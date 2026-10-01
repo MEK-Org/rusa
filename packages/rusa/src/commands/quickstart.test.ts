@@ -31,14 +31,15 @@ import {
   buildAppDockerRunArgs,
   buildQuickstartImage,
   buildSetupDockerRunArgs,
+  configureBridgeRemote,
   enabledProviders,
+  type GitCommandExecutor,
   printFallbackCommands,
   QUICKSTART_DASHBOARD_PORT,
   QUICKSTART_GIT_BRIDGE_PORT,
   runProviderLogins,
   runQuickstart,
   runQuickstartConfigure,
-  setupBridgeRemoteAndPush,
   updateQuickstartRepoConfig,
   validateLocalGitRepo,
 } from "./quickstart.js";
@@ -403,10 +404,14 @@ describe("quickstart command", () => {
             if (args.includes("--verify")) {
               return { status: 0, stdout: "c0ffee\n", stderr: "" };
             }
+            if (args.includes("symbolic-ref")) {
+              return { status: 0, stdout: "main\n", stderr: "" };
+            }
             return { status: 0, stdout: "", stderr: "" };
           });
           const res = validateLocalGitRepo(tempDir, fakeGit);
           expect(res.valid).toBe(true);
+          expect(res.branch).toBe("main");
           expect(res.repoName).toBe(tempDir.split("/").pop());
           expect(res.repoKey).toBe(`local/${res.repoName}`);
           expect(res.resolvedPath).toBe(tempDir);
@@ -511,98 +516,42 @@ describe("quickstart command", () => {
       });
     });
 
-    describe("setupBridgeRemoteAndPush", () => {
-      it("adds remote rusa and pushes HEAD when remote does not exist", () => {
-        const gitCalls: string[][] = [];
-        const executeGit = vi.fn((args: string[]) => {
-          gitCalls.push(args);
-          if (args.includes("remote") && args.includes("get-url")) {
-            return { status: 1, stdout: "", stderr: "no such remote" };
-          }
-          return { status: 0, stdout: "", stderr: "" };
-        });
+    describe("configureBridgeRemote", () => {
+      const remoteUrl = `http://localhost:${QUICKSTART_GIT_BRIDGE_PORT}/local/my-repo.git`;
 
-        const res = setupBridgeRemoteAndPush({
-          repoPath: "/work/my-repo",
-          repoKey: "local/my-repo",
-          port: 8085,
-          executeGit,
-        });
-
-        expect(res.success).toBe(true);
-        expect(res.pushed).toBe(true);
-        expect(gitCalls).toEqual([
+      it("adds remote rusa when it does not exist and pushes nothing", () => {
+        const executeGit = vi.fn((args: string[]) =>
+          args.includes("get-url")
+            ? { status: 2, stdout: "", stderr: "No such remote" }
+            : { status: 0, stdout: "", stderr: "" }
+        );
+        expect(configureBridgeRemote("/work/my-repo", "local/my-repo", executeGit)).toBe(true);
+        expect(executeGit.mock.calls.map((call) => call[0])).toEqual([
           ["-C", "/work/my-repo", "remote", "get-url", "rusa"],
-          [
-            "-C",
-            "/work/my-repo",
-            "remote",
-            "add",
-            "rusa",
-            "http://localhost:8085/local/my-repo.git",
-          ],
-          ["-C", "/work/my-repo", "push", "rusa", "HEAD"],
+          ["-C", "/work/my-repo", "remote", "add", "rusa", remoteUrl],
         ]);
       });
 
-      it("updates remote rusa with set-url when remote already exists", () => {
-        const gitCalls: string[][] = [];
-        const executeGit = vi.fn((args: string[]) => {
-          gitCalls.push(args);
-          if (args.includes("remote") && args.includes("get-url")) {
-            return { status: 0, stdout: "http://localhost:8085/old.git\n", stderr: "" };
-          }
-          return { status: 0, stdout: "", stderr: "" };
-        });
-
-        const res = setupBridgeRemoteAndPush({
-          repoPath: "/work/my-repo",
-          repoKey: "local/my-repo",
-          port: 8085,
-          executeGit,
-        });
-
-        expect(res.success).toBe(true);
-        expect(res.pushed).toBe(true);
-        expect(gitCalls).toEqual([
+      it("repoints an existing rusa remote with set-url", () => {
+        const executeGit = vi.fn((_args: string[]) => ({ status: 0, stdout: "", stderr: "" }));
+        expect(configureBridgeRemote("/work/my-repo", "local/my-repo", executeGit)).toBe(true);
+        expect(executeGit.mock.calls.map((call) => call[0])).toEqual([
           ["-C", "/work/my-repo", "remote", "get-url", "rusa"],
-          [
-            "-C",
-            "/work/my-repo",
-            "remote",
-            "set-url",
-            "rusa",
-            "http://localhost:8085/local/my-repo.git",
-          ],
-          ["-C", "/work/my-repo", "push", "rusa", "HEAD"],
+          ["-C", "/work/my-repo", "remote", "set-url", "rusa", remoteUrl],
         ]);
       });
 
-      it("prints fallback commands and returns failure when push fails", () => {
+      it("prints the recovery command when the remote cannot be set", () => {
         const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
         const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-        const executeGit = vi.fn((args: string[]) => {
-          if (args.includes("push")) {
-            return { status: 1, stdout: "", stderr: "Connection refused" };
-          }
-          return { status: 0, stdout: "", stderr: "" };
-        });
-
-        const res = setupBridgeRemoteAndPush({
-          repoPath: "/work/my-repo",
-          repoKey: "local/my-repo",
-          port: 8085,
-          executeGit,
-        });
-
-        expect(res.success).toBe(false);
-        expect(res.pushed).toBe(false);
-        expect(warn).toHaveBeenCalledWith(
-          expect.stringContaining("Automatic git push to local bridge failed")
+        const executeGit = vi.fn((args: string[]) =>
+          args.includes("get-url")
+            ? { status: 0, stdout: "", stderr: "" }
+            : { status: 1, stdout: "", stderr: "could not lock config file" }
         );
-        expect(log).toHaveBeenCalledWith(
-          expect.stringContaining("You can manually configure and push your repository")
-        );
+        expect(configureBridgeRemote("/work/my-repo", "local/my-repo", executeGit)).toBe(false);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("could not lock config file"));
+        expect(log).toHaveBeenCalledWith(expect.stringContaining("remote set-url rusa"));
         log.mockRestore();
         warn.mockRestore();
       });
@@ -620,61 +569,133 @@ describe("quickstart command", () => {
       });
     });
 
-    describe("runQuickstart four root scenarios", () => {
-      it("scenario 1 (reconfigure path): adds local/new beside local/old and pushes", async () => {
-        doctorMocks.runQuickstartDoctor.mockResolvedValue([
-          { name: "node", status: "pass", message: "node ok" },
-        ]);
-
-        let writtenConfig = "";
-        const gitOps: string[][] = [];
-
-        const executeGit = vi.fn((args: string[]) => {
+    describe("runQuickstart with a local repository", () => {
+      // A git double for a valid repo on branch main whose `rusa` remote is absent
+      // unless `remoteExists` is set.
+      function validRepoGit(gitOps: string[][], remoteExists = false) {
+        return vi.fn((args: string[]) => {
           gitOps.push(args);
           if (args.includes("--is-inside-work-tree"))
             return { status: 0, stdout: "true\n", stderr: "" };
-          if (args.includes("--verify")) return { status: 0, stdout: "commit1\n", stderr: "" };
-          if (args.includes("remote") && args.includes("get-url"))
-            return { status: 1, stdout: "", stderr: "" };
-          return { status: 0, stdout: "", stderr: "" };
+          if (args.includes("symbolic-ref")) return { status: 0, stdout: "main\n", stderr: "" };
+          if (args.includes("get-url"))
+            return remoteExists
+              ? { status: 0, stdout: "http://localhost:8085/old.git\n", stderr: "" }
+              : { status: 2, stdout: "", stderr: "" };
+          return { status: 0, stdout: "commit1\n", stderr: "" };
         });
+      }
 
-        const testRepoDir = mkdtempSync(join(tmpdir(), "new-repo-"));
-
+      function dockerDouble(
+        dockerOps: string[][],
+        opts: {
+          config: RusaConfig;
+          onWrite?: (input: string) => void;
+          seedStatus?: number;
+        }
+      ) {
         spawnSyncMock.mockImplementation(
-          (cmd: string, args: string[], opts?: { input?: string }) => {
-            if (cmd === "docker") {
-              if (args.includes("test") && args.includes("/home/node/.rusa/config.yaml")) {
-                return { status: 0, stdout: "", stderr: "" };
-              }
-              if (args.includes("cat") && args.includes("/home/node/.rusa/config.yaml")) {
-                const initialConfig = createTestConfig({
-                  github: { repos: ["local/old-repo"] },
-                });
-                return { status: 0, stdout: toYaml(initialConfig), stderr: "" };
-              }
-              if (args.includes("sh") && opts?.input) {
-                writtenConfig = opts.input;
-                return { status: 0, stdout: "", stderr: "" };
-              }
+          (cmd: string, args: string[], spawnOpts?: { input?: string }) => {
+            if (cmd !== "docker") return { status: 0, stdout: "", stderr: "" };
+            dockerOps.push(args);
+            if (args.includes("cat")) return { status: 0, stdout: toYaml(opts.config), stderr: "" };
+            if (args.includes("sh") && spawnOpts?.input !== undefined) {
+              opts.onWrite?.(spawnOpts.input);
+              return { status: 0, stdout: "", stderr: "" };
             }
+            if (args.includes("seed"))
+              return { status: opts.seedStatus ?? 0, stdout: "", stderr: "seed failed" };
             return { status: 0, stdout: "", stderr: "" };
           }
         );
+      }
 
+      const isAppRun = (args: string[]) => args[0] === "run" && !args.includes("sleep");
+
+      it("registers beside existing entries, seeds before the app starts, then sets the remote", async () => {
+        const gitOps: string[][] = [];
+        const dockerOps: string[][] = [];
+        let writtenConfig = "";
+        dockerDouble(dockerOps, {
+          config: createTestConfig({ github: { repos: ["local/old-repo"] } }),
+          onWrite: (input) => {
+            writtenConfig = input;
+          },
+        });
+        const testRepoDir = mkdtempSync(join(tmpdir(), "new-repo-"));
+        const repoKey = `local/${basename(testRepoDir)}`;
         try {
           await runQuickstart({
             skipBuild: true,
             reconfigure: true,
             localRepo: testRepoDir,
-            executeGit,
-            waitForBridgeReady: async () => true,
+            executeGit: validRepoGit(gitOps),
           });
 
-          const parsed = parseYaml(writtenConfig) as RusaConfig;
-          const repoName = testRepoDir.split("/").pop();
-          expect(parsed.github?.repos).toEqual(["local/old-repo", `local/${repoName}`]);
-          expect(gitOps.some((args) => args.includes("push") && args.includes("rusa"))).toBe(true);
+          expect((parseYaml(writtenConfig) as RusaConfig).github?.repos).toEqual([
+            "local/old-repo",
+            repoKey,
+          ]);
+          const bundleOp = gitOps.find((args) => args.includes("bundle"));
+          expect(bundleOp?.slice(0, 4)).toEqual(["-C", testRepoDir, "bundle", "create"]);
+          expect(bundleOp?.at(-1)).toBe("refs/heads/main");
+
+          const cpIndex = dockerOps.findIndex((args) => args[0] === "cp");
+          const seedIndex = dockerOps.findIndex((args) => args.includes("seed"));
+          const appIndex = dockerOps.findIndex(isAppRun);
+          expect(cpIndex).toBeGreaterThan(-1);
+          expect(dockerOps[seedIndex]).toEqual([
+            "exec",
+            "rusa-quickstart-setup",
+            "rusa",
+            "quickstart",
+            "seed",
+            "--repo-key",
+            repoKey,
+            "--bundle",
+            "/tmp/rusa-seed.bundle",
+            "--branch",
+            "main",
+          ]);
+          expect(cpIndex).toBeLessThan(seedIndex);
+          expect(seedIndex).toBeLessThan(appIndex);
+
+          expect(gitOps.at(-1)).toEqual([
+            "-C",
+            testRepoDir,
+            "remote",
+            "add",
+            "rusa",
+            `http://localhost:${QUICKSTART_GIT_BRIDGE_PORT}/${repoKey}.git`,
+          ]);
+          expect(gitOps.some((args) => args.includes("push"))).toBe(false);
+        } finally {
+          rmSync(testRepoDir, { recursive: true, force: true });
+        }
+      });
+
+      it("does not duplicate an entry the volume already holds and repoints the remote", async () => {
+        const gitOps: string[][] = [];
+        const dockerOps: string[][] = [];
+        const testRepoDir = mkdtempSync(join(tmpdir(), "existing-repo-"));
+        const repoKey = `local/${basename(testRepoDir)}`;
+        let writtenConfig = "";
+        dockerDouble(dockerOps, {
+          config: createTestConfig({ github: { repos: [repoKey] } }),
+          onWrite: (input) => {
+            writtenConfig = input;
+          },
+        });
+        try {
+          await runQuickstart({
+            skipBuild: true,
+            localRepo: testRepoDir,
+            executeGit: validRepoGit(gitOps, true),
+          });
+
+          expect((parseYaml(writtenConfig) as RusaConfig).github?.repos).toEqual([repoKey]);
+          expect(dockerOps.some((args) => args.includes("seed"))).toBe(true);
+          expect(gitOps.at(-1)?.slice(2, 4)).toEqual(["remote", "set-url"]);
         } finally {
           rmSync(testRepoDir, { recursive: true, force: true });
         }
@@ -695,14 +716,8 @@ describe("quickstart command", () => {
         },
       ];
       for (const failure of registrationFailures) {
-        it(`stops before the app container and any host remote change when ${failure.name}`, async () => {
+        it(`stops before seeding, the app container and any host remote change when ${failure.name}`, async () => {
           const gitOps: string[][] = [];
-          const executeGit = vi.fn((args: string[]) => {
-            gitOps.push(args);
-            if (args.includes("--is-inside-work-tree"))
-              return { status: 0, stdout: "true\n", stderr: "" };
-            return { status: 0, stdout: "commit1\n", stderr: "" };
-          });
           const dockerOps: string[][] = [];
           spawnSyncMock.mockImplementation(
             (cmd: string, args: string[], opts?: { input?: string }) => {
@@ -721,13 +736,13 @@ describe("quickstart command", () => {
                 skipBuild: true,
                 reconfigure: true,
                 localRepo: testRepoDir,
-                executeGit,
-                waitForBridgeReady: async () => true,
+                executeGit: validRepoGit(gitOps),
               })
             ).rejects.toThrow(/Could not register local\/reg-fail-/);
             expect(
-              gitOps.filter((args) => args.includes("remote") || args.includes("push"))
+              gitOps.filter((args) => args.includes("remote") || args.includes("bundle"))
             ).toEqual([]);
+            expect(dockerOps.some((args) => args[0] === "cp" || args.includes("seed"))).toBe(false);
             // Only the setup container ever starts; the app container never does.
             expect(dockerOps.filter((args) => args[0] === "run")).toHaveLength(1);
           } finally {
@@ -737,217 +752,89 @@ describe("quickstart command", () => {
         });
       }
 
-      it("scenario 2 (missing/non-git path): rejects invalid path before container launch", async () => {
-        doctorMocks.runQuickstartDoctor.mockResolvedValue([
-          { name: "node", status: "pass", message: "node ok" },
-        ]);
+      it("stops before the app container and any host remote change when seeding fails", async () => {
+        const gitOps: string[][] = [];
+        const dockerOps: string[][] = [];
+        dockerDouble(dockerOps, { config: createTestConfig(), seedStatus: 1 });
+        const testRepoDir = mkdtempSync(join(tmpdir(), "seed-fail-"));
+        try {
+          await expect(
+            runQuickstart({
+              skipBuild: true,
+              localRepo: testRepoDir,
+              executeGit: validRepoGit(gitOps),
+            })
+          ).rejects.toThrow(/seed failed/);
+          expect(dockerOps.some(isAppRun)).toBe(false);
+          expect(gitOps.some((args) => args.includes("remote"))).toBe(false);
+        } finally {
+          rmSync(testRepoDir, { recursive: true, force: true });
+        }
+      });
 
+      it("rejects a missing path before any container work", async () => {
         await expect(
           runQuickstart({
             skipBuild: true,
             localRepo: "/does/not/exist/at/all",
           })
         ).rejects.toThrow("Path does not exist");
-      });
-
-      it("scenario 3 (existing volume with a config already holding the entry): does not duplicate and updates remote", async () => {
-        doctorMocks.runQuickstartDoctor.mockResolvedValue([
-          { name: "node", status: "pass", message: "node ok" },
-        ]);
-
-        const testRepoDir = mkdtempSync(join(tmpdir(), "existing-repo-"));
-        const repoName = testRepoDir.split("/").pop();
-        const repoKey = `local/${repoName}`;
-
-        let writtenConfig = "";
-        const gitOps: string[][] = [];
-
-        const executeGit = vi.fn((args: string[]) => {
-          gitOps.push(args);
-          if (args.includes("--is-inside-work-tree"))
-            return { status: 0, stdout: "true\n", stderr: "" };
-          if (args.includes("--verify")) return { status: 0, stdout: "commit1\n", stderr: "" };
-          if (args.includes("remote") && args.includes("get-url")) {
-            return { status: 0, stdout: `http://localhost:8085/${repoKey}.git\n`, stderr: "" };
-          }
-          return { status: 0, stdout: "", stderr: "" };
-        });
-
-        spawnSyncMock.mockImplementation(
-          (cmd: string, args: string[], opts?: { input?: string }) => {
-            if (cmd === "docker") {
-              if (args.includes("test") && args.includes("/home/node/.rusa/config.yaml")) {
-                return { status: 0, stdout: "", stderr: "" };
-              }
-              if (args.includes("cat") && args.includes("/home/node/.rusa/config.yaml")) {
-                const existingConfig = createTestConfig({
-                  github: { repos: [repoKey] },
-                });
-                return { status: 0, stdout: toYaml(existingConfig), stderr: "" };
-              }
-              if (args.includes("sh") && opts?.input) {
-                writtenConfig = opts.input;
-                return { status: 0, stdout: "", stderr: "" };
-              }
-            }
-            return { status: 0, stdout: "", stderr: "" };
-          }
-        );
-
-        try {
-          await runQuickstart({
-            skipBuild: true,
-            localRepo: testRepoDir,
-            executeGit,
-            waitForBridgeReady: async () => true,
-          });
-
-          const parsed = parseYaml(writtenConfig) as RusaConfig;
-          expect(parsed.github?.repos).toEqual([repoKey]);
-          expect(
-            gitOps.some(
-              (args) => args.includes("remote") && args.includes("set-url") && args.includes("rusa")
-            )
-          ).toBe(true);
-          expect(gitOps.some((args) => args.includes("push") && args.includes("rusa"))).toBe(true);
-        } finally {
-          rmSync(testRepoDir, { recursive: true, force: true });
-        }
-      });
-
-      it("scenario 4 (bridge not ready within the wait): logs warning and prints fallback instructions", async () => {
-        doctorMocks.runQuickstartDoctor.mockResolvedValue([
-          { name: "node", status: "pass", message: "node ok" },
-        ]);
-
-        const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-        const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
-        const testRepoDir = mkdtempSync(join(tmpdir(), "unready-bridge-"));
-
-        const executeGit = vi.fn((args: string[]) => {
-          if (args.includes("--is-inside-work-tree"))
-            return { status: 0, stdout: "true\n", stderr: "" };
-          if (args.includes("--verify")) return { status: 0, stdout: "commit1\n", stderr: "" };
-          return { status: 0, stdout: "", stderr: "" };
-        });
-
-        spawnSyncMock.mockImplementation((cmd: string, args: string[]) => {
-          if (cmd === "docker") {
-            if (args.includes("test") && args.includes("/home/node/.rusa/config.yaml")) {
-              return { status: 0, stdout: "", stderr: "" };
-            }
-            if (args.includes("cat") && args.includes("/home/node/.rusa/config.yaml")) {
-              return {
-                status: 0,
-                stdout: toYaml({ profile: "quickstart", github: {} }),
-                stderr: "",
-              };
-            }
-          }
-          return { status: 0, stdout: "", stderr: "" };
-        });
-
-        try {
-          await runQuickstart({
-            skipBuild: true,
-            localRepo: testRepoDir,
-            executeGit,
-            waitForBridgeReady: async () => false,
-          });
-
-          expect(warn).toHaveBeenCalledWith(
-            expect.stringContaining("did not become ready within the timeout")
-          );
-          expect(log).toHaveBeenCalledWith(
-            expect.stringContaining("You can manually configure and push your repository")
-          );
-          expect(executeGit.mock.calls.some((c) => c[0].includes("push"))).toBe(false);
-        } finally {
-          rmSync(testRepoDir, { recursive: true, force: true });
-          warn.mockRestore();
-          log.mockRestore();
-        }
+        expect(spawnSyncMock).not.toHaveBeenCalled();
       });
     });
 
-    describe("real disposable git repository integration", () => {
-      it("validates a real git repository on disk and configures remote", async () => {
-        const cp = await vi.importActual<typeof import("child_process")>("child_process");
-        const actualSpawnSync = cp.spawnSync;
-        spawnSyncMock.mockImplementation((cmd: string, args: string[], opts?: unknown) =>
-          actualSpawnSync(cmd, args as never, opts as never)
-        );
-
-        const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-        const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
-        const realRepoDir = mkdtempSync(join(tmpdir(), "rusa-real-git-"));
+    describe("real disposable git repository", () => {
+      const realGit: GitCommandExecutor = (args) => {
         try {
-          // 1. Directory before git init
-          const emptyDirRes = validateLocalGitRepo(realRepoDir);
-          expect(emptyDirRes.valid).toBe(false);
-          expect(emptyDirRes.error).toContain("Not a git repository");
+          const stdout = execFileSync("git", args, { encoding: "utf8", stdio: "pipe" });
+          return { status: 0, stdout, stderr: "" };
+        } catch (err) {
+          const failed = err as { status?: number; stderr?: string };
+          return { status: failed.status ?? 1, stdout: "", stderr: String(failed.stderr ?? "") };
+        }
+      };
+      const getUrl = (cwd: string) =>
+        execFileSync("git", ["remote", "get-url", "rusa"], { cwd, encoding: "utf8" }).trim();
 
-          // 2. Initialized repo with no commits
-          execFileSync("git", ["init"], { cwd: realRepoDir });
-          execFileSync("git", ["config", "user.name", "Quickstart Tester"], { cwd: realRepoDir });
-          execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: realRepoDir });
+      it("validates step by step, then adds and repoints the rusa remote on disk", () => {
+        const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+        const repo = mkdtempSync(join(tmpdir(), "rusa-real-git-"));
+        try {
+          expect(validateLocalGitRepo(repo, realGit).error).toContain("Not a git repository");
 
-          const noCommitRes = validateLocalGitRepo(realRepoDir);
-          expect(noCommitRes.valid).toBe(false);
-          expect(noCommitRes.error).toContain("has no commits");
+          execFileSync("git", ["init", "-b", "main"], { cwd: repo, stdio: "pipe" });
+          execFileSync("git", ["config", "user.name", "Quickstart Tester"], { cwd: repo });
+          execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+          expect(validateLocalGitRepo(repo, realGit).error).toContain("has no commits");
 
-          // 3. Repo with an initial commit
-          execFileSync("git", ["commit", "--allow-empty", "-m", "initial commit"], {
-            cwd: realRepoDir,
+          execFileSync("git", ["commit", "--allow-empty", "-m", "initial"], {
+            cwd: repo,
+            stdio: "pipe",
+          });
+          const valid = validateLocalGitRepo(repo, realGit);
+          expect(valid).toMatchObject({
+            valid: true,
+            repoKey: `local/${basename(repo)}`,
+            resolvedPath: repo,
+            branch: "main",
           });
 
-          const validRes = validateLocalGitRepo(realRepoDir);
-          expect(validRes.valid).toBe(true);
-          const repoName = basename(realRepoDir);
-          expect(validRes.repoName).toBe(repoName);
-          expect(validRes.repoKey).toBe(`local/${repoName}`);
-          expect(validRes.resolvedPath).toBe(realRepoDir);
+          execFileSync("git", ["checkout", "-q", "--detach"], { cwd: repo });
+          expect(validateLocalGitRepo(repo, realGit).error).toContain("HEAD is detached");
+          execFileSync("git", ["checkout", "-q", "main"], { cwd: repo });
 
-          if (!validRes.valid || !validRes.repoKey) {
-            throw new Error(`Expected repo to be valid: ${validRes.error}`);
-          }
-          const repoKey = validRes.repoKey;
+          const repoKey = valid.repoKey as string;
+          const url = `http://localhost:${QUICKSTART_GIT_BRIDGE_PORT}/${repoKey}.git`;
+          expect(configureBridgeRemote(repo, repoKey, realGit)).toBe(true);
+          expect(getUrl(repo)).toBe(url);
 
-          // 4. End-to-end setupBridgeRemoteAndPush: adds remote 'rusa' on disk
-          const setupRes = setupBridgeRemoteAndPush({
-            repoPath: realRepoDir,
-            repoKey,
+          execFileSync("git", ["remote", "set-url", "rusa", "http://localhost:9/stale.git"], {
+            cwd: repo,
           });
-          expect(setupRes.success).toBe(false);
-          expect(setupRes.pushed).toBe(false);
-          expect(setupRes.error).toBeDefined();
-
-          const remoteUrlOnDisk = execFileSync("git", ["remote", "get-url", "rusa"], {
-            cwd: realRepoDir,
-            encoding: "utf8",
-          }).trim();
-          expect(remoteUrlOnDisk).toBe(
-            `http://localhost:${QUICKSTART_GIT_BRIDGE_PORT}/${repoKey}.git`
-          );
-
-          // 5. Subsequent run: updates remote url via set-url on disk
-          const updatedPort = 8089;
-          const reconfigureRes = setupBridgeRemoteAndPush({
-            repoPath: realRepoDir,
-            repoKey,
-            port: updatedPort,
-          });
-          expect(reconfigureRes.success).toBe(false);
-          expect(reconfigureRes.pushed).toBe(false);
-
-          const updatedUrlOnDisk = execFileSync("git", ["remote", "get-url", "rusa"], {
-            cwd: realRepoDir,
-            encoding: "utf8",
-          }).trim();
-          expect(updatedUrlOnDisk).toBe(`http://localhost:${updatedPort}/${repoKey}.git`);
+          expect(configureBridgeRemote(repo, repoKey, realGit)).toBe(true);
+          expect(getUrl(repo)).toBe(url);
         } finally {
-          rmSync(realRepoDir, { recursive: true, force: true });
-          warn.mockRestore();
+          rmSync(repo, { recursive: true, force: true });
           log.mockRestore();
         }
       });

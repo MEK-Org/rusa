@@ -5,18 +5,20 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { createConnection } from "node:net";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { input, password } from "@inquirer/prompts";
 import { parse as parseYaml, stringify as toYaml } from "yaml";
 import { generateRandomRootHandle } from "../actor/handle-generator.js";
 import { GEMINI_API_KEY_SECRET_FILENAME, writeHostSecret } from "../config/secrets.js";
 import type { RusaConfig } from "../config/types.js";
+import { seedBareRepoFromLocalPath } from "../gitops/worktree.js";
 import { formatDoctorResults, runQuickstartDoctor } from "./quickstart-doctor.js";
 
 export const QUICKSTART_DASHBOARD_PORT = 8080;
@@ -74,6 +76,7 @@ export interface LocalRepoValidation {
   repoName?: string;
   repoKey?: string;
   resolvedPath?: string;
+  branch?: string;
   error?: string;
 }
 
@@ -121,6 +124,15 @@ export function validateLocalGitRepo(
     };
   }
 
+  const branchCheck = executeGit(["-C", resolvedPath, "symbolic-ref", "--short", "-q", "HEAD"]);
+  const branch = branchCheck.status === 0 ? branchCheck.stdout?.trim() : "";
+  if (!branch) {
+    return {
+      valid: false,
+      error: `HEAD is detached in ${resolvedPath}. Check out the branch Rusa should work from.`,
+    };
+  }
+
   // The name becomes the `local/<name>` key in github.repos and a path segment of
   // the bridge URL, so it must pass the config loader's repo pattern and route
   // through the bridge without percent-encoding.
@@ -137,6 +149,7 @@ export function validateLocalGitRepo(
     repoName,
     repoKey: `local/${repoName}`,
     resolvedPath,
+    branch,
   };
 }
 
@@ -152,85 +165,71 @@ export function updateQuickstartRepoConfig(config: RusaConfig, repoKey: string):
   };
 }
 
-export async function waitForPortReady(
-  port: number,
-  host = "127.0.0.1",
-  timeoutMs = 15000,
-  intervalMs = 250
-): Promise<boolean> {
-  const startTime = Date.now();
-  while (Date.now() - startTime < timeoutMs) {
-    const ready = await new Promise<boolean>((resolve) => {
-      const socket = createConnection({ port, host });
-      socket.once("connect", () => {
-        socket.destroy();
-        resolve(true);
-      });
-      socket.once("error", () => {
-        socket.destroy();
-        resolve(false);
-      });
-    });
-    if (ready) return true;
-    await new Promise((r) => setTimeout(r, intervalMs));
-  }
-  return false;
-}
-
-export interface SetupBridgeRemoteOptions {
-  repoPath: string;
-  repoKey: string;
-  port?: number;
-  executeGit?: GitCommandExecutor;
+export function bridgeRemoteUrl(repoKey: string): string {
+  return `http://localhost:${QUICKSTART_GIT_BRIDGE_PORT}/${repoKey}.git`;
 }
 
 export function printFallbackCommands(repoPath: string, remoteUrl: string): void {
   const git = `git -C ${shellQuote(repoPath)}`;
   const url = shellQuote(remoteUrl);
-  console.log(`[quickstart] You can manually configure and push your repository:`);
+  console.log(`[quickstart] You can add the remote yourself:`);
   console.log(`  ${git} remote set-url rusa ${url} || ${git} remote add rusa ${url}`);
-  console.log(`  ${git} push rusa HEAD`);
 }
 
-export function setupBridgeRemoteAndPush(opts: SetupBridgeRemoteOptions): {
-  success: boolean;
-  pushed: boolean;
-  error?: string;
-} {
-  const port = opts.port ?? QUICKSTART_GIT_BRIDGE_PORT;
-  const remoteUrl = `http://localhost:${port}/${opts.repoKey}.git`;
-  const execute =
-    opts.executeGit ?? ((args) => spawnSync("git", args, { encoding: "utf8", stdio: "pipe" }));
-
-  const getUrlRes = execute(["-C", opts.repoPath, "remote", "get-url", "rusa"]);
-  if (getUrlRes.status === 0) {
-    const setUrlRes = execute(["-C", opts.repoPath, "remote", "set-url", "rusa", remoteUrl]);
-    if (setUrlRes.status !== 0) {
-      const err = setUrlRes.stderr?.trim() || "Failed to update git remote url";
-      console.warn(`[quickstart] Failed to update git remote "rusa": ${err}`);
-      printFallbackCommands(opts.repoPath, remoteUrl);
-      return { success: false, pushed: false, error: err };
-    }
-  } else {
-    const addRes = execute(["-C", opts.repoPath, "remote", "add", "rusa", remoteUrl]);
-    if (addRes.status !== 0) {
-      const err = addRes.stderr?.trim() || "Failed to add git remote";
-      console.warn(`[quickstart] Failed to add git remote "rusa": ${err}`);
-      printFallbackCommands(opts.repoPath, remoteUrl);
-      return { success: false, pushed: false, error: err };
-    }
+// Points the host repo's `rusa` remote at the bridge so agent mc/* branches can
+// be fetched. The base branch is already seeded; nothing is pushed.
+export function configureBridgeRemote(
+  repoPath: string,
+  repoKey: string,
+  executeGit: GitCommandExecutor
+): boolean {
+  const remoteUrl = bridgeRemoteUrl(repoKey);
+  const exists = executeGit(["-C", repoPath, "remote", "get-url", "rusa"]).status === 0;
+  const res = executeGit(["-C", repoPath, "remote", exists ? "set-url" : "add", "rusa", remoteUrl]);
+  if (res.status !== 0) {
+    console.warn(
+      `[quickstart] Could not set git remote "rusa": ${res.stderr?.trim() || "git remote failed"}`
+    );
+    printFallbackCommands(repoPath, remoteUrl);
+    return false;
   }
+  console.log(`[quickstart] Remote "rusa" in ${repoPath} now points at ${remoteUrl}`);
+  return true;
+}
 
-  const pushRes = execute(["-C", opts.repoPath, "push", "rusa", "HEAD"]);
-  if (pushRes.status !== 0) {
-    const err = pushRes.stderr?.trim() || "Failed to push HEAD to rusa git bridge";
-    console.warn(`[quickstart] Automatic git push to local bridge failed: ${err}`);
-    printFallbackCommands(opts.repoPath, remoteUrl);
-    return { success: false, pushed: false, error: err };
+// Bundles the host branch so the setup container can seed the bridge from it;
+// the host repo itself is never mounted into a container.
+export function createSeedBundle(
+  repoPath: string,
+  branch: string,
+  outDir: string,
+  executeGit: GitCommandExecutor = (args) =>
+    spawnSync("git", args, { encoding: "utf8", stdio: "pipe" })
+): string {
+  const bundlePath = join(outDir, "seed.bundle");
+  const res = executeGit(["-C", repoPath, "bundle", "create", bundlePath, `refs/heads/${branch}`]);
+  if (res.status !== 0) {
+    throw new Error(`git bundle of ${branch} failed: ${res.stderr?.trim() || "unknown error"}`);
   }
+  return bundlePath;
+}
 
-  console.log(`[quickstart] Successfully pushed HEAD to local git bridge at ${remoteUrl}`);
-  return { success: true, pushed: true };
+export interface QuickstartSeedOptions {
+  home?: string;
+  repo: string;
+  bundle: string;
+  branch: string;
+}
+
+// In-container half of seeding: writes the bundled branch into the bridge repo.
+export function runQuickstartSeed(opts: QuickstartSeedOptions): void {
+  seedBareRepoFromLocalPath({
+    mcHome: resolveHomeOverride(opts.home),
+    repoId: opts.repo,
+    localPath: resolve(opts.bundle),
+    branch: opts.branch,
+  });
+  console.log(`[quickstart] Seeded ${opts.repo} at ${opts.branch}`);
 }
 
 export interface QuickstartOptions {
@@ -241,7 +240,6 @@ export interface QuickstartOptions {
   reconfigure?: boolean;
   localRepo?: string;
   promptLocalRepo?: () => Promise<string>;
-  waitForBridgeReady?: (port: number, host?: string, timeoutMs?: number) => Promise<boolean>;
   executeGit?: GitCommandExecutor;
 }
 
@@ -354,6 +352,38 @@ function registerLocalRepo(setupContainer: string, repoKey: string): void {
   console.log(`[quickstart] Registered ${repoKey} in volume config.yaml`);
 }
 
+const SETUP_BUNDLE_PATH = "/tmp/rusa-seed.bundle";
+
+// Seeds the bridge repo before the app starts. Any failure throws, so the app
+// never comes up serving a repo without its base branch.
+function seedLocalRepo(
+  setupContainer: string,
+  repo: Required<Pick<LocalRepoValidation, "repoKey" | "resolvedPath" | "branch">>,
+  executeGit: GitCommandExecutor
+): void {
+  const dir = mkdtempSync(join(tmpdir(), "rusa-quickstart-"));
+  try {
+    const bundle = createSeedBundle(repo.resolvedPath, repo.branch, dir, executeGit);
+    runDocker(["cp", bundle, `${setupContainer}:${SETUP_BUNDLE_PATH}`]);
+    runDocker([
+      "exec",
+      setupContainer,
+      "rusa",
+      "quickstart",
+      "seed",
+      "--repo-key",
+      repo.repoKey,
+      "--bundle",
+      SETUP_BUNDLE_PATH,
+      "--branch",
+      repo.branch,
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  console.log(`[quickstart] Seeded ${repo.repoKey} from ${repo.branch} at ${repo.resolvedPath}`);
+}
+
 export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void> {
   const image = opts.image ?? "rusa:quickstart";
   const container = opts.container ?? "rusa-quickstart";
@@ -361,7 +391,6 @@ export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void>
   const volume = opts.volume ?? "rusa-quickstart-home";
   const executeGit =
     opts.executeGit ?? ((args) => spawnSync("git", args, { encoding: "utf8", stdio: "pipe" }));
-  const waitForBridge = opts.waitForBridgeReady ?? waitForPortReady;
 
   console.log("\nRusa quickstart\n");
   const doctorResults = await runQuickstartDoctor({
@@ -462,8 +491,17 @@ export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void>
     }
   }
 
-  if (localRepoValidation?.repoKey) {
-    registerLocalRepo(setupContainer, localRepoValidation.repoKey);
+  const localRepo =
+    localRepoValidation?.repoKey && localRepoValidation.resolvedPath && localRepoValidation.branch
+      ? {
+          repoKey: localRepoValidation.repoKey,
+          resolvedPath: localRepoValidation.resolvedPath,
+          branch: localRepoValidation.branch,
+        }
+      : null;
+  if (localRepo) {
+    registerLocalRepo(setupContainer, localRepo.repoKey);
+    seedLocalRepo(setupContainer, localRepo, executeGit);
   }
 
   console.log("\n[quickstart] Replacing setup container with the app container...");
@@ -472,23 +510,8 @@ export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void>
 
   console.log(`\nDashboard: http://localhost:${QUICKSTART_DASHBOARD_PORT}\n`);
 
-  if (localRepoValidation?.resolvedPath && localRepoValidation?.repoKey) {
-    console.log(`[quickstart] Waiting for git bridge on port ${QUICKSTART_GIT_BRIDGE_PORT}...`);
-    const bridgeReady = await waitForBridge(QUICKSTART_GIT_BRIDGE_PORT);
-    if (!bridgeReady) {
-      console.warn(
-        `[quickstart] Git bridge port ${QUICKSTART_GIT_BRIDGE_PORT} did not become ready within the timeout.`
-      );
-      const remoteUrl = `http://localhost:${QUICKSTART_GIT_BRIDGE_PORT}/${localRepoValidation.repoKey}.git`;
-      printFallbackCommands(localRepoValidation.resolvedPath, remoteUrl);
-    } else {
-      setupBridgeRemoteAndPush({
-        repoPath: localRepoValidation.resolvedPath,
-        repoKey: localRepoValidation.repoKey,
-        port: QUICKSTART_GIT_BRIDGE_PORT,
-        executeGit,
-      });
-    }
+  if (localRepo) {
+    configureBridgeRemote(localRepo.resolvedPath, localRepo.repoKey, executeGit);
   }
 }
 

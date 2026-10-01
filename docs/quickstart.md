@@ -24,6 +24,7 @@ The root `quickstart` command accepts the following options:
    * Confirms the path exists and is a directory.
    * Confirms the path is inside a Git worktree (`git rev-parse --is-inside-work-tree`).
    * Confirms the repository has at least one commit (`git rev-parse --verify HEAD`).
+   * Confirms a branch is checked out (not a detached `HEAD`); that branch becomes the base agents work from.
    * Confirms the directory name uses only letters, digits, `.`, `_` and `-`, since it becomes the `local/<dirname>` repo key and part of the bridge URL.
 
 2. **Image Build & Volume Provisioning**
@@ -38,35 +39,31 @@ The root `quickstart` command accepts the following options:
    * **Root handle**: The display identity for the local root actor.
 
 4. **Automatic Repository Subscription**
-   Quickstart writes or updates `github.repos` in the volume's `config.yaml` with `local/<dirname>`. On reconfigure, it updates any existing `local/*` entry without duplicates, preserving other configured repositories.
+   Quickstart adds `local/<dirname>` to `github.repos` in the volume's `config.yaml` if it is not already there. Existing entries, local or not, are never removed, and `--reconfigure` carries them forward. If the config cannot be read or written, quickstart stops before starting the app or touching your repository.
 
-5. **Launching the Orchestrator & Local Git Remote Setup**
-   Once configuration is complete, the quickstart CLI tears down the setup container and boots the main app container (`rusa-quickstart`).
-   After the container starts:
-   * Quickstart polls the local Git bridge port (`8085`) on loopback until it accepts connections (up to 15s).
-   * It configures the Git remote on your local repo (`git remote add rusa http://localhost:8085/local/<dirname>.git` or `set-url` if the remote already exists).
-   * It seeds the repository to Rusa by pushing `HEAD` (`git push rusa HEAD`).
-   * If the bridge wait times out or the push fails, fallback commands are printed so you can manually push.
+5. **Seeding the Bridge Repository**
+   Still in the setup container, before the app starts, quickstart seeds the bridge's copy of your repository with the branch you have checked out:
+   * On the host it writes that branch to a temporary `git bundle`, copies the bundle into the setup container, and runs `rusa quickstart seed` there. Your repository is never mounted into a container.
+   * The first seed creates the bridge repository. A later run with `--repo` fast-forwards the base branch to your current commit and leaves agent `mc/*` branches untouched. If your branch has been rewritten so it no longer fast-forwards, seeding fails and quickstart stops.
+   * The bridge keeps refusing pushes outside `refs/heads/mc/*`, so seeding is the only way the base branch changes.
+
+6. **Launching the Orchestrator & Local Git Remote**
+   Quickstart replaces the setup container with the main app container (`rusa-quickstart`), then points a `rusa` remote in your repository at the bridge (`remote add`, or `set-url` if `rusa` already exists). Nothing is pushed. If the remote cannot be set, quickstart prints the command to run yourself.
 
 ### Local Repository, Not GitHub
 Quickstart is built to run against a **local repository** through the Git bridge below; it does not talk to GitHub. The wizard writes a webhook stanza (the only GitHub ingestion edge) and subscribes only to the selected `local/<dirname>` repository: the orchestrator still binds the webhook listener inside the container, but the port is not published and no GitHub repository is admitted, so any GitHub delivery that did reach it is dropped as not covered by any subscription. Rusa has no GitHub polling fallback: connecting a quickstart instance to GitHub means adding `github.repos`, publishing the webhook port (`9742`, not published by the quickstart container by default), and registering a GitHub webhook that can reach it. See `rusa config-docs` for the `webhook` keys. A `github-poller-state.json` left in the volume by an earlier build is ignored.
 
 ### Local Git Bridge
 The Git bridge publishes a local web dashboard on port `8080` and the smart HTTP Git server on port `8085`.
-When quickstart configures your repository, you can interact with the bridge using standard Git commands from your repository directory:
-
-Fetch branches produced by agents:
+From your repository directory, fetch the branches agents produce:
 ```bash
 git fetch rusa
 ```
-Push updates to the orchestrator:
+The bridge accepts pushes only to `mc/*` branches, so `git push rusa HEAD` from your own branch is rejected. To give agents newer work on your base branch, rerun quickstart with `--repo <path>`, which reseeds it.
+
+To set the remote yourself:
 ```bash
-git push rusa HEAD
-```
-If you need to manually configure or re-seed the remote:
-```bash
-git remote add rusa http://localhost:8085/local/<dirname>.git
-git push rusa HEAD
+git remote set-url rusa http://localhost:8085/local/<dirname>.git || git remote add rusa http://localhost:8085/local/<dirname>.git
 ```
 
 ---

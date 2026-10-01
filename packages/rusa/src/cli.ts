@@ -13,7 +13,7 @@ import { runForwardWebhooks } from "./commands/forward-webhooks.js";
 import { runInit } from "./commands/init.js";
 import { runInstallQuotaCoordinator, runInstallService } from "./commands/install-service.js";
 import { runActorLogs, runLogs } from "./commands/logs.js";
-import { runQuickstart, runQuickstartConfigure } from "./commands/quickstart.js";
+import { runQuickstart, runQuickstartConfigure, runQuickstartSeed } from "./commands/quickstart.js";
 import { runQuotaBackup, runQuotaBackupList, runQuotaRestore } from "./commands/quota-backup.js";
 import { runQuotaCoordinator } from "./commands/quota-coordinator.js";
 import { runQuotaPacingReset } from "./commands/quota-pacing-reset.js";
@@ -134,6 +134,17 @@ quickstart
   .option("--home <path>", "Override RUSA_HOME for this setup")
   .action(async (opts: { home?: string }) => {
     await runQuickstartConfigure({ home: opts.home });
+  });
+
+quickstart
+  .command("seed")
+  .description("Seed a local repo's git-bridge base branch from a bundle (run by quickstart)")
+  .requiredOption("--repo-key <key>", "Repo key, e.g. local/<dirname>")
+  .requiredOption("--bundle <path>", "Git bundle holding the branch")
+  .requiredOption("--branch <name>", "Branch to seed as the base")
+  .option("--home <path>", "Override RUSA_HOME")
+  .action((opts: { repoKey: string; bundle: string; branch: string; home?: string }) => {
+    runQuickstartSeed({ ...opts, repo: opts.repoKey });
   });
 
 // NB: the IU distiller cursor ops (seed/gate/window/advance/mode) are actor-invoked, so
