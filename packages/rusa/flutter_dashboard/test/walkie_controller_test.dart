@@ -573,6 +573,92 @@ void main() {
       expect(controller.record.value.phase, RecordPhase.idle);
       expect(api.memoSends, isEmpty);
     });
+
+    test(
+      'a new recording after a cancelled pending start survives when the new '
+      'acquisition resolves first',
+      () async {
+        final cancelledStart = Completer<void>();
+        final newStart = Completer<void>();
+        walkie.recorder.startGates.addAll([cancelledStart, newStart]);
+
+        final firstToggle = controller.toggleRecord();
+        await pumpEventQueue();
+        expect(controller.record.value.phase, RecordPhase.starting);
+
+        await controller.cancelRecord();
+        await pumpEventQueue();
+        expect(controller.record.value.phase, RecordPhase.idle);
+
+        final secondToggle = controller.toggleRecord();
+        await pumpEventQueue();
+        expect(controller.record.value.phase, RecordPhase.starting);
+
+        // The newer acquisition wins the mic; the cancelled one rejects after.
+        newStart.complete();
+        await secondToggle;
+        await pumpEventQueue();
+        expect(controller.record.value.phase, RecordPhase.recording);
+
+        cancelledStart.complete();
+        await firstToggle;
+        await pumpEventQueue();
+
+        // The superseded start's rejection must not surface as B's mic error
+        // nor touch the newer capture: exactly one seam cancel (cancelRecord).
+        expect(walkie.recorder.cancelCalls, 1);
+        expect(controller.record.value.phase, RecordPhase.recording);
+        expect(controller.record.value.message, isNull);
+
+        // The newer capture remains usable end to end.
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        expect(api.memoSends, hasLength(1));
+        expect(api.memoSends.single.actorId, 'a');
+        expect(controller.record.value.phase, RecordPhase.delivered);
+      },
+    );
+
+    test(
+      'a new recording after a cancelled pending start survives when the '
+      'cancelled acquisition resolves first',
+      () async {
+        final cancelledStart = Completer<void>();
+        final newStart = Completer<void>();
+        walkie.recorder.startGates.addAll([cancelledStart, newStart]);
+
+        final firstToggle = controller.toggleRecord();
+        await pumpEventQueue();
+
+        await controller.cancelRecord();
+        await pumpEventQueue();
+        expect(controller.record.value.phase, RecordPhase.idle);
+
+        final secondToggle = controller.toggleRecord();
+        await pumpEventQueue();
+        expect(controller.record.value.phase, RecordPhase.starting);
+
+        // The cancelled acquisition settles first; its rejection must leave
+        // the pending newer capture untouched.
+        cancelledStart.complete();
+        await firstToggle;
+        await pumpEventQueue();
+        expect(walkie.recorder.cancelCalls, 1);
+        expect(controller.record.value.phase, RecordPhase.starting);
+
+        newStart.complete();
+        await secondToggle;
+        await pumpEventQueue();
+        expect(controller.record.value.phase, RecordPhase.recording);
+        expect(controller.record.value.message, isNull);
+
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        expect(api.memoSends, hasLength(1));
+        expect(api.memoSends.single.actorId, 'a');
+        expect(controller.record.value.phase, RecordPhase.delivered);
+      },
+    );
   });
 
   group('voice unavailable (503)', () {

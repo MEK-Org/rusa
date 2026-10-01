@@ -147,6 +147,7 @@ class WalkieController {
   Timer? _recordTicker;
   Timer? _deliveredReset;
   DateTime? _recordStartedAt;
+  int _recordGeneration = 0;
   bool _disposed = false;
 
   // ── Exposed streams ──
@@ -229,6 +230,8 @@ class WalkieController {
   /// NOT acked — they come back via the backlog on the next mode entry.
   Future<void> disable() async {
     if (!_enabled.value) return;
+    // Supersede any pending mic acquisition before the abort below.
+    _recordGeneration++;
     final sessionId = _sessionId;
     _sessionId = null;
     _enabled.add(false);
@@ -511,6 +514,7 @@ class WalkieController {
         _record.value.phase != RecordPhase.starting) {
       return;
     }
+    _recordGeneration++;
     _stopRecordTimers();
     try {
       await _deps.recorder.cancel();
@@ -523,19 +527,26 @@ class WalkieController {
   Future<void> _startRecording() async {
     if (!_enabled.value) return;
     _deliveredReset?.cancel();
+    final generation = ++_recordGeneration;
     _record.add(const RecordStatus(phase: RecordPhase.starting));
     try {
       await _deps.recorder.start();
     } catch (e) {
       // A superseded start (cancel raced the pending acquisition) is expected
       // during normal use; only a live failure surfaces as a mic error.
-      if (_record.value.phase != RecordPhase.starting) return;
+      if (generation != _recordGeneration) return;
       _record.add(
         RecordStatus(phase: RecordPhase.error, message: 'Mic unavailable: $e'),
       );
       return;
     }
-    if (!_enabled.value || _disposed) return;
+    if (generation != _recordGeneration || !_enabled.value || _disposed) {
+      // Stale: a cancel or disable already owns (or has released) the recorder
+      // seam, and WebVoiceRecorder's acquisition guard has already stopped the
+      // superseded start's own tracks. A shared cancel() here could tear down
+      // a newer capture's recorder.
+      return;
+    }
     _recordStartedAt = DateTime.now();
     _record.add(const RecordStatus(phase: RecordPhase.recording));
     _recordTicker = Timer.periodic(const Duration(seconds: 1), (_) {

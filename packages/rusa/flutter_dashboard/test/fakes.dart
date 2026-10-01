@@ -1268,9 +1268,15 @@ class FakeVoiceRecorder implements VoiceRecorder {
     mimeType: 'audio/webm;codecs=opus',
   );
 
+  /// Mirrors `WebVoiceRecorder`'s ownership token: [cancel] and [stop] bump
+  /// it, so a [start] still awaiting a gate when either runs is superseded
+  /// and throws instead of returning normally.
+  int _generation = 0;
+
   @override
   Future<void> start() async {
     startCalls++;
+    final generation = _generation;
     final err = startError;
     if (err != null) throw err;
     final gate = startCalls <= startGates.length
@@ -1279,17 +1285,22 @@ class FakeVoiceRecorder implements VoiceRecorder {
     if (gate != null) await gate.future;
     final c = startCompleter;
     if (c != null) await c.future;
+    if (generation != _generation) {
+      throw StateError('mic acquisition superseded by a newer recording session');
+    }
   }
 
   @override
   Future<RecordedAudio> stop() async {
     stopCalls++;
+    _generation++;
     return result;
   }
 
   @override
   Future<void> cancel() async {
     cancelCalls++;
+    _generation++;
   }
 }
 
