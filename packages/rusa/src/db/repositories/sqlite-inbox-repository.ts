@@ -5,6 +5,7 @@ import {
   type InboxAppendInput,
   type InboxEntry,
   type InboxItemsAppendedListener,
+  type InboxItemsHandledListener,
   type InboxListOptions,
   type InboxPage,
   type InboxPayload,
@@ -68,6 +69,7 @@ export type InboxListenerErrorHandler = (error: unknown) => void;
 /** SQLite implementation of the actor inbox persistence seam. */
 export class SqliteInboxRepository implements InboxRepository {
   private readonly listeners = new Set<InboxItemsAppendedListener>();
+  private readonly handledListeners = new Set<InboxItemsHandledListener>();
   private onListenerError: InboxListenerErrorHandler = () => {};
 
   constructor(
@@ -146,6 +148,13 @@ export class SqliteInboxRepository implements InboxRepository {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
+    };
+  }
+
+  onItemsHandled(listener: InboxItemsHandledListener): () => void {
+    this.handledListeners.add(listener);
+    return () => {
+      this.handledListeners.delete(listener);
     };
   }
 
@@ -268,7 +277,7 @@ export class SqliteInboxRepository implements InboxRepository {
     }
     if (!Number.isFinite(at.getTime())) throw new Error("invalid handledAt");
     const note = handledNote?.trim() || null;
-    return this.db.transaction(() => {
+    const results = this.db.transaction(() => {
       const placeholders = entryIds.map(() => "?").join(", ");
       const rows = this.db
         .prepare(
@@ -296,6 +305,8 @@ export class SqliteInboxRepository implements InboxRepository {
         };
       });
     })();
+    if (results.length > 0) this.notifyItemsHandled(actorId, results);
+    return results;
   }
 
   replaceEntries(
@@ -394,6 +405,7 @@ export class SqliteInboxRepository implements InboxRepository {
       return { handled: handledResults, insertedRows: inserted };
     })();
 
+    if (handled.length > 0) this.notifyItemsHandled(actorId, handled);
     if (insertedRows.length > 0) this.notifyItemsAppended(insertedRows);
     return { handled, replacements: insertedRows };
   }
@@ -413,6 +425,20 @@ export class SqliteInboxRepository implements InboxRepository {
           this.onListenerError(error);
         } catch {
           // A throwing reporter must neither escape append nor starve later listeners.
+        }
+      }
+    }
+  }
+
+  private notifyItemsHandled(actorId: string, results: readonly MarkHandledResult[]): void {
+    for (const listener of [...this.handledListeners]) {
+      try {
+        listener(actorId, results);
+      } catch (error) {
+        try {
+          this.onListenerError(error);
+        } catch {
+          // A throwing reporter must neither escape markHandled nor starve later listeners.
         }
       }
     }

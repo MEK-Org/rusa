@@ -122,9 +122,9 @@ export type LeaderCommand =
   /**
    * The leader is cancelling this actor's unstarted admission. Sent before the
    * admission's error reply, so the follower's Actor keeps the opportunity for
-   * `resumeCancelled` exactly as a local queued-start cancellation does.
+   * `resumeCancelled` when retain is true, or drops it when retain is false.
    */
-  | { type: "cancelQueued" }
+  | { type: "cancelQueued"; retain?: boolean }
   /** Replay a cancelled queued opportunity; `nudge` covers a follower that kept none. */
   | { type: "resumeCancelled"; nudge: RunNudge }
   | { type: "yield"; status?: string; note?: string }

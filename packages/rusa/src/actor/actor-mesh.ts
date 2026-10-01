@@ -126,7 +126,7 @@ export interface MeshActor {
   readonly isRunning: boolean;
   readonly isQueued?: boolean;
   readonly isYielded?: boolean;
-  cancelQueuedRun?(): boolean;
+  cancelQueuedRun?(opts?: { retain?: boolean }): boolean;
   /** Cancel a queued reservation and re-admit its same work against current next-run config. */
   rescheduleQueuedRun?(): boolean;
   resumeCancelledRun?(): boolean;
@@ -926,6 +926,7 @@ export class ActorMesh {
   private readonly headClosureRuns = new Map<string, HeadClosureRunState>();
   private readonly inboxStore?: InboxRepository;
   private unsubscribeInboxAppends?: () => void;
+  private unsubscribeInboxHandled?: () => void;
   private dispatchJoiningActiveRunPort?: (actorId: string) => boolean;
   /**
    * Recipients of durably committed inbox rows that nothing has woken yet, with
@@ -1118,6 +1119,9 @@ export class ActorMesh {
     if (opts.inboxStore) {
       this.unsubscribeInboxAppends = opts.inboxStore.onItemsAppended((items) => {
         this.scheduleAppendedWork(items);
+      });
+      this.unsubscribeInboxHandled = opts.inboxStore.onItemsHandled?.((actorId) => {
+        this.cancelEmptyQueuedRun(actorId);
       });
     }
   }
@@ -5182,6 +5186,8 @@ export class ActorMesh {
   shutdownAll(): void {
     this.unsubscribeInboxAppends?.();
     this.unsubscribeInboxAppends = undefined;
+    this.unsubscribeInboxHandled?.();
+    this.unsubscribeInboxHandled = undefined;
     this.appendWakesOwed.clear();
     this.runResponsiveReadyAttention.clear();
     this.runs.closeAll();
@@ -5334,6 +5340,30 @@ export class ActorMesh {
       }
     }
     return resumed;
+  }
+
+  /**
+   * If an actor's unhandled inbox items have dropped to zero while its run is
+   * still queued (in provider pacing or the concurrency limiter), cancel the
+   * queued run without retaining a scheduling opportunity. Active runs and
+   * runs with remaining durable work are preserved.
+   */
+  cancelEmptyQueuedRun(actorId: string): boolean {
+    const resolved = this.resolveThreadId(actorId);
+    const actor = this.runs.liveActor(resolved);
+    if (!actor || actor.isRunning || !actor.isQueued) return false;
+    if (this.inboxStore) {
+      const watermark = actor.getInterruptedWatermark?.();
+      if (watermark) {
+        const entries = this.inboxStore.list(resolved, { status: "unhandled" }).entries;
+        if (entries.some((e) => e.deliveredAt > watermark)) return false;
+      } else if (this.inboxStore.countUnhandled(resolved) > 0) {
+        return false;
+      }
+    } else if (this.runs.durableWork(resolved) !== null) {
+      return false;
+    }
+    return actor.cancelQueuedRun?.({ retain: false }) === true;
   }
 
   /**

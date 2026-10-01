@@ -428,30 +428,48 @@ export class Actor {
     this.killable = false;
   }
 
-  /** Cancel a provider start that is still queued, retaining its scheduling opportunity. */
-  cancelQueuedRun(): boolean {
+  /**
+   * Cancel a provider start that is still queued. By default (`retain: true`),
+   * retains its scheduling opportunity for resume (used by halt/concurrency).
+   * When `retain: false`, drops the opportunity so empty-inbox cancellations
+   * leave the actor idle without waiting for a resume replay.
+   */
+  cancelQueuedRun(opts?: { retain?: boolean }): boolean {
+    const retain = opts?.retain ?? true;
     // A re-quote has already cancelled the provider reservation but has not
     // unwound into its fresh admission yet. A halt in that window must claim
     // the queued work and clear the dirty replay, otherwise the fresh
     // beforeRun would skip it without leaving anything for /resume to replay.
     if (this.reschedulingQueuedRun) {
-      this.cancelledQueuedNudge = this.runner.currentNudgeSnapshot();
+      if (retain) {
+        this.cancelledQueuedNudge = this.runner.currentNudgeSnapshot();
+        this.cancelledQueuedRun = true;
+      } else {
+        this.cancelledQueuedNudge = undefined;
+        this.cancelledQueuedRun = false;
+      }
       this.reschedulingQueuedRun = false;
       // A re-admission can be paused in beforeRun after the old reservation
       // has unwound. Invalidate that admission too, so its eventual preflight
       // result cannot proceed after this halt has parked the opportunity.
       this.admissionEpoch++;
       this.runner.cancelPending();
-      this.cancelledQueuedRun = true;
       return true;
     }
     if (!this.pendingStart?.cancel?.()) return false;
-    this.cancelledQueuedNudge = mergeNudges(
-      this.runner.currentNudgeSnapshot(),
-      this.nudgeWhileQueued ?? null
-    );
-    this.nudgeWhileQueued = undefined;
-    this.cancelledQueuedRun = true;
+    if (retain) {
+      this.cancelledQueuedNudge = mergeNudges(
+        this.runner.currentNudgeSnapshot(),
+        this.nudgeWhileQueued ?? null
+      );
+      this.cancelledQueuedRun = true;
+      this.nudgeWhileQueued = undefined;
+    } else {
+      this.cancelledQueuedNudge = undefined;
+      this.cancelledQueuedRun = false;
+      // Leave this.nudgeWhileQueued intact: if new work arrived while queued,
+      // runOnce's finally block will request a fresh run for it.
+    }
     this.opts.onQueuedRunCancelled?.();
     return true;
   }
