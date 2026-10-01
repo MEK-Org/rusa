@@ -217,8 +217,10 @@ enables alongside the service:
 - The timer fires hourly, and `Persistent=true` catches up a run missed while
   the host was down.
 - The oneshot runs the standalone `scripts/rotate-log.mjs` against that
-  instance's own log, pinned by absolute path. It only ever touches `rusa.log`
-  and `rusa.log.<n>`, so rotation never reaches another instance's files.
+  instance's own log. The unit passes the log's absolute path as an argument,
+  so nothing in the instance's `.env` can point it at a different file. It only
+  ever touches `rusa.log` and `rusa.log.<n>`, so rotation never reaches another
+  instance's files.
 
 Each run checks the file against a size bound:
 

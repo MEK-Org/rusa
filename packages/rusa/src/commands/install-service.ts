@@ -258,6 +258,12 @@ export function buildAlertUnit(opts: {
  * against this instance's log, pinned by absolute path so it can never touch
  * another instance's files. The bound, the retention count, and the opt-out are
  * read from the instance's `.env` (see docs/logging.md).
+ *
+ * The log path is an ExecStart argument, not an `Environment=` line: systemd
+ * lets `EnvironmentFile=` values override `Environment=`, so a `RUSA_LOG_PATH`
+ * in the `.env` would otherwise retarget this unit at another instance's log.
+ * Its `$` is doubled so systemd's `${NAME}` substitution, which also reads the
+ * `.env`, cannot rewrite the path either.
  */
 export function buildLogRotateUnit(opts: {
   description: string;
@@ -272,10 +278,8 @@ export function buildLogRotateUnit(opts: {
     "",
     "[Service]",
     "Type=oneshot",
-    `Environment=RUSA_HOME=${opts.mcHome}`,
-    `Environment=RUSA_LOG_PATH=${opts.logPath}`,
     `EnvironmentFile=-${join(opts.mcHome, ".env")}`,
-    `ExecStart=${quoteExecArg(opts.nodePath)} ${quoteExecArg(opts.rotateScript)}`,
+    `ExecStart=${quoteExecArg(opts.nodePath)} ${quoteExecArg(opts.rotateScript)} ${quoteExecArg(opts.logPath.replaceAll("$", () => "$$"))}`,
     "",
   ].join("\n");
 }

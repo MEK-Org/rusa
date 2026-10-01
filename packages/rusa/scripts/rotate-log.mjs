@@ -17,8 +17,10 @@
 // Only `<log>` and `<log>.<n>` are ever touched, so one instance's rotation
 // cannot delete another instance's files.
 //
-// Usage: node rotate-log.mjs
-//   log:      $RUSA_LOG_PATH (default $RUSA_HOME/logs/rusa.log, RUSA_HOME default ~/.rusa)
+// Usage: node rotate-log.mjs [log]
+//   log:      the argument, else $RUSA_LOG_PATH, else $RUSA_HOME/logs/rusa.log
+//             (RUSA_HOME default ~/.rusa). The installed unit always passes the
+//             argument, so nothing in the instance .env can retarget it.
 //   bound:    $RUSA_LOG_ROTATE_MAX_BYTES (default 52428800 = 50 MiB)
 //   keep:     $RUSA_LOG_ROTATE_KEEP rotated generations (default 5; 0 = truncate only)
 //   opt-out:  $RUSA_LOG_ROTATE=off
@@ -53,7 +55,7 @@ if ((process.env.RUSA_LOG_ROTATE ?? "").trim().toLowerCase() === "off") {
 }
 
 const home = process.env.RUSA_HOME || join(homedir(), ".rusa");
-const logPath = process.env.RUSA_LOG_PATH || join(home, "logs", "rusa.log");
+const logPath = process.argv[2] || process.env.RUSA_LOG_PATH || join(home, "logs", "rusa.log");
 const maxBytes = nonNegativeInt("RUSA_LOG_ROTATE_MAX_BYTES", DEFAULT_MAX_BYTES);
 const keep = nonNegativeInt("RUSA_LOG_ROTATE_KEEP", DEFAULT_KEEP);
 
