@@ -322,6 +322,50 @@ describe("dashboard quota snapshot", () => {
     expect(throttle).not.toHaveProperty("learning");
   });
 
+  it("carries model-lane throttle status on the DTO when present and does not invent one when absent (#811)", async () => {
+    const { deps } = fakeDeps({ claude: claudeState, codex: codexState });
+    const fableLane = {
+      models: ["claude-fable-5-1"],
+      intervalSeconds: 900,
+      uncappedIntervalSeconds: 900,
+      expired: false,
+      capped: false,
+      buckets: [],
+      updatedAt: "2026-09-28T14:00:00.000Z",
+    };
+    const snapshot = await buildQuotaSnapshot({
+      ...deps,
+      providers: ["claude", "codex"],
+      getThrottle: (provider) =>
+        provider === "claude"
+          ? {
+              intervalSeconds: 300,
+              expired: false,
+              capped: false,
+              buckets: [],
+              uncappedIntervalSeconds: 300,
+              updatedAt: "2026-09-28T14:00:00.000Z",
+              modelLanes: [fableLane],
+            }
+          : {
+              intervalSeconds: 120,
+              expired: false,
+              capped: false,
+              buckets: [],
+              uncappedIntervalSeconds: 120,
+              updatedAt: "2026-09-28T14:00:00.000Z",
+            },
+    });
+
+    const claudeThrottle = snapshot.providers.find((p) => p.provider === "claude")?.throttle;
+    expect(claudeThrottle?.intervalSeconds).toBe(300);
+    expect(claudeThrottle?.modelLanes).toEqual([fableLane]);
+
+    const codexThrottle = snapshot.providers.find((p) => p.provider === "codex")?.throttle;
+    expect(codexThrottle?.intervalSeconds).toBe(120);
+    expect(codexThrottle?.modelLanes).toBeUndefined();
+  });
+
   it("kimi: carries the 5h and Weekly windows from the CLI /usage scrape", async () => {
     const { deps } = fakeDeps({ kimi: kimiState });
     const snapshot = await buildQuotaSnapshot(deps);

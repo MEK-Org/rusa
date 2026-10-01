@@ -640,6 +640,8 @@ export interface RunStartE2EHandles {
   coordinatorPacerQuote: (provider: string) => number;
   /** Test-only deterministic tick for asserting exhaustion and renewal transitions without a real cadence. */
   triggerQuotaThrottleTick?: () => Promise<void>;
+  /** Test-only read of the latest quota throttle status. */
+  getThrottle?: (provider: string) => QuotaThrottleStatus | null;
   root: MeshActor;
   rootControl: RootControlService;
   externalRoot: ExternalRootDriver | null;
@@ -1847,6 +1849,24 @@ async function composeStart(
     // Update the lanes before asking the shared admission list to re-scan them.
     applyThrottleStatusToPacer(pacer, status);
     applyModelLaneStatuses(providerName, status);
+    const validModelLanes = Array.isArray(status.modelLanes)
+      ? status.modelLanes.filter(isPublishedModelLane).map((lane) => ({
+          models: [...lane.models],
+          intervalSeconds: lane.intervalSeconds,
+          uncappedIntervalSeconds: lane.uncappedIntervalSeconds,
+          expired: lane.expired,
+          capped: lane.capped,
+          buckets: (lane.buckets ?? []).map((bucket) => ({
+            key: bucket.key,
+            percentLeft: bucket.percentLeft,
+            timeRemainingPct: bucket.timeRemainingPct,
+            error: bucket.error,
+            requiredIntervalSeconds: bucket.requiredIntervalSeconds,
+          })),
+          freshness: lane.freshness,
+          updatedAt: lane.updatedAt,
+        }))
+      : [];
     recordQuotaThrottleTick(
       providerName,
       {
@@ -1862,6 +1882,7 @@ async function composeStart(
           requiredIntervalSeconds: bucket.requiredIntervalSeconds,
         })),
         freshness: status.freshness,
+        ...(validModelLanes.length > 0 ? { modelLanes: validModelLanes } : {}),
       },
       status.updatedAt,
       status.exhaustedUntil,
@@ -4734,6 +4755,7 @@ async function composeStart(
       quotaCoordinatorClient?.getLastAppliedInterval(provider),
     coordinatorPacerQuote: (provider) => pacerFor(provider).quote(),
     triggerQuotaThrottleTick: tickQuotaThrottle,
+    getThrottle: (provider) => quotaThrottleStatuses.get(provider as QuotaThrottleProvider) ?? null,
     root,
     rootControl,
     externalRoot,
