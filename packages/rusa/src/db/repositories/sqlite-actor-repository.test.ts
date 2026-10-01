@@ -379,7 +379,7 @@ describe("SqliteActorRepository", () => {
 
   it("round-trips delivery-introduced and explicit handles with and without roles", () => {
     repository.upsert(root);
-    for (const peerId of ["peer-1", "peer-2", "peer-3"]) {
+    for (const peerId of ["peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7"]) {
       repository.upsert({
         id: peerId,
         charter: `Charter for ${peerId}`,
@@ -397,16 +397,46 @@ describe("SqliteActorRepository", () => {
         { id: "peer-1", origin: "message" },
         { id: "peer-2", role: "reviewer" },
         { id: "peer-3" },
+        { id: "peer-4", origin: "message", role: "introducer" },
+        { id: "peer-5", role: "__origin:message" },
+        { id: "peer-6", role: "__origin:message:reviewer" },
       ],
       createdAt: "2026-09-03T13:01:00.000Z",
     };
     repository.upsert(worker);
 
+    // Verify stored representation in SQLite preserves distinction without collision
     expect(repository.get("worker-handles")?.handles).toEqual([
       { id: "peer-1", origin: "message" },
       { id: "peer-2", role: "reviewer" },
       { id: "peer-3" },
+      { id: "peer-4", origin: "message", role: "introducer" },
+      { id: "peer-5", role: "__origin:message" },
+      { id: "peer-6", role: "__origin:message:reviewer" },
     ]);
+
+    // Re-upserting after readback preserves exact labels and provenance
+    const loaded = repository.get("worker-handles");
+    expect(loaded).toBeDefined();
+    if (!loaded) throw new Error("expected worker-handles to exist");
+    repository.upsert(loaded);
+    expect(repository.get("worker-handles")?.handles).toEqual([
+      { id: "peer-1", origin: "message" },
+      { id: "peer-2", role: "reviewer" },
+      { id: "peer-3" },
+      { id: "peer-4", origin: "message", role: "introducer" },
+      { id: "peer-5", role: "__origin:message" },
+      { id: "peer-6", role: "__origin:message:reviewer" },
+    ]);
+
+    // Legacy row written before prefix escaping retains its label as an explicit grant
+    db.prepare(
+      "INSERT INTO actor_handles (actor_id, target_id, role) VALUES ('worker-handles', 'peer-7', '__origin:legacy_unmatched')"
+    ).run();
+    expect(repository.get("worker-handles")?.handles).toContainEqual({
+      id: "peer-7",
+      role: "__origin:legacy_unmatched",
+    });
   });
 
   it("preserves the original retired_at across repeated upserts of an already-retired record", () => {

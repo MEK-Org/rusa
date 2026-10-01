@@ -4232,7 +4232,8 @@ describe("ActorMesh", () => {
         (event) =>
           event.kind === "handle_granted" &&
           event.actorId === recipient &&
-          JSON.parse(event.payload ?? "{}").handleId === sender
+          JSON.parse(event.payload ?? "{}").handleId === sender &&
+          JSON.parse(event.payload ?? "{}").origin === "message"
       )
     ).toHaveLength(1);
   });
@@ -4277,6 +4278,15 @@ describe("ActorMesh", () => {
       delivered: true,
     });
     expect(mesh.transferVoiceSession(authorizedRecipient, sender)).toEqual({
+      sessionId: "walkie-session",
+      targetActorId: sender,
+    });
+
+    // An explicit grant whose role text resembles the storage sentinel retains voice transfer authority
+    const explicitRoleRecipient = mesh.spawn({ charter: "recipient 3", parentId: "root" });
+    mesh.grantHandle(explicitRoleRecipient, { id: sender, role: "__origin:message" });
+    holder = explicitRoleRecipient;
+    expect(mesh.transferVoiceSession(explicitRoleRecipient, sender)).toEqual({
       sessionId: "walkie-session",
       targetActorId: sender,
     });

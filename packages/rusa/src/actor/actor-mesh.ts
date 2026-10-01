@@ -2814,8 +2814,10 @@ export class ActorMesh {
       kind: "handle_granted",
       actorId: toId,
       detail: entry.role,
-      // TODO: Consider threading through the grantor and storing it in payload.grantorId
-      payload: JSON.stringify({ handleId: handle.id }),
+      payload: JSON.stringify({
+        handleId: handle.id,
+        ...(entry.origin ? { origin: entry.origin } : {}),
+      }),
     });
   }
 

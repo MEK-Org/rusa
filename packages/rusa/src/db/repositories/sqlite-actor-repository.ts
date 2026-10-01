@@ -525,12 +525,14 @@ export class SqliteActorRepository implements ActorRepository {
         "INSERT INTO actor_handles (actor_id, target_id, role) VALUES (?, ?, ?)"
       );
       for (const handle of record.handles ?? []) {
-        const storedRole =
-          handle.origin === "message"
-            ? handle.role
-              ? `__origin:message:${handle.role}`
-              : "__origin:message"
-            : (handle.role ?? null);
+        let storedRole: string | null = null;
+        if (handle.origin === "message") {
+          storedRole = handle.role ? `__origin:message:${handle.role}` : "__origin:message";
+        } else if (handle.role) {
+          storedRole = handle.role.startsWith("__origin:")
+            ? `__origin:explicit:${handle.role}`
+            : handle.role;
+        }
         addHandle.run(record.id, handle.id, storedRole);
       }
     })();
@@ -633,18 +635,31 @@ export class SqliteActorRepository implements ActorRepository {
         ? {
             handles: handles.map((handle) => {
               const roleText = handle.role ?? undefined;
-              const isMessage =
-                roleText === "__origin:message" ||
-                Boolean(roleText?.startsWith("__origin:message:"));
-              const role = isMessage
-                ? roleText === "__origin:message"
-                  ? undefined
-                  : roleText?.slice("__origin:message:".length)
-                : roleText;
+              if (!roleText) {
+                return { id: handle.target_id };
+              }
+              if (roleText.startsWith("__origin:explicit:")) {
+                return {
+                  id: handle.target_id,
+                  role: roleText.slice("__origin:explicit:".length),
+                };
+              }
+              if (roleText === "__origin:message") {
+                return {
+                  id: handle.target_id,
+                  origin: "message" as const,
+                };
+              }
+              if (roleText.startsWith("__origin:message:")) {
+                return {
+                  id: handle.target_id,
+                  role: roleText.slice("__origin:message:".length),
+                  origin: "message" as const,
+                };
+              }
               return {
                 id: handle.target_id,
-                ...(role ? { role } : {}),
-                ...(isMessage ? { origin: "message" as const } : {}),
+                role: roleText,
               };
             }),
           }
