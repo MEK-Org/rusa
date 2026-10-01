@@ -1050,11 +1050,11 @@ a claim that the code could not fire, so each is worth its sentence:
 - **`stale_snapshot` had no caller.** It fired when "the caller demanded fresh",
   and v1's surface defines exactly two query parameters across all five paths —
   `?provider=` and `?since=`. There is no way to demand anything. It also
-  duplicated a decision §5.7 already makes: past `hardStaleAfterMs` the service
-  *publishes* `maxIntervalSeconds` rather than refusing, and the row's prescribed
-  client action was to apply `maxIntervalSeconds` — the same value by a harder
-  path, with an error branch in every client to reach it. §5.7 is now the single
-  place staleness is handled.
+  duplicated the decision §5.7 already makes: a hard-stale response publishes
+  either the last reasoned interval for a still-valid whole lane or the
+  conservative ceiling, rather than refusing. The client applies that published
+  value without an error branch. §5.7 is now the single place staleness is
+  handled.
 - **`busy` was anticipation.** Under v1 there is one writer; readers are N
   instances on a `tickSeconds` timer plus the dashboard; the store already sets
   `busy_timeout` (`db/wal.ts:4`); and WAL readers do not block on a writer. There
@@ -1099,9 +1099,12 @@ launch. Nothing fails closed, because there is no closed to fail to.
   keep publishing the last reasoned interval. This matches today's stated
   behaviour on a failed scrape — "keep the last persisted reasoned interval"
   (`start.ts:1362`) — and `freshness.stale` says so, so the dashboard can show it.
-- `hardStale` at `now - observedAt > hardStaleAfterMs` (default 3600 s): the
-  published interval widens to `maxIntervalSeconds`. **The degradation is always
-  toward slower, never faster.**
+- `hardStale` at `now - observedAt > hardStaleAfterMs` (default 3600 s): a
+  whole lane with a still-valid governing window keeps its last reasoned
+  interval and reports its hard-stale freshness. A newer scrape that omitted
+  only the governing bucket, a lane with no governing reset, or a passed reset
+  widens to `maxIntervalSeconds`. **The fallback degradation is always toward
+  slower, never faster.**
 
 **The hard-stale widening is a named transformation, not a client courtesy**,
 because two criteria depend on knowing exactly where it happens. Define:
@@ -1109,7 +1112,12 @@ because two criteria depend on knowing exactly where it happens. Define:
 ```
 publishedThrottle(p).intervalSeconds
     = stored(p).intervalSeconds                            when not hardStale
+    = stored(p).intervalSeconds                            when hardStale,
+                                                          the governing bucket is
+                                                          from the newest stored
+                                                          scrape, and its reset is future
     = max(stored(p).intervalSeconds, maxIntervalSeconds)   when hardStale
+                                                          otherwise
 
 publishedThrottle(p).capped
     = stored(p).uncappedIntervalSeconds > publishedThrottle(p).intervalSeconds
@@ -1268,13 +1276,19 @@ sequenceDiagram
     Note over A: A applies it unchanged, exactly as today
     Note over S: ... failures continue past hardStaleAfterMs ...
     A->>S: GET /v1/throttle
+    S-->>A: last interval, freshness.hardStale true, while governing reset is future
+    Note over S: ... governing reset passes without a newer reading ...
+    A->>S: GET /v1/throttle
     S-->>A: intervalSeconds = maxIntervalSeconds, freshness.hardStale true
-    S->>S: metric quota_service_snapshot_age_seconds rises, alert fires
+    Note over S: provider-wide retirement and alert are not implemented; #794 tracks them
 ```
 
-Degradation is monotone toward slower. A stale publication never speeds anything
-up. Note where the alert lives: on the **service**, because under A5 the service
-is the only thing that can tell a failed scrape from a stable quota window. A
+A whole provider lane whose governing reset is still future keeps its last
+reasoned interval through a hard-stale failed scrape; after that reset, the
+fallback widens to `maxIntervalSeconds`. The fallback degradation is monotone
+toward slower. Provider-wide retirement and an alert after the reset are not
+implemented yet; #794 tracks that work. The service, not a client, is the only
+place that can distinguish a failed scrape from a stable quota window, because a
 client sees an unchanging interval either way.
 
 ### 6.3 Service restart

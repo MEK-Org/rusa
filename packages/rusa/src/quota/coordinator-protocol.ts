@@ -418,9 +418,12 @@ export function publishedThrottle(
   // its last reading, not the hard-stale ceiling, until that window's reset
   // (or, if later, its #712 exhaustion deadline) has passed, and then it
   // retires. A lane with no known reset retires once the provider has kept
-  // reporting for longer than the hard-stale horizon without it. A
-  // coordinator that stops collecting ages both lanes together instead, so
-  // the conservative widening still applies there.
+  // reporting for longer than the hard-stale horizon without it. When the
+  // whole provider reading is missing or failed (including a coordinator that
+  // stops collecting), both lanes age together and skip this retirement:
+  // `publishedLane` keeps each one's interval until its governing reset and
+  // widens it to the ceiling afterwards. This reverses #730, which widened
+  // that case to the ceiling at once.
   const modelLanes = (stored.modelLanes ?? []).flatMap(
     (lane: PersistedQuotaModelLaneStatus): PublishedThrottleModelLaneStatus[] => {
       const current = { ...publishedLane(lane, options), models: [...lane.models] };
@@ -469,10 +472,19 @@ function publishedLane(
 ): Omit<PublishedThrottleProviderStatus, "modelLanes"> {
   const maxIntervalSeconds = options?.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
   const freshness = calculateFreshness(stored, options);
+  const nowMs = options?.nowMs ?? Date.now();
 
-  const intervalSeconds = freshness.hardStale
-    ? Math.max(stored.intervalSeconds, maxIntervalSeconds)
-    : stored.intervalSeconds;
+  // A reachable coordinator can still have no newer reading for a whole lane.
+  // While that last computed governing window has not reset, retain the
+  // interval and expose its stale freshness honestly. A newer provider scrape
+  // that omitted only the governing window is the established partial-window
+  // case and remains fail-safe. The client separately handles a coordinator it
+  // cannot reach; a cold provider has no stored lane to publish at all.
+  const retainKnownWindow = governingWindowIsStillValid(stored, nowMs);
+  const intervalSeconds =
+    freshness.hardStale && !retainKnownWindow
+      ? Math.max(stored.intervalSeconds, maxIntervalSeconds)
+      : stored.intervalSeconds;
 
   const capped = stored.uncappedIntervalSeconds > intervalSeconds;
 
@@ -488,6 +500,20 @@ function publishedLane(
     buckets: stored.buckets,
     freshness,
   };
+}
+
+function governingWindowIsStillValid(
+  stored: Omit<PersistedQuotaProviderStatus, "modelLanes">,
+  nowMs: number
+): boolean {
+  if (!stored.governingBucketKey) return false;
+  const governing = stored.buckets.find((bucket) => bucket.key === stored.governingBucketKey);
+  if (!governing?.resetAtIso) return false;
+  // A newer scrape that leaves only this bucket out is not a whole-lane missing
+  // reading. Keep the existing conservative partial-window election rule.
+  if (governing.observedAt !== stored.updatedAt) return false;
+  const resetMs = Date.parse(governing.resetAtIso);
+  return Number.isFinite(resetMs) && resetMs > nowMs;
 }
 
 /** The pacing a model-scoped lane set imposes on one concrete candidate model. */
