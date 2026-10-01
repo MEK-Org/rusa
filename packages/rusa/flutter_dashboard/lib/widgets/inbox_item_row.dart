@@ -78,10 +78,16 @@ class InboxItemRow extends StatelessWidget {
   final void Function(String url) openLink;
   final EdgeInsetsGeometry contentPadding;
 
+  /// The obligation this row shows in place of the entry (#610): the one the
+  /// server ties it to, else the one a ready-head payload names.
+  static String? obligationIdFor(InboxEntryDto entry) =>
+      entry.obligationId ??
+      ObligationReferenceCard.obligationIdFor(entry.payload);
+
   /// Whether this row draws its own card, so a caller should not frame it.
   static bool rendersOwnFrame(InboxEntryDto entry) =>
       ReferencePreview.rendersOwnContent(entry.reference) ||
-      ObligationReferenceCard.obligationIdFor(entry.payload) != null;
+      obligationIdFor(entry) != null;
 
   Widget _referenceCard(Widget? action) {
     final event = presentGitHubInboxEvent(
@@ -140,9 +146,7 @@ class InboxItemRow extends StatelessWidget {
                 ],
               ],
             );
-      final obligationId = ObligationReferenceCard.obligationIdFor(
-        entry.payload,
-      );
+      final obligationId = obligationIdFor(entry);
       return InkWell(
         onTap: () => _openActor(context),
         borderRadius: BorderRadius.circular(6),
@@ -150,7 +154,9 @@ class InboxItemRow extends StatelessWidget {
             ? ObligationReferenceCard(
                 obligationId: obligationId,
                 store: store,
-                fallbackText: entry.payload['intent']?.toString(),
+                fallbackText:
+                    entry.payload['intent']?.toString() ??
+                    entry.reference?.title,
                 action: action,
                 onSelectView: onSelectView,
               )

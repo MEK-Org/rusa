@@ -95,6 +95,7 @@ class InboxEntryDto {
     this.payload = const {},
     this.reference,
     this.eventReference,
+    this.obligationId,
   });
 
   final String id;
@@ -110,6 +111,11 @@ class InboxEntryDto {
   /// The comment or review the event is about, nested under [reference] (the
   /// issue or PR it arrived through), when the event names one.
   final ReferenceDto? eventReference;
+
+  /// The one obligation the server ties this entry to (#610): the obligation
+  /// a ready signal names, or the live obligation whose external ref is the
+  /// entry's source. Null when there is no tie, or more than one.
+  final String? obligationId;
 
   factory InboxEntryDto.fromJson(Map<String, dynamic> j) {
     final rawReference = j['reference'];
@@ -129,6 +135,7 @@ class InboxEntryDto {
       eventReference: rawEventReference is Map<String, dynamic>
           ? ReferenceDto.fromJson(rawEventReference)
           : null,
+      obligationId: j['obligationId'] as String?,
     );
   }
 
