@@ -53,13 +53,14 @@ export async function resolveDownloadPath(
 }
 
 /**
- * Open a resolved path by walking it from the workdir root one component at a
- * time, each relative to the previous directory's descriptor and without
- * following symlinks. The workdir is mutable by its actor, so a pathname
- * validated earlier can have an ancestor swapped for a symlink before the I/O;
- * descriptor-anchored lookups refuse that instead of following it out of the
- * root. Node has no openat, so lookups go through Linux's `/proc/self/fd`;
- * without it this fails closed rather than falling back to a pathname open.
+ * Open a resolved path by walking it from the filesystem root one component at
+ * a time, each relative to the previous directory's descriptor and without
+ * following symlinks. The path was realpath'd, so it has no legitimate
+ * symlinks; one that appears in any component, whether inside the workdir or
+ * above the workdir root, was swapped in after resolution and is refused
+ * rather than followed out of the root. Node has no openat, so lookups go
+ * through Linux's `/proc/self/fd`; without it this fails closed rather than
+ * falling back to a pathname open.
  */
 async function openInWorkdir(
   workDir: string,
@@ -71,13 +72,13 @@ async function openInWorkdir(
   if (!isContained(realRoot, confinedPath)) {
     throw new Error("access denied: path resolves outside the actor workdir");
   }
-  const names = relative(realRoot, confinedPath).split(sep).filter(Boolean);
+  const names = confinedPath.split(sep).filter(Boolean);
   const dirFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
-  let dir = await open(realRoot, names.length > 0 ? dirFlags : flags, mode);
+  let dir = await open(sep, dirFlags);
   try {
     const anchor = await stat(`/proc/self/fd/${dir.fd}`).catch(() => undefined);
-    const rootStat = await dir.stat();
-    if (anchor?.dev !== rootStat.dev || anchor?.ino !== rootStat.ino) {
+    const fsRoot = await dir.stat();
+    if (anchor?.dev !== fsRoot.dev || anchor?.ino !== fsRoot.ino) {
       throw new Error("workdir file I/O needs Linux /proc/self/fd; refusing to open by pathname");
     }
     for (const [index, name] of names.entries()) {
@@ -89,14 +90,15 @@ async function openInWorkdir(
         const code = (err as NodeJS.ErrnoException).code;
         if (code === "ELOOP" || (!last && code === "ENOTDIR")) {
           throw Object.assign(
-            new Error("access denied: path changed to a symlink inside the actor workdir"),
+            new Error("access denied: a path component changed to a symlink after resolution"),
             { code }
           );
         }
         throw err;
       }
-      await dir.close();
+      const parent = dir;
       dir = next;
+      await parent.close();
     }
     return dir;
   } catch (err) {

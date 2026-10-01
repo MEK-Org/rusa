@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -11,8 +12,28 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
-import { readBoundedRegularFile, resolveAttachmentPath } from "./workdir-path.js";
+import { describe, expect, it, vi } from "vitest";
+import {
+  readBoundedRegularFile,
+  resolveAttachmentPath,
+  resolveDownloadPath,
+  writeNewFileInWorkdir,
+} from "./workdir-path.js";
+
+// One-shot hook run right after the next realpath resolves, to land a swap in
+// the window between resolving the workdir root and opening it.
+const afterRealpath = vi.hoisted(() => ({ run: undefined as (() => void) | undefined }));
+vi.mock("node:fs/promises", async () => {
+  const actual = (await vi.importActual<typeof import("node:fs")>("node:fs")).promises;
+  const realpath = async (...args: Parameters<typeof actual.realpath>) => {
+    const resolved = await actual.realpath(...args);
+    const run = afterRealpath.run;
+    afterRealpath.run = undefined;
+    run?.();
+    return resolved;
+  };
+  return { ...actual, default: { ...actual, realpath }, realpath };
+});
 
 function workdir(): string {
   return mkdtempSync(join(tmpdir(), "rusa-workdir-path-"));
@@ -80,5 +101,42 @@ describe("readBoundedRegularFile", () => {
       const source = await resolveAttachmentPath(dir, name);
       await expect(readBoundedRegularFile(dir, source, 8)).rejects.toThrow("not a regular file");
     }
+  });
+});
+
+describe("workdir root acquisition", () => {
+  // The workdir root sits under an ancestor; an outside tree mirrors the root's
+  // name. Swapping the ancestor for a symlink to it after the root is resolved
+  // must not hand back the outside root.
+  function rootAncestorSwap() {
+    const base = workdir();
+    const outside = workdir();
+    const root = join(base, "ancestor", "root");
+    mkdirSync(root, { recursive: true });
+    mkdirSync(join(outside, "root"));
+    writeFileSync(join(root, "file.txt"), "ok");
+    writeFileSync(join(outside, "root", "file.txt"), "secret");
+    const swap = () => {
+      renameSync(join(base, "ancestor"), join(base, "ancestor-moved"));
+      symlinkSync(outside, join(base, "ancestor"));
+    };
+    return { root, outside, swap };
+  }
+
+  it("refuses to read through a root ancestor swapped for an outside symlink", async () => {
+    const { root, swap } = rootAncestorSwap();
+    const source = await resolveAttachmentPath(root, "file.txt");
+    afterRealpath.run = swap;
+    await expect(readBoundedRegularFile(root, source, 64)).rejects.toThrow("access denied");
+  });
+
+  it("refuses to create a file through a root ancestor swapped for an outside symlink", async () => {
+    const { root, outside, swap } = rootAncestorSwap();
+    const destination = await resolveDownloadPath(root, "new.txt");
+    afterRealpath.run = swap;
+    await expect(writeNewFileInWorkdir(root, destination, Buffer.from("x"))).rejects.toThrow(
+      "access denied"
+    );
+    expect(existsSync(join(outside, "root", "new.txt"))).toBe(false);
   });
 });
