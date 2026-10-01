@@ -219,6 +219,45 @@ describe("collection metrics", () => {
     }
   });
 
+  it("counts a failed read as a failure even when its state carries a reading forward", async () => {
+    // #775: extraction failed, the served state carried the last weekly
+    // windows forward as available, and the series still read success.
+    const store = new SharedQuotaStore(join(makeRoot("rusa-quota-metrics-"), "quota.db"));
+    const { metrics, emitted } = recordingMetrics();
+    try {
+      const loop = new QuotaCollectionLoop({
+        store,
+        metrics,
+        quotaService: {
+          getQuotaProbeOutcome: vi.fn().mockResolvedValue({
+            state: {
+              provider: "claude",
+              status: "available",
+              message: "LLM quota parsing failed: window 'Current session' has invalid usedPercent",
+              scrapedAt: "2030-01-01T00:00:00Z",
+            },
+            didProbe: true,
+            readFailed: true,
+          }),
+          hydrate: vi.fn(),
+        } as unknown as QuotaService,
+        providers: ["claude"],
+      });
+
+      await loop.tick();
+
+      expect(
+        seriesOf(emitted, QUOTA_SERVICE_METRICS.scrapesTotal).map((m) => m.labels.outcome)
+      ).toEqual(["failure"]);
+      const stats = loop.getAllStats().claude;
+      expect(stats.lastOutcome).toBe("failure");
+      expect(stats.lastError).toContain("invalid usedPercent");
+      expect(stats.lastScrapedAt).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
   it("retains an unknown reading's own message where readiness can read it", async () => {
     // The probe path reports a failed scrape or parse as data, not a throw. Its
     // message is the only thing that distinguishes "the codex TUI never
@@ -316,6 +355,42 @@ describe("store metrics", () => {
       ]);
       expect(seriesOf(emitted, QUOTA_SERVICE_METRICS.controllerStepsTotal)).toMatchObject([
         { labels: { provider: "claude" } },
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("counts a failed read as a failed parse even when a reading is carried forward", () => {
+    const store = new SharedQuotaStore(join(makeRoot("rusa-quota-metrics-"), "quota.db"));
+    const { metrics, emitted } = recordingMetrics();
+    try {
+      store.setMetrics(metrics);
+      const scrapedAt = "2030-01-01T00:00:00.000Z";
+      const raw = {
+        provider: "claude",
+        status: "unknown" as const,
+        message: "LLM quota parsing failed: window 'Current session' has invalid usedPercent",
+        scrapedAt,
+      };
+      const carried = {
+        ...raw,
+        status: "available" as const,
+        limits: [
+          {
+            label: "Weekly",
+            kind: "weekly" as const,
+            percentLeft: 50,
+            resetAtIso: "2030-01-08T00:00:00.000Z",
+            scope: { provider: "claude" },
+          },
+        ],
+      };
+      const id = store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "fixture" });
+      store.recordParsed(id, raw, carried);
+
+      expect(seriesOf(emitted, QUOTA_SERVICE_METRICS.parsesTotal)).toMatchObject([
+        { labels: { provider: "claude", outcome: "failure" } },
       ]);
     } finally {
       store.close();

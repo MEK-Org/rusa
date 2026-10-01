@@ -139,6 +139,36 @@ describe("quota MCP server", () => {
       expect(lastCallArgs.config.responseSchema.properties.windows).toBeDefined();
     });
 
+    it("asks for each window's percentage before its reset", async () => {
+      // #775: with Gemini's default alphabetical order usedPercent came after
+      // both reset fields, and the model wrote the reset into the percentage.
+      mockGenerateContent.mockResolvedValue({
+        text: () => JSON.stringify({ status: "available", windows: [] }),
+      });
+
+      await parseClaudeQuota("Claude output here", "test-key");
+
+      const config = (
+        mockGenerateContent.mock.calls[0][0] as {
+          config: {
+            responseSchema: {
+              properties: {
+                windows: { items: { properties: object; propertyOrdering: string[] } };
+              };
+            };
+          };
+        }
+      ).config;
+      const item = config.responseSchema.properties.windows.items;
+      const order = item.propertyOrdering;
+      expect([...order].sort()).toEqual(Object.keys(item.properties).sort());
+      for (const percent of ["usedPercent", "remainingPercent"]) {
+        for (const reset of ["resetAtIso", "resetInIso"]) {
+          expect(order.indexOf(percent)).toBeLessThan(order.indexOf(reset));
+        }
+      }
+    });
+
     it("scopes the Claude LLM prompt to the Claude quota clause", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () => JSON.stringify({ status: "available", windows: [] }),
@@ -2462,6 +2492,81 @@ describe("quota MCP server", () => {
 
       await Promise.all([p1, p2]);
       expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
+    });
+
+    it("reports a failed read even when its state carries the last reading forward", async () => {
+      // #775: both extraction attempts failed and the served state carried the
+      // previous weekly window forward as available.
+      mockClaudeProvider.run = vi.fn().mockResolvedValue({
+        success: true,
+        output:
+          "Current session: 10% used · resets Sep 30, 9:49pm (UTC)\n" +
+          "Current week (all models): 39% used · resets Oct 5, 2:59am (UTC)",
+        exitCode: 0,
+      });
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Current session",
+                kind: "session",
+                placeholder: false,
+                scope: "provider",
+                usedPercent: "10idk",
+              },
+            ],
+          }),
+      });
+      const service = new QuotaService({
+        config: { ...mockConfig, geminiApiKey: "test-gemini-key" } as RusaConfig,
+        workersDir: "/tmp/workers",
+        resolveProvider: mockResolveProvider,
+        now: () => Date.parse("2026-09-30T18:18:46.000Z"),
+        ttlMs: 0,
+      });
+      service.hydrate("claude", {
+        provider: "claude",
+        status: "available",
+        scrapedAt: "2026-09-30T16:48:40.000Z",
+        limits: [
+          {
+            label: "Current week (all models)",
+            kind: "weekly",
+            percentLeft: 62,
+            resetAtIso: "2026-10-05T02:59:00.000Z",
+            scope: { provider: "claude" },
+          },
+        ],
+      });
+
+      const failed = await service.getQuotaProbeOutcome("claude");
+      expect(failed.state).toMatchObject({
+        status: "available",
+        limits: [{ label: "Current week (all models)", percentLeft: 62 }],
+      });
+      expect(failed.readFailed).toBe(true);
+
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Current week (all models)",
+                kind: "weekly",
+                placeholder: false,
+                scope: "provider",
+                usedPercent: "39",
+                resetAtIso: "2026-10-05T02:59:00+00:00",
+              },
+            ],
+          }),
+      });
+      const clean = await service.getQuotaProbeOutcome("claude");
+      expect(clean.state).toMatchObject({ status: "available", limits: [{ percentLeft: 61 }] });
+      expect(clean.readFailed).toBeUndefined();
     });
 
     it("serves list_models returning per-provider catalog with passable field", async () => {
