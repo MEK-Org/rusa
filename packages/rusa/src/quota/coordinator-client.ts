@@ -14,6 +14,7 @@ import {
   isValidHistoryRecord,
   isValidQuotaPayload,
   isValidScrapeOutcome,
+  MANUAL_QUOTA_OBSERVATION_PATH,
   type PublishedHistoryRecord,
   type PublishedScrapeOutcome,
   type PublishedThrottleColdResponse,
@@ -89,6 +90,25 @@ export interface QuotaCoordinatorClientOptions {
  * cannot count the clients it cannot see, so this gauge belongs to the client
  * and is read from here by whatever samples instance health.
  */
+/** One manual reading as `POST /v1/quota/observations` takes it (#573). */
+export interface ManualReadingRequest {
+  provider: string;
+  /** The generation the reading-mode switch returned. */
+  generation: number;
+  /** A full provider snapshot; its `scrapedAt` is when the source was read. */
+  snapshot: ProviderQuotaSnapshot;
+  idempotencyKey: string;
+}
+
+/**
+ * what the coordinator answered a manual reading write with. `body` is the
+ * response text exactly as sent, accept or reject, so a caller can hand the
+ * service's own envelope on without re-encoding it.
+ */
+export type ManualReadingResult =
+  | { reached: true; statusCode: number; body: string }
+  | { reached: false; error: string };
+
 export interface QuotaCoordinatorClientHealth {
   quota_client_service_connected: 0 | 1;
 }
@@ -808,6 +828,77 @@ export class QuotaCoordinatorClient {
         hardStale: true,
       },
     };
+  }
+
+  /**
+   * Submit one manual reading to the coordinator's write route (#690). Unlike
+   * the reads, this neither validates nor interprets the answer: the service
+   * owns acceptance, so any HTTP response comes back verbatim, and only a
+   * transport failure or timeout is reported as not reached. A write never
+   * touches the read path's connection state or backoff.
+   */
+  postManualReading(request: ManualReadingRequest): Promise<ManualReadingResult> {
+    const payload = JSON.stringify({
+      provider: request.provider,
+      generation: request.generation,
+      observation: request.snapshot,
+    });
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let deadlineTimer: NodeJS.Timeout | undefined;
+
+      const finish = (value: ManualReadingResult): void => {
+        if (settled) return;
+        settled = true;
+        if (deadlineTimer !== undefined) {
+          clearTimeout(deadlineTimer);
+        }
+        resolve(value);
+      };
+
+      const fail = (err: unknown): void => {
+        const error = err instanceof Error ? err.message : String(err);
+        this.options.logger?.warn(
+          `[quota-client] Coordinator manual reading write failed: ${error}`
+        );
+        finish({ reached: false, error });
+      };
+
+      const req = http.request(
+        {
+          socketPath: this.options.socketPath,
+          path: MANUAL_QUOTA_OBSERVATION_PATH,
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "content-length": Buffer.byteLength(payload),
+            "idempotency-key": request.idempotencyKey,
+          },
+        },
+        (res) => {
+          let data = "";
+          res.setEncoding("utf8");
+          res.on("data", (chunk) => {
+            data += chunk;
+          });
+          res.on("error", fail);
+          res.on("end", () => {
+            finish({ reached: true, statusCode: res.statusCode ?? 0, body: data });
+          });
+        }
+      );
+
+      req.on("error", fail);
+
+      const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+      deadlineTimer = setTimeout(() => {
+        req.destroy(new Error(`coordinator manual reading write timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      deadlineTimer.unref?.();
+
+      req.end(payload);
+    });
   }
 
   private nowMs(): number {

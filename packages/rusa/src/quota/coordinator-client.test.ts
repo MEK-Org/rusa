@@ -483,6 +483,9 @@ describe("QuotaCoordinatorClient unavailability (#359, design §5.7/§6.3–6.4,
     const body = source
       .split("\n")
       .filter((line) => !/^\s*(\*|\/\*|\/\/)/.test(line))
+      // #690: the manual-reading write forwards the caller's snapshot under
+      // the route's wire field unchanged; that one line derives nothing.
+      .filter((line) => line.trim() !== "observation: request.snapshot,")
       .join("\n");
 
     // §6.4: there is no safe local degraded pacer under a partial outage, so
