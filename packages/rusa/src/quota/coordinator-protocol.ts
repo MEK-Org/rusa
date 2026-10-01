@@ -418,9 +418,11 @@ export function publishedThrottle(
   // its last reading, not the hard-stale ceiling, until that window's reset
   // (or, if later, its #712 exhaustion deadline) has passed, and then it
   // retires. A lane with no known reset retires once the provider has kept
-  // reporting for longer than the hard-stale horizon without it. A
-  // coordinator that stops collecting ages both lanes together instead, so
-  // the conservative widening still applies there.
+  // reporting for longer than the hard-stale horizon without it. When the
+  // whole provider reading is missing (including a coordinator that stops
+  // collecting), both lanes age together and skip this retirement:
+  // `publishedLane` keeps each one's interval until its governing reset and
+  // widens it to the ceiling afterwards.
   const modelLanes = (stored.modelLanes ?? []).flatMap(
     (lane: PersistedQuotaModelLaneStatus): PublishedThrottleModelLaneStatus[] => {
       const current = { ...publishedLane(lane, options), models: [...lane.models] };

@@ -281,7 +281,10 @@ lanes the same way.
 When the coordinator can still answer but a whole provider reading is missing,
 the provider lane and model lanes from that last reading keep their computed
 intervals while their governing window has not reset. The response remains
-truthfully `hardStale`; this is a pacing decision, not a freshness disguise. A
+truthfully `hardStale`; this is a pacing decision, not a freshness disguise.
+Once the window resets with still no reading, those lanes widen to the ceiling.
+They are not retired, and root is not alerted, as they are for a single missing
+model window. That retire-and-alert step is not implemented yet. A
 newer provider scrape that omits only a governing window remains the existing
 partial-window case and widens conservatively. A client that cannot reach the
 coordinator keeps its separate local hard-stale ceiling fallback.
