@@ -123,7 +123,6 @@ export function createAgentExecMcpServer(
   options?: {
     onWrite?: () => void;
     rootControl?: RootControlService;
-    isFenced?: () => boolean;
     /**
      * Runtime model-class store. The model-class tools mount only when this and
      * `validateModelClass` are wired AND the endpoint's actor holds
@@ -141,10 +140,7 @@ export function createAgentExecMcpServer(
     chatRoom?: Pick<ChatRoomService, "participants" | "add" | "remove">;
   }
 ): McpServer {
-  const server = createMcpServer(
-    { name: AGENT_EXEC_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced ?? (() => mesh.isYielded(selfId)) }
-  );
+  const server = createMcpServer({ name: AGENT_EXEC_MCP_NAME, version: "0.1.0" });
 
   const eventResourceInputSchema = {
     source: z
@@ -514,36 +510,6 @@ export function createAgentExecMcpServer(
   );
 
   server.registerTool(
-    "yield_run",
-    {
-      title: "Yield your turn (done or blocked)",
-      description:
-        "Release your turn. Call this ONLY when you have no next step you could take yourself right now — either your current objective is complete, or you're blocked waiting on someone else (a review, a reply, an external event). Until you call it, the system keeps waking you to keep making progress, so do NOT yield while a next step is still in your own hands (e.g. you committed but haven't pushed/opened the PR yet — push and open it first). You'll wake again whenever you receive a message or a relevant event. Yielding automatically notifies your parent only when this run was triggered by your parent; externally-triggered clean runs stay silent unless you send_message by judgment. In particular: if you finish work your parent asked you to do during an externally-triggered run (an event or cron woke you, not your parent's message), send_message your parent with the result — the automatic parent notification won't fire for that run. Failed runs still mechanically notify the parent.",
-      inputSchema: {
-        status: z
-          .enum(["complete", "blocked"])
-          .describe(
-            "'complete' = your current objective is finished; 'blocked' = you can't proceed without someone else."
-          ),
-        note: z
-          .string()
-          .optional()
-          .describe(
-            "Recommended: a one-line summary of what you finished, or what you're blocked on and what would unblock you. For parent-triggered runs, your PARENT receives this; it is always recorded in the mesh log."
-          ),
-      },
-    },
-    async ({ status, note }) => {
-      try {
-        mesh.declareYield(selfId, status, note);
-        return toolOk("yielded");
-      } catch (err) {
-        return toolError(err);
-      }
-    }
-  );
-
-  server.registerTool(
     "introduce",
     {
       title: "Introduce one thread to another",
@@ -581,7 +547,7 @@ export function createAgentExecMcpServer(
       description:
         "List the child threads you've spawned, with their charter summary, status, handle, declared model pool, context portability, and " +
         "whether each one has a run in flight right now — your org chart for deciding what " +
-        "to follow up on, inspect, or retire. Supply `handle` to resolve a specific direct child. A child whose run_state is 'running', 'winding_down', or 'queued' is " +
+        "to follow up on, inspect, or retire. Supply `handle` to resolve a specific direct child. A child whose run_state is 'running' or 'queued' is " +
         "mid-work: retiring it would abandon that run, and the attempt will be refused.",
       inputSchema: {
         handle: z
@@ -641,7 +607,7 @@ export function createAgentExecMcpServer(
         "own descendants — completion is the parent's judgment. Refused while that subtree " +
         "has a run in flight: retiring mid-run abandons the provider call and destroys that " +
         "run's work. A queued run can be cancelled and retired by passing force: true. " +
-        "Check run_state in list_threads, or just wait for the thread's yield. " +
+        "Check run_state in list_threads, or wait for the thread's run to end. " +
         "Also refused while the subtree still owns a live obligation, has a scheduled " +
         "message pending in either direction, or holds a live event subscription; the " +
         "refusal names each one, and nothing is retired until you have reassigned or finished " +
@@ -1417,7 +1383,7 @@ export function createAgentExecMcpServer(
       {
         title: "Move an actor to a new parent (actor-admin)",
         description:
-          "Re-parent an actor to a new parent by thread id (e.g. promote a steward and move workers under it so they report to it). Requires the actor-admin capability; both the actor and its new parent must lie in your own subtree. Changes who receives the actor's completion/yield reports and who may retire it (ownership is the parent edge), and grants the new parent a handle so it can message the actor. The actor's own subtree moves with it. Rejected if it would create a cycle, target the root, or reference an unknown thread.",
+          "Re-parent an actor to a new parent by thread id (e.g. promote a steward and move workers under it so they report to it). Requires the actor-admin capability; both the actor and its new parent must lie in your own subtree. Changes who receives the actor's reports and failure notices and who may retire it (ownership is the parent edge), and grants the new parent a handle so it can message the actor. The actor's own subtree moves with it. Rejected if it would create a cycle, target the root, or reference an unknown thread.",
         inputSchema: {
           thread_id: z.string().describe("The actor to move."),
           new_parent_id: z.string().describe("The actor that becomes its new parent."),

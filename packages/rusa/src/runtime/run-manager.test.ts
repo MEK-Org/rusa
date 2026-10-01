@@ -33,7 +33,7 @@ interface FakeActor extends MeshActor {
   /** Let a held run complete, then drain the follow-up microtasks. */
   finishRun(): Promise<void>;
   /** What a preemption attempt should report; null means "nothing to replace". */
-  preemptPhase: "running" | "winding_down" | "queued" | null;
+  preemptPhase: "running" | "queued" | null;
   queued: boolean;
   preemptions: number;
   closed: number;
@@ -63,7 +63,6 @@ function liveActor(id: string, opts: { debounceMs?: number; hold?: boolean } = {
       self.nudges.push(nudge);
       runner.requestRun(nudge);
     },
-    declareYield: () => {},
     markUnkillable: () => {},
     close: () => {
       self.closed += 1;

@@ -47,7 +47,6 @@ import { runMigrations } from "../db/migrations/runner.js";
 import type { ChatRoomMember } from "../db/repositories/chat-room-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
-import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { FakeProvider } from "../providers/fake-provider.js";
@@ -794,81 +793,8 @@ describe("agent-execution MCP server", () => {
         "transfer_voice_session",
         "unenroll_actor_experiment",
         "unsubscribe_event_source",
-        "yield_run",
       ].sort()
     );
-  });
-
-  it("describes externally-triggered parent-delegated completion reporting", async () => {
-    const { mesh } = setup();
-    const client = await connect(createAgentExecMcpServer(mesh, "worker-1", "root"));
-    const { tools } = await client.listTools();
-    const yieldTool = tools.find((t) => t.name === "yield_run");
-    expect(yieldTool?.description).toMatch(/finish work your parent asked you to do/i);
-    expect(yieldTool?.description).toMatch(/automatic parent notification won't fire/i);
-  });
-
-  it("uses root enrollment to gate the opted-in worker while an unenrolled MCP control keeps yielding", async () => {
-    const db = new Database(":memory:");
-    runMigrations(db);
-    try {
-      const obligations = new ObligationRepository(db);
-      const { inboxStore, mesh } = setup({
-        obligations: {
-          findLiveByExternalRef: (ref) => obligations.findLiveByExternalRef(ref),
-          get: (id) => obligations.get(id),
-          listDirectChildEdges: (id) => obligations.listDirectChildEdges(id),
-          listPrerequisiteEdges: (id) => obligations.listPrerequisiteEdges(id),
-          expireDueSnoozes: (ids) => obligations.expireDueSnoozes(ids, "system:mesh"),
-        },
-      });
-      const root = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-      const optedIn = mesh.spawn({
-        charter: "opted in",
-        parentId: "root",
-        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-      });
-      const control = mesh.spawn({
-        charter: "control",
-        parentId: "root",
-        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-      });
-      const enrollment = (await root.callTool({
-        name: "enroll_actor_experiment",
-        arguments: { actor_id: optedIn, experiment: "strict_obligation_handling" },
-      })) as CallToolResult;
-      expect(enrollment.isError).toBeFalsy();
-
-      for (const [actorId, obligationId] of [
-        [optedIn, "strict-mcp-head"],
-        [control, "control-mcp-head"],
-      ]) {
-        obligations.create({ id: obligationId, title: obligationId, ownerId: actorId });
-        mesh.deliverReadyHeadAttention(actorId, { id: obligationId, intent: "handle it" }, null);
-        mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
-        const entry = inboxStore
-          .list(actorId, { status: "unhandled" })
-          .entries.find((candidate) => candidate.payload.type === "obligation.ready_head");
-        if (!entry) throw new Error("expected ready-head inbox entry");
-        mesh.selectInboxEntries(actorId, [entry.id]);
-      }
-
-      const optedInClient = await connect(createAgentExecMcpServer(mesh, optedIn, "root"));
-      const controlClient = await connect(createAgentExecMcpServer(mesh, control, "root"));
-      const rejected = (await optedInClient.callTool({
-        name: "yield_run",
-        arguments: { status: "complete" },
-      })) as CallToolResult;
-      expect(rejected.isError).toBe(true);
-      expect(String(dataOf(rejected))).toContain("selected head obligation strict-mcp-head");
-      const accepted = (await controlClient.callTool({
-        name: "yield_run",
-        arguments: { status: "complete" },
-      })) as CallToolResult;
-      expect(accepted.isError).toBeFalsy();
-    } finally {
-      db.close();
-    }
   });
 
   it("transfers only the caller's active voice session through a held target", async () => {
@@ -961,7 +887,6 @@ describe("agent-execution MCP server", () => {
       ({
         id,
         requestRun: () => {},
-        declareYield: () => {},
         markUnkillable: () => {},
         close: () => {},
         isRunning: false,
@@ -1063,44 +988,8 @@ describe("agent-execution MCP server", () => {
         "subscribe_event_source",
         "transfer_voice_session",
         "unsubscribe_event_source",
-        "yield_run",
       ].sort()
     );
-  });
-
-  it("yield_run records a run_yielded event for the caller", async () => {
-    const { mesh, events } = setup();
-    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-    const result = await client.callTool({
-      name: "yield_run",
-      arguments: { status: "complete", note: "done for now" },
-    });
-    expect(dataOf(result as CallToolResult)).toBe("yielded");
-    const yielded = events.find((e) => e.kind === "run_yielded");
-    expect(yielded).toMatchObject({ actorId: "root", detail: "complete" });
-  });
-
-  it("yield_run only records the yield when it is called outside an active run", async () => {
-    const { mesh, events } = setup();
-    const rootSrv = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-    const spawn = await rootSrv.callTool({
-      name: "spawn_thread",
-      arguments: {
-        charter: "do a thing",
-        model_config: { provider: "claude", model: "claude-sonnet-4-6" },
-      },
-    });
-    const { thread_id } = dataOf(spawn as CallToolResult) as { thread_id: string };
-    const childSrv = await connect(createAgentExecMcpServer(mesh, thread_id, "root"));
-    await childSrv.callTool({
-      name: "yield_run",
-      arguments: { status: "blocked", note: "waiting on review" },
-    });
-    const toParent = events.find((e) => e.kind === "message_sent");
-    expect(toParent).toBeUndefined();
-    const yielded = events.find((e) => e.kind === "run_yielded" && e.actorId === thread_id);
-    expect(yielded?.detail).toBe("blocked");
-    expect(yielded?.body).toBe("waiting on review");
   });
 
   it("spawn_thread creates a child parented to the caller and returns its id", async () => {

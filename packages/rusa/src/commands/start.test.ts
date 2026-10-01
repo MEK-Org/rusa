@@ -1743,7 +1743,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   });
 
-  it("tells and gates a root-enrolled worker across the live MCP boundary while an unenrolled control is untouched", async () => {
+  it("tells a root-enrolled worker its closure rule across the live MCP boundary while an unenrolled control is untouched", async () => {
     let mesh: ActorMesh | undefined;
     let root: Actor | undefined;
     await new Promise<void>((resolve) => {
@@ -1849,8 +1849,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const strictHeadId = strict.obligationId;
     const controlSelection = await selectHeadOverMcp(control);
 
-    // The selection that arms enforcement is also what states the rule, so the
-    // worker learns it before its first yield rather than from a rejection.
+    // The selection that arms the experiment is also what states the rule, so the
+    // worker learns it before its run returns.
     // The rule is stated directly without mentioning the experiment itself.
     expect(String(strict.selection.discipline)).not.toContain("strict_obligation_handling");
     expect(String(strict.selection.discipline)).not.toMatch(/experiment/i);
@@ -1863,22 +1863,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(controlSelection.selection).not.toHaveProperty("discipline");
     expect(JSON.stringify(controlSelection.selection)).not.toContain("strict_obligation_handling");
 
-    // The enrolled worker cannot yield cleanly on an untouched head.
-    const rejected = await call(urlOf(actorOf(optedIn), "mesh"), "yield_run", {
-      status: "complete",
-    });
-    expect(rejected.isError).toBe(true);
-    expect(JSON.stringify(rejected)).toContain(`selected head obligation ${strictHeadId}`);
-    expect(
-      getRepositories()
-        .meshEvents.listEventsByActors([optedIn], { limit: 20, kinds: ["run_yield_rejected"] })
-        .events.some((event) => (event.payload ?? "").includes(strictHeadId))
-    ).toBe(true);
-
     // Direct focus takes the separate production path: an ordinary mesh
     // message plus an explicit owned obligation, selected through the same
     // live inbox MCP endpoint. It must arm independently of ready-head
-    // delivery and describe that commitment before the yield attempt.
+    // delivery and describe that commitment.
     const direct = spawnWorker("live direct-focus worker");
     expect(
       (
@@ -1912,15 +1900,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
     expect(directSelection.isError).toBeFalsy();
     expect(String(payloadOf(directSelection).discipline)).toContain(directId);
-    const directRejected = await call(urlOf(actorOf(direct), "mesh"), "yield_run", {
-      status: "complete",
-    });
-    expect(directRejected.isError).toBe(true);
-    expect(JSON.stringify(directRejected)).toContain(`selected head obligation ${directId}`);
     getRepositories().obligations.setTerminalStatus(directId, "done", null, null, "root");
-    expect(
-      (await call(urlOf(actorOf(direct), "mesh"), "yield_run", { status: "complete" })).isError
-    ).toBeFalsy();
     await endLifecycleRun(actorOf(direct), directRunId, { success: true, output: "", exitCode: 0 });
 
     // Decomposing it through the worker's own obligations MCP is a legal exit.
@@ -1930,17 +1910,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       title: "Review the strict head",
     });
     expect(child.isError).toBeFalsy();
-    const accepted = await call(urlOf(actorOf(optedIn), "mesh"), "yield_run", {
-      status: "complete",
-    });
-    expect(accepted.isError).toBeFalsy();
 
     // Handing the head to a sibling is a legal exit too (#420), through the
     // worker's own obligations MCP under the production owner-or-ancestor
     // policy: checkpoint first, reassign second. The committed transition
     // reaches the recipient's durable inbox through runStart's ready-head
-    // sink in this process — no restart, no injection. A fresh enrolled
-    // worker, because a clean yield fences every tool of the one above.
+    // sink in this process — no restart, no injection.
     const handoffSource = spawnWorker("live handoff source");
     const recipient = spawnWorker("live handoff recipient");
     expect(
@@ -1990,24 +1965,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
           entry.payload.obligationId === handoffHeadId
       )
     ).toBe(true);
-    const handedOff = await call(urlOf(actorOf(handoffSource), "mesh"), "yield_run", {
-      status: "complete",
-    });
-    expect(handedOff.isError).toBeFalsy();
     expect(getRepositories().obligations.require(handoffHeadId)).toMatchObject({
       ownerId: recipient,
       status: "ready",
       checkpointBy: handoffSource,
     });
 
-    // The unenrolled control keeps the existing behavior on the same wiring.
-    const controlYield = await call(urlOf(actorOf(control), "mesh"), "yield_run", {
-      status: "complete",
-    });
-    expect(controlYield.isError).toBeFalsy();
-
-    // A root enrollment change lands on instruction and enforcement together,
-    // at the next selection across the same live boundary.
+    // A root enrollment change lands at the next selection across the same
+    // live boundary.
     const switched = spawnWorker("live enrollment-change worker");
     expect(
       (
@@ -2022,10 +1987,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(String(enrolledRun.selection.discipline)).toContain(enrolledRun.obligationId);
     expect(String(enrolledRun.selection.discipline)).not.toContain("strict_obligation_handling");
     expect(String(enrolledRun.selection.discipline)).not.toMatch(/experiment/i);
-    const enrolledYield = await call(urlOf(actorOf(switched), "mesh"), "yield_run", {
-      status: "complete",
-    });
-    expect(enrolledYield.isError).toBe(true);
 
     expect(
       (
@@ -2050,10 +2011,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const releasedRun = await selectHeadOverMcp(switched);
     expect(releasedRun.obligationId).not.toBe(enrolledRun.obligationId);
     expect(releasedRun.selection).not.toHaveProperty("discipline");
-    const releasedYield = await call(urlOf(actorOf(switched), "mesh"), "yield_run", {
-      status: "complete",
-    });
-    expect(releasedYield.isError).toBeFalsy();
   }, 10_000);
 
   describe("root pool fallback is root-only ", () => {
@@ -2617,7 +2574,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(abandoned).toContainEqual({ actorId: "root", detail: "coalesced", started: true });
   });
 
-  describe("supervisor cleanup after an accepted yield (#257)", () => {
+  describe("run settlement on provider return (#828)", () => {
     /**
      * Boot the production wiring with one rehydrated worker and hand back the
      * hooks `runStart` actually built for it. The Actor's own classification is
@@ -2644,7 +2601,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
             legacyRootThread,
             {
               id: workerId,
-              charter: "yield cleanup worker",
+              charter: "returning worker",
               parentId: "root",
               status: "active",
               createdAt: "2026-09-06T00:00:00.000Z",
@@ -2707,60 +2664,34 @@ describe("runStart webhook event routing (Phase 4)", () => {
       mesh.selectInboxEntries(workerId, [entry.id]);
     };
 
-    // #257 asks for complete *and* blocked to survive; both are accepted
-    // outcomes and only the blocked one tells a parent someone is waiting.
-    it.each([
-      { status: "complete", note: "branch pushed" },
-      { status: "blocked", note: "waiting on review" },
-    ])("preserves an accepted $status yield through history, run_end and the parent's inbox", async ({
-      status,
-      note,
-    }) => {
-      const workerId = `grace-kill-worker-${status}`;
+    // Since #828 a run settles on provider return alone: a successful return of a
+    // parent-triggered run is recorded as completed and sends the parent no
+    // ceremonial status notice. Only failures reach the parent mechanically.
+    it("settles a successful parent-triggered return without a status notice", async () => {
+      const workerId = "returned-worker";
       const mesh = await bootWithWorker(workerId);
       const actor = actorFor(mesh, workerId);
 
       const runId = await startRun(actor);
       selectParentMessage(mesh, workerId);
-      mesh.declareYield(workerId, status, note);
-      // The result the Actor produces for a grace-kill that followed an accepted
-      // yield: the yield's outcome, with the raw process exit kept as annotation.
       await endLifecycleRun(actor, runId, {
         success: true,
-        graceKilled: true,
-        cancelled: true,
-        exitCode: 143,
-        output: "agent transcript\n[Task killed by supervisor (yield grace period exceeded)]",
-        yieldStatus: status,
-        yieldNote: note,
+        exitCode: 0,
+        output: "branch pushed",
       });
 
       const [run] = getRepositories().actorRuns.listRecentCompleted(workerId, 5);
-      expect(run).toMatchObject({
-        outcome: "completed",
-        success: true,
-        exitCode: 143,
-        yieldStatus: status,
-        yieldNote: note,
-      });
-      // Raw process exit diagnostics stay recoverable from the persisted run.
-      expect(run?.output).toContain("[Task killed by supervisor (yield grace period exceeded)]");
+      expect(run).toMatchObject({ outcome: "completed", success: true, exitCode: 0 });
 
       const [end] = getRepositories().meshEvents.listEventsByActors([workerId], {
         limit: 20,
         kinds: ["run_end"],
       }).events;
       expect(end?.success).toBe(true);
-      expect(end?.detail).toBe("exit 143");
-      expect(JSON.parse(end?.payload ?? "{}")).toMatchObject({
-        graceKilled: true,
-        yieldStatus: status,
-      });
+      expect(JSON.parse(end?.payload ?? "{}")).not.toHaveProperty("yieldStatus");
 
-      // The parent hears the yield it accepted — asserted positively, since an
-      // absent notification would satisfy the no-failure check on its own.
       const notes = mechanicalNotes("root");
-      expect(notes.some((n) => n.startsWith(`[yield/${status}] ${workerId}: ${note}`))).toBe(true);
+      expect(notes.some((n) => n.startsWith("[yield/"))).toBe(false);
       expect(notes.some((n) => n.startsWith("[run failed]"))).toBe(false);
     });
 
@@ -8334,73 +8265,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "mesh-chat-read",
         "pnpm-install",
       ]);
-    });
-
-    it("fences every worker endpoint on yield, and of root's only agent execution", async () => {
-      setIssueClient(new MockIssueClient() as unknown as IssueClient);
-      withWorker("fence-worker");
-      const { mesh, root } = await boot();
-      vi.spyOn(mesh, "isYielded").mockReturnValue(true);
-
-      // One argument-valid call per server, so the only thing that can refuse
-      // it is the fence. Root's pnpm-install, repo and update are not called:
-      // unfenced, those would do real work.
-      const probes: Record<string, { tool: string; args: Record<string, unknown> }> = {
-        tracker: { tool: "list_open_issues", args: { repo: "dummy-org/dummy-repo" } },
-        repo: { tool: "merge_pull_request", args: { repo: "dummy-org/dummy-repo", prNumber: 1 } },
-        understanding: { tool: "overview", args: {} },
-        quota: { tool: "list_models", args: {} },
-        mesh: { tool: "list_threads", args: {} },
-        inbox: { tool: "list", args: {} },
-        obligations: { tool: "list_owned", args: {} },
-        "mesh-chat-read": { tool: "list_messages", args: {} },
-        "pnpm-install": { tool: "pnpm_install", args: {} },
-        "pnpm-hardlinks": { tool: "force_relink_workers", args: {} },
-      };
-      const fencedByServer = async (
-        servers: McpSpec[],
-        skip: string[] = []
-      ): Promise<Record<string, boolean>> => {
-        const fenced: Record<string, boolean> = {};
-        for (const server of servers) {
-          const probe = probes[server.name];
-          if (!probe || skip.includes(server.name)) continue;
-          const client = new Client({ name: "fence-probe", version: "0.0.0" });
-          await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
-          try {
-            const result = await client.callTool({ name: probe.tool, arguments: probe.args });
-            const text = (result.content as { text?: string }[])
-              .map((part) => part.text ?? "")
-              .join("");
-            fenced[server.name] = text.includes("Run is over");
-          } finally {
-            await client.close();
-          }
-        }
-        return fenced;
-      };
-
-      expect(await fencedByServer(mcpServersOf(workerOf(mesh, "fence-worker")))).toEqual({
-        tracker: true,
-        repo: true,
-        understanding: true,
-        quota: true,
-        mesh: true,
-        inbox: true,
-        obligations: true,
-        "mesh-chat-read": true,
-        "pnpm-install": true,
-      });
-      expect(await fencedByServer(mcpServersOf(root), ["repo", "pnpm-install"])).toEqual({
-        understanding: false,
-        quota: false,
-        tracker: false,
-        mesh: true,
-        inbox: false,
-        obligations: false,
-        "mesh-chat-read": false,
-        "pnpm-hardlinks": false,
-      });
     });
 
     it("records the same run accounting, events and logs for root and worker runs", async () => {

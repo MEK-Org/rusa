@@ -7,8 +7,8 @@ import { createMcpServer } from "./strict-server.js";
 export const SLACK_READ_MCP_NAME = "slack-read";
 export const SLACK_WRITE_MCP_NAME = "slack-write";
 
-export function createSlackReadMcpServer(client: SlackClient, isFenced?: () => boolean): McpServer {
-  const server = createMcpServer({ name: SLACK_READ_MCP_NAME, version: "0.1.0" }, { isFenced });
+export function createSlackReadMcpServer(client: SlackClient): McpServer {
+  const server = createMcpServer({ name: SLACK_READ_MCP_NAME, version: "0.1.0" });
   server.registerTool(
     "get_message",
     {
@@ -44,10 +44,9 @@ export function createSlackReadMcpServer(client: SlackClient, isFenced?: () => b
 
 export function createSlackWriteMcpServer(
   client: SlackClient,
-  allowedChannels: "all" | string[],
-  isFenced?: () => boolean
+  allowedChannels: "all" | string[]
 ): McpServer {
-  const server = createMcpServer({ name: SLACK_WRITE_MCP_NAME, version: "0.1.0" }, { isFenced });
+  const server = createMcpServer({ name: SLACK_WRITE_MCP_NAME, version: "0.1.0" });
   const allowed = (channel: string) =>
     allowedChannels === "all" || allowedChannels.includes(channel);
   server.registerTool(

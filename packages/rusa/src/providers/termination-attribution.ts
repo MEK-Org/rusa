@@ -11,7 +11,6 @@
 
 export const STALL_WATCHDOG_ABORT_REASON = "stall-watchdog";
 export const RUN_CEILING_ABORT_REASON = "run-ceiling";
-export const YIELD_GRACE_ABORT_REASON = "yield-grace-exceeded";
 export const INTERRUPT_ABORT_REASON_PREFIX = "interrupt:";
 
 export function createInterruptAbortReason(by: string): string {
@@ -33,7 +32,6 @@ export interface TerminationAttribution {
   cancelled: boolean;
   interrupted?: boolean;
   interruptSource?: string;
-  graceKilled?: boolean;
 }
 
 /**
@@ -70,15 +68,6 @@ export function formatSigtermResult(
       output: `${baseOutput}\n[Task killed by run ceiling timeout]`,
       exitCode: 143, // 128 + SIGTERM (15)
       cancelled: true,
-    };
-  }
-
-  if (reason === YIELD_GRACE_ABORT_REASON) {
-    return {
-      output: `${baseOutput}\n[Task killed by supervisor (yield grace period exceeded)]`,
-      exitCode: 143, // 128 + SIGTERM (15)
-      cancelled: true,
-      graceKilled: true,
     };
   }
 

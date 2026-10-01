@@ -39,11 +39,11 @@ export interface ExperimentDefinition {
 
 /**
  * The `strict_obligation_handling` experiment: holding an enrolled actor to a
- * stricter standard for how it handles its obligations. Its first rule is the
- * #382 clean-yield rule — a run that selects a new head obligation must make
- * that obligation terminal or decompose it before yielding cleanly. Named here
- * so the rollout boundary exists ahead of the behavior; #382 consumes it
- * separately, and this package deliberately carries none of that behavior.
+ * stricter standard for how it handles its obligations. Its rule is head
+ * closure (#382, #828) — a run that selects a head obligation must finish,
+ * decompose, snooze or hand it off before it returns. Named here so the
+ * rollout boundary exists apart from the behavior; the mesh consumes it, and
+ * this package deliberately carries none of that behavior.
  */
 export const STRICT_OBLIGATION_HANDLING_EXPERIMENT = "strict_obligation_handling";
 
@@ -56,7 +56,7 @@ export const STRICT_OBLIGATION_HANDLING_EXPERIMENT = "strict_obligation_handling
 export const EXPERIMENTS = {
   [STRICT_OBLIGATION_HANDLING_EXPERIMENT]: {
     intent:
-      "Hold the actor to stricter obligation handling: a run that selects a new head obligation must finish or decompose it before it may yield cleanly.",
+      "Hold the actor to stricter obligation handling: a run that selects a new head obligation must finish, decompose, snooze or hand it off before it returns.",
   },
 } as const satisfies Record<string, ExperimentDefinition>;
 

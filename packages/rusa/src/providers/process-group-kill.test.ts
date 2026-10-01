@@ -25,8 +25,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderConfig } from "../config/types.js";
 import { CopilotProvider } from "./copilot.js";
 import {
+  RUN_CEILING_ABORT_REASON,
   STALL_WATCHDOG_ABORT_REASON,
-  YIELD_GRACE_ABORT_REASON,
 } from "./termination-attribution.js";
 
 // ---------------------------------------------------------------------------
@@ -105,27 +105,24 @@ describe("CopilotProvider — transitive process-group kill (ISSUE_NUM leg 2)", 
    * the grandchild is never signalled, and isAlive(grandchildPid) returns true.
    *
    * Parameterized over the abort reason because the group kill is reason-blind
-   * while the attribution is not: #257's post-yield cleanup takes this same
-   * path, so the descendants of a CLI that outlived its yield are reaped too,
-   * and the run comes back attributed as cleanup rather than a bare SIGTERM.
+   * while the attribution is not: every supervisor abort takes this same path,
+   * so the descendants are reaped whichever limit fired, and the run comes back
+   * attributed to that limit rather than as a bare SIGTERM.
    */
   it.each([
     {
       label: "the stall watchdog fires",
       reason: STALL_WATCHDOG_ABORT_REASON,
       marker: "[Task killed by stall watchdog (no output for 15 minutes)]",
-      graceKilled: undefined,
     },
     {
-      label: "the yield grace period is exceeded (#257)",
-      reason: YIELD_GRACE_ABORT_REASON,
-      marker: "[Task killed by supervisor (yield grace period exceeded)]",
-      graceKilled: true,
+      label: "the run ceiling is reached",
+      reason: RUN_CEILING_ABORT_REASON,
+      marker: "[Task killed by run ceiling timeout]",
     },
   ])("reaps the grandchild and attributes the kill when $label — remove detached:true from copilot.ts to see RED", async ({
     reason,
     marker,
-    graceKilled,
   }) => {
     const tmp = mkdtempSync(join(tmpdir(), "mc-pgkill-"));
     temps.push(tmp);
@@ -152,7 +149,6 @@ describe("CopilotProvider — transitive process-group kill (ISSUE_NUM leg 2)", 
     expect(result.success).toBe(false);
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(143);
-    expect(result.graceKilled).toBe(graceKilled);
     // The raw termination diagnostic reaches the caller from the real adapter,
     // not just from formatSigtermResult in isolation.
     expect(result.output).toContain(marker);

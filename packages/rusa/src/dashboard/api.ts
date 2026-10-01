@@ -122,8 +122,6 @@ export interface DashboardDataDeps {
   runningThreadIds?: () => Set<string>;
   /** Read-only snapshot of actors waiting for their provider run to start. */
   queuedThreadIds?: () => Set<string>;
-  /** Optional yield check for testing runState without full mesh instance. */
-  isYielded?: (actorId: string) => boolean;
   /**
    * Read-only snapshot of the leader's one admission list, across lanes.
    * `position` is 0-based in that list; `estimatedStartAt` is an ISO-8601
@@ -351,7 +349,7 @@ interface ThreadDto {
    * built. Server-side truth so the client can seed its dots correctly on a cold
    * load (before any live `mesh_event` arrives), rather than guessing "active".
    */
-  runState: "running" | "queued" | "winding_down" | "idle";
+  runState: "running" | "queued" | "idle";
   chatDisabled: boolean;
   /** ISO-8601 timestamp of the actor's most recent mesh event, or null if none. */
   lastActiveAt: string | null;
@@ -1923,11 +1921,11 @@ export async function handleMeshApiRequest(
 
     const threads: ThreadDto[] = await Promise.all(
       actors.list().map(async (r) => {
-        let runState: "running" | "queued" | "winding_down" | "idle" = "idle";
+        let runState: "running" | "queued" | "idle" = "idle";
         if (runtime) {
           runState = runtime.states.get(r.id) ?? "idle";
         } else if (running.has(r.id)) {
-          runState = deps.isYielded?.(r.id) ? "winding_down" : "running";
+          runState = "running";
         } else if (queued.has(r.id)) {
           runState = "queued";
         }
@@ -1936,12 +1934,10 @@ export async function handleMeshApiRequest(
         // reservation deliberately has no focus from the prior run (or a
         // speculative next one) to project.
         const selectedObligation =
-          runState === "running" || runState === "winding_down"
-            ? (deps.selectedObligationForActor?.(r.id) ?? null)
-            : null;
+          runState === "running" ? (deps.selectedObligationForActor?.(r.id) ?? null) : null;
 
         let inboxSelection: { item: InboxEntry; moreCount?: number } | null = null;
-        if (runState === "running" || runState === "winding_down") {
+        if (runState === "running") {
           if (!selectedObligation) {
             const items = deps.selectedInboxItemsForActor?.(r.id);
             if (items && items.length > 0) {

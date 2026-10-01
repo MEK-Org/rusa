@@ -20,7 +20,8 @@ class EventRow {
   String? get yieldStatus => yielded?.detail;
 }
 
-/// Status strings a live `run_yielded` carries (see `actor-mesh.ts declareYield`).
+/// Status strings a historical `run_yielded` carries. Explicit yield was removed
+/// (#828), so these rows come only from runs recorded before then.
 /// A yield to a non-live actor instead carries a "dropped — no live actor"
 /// detail and has *no* paired `run_end` (no run happened) — so it is never
 /// coalesced.
@@ -30,7 +31,7 @@ const _kYieldStatuses = {'complete', 'blocked'};
 /// row. Input is the store's newest-first event list (server order = rowid desc).
 ///
 /// Why this is safe as a pure presentation pass (confirmed with the mesh elder):
-///   • `run_yielded` is recorded mid-turn by the `yield_run` tool; `run_end` is
+///   • `run_yielded` was recorded mid-turn by the removed `yield_run` tool; `run_end` is
 ///     recorded after the provider run returns — so `run_yielded` always has a
 ///     *strictly newer* `run_end` for that actor (yield rowid < end rowid). In a
 ///     newest-first list the `run_end` therefore sits *above* (before) its yield.

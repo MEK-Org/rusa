@@ -27,7 +27,6 @@ export interface InboxMcpRunScope {
   select: (entryIds: string[], obligationId?: string) => InboxEntry[] | SelectedInboxRun;
   selected: () => readonly string[];
   onHandled?: () => void;
-  isFenced?: () => boolean;
   /** Explicit walkie authority hides and fences ordinary work for this actor. */
   isVoiceSessionActive?: () => boolean;
   /** Where selected chat entries read their recent conversation from (#651). Omitted: no chat context. */
@@ -40,10 +39,7 @@ export function createInboxMcpServer(
   actorId: string,
   runScope?: InboxMcpRunScope
 ): McpServer {
-  const server = createMcpServer(
-    { name: INBOX_MCP_NAME, version: "0.1.0" },
-    { isFenced: runScope?.isFenced }
-  );
+  const server = createMcpServer({ name: INBOX_MCP_NAME, version: "0.1.0" });
   let localSelection: string[] = [];
   const scope: InboxMcpRunScope =
     runScope ??

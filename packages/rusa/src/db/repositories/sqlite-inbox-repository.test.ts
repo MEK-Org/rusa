@@ -541,7 +541,7 @@ describe("SqliteInboxRepository", () => {
     store.actorsWithUnhandled();
     store.list("actor", { status: "all" });
 
-    // Exercise run start/end, yield, boot recovery, and retire/retention wiring.
+    // Exercise run start/end, boot recovery, and retire/retention wiring.
     const registry = new InMemoryActorRepository();
     const mesh = new ActorMesh({
       actors: registry,
@@ -574,7 +574,6 @@ describe("SqliteInboxRepository", () => {
     );
     mesh.reconcileInbox();
     await vi.advanceTimersByTimeAsync(2);
-    mesh.declareYield("actor", "complete");
     mesh.retire("actor");
     expect(
       (

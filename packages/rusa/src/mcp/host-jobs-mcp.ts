@@ -72,15 +72,8 @@ function requireOwnJob(store: HostJobStore, id: string, selfId: string): HostJob
  * grantable-servers wiring, and every store call here is scoped to it — one actor
  * can never see or touch another's jobs through this surface.
  */
-export function createHostJobsServer(
-  deps: HostJobsMcpDeps,
-  selfId: string,
-  options?: { isFenced?: () => boolean }
-): McpServer {
-  const server = createMcpServer(
-    { name: HOST_JOBS_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced }
-  );
+export function createHostJobsServer(deps: HostJobsMcpDeps, selfId: string): McpServer {
+  const server = createMcpServer({ name: HOST_JOBS_MCP_NAME, version: "0.1.0" });
   const now = deps.now ?? (() => new Date().toISOString());
 
   server.registerTool(

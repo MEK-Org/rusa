@@ -89,7 +89,6 @@ function releasableCapabilityProvider() {
         void gate(prompt.charter).promise.then(resolve);
       });
       await bridge.sendMessage(prompt.parentId, prompt.charter);
-      bridge.yieldRun("complete", "capability boundary fixture complete");
       return {
         success: true,
         output: prompt.charter,
@@ -185,7 +184,6 @@ describe("monolithic follower instance", () => {
           try {
             await delay(400, undefined, { signal: run.signal });
             await bridge.sendMessage(prompt.parentId, prompt.charter);
-            bridge.yieldRun("complete", "computer use fixture complete");
             return {
               success: true,
               output: prompt.charter,

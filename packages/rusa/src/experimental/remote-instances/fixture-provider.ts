@@ -24,7 +24,6 @@ export const createProvider: ProviderFactory = (bridge, options, selected) => ({
       messages: prompt.messages,
     };
     await bridge.sendMessage(prompt.parentId, JSON.stringify(report));
-    bridge.yieldRun("complete", "Scripted instance round trip complete");
     return {
       success: true,
       output: JSON.stringify(report),

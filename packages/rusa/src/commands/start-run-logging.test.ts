@@ -37,7 +37,7 @@ describe("logRunEnd", () => {
   it("records a completed run at info", () => {
     const { logger, records } = recordingLogger();
 
-    logRunEnd(logger, runResult({ yieldStatus: "complete", model: "claude-opus-5" }));
+    logRunEnd(logger, runResult({ model: "claude-opus-5" }));
 
     expect(records()[0]).toMatchObject({
       level: "info",
@@ -47,7 +47,6 @@ describe("logRunEnd", () => {
       capped: false,
       cancelled: false,
       interrupted: false,
-      yieldStatus: "complete",
       model: "claude-opus-5",
     });
   });
@@ -77,11 +76,10 @@ describe("logRunEnd", () => {
   it("keeps the run's own output out of the record", () => {
     const { logger, records } = recordingLogger();
 
-    logRunEnd(logger, runResult({ output: "a very long model transcript", yieldNote: "done" }));
+    logRunEnd(logger, runResult({ output: "a very long model transcript" }));
 
     const written = JSON.stringify(records()[0]);
     expect(written).not.toContain("a very long model transcript");
-    expect(written).not.toContain("done");
   });
 
   it("carries whatever context the caller bound, so the run is identifiable", () => {

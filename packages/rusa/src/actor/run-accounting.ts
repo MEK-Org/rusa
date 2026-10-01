@@ -60,8 +60,6 @@ export function createRunAccounting(runs: () => ActorRunRepository): RunAccounti
       success: result.success,
       exitCode: result.exitCode,
       output: result.output,
-      yieldStatus: result.yieldStatus,
-      yieldNote: result.yieldNote,
     });
     activeRunIds.delete(actorId);
   };

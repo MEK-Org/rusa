@@ -28,7 +28,6 @@ export function inferChatMimeType(filename: string): string {
 
 export interface ChatReadMcpOptions {
   allowedSpaces?: string[];
-  isFenced?: () => boolean;
   maxAttachmentBytes?: number;
 }
 
@@ -37,10 +36,7 @@ export function createChatReadMcpServer(
   chatClient: ChatClient,
   options?: ChatReadMcpOptions
 ): McpServer {
-  const server = createMcpServer(
-    { name: CHAT_READ_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced }
-  );
+  const server = createMcpServer({ name: CHAT_READ_MCP_NAME, version: "0.1.0" });
 
   const isAllowed = (spaceName: string) => {
     if (!options?.allowedSpaces || options.allowedSpaces.length === 0) return true;
@@ -275,7 +271,6 @@ export interface ChatWriteMcpOptions {
   /** The exact normalized selection for the provider attempt currently writing. */
   getRunSelection?: () => RawProviderModelConfig | undefined;
   onWrite?: (actorId: string) => void;
-  isFenced?: () => boolean;
   maxAttachmentBytes?: number;
   /** Directory attachment `filePath`s are confined to; defaults to `process.cwd()`. */
   workDir?: string;
@@ -496,10 +491,7 @@ export function createChatWriteMcpServer(
   chatClient: ChatClient,
   options: ChatWriteMcpOptions
 ): McpServer {
-  const server = createMcpServer(
-    { name: CHAT_WRITE_MCP_NAME, version: "0.1.0" },
-    { isFenced: options.isFenced }
-  );
+  const server = createMcpServer({ name: CHAT_WRITE_MCP_NAME, version: "0.1.0" });
 
   const isAllowed = (spaceName: string) => {
     if (!options.allowedSpaces || options.allowedSpaces.length === 0) return false;

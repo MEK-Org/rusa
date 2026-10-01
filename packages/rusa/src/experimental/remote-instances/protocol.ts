@@ -39,10 +39,7 @@ export interface Bootstrap {
   modelConfigGeneration?: number;
   providerOptions?: Record<string, unknown>;
   mcpServers?: McpServerSpec[];
-  actorOptions?: Pick<
-    ActorOptions,
-    "sandbox" | "addDirs" | "timeoutMs" | "yieldGraceMs" | "debounceMs"
-  >;
+  actorOptions?: Pick<ActorOptions, "sandbox" | "addDirs" | "timeoutMs" | "debounceMs">;
   /** True when reconnecting to an existing actor runtime (avoids duplicate host error). */
   reconnect?: boolean;
   /**
@@ -72,7 +69,6 @@ export interface RunSnapshot {
 
 export interface ProviderBridge {
   sendMessage(to: string, body: string): Promise<unknown>;
-  yieldRun(status?: string, note?: string): void;
 }
 
 export type ProviderFactory = (
@@ -133,7 +129,6 @@ export type LeaderCommand =
   | { type: "cancelQueued"; retain?: boolean }
   /** Replay a cancelled queued opportunity; `nudge` covers a follower that kept none. */
   | { type: "resumeCancelled"; nudge: RunNudge }
-  | { type: "yield"; status?: string; note?: string }
   | { type: "unkillable" }
   | { type: "stop" }
   | { type: "reply"; requestId: number; value?: unknown; error?: string };
@@ -145,11 +140,11 @@ export type ActorEvent =
       type: "preempted";
       requestId: number;
       preempted: boolean;
-      phase?: "running" | "winding_down" | "queued";
+      phase?: "running" | "queued";
     }
   | { type: "request"; requestId: number; request: Request }
   | { type: "release"; requestId: number }
-  | { type: "state"; state: ActorRuntimeState; yielded: boolean }
+  | { type: "state"; state: ActorRuntimeState }
   | { type: "session"; sessionId: string }
   | { type: "queued"; responsive: boolean; mode: ActorRunMode; runId?: string }
   | { type: "error"; error: string }

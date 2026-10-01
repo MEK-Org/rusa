@@ -149,7 +149,7 @@ export interface Obligation {
    * blocks its parent and dependents exactly as before, and dependency
    * satisfaction never looks at this field. It only defers *automatic ready
    * attention* — the owner's ready head, responsive ready delivery, and the
-   * strict-yield closure check — until the deadline. Events still wake the
+   * strict head closure check — until the deadline. Events still wake the
    * owner. It survives reassignment (the new owner holds it) and recurrence
    * (completion keeps it); final `done`/`cancelled` clears it.
    */
