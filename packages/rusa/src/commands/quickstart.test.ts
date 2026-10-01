@@ -37,6 +37,7 @@ import {
   printFallbackCommands,
   QUICKSTART_DASHBOARD_PORT,
   QUICKSTART_GIT_BRIDGE_PORT,
+  readExistingRepos,
   runProviderLogins,
   runQuickstart,
   runQuickstartConfigure,
@@ -216,6 +217,21 @@ describe("quickstart command", () => {
       "upstream/project",
       "local/second",
     ]);
+  });
+
+  it("rejects and leaves the file byte-identical when config.yaml is malformed", async () => {
+    const malformedContent = "this: is: invalid: yaml:\n  [unclosed-bracket";
+    const configPath = join(home, "config.yaml");
+    writeFileSync(configPath, malformedContent, "utf8");
+
+    promptMocks.state.inputs = ["codex", "my-root-entity", "gpt-5.6-sol"];
+    promptMocks.state.passwords = ["test-gemini-key"];
+
+    await expect(runQuickstartConfigure({ home, executeProviderCommand: () => 0 })).rejects.toThrow(
+      /Could not read existing configuration/
+    );
+
+    expect(readFileSync(configPath, "utf8")).toBe(malformedContent);
   });
 
   it("persists the entire node home for provider CLI state", () => {
@@ -516,6 +532,26 @@ describe("quickstart command", () => {
       });
     });
 
+    describe("readExistingRepos", () => {
+      it("returns an empty array when config.yaml does not exist", () => {
+        expect(readExistingRepos(join(home, "non-existent-config.yaml"))).toEqual([]);
+      });
+
+      it("returns github.repos when config.yaml contains valid repos", () => {
+        const configPath = join(home, "test-config.yaml");
+        writeFileSync(configPath, toYaml({ github: { repos: ["local/repo-a", "org/repo-b"] } }));
+        expect(readExistingRepos(configPath)).toEqual(["local/repo-a", "org/repo-b"]);
+      });
+
+      it("throws when config.yaml exists but cannot be parsed", () => {
+        const configPath = join(home, "broken-config.yaml");
+        writeFileSync(configPath, "not: [valid: yaml", "utf8");
+        expect(() => readExistingRepos(configPath)).toThrow(
+          /Could not read existing configuration/
+        );
+      });
+    });
+
     describe("configureBridgeRemote", () => {
       const remoteUrl = `http://localhost:${QUICKSTART_GIT_BRIDGE_PORT}/local/my-repo.git`;
 
@@ -539,6 +575,23 @@ describe("quickstart command", () => {
           ["-C", "/work/my-repo", "remote", "get-url", "rusa"],
           ["-C", "/work/my-repo", "remote", "set-url", "rusa", remoteUrl],
         ]);
+      });
+
+      it("logs update notice when repointing an existing remote with a different url", () => {
+        const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+        const executeGit = vi.fn((args: string[]) => {
+          if (args.includes("remote") && args.includes("get-url")) {
+            return { status: 0, stdout: "git@github.com:MEK-Org/rusa.git\n", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        });
+        expect(configureBridgeRemote("/work/my-repo", "local/my-repo", executeGit)).toBe(true);
+        expect(log).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'Remote "rusa" in /work/my-repo updated: was git@github.com:MEK-Org/rusa.git, now points at http://localhost:8085/local/my-repo.git'
+          )
+        );
+        log.mockRestore();
       });
 
       it("prints the recovery command when the remote cannot be set", () => {

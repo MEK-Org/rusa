@@ -184,7 +184,9 @@ export function configureBridgeRemote(
   executeGit: GitCommandExecutor
 ): boolean {
   const remoteUrl = bridgeRemoteUrl(repoKey);
-  const exists = executeGit(["-C", repoPath, "remote", "get-url", "rusa"]).status === 0;
+  const getUrl = executeGit(["-C", repoPath, "remote", "get-url", "rusa"]);
+  const exists = getUrl.status === 0;
+  const previousUrl = exists ? getUrl.stdout?.trim() : undefined;
   const res = executeGit(["-C", repoPath, "remote", exists ? "set-url" : "add", "rusa", remoteUrl]);
   if (res.status !== 0) {
     console.warn(
@@ -193,7 +195,13 @@ export function configureBridgeRemote(
     printFallbackCommands(repoPath, remoteUrl);
     return false;
   }
-  console.log(`[quickstart] Remote "rusa" in ${repoPath} now points at ${remoteUrl}`);
+  if (previousUrl && previousUrl !== remoteUrl) {
+    console.log(
+      `[quickstart] Remote "rusa" in ${repoPath} updated: was ${previousUrl}, now points at ${remoteUrl}`
+    );
+  } else {
+    console.log(`[quickstart] Remote "rusa" in ${repoPath} now points at ${remoteUrl}`);
+  }
   return true;
 }
 
@@ -599,17 +607,18 @@ export function runProviderLogins(
   }
 }
 
-function readExistingRepos(configPath: string): string[] {
+export function readExistingRepos(configPath: string): string[] {
   if (!existsSync(configPath)) return [];
+  let parsed: unknown;
   try {
-    const repos = (parseYaml(readFileSync(configPath, "utf8")) as RusaConfig | null)?.github?.repos;
-    return Array.isArray(repos) ? repos.filter((repo) => typeof repo === "string") : [];
+    parsed = parseYaml(readFileSync(configPath, "utf8"));
   } catch (err) {
-    console.warn(
-      `[quickstart] Warning: could not read github.repos from the existing ${configPath}; it will not be carried forward: ${err}`
+    throw new Error(
+      `Could not read existing configuration at ${configPath}: ${err instanceof Error ? err.message : err}`
     );
-    return [];
   }
+  const repos = (parsed as RusaConfig | null)?.github?.repos;
+  return Array.isArray(repos) ? repos.filter((repo) => typeof repo === "string") : [];
 }
 
 export interface QuickstartConfigureOptions {
@@ -619,6 +628,9 @@ export interface QuickstartConfigureOptions {
 
 export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = {}): Promise<void> {
   const mcHome = resolveHomeOverride(opts.home);
+  const configPath = join(mcHome, "config.yaml");
+  const existingRepos = readExistingRepos(configPath);
+
   console.log("\nRusa quickstart configuration\n");
   console.log("This writes configuration inside the container.\n");
 
@@ -679,8 +691,6 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
   // only GitHub ingestion edge, and it stays idle until an operator adds
   // `github.repos` and points a reachable webhook at it (docs/quickstart.md).
   // A reconfigure keeps the repositories an earlier run or the operator added.
-  const configPath = join(mcHome, "config.yaml");
-  const existingRepos = readExistingRepos(configPath);
   const config: RusaConfig = {
     profile: "quickstart",
     github: existingRepos.length > 0 ? { repos: existingRepos } : {},

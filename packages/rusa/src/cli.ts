@@ -137,7 +137,7 @@ quickstart
   });
 
 quickstart
-  .command("seed")
+  .command("seed", { hidden: true })
   .description("Seed a local repo's git-bridge base branch from a bundle (run by quickstart)")
   .requiredOption("--repo-key <key>", "Repo key, e.g. local/<dirname>")
   .requiredOption("--bundle <path>", "Git bundle holding the branch")
