@@ -855,6 +855,8 @@ export class Actor {
         // A normal run can wait in provider pacing after its initial preflight.
         // Do not let that stale opportunity cross a newer host-owned authority
         // boundary; the authority release supplies its own durable-work nudge.
+        // The same refusal drops a run whose inbox was handled to empty while
+        // it waited; newly delivered work requests a fresh run.
         this.lastRunSkipped = true;
         throw new RunStartCancelledError();
       }

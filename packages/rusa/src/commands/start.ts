@@ -3659,17 +3659,13 @@ async function composeStart(
     },
     // Responsive human wakes bypass normal pacing/concurrency; background root
     // wakes use the same normal scheduling path as workers.
-    beforeRun: (): boolean => {
-      if (!mesh.prepareRun(rootId)) return false;
-      const watermark = root.getInterruptedWatermark?.();
-      if (watermark) {
-        const entries = inboxStore.list(rootId, { status: "unhandled" }).entries;
-        return entries.some((e) => e.deliveredAt > watermark);
-      }
-      return inboxStore.countUnhandled(rootId) > 0;
-    },
+    // Root shares the workers' durable-work predicate at both boundaries, so
+    // work handled while its queued run awaits async onQueued is refused at
+    // final admission instead of launching a provider with an empty inbox.
+    beforeRun: (): boolean => mesh.prepareRun(rootId) && mesh.hasRunnableInbox(rootId),
     admitRun: ({ responsive }): boolean =>
-      responsive || !(voiceService?.hasActiveSession(rootId) ?? false),
+      mesh.hasRunnableInbox(rootId) &&
+      (responsive || !(voiceService?.hasActiveSession(rootId) ?? false)),
     gate: (fn, candidates, responsive) =>
       computerUseLock.gateAfterProvider(
         rootId,
