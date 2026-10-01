@@ -1,11 +1,15 @@
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { basename } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { MAX_SLACK_FILE_BYTES, type SlackClient } from "../slack/slack-client.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
-import { resolveAttachmentPath, resolveDownloadPath } from "./workdir-path.js";
+import {
+  readBoundedRegularFile,
+  resolveAttachmentPath,
+  resolveDownloadPath,
+} from "./workdir-path.js";
 
 export const SLACK_READ_MCP_NAME = "slack-read";
 export const SLACK_WRITE_MCP_NAME = "slack-write";
@@ -168,13 +172,13 @@ export function createSlackWriteMcpServer(
       try {
         if (!allowed(channel)) throw new Error(`access denied: Slack channel ${channel}`);
         const source = await resolveAttachmentPath(requireWorkDir(options), filePath);
-        const maxBytes = options.maxFileBytes ?? MAX_SLACK_FILE_BYTES;
-        if ((await stat(source)).size > maxBytes) {
-          throw new Error(`file size limit exceeded: file is larger than ${maxBytes} bytes`);
-        }
+        const data = await readBoundedRegularFile(
+          source,
+          options.maxFileBytes ?? MAX_SLACK_FILE_BYTES
+        );
         const fileIds = await client.uploadFile(channel, {
           filename: filename || basename(source),
-          data: await readFile(source),
+          data,
           ...(threadTs ? { threadTs } : {}),
           ...(title ? { title } : {}),
           ...(initialComment ? { initialComment } : {}),

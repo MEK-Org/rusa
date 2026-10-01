@@ -1,4 +1,5 @@
-import { realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 function isContained(parent: string, child: string): boolean {
@@ -49,4 +50,37 @@ export async function resolveDownloadPath(
     throw new Error("access denied: destinationPath resolves outside the actor workdir");
   }
   return join(realParent, basename(target));
+}
+
+const READ_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * Read a confined file with a hard byte bound at the read itself, so the cap
+ * holds even if the file grows or is replaced after it was resolved. The
+ * handle is opened without following a final symlink and nonblocking (a FIFO
+ * cannot stall the open), then must be a regular file; at most `maxBytes + 1`
+ * bytes are ever read.
+ */
+export async function readBoundedRegularFile(path: string, maxBytes: number): Promise<Buffer> {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    if (!(await handle.stat()).isFile()) {
+      throw new Error("access denied: filePath is not a regular file");
+    }
+    const chunks: Buffer[] = [];
+    let length = 0;
+    for (;;) {
+      const chunk = Buffer.alloc(Math.min(READ_CHUNK_BYTES, maxBytes + 1 - length));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      chunks.push(chunk.subarray(0, bytesRead));
+      length += bytesRead;
+      if (length > maxBytes) {
+        throw new Error(`file size limit exceeded: file is larger than ${maxBytes} bytes`);
+      }
+    }
+    return Buffer.concat(chunks, length);
+  } finally {
+    await handle.close();
+  }
 }
