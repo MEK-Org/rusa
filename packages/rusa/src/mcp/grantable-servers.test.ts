@@ -98,7 +98,8 @@ describe("grantable capabilities allow-list ", () => {
   // ISSUE_NUM (claude FS isolation) is MERGED, so phase 1b legitimately registers
   // `understanding-write` (the glass-goals write tools). ISSUE_NUM adds `distiller`,
   // another IU-steward-only capability. ISSUE_NUM adds `host-jobs`, a per-actor
-  // host-plane job runner. Adding anything further means updating this
+  // host-plane job runner. #690 adds `quota-manual`, the leader-hosted write of
+  // one manual quota reading. Adding anything further means updating this
   // assertion — the deliberate checkpoint.
   it("registers exactly the production grantable capabilities", () => {
     expect([...buildGrantableServers(STUB_DEPS).keys()]).toEqual([
@@ -110,6 +111,7 @@ describe("grantable capabilities allow-list ", () => {
       "calendar-read",
       "calendar-write",
       "drive-read",
+      "quota-manual",
     ]);
   });
 
@@ -140,6 +142,7 @@ describe("grantable capabilities allow-list ", () => {
       "calendar-read",
       "calendar-write",
       "drive-read",
+      "quota-manual",
       "update",
       "pnpm-hardlinks",
     ]);

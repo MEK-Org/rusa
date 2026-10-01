@@ -170,7 +170,9 @@ describe("EventManager", () => {
       idempotencyKey: "Ev123",
     };
     const first = await manager.handleExternalEvent(raw);
-    await manager.handleExternalEvent(raw);
+    const redelivered = await manager.handleExternalEvent(raw);
+    // The Slack receipt (#609) reads a redelivery as accepted: no new row, same owners.
+    expect(redelivered).toEqual({ entries: [], ownerIds: ["root"] });
     expect(first.entries[0].source).toBe("slack:channels/C123");
     expect(first.entries[0].payload.messageRef).toBe(
       "slack:channels/C123/messages/1720000000.000001"

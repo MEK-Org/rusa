@@ -1,4 +1,5 @@
 import { SocketModeClient } from "@slack/socket-mode";
+import type { DurableEventDelivery } from "../runtime/event-manager.js";
 
 export interface SlackInboundMessage {
   channel: string;
@@ -92,4 +93,40 @@ export class SlackSocketSource {
   async close(): Promise<void> {
     await this.socket.disconnect();
   }
+}
+
+/**
+ * Wrap inbox delivery so an accepted message gets an 👀 receipt on that exact
+ * message, thread replies included (#609). A delivery that throws is never
+ * acknowledged, so Slack retries it and no receipt is posted. The receipt is
+ * fire-and-forget: its failure is reported, never retried, and never fails
+ * the delivery, so it cannot make Slack redeliver an event the inbox holds.
+ */
+export function withReceiptReaction(
+  deliver: (
+    message: SlackInboundMessage
+  ) => Promise<Pick<DurableEventDelivery, "entries" | "ownerIds">>,
+  react: (channel: string, ts: string) => Promise<void>,
+  onReactionError: (error: unknown, message: SlackInboundMessage) => void
+): (message: SlackInboundMessage) => Promise<void> {
+  return async (message) => {
+    const delivery = await deliver(message);
+    // A redelivered event inserts no new row but still resolves to its owners;
+    // an event no subscription covers resolves to nobody and gets no receipt.
+    if (delivery.entries.length === 0 && delivery.ownerIds.length === 0) return;
+    let receipt: Promise<void>;
+    try {
+      receipt = react(message.channel, message.ts);
+    } catch (error) {
+      receipt = Promise.reject(error);
+    }
+    void receipt.catch((error: unknown) => {
+      if (isAlreadyReacted(error)) return;
+      onReactionError(error, message);
+    });
+  };
+}
+
+function isAlreadyReacted(error: unknown): boolean {
+  return (error as { data?: { error?: unknown } } | null)?.data?.error === "already_reacted";
 }

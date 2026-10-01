@@ -39,6 +39,11 @@ import {
   PNPM_HARDLINKS_MCP_NAME,
   type PnpmHardlinksToolDeps,
 } from "./pnpm-hardlinks-mcp.js";
+import {
+  createQuotaManualServer,
+  QUOTA_MANUAL_MCP_NAME,
+  type QuotaManualMcpDeps,
+} from "./quota-manual-mcp.js";
 import { createSlackWriteMcpServer, SLACK_WRITE_MCP_NAME } from "./slack-mcp.js";
 import {
   createUnderstandingWriteServer,
@@ -79,6 +84,12 @@ export interface GrantableServerDeps {
   actorRootFor?: (actorId: string) => string;
   driveClients: DriveClient;
   onDriveRead?: (actorId: string, observation: DriveReadObservation) => void;
+  /**
+   * The leader's quota coordinator client for `quota-manual` (#690). Absent or
+   * `client: null` when no coordinator socket is configured; the capability
+   * stays registered and its tool reports that instead.
+   */
+  quotaManual?: QuotaManualMcpDeps;
   /**
    * Host-maintenance servers (#549). Formerly mounted on the configured root's
    * tool set by id; now capabilities named after their servers (`update`,
@@ -121,7 +132,9 @@ export interface GrantableServerDeps {
  * calendar IDs; ISSUE_NUM adds its identity-verified whole-account form. ISSUE_NUM
  * adds `email-send`, scoped to explicit recipients. #549 adds the host-maintenance
  * servers `update` and `pnpm-hardlinks` (when their deps are wired) so root's
- * former by-id mounts become grant-derived like everything else.
+ * former by-id mounts become grant-derived like everything else. #690 adds
+ * `quota-manual`, which submits one manual quota reading to the leader's
+ * coordinator.
  */
 export function buildGrantableServers(
   deps: GrantableServerDeps
@@ -176,6 +189,7 @@ export function buildGrantableServers(
         });
       },
     ],
+    [QUOTA_MANUAL_MCP_NAME, () => createQuotaManualServer(deps.quotaManual ?? { client: null })],
   ]);
   if (deps.chatClient) {
     map.set(CHAT_WRITE_MCP_NAME, (selfId, params) => {
