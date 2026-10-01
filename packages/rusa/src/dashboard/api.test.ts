@@ -2667,6 +2667,12 @@ describe("handleMeshApiRequest", () => {
       ownerId: UUID_A,
       externalRef: "github:MEK-Org/rusa/issues/701",
     });
+    obligations.create({
+      id: "ob-other",
+      title: "Other work",
+      ownerId: UUID_A,
+      externalRef: "github:MEK-Org/rusa/issues/703",
+    });
     obligations.setTerminalStatus("ob-closed", "done", null, null, UUID_A);
     inbox.append([
       {
@@ -2703,6 +2709,16 @@ describe("handleMeshApiRequest", () => {
           prerequisiteId: "ob-closed",
         },
       },
+      {
+        id: "conflict-event",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/pulls/700",
+        payload: {
+          type: "obligation.ready_head",
+          obligationId: "ob-other",
+          intent: "Other work",
+        },
+      },
     ]);
 
     const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
@@ -2721,6 +2737,8 @@ describe("handleMeshApiRequest", () => {
     expect(byId.get("unlinked-event")?.obligationId).toBeUndefined();
     // A cancelled-prerequisite notice keeps its own rendering.
     expect(byId.get("prereq-cancelled")?.obligationId).toBeUndefined();
+    // When named and linked obligations disagree, it falls back to none (#610).
+    expect(byId.get("conflict-event")?.obligationId).toBeUndefined();
   });
 
   it("GET /api/mesh/inbox resolves a Google Chat entry to its message card through the artifact resolver (#654)", async () => {
