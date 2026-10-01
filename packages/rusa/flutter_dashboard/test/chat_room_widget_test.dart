@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
@@ -432,6 +433,119 @@ void main() {
         await tester.pump(const Duration(seconds: 10));
       },
     );
+  });
+  group('#816 tap spinner', () {
+    Finder busy(String id) => find.byKey(ValueKey('chat-room-busy-$id'));
+
+    Color borderOf(WidgetTester tester, String id) {
+      final box = tester.widget<AnimatedContainer>(
+        find
+            .descendant(
+              of: find.byKey(ValueKey('chat-room-avatar-$id')),
+              matching: find.byType(AnimatedContainer),
+            )
+            .first,
+      );
+      return ((box.decoration! as BoxDecoration).border! as Border).top.color;
+    }
+
+    testWidgets(
+      'spins on the tapped tile only while starting and sending, in place',
+      (tester) async {
+        api.chatRoomParticipants = ['root', 'actor-b'];
+        await pumpRoom(tester, size: const Size(420, 860));
+
+        const ids = ['root', 'actor-b'];
+        final idle = {for (final id in ids) id: tileRect(tester, id)};
+        final idleBorder = {for (final id in ids) id: borderOf(tester, id)};
+        void expectSpinner(String? on, String phase) {
+          for (final id in ids) {
+            expect(
+              busy(id),
+              id == on ? findsOneWidget : findsNothing,
+              reason: '$id spinner while $phase',
+            );
+            expect(tileRect(tester, id), idle[id], reason: '$id while $phase');
+            expect(
+              borderOf(tester, id),
+              idleBorder[id],
+              reason: '$id border while $phase',
+            );
+          }
+        }
+
+        expectSpinner(null, 'idle');
+
+        // Starting: the spinner is there on the first frame after the tap.
+        final mic = Completer<void>();
+        walkie.recorder.startCompleter = mic;
+        await tester.tap(find.byKey(const ValueKey('chat-room-avatar-root')));
+        await tester.pump();
+        expect(find.textContaining('Opening the mic'), findsOneWidget);
+        expectSpinner('root', 'starting');
+
+        mic.complete();
+        walkie.recorder.startCompleter = null;
+        await tester.pump();
+        await tester.pump();
+        expect(find.textContaining('Recording for'), findsOneWidget);
+        expectSpinner(null, 'recording');
+
+        final sending = Completer<void>();
+        api.memoGate = sending;
+        await tester.tap(find.byKey(const ValueKey('chat-room-avatar-root')));
+        await tester.pump();
+        expect(find.textContaining('Sending the memo'), findsOneWidget);
+        expectSpinner('root', 'sending');
+
+        sending.complete();
+        await tester.pump();
+        await tester.pump();
+        expect(find.text('Delivered to root-handle.'), findsOneWidget);
+        expectSpinner(null, 'delivered');
+        await tester.pump(const Duration(seconds: 10));
+      },
+    );
+
+    testWidgets('clears when starting is cancelled or sending fails', (
+      tester,
+    ) async {
+      api.chatRoomParticipants = ['root', 'actor-b'];
+      await pumpRoom(tester, size: const Size(1180, 820));
+
+      final mic = Completer<void>();
+      walkie.recorder.startCompleter = mic;
+      await tester.tap(find.byKey(const ValueKey('chat-room-avatar-actor-b')));
+      await tester.pump();
+      expect(busy('actor-b'), findsOneWidget);
+      expect(busy('root'), findsNothing);
+
+      await tester.tap(find.byKey(const ValueKey('chat-room-cancel')));
+      await tester.pump();
+      await tester.pump();
+      expect(busy('actor-b'), findsNothing);
+      mic.complete();
+      walkie.recorder.startCompleter = null;
+      await tester.pump();
+
+      await tester.tap(find.byKey(const ValueKey('chat-room-avatar-actor-b')));
+      await tester.pump();
+      await tester.pump();
+      final sending = Completer<void>();
+      api
+        ..memoGate = sending
+        ..memoError = DashboardApiException(Uri.parse('/memo'), 500, 'boom');
+      await tester.tap(find.byKey(const ValueKey('chat-room-avatar-actor-b')));
+      await tester.pump();
+      expect(busy('actor-b'), findsOneWidget);
+
+      sending.complete();
+      await tester.pump();
+      await tester.pump();
+      expect(find.textContaining('Send failed'), findsOneWidget);
+      expect(busy('actor-b'), findsNothing);
+      expect(busy('root'), findsNothing);
+    });
   });
 }
 

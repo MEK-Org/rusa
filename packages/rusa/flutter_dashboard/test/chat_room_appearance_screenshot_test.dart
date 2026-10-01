@@ -3,10 +3,12 @@
 //   flutter test test/chat_room_appearance_screenshot_test.dart
 //
 // It writes `flutter_dashboard/screenshots/chat_room_two_up_<viewport>_<state>.png`
-// for a wide and a tall viewport, each idle, recording, and speaking. root is
+// for a wide and a tall viewport, each idle, recording, speaking, starting and
+// sending (#816: the mic or the memo held open after an accepted tap). root is
 // running (green border) and actor-b is queued (yellow border); in the speaking
 // shots actor-b's speaking border takes precedence over its queued colour.
 
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -24,7 +26,7 @@ const _actorIds = ['root', 'actor-b'];
 
 const _viewports = {'wide': Size(1180, 820), 'tall': Size(420, 860)};
 
-enum _Shot { idle, recording, speaking }
+enum _Shot { idle, recording, speaking, starting, sending }
 
 void main() {
   setUpAll(loadFonts);
@@ -101,6 +103,23 @@ void main() {
                 makeAnnouncement('reply-a', actor: 'actor-b'),
               );
               await tester.pump();
+              await tester.pump();
+            case _Shot.starting:
+              walkie.recorder.startCompleter = Completer<void>();
+              await tester.tap(
+                find.byKey(const ValueKey('chat-room-avatar-root')),
+              );
+              await tester.pump();
+            case _Shot.sending:
+              await tester.tap(
+                find.byKey(const ValueKey('chat-room-avatar-root')),
+              );
+              await tester.pump();
+              await tester.pump();
+              api.memoGate = Completer<void>();
+              await tester.tap(
+                find.byKey(const ValueKey('chat-room-avatar-root')),
+              );
               await tester.pump();
           }
           // Let the tile's 180ms border animation finish.

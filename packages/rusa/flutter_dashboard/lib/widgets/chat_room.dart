@@ -168,6 +168,13 @@ class _ChatRoomTabState extends State<ChatRoomTab> {
                   store: widget.store,
                   recordingRecipient: recordingRecipient,
                   speakingActorId: nowPlaying?.actorId,
+                  // A tap was accepted and the room is waiting on the mic or
+                  // the memo; the tapped tile spins until the phase moves on.
+                  busyActorId:
+                      record.phase == RecordPhase.starting ||
+                          record.phase == RecordPhase.sending
+                      ? recordingRecipient
+                      : null,
                   disabled:
                       available == false ||
                       record.phase == RecordPhase.starting ||
@@ -277,6 +284,7 @@ class _AvatarGrid extends StatelessWidget {
     required this.store,
     required this.recordingRecipient,
     required this.speakingActorId,
+    required this.busyActorId,
     required this.disabled,
     required this.onTap,
   });
@@ -285,6 +293,7 @@ class _AvatarGrid extends StatelessWidget {
   final DashboardStore store;
   final String? recordingRecipient;
   final String? speakingActorId;
+  final String? busyActorId;
   final bool disabled;
   final ValueChanged<String> onTap;
 
@@ -327,6 +336,7 @@ class _AvatarGrid extends StatelessWidget {
               store: store,
               recording: actor.id == recordingRecipient,
               speaking: actor.id == speakingActorId,
+              busy: actor.id == busyActorId,
               disabled: disabled,
               onTap: () => onTap(actor.id),
             );
@@ -344,6 +354,7 @@ class _RoomAvatarButton extends StatelessWidget {
     required this.store,
     required this.recording,
     required this.speaking,
+    required this.busy,
     required this.disabled,
     required this.onTap,
   });
@@ -353,6 +364,7 @@ class _RoomAvatarButton extends StatelessWidget {
   final DashboardStore store;
   final bool recording;
   final bool speaking;
+  final bool busy;
   final bool disabled;
   final VoidCallback onTap;
 
@@ -408,11 +420,30 @@ class _RoomAvatarButton extends StatelessWidget {
                                 constraints.maxWidth,
                                 constraints.maxHeight,
                               );
+                              // The spinner rings the avatar in the avatar's
+                              // own box, so it never moves or resizes the
+                              // tile, and leaves the state border alone (#816).
                               return AbsorbPointer(
-                                child: ActorAvatar(
-                                  id: actor.id,
-                                  size: size,
-                                  store: store,
+                                child: Stack(
+                                  alignment: Alignment.center,
+                                  children: [
+                                    ActorAvatar(
+                                      id: actor.id,
+                                      size: size,
+                                      store: store,
+                                    ),
+                                    if (busy)
+                                      SizedBox.square(
+                                        dimension: size,
+                                        child: CircularProgressIndicator(
+                                          key: ValueKey(
+                                            'chat-room-busy-${actor.id}',
+                                          ),
+                                          strokeWidth: 5,
+                                          color: MeshColors.textPrimary,
+                                        ),
+                                      ),
+                                  ],
                                 ),
                               );
                             },
