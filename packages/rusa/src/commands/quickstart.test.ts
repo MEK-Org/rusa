@@ -179,7 +179,7 @@ describe("quickstart command", () => {
     expect(loadedConfig.rootActor?.effort).toBe("high");
   });
 
-  it("keeps the generated root handle when the handle prompt is blank", async () => {
+  it("keeps the generated root handle when a fresh-install handle prompt is blank", async () => {
     promptMocks.state.inputs = ["codex", "", "gpt-5.6-sol"];
     promptMocks.state.passwords = ["test-gemini-key"];
 
@@ -192,6 +192,36 @@ describe("quickstart command", () => {
     expect(config.github).toEqual({});
     expect(config).not.toHaveProperty("targets");
     expect(config.rootActor?.handle).toMatch(/^[a-z]+(?:-[a-z]+)+$/);
+    expect(promptMocks.input).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: `Root entity handle/name (leave blank for suggested: "${config.rootActor?.handle}"):`,
+        default: config.rootActor?.handle,
+      })
+    );
+  });
+
+  it("keeps the existing root handle when a reconfigure handle prompt is blank (#833)", async () => {
+    writeFileSync(
+      join(home, "config.yaml"),
+      toYaml({
+        profile: "quickstart",
+        providers: { codex: { cliCommand: "codex" } },
+        rootActor: { provider: "codex", model: "gpt-5.6-sol", handle: "my-root" },
+      })
+    );
+    promptMocks.state.inputs = ["codex", "", "gpt-5.6-sol"];
+    promptMocks.state.passwords = ["test-gemini-key"];
+
+    await runQuickstartConfigure({ home, executeProviderCommand: () => 0 });
+
+    const config = parseYaml(readFileSync(join(home, "config.yaml"), "utf8")) as RusaConfig;
+    expect(config.rootActor?.handle).toBe("my-root");
+    expect(promptMocks.input).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: 'Root entity handle/name (leave blank to keep current: "my-root"):',
+        default: "my-root",
+      })
+    );
   });
 
   it("carries github.repos forward when configure rewrites an existing config", async () => {
