@@ -33,6 +33,7 @@ import type {
   InboxActorWork,
   InboxEntry,
   InboxItemsAppendedListener,
+  InboxItemsHandledListener,
   InboxListOptions,
   InboxPage,
   InboxPayload,
@@ -134,6 +135,7 @@ function captureLogger(records: Array<Record<string, unknown>>): Logger {
 function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
   const entries: InboxEntry[] = [];
   const listeners = new Set<InboxItemsAppendedListener>();
+  const handledListeners = new Set<InboxItemsHandledListener>();
   const pendingActors = (predicate: (entry: InboxEntry) => boolean): InboxActorWork[] => {
     const priorities = new Map<string, InboxActorWork["priority"]>();
     for (const entry of entries.filter(predicate)) {
@@ -186,6 +188,12 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
       listeners.add(listener);
       return () => {
         listeners.delete(listener);
+      };
+    },
+    onItemsHandled: (listener) => {
+      handledListeners.add(listener);
+      return () => {
+        handledListeners.delete(listener);
       };
     },
     list: (actorId: string, options: InboxListOptions = {}): InboxPage => {
@@ -244,7 +252,7 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
       handledAt = new Date("2026-01-01T00:00:00Z"),
       handledNote?: string
     ) => {
-      return entryIds.map((id) => {
+      const results = entryIds.map((id) => {
         const entry = entries.find(
           (candidate) => candidate.actorId === actorId && candidate.id === id
         );
@@ -256,6 +264,16 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
         }
         return { id, handledAt: entry.handledAt, alreadyHandled };
       });
+      if (results.length > 0) {
+        for (const listener of [...handledListeners]) {
+          try {
+            listener(actorId, results);
+          } catch {
+            // advisory
+          }
+        }
+      }
+      return results;
     },
     replaceEntries: (
       actorId,
@@ -295,6 +313,15 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
         return { id: entry.id, handledAt: entry.handledAt, alreadyHandled };
       });
       entries.push(...inserted);
+      if (handled.length > 0) {
+        for (const listener of [...handledListeners]) {
+          try {
+            listener(actorId, handled);
+          } catch {
+            // advisory
+          }
+        }
+      }
       if (inserted.length > 0) {
         for (const listener of [...listeners]) {
           try {
@@ -1068,6 +1095,7 @@ describe("ActorMesh", () => {
       // Partial fake: it never notifies, so the only wake here is whatever the
       // mesh path under test sends itself.
       onItemsAppended: () => () => {},
+      onItemsHandled: () => () => {},
     } as unknown as InboxRepository;
     const { mesh, registry, fake, logs } = setup({ inboxStore });
     registry.upsert({
@@ -8536,6 +8564,7 @@ describe("ActorMesh", () => {
           appendListeners.push(listener);
           return () => {};
         },
+        onItemsHandled: () => () => {},
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({
         inboxStore,
@@ -8630,6 +8659,7 @@ describe("ActorMesh", () => {
         // Partial fake: it never notifies, so the only wake here is whatever the
         // mesh path under test sends itself.
         onItemsAppended: () => () => {},
+        onItemsHandled: () => () => {},
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({ inboxStore, onInboxEntriesSeen });
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
@@ -8671,6 +8701,7 @@ describe("ActorMesh", () => {
         // Partial fake: it never notifies, so the only wake here is whatever the
         // mesh path under test sends itself.
         onItemsAppended: () => () => {},
+        onItemsHandled: () => () => {},
       } as unknown as InboxRepository;
 
       const { mesh, tick } = setup({ inboxStore });
@@ -13514,6 +13545,274 @@ describe("accountRun token accounting (#443)", () => {
       const res = mesh.releaseChildInboxSelectionLock(parent, child, ["item-1"], "retry release");
       expect(res.released).toEqual(["item-1"]);
       expect(inboxStore.read(child, "item-1")?.handledAt).not.toBeNull();
+    });
+  });
+
+  describe("cancelling empty queued runs (#787)", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("cancels a queued run when the last unhandled inbox item is marked handled", async () => {
+      const d = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, tick } = setup({
+        inboxStore,
+        maxConcurrent: 1,
+        sharedProvider: d.provider,
+      });
+
+      const runningWorker = mesh.spawn({ charter: "occupy slot", parentId: "root" });
+      const queuedWorker = mesh.spawn({ charter: "queued worker", parentId: "root" });
+
+      mesh.sendMessage(runningWorker, "first task", "root");
+      await tick();
+      expect(mesh.runningThreadIds().has(runningWorker)).toBe(true);
+
+      mesh.sendMessage(queuedWorker, "second task", "root");
+      await tick();
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+      expect(inboxStore.countUnhandled(queuedWorker)).toBe(1);
+
+      // Now the last unhandled item for queuedWorker is marked handled:
+      const [entry] = inboxStore.list(queuedWorker, { status: "unhandled" }).entries;
+      expect(entry).toBeDefined();
+      inboxStore.markHandled(queuedWorker, [entry.id]);
+      await tick();
+
+      // The queued run should be cancelled and no longer queued:
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(false);
+      expect(inboxStore.countUnhandled(queuedWorker)).toBe(0);
+
+      // When the running worker completes and frees the concurrency slot,
+      // the queued worker must NOT run because its run was cancelled:
+      d.releaseAll();
+      await tick();
+      await tick();
+
+      expect(d.pending()).toBe(0);
+      expect(mesh.runningThreadIds().has(queuedWorker)).toBe(false);
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(false);
+    });
+
+    it("drops work cleared during async onQueued before its provider reservation exists", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const provider = new FakeProvider();
+      let releaseQueued!: () => void;
+      let queued!: () => void;
+      const queuedEntered = new Promise<void>((resolve) => (queued = resolve));
+      const queuedHold = new Promise<void>((resolve) => (releaseQueued = resolve));
+      const { mesh, tick } = setup({
+        inboxStore,
+        createActor: (ctx) => {
+          ctx.lifecycle.add({
+            onQueued: async () => {
+              queued();
+              await queuedHold;
+            },
+          });
+          return new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            modelConfig: ctx.record.modelConfig ?? [{ provider: provider.providerName }],
+            resolveProvider: () => provider,
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: () => {},
+            buildPrompt: () => ({ prompt: "Work from your inbox." }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            admitRun: ctx.admitRun,
+            lifecycle: ctx.lifecycle,
+            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+        },
+      });
+      const worker = mesh.spawn({ charter: "queued worker", parentId: "root" });
+      mesh.sendMessage(worker, "work to clear", "root");
+      await tick();
+      await queuedEntered;
+
+      const [entry] = inboxStore.list(worker, { status: "unhandled" }).entries;
+      inboxStore.markHandled(worker, [entry.id]);
+      releaseQueued();
+      await tick();
+
+      expect(provider.calls).toHaveLength(0);
+      expect(mesh.runningThreadIds().has(worker)).toBe(false);
+    });
+
+    it("preserves an already-running turn when its inbox item is marked handled", async () => {
+      const d = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, tick } = setup({
+        inboxStore,
+        sharedProvider: d.provider,
+      });
+
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      mesh.sendMessage(worker, "active task", "root");
+      await tick();
+
+      expect(mesh.runningThreadIds().has(worker)).toBe(true);
+      expect(d.pending()).toBe(1);
+
+      const [entry] = inboxStore.list(worker, { status: "unhandled" }).entries;
+      inboxStore.markHandled(worker, [entry.id]);
+      await tick();
+
+      // The active run is preserved:
+      expect(mesh.runningThreadIds().has(worker)).toBe(true);
+      expect(d.pending()).toBe(1);
+
+      d.releaseAll();
+      await tick();
+      expect(mesh.runningThreadIds().has(worker)).toBe(false);
+    });
+
+    it("keeps the run queued when other unhandled inbox items remain", async () => {
+      const d = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, tick } = setup({
+        inboxStore,
+        maxConcurrent: 1,
+        sharedProvider: d.provider,
+      });
+
+      const runningWorker = mesh.spawn({ charter: "occupy slot", parentId: "root" });
+      const queuedWorker = mesh.spawn({ charter: "queued worker", parentId: "root" });
+
+      mesh.sendMessage(runningWorker, "first task", "root");
+      await tick();
+      expect(mesh.runningThreadIds().has(runningWorker)).toBe(true);
+
+      mesh.sendMessage(queuedWorker, "task 1", "root");
+      mesh.sendMessage(queuedWorker, "task 2", "root");
+      await tick();
+
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+      expect(inboxStore.countUnhandled(queuedWorker)).toBe(2);
+
+      const [firstEntry] = inboxStore.list(queuedWorker, { status: "unhandled" }).entries;
+      inboxStore.markHandled(queuedWorker, [firstEntry.id]);
+      await tick();
+
+      // Since 1 unhandled item remains, the run stays queued:
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+      expect(inboxStore.countUnhandled(queuedWorker)).toBe(1);
+
+      // Release running worker: queued worker claims the slot:
+      d.releaseAll();
+      await tick();
+      expect(mesh.runningThreadIds().has(queuedWorker)).toBe(true);
+      d.releaseAll();
+      await tick();
+    });
+
+    it("re-dispatches newly arriving work after an empty queued run was cancelled", async () => {
+      const d = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, tick } = setup({
+        inboxStore,
+        maxConcurrent: 1,
+        sharedProvider: d.provider,
+      });
+
+      const runningWorker = mesh.spawn({ charter: "occupy slot", parentId: "root" });
+      const queuedWorker = mesh.spawn({ charter: "queued worker", parentId: "root" });
+
+      mesh.sendMessage(runningWorker, "first task", "root");
+      await tick();
+
+      mesh.sendMessage(queuedWorker, "cancelled task", "root");
+      await tick();
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+
+      const [entry] = inboxStore.list(queuedWorker, { status: "unhandled" }).entries;
+      inboxStore.markHandled(queuedWorker, [entry.id]);
+      await tick();
+
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(false);
+
+      // New work arrives for queuedWorker:
+      mesh.sendMessage(queuedWorker, "fresh task", "root");
+      await tick();
+
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+      expect(inboxStore.countUnhandled(queuedWorker)).toBe(1);
+
+      d.releaseAll();
+      await tick();
+      expect(mesh.runningThreadIds().has(queuedWorker)).toBe(true);
+      d.releaseAll();
+      await tick();
+    });
+
+    it("replays work delivered while an empty queued cancellation unwinds", async () => {
+      const d = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, tick } = setup({
+        inboxStore,
+        maxConcurrent: 1,
+        sharedProvider: d.provider,
+      });
+
+      const runningWorker = mesh.spawn({ charter: "occupy slot", parentId: "root" });
+      const queuedWorker = mesh.spawn({ charter: "queued worker", parentId: "root" });
+      mesh.sendMessage(runningWorker, "first task", "root");
+      await tick();
+      mesh.sendMessage(queuedWorker, "cancelled task", "root");
+      await tick();
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+
+      const [entry] = inboxStore.list(queuedWorker, { status: "unhandled" }).entries;
+      inboxStore.markHandled(queuedWorker, [entry.id]);
+      // Deliver before the cancelled gate's rejection reaches runOnce's finally.
+      mesh.sendMessage(queuedWorker, "fresh task during unwind", "root");
+      await tick();
+
+      expect(inboxStore.countUnhandled(queuedWorker)).toBe(1);
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+      d.releaseAll();
+      await tick();
+      expect(mesh.runningThreadIds().has(queuedWorker)).toBe(true);
+      d.releaseAll();
+      await tick();
+    });
+
+    it("cancels empty queued run through SqliteInboxRepository", async () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      const sqliteInbox = new SqliteInboxRepository(db);
+
+      const d = deferredProvider();
+      const { mesh, tick } = setup({
+        inboxStore: sqliteInbox,
+        maxConcurrent: 1,
+        sharedProvider: d.provider,
+      });
+
+      const runningWorker = mesh.spawn({ charter: "occupy slot", parentId: "root" });
+      const queuedWorker = mesh.spawn({ charter: "queued worker", parentId: "root" });
+
+      mesh.sendMessage(runningWorker, "first task", "root");
+      await tick();
+      expect(mesh.runningThreadIds().has(runningWorker)).toBe(true);
+
+      mesh.sendMessage(queuedWorker, "second task", "root");
+      await tick();
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+
+      const [entry] = sqliteInbox.list(queuedWorker, { status: "unhandled" }).entries;
+      expect(entry).toBeDefined();
+      sqliteInbox.markHandled(queuedWorker, [entry.id]);
+      await tick();
+
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(false);
+      expect(sqliteInbox.countUnhandled(queuedWorker)).toBe(0);
+
+      db.close();
     });
   });
 });

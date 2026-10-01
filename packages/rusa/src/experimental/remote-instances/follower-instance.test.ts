@@ -599,6 +599,43 @@ describe("monolithic follower instance", () => {
     );
   });
 
+  it("drops a pre-gate remote admission without retaining it and replays newer work (#787)", async () => {
+    const h = setup({ delayMs: 500 });
+    // Hold the follower's admission request after its queued state reaches the
+    // leader. This is the ActorHandle pendingQueuedCancel path, not a gate stub.
+    const held: Parameters<typeof h.remote.receive>[0][] = [];
+    const receive = h.remote.receive.bind(h.remote);
+    h.remote.receive = (event) => {
+      if (event.message.type === "request" && event.message.request.op === "admit") {
+        held.push(event);
+        return;
+      }
+      receive(event);
+    };
+    const queued = h.spawn("Cancel before leader admission");
+    await waitUntil(() => h.runtime(queued).isQueued && held.length === 1);
+
+    const entries = h.inboxStore.list(queued, { status: "unhandled" }).entries;
+    h.inboxStore.markHandled(
+      queued,
+      entries.map((entry) => entry.id)
+    );
+    // New durable work crosses the refusal before the old admit is released.
+    h.mesh.sendMessage(queued, "fresh work after cancellation", "root");
+    h.remote.receive = receive;
+    for (const event of held.splice(0)) receive(event);
+
+    await waitUntil(() =>
+      h.events.some(
+        (event) =>
+          event.actorId === queued && event.event.type === "result" && event.event.result.success
+      )
+    );
+    expect(runStarts(h, queued)).toHaveLength(1);
+    expect(abandonedRuns(h, queued)).toHaveLength(1);
+    expect(h.failures).toEqual([]);
+  });
+
   it("re-decides a preemption requested during disconnect against the follower's reattach state", async () => {
     const h = setup({ delayMs: 1500 });
     const id = h.spawn("Survive the gap");

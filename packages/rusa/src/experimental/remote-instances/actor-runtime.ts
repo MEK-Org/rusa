@@ -401,7 +401,7 @@ export function createActorRuntime(
       case "cancelQueued":
         leaderCancelling = true;
         try {
-          actor?.cancelQueuedRun();
+          actor?.cancelQueuedRun({ retain: message.retain });
         } finally {
           leaderCancelling = false;
         }

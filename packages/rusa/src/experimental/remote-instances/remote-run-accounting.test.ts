@@ -449,4 +449,42 @@ describe("remote actor run accounting", () => {
       orderedHandle.close();
     }
   });
+
+  it("cancels a queued remote run without retaining the opportunity when retain is false (#787)", async () => {
+    bootActor();
+    let gateCancelled = false;
+    const gateHandle = {
+      get started() {
+        return false;
+      },
+      promote: () => {},
+      cancel: () => {
+        gateCancelled = true;
+        return true;
+      },
+    };
+    (context as unknown as { admitRun: () => boolean }).admitRun = () => true;
+    (context as unknown as { gate: () => typeof gateHandle }).gate = () => gateHandle;
+
+    followerSends({
+      type: "request",
+      requestId: 20,
+      request: {
+        op: "admit",
+        candidates: [{ provider: "codex", model: "gpt-5.5" }],
+        responsive: false,
+        mode: "ordinary",
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(handle.cancelQueuedRun({ retain: false })).toBe(true);
+    expect(gateCancelled).toBe(true);
+    expect(remote.commands).toContainEqual({
+      actorId: ACTOR_ID,
+      message: { type: "cancelQueued", retain: false },
+    });
+    expect(handle.resumeCancelledRun()).toBe(false);
+  });
 });
