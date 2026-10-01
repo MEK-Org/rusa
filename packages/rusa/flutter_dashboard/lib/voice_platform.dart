@@ -21,6 +21,11 @@ class RecordedAudio {
 }
 
 /// Microphone capture (MediaRecorder on web). One recording at a time.
+///
+/// Implementations must treat [cancel] as taking effect immediately: if it
+/// runs while [start] is still awaiting mic acquisition, the pending start
+/// fails (never returns normally) and releases whatever it acquired without
+/// disturbing a newer session's state.
 abstract interface class VoiceRecorder {
   /// Start capturing (may prompt for mic permission). Throws when the mic is
   /// unavailable or permission is denied.

@@ -41,12 +41,32 @@ class WebVoiceRecorder implements VoiceRecorder {
   web.MediaStream? _mediaStream;
   List<web.Blob> _chunks = [];
 
+  /// Ownership token for the shared recorder fields. [cancel] bumps it so an
+  /// acquisition still awaiting getUserMedia becomes stale; a stale start
+  /// releases the tracks it acquired without touching fields a newer capture
+  /// may already own.
+  int _generation = 0;
+
   @override
   Future<void> start() async {
-    await cancel(); // drop any stale session
+    // Claim ownership before any await: a cancel() interleaved with this
+    // start must win, so a cancelled acquisition can never revive.
+    final generation = ++_generation;
+    _release(); // drop any stale session
     final stream = await web.window.navigator.mediaDevices
         .getUserMedia(web.MediaStreamConstraints(audio: true.toJS))
         .toDart;
+    if (generation != _generation) {
+      // Superseded while awaiting the mic: a newer session (or a cancel)
+      // owns the shared fields now. Stop only the tracks this acquisition
+      // obtained — never the fields another session may already own.
+      for (final track in stream.getTracks().toDart) {
+        track.stop();
+      }
+      throw StateError(
+        'mic acquisition superseded by a newer recording session',
+      );
+    }
     _mediaStream = stream;
     String mime = '';
     for (final candidate in _kPreferredMimes) {
@@ -72,6 +92,7 @@ class WebVoiceRecorder implements VoiceRecorder {
 
   @override
   Future<RecordedAudio> stop() async {
+    _generation++;
     final recorder = _recorder;
     if (recorder == null) throw StateError('not recording');
     final stopped = Completer<void>();
@@ -96,6 +117,11 @@ class WebVoiceRecorder implements VoiceRecorder {
 
   @override
   Future<void> cancel() async {
+    _generation++;
+    _release();
+  }
+
+  void _release() {
     final recorder = _recorder;
     _recorder = null;
     _chunks = [];

@@ -371,9 +371,10 @@ class ChatRoomController {
       return;
     }
     if (generation != _recordGeneration || !_enabled.value || _disposed) {
-      try {
-        await _deps.recorder.cancel();
-      } catch (_) {}
+      // Stale: a newer capture, a cancel, or a room disable already owns (or
+      // has released) the recorder seam, and WebVoiceRecorder's acquisition
+      // guard has already stopped the superseded start's own tracks. A
+      // shared cancel() here could tear down a newer capture's recorder.
       return;
     }
     _recordStartedAt = DateTime.now();

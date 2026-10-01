@@ -527,6 +527,9 @@ class WalkieController {
     try {
       await _deps.recorder.start();
     } catch (e) {
+      // A superseded start (cancel raced the pending acquisition) is expected
+      // during normal use; only a live failure surfaces as a mic error.
+      if (_record.value.phase != RecordPhase.starting) return;
       _record.add(
         RecordStatus(phase: RecordPhase.error, message: 'Mic unavailable: $e'),
       );

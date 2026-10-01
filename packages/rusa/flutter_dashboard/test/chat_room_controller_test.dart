@@ -194,6 +194,91 @@ void main() {
   );
 
   test(
+    'a new capture after a cancelled pending start survives when the new '
+    'acquisition resolves first',
+    () async {
+      final cancelledStart = Completer<void>();
+      final newStart = Completer<void>();
+      walkie.recorder.startGates.addAll([cancelledStart, newStart]);
+
+      final cancelledTap = controller.tapParticipant('root');
+      await pumpEventQueue();
+      expect(controller.record.value.phase, RecordPhase.starting);
+
+      await controller.cancelRecord();
+      await pumpEventQueue();
+      expect(controller.record.value.phase, RecordPhase.idle);
+
+      final newTap = controller.tapParticipant('actor-b');
+      await pumpEventQueue();
+      expect(controller.record.value.phase, RecordPhase.starting);
+
+      // The newer acquisition wins the mic; the cancelled one settles after.
+      newStart.complete();
+      await pumpEventQueue();
+      expect(controller.record.value.phase, RecordPhase.recording);
+      expect(controller.recordingRecipient.value, 'actor-b');
+
+      cancelledStart.complete();
+      await cancelledTap;
+      await newTap;
+      await pumpEventQueue();
+
+      // The cancelled start's stale continuation must not tear down the
+      // newer capture: exactly one seam cancel (from cancelRecord).
+      expect(walkie.recorder.cancelCalls, 1);
+      expect(controller.record.value.phase, RecordPhase.recording);
+      expect(controller.recordingRecipient.value, 'actor-b');
+
+      // The newer capture remains usable end to end.
+      await controller.tapParticipant('actor-b');
+      await pumpEventQueue();
+      expect(api.memoSends, hasLength(1));
+      expect(api.memoSends.single.actorId, 'actor-b');
+    },
+  );
+
+  test(
+    'a new capture after a cancelled pending start survives when the '
+    'cancelled acquisition resolves first',
+    () async {
+      final cancelledStart = Completer<void>();
+      final newStart = Completer<void>();
+      walkie.recorder.startGates.addAll([cancelledStart, newStart]);
+
+      final cancelledTap = controller.tapParticipant('root');
+      await pumpEventQueue();
+
+      await controller.cancelRecord();
+      await pumpEventQueue();
+      expect(controller.record.value.phase, RecordPhase.idle);
+
+      final newTap = controller.tapParticipant('actor-b');
+      await pumpEventQueue();
+      expect(controller.record.value.phase, RecordPhase.starting);
+
+      // The cancelled acquisition settles first; the stale continuation must
+      // leave the pending newer capture untouched.
+      cancelledStart.complete();
+      await cancelledTap;
+      await pumpEventQueue();
+      expect(walkie.recorder.cancelCalls, 1);
+      expect(controller.record.value.phase, RecordPhase.starting);
+
+      newStart.complete();
+      await newTap;
+      await pumpEventQueue();
+      expect(controller.record.value.phase, RecordPhase.recording);
+      expect(controller.recordingRecipient.value, 'actor-b');
+
+      await controller.tapParticipant('actor-b');
+      await pumpEventQueue();
+      expect(api.memoSends, hasLength(1));
+      expect(api.memoSends.single.actorId, 'actor-b');
+    },
+  );
+
+  test(
     'live frames arriving during backlog fetch are queued and played in chronological order after backlog completes',
     () async {
       final backlogGate = Completer<List<VoiceAnnouncement>>();

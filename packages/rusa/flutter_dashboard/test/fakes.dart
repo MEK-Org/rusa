@@ -1258,6 +1258,11 @@ class FakeVoiceRecorder implements VoiceRecorder {
   int cancelCalls = 0;
   Object? startError;
   Completer<void>? startCompleter;
+
+  /// Per-call acquisition gates for multi-start races: the Nth [start] call
+  /// awaits index N-1 when present, letting tests resolve overlapping
+  /// acquisitions in either completion order.
+  final List<Completer<void>> startGates = [];
   RecordedAudio result = RecordedAudio(
     bytes: Uint8List.fromList([1, 2, 3]),
     mimeType: 'audio/webm;codecs=opus',
@@ -1268,6 +1273,10 @@ class FakeVoiceRecorder implements VoiceRecorder {
     startCalls++;
     final err = startError;
     if (err != null) throw err;
+    final gate = startCalls <= startGates.length
+        ? startGates[startCalls - 1]
+        : null;
+    if (gate != null) await gate.future;
     final c = startCompleter;
     if (c != null) await c.future;
   }
