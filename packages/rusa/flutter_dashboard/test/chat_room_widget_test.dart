@@ -437,18 +437,6 @@ void main() {
   group('#816 tap spinner', () {
     Finder busy(String id) => find.byKey(ValueKey('chat-room-busy-$id'));
 
-    Color borderOf(WidgetTester tester, String id) {
-      final box = tester.widget<AnimatedContainer>(
-        find
-            .descendant(
-              of: find.byKey(ValueKey('chat-room-avatar-$id')),
-              matching: find.byType(AnimatedContainer),
-            )
-            .first,
-      );
-      return ((box.decoration! as BoxDecoration).border! as Border).top.color;
-    }
-
     testWidgets(
       'spins on the tapped tile only while starting and sending, in place',
       (tester) async {
