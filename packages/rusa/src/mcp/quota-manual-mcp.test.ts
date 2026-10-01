@@ -256,10 +256,10 @@ describe("submit_manual_reading (#690)", () => {
       },
     },
     {
-      // Two hours old against a one-hour hard-stale limit: the coordinator
+      // Older than the coordinator's manual hard-stale limit: the coordinator
       // refuses it; the tool does not pre-filter or re-date it.
       code: "stale_observation",
-      observedAt: "2029-12-31T22:10:00Z",
+      observedAt: "2029-12-31T21:10:00Z",
       setup: async (switchTo: (mode: "manual" | "scrape") => Promise<number>) => switchTo("manual"),
     },
   ])("returns the coordinator's $code envelope unchanged", async ({ code, observedAt, setup }) => {
