@@ -278,9 +278,12 @@ reporting for longer than the hard-stale horizon without it. Manual readings
 carry no model windows, so a provider in manual mode dead-reckons its model
 lanes the same way.
 
-When the coordinator can still answer but a whole provider reading is missing,
-the provider lane and model lanes from that last reading keep their computed
-intervals while their governing window has not reset. The response remains
+When the coordinator can still answer but a whole provider reading is missing
+or failed, including when the coordinator stops collecting, the provider lane
+and model lanes from that last reading keep their computed intervals while
+their governing window has not reset. A failed probe carries no new
+information, so it does not send the lane back to the ceiling. This reverses
+the earlier #730 rule that such lanes age together and widen to the ceiling. The response remains
 truthfully `hardStale`; this is a pacing decision, not a freshness disguise.
 Once the window resets with still no reading, those lanes widen to the ceiling.
 They are not retired, and root is not alerted, as they are for a single missing
