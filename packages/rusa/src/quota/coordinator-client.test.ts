@@ -480,13 +480,19 @@ describe("QuotaCoordinatorClient unavailability (#359, design §5.7/§6.3–6.4,
 
   it("holds no local pacing formula, probing, or pool-size configuration", () => {
     const source = readFileSync("src/quota/coordinator-client.ts", "utf8");
-    const body = source
-      .split("\n")
-      .filter((line) => !/^\s*(\*|\/\*|\/\/)/.test(line))
-      // #690: the manual-reading write forwards the caller's snapshot under
-      // the route's wire field unchanged; that one line derives nothing.
-      .filter((line) => line.trim() !== "observation: request.snapshot,")
-      .join("\n");
+    // #690: the manual-reading write forwards the caller's snapshot under the
+    // route's wire field unchanged; that one line derives nothing. The
+    // exemption covers exactly one occurrence, inside postManualReading.
+    const WIRE_LINE = "observation: request.snapshot,";
+    const lines = source.split("\n").filter((line) => !/^\s*(\*|\/\*|\/\/)/.test(line));
+    const wireLines = lines.flatMap((line, index) => (line.trim() === WIRE_LINE ? [index] : []));
+    expect(wireLines).toHaveLength(1);
+    const owner = lines
+      .slice(0, wireLines[0])
+      .reverse()
+      .find((line) => /^ {2}[A-Za-z]\w*\(.*\)[^;]*\{$/.test(line));
+    expect(owner?.trim().startsWith("postManualReading(")).toBe(true);
+    const body = lines.filter((line) => line.trim() !== WIRE_LINE).join("\n");
 
     // §6.4: there is no safe local degraded pacer under a partial outage, so
     // the client derives no interval of its own — it retains what the service

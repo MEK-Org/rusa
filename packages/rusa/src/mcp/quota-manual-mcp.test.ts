@@ -10,7 +10,11 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
 import { INSTANCE_PROTOCOL_VERSION } from "../experimental/remote-instances/protocol.js";
-import { type ManualReadingRequest, QuotaCoordinatorClient } from "../quota/coordinator-client.js";
+import {
+  type ManualReadingRequest,
+  type ManualReadingResult,
+  QuotaCoordinatorClient,
+} from "../quota/coordinator-client.js";
 import {
   MANUAL_QUOTA_OBSERVATION_PATH,
   QUOTA_READING_MODE_PATH,
@@ -26,6 +30,7 @@ import { McpHttpServer } from "./http-server.js";
 import {
   createQuotaManualServer,
   manualReadingIdempotencyKey,
+  manualReadingStatus,
   QUOTA_MANUAL_MCP_NAME,
   type QuotaManualMcpDeps,
 } from "./quota-manual-mcp.js";
@@ -97,6 +102,7 @@ describe("submit_manual_reading (#690)", () => {
   let store: SharedQuotaStore;
   let service: QuotaCoordinatorService;
   let sent: ManualReadingRequest[];
+  let received: ManualReadingResult[];
   let deps: QuotaManualMcpDeps;
 
   beforeEach(async () => {
@@ -113,11 +119,14 @@ describe("submit_manual_reading (#690)", () => {
     await service.start();
     const client = new QuotaCoordinatorClient({ socketPath });
     sent = [];
+    received = [];
     deps = {
       client: {
-        postManualReading: (request) => {
+        postManualReading: async (request) => {
           sent.push(structuredClone(request));
-          return client.postManualReading(request);
+          const result = await client.postManualReading(request);
+          received.push(result);
+          return result;
         },
       },
     };
@@ -172,6 +181,11 @@ describe("submit_manual_reading (#690)", () => {
         idempotencyKey: manualReadingIdempotencyKey("kimi", generation, OBSERVED_AT),
       },
     ]);
+    // The accept envelope is the coordinator's own bytes, as the client got them.
+    const acceptedRaw = received[0];
+    if (!acceptedRaw?.reached) throw new Error("coordinator not reached");
+    expect(acceptedRaw.statusCode).toBe(200);
+    expect(text(accepted)).toBe(acceptedRaw.body);
     expect(JSON.parse(text(accepted))).toMatchObject({
       provider: "kimi",
       generation,
@@ -192,6 +206,37 @@ describe("submit_manual_reading (#690)", () => {
     expect(replay.isError).toBeFalsy();
     expect(text(replay)).toBe((await direct(replayRequest)).body);
     expect(JSON.parse(text(replay))).toMatchObject({ duplicate: true });
+  });
+
+  it("records a reading with a provider-wide window at zero as exhausted, gating the lane", async () => {
+    const generation = await switchMode("manual");
+    const tool = await connect(deps);
+    const exhausted = [{ ...LIMITS[0], percentLeft: 0 }];
+
+    const accepted = (await tool.callTool({
+      name: "submit_manual_reading",
+      arguments: { provider: "kimi", generation, observedAt: OBSERVED_AT, limits: exhausted },
+    })) as CallToolResult;
+
+    expect(accepted.isError).toBeFalsy();
+    expect(sent[0]?.snapshot.status).toBe("exhausted");
+    expect(store.getExhaustedUntil("kimi", NOW_MS)).toBe(LIMITS[0]?.resetAtIso);
+  });
+
+  it("derives status the way a scrape does: provider-wide windows only", () => {
+    const weekly = LIMITS[0];
+    if (!weekly) throw new Error("no fixture limit");
+    expect(manualReadingStatus([weekly])).toBe("available");
+    expect(manualReadingStatus([{ ...weekly, percentLeft: 0 }])).toBe("exhausted");
+    expect(manualReadingStatus([{ ...weekly, scope: undefined, percentLeft: 0 }])).toBe(
+      "exhausted"
+    );
+    expect(
+      manualReadingStatus([
+        weekly,
+        { ...weekly, percentLeft: 0, scope: { provider: "kimi", models: ["kimi-k2"] } },
+      ])
+    ).toBe("available");
   });
 
   it.each([

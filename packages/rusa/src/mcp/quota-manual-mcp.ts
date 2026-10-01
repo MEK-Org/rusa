@@ -2,7 +2,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
-import type { ProviderQuotaSnapshot } from "./quota-mcp.js";
+import { isProviderScopedWindow } from "../quota/window-scope.js";
+import type { ProviderQuotaSnapshot, QuotaLimit } from "./quota-mcp.js";
 import { toolError } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 
@@ -25,6 +26,18 @@ export function manualReadingIdempotencyKey(
   observedAt: string
 ): string {
   return `manual-reading:${provider}:${generation}:${observedAt}`;
+}
+
+/**
+ * The snapshot status the route requires, derived the way a scrape derives it
+ * (`quota-mcp.ts`): exhausted when any provider-wide window shows nothing
+ * left, available otherwise. A model-scoped window at zero does not mark the
+ * whole provider exhausted. The caller states only the windows it read.
+ */
+export function manualReadingStatus(limits: readonly QuotaLimit[]): "available" | "exhausted" {
+  return limits.some((limit) => isProviderScopedWindow(limit) && limit.percentLeft <= 0)
+    ? "exhausted"
+    : "available";
 }
 
 const limitSchema = z.object({
@@ -76,22 +89,16 @@ export function createQuotaManualServer(
           .min(1)
           .max(64)
           .describe("ISO-8601 instant you read the source, e.g. 2026-10-01T11:51:42Z."),
-        status: z
-          .enum(["available", "exhausted"])
-          .optional()
-          .describe(
-            '"exhausted" when the source shows the provider out of quota. Default available.'
-          ),
         limits: z.array(limitSchema).min(1).describe("Every window the source shows."),
       },
     },
-    async ({ provider, generation, observedAt, status, limits }): Promise<CallToolResult> => {
+    async ({ provider, generation, observedAt, limits }): Promise<CallToolResult> => {
       if (!deps.client) {
         return toolError("No quota coordinator is configured on this instance");
       }
       const snapshot: ProviderQuotaSnapshot = {
         provider,
-        status: status ?? "available",
+        status: manualReadingStatus(limits),
         scrapedAt: observedAt,
         limits,
       };

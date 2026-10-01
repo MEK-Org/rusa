@@ -242,10 +242,13 @@ other leader endpoint; it needs no access to the socket. When the leader has no
 returns `No quota coordinator is configured on this instance`.
 
 Arguments are `provider`, `generation` (from the switch to `manual`),
-`observedAt`, an optional `status` (`available` by default, or `exhausted`), and
-`limits` in the shape shown above. The tool does not rewrite or check anything:
+`observedAt`, and `limits` in the shape shown above. The tool does not rewrite or
+check anything:
 
 - `observedAt` is sent as the observation's `scrapedAt` exactly as given.
+- The snapshot's `status` is derived from `limits` the way a scrape derives it:
+  `exhausted` when any provider-wide window shows 0% left, otherwise
+  `available`. A model-scoped window at 0% does not mark the provider exhausted.
 - The `Idempotency-Key` is `manual-reading:<provider>:<generation>:<observedAt>`.
   A retried call for the same reading is therefore `duplicate: true`, and a
   different reading at the same instant is `idempotency_conflict`.
