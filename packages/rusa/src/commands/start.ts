@@ -1530,7 +1530,10 @@ async function composeStart(
                     ...(slackClient ? { slackClient } : {}),
                     meshChat: getRepositories().meshChat,
                     issueClient,
-                  })
+                  }),
+                  {
+                    auditPath: join(mcHome, "audit", "jev-queries.jsonl"),
+                  }
                 ),
               }
             : {}),

@@ -52,6 +52,8 @@ export class JevInputUnavailableError extends Error {
 export interface JevDecisionRequest {
   /** Host-local lookup key. It is not copied into the durable decision audit. */
   actorId: string;
+  /** Optional evaluation ID linking the decision audit to its query log entry. */
+  evaluationId?: string;
   /** The open-ended decision put to the model, verbatim. */
   question: string;
   input: {
@@ -143,9 +145,12 @@ export interface ResponsiveInterruptionInput {
   selectedEntryIds: readonly string[];
   /** Unselected rows, offered only when nothing is selected. */
   pendingEntryIds: readonly string[];
+  /** Optional evaluation ID linking the decision audit to its query log entry. */
+  evaluationId?: string;
 }
 
 interface DecisionBase {
+  evaluationId?: string;
   incomingEntryId: string;
   candidateSource: ResponsiveInterruptionCandidateSource;
   threshold: number;
@@ -226,6 +231,7 @@ export class ShadowResponsiveInterruptionClassifier {
       ...new Set(selected ? input.selectedEntryIds : input.pendingEntryIds),
     ].filter((entryId) => entryId !== input.incomingEntryId);
     const base: DecisionBase = {
+      ...(input.evaluationId !== undefined ? { evaluationId: input.evaluationId } : {}),
       incomingEntryId: input.incomingEntryId,
       candidateSource,
       threshold: this.threshold,
@@ -251,6 +257,7 @@ export class ShadowResponsiveInterruptionClassifier {
     try {
       response = await this.withDeadline(this.client, {
         actorId: input.actorId,
+        ...(input.evaluationId !== undefined ? { evaluationId: input.evaluationId } : {}),
         question: RESPONSIVE_INTERRUPTION_QUESTION,
         input: { incomingEntryId: input.incomingEntryId, candidateEntryIds, candidateSource },
       });

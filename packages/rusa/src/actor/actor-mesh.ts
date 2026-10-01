@@ -1079,9 +1079,10 @@ export class ActorMesh {
             onResponsiveArrived: (
               actorId: string,
               entries: readonly InboxEntry[],
-              baseline: "interrupt" | "queue"
+              baseline: "interrupt" | "queue",
+              isRunning: boolean
             ) => {
-              this.shadowResponsiveInterruptions(actorId, entries, baseline);
+              this.shadowResponsiveInterruptions(actorId, entries, baseline, isRunning);
             },
           }
         : {}),
@@ -1484,10 +1485,11 @@ export class ActorMesh {
   private shadowResponsiveInterruptions(
     actorId: string,
     incoming: readonly InboxEntry[],
-    baseline: "interrupt" | "queue"
+    baseline: "interrupt" | "queue",
+    wasRunning: boolean
   ): void {
     const classifier = this.responsiveInterruption;
-    if (!classifier || incoming.length === 0) return;
+    if (!classifier || incoming.length === 0 || !wasRunning) return;
     const selectedEntryIds = [...this.selectedInboxEntries(actorId)];
     // Unselected rows are only ever the fallback for an actor holding no
     // selection, so a selection spares the full unhandled scan entirely.
@@ -1498,14 +1500,15 @@ export class ActorMesh {
       // Direct interrupt() does not dispatch at all, preserving its hard path.
       if (entry.payload.type === "operator.run_now") continue;
       const incomingEntryId = entry.id;
+      const evaluationId = this.idgen();
       void classifier
-        .evaluate({ actorId, incomingEntryId, selectedEntryIds, pendingEntryIds })
+        .evaluate({ evaluationId, actorId, incomingEntryId, selectedEntryIds, pendingEntryIds })
         .then((decision) => {
           this.recordEvent({
             kind: "responsive_interruption_shadow",
             actorId,
             detail: "shadow",
-            payload: JSON.stringify({ baseline, decision }),
+            payload: JSON.stringify({ evaluationId, baseline, decision }),
           });
           // The audit row is recorded first and independently: a chat space
           // the bot cannot react in must not cost the measurement this whole

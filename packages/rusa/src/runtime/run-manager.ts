@@ -147,7 +147,8 @@ export interface RunManagerOptions {
   onResponsiveArrived?: (
     actorId: string,
     entries: readonly InboxEntry[],
-    baseline: "interrupt" | "queue"
+    baseline: "interrupt" | "queue",
+    isRunning: boolean
   ) => void;
   /** Internal construction-only port receiver. */
   onInternalPort?: (port: RunManagerInternalPort) => void;
@@ -337,7 +338,8 @@ export class RunManager {
   private observeResponsiveArrival(
     actorId: string,
     work: DurableDispatchWork,
-    baseline: "interrupt" | "queue"
+    baseline: "interrupt" | "queue",
+    isRunning: boolean
   ): void {
     const observe = this.onResponsiveArrived;
     if (!observe) return;
@@ -353,7 +355,7 @@ export class RunManager {
     for (const entry of arrived) observed.add(entry.id);
     if (observed.size > 0) this.observedResponsive.set(actorId, observed);
     else this.observedResponsive.delete(actorId);
-    if (arrived.length > 0) observe(actorId, arrived, baseline);
+    if (arrived.length > 0) observe(actorId, arrived, baseline, isRunning);
   }
 
   private dispatchInternal(actorId: string, opts: { preempt: boolean }): boolean {
@@ -389,8 +391,14 @@ export class RunManager {
       this.log(`dispatch(${actorId}) held — active voice session`);
       return false;
     }
+    const wasRunning = target.isRunning;
     if (responsiveArrived) {
-      this.observeResponsiveArrival(actorId, work, opts.preempt ? "interrupt" : "queue");
+      this.observeResponsiveArrival(
+        actorId,
+        work,
+        opts.preempt ? "interrupt" : "queue",
+        wasRunning
+      );
     }
     if (responsiveArrived && opts.preempt) {
       const preemption = target.preemptForResponsive();
