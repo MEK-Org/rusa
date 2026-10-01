@@ -287,7 +287,11 @@ import {
 } from "../runtime/event-manager.js";
 import { ResourceScope } from "../runtime/resource-scope.js";
 import { readSlackToken, SlackClient } from "../slack/slack-client.js";
-import { SlackSocketSource } from "../slack/socket-source.js";
+import {
+  type SlackInboundMessage,
+  SlackSocketSource,
+  withReceiptReaction,
+} from "../slack/socket-source.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import {
   DistillerCursorStore,
@@ -4425,8 +4429,8 @@ async function composeStart(
           }),
         (event) => log.info("slack_event_received", event)
       );
-      await source.start(async (msg) => {
-        await mesh.deliverExternalEvent({
+      const deliver = async (msg: SlackInboundMessage) => {
+        const delivery = await mesh.deliverExternalEvent({
           sourceType: "slack",
           rawPayload: {
             channel: msg.channel,
@@ -4439,7 +4443,20 @@ async function composeStart(
           eventSummary: `Slack message from ${msg.user}`,
         });
         log.info("slack_message_delivered", { channel: msg.channel, eventId: msg.eventId });
-      });
+        return delivery;
+      };
+      await source.start(
+        withReceiptReaction(
+          deliver,
+          (channel, ts) => slackClient.react(channel, ts),
+          (err, msg) =>
+            log.warn("slack_receipt_reaction_failed", {
+              channel: msg.channel,
+              eventId: msg.eventId,
+              error: err instanceof Error ? err.message : String(err),
+            })
+        )
+      );
       resources.acquire("slack source", () => source?.close());
       log.info("slack_socket_active");
     } catch (err) {
