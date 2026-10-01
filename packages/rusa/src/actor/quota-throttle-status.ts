@@ -9,6 +9,17 @@ export interface QuotaBucketError {
   stale?: boolean;
 }
 
+export interface QuotaThrottleModelLaneStatus {
+  models: string[];
+  intervalSeconds: number;
+  uncappedIntervalSeconds: number;
+  expired: boolean;
+  capped: boolean;
+  buckets: QuotaBucketError[];
+  freshness?: QuotaFreshness;
+  updatedAt: string;
+}
+
 export interface QuotaThrottleTick {
   intervalSeconds: number;
   expired: boolean;
@@ -16,6 +27,7 @@ export interface QuotaThrottleTick {
   buckets: QuotaBucketError[];
   uncappedIntervalSeconds: number;
   freshness?: QuotaFreshness;
+  modelLanes?: QuotaThrottleModelLaneStatus[];
 }
 
 export interface QuotaThrottleStatus extends QuotaThrottleTick {

@@ -1351,6 +1351,53 @@ class QuotaFreshnessDto {
   };
 }
 
+/// A model-scoped throttle lane within a provider throttle (#811).
+class QuotaThrottleModelLaneDto extends QuotaThrottleDto {
+  const QuotaThrottleModelLaneDto({
+    required super.intervalSeconds,
+    super.expired = false,
+    super.capped = false,
+    super.buckets = const [],
+    super.updatedAt = '',
+    super.freshness,
+    this.models = const [],
+  });
+
+  final List<String> models;
+
+  factory QuotaThrottleModelLaneDto.fromJson(Map<String, dynamic> j) =>
+      QuotaThrottleModelLaneDto(
+        intervalSeconds: (j['intervalSeconds'] as num?)?.toDouble() ?? 0,
+        expired: j['expired'] as bool? ?? false,
+        capped: j['capped'] as bool? ?? false,
+        buckets: (j['buckets'] as List<dynamic>? ?? const [])
+            .whereType<Map<dynamic, dynamic>>()
+            .map(
+              (e) => QuotaThrottleBucketDto.fromJson(
+                Map<String, dynamic>.from(e),
+              ),
+            )
+            .toList(),
+        updatedAt: j['updatedAt'] as String? ?? '',
+        freshness: j['freshness'] is Map<dynamic, dynamic>
+            ? QuotaFreshnessDto.fromJson(
+                Map<String, dynamic>.from(
+                  j['freshness'] as Map<dynamic, dynamic>,
+                ),
+              )
+            : null,
+        models: (j['models'] as List<dynamic>? ?? const [])
+            .whereType<String>()
+            .toList(),
+      );
+
+  @override
+  Map<String, dynamic> toJson() => {
+    ...super.toJson(),
+    'models': models,
+  };
+}
+
 /// Latest adaptive start interval for one provider, when quota pacing is enabled.
 class QuotaThrottleDto {
   const QuotaThrottleDto({
@@ -1360,6 +1407,7 @@ class QuotaThrottleDto {
     required this.buckets,
     required this.updatedAt,
     this.freshness,
+    this.modelLanes = const [],
   });
 
   final double intervalSeconds;
@@ -1368,18 +1416,32 @@ class QuotaThrottleDto {
   final List<QuotaThrottleBucketDto> buckets;
   final String updatedAt;
   final QuotaFreshnessDto? freshness;
+  final List<QuotaThrottleModelLaneDto> modelLanes;
 
   factory QuotaThrottleDto.fromJson(Map<String, dynamic> j) => QuotaThrottleDto(
     intervalSeconds: (j['intervalSeconds'] as num?)?.toDouble() ?? 0,
     expired: j['expired'] as bool? ?? false,
     capped: j['capped'] as bool? ?? false,
     buckets: (j['buckets'] as List<dynamic>? ?? const [])
-        .map((e) => QuotaThrottleBucketDto.fromJson(e as Map<String, dynamic>))
+        .whereType<Map<dynamic, dynamic>>()
+        .map(
+          (e) => QuotaThrottleBucketDto.fromJson(Map<String, dynamic>.from(e)),
+        )
         .toList(),
     updatedAt: j['updatedAt'] as String? ?? '',
-    freshness: j['freshness'] is Map<String, dynamic>
-        ? QuotaFreshnessDto.fromJson(j['freshness'] as Map<String, dynamic>)
+    freshness: j['freshness'] is Map<dynamic, dynamic>
+        ? QuotaFreshnessDto.fromJson(
+            Map<String, dynamic>.from(j['freshness'] as Map<dynamic, dynamic>),
+          )
         : null,
+    modelLanes: (j['modelLanes'] as List<dynamic>? ?? const [])
+        .whereType<Map<dynamic, dynamic>>()
+        .map(
+          (e) => QuotaThrottleModelLaneDto.fromJson(
+            Map<String, dynamic>.from(e),
+          ),
+        )
+        .toList(),
   );
 
   Map<String, dynamic> toJson() => {
@@ -1389,6 +1451,8 @@ class QuotaThrottleDto {
     'buckets': buckets.map((bucket) => bucket.toJson()).toList(),
     'updatedAt': updatedAt,
     if (freshness != null) 'freshness': freshness!.toJson(),
+    if (modelLanes.isNotEmpty)
+      'modelLanes': modelLanes.map((lane) => lane.toJson()).toList(),
   };
 }
 

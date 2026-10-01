@@ -782,7 +782,8 @@ class _QuotaHeaderStrip extends StatelessWidget {
             weeklyWindow: fableWeeklyWindow(entry.provider!),
             sessionWindow: null,
             label: 'Fable',
-            showThrottle: false,
+            throttle: fableThrottle(entry.provider!),
+            showThrottle: true,
           ),
       ],
     ];
@@ -854,6 +855,23 @@ QuotaWindowDto? fableWeeklyWindow(ProviderQuotaDto claude) {
   return matches.length == 1 ? matches.single : null;
 }
 
+/// Fable's throttle on the Claude reading (#811): the one model lane scoped to
+/// Fable alone with a valid interval. Null when there is none, or when more
+/// than one claims to be it — an ambiguous, missing, or malformed identity
+/// reads null so the tooltip renders "Pacing: n/a".
+QuotaThrottleModelLaneDto? fableThrottle(ProviderQuotaDto claude) {
+  final throttle = claude.throttle;
+  if (throttle == null) return null;
+  final matches = [
+    for (final lane in throttle.modelLanes)
+      if (isFableModelScope(lane.models) &&
+          lane.intervalSeconds.isFinite &&
+          lane.intervalSeconds >= 0)
+        lane,
+  ];
+  return matches.length == 1 ? matches.single : null;
+}
+
 /// Renders a provider's weekly quota as the outer ring and its session/5h
 /// quota as a smaller concentric ring inside it . Either ring shows grey
 /// (no crash) when its window is missing, unread, or otherwise unknown.
@@ -864,6 +882,7 @@ class _ProviderQuotaRing extends StatelessWidget {
     required this.sessionWindow,
     this.axis = Axis.horizontal,
     this.label,
+    this.throttle,
     this.showThrottle = true,
   });
 
@@ -874,6 +893,9 @@ class _ProviderQuotaRing extends StatelessWidget {
   /// Overrides the provider name, for a ring that shows one model's
   /// allocation within the provider (#752).
   final String? label;
+
+  /// Overrides the provider throttle, for a model ring showing its own lane (#811).
+  final QuotaThrottleDto? throttle;
 
   /// Whether the tooltip carries the provider's launch pacing. A model ring
   /// leaves it out: that pacing is provider-wide, not the model's.
@@ -918,10 +940,12 @@ class _ProviderQuotaRing extends StatelessWidget {
     }
     final scrapedAt =
         weeklyWindow?.scrapedAt ?? sessionWindow?.scrapedAt ?? provider.scrapedAt;
+    final effectiveThrottle =
+        throttle ?? (label == null ? provider.throttle : null);
     final tooltipWidget = QuotaTooltip(
       providerName: name,
       windows: windows,
-      throttle: showThrottle ? provider.throttle : null,
+      throttle: showThrottle ? effectiveThrottle : null,
       scrapedAt: scrapedAt,
       showThrottle: showThrottle,
       staleFor: staleFor,

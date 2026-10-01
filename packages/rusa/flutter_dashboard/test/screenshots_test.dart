@@ -404,6 +404,7 @@ void main() {
         await tester.pump(const Duration(milliseconds: 250));
         expect(find.textContaining('Weekly: '), findsOneWidget);
         expect(find.textContaining('Last Read: 30 minutes ago'), findsOneWidget);
+        expect(find.textContaining('Pacing: every 15 minutes'), findsOneWidget);
         await captureBoundary(key, '$_outDir/header_quota_fable_tooltip.png');
       });
     },
@@ -828,7 +829,10 @@ QuotaSnapshotDto _seedQuota() => const QuotaSnapshotDto(
 /// Claude with a Fable weekly allocation beside its provider-wide week (#752),
 /// plus Codex. The Fable window carries the provider's reset and scrape
 /// instants, as the server sends them, relative to the capture time.
-QuotaSnapshotDto _seedFableQuota({List<QuotaWindowDto>? fableWindows}) {
+QuotaSnapshotDto _seedFableQuota({
+  List<QuotaWindowDto>? fableWindows,
+  QuotaThrottleDto? throttle,
+}) {
   final base = _seedQuota();
   final now = DateTime.now().toUtc();
   final claude = base.providers.first;
@@ -842,6 +846,22 @@ QuotaSnapshotDto _seedFableQuota({List<QuotaWindowDto>? fableWindows}) {
         tier: null,
         message: null,
         windows: claude.windows,
+        throttle: throttle ??
+            QuotaThrottleDto(
+              intervalSeconds: 600,
+              expired: false,
+              capped: false,
+              buckets: const [],
+              updatedAt: now
+                  .subtract(const Duration(minutes: 5))
+                  .toIso8601String(),
+              modelLanes: const [
+                QuotaThrottleModelLaneDto(
+                  models: ['claude-fable-5-1'],
+                  intervalSeconds: 900,
+                ),
+              ],
+            ),
         scrapedAt: now.subtract(const Duration(minutes: 30)).toIso8601String(),
         modelWindows: fableWindows ?? [
           QuotaWindowDto(
