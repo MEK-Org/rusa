@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { DurableEventDelivery } from "../runtime/event-manager.js";
 
 type SocketEnvelope = { type: string; body: unknown; ack: () => Promise<void> };
 const mock = vi.hoisted(() => ({
@@ -16,7 +17,6 @@ vi.mock("@slack/socket-mode", () => ({
 }));
 
 import {
-  type SlackDeliveryResult,
   type SlackInboundMessage,
   SlackSocketSource,
   withReceiptReaction,
@@ -57,14 +57,18 @@ describe("Slack Socket Mode delivery", () => {
 describe("Slack receipt reaction (#609)", () => {
   beforeEach(() => mock.listeners.clear());
 
-  const accepted: SlackDeliveryResult = { entries: [{ id: "entry-1" }], ownerIds: ["owner-1"] };
+  type Delivery = Pick<DurableEventDelivery, "entries" | "ownerIds">;
+  const accepted: Delivery = {
+    entries: [{ id: "entry-1" }] as unknown as Delivery["entries"],
+    ownerIds: ["owner-1"],
+  };
 
   function platformError(code: string) {
     return Object.assign(new Error(`An API error occurred: ${code}`), { data: { error: code } });
   }
 
   async function receive(
-    deliver: (message: SlackInboundMessage) => Promise<SlackDeliveryResult>,
+    deliver: (message: SlackInboundMessage) => Promise<Delivery>,
     react: (channel: string, ts: string) => Promise<void>,
     event: Record<string, unknown>
   ) {

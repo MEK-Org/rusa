@@ -1,4 +1,5 @@
 import { SocketModeClient } from "@slack/socket-mode";
+import type { DurableEventDelivery } from "../runtime/event-manager.js";
 
 export interface SlackInboundMessage {
   channel: string;
@@ -94,12 +95,6 @@ export class SlackSocketSource {
   }
 }
 
-/** What a durable delivery reports back; the shape `deliverExternalEvent` returns. */
-export interface SlackDeliveryResult {
-  entries: readonly unknown[];
-  ownerIds: readonly string[];
-}
-
 /**
  * Wrap inbox delivery so an accepted message gets an 👀 receipt on that exact
  * message, thread replies included (#609). A delivery that throws is never
@@ -108,7 +103,9 @@ export interface SlackDeliveryResult {
  * the delivery, so it cannot make Slack redeliver an event the inbox holds.
  */
 export function withReceiptReaction(
-  deliver: (message: SlackInboundMessage) => Promise<SlackDeliveryResult>,
+  deliver: (
+    message: SlackInboundMessage
+  ) => Promise<Pick<DurableEventDelivery, "entries" | "ownerIds">>,
   react: (channel: string, ts: string) => Promise<void>,
   onReactionError: (error: unknown, message: SlackInboundMessage) => void
 ): (message: SlackInboundMessage) => Promise<void> {
