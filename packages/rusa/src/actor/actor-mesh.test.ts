@@ -3901,6 +3901,101 @@ describe("ActorMesh", () => {
     );
   });
 
+  describe("responsive failure notices (#189)", () => {
+    it("wakes an idle parent on the responsive lane", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const admissions: Array<[string, boolean]> = [];
+      const { mesh, tick } = setup({
+        inboxStore,
+        onQueued: (actorId, ctx) => admissions.push([actorId, ctx.responsive]),
+      });
+      const child = mesh.spawn({ charter: "do work", parentId: "root" });
+
+      mesh.deliverMechanicalInboxNotice(
+        "root",
+        "[run failed] (exit 1)",
+        child,
+        { actorId: child, exitCode: 1 },
+        undefined,
+        { responsive: true }
+      );
+      await tick();
+
+      expect(inboxStore.entries.find((entry) => entry.actorId === "root")?.payload).toMatchObject({
+        type: "mesh.mechanical_note",
+        priority: "responsive",
+      });
+      expect(admissions).toEqual([["root", true]]);
+    });
+
+    it("keeps ordinary mechanical notices at normal priority", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const admissions: Array<[string, boolean]> = [];
+      const { mesh, tick } = setup({
+        inboxStore,
+        onQueued: (actorId, ctx) => admissions.push([actorId, ctx.responsive]),
+      });
+      const child = mesh.spawn({ charter: "do work", parentId: "root" });
+
+      mesh.deliverMechanicalInboxNotice("root", "[yield/complete] done", child, { actorId: child });
+      await tick();
+
+      const notice = inboxStore.entries.find((entry) => entry.actorId === "root");
+      expect(notice?.payload.priority).toBeUndefined();
+      expect(admissions).toEqual([["root", false]]);
+    });
+
+    it("does not abort the parent's run in flight; the notice earns a responsive follow-up", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const events: MeshEventInput[] = [];
+      const admissions: boolean[] = [];
+      let parent = "";
+      let firstSignal: AbortSignal | undefined;
+      let resolveFirst!: (result: Partial<RunResult>) => void;
+      let parentRuns = 0;
+      const provider = new FakeProvider((opts) => {
+        if (opts.cwd !== `/tmp/${parent}`) return { success: true, exitCode: 0, output: "ok" };
+        parentRuns++;
+        if (parentRuns > 1) return { success: true, exitCode: 0, output: "handled failure" };
+        firstSignal = opts.signal;
+        return new Promise<Partial<RunResult>>((resolve) => {
+          resolveFirst = resolve;
+        });
+      });
+      const { mesh, tick } = setup({
+        inboxStore,
+        sharedProvider: provider,
+        events: (event) => events.push(event),
+        onQueued: (actorId, ctx) => {
+          if (actorId === parent) admissions.push(ctx.responsive);
+        },
+      });
+      parent = mesh.spawn({ charter: "supervise", parentId: "root" });
+      const child = mesh.spawn({ charter: "do work", parentId: parent });
+      mesh.sendMessage(parent, "start", "root");
+      await tick();
+      expect(parentRuns).toBe(1);
+
+      mesh.deliverMechanicalInboxNotice(
+        parent,
+        "[run failed] (exit 1)",
+        child,
+        { actorId: child, exitCode: 1 },
+        undefined,
+        { responsive: true }
+      );
+      await tick();
+
+      expect(firstSignal?.aborted).toBe(false);
+      expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
+
+      resolveFirst({ success: true, exitCode: 0, output: "finished normally" });
+      await tick();
+      expect(parentRuns).toBe(2);
+      expect(admissions).toEqual([false, true]);
+    });
+  });
+
   it("appends git-bridge review instructions to the parent yield notification", async () => {
     const chat: { senderId: string; recipientId: string; body: string; sessionId?: string }[] = [];
     const inboxStore = createMemoryInboxStore();

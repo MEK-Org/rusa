@@ -54,6 +54,7 @@ import {
 } from "../actor/event-subscriptions.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import {
+  FailureEscalationBackoff,
   type FailureSinkDeps,
   formatProviderLabel,
   routeRunFailure,
@@ -3397,8 +3398,8 @@ async function composeStart(
   });
   const failureSink: FailureSinkDeps = {
     actors,
-    sendToParent: (toId, body, fromId, forensics) =>
-      mesh.deliverMechanicalInboxNotice(toId, body, fromId, forensics),
+    sendToParent: (toId, body, fromId, forensics, delivery) =>
+      mesh.deliverMechanicalInboxNotice(toId, body, fromId, forensics, undefined, delivery),
     postToErrorChat: errorNotifier ? (text) => errorNotifier.notify(text) : null,
     rootId: rootId,
     log: (m) => console.warn(`[failure-sink] ${m}`),
@@ -3407,6 +3408,9 @@ async function composeStart(
     // ISSUE_NUM: name quota exhaustion in the failure notice so a worker's parent
     // (who now owns the fallback judgment) can see the cause up front.
     classify: classifyExhaustion,
+    // #189: a child's failure wakes its parent past provider pacing, backed
+    // off per child so a crash loop cannot hammer the parent.
+    escalation: new FailureEscalationBackoff(),
   };
 
   // Publish the live callback port only after the shared MCP server is bound.

@@ -17,7 +17,8 @@ export interface FailureSinkDeps {
     toId: string,
     body: string,
     fromId: string,
-    forensics?: MechanicalInboxForensics
+    forensics?: MechanicalInboxForensics,
+    delivery?: { responsive: boolean }
   ) => void;
   /** Mechanical post to the configured error chat, or null if unconfigured. */
   postToErrorChat: ((text: string) => void) | null;
@@ -40,6 +41,48 @@ export interface FailureSinkDeps {
    * recognized as a human cancellation (#460) rather than a failure to report.
    */
   principals?: Pick<PrincipalRepository, "getUser">;
+  /**
+   * Optional per-child backoff for waking the parent responsively (#189).
+   * Absent, every failure notice keeps ordinary priority.
+   */
+  escalation?: Pick<FailureEscalationBackoff, "admit">;
+}
+
+/**
+ * Decides which child failures may wake the parent past provider pacing (#189).
+ *
+ * A child's first failure escalates. Repeats inside the backoff window are
+ * still delivered, just at ordinary priority, so a crash loop cannot turn the
+ * bypass into a tight loop on the parent. Each escalation that lands soon after
+ * the previous window doubles the next window up to `maxMs`; a full window of
+ * quiet past the last one resets the child to `baseMs`. Process-local by
+ * design: a restart forgets the backoff and at worst grants one extra
+ * responsive wake per failing child.
+ */
+export class FailureEscalationBackoff {
+  private readonly baseMs: number;
+  private readonly maxMs: number;
+  private readonly now: () => number;
+  private readonly windows = new Map<string, { until: number; windowMs: number }>();
+
+  constructor(opts: { baseMs?: number; maxMs?: number; now?: () => number } = {}) {
+    this.baseMs = opts.baseMs ?? 60_000;
+    this.maxMs = opts.maxMs ?? 30 * 60_000;
+    this.now = opts.now ?? Date.now;
+  }
+
+  /** Whether this failure from `childId` may wake its parent responsively. */
+  admit(childId: string): boolean {
+    const t = this.now();
+    for (const [id, w] of this.windows) {
+      if (t >= w.until + w.windowMs) this.windows.delete(id);
+    }
+    const previous = this.windows.get(childId);
+    if (previous && t < previous.until) return false;
+    const windowMs = previous ? Math.min(previous.windowMs * 2, this.maxMs) : this.baseMs;
+    this.windows.set(childId, { until: t + windowMs, windowMs });
+    return true;
+  }
 }
 
 /**
@@ -293,13 +336,19 @@ function routeMechanicalFailureNotice(
   }
 
   if (record?.parentId) {
-    deps.sendToParent(record.parentId, `[${label}] ${summary}${extraMessage}`, actorId, {
-      // Older direct callers have no durable run record. Lifecycle callers
-      // pass the UUID so the parent can inspect the exact failed attempt.
-      runId: runId ?? actorId,
+    deps.sendToParent(
+      record.parentId,
+      `[${label}] ${summary}${extraMessage}`,
       actorId,
-      exitCode,
-    });
+      {
+        // Older direct callers have no durable run record. Lifecycle callers
+        // pass the UUID so the parent can inspect the exact failed attempt.
+        runId: runId ?? actorId,
+        actorId,
+        exitCode,
+      },
+      { responsive: deps.escalation?.admit(actorId) ?? false }
+    );
     return;
   }
 
