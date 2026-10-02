@@ -201,4 +201,102 @@ void main() {
       expect(find.text('Carried intent for ob-gone'), findsOneWidget);
     });
   });
+
+  group('#610 entries tied to an obligation', () {
+    const pr = ReferenceDto(
+      ref: 'github:rusa-e2e/scratch/pulls/3',
+      scheme: 'github',
+      title: 'rusa-e2e/scratch#3 — Tighten inbox payload validation',
+      url: 'https://github.com/rusa-e2e/scratch/pull/3',
+      entity: {
+        'type': 'github_pull_request',
+        'title': 'Tighten inbox payload validation',
+      },
+    );
+
+    InboxEntryDto reviewEntry({String? obligationId}) =>
+        InboxEntryDto.fromJson({
+          'id': 'entry-review',
+          'actorId': 'actor-1',
+          'source': 'github:rusa-e2e/scratch/pulls/3',
+          'deliveredAt': '2026-10-01T12:00:00.000Z',
+          'payload': {
+            'type': 'pull_request_review.submitted',
+            'reviewId': 1,
+            'priority': 'responsive',
+          },
+          'reference': {
+            'ref': pr.ref,
+            'scheme': pr.scheme,
+            'title': pr.title,
+            'url': pr.url,
+            'entity': pr.entity,
+          },
+          'obligationId': ?obligationId,
+        });
+
+    testWidgets('a GitHub event shows the obligation that owns its source', (
+      tester,
+    ) async {
+      final api = FakeApi()
+        ..obligationsResult = [
+          makeObligation('ob-pr', title: 'Land the validation PR'),
+        ];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      final entry = reviewEntry(obligationId: 'ob-pr');
+      expect(entry.obligationId, 'ob-pr');
+      expect(InboxItemRow.rendersOwnFrame(entry), isTrue);
+
+      await tester.pumpWidget(
+        _host(InboxItemRow(entry: entry, moreCount: 2, store: store)),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('OBLIGATION'), findsOneWidget);
+      expect(find.text('Land the validation PR'), findsOneWidget);
+      expect(find.text('GITHUB PR'), findsNothing);
+      expect(find.text('RESPONSIVE'), findsOneWidget);
+      expect(find.text('(+2 more)'), findsOneWidget);
+    });
+
+    testWidgets('an untied GitHub event keeps its own card', (tester) async {
+      final store = DashboardStore(api: FakeApi(), stream: FakeStream());
+      final entry = reviewEntry();
+      expect(entry.obligationId, isNull);
+
+      await tester.pumpWidget(_host(InboxItemRow(entry: entry, store: store)));
+      await tester.pumpAndSettle();
+
+      expect(find.text('OBLIGATION'), findsNothing);
+      expect(find.byType(ReferencePreview), findsOneWidget);
+    });
+
+    testWidgets('a responsive ready signal shows its obligation', (
+      tester,
+    ) async {
+      final api = FakeApi()
+        ..obligationsResult = [makeObligation('ob-1', title: 'Ship the fix')];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      final entry = InboxEntryDto.fromJson({
+        'id': 'entry-1',
+        'actorId': 'actor-1',
+        'source': 'obligation:ob-1',
+        'deliveredAt': '2026-10-01T12:00:00.000Z',
+        'payload': {
+          'type': 'obligation.ready_responsive',
+          'obligationId': 'ob-1',
+          'intent': 'Carried intent for ob-1',
+          'priority': 'responsive',
+        },
+        'obligationId': 'ob-1',
+      });
+
+      await tester.pumpWidget(_host(InboxItemRow(entry: entry, store: store)));
+      await tester.pumpAndSettle();
+
+      expect(find.text('OBLIGATION'), findsOneWidget);
+      expect(find.text('Ship the fix'), findsOneWidget);
+      expect(find.byType(InboxChip), findsNothing);
+    });
+  });
 }
