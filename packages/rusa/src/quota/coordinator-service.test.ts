@@ -519,7 +519,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       JSON.stringify({ provider: "agy", mode: "manual" })
     );
 
-    const makeObs = (provider: string, scrapedAt: string) => ({
+    const createManualObs = (provider: string, scrapedAt: string) => ({
       provider,
       status: "available",
       scrapedAt,
@@ -543,7 +543,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       JSON.stringify({
         provider: "claude",
         generation: 1,
-        observation: makeObs("claude", aged75m),
+        observation: createManualObs("claude", aged75m),
       }),
       { "Idempotency-Key": "manual-reading-75m" }
     );
@@ -570,7 +570,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       JSON.stringify({
         provider: "claude",
         generation: 1,
-        observation: makeObs("claude", new Date(nowMs - 80 * 60_000).toISOString()),
+        observation: createManualObs("claude", new Date(nowMs - 80 * 60_000).toISOString()),
       }),
       { "Idempotency-Key": "manual-reading-non-newer" }
     );
@@ -587,7 +587,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       JSON.stringify({
         provider: "codex",
         generation: 1,
-        observation: makeObs("codex", exact120m),
+        observation: createManualObs("codex", exact120m),
       }),
       { "Idempotency-Key": "manual-reading-exact-120m" }
     );
@@ -602,7 +602,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       JSON.stringify({
         provider: "agy",
         generation: 1,
-        observation: makeObs("agy", aged121m),
+        observation: createManualObs("agy", aged121m),
       }),
       { "Idempotency-Key": "manual-reading-aged-121m" }
     );
@@ -615,7 +615,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     service = new QuotaCoordinatorService({
       socketPath,
       store,
-      configuredProviders: ["claude", "codex"],
+      configuredProviders: ["claude", "codex", "agy"],
       now: () => nowMs,
       manualHardStaleAfterMs: 90 * 60_000, // Configured override: 90 minutes
     });
@@ -633,9 +633,15 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       "POST",
       JSON.stringify({ provider: "codex", mode: "manual" })
     );
+    await makeRequest(
+      socketPath,
+      QUOTA_READING_MODE_PATH,
+      "POST",
+      JSON.stringify({ provider: "agy", mode: "manual" })
+    );
 
-    const makeObs = (scrapedAt: string) => ({
-      provider: "claude",
+    const createManualObs = (provider: string, scrapedAt: string) => ({
+      provider,
       status: "available",
       scrapedAt,
       limits: [
@@ -644,7 +650,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
           kind: "weekly",
           percentLeft: 50,
           resetAtIso: "2030-01-08T00:00:00.000Z",
-          scope: { provider: "claude" },
+          scope: { provider },
         },
       ],
     });
@@ -656,7 +662,11 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       socketPath,
       MANUAL_QUOTA_OBSERVATION_PATH,
       "POST",
-      JSON.stringify({ provider: "claude", generation: 1, observation: makeObs(aged89m) }),
+      JSON.stringify({
+        provider: "claude",
+        generation: 1,
+        observation: createManualObs("claude", aged89m),
+      }),
       { "Idempotency-Key": "manual-reading-89m" }
     );
     expect(res89m.status).toBe(200);
@@ -670,23 +680,25 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       JSON.stringify({
         provider: "codex",
         generation: 1,
-        observation: {
-          ...makeObs(exact90m),
-          provider: "codex",
-          limits: [{ ...makeObs(exact90m).limits[0], scope: { provider: "codex" } }],
-        },
+        observation: createManualObs("codex", exact90m),
       }),
       { "Idempotency-Key": "manual-reading-exact-90m" }
     );
     expect(resExact90m.status).toBe(200);
 
-    // Aged 91m exceeds 90m override: rejected as hard-stale fail-safe
+    // Aged 91m exceeds 90m override: tested on a fresh provider lane ("agy") with no prior observation.
+    // In this fresh lane, 91m is otherwise admissible under default 120m, proving that the 90m override
+    // alone causes the 409 rejection and cleanly distinguishing it from the non-newer guard.
     const aged91m = new Date(nowMs - 91 * 60_000).toISOString();
     const res91m = await makeRequest(
       socketPath,
       MANUAL_QUOTA_OBSERVATION_PATH,
       "POST",
-      JSON.stringify({ provider: "claude", generation: 1, observation: makeObs(aged91m) }),
+      JSON.stringify({
+        provider: "agy",
+        generation: 1,
+        observation: createManualObs("agy", aged91m),
+      }),
       { "Idempotency-Key": "manual-reading-91m" }
     );
     expect(res91m.status).toBe(409);
