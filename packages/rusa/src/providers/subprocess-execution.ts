@@ -50,10 +50,7 @@ export interface SubprocessRunConfig {
   /** Optional stdout end hook (e.g. flushing a line buffer). */
   onStdoutEnd?: (chunks: string[]) => void;
   /** Optional callback fired once the child process is spawned, exposing child and killGroup. */
-  onSpawn?: (
-    child: ChildProcessByStdio<null, Readable, Readable>,
-    killGroup: () => void
-  ) => void;
+  onSpawn?: (child: ChildProcessByStdio<null, Readable, Readable>, killGroup: () => void) => void;
   cleanup?: () => void;
   buildKilledResult: (sigtermResult: TerminationAttribution) => RunResult;
   buildSignalResult: (sigtermResult: TerminationAttribution, signal: NodeJS.Signals) => RunResult;

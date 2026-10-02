@@ -744,7 +744,13 @@ describe("routeRunFailure", () => {
         abortReason: "stall-watchdog",
         output: "[Task killed by stall watchdog (no output for 15 minutes)]",
       };
-      await routeRunFailure(deps, "w1", watchdogFail, "antigravity/gemini-3.8-flash @ high", "run-1");
+      await routeRunFailure(
+        deps,
+        "w1",
+        watchdogFail,
+        "antigravity/gemini-3.8-flash @ high",
+        "run-1"
+      );
       expect(toParent).toHaveLength(1);
       expect(toParent[0]?.toId).toBe("root");
       expect(toParent[0]?.body).toContain("(exit 143, stall-watchdog)");
@@ -762,7 +768,13 @@ describe("routeRunFailure", () => {
         abortReason: "run-ceiling",
         output: "[Task killed by run ceiling timeout]",
       };
-      await routeRunFailure(deps, "w1", ceilingFail, "antigravity/gemini-3.8-flash @ high", "run-2");
+      await routeRunFailure(
+        deps,
+        "w1",
+        ceilingFail,
+        "antigravity/gemini-3.8-flash @ high",
+        "run-2"
+      );
       expect(toParent).toHaveLength(1);
       expect(toParent[0]?.body).toContain("(exit 143, run-ceiling)");
       expect(toParent[0]?.forensics?.abortReason).toBe("run-ceiling");

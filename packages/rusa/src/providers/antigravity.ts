@@ -3,9 +3,9 @@ import {
   closeSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   readSync,
-  readdirSync,
   realpathSync,
   rmSync,
   statSync,
@@ -824,7 +824,14 @@ export class AntigravityProvider implements CodingProvider {
         spawnedChild = child;
         groupKiller = killGroup;
       },
-      buildKilledResult: ({ output, exitCode, cancelled, interrupted, interruptSource, abortReason }) => {
+      buildKilledResult: ({
+        output,
+        exitCode,
+        cancelled,
+        interrupted,
+        interruptSource,
+        abortReason,
+      }) => {
         if (buffer) {
           processLine(buffer);
           buffer = "";
@@ -839,9 +846,7 @@ export class AntigravityProvider implements CodingProvider {
         }
         return withTokenUsage({
           success: false,
-          output: finalResultText && !opts.signal?.aborted
-            ? finalResultText
-            : output,
+          output: finalResultText && !opts.signal?.aborted ? finalResultText : output,
           exitCode,
           cancelled,
           interrupted,
@@ -850,7 +855,14 @@ export class AntigravityProvider implements CodingProvider {
           sessionId: opts.session?.id,
         });
       },
-      buildSignalResult: ({ output, exitCode, cancelled, interrupted, interruptSource, abortReason }) => {
+      buildSignalResult: ({
+        output,
+        exitCode,
+        cancelled,
+        interrupted,
+        interruptSource,
+        abortReason,
+      }) => {
         if (buffer) {
           processLine(buffer);
           buffer = "";
@@ -865,9 +877,7 @@ export class AntigravityProvider implements CodingProvider {
         }
         return withTokenUsage({
           success: false,
-          output: finalResultText && !opts.signal?.aborted
-            ? finalResultText
-            : output,
+          output: finalResultText && !opts.signal?.aborted ? finalResultText : output,
           exitCode,
           cancelled,
           interrupted,

@@ -18,7 +18,10 @@ describe("run_end payload", () => {
   it("round-trips the abortReason a run reported", () => {
     const payload = runEndPayload({ runId: "run-1", abortReason: "stall-watchdog" });
     expect(payload).toBeDefined();
-    expect(JSON.parse(payload!)).toMatchObject({ runId: "run-1", abortReason: "stall-watchdog" });
+    expect(JSON.parse(payload ?? "{}")).toMatchObject({
+      runId: "run-1",
+      abortReason: "stall-watchdog",
+    });
   });
 
   it("records no payload at all for an ordinary run", () => {
