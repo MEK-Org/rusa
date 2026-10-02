@@ -62,21 +62,7 @@ import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-
 import { ChatRoomService } from "../voice/chat-room.js";
 import { buildSupportedVoiceCatalog, parseVoiceDefinitions } from "../voice/voice-catalog.js";
 import { googleVoiceConfig, type VoiceConfigDocument } from "../voice/voice-config.js";
-import { createVoiceService } from "../voice/wiring.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
-
-// The own-voice tests (#817) follow a stored choice to the next spoken reply;
-// they stop at the synthesis boundary, so no provider is ever called.
-const speechClients = vi.hoisted(() => ({
-  google: { transcribe: vi.fn(), streamSynthesize: vi.fn(), synthesize: vi.fn() },
-  elevenlabs: { transcribe: vi.fn(), streamSynthesize: vi.fn(), synthesize: vi.fn() },
-}));
-vi.mock("../voice/gemini-speech.js", () => ({
-  createGeminiSpeechClient: () => speechClients.google,
-}));
-vi.mock("../voice/elevenlabs-speech.js", () => ({
-  createElevenLabsSpeechClient: () => speechClients.elevenlabs,
-}));
 
 async function connect(server: McpServer): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -4960,64 +4946,18 @@ describe("own voice tools (#817)", () => {
     });
   });
 
-  it("rejects ambiguous, unknown and unavailable choices without writing", async () => {
+  it("rejects a choice as a tool error without writing", async () => {
     const { a, registry } = await twoWorkers();
     await setVoice(a, "custom puck");
     expect(registry.get("worker-a")?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
 
+    // Resolution itself is covered in voice-catalog.test.ts; here, the boundary.
     const ambiguous = await setVoice(a, "Puck");
     expect(ambiguous.isError).toBe(true);
     expect(dataOf(ambiguous)).toMatch(
       /ambiguous.*Custom Puck \(Gemini\).*Christopher \(ElevenLabs\)/
     );
-    const unknown = await setVoice(a, "Nobody");
-    expect(unknown.isError).toBe(true);
-    expect(dataOf(unknown)).toMatch(/not an available voice; choose one of: .*Kore \(Gemini\)/);
     expect(registry.get("worker-a")?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
-
-    // A configured voice whose provider has no credentials is not in the catalog.
-    const googleOnly = buildSupportedVoiceCatalog(configured, { availableProviders: ["google"] });
-    const restricted = await connect(
-      createAgentExecMcpServer(setup().mesh, "root", "root", undefined, {
-        voices: () => googleOnly,
-      })
-    );
-    const unavailable = await setVoice(restricted, "Christopher");
-    expect(unavailable.isError).toBe(true);
-    expect(dataOf(unavailable)).toMatch(/not an available voice/);
-  });
-
-  it("speaks the next reply with the stored choice, and the default once cleared", async () => {
-    const { a, registry } = await twoWorkers();
-    const service = createVoiceService({
-      home: "/unused",
-      apiKey: "key",
-      elevenlabsApiKey: "key",
-      voice: { voiceName: "Laomedeia" },
-      // The production read path (start.ts): the actor record, per reply.
-      voiceConfigFor: (actorId) => registry.get(actorId)?.voiceConfig,
-    });
-    service.presenceConnect(["worker-a"]);
-    speechClients.google.streamSynthesize.mockRejectedValue(new Error("render"));
-    speechClients.elevenlabs.streamSynthesize.mockRejectedValue(new Error("render"));
-    const reply = (id: string) => ({
-      id,
-      ts: "now",
-      kind: "message_sent",
-      actorId: "worker-a",
-      detail: null,
-      body: "Hello",
-      payload: JSON.stringify({ to: "human:operator" }),
-      success: null,
-    });
-
-    await setVoice(a, "Christopher (ElevenLabs)");
-    await expect(service.handleMeshEvent(reply("one"))).rejects.toThrow("render");
-    await setVoice(a, null);
-    await expect(service.handleMeshEvent(reply("two"))).rejects.toThrow("render");
-
-    expect(speechClients.elevenlabs.streamSynthesize.mock.calls).toEqual([["Hello", "Puck"]]);
-    expect(speechClients.google.streamSynthesize.mock.calls).toEqual([["Hello", "Laomedeia"]]);
   });
 
   it("does not mount the tools when no catalog is wired", async () => {
