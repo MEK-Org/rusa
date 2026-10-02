@@ -772,7 +772,8 @@ export class QuotaCoordinatorService {
       });
       return;
     }
-    if (nowMs - observedAtMs > this.hardStaleAfterMs) {
+    const manualHardStaleAfterMs = this.freshnessThresholds("manual").hardStaleAfterMs;
+    if (nowMs - observedAtMs > manualHardStaleAfterMs) {
       this.sendError(res, 409, {
         code: "stale_observation",
         message: "Observation is older than the coordinator hard-stale threshold",

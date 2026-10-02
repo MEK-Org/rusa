@@ -488,6 +488,168 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     });
   });
 
+  const createManualObs = (provider: string, scrapedAt: string) => ({
+    provider,
+    status: "available",
+    scrapedAt,
+    limits: [
+      {
+        label: "Weekly",
+        kind: "weekly",
+        percentLeft: 50,
+        resetAtIso: "2030-01-08T00:00:00.000Z",
+        scope: { provider },
+      },
+    ],
+  });
+
+  it("aligns manual observation ingress with default 120m manual hard threshold (aged 60-120m and boundaries)", async () => {
+    const nowMs = Date.parse("2030-01-01T12:00:00.000Z");
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude", "codex", "agy"],
+      now: () => nowMs,
+      // Default: hardStaleAfterMs is 60m (3,600,000ms), manualHardStaleAfterMs is 120m (7,200,000ms)
+    });
+    await service.start();
+
+    // 1. Switch claude, codex, and agy to manual mode
+    await makeRequest(
+      socketPath,
+      QUOTA_READING_MODE_PATH,
+      "POST",
+      JSON.stringify({ provider: "claude", mode: "manual" })
+    );
+    await makeRequest(
+      socketPath,
+      QUOTA_READING_MODE_PATH,
+      "POST",
+      JSON.stringify({ provider: "codex", mode: "manual" })
+    );
+    await makeRequest(
+      socketPath,
+      QUOTA_READING_MODE_PATH,
+      "POST",
+      JSON.stringify({ provider: "agy", mode: "manual" })
+    );
+
+    // 2. Original capture aged 75 minutes (in 60–120m window): must be accepted in manual mode
+    const aged75m = new Date(nowMs - 75 * 60_000).toISOString();
+    const res75m = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({
+        provider: "claude",
+        generation: 1,
+        observation: createManualObs("claude", aged75m),
+      }),
+      { "Idempotency-Key": "manual-reading-75m" }
+    );
+    expect(res75m.status).toBe(200);
+    expect(res75m.json).toMatchObject({
+      observedAt: aged75m,
+      generation: 1,
+      duplicate: false,
+    });
+
+    // Publication reflects the 75m-old manual observation as not hard-stale
+    const throttle75m = await makeRequest(socketPath, "/v1/throttle?provider=claude");
+    expect(throttle75m.status).toBe(200);
+    expect(throttle75m.json.freshness).toMatchObject({
+      ageMs: 75 * 60_000,
+      hardStale: false,
+    });
+
+    // Exact boundary at default manual threshold (120 minutes):
+    // aged exactly 120m (nowMs - 120*60_000) is accepted (ageMs > hardStaleAfterMs is false)
+    const exact120m = new Date(nowMs - 120 * 60_000).toISOString();
+    const resExact120m = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({
+        provider: "codex",
+        generation: 1,
+        observation: createManualObs("codex", exact120m),
+      }),
+      { "Idempotency-Key": "manual-reading-exact-120m" }
+    );
+    expect(resExact120m.status).toBe(200);
+
+    // Beyond 120m threshold: true hard-stale fail-safe rejects with 409
+    const aged121m = new Date(nowMs - 121 * 60_000).toISOString();
+    const resAged121m = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({
+        provider: "agy",
+        generation: 1,
+        observation: createManualObs("agy", aged121m),
+      }),
+      { "Idempotency-Key": "manual-reading-aged-121m" }
+    );
+    expect(resAged121m.status).toBe(409);
+    expect(resAged121m.json.error.code).toBe("stale_observation");
+  });
+
+  it("respects configured manualHardStaleAfterMs override on manual observation ingress", async () => {
+    const nowMs = Date.parse("2030-01-01T12:00:00.000Z");
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude", "codex", "agy"],
+      now: () => nowMs,
+      manualHardStaleAfterMs: 90 * 60_000, // Configured override: 90 minutes
+    });
+    await service.start();
+
+    // Switch providers to manual mode for override boundary tests
+    for (const provider of ["codex", "agy"]) {
+      await makeRequest(
+        socketPath,
+        QUOTA_READING_MODE_PATH,
+        "POST",
+        JSON.stringify({ provider, mode: "manual" })
+      );
+    }
+
+    // Exact boundary at 90m override: aged exactly 90m is accepted
+    const exact90m = new Date(nowMs - 90 * 60_000).toISOString();
+    const resExact90m = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({
+        provider: "codex",
+        generation: 1,
+        observation: createManualObs("codex", exact90m),
+      }),
+      { "Idempotency-Key": "manual-reading-exact-90m" }
+    );
+    expect(resExact90m.status).toBe(200);
+
+    // Aged 91m exceeds 90m override: tested on a fresh provider lane ("agy") with no prior observation.
+    // In this fresh lane, 91m is otherwise admissible under default 120m, proving that the 90m override
+    // alone causes the 409 rejection and cleanly distinguishing it from the non-newer guard.
+    const aged91m = new Date(nowMs - 91 * 60_000).toISOString();
+    const res91m = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({
+        provider: "agy",
+        generation: 1,
+        observation: createManualObs("agy", aged91m),
+      }),
+      { "Idempotency-Key": "manual-reading-91m" }
+    );
+    expect(res91m.status).toBe(409);
+    expect(res91m.json.error.code).toBe("stale_observation");
+  });
+
   it("retains provider and model intervals through a hard-stale missing scrape until their governing windows reset", () => {
     const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
     const observedAt = new Date(nowMs - 2 * 60 * 60_000).toISOString();
