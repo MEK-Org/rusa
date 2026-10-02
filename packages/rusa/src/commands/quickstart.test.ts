@@ -182,6 +182,29 @@ describe("quickstart command", () => {
     expect(startApp).toBeGreaterThan(removeApp);
   });
 
+  it("still probes a port its own container publishes on another address or protocol", async () => {
+    spawnSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "docker" && args[0] === "port" && args[1] === "rusa-quickstart") {
+        return {
+          status: 0,
+          stdout: "8080/tcp -> 127.0.0.2:8080\n8085/udp -> 127.0.0.1:8085\n",
+          stderr: "",
+        };
+      }
+      if (cmd === "docker" && args[0] === "port") {
+        return { status: 1, stdout: "", stderr: "Error: No such container" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    await runQuickstart({ skipBuild: true });
+
+    expect(doctorMocks.runQuickstartDoctor).toHaveBeenCalledWith({
+      ports: [QUICKSTART_DASHBOARD_PORT, QUICKSTART_GIT_BRIDGE_PORT],
+      replaceablePorts: [],
+    });
+  });
+
   it("writes quickstart config without the removed targets field", async () => {
     promptMocks.state.inputs = ["codex", "my-root-entity", "gpt-5.6-sol"];
     promptMocks.state.passwords = ["test-gemini-key"];

@@ -394,14 +394,16 @@ function seedLocalRepo(
 
 // Host ports published by an earlier run's containers. This run removes those
 // containers before starting its own, so the preflight must not count their
-// ports as taken. Read-only: a missing container or docker reports nothing.
+// ports as taken. Only TCP mappings on 127.0.0.1 or 0.0.0.0 count: those are
+// the bindings that block the doctor's 127.0.0.1 TCP probe. Read-only: a
+// missing container or docker reports nothing.
 export function quickstartContainerPorts(containers: string[], ports: number[]): number[] {
   const held = new Set<number>();
   for (const container of containers) {
     const res = spawnSync("docker", ["port", container], { encoding: "utf8", stdio: "pipe" });
     if (res?.status !== 0) continue;
     for (const line of res.stdout?.split("\n") ?? []) {
-      const match = /:(\d+)\s*$/.exec(line);
+      const match = /\/tcp -> (?:127\.0\.0\.1|0\.0\.0\.0):(\d+)\s*$/.exec(line);
       if (match) held.add(Number(match[1]));
     }
   }
