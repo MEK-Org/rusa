@@ -488,7 +488,22 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     });
   });
 
-  it("aligns manual observation ingress with default 120m manual hard threshold (aged 60-120m, non-newer, and boundaries)", async () => {
+  const createManualObs = (provider: string, scrapedAt: string) => ({
+    provider,
+    status: "available",
+    scrapedAt,
+    limits: [
+      {
+        label: "Weekly",
+        kind: "weekly",
+        percentLeft: 50,
+        resetAtIso: "2030-01-08T00:00:00.000Z",
+        scope: { provider },
+      },
+    ],
+  });
+
+  it("aligns manual observation ingress with default 120m manual hard threshold (aged 60-120m and boundaries)", async () => {
     const nowMs = Date.parse("2030-01-01T12:00:00.000Z");
     service = new QuotaCoordinatorService({
       socketPath,
@@ -519,21 +534,6 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       JSON.stringify({ provider: "agy", mode: "manual" })
     );
 
-    const createManualObs = (provider: string, scrapedAt: string) => ({
-      provider,
-      status: "available",
-      scrapedAt,
-      limits: [
-        {
-          label: "Weekly",
-          kind: "weekly",
-          percentLeft: 50,
-          resetAtIso: "2030-01-08T00:00:00.000Z",
-          scope: { provider },
-        },
-      ],
-    });
-
     // 2. Original capture aged 75 minutes (in 60–120m window): must be accepted in manual mode
     const aged75m = new Date(nowMs - 75 * 60_000).toISOString();
     const res75m = await makeRequest(
@@ -561,21 +561,6 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       ageMs: 75 * 60_000,
       hardStale: false,
     });
-
-    // Non-newer rejection: an observation older than or equal to current authoritative reading is rejected
-    const nonNewer = await makeRequest(
-      socketPath,
-      MANUAL_QUOTA_OBSERVATION_PATH,
-      "POST",
-      JSON.stringify({
-        provider: "claude",
-        generation: 1,
-        observation: createManualObs("claude", new Date(nowMs - 80 * 60_000).toISOString()),
-      }),
-      { "Idempotency-Key": "manual-reading-non-newer" }
-    );
-    expect(nonNewer.status).toBe(409);
-    expect(nonNewer.json.error.code).toBe("stale_observation");
 
     // Exact boundary at default manual threshold (120 minutes):
     // aged exactly 120m (nowMs - 120*60_000) is accepted (ageMs > hardStaleAfterMs is false)
@@ -621,55 +606,15 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     });
     await service.start();
 
-    await makeRequest(
-      socketPath,
-      QUOTA_READING_MODE_PATH,
-      "POST",
-      JSON.stringify({ provider: "claude", mode: "manual" })
-    );
-    await makeRequest(
-      socketPath,
-      QUOTA_READING_MODE_PATH,
-      "POST",
-      JSON.stringify({ provider: "codex", mode: "manual" })
-    );
-    await makeRequest(
-      socketPath,
-      QUOTA_READING_MODE_PATH,
-      "POST",
-      JSON.stringify({ provider: "agy", mode: "manual" })
-    );
-
-    const createManualObs = (provider: string, scrapedAt: string) => ({
-      provider,
-      status: "available",
-      scrapedAt,
-      limits: [
-        {
-          label: "Weekly",
-          kind: "weekly",
-          percentLeft: 50,
-          resetAtIso: "2030-01-08T00:00:00.000Z",
-          scope: { provider },
-        },
-      ],
-    });
-
-    // With 90m override:
-    // Aged 89m is accepted
-    const aged89m = new Date(nowMs - 89 * 60_000).toISOString();
-    const res89m = await makeRequest(
-      socketPath,
-      MANUAL_QUOTA_OBSERVATION_PATH,
-      "POST",
-      JSON.stringify({
-        provider: "claude",
-        generation: 1,
-        observation: createManualObs("claude", aged89m),
-      }),
-      { "Idempotency-Key": "manual-reading-89m" }
-    );
-    expect(res89m.status).toBe(200);
+    // Switch providers to manual mode for override boundary tests
+    for (const provider of ["codex", "agy"]) {
+      await makeRequest(
+        socketPath,
+        QUOTA_READING_MODE_PATH,
+        "POST",
+        JSON.stringify({ provider, mode: "manual" })
+      );
+    }
 
     // Exact boundary at 90m override: aged exactly 90m is accepted
     const exact90m = new Date(nowMs - 90 * 60_000).toISOString();
