@@ -148,8 +148,12 @@ export function createSlackWriteMcpServer(
     "react",
     {
       title: "React to a Slack message",
-      description: "Add an emoji reaction to a message.",
-      inputSchema: { channel: z.string(), ts: z.string(), emoji: z.string().optional() },
+      description: "Add an emoji reaction (default eyes) to a message.",
+      inputSchema: {
+        channel: z.string(),
+        ts: z.string(),
+        emoji: z.string().optional().describe("Slack emoji name without colons (defaults to eyes)"),
+      },
     },
     async ({ channel, ts, emoji }) => {
       try {
