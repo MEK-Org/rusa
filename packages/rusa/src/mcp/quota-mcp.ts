@@ -1097,7 +1097,7 @@ export async function parseKimiQuota(
  */
 class QuotaCaptureError extends Error {
   constructor(provider: string, command: string, result: RunResult) {
-    const flags = (["cancelled", "interrupted", "graceKilled"] as const).filter((f) => result[f]);
+    const flags = (["cancelled", "interrupted"] as const).filter((f) => result[f]);
     const lastLine = result.output.trim().split("\n").pop()?.slice(-200) ?? "";
     super(
       `${provider} ${command} capture failed: exit ${result.exitCode}` +
@@ -1811,8 +1811,7 @@ export function createQuotaService(deps: QuotaMcpDeps): QuotaService {
  */
 export function createQuotaMcpServer(
   deps: QuotaMcpDeps,
-  service: QuotaService = createQuotaService(deps),
-  options?: { isFenced?: () => boolean }
+  service: QuotaService = createQuotaService(deps)
 ): McpServer {
   // §12 item 4 (#356): when a coordinator client is wired, get_quota reads
   // through GET /v1/quota and never reaches the local probe path. Both the
@@ -1820,10 +1819,7 @@ export function createQuotaMcpServer(
   // `status: "unsupported"` themselves, so there is one dispatch seam here.
   const coordinatorClient = deps.coordinatorClient ?? null;
 
-  const server = createMcpServer(
-    { name: QUOTA_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced }
-  );
+  const server = createMcpServer({ name: QUOTA_MCP_NAME, version: "0.1.0" });
 
   server.registerTool(
     "get_quota",

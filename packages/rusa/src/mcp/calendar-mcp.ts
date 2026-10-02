@@ -20,13 +20,9 @@ export function createCalendarReadMcpServer(
     allowedCalendars: string[];
     allowedAccounts: string[];
     onRead?: (actorId: string, observation: CalendarReadObservation) => void;
-    isFenced?: () => boolean;
   }
 ): McpServer {
-  const server = createMcpServer(
-    { name: CALENDAR_READ_MCP_NAME, version: "0.1.0" },
-    { isFenced: options.isFenced }
-  );
+  const server = createMcpServer({ name: CALENDAR_READ_MCP_NAME, version: "0.1.0" });
 
   const clientFor = (calendarId: string, account?: string) => {
     if (account !== undefined) {
@@ -142,13 +138,9 @@ export function createCalendarWriteMcpServer(
   options: {
     allowedCalendars: string[];
     onWrite?: (actorId: string, observation: CalendarWriteObservation) => void;
-    isFenced?: () => boolean;
   }
 ): McpServer {
-  const server = createMcpServer(
-    { name: CALENDAR_WRITE_MCP_NAME, version: "0.1.0" },
-    { isFenced: options.isFenced }
-  );
+  const server = createMcpServer({ name: CALENDAR_WRITE_MCP_NAME, version: "0.1.0" });
 
   const clientFor = (calendarId: string) => {
     if (!options.allowedCalendars || !options.allowedCalendars.includes(calendarId)) {

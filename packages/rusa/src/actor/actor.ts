@@ -11,7 +11,6 @@ import {
   formatSigtermResult,
   RUN_CEILING_ABORT_REASON,
   STALL_WATCHDOG_ABORT_REASON,
-  YIELD_GRACE_ABORT_REASON,
 } from "../providers/termination-attribution.js";
 import type {
   CodingProvider,
@@ -41,7 +40,6 @@ import {
 
 export const WATCHDOG_STALL_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 export const WATCHDOG_CEILING_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
-export const DEFAULT_YIELD_GRACE_MS = 10 * 1000; // 10 seconds
 export const RESPONSIVE_PREEMPTION_SOURCE = "responsive-notification";
 
 /**
@@ -152,8 +150,6 @@ export interface ActorOptions {
   debounceMs?: number;
   /** Per-run provider timeout. */
   timeoutMs?: number;
-  /** Grace period in ms between yield declaration and supervisor SIGKILL (default 10,000ms). */
-  yieldGraceMs?: number;
   /** Max age of coalesced voice events before the run becomes unkillable (default 8000). */
   voiceCoalesceMaxAgeMs?: number;
   /**
@@ -194,7 +190,7 @@ export interface ActorOptions {
    */
   onFirstChunk?: () => void;
   /** Publish the actor's derived runtime state after each real flag mutation cluster. */
-  onRuntimeStateChanged?: (state: "queued" | "running" | "winding_down" | "idle") => void;
+  onRuntimeStateChanged?: (state: "queued" | "running" | "idle") => void;
   /**
    * Fires when a genuinely queued (not yet started) run is actually
    * cancelled — from {@link cancelQueuedRun} or a successful cancel inside
@@ -295,11 +291,6 @@ export class Actor {
   private coalesceAbortController?: AbortController;
   /** Handle for this actor's provider run while it is waiting to start. */
   private pendingStart?: RunStartHandle<RunResult>;
-  /** Set within a run when the actor calls its yield tool; read after the run. */
-  private yielded = false;
-  /** Status ('complete' | 'blocked') set when the actor calls its yield tool. */
-  private yieldStatus?: string;
-  private yieldNote?: string;
   /** True when the last wake was gated off by {@link ActorOptions.beforeRun} (nothing ran). */
   private lastRunSkipped = false;
   /** True only while the provider run and its post-run hook are active. */
@@ -330,11 +321,9 @@ export class Actor {
   private runStartReported = false;
   /** Identity is minted when the queued opportunity opens, before admission. */
   private currentRunId: string | undefined;
-  private yieldGraceTimer?: NodeJS.Timeout;
-  private readonly yieldGraceMs: number;
   private currentRunStartTime: Date | null = null;
   private interruptedWatermark: Date | null = null;
-  private lastPublishedRuntimeState: "queued" | "running" | "winding_down" | "idle" = "idle";
+  private lastPublishedRuntimeState: "queued" | "running" | "idle" = "idle";
 
   constructor(private readonly opts: ActorOptions) {
     this.id = opts.id;
@@ -345,7 +334,6 @@ export class Actor {
           `lifecycle ${failure.event} listener failed: ${failure.error instanceof Error ? failure.error.message : String(failure.error)}\n`
         );
       });
-    this.yieldGraceMs = opts.yieldGraceMs ?? DEFAULT_YIELD_GRACE_MS;
     this.runner = new TriggerRunner({
       debounceMs: opts.debounceMs,
       log: opts.log ? (m) => opts.log?.(`${m}\n`) : undefined,
@@ -383,39 +371,8 @@ export class Actor {
   }
 
   /**
-   * The actor signalled it has nothing more to do *right now* — its current
-   * objective is complete, or it's blocked waiting on someone else. Called via
-   * the mesh when the actor invokes its yield tool. Starts the supervisor grace
-   * period timer to forcefully kill the process if it does not exit promptly.
-   * Stops the corrective run path; the actor next runs on a real external trigger.
-   */
-  declareYield(status?: string, note?: string): void {
-    this.yielded = true;
-    this.yieldStatus = status ?? "complete";
-    this.yieldNote = note;
-    this.publishRuntimeStateIfChanged();
-    if (this.executing && !this.yieldGraceTimer) {
-      this.yieldGraceTimer = setTimeout(() => {
-        this.yieldGraceTimer = undefined;
-        if (this.executing) {
-          this.opts.log?.(
-            `\n[Supervisor] Actor ${this.id} did not exit within ${this.yieldGraceMs}ms grace period after yield. Terminating...\n`
-          );
-          this.coalesceAbortController?.abort(YIELD_GRACE_ABORT_REASON);
-        }
-      }, this.yieldGraceMs);
-      this.yieldGraceTimer.unref?.();
-    }
-  }
-
-  get isYielded(): boolean {
-    return this.yielded;
-  }
-
-  /**
    * The {@link TriggerRunner.onIdle} policy: under #664, a provider CLI run
-   * settles when the local or remote CLI returns without requiring a routine
-   * yield_run call or corrective yield-elicitation run.
+   * settles when the local or remote CLI returns.
    */
   private continueOrIdle(): RunNudge | null {
     return null;
@@ -530,14 +487,10 @@ export class Actor {
    * without retaining the halt/resume dirty flag because the caller immediately
    * requests its responsive replacement.
    */
-  preemptForResponsive():
-    | { preempted: false }
-    | { preempted: true; phase: "running" | "winding_down" | "queued" } {
+  preemptForResponsive(): { preempted: false } | { preempted: true; phase: "running" | "queued" } {
     this.admissionEpoch++;
     const phase = this.executing
-      ? this.yielded
-        ? "winding_down"
-        : "running"
+      ? "running"
       : this.pendingStart || this.queued || this.runner.isBusy
         ? "queued"
         : undefined;
@@ -625,10 +578,6 @@ export class Actor {
     if (this.opts.sandbox) {
       teardownFlutterOverlay(this.opts.cwd);
     }
-    if (this.yieldGraceTimer) {
-      clearTimeout(this.yieldGraceTimer);
-      this.yieldGraceTimer = undefined;
-    }
   }
 
   private admissionEpoch = 0;
@@ -661,10 +610,6 @@ export class Actor {
     // point a normal queued-start cancellation owns the fresh reservation.
     this.reschedulingQueuedRun = false;
     this.lastRunSkipped = false;
-    // A yield only counts for the run it was declared in; clear any prior flag.
-    this.yielded = false;
-    this.yieldStatus = undefined;
-    this.yieldNote = undefined;
     this.runEndReported = false;
     this.runStartReported = false;
     const runId = randomUUID();
@@ -684,10 +629,6 @@ export class Actor {
     } finally {
       if (this.opts.sandbox) {
         teardownFlutterOverlay(this.opts.cwd);
-      }
-      if (this.yieldGraceTimer) {
-        clearTimeout(this.yieldGraceTimer);
-        this.yieldGraceTimer = undefined;
       }
       this.currentRunStartTime = null;
       this.queued = false;
@@ -768,10 +709,6 @@ export class Actor {
       if (ceilingTimer) {
         clearTimeout(ceilingTimer);
         ceilingTimer = undefined;
-      }
-      if (this.yieldGraceTimer) {
-        clearTimeout(this.yieldGraceTimer);
-        this.yieldGraceTimer = undefined;
       }
     };
 
@@ -1014,24 +951,6 @@ export class Actor {
       this.opts.saveSessionId(result.sessionId);
     }
 
-    const wasGraceKilled =
-      (abortController.signal.aborted &&
-        abortController.signal.reason === YIELD_GRACE_ABORT_REASON) ||
-      result.graceKilled === true;
-
-    if (this.yielded) {
-      result.yieldStatus = this.yieldStatus ?? "complete";
-      result.yieldNote = this.yieldNote;
-      if (wasGraceKilled) {
-        // Fix ISSUE_NUM: when the supervisor's grace-kill follows a successful yield
-        // in the same run, the run-end record must KEEP the yield's status
-        // (complete/blocked) and carry the overrun as an attributed annotation
-        // (graceKilled: true), NOT flip the run to failed.
-        result.success = true;
-        result.graceKilled = true;
-      }
-    }
-
     // Set BEFORE the await, not after: from here this run has reported its
     // outcome. If the hook itself throws partway, the run must not ALSO be
     // reported abandoned — one opportunity, one terminal signal.
@@ -1051,13 +970,7 @@ export class Actor {
    * second, fallible state machine.
    */
   private publishRuntimeStateIfChanged(): void {
-    const state = this.executing
-      ? this.yielded
-        ? "winding_down"
-        : "running"
-      : this.queued
-        ? "queued"
-        : "idle";
+    const state = this.executing ? "running" : this.queued ? "queued" : "idle";
     if (state === this.lastPublishedRuntimeState) return;
     this.lastPublishedRuntimeState = state;
     this.opts.onRuntimeStateChanged?.(state);
@@ -1088,16 +1001,6 @@ export class Actor {
     const result = await runProvider(primary);
     const classify = this.opts.classifyExhaustion;
     if (result.success || !classify) return result;
-    // A supervisor grace-kill (#257) is cleanup after the actor already yielded,
-    // not a capacity failure, and the kill has already aborted this run's
-    // signal — so there is nothing left to retry: every fallback attempt would
-    // short-circuit to an instantly-killed result. Deterministically, without
-    // this guard such a run is still handed to the exhaustion classifier, an
-    // LLM judgment over its own transcript tail. Conditionally, if that returns
-    // exhausted, the chain then runs to its end and replaces the termination
-    // diagnostic with a pool-exhausted summary that never happened.
-    if (result.graceKilled) return result;
-
     if (!(await classify(result)).exhausted) return result;
 
     const primaryName = describeModelConfigEntry(selected);

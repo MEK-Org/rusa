@@ -12,15 +12,8 @@ export interface MeshChatReadDeps {
 }
 
 /** Source-backed lookup for content referenced by mesh inbox entries. */
-export function createMeshChatMcpServer(
-  deps: MeshChatReadDeps,
-  actorId: string,
-  options?: { isFenced?: () => boolean }
-): McpServer {
-  const server = createMcpServer(
-    { name: MESH_CHAT_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced }
-  );
+export function createMeshChatMcpServer(deps: MeshChatReadDeps, actorId: string): McpServer {
+  const server = createMcpServer({ name: MESH_CHAT_MCP_NAME, version: "0.1.0" });
   server.registerTool(
     "get_message",
     {

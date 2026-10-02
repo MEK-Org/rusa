@@ -43,11 +43,6 @@ const spawn = () =>
             name: "mcp_mesh_send_message",
             arguments: { thread_id: root.id, body: "Follower MCP reply" },
           },
-          {
-            id: "yield",
-            name: "mcp_mesh_yield_run",
-            arguments: { status: "complete", note: "Follower MCP round trip complete" },
-          },
         ],
       }),
   });

@@ -63,7 +63,6 @@ describe("actor lifecycle contract", () => {
         id: context.record.id,
         lifecycle: context.lifecycle,
         requestRun: () => {},
-        declareYield: () => {},
         markUnkillable: () => {},
         close: () => {},
         preemptForResponsive: () => ({ preempted: false }),
@@ -85,11 +84,7 @@ describe("actor lifecycle contract", () => {
 
   it("keeps an actor run alive when an observer fails", async () => {
     const observed: string[] = [];
-    let actor!: Actor;
-    const provider = new FakeProvider(() => {
-      actor.declareYield();
-      return { success: true, output: "done", exitCode: 0 };
-    });
+    const provider = new FakeProvider(() => ({ success: true, output: "done", exitCode: 0 }));
     const lifecycle = createActorLifecycle([
       {
         onQueued: () => {
@@ -105,7 +100,7 @@ describe("actor lifecycle contract", () => {
         },
       },
     ]);
-    actor = new Actor({
+    const actor = new Actor({
       id: "worker",
       cwd: "/tmp/worker",
       modelConfig: [{ provider: provider.providerName }],
@@ -129,11 +124,7 @@ describe("actor lifecycle contract", () => {
   it.each(["root", "worker"])("keeps %s run ordering and identity stable", async (actorId) => {
     const observed: string[] = [];
     const ids: string[] = [];
-    let actor!: Actor;
-    const provider = new FakeProvider(() => {
-      actor.declareYield();
-      return { success: true, output: "done", exitCode: 0 };
-    });
+    const provider = new FakeProvider(() => ({ success: true, output: "done", exitCode: 0 }));
     const lifecycle = createActorLifecycle([
       {
         onQueued: (event) => {
@@ -151,7 +142,7 @@ describe("actor lifecycle contract", () => {
         },
       },
     ]);
-    actor = new Actor({
+    const actor = new Actor({
       id: actorId,
       cwd: `/tmp/${actorId}`,
       modelConfig: [{ provider: provider.providerName }],
@@ -277,7 +268,6 @@ describe("actor lifecycle contract", () => {
         id: context.record.id,
         lifecycle: context.lifecycle,
         requestRun: () => {},
-        declareYield: () => {},
         markUnkillable: () => {},
         close: () => {},
         preemptForResponsive: () => ({ preempted: false }),

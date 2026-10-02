@@ -251,15 +251,8 @@ async function defaultRunPnpmInstall(opts: {
   });
 }
 
-export function createPnpmInstallMcpServer(
-  deps: PnpmInstallDeps,
-  selfId: string,
-  options?: { isFenced?: () => boolean }
-): McpServer {
-  const server = createMcpServer(
-    { name: PNPM_INSTALL_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced }
-  );
+export function createPnpmInstallMcpServer(deps: PnpmInstallDeps, selfId: string): McpServer {
+  const server = createMcpServer({ name: PNPM_INSTALL_MCP_NAME, version: "0.1.0" });
 
   server.registerTool(
     "pnpm_install",

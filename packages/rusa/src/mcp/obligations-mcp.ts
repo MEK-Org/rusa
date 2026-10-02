@@ -50,7 +50,6 @@ export interface ObligationsMcpOptions {
     rawOwnerId: string
   ) => { ok: true; ownerId: string } | { ok: false; error: string };
 
-  isFenced?: () => boolean;
   /** Bound by the composition root; ordinary ownership/ancestry grants do not confer this. */
   canSetResponsive?: boolean;
   /**
@@ -155,10 +154,7 @@ export function createObligationsMcpServer(
   actorId: string,
   options?: ObligationsMcpOptions
 ): McpServer {
-  const server = createMcpServer(
-    { name: OBLIGATIONS_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced }
-  );
+  const server = createMcpServer({ name: OBLIGATIONS_MCP_NAME, version: "0.1.0" });
   const ownerId = actorId;
   const canManage = (obligation: ManageableObligation): boolean =>
     options?.canManage ? options.canManage(actorId, obligation) : obligation.ownerId === actorId;
@@ -538,7 +534,7 @@ export function createObligationsMcpServer(
     {
       title: "Snooze or unsnooze an obligation you own",
       description:
-        "Deliberately defer an obligation you own until a UTC time, or pass null to clear the snooze. Only the current owner may set or clear it — not its creator, an ancestor, or root. A snooze keeps the obligation's status (ready, waiting or scheduled) and still blocks its parent and dependents; it defers only automatic ready attention: it is not your ready head, sends no responsive-ready wake, and satisfies strict yield closure, until the deadline. Events still wake you. At the deadline it clears itself: ready work becomes actionable again as a fresh episode, waiting work keeps waiting, and a recurring occurrence that came due meanwhile activates once. Recurrence keeps its cadence underneath; completing a recurring obligation keeps the snooze, and final done/cancel clears it. Reassigning keeps the snooze and hands it to the new owner. `until` must be a future ISO-8601 timestamp with an offset (e.g. 2026-10-05T09:00:00Z); rewriting the same value is a no-op. A checkpoint is not a snooze reason — say why in set_checkpoint if it matters.",
+        "Deliberately defer an obligation you own until a UTC time, or pass null to clear the snooze. Only the current owner may set or clear it — not its creator, an ancestor, or root. A snooze keeps the obligation's status (ready, waiting or scheduled) and still blocks its parent and dependents; it defers only automatic ready attention: it is not your ready head, sends no responsive-ready wake, and satisfies strict head closure, until the deadline. Events still wake you. At the deadline it clears itself: ready work becomes actionable again as a fresh episode, waiting work keeps waiting, and a recurring occurrence that came due meanwhile activates once. Recurrence keeps its cadence underneath; completing a recurring obligation keeps the snooze, and final done/cancel clears it. Reassigning keeps the snooze and hands it to the new owner. `until` must be a future ISO-8601 timestamp with an offset (e.g. 2026-10-05T09:00:00Z); rewriting the same value is a no-op. A checkpoint is not a snooze reason — say why in set_checkpoint if it matters.",
       inputSchema: {
         id: z.string().trim().min(1),
         until: z.string().trim().min(1).nullable(),

@@ -109,7 +109,6 @@ export class ActorHandle implements MeshActor {
    */
   private quotedGeneration = 0;
   private state: ActorRuntimeState = "idle";
-  private yielded = false;
   private closed = false;
   private terminated = false;
   private gates = new Map<
@@ -303,13 +302,10 @@ export class ActorHandle implements MeshActor {
   }
 
   get isRunning(): boolean {
-    return this.state === "running" || this.state === "winding_down";
+    return this.state === "running";
   }
   get isQueued(): boolean {
     return this.state === "queued";
-  }
-  get isYielded(): boolean {
-    return this.yielded;
   }
 
   requestRun(nudge?: RunNudge): void {
@@ -474,11 +470,6 @@ export class ActorHandle implements MeshActor {
     this.interruptedWatermark = null;
   }
 
-  declareYield(status?: string, note?: string): void {
-    // Fence parent-hosted tools immediately when the mesh accepts yield_run.
-    this.yielded = true;
-    this.send({ type: "yield", status, note });
-  }
   markUnkillable(): void {
     this.send({ type: "unkillable" });
   }
@@ -946,11 +937,16 @@ export class ActorHandle implements MeshActor {
         if (message.state === "queued" && (this.state !== "queued" || reattachReport)) {
           this.quotedGeneration = this.modelConfigGeneration;
         }
-        this.state = message.state;
-        this.yielded = message.yielded;
+        // Legacy wire reader: older v7/v8 followers can still report "winding_down"
+        // while their provider is alive; normalize it to "running" so activeRunState
+        // and isRunning treat the live run as running until those versions leave
+        // the supported window.
+        const wireState: ActorRuntimeState =
+          message.state === "winding_down" ? "running" : message.state;
+        this.state = wireState;
         this.stateStale = false;
         this.stateUnconfirmed = false;
-        if (message.state !== "queued") {
+        if (wireState !== "queued") {
           this.pendingQueuedPromotion = false;
           this.pendingQueuedCancel = false;
         }
@@ -960,7 +956,7 @@ export class ActorHandle implements MeshActor {
         }
         // Any wake held since reattach is now ordered behind the preempt decision.
         this.settleState?.();
-        ctx.onRuntimeStateChanged(message.state);
+        ctx.onRuntimeStateChanged(wireState);
         // The first report after a reattach is the deadline for claiming a
         // retained ticket: whatever the follower holds now, it is not the run
         // that ticket was reserved for.

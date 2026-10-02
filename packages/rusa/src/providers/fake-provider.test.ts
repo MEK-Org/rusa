@@ -19,11 +19,11 @@ describe("FakeProvider scripted runs", () => {
         mesh: () => {
           const server = createMcpServer({ name: "mesh", version: "0.1.0" });
           server.registerTool(
-            "yield_run",
-            { inputSchema: { status: z.enum(["complete", "blocked"]), note: z.string() } },
+            "send_message",
+            { inputSchema: { thread_id: z.string(), body: z.string() } },
             async (args) => {
               calls.push(args);
-              return toolOk("yielded");
+              return toolOk("sent");
             }
           );
           return server;
@@ -42,8 +42,8 @@ describe("FakeProvider scripted runs", () => {
           toolCalls: [
             {
               id: "call-1",
-              name: "mcp_mesh_yield_run",
-              arguments: { status: "blocked", note: "review" },
+              name: "mcp_mesh_send_message",
+              arguments: { thread_id: "root", body: "review" },
             },
           ],
         }) +
@@ -52,7 +52,7 @@ describe("FakeProvider scripted runs", () => {
     });
 
     expect(result.output).toBe("done");
-    expect(calls).toEqual([{ status: "blocked", note: "review" }]);
+    expect(calls).toEqual([{ thread_id: "root", body: "review" }]);
   });
 
   it("fails loudly when a scripted tool has no matching server", async () => {
@@ -63,7 +63,7 @@ describe("FakeProvider scripted runs", () => {
         prompt:
           "FAKE_PROVIDER_OUTPUT: " +
           JSON.stringify({
-            toolCalls: [{ id: "call-1", name: "mcp_mesh_yield_run", arguments: {} }],
+            toolCalls: [{ id: "call-1", name: "mcp_mesh_send_message", arguments: {} }],
           }),
         mcpServers: [],
       })

@@ -154,13 +154,9 @@ async function resolveContents<T extends { id: string; contents: string }>(
 export function createUnderstandingReadServer(
   deps: UnderstandingMcpDeps,
   rootNodeId?: string,
-  loadStrings?: (ids: string[]) => Promise<Record<string, string>>,
-  options?: { isFenced?: () => boolean }
+  loadStrings?: (ids: string[]) => Promise<Record<string, string>>
 ): McpServer {
-  const server = createMcpServer(
-    { name: UNDERSTANDING_READ_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced }
-  );
+  const server = createMcpServer({ name: UNDERSTANDING_READ_MCP_NAME, version: "0.1.0" });
 
   server.registerTool(
     "search",
@@ -279,13 +275,9 @@ export function createUnderstandingReadServer(
  */
 export function createUnderstandingWriteServer(
   deps: UnderstandingMcpDeps,
-  rootNodeId?: string,
-  options?: { isFenced?: () => boolean }
+  rootNodeId?: string
 ): McpServer {
-  const server = createMcpServer(
-    { name: UNDERSTANDING_WRITE_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced }
-  );
+  const server = createMcpServer({ name: UNDERSTANDING_WRITE_MCP_NAME, version: "0.1.0" });
 
   server.registerTool(
     "create_node",

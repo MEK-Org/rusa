@@ -15,7 +15,6 @@ export const REPO_MCP_NAME = "repo";
 export interface RepoMcpOptions {
   onWrite?: () => void;
   instanceId?: string;
-  isFenced?: () => boolean;
 }
 
 /**
@@ -28,10 +27,7 @@ export function createRepoMcpServer(
   issueClient: IssueClient,
   options: RepoMcpOptions = {}
 ): McpServer {
-  const server = createMcpServer(
-    { name: REPO_MCP_NAME, version: "0.1.0" },
-    { isFenced: options.isFenced }
-  );
+  const server = createMcpServer({ name: REPO_MCP_NAME, version: "0.1.0" });
 
   const appendAuthorStamp = (body: string, repo: string, issueNumber: number) =>
     body

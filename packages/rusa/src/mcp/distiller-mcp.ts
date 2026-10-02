@@ -136,14 +136,8 @@ async function resolveChatSpaces(
  * understanding/distiller-ops.ts, while this server only adapts MCP args/results
  * to the narrow host-side distiller store.
  */
-export function createDistillerServer(
-  deps: DistillerMcpDeps,
-  options?: { isFenced?: () => boolean }
-): McpServer {
-  const server = createMcpServer(
-    { name: DISTILLER_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced }
-  );
+export function createDistillerServer(deps: DistillerMcpDeps): McpServer {
+  const server = createMcpServer({ name: DISTILLER_MCP_NAME, version: "0.1.0" });
 
   server.registerTool(
     "distill_gate",

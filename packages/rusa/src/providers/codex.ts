@@ -700,14 +700,7 @@ export class CodexProvider implements CodingProvider {
           chunks.push(text);
         },
         // Temp cleanup is owned by run() below, not per-spawn.
-        buildKilledResult: ({
-          output,
-          exitCode,
-          cancelled,
-          interrupted,
-          interruptSource,
-          graceKilled,
-        }) =>
+        buildKilledResult: ({ output, exitCode, cancelled, interrupted, interruptSource }) =>
           buildResultWithSession({
             success: false,
             output,
@@ -715,16 +708,8 @@ export class CodexProvider implements CodingProvider {
             cancelled,
             interrupted,
             interruptSource,
-            graceKilled,
           }),
-        buildSignalResult: ({
-          output,
-          exitCode,
-          cancelled,
-          interrupted,
-          interruptSource,
-          graceKilled,
-        }) =>
+        buildSignalResult: ({ output, exitCode, cancelled, interrupted, interruptSource }) =>
           buildResultWithSession({
             success: false,
             output,
@@ -732,7 +717,6 @@ export class CodexProvider implements CodingProvider {
             cancelled,
             interrupted,
             interruptSource,
-            graceKilled,
           }),
         buildExitResult: (output, exitCode) => {
           if (lineBuffer) {

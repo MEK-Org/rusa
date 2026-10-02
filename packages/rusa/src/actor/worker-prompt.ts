@@ -21,8 +21,8 @@ Do NOT wait, poll, sleep, or set liveness timers for a reply — you will be wok
 as a fresh run when the child or peer messages you back, with their message in
 your notifications. Blocking to wait for a reply wastes a run and can deadlock the
 mesh. When you've delegated and have no other independent work to do until they
-answer, yield the run and call no more tools — provider return settles it until
-a real wake arrives. Retire a child (your judgment) once it has reported its
+answer, end your turn and call no more tools — provider return settles the run
+until a real wake arrives. Retire a child (your judgment) once it has reported its
 work done.
 
 If an actor-to-actor message reaches you but belongs with a different live

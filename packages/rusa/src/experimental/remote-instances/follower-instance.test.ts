@@ -2,10 +2,18 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import type { ActorFactoryContext } from "../../actor/actor-mesh.js";
+import type { ActorFactoryContext, ActorMeshOptions } from "../../actor/actor-mesh.js";
+import { EXPERIMENT_ADMIN_CAPABILITY } from "../../actor/administrative-capabilities.js";
 import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../../actor/computer-use-lock.js";
+import {
+  InMemoryExperimentEnrollmentStore,
+  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
+} from "../../actor/experiments.js";
 import { ProviderPacer } from "../../actor/provider-pacer.js";
+import { runMigrations } from "../../db/migrations/runner.js";
+import { ObligationRepository } from "../../db/repositories/obligation-repository.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { createHarness, waitUntil } from "./harness.js";
 import type { ActorEvent, LeaderCommand, ProviderFactory } from "./protocol.js";
@@ -23,6 +31,8 @@ function setup(
     isHalted?: (provider?: string, model?: string) => boolean;
     onEvent?: (actorId: string, event: ActorEvent) => void;
     maxConcurrent?: number;
+    obligations?: ActorMeshOptions["obligations"];
+    experimentEnrollments?: ActorMeshOptions["experimentEnrollments"];
   } = {}
 ) {
   const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-unit-"));
@@ -36,6 +46,8 @@ function setup(
     isHalted: options.isHalted,
     onEvent: options.onEvent,
     maxConcurrent: options.maxConcurrent,
+    obligations: options.obligations,
+    experimentEnrollments: options.experimentEnrollments,
     providerFactory: options.failInit
       ? () => {
           throw new Error("test provider initialization failed");
@@ -89,7 +101,6 @@ function releasableCapabilityProvider() {
         void gate(prompt.charter).promise.then(resolve);
       });
       await bridge.sendMessage(prompt.parentId, prompt.charter);
-      bridge.yieldRun("complete", "capability boundary fixture complete");
       return {
         success: true,
         output: prompt.charter,
@@ -185,7 +196,6 @@ describe("monolithic follower instance", () => {
           try {
             await delay(400, undefined, { signal: run.signal });
             await bridge.sendMessage(prompt.parentId, prompt.charter);
-            bridge.yieldRun("complete", "computer use fixture complete");
             return {
               success: true,
               output: prompt.charter,
@@ -2239,5 +2249,96 @@ describe("monolithic follower instance", () => {
       await waitUntil(() => started(h, id).length === 2);
       expect(h.runtime(id).getInterruptedWatermark()).toBeNull();
     });
+  });
+
+  it.each([
+    ["leaves its selected head as found", false],
+    ["closes its selected head", true],
+  ] as const)("checks strict head closure when a follower run that %s returns (#828)", async (_label, closes) => {
+    const db = new Database(":memory:");
+    onTestFinished(() => {
+      db.close();
+    });
+    runMigrations(db);
+    const repo = new ObligationRepository(db);
+    const enrollments = new InMemoryExperimentEnrollmentStore();
+    const h = setup({
+      delayMs: 300,
+      experimentEnrollments: enrollments,
+      obligations: {
+        findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
+        get: (id) => repo.get(id),
+        listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
+        listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+        expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
+      },
+    });
+    h.capabilityGrants.grant({
+      actorId: "root",
+      capability: EXPERIMENT_ADMIN_CAPABILITY,
+      grantedBy: "root",
+      grantedAt: "2026-10-01T00:00:00Z",
+    });
+    const id = h.mesh.spawn({
+      charter: "strict follower",
+      parentId: "root",
+      modelConfig: { provider: "instance-fixture", model: "scripted" },
+    });
+    h.mesh.enrollActorInExperiment(id, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "remote-head", title: "Remote head", ownerId: id });
+    h.mesh.deliverReadyHeadAttention(id, { id: "remote-head", intent: "handle it" }, null);
+    await waitUntil(() => h.runtime(id).isRunning);
+
+    // Selected mid-run on the leader, exactly as the follower's inbox MCP call
+    // lands there.
+    const entry = h.inboxStore
+      .list(id)
+      .entries.find((candidate) => candidate.payload.type === "obligation.ready_head");
+    if (!entry) throw new Error("expected ready-head inbox entry");
+    h.mesh.selectInboxEntries(id, [entry.id]);
+    if (closes) {
+      repo.setTerminalStatus("remote-head", "done", null, null, "system:mesh");
+      h.mesh.assertInboxEntriesHandleable(id, [entry.id]);
+      h.inboxStore.markHandled(id, [entry.id]);
+    } else {
+      expect(() => h.mesh.assertInboxEntriesHandleable(id, [entry.id])).toThrow(
+        /Cannot mark handled: selected head obligation remote-head/
+      );
+    }
+
+    await waitUntil(
+      () =>
+        h.events.some((event) => event.actorId === id && event.event.type === "result") &&
+        h.mesh.selectedInboxEntries(id).length === 0
+    );
+    const rejections = h.meshEvents.filter(
+      (event) => event.kind === "run_return_rejected" && event.actorId === id
+    );
+    expect(rejections).toEqual(
+      closes
+        ? []
+        : [
+            expect.objectContaining({
+              detail: "Return rejected for head obligation remote-head: obligation is still ready",
+            }),
+          ]
+    );
+    expect(Boolean(h.inboxStore.read(id, entry.id)?.handledAt)).toBe(closes);
+  });
+
+  it("normalizes an admitted v7/v8 follower's winding_down state to running (#828)", async () => {
+    const h = setup({ delayMs: 300 });
+    const id = h.mesh.spawn({
+      charter: "legacy follower",
+      parentId: "root",
+      modelConfig: { provider: "instance-fixture", model: "scripted" },
+    });
+    // Synthesize an older follower reporting winding_down while its provider is alive
+    h.remote.receive({
+      actorId: id,
+      message: { type: "state", state: "winding_down" as const },
+    });
+    expect(h.mesh.activeRunState(id)).toEqual({ actorId: id, phase: "running" });
+    expect(() => h.mesh.retire(id)).toThrow(/cannot retire/);
   });
 });

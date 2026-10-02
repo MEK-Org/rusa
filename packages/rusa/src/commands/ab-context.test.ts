@@ -13,7 +13,6 @@ const stubActor = (id: string): MeshActor => ({
   isRunning: false,
   isQueued: false,
   requestRun: () => {},
-  declareYield: () => {},
   markUnkillable: () => {},
   preemptForResponsive: () => ({ preempted: false }),
   close: () => {},

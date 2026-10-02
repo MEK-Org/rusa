@@ -98,10 +98,8 @@ describe("routeRunFailure", () => {
     const { deps, toParent, toChat } = makeDeps({ w1: { id: "w1", parentId: "root" } });
     await routeRunFailure(deps, "w1", {
       success: true,
-      exitCode: 143,
-      graceKilled: true,
-      yieldStatus: "complete",
-      output: "[Task killed by supervisor (yield grace period exceeded)]",
+      exitCode: 0,
+      output: "done",
     });
     expect(toParent).toHaveLength(0);
     expect(toChat).toHaveLength(0);

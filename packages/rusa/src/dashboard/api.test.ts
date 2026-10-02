@@ -1816,7 +1816,8 @@ describe("handleMeshApiRequest", () => {
       revision: 17,
       states: new Map([
         ["root", "idle" as const],
-        [UUID_A, "winding_down" as const],
+        // The one capture wins over the legacy running set below.
+        [UUID_A, "idle" as const],
       ]),
     };
     const runtimeStateSnapshot = vi.fn(() => snapshot);
@@ -1831,7 +1832,7 @@ describe("handleMeshApiRequest", () => {
     expect(runtimeStateSnapshot).toHaveBeenCalledTimes(1);
     expect(body.runtimeCursor).toEqual({ streamId: "epoch-a", revision: 17 });
     expect(body.threads.find((thread: { id: string }) => thread.id === UUID_A).runState).toBe(
-      "winding_down"
+      "idle"
     );
   });
 
@@ -2104,21 +2105,6 @@ describe("handleMeshApiRequest", () => {
     const thread = body.threads.find((candidate: { id: string }) => candidate.id === UUID_A);
 
     expect(thread.selectedInboxItem.reference).toMatchObject({ title: "Cached issue" });
-  });
-
-  it("GET /api/mesh/threads surfaces winding_down when a running actor is yielded", async () => {
-    actors.upsert(rec("root", null, "active"));
-    actors.upsert(rec(UUID_A, "root", "active"));
-    deps = {
-      ...deps,
-      runningThreadIds: () => new Set([UUID_A]),
-      isYielded: (id) => id === UUID_A,
-    };
-
-    const { res } = await call(deps, "GET", "/api/mesh/threads");
-    const body = JSON.parse(res.body);
-    const byId = (id: string) => body.threads.find((t: { id: string }) => t.id === id);
-    expect(byId(UUID_A).runState).toBe("winding_down");
   });
 
   it("GET /api/mesh/threads exposes lastActiveAt from mesh_events", async () => {

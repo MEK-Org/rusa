@@ -15,7 +15,6 @@ export const SLACK_READ_MCP_NAME = "slack-read";
 export const SLACK_WRITE_MCP_NAME = "slack-write";
 
 export interface SlackMcpOptions {
-  isFenced?: () => boolean;
   /** The calling actor's workdir; file uploads read from and downloads write into it. */
   workDir?: string;
   /** Rechecked when a file tool is called, because follower placement can change live. */
@@ -38,10 +37,7 @@ export function createSlackReadMcpServer(
   client: SlackClient,
   options: SlackMcpOptions = {}
 ): McpServer {
-  const server = createMcpServer(
-    { name: SLACK_READ_MCP_NAME, version: "0.1.0" },
-    { isFenced: options.isFenced }
-  );
+  const server = createMcpServer({ name: SLACK_READ_MCP_NAME, version: "0.1.0" });
   server.registerTool(
     "get_message",
     {
@@ -121,10 +117,7 @@ export function createSlackWriteMcpServer(
   allowedChannels: "all" | string[],
   options: SlackMcpOptions = {}
 ): McpServer {
-  const server = createMcpServer(
-    { name: SLACK_WRITE_MCP_NAME, version: "0.1.0" },
-    { isFenced: options.isFenced }
-  );
+  const server = createMcpServer({ name: SLACK_WRITE_MCP_NAME, version: "0.1.0" });
   const allowed = (channel: string) =>
     allowedChannels === "all" || allowedChannels.includes(channel);
   server.registerTool(

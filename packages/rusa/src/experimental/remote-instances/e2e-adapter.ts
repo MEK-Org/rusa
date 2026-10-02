@@ -43,7 +43,6 @@ export function instanceWorkerFactory(
           sandbox: options.sandbox,
           addDirs: options.addDirs,
           timeoutMs: options.timeoutMs,
-          yieldGraceMs: options.yieldGraceMs,
           debounceMs: options.debounceMs,
         },
         reconnect: Boolean(options.loadSessionId() || record.sessionId),

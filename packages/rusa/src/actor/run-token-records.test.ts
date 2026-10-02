@@ -22,7 +22,6 @@ function fakeActor(id: string): MeshActor {
   return {
     id,
     requestRun: () => {},
-    declareYield: () => {},
     markUnkillable: () => {},
     preemptForResponsive: () => ({ preempted: false as const }),
     close: () => {},
@@ -30,9 +29,6 @@ function fakeActor(id: string): MeshActor {
       return false;
     },
     get isQueued() {
-      return false;
-    },
-    get isYielded() {
       return false;
     },
   };

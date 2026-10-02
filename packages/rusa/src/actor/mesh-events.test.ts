@@ -4,9 +4,13 @@ import { runEndModel, runEndPayload } from "./mesh-events.js";
 describe("run_end payload", () => {
   it("round-trips the model a run reported", () => {
     expect(runEndModel(runEndPayload({ model: "gpt-5.5-codex" }))).toBe("gpt-5.5-codex");
+    expect(runEndModel(runEndPayload({ runId: "run-1", model: "gpt-5.5-codex" }))).toBe(
+      "gpt-5.5-codex"
+    );
+    // A run recorded before #828 still carries the historical yield keys.
     expect(
       runEndModel(
-        runEndPayload({ model: "gpt-5.5-codex", graceKilled: true, yieldStatus: "blocked" })
+        JSON.stringify({ model: "gpt-5.5-codex", graceKilled: true, yieldStatus: "blocked" })
       )
     ).toBe("gpt-5.5-codex");
   });
@@ -17,8 +21,8 @@ describe("run_end payload", () => {
     expect(runEndPayload({})).toBeUndefined();
     expect(runEndPayload({ model: undefined })).toBeUndefined();
     // ...but a run with something else to say still carries it, model or no model.
-    expect(runEndPayload({ graceKilled: true })).toBeDefined();
-    expect(runEndModel(runEndPayload({ graceKilled: true }))).toBeNull();
+    expect(runEndPayload({ runId: "run-1" })).toBeDefined();
+    expect(runEndModel(runEndPayload({ runId: "run-1" }))).toBeNull();
   });
 
   it("reads NOT REPORTED as null, never as a value", () => {
