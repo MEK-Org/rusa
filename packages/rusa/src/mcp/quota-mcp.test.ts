@@ -2647,9 +2647,9 @@ describe("quota MCP server", () => {
       }
 
       it("records a timed-out capture of a local silent process as a failed scrape with its cause", async () => {
-        // The real subprocess lifecycle, as the Claude provider configures it:
-        // a silent child killed at its timeout settles cancelled, exit 143,
-        // with only the unattributed termination marker as output.
+        // The real subprocess timeout, with builders shaped like the Claude
+        // provider's: a silent child killed at its timeout settles cancelled,
+        // exit 143, with only the unattributed termination marker as output.
         mockClaudeProvider.run = vi.fn(() =>
           runSubprocess({
             command: process.execPath,
@@ -2774,11 +2774,13 @@ describe("quota MCP server", () => {
             extracted: false,
           },
           {
-            name: "failed capture",
-            run: { success: false, output: "synthetic CLI error", exitCode: 1 },
+            // Nothing evidences `/usage` exiting 0, so an ordinary non-zero
+            // exit that completed still reaches the extractor.
+            name: "ordinary non-zero exit",
+            run: { success: false, output: "Current week (all models): 39% used", exitCode: 1 },
             llm: () => mockGenerateContent.mockResolvedValue(noPanel),
-            parseError: "claude /usage capture failed",
-            extracted: false,
+            parseError: null,
+            extracted: true,
           },
         ];
         const observed = [];

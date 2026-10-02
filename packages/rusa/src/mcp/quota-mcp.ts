@@ -1089,9 +1089,11 @@ export async function parseKimiQuota(
 }
 
 /**
- * A provider run that did not complete, so its output holds no panel to
- * extract (#847). It fails the scrape the way a parser throw does, so history
- * reports it `failed` and its cause survives in the scrape's `parse_error`.
+ * A provider run that was killed before it completed, so its output holds no
+ * panel to extract (#847). It fails the scrape the way a parser throw does, so
+ * history reports it `failed` and its cause survives in the scrape's
+ * `parse_error`. Every killed or signalled subprocess result is `cancelled`;
+ * an ordinary non-zero exit is not, and still goes to extraction.
  */
 class QuotaCaptureError extends Error {
   constructor(provider: string, command: string, result: RunResult) {
@@ -1596,7 +1598,7 @@ export class QuotaService {
     // before the LLM parse, which is post-processing, not part of the scrape.
     const scrapedAt = this.scrapedAtNow();
     return this.parsePersistedScrape("claude", output, scrapedAt, async () => {
-      if (!result.success) throw new QuotaCaptureError("claude", "/usage", result);
+      if (result.cancelled) throw new QuotaCaptureError("claude", "/usage", result);
       const apiKey = this.deps.config.geminiApiKey?.trim();
 
       if (!apiKey) {
