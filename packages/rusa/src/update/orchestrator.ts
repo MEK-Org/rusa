@@ -119,8 +119,24 @@ export type CoordinatorRefresh =
       loadedRevision: string | null;
     }
   | {
-      /** `refreshed`: confirmed on the new build. `restored`: confirmed back on the retained one. */
-      outcome: "refreshed" | "restored";
+      /**
+       * The owned coordinator's loaded artifact is not the one the build would
+       * retain, or either cannot be identified, so a failed refresh could not
+       * return to it. The update stopped before building or restarting.
+       */
+      outcome: "rollback-unavailable";
+      reason: string;
+      loadedRevision: string | null;
+      /** The live dist sentinel the build would retain as its rollback artifact. */
+      artifactRevision: string | null;
+    }
+  | {
+      /**
+       * `refreshed`: confirmed on the new build. `restored`: confirmed back on
+       * the artifact it had loaded before. `degraded`: confirmed on the
+       * retained artifact, which no longer matched what it had loaded before.
+       */
+      outcome: "refreshed" | "restored" | "degraded";
       /** What the coordinator reported before this update restarted it (null: it could not say). */
       previousLoadedRevision: string | null;
       /** What readyz confirmed after the restart. */
@@ -128,6 +144,13 @@ export type CoordinatorRefresh =
     };
 
 function describeCoordinator(refresh: CoordinatorRefresh): string {
+  if (refresh.outcome === "rollback-unavailable") {
+    const id = (sha: string | null) => (sha ? shortSha(sha) : "unknown");
+    return (
+      `not refreshed, rollback protection unavailable: ${refresh.reason}; ` +
+      `loaded ${id(refresh.loadedRevision)}, retained artifact ${id(refresh.artifactRevision)}`
+    );
+  }
   if ("reason" in refresh) {
     const why = refresh.outcome === "not-owner" ? "not owned" : "ownership unknown";
     const loaded = refresh.loadedRevision
@@ -284,6 +307,7 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
   let movedToNew = false;
   let builtNew = false;
   let coordinatorTarget: CoordinatorTarget | undefined;
+  let coordinatorRestarted = false;
   let previousLoadedRevision: string | null = null;
   let coordinator: CoordinatorRefresh | undefined;
   let rollbackFailed = false;
@@ -323,6 +347,46 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
           `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
         );
       }
+      // The coordinator decision comes before anything destructive. The build's
+      // swap retires the live dist to dist.old and deletes the previous
+      // dist.old, so the live dist is the only artifact a failed refresh can
+      // return to. Unless it is verifiably the artifact the coordinator has
+      // loaded, stop here: nothing has been moved, built, or restarted.
+      if (deps.coordinator) {
+        step = "coordinator";
+        const resolved = await deps.coordinator.resolve();
+        if (resolved.ownership !== "owner") {
+          coordinator = {
+            outcome: resolved.ownership,
+            reason: resolved.reason,
+            loadedRevision: await deps.coordinator.dialedRevision(),
+          };
+          log(
+            `[update] pool coordinator ${describeCoordinator(coordinator)}` +
+              (coordinator.loadedRevision && coordinator.loadedRevision !== newSha
+                ? ` (drift from this build ${shortSha(newSha)}; not a rollback trigger)`
+                : "")
+          );
+        } else {
+          const retained = deps.coordinator.artifactRevision();
+          previousLoadedRevision = await deps.coordinator.loadedRevision(resolved.target);
+          if (!previousLoadedRevision || retained !== previousLoadedRevision) {
+            coordinator = {
+              outcome: "rollback-unavailable",
+              reason: !previousLoadedRevision
+                ? "the running coordinator does not report its loaded revision"
+                : retained
+                  ? "the live dist is not the artifact the coordinator has loaded"
+                  : "the live dist records no valid revision",
+              loadedRevision: previousLoadedRevision,
+              artifactRevision: retained,
+            };
+            throw new Error(`rollback protection unavailable: ${coordinator.reason}`);
+          }
+          coordinatorTarget = resolved.target;
+        }
+        step = "pull";
+      }
       log(`[update] resetting checkout to ${shortSha(newSha)}`);
       await deps.git.resetHard(newSha);
       movedToNew = true;
@@ -352,38 +416,32 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     // not change when this instance's checkout moves, so refresh it before the
     // mesh drain. The seam verifies the coordinator reports the build revision
     // it loaded; a successful systemctl invocation alone is not sufficient.
-    if (deps.coordinator) {
+    if (deps.coordinator && coordinatorTarget) {
       step = "coordinator";
-      const resolved = await deps.coordinator.resolve();
-      if (resolved.ownership !== "owner") {
-        coordinator = {
-          outcome: resolved.ownership,
-          reason: resolved.reason,
-          loadedRevision: await deps.coordinator.dialedRevision(),
-        };
-        log(
-          `[update] pool coordinator ${describeCoordinator(coordinator)}` +
-            (coordinator.loadedRevision && coordinator.loadedRevision !== newSha
-              ? ` (drift from this build ${shortSha(newSha)}; not a rollback trigger)`
-              : "")
+      const target = coordinatorTarget;
+      const built = deps.coordinator.artifactRevision();
+      if (built !== newSha) {
+        throw new Error(
+          `the coordinator artifact records ${built ? shortSha(built) : "no valid revision"}, ` +
+            `not the built ${shortSha(newSha)}; refusing to restart onto it`
         );
-      } else {
-        const { target } = resolved;
-        const built = deps.coordinator.artifactRevision();
-        if (built !== newSha) {
-          throw new Error(
-            `the coordinator artifact records ${built ? shortSha(built) : "no valid revision"}, ` +
-              `not the built ${shortSha(newSha)}; refusing to restart onto it`
-          );
-        }
-        previousLoadedRevision = await deps.coordinator.loadedRevision(target);
-        await deps.coordinator.backup(target);
-        log(`[update] pre-restart quota backup taken; restarting ${target.unit}`);
-        coordinatorTarget = target;
-        await deps.coordinator.restart(target, built);
-        coordinator = { outcome: "refreshed", previousLoadedRevision, loadedRevision: built };
-        log(`[update] pool coordinator ${describeCoordinator(coordinator)}`);
       }
+      // The preflight's assurance holds only while the coordinator still runs
+      // the artifact now retained at dist.old.
+      const loadedNow = await deps.coordinator.loadedRevision(target);
+      if (loadedNow !== previousLoadedRevision) {
+        throw new Error(
+          `the coordinator's loaded revision changed during the build ` +
+            `(${loadedNow ? shortSha(loadedNow) : "unknown"}, was ${shortSha(previousLoadedRevision ?? "")}); ` +
+            `refusing to restart it`
+        );
+      }
+      await deps.coordinator.backup(target);
+      log(`[update] pre-restart quota backup taken; restarting ${target.unit}`);
+      coordinatorRestarted = true;
+      await deps.coordinator.restart(target, built);
+      coordinator = { outcome: "refreshed", previousLoadedRevision, loadedRevision: built };
+      log(`[update] pool coordinator ${describeCoordinator(coordinator)}`);
     }
 
     // ── 3. GATE passed → quiesce + restart. Only now do we touch run-state. ─
@@ -466,14 +524,16 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
         // A restart command can fail after it has stopped or even started the
         // unit. Once dist and checkout are restored, restart the coordinator onto
         // the restored artifact so the pool does not keep a new in-memory
-        // coordinator beside an old deploy. The expected revision is the restored
-        // dist's own sentinel — neither checkout HEAD nor the revision the
-        // coordinator had loaded before, which the retained dist need not match.
-        // An artifact with no identity cannot be verified, so it is not
-        // restarted onto at all. Any failure is surfaced as rollback-unsafe;
-        // that includes a new build that already migrated the quota schema,
-        // whose recovery is the runbook's restore from the pre-restart backup.
-        if (coordinatorTarget && deps.coordinator) {
+        // coordinator beside an old deploy. The preflight established that this
+        // artifact is the one the coordinator had loaded; readyz must confirm
+        // the restored dist's own sentinel. Should that sentinel no longer
+        // match, the restart onto it is degraded recovery, never a restore, and
+        // is surfaced as rollback-unsafe. An artifact with no identity cannot be
+        // verified, so it is not restarted onto at all. Any failure is surfaced
+        // as rollback-unsafe; that includes a new build that already migrated
+        // the quota schema, whose recovery is the runbook's restore from the
+        // pre-restart backup.
+        if (coordinatorRestarted && coordinatorTarget && deps.coordinator) {
           const restored = deps.coordinator.artifactRevision();
           if (!restored) {
             throw new Error(
@@ -488,8 +548,15 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
                 `${restoreCoordinatorErr instanceof Error ? restoreCoordinatorErr.message : String(restoreCoordinatorErr)}`
             );
           }
-          coordinator = { outcome: "restored", previousLoadedRevision, loadedRevision: restored };
+          const outcome = restored === previousLoadedRevision ? "restored" : "degraded";
+          coordinator = { outcome, previousLoadedRevision, loadedRevision: restored };
           log(`[update] pool coordinator ${describeCoordinator(coordinator)}`);
+          if (outcome === "degraded") {
+            throw new Error(
+              `coordinator recovered onto retained ${shortSha(restored)}, not the previously ` +
+                `loaded ${previousLoadedRevision ? shortSha(previousLoadedRevision) : "unknown"}`
+            );
+          }
         }
       } catch (rbErr) {
         const rbMsg = rbErr instanceof Error ? rbErr.message : String(rbErr);

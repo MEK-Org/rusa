@@ -363,6 +363,9 @@ const BUILT_D = "d".repeat(40);
 async function composedUpdate(opts: {
   updating: "owner" | "client";
   failDrain?: boolean;
+  /** What the running coordinator reports before the update (default C, distinct from B). */
+  loadedAtStart?: string | null;
+  /** Overwrites the restored dist's sentinel during rollback (null removes it). */
   retainedSentinel?: string | null;
   /** Whether the updating instance has a `quota.coordinator.socketPath` to dial. */
   dials?: boolean;
@@ -371,10 +374,10 @@ async function composedUpdate(opts: {
   const ownerDist = host.distDir(host.owner);
   const updatingCheckout = opts.updating === "owner" ? host.owner : host.client;
   const updatingDist = host.distDir(updatingCheckout);
-  // Distinct identities: checkout HEAD A, retained (live) dist B, loaded C.
+  // Identities: checkout HEAD A, live dist B (retained by the build), loaded C.
   writeBuildSentinel(ownerDist, RETAINED_B);
   if (opts.updating === "client") writeBuildSentinel(updatingDist, RETAINED_B);
-  let loaded: string | null = LOADED_C;
+  let loaded: string | null = opts.loadedAtStart === undefined ? LOADED_C : opts.loadedAtStart;
   const configuredSocket = (
     resolvePoolCoordinatorOwnership({ cliPath: host.cliPath(host.owner), show: host.show() }) as {
       target: { socketPath: string };
@@ -411,8 +414,10 @@ async function composedUpdate(opts: {
     async updateSubmodules() {},
   };
   // The build promotes D over the live dist and retains the previous tree.
+  const builds: string[] = [];
   const build: BuildSeam = {
     async build(sha) {
+      builds.push(sha);
       cpSync(updatingDist, `${updatingDist}.old`, { recursive: true });
       writeBuildSentinel(updatingDist, sha);
     },
@@ -420,6 +425,7 @@ async function composedUpdate(opts: {
       rmSync(updatingDist, { recursive: true, force: true });
       cpSync(`${updatingDist}.old`, updatingDist, { recursive: true });
       if (opts.retainedSentinel === null) rmSync(join(updatingDist, ".build-ok"));
+      else if (opts.retainedSentinel) writeBuildSentinel(updatingDist, opts.retainedSentinel);
     },
   };
   const exits: number[] = [];
@@ -441,7 +447,7 @@ async function composedUpdate(opts: {
   const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
   try {
     const result = await executeUpdate({ branch: "staging", drainTimeoutMs: 10 }, deps);
-    return { result, restarts, exits, git, loaded };
+    return { result, restarts, exits, git, builds, loaded };
   } finally {
     errorSpy.mockRestore();
     await close(server);
@@ -470,21 +476,56 @@ describe("composed update across an owner and a client checkout", () => {
     expect(restarts).toEqual([]);
   });
 
-  it("the owner's update confirms the built artifact and records what was loaded before", async () => {
-    const { result, restarts, loaded } = await composedUpdate({ updating: "owner" });
+  it.each([
+    [
+      "is not the live dist B",
+      LOADED_C,
+      "the live dist is not the artifact the coordinator has loaded",
+    ],
+    ["cannot be identified", null, "the running coordinator does not report its loaded revision"],
+  ] as const)("the owner's update stops before building when loaded C %s, with zero restarts", async (_label, loadedAtStart, reason) => {
+    const { result, restarts, git, builds, loaded, exits } = await composedUpdate({
+      updating: "owner",
+      loadedAtStart,
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      failedStep: "coordinator",
+      error: `rollback protection unavailable: ${reason}`,
+      rollbackFailed: false,
+    });
+    expect(result.coordinator).toEqual({
+      outcome: "rollback-unavailable",
+      reason,
+      loadedRevision: loadedAtStart,
+      artifactRevision: RETAINED_B,
+    });
+    expect(restarts).toEqual([]);
+    expect(builds).toEqual([]);
+    expect(git.resets).toEqual([]);
+    expect(loaded).toBe(loadedAtStart); // the running coordinator was never disturbed
+    expect(exits).toEqual([]);
+  });
+
+  it("the owner's update with B = C confirms the built artifact and records what was loaded before", async () => {
+    const { result, restarts, loaded } = await composedUpdate({
+      updating: "owner",
+      loadedAtStart: RETAINED_B,
+    });
     expect(result.ok).toBe(true);
     expect(result.coordinator).toEqual({
       outcome: "refreshed",
-      previousLoadedRevision: LOADED_C,
+      previousLoadedRevision: RETAINED_B,
       loadedRevision: BUILT_D,
     });
     expect(restarts).toHaveLength(1);
     expect(loaded).toBe(BUILT_D);
   });
 
-  it("rollback verifies the retained artifact B, not checkout A or previously loaded C", async () => {
+  it("with B = C a post-restart failure restores the coordinator to the artifact it had loaded", async () => {
     const { result, restarts, git, loaded } = await composedUpdate({
       updating: "owner",
+      loadedAtStart: RETAINED_B,
       failDrain: true,
     });
     expect(result.ok).toBe(false);
@@ -494,14 +535,32 @@ describe("composed update across an owner and a client checkout", () => {
     expect(loaded).toBe(RETAINED_B);
     expect(result.coordinator).toEqual({
       outcome: "restored",
-      previousLoadedRevision: LOADED_C,
+      previousLoadedRevision: RETAINED_B,
       loadedRevision: RETAINED_B,
+    });
+  });
+
+  it("a retained artifact that no longer matches C is degraded recovery, reported unsafe", async () => {
+    const { result, restarts, loaded } = await composedUpdate({
+      updating: "owner",
+      loadedAtStart: RETAINED_B,
+      failDrain: true,
+      retainedSentinel: LOADED_C,
+    });
+    expect(result.rollbackFailed).toBe(true);
+    expect(restarts).toHaveLength(2);
+    expect(loaded).toBe(LOADED_C);
+    expect(result.coordinator).toEqual({
+      outcome: "degraded",
+      previousLoadedRevision: RETAINED_B,
+      loadedRevision: LOADED_C,
     });
   });
 
   it("a retained artifact with no identity is reported unsafe, not restarted onto", async () => {
     const { result, restarts, loaded } = await composedUpdate({
       updating: "owner",
+      loadedAtStart: RETAINED_B,
       failDrain: true,
       retainedSentinel: null,
     });

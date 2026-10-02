@@ -62,7 +62,7 @@ export function readReadyRevision(
         try {
           const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as ReadyEnvelope;
           const revision = parsed.service?.loadedRevision;
-          finish(typeof revision === "string" ? revision : null);
+          finish(typeof revision === "string" && revision ? revision : null);
         } catch {
           finish(null);
         }

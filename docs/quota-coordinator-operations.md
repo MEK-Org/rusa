@@ -162,12 +162,24 @@ fails. The read is for the report only and never decides ownership. A revision
 that differs from the client's build is drift, logged as such, not a reason to
 fail or roll back a client update.
 
-For an owned unit, after a green build and before the client drain, the
-update:
+For an owned unit, the update first establishes that it can return the
+coordinator to what it is running. Before it moves the checkout or builds, it
+requires the running coordinator to report a loaded revision and the live
+dist's sentinel to name that same revision. The build's swap retires the live
+dist to `dist.old` and deletes the previous `dist.old`, so the live dist is the
+only artifact a failed refresh could restart onto. If the coordinator cannot say
+what it loaded, the live dist has no valid sentinel, or the two differ, the
+update stops with `rollback protection unavailable`: nothing is moved, built,
+backed up, or restarted, and the running coordinator is not disturbed. To
+clear it, restart the coordinator onto the live dist
+(`systemctl --user restart rusa-quota-coordinator.service`) once that build is
+acceptable, confirm `/v1/readyz` reports it, then update again.
+
+After a green build and before the client drain, the update then:
 
 1. requires the live dist's sentinel to name the revision just built;
-2. records the revision the running coordinator reports loaded (or that it
-   could not say);
+2. requires the running coordinator still to report the revision recorded
+   before the build;
 3. takes the runbook's pre-restart backup with `rusa quota-backup` into
    `<backupDir>/pre-deploy` (its own retention, so frequent deploys never evict
    the daily copies; skipped only when the database does not exist yet);
@@ -181,10 +193,12 @@ Any failure before the client exits restores the previous dist and checkout.
 Restoring the dist is two renames, not an atomic exchange: the live path is
 briefly absent between them. If the coordinator was restarted, it is restarted
 again onto the restored dist, and readiness must report that dist's own
-sentinel. That revision can differ from both checkout `HEAD` and the revision
-the coordinator had loaded before the update, which may no longer exist on
-disk; the update records both. A restored dist with no valid sentinel is not
-restarted onto. That case, a failed restore, and a new build that already
+sentinel. When that is the revision the coordinator had loaded before the
+update, which the preflight established, the outcome is `restored`. Should the
+restored sentinel differ from it anyway, the restart onto it is reported as
+`degraded` recovery, never as restored, and raises the rollback-failed alert.
+A restored dist with no valid sentinel is not restarted onto. Those cases, a
+failed restore, and a new build that already
 migrated the quota schema (whose old build's guard refuses it) raise the
 durable rollback-failed alert; recover with the binary rollback procedure
 above using the pre-deploy backup.
