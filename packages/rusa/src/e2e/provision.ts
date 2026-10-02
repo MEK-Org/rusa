@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify as toYaml } from "yaml";
 import { loadConfig, type RusaConfig } from "../config/index.js";
+import type { ProviderConfig } from "../config/types.js";
 import { filterConfiguredVoices } from "../voice/voice-catalog.js";
 
 /**
@@ -48,6 +49,11 @@ export interface E2EInstance {
   repo: string;
 }
 
+function withoutCodexHome(codex: ProviderConfig): ProviderConfig {
+  const { home: _home, ...rest } = codex;
+  return rest;
+}
+
 /**
  * Build the config for an e2e instance. Pure (no filesystem side effects) so it
  * can be unit-tested. Providers and the Gemini API key are seeded from a base
@@ -89,6 +95,9 @@ export function buildE2EConfig(opts: {
     github: { account: E2E_BOT, repos: [E2E_REPO] },
     providers: {
       ...(base?.providers ?? { antigravity: { cliCommand: "agy" } }),
+      // A configured Codex home (#782) is hidden inside the instance sandbox and
+      // projected as its ~/.codex instead, so the nested config must not name it.
+      ...(base?.providers?.codex ? { codex: withoutCodexHome(base.providers.codex) } : {}),
       fake: { cliCommand: "fake" },
     },
     geminiApiKey: base?.geminiApiKey ?? "MISSING",

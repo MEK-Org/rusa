@@ -31,6 +31,7 @@ import {
   ensureAntigravityPrivateState,
 } from "./antigravity-paths.js";
 import { CODEX_REFRESH_URL_ENV } from "./codex-auth-broker.js";
+import { codexHomeDir, configuredCodexHome } from "./codex-home.js";
 
 export type SandboxAuthMode = "copilot" | "claude" | "codex" | "antigravity" | "kimi";
 
@@ -1001,15 +1002,22 @@ function buildMeshActorBwrapArgs(o: {
   if (o.authMode === "codex") {
     if (o.codexAuth) {
       // Brokered login (#782): nothing in the sandbox can read or write the
-      // canonical login. The host ~/.codex (visible through the root ro-bind,
+      // canonical login. The Codex home (visible through the root ro-bind,
       // auth.json included) is shadowed by an empty read-only tmpfs at both its
       // path and its real path. The CLI reads a private copy whose refresh token
       // is a per-run capability and refreshes through the host broker, which
       // answers with fresh access tokens and alone writes the canonical file. A
       // child that reads or rewrites /tmp/auth.json gets, or spoils, only this
       // run's capability.
-      const hostCodexDir = join(getHostHomeDir(), ".codex");
-      for (const dir of new Set([hostCodexDir, realpathIfExists(hostCodexDir)])) {
+      //
+      // A configured `providers.codex.home` is shadowed as well as `~/.codex`,
+      // which on a shared host still holds another daemon's login. These mounts
+      // come after the writable actor, pnpm and provider-state binds above, so
+      // they win even when the configured home lies beneath one of them.
+      const codexHomes = [join(getHostHomeDir(), ".codex"), configuredCodexHome()].filter(
+        (dir): dir is string => dir !== undefined
+      );
+      for (const dir of new Set(codexHomes.flatMap((home) => [home, realpathIfExists(home)]))) {
         if (existsSync(dir)) args.push("--tmpfs", dir, "--remount-ro", dir);
       }
       args.push("--bind", o.codexAuth.authFile, "/tmp/auth.json");
@@ -1021,8 +1029,8 @@ function buildMeshActorBwrapArgs(o: {
       // CODEX_HOME remains the sandbox's private /tmp, and config/session state stays
       // isolated. Codex's file auth backend truncates and rewrites auth.json in place,
       // so a file bind supports refresh without granting the worker write access to
-      // the rest of the host ~/.codex directory.
-      const hostAuthPath = join(getHostHomeDir(), ".codex", "auth.json");
+      // the rest of the host Codex home.
+      const hostAuthPath = join(codexHomeDir(getHostHomeDir()), "auth.json");
       if (existsSync(hostAuthPath)) {
         args.push("--bind", hostAuthPath, "/tmp/auth.json");
       }

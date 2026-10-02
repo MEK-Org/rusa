@@ -19,6 +19,7 @@ import {
   seedBrokeredCodexHome,
   writeCodexLeaseAuth,
 } from "./codex-auth-broker.js";
+import { codexHomeDir, configuredCodexHome } from "./codex-home.js";
 import {
   formatLiveError,
   formatMcpInvocationNotice,
@@ -298,7 +299,7 @@ export function stripMcpServersFromToml(toml: string): string {
 /**
  * Force the top-level `model` key of a codex config TOML to the requested model
  * (no-op when no model was requested). Belt-and-suspenders for ISSUE_NUM: the merged
- * worker config starts from the HOST's ~/.codex/config.toml, whose `model`
+ * worker config starts from the host Codex home's config.toml, whose `model`
  * default is what the CLI silently falls back to if it fails to resolve the
  * `--model` slug in the worker's environment (ISSUE_NUM-class silent substitution).
  * Forcing the key makes the flag and the config agree, so a resolution hiccup
@@ -774,8 +775,7 @@ export class CodexProvider implements CodingProvider {
       if (opts.sandbox && (hasMcpServers || this.model || this.effort)) {
         mcpConfigSource = join("/tmp", `rusa-mcp-codex-${randomUUID()}.toml`);
         let baseConfig = "";
-        const hostHome = process.env.HOME ?? "/root";
-        const hostConfigPath = join(hostHome, ".codex", "config.toml");
+        const hostConfigPath = join(codexHomeDir(), "config.toml");
         if (existsSync(hostConfigPath)) {
           try {
             baseConfig = readFileSync(hostConfigPath, "utf-8");
@@ -815,7 +815,7 @@ export class CodexProvider implements CodingProvider {
             exitCode: 1,
           };
         }
-        const hostCodexDir = join(process.env.HOME ?? "/root", ".codex");
+        const hostCodexDir = codexHomeDir();
         if (opts.sandbox) {
           const authDir = mkdtempSync(join(tmpdir(), "rusa-codex-auth-"));
           tempPaths.push(authDir);
@@ -832,6 +832,10 @@ export class CodexProvider implements CodingProvider {
             [CODEX_REFRESH_URL_ENV]: authLease.refreshUrl,
           };
         }
+      } else if (!opts.sandbox && configuredCodexHome()) {
+        // Broker off, unsandboxed: run on the configured login itself, as a
+        // default run uses `~/.codex`. Sandboxed runs get it through the bind.
+        spawnEnv = { ...process.env, CODEX_HOME: configuredCodexHome() };
       }
 
       if (opts.sandbox) {

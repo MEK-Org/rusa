@@ -18,6 +18,12 @@ export interface ProviderConfig {
    * (#782). Default off while it canaries.
    */
   authBroker?: boolean;
+  /**
+   * Codex only: absolute directory holding the Codex login, instead of
+   * `~/.codex` (#782). Lets a daemon run on a dedicated login. The broker,
+   * worker launch, quota/model probes and sandbox isolation all use it.
+   */
+  home?: string;
 }
 
 export interface GitHubOrgConfig {

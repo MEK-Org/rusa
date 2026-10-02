@@ -14,11 +14,12 @@ import {
 } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import type { RusaConfig } from "../config/types.js";
 import { createLogger, type Logger } from "../observability/logger.js";
+import { codexHomeDir } from "./codex-home.js";
 
 /**
  * Host-owned Codex refresh broker (#782).
@@ -100,7 +101,7 @@ export interface CodexAuthLease {
 }
 
 export interface CodexAuthBrokerOptions {
-  /** Directory holding the canonical `auth.json`. Default `~/.codex`. */
+  /** Directory holding the canonical `auth.json`. Default {@link codexHomeDir}. */
   codexHome?: string;
   /** Upstream token endpoint (test seam). Default {@link CODEX_OAUTH_TOKEN_URL}. */
   upstreamUrl?: string;
@@ -209,7 +210,7 @@ export class CodexAuthBroker {
   private deadRefresh: string | undefined;
 
   constructor(opts: CodexAuthBrokerOptions = {}) {
-    this.codexHome = opts.codexHome ?? join(homedir(), ".codex");
+    this.codexHome = opts.codexHome ?? codexHomeDir();
     this.canonicalPath = join(this.codexHome, "auth.json");
     this.upstreamUrl = opts.upstreamUrl ?? CODEX_OAUTH_TOKEN_URL;
     this.upstreamTimeoutMs = opts.upstreamTimeoutMs ?? 30_000;

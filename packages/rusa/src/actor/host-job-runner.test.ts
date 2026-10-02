@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { configureCodexHome } from "../providers/codex-home.js";
 import {
   buildHostJobBwrapArgs,
   buildSystemdRunArgv,
@@ -53,6 +54,17 @@ describe("hostJobDenylistDirs (ISSUE_NUM, expanded credential stores)", () => {
   it("always includes mcHome itself, even when configured outside hostHome", () => {
     const dirs = hostJobDenylistDirs("/home/familiar", "/var/lib/rusa-home");
     expect(dirs).toContain("/var/lib/rusa-home");
+  });
+
+  it("adds a configured Codex home (#782) and keeps the default ~/.codex", () => {
+    configureCodexHome("/srv/codex-fixture/login");
+    try {
+      const dirs = hostJobDenylistDirs("/home/familiar", "/home/familiar/.rusa");
+      expect(dirs).toContain("/srv/codex-fixture/login");
+      expect(dirs).toContain("/home/familiar/.codex");
+    } finally {
+      configureCodexHome(undefined);
+    }
   });
 });
 
@@ -217,6 +229,35 @@ describe("buildHostJobBwrapArgs (pure argv)", () => {
     const homeIndex = args.indexOf("HOME");
     expect(args[homeIndex - 1]).toBe("--setenv");
     expect(args[homeIndex + 1]).toBe(scratchDir);
+  });
+
+  it("shadows a configured Codex home outside hostHome and refuses it as a read path (#782)", () => {
+    const configuredHome = join(dir, "codex-canary");
+    mkdirSync(configuredHome, { recursive: true });
+    configureCodexHome(configuredHome);
+    try {
+      const args = buildHostJobBwrapArgs({
+        hostHome,
+        mcHome,
+        scratchDir,
+        manifest: { readPaths: [] },
+      });
+      const tmpfsTargets = args.reduce<string[]>((acc, arg, i) => {
+        if (arg === "--tmpfs") acc.push(args[i + 1]);
+        return acc;
+      }, []);
+      expect(tmpfsTargets).toContain(configuredHome);
+      expect(() =>
+        buildHostJobBwrapArgs({
+          hostHome,
+          mcHome,
+          scratchDir,
+          manifest: { readPaths: [join(configuredHome, "auth.json")] },
+        })
+      ).toThrow(/denied/);
+    } finally {
+      configureCodexHome(undefined);
+    }
   });
 
   it("does not double-shadow mcHome when it is nested inside hostHome", () => {

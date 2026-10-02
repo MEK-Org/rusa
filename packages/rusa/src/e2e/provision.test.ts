@@ -119,6 +119,20 @@ describe("buildE2EConfig", () => {
     expect(config.voice).toBeUndefined();
   });
 
+  it("drops providers.codex.home so the nested instance uses its projected ~/.codex (#782)", () => {
+    const base = {
+      providers: {
+        codex: { cliCommand: "codex", authBroker: true, home: "/srv/codex-fixture/login" },
+      },
+    } as unknown as RusaConfig;
+
+    const config = buildE2EConfig({ scratchPath: "/some/scratch", baseConfig: base });
+
+    expect(config.providers.codex).toEqual({ cliCommand: "codex", authBroker: true });
+    expect(config.providers.codex).not.toHaveProperty("home");
+    expect(base.providers.codex?.home).toBe("/srv/codex-fixture/login");
+  });
+
   it("carries only the coordinator client settings into one E2E instance", () => {
     const base = {
       quota: {

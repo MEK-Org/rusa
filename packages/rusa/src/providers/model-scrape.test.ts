@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RusaConfig } from "../config/types.js";
+import { configureCodexHome } from "./codex-home.js";
 import {
   clearProviderModelCatalog,
   getProviderModelCatalog,
@@ -679,6 +680,42 @@ sleep 1
       expect(output).toContain("gpt-5.6-sol");
       expect(output).toContain("gpt-5.6-terra");
     } finally {
+      rmSync(actorDir, { recursive: true, force: true });
+    }
+  });
+
+  it("runs codex on a configured Codex home (#782)", async () => {
+    const actorDir = mkdtempSync(join(tmpdir(), "codex-test-actor-home-"));
+    const configuredHome = join(actorDir, "codex-canary");
+    const mockBin = join(actorDir, "mock-codex-home.sh");
+    writeFileSync(
+      mockBin,
+      `#!/bin/bash
+echo "OpenAI Codex"
+echo "Ask Codex to do anything"
+while read -r line; do
+  if [ "$line" = "/model" ]; then
+    echo "Select Model and Effort"
+    echo "home=$CODEX_HOME"
+    break
+  fi
+done
+sleep 1
+`,
+      { mode: 0o755 }
+    );
+    vi.stubEnv("CODEX_HOME", "");
+    configureCodexHome(configuredHome);
+
+    try {
+      const output = await scrapeCodexModelScreen({
+        actorDir,
+        cliCommand: mockBin,
+        timeoutMs: 10_000,
+      });
+      expect(output).toContain(`home=${configuredHome}`);
+    } finally {
+      configureCodexHome(undefined);
       rmSync(actorDir, { recursive: true, force: true });
     }
   });

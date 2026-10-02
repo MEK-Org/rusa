@@ -985,6 +985,40 @@ describe("loadConfig providers.codex.authBroker", () => {
   });
 });
 
+describe("loadConfig providers.codex.home", () => {
+  it("is absent by default, so the default ~/.codex applies", () => {
+    const config = loadConfig(writeConfig({ providers: { codex: { cliCommand: "codex" } } }));
+    expect(config.providers.codex?.home).toBeUndefined();
+  });
+
+  it("accepts an absolute path on codex and normalizes it", () => {
+    const config = loadConfig(
+      writeConfig({
+        providers: { codex: { cliCommand: "codex", home: "  /srv/codex-canary/./login/  " } },
+      })
+    );
+    expect(config.providers.codex?.home).toBe("/srv/codex-canary/login");
+  });
+
+  it("rejects a relative or non-string path, and the key on any other provider", () => {
+    for (const home of ["codex-canary", "~/.codex-canary", "", 7]) {
+      expect(() =>
+        loadConfig(writeConfig({ providers: { codex: { cliCommand: "codex", home } } }))
+      ).toThrow(/providers\.codex\.home must be an absolute path/);
+    }
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          providers: {
+            codex: { cliCommand: "codex" },
+            claude: { cliCommand: "claude", home: "/srv/claude" },
+          },
+        })
+      )
+    ).toThrow(/providers\.claude\.home is only supported for codex/);
+  });
+});
+
 describe("loadConfig providers.<name>.fallbackModel is rejected ", () => {
   it("throws naming the ruling and issue when a provider carries fallbackModel", () => {
     expect(() =>

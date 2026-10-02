@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { codexHomeDir, configuredCodexHome } from "../providers/codex-home.js";
 import {
   buildToolchainPath,
   ensureTargetParentDirs,
@@ -70,6 +71,8 @@ export function hostJobDenylistDirs(hostHome: string, mcHome: string): string[] 
     join(hostHome, ".npmrc"),
     join(hostHome, ".git-credentials"),
     mcHome,
+    // A configured Codex login (#782) can live outside hostHome.
+    ...(configuredCodexHome() ? [codexHomeDir(hostHome)] : []),
   ];
 }
 
@@ -168,12 +171,17 @@ export function buildHostJobBwrapArgs(o: BuildHostJobBwrapArgsOptions): string[]
   // Shadow the real home to empty — the deny-by-default gate. Also shadow
   // mcHome explicitly in case it's configured outside hostHome (a non-default
   // RUSA_HOME), so the mesh's own secrets root is never merely "usually"
-  // hidden. Mounting a tmpfs inside an already-shadowed tree is a harmless
-  // no-op (still empty), so no ordering/overlap check is needed here.
+  // hidden. The same goes for a configured Codex home (#782). Mounting a tmpfs
+  // inside an already-shadowed tree is a harmless no-op (still empty), so no
+  // ordering/overlap check is needed here.
   const realHostHome = realpathIfExists(hostHome);
   const realMcHome = realpathIfExists(o.mcHome);
   args.push("--tmpfs", hostHome);
   if (!overlaps(realHostHome, realMcHome)) args.push("--tmpfs", o.mcHome);
+  const configuredCodex = configuredCodexHome();
+  if (configuredCodex && !overlaps(realHostHome, realpathIfExists(configuredCodex))) {
+    args.push("--tmpfs", configuredCodex);
+  }
   args.push("--tmpfs", "/tmp");
 
   // The job's own writable scratch dir, punched back through the shadow.

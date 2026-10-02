@@ -1,8 +1,9 @@
 # Codex host-owned auth broker
 
 `providers.codex.authBroker: true` moves every Codex refresh behind trusted host
-code (#782). This page covers the boundary, how to roll it out and back, and how
-to reproduce the fixture evidence.
+code (#782). This page covers the boundary, a dedicated Codex home, when the
+CLI refreshes, how to roll the broker out and back, and how to reproduce the
+fixture evidence.
 
 ## Boundary
 
@@ -23,9 +24,11 @@ With the broker on:
   the `/status` quota probe and `/model` probe. When Codex refreshes, it sends
   the capability. The broker's reply has no `refresh_token`, so the capability
   stays in place.
-- **Sandboxes cannot see the canonical login.** `~/.codex` is shadowed by an
-  empty read-only tmpfs, at both its path and its real path. Nothing canonical
-  is bound in.
+- **Sandboxes cannot see the canonical login.** `~/.codex`, and a configured
+  `providers.codex.home`, are shadowed by an empty read-only tmpfs, at both
+  path and real path. The shadow is mounted after the sandbox's writable
+  binds, so it holds even when the configured home sits inside the actor's
+  own workspace. Nothing canonical is bound in.
 - **Requests are strict.** The broker accepts only `POST /oauth/token` with a
   JSON body made of `grant_type: "refresh_token"`, `refresh_token` and an
   optional `client_id`. It rejects any other field, and a request that names an
@@ -62,6 +65,8 @@ With the broker on:
   enabled, the nested E2E manager binds no Codex login into the instance runtime
   home. Nested Codex workers find no credentials and fail closed, preventing
   unbrokered workers from reading canonical credentials or racing upstream refresh.
+  A configured `providers.codex.home` is also shadowed at its own path inside
+  the instance, and the instance's generated config omits the key.
 - **Redaction.** Logs name events, the broker's own fixed messages, and
   bounded error codes (for example `EACCES` or `SQLITE_BUSY`). A native error's
   message, which names file paths, is never logged. Logs never contain tokens,
@@ -79,6 +84,55 @@ When upstream refuses the canonical token, the broker logs
 `codex_auth_login_rejected`. It then marks that token dead, so later consumers
 fail closed without calling upstream again. Consumers recover once the
 canonical file changes, which is what `codex login` on the host does.
+
+## Dedicated Codex home
+
+`providers.codex.home` names the directory that holds the Codex login, in place
+of `~/.codex`:
+
+```yaml
+providers:
+  codex:
+    cliCommand: codex
+    authBroker: true
+    home: /absolute/path/to/codex-home
+```
+
+It must be an absolute path; the loader normalizes it and rejects anything
+else, and rejects the key on any other provider. Unset, everything uses
+`~/.codex` exactly as before.
+
+One resolver (`providers/codex-home.ts`) answers "where is the login" for the
+whole process. The daemon and the quota coordinator set it at boot, and every
+host-side consumer reads it:
+
+- the broker (its canonical file, refresh lock and intent marker);
+- worker launch (`codex.ts`): the config merged into a sandboxed run, the login
+  a brokered run seeds from, the login a broker-off sandbox binds, and
+  `CODEX_HOME` for a broker-off unsandboxed run;
+- the `/status` quota probe and the `/model` probe, and the models cache the
+  catalog reads;
+- the actor sandbox, the host-job sandbox and the E2E instance, which hide it.
+
+Setting the key does not create a login. That is one device login into the
+directory (`CODEX_HOME=<dir> codex login`), an operator step. Whether a second
+device login on the same account leaves the first session valid is not settled
+from source; if it does not, the existing login stops working at that moment.
+
+## When the CLI refreshes
+
+A ChatGPT-login access token lives 240 hours (ten days), not an hour. The CLI
+refreshes it (`should_refresh_proactively` in `codex-rs/login/src/auth/manager.rs`,
+the same in 0.144.4 and 0.159.3):
+
+- when the access token's expiry can be parsed: within 5 minutes of that expiry
+  (`CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES = 5`), and at no other time;
+- only when the expiry cannot be parsed: when `last_refresh` is more than 8 days
+  old (`TOKEN_REFRESH_INTERVAL = 8`);
+- after a 401 from the backend: it reloads the file, then refreshes.
+
+So a natural brokered rotation happens about ten days after a login, at the
+token's expiry minus five minutes.
 
 ## Rollout
 
@@ -105,10 +159,14 @@ canonical file changes, which is what `codex login` on the host does.
      configuration read error): the E2E instance manager binds no Codex login,
      preventing nested workers from reading or racing the canonical refresh token.
 2. **Canary.** Set `providers.codex.authBroker: true` on staging only and
-   restart it. On a host where prod and staging share the same `~/.codex`
-   login, prod stays stopped (step 1) for the canary window, at least one
-   access-token lifetime (about an hour). No unbrokered process may refresh
-   while staging exercises the broker. Over that window:
+   restart it. The canary window lasts until at least one natural rotation,
+   which is the token's expiry minus five minutes: up to ten days after the
+   login (see [When the CLI refreshes](#when-the-cli-refreshes)). No unbrokered
+   process may refresh that login over the window. On a host where prod and
+   staging share one login, that would stop prod for up to ten days, so give
+   the canary its own login with `providers.codex.home` instead; only the
+   processes on that directory need draining. The canary plan and what a
+   dedicated login cannot prove about production are on #782. Over the window:
    - Check for `codex_auth_rotated` and the absence of
      `codex_auth_login_rejected`.
    - Confirm that the `/status` quota probe and the `/model` probe return real
@@ -141,9 +199,22 @@ cd packages/rusa
 # a lease revoked or expired while queued, a filesystem failure's log line.
 pnpm vitest run src/providers/codex-auth-broker.test.ts
 
+# Dedicated Codex home: the resolver and its defaults, config validation,
+# the sandbox, host-job and E2E hides, the E2E projection (with a real bwrap
+# probe), the /status probe's refresh persisting to the configured home, and
+# the /model probe's CODEX_HOME.
+pnpm vitest run src/providers/codex-home.test.ts src/config/loader.test.ts \
+  src/providers/sandbox.test.ts src/actor/host-job-runner.test.ts \
+  src/actor/e2e-instance-manager.test.ts src/e2e/provision.test.ts \
+  src/providers/codex-status-scrape-auth.integration.test.ts \
+  src/providers/model-scrape.test.ts
+
 # Real driver: CodexProvider.run under bwrap against each CLI listed
 # (colon-separated). Omitted, it uses `codex` on PATH. A missing CLI or bwrap
-# shows as a skipped test, which is missing evidence, not a pass.
+# shows as a skipped test, which is missing evidence, not a pass. It includes
+# the dedicated-home cases: a hostile child with the configured home inside
+# its own workspace, and rotations persisting to the configured home with a
+# decoy default home left untouched.
 RUSA_CODEX_DRIVER_BINS=/path/to/codex-0.144.4:/path/to/codex-current \
   pnpm vitest run src/providers/codex-auth-broker.integration.test.ts
 ```

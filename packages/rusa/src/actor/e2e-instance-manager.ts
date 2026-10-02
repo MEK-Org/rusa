@@ -21,6 +21,7 @@ import {
   activeCodexAuthBroker,
   codexAuthBrokerConfigured,
 } from "../providers/codex-auth-broker.js";
+import { codexHomeDir, configuredCodexHome } from "../providers/codex-home.js";
 import {
   addReadonlyBindIfExists,
   addWritableDirBindIfRealDir,
@@ -559,6 +560,8 @@ export class E2EInstanceManager {
     // sandbox binds it writable directly, matching the direct/non-e2e path).
     // When providers.codex.authBroker is enabled, bind no Codex login at all:
     // nested instances fail closed rather than exposing canonical host credentials.
+    // The Codex source is the resolved Codex home, so a configured
+    // providers.codex.home (#782) reaches the nested instance as its ~/.codex.
     // Kimi is handled separately below: it needs a narrower, per-subdirectory
     // split rather than one blanket read-only (or writable) directory bind.
     const codexBrokerActive =
@@ -582,7 +585,8 @@ export class E2EInstanceManager {
       [join(".config", "github-copilot"), true],
       [join(".config", "copilot"), true],
     ] as const) {
-      const source = join(this.hostHome, relativePath);
+      const source =
+        relativePath === ".codex" ? codexHomeDir(this.hostHome) : join(this.hostHome, relativePath);
       if (!existsSync(source)) continue;
       const target = join(runtimeHome, relativePath);
       ensureMountTarget(source, target);
@@ -626,6 +630,15 @@ export class E2EInstanceManager {
       const target = join(providerBin, command);
       ensureMountTarget(source, target);
       args.push("--ro-bind", realpathIfExists(source), target);
+    }
+    // A configured Codex home (#782) can sit outside the host home shadowed
+    // above, even beneath a writable root bound in here. Shadow it last, so no
+    // later mount re-exposes it; a projection of it above keeps its own view.
+    const configuredCodex = configuredCodexHome();
+    if (configuredCodex) {
+      for (const dir of new Set([configuredCodex, realpathIfExists(configuredCodex)])) {
+        if (existsSync(dir)) args.push("--tmpfs", dir, "--remount-ro", dir);
+      }
     }
     args.push(
       "--clearenv",

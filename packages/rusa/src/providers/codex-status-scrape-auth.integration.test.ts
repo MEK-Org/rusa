@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { configureCodexHome } from "./codex-home.js";
 import { scrapeCodexStatus } from "./codex-status-scrape.js";
 
 const FIXTURE_INITIAL_AUTH = JSON.stringify({
@@ -170,6 +171,24 @@ esac
     const hostConfigContent = readFileSync(join(hostCodexDir, "config.toml"), "utf8");
     expect(hostConfigContent).not.toContain(actorDir);
     expect(hostConfigContent).toContain('model = "o3"');
+  }, 30_000);
+
+  it("persists refreshed credentials to a configured Codex home without a test seam (#782)", async () => {
+    configureCodexHome(hostCodexDir);
+    try {
+      const output = await scrapeCodexStatus({
+        actorDir,
+        cliCommand: writeFakeCli({ payload: FIXTURE_REFRESHED_AUTH_SUCCESS, scenario: "normal" }),
+        timeoutMs: 15_000,
+      });
+      expect(output).toContain("5h limit:");
+    } finally {
+      configureCodexHome(undefined);
+    }
+
+    const hostAuthContent = readFileSync(join(hostCodexDir, "auth.json"), "utf8");
+    expect(JSON.parse(hostAuthContent)).toEqual(JSON.parse(FIXTURE_REFRESHED_AUTH_SUCCESS));
+    expect(readFileSync(join(hostCodexDir, "config.toml"), "utf8")).not.toContain(actorDir);
   }, 30_000);
 
   it("never runs a Codex process against an inherited CODEX_HOME (issue #781)", async () => {
