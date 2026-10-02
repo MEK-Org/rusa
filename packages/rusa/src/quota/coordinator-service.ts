@@ -491,8 +491,8 @@ export class QuotaCoordinatorService {
         return;
       }
 
-      const snapshot = this.options.store.getLatestSnapshot(provider);
-      if (!snapshot) {
+      const rawSnapshot = this.options.store.getLatestSnapshot(provider);
+      if (!rawSnapshot) {
         this.sendJson(res, 200, {
           service: serviceInfo,
           provider,
@@ -508,6 +508,7 @@ export class QuotaCoordinatorService {
         return;
       }
 
+      const snapshot = this.options.store.projectPacerState(provider, rawSnapshot);
       this.sendJson(res, 200, {
         service: serviceInfo,
         ...snapshot,

@@ -1220,10 +1220,72 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(warmRes.json.status).toBe("available");
     expect(warmRes.json.provider).toBe("claude");
     expect(warmRes.json.limits[0].percentLeft).toBe(75);
+    expect(warmRes.json.limits[0].throttleSeconds).toBeNull();
+    expect(warmRes.json.limits[0].paceError).toBeNull();
     expect(warmRes.json.limits[1].scope).toEqual({
       provider: "claude",
       models: ["claude-fable"],
     });
+    expect(warmRes.json.limits[1].throttleSeconds).toBeNull();
+    expect(warmRes.json.limits[1].paceError).toBeNull();
+  });
+
+  it("GET /v1/quota returns limits carrying projected start-pacer throttleSeconds and paceError (#336)", async () => {
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+    });
+    await service.start();
+    store.configureController({ maxIntervalSeconds: 36000 });
+
+    const nowMs = Date.parse("2030-01-01T12:00:00.000Z");
+    const scrapedAt = new Date(nowMs).toISOString();
+    const resetAtIso = new Date(nowMs + 6 * 24 * 3600 * 1000).toISOString();
+
+    const id = store.recordRaw({
+      provider: "claude",
+      scrapedAt,
+      rawOutput: "raw",
+    });
+    store.recordParsed(
+      id,
+      {
+        provider: "claude",
+        status: "available",
+        scrapedAt,
+        limits: [
+          {
+            kind: "weekly",
+            label: "Weekly",
+            percentLeft: 10,
+            resetAtIso,
+            scope: { provider: "claude" },
+          },
+        ],
+      },
+      {
+        provider: "claude",
+        status: "available",
+        scrapedAt,
+        limits: [
+          {
+            kind: "weekly",
+            label: "Weekly",
+            percentLeft: 10,
+            resetAtIso,
+            scope: { provider: "claude" },
+          },
+        ],
+      }
+    );
+    store.advancePendingController({ maxIntervalSeconds: 36000 }, "claude");
+
+    const res = await makeRequest(socketPath, "/v1/quota?provider=claude");
+    expect(res.status).toBe(200);
+    expect(res.json.limits).toHaveLength(1);
+    expect(res.json.limits[0].throttleSeconds).toBeGreaterThan(0);
+    expect(res.json.limits[0].paceError).toBeGreaterThan(0);
   });
 
   // §5.5: GET /v1/history
