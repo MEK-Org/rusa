@@ -2,10 +2,10 @@
 //
 //   flutter test test/iu_reports_appearance_screenshot_test.dart
 //
-// It captures before-and-after screenshots of the zero-space chat coverage
+// It captures screenshots of the zero-space chat coverage
 // sentence in the IU Reports view:
-//   - flutter_dashboard/screenshots/iu_reports_zero_space_before.png
 //   - flutter_dashboard/screenshots/iu_reports_zero_space_after.png
+//   - flutter_dashboard/screenshots/iu_reports_zero_space_before.png (reproducible with CAPTURE_BEFORE_SCREENSHOT=true)
 
 import 'dart:io';
 
@@ -98,7 +98,7 @@ _Nothing skipped this run._
 - Cursor advanced: yes → 2026-10-02T08:00:00Z
 ''';
 
-  testWidgets('captures IU Reports zero-space before and after screenshots', (
+  testWidgets('renders IU Reports zero-space chat coverage without placeholders', (
     tester,
   ) async {
     await tester.runAsync(() async {
@@ -114,8 +114,8 @@ _Nothing skipped this run._
         },
       ];
 
-      // ── Capture Before ──
-      {
+      // ── Capture Before (reproducible review artifact on demand) ──
+      if (Platform.environment['CAPTURE_BEFORE_SCREENSHOT'] == 'true') {
         final apiBefore = FakeReportsApi(
           {'v': 1, 'runs': runs},
           {'2026-10-02-01': beforeMarkdown},
