@@ -671,7 +671,7 @@ describe("chat MCP server", () => {
         },
       })) as CallToolResult;
       expect(uploadRes.isError).toBe(true);
-      expect(textOf(uploadRes)).toContain("attachment size limit exceeded");
+      expect(textOf(uploadRes)).toContain("file size limit exceeded");
 
       const sendRes = (await client.callTool({
         name: "send_message",
@@ -686,7 +686,7 @@ describe("chat MCP server", () => {
         },
       })) as CallToolResult;
       expect(sendRes.isError).toBe(true);
-      expect(textOf(sendRes)).toContain("attachment size limit exceeded");
+      expect(textOf(sendRes)).toContain("file size limit exceeded");
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }

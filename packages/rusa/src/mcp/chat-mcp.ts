@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import mime from "mime";
@@ -18,7 +17,7 @@ import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { formatVisibleActorSignature } from "./actor-signature.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
-import { resolveAttachmentPath } from "./workdir-path.js";
+import { readBoundedRegularFile, resolveAttachmentPath } from "./workdir-path.js";
 
 export const CHAT_WRITE_MCP_NAME = "chat-write";
 export const CHAT_READ_MCP_NAME = "chat-read";
@@ -574,13 +573,11 @@ export function createChatWriteMcpServer(
               });
             } else if (att.filePath) {
               const confinedPath = await resolveAttachmentPath(workDir, att.filePath);
-              const maxBytes = options.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
-              const buf = await readFile(confinedPath);
-              if (buf.length > maxBytes) {
-                throw new Error(
-                  `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
-                );
-              }
+              const buf = await readBoundedRegularFile(
+                workDir,
+                confinedPath,
+                options.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES
+              );
               const filename = att.filename || basename(att.filePath) || "attachment.bin";
               const mimeType = att.mimeType ?? inferChatMimeType(filename);
               const uploaded = await chatClient.uploadAttachment(
@@ -681,12 +678,7 @@ export function createChatWriteMcpServer(
         let effectiveFilename: string;
         if (filePath) {
           const confinedPath = await resolveAttachmentPath(workDir, filePath);
-          contentBuffer = await readFile(confinedPath);
-          if (contentBuffer.length > maxBytes) {
-            throw new Error(
-              `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
-            );
-          }
+          contentBuffer = await readBoundedRegularFile(workDir, confinedPath, maxBytes);
           effectiveFilename = filename || basename(filePath) || "attachment.bin";
         } else if (contentBase64) {
           const estimatedBytes = Math.ceil((contentBase64.length * 3) / 4);
