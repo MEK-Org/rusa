@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { codexHomeDir, configuredCodexHome } from "../providers/codex-home.js";
 import {
@@ -172,17 +172,23 @@ export function buildHostJobBwrapArgs(o: BuildHostJobBwrapArgsOptions): string[]
   // mcHome explicitly in case it's configured outside hostHome (a non-default
   // RUSA_HOME), so the mesh's own secrets root is never merely "usually"
   // hidden. The same goes for a configured Codex home (#782), shadowed at its
-  // real path: a symlink to it vanishes with the home tmpfs, but the target
-  // stays reachable through the root ro-bind. Mounting a tmpfs inside an
-  // already-shadowed tree is a harmless no-op (still empty), so no
-  // ordering/overlap check is needed here.
+  // real path: any symlink to it then resolves into the empty tmpfs, while the
+  // target would otherwise stay reachable through the root ro-bind. A
+  // configured home that does not exist yet is skipped, as in sandbox.ts:
+  // there is nothing to hide, and bwrap cannot mkdir a mountpoint on the
+  // read-only root. Mounting a tmpfs inside an already-shadowed tree is a
+  // harmless no-op (still empty), so no ordering/overlap check is needed here.
   const realHostHome = realpathIfExists(hostHome);
   const realMcHome = realpathIfExists(o.mcHome);
   args.push("--tmpfs", hostHome);
   if (!overlaps(realHostHome, realMcHome)) args.push("--tmpfs", o.mcHome);
   const configuredCodex = configuredCodexHome();
   const realConfiguredCodex = configuredCodex && realpathIfExists(configuredCodex);
-  if (realConfiguredCodex && !overlaps(realHostHome, realConfiguredCodex)) {
+  if (
+    realConfiguredCodex &&
+    existsSync(realConfiguredCodex) &&
+    !overlaps(realHostHome, realConfiguredCodex)
+  ) {
     args.push("--tmpfs", realConfiguredCodex);
   }
   args.push("--tmpfs", "/tmp");

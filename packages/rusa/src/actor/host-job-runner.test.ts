@@ -567,6 +567,26 @@ describe.skipIf(!BWRAP_CAPABLE)("buildHostJobBwrapArgs + real bwrap (ack item 3 
     }
   });
 
+  it("still runs when the configured Codex home does not exist yet (#782)", () => {
+    // Outside /tmp and hostHome, so bwrap would have to mkdir it on the read-only root.
+    const missingHome = join(process.cwd(), `.host-job-codex-missing-${process.pid}`);
+    configureCodexHome(missingHome);
+    try {
+      const args = buildHostJobBwrapArgs({
+        hostHome,
+        mcHome,
+        scratchDir,
+        manifest: { readPaths: [] },
+      });
+      const output = execFileSync("bwrap", [...args, "--", "/bin/sh", "-c", "echo JOB_RAN"], {
+        encoding: "utf-8",
+      });
+      expect(output.trim()).toBe("JOB_RAN");
+    } finally {
+      configureCodexHome(undefined);
+    }
+  });
+
   it("can write into its own scratch dir (the job's real workspace)", () => {
     const args = buildHostJobBwrapArgs({
       hostHome,
