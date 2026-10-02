@@ -291,29 +291,33 @@ export class BuildRunner implements BuildSeam {
       throw new Error(`cannot restore previous dist: ${previous} is absent`);
     }
     rmSync(failed, { recursive: true, force: true });
+    // A failure here leaves the live dist where it was.
+    renameSync(live, failed);
     try {
-      renameSync(live, failed);
-      try {
-        renameSync(previous, live);
-      } catch (err) {
-        // Preserve the new pair if the old one cannot be promoted. Leaving the
-        // live path absent would turn a recoverable failed update into a boot
-        // outage, and keeping the new pair avoids a HEAD/sentinel mismatch.
-        renameSync(failed, live);
-        throw err;
-      }
-      rmSync(failed, { recursive: true, force: true });
-      this.log("[update] restored previous dist after post-build failure");
+      renameSync(previous, live);
     } catch (err) {
-      if (!existsSync(live) && existsSync(failed)) {
-        try {
-          renameSync(failed, live);
-        } catch {
-          // The original error is the actionable one; the caller marks the
-          // deployment rollback unsafe and emits the durable alert.
-        }
+      // Preserve the new pair if the old one cannot be promoted. Leaving the
+      // live path absent would turn a recoverable failed update into a boot
+      // outage, and keeping the new pair avoids a HEAD/sentinel mismatch.
+      const why = err instanceof Error ? err.message : String(err);
+      try {
+        renameSync(failed, live);
+      } catch (restoreErr) {
+        throw new Error(
+          `cannot promote ${previous} (${why}) nor put the new dist back ` +
+            `(${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}); ${live} is absent`
+        );
       }
       throw err;
     }
+    // The restore has happened; a leftover directory must not report it failed.
+    try {
+      rmSync(failed, { recursive: true, force: true });
+    } catch (err) {
+      this.log(
+        `[update] could not remove ${failed}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    this.log("[update] restored previous dist after post-build failure");
   }
 }

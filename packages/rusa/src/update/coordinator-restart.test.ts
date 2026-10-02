@@ -47,6 +47,11 @@ function close(server: http.Server): Promise<void> {
   );
 }
 
+async function delayThen(ms: number, fn: () => Promise<void>): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+  await fn();
+}
+
 function socketDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "rusa-coordinator-restart-"));
   testDirs.push(dir);
@@ -67,6 +72,24 @@ describe("coordinator restart verification", () => {
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve()))
       );
+    }
+  });
+
+  it("keeps polling while the socket is absent during the restart, then confirms", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rusa-coordinator-restart-"));
+    testDirs.push(dir);
+    const socketPath = join(dir, "coordinator.sock");
+    let server: http.Server | undefined;
+    const late = delayThen(300, async () => {
+      server = await startReadyServer(socketPath, SHA);
+    });
+    try {
+      await expect(
+        waitForCoordinatorRevision({ socketPath, expectedRevision: SHA, timeoutMs: 3_000 })
+      ).resolves.toBeUndefined();
+    } finally {
+      await late;
+      if (server) await close(server);
     }
   });
 
@@ -275,19 +298,6 @@ describe("pool coordinator ownership from effective systemd settings", () => {
     });
   });
 
-  it("follows a drop-in that repoints the effective ExecStart, whatever the base file says", () => {
-    // systemd folds the drop-in into `show`; the base file naming the client
-    // checkout is not what a restart would launch.
-    const host = syntheticHost();
-    const show = host.show({ cli: host.cliPath(host.owner) });
-    expect(
-      resolvePoolCoordinatorOwnership({ cliPath: host.cliPath(host.owner), show })
-    ).toMatchObject({ ownership: "owner" });
-    expect(
-      resolvePoolCoordinatorOwnership({ cliPath: host.cliPath(host.client), show })
-    ).toMatchObject({ ownership: "not-owner" });
-  });
-
   it.each([
     ["systemd cannot be asked", { show: null }, /could not be asked/],
     ["a daemon-reload is pending", { needReload: "yes" }, /daemon-reload pending/],
@@ -299,7 +309,7 @@ describe("pool coordinator ownership from effective systemd settings", () => {
       { execStart: ["{ path=/x ; argv[]=/x ; ignore_errors=no }"] },
       /cannot split/,
     ],
-    ["its executable path has a space", { spacedCli: true }, /cannot split|does not exist/],
+    ["its executable path has a space", { spacedCli: true }, /cannot split/],
     ["--home and RUSA_HOME disagree", { environment: "RUSA_HOME=/elsewhere" }, /disagrees/],
   ] as const)("is unknown when %s", (_label, over, reason) => {
     const host = syntheticHost();

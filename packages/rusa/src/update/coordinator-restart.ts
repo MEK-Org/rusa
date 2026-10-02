@@ -329,12 +329,14 @@ export class SystemdCoordinatorRestarter implements CoordinatorRestartSeam {
     await this.runBackup(target.home, backupDir);
   }
 
+  /** One deadline spans the restart command and readiness together. */
   async restart(target: CoordinatorTarget, expectedRevision: string): Promise<void> {
+    const deadline = Date.now() + this.timeoutMs;
     await this.restartUnit(target.unit);
     await waitForCoordinatorRevision({
       socketPath: target.socketPath,
       expectedRevision,
-      timeoutMs: this.timeoutMs,
+      timeoutMs: Math.max(0, deadline - Date.now()),
     });
   }
 }

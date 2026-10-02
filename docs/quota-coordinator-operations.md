@@ -183,11 +183,15 @@ After a green build and before the client drain, the update then:
 3. takes the runbook's pre-restart backup with `rusa quota-backup` into
    `<backupDir>/pre-deploy` (its own retention, so frequent deploys never evict
    the daily copies; skipped only when the database does not exist yet);
-4. restarts only the fixed pool unit;
-5. waits up to 60 seconds in total for `/v1/readyz` on the socket that
-   coordinator's own home configures to report the built revision. Each
-   attempt is bounded by wall-clock time and by envelope size, so a response
-   that streams, stalls, or aborts cannot extend the wait.
+4. restarts only the fixed pool unit and waits for `/v1/readyz` on the socket
+   that coordinator's own home configures to report the built revision. One
+   60-second deadline covers the restart command and readiness together. Each
+   readiness attempt is bounded by wall-clock time and by envelope size, so a
+   response that streams, stalls, or aborts cannot extend the wait.
+
+The backup has its own 60-second bound before that. So the worst case is
+about 60 seconds of backup, then up to 60 seconds with the coordinator
+restarting; a rollback restart adds up to another 60 seconds.
 
 Any failure before the client exits restores the previous dist and checkout.
 Restoring the dist is two renames, not an atomic exchange: the live path is
