@@ -388,6 +388,282 @@ describe("assemblePortableContextV2", () => {
     expect(portable.section).not.toContain("B".repeat(8_000));
   });
 
+  it("retains newest-first rulings when an overflowing must tier exceeds the byte budget (#328)", () => {
+    const state = emptyPortableContextState("actor-a");
+    // Create several active must items dated across time that together exceed 16,000 bytes.
+    // The oldest item was recorded earlier; the newest item is recorded recently.
+    state.items = [
+      {
+        id: "must-old-1",
+        kind: "constraint",
+        priority: "must",
+        status: "active",
+        statement: `Old ruling 1 from August: ${"1".repeat(6_000)}`,
+        evidence: [
+          { eventId: "e1", sender: "root", ts: "2026-08-25T10:00:00.000Z", quote: "old 1" },
+        ],
+        updatedAt: "2026-08-25T10:00:00.000Z",
+      },
+      {
+        id: "must-old-2",
+        kind: "constraint",
+        priority: "must",
+        status: "active",
+        statement: `Old ruling 2 from August: ${"2".repeat(6_000)}`,
+        evidence: [
+          { eventId: "e2", sender: "root", ts: "2026-08-26T10:00:00.000Z", quote: "old 2" },
+        ],
+        updatedAt: "2026-08-26T10:00:00.000Z",
+      },
+      {
+        id: "must-recent-3",
+        kind: "constraint",
+        priority: "must",
+        status: "active",
+        statement: `Recent ruling 3 from September: ${"3".repeat(6_000)}`,
+        evidence: [
+          { eventId: "e3", sender: "root", ts: "2026-09-07T12:00:00.000Z", quote: "recent 3" },
+        ],
+        updatedAt: "2026-09-07T12:00:00.000Z",
+      },
+    ];
+
+    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
+    expect(portable).not.toBeNull();
+    if (!portable) throw new Error("expected portable context");
+
+    // Under #328, newest-first within the must tier ensures the September ruling is retained,
+    // and older rulings that overflow the 16KB budget are dropped.
+    // The pre-fix bug keeps a fixed slab of the oldest items (must-old-1 and must-old-2), dropping must-recent-3.
+    expect(portable.section).toContain("Recent ruling 3 from September");
+    expect(portable.section).not.toContain("Old ruling 1 from August");
+
+    // Omission marker and overflow metrics are observable
+    expect(portable.section).toContain("… [1 active item omitted due to budget]");
+    expect(portable.record.active).toBe(3);
+    expect(portable.record.selected).toBe(2);
+    expect(portable.record.dropped).toBe(1);
+    expect(portable.record.droppedByPriority).toEqual({ must: 1, should: 0, background: 0 });
+    expect(portable.record.minSelectedEvidenceTs).toBe("2026-08-26T10:00:00.000Z");
+    expect(portable.record.maxSelectedEvidenceTs).toBe("2026-09-07T12:00:00.000Z");
+    expect(portable.record.minDroppedEvidenceTs).toBe("2026-08-25T10:00:00.000Z");
+    expect(portable.record.maxDroppedEvidenceTs).toBe("2026-08-25T10:00:00.000Z");
+  });
+
+  it("preserves priority tier dominance so older must items precede newer should items (#328)", () => {
+    const state = emptyPortableContextState("actor-a");
+    state.items = [
+      {
+        id: "must-old",
+        kind: "constraint",
+        priority: "must",
+        status: "active",
+        statement: `Old must item from August: ${"M".repeat(9_000)}`,
+        evidence: [
+          { eventId: "e1", sender: "root", ts: "2026-08-01T10:00:00.000Z", quote: "must" },
+        ],
+        updatedAt: "2026-08-01T10:00:00.000Z",
+      },
+      {
+        id: "should-recent",
+        kind: "constraint",
+        priority: "should",
+        status: "active",
+        statement: `Recent should item from September: ${"S".repeat(9_000)}`,
+        evidence: [
+          { eventId: "e2", sender: "root", ts: "2026-09-15T10:00:00.000Z", quote: "should" },
+        ],
+        updatedAt: "2026-09-15T10:00:00.000Z",
+      },
+    ];
+
+    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
+    expect(portable).not.toBeNull();
+    if (!portable) throw new Error("expected portable context");
+
+    // Priority tier dominance: 'must' > 'should' regardless of timestamp
+    expect(portable.section).toContain("Old must item from August");
+    expect(portable.section).not.toContain("Recent should item from September");
+    expect(portable.section).toContain("… [1 active item omitted due to budget]");
+
+    expect(portable.record.active).toBe(2);
+    expect(portable.record.selected).toBe(1);
+    expect(portable.record.dropped).toBe(1);
+    expect(portable.record.droppedByPriority).toEqual({ must: 0, should: 1, background: 0 });
+    expect(portable.record.minSelectedEvidenceTs).toBe("2026-08-01T10:00:00.000Z");
+    expect(portable.record.maxSelectedEvidenceTs).toBe("2026-08-01T10:00:00.000Z");
+    expect(portable.record.minDroppedEvidenceTs).toBe("2026-09-15T10:00:00.000Z");
+    expect(portable.record.maxDroppedEvidenceTs).toBe("2026-09-15T10:00:00.000Z");
+  });
+
+  it("evaluates recency using newest evidence timestamp when item is re-evidenced (#328)", () => {
+    const state = emptyPortableContextState("actor-a");
+    // Item A was created early August, but re-evidenced in late September.
+    // Item B was created late August with no newer evidence.
+    state.items = [
+      {
+        id: "item-a-re-evidenced",
+        kind: "constraint",
+        priority: "must",
+        status: "active",
+        statement: `Item A re-evidenced: ${"A".repeat(8_500)}`,
+        evidence: [
+          { eventId: "e1", sender: "root", ts: "2026-08-01T10:00:00.000Z", quote: "orig" },
+          { eventId: "e3", sender: "root", ts: "2026-09-25T10:00:00.000Z", quote: "re-affirmed" },
+        ],
+        updatedAt: "2026-08-01T10:00:00.000Z",
+      },
+      {
+        id: "item-b-intermediate",
+        kind: "constraint",
+        priority: "must",
+        status: "active",
+        statement: `Item B intermediate: ${"B".repeat(8_500)}`,
+        evidence: [
+          { eventId: "e2", sender: "root", ts: "2026-08-20T10:00:00.000Z", quote: "intermediate" },
+        ],
+        updatedAt: "2026-08-20T10:00:00.000Z",
+      },
+    ];
+
+    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
+    expect(portable).not.toBeNull();
+    if (!portable) throw new Error("expected portable context");
+
+    // Item A's newest evidence timestamp (2026-09-25) is newer than Item B (2026-08-20)
+    expect(portable.section).toContain("Item A re-evidenced");
+    expect(portable.section).not.toContain("Item B intermediate");
+    expect(portable.section).toContain("… [1 active item omitted due to budget]");
+  });
+
+  it("breaks recency ties deterministically using original index descending (#328)", () => {
+    const state = emptyPortableContextState("actor-a");
+    // Both items have identical evidence timestamps and same priority
+    state.items = [
+      {
+        id: "item-first",
+        kind: "constraint",
+        priority: "must",
+        status: "active",
+        statement: `Item first in array: ${"1".repeat(9_000)}`,
+        evidence: [{ eventId: "e1", sender: "root", ts: "2026-09-01T12:00:00.000Z", quote: "q" }],
+        updatedAt: "2026-09-01T12:00:00.000Z",
+      },
+      {
+        id: "item-second",
+        kind: "constraint",
+        priority: "must",
+        status: "active",
+        statement: `Item second in array: ${"2".repeat(9_000)}`,
+        evidence: [{ eventId: "e2", sender: "root", ts: "2026-09-01T12:00:00.000Z", quote: "q" }],
+        updatedAt: "2026-09-01T12:00:00.000Z",
+      },
+    ];
+
+    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
+    expect(portable).not.toBeNull();
+    if (!portable) throw new Error("expected portable context");
+
+    // On tie, later originalIndex (item-second) is selected first
+    expect(portable.section).toContain("Item second in array");
+    expect(portable.section).not.toContain("Item first in array");
+  });
+
+  it("strictly enforces 16,000B ledger limit with omission marker and renders stable original order (#328)", () => {
+    const state = emptyPortableContextState("actor-a");
+    // 20 items of ~1,000 bytes each (total ~20KB) across various dates
+    state.items = Array.from({ length: 20 }, (_, idx) => ({
+      id: `item-${idx}`,
+      kind: "constraint" as const,
+      priority: "must" as const,
+      status: "active" as const,
+      statement: `Ruling index ${idx} with content: ${"x".repeat(900)}`,
+      evidence: [
+        {
+          eventId: `e-${idx}`,
+          sender: "root",
+          ts: `2026-08-${String(idx + 1).padStart(2, "0")}T00:00:00.000Z`,
+          quote: `q-${idx}`,
+        },
+      ],
+      updatedAt: `2026-08-${String(idx + 1).padStart(2, "0")}T00:00:00.000Z`,
+    }));
+
+    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
+    expect(portable).not.toBeNull();
+    if (!portable) throw new Error("expected portable context");
+
+    const ledgerBytes = portable.record.sections?.ledger;
+    expect(ledgerBytes).toBeDefined();
+    expect(ledgerBytes).toBeLessThanOrEqual(PORTABLE_CONTEXT_LEDGER_MAX_BYTES);
+
+    const metrics = portable.record.ledger;
+    expect(metrics).toBeDefined();
+    if (!metrics) throw new Error("expected ledger metrics");
+
+    // Invariants
+    expect(metrics.active).toBe(20);
+    expect(metrics.selected + metrics.dropped).toBe(metrics.active);
+    expect(
+      metrics.droppedByPriority.must +
+        metrics.droppedByPriority.should +
+        metrics.droppedByPriority.background
+    ).toBe(metrics.dropped);
+    expect(metrics.dropped).toBeGreaterThan(0);
+
+    // Omission marker matches dropped count exactly
+    expect(portable.section).toContain(`… [${metrics.dropped} active items omitted due to budget]`);
+
+    // Selected items are rendered in ascending originalIndex order (stable prefix)
+    const indicesInOutput: number[] = [];
+    for (let idx = 0; idx < 20; idx++) {
+      if (portable.section.includes(`Ruling index ${idx} with content`)) {
+        indicesInOutput.push(idx);
+      }
+    }
+    expect(indicesInOutput.length).toBe(metrics.selected);
+    const sortedIndices = [...indicesInOutput].sort((a, b) => a - b);
+    expect(indicesInOutput).toEqual(sortedIndices);
+  });
+
+  it("reports zero dropped metrics and null dropped evidence timestamps when ledger fits budget (#328)", () => {
+    const state = emptyPortableContextState("actor-a");
+    state.items = [
+      {
+        id: "small-1",
+        kind: "constraint",
+        priority: "must",
+        status: "active",
+        statement: "Small ruling 1",
+        evidence: [{ eventId: "e1", sender: "root", ts: "2026-09-01T00:00:00.000Z", quote: "q1" }],
+        updatedAt: "2026-09-01T00:00:00.000Z",
+      },
+      {
+        id: "small-2",
+        kind: "constraint",
+        priority: "should",
+        status: "active",
+        statement: "Small ruling 2",
+        evidence: [{ eventId: "e2", sender: "root", ts: "2026-09-02T00:00:00.000Z", quote: "q2" }],
+        updatedAt: "2026-09-02T00:00:00.000Z",
+      },
+    ];
+
+    const portable = assemblePortableContextV2({ state, messages: [], runs: [] });
+    expect(portable).not.toBeNull();
+    if (!portable) throw new Error("expected portable context");
+
+    expect(portable.record.active).toBe(2);
+    expect(portable.record.selected).toBe(2);
+    expect(portable.record.dropped).toBe(0);
+    expect(portable.record.droppedByPriority).toEqual({ must: 0, should: 0, background: 0 });
+    expect(portable.record.minSelectedEvidenceTs).toBe("2026-09-01T00:00:00.000Z");
+    expect(portable.record.maxSelectedEvidenceTs).toBe("2026-09-02T00:00:00.000Z");
+    expect(portable.record.minDroppedEvidenceTs).toBeNull();
+    expect(portable.record.maxDroppedEvidenceTs).toBeNull();
+    expect(portable.section).not.toContain("omitted due to budget");
+  });
+
   it("renders originating evidence (evidence[0]) as Source so re-evidencing does not misattribute issuer (§4 / ISSUE_NUM)", () => {
     const state = emptyPortableContextState("actor-a");
     state.items = [

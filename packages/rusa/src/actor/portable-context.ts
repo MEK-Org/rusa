@@ -31,6 +31,20 @@ export interface PriorRun {
 }
 
 /**
+ * Aggregate content-free metrics on active durable ledger items and overflow (#328).
+ */
+export interface LedgerMetrics {
+  active: number;
+  selected: number;
+  dropped: number;
+  droppedByPriority: Record<PortableMemoryPriority, number>;
+  minSelectedEvidenceTs: string | null;
+  maxSelectedEvidenceTs: string | null;
+  minDroppedEvidenceTs: string | null;
+  maxDroppedEvidenceTs: string | null;
+}
+
+/**
  * The per-run inject record (design ISSUE_NUM, root's one attached requirement).
  * Emitted at inject time so "what was injected into run X" is answerable even
  * after observability events age out. `bytes` is the A/B PRIMARY metric
@@ -54,6 +68,16 @@ export interface InjectRecord {
   sourceMessageEventIds?: string[];
   /** Byte breakdown for diagnosing what consumed the bounded prompt budget. */
   sections?: { ledger: number; messages: number; runs: number };
+  /** Aggregate content-free metrics on active durable ledger items and overflow (#328). */
+  ledger?: LedgerMetrics;
+  active?: number;
+  selected?: number;
+  dropped?: number;
+  droppedByPriority?: Record<PortableMemoryPriority, number>;
+  minSelectedEvidenceTs?: string | null;
+  maxSelectedEvidenceTs?: string | null;
+  minDroppedEvidenceTs?: string | null;
+  maxDroppedEvidenceTs?: string | null;
 }
 
 export interface PortableContext {
@@ -240,9 +264,108 @@ function renderableLedgerItems(state: PortableContextState): PortableMemoryItem[
   return state.items.filter((item) => item.status === "active" && !isRetiredMemoryKind(item.kind));
 }
 
-function renderLedger(state: PortableContextState): string {
+function parseIsoTimestamp(ts: string | undefined | null): number | null {
+  if (!ts || typeof ts !== "string") return null;
+  const ms = Date.parse(ts);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+function getItemRecency(item: PortableMemoryItem): number | null {
+  let newestEvidenceMs: number | null = null;
+  if (Array.isArray(item.evidence)) {
+    for (const ev of item.evidence) {
+      const ms = parseIsoTimestamp(ev?.ts);
+      if (ms !== null && (newestEvidenceMs === null || ms > newestEvidenceMs)) {
+        newestEvidenceMs = ms;
+      }
+    }
+  }
+  if (newestEvidenceMs !== null) {
+    return newestEvidenceMs;
+  }
+  return parseIsoTimestamp(item.updatedAt);
+}
+
+function compareLedgerCandidates(
+  a: { item: PortableMemoryItem; originalIndex: number; recency: number | null },
+  b: { item: PortableMemoryItem; originalIndex: number; recency: number | null }
+): number {
+  const priorityDiff =
+    LEDGER_PRIORITY_ORDER[a.item.priority] - LEDGER_PRIORITY_ORDER[b.item.priority];
+  if (priorityDiff !== 0) return priorityDiff;
+
+  if (a.recency !== null && b.recency !== null) {
+    if (a.recency !== b.recency) {
+      return b.recency - a.recency;
+    }
+  } else if (a.recency !== null) {
+    return -1;
+  } else if (b.recency !== null) {
+    return 1;
+  }
+
+  return b.originalIndex - a.originalIndex;
+}
+
+function getItemEvidenceTimestamps(item: PortableMemoryItem): string[] {
+  const timestamps: string[] = [];
+  if (Array.isArray(item.evidence)) {
+    for (const ev of item.evidence) {
+      if (parseIsoTimestamp(ev?.ts) !== null) {
+        timestamps.push(ev.ts);
+      }
+    }
+  }
+  if (timestamps.length === 0 && parseIsoTimestamp(item.updatedAt) !== null) {
+    timestamps.push(item.updatedAt);
+  }
+  return timestamps;
+}
+
+function computeMinMaxTimestamps(items: { item: PortableMemoryItem }[]): {
+  min: string | null;
+  max: string | null;
+} {
+  const allTimestamps: { ts: string; ms: number }[] = [];
+  for (const entry of items) {
+    const itemTimestamps = getItemEvidenceTimestamps(entry.item);
+    for (const ts of itemTimestamps) {
+      const ms = parseIsoTimestamp(ts);
+      if (ms !== null) {
+        allTimestamps.push({ ts, ms });
+      }
+    }
+  }
+  if (allTimestamps.length === 0) {
+    return { min: null, max: null };
+  }
+  allTimestamps.sort((a, b) => a.ms - b.ms);
+  return {
+    min: allTimestamps[0].ts,
+    max: allTimestamps[allTimestamps.length - 1].ts,
+  };
+}
+
+function formatOmissionMarker(droppedCount: number): string {
+  return `… [${droppedCount} active item${droppedCount === 1 ? "" : "s"} omitted due to budget]`;
+}
+
+export function renderLedger(state: PortableContextState): {
+  section: string;
+  metrics: LedgerMetrics;
+} {
   const active = renderableLedgerItems(state);
-  if (active.length === 0) return "";
+  const emptyMetrics: LedgerMetrics = {
+    active: 0,
+    selected: 0,
+    dropped: 0,
+    droppedByPriority: { must: 0, should: 0, background: 0 },
+    minSelectedEvidenceTs: null,
+    maxSelectedEvidenceTs: null,
+    minDroppedEvidenceTs: null,
+    maxDroppedEvidenceTs: null,
+  };
+  if (active.length === 0) return { section: "", metrics: emptyMetrics };
 
   const heading = "\n### Durable intent\n\n";
   const trailing = "\n";
@@ -252,32 +375,49 @@ function renderLedger(state: PortableContextState): string {
   const renderedItems = active.map((item, originalIndex) => ({
     item,
     originalIndex,
+    recency: getItemRecency(item),
     rendered: renderItem(item),
   }));
 
   const allLines = renderedItems.map((r) => r.rendered);
   const fullContent = heading + allLines.join("\n") + trailing;
   if (byteLen(fullContent) <= PORTABLE_CONTEXT_LEDGER_MAX_BYTES) {
-    return fullContent;
+    const selectedTimestamps = computeMinMaxTimestamps(renderedItems);
+    return {
+      section: fullContent,
+      metrics: {
+        active: active.length,
+        selected: active.length,
+        dropped: 0,
+        droppedByPriority: { must: 0, should: 0, background: 0 },
+        minSelectedEvidenceTs: selectedTimestamps.min,
+        maxSelectedEvidenceTs: selectedTimestamps.max,
+        minDroppedEvidenceTs: null,
+        maxDroppedEvidenceTs: null,
+      },
+    };
   }
 
   // Gracefully degrade: prioritize items by priority ("must" > "should" > "background"),
-  // preserving original order within the same priority level.
-  const prioritized = [...renderedItems].sort((a, b) => {
-    const priorityDiff =
-      LEDGER_PRIORITY_ORDER[a.item.priority] - LEDGER_PRIORITY_ORDER[b.item.priority];
-    if (priorityDiff !== 0) return priorityDiff;
-    return a.originalIndex - b.originalIndex;
-  });
+  // then by recency descending (newest evidence timestamp first),
+  // falling back to original index descending (#328).
+  const prioritized = [...renderedItems].sort(compareLedgerCandidates);
 
   const selected: typeof renderedItems = [];
-  let usedBytes = 0;
+  let usedItemBytes = 0;
 
   for (const candidate of prioritized) {
-    const candidateCost = byteLen(candidate.rendered) + (selected.length > 0 ? 1 : 0);
-    if (usedBytes + candidateCost <= budget) {
+    const candidateBytes = byteLen(candidate.rendered);
+    const separatorBytes = selected.length > 0 ? 1 : 0;
+    const nextItemBytes = usedItemBytes + separatorBytes + candidateBytes;
+
+    const tentativeDropped = active.length - (selected.length + 1);
+    const marker = tentativeDropped > 0 ? formatOmissionMarker(tentativeDropped) : "";
+    const markerBytes = marker ? 1 + byteLen(marker) : 0;
+
+    if (nextItemBytes + markerBytes <= budget) {
       selected.push(candidate);
-      usedBytes += candidateCost;
+      usedItemBytes = nextItemBytes;
     } else if (selected.length === 0) {
       // Even the single highest-priority item exceeds the budget alone, so it is
       // truncated rather than dropped: the actor's most urgent durable memory
@@ -292,26 +432,58 @@ function renderLedger(state: PortableContextState): string {
       // quote throws `portable context fixed sections exceed 32000 bytes` from
       // `assemblePortableContextV2`, which is raised inside `buildPrompt` with no
       // try/catch, so the owning actor cannot start until its data changes.
-      //
-      // Same defect and same failure mode as ISSUE_NUM's, one function over. Live
-      // ledger items are nowhere near it — the largest rendered line across all
-      // 17 state files is 808 bytes as of 2026-08-21 — so this is latent, and
-      // latent is exactly when it is cheap to close.
-      const truncatedRendered = headToBytes(candidate.rendered, budget);
+      const singleDropped = active.length - 1;
+      const singleMarker = singleDropped > 0 ? formatOmissionMarker(singleDropped) : "";
+      const singleMarkerBytes = singleMarker ? 1 + byteLen(singleMarker) : 0;
+      const availableForFirst = Math.max(0, budget - singleMarkerBytes);
+      const truncatedRendered = headToBytes(candidate.rendered, availableForFirst);
       selected.push({
-        item: candidate.item,
-        originalIndex: candidate.originalIndex,
+        ...candidate,
         rendered: truncatedRendered,
       });
+      usedItemBytes = byteLen(truncatedRendered);
       break;
     }
   }
 
-  if (selected.length === 0) return "";
+  const selectedIndices = new Set(selected.map((s) => s.originalIndex));
+  const dropped = renderedItems.filter((r) => !selectedIndices.has(r.originalIndex));
+
+  const droppedByPriority: Record<PortableMemoryPriority, number> = {
+    must: 0,
+    should: 0,
+    background: 0,
+  };
+  for (const d of dropped) {
+    if (d.item.priority in droppedByPriority) {
+      droppedByPriority[d.item.priority]++;
+    }
+  }
+
+  const selectedTimestamps = computeMinMaxTimestamps(selected);
+  const droppedTimestamps = computeMinMaxTimestamps(dropped);
 
   // Render selected items in their original array order for a stable prefix
   selected.sort((a, b) => a.originalIndex - b.originalIndex);
-  return heading + selected.map((s) => s.rendered).join("\n") + trailing;
+  const lines = selected.map((s) => s.rendered);
+  if (dropped.length > 0) {
+    lines.push(formatOmissionMarker(dropped.length));
+  }
+  const section = heading + lines.join("\n") + trailing;
+
+  return {
+    section,
+    metrics: {
+      active: active.length,
+      selected: selected.length,
+      dropped: dropped.length,
+      droppedByPriority,
+      minSelectedEvidenceTs: selectedTimestamps.min,
+      maxSelectedEvidenceTs: selectedTimestamps.max,
+      minDroppedEvidenceTs: droppedTimestamps.min,
+      maxDroppedEvidenceTs: droppedTimestamps.max,
+    },
+  };
 }
 
 const OBLIGATIONS_HEADING =
@@ -485,7 +657,7 @@ export function assemblePortableContextV2(input: {
   /** The actor's own obligations in store queue order; omit when unavailable. */
   obligations?: Obligation[];
 }): PortableContext | null {
-  const ledger = renderLedger(input.state);
+  const { section: ledger, metrics: ledgerMetrics } = renderLedger(input.state);
   const obligations = renderObligations(input.obligations ?? []);
   const recentMessages = boundedMessages(input.messages);
   const fixed = V2_HEADER + ledger + obligations + recentMessages.section;
@@ -532,6 +704,15 @@ export function assemblePortableContextV2(input: {
         messages: byteLen(recentMessages.section),
         runs: byteLen(runsSection),
       },
+      ledger: ledgerMetrics,
+      active: ledgerMetrics.active,
+      selected: ledgerMetrics.selected,
+      dropped: ledgerMetrics.dropped,
+      droppedByPriority: ledgerMetrics.droppedByPriority,
+      minSelectedEvidenceTs: ledgerMetrics.minSelectedEvidenceTs,
+      maxSelectedEvidenceTs: ledgerMetrics.maxSelectedEvidenceTs,
+      minDroppedEvidenceTs: ledgerMetrics.minDroppedEvidenceTs,
+      maxDroppedEvidenceTs: ledgerMetrics.maxDroppedEvidenceTs,
     },
   };
 }
