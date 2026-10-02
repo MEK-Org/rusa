@@ -13,7 +13,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProviderConfig } from "../config/types.js";
-import { AntigravityProvider, formatAgyToolInvocation } from "./antigravity.js";
+import {
+  ANTIGRAVITY_COMMAND_DISCIPLINE,
+  AntigravityProvider,
+  formatAgyToolInvocation,
+} from "./antigravity.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "./model-catalog.js";
 import {
   RUN_CEILING_ABORT_REASON,
@@ -97,7 +101,7 @@ describe("AntigravityProvider", () => {
       "agy",
       expect.arrayContaining([
         "-p",
-        "test prompt",
+        expect.stringContaining("test prompt"),
         "--dangerously-skip-permissions",
         "--model",
         "gemini-3.1-pro",
@@ -255,7 +259,13 @@ describe("AntigravityProvider", () => {
 
     expect(spawn).toHaveBeenCalledWith(
       "bwrap",
-      expect.arrayContaining(["--", "agy", "-p", "test prompt", "--dangerously-skip-permissions"]),
+      expect.arrayContaining([
+        "--",
+        "agy",
+        "-p",
+        expect.stringContaining("test prompt"),
+        "--dangerously-skip-permissions",
+      ]),
       expect.objectContaining({ cwd: "/" })
     );
   });
@@ -483,53 +493,99 @@ describe("AntigravityProvider", () => {
     expect(result.abortReason).toBe("unknown");
   });
 
-  it("exits cleanly when the model backgrounds a command and completes its turn with SUCCESS", async () => {
+  it("preserves unattributed SIGTERM failure attribution even after a SUCCESS result event", async () => {
     const config: ProviderConfig = { cliCommand: "agy" };
     const provider = new AntigravityProvider("antigravity", config, "Gemini 3.1 Pro (High)");
 
     const child = mockChildProcess() as unknown as ChildProcessWithoutNullStreams;
     vi.mocked(spawn).mockReturnValue(child);
 
-    const chunks: string[] = [];
     const runPromise = provider.run({
       prompt: "test prompt",
       cwd: "/tmp",
-      onChunk: (c) => chunks.push(c),
     });
 
-    // 1. Model launches a background command
-    child.stdout.emit(
-      "data",
-      `${JSON.stringify({
-        event: "step_update",
-        step_update: {
-          step_type: "tool",
-          state: "DONE",
-          tool_name: "run_command",
-          tool_info: { output: "Command was sent to the background as task-123" },
-        },
-      })}\n`
-    );
-
-    // 2. Model outputs response and ends turn with SUCCESS result
     child.stdout.emit(
       "data",
       `${JSON.stringify({
         event: "result",
         result: {
           status: "SUCCESS",
-          response: "Background capture script started.",
+          response: "Turn completed.",
         },
       })}\n`
     );
 
-    // 3. The background command finishes; agy process is signaled to close
+    // Unattributed SIGTERM arrives (e.g. external kill) — must NOT be converted to success: true
     child.emit("close", null, "SIGTERM");
 
     const result = await runPromise;
-    expect(result.success).toBe(true);
-    expect(result.exitCode).toBe(0);
-    expect(result.output).toBe("Background capture script started.");
+    expect(result.success).toBe(false);
+    expect(result.cancelled).toBe(true);
+    expect(result.exitCode).toBe(143);
+    expect(result.output).toBe("Turn completed.");
+    expect(result.abortReason).toBe("unknown");
+  });
+
+  it("preserves stall-watchdog attribution even after a SUCCESS result event", async () => {
+    const config: ProviderConfig = { cliCommand: "agy" };
+    const provider = new AntigravityProvider("antigravity", config, "Gemini 3.1 Pro (High)");
+
+    const child = mockChildProcess() as unknown as ChildProcessWithoutNullStreams;
+    vi.mocked(spawn).mockReturnValue(child);
+
+    const controller = new AbortController();
+    const runPromise = provider.run({
+      prompt: "test prompt",
+      cwd: "/tmp",
+      signal: controller.signal,
+    });
+
+    child.stdout.emit(
+      "data",
+      `${JSON.stringify({
+        event: "result",
+        result: {
+          status: "SUCCESS",
+          response: "Awaiting completion.",
+        },
+      })}\n`
+    );
+
+    controller.abort(STALL_WATCHDOG_ABORT_REASON);
+    child.emit("close", null, "SIGTERM");
+
+    const result = await runPromise;
+    expect(result.success).toBe(false);
+    expect(result.cancelled).toBe(true);
+    expect(result.exitCode).toBe(143);
+    expect(result.output).toContain("[Task killed by stall watchdog (no output for 15 minutes)]");
+    expect(result.abortReason).toBe("stall-watchdog");
+  });
+
+  it("appends Antigravity command discipline to the prompt", async () => {
+    const config: ProviderConfig = { cliCommand: "agy" };
+    const provider = new AntigravityProvider("antigravity", config, "Gemini 3.1 Pro (High)");
+
+    const child = mockChildProcess() as unknown as ChildProcessWithoutNullStreams;
+    vi.mocked(spawn).mockReturnValue(child);
+
+    const runPromise = provider.run({
+      prompt: "Execute migration script",
+      cwd: "/tmp",
+    });
+
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const spawnArgs = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+    const pIdx = spawnArgs.indexOf("-p");
+    expect(pIdx).toBeGreaterThanOrEqual(0);
+    const promptArg = spawnArgs[pIdx + 1];
+    expect(promptArg).toContain("Execute migration script");
+    expect(promptArg).toContain(ANTIGRAVITY_COMMAND_DISCIPLINE);
+    expect(promptArg).toContain("manage_task");
+
+    child.emit("close", 0, null);
+    await runPromise;
   });
 
   it("classifies exit-0 empty-output QUOTA_EXHAUSTED conversation tails as failure", async () => {

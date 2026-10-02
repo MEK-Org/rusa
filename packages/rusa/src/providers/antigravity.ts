@@ -3,7 +3,6 @@ import {
   closeSync,
   mkdirSync,
   openSync,
-  readdirSync,
   readFileSync,
   readSync,
   realpathSync,
@@ -413,56 +412,22 @@ export function formatAgyToolInvocation(step: AgyToolStep): string {
 }
 
 /**
- * Detect whether child commands (e.g. background tasks spawned via run_command)
- * are still running in the process subtree under `rootPid`.
- * In Linux /proc, process entries are numeric. We trace descendant PIDs and check
- * if any descendant process is a non-wrapper command (not "agy" and not "bwrap").
+ * Guidance injected into the prompt for Antigravity-backed workers.
+ * Warns models not to background commands and end their turn with tasks pending,
+ * because headless `agy -p` print mode does not resume or exit cleanly once
+ * background tasks are left running.
  */
-export function hasActiveChildCommands(rootPid: number): boolean {
-  try {
-    const entries = readdirSync("/proc");
-    const parentMap = new Map<number, number[]>();
-    for (const entry of entries) {
-      if (!/^\d+$/.test(entry)) continue;
-      const pid = parseInt(entry, 10);
-      try {
-        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-        const closeParen = stat.lastIndexOf(")");
-        if (closeParen === -1) continue;
-        const rest = stat.slice(closeParen + 2).split(" ");
-        const ppid = parseInt(rest[1], 10);
-        const children = parentMap.get(ppid) ?? [];
-        children.push(pid);
-        parentMap.set(ppid, children);
-      } catch {
-        /* process vanished */
-      }
-    }
-    const descendants: number[] = [];
-    const collect = (p: number) => {
-      const children = parentMap.get(p) ?? [];
-      for (const child of children) {
-        descendants.push(child);
-        collect(child);
-      }
-    };
-    collect(rootPid);
+export const ANTIGRAVITY_COMMAND_DISCIPLINE = `## Antigravity command discipline
+When running commands, do not background long tasks and yield "awaiting completion".
+Keep commands in the foreground or poll them with \`manage_task\` to resolution
+before completing your turn; ending a turn with background tasks pending in headless
+mode prevents clean continuation.`;
 
-    if (descendants.length === 0) return false;
-    for (const d of descendants) {
-      try {
-        const comm = readFileSync(`/proc/${d}/comm`, "utf8").trim();
-        if (comm !== "agy" && comm !== "bwrap") {
-          return true;
-        }
-      } catch {
-        /* process vanished */
-      }
-    }
-    return false;
-  } catch {
-    return false;
+export function appendAntigravityCommandDiscipline(prompt: string): string {
+  if (prompt.includes("## Antigravity command discipline")) {
+    return prompt;
   }
+  return `${prompt.trim()}\n\n${ANTIGRAVITY_COMMAND_DISCIPLINE}\n`;
 }
 
 /**
@@ -561,7 +526,7 @@ export class AntigravityProvider implements CodingProvider {
     const logFile = opts.session ? join(logDir, `.rusa-agy-${randomUUID()}.log`) : undefined;
 
     const args = buildAntigravityArgs({
-      prompt: opts.prompt,
+      prompt: appendAntigravityCommandDiscipline(opts.prompt),
       model: selection.model,
       effort: selection.effort,
       conversationId: opts.session?.id,
@@ -613,64 +578,12 @@ export class AntigravityProvider implements CodingProvider {
       if (opts.sandbox) {
         teardownFlutterOverlay(opts.cwd);
       }
-      if (backgroundCheckTimeout) {
-        clearTimeout(backgroundCheckTimeout);
-        backgroundCheckTimeout = undefined;
-      }
-      if (backgroundCheckInterval) {
-        clearInterval(backgroundCheckInterval);
-        backgroundCheckInterval = undefined;
-      }
     };
 
     let buffer = "";
     let capturedSessionId = opts.session?.id;
     let finalResultText: string | undefined;
     const emittedChunks: string[] = [];
-
-    let spawnedChild:
-      | import("node:child_process").ChildProcessByStdio<
-          null,
-          import("node:stream").Readable,
-          import("node:stream").Readable
-        >
-      | undefined;
-    let groupKiller: (() => void) | undefined;
-    let backgroundCheckInterval: NodeJS.Timeout | undefined;
-    let backgroundCheckTimeout: NodeJS.Timeout | undefined;
-    let resultSuccess = false;
-
-    const scheduleBackgroundCompletionCheck = () => {
-      if (backgroundCheckInterval || backgroundCheckTimeout) return;
-      backgroundCheckTimeout = setTimeout(() => {
-        backgroundCheckTimeout = undefined;
-        backgroundCheckInterval = setInterval(() => {
-          if (!spawnedChild || spawnedChild.killed || spawnedChild.exitCode !== null) {
-            if (backgroundCheckInterval) {
-              clearInterval(backgroundCheckInterval);
-              backgroundCheckInterval = undefined;
-            }
-            return;
-          }
-          const pid = spawnedChild.pid;
-          if (pid && !hasActiveChildCommands(pid)) {
-            if (backgroundCheckInterval) {
-              clearInterval(backgroundCheckInterval);
-              backgroundCheckInterval = undefined;
-            }
-            try {
-              if (groupKiller) {
-                groupKiller();
-              } else {
-                spawnedChild.kill("SIGTERM");
-              }
-            } catch {
-              /* already gone */
-            }
-          }
-        }, 250);
-      }, 500);
-    };
 
     const processLine = (line: string, chunks?: string[]) => {
       if (!line.trim()) return;
@@ -729,10 +642,6 @@ export class AntigravityProvider implements CodingProvider {
         } else if (json.event === "result" && json.result) {
           if (json.result.conversation_id && !capturedSessionId) {
             capturedSessionId = json.result.conversation_id;
-          }
-          if (json.result.status === "SUCCESS") {
-            resultSuccess = true;
-            scheduleBackgroundCompletionCheck();
           }
           if (json.result.status === "ERROR" && json.result.error) {
             const msg = `\n[Error]: ${json.result.error}\n`;
@@ -820,10 +729,6 @@ export class AntigravityProvider implements CodingProvider {
         }
       },
       cleanup,
-      onSpawn: (child, killGroup) => {
-        spawnedChild = child;
-        groupKiller = killGroup;
-      },
       buildKilledResult: ({
         output,
         exitCode,
@@ -835,14 +740,6 @@ export class AntigravityProvider implements CodingProvider {
         if (buffer) {
           processLine(buffer);
           buffer = "";
-        }
-        if (resultSuccess && !opts.signal?.aborted) {
-          return withTokenUsage({
-            success: true,
-            output: finalResultText ?? (emittedChunks.length > 0 ? emittedChunks.join("") : output),
-            exitCode: 0,
-            sessionId: opts.session?.id,
-          });
         }
         return withTokenUsage({
           success: false,
@@ -866,14 +763,6 @@ export class AntigravityProvider implements CodingProvider {
         if (buffer) {
           processLine(buffer);
           buffer = "";
-        }
-        if (resultSuccess && !opts.signal?.aborted) {
-          return withTokenUsage({
-            success: true,
-            output: finalResultText ?? (emittedChunks.length > 0 ? emittedChunks.join("") : output),
-            exitCode: 0,
-            sessionId: captureSessionFromLog(),
-          });
         }
         return withTokenUsage({
           success: false,
