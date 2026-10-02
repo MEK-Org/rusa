@@ -4,6 +4,7 @@ import {
   filterConfiguredVoices,
   parseVoiceDefinitions,
   resolveVoiceChoice,
+  voiceChoiceText,
 } from "./voice-catalog.js";
 import { googleVoiceConfig } from "./voice-config.js";
 
@@ -102,6 +103,34 @@ describe("shared voice catalog", () => {
       expect(result.error).not.toContain("Kore");
       // ElevenLabs ids are case-sensitive; Google names are not.
       expect(configOf("puck")).toEqual(googleVoiceConfig("Puck"));
+    });
+
+    it("offers each entry choice text that resolves to it, qualifying a shared label", () => {
+      // Two configurations may share a label. One id also collides with a Google name.
+      const eleven = (voiceId: string) =>
+        ({ schemaVersion: 1, provider: "elevenlabs", config: { voiceId } }) as const;
+      const twins = buildSupportedVoiceCatalog(
+        parseVoiceDefinitions([
+          { label: "Alex", voiceConfig: eleven("Puck") },
+          { label: "Alex", voiceConfig: eleven("alex-2") },
+        ]),
+        { availableProviders: ["google", "elevenlabs"] }
+      );
+      const texts = twins.map((voice) => voiceChoiceText(twins, voice));
+      expect(texts).toContain("Alex (ElevenLabs, Puck)");
+      expect(texts).toContain("Alex (ElevenLabs, alex-2)");
+      expect(texts).toContain("Puck (Gemini)");
+      for (const voice of twins) {
+        expect(resolveVoiceChoice(twins, voiceChoiceText(twins, voice))).toEqual({
+          ok: true,
+          voice,
+        });
+      }
+      expect(resolveVoiceChoice(twins, "Alex (ElevenLabs)")).toEqual({
+        ok: false,
+        error:
+          "voice 'Alex (ElevenLabs)' is ambiguous; choose one of: Alex (ElevenLabs, Puck), Alex (ElevenLabs, alex-2)",
+      });
     });
 
     it("rejects unknown and credential-unavailable choices with the valid choices", () => {

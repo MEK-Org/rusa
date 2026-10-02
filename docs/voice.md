@@ -83,10 +83,12 @@ Send `{"voiceConfig":null}` to restore the Google instance default.
 An actor can also change its own voice with the `get_voice` and `set_voice`
 mesh tools. They act only on the calling actor, take no actor argument and need
 no capability. `get_voice` returns the stored voice (null for the instance
-default) and the same choices as the dashboard dropdown. `set_voice` accepts a
-label, the dropdown's `label (provider)` text, a Gemini voice name in any case
-or an ElevenLabs voice ID. A choice that matches several voices, or none, is
-rejected with the valid choices and nothing is stored. `null` restores the
+default) and the same choices as the dashboard dropdown. Each choice's text is
+the dropdown's `label (provider)`, or `label (provider, voice)` when two voices
+share a label, and always names exactly that voice. `set_voice` accepts that
+text, a label, a Gemini voice name in any case or an ElevenLabs voice ID. A
+choice that matches several voices, or none, is rejected with the valid choices
+and nothing is stored. `null` restores the
 instance default. The change applies to the actor's next spoken reply.
 Keys stay on the host and are included in log secret redaction.
 

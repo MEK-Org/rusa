@@ -4960,6 +4960,26 @@ describe("own voice tools (#817)", () => {
     expect(registry.get("worker-a")?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
   });
 
+  it("sets the voice named by each offered choice, including a shared label", async () => {
+    const { registry, mesh } = await twoWorkers();
+    const twins = buildSupportedVoiceCatalog(
+      parseVoiceDefinitions([
+        { label: "Alex", voiceConfig: { ...christopher } },
+        { label: "Alex", voiceConfig: { ...christopher, config: { voiceId: "alex-2" } } },
+      ]),
+      { availableProviders: ["google", "elevenlabs"] }
+    );
+    const client = await connect(
+      createAgentExecMcpServer(mesh, "worker-a", "root", undefined, { voices: () => twins })
+    );
+    const { choices } = dataOf(await getVoice(client)) as { choices: { choice: string }[] };
+    expect(choices.map((c) => c.choice)).toContain("Alex (ElevenLabs, alex-2)");
+    for (const [i, { choice }] of choices.entries()) {
+      expect((await setVoice(client, choice)).isError).toBeFalsy();
+      expect(registry.get("worker-a")?.voiceConfig).toEqual(twins[i].voiceConfig);
+    }
+  });
+
   it("does not mount the tools when no catalog is wired", async () => {
     const { mesh } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));

@@ -26,7 +26,7 @@ import type { ChatRoomService } from "../voice/chat-room.js";
 import {
   resolveVoiceChoice,
   type SupportedVoice,
-  voiceChoiceLabel,
+  voiceChoiceText,
 } from "../voice/voice-catalog.js";
 import type { VoiceConfigDocument } from "../voice/voice-config.js";
 import { MAX_VOICE_TRANSFER_NOTE_CHARS } from "../voice/voice-transfer-context.js";
@@ -1663,13 +1663,13 @@ export function createAgentExecMcpServer(
   // catalog the dashboard picker offers.
   if (options?.voices) {
     const voices = options.voices;
-    const describeVoice = (voice: VoiceConfigDocument) => {
+    const describeVoice = (catalog: readonly SupportedVoice[], voice: VoiceConfigDocument) => {
       const key = JSON.stringify(voice);
-      const entry = voices().find((v) => JSON.stringify(v.voiceConfig) === key);
+      const entry = catalog.find((v) => JSON.stringify(v.voiceConfig) === key);
       const name = voice.provider === "google" ? voice.config.voiceName : voice.config.voiceId;
       return {
         // A stored voice no longer in the catalog still reads back, unlabelled.
-        choice: entry ? voiceChoiceLabel(entry) : null,
+        choice: entry ? voiceChoiceText(catalog, entry) : null,
         provider: voice.provider,
         voice: name,
       };
@@ -1680,15 +1680,16 @@ export function createAgentExecMcpServer(
       {
         title: "Read your walkie voice",
         description:
-          "Read your own walkie-talkie voice and the voices you can choose. `voice` is null when you speak with the instance default. Each choice's `choice` text can be passed to set_voice.",
+          "Read your own walkie-talkie voice and the voices you can choose. `voice` is null when you speak with the instance default. Each choice's `choice` text names exactly that voice when passed to set_voice.",
         inputSchema: {},
       },
       async () => {
         try {
           const stored = mesh.actors.get(selfId)?.voiceConfig;
+          const catalog = voices();
           return toolOk({
-            voice: stored ? describeVoice(stored) : null,
-            choices: voices().map((v) => describeVoice(v.voiceConfig)),
+            voice: stored ? describeVoice(catalog, stored) : null,
+            choices: catalog.map((v) => describeVoice(catalog, v.voiceConfig)),
           });
         } catch (err) {
           return toolError(err);
@@ -1701,7 +1702,7 @@ export function createAgentExecMcpServer(
       {
         title: "Choose your walkie voice",
         description:
-          "Choose your own walkie-talkie voice, used from your next spoken reply. Name a choice from get_voice: its label, its 'label (provider)' text, a Gemini voice name, or an ElevenLabs voice id. An ambiguous or unavailable choice is rejected with the valid choices and changes nothing. Pass null to restore the instance default.",
+          "Choose your own walkie-talkie voice, used from your next spoken reply. Name a choice from get_voice: its `choice` text, its label, a Gemini voice name, or an ElevenLabs voice id. An ambiguous or unavailable choice is rejected with choice text for each candidate and changes nothing. Pass null to restore the instance default.",
         inputSchema: {
           voice: z
             .string()
@@ -1714,15 +1715,16 @@ export function createAgentExecMcpServer(
       async ({ voice }) => {
         try {
           if (!mesh.actors.get(selfId)) throw new Error(`unknown actor ${selfId}`);
+          const catalog = voices();
           let voiceConfig: VoiceConfigDocument | undefined;
           if (voice !== null) {
-            const resolved = resolveVoiceChoice(voices(), voice);
+            const resolved = resolveVoiceChoice(catalog, voice);
             if (!resolved.ok) throw new Error(resolved.error);
             voiceConfig = resolved.voice.voiceConfig;
           }
           mesh.actors.patch(selfId, { voiceConfig });
           options?.onWrite?.();
-          return toolOk({ voice: voiceConfig ? describeVoice(voiceConfig) : null });
+          return toolOk({ voice: voiceConfig ? describeVoice(catalog, voiceConfig) : null });
         } catch (err) {
           return toolError(err);
         }
