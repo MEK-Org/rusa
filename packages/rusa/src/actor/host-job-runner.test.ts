@@ -538,6 +538,35 @@ describe.skipIf(!BWRAP_CAPABLE)("buildHostJobBwrapArgs + real bwrap (ack item 3 
     expect(output.trim()).toBe("ALLOWED_CONTENT");
   });
 
+  it("hides the real target of a symlinked configured Codex home (#782)", () => {
+    // Outside /tmp, which the sandbox already shadows, so only a real-path shadow hides it.
+    const realCodexHome = mkdtempSync(join(process.cwd(), ".host-job-codex-real-"));
+    writeFileSync(join(realCodexHome, "auth.json"), "fixture-codex-login");
+    const linkedHome = join(hostHome, "codex-canary");
+    symlinkSync(realCodexHome, linkedHome);
+    configureCodexHome(linkedHome);
+    try {
+      const args = buildHostJobBwrapArgs({
+        hostHome,
+        mcHome,
+        scratchDir,
+        manifest: { readPaths: [] },
+      });
+      const probe = [
+        `test -r "${join(linkedHome, "auth.json")}" && echo LINK_READABLE || echo LINK_DENIED`,
+        `test -r "${join(realCodexHome, "auth.json")}" && echo REAL_READABLE || echo REAL_DENIED`,
+      ].join("\n");
+      const output = execFileSync("bwrap", [...args, "--", "/bin/sh", "-c", probe], {
+        encoding: "utf-8",
+      });
+      expect(output).toContain("LINK_DENIED");
+      expect(output).toContain("REAL_DENIED");
+    } finally {
+      configureCodexHome(undefined);
+      rmSync(realCodexHome, { recursive: true, force: true });
+    }
+  });
+
   it("can write into its own scratch dir (the job's real workspace)", () => {
     const args = buildHostJobBwrapArgs({
       hostHome,

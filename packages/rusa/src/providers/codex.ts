@@ -775,7 +775,7 @@ export class CodexProvider implements CodingProvider {
       if (opts.sandbox && (hasMcpServers || this.model || this.effort)) {
         mcpConfigSource = join("/tmp", `rusa-mcp-codex-${randomUUID()}.toml`);
         let baseConfig = "";
-        const hostConfigPath = join(codexHomeDir(), "config.toml");
+        const hostConfigPath = join(codexHomeDir(process.env.HOME ?? "/root"), "config.toml");
         if (existsSync(hostConfigPath)) {
           try {
             baseConfig = readFileSync(hostConfigPath, "utf-8");
@@ -815,7 +815,7 @@ export class CodexProvider implements CodingProvider {
             exitCode: 1,
           };
         }
-        const hostCodexDir = codexHomeDir();
+        const hostCodexDir = codexHomeDir(process.env.HOME ?? "/root");
         if (opts.sandbox) {
           const authDir = mkdtempSync(join(tmpdir(), "rusa-codex-auth-"));
           tempPaths.push(authDir);

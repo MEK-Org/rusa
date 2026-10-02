@@ -114,6 +114,13 @@ host-side consumer reads it:
   catalog reads;
 - the actor sandbox, the host-job sandbox and the E2E instance, which hide it.
 
+The actor sandbox hides the configured home only when the broker is on. With
+the broker off, it binds the home's `auth.json` and leaves the rest of the
+directory as the host mounts it. So with the broker off, keep the configured home
+outside every writable root (actor directories, the pnpm store, provider state).
+Beneath one, a worker could rewrite its `config.toml`, which the next sandboxed
+launch merges in.
+
 Setting the key does not create a login. That is one device login into the
 directory (`CODEX_HOME=<dir> codex login`), an operator step. Whether a second
 device login on the same account leaves the first session valid is not settled
