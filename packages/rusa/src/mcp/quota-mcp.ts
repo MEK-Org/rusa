@@ -113,6 +113,21 @@ export interface QuotaLimit {
    * can observe the true age of carried model or provider readings (#763).
    */
   scrapedAt?: string;
+  /**
+   * Start-pacer throttle interval in seconds for this lane, 0 when unthrottled,
+   * null when no observation has been reasoned (#336).
+   */
+  throttleSeconds?: number | null;
+  /**
+   * Start-pacer controller pace error (positive = consuming faster than linear pace),
+   * null when no observation has been reasoned (#336).
+   */
+  paceError?: number | null;
+  /**
+   * Optional next admitted start ISO timestamp if tracked for the lane, null when
+   * untracked or unobserved (#336).
+   */
+  nextAdmitAt?: string | null;
 }
 
 /**
@@ -217,6 +232,7 @@ export interface QuotaMcpDeps {
       inferredParsed: ProviderQuotaSnapshot
     ): void;
     recordParseError(id: string, error: unknown): void;
+    projectPacerState?(provider: string, snapshot: ProviderQuotaSnapshot): ProviderQuotaSnapshot;
   };
   /**
    * Quota coordinator client for reading quota status via GET /v1/quota without local probes
@@ -1452,13 +1468,20 @@ export class QuotaService {
     };
   }
 
+  private projectPacerState(provider: string, state: ProviderQuotaSnapshot): ProviderQuotaSnapshot {
+    if (this.deps.scrapeStore?.projectPacerState) {
+      return this.deps.scrapeStore.projectPacerState(provider, state);
+    }
+    return state;
+  }
+
   async getQuota(provider: "claude" | "codex" | "agy" | "kimi"): Promise<ProviderQuotaSnapshot> {
     const outcome = await this.getQuotaProbeOutcome(provider);
     if (outcome.error) throw outcome.error;
     // Every non-error outcome carries state; keep this guard for a future
     // implementation change rather than returning an invented snapshot.
     if (!outcome.state) throw new Error(`Quota probe for ${provider} returned no state`);
-    return outcome.state;
+    return this.projectPacerState(provider, outcome.state);
   }
 
   /**
@@ -1502,13 +1525,12 @@ export class QuotaService {
         });
       });
     }
-    return (
-      cached?.state ?? {
-        provider,
-        status: "unknown",
-        message: "no quota reading yet; refreshing in background",
-      }
-    );
+    const state = cached?.state ?? {
+      provider,
+      status: "unknown",
+      message: "no quota reading yet; refreshing in background",
+    };
+    return this.projectPacerState(provider, state);
   }
 
   private async executeProbe(

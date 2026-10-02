@@ -39,12 +39,14 @@ import {
 } from "../quota/coordinator-protocol.js";
 import {
   createQuotaMcpServer,
+  createQuotaService,
   inferQuotaState,
   type ProviderQuotaSnapshot,
   parseAgyQuota,
   parseClaudeQuota,
   parseCodexQuota,
   parseKimiQuota,
+  type QuotaLimit,
   QuotaService,
 } from "./quota-mcp.js";
 
@@ -4037,6 +4039,9 @@ describe("quota MCP server", () => {
                       label: "Weekly",
                       kind: "weekly",
                       percentLeft: 75,
+                      throttleSeconds: 120,
+                      paceError: 15.5,
+                      nextAdmitAt: null,
                     },
                   ],
                 })
@@ -4073,6 +4078,9 @@ describe("quota MCP server", () => {
           expect(parsed.status).toBe("available");
           expect(parsed.provider).toBe("claude");
           expect(parsed.limits?.[0].percentLeft).toBe(75);
+          expect(parsed.limits?.[0].throttleSeconds).toBe(120);
+          expect(parsed.limits?.[0].paceError).toBe(15.5);
+          expect(parsed.limits?.[0].nextAdmitAt).toBeNull();
         });
 
         it("with service cold (or socket absent): returns status unknown with freshness block, triggering 0 probes", async () => {
@@ -4143,6 +4151,84 @@ describe("quota MCP server", () => {
           expect(parsed.status).toBe("unsupported");
           expect(parsed.provider).toBe("codex");
           expect(parsed.message).toContain("is not configured");
+        });
+
+        it("get_quota projects start-pacer throttleSeconds, paceError, and nextAdmitAt via stubbed store in fallback mode (#336)", async () => {
+          const stubbedScrapeStore = {
+            recordRaw: vi.fn().mockReturnValue("scrape-1"),
+            recordParsed: vi.fn(),
+            recordParseError: vi.fn(),
+            projectPacerState: vi.fn().mockImplementation((_provider, snapshot) => ({
+              ...snapshot,
+              limits: snapshot.limits?.map((l: QuotaLimit) => {
+                if (l.kind === "weekly") {
+                  return {
+                    ...l,
+                    throttleSeconds: 180,
+                    paceError: 12.5,
+                    nextAdmitAt: null,
+                  };
+                }
+                return {
+                  ...l,
+                  throttleSeconds: null,
+                  paceError: null,
+                  nextAdmitAt: null,
+                };
+              }),
+            })),
+          };
+
+          const quotaService = createQuotaService({
+            config: mockConfig,
+            workersDir: "/tmp/workers",
+            scrapeStore: stubbedScrapeStore,
+          });
+          quotaService.hydrate("claude", {
+            provider: "claude",
+            status: "available",
+            scrapedAt: new Date().toISOString(),
+            limits: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                percentLeft: 50,
+              },
+              {
+                label: "Session",
+                kind: "session",
+                percentLeft: 90,
+              },
+            ],
+          });
+
+          const mcpServer = createQuotaMcpServer(
+            {
+              config: mockConfig,
+              workersDir: "/tmp/workers",
+              scrapeStore: stubbedScrapeStore,
+            },
+            quotaService
+          );
+
+          const client = await connect(mcpServer);
+          const result = (await client.callTool({
+            name: "get_quota",
+            arguments: { provider: "claude" },
+          })) as CallToolResult;
+
+          expect(result.isError).toBeFalsy();
+          const parsed = JSON.parse(textOf(result));
+          expect(stubbedScrapeStore.projectPacerState).toHaveBeenCalledWith(
+            "claude",
+            expect.anything()
+          );
+          expect(parsed.limits?.[0].throttleSeconds).toBe(180);
+          expect(parsed.limits?.[0].paceError).toBe(12.5);
+          expect(parsed.limits?.[0].nextAdmitAt).toBeNull();
+          expect(parsed.limits?.[1].throttleSeconds).toBeNull();
+          expect(parsed.limits?.[1].paceError).toBeNull();
+          expect(parsed.limits?.[1].nextAdmitAt).toBeNull();
         });
       });
 

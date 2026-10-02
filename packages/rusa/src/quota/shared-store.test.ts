@@ -28,6 +28,7 @@ import {
   QUOTA_SCHEMA_VERSION,
   SharedQuotaStore,
 } from "./shared-store.js";
+import { isModelScopedWindow, isProviderScopedWindow } from "./window-scope.js";
 
 const roots: string[] = [];
 
@@ -2005,5 +2006,137 @@ describe("SharedQuotaStore operator pacing reset", () => {
     } finally {
       store.close();
     }
+  });
+
+  describe("SharedQuotaStore pacer projection on getLatestSnapshot (#336)", () => {
+    it("projects throttleSeconds, paceError, and nextAdmitAt for live throttled and unthrottled lanes", () => {
+      const root = mkdtempSync(join(tmpdir(), "rusa-quota-pacer-proj-"));
+      roots.push(root);
+      const store = new SharedQuotaStore(join(root, "quota.db"));
+      try {
+        const nowMs = Date.parse("2030-01-01T12:00:00.000Z");
+        const scrapedAt = new Date(nowMs).toISOString();
+        const resetAtIso = new Date(nowMs + 6 * 24 * 3600 * 1000).toISOString();
+
+        // 1. Lane with unreasoned observation (interval_seconds is null before controller runs) -> returns null fields
+        const emptyState: ProviderQuotaSnapshot = {
+          provider: "agy",
+          status: "available",
+          scrapedAt,
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 50,
+              resetAtIso,
+              scope: "provider",
+            },
+          ],
+        };
+        const id = store.recordRaw({ provider: "agy", scrapedAt, rawOutput: "raw" });
+        store.recordParsed(id, emptyState, emptyState);
+
+        const unreasonedSnapshot = store.getLatestSnapshot("agy");
+        expect(unreasonedSnapshot).not.toBeNull();
+        expect(unreasonedSnapshot?.limits).toHaveLength(1);
+        const unreasonedLimit = unreasonedSnapshot?.limits?.[0];
+        if (!unreasonedLimit) throw new Error("expected unreasoned limit");
+        expect(unreasonedLimit.throttleSeconds).toBeNull();
+        expect(unreasonedLimit.paceError).toBeNull();
+        expect(unreasonedLimit.nextAdmitAt).toBeNull();
+
+        // Configure controller
+        store.configureController({ maxIntervalSeconds: 36000 });
+
+        // 2. Throttled lane (burning faster than linear pace -> positive pace error, interval_seconds > 0)
+        // Remaining time is ~85.7%, percentLeft is 10% -> error is ~+75.7% (throttled)
+        recordObservation(store, "claude", scrapedAt, 10, resetAtIso);
+        store.advancePendingController({ maxIntervalSeconds: 36000 }, "claude");
+
+        const throttledSnapshot = store.getLatestSnapshot("claude");
+        expect(throttledSnapshot).not.toBeNull();
+        expect(throttledSnapshot?.limits).toHaveLength(1);
+        const throttledLimit = throttledSnapshot?.limits?.[0];
+        if (!throttledLimit) throw new Error("expected throttled limit");
+        expect(throttledLimit.throttleSeconds).toBeGreaterThan(0);
+        expect(throttledLimit.paceError).toBeGreaterThan(0);
+        expect(throttledLimit.nextAdmitAt).toBeNull();
+
+        // 3. Unthrottled lane (plenty of quota -> negative pace error, interval_seconds = 0)
+        const unthrottledScrapedAt = new Date(nowMs).toISOString();
+        const unthrottledReset = new Date(nowMs + 1 * 24 * 3600 * 1000).toISOString();
+        // Remaining time is ~14.3%, percentLeft is 90% -> error is -75.7% (unthrottled)
+        recordObservation(store, "codex", unthrottledScrapedAt, 90, unthrottledReset);
+        store.advancePendingController({ maxIntervalSeconds: 36000 }, "codex");
+
+        const unthrottledSnapshot = store.getLatestSnapshot("codex");
+        expect(unthrottledSnapshot).not.toBeNull();
+        expect(unthrottledSnapshot?.limits).toHaveLength(1);
+        const unthrottledLimit = unthrottledSnapshot?.limits?.[0];
+        if (!unthrottledLimit) throw new Error("expected unthrottled limit");
+        expect(unthrottledLimit.throttleSeconds).toBe(0);
+        expect(unthrottledLimit.paceError).toBeLessThan(0);
+        expect(unthrottledLimit.nextAdmitAt).toBeNull();
+      } finally {
+        store.close();
+      }
+    });
+
+    it("projects model-scoped pacer observation onto model-scoped limit and provider observation onto provider limit", () => {
+      const root = mkdtempSync(join(tmpdir(), "rusa-quota-pacer-model-scoped-"));
+      roots.push(root);
+      const store = new SharedQuotaStore(join(root, "quota.db"));
+      try {
+        store.configureController({ maxIntervalSeconds: 36000 });
+        const nowMs = Date.parse("2030-01-01T12:00:00.000Z");
+        const scrapedAt = new Date(nowMs).toISOString();
+        const resetAtIso = new Date(nowMs + 6 * 24 * 3600 * 1000).toISOString();
+
+        const multiLimitSnapshot: ProviderQuotaSnapshot = {
+          provider: "claude",
+          status: "available",
+          scrapedAt,
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 95, // provider lane: timeRemaining is 85.7% -> error is -9.3% -> unthrottled (0)
+              resetAtIso,
+              scope: { provider: "claude" },
+            },
+            {
+              label: "Current week (Fable)",
+              kind: "weekly",
+              percentLeft: 10, // model lane: timeRemaining is 85.7% -> error is +75.7% -> throttled (>0)
+              resetAtIso,
+              scope: { provider: "claude", models: ["fable"] },
+            },
+          ],
+        };
+        const id = store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "raw" });
+        store.recordParsed(id, multiLimitSnapshot, multiLimitSnapshot);
+        store.advancePendingController({ maxIntervalSeconds: 36000 }, "claude");
+
+        const snapshot = store.getLatestSnapshot("claude");
+        expect(snapshot).not.toBeNull();
+        expect(snapshot?.limits).toHaveLength(2);
+
+        const limits = snapshot?.limits ?? [];
+        const providerLimit = limits.find((l) => isProviderScopedWindow(l));
+        const modelLimit = limits.find((l) => isModelScopedWindow(l));
+
+        expect(providerLimit).toBeDefined();
+        expect(providerLimit?.throttleSeconds).toBe(0);
+        expect(providerLimit?.paceError).toBeLessThan(0);
+        expect(providerLimit?.nextAdmitAt).toBeNull();
+
+        expect(modelLimit).toBeDefined();
+        expect(modelLimit?.throttleSeconds).toBeGreaterThan(0);
+        expect(modelLimit?.paceError).toBeGreaterThan(0);
+        expect(modelLimit?.nextAdmitAt).toBeNull();
+      } finally {
+        store.close();
+      }
+    });
   });
 });

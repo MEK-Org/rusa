@@ -982,6 +982,50 @@ export class SharedQuotaStore {
     ).map(({ observedAt, failed }) => ({ observedAt, outcome: failed ? "failed" : "parsed" }));
   }
 
+  /**
+   * Project latest reasoned pacer observations onto a snapshot's limits (#336).
+   * For each limit, resolves (provider, model_scope, kind) against quota_observations.
+   * If an observation with a reasoned interval exists, projects throttleSeconds and
+   * paceError; otherwise projects null. nextAdmitAt is null (untracked centrally).
+   */
+  projectPacerState(provider: string, snapshot: ProviderQuotaSnapshot): ProviderQuotaSnapshot {
+    if (!snapshot.limits || snapshot.limits.length === 0) {
+      return snapshot;
+    }
+    const stmt = this.db.prepare(
+      `SELECT interval_seconds AS intervalSeconds, controller_error AS controllerError
+       FROM quota_observations
+       WHERE provider = ? AND model_scope = ? AND kind = ? AND interval_seconds IS NOT NULL
+       ORDER BY observed_at DESC, rowid DESC
+       LIMIT 1`
+    );
+    const limits = snapshot.limits.map((limit) => {
+      const scopeKey = observationScopeKey(limit, provider, true);
+      if (scopeKey === null) {
+        return {
+          ...limit,
+          throttleSeconds: null,
+          paceError: null,
+          nextAdmitAt: null,
+        };
+      }
+      const kind = normalizeKind(limit.kind);
+      const row = stmt.get(provider, scopeKey, kind) as
+        | { intervalSeconds: number; controllerError: number | null }
+        | undefined;
+      return {
+        ...limit,
+        throttleSeconds: row ? row.intervalSeconds : null,
+        paceError: row ? (row.controllerError ?? null) : null,
+        nextAdmitAt: null,
+      };
+    });
+    return {
+      ...snapshot,
+      limits,
+    };
+  }
+
   getLatestSnapshot(provider: string): ProviderQuotaSnapshot | null {
     const row = this.db
       .prepare(
@@ -993,7 +1037,8 @@ export class SharedQuotaStore {
       )
       .get(provider) as { parsed_state: string } | undefined;
     if (!row) return null;
-    return parseParsedState(row.parsed_state);
+    const snapshot = parseParsedState(row.parsed_state);
+    return snapshot ? this.projectPacerState(provider, snapshot) : null;
   }
 
   /** Advance every unprocessed observation exactly once across all connections. */
