@@ -7,10 +7,12 @@ import type { RunResult } from "../providers/types.js";
 import type { MechanicalInboxForensics } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
 import {
+  FailureEscalationBackoff,
   type FailureSinkDeps,
   formatProviderLabel,
   isHumanOperatorCancelled,
   routeRunFailure,
+  routeSpawnFailure,
 } from "./failure-sink.js";
 
 const FAIL: RunResult = {
@@ -29,6 +31,7 @@ function makeDeps(
     body: string;
     fromId: string;
     forensics?: MechanicalInboxForensics;
+    responsive?: boolean;
   }>;
   toChat: string[];
   logs: string[];
@@ -38,13 +41,14 @@ function makeDeps(
     body: string;
     fromId: string;
     forensics?: MechanicalInboxForensics;
+    responsive?: boolean;
   }> = [];
   const toChat: string[] = [];
   const logs: string[] = [];
   const deps: FailureSinkDeps = {
     actors: { get: (id: string) => records[id] as ActorRecord | undefined },
-    sendToParent: (toId, body, fromId, forensics) =>
-      toParent.push({ toId, body, fromId, forensics }),
+    sendToParent: (toId, body, fromId, forensics, delivery) =>
+      toParent.push({ toId, body, fromId, forensics, responsive: delivery?.responsive }),
     postToErrorChat: (text) => toChat.push(text),
     rootId: "root",
     log: (m) => logs.push(m),
@@ -166,6 +170,162 @@ describe("routeRunFailure", () => {
     expect(toParent[0]?.body).not.toContain("secret payload");
     expect(toParent[0]?.body).not.toContain("private prompt");
     expect(toParent[0]?.body).not.toContain("thread_id");
+  });
+
+  describe("responsive escalation to the parent (#189)", () => {
+    function escalating(now: { t: number }) {
+      return makeDeps(
+        {
+          w1: { id: "w1", parentId: "root" },
+          w2: { id: "w2", parentId: "root" },
+          root: { id: "root", parentId: null },
+        },
+        {
+          escalation: new FailureEscalationBackoff({
+            baseMs: 60_000,
+            maxMs: 240_000,
+            now: () => now.t,
+          }),
+        }
+      );
+    }
+
+    it("delivers a repeat failure inside the backoff window at normal priority", async () => {
+      const now = { t: 0 };
+      const { deps, toParent } = escalating(now);
+      await routeRunFailure(deps, "w1", FAIL);
+      now.t = 30_000;
+      await routeRunFailure(deps, "w1", FAIL);
+      expect(toParent.map((n) => n.responsive)).toEqual([true, false]);
+      // The notice itself is still delivered; only the bypass is withheld.
+      expect(toParent[1]?.body).toContain("[run failed]");
+    });
+
+    it("doubles the window while a child keeps failing, up to the cap", async () => {
+      const now = { t: 0 };
+      const { deps, toParent } = escalating(now);
+      // Windows: 60s from 0, 120s from 60s, 240s from 180s, capped at 240s from 420s.
+      for (const t of [0, 59_999, 60_000, 179_999, 180_000, 419_999, 420_000, 659_999, 660_000]) {
+        now.t = t;
+        await routeRunFailure(deps, "w1", FAIL);
+      }
+      expect(toParent.map((n) => n.responsive)).toEqual([
+        true,
+        false,
+        true,
+        false,
+        true,
+        false,
+        true,
+        false,
+        true,
+      ]);
+    });
+
+    it("resets to the base window after a quiet period", async () => {
+      const now = { t: 0 };
+      const { deps, toParent } = escalating(now);
+      await routeRunFailure(deps, "w1", FAIL); // window 60s
+      now.t = 60_000;
+      await routeRunFailure(deps, "w1", FAIL); // window 120s, until 180s
+      now.t = 180_000 + 120_000; // a full window with no failure past the last one
+      await routeRunFailure(deps, "w1", FAIL); // back to the 60s base
+      now.t += 60_000;
+      await routeRunFailure(deps, "w1", FAIL);
+      expect(toParent.map((n) => n.responsive)).toEqual([true, true, true, true]);
+    });
+
+    it("backs off each child independently", async () => {
+      const { deps, toParent } = escalating({ t: 0 });
+      await routeRunFailure(deps, "w1", FAIL);
+      await routeRunFailure(deps, "w2", FAIL);
+      await routeRunFailure(deps, "w1", FAIL);
+      expect(toParent.map((n) => [n.fromId, n.responsive])).toEqual([
+        ["w1", true],
+        ["w2", true],
+        ["w1", false],
+      ]);
+    });
+
+    it("does not spend a child's escalation on a suppressed preemption", async () => {
+      const { deps, toParent } = escalating({ t: 0 });
+      await routeRunFailure(deps, "w1", {
+        success: false,
+        exitCode: 143,
+        cancelled: true,
+        interrupted: true,
+        interruptSource: "responsive-notification",
+        output: "[Task interrupted by responsive-notification]",
+      });
+      await routeRunFailure(deps, "w1", FAIL);
+      expect(toParent.map((n) => n.responsive)).toEqual([true]);
+    });
+
+    it.each([
+      ["run", (deps: FailureSinkDeps) => routeRunFailure(deps, "w1", FAIL)],
+      ["spawn", (deps: FailureSinkDeps) => routeSpawnFailure(deps, "w1", "root", "bad pool")],
+    ] as const)("keeps a child's escalation when its %s-failure notice fails to deliver", async (_, route) => {
+      const now = { t: 0 };
+      const { deps, toParent } = escalating(now);
+      const deliver = deps.sendToParent;
+      let failNext = true;
+      deps.sendToParent = (...args) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error("inbox append failed");
+        }
+        deliver(...args);
+      };
+      await expect(async () => route(deps)).rejects.toThrow("inbox append failed");
+      now.t = 30_000;
+      await route(deps);
+      expect(toParent.map((n) => n.responsive)).toEqual([true]);
+    });
+
+    it("leaves the root's error-chat path unchanged", async () => {
+      const { deps, toParent, toChat } = escalating({ t: 0 });
+      await routeRunFailure(deps, "root", FAIL);
+      expect(toParent).toHaveLength(0);
+      expect(toChat).toHaveLength(1);
+    });
+
+    it("keeps normal priority when no escalation policy is configured", async () => {
+      const { deps, toParent } = makeDeps({ w1: { id: "w1", parentId: "root" } });
+      await routeRunFailure(deps, "w1", FAIL);
+      expect(toParent.map((n) => n.responsive)).toEqual([false]);
+    });
+
+    it("wakes the parent responsively for a child's spawn failure", () => {
+      const { deps, toParent, toChat } = escalating({ t: 0 });
+      routeSpawnFailure(deps, "w1", "root", "worker w1 spawn failed: bad pool");
+      expect(toParent).toEqual([
+        {
+          toId: "root",
+          body: "[spawn failed] worker w1 spawn failed: bad pool",
+          fromId: "w1",
+          forensics: undefined,
+          responsive: true,
+        },
+      ]);
+      expect(toChat).toHaveLength(0);
+    });
+
+    it("shares one per-child budget between spawn and run failures", async () => {
+      const { deps, toParent } = escalating({ t: 0 });
+      // A spawn failure spends the budget a run failure then finds spent, and
+      // also honors it: a revived child can spawn-fail again inside the window.
+      routeSpawnFailure(deps, "w1", "root", "worker w1 spawn failed: bad pool");
+      await routeRunFailure(deps, "w1", FAIL);
+      routeSpawnFailure(deps, "w1", "root", "worker w1 spawn failed: bad pool");
+      expect(toParent.map((n) => n.responsive)).toEqual([true, false, false]);
+    });
+
+    it("posts a parentless spawn failure to the error chat", () => {
+      const { deps, toParent, toChat } = escalating({ t: 0 });
+      routeSpawnFailure(deps, "w1", null, "worker w1 spawn failed: bad pool");
+      expect(toParent).toHaveLength(0);
+      expect(toChat).toEqual(["⚠️ worker w1 spawn failed: bad pool"]);
+    });
   });
 
   describe("exhaustion classification leads the notice ", () => {

@@ -17,7 +17,8 @@ export interface FailureSinkDeps {
     toId: string,
     body: string,
     fromId: string,
-    forensics?: MechanicalInboxForensics
+    forensics?: MechanicalInboxForensics,
+    delivery?: { responsive: boolean }
   ) => void;
   /** Mechanical post to the configured error chat, or null if unconfigured. */
   postToErrorChat: ((text: string) => void) | null;
@@ -40,6 +41,54 @@ export interface FailureSinkDeps {
    * recognized as a human cancellation (#460) rather than a failure to report.
    */
   principals?: Pick<PrincipalRepository, "getUser">;
+  /**
+   * Optional per-child backoff for waking the parent responsively (#189).
+   * Absent, every failure notice keeps ordinary priority.
+   */
+  escalation?: Pick<FailureEscalationBackoff, "mayEscalate" | "recordEscalation">;
+}
+
+/**
+ * Decides which child failures may wake the parent past provider pacing (#189).
+ *
+ * A child's first failure escalates. Repeats inside the backoff window are
+ * still delivered, just at ordinary priority, so a crash loop cannot turn the
+ * bypass into a tight loop on the parent. Each escalation that lands soon after
+ * the previous window doubles the next window up to `maxMs`; a full window of
+ * quiet past the last one resets the child to `baseMs`. A child's budget is
+ * spent only once its responsive notice is delivered, so a delivery that
+ * throws leaves the next failure free to escalate. Process-local by
+ * design: a restart forgets the backoff and at worst grants one extra
+ * responsive wake per failing child.
+ */
+export class FailureEscalationBackoff {
+  private readonly baseMs: number;
+  private readonly maxMs: number;
+  private readonly now: () => number;
+  private readonly windows = new Map<string, { until: number; windowMs: number }>();
+
+  constructor(opts: { baseMs?: number; maxMs?: number; now?: () => number } = {}) {
+    this.baseMs = opts.baseMs ?? 60_000;
+    this.maxMs = opts.maxMs ?? 30 * 60_000;
+    this.now = opts.now ?? Date.now;
+  }
+
+  /** Whether a failure from `childId` may wake its parent responsively now. Spends nothing. */
+  mayEscalate(childId: string): boolean {
+    const previous = this.windows.get(childId);
+    return !previous || this.now() >= previous.until;
+  }
+
+  /** Spend `childId`'s escalation once its responsive notice has been delivered. */
+  recordEscalation(childId: string): void {
+    const t = this.now();
+    for (const [id, w] of this.windows) {
+      if (t >= w.until + w.windowMs) this.windows.delete(id);
+    }
+    const previous = this.windows.get(childId);
+    const windowMs = previous ? Math.min(previous.windowMs * 2, this.maxMs) : this.baseMs;
+    this.windows.set(childId, { until: t + windowMs, windowMs });
+  }
 }
 
 /**
@@ -195,7 +244,47 @@ export async function routeRunFailure(
     leadLine = `provider run ${providerLabel} failed.`;
   }
   const body = leadLine ? `${leadLine}\n\n${summary}` : summary;
-  routeMechanicalFailureNotice(deps, actorId, "run failed", body, result.exitCode, result, runId);
+  // A capped run is a failure too (#189); it keeps its own label so the parent
+  // can tell a hit limit from a crash.
+  const label = result.capped ? "capped" : "run failed";
+  routeMechanicalFailureNotice(deps, actorId, label, body, result.exitCode, result, runId);
+}
+
+/**
+ * Report a child that could not be instantiated (#189). With a parent, the
+ * `[spawn failed]` notice spends the same per-child escalation budget as a run
+ * failure; without one it goes to the error chat.
+ */
+export function routeSpawnFailure(
+  deps: FailureSinkDeps,
+  actorId: string,
+  parentId: string | null | undefined,
+  errorMsg: string
+): void {
+  if (parentId) {
+    sendFailureToParent(deps, parentId, `[spawn failed] ${errorMsg}`, actorId);
+  } else {
+    deps.postToErrorChat?.(`⚠️ ${errorMsg}`);
+  }
+}
+
+/**
+ * Deliver a child's failure notice, responsive when the child's escalation
+ * budget allows (#189). The budget is spent only after `sendToParent` returns:
+ * a throwing delivery reached no one, so it must not cost the next failure its
+ * responsive wake. Check, delivery and spend run in one synchronous turn, so no
+ * other failure from the same child can interleave.
+ */
+function sendFailureToParent(
+  deps: FailureSinkDeps,
+  parentId: string,
+  body: string,
+  actorId: string,
+  forensics?: MechanicalInboxForensics
+): void {
+  const responsive = deps.escalation?.mayEscalate(actorId) ?? false;
+  deps.sendToParent(parentId, body, actorId, forensics, { responsive });
+  if (responsive) deps.escalation?.recordEscalation(actorId);
 }
 
 /** Responsive inbox preemption is intentional scheduling, not a supervisor failure. */
@@ -293,7 +382,7 @@ function routeMechanicalFailureNotice(
   }
 
   if (record?.parentId) {
-    deps.sendToParent(record.parentId, `[${label}] ${summary}${extraMessage}`, actorId, {
+    sendFailureToParent(deps, record.parentId, `[${label}] ${summary}${extraMessage}`, actorId, {
       // Older direct callers have no durable run record. Lifecycle callers
       // pass the UUID so the parent can inspect the exact failed attempt.
       runId: runId ?? actorId,

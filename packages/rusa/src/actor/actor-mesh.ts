@@ -3754,12 +3754,19 @@ export class ActorMesh {
     return { delivered: true };
   }
 
+  /**
+   * `delivery.responsive` (#189) marks the notice responsive so the recipient's
+   * wake takes the responsive lane past provider pacing. It joins rather than
+   * replaces a run already in flight: a failure report is urgent enough to skip
+   * the queue, not to abort the supervisor's current work.
+   */
   deliverMechanicalInboxNotice(
     toId: string,
     note: string,
     fromId: string,
     forensics: MechanicalInboxForensics = {},
-    id?: string
+    id?: string,
+    delivery: { responsive?: boolean } = {}
   ): MessageDeliveryResult {
     if (!this.inboxStore) throw new Error("Mechanical inbox delivery requires an inbox store");
     toId = this.resolveThreadId(toId);
@@ -3788,11 +3795,13 @@ export class ActorMesh {
           note,
           ...forensics,
           fromId,
+          ...(delivery.responsive ? { priority: "responsive" as const } : {}),
         },
       },
     ]);
     if (inserted.length === 0) return { delivered: true };
-    this.dispatch(toId);
+    if (delivery.responsive) this.dispatchJoiningActiveRun(toId);
+    else this.dispatch(toId);
     return { delivered: true };
   }
 
