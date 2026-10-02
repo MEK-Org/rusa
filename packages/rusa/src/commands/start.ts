@@ -4589,7 +4589,7 @@ async function composeStart(
 
   raiseQuotaWindowMissedAlarm = (missed) => {
     const scrape = missed.scrapeFailed
-      ? "quota scrape failed to parse, so it no longer shows"
+      ? "quota scrape failed, so it no longer shows"
       : "quota scrape no longer shows";
     const message =
       `Quota window missed: the latest ${missed.provider} ${scrape} ` +

@@ -31,12 +31,15 @@ import { buildQuotaSnapshot } from "../dashboard/quota-api.js";
 import { KimiAuthRequiredError } from "../providers/kimi-usage-scrape.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import { buildActorBwrapArgs } from "../providers/sandbox.js";
+import { runSubprocess } from "../providers/subprocess-execution.js";
 import type { CodingProvider } from "../providers/types.js";
 import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
   COORDINATOR_PROTOCOL_MINOR,
 } from "../quota/coordinator-protocol.js";
+import { MissedQuotaWindowDetector } from "../quota/missed-windows.js";
+import { SharedQuotaStore } from "../quota/shared-store.js";
 import {
   createQuotaMcpServer,
   inferQuotaState,
@@ -2567,6 +2570,251 @@ describe("quota MCP server", () => {
       const clean = await service.getQuotaProbeOutcome("claude");
       expect(clean.state).toMatchObject({ status: "available", limits: [{ percentLeft: 61 }] });
       expect(clean.readFailed).toBeUndefined();
+    });
+
+    describe("failed Claude capture (#847)", () => {
+      const baselineAt = "2026-09-30T16:00:00.000Z";
+      const probeAt = "2026-09-30T16:30:00.000Z";
+      const baseline: ProviderQuotaSnapshot = {
+        provider: "claude",
+        status: "available",
+        scrapedAt: baselineAt,
+        limits: [
+          {
+            label: "Current session",
+            kind: "session",
+            percentLeft: 70,
+            // Expires between the baseline and the failed capture.
+            resetAtIso: "2026-09-30T16:20:00.000Z",
+          },
+          {
+            label: "Current week (all models)",
+            kind: "weekly",
+            percentLeft: 62,
+            resetAtIso: "2026-10-05T02:59:00.000Z",
+          },
+          {
+            label: "Current week (Fable)",
+            kind: "weekly",
+            percentLeft: 40,
+            resetAtIso: "2026-10-05T02:59:00.000Z",
+            scope: { provider: "claude", models: ["claude-fable-5-1"] },
+          },
+        ],
+      };
+      // What the extractor answers when shown only a termination marker.
+      const noPanel = {
+        text: () => JSON.stringify({ status: "unknown", windows: [] }),
+      };
+
+      let root: string;
+      let store: SharedQuotaStore;
+      beforeEach(() => {
+        mockGenerateContent.mockReset();
+        root = mkdtempSync(join(tmpdir(), "rusa-847-"));
+        store = new SharedQuotaStore(join(root, "shared.db"));
+        store.recordParsed(
+          store.recordRaw({ provider: "claude", scrapedAt: baselineAt, rawOutput: "" }),
+          baseline,
+          baseline
+        );
+      });
+      afterEach(() => {
+        store.close();
+        rmSync(root, { recursive: true, force: true });
+      });
+
+      function serviceWith(baselineCarried: boolean): QuotaService {
+        const service = new QuotaService({
+          config: { ...mockConfig, geminiApiKey: "test-gemini-key" } as RusaConfig,
+          workersDir: root,
+          resolveProvider: mockResolveProvider,
+          scrapeStore: store,
+          now: () => Date.parse(probeAt),
+          ttlMs: 0,
+        });
+        if (baselineCarried) service.hydrate("claude", baseline);
+        return service;
+      }
+
+      function latestScrape(): { parse_error: string | null; parsed_state: string | null } {
+        return store.db
+          .prepare(
+            `SELECT parse_error, parsed_state FROM quota_scrapes
+             WHERE provider = 'claude' ORDER BY scraped_at DESC, rowid DESC LIMIT 1`
+          )
+          .get() as { parse_error: string | null; parsed_state: string | null };
+      }
+
+      it("records a timed-out capture of a local silent process as a failed scrape with its cause", async () => {
+        // The real subprocess timeout, with builders shaped like the Claude
+        // provider's: a silent child killed at its timeout settles cancelled,
+        // exit 143, with only the unattributed termination marker as output.
+        mockClaudeProvider.run = vi.fn(() =>
+          runSubprocess({
+            command: process.execPath,
+            args: ["-e", "setTimeout(() => {}, 10_000)"],
+            cwd: root,
+            timeoutMs: 100,
+            buildKilledResult: (r) => ({ success: false, ...r }),
+            buildSignalResult: (r) => ({ success: false, ...r }),
+            buildExitResult: (output, exitCode) => ({ success: exitCode === 0, output, exitCode }),
+            buildSpawnErrorResult: (err) => ({ success: false, output: err.message, exitCode: 1 }),
+          })
+        );
+        mockGenerateContent.mockResolvedValue(noPanel);
+        const service = serviceWith(true);
+
+        const outcome = await service.getQuotaProbeOutcome("claude");
+
+        const raw = await vi.mocked(mockClaudeProvider.run).mock.results[0]?.value;
+        expect(raw).toMatchObject({ success: false, cancelled: true, exitCode: 143 });
+        expect(raw.output.trim()).toBe("[Task terminated by SIGTERM (source unattributed)]");
+
+        // The cause is persisted where history and readiness read it.
+        expect(mockGenerateContent).not.toHaveBeenCalled();
+        const row = latestScrape();
+        expect(row.parse_error).toContain("claude /usage capture failed");
+        expect(row.parse_error).toContain("exit 143");
+        expect(row.parse_error).toContain("cancelled");
+        expect(store.listScrapeOutcomesSince("claude", baselineAt)).toEqual([
+          { observedAt: baselineAt, outcome: "parsed" },
+          { observedAt: probeAt, outcome: "failed" },
+        ]);
+
+        // Last-good windows keep their own reading time; the expired session
+        // is not carried forward.
+        expect(outcome.readFailed).toBe(true);
+        expect(outcome.state?.message).toContain("claude /usage capture failed");
+        expect(outcome.state?.limits).toEqual([
+          expect.objectContaining({
+            label: "Current week (all models)",
+            percentLeft: 62,
+            scrapedAt: baselineAt,
+          }),
+          expect.objectContaining({
+            label: "Current week (Fable)",
+            percentLeft: 40,
+            scrapedAt: baselineAt,
+          }),
+        ]);
+
+        // The missed-window alert names the failed scrape rather than a
+        // window the panel no longer shows.
+        const detector = new MissedQuotaWindowDetector();
+        detector.observe(
+          "claude",
+          store.listHistorySince("claude", baselineAt),
+          store.listScrapeOutcomesSince("claude", baselineAt).slice(0, 1)
+        );
+        const missed = detector.observe(
+          "claude",
+          store.listHistorySince("claude", baselineAt),
+          store.listScrapeOutcomesSince("claude", baselineAt)
+        );
+        expect(missed.length).toBeGreaterThan(0);
+        expect(missed.every((m) => m.scrapeFailed)).toBe(true);
+      });
+
+      it("keeps capture failure distinct from a clean read, an absent window, and an extraction failure", async () => {
+        const cases: Array<{
+          name: string;
+          run: { success: boolean; output: string; exitCode: number; cancelled?: boolean };
+          llm: () => void;
+          parseError: string | null;
+          extracted: boolean;
+        }> = [
+          {
+            name: "clean read",
+            run: { success: true, output: "Current week (all models): 39% used", exitCode: 0 },
+            llm: () =>
+              mockGenerateContent.mockResolvedValue({
+                text: () =>
+                  JSON.stringify({
+                    status: "available",
+                    windows: [
+                      {
+                        label: "Current week (all models)",
+                        kind: "weekly",
+                        placeholder: false,
+                        scope: "provider",
+                        usedPercent: "39",
+                        resetAtIso: "2026-10-05T02:59:00+00:00",
+                      },
+                    ],
+                  }),
+              }),
+            parseError: null,
+            extracted: true,
+          },
+          {
+            name: "panel without any window",
+            run: { success: true, output: "no usage panel available", exitCode: 0 },
+            llm: () => mockGenerateContent.mockResolvedValue(noPanel),
+            parseError: null,
+            extracted: true,
+          },
+          {
+            name: "extraction failure",
+            run: { success: true, output: "Current week (all models): 39% used", exitCode: 0 },
+            llm: () => mockGenerateContent.mockRejectedValue(new Error("extractor unavailable")),
+            parseError: null,
+            extracted: true,
+          },
+          {
+            name: "cancelled capture",
+            run: {
+              success: false,
+              output: "\n[Task terminated by SIGTERM (source unattributed)]",
+              exitCode: 143,
+              cancelled: true,
+            },
+            llm: () => mockGenerateContent.mockResolvedValue(noPanel),
+            parseError: "claude /usage capture failed",
+            extracted: false,
+          },
+          {
+            // Nothing evidences `/usage` exiting 0, so an ordinary non-zero
+            // exit that completed still reaches the extractor.
+            name: "ordinary non-zero exit",
+            run: { success: false, output: "Current week (all models): 39% used", exitCode: 1 },
+            llm: () => mockGenerateContent.mockResolvedValue(noPanel),
+            parseError: null,
+            extracted: true,
+          },
+        ];
+        const observed = [];
+        for (const c of cases) {
+          mockGenerateContent.mockReset();
+          c.llm();
+          mockClaudeProvider.run = vi.fn().mockResolvedValue(c.run);
+          // No earlier reading: a failed capture has nothing to carry.
+          const outcome = await serviceWith(false).getQuotaProbeOutcome("claude");
+          const row = latestScrape();
+          if (c.name === "extraction failure") {
+            // Still a parsed `unknown` that names the extractor as its cause.
+            expect(outcome.state?.message).toContain("LLM quota parsing failed");
+          }
+          observed.push({
+            name: c.name,
+            failed: row.parse_error !== null,
+            capture: row.parse_error?.includes("claude /usage capture failed") ?? false,
+            extracted: mockGenerateContent.mock.calls.length > 0,
+          });
+        }
+        expect(observed).toEqual(
+          cases.map((c) => ({
+            name: c.name,
+            failed: c.parseError !== null,
+            capture: c.parseError !== null,
+            extracted: c.extracted,
+          }))
+        );
+        expect(store.listScrapeOutcomesSince("claude", baselineAt).map((s) => s.outcome)).toEqual([
+          "parsed",
+          ...cases.map((c) => (c.parseError ? "failed" : "parsed")),
+        ]);
+      });
     });
 
     it("serves list_models returning per-provider catalog with passable field", async () => {
