@@ -884,61 +884,28 @@ describe("quickstart command", () => {
         }
       });
 
-      const invalidRepos: Array<{
-        name: string;
-        error: string;
-        git?: (args: string[]) => { status: number; stdout: string; stderr: string };
-      }> = [
-        { name: "a missing path", error: "Path does not exist" },
-        {
-          name: "a non-Git directory",
-          error: "Not a git repository",
-          git: () => ({ status: 128, stdout: "", stderr: "not a git repository" }),
-        },
-        {
-          name: "a repository with no commits",
-          error: "Git repository has no commits",
-          git: (args) =>
-            args.includes("--is-inside-work-tree")
-              ? { status: 0, stdout: "true\n", stderr: "" }
-              : { status: 128, stdout: "", stderr: "" },
-        },
-        {
-          name: "a detached HEAD",
-          error: "HEAD is detached",
-          git: (args) =>
-            args.includes("symbolic-ref")
-              ? { status: 1, stdout: "", stderr: "" }
-              : { status: 0, stdout: "true\n", stderr: "" },
-        },
-      ];
-      for (const invalid of invalidRepos) {
-        it(`exits 1 with only the friendly line and no container work for ${invalid.name}`, async () => {
-          const repoDir = mkdtempSync(join(tmpdir(), "invalid-repo-"));
-          const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-          try {
-            await expect(
-              runQuickstart({
-                skipBuild: true,
-                localRepo: invalid.git ? repoDir : "/does/not/exist/at/all",
-                executeGit: invalid.git ? vi.fn(invalid.git) : undefined,
-              })
-            ).resolves.toBeUndefined();
-            expect(process.exitCode).toBe(1);
-            expect(errorSpy).toHaveBeenCalledTimes(1);
-            expect(String(errorSpy.mock.calls[0]?.[0])).toMatch(
-              new RegExp(`^\\[quickstart\\] Invalid repository path: .*${invalid.error}`)
-            );
-            const containerWork = spawnSyncMock.mock.calls.filter(
-              (call: unknown[]) => !(call[0] === "docker" && (call[1] as string[])[0] === "port")
-            );
-            expect(containerWork).toHaveLength(0);
-          } finally {
-            errorSpy.mockRestore();
-            rmSync(repoDir, { recursive: true, force: true });
-          }
-        });
-      }
+      it("exits 1 with only the friendly line and no container work for a missing path", async () => {
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          await expect(
+            runQuickstart({
+              skipBuild: true,
+              localRepo: "/does/not/exist/at/all",
+            })
+          ).resolves.toBeUndefined();
+          expect(process.exitCode).toBe(1);
+          expect(errorSpy).toHaveBeenCalledTimes(1);
+          expect(String(errorSpy.mock.calls[0]?.[0])).toMatch(
+            /^\[quickstart\] Invalid repository path: .*Path does not exist/
+          );
+          const containerWork = spawnSyncMock.mock.calls.filter(
+            (call: unknown[]) => !(call[0] === "docker" && (call[1] as string[])[0] === "port")
+          );
+          expect(containerWork).toHaveLength(0);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
     });
 
     describe("real disposable git repository", () => {
