@@ -256,6 +256,23 @@ describe("buildHostJobBwrapArgs (pure argv)", () => {
     expect(tmpfsTargets).not.toContain(linkedMcHome);
   });
 
+  it("still denies manifest paths through a symlinked mcHome or at its real target", () => {
+    const realMcHome = join(dir, "real-mc");
+    mkdirSync(join(realMcHome, "secrets"), { recursive: true });
+    const linkedMcHome = join(hostHome, ".rusa-link");
+    symlinkSync(realMcHome, linkedMcHome);
+    for (const readPath of [linkedMcHome, realMcHome, join(realMcHome, "secrets")]) {
+      expect(() =>
+        buildHostJobBwrapArgs({
+          hostHome,
+          mcHome: linkedMcHome,
+          scratchDir,
+          manifest: { readPaths: [readPath] },
+        })
+      ).toThrow(/denied/);
+    }
+  });
+
   it("ensures parent dirs before every bind onto the shadowed tree (the ISSUE_NUM-class fix)", () => {
     const allowed = join(dir, "allowed", "nested", "data");
     mkdirSync(allowed, { recursive: true });
@@ -539,7 +556,8 @@ describe.skipIf(!BWRAP_CAPABLE)("buildHostJobBwrapArgs + real bwrap (ack item 3 
  * decoy root lives under the package dir — outside `/tmp` and outside the
  * fixture `$HOME` — so neither existing tmpfs can hide it by accident; only a
  * shadow mounted on the resolved mcHome does. Scratch sits under mcHome, as
- * `scratchDirFor` places it in production.
+ * `scratchDirFor` places it in production, and does not exist yet when the
+ * argv is built.
  */
 describe.skipIf(!BWRAP_CAPABLE)("buildHostJobBwrapArgs + real bwrap: symlinked mcHome", () => {
   const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -571,14 +589,16 @@ describe.skipIf(!BWRAP_CAPABLE)("buildHostJobBwrapArgs + real bwrap: symlinked m
   }
 
   function runJob(mcHome: string, realMcHome: string): { output: string; written: string } {
+    // Production order: host-jobs-mcp builds the argv before
+    // writeHostJobScript creates the scratch dir.
     const scratchDir = join(mcHome, "host-jobs", "scratch", "job-test");
-    mkdirSync(scratchDir, { recursive: true });
     const args = buildHostJobBwrapArgs({
       hostHome,
       mcHome,
       scratchDir,
       manifest: { readPaths: [allowedDir] },
     });
+    mkdirSync(scratchDir, { recursive: true });
     const probe = [
       `test -r "${join(realMcHome, "wake-token")}" && echo TOKEN_READABLE || echo TOKEN_DENIED`,
       `test -r "${join(realMcHome, "secrets", "decoy.key")}" && echo SECRET_READABLE || echo SECRET_DENIED`,
@@ -613,30 +633,5 @@ describe.skipIf(!BWRAP_CAPABLE)("buildHostJobBwrapArgs + real bwrap: symlinked m
     const mcHome = join(outside, "state");
     seedState(mcHome);
     expectHidden(runJob(mcHome, mcHome));
-  });
-
-  it("hides a symlinked mcHome whose target stays inside $HOME", () => {
-    const realMcHome = join(hostHome, ".rusa-real");
-    seedState(realMcHome);
-    const mcHome = join(hostHome, ".rusa-link");
-    symlinkSync(realMcHome, mcHome);
-    expectHidden(runJob(mcHome, realMcHome));
-  });
-
-  it("still denies manifest paths through the symlink or at its real target", () => {
-    const realMcHome = join(outside, "state");
-    seedState(realMcHome);
-    const mcHome = join(hostHome, ".rusa-link");
-    symlinkSync(realMcHome, mcHome);
-    for (const readPath of [mcHome, realMcHome, join(realMcHome, "secrets")]) {
-      expect(() =>
-        buildHostJobBwrapArgs({
-          hostHome,
-          mcHome,
-          scratchDir: join(dir, "scratch"),
-          manifest: { readPaths: [readPath] },
-        })
-      ).toThrow(/denied/);
-    }
   });
 });
