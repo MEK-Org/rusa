@@ -1035,8 +1035,7 @@ export class SharedQuotaStore {
       )
       .get(provider) as { parsed_state: string } | undefined;
     if (!row) return null;
-    const snapshot = parseParsedState(row.parsed_state);
-    return snapshot ? this.projectPacerState(provider, snapshot) : null;
+    return parseParsedState(row.parsed_state);
   }
 
   /** Advance every unprocessed observation exactly once across all connections. */

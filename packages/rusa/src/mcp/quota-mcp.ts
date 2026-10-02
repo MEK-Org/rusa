@@ -114,13 +114,19 @@ export interface QuotaLimit {
    */
   scrapedAt?: string;
   /**
-   * Start-pacer throttle interval in seconds for this lane, 0 when unthrottled,
-   * null when no observation has been reasoned (#336).
+   * Raw commanded start-pacer throttle period in seconds from the latest reasoned
+   * observation for this specific window (0 when unthrottled, null when no observation
+   * has been reasoned) (#336).
+   *
+   * Note: This is the raw per-window commanded period, NOT the effective lane admission
+   * interval enforced by the start pacer (which is the governing maximum across all of
+   * the lane's windows and may be widened to maxIntervalSeconds upon hard staleness via
+   * /v1/throttle).
    */
   throttleSeconds?: number | null;
   /**
-   * Start-pacer controller pace error (positive = consuming faster than linear pace),
-   * null when no observation has been reasoned (#336).
+   * Start-pacer controller pace error (positive = consuming faster than linear pace,
+   * negative = plenty of quota headroom), null when no observation has been reasoned (#336).
    */
   paceError?: number | null;
 }

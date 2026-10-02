@@ -2008,8 +2008,37 @@ describe("SharedQuotaStore operator pacing reset", () => {
     }
   });
 
-  describe("SharedQuotaStore pacer projection on getLatestSnapshot (#336)", () => {
-    it("projects throttleSeconds, paceError, and nextAdmitAt for live throttled and unthrottled lanes", () => {
+  describe("SharedQuotaStore projectPacerState (#336)", () => {
+    it("ensures getLatestSnapshot returns raw unprojected parsed_state to keep hydrate clean", () => {
+      const root = mkdtempSync(join(tmpdir(), "rusa-quota-raw-hydrate-"));
+      roots.push(root);
+      const store = new SharedQuotaStore(join(root, "quota.db"));
+      try {
+        store.configureController({ maxIntervalSeconds: 36000 });
+        const nowMs = Date.parse("2030-01-01T12:00:00.000Z");
+        const scrapedAt = new Date(nowMs).toISOString();
+        const resetAtIso = new Date(nowMs + 6 * 24 * 3600 * 1000).toISOString();
+
+        recordObservation(store, "claude", scrapedAt, 10, resetAtIso);
+        store.advancePendingController({ maxIntervalSeconds: 36000 }, "claude");
+
+        // getLatestSnapshot returns the raw snapshot from parsed_state with no controller projection
+        const raw = store.getLatestSnapshot("claude");
+        expect(raw).not.toBeNull();
+        if (!raw) throw new Error("expected raw snapshot");
+        expect(raw.limits?.[0].throttleSeconds).toBeUndefined();
+        expect(raw.limits?.[0].paceError).toBeUndefined();
+
+        // Calling projectPacerState explicitly decorates the limits
+        const projected = store.projectPacerState("claude", raw);
+        expect(projected.limits?.[0].throttleSeconds).toBeGreaterThan(0);
+        expect(projected.limits?.[0].paceError).toBeGreaterThan(0);
+      } finally {
+        store.close();
+      }
+    });
+
+    it("projects throttleSeconds and paceError for live throttled and unthrottled lanes", () => {
       const root = mkdtempSync(join(tmpdir(), "rusa-quota-pacer-proj-"));
       roots.push(root);
       const store = new SharedQuotaStore(join(root, "quota.db"));
@@ -2036,10 +2065,12 @@ describe("SharedQuotaStore operator pacing reset", () => {
         const id = store.recordRaw({ provider: "agy", scrapedAt, rawOutput: "raw" });
         store.recordParsed(id, emptyState, emptyState);
 
-        const unreasonedSnapshot = store.getLatestSnapshot("agy");
-        expect(unreasonedSnapshot).not.toBeNull();
-        expect(unreasonedSnapshot?.limits).toHaveLength(1);
-        const unreasonedLimit = unreasonedSnapshot?.limits?.[0];
+        const unreasonedRaw = store.getLatestSnapshot("agy");
+        expect(unreasonedRaw).not.toBeNull();
+        if (!unreasonedRaw) throw new Error("expected unreasoned raw snapshot");
+        const unreasonedSnapshot = store.projectPacerState("agy", unreasonedRaw);
+        expect(unreasonedSnapshot.limits).toHaveLength(1);
+        const unreasonedLimit = unreasonedSnapshot.limits?.[0];
         if (!unreasonedLimit) throw new Error("expected unreasoned limit");
         expect(unreasonedLimit.throttleSeconds).toBeNull();
         expect(unreasonedLimit.paceError).toBeNull();
@@ -2052,10 +2083,12 @@ describe("SharedQuotaStore operator pacing reset", () => {
         recordObservation(store, "claude", scrapedAt, 10, resetAtIso);
         store.advancePendingController({ maxIntervalSeconds: 36000 }, "claude");
 
-        const throttledSnapshot = store.getLatestSnapshot("claude");
-        expect(throttledSnapshot).not.toBeNull();
-        expect(throttledSnapshot?.limits).toHaveLength(1);
-        const throttledLimit = throttledSnapshot?.limits?.[0];
+        const throttledRaw = store.getLatestSnapshot("claude");
+        expect(throttledRaw).not.toBeNull();
+        if (!throttledRaw) throw new Error("expected throttled raw snapshot");
+        const throttledSnapshot = store.projectPacerState("claude", throttledRaw);
+        expect(throttledSnapshot.limits).toHaveLength(1);
+        const throttledLimit = throttledSnapshot.limits?.[0];
         if (!throttledLimit) throw new Error("expected throttled limit");
         expect(throttledLimit.throttleSeconds).toBeGreaterThan(0);
         expect(throttledLimit.paceError).toBeGreaterThan(0);
@@ -2067,10 +2100,12 @@ describe("SharedQuotaStore operator pacing reset", () => {
         recordObservation(store, "codex", unthrottledScrapedAt, 90, unthrottledReset);
         store.advancePendingController({ maxIntervalSeconds: 36000 }, "codex");
 
-        const unthrottledSnapshot = store.getLatestSnapshot("codex");
-        expect(unthrottledSnapshot).not.toBeNull();
-        expect(unthrottledSnapshot?.limits).toHaveLength(1);
-        const unthrottledLimit = unthrottledSnapshot?.limits?.[0];
+        const unthrottledRaw = store.getLatestSnapshot("codex");
+        expect(unthrottledRaw).not.toBeNull();
+        if (!unthrottledRaw) throw new Error("expected unthrottled raw snapshot");
+        const unthrottledSnapshot = store.projectPacerState("codex", unthrottledRaw);
+        expect(unthrottledSnapshot.limits).toHaveLength(1);
+        const unthrottledLimit = unthrottledSnapshot.limits?.[0];
         if (!unthrottledLimit) throw new Error("expected unthrottled limit");
         expect(unthrottledLimit.throttleSeconds).toBe(0);
         expect(unthrottledLimit.paceError).toBeLessThan(0);
@@ -2114,11 +2149,13 @@ describe("SharedQuotaStore operator pacing reset", () => {
         store.recordParsed(id, multiLimitSnapshot, multiLimitSnapshot);
         store.advancePendingController({ maxIntervalSeconds: 36000 }, "claude");
 
-        const snapshot = store.getLatestSnapshot("claude");
-        expect(snapshot).not.toBeNull();
-        expect(snapshot?.limits).toHaveLength(2);
+        const raw = store.getLatestSnapshot("claude");
+        expect(raw).not.toBeNull();
+        if (!raw) throw new Error("expected raw snapshot");
+        const snapshot = store.projectPacerState("claude", raw);
+        expect(snapshot.limits).toHaveLength(2);
 
-        const limits = snapshot?.limits ?? [];
+        const limits = snapshot.limits ?? [];
         const providerLimit = limits.find((l) => isProviderScopedWindow(l));
         const modelLimit = limits.find((l) => isModelScopedWindow(l));
 
@@ -2134,7 +2171,7 @@ describe("SharedQuotaStore operator pacing reset", () => {
       }
     });
 
-    it("pins exact latest-row selection over older decisions, model/provider scope isolation, and ignores later unreasoned observations", () => {
+    it("pins exact latest-row selection over older decisions and ignores later unreasoned observations", () => {
       const root = mkdtempSync(join(tmpdir(), "rusa-quota-pacer-exact-"));
       roots.push(root);
       const store = new SharedQuotaStore(join(root, "quota.db"));
@@ -2158,7 +2195,10 @@ describe("SharedQuotaStore operator pacing reset", () => {
           .get() as { intervalSeconds: number; controllerError: number };
         expect(row1.intervalSeconds).toBeDefined();
 
-        const snap1 = store.getLatestSnapshot("claude");
+        const raw1 = store.getLatestSnapshot("claude");
+        expect(raw1).not.toBeNull();
+        if (!raw1) throw new Error("expected raw1");
+        const snap1 = store.projectPacerState("claude", raw1);
         expect(snap1?.limits?.[0].throttleSeconds).toBe(row1.intervalSeconds);
         expect(snap1?.limits?.[0].paceError).toBe(row1.controllerError);
 
@@ -2178,12 +2218,15 @@ describe("SharedQuotaStore operator pacing reset", () => {
           .get() as { intervalSeconds: number; controllerError: number };
         expect(row2.intervalSeconds).not.toBe(row1.intervalSeconds);
 
-        const snap2 = store.getLatestSnapshot("claude");
+        const raw2 = store.getLatestSnapshot("claude");
+        expect(raw2).not.toBeNull();
+        if (!raw2) throw new Error("expected raw2");
+        const snap2 = store.projectPacerState("claude", raw2);
         // Pins exact latest-row selection over older decision:
         expect(snap2?.limits?.[0].throttleSeconds).toBe(row2.intervalSeconds);
         expect(snap2?.limits?.[0].paceError).toBe(row2.controllerError);
 
-        // 3. Third observation at t3 (later unreasoned observation: parsed but not reasoned by controller)
+        // 3. Third observation at t3 (later unreasoned observation recorded via separate unconfigured connection)
         const t3Ms = t2Ms + 3600 * 1000;
         const t3Scraped = new Date(t3Ms).toISOString();
         const unreasonedState: ProviderQuotaSnapshot = {
@@ -2200,22 +2243,23 @@ describe("SharedQuotaStore operator pacing reset", () => {
             },
           ],
         };
-        const rawId3 = store.recordRaw({
-          provider: "claude",
-          scrapedAt: t3Scraped,
-          rawOutput: "raw",
-        });
-        const storeAny = store as unknown as { controllerOptions?: unknown };
-        const savedOptions = storeAny.controllerOptions;
-        storeAny.controllerOptions = undefined;
+        const unconfiguredStore = new SharedQuotaStore(join(root, "quota.db"));
         try {
-          store.recordParsed(rawId3, unreasonedState, unreasonedState);
+          const rawId3 = unconfiguredStore.recordRaw({
+            provider: "claude",
+            scrapedAt: t3Scraped,
+            rawOutput: "raw",
+          });
+          unconfiguredStore.recordParsed(rawId3, unreasonedState, unreasonedState);
         } finally {
-          storeAny.controllerOptions = savedOptions;
+          unconfiguredStore.close();
         }
 
-        const snap3 = store.getLatestSnapshot("claude");
-        expect(snap3?.scrapedAt).toBe(t3Scraped);
+        const raw3 = store.getLatestSnapshot("claude");
+        expect(raw3).not.toBeNull();
+        if (!raw3) throw new Error("expected raw3");
+        expect(raw3.scrapedAt).toBe(t3Scraped);
+        const snap3 = store.projectPacerState("claude", raw3);
         // Latest reasoned row (row2) is retained and NOT overwritten by the unreasoned t3 reading:
         expect(snap3?.limits?.[0].throttleSeconds).toBe(row2.intervalSeconds);
         expect(snap3?.limits?.[0].paceError).toBe(row2.controllerError);
