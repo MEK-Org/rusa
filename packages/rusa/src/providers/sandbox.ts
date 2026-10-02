@@ -339,7 +339,7 @@ function syncWorkerGhConfigDir(mcHome: string, tokenPath: string): string {
   if (!token) {
     throw new Error(
       `github.workerTokenPath ("${tokenPath}") is empty. Refusing to spawn sandboxed actors ` +
-        "with no worker GitHub credential (fail-closed — see ISSUE_NUM's boot-gate precedent: a " +
+        "with no worker GitHub credential (fail-closed: a " +
         "silent fallback to the host's write-capable token would defeat the credential split)."
     );
   }
@@ -436,7 +436,7 @@ function injectWorkerGithubCredential(args: string[], mcHome: string): string | 
   if (!existsSync(workerTokenPath)) {
     throw new Error(
       `github.workerTokenPath is set to "${workerTokenPath}" but that file does not exist. ` +
-        "Refusing to spawn sandboxed actors (fail-closed — see ISSUE_NUM's boot-gate precedent): " +
+        "Refusing to spawn sandboxed actors (fail-closed): " +
         "silently falling back to the host's write-capable token would defeat the credential " +
         "split. Place the read-only PAT file at that path (mode 0600), or unset " +
         "github.workerTokenPath to explicitly accept the host-credential exposure."
@@ -1287,7 +1287,7 @@ export function setupFlutterOverlay(
   const fakeFlutterBin = join(realActorDir, ".flutter_fail");
   writeFileSync(
     fakeFlutterBin,
-    `#!/bin/sh\necho "[Sandbox Error] fuse-overlayfs or /dev/fuse is missing or failed to mount. Cannot mount shared Flutter SDK. Silent private copy fallback is disabled per ISSUE_NUM." >&2\nexit 1\n`,
+    `#!/bin/sh\necho "[Sandbox Error] fuse-overlayfs or /dev/fuse is missing or failed to mount. Cannot mount shared Flutter SDK. Silent private copy fallback is disabled." >&2\nexit 1\n`,
     { mode: 0o755 }
   );
   args.push("--ro-bind", fakeFlutterBin, `${fakeWrapperDir}/flutter`);

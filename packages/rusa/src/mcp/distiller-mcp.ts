@@ -249,7 +249,7 @@ export function createDistillerServer(
     {
       title: "Read distiller status",
       description:
-        "Return distiller cursor state, the local outbox unsynced op count for health checks, and `chatSpaces` — the Google Chat read set for this run, which is every space the Chat identity is a member of (ISSUE_NUM/ISSUE_NUM). Read `chatSpaces.status` before `chatSpaces.spaces`: `enumerated` means the list is the membership, `incomplete` means the walk failed or stopped short and the list is NOT the read set, `not_configured` means this host has no Chat identity at all. Judgment about what belongs in a durable node is applied per message while distilling, never by excluding a space up front.",
+        "Return distiller cursor state, the local outbox unsynced op count for health checks, and `chatSpaces` — the Google Chat read set for this run, which is every space the Chat identity is a member of. Read `chatSpaces.status` before `chatSpaces.spaces`: `enumerated` means the list is the membership, `incomplete` means the walk failed or stopped short and the list is NOT the read set, `not_configured` means this host has no Chat identity at all. Judgment about what belongs in a durable node is applied per message while distilling, never by excluding a space up front.",
       inputSchema: {},
     },
     async () => {

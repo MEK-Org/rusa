@@ -1367,7 +1367,7 @@ export function createAgentExecMcpServer(
       {
         title: "Set an actor's display title (actor-admin)",
         description:
-          "Set or replace the parent-authored display title shown under an actor's handle in the dashboard (ISSUE_NUM/ISSUE_NUM). Requires the actor-admin capability; the actor must lie in your own subtree. Patches the durable thread record and reflects immediately (the dashboard reads the record). Use to backfill titles on actors spawned before titles existed, or to re-title an actor.",
+          "Set or replace the parent-authored display title shown under an actor's handle in the dashboard. Requires the actor-admin capability; the actor must lie in your own subtree. Patches the durable thread record and reflects immediately (the dashboard reads the record). Use to backfill titles on actors spawned before titles existed, or to re-title an actor.",
         inputSchema: {
           thread_id: z.string().describe("The actor's thread id."),
           title: z.string().describe("The display title — a brief one-liner."),

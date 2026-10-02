@@ -162,7 +162,7 @@ export function createInboxMcpServer(
         note: z
           .string({
             error:
-              'mark_handled requires a `note`: a brief explanation of how this inbox item was handled or why no action was needed (e.g. "merged PR ISSUE_NUM to staging" or "duplicate of ISSUE_NUM; no action needed").',
+              'mark_handled requires a `note`: a brief explanation of how this inbox item was handled or why no action was needed (e.g. "merged PR to staging" or "duplicate; no action needed").',
           })
           .trim()
           .min(1, {

@@ -121,8 +121,8 @@ describe("model identity across A/B arms ", () => {
     expect(message).toContain("NOT CAPTURED");
     expect(message).toContain("UNVERIFIED, not verified");
     expect(message).toContain("absence of evidence");
-    // and points at the remedy rather than leaving the reader to rediscover it
-    expect(message).toContain("ISSUE_NUM");
+    expect(message).toContain("Do NOT read this as a pass.");
+    expect(message).not.toContain("ISSUE_NUM");
   });
 
   it("names the reason as a missing adapter feature, not a failed read", () => {
