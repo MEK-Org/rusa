@@ -438,7 +438,8 @@ export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void>
     const validation = validateLocalGitRepo(opts.localRepo, executeGit);
     if (!validation.valid) {
       console.error(`[quickstart] Invalid repository path: ${validation.error}`);
-      throw new Error(validation.error);
+      process.exitCode = 1;
+      return;
     }
     localRepoValidation = validation;
     console.log(`[quickstart] Local repository selected: ${validation.resolvedPath}`);

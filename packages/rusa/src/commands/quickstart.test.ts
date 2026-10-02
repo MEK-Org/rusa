@@ -920,17 +920,27 @@ describe("quickstart command", () => {
         }
       });
 
-      it("rejects a missing path before any container work", async () => {
-        await expect(
-          runQuickstart({
-            skipBuild: true,
-            localRepo: "/does/not/exist/at/all",
-          })
-        ).rejects.toThrow("Path does not exist");
-        const containerWork = spawnSyncMock.mock.calls.filter(
-          (call: unknown[]) => !(call[0] === "docker" && (call[1] as string[])[0] === "port")
-        );
-        expect(containerWork).toHaveLength(0);
+      it("exits 1 with only the friendly line and no container work for a missing path", async () => {
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          await expect(
+            runQuickstart({
+              skipBuild: true,
+              localRepo: "/does/not/exist/at/all",
+            })
+          ).resolves.toBeUndefined();
+          expect(process.exitCode).toBe(1);
+          expect(errorSpy).toHaveBeenCalledTimes(1);
+          expect(String(errorSpy.mock.calls[0]?.[0])).toMatch(
+            /^\[quickstart\] Invalid repository path: .*Path does not exist/
+          );
+          const containerWork = spawnSyncMock.mock.calls.filter(
+            (call: unknown[]) => !(call[0] === "docker" && (call[1] as string[])[0] === "port")
+          );
+          expect(containerWork).toHaveLength(0);
+        } finally {
+          errorSpy.mockRestore();
+        }
       });
     });
 
