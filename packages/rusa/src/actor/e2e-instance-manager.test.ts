@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { configureCodexHome } from "../providers/codex-home.js";
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
 import { QuotaCoordinatorService } from "../quota/coordinator-service.js";
 import { SharedQuotaStore } from "../quota/shared-store.js";
@@ -94,6 +95,7 @@ describe("E2EInstanceManager", () => {
   });
 
   afterEach(() => {
+    configureCodexHome(undefined);
     teardownFlutterOverlay(join(mcHome, "e2e-instance", "runtime"));
     rmSync(root, { recursive: true, force: true });
   });
@@ -1480,6 +1482,158 @@ describe("E2EInstanceManager", () => {
     ).toBe(false);
     expect(args.join(" ")).not.toContain(".codex");
   });
+
+  it("projects a configured Codex home as the nested ~/.codex and hides its host path last (#782)", async () => {
+    // Beneath the actor worktree, which the instance binds writable.
+    const configuredHome = join(actorWorktree, "codex-canary");
+    mkdirSync(configuredHome, { recursive: true });
+    configureCodexHome(configuredHome);
+
+    const subject = manager();
+    await subject.up("actor-a", actorWorktree);
+
+    const args = calls.find((call) => call.file === "systemd-run")?.args ?? [];
+    const runtimeHome = join(mcHome, "e2e-instance", "runtime", "home");
+    const projection = args.findIndex(
+      (arg, index) =>
+        arg === "--ro-bind" &&
+        args[index + 1] === configuredHome &&
+        args[index + 2] === join(runtimeHome, ".codex")
+    );
+    expect(projection).toBeGreaterThan(-1);
+    // The default login is not the one projected.
+    expect(
+      args.some((arg, index) => arg === "--ro-bind" && args[index + 1] === join(root, ".codex"))
+    ).toBe(false);
+
+    const hide = args.findIndex(
+      (arg, index) =>
+        arg === "--tmpfs" &&
+        args[index + 1] === configuredHome &&
+        args[index + 2] === "--remount-ro" &&
+        args[index + 3] === configuredHome
+    );
+    const worktreeBind = args.findIndex(
+      (arg, index) => arg === "--bind" && args[index + 1] === actorWorktree
+    );
+    expect(worktreeBind).toBeGreaterThan(-1);
+    expect(hide).toBeGreaterThan(worktreeBind);
+    expect(hide).toBeGreaterThan(projection);
+    // Nothing after the hide mounts over or beneath the configured home again.
+    const command = args.indexOf("--", hide);
+    expect(
+      args
+        .slice(hide + 4, command)
+        .some((arg) => arg === configuredHome || arg.startsWith(`${configuredHome}/`))
+    ).toBe(false);
+  });
+
+  it("hides a configured Codex home and projects no login when the auth broker is enabled (#782)", async () => {
+    const configuredHome = join(actorWorktree, "codex-canary");
+    mkdirSync(configuredHome, { recursive: true });
+    configureCodexHome(configuredHome);
+
+    const subject = manager({ codexAuthBroker: true });
+    await subject.up("actor-a", actorWorktree);
+
+    const args = calls.find((call) => call.file === "systemd-run")?.args ?? [];
+    const runtimeHome = join(mcHome, "e2e-instance", "runtime", "home");
+    expect(args).not.toContain(join(runtimeHome, ".codex"));
+    expect(
+      args.some((arg, index) => arg === "--ro-bind" && args[index + 1] === configuredHome)
+    ).toBe(false);
+    expect(args.join(" ")).toContain(`--tmpfs ${configuredHome} --remount-ro ${configuredHome}`);
+    expect(existsSync(join(runtimeHome, ".codex"))).toBe(false);
+  });
+
+  it.skipIf(!BWRAP_CAPABLE)(
+    "real bwrap: the nested instance reads the configured login only as ~/.codex (#782)",
+    () => {
+      const configuredHome = join(actorWorktree, "codex-canary");
+      mkdirSync(configuredHome, { recursive: true });
+      writeFileSync(join(configuredHome, "auth.json"), '{"fixture":"configured"}');
+      writeFileSync(join(root, ".codex", "auth.json"), '{"fixture":"default"}');
+      configureCodexHome(configuredHome);
+
+      const runRoot = join(root, "run-1");
+      mkdirSync(runRoot, { recursive: true });
+      const args = (
+        manager({ flutterRoot: "" }) as unknown as {
+          buildBwrapArgs(worktree: string, root: string, resume: boolean): string[];
+        }
+      ).buildBwrapArgs(actorWorktree, runRoot, false);
+      const runtimeHome = join(mcHome, "e2e-instance", "runtime", "home");
+      const probe = [
+        `/bin/cat ${runtimeHome}/.codex/auth.json`,
+        `echo; test -e ${configuredHome}/auth.json && echo configured-visible || echo configured-hidden`,
+        `/usr/bin/touch ${configuredHome}/planted 2>/dev/null && echo configured-writable || echo configured-readonly`,
+        `/usr/bin/touch ${actorWorktree}/still-writable && echo worktree-writable`,
+      ].join("; ");
+      const output = execFileSync(
+        "bwrap",
+        [...args.slice(0, args.indexOf("--")), "--", "/bin/sh", "-c", probe],
+        { encoding: "utf8" }
+      );
+
+      expect(output.split("\n")).toEqual([
+        '{"fixture":"configured"}',
+        "configured-hidden",
+        "configured-readonly",
+        "worktree-writable",
+        "",
+      ]);
+      expect(existsSync(join(configuredHome, "planted"))).toBe(false);
+      expect(readFileSync(join(configuredHome, "auth.json"), "utf8")).toBe(
+        '{"fixture":"configured"}'
+      );
+    }
+  );
+
+  it.skipIf(!BWRAP_CAPABLE)(
+    "real bwrap: a configured Codex home reached through an absolute symlink is hidden at both paths (#782)",
+    () => {
+      // bwrap cannot mount over an absolute symlink, so the hide goes on the real path.
+      const realHome = join(actorWorktree, "codex-canary-real");
+      const configuredHome = join(actorWorktree, "codex-canary");
+      mkdirSync(realHome, { recursive: true });
+      symlinkSync(realHome, configuredHome);
+      writeFileSync(join(realHome, "auth.json"), '{"fixture":"configured"}');
+      writeFileSync(join(realHome, "config.toml"), "host-config");
+      configureCodexHome(configuredHome);
+
+      const runRoot = join(root, "run-1");
+      mkdirSync(runRoot, { recursive: true });
+      const args = (
+        manager({ flutterRoot: "" }) as unknown as {
+          buildBwrapArgs(worktree: string, root: string, resume: boolean): string[];
+        }
+      ).buildBwrapArgs(actorWorktree, runRoot, false);
+      const runtimeHome = join(mcHome, "e2e-instance", "runtime", "home");
+      const probe = [
+        `/bin/cat ${runtimeHome}/.codex/auth.json; echo`,
+        ...[configuredHome, realHome].map(
+          (dir) =>
+            `test -e ${dir}/config.toml && echo visible || echo hidden; ` +
+            `/usr/bin/touch ${dir}/planted 2>/dev/null && echo writable || echo readonly`
+        ),
+      ].join("; ");
+      const output = execFileSync(
+        "bwrap",
+        [...args.slice(0, args.indexOf("--")), "--", "/bin/sh", "-c", probe],
+        { encoding: "utf8" }
+      );
+
+      expect(output.split("\n")).toEqual([
+        '{"fixture":"configured"}',
+        "hidden",
+        "readonly",
+        "hidden",
+        "readonly",
+        "",
+      ]);
+      expect(existsSync(join(realHome, "planted"))).toBe(false);
+    }
+  );
 });
 
 describe.skipIf(!BWRAP_CAPABLE)(

@@ -11,7 +11,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createLogger, type Logger } from "../observability/logger.js";
 import {
@@ -20,6 +20,7 @@ import {
   type CodexAuthLease,
   writeCodexLeaseAuth,
 } from "./codex-auth-broker.js";
+import { codexHomeDir } from "./codex-home.js";
 
 let _scrapeLogger: Logger | undefined;
 export function setCodexScrapeLogger(logger: Logger | undefined): void {
@@ -67,7 +68,7 @@ export interface ScrapeCodexStatusOptions {
   signal?: AbortSignal;
   /** Command binary (test/override). Default "codex". */
   cliCommand?: string;
-  /** Host codex config dir to copy auth/config from (test seam). Default `~/.codex`. */
+  /** Host codex config dir to copy auth/config from (test seam). Default {@link codexHomeDir}. */
   codexConfigDir?: string;
 }
 
@@ -362,7 +363,7 @@ export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise
   const timeoutMs = opts.timeoutMs ?? 90_000;
   mkdirSync(opts.actorDir, { recursive: true });
 
-  const hostCodexDir = opts.codexConfigDir ?? join(homedir(), ".codex");
+  const hostCodexDir = opts.codexConfigDir ?? codexHomeDir();
   // A broker fault rejects the scrape (an unknown reading), never falls back to
   // the shared writable login.
   const lease = await activeCodexAuthBroker()?.lease(timeoutMs + 60_000);

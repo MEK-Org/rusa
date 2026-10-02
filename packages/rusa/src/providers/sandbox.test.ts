@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
@@ -1646,6 +1646,107 @@ describe("sandbox bwrap args", () => {
     expect(joined).toContain("--setenv CODEX_HOME /tmp");
     expect(args[args.indexOf(SANDBOX_CODEX_SHELL_HOME) - 1]).toBe("--dir");
     tempDirs.push("/tmp/rusa-codex-sessions-worktree");
+  });
+
+  it("with a brokered login, hides a configured codex home beneath the actor's writable root, after that bind", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mc-home-"));
+    tempDirs.push(home);
+    process.env.HOME = home;
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(join(home, ".codex", "auth.json"), "default-login");
+    const actorDir = realpathSync(mkdtempSync(join(tmpdir(), "mc-actor-")));
+    tempDirs.push(actorDir, `/tmp/rusa-codex-sessions-${basename(actorDir)}`);
+    const configured = join(actorDir, "codex-login");
+    mkdirSync(configured);
+    writeFileSync(join(configured, "auth.json"), "configured-login");
+
+    execSyncMock.mockImplementation((command: string) => {
+      if (command === "pnpm store path") return "/tmp/pnpm-store\n";
+      const fallback = defaultExecSyncResponse(command);
+      if (fallback) return fallback;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const { configureCodexHome } = await import("./codex-home.js");
+    configureCodexHome(configured);
+    const { buildActorBwrapArgs } = await import("./sandbox.js");
+    const { args } = buildActorBwrapArgs(actorDir, "codex", undefined, false, undefined, {
+      authFile: "/tmp/rusa-codex-auth-run/auth.json",
+      refreshUrl: "http://127.0.0.1:4555/oauth/token",
+    });
+
+    const writableRoot = args.findIndex(
+      (a, i) => a === "--bind" && args[i + 1] === actorDir && args[i + 2] === actorDir
+    );
+    expect(writableRoot).toBeGreaterThan(-1);
+    for (const dir of [configured, join(home, ".codex")]) {
+      const hide = args.findIndex((a, i) => a === "--tmpfs" && args[i + 1] === dir);
+      expect(hide, dir).toBeGreaterThan(writableRoot);
+      expect(args.slice(hide, hide + 4)).toEqual(["--tmpfs", dir, "--remount-ro", dir]);
+    }
+    // No later mount re-exposes the configured home or its login.
+    const lastHide = args.lastIndexOf(configured);
+    expect(args.slice(lastHide + 1).some((a) => a.startsWith(configured))).toBe(false);
+    expect(args).not.toContain(join(configured, "auth.json"));
+  });
+
+  it("with the broker off, binds the configured codex home's auth file, not ~/.codex's", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mc-home-"));
+    tempDirs.push(home);
+    process.env.HOME = home;
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(join(home, ".codex", "auth.json"), "default-login");
+    const configured = mkdtempSync(join(tmpdir(), "mc-codex-login-"));
+    tempDirs.push(configured, "/tmp/rusa-codex-sessions-worktree");
+    writeFileSync(join(configured, "auth.json"), "configured-login");
+
+    execSyncMock.mockImplementation((command: string) => {
+      if (command === "pnpm store path") return "/tmp/pnpm-store\n";
+      const fallback = defaultExecSyncResponse(command);
+      if (fallback) return fallback;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const { configureCodexHome } = await import("./codex-home.js");
+    configureCodexHome(configured);
+    const { buildActorBwrapArgs } = await import("./sandbox.js");
+    const { args } = buildActorBwrapArgs("/tmp/worktree", "codex");
+    const joined = args.join(" ");
+
+    expect(joined).toContain(`--bind ${join(configured, "auth.json")} /tmp/auth.json`);
+    expect(args).not.toContain(join(home, ".codex", "auth.json"));
+    // The rest of the configured home is shadowed, after the writable binds; the
+    // auth bind's source still resolves on the host. ~/.codex keeps the default.
+    const hide = args.findIndex((a, i) => a === "--tmpfs" && args[i + 1] === configured);
+    expect(args.slice(hide, hide + 4)).toEqual(["--tmpfs", configured, "--remount-ro", configured]);
+    const writableRoot = args.findIndex(
+      (a, i) => a === "--bind" && args[i + 1] === "/tmp/worktree" && args[i + 2] === "/tmp/worktree"
+    );
+    expect(writableRoot).toBeGreaterThan(-1);
+    expect(hide).toBeGreaterThan(writableRoot);
+    expect(args).not.toContain(join(home, ".codex"));
+  });
+
+  it("with the broker off and no configured home, shadows nothing and binds ~/.codex's auth file", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mc-home-"));
+    tempDirs.push(home, "/tmp/rusa-codex-sessions-worktree");
+    process.env.HOME = home;
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(join(home, ".codex", "auth.json"), "default-login");
+
+    execSyncMock.mockImplementation((command: string) => {
+      if (command === "pnpm store path") return "/tmp/pnpm-store\n";
+      const fallback = defaultExecSyncResponse(command);
+      if (fallback) return fallback;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const { buildActorBwrapArgs } = await import("./sandbox.js");
+    const { args } = buildActorBwrapArgs("/tmp/worktree", "codex");
+
+    expect(args.join(" ")).toContain(`--bind ${join(home, ".codex", "auth.json")} /tmp/auth.json`);
+    expect(args).not.toContain(join(home, ".codex"));
+    expect(args).not.toContain("--remount-ro");
   });
 
   it("persists codex session rollouts: binds a per-actor host-/tmp store over /tmp/sessions, after the tmpfs", async () => {

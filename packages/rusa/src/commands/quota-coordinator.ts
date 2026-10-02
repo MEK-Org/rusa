@@ -11,6 +11,7 @@ import {
   codexAuthBrokerConfigured,
   configureCodexAuthBroker,
 } from "../providers/codex-auth-broker.js";
+import { codexHomeFromConfig, configureCodexHome } from "../providers/codex-home.js";
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
 import { providerThrottleKey, QUOTA_THROTTLE_PROVIDERS } from "../providers/registry.js";
 import {
@@ -249,6 +250,7 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
   const mcHome = opts.home ?? resolveHome();
   const config = loadConfig(mcHome);
   // The coordinator's quota probes refresh the same login as the daemons do.
+  configureCodexHome(codexHomeFromConfig(config));
   configureCodexAuthBroker(codexAuthBrokerConfigured(config));
   const probeOff = opts.probeOff === true || process.env.RUSA_QUOTA_COORDINATOR_PROBE_OFF === "1";
 

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { Type } from "@google/genai";
 import { parse as parseToml } from "smol-toml";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
+import { codexHomeDir, configuredCodexHome } from "./codex-home.js";
 import { parseCodexModel } from "./reasoning-effort.js";
 
 /**
@@ -709,9 +710,16 @@ export function extractCodexModelsFromCacheJson(
   return { fetchedAt, clientVersion, entries };
 }
 
-/** Resolves the host Codex models cache path, honouring `CODEX_HOME` as codex does. */
+/**
+ * Resolves the host Codex models cache path. A configured `providers.codex.home`
+ * (#782) wins, since the `/model` probe pins `CODEX_HOME` to it; otherwise
+ * `CODEX_HOME` is honoured as codex does, then `~/.codex`.
+ */
 export function getHostCodexModelsCachePath(): string {
-  return join(process.env.CODEX_HOME || join(homedir(), ".codex"), "models_cache.json");
+  return join(
+    configuredCodexHome() ?? (process.env.CODEX_HOME || codexHomeDir()),
+    "models_cache.json"
+  );
 }
 
 /**

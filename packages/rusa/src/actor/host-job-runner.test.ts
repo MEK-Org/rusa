@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { configureCodexHome } from "../providers/codex-home.js";
 import {
   buildHostJobBwrapArgs,
   buildSystemdRunArgv,
@@ -53,6 +54,17 @@ describe("hostJobDenylistDirs (ISSUE_NUM, expanded credential stores)", () => {
   it("always includes mcHome itself, even when configured outside hostHome", () => {
     const dirs = hostJobDenylistDirs("/home/familiar", "/var/lib/rusa-home");
     expect(dirs).toContain("/var/lib/rusa-home");
+  });
+
+  it("adds a configured Codex home (#782) and keeps the default ~/.codex", () => {
+    configureCodexHome("/srv/codex-fixture/login");
+    try {
+      const dirs = hostJobDenylistDirs("/home/familiar", "/home/familiar/.rusa");
+      expect(dirs).toContain("/srv/codex-fixture/login");
+      expect(dirs).toContain("/home/familiar/.codex");
+    } finally {
+      configureCodexHome(undefined);
+    }
   });
 });
 
@@ -217,6 +229,58 @@ describe("buildHostJobBwrapArgs (pure argv)", () => {
     const homeIndex = args.indexOf("HOME");
     expect(args[homeIndex - 1]).toBe("--setenv");
     expect(args[homeIndex + 1]).toBe(scratchDir);
+  });
+
+  it("shadows a configured Codex home outside hostHome and refuses it as a read path (#782)", () => {
+    const configuredHome = join(dir, "codex-canary");
+    mkdirSync(configuredHome, { recursive: true });
+    configureCodexHome(configuredHome);
+    try {
+      const args = buildHostJobBwrapArgs({
+        hostHome,
+        mcHome,
+        scratchDir,
+        manifest: { readPaths: [] },
+      });
+      const tmpfsTargets = args.reduce<string[]>((acc, arg, i) => {
+        if (arg === "--tmpfs") acc.push(args[i + 1]);
+        return acc;
+      }, []);
+      expect(tmpfsTargets).toContain(configuredHome);
+      expect(() =>
+        buildHostJobBwrapArgs({
+          hostHome,
+          mcHome,
+          scratchDir,
+          manifest: { readPaths: [join(configuredHome, "auth.json")] },
+        })
+      ).toThrow(/denied/);
+    } finally {
+      configureCodexHome(undefined);
+    }
+  });
+
+  it("shadows a configured Codex home when it is an ancestor of hostHome (inverse containment) (#782)", () => {
+    const fixtureRoot = join(dir, "codex-ancestor-root");
+    const configuredHome = fixtureRoot;
+    const testHostHome = join(fixtureRoot, "user");
+    mkdirSync(testHostHome, { recursive: true });
+    configureCodexHome(configuredHome);
+    try {
+      const args = buildHostJobBwrapArgs({
+        hostHome: testHostHome,
+        mcHome,
+        scratchDir,
+        manifest: { readPaths: [] },
+      });
+      const tmpfsTargets = args.reduce<string[]>((acc, arg, i) => {
+        if (arg === "--tmpfs") acc.push(args[i + 1]);
+        return acc;
+      }, []);
+      expect(tmpfsTargets).toContain(configuredHome);
+    } finally {
+      configureCodexHome(undefined);
+    }
   });
 
   it("does not double-shadow mcHome when it is nested inside hostHome", () => {
@@ -495,6 +559,86 @@ describe.skipIf(!BWRAP_CAPABLE)("buildHostJobBwrapArgs + real bwrap (ack item 3 
       { encoding: "utf-8" }
     );
     expect(output.trim()).toBe("ALLOWED_CONTENT");
+  });
+
+  it("hides the real target of a symlinked configured Codex home (#782)", () => {
+    // Outside /tmp, which the sandbox already shadows, so only a real-path shadow hides it.
+    const realCodexHome = mkdtempSync(join(process.cwd(), ".host-job-codex-real-"));
+    writeFileSync(join(realCodexHome, "auth.json"), "fixture-codex-login");
+    const linkedHome = join(hostHome, "codex-canary");
+    symlinkSync(realCodexHome, linkedHome);
+    configureCodexHome(linkedHome);
+    try {
+      const args = buildHostJobBwrapArgs({
+        hostHome,
+        mcHome,
+        scratchDir,
+        manifest: { readPaths: [] },
+      });
+      const probe = [
+        `test -r "${join(linkedHome, "auth.json")}" && echo LINK_READABLE || echo LINK_DENIED`,
+        `test -r "${join(realCodexHome, "auth.json")}" && echo REAL_READABLE || echo REAL_DENIED`,
+      ].join("\n");
+      const output = execFileSync("bwrap", [...args, "--", "/bin/sh", "-c", probe], {
+        encoding: "utf-8",
+      });
+      expect(output).toContain("LINK_DENIED");
+      expect(output).toContain("REAL_DENIED");
+    } finally {
+      configureCodexHome(undefined);
+      rmSync(realCodexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("shadows a configured Codex home when it is an ancestor of hostHome (#782)", () => {
+    // Outside /tmp so /tmp tmpfs cannot hide it; configured home is ancestor of hostHome
+    const fixtureRoot = mkdtempSync(join(process.cwd(), ".host-job-codex-ancestor-"));
+    const configuredHome = fixtureRoot;
+    const testHostHome = join(fixtureRoot, "user");
+    const testScratchDir = join(mcHome, "scratch-ancestor-test");
+    mkdirSync(testHostHome, { recursive: true });
+    mkdirSync(testScratchDir, { recursive: true });
+    writeFileSync(join(configuredHome, "auth.json"), "fixture-codex-login");
+    configureCodexHome(configuredHome);
+    try {
+      const args = buildHostJobBwrapArgs({
+        hostHome: testHostHome,
+        mcHome,
+        scratchDir: testScratchDir,
+        manifest: { readPaths: [] },
+      });
+      const probe = [
+        `test -r "${join(configuredHome, "auth.json")}" && echo ANCESTOR_READABLE || echo ANCESTOR_DENIED`,
+      ].join("\n");
+      const output = execFileSync("bwrap", [...args, "--", "/bin/sh", "-c", probe], {
+        encoding: "utf-8",
+      });
+      expect(output).toContain("ANCESTOR_DENIED");
+      expect(output).not.toContain("ANCESTOR_READABLE");
+    } finally {
+      configureCodexHome(undefined);
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("still runs when the configured Codex home does not exist yet (#782)", () => {
+    // Outside /tmp and hostHome, so bwrap would have to mkdir it on the read-only root.
+    const missingHome = join(process.cwd(), `.host-job-codex-missing-${process.pid}`);
+    configureCodexHome(missingHome);
+    try {
+      const args = buildHostJobBwrapArgs({
+        hostHome,
+        mcHome,
+        scratchDir,
+        manifest: { readPaths: [] },
+      });
+      const output = execFileSync("bwrap", [...args, "--", "/bin/sh", "-c", "echo JOB_RAN"], {
+        encoding: "utf-8",
+      });
+      expect(output.trim()).toBe("JOB_RAN");
+    } finally {
+      configureCodexHome(undefined);
+    }
   });
 
   it("can write into its own scratch dir (the job's real workspace)", () => {

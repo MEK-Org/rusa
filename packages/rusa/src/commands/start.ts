@@ -234,6 +234,7 @@ import {
   codexAuthBrokerConfigured,
   configureCodexAuthBroker,
 } from "../providers/codex-auth-broker.js";
+import { codexHomeFromConfig, configureCodexHome } from "../providers/codex-home.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import {
   acceptableModelPins,
@@ -1002,6 +1003,7 @@ async function composeStart(
     return;
   }
   const rootActor = config.rootActor;
+  configureCodexHome(codexHomeFromConfig(config));
   configureCodexAuthBroker(codexAuthBrokerConfigured(config));
   const errorSink = resolveErrorSink(config);
   if (!rootActor) {

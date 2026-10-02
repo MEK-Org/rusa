@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { codexHomeDir, configuredCodexHome } from "../providers/codex-home.js";
 import {
   buildToolchainPath,
   ensureTargetParentDirs,
@@ -70,6 +71,8 @@ export function hostJobDenylistDirs(hostHome: string, mcHome: string): string[] 
     join(hostHome, ".npmrc"),
     join(hostHome, ".git-credentials"),
     mcHome,
+    // A configured Codex login (#782) can live outside hostHome.
+    ...(configuredCodexHome() ? [codexHomeDir(hostHome)] : []),
   ];
 }
 
@@ -168,12 +171,27 @@ export function buildHostJobBwrapArgs(o: BuildHostJobBwrapArgsOptions): string[]
   // Shadow the real home to empty — the deny-by-default gate. Also shadow
   // mcHome explicitly in case it's configured outside hostHome (a non-default
   // RUSA_HOME), so the mesh's own secrets root is never merely "usually"
-  // hidden. Mounting a tmpfs inside an already-shadowed tree is a harmless
-  // no-op (still empty), so no ordering/overlap check is needed here.
+  // hidden. The same goes for a configured Codex home (#782), shadowed at its
+  // real path: any symlink to it then resolves into the empty tmpfs, while the
+  // target would otherwise stay reachable through the root ro-bind. A
+  // configured home that does not exist yet is skipped, as in sandbox.ts:
+  // there is nothing to hide, and bwrap cannot mkdir a mountpoint on the
+  // read-only root. If hostHome already contains the configured home, the
+  // hostHome tmpfs hides it; if the configured home is outside or an ancestor
+  // of hostHome, it is shadowed explicitly so it is not visible via ro-bind /.
   const realHostHome = realpathIfExists(hostHome);
   const realMcHome = realpathIfExists(o.mcHome);
   args.push("--tmpfs", hostHome);
   if (!overlaps(realHostHome, realMcHome)) args.push("--tmpfs", o.mcHome);
+  const configuredCodex = configuredCodexHome();
+  const realConfiguredCodex = configuredCodex && realpathIfExists(configuredCodex);
+  if (
+    realConfiguredCodex &&
+    existsSync(realConfiguredCodex) &&
+    !isSelfOrAncestor(realHostHome, realConfiguredCodex)
+  ) {
+    args.push("--tmpfs", realConfiguredCodex);
+  }
   args.push("--tmpfs", "/tmp");
 
   // The job's own writable scratch dir, punched back through the shadow.

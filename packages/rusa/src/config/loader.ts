@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
@@ -300,6 +300,16 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       if (typeof providerConfig.authBroker !== "boolean") {
         throw new Error("config.yaml: providers.codex.authBroker must be true or false");
       }
+    }
+    if (providerConfig && "home" in providerConfig) {
+      if (providerName !== "codex") {
+        throw new Error(`config.yaml: providers.${providerName}.home is only supported for codex`);
+      }
+      const home = providerConfig.home;
+      if (typeof home !== "string" || !isAbsolute(home.trim())) {
+        throw new Error("config.yaml: providers.codex.home must be an absolute path");
+      }
+      providerConfig.home = resolve(home.trim());
     }
   }
   if (

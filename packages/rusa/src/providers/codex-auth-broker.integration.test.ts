@@ -3,10 +3,11 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CodexProvider } from "./codex.js";
-import { configureCodexAuthBroker } from "./codex-auth-broker.js";
+import { CODEX_REFRESH_URL_ENV, configureCodexAuthBroker } from "./codex-auth-broker.js";
+import { configureCodexHome } from "./codex-home.js";
 import { codexRolloutStoreDir, teardownFlutterOverlay } from "./sandbox.js";
 import type { RunResult } from "./types.js";
 
@@ -260,8 +261,43 @@ describe("Codex host-owned auth broker (real driver)", () => {
       minRotationIntervalMs,
     });
 
+  /**
+   * Move the fixture login to a dedicated `providers.codex.home` (#782) under
+   * `parent`, and leave a decoy at the default `~/.codex` that no run may use:
+   * its config points at a closed port and its login is never refreshed. The
+   * broker is configured without `codexHome`, so it finds the login only
+   * through the resolver.
+   */
+  const useConfiguredHome = (parent: string, brokered = true) => {
+    const home = join(parent, "codex-canary");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(home, "config.toml"), readFileSync(join(codexDir, "config.toml")));
+    writeFileSync(
+      join(codexDir, "config.toml"),
+      'model_provider = "decoy"\n[model_providers.decoy]\nname = "decoy"\nbase_url = "http://127.0.0.1:9/v1"\nwire_api = "responses"\n'
+    );
+    writeFileSync(
+      join(codexDir, "auth.json"),
+      JSON.stringify({ auth_mode: "chatgpt", tokens: { refresh_token: "fixture-refresh-decoy" } }),
+      { mode: 0o600 }
+    );
+    canonical = join(home, "auth.json");
+    configureCodexHome(home);
+    if (brokered) {
+      configureCodexAuthBroker(true, {
+        upstreamUrl: `${fx.base}/oauth/token`,
+        upstreamTimeoutMs: 10_000,
+      });
+    } else {
+      configureCodexAuthBroker(false);
+    }
+    return { home, decoy: readFileSync(join(codexDir, "auth.json"), "utf8") };
+  };
+
   afterEach(async () => {
     configureCodexAuthBroker(false);
+    configureCodexHome(undefined);
+    delete process.env[CODEX_REFRESH_URL_ENV];
     fx.server.closeAllConnections();
     await new Promise((r) => fx.server.close(r));
     for (const name of ["w1", "w2", "w3", "a", "b", "c"]) {
@@ -438,6 +474,74 @@ describe("Codex host-owned auth broker (real driver)", () => {
           expect(result.success).toBe(false);
           expect(readFileSync(canonical, "utf8")).toBe(before);
           expect(fx.refreshes).toEqual(["fixture-refresh-0"]);
+        },
+        90_000
+      );
+
+      it.skipIf(!!missing)(
+        "configured home beneath the actor's writable dir: a hostile child reaches neither login (#782)",
+        async () => {
+          const parent = join(root, "a");
+          const configured = join(parent, "codex-canary", "auth.json");
+          const defaultAuth = join(codexDir, "auth.json");
+          const dir = actor(
+            "a",
+            `${HOSTILE_CHILD(configured)}
+( printf child-evil > "${defaultAuth}" ) 2>/dev/null; echo "default_write:$?"
+( cat "${defaultAuth}" >/dev/null ) 2>/dev/null; echo "default_read:$?"
+( ls "${dirname(configured)}" | grep -q . ) 2>/dev/null; echo "configured_listing:$?"
+`
+          );
+          const { decoy } = useConfiguredHome(parent);
+          writeCanonical(FAR);
+          const before = readFileSync(canonical, "utf8");
+          const result = await runIn(dir);
+          expect(result.success, result.output.slice(-2000)).toBe(true);
+          const lines = report(dir);
+          expect(lines).toContain("private_refresh_is_cap:yes");
+          expect(lines).toMatch(/canonical_write:[1-9]/);
+          expect(lines).toMatch(/canonical_read:[1-9]/);
+          expect(lines).toMatch(/default_write:[1-9]/);
+          expect(lines).toMatch(/default_read:[1-9]/);
+          expect(lines).toMatch(/configured_listing:[1-9]/);
+          expect(lines).toContain("direct_refresh:access-only");
+          const after = readFileSync(canonical, "utf8");
+          expect(after).not.toContain("child-evil");
+          expect(after).not.toBe(before);
+          expect(fx.refreshes).toEqual(["fixture-refresh-0"]);
+          expect(readFileSync(defaultAuth, "utf8")).toBe(decoy);
+        },
+        90_000
+      );
+
+      for (const sandboxed of [true, false]) {
+        it.skipIf(!!missing)(
+          `configured home, expired at start${sandboxed ? "" : " (unsandboxed)"}: the broker persists the rotation there (#782)`,
+          async () => {
+            const { decoy } = useConfiguredHome(root);
+            writeCanonical(EXPIRED);
+            const result = await runIn(actor("a"), { sandboxed });
+            expect(result.success, result.output.slice(-2000)).toBe(true);
+            expect(fx.refreshes).toEqual(["fixture-refresh-0"]);
+            expect(canonicalRefresh()).toBe("fixture-refresh-1");
+            expect(fx.turns.every((t) => t.status === 200 && t.tag === "a1")).toBe(true);
+            expect(readFileSync(join(codexDir, "auth.json"), "utf8")).toBe(decoy);
+          },
+          90_000
+        );
+      }
+
+      it.skipIf(!!missing)(
+        "configured home, broker off, unsandboxed: the CLI refreshes the configured login in place (#782)",
+        async () => {
+          const { decoy } = useConfiguredHome(root, false);
+          process.env[CODEX_REFRESH_URL_ENV] = `${fx.base}/oauth/token`;
+          writeCanonical(EXPIRED);
+          const result = await runIn(actor("a"), { sandboxed: false });
+          expect(result.success, result.output.slice(-2000)).toBe(true);
+          expect(fx.refreshes).toEqual(["fixture-refresh-0"]);
+          expect(canonicalRefresh()).toBe("fixture-refresh-1");
+          expect(readFileSync(join(codexDir, "auth.json"), "utf8")).toBe(decoy);
         },
         90_000
       );
