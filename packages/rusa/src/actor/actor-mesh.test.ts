@@ -12754,7 +12754,7 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(notice).toContain("told-head");
     // The exits it names are the exits enforcement accepts, worded once.
     const exits =
-      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
+      "complete it, cancel it, schedule it, snooze it until a future time with `set_snooze`, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
     expect(notice).toContain(exits);
     expect(() => mesh.declareYield(optedIn, "complete")).toThrow(exits);
 
@@ -12892,6 +12892,16 @@ describe("strict obligation handling experiment (#382)", () => {
       mesh.enrollActorInExperiment(id, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
       return id;
     }
+
+    it("names snooze as an exit in both the discipline notice and the rejection (#819)", () => {
+      const { mesh } = snoozeMesh();
+      const subject = enrolled(mesh, "told about snooze");
+      repo.create({ id: "head", title: "Head", ownerId: subject });
+      selectHead(mesh, subject, "head");
+      const snoozeExit = "snooze it until a future time with `set_snooze`";
+      expect(mesh.runDisciplineNotice(subject)).toContain(snoozeExit);
+      expect(() => mesh.declareYield(subject, "complete")).toThrow(snoozeExit);
+    });
 
     it("closes a ready head snoozed during the run", () => {
       const { mesh } = snoozeMesh();
