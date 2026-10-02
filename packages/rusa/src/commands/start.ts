@@ -1519,7 +1519,11 @@ async function composeStart(
   if (chatClient) {
     servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
   }
-  if (slackClient) servers[SLACK_READ_MCP_NAME] = () => createSlackReadMcpServer(slackClient);
+  if (slackClient) {
+    // Only root mounts the shared server, so its downloads land in root's workdir.
+    const workDir = join(mcHome, "root-agent");
+    servers[SLACK_READ_MCP_NAME] = () => createSlackReadMcpServer(slackClient, { workDir });
+  }
   // Read when an inbox server is built, so every actor's selection sees the
   // same chat backends the read tools do.
   const inboxChatContextSources = (): InboxChatContextSources => ({
@@ -2287,6 +2291,9 @@ async function composeStart(
     // mapping the pnpm-install and root wiring use for actor roots.
     actorRootFor: (actorId) =>
       actorId === rootId ? join(mcHome, "root-agent") : join(workersDir, actorId),
+    // File tools run on the leader. Recheck placement at each call so a
+    // follower-hosted actor cannot read a stale leader-side workdir.
+    fileToolsAvailableForActor: (actorId) => actors.get(actorId)?.executionTarget === undefined,
     driveClients,
     hostMaintenance: { updateToolDepsFor, pnpmHardlinks: pnpmHardlinksDeps },
     onDriveRead: (actorId, observation) =>
@@ -3148,7 +3155,11 @@ async function composeStart(
         }
         if (slackClient) {
           const slackReadUrl = mcpHttp.addServer(`${id}:${SLACK_READ_MCP_NAME}`, () =>
-            createSlackReadMcpServer(slackClient, isFenced)
+            createSlackReadMcpServer(slackClient, {
+              isFenced,
+              workDir: join(workersDir, id),
+              fileToolsAvailable: () => actors.get(id)?.executionTarget === undefined,
+            })
           );
           perActorShared.push({ name: SLACK_READ_MCP_NAME, url: slackReadUrl });
         }
@@ -3586,7 +3597,7 @@ async function composeStart(
   const rootSlackUrl =
     slackClient && config.slack
       ? mcpHttp.addServer(`${rootId}:${SLACK_WRITE_MCP_NAME}`, () =>
-          createSlackWriteMcpServer(slackClient, "all")
+          createSlackWriteMcpServer(slackClient, "all", { workDir: rootAgentDir })
         )
       : undefined;
 
