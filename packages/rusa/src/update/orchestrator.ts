@@ -448,7 +448,12 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     step = "drain";
     if (deps.notify) {
       try {
-        await deps.notify.notify(updateStatusText(newSha, subject));
+        // The coordinator outcome rides on the chat notice, so a deploy that
+        // left it unrefreshed (not owned, or ownership unknown) says so there.
+        await deps.notify.notify(
+          updateStatusText(newSha, subject) +
+            (coordinator ? ` [coordinator: ${describeCoordinator(coordinator)}]` : "")
+        );
       } catch (nErr) {
         log(`[update] notify failed: ${nErr instanceof Error ? nErr.message : String(nErr)}`);
       }

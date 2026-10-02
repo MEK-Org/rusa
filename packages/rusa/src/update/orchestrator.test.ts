@@ -338,7 +338,7 @@ describe("executeUpdate — happy path (green build → drain → exit)", () => 
     ["not-owner", "no unit is installed", "not refreshed, not owned"],
     ["unknown", "daemon-reload pending", "not refreshed, ownership unknown"],
   ] as const)("a %s coordinator is left alone and reported, and the update proceeds", async (ownership, reason, logged) => {
-    const { deps, exits, actions } = makeDeps();
+    const { deps, exits, actions, notify } = makeDeps();
     const logs: string[] = [];
     deps.log = (m) => void logs.push(m);
     const coordinator = fakeCoordinator({ resolved: { ownership, reason } });
@@ -350,6 +350,7 @@ describe("executeUpdate — happy path (green build → drain → exit)", () => 
     expect(res.coordinator).toEqual({ outcome: ownership, reason, loadedRevision: OLD });
     expect(coordinator.calls).toEqual(["resolve", "dialed"]);
     expect(actions.at(-1)).toContain(`[coordinator: ${logged}: ${reason}; loaded 0000000]`);
+    expect(notify.messages.at(-1)).toContain(`[coordinator: ${logged}: ${reason}`);
     expect(
       logs.some((l) => l.includes("drift from this build 1111111; not a rollback trigger"))
     ).toBe(true);
