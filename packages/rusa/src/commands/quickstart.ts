@@ -597,7 +597,7 @@ export function runProviderLogins(
     if (!spec) {
       if (UNSUPPORTED_QUICKSTART_LOGIN_PROVIDERS.has(provider)) {
         console.log(
-          `[quickstart] Quickstart login for ${provider} isn't supported yet (tracked in ISSUE_NUM); complete auth via the vendor's own CLI.`
+          `[quickstart] Quickstart login for ${provider} isn't supported yet; complete auth via the vendor's own CLI.`
         );
         continue;
       }
