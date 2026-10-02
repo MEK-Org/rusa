@@ -20,7 +20,7 @@
  */
 
 /** The ordered steps; a failure is reported against the granular step that threw. */
-export type UpdateStep = "pull" | "install" | "typecheck" | "build" | "drain";
+export type UpdateStep = "pull" | "install" | "typecheck" | "build" | "coordinator" | "drain";
 
 /** A git/build step that failed or — critically — HUNG past its hard timeout. */
 export class StepError extends Error {
@@ -56,6 +56,18 @@ export interface GitSeam {
 export interface BuildSeam {
   /** Build the checkout at `sha`. Throws {@link StepError} on failure/timeout. */
   build(sha: string): Promise<void>;
+  /**
+   * Restore the previously bootable dist after a post-build deployment failure.
+   * Production BuildRunner supplies this. Isolated legacy seams that cannot
+   * promote a dist leave it absent and fail closed if a post-build rollback is
+   * ever needed.
+   */
+  rollback?(): Promise<void>;
+}
+
+/** Restart the single pool coordinator and verify the process loaded this build. */
+export interface CoordinatorRestartSeam {
+  restart(expectedRevision: string): Promise<void>;
 }
 
 /** The in-memory graceful-shutdown brake + a self-excluding, bounded drain. */
@@ -80,6 +92,8 @@ export interface NotifySeam {
 export interface UpdateDeps {
   git: GitSeam;
   build: BuildSeam;
+  /** Required in deployed startup wiring; optional for isolated legacy callers. */
+  coordinator?: CoordinatorRestartSeam;
   drain: DrainSeam;
   /** Best-effort failure notice (root also gets the result string). Optional. */
   notify?: NotifySeam;
@@ -121,6 +135,8 @@ export interface UpdateResult {
   newSha?: string;
   subject?: string;
   alreadyCurrent?: boolean;
+  /** True only after the pool coordinator reported the new loaded revision. */
+  coordinatorRestarted?: boolean;
   /** True once we've engaged drain + called exit(0) (the restart path). */
   restarting: boolean;
   /**
@@ -197,6 +213,9 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
   let oldSha = "";
   let newSha = "";
   let movedToNew = false;
+  let builtNew = false;
+  let coordinatorRestartAttempted = false;
+  let coordinatorRestarted = false;
   let rollbackFailed = false;
 
   try {
@@ -256,7 +275,21 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     step = "build";
     log(`[update] building ${shortSha(newSha)} (mesh stays live)…`);
     await deps.build.build(newSha);
+    builtNew = true;
     log(`[update] build green`);
+
+    // The coordinator is a distinct, pool-owned process. Its module cache does
+    // not change when this instance's checkout moves, so refresh it before the
+    // mesh drain. The seam verifies the coordinator reports the build revision
+    // it loaded; a successful systemctl invocation alone is not sufficient.
+    if (deps.coordinator) {
+      step = "coordinator";
+      coordinatorRestartAttempted = true;
+      log(`[update] restarting pool coordinator onto ${shortSha(newSha)}`);
+      await deps.coordinator.restart(newSha);
+      coordinatorRestarted = true;
+      log(`[update] pool coordinator confirmed ${shortSha(newSha)}`);
+    }
 
     // ── 3. GATE passed → quiesce + restart. Only now do we touch run-state. ─
     step = "drain";
@@ -307,6 +340,7 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
       newSha,
       subject,
       alreadyCurrent,
+      coordinatorRestarted,
       restarting: true,
     };
   } catch (err) {
@@ -316,21 +350,47 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     const error = err instanceof Error ? err.message : String(err);
     log(`[update] FAILED at ${failedStep}${timedOut ? " (timeout)" : ""}: ${error}`);
 
-    // Fail-safe: roll the checkout back so a retry starts clean from old code.
+    // Fail-safe: restore the bootable dist before moving checkout HEAD back.
+    // A green build has already atomically promoted a matching dist/sentinel;
+    // resetting only git after a coordinator restart failure would leave the
+    // next systemd boot correctly refusing the mismatched pair.
     if (movedToNew && oldSha) {
       try {
+        if (builtNew) {
+          if (!deps.build.rollback) {
+            throw new Error("cannot restore previous dist: build seam has no post-build rollback");
+          }
+          await deps.build.rollback();
+          log(`[update] restored previous dist before checkout rollback`);
+        }
         await deps.git.resetHard(oldSha);
         log(`[update] rolled checkout back to ${shortSha(oldSha)}`);
+
+        // A restart command can fail after it has stopped or even started the
+        // unit. Once old dist and checkout are restored, make a best-effort
+        // second restart so the pool cannot keep a new in-memory coordinator
+        // beside an old deploy. Failure is surfaced as rollback-unsafe.
+        if (coordinatorRestartAttempted && deps.coordinator) {
+          try {
+            await deps.coordinator.restart(oldSha);
+            log(`[update] pool coordinator restored to ${shortSha(oldSha)}`);
+          } catch (restoreCoordinatorErr) {
+            throw new Error(
+              `coordinator rollback to ${shortSha(oldSha)} failed: ` +
+                `${restoreCoordinatorErr instanceof Error ? restoreCoordinatorErr.message : String(restoreCoordinatorErr)}`
+            );
+          }
+        }
       } catch (rbErr) {
         const rbMsg = rbErr instanceof Error ? rbErr.message : String(rbErr);
         log(`[update] WARNING: rollback to ${shortSha(oldSha)} failed: ${rbMsg}`);
         rollbackFailed = true;
-        // The last silent-failure path: git is now at the new sha while the live
-        // dist+sentinel are still old → sentinel ≠ HEAD → the next restart REFUSES
-        // boot (the fragility window reopened). The process is still alive, so SHOUT
-        // — the same loud, chat-independent path as the boot-flap alert.
+        // The last silent-failure path: either the checkout/dist pair or the
+        // separately restarted coordinator may now disagree with the restored
+        // deployment. The process is still alive, so SHOUT — the same loud,
+        // chat-independent path as the boot-flap alert.
         const alert =
-          `⚠️ update rollback FAILED (${rbMsg}) — git HEAD≠dist/sentinel; ` +
+          `⚠️ update rollback FAILED (${rbMsg}) — deployment state may be split; ` +
           `system is restart-fragile, recover before any restart`;
         console.error(`[update] ${alert}`); // journal ERROR — always, chat-independent
         try {

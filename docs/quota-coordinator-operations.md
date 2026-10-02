@@ -134,6 +134,15 @@ carries the per-provider scrape outcome (`status`, `attempts`, `failures`,
 `lastAttemptAt`, `error`). A coordinator whose probes are broken still passes
 `healthz` — that asymmetry is the point, and drill 2 rehearses it.
 
+Both envelopes also carry `service.loadedRevision`: the valid build sentinel
+captured by that process at startup, or `null` when no valid sentinel exists.
+It is not derived from checkout `HEAD`, which can change under a still-running
+coordinator. A successful self-update restarts only the fixed pool unit, then
+waits for `/v1/readyz` to report the newly built revision before draining and
+restarting the client instance. That preserves one coordinator per pool and
+uses the coordinator's ordinary startup path, including its schema guard and
+due backup; it neither creates a second unit nor changes the quota schema.
+
 ### Runtime manual quota readings
 
 The two write routes are `POST /v1/quota/reading-mode` and

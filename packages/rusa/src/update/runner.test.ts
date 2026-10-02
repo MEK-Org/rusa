@@ -169,6 +169,27 @@ describe("BuildRunner — staging + atomic swap (elder require #1: failed build 
     expect(readFileSync(join(`${dist}.old`, "cli.js"), "utf8")).toBe(`built@${OLD_SHA}`);
   });
 
+  it("restores the retained build when deployment fails after a green swap", async () => {
+    const { pkgDir, dist } = pkgWithLiveDist(OLD_SHA);
+    const { fn } = fakeSpawn({
+      codes: [0, 0, 0],
+      onStep: (args, spawnOpts) => {
+        if (args.includes("build")) {
+          const staging = spawnOpts.env?.RUSA_DIST_DIR as string;
+          mkdirSync(staging, { recursive: true });
+          writeFileSync(join(staging, "cli.js"), `built@${SHA}`);
+        }
+      },
+    });
+    const runner = new BuildRunner(pkgDir, timeouts, () => {}, "pnpm", fn);
+    await runner.build(SHA);
+    await runner.rollback();
+
+    expect(readFileSync(join(dist, "cli.js"), "utf8")).toBe(`built@${OLD_SHA}`);
+    expect(readBuildSentinel(dist)).toBe(OLD_SHA);
+    expect(verifyBuildSentinel(dist, OLD_SHA).ok).toBe(true);
+  });
+
   it("FAILED build: live dist + sentinel are BYTE-IDENTICAL (never touched), staging discarded", async () => {
     const { pkgDir, dist } = pkgWithLiveDist(OLD_SHA);
     const before = {

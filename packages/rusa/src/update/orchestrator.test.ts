@@ -69,12 +69,16 @@ class FakeDrain implements DrainSeam {
 function makeDeps(over: Partial<UpdateDeps> = {}) {
   const git = new FakeGit();
   const drain = new FakeDrain();
-  const build: BuildSeam & { builtSha?: string; fail?: Error } = {
+  const build: BuildSeam & { builtSha?: string; fail?: Error; rollbackCalls: number } = {
     fail: undefined,
     builtSha: undefined,
+    rollbackCalls: 0,
     async build(sha: string) {
       if (this.fail) throw this.fail;
       this.builtSha = sha;
+    },
+    async rollback() {
+      this.rollbackCalls++;
     },
   };
   const exits: number[] = [];
@@ -221,6 +225,26 @@ describe("executeUpdate — happy path (green build → drain → exit)", () => 
     expect(order).toEqual(["build", "engage"]);
   });
 
+  it("restarts the pool coordinator onto the built revision before draining", async () => {
+    const { deps, build, drain, exits } = makeDeps();
+    const order: string[] = [];
+    build.build = async () => void order.push("build");
+    deps.coordinator = {
+      restart: async (revision) => void order.push(`coordinator:${revision}`),
+    };
+    const engage = drain.engage.bind(drain);
+    drain.engage = (reason) => {
+      order.push("drain");
+      engage(reason);
+    };
+
+    const res = await executeUpdate(plan(), deps);
+
+    expect(res.coordinatorRestarted).toBe(true);
+    expect(order).toEqual([`build`, `coordinator:${NEW}`, "drain"]);
+    expect(exits).toEqual([0]);
+  });
+
   it("still exits even if the drain times out (don't wedge on a stuck actor)", async () => {
     const { deps, drain, exits, actions } = makeDeps();
     drain.quiesced = false; // bounded wait expired
@@ -321,6 +345,50 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     ]);
   });
 
+  it("restores dist and checkout when the coordinator cannot confirm the new revision", async () => {
+    const { deps, git, build, drain, exits } = makeDeps();
+    const revisions: string[] = [];
+    deps.coordinator = {
+      restart: async (revision) => {
+        revisions.push(revision);
+        if (revision === NEW) throw new Error("readyz still reports the previous revision");
+      },
+    };
+
+    const res = await executeUpdate(plan(), deps);
+
+    expect(res.ok).toBe(false);
+    expect(res.failedStep).toBe("coordinator");
+    expect(build.rollbackCalls).toBe(1);
+    expect(git.resets).toEqual([NEW, OLD]);
+    expect(revisions).toEqual([NEW, OLD]);
+    expect(drain.engaged).toBe(false);
+    expect(exits).toEqual([]);
+  });
+
+  it("raises the durable rollback alert when the old coordinator cannot be restored", async () => {
+    const { deps, build, markers, git, notify } = makeDeps();
+    deps.coordinator = {
+      restart: async () => {
+        throw new Error("systemctl restart failed");
+      },
+    };
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args) => {
+      errors.push(args.join(" "));
+    });
+
+    const res = await executeUpdate(plan(), deps);
+    errorSpy.mockRestore();
+
+    expect(res.rollbackFailed).toBe(true);
+    expect(build.rollbackCalls).toBe(1);
+    expect(git.resets).toEqual([NEW, OLD]);
+    expect(errors.some((message) => message.includes("rollback FAILED"))).toBe(true);
+    expect(markers.some((message) => message.includes("restart-fragile"))).toBe(true);
+    expect(notify.messages.some((message) => message.includes("rollback FAILED"))).toBe(true);
+  });
+
   it("a pull failure aborts before build, drain and exit (no rollback — never moved)", async () => {
     const { deps, git, drain, build, exits, actions, notify } = makeDeps();
     git.failFetch = new Error("network down");
@@ -397,7 +465,7 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     // The reason the hook moved off build-green: a drain failure resets the checkout to
     // oldSha, so anything persisted at build time would name a revision this leader
     // reverted — and would later deploy followers onto it.
-    const { deps, git, drain } = makeDeps();
+    const { deps, git, drain, build } = makeDeps();
     const committed: { sha: string; branch: string }[] = [];
     deps.onCommitted = (sha, branch) => {
       committed.push({ sha, branch });
@@ -411,6 +479,7 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     expect(res.ok).toBe(false);
     expect(committed).toHaveLength(0);
     expect(git.resets).toEqual([NEW, OLD]); // rolled back off the revision no trigger names
+    expect(build.rollbackCalls).toBe(1); // returned to the last bootable dist as well
   });
 
   it("still restarts when onCommitted throws", async () => {

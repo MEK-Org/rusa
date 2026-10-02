@@ -274,4 +274,44 @@ export class BuildRunner implements BuildSeam {
     renameSync(staging, live);
     this.log(`[update] atomically swapped dist → ${sha.slice(0, 7)} (previous at dist.old)`);
   }
+
+  /**
+   * Put the retained bootable dist back after a failure that occurs after a
+   * green build but before the update commits. This is intentionally a second
+   * atomic swap: the live dist is never absent, and if restoring the previous
+   * tree cannot begin, the new checkout and new dist remain paired.
+   */
+  async rollback(): Promise<void> {
+    const live = this.distDir;
+    const previous = `${live}.old`;
+    const failed = `${live}.failed-rollback`;
+    if (!existsSync(previous)) {
+      throw new Error(`cannot restore previous dist: ${previous} is absent`);
+    }
+    rmSync(failed, { recursive: true, force: true });
+    try {
+      renameSync(live, failed);
+      try {
+        renameSync(previous, live);
+      } catch (err) {
+        // Preserve the new pair if the old one cannot be promoted. Leaving the
+        // live path absent would turn a recoverable failed update into a boot
+        // outage, and keeping the new pair avoids a HEAD/sentinel mismatch.
+        renameSync(failed, live);
+        throw err;
+      }
+      rmSync(failed, { recursive: true, force: true });
+      this.log("[update] restored previous dist after post-build failure");
+    } catch (err) {
+      if (!existsSync(live) && existsSync(failed)) {
+        try {
+          renameSync(failed, live);
+        } catch {
+          // The original error is the actionable one; the caller marks the
+          // deployment rollback unsafe and emits the durable alert.
+        }
+      }
+      throw err;
+    }
+  }
 }

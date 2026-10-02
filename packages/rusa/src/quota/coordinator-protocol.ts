@@ -11,8 +11,9 @@ export const COORDINATOR_PROTOCOL_MAJOR = 1;
 // throttle lanes (#588). Both are additive: an older reader ignores them and
 // keeps its provider-only behavior. Minor 3 adds each scrape's outcome to
 // history (#759), so a reader can see a scrape that left no window row; an
-// older reader ignores it, and a newer reader of a minor-2 service sees rows only.
-export const COORDINATOR_PROTOCOL_MINOR = 3;
+// older reader of a minor-2 service sees rows only. Minor 4 adds the immutable
+// build revision captured when the coordinator process starts (#852).
+export const COORDINATOR_PROTOCOL_MINOR = 4;
 /** Routine provider probe cache TTL: one scrape per provider per ~30 minutes (#690). */
 export const QUOTA_PROBE_TTL_MS = 30 * 60 * 1000;
 export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
@@ -78,6 +79,12 @@ export interface QuotaCoordinatorServiceInfo {
   protocolMinor: number;
   serverVersion: string;
   serverTime: string;
+  /**
+   * The revision baked into the dist this process loaded at startup, or null
+   * when there is no valid build sentinel. This is intentionally not checkout
+   * HEAD: a checkout can move while a long-running coordinator keeps old code.
+   */
+  loadedRevision?: string | null;
 }
 
 export interface QuotaFreshness {

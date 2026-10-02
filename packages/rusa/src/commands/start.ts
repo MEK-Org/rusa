@@ -314,6 +314,7 @@ import {
 } from "../understanding/root-scope.js";
 import { renderUnderstandingSnapshot } from "../understanding/snapshot.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
+import { SystemdCoordinatorRestarter } from "../update/coordinator-restart.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { BuildRunner, GitRunner } from "../update/runner.js";
@@ -338,6 +339,7 @@ import {
   WEBHOOK_SILENCE_CHECK_INTERVAL_MS,
   WebhookSilenceDetector,
 } from "../webhook/silence-detector.js";
+import { resolveQuotaCoordinatorSocketPath } from "./quota-coordinator.js";
 import { resolveRepoRoot } from "./service-instance.js";
 
 // `update` tool bounds . Per-step HARD timeouts so a hung build can't wedge
@@ -2136,6 +2138,10 @@ async function composeStart(
           { installMs: UPDATE_INSTALL_TIMEOUT_MS, buildMs: UPDATE_BUILD_TIMEOUT_MS },
           (m) => console.log(m)
         ),
+        coordinator: new SystemdCoordinatorRestarter({
+          socketPath: resolveQuotaCoordinatorSocketPath(config),
+          log: (m) => console.log(m),
+        }),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
         onCommitted: (newSha, branch) => {
           try {
