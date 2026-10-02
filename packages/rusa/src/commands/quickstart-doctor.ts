@@ -39,6 +39,8 @@ export interface QuickstartDoctorOptions {
   minFlutterVersion?: string;
   minFreeDiskBytes?: number;
   ports?: number[];
+  /** Ports published by quickstart's own containers, which the run replaces. */
+  replaceablePorts?: number[];
   providerEnvKeys?: string[];
   deps?: Partial<QuickstartDoctorDeps>;
 }
@@ -87,6 +89,7 @@ function buildQuickstartDoctorChecks(opts: {
   minFlutterVersion: string;
   minFreeDiskBytes: number;
   ports: number[];
+  replaceablePorts: number[];
   providerEnvKeys: readonly string[];
 }): QuickstartDoctorCheck[] {
   const gitCheck = checkCommand("git", "git", ["--version"], REMEDIATION.git);
@@ -104,7 +107,10 @@ function buildQuickstartDoctorChecks(opts: {
       id: "free-disk",
       run: () => checkFreeDisk(opts.targetPath, opts.minFreeDiskBytes, opts.deps),
     },
-    { id: "loopback-ports", run: () => checkLoopbackPorts(opts.ports, opts.deps) },
+    {
+      id: "loopback-ports",
+      run: () => checkLoopbackPorts(opts.ports, opts.replaceablePorts, opts.deps),
+    },
     {
       id: "provider-env-keys",
       run: () => checkProviderEnvKeys(opts.deps.env, opts.providerEnvKeys),
@@ -669,10 +675,13 @@ function checkFreeDisk(
 
 async function checkLoopbackPorts(
   ports: number[],
+  replaceablePorts: number[],
   deps: QuickstartDoctorDeps
 ): Promise<DoctorResult> {
+  const replaced = ports.filter((port) => replaceablePorts.includes(port));
+  const probed = ports.filter((port) => !replaceablePorts.includes(port));
   const busy: number[] = [];
-  for (const port of ports) {
+  for (const port of probed) {
     if (!(await deps.isPortAvailable(port))) busy.push(port);
   }
   if (busy.length > 0) {
@@ -681,13 +690,21 @@ async function checkLoopbackPorts(
       status: "fail",
       message: `localhost port(s) already in use: ${busy.join(", ")}.`,
       hint: REMEDIATION.ports,
-      probed: [`loopback host: 127.0.0.1`, `ports checked: ${ports.join(", ")}`],
+      probed: [`loopback host: 127.0.0.1`, `ports checked: ${probed.join(", ")}`],
     };
   }
+  const messages = [
+    ...(probed.length > 0 ? [`localhost port(s) available: ${probed.join(", ")}.`] : []),
+    ...(replaced.length > 0
+      ? [
+          `localhost port(s) ${replaced.join(", ")} are held by the quickstart container this run replaces.`,
+        ]
+      : []),
+  ];
   return {
     name: "loopback ports",
     status: "pass",
-    message: `localhost port(s) available: ${ports.join(", ")}.`,
+    message: messages.join(" ") || "no localhost ports to check.",
   };
 }
 
@@ -721,6 +738,7 @@ export async function runQuickstartDoctor(
   const minFlutterVersion = options.minFlutterVersion ?? QUICKSTART_MIN_FLUTTER_VERSION;
   const minFreeDiskBytes = options.minFreeDiskBytes ?? QUICKSTART_MIN_FREE_DISK_BYTES;
   const ports = options.ports ?? [];
+  const replaceablePorts = options.replaceablePorts ?? [];
   const providerEnvKeys = options.providerEnvKeys ?? QUICKSTART_PROVIDER_ENV_KEYS;
   const checks = buildQuickstartDoctorChecks({
     deps,
@@ -729,6 +747,7 @@ export async function runQuickstartDoctor(
     minFlutterVersion,
     minFreeDiskBytes,
     ports,
+    replaceablePorts,
     providerEnvKeys,
   });
 

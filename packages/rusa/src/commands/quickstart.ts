@@ -392,6 +392,24 @@ function seedLocalRepo(
   console.log(`[quickstart] Seeded ${repo.repoKey} from ${repo.branch} at ${repo.resolvedPath}`);
 }
 
+// Host ports published by an earlier run's containers. This run removes those
+// containers before starting its own, so the preflight must not count their
+// ports as taken. Only TCP mappings on 127.0.0.1 or 0.0.0.0 count: those are
+// the bindings that block the doctor's 127.0.0.1 TCP probe. Read-only: a
+// missing container or docker reports nothing.
+export function quickstartContainerPorts(containers: string[], ports: number[]): number[] {
+  const held = new Set<number>();
+  for (const container of containers) {
+    const res = spawnSync("docker", ["port", container], { encoding: "utf8", stdio: "pipe" });
+    if (res?.status !== 0) continue;
+    for (const line of res.stdout?.split("\n") ?? []) {
+      const match = /\/tcp -> (?:127\.0\.0\.1|0\.0\.0\.0):(\d+)\s*$/.exec(line);
+      if (match) held.add(Number(match[1]));
+    }
+  }
+  return ports.filter((port) => held.has(port));
+}
+
 export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void> {
   const image = opts.image ?? "rusa:quickstart";
   const container = opts.container ?? "rusa-quickstart";
@@ -401,8 +419,10 @@ export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void>
     opts.executeGit ?? ((args) => spawnSync("git", args, { encoding: "utf8", stdio: "pipe" }));
 
   console.log("\nRusa quickstart\n");
+  const ports = [QUICKSTART_DASHBOARD_PORT, QUICKSTART_GIT_BRIDGE_PORT];
   const doctorResults = await runQuickstartDoctor({
-    ports: [QUICKSTART_DASHBOARD_PORT, QUICKSTART_GIT_BRIDGE_PORT],
+    ports,
+    replaceablePorts: quickstartContainerPorts([container, setupContainer], ports),
   });
   console.log(formatDoctorResults(doctorResults));
   if (doctorResults.some((result) => result.status === "fail")) {
