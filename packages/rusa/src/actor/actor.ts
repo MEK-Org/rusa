@@ -942,9 +942,14 @@ export class Actor {
     if (this.coalesceAborted) return;
     this.coalesceAbortController = undefined;
 
-    if (abortController.signal.aborted && !result.cancelled) {
-      result.success = false;
-      Object.assign(result, formatSigtermResult(result.output, abortController.signal));
+    if (abortController.signal.aborted) {
+      if (!result.cancelled) {
+        result.success = false;
+        Object.assign(result, formatSigtermResult(result.output, abortController.signal));
+      } else if (!result.abortReason) {
+        const attribution = formatSigtermResult(result.output, abortController.signal);
+        result.abortReason = attribution.abortReason;
+      }
     }
 
     if (result.sessionId && result.sessionId !== sessionId) {

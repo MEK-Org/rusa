@@ -32,6 +32,7 @@ export interface TerminationAttribution {
   cancelled: boolean;
   interrupted?: boolean;
   interruptSource?: string;
+  abortReason?: string;
 }
 
 /**
@@ -52,6 +53,7 @@ export function formatSigtermResult(
       cancelled: true,
       interrupted: true,
       interruptSource: by,
+      abortReason: typeof reason === "string" ? reason : createInterruptAbortReason(by),
     };
   }
 
@@ -60,6 +62,7 @@ export function formatSigtermResult(
       output: `${baseOutput}\n[Task killed by stall watchdog (no output for 15 minutes)]`,
       exitCode: 143, // 128 + SIGTERM (15)
       cancelled: true,
+      abortReason: STALL_WATCHDOG_ABORT_REASON,
     };
   }
 
@@ -68,6 +71,7 @@ export function formatSigtermResult(
       output: `${baseOutput}\n[Task killed by run ceiling timeout]`,
       exitCode: 143, // 128 + SIGTERM (15)
       cancelled: true,
+      abortReason: RUN_CEILING_ABORT_REASON,
     };
   }
 
@@ -75,5 +79,6 @@ export function formatSigtermResult(
     output: `${baseOutput}\n[Task terminated by SIGTERM (source unattributed)]`,
     exitCode: 143, // 128 + SIGTERM (15)
     cancelled: true,
+    abortReason: "unknown",
   };
 }

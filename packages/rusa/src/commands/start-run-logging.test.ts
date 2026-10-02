@@ -73,6 +73,52 @@ describe("logRunEnd", () => {
     });
   });
 
+  it("records stall-watchdog abortReason on run_end", () => {
+    const { logger, records } = recordingLogger();
+
+    logRunEnd(
+      logger,
+      runResult({
+        success: false,
+        exitCode: 143,
+        cancelled: true,
+        abortReason: "stall-watchdog",
+      })
+    );
+
+    expect(records()[0]).toMatchObject({
+      level: "error",
+      msg: "run_end",
+      success: false,
+      exitCode: 143,
+      cancelled: true,
+      abortReason: "stall-watchdog",
+    });
+  });
+
+  it("records run-ceiling abortReason on run_end", () => {
+    const { logger, records } = recordingLogger();
+
+    logRunEnd(
+      logger,
+      runResult({
+        success: false,
+        exitCode: 143,
+        cancelled: true,
+        abortReason: "run-ceiling",
+      })
+    );
+
+    expect(records()[0]).toMatchObject({
+      level: "error",
+      msg: "run_end",
+      success: false,
+      exitCode: 143,
+      cancelled: true,
+      abortReason: "run-ceiling",
+    });
+  });
+
   it("keeps the run's own output out of the record", () => {
     const { logger, records } = recordingLogger();
 

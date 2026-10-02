@@ -238,6 +238,10 @@ Push your charter forward end to end within the current run whenever feasible
 (e.g. commit → push → open the PR → report to your parent); don't stop after one
 step expecting another automatic work run. Your run settles when you finish your
 turn and return from the provider CLI.
+When running commands, do not background long tasks and yield "awaiting completion".
+Keep commands in the foreground or poll them with \`manage_task\` to resolution
+before completing your turn; ending a turn with background tasks pending in headless
+mode prevents clean continuation.
 Keep your parent thread apprised at meaningful milestones, decisions, blockers,
 or proposed completion using \`send_message\`. Mark selected inbox items handled
 as you address them. Failed runs still mechanically notify the parent.`;

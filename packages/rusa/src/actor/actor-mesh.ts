@@ -519,6 +519,7 @@ export interface MechanicalInboxForensics {
   pendingMessageId?: string;
   exitCode?: number;
   status?: string;
+  abortReason?: string;
 }
 
 /** What the mesh hands the factory to build a live {@link Actor} for a record. */

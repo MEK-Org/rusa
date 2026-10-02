@@ -907,6 +907,7 @@ export function logRunEnd(logger: Logger, result: RunResult): void {
     cancelled: result.cancelled ?? false,
     interrupted: result.interrupted ?? false,
     model: result.model,
+    abortReason: result.abortReason,
   };
   if (result.success) logger.info("run_end", fields);
   else if (result.capped) logger.warn("run_end", fields);

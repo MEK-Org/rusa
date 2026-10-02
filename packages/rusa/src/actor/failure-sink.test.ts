@@ -732,6 +732,41 @@ describe("routeRunFailure", () => {
       expect(toParent[0]?.body).toContain("interrupted by human:operator");
       expect(toChat).toHaveLength(0);
     });
+
+    it("distinguishes stall watchdog abort from other cancellations in parent notice", async () => {
+      const { deps, toParent } = makeDeps({
+        w1: { id: "w1", parentId: "root" },
+      });
+      const watchdogFail: RunResult = {
+        success: false,
+        exitCode: 143,
+        cancelled: true,
+        abortReason: "stall-watchdog",
+        output: "[Task killed by stall watchdog (no output for 15 minutes)]",
+      };
+      await routeRunFailure(deps, "w1", watchdogFail, "antigravity/gemini-3.8-flash @ high", "run-1");
+      expect(toParent).toHaveLength(1);
+      expect(toParent[0]?.toId).toBe("root");
+      expect(toParent[0]?.body).toContain("(exit 143, stall-watchdog)");
+      expect(toParent[0]?.forensics?.abortReason).toBe("stall-watchdog");
+    });
+
+    it("distinguishes run ceiling abort in parent notice", async () => {
+      const { deps, toParent } = makeDeps({
+        w1: { id: "w1", parentId: "root" },
+      });
+      const ceilingFail: RunResult = {
+        success: false,
+        exitCode: 143,
+        cancelled: true,
+        abortReason: "run-ceiling",
+        output: "[Task killed by run ceiling timeout]",
+      };
+      await routeRunFailure(deps, "w1", ceilingFail, "antigravity/gemini-3.8-flash @ high", "run-2");
+      expect(toParent).toHaveLength(1);
+      expect(toParent[0]?.body).toContain("(exit 143, run-ceiling)");
+      expect(toParent[0]?.forensics?.abortReason).toBe("run-ceiling");
+    });
   });
 
   describe("isHumanOperatorCancelled helper ", () => {

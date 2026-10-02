@@ -365,7 +365,7 @@ export class KimiProvider implements CodingProvider {
             teardownFlutterOverlay(opts.sandbox.worktreePath);
           }
         },
-        buildKilledResult: ({ output, exitCode, cancelled, interrupted, interruptSource }) =>
+        buildKilledResult: ({ output, exitCode, cancelled, interrupted, interruptSource, abortReason }) =>
           withTokenUsage({
             success: false,
             output,
@@ -373,8 +373,9 @@ export class KimiProvider implements CodingProvider {
             cancelled,
             interrupted,
             interruptSource,
+            abortReason,
           }),
-        buildSignalResult: ({ output, exitCode, cancelled, interrupted, interruptSource }) =>
+        buildSignalResult: ({ output, exitCode, cancelled, interrupted, interruptSource, abortReason }) =>
           withTokenUsage({
             success: false,
             output,
@@ -382,6 +383,7 @@ export class KimiProvider implements CodingProvider {
             cancelled,
             interrupted,
             interruptSource,
+            abortReason,
             sessionId: parseStreamJson(output).sessionId,
           }),
         buildExitResult: (rawOutput, exitCode) => {

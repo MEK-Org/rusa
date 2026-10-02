@@ -406,6 +406,7 @@ describe("AntigravityProvider", () => {
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(143);
     expect(result.output).toContain("[Task killed by stall watchdog (no output for 15 minutes)]");
+    expect(result.abortReason).toBe("stall-watchdog");
   });
 
   it("reports run-ceiling attribution when aborted with the ceiling reason", async () => {
@@ -431,6 +432,7 @@ describe("AntigravityProvider", () => {
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(143);
     expect(result.output).toContain("[Task killed by run ceiling timeout]");
+    expect(result.abortReason).toBe("run-ceiling");
   });
 
   it("reports an unattributed SIGTERM for a generic abort", async () => {
@@ -456,6 +458,7 @@ describe("AntigravityProvider", () => {
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(143);
     expect(result.output).toContain("[Task terminated by SIGTERM (source unattributed)]");
+    expect(result.abortReason).toBe("unknown");
   });
 
   it("reports an unattributed SIGTERM when SIGTERM arrives without an abort signal", async () => {
@@ -477,6 +480,56 @@ describe("AntigravityProvider", () => {
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(143);
     expect(result.output).toContain("[Task terminated by SIGTERM (source unattributed)]");
+    expect(result.abortReason).toBe("unknown");
+  });
+
+  it("exits cleanly when the model backgrounds a command and completes its turn with SUCCESS", async () => {
+    const config: ProviderConfig = { cliCommand: "agy" };
+    const provider = new AntigravityProvider("antigravity", config, "Gemini 3.1 Pro (High)");
+
+    const child = mockChildProcess() as unknown as ChildProcessWithoutNullStreams;
+    vi.mocked(spawn).mockReturnValue(child);
+
+    const chunks: string[] = [];
+    const runPromise = provider.run({
+      prompt: "test prompt",
+      cwd: "/tmp",
+      onChunk: (c) => chunks.push(c),
+    });
+
+    // 1. Model launches a background command
+    child.stdout.emit(
+      "data",
+      `${JSON.stringify({
+        event: "step_update",
+        step_update: {
+          step_type: "tool",
+          state: "DONE",
+          tool_name: "run_command",
+          tool_info: { output: "Command was sent to the background as task-123" },
+        },
+      })}\n`
+    );
+
+    // 2. Model outputs response and ends turn with SUCCESS result
+    child.stdout.emit(
+      "data",
+      `${JSON.stringify({
+        event: "result",
+        result: {
+          status: "SUCCESS",
+          response: "Background capture script started.",
+        },
+      })}\n`
+    );
+
+    // 3. The background command finishes; agy process is signaled to close
+    child.emit("close", null, "SIGTERM");
+
+    const result = await runPromise;
+    expect(result.success).toBe(true);
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("Background capture script started.");
   });
 
   it("classifies exit-0 empty-output QUOTA_EXHAUSTED conversation tails as failure", async () => {
