@@ -1,42 +1,77 @@
-import { spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import http from "node:http";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { POOL_COORDINATOR_UNIT } from "../commands/coordinator-provisioning.js";
 import { resolveQuotaBackupPaths } from "../commands/quota-backup.js";
-import { defaultQuotaCoordinatorSocketPath } from "../commands/quota-coordinator.js";
+import {
+  coordinatorLoadedRevision,
+  defaultQuotaCoordinatorSocketPath,
+} from "../commands/quota-coordinator.js";
 import { readUnitEnvironment } from "../commands/service-instance.js";
 import { loadConfig } from "../config/index.js";
-import type { CoordinatorRestartSeam, CoordinatorTarget } from "./orchestrator.js";
+import type {
+  CoordinatorOwnership,
+  CoordinatorRestartSeam,
+  CoordinatorTarget,
+} from "./orchestrator.js";
 import { runTimedStep } from "./runner.js";
 
 export const COORDINATOR_RESTART_TIMEOUT_MS = 60_000;
 const READY_POLL_INTERVAL_MS = 200;
+/** Each readiness attempt's wall-clock bound: connect, headers, and body together. */
+const READY_ATTEMPT_TIMEOUT_MS = 2_000;
+/** A ready envelope is a few hundred bytes; anything far larger is not one. */
+export const READY_ENVELOPE_MAX_BYTES = 64 * 1024;
 
 type ReadyEnvelope = { service?: { loadedRevision?: unknown } };
 
-function readReadyRevision(socketPath: string): Promise<string | null> {
+/**
+ * Read the loaded revision from one readyz response, or null when the
+ * coordinator cannot say. The timer bounds the whole exchange rather than
+ * inactivity, so a server that keeps writing, never ends, or drops the
+ * connection mid-body still settles within `timeoutMs`.
+ */
+export function readReadyRevision(
+  socketPath: string,
+  timeoutMs = READY_ATTEMPT_TIMEOUT_MS
+): Promise<string | null> {
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (revision: string | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      request.destroy();
+      resolve(revision);
+    };
+    const timer = setTimeout(() => finish(null), Math.max(0, timeoutMs));
     const request = http.request({ socketPath, path: "/v1/readyz", method: "GET" }, (response) => {
-      let body = "";
-      response.setEncoding("utf8");
-      response.on("data", (chunk) => (body += chunk));
+      if (response.statusCode !== 200) {
+        finish(null);
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let size = 0;
+      response.on("data", (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > READY_ENVELOPE_MAX_BYTES) finish(null);
+        else chunks.push(chunk);
+      });
       response.on("end", () => {
-        if (response.statusCode !== 200) {
-          resolve(null);
-          return;
-        }
         try {
-          const parsed = JSON.parse(body) as ReadyEnvelope;
+          const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as ReadyEnvelope;
           const revision = parsed.service?.loadedRevision;
-          resolve(typeof revision === "string" ? revision : null);
+          finish(typeof revision === "string" ? revision : null);
         } catch {
-          resolve(null);
+          finish(null);
         }
       });
+      // An aborted body emits `error` and/or `close` without `end`.
+      response.on("error", () => finish(null));
+      response.on("close", () => finish(null));
     });
-    request.on("error", () => resolve(null));
-    request.setTimeout(2_000, () => request.destroy());
+    request.on("error", () => finish(null));
     request.end();
   });
 }
@@ -45,7 +80,10 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Wait until readyz identifies the exact revision that this update built. */
+/**
+ * Wait until readyz identifies the exact expected revision. `timeoutMs` is a
+ * total bound: every attempt is capped by the time remaining.
+ */
 export async function waitForCoordinatorRevision(opts: {
   socketPath: string;
   expectedRevision: string;
@@ -56,8 +94,11 @@ export async function waitForCoordinatorRevision(opts: {
   const pollIntervalMs = opts.pollIntervalMs ?? READY_POLL_INTERVAL_MS;
   const deadline = Date.now() + timeoutMs;
   let observed: string | null = null;
-  while (Date.now() <= deadline) {
-    observed = await readReadyRevision(opts.socketPath);
+  for (let remaining = timeoutMs; remaining > 0; remaining = deadline - Date.now()) {
+    observed = await readReadyRevision(
+      opts.socketPath,
+      Math.min(READY_ATTEMPT_TIMEOUT_MS, remaining)
+    );
     if (observed === opts.expectedRevision) return;
     await delay(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
   }
@@ -67,13 +108,20 @@ export async function waitForCoordinatorRevision(opts: {
   );
 }
 
-/** Split an `ExecStart=` value written by the installer's quoting into argv. */
-function parseExecStart(value: string): string[] {
-  const args: string[] = [];
-  for (const match of value.matchAll(/"((?:[^"\\]|\\.)*)"|(\S+)/g)) {
-    args.push(match[1] !== undefined ? match[1].replace(/\\(.)/g, "$1") : match[2]);
-  }
-  return args;
+/** The `systemctl show` properties ownership is decided from. */
+export const COORDINATOR_SHOW_PROPERTIES = [
+  "LoadState",
+  "NeedDaemonReload",
+  "ExecStart",
+  "Environment",
+] as const;
+
+function showProperty(show: string, name: string): string[] {
+  const prefix = `${name}=`;
+  return show
+    .split("\n")
+    .filter((line) => line.startsWith(prefix))
+    .map((line) => line.slice(prefix.length));
 }
 
 function canonicalPath(path: string): string {
@@ -84,46 +132,104 @@ function canonicalPath(path: string): string {
   }
 }
 
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Establish whether this checkout's build is what the installed pool unit
- * runs, and where that coordinator listens. The unit file is the durable
- * record the installer wrote: its `ExecStart` names the CLI it executes and
- * its `--home` names the coordinator's own config, whose socket setting (or
- * the unit's runtime directory) is the socket readiness must be read from.
+ * Decide from systemd's *effective* view of the pool unit whether this
+ * checkout's build is what a restart would launch, and where that coordinator
+ * listens.
+ *
+ * `systemctl show` folds in `<unit>.d/*.conf` drop-ins and resolves repeated
+ * assignments, so it is the launch definition rather than the base file. It is
+ * also only the definition systemd has *loaded*: `NeedDaemonReload=yes` means
+ * the files on disk say something else, so neither view is known to be what a
+ * restart runs. Anything not established — no answer from systemd, a reload
+ * pending, several or no commands, an argv this parser cannot split
+ * unambiguously, a home or config it cannot read — is `unknown`, never
+ * inferred from the fixed unit name or from a reachable socket.
+ *
+ * `show` is the raw output of `systemctl --user show -p …` for
+ * {@link COORDINATOR_SHOW_PROPERTIES}, or null when systemd could not be asked.
  */
-export function resolveOwnedPoolCoordinator(opts: {
-  systemdUserDir: string;
+export function resolvePoolCoordinatorOwnership(opts: {
   /** This checkout's built CLI, e.g. `<checkout>/packages/rusa/dist/cli.js`. */
   cliPath: string;
+  show: string | null;
   unit?: string;
-}): CoordinatorTarget | { skip: string } {
+  /** The caller's runtime dir, used only when the unit sets none. */
+  fallbackRuntimeDir?: string;
+}): CoordinatorOwnership {
   const unit = opts.unit ?? POOL_COORDINATOR_UNIT;
-  const unitPath = join(opts.systemdUserDir, unit);
-  if (!existsSync(unitPath)) {
-    return { skip: `no ${unit} is installed on this host (client-only deployment)` };
+  const unknown = (reason: string): CoordinatorOwnership => ({
+    ownership: "unknown",
+    reason: `${unit}: ${reason}`,
+  });
+  if (opts.show === null) return unknown("systemd could not be asked for its launch settings");
+  const loadState = showProperty(opts.show, "LoadState").at(-1);
+  if (loadState === "not-found") {
+    return { ownership: "not-owner", reason: `no ${unit} is installed (client-only host)` };
   }
-  const contents = readFileSync(unitPath, "utf-8");
-  const execLine = contents
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith("ExecStart="))
-    .at(-1);
-  const argv = execLine ? parseExecStart(execLine.slice("ExecStart=".length)) : [];
-  const unitCli = argv[1];
-  if (!unitCli) throw new Error(`cannot read the executable ${unit} runs from its ExecStart`);
-  if (canonicalPath(unitCli) !== canonicalPath(opts.cliPath)) {
-    return { skip: `${unit} runs another checkout's build, not this deployment's` };
+  if (loadState !== "loaded") return unknown(`unit load state is ${loadState ?? "unreported"}`);
+  if (showProperty(opts.show, "NeedDaemonReload").at(-1) !== "no") {
+    return unknown("its unit files changed since systemd loaded them (daemon-reload pending)");
   }
+
+  // `argv[]=` is systemd's space-joined argv, one per command.
+  const commands = showProperty(opts.show, "ExecStart").flatMap((value) =>
+    [...value.matchAll(/argv\[\]=(.*?) ; /g)].map((match) => match[1])
+  );
+  if (commands.length !== 1)
+    return unknown(`expected one ExecStart command, found ${commands.length}`);
+  const argv = commands[0].split(" ");
+  const ownCli = canonicalPath(opts.cliPath);
+  if (argv[2] !== "quota-coordinator" || !argv[1]) {
+    // Includes a path containing a space, which systemd prints unquoted.
+    return unknown(`cannot split its ExecStart unambiguously: ${commands[0]}`);
+  }
+  if (canonicalPath(argv[1]) !== ownCli) {
+    if (!existsSync(argv[1])) return unknown(`its executable ${argv[1]} does not exist`);
+    return { ownership: "not-owner", reason: `${unit} runs ${argv[1]}, not this checkout's build` };
+  }
+
   const homeFlag = argv.indexOf("--home");
-  const home =
-    (homeFlag >= 0 ? argv[homeFlag + 1] : undefined) ?? readUnitEnvironment(contents, "RUSA_HOME");
-  if (!home) throw new Error(`cannot read the coordinator home from ${unit}`);
-  const socketPath =
-    loadConfig(home).quota?.coordinator?.socketPath?.trim() ||
-    defaultQuotaCoordinatorSocketPath(
-      readUnitEnvironment(contents, "XDG_RUNTIME_DIR") ?? process.env.XDG_RUNTIME_DIR
+  const argvHome = homeFlag >= 0 ? argv[homeFlag + 1] : undefined;
+  const envHome = readUnitEnvironment(opts.show, "RUSA_HOME") ?? undefined;
+  if (argvHome && envHome && canonicalPath(argvHome) !== canonicalPath(envHome)) {
+    return unknown(`its --home ${argvHome} disagrees with RUSA_HOME ${envHome}`);
+  }
+  const home = argvHome ?? envHome;
+  if (!home || !isDirectory(home))
+    return unknown(`cannot read the coordinator home (${home ?? "unset"})`);
+  let configuredSocket: string | undefined;
+  try {
+    configuredSocket = loadConfig(home).quota?.coordinator?.socketPath?.trim();
+  } catch (err) {
+    return unknown(
+      `cannot load its home config: ${err instanceof Error ? err.message : String(err)}`
     );
-  return { unit, home, socketPath };
+  }
+  const socketPath =
+    configuredSocket ||
+    defaultQuotaCoordinatorSocketPath(
+      readUnitEnvironment(opts.show, "XDG_RUNTIME_DIR") ?? opts.fallbackRuntimeDir
+    );
+  return { ownership: "owner", target: { unit, home, socketPath } };
+}
+
+/** Ask the user manager for the unit's effective launch settings; null when it cannot answer. */
+function systemctlShow(unit: string): Promise<string | null> {
+  const args = ["--user", "show", ...COORDINATOR_SHOW_PROPERTIES.flatMap((p) => ["-p", p]), unit];
+  return new Promise((resolve) => {
+    execFile("systemctl", args, { encoding: "utf8", timeout: 10_000 }, (error, stdout) =>
+      resolve(error ? null : stdout)
+    );
+  });
 }
 
 /**
@@ -137,12 +243,12 @@ export function preRestartBackupDir(home: string): string | null {
 }
 
 export interface SystemdCoordinatorRestarterOptions {
-  systemdUserDir: string;
-  /** This checkout's built CLI; it both decides ownership and runs the backup. */
+  /** This checkout's built CLI; it decides ownership, names the artifact, and runs the backup. */
   cliPath: string;
   unit?: string;
   timeoutMs?: number;
   /** Injection seams for tests; production runs systemctl and the built CLI. */
+  showUnit?: (unit: string) => Promise<string | null>;
   restartUnit?: (unit: string) => Promise<void>;
   runBackup?: (home: string, backupDir: string) => Promise<void>;
   log?: (message: string) => void;
@@ -150,12 +256,13 @@ export interface SystemdCoordinatorRestarterOptions {
 
 /**
  * Refresh the one fixed pool-owned coordinator when this checkout owns it,
- * then require its ready envelope to prove it loaded the just-built revision.
+ * then require its ready envelope to prove it loaded the artifact on disk.
  * No client service is touched here; the normal update drain/restart remains
  * responsible for that.
  */
 export class SystemdCoordinatorRestarter implements CoordinatorRestartSeam {
   private readonly timeoutMs: number;
+  private readonly showUnit: (unit: string) => Promise<string | null>;
   private readonly restartUnit: (unit: string) => Promise<void>;
   private readonly runBackup: (home: string, backupDir: string) => Promise<void>;
 
@@ -168,6 +275,7 @@ export class SystemdCoordinatorRestarter implements CoordinatorRestartSeam {
         log: options.log,
         spawnImpl: spawn,
       });
+    this.showUnit = options.showUnit ?? systemctlShow;
     this.restartUnit =
       options.restartUnit ??
       ((unit) => step("coordinator-restart", ["systemctl", "--user", "restart", unit]));
@@ -187,12 +295,23 @@ export class SystemdCoordinatorRestarter implements CoordinatorRestartSeam {
         ]));
   }
 
-  async resolve(): Promise<CoordinatorTarget | { skip: string }> {
-    return resolveOwnedPoolCoordinator({
-      systemdUserDir: this.options.systemdUserDir,
+  async resolve(): Promise<CoordinatorOwnership> {
+    const unit = this.options.unit ?? POOL_COORDINATOR_UNIT;
+    return resolvePoolCoordinatorOwnership({
       cliPath: this.options.cliPath,
-      unit: this.options.unit,
+      show: await this.showUnit(unit),
+      unit,
+      fallbackRuntimeDir: process.env.XDG_RUNTIME_DIR,
     });
+  }
+
+  /** The same sentinel read the coordinator performs at startup, on this checkout's live dist. */
+  artifactRevision(): string | null {
+    return coordinatorLoadedRevision(dirname(this.options.cliPath));
+  }
+
+  loadedRevision(target: CoordinatorTarget): Promise<string | null> {
+    return readReadyRevision(target.socketPath);
   }
 
   async backup(target: CoordinatorTarget): Promise<void> {

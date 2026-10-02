@@ -9,7 +9,7 @@ import {
   statSync,
   unlinkSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
@@ -2138,9 +2138,8 @@ async function composeStart(
           (m) => console.log(m)
         ),
         coordinator: new SystemdCoordinatorRestarter({
-          systemdUserDir: join(homedir(), ".config", "systemd", "user"),
           cliPath: join(packageDir, "dist", "cli.js"),
-          log: (m) => console.log(m),
+          log: (m) => log.info("update_coordinator", { detail: m }),
         }),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
         onCommitted: (newSha, branch) => {

@@ -68,25 +68,61 @@ export interface BuildSeam {
 /** The installed pool coordinator unit that this checkout's build runs. */
 export interface CoordinatorTarget {
   unit: string;
-  /** The coordinator's own home, read from its unit. */
+  /** The coordinator's own home, read from its effective unit settings. */
   home: string;
   /** The socket that coordinator listens on, resolved from its own home. */
   socketPath: string;
 }
 
 /**
+ * Whether this deployment built what the pool unit launches. Only `owner`
+ * refreshes; `not-owner` is a client of a coordinator another checkout owns;
+ * `unknown` is reported as such and never treated as either.
+ */
+export type CoordinatorOwnership =
+  | { ownership: "owner"; target: CoordinatorTarget }
+  | { ownership: "not-owner" | "unknown"; reason: string };
+
+/**
  * Refresh the single pool coordinator when, and only when, this deployment
- * owns its executable. A host with no pool unit, or whose unit runs another
- * checkout's build, is a client of that coordinator: restarting it would load
- * a build this update did not produce.
+ * owns its executable. Restarting a coordinator this update did not build
+ * would load an artifact nobody verified.
  */
 export interface CoordinatorRestartSeam {
-  /** The owned unit, or why there is none. Throws when ownership cannot be established. */
-  resolve(): Promise<CoordinatorTarget | { skip: string }>;
+  /** Who owns the launched executable. Total: undecidable ownership is `unknown`. */
+  resolve(): Promise<CoordinatorOwnership>;
+  /**
+   * The revision recorded by the artifact the owned unit would launch now —
+   * this checkout's live dist sentinel — or null when it records none.
+   */
+  artifactRevision(): string | null;
+  /** The revision the running coordinator reports loaded, or null when it cannot say. */
+  loadedRevision(target: CoordinatorTarget): Promise<string | null>;
   /** The runbook's pre-restart database backup. Throws to refuse the restart. */
   backup(target: CoordinatorTarget): Promise<void>;
   /** Restart the unit and require its readyz to report `expectedRevision`. */
   restart(target: CoordinatorTarget, expectedRevision: string): Promise<void>;
+}
+
+/** What the update did about the pool coordinator, for the result and the action log. */
+export type CoordinatorRefresh =
+  | { outcome: "not-owner" | "unknown"; reason: string }
+  | {
+      /** `refreshed`: confirmed on the new build. `restored`: confirmed back on the retained one. */
+      outcome: "refreshed" | "restored";
+      /** What the coordinator reported before this update restarted it (null: it could not say). */
+      previousLoadedRevision: string | null;
+      /** What readyz confirmed after the restart. */
+      loadedRevision: string;
+    };
+
+function describeCoordinator(refresh: CoordinatorRefresh): string {
+  if ("reason" in refresh) {
+    const why = refresh.outcome === "not-owner" ? "not owned" : "ownership unknown";
+    return `not refreshed, ${why}: ${refresh.reason}`;
+  }
+  const was = refresh.previousLoadedRevision ? shortSha(refresh.previousLoadedRevision) : "unknown";
+  return `${refresh.outcome} to ${shortSha(refresh.loadedRevision)} (previously loaded ${was})`;
 }
 
 /** The in-memory graceful-shutdown brake + a self-excluding, bounded drain. */
@@ -154,10 +190,8 @@ export interface UpdateResult {
   newSha?: string;
   subject?: string;
   alreadyCurrent?: boolean;
-  /** True only after the pool coordinator reported the new loaded revision. */
-  coordinatorRestarted?: boolean;
-  /** Why no coordinator restart was owed (absent unit, another checkout's build). */
-  coordinatorSkipped?: string;
+  /** The pool coordinator outcome, when the update reached that step. */
+  coordinator?: CoordinatorRefresh;
   /** True once we've engaged drain + called exit(0) (the restart path). */
   restarting: boolean;
   /**
@@ -236,8 +270,8 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
   let movedToNew = false;
   let builtNew = false;
   let coordinatorTarget: CoordinatorTarget | undefined;
-  let coordinatorRestarted = false;
-  let coordinatorSkipped: string | undefined;
+  let previousLoadedRevision: string | null = null;
+  let coordinator: CoordinatorRefresh | undefined;
   let rollbackFailed = false;
 
   try {
@@ -307,16 +341,25 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     if (deps.coordinator) {
       step = "coordinator";
       const resolved = await deps.coordinator.resolve();
-      if ("skip" in resolved) {
-        coordinatorSkipped = resolved.skip;
-        log(`[update] pool coordinator not refreshed: ${resolved.skip}`);
+      if (resolved.ownership !== "owner") {
+        coordinator = { outcome: resolved.ownership, reason: resolved.reason };
+        log(`[update] pool coordinator ${describeCoordinator(coordinator)}`);
       } else {
-        await deps.coordinator.backup(resolved);
-        log(`[update] pre-restart quota backup taken; restarting ${resolved.unit}`);
-        coordinatorTarget = resolved;
-        await deps.coordinator.restart(resolved, newSha);
-        coordinatorRestarted = true;
-        log(`[update] pool coordinator confirmed ${shortSha(newSha)}`);
+        const { target } = resolved;
+        const built = deps.coordinator.artifactRevision();
+        if (built !== newSha) {
+          throw new Error(
+            `the coordinator artifact records ${built ? shortSha(built) : "no valid revision"}, ` +
+              `not the built ${shortSha(newSha)}; refusing to restart onto it`
+          );
+        }
+        previousLoadedRevision = await deps.coordinator.loadedRevision(target);
+        await deps.coordinator.backup(target);
+        log(`[update] pre-restart quota backup taken; restarting ${target.unit}`);
+        coordinatorTarget = target;
+        await deps.coordinator.restart(target, built);
+        coordinator = { outcome: "refreshed", previousLoadedRevision, loadedRevision: built };
+        log(`[update] pool coordinator ${describeCoordinator(coordinator)}`);
       }
     }
 
@@ -341,7 +384,9 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     const drainSummary = drain.quiesced ? "quiesced" : `timeout after ${drain.waitedMs}ms`;
     try {
       deps.recordAction?.(
-        `update committed: ${shortSha(oldSha)} → ${shortSha(newSha)} (${subject}) [drain: ${drainSummary}] — restarting`
+        `update committed: ${shortSha(oldSha)} → ${shortSha(newSha)} (${subject}) [drain: ${drainSummary}]` +
+          (coordinator ? ` [coordinator: ${describeCoordinator(coordinator)}]` : "") +
+          " — restarting"
       );
     } catch (recErr) {
       log(
@@ -369,8 +414,7 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
       newSha,
       subject,
       alreadyCurrent,
-      coordinatorRestarted,
-      coordinatorSkipped,
+      coordinator,
       restarting: true,
     };
   } catch (err) {
@@ -397,22 +441,32 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
         log(`[update] rolled checkout back to ${shortSha(oldSha)}`);
 
         // A restart command can fail after it has stopped or even started the
-        // unit. Once old dist and checkout are restored, make a best-effort
-        // second restart so the pool cannot keep a new in-memory coordinator
-        // beside an old deploy. Failure is surfaced as rollback-unsafe. That
-        // includes a new build that already migrated the quota schema: the old
-        // build's guard refuses the newer database, and recovery is the
-        // runbook's restore from the pre-restart backup, never a silent retry.
+        // unit. Once dist and checkout are restored, restart the coordinator onto
+        // the restored artifact so the pool does not keep a new in-memory
+        // coordinator beside an old deploy. The expected revision is the restored
+        // dist's own sentinel — neither checkout HEAD nor the revision the
+        // coordinator had loaded before, which the retained dist need not match.
+        // An artifact with no identity cannot be verified, so it is not
+        // restarted onto at all. Any failure is surfaced as rollback-unsafe;
+        // that includes a new build that already migrated the quota schema,
+        // whose recovery is the runbook's restore from the pre-restart backup.
         if (coordinatorTarget && deps.coordinator) {
+          const restored = deps.coordinator.artifactRevision();
+          if (!restored) {
+            throw new Error(
+              "coordinator rollback not attempted: the restored dist records no valid revision"
+            );
+          }
           try {
-            await deps.coordinator.restart(coordinatorTarget, oldSha);
-            log(`[update] pool coordinator restored to ${shortSha(oldSha)}`);
+            await deps.coordinator.restart(coordinatorTarget, restored);
           } catch (restoreCoordinatorErr) {
             throw new Error(
-              `coordinator rollback to ${shortSha(oldSha)} failed: ` +
+              `coordinator rollback to ${shortSha(restored)} failed: ` +
                 `${restoreCoordinatorErr instanceof Error ? restoreCoordinatorErr.message : String(restoreCoordinatorErr)}`
             );
           }
+          coordinator = { outcome: "restored", previousLoadedRevision, loadedRevision: restored };
+          log(`[update] pool coordinator ${describeCoordinator(coordinator)}`);
         }
       } catch (rbErr) {
         const rbMsg = rbErr instanceof Error ? rbErr.message : String(rbErr);
@@ -440,15 +494,16 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
         }
       }
     }
-    const failureSummary = formatFailureOutcome({
-      failedStep,
-      timedOut,
-      error,
-      movedToNew,
-      rollbackFailed,
-      oldSha,
-      newSha,
-    });
+    const failureSummary =
+      formatFailureOutcome({
+        failedStep,
+        timedOut,
+        error,
+        movedToNew,
+        rollbackFailed,
+        oldSha,
+        newSha,
+      }) + (coordinator ? ` [coordinator: ${describeCoordinator(coordinator)}]` : "");
     try {
       deps.recordAction?.(failureSummary);
     } catch (recErr) {
@@ -470,6 +525,7 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
       error,
       timedOut,
       oldSha,
+      coordinator,
       restarting: false,
       rollbackFailed,
     };

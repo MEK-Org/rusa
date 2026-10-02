@@ -139,26 +139,51 @@ captured by that process at startup, or `null` when no valid sentinel exists.
 It is not derived from checkout `HEAD`, which can change under a still-running
 coordinator.
 
-A successful self-update refreshes the coordinator only when this checkout owns
-it: the installed `rusa-quota-coordinator.service` must exist and its
-`ExecStart` must run this checkout's built CLI. A host with no pool unit, or
-whose unit runs another checkout's build, is a client of that coordinator and
-updates without touching it. For an owned unit, after a green build and before
-the client drain, the update:
+A successful self-update refreshes the coordinator only when it built the
+artifact the pool unit actually launches. Ownership is read from systemd's
+effective settings for `rusa-quota-coordinator.service` (`systemctl --user
+show`, which folds in drop-ins), never from the unit's name or a reachable
+socket:
 
-1. takes the runbook's pre-restart backup with `rusa quota-backup` into
+- **owner** — the unit is loaded, no daemon-reload is pending, and its single
+  `ExecStart` runs this checkout's built CLI;
+- **not owner** — no pool unit is loaded (a client-only host), or it runs
+  another checkout's build; the update proceeds and leaves the coordinator
+  alone;
+- **unknown** — systemd cannot answer, a daemon-reload is pending, the unit
+  has zero or several commands, its argv cannot be split unambiguously, or
+  its home or config cannot be read. The update proceeds, does not restart the
+  coordinator, and says so; it never reports a refresh it did not verify.
+
+A coordinator revision that differs from the client's is drift, reported by
+`loadedRevision`, not a reason to fail or roll back a client update.
+
+For an owned unit, after a green build and before the client drain, the
+update:
+
+1. requires the live dist's sentinel to name the revision just built;
+2. records the revision the running coordinator reports loaded (or that it
+   could not say);
+3. takes the runbook's pre-restart backup with `rusa quota-backup` into
    `<backupDir>/pre-deploy` (its own retention, so frequent deploys never evict
    the daily copies; skipped only when the database does not exist yet);
-2. restarts only the fixed pool unit;
-3. waits up to 60 seconds for `/v1/readyz` on the socket that coordinator's own
-   home configures to report the newly built revision.
+4. restarts only the fixed pool unit;
+5. waits up to 60 seconds in total for `/v1/readyz` on the socket that
+   coordinator's own home configures to report the built revision. Each
+   attempt is bounded by wall-clock time and by envelope size, so a response
+   that streams, stalls, or aborts cannot extend the wait.
 
-Any failure before the client exits restores the previous dist and checkout and,
-if the coordinator was restarted, restarts it onto the restored build and waits
-for the old revision. If that restore fails — including when the new build has
-already migrated the quota schema and the old build's guard refuses it — the
-update raises the durable rollback-failed alert; recover with the binary
-rollback procedure above using the pre-deploy backup.
+Any failure before the client exits restores the previous dist and checkout.
+Restoring the dist is two renames, not an atomic exchange: the live path is
+briefly absent between them. If the coordinator was restarted, it is restarted
+again onto the restored dist, and readiness must report that dist's own
+sentinel. That revision can differ from both checkout `HEAD` and the revision
+the coordinator had loaded before the update, which may no longer exist on
+disk; the update records both. A restored dist with no valid sentinel is not
+restarted onto. That case, a failed restore, and a new build that already
+migrated the quota schema (whose old build's guard refuses it) raise the
+durable rollback-failed alert; recover with the binary rollback procedure
+above using the pre-deploy backup.
 
 Between the coordinator restart and the client's own restart, the updating
 instance is an old client of the new coordinator for at most the drain timeout.

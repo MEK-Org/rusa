@@ -277,9 +277,11 @@ export class BuildRunner implements BuildSeam {
 
   /**
    * Put the retained bootable dist back after a failure that occurs after a
-   * green build but before the update commits. This is intentionally a second
-   * atomic swap: the live dist is never absent, and if restoring the previous
-   * tree cannot begin, the new checkout and new dist remain paired.
+   * green build but before the update commits. Like the forward swap this is
+   * two renames, not an atomic exchange: between them the live dist path is
+   * briefly absent, and a boot in that window refuses and is retried. If the
+   * retained tree cannot be promoted, the new dist is renamed back so the new
+   * checkout and new dist stay paired.
    */
   async rollback(): Promise<void> {
     const live = this.distDir;

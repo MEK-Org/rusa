@@ -1,14 +1,17 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { buildQuotaCoordinatorUnit } from "../commands/install-service.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { writeBuildSentinel } from "./build-sentinel.js";
 import {
-  resolveOwnedPoolCoordinator,
+  READY_ENVELOPE_MAX_BYTES,
+  readReadyRevision,
+  resolvePoolCoordinatorOwnership,
   SystemdCoordinatorRestarter,
   waitForCoordinatorRevision,
 } from "./coordinator-restart.js";
+import { type BuildSeam, executeUpdate, type GitSeam, type UpdateDeps } from "./orchestrator.js";
 
 const SHA = "1".repeat(40);
 const testDirs: string[] = [];
@@ -17,16 +20,37 @@ afterEach(() => {
   for (const dir of testDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-async function startReadyServer(socketPath: string, revision: string): Promise<http.Server> {
-  const server = http.createServer((_request, response) => {
-    response.setHeader("content-type", "application/json");
-    response.end(JSON.stringify({ service: { loadedRevision: revision } }));
-  });
+async function listen(socketPath: string, handler: http.RequestListener): Promise<http.Server> {
+  const server = http.createServer(handler);
   await new Promise<void>((resolve, reject) => {
     server.listen(socketPath, resolve);
     server.on("error", reject);
   });
   return server;
+}
+
+function startReadyServer(
+  socketPath: string,
+  revision: string | (() => string | null)
+): Promise<http.Server> {
+  return listen(socketPath, (_request, response) => {
+    response.setHeader("content-type", "application/json");
+    const loadedRevision = typeof revision === "function" ? revision() : revision;
+    response.end(JSON.stringify({ service: { loadedRevision } }));
+  });
+}
+
+function close(server: http.Server): Promise<void> {
+  server.closeAllConnections();
+  return new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve()))
+  );
+}
+
+function socketDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "rusa-coordinator-restart-"));
+  testDirs.push(dir);
+  return dir;
 }
 
 describe("coordinator restart verification", () => {
@@ -75,7 +99,6 @@ describe("coordinator restart verification", () => {
     const restarted: string[] = [];
     try {
       const restarter = new SystemdCoordinatorRestarter({
-        systemdUserDir: dir,
         cliPath: join(dir, "dist", "cli.js"),
         restartUnit: async (unit) => void restarted.push(unit),
         timeoutMs: 100,
@@ -93,20 +116,82 @@ describe("coordinator restart verification", () => {
   });
 });
 
-/** A synthetic host: a checkout's built CLI, a coordinator home, a systemd user dir. */
+describe("readiness reads are bounded in total, not by inactivity", () => {
+  it("gives up on a response that keeps streaming without ending", async () => {
+    const socketPath = join(socketDir(), "coordinator.sock");
+    const server = await listen(socketPath, (_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.write('{"service":');
+      // A byte every 20ms resets any inactivity timer forever.
+      const drip = setInterval(() => response.write(" "), 20);
+      response.on("close", () => clearInterval(drip));
+    });
+    try {
+      const started = Date.now();
+      await expect(
+        waitForCoordinatorRevision({
+          socketPath,
+          expectedRevision: SHA,
+          timeoutMs: 300,
+          pollIntervalMs: 10,
+        })
+      ).rejects.toThrow(/did not report loaded revision/);
+      expect(Date.now() - started).toBeLessThan(1_500);
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("settles when the response is aborted mid-body", async () => {
+    const socketPath = join(socketDir(), "coordinator.sock");
+    const server = await listen(socketPath, (_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.write('{"service":{"loadedRevision":"');
+      setTimeout(() => response.socket?.destroy(), 10);
+    });
+    try {
+      const started = Date.now();
+      await expect(readReadyRevision(socketPath, 5_000)).resolves.toBeNull();
+      expect(Date.now() - started).toBeLessThan(1_000);
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("refuses an envelope larger than a ready response could be", async () => {
+    const socketPath = join(socketDir(), "coordinator.sock");
+    const padding = "x".repeat(READY_ENVELOPE_MAX_BYTES);
+    const server = await listen(socketPath, (_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ padding, service: { loadedRevision: SHA } }));
+    });
+    try {
+      await expect(readReadyRevision(socketPath)).resolves.toBeNull();
+    } finally {
+      await close(server);
+    }
+  });
+});
+
+/**
+ * A synthetic host with two checkouts — the pool owner's and a client's — and
+ * one coordinator home. `show` renders what `systemctl --user show` prints for
+ * a loaded pool unit, so ownership is decided from effective settings.
+ */
 function syntheticHost(opts: { socketPath?: string } = {}) {
   const root = mkdtempSync(join(tmpdir(), "rusa-coordinator-owner-"));
   testDirs.push(root);
-  const checkout = join(root, "checkout");
-  const otherCheckout = join(root, "other-checkout");
+  const owner = join(root, "owner-checkout");
+  const client = join(root, "client-checkout");
   const home = join(root, "coordinator-home");
-  const systemdUserDir = join(root, "systemd-user");
-  for (const dir of [checkout, otherCheckout].map((c) => join(c, "packages/rusa/dist"))) {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "cli.js"), "");
+  const runtime = join(root, "runtime");
+  const distDir = (c: string) => join(c, "packages/rusa/dist");
+  const cliPath = (c: string) => join(distDir(c), "cli.js");
+  for (const c of [owner, client]) {
+    mkdirSync(distDir(c), { recursive: true });
+    writeFileSync(cliPath(c), "");
   }
   mkdirSync(home, { recursive: true });
-  mkdirSync(systemdUserDir, { recursive: true });
   const coordinatorConfig = [
     "github:",
     "  account: synthetic-bot",
@@ -122,72 +207,135 @@ function syntheticHost(opts: { socketPath?: string } = {}) {
     ...(opts.socketPath ? [`    socketPath: ${opts.socketPath}`] : []),
   ];
   writeFileSync(join(home, "config.yaml"), `${coordinatorConfig.join("\n")}\n`);
-  const cliPath = (c: string) => join(c, "packages/rusa/dist/cli.js");
-  const installUnit = (unitCheckout: string) =>
-    writeFileSync(
-      join(systemdUserDir, "rusa-quota-coordinator.service"),
-      buildQuotaCoordinatorUnit({
-        description: "synthetic pool coordinator",
-        mcHome: home,
-        cliPath: cliPath(unitCheckout),
-        nodePath: "/synthetic/node",
-        userPath: "/usr/bin:/bin",
-        xdgRuntimeDir: join(root, "runtime"),
-      })
-    );
-  return { root, checkout, otherCheckout, home, systemdUserDir, cliPath, installUnit };
+  const exec = (cli: string, extra = "") =>
+    `{ path=/synthetic/node ; argv[]=/synthetic/node ${cli} quota-coordinator --home ${home}${extra} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }`;
+  const show = (
+    over: {
+      cli?: string;
+      loadState?: string;
+      needReload?: string;
+      execStart?: string[];
+      environment?: string;
+    } = {}
+  ) =>
+    [
+      `LoadState=${over.loadState ?? "loaded"}`,
+      `NeedDaemonReload=${over.needReload ?? "no"}`,
+      ...(over.execStart ?? [exec(over.cli ?? cliPath(owner))]).map((e) => `ExecStart=${e}`),
+      `Environment=${over.environment ?? `RUSA_HOME=${home} PATH=/usr/bin:/bin XDG_RUNTIME_DIR=${runtime}`}`,
+      "",
+    ].join("\n");
+  return { root, owner, client, home, runtime, distDir, cliPath, exec, show };
 }
 
-describe("pool coordinator ownership", () => {
-  it("skips a client-only host with no pool unit installed", () => {
+describe("pool coordinator ownership from effective systemd settings", () => {
+  it("is not-owner on a client-only host with no pool unit loaded", () => {
     const host = syntheticHost();
-    const resolved = resolveOwnedPoolCoordinator({
-      systemdUserDir: host.systemdUserDir,
-      cliPath: host.cliPath(host.checkout),
+    const resolved = resolvePoolCoordinatorOwnership({
+      cliPath: host.cliPath(host.client),
+      show: "LoadState=not-found\nNeedDaemonReload=no\n",
     });
-    expect(resolved).toEqual({ skip: expect.stringMatching(/client-only/) });
+    expect(resolved).toEqual({
+      ownership: "not-owner",
+      reason: expect.stringMatching(/client-only/),
+    });
   });
 
-  it("skips a pool unit that runs another checkout's build", () => {
+  it("is not-owner when the effective ExecStart runs the other checkout's build", () => {
     const host = syntheticHost();
-    host.installUnit(host.otherCheckout);
-    const resolved = resolveOwnedPoolCoordinator({
-      systemdUserDir: host.systemdUserDir,
-      cliPath: host.cliPath(host.checkout),
+    expect(
+      resolvePoolCoordinatorOwnership({ cliPath: host.cliPath(host.client), show: host.show() })
+    ).toEqual({
+      ownership: "not-owner",
+      reason: expect.stringContaining(host.cliPath(host.owner)),
     });
-    expect(resolved).toEqual({ skip: expect.stringMatching(/another checkout/) });
   });
 
   it("targets the owned unit at the socket its own home configures", () => {
     const socketPath = "/synthetic/pool/coordinator.sock";
     const host = syntheticHost({ socketPath });
-    host.installUnit(host.checkout);
     expect(
-      resolveOwnedPoolCoordinator({
-        systemdUserDir: host.systemdUserDir,
-        cliPath: host.cliPath(host.checkout),
-      })
-    ).toEqual({ unit: "rusa-quota-coordinator.service", home: host.home, socketPath });
+      resolvePoolCoordinatorOwnership({ cliPath: host.cliPath(host.owner), show: host.show() })
+    ).toEqual({
+      ownership: "owner",
+      target: { unit: "rusa-quota-coordinator.service", home: host.home, socketPath },
+    });
   });
 
-  it("falls back to the socket under the unit's runtime directory, not the caller's", () => {
+  it("falls back to the socket under the unit's effective runtime dir, not the caller's", () => {
     const host = syntheticHost();
-    host.installUnit(host.checkout);
-    const resolved = resolveOwnedPoolCoordinator({
-      systemdUserDir: host.systemdUserDir,
-      cliPath: host.cliPath(host.checkout),
+    expect(
+      resolvePoolCoordinatorOwnership({
+        cliPath: host.cliPath(host.owner),
+        show: host.show(),
+        fallbackRuntimeDir: "/caller/runtime",
+      })
+    ).toMatchObject({
+      target: { socketPath: join(host.runtime, "rusa-quota", "coordinator.sock") },
     });
-    expect(resolved).toMatchObject({
-      socketPath: join(host.root, "runtime", "rusa-quota", "coordinator.sock"),
+  });
+
+  it("follows a drop-in that repoints the effective ExecStart, whatever the base file says", () => {
+    // systemd folds the drop-in into `show`; the base file naming the client
+    // checkout is not what a restart would launch.
+    const host = syntheticHost();
+    const show = host.show({ cli: host.cliPath(host.owner) });
+    expect(
+      resolvePoolCoordinatorOwnership({ cliPath: host.cliPath(host.owner), show })
+    ).toMatchObject({ ownership: "owner" });
+    expect(
+      resolvePoolCoordinatorOwnership({ cliPath: host.cliPath(host.client), show })
+    ).toMatchObject({ ownership: "not-owner" });
+  });
+
+  it.each([
+    ["systemd cannot be asked", { show: null }, /could not be asked/],
+    ["a daemon-reload is pending", { needReload: "yes" }, /daemon-reload pending/],
+    ["the unit failed to load", { loadState: "bad-setting" }, /load state is bad-setting/],
+    ["it has no ExecStart command", { execStart: [] }, /found 0/],
+    ["it has two ExecStart commands", { twoCommands: true }, /found 2/],
+    [
+      "its argv is not a coordinator launch",
+      { execStart: ["{ path=/x ; argv[]=/x ; ignore_errors=no }"] },
+      /cannot split/,
+    ],
+    ["its executable path has a space", { spacedCli: true }, /cannot split|does not exist/],
+    ["--home and RUSA_HOME disagree", { environment: "RUSA_HOME=/elsewhere" }, /disagrees/],
+  ] as const)("is unknown when %s", (_label, over, reason) => {
+    const host = syntheticHost();
+    const o = over as Record<string, unknown>;
+    const show =
+      o.show === null
+        ? null
+        : host.show({
+            needReload: o.needReload as string | undefined,
+            loadState: o.loadState as string | undefined,
+            environment: o.environment as string | undefined,
+            execStart: o.twoCommands
+              ? [host.exec(host.cliPath(host.owner)), host.exec(host.cliPath(host.owner))]
+              : o.spacedCli
+                ? [host.exec(join(host.root, "spaced checkout", "dist", "cli.js"))]
+                : (o.execStart as string[] | undefined),
+          });
+    expect(resolvePoolCoordinatorOwnership({ cliPath: host.cliPath(host.owner), show })).toEqual({
+      ownership: "unknown",
+      reason: expect.stringMatching(reason),
     });
+  });
+
+  it("is unknown when the coordinator home config is malformed", () => {
+    const host = syntheticHost();
+    writeFileSync(join(host.home, "config.yaml"), "quota: [unterminated\n");
+    expect(
+      resolvePoolCoordinatorOwnership({ cliPath: host.cliPath(host.owner), show: host.show() })
+    ).toEqual({ ownership: "unknown", reason: expect.stringMatching(/home config/) });
   });
 
   it("backs up an existing database into its own pre-deploy retention directory", async () => {
     const host = syntheticHost();
     const backups: [string, string][] = [];
     const restarter = new SystemdCoordinatorRestarter({
-      systemdUserDir: host.systemdUserDir,
-      cliPath: host.cliPath(host.checkout),
+      cliPath: host.cliPath(host.owner),
       runBackup: async (home, backupDir) => void backups.push([home, backupDir]),
     });
     const target = { unit: "rusa-quota-coordinator.service", home: host.home, socketPath: "" };
@@ -199,5 +347,154 @@ describe("pool coordinator ownership", () => {
     writeFileSync(join(host.home, "data", "quota.db"), "");
     await restarter.backup(target);
     expect(backups).toEqual([[host.home, join(host.home, "data", "backups", "pre-deploy")]]);
+  });
+});
+
+const CHECKOUT_A = "a".repeat(40);
+const RETAINED_B = "b".repeat(40);
+const LOADED_C = "c".repeat(40);
+const BUILT_D = "d".repeat(40);
+
+/**
+ * Compose the real restarter with executeUpdate against one synthetic host.
+ * The fake systemd "restart" loads whatever the unit's dist sentinel says at
+ * that moment, so readiness reports what a real restart would have loaded.
+ */
+async function composedUpdate(opts: {
+  updating: "owner" | "client";
+  failDrain?: boolean;
+  retainedSentinel?: string | null;
+}) {
+  const host = syntheticHost({ socketPath: join(socketDir(), "coordinator.sock") });
+  const ownerDist = host.distDir(host.owner);
+  const updatingCheckout = opts.updating === "owner" ? host.owner : host.client;
+  const updatingDist = host.distDir(updatingCheckout);
+  // Distinct identities: checkout HEAD A, retained (live) dist B, loaded C.
+  writeBuildSentinel(ownerDist, RETAINED_B);
+  if (opts.updating === "client") writeBuildSentinel(updatingDist, RETAINED_B);
+  let loaded: string | null = LOADED_C;
+  const configuredSocket = (
+    resolvePoolCoordinatorOwnership({ cliPath: host.cliPath(host.owner), show: host.show() }) as {
+      target: { socketPath: string };
+    }
+  ).target.socketPath;
+  const server = await startReadyServer(configuredSocket, () => loaded ?? "");
+  const restarts: string[] = [];
+  const restarter = new SystemdCoordinatorRestarter({
+    cliPath: host.cliPath(updatingCheckout),
+    timeoutMs: 500,
+    showUnit: async () => host.show(),
+    restartUnit: async (unit) => {
+      restarts.push(unit);
+      loaded = readFileSync(join(ownerDist, ".build-ok"), "utf8").trim() || null;
+    },
+    runBackup: async () => {},
+  });
+  const git: GitSeam & { resets: string[] } = {
+    resets: [],
+    async headSha() {
+      return CHECKOUT_A;
+    },
+    async fetch() {},
+    async remoteSha() {
+      return BUILT_D;
+    },
+    async resetHard(sha: string) {
+      this.resets.push(sha);
+    },
+    async subject() {
+      return "synthetic subject";
+    },
+    async updateSubmodules() {},
+  };
+  // The build promotes D over the live dist and retains the previous tree.
+  const build: BuildSeam = {
+    async build(sha) {
+      cpSync(updatingDist, `${updatingDist}.old`, { recursive: true });
+      writeBuildSentinel(updatingDist, sha);
+    },
+    async rollback() {
+      rmSync(updatingDist, { recursive: true, force: true });
+      cpSync(`${updatingDist}.old`, updatingDist, { recursive: true });
+      if (opts.retainedSentinel === null) rmSync(join(updatingDist, ".build-ok"));
+    },
+  };
+  const exits: number[] = [];
+  const deps: UpdateDeps = {
+    git,
+    build,
+    coordinator: restarter,
+    drain: {
+      engage() {},
+      cancel() {},
+      async waitForQuiescence() {
+        if (opts.failDrain) throw new Error("drain exploded");
+        return { quiesced: true, waitedMs: 0 };
+      },
+    },
+    exit: (code) => void exits.push(code),
+    alertMarker: () => {},
+  };
+  const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const result = await executeUpdate({ branch: "staging", drainTimeoutMs: 10 }, deps);
+    return { result, restarts, exits, git, loaded };
+  } finally {
+    errorSpy.mockRestore();
+    await close(server);
+  }
+}
+
+describe("composed update across an owner and a client checkout", () => {
+  it("a client checkout's update restarts the coordinator zero times", async () => {
+    const { result, restarts, exits } = await composedUpdate({ updating: "client" });
+    expect(result.ok).toBe(true);
+    expect(result.coordinator).toEqual({
+      outcome: "not-owner",
+      reason: expect.stringContaining("owner-checkout"),
+    });
+    expect(restarts).toEqual([]);
+    expect(exits).toEqual([0]);
+  });
+
+  it("the owner's update confirms the built artifact and records what was loaded before", async () => {
+    const { result, restarts, loaded } = await composedUpdate({ updating: "owner" });
+    expect(result.ok).toBe(true);
+    expect(result.coordinator).toEqual({
+      outcome: "refreshed",
+      previousLoadedRevision: LOADED_C,
+      loadedRevision: BUILT_D,
+    });
+    expect(restarts).toHaveLength(1);
+    expect(loaded).toBe(BUILT_D);
+  });
+
+  it("rollback verifies the retained artifact B, not checkout A or previously loaded C", async () => {
+    const { result, restarts, git, loaded } = await composedUpdate({
+      updating: "owner",
+      failDrain: true,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.rollbackFailed).toBe(false);
+    expect(git.resets).toEqual([BUILT_D, CHECKOUT_A]);
+    expect(restarts).toHaveLength(2);
+    expect(loaded).toBe(RETAINED_B);
+    expect(result.coordinator).toEqual({
+      outcome: "restored",
+      previousLoadedRevision: LOADED_C,
+      loadedRevision: RETAINED_B,
+    });
+  });
+
+  it("a retained artifact with no identity is reported unsafe, not restarted onto", async () => {
+    const { result, restarts, loaded } = await composedUpdate({
+      updating: "owner",
+      failDrain: true,
+      retainedSentinel: null,
+    });
+    expect(result.rollbackFailed).toBe(true);
+    expect(result.error).toBe("drain exploded");
+    expect(restarts).toHaveLength(1); // the forward restart only
+    expect(loaded).toBe(BUILT_D);
   });
 });
