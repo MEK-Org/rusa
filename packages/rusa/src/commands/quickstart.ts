@@ -627,18 +627,30 @@ export function runProviderLogins(
   }
 }
 
-export function readExistingRepos(configPath: string): string[] {
-  if (!existsSync(configPath)) return [];
-  let parsed: unknown;
+function readExistingConfig(configPath: string): RusaConfig | null {
+  if (!existsSync(configPath)) return null;
   try {
-    parsed = parseYaml(readFileSync(configPath, "utf8"));
+    return parseYaml(readFileSync(configPath, "utf8")) as RusaConfig | null;
   } catch (err) {
     throw new Error(
       `Could not read existing configuration at ${configPath}: ${err instanceof Error ? err.message : err}`
     );
   }
-  const repos = (parsed as RusaConfig | null)?.github?.repos;
+}
+
+export function readExistingRepos(configPath: string): string[] {
+  return reposFromConfig(readExistingConfig(configPath));
+}
+
+function reposFromConfig(config: RusaConfig | null): string[] {
+  const repos = config?.github?.repos;
   return Array.isArray(repos) ? repos.filter((repo) => typeof repo === "string") : [];
+}
+
+function rootHandleFromConfig(config: RusaConfig | null): string | undefined {
+  const handle = config?.rootActor?.handle;
+  // Kept verbatim: the runtime resolves the stored handle byte-for-byte.
+  return typeof handle === "string" && handle.trim() ? handle : undefined;
 }
 
 export interface QuickstartConfigureOptions {
@@ -649,7 +661,9 @@ export interface QuickstartConfigureOptions {
 export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = {}): Promise<void> {
   const mcHome = resolveHomeOverride(opts.home);
   const configPath = join(mcHome, "config.yaml");
-  const existingRepos = readExistingRepos(configPath);
+  const existingConfig = readExistingConfig(configPath);
+  const existingRepos = reposFromConfig(existingConfig);
+  const existingRootHandle = rootHandleFromConfig(existingConfig);
 
   console.log("\nRusa quickstart configuration\n");
   console.log("This writes configuration inside the container.\n");
@@ -691,12 +705,21 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
 
   writeHostSecret(GEMINI_API_KEY_SECRET_FILENAME, geminiApiKey.trim(), mcHome);
 
-  const suggestedRootHandle = generateRandomRootHandle();
+  // A reconfigure offers the current handle so accepting the default never
+  // renames root; only a fresh install gets a random suggestion.
+  const suggestedRootHandle = existingRootHandle ?? generateRandomRootHandle();
   const rootHandleAnswer = await input({
-    message: `Root entity handle/name (leave blank for suggested: "${suggestedRootHandle}"):`,
+    message: existingRootHandle
+      ? `Root entity handle/name (leave blank to keep current: "${existingRootHandle}"):`
+      : `Root entity handle/name (leave blank for suggested: "${suggestedRootHandle}"):`,
     default: suggestedRootHandle,
   });
-  const rootHandle = rootHandleAnswer.trim() || suggestedRootHandle;
+  // Accepting the displayed default returns it untrimmed; only a new answer
+  // is normalized.
+  const rootHandle =
+    rootHandleAnswer === suggestedRootHandle || !rootHandleAnswer.trim()
+      ? suggestedRootHandle
+      : rootHandleAnswer.trim();
   const rootProvider = providers[0];
   const rootModel = (
     await input({
