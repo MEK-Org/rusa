@@ -2666,7 +2666,7 @@ export class ActorMesh {
     if (requested === requesterId || this.handleForId(requesterId).toLowerCase() === normalized) {
       throw new Error("cannot transfer a voice session to itself");
     }
-    const held = requester.handles ?? [];
+    const held = (requester.handles ?? []).filter((handle) => handle.origin !== "message");
     const matches = held
       .map((handle) => this.actors.get(handle.id))
       .filter((record): record is ActorRecord =>
@@ -2806,9 +2806,11 @@ export class ActorMesh {
     const rec = this.actors.get(toId);
     if (!rec) return;
     if (handle.id === toId) return; // don't hand an actor its own handle
-    const entry: ActorHandle = handle.role
-      ? { id: handle.id, role: handle.role }
-      : { id: handle.id };
+    const entry: ActorHandle = {
+      id: handle.id,
+      ...(handle.role ? { role: handle.role } : {}),
+      ...(handle.origin ? { origin: handle.origin } : {}),
+    };
     const handles = (rec.handles ?? []).filter((h) => h.id !== handle.id);
     handles.push(entry);
     this.actors.patch(toId, { handles });
@@ -2816,9 +2818,42 @@ export class ActorMesh {
       kind: "handle_granted",
       actorId: toId,
       detail: entry.role,
-      // TODO: Consider threading through the grantor and storing it in payload.grantorId
-      payload: JSON.stringify({ handleId: handle.id }),
+      payload: JSON.stringify({
+        handleId: handle.id,
+        ...(entry.origin ? { origin: entry.origin } : {}),
+      }),
     });
+  }
+
+  /**
+   * A delivered actor message is an introduction to its sender (#187). Keep
+   * this at the delivery boundary rather than the send boundary: a dropped or
+   * merely scheduled message must not mint an address-book capability.
+   *
+   * Human principals deliberately stay outside actor handles. A known retired
+   * actor remains an attributable sender, so the recipient can inspect its
+   * context and attempt the requested reply; the normal send path then reports
+   * that it is no longer live.
+   */
+  private introduceMessageSender(toId: string, fromId: string): void {
+    if (
+      isHumanOperator(fromId) ||
+      (this.principals !== undefined && this.principals.getUser(fromId) !== undefined)
+    ) {
+      return;
+    }
+    const recipient = this.actors.get(toId);
+    const sender = this.actors.get(fromId);
+    if (!recipient || !sender || recipient.id === sender.id) return;
+    // A parent is already a stable, separately rendered address-book alias.
+    // Do not turn that topology edge into a duplicate explicit handle.
+    if (recipient.parentId !== null && this.resolveThreadId(recipient.parentId) === sender.id) {
+      return;
+    }
+    // Callback retries re-enter the delivery seam. Do not record a second
+    // handle_granted event once the durable address-book entry exists.
+    if ((recipient.handles ?? []).some((handle) => handle.id === sender.id)) return;
+    this.grantHandle(recipient.id, { id: sender.id, origin: "message" });
   }
 
   /**
@@ -3749,6 +3784,7 @@ export class ActorMesh {
           payload: { type: "mesh.message", messageId, fromId, sessionId },
         },
       ]);
+      this.introduceMessageSender(toId, fromId);
     }
     this.dispatch(toId);
     return { delivered: true };
@@ -5529,6 +5565,7 @@ export class ActorMesh {
           },
         },
       ]);
+      this.introduceMessageSender(toId, scheduled.fromId);
       this.dispatch(toId);
       return;
     }
