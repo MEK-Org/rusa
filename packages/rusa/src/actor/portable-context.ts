@@ -70,14 +70,6 @@ export interface InjectRecord {
   sections?: { ledger: number; messages: number; runs: number };
   /** Aggregate content-free metrics on active durable ledger items and overflow (#328). */
   ledger?: LedgerMetrics;
-  active?: number;
-  selected?: number;
-  dropped?: number;
-  droppedByPriority?: Record<PortableMemoryPriority, number>;
-  minSelectedEvidenceTs?: string | null;
-  maxSelectedEvidenceTs?: string | null;
-  minDroppedEvidenceTs?: string | null;
-  maxDroppedEvidenceTs?: string | null;
 }
 
 export interface PortableContext {
@@ -264,39 +256,49 @@ function renderableLedgerItems(state: PortableContextState): PortableMemoryItem[
   return state.items.filter((item) => item.status === "active" && !isRetiredMemoryKind(item.kind));
 }
 
-function parseIsoTimestamp(ts: string | undefined | null): number | null {
-  if (!ts || typeof ts !== "string") return null;
-  const ms = Date.parse(ts);
-  return Number.isNaN(ms) ? null : ms;
+const ISO_8601_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}(?::?\d{2})?)$/;
+
+interface ItemRecency {
+  ms: number;
+  iso: string;
 }
 
-function getItemRecency(item: PortableMemoryItem): number | null {
-  let newestEvidenceMs: number | null = null;
+function parseIsoTimestamp(ts: string | undefined | null): ItemRecency | null {
+  if (!ts || typeof ts !== "string") return null;
+  const trimmed = ts.trim();
+  if (!ISO_8601_PATTERN.test(trimmed)) return null;
+  const ms = Date.parse(trimmed);
+  return Number.isNaN(ms) ? null : { ms, iso: trimmed };
+}
+
+function getItemRecency(item: PortableMemoryItem): ItemRecency | null {
+  let newest: ItemRecency | null = null;
   if (Array.isArray(item.evidence)) {
     for (const ev of item.evidence) {
-      const ms = parseIsoTimestamp(ev?.ts);
-      if (ms !== null && (newestEvidenceMs === null || ms > newestEvidenceMs)) {
-        newestEvidenceMs = ms;
+      const rec = parseIsoTimestamp(ev?.ts);
+      if (rec !== null && (newest === null || rec.ms > newest.ms)) {
+        newest = rec;
       }
     }
   }
-  if (newestEvidenceMs !== null) {
-    return newestEvidenceMs;
+  if (newest !== null) {
+    return newest;
   }
   return parseIsoTimestamp(item.updatedAt);
 }
 
 function compareLedgerCandidates(
-  a: { item: PortableMemoryItem; originalIndex: number; recency: number | null },
-  b: { item: PortableMemoryItem; originalIndex: number; recency: number | null }
+  a: { item: PortableMemoryItem; originalIndex: number; recency: ItemRecency | null },
+  b: { item: PortableMemoryItem; originalIndex: number; recency: ItemRecency | null }
 ): number {
   const priorityDiff =
     LEDGER_PRIORITY_ORDER[a.item.priority] - LEDGER_PRIORITY_ORDER[b.item.priority];
   if (priorityDiff !== 0) return priorityDiff;
 
   if (a.recency !== null && b.recency !== null) {
-    if (a.recency !== b.recency) {
-      return b.recency - a.recency;
+    if (a.recency.ms !== b.recency.ms) {
+      return b.recency.ms - a.recency.ms;
     }
   } else if (a.recency !== null) {
     return -1;
@@ -307,42 +309,25 @@ function compareLedgerCandidates(
   return b.originalIndex - a.originalIndex;
 }
 
-function getItemEvidenceTimestamps(item: PortableMemoryItem): string[] {
-  const timestamps: string[] = [];
-  if (Array.isArray(item.evidence)) {
-    for (const ev of item.evidence) {
-      if (parseIsoTimestamp(ev?.ts) !== null) {
-        timestamps.push(ev.ts);
-      }
-    }
-  }
-  if (timestamps.length === 0 && parseIsoTimestamp(item.updatedAt) !== null) {
-    timestamps.push(item.updatedAt);
-  }
-  return timestamps;
-}
-
-function computeMinMaxTimestamps(items: { item: PortableMemoryItem }[]): {
+function computeMinMaxTimestamps(items: { recency: ItemRecency | null }[]): {
   min: string | null;
   max: string | null;
 } {
-  const allTimestamps: { ts: string; ms: number }[] = [];
+  let min: ItemRecency | null = null;
+  let max: ItemRecency | null = null;
   for (const entry of items) {
-    const itemTimestamps = getItemEvidenceTimestamps(entry.item);
-    for (const ts of itemTimestamps) {
-      const ms = parseIsoTimestamp(ts);
-      if (ms !== null) {
-        allTimestamps.push({ ts, ms });
+    if (entry.recency !== null) {
+      if (min === null || entry.recency.ms < min.ms) {
+        min = entry.recency;
+      }
+      if (max === null || entry.recency.ms > max.ms) {
+        max = entry.recency;
       }
     }
   }
-  if (allTimestamps.length === 0) {
-    return { min: null, max: null };
-  }
-  allTimestamps.sort((a, b) => a.ms - b.ms);
   return {
-    min: allTimestamps[0].ts,
-    max: allTimestamps[allTimestamps.length - 1].ts,
+    min: min ? min.iso : null,
+    max: max ? max.iso : null,
   };
 }
 
@@ -350,7 +335,7 @@ function formatOmissionMarker(droppedCount: number): string {
   return `… [${droppedCount} active item${droppedCount === 1 ? "" : "s"} omitted due to budget]`;
 }
 
-export function renderLedger(state: PortableContextState): {
+function renderLedger(state: PortableContextState): {
   section: string;
   metrics: LedgerMetrics;
 } {
@@ -705,14 +690,6 @@ export function assemblePortableContextV2(input: {
         runs: byteLen(runsSection),
       },
       ledger: ledgerMetrics,
-      active: ledgerMetrics.active,
-      selected: ledgerMetrics.selected,
-      dropped: ledgerMetrics.dropped,
-      droppedByPriority: ledgerMetrics.droppedByPriority,
-      minSelectedEvidenceTs: ledgerMetrics.minSelectedEvidenceTs,
-      maxSelectedEvidenceTs: ledgerMetrics.maxSelectedEvidenceTs,
-      minDroppedEvidenceTs: ledgerMetrics.minDroppedEvidenceTs,
-      maxDroppedEvidenceTs: ledgerMetrics.maxDroppedEvidenceTs,
     },
   };
 }
