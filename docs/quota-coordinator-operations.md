@@ -175,6 +175,12 @@ clear it, restart the coordinator onto the live dist
 (`systemctl --user restart rusa-quota-coordinator.service`) once that build is
 acceptable, confirm `/v1/readyz` reports it, then update again.
 
+The first owner update after this behavior lands always stops this way.
+Coordinators built before it do not report `loadedRevision`, and the update
+that lands it runs the previous orchestrator, which leaves the coordinator
+alone. Expect that stop once per owning host; it is not a regression. Clear it
+with the restart above, then update again.
+
 After a green build and before the client drain, the update then:
 
 1. requires the live dist's sentinel to name the revision just built;
