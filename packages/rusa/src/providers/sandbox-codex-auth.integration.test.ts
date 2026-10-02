@@ -1,11 +1,20 @@
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildCodexArgs } from "./codex.js";
+import { configureCodexHome } from "./codex-home.js";
 import {
   buildActorBwrapArgs,
   codexRolloutStoreDir,
@@ -52,6 +61,7 @@ describe.skipIf(!BWRAP_CAPABLE)("Codex shared auth bind (real bwrap)", () => {
     teardownFlutterOverlay(actorDir);
     rmSync(actorDir, { recursive: true, force: true });
     rmSync(fixtureHome, { recursive: true, force: true });
+    configureCodexHome(undefined);
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
   });
@@ -69,6 +79,58 @@ describe.skipIf(!BWRAP_CAPABLE)("Codex shared auth bind (real bwrap)", () => {
     );
 
     expect(readFileSync(hostAuthPath, "utf8")).toBe("sandbox-after");
+  });
+
+  // #782: a configured home beneath a writable root (here the actor directory)
+  // would otherwise be readable and writable through that bind. Its path is a
+  // symlink, so both spellings must be shadowed.
+  it("with a configured home beneath the actor's writable root, hides its other files at both paths and still persists /tmp/auth.json", () => {
+    const realHome = join(actorDir, "codex-real");
+    const configured = join(actorDir, "codex-link");
+    mkdirSync(realHome);
+    symlinkSync(realHome, configured);
+    writeFileSync(join(realHome, "auth.json"), "host-before", { mode: 0o600 });
+    writeFileSync(join(realHome, "config.toml"), "host-config");
+    writeFileSync(join(realHome, "history.jsonl"), "host-history");
+    configureCodexHome(configured);
+
+    const { args } = buildActorBwrapArgs(actorDir, "codex");
+    const probe = [configured, realHome]
+      .map(
+        (dir) =>
+          `cat ${dir}/config.toml >/dev/null 2>&1 && echo READ_CONFIG:${dir}; ` +
+          `cat ${dir}/history.jsonl >/dev/null 2>&1 && echo READ_OTHER:${dir}; ` +
+          `cat ${dir}/auth.json >/dev/null 2>&1 && echo READ_AUTH:${dir}; ` +
+          `(printf sandbox > ${dir}/config.toml) 2>/dev/null && echo WROTE_CONFIG:${dir}; ` +
+          `(printf sandbox > ${dir}/planted) 2>/dev/null && echo PLANTED:${dir}; `
+      )
+      .join("");
+    const out = execFileSync(
+      "bwrap",
+      [...args, "--", "/bin/sh", "-c", `${probe}printf sandbox-after > /tmp/auth.json`],
+      { encoding: "utf8" }
+    );
+
+    expect(out).toBe("");
+    expect(readFileSync(join(realHome, "config.toml"), "utf8")).toBe("host-config");
+    expect(existsSync(join(realHome, "planted"))).toBe(false);
+    expect(readFileSync(join(realHome, "auth.json"), "utf8")).toBe("sandbox-after");
+  });
+
+  it("with a configured home that does not exist yet, still launches", () => {
+    // Off /tmp, off the fixture HOME and off every writable root: a mount on a
+    // missing path there makes bwrap fail to mkdir it on the read-only root.
+    const missing = join(process.cwd(), `.codex-home-missing-${process.pid}-${Date.now()}`);
+    expect(missing.startsWith("/tmp/")).toBe(false);
+    configureCodexHome(missing);
+
+    const { args } = buildActorBwrapArgs(actorDir, "codex");
+    expect(
+      execFileSync("bwrap", [...args, "--", "/bin/sh", "-c", "echo launched"], {
+        encoding: "utf8",
+      })
+    ).toBe("launched\n");
+    expect(existsSync(missing)).toBe(false);
   });
 });
 

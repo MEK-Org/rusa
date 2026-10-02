@@ -30,6 +30,7 @@ import {
   getCorepackPath,
   realpathIfExists,
   setupFlutterOverlay,
+  shadowCodexHomes,
   teardownFlutterOverlay,
 } from "../providers/sandbox.js";
 import { PARENT_GRANTABLE_SECRET_FILENAMES } from "./capability-grants.js";
@@ -634,12 +635,7 @@ export class E2EInstanceManager {
     // A configured Codex home (#782) can sit outside the host home shadowed
     // above, even beneath a writable root bound in here. Shadow it last, so no
     // later mount re-exposes it; a projection of it above keeps its own view.
-    const configuredCodex = configuredCodexHome();
-    if (configuredCodex) {
-      for (const dir of new Set([configuredCodex, realpathIfExists(configuredCodex)])) {
-        if (existsSync(dir)) args.push("--tmpfs", dir, "--remount-ro", dir);
-      }
-    }
+    shadowCodexHomes(args, [configuredCodexHome()]);
     args.push(
       "--clearenv",
       "--setenv",

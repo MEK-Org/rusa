@@ -25,10 +25,11 @@ With the broker on:
   the capability. The broker's reply has no `refresh_token`, so the capability
   stays in place.
 - **Sandboxes cannot see the canonical login.** `~/.codex`, and a configured
-  `providers.codex.home`, are shadowed by an empty read-only tmpfs, at both
-  path and real path. The shadow is mounted after the sandbox's writable
-  binds, so it holds even when the configured home sits inside the actor's
-  own workspace. Nothing canonical is bound in.
+  `providers.codex.home`, are shadowed by an empty read-only tmpfs on the
+  real path, which also covers a symlinked path into it. The shadow is
+  mounted after the sandbox's writable binds, so it holds even when the
+  configured home sits inside the actor's own workspace. Nothing canonical is
+  bound in.
 - **Requests are strict.** The broker accepts only `POST /oauth/token` with a
   JSON body made of `grant_type: "refresh_token"`, `refresh_token` and an
   optional `client_id`. It rejects any other field, and a request that names an
@@ -114,17 +115,22 @@ host-side consumer reads it:
   catalog reads;
 - the actor sandbox, the host-job sandbox and the E2E instance, which hide it.
 
-The actor sandbox hides the configured home only when the broker is on. With
-the broker off, it binds the home's `auth.json` and leaves the rest of the
-directory as the host mounts it. So with the broker off, keep the configured home
-outside every writable root (actor directories, the pnpm store, provider state).
-Beneath one, a worker could rewrite its `config.toml`, which the next sandboxed
-launch merges in.
+The actor sandbox hides the configured home with the broker on or off, after
+its writable binds, so it stays hidden even beneath an actor directory, the
+pnpm store or provider state. With the broker off, the sandbox still binds the
+home's `auth.json` writable at `/tmp/auth.json`, so the CLI's refreshes persist
+to it; nothing else in the directory is readable or writable. With the key
+unset, a broker-off sandbox leaves `~/.codex` as before.
 
 Setting the key does not create a login. That is one device login into the
 directory (`CODEX_HOME=<dir> codex login`), an operator step. Whether a second
 device login on the same account leaves the first session valid is not settled
 from source; if it does not, the existing login stops working at that moment.
+
+Activate in this order: log in first, then set the key, then restart. A sandbox
+only hides a directory that exists when it starts. A host job (up to 48 hours by
+default) or an actor run started while the key names a directory that does not
+exist yet sees whatever the login later writes there.
 
 ## When the CLI refreshes
 
@@ -207,11 +213,14 @@ cd packages/rusa
 pnpm vitest run src/providers/codex-auth-broker.test.ts
 
 # Dedicated Codex home: the resolver and its defaults, config validation,
-# the sandbox, host-job and E2E hides, the E2E projection (with a real bwrap
-# probe), the /status probe's refresh persisting to the configured home, and
-# the /model probe's CODEX_HOME.
+# the sandbox, host-job and E2E hides, the E2E projection (with real bwrap
+# probes, including a symlinked home), the broker-off sandbox under real bwrap
+# (hidden beneath the actor's writable root, /tmp/auth.json still persisting, a
+# missing home still launching), the /status probe's refresh persisting to the
+# configured home, and the /model probe's CODEX_HOME.
 pnpm vitest run src/providers/codex-home.test.ts src/config/loader.test.ts \
-  src/providers/sandbox.test.ts src/actor/host-job-runner.test.ts \
+  src/providers/sandbox.test.ts src/providers/sandbox-codex-auth.integration.test.ts \
+  src/actor/host-job-runner.test.ts \
   src/actor/e2e-instance-manager.test.ts src/e2e/provision.test.ts \
   src/providers/codex-status-scrape-auth.integration.test.ts \
   src/providers/model-scrape.test.ts

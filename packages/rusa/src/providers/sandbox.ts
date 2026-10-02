@@ -700,6 +700,21 @@ export function ensureTargetParentDirs(args: string[], target: string): void {
   }
 }
 
+/**
+ * Hide Codex homes behind an empty read-only tmpfs mounted on their real path,
+ * which also hides them through any symlinked spelling: a path through a symlink
+ * resolves into the tmpfs. The mount goes on the real path because bwrap cannot
+ * mount over a path that crosses an absolute symlink ("No such file or
+ * directory"). A home that does not exist yet is skipped: bwrap cannot create a
+ * mount point on the read-only root.
+ */
+export function shadowCodexHomes(args: string[], homes: (string | undefined)[]): void {
+  const dirs = homes.filter((dir): dir is string => dir !== undefined);
+  for (const dir of new Set(dirs.map(realpathIfExists))) {
+    if (existsSync(dir)) args.push("--tmpfs", dir, "--remount-ro", dir);
+  }
+}
+
 /** Exported for reuse by the host-jobs runner  — symlink-resolving path compare. */
 export function realpathIfExists(path: string): string {
   try {
@@ -1003,23 +1018,18 @@ function buildMeshActorBwrapArgs(o: {
     if (o.codexAuth) {
       // Brokered login (#782): nothing in the sandbox can read or write the
       // canonical login. The Codex home (visible through the root ro-bind,
-      // auth.json included) is shadowed by an empty read-only tmpfs at both its
-      // path and its real path. The CLI reads a private copy whose refresh token
-      // is a per-run capability and refreshes through the host broker, which
-      // answers with fresh access tokens and alone writes the canonical file. A
-      // child that reads or rewrites /tmp/auth.json gets, or spoils, only this
-      // run's capability.
+      // auth.json included) is shadowed by an empty read-only tmpfs on its real
+      // path, which also covers its path. The CLI reads a private copy whose
+      // refresh token is a per-run capability and refreshes through the host
+      // broker, which answers with fresh access tokens and alone writes the
+      // canonical file. A child that reads or rewrites /tmp/auth.json gets, or
+      // spoils, only this run's capability.
       //
       // A configured `providers.codex.home` is shadowed as well as `~/.codex`,
       // which on a shared host still holds another daemon's login. These mounts
       // come after the writable actor, pnpm and provider-state binds above, so
       // they win even when the configured home lies beneath one of them.
-      const codexHomes = [join(getHostHomeDir(), ".codex"), configuredCodexHome()].filter(
-        (dir): dir is string => dir !== undefined
-      );
-      for (const dir of new Set(codexHomes.flatMap((home) => [home, realpathIfExists(home)]))) {
-        if (existsSync(dir)) args.push("--tmpfs", dir, "--remount-ro", dir);
-      }
+      shadowCodexHomes(args, [join(getHostHomeDir(), ".codex"), configuredCodexHome()]);
       args.push("--bind", o.codexAuth.authFile, "/tmp/auth.json");
       args.push("--setenv", CODEX_REFRESH_URL_ENV, o.codexAuth.refreshUrl);
     } else {
@@ -1030,6 +1040,14 @@ function buildMeshActorBwrapArgs(o: {
       // isolated. Codex's file auth backend truncates and rewrites auth.json in place,
       // so a file bind supports refresh without granting the worker write access to
       // the rest of the host Codex home.
+      //
+      // A configured `providers.codex.home` (#782) is shadowed like the brokered
+      // case, after the writable binds above, so a worker cannot read or rewrite
+      // its config.toml or other files even when it lies beneath one of them.
+      // The auth bind below still reaches its auth.json: bwrap resolves bind
+      // sources on the host filesystem, not through mounts made in the sandbox.
+      // Unset, `~/.codex` stays as the root ro-bind shows it, as before.
+      shadowCodexHomes(args, [configuredCodexHome()]);
       const hostAuthPath = join(codexHomeDir(getHostHomeDir()), "auth.json");
       if (existsSync(hostAuthPath)) {
         args.push("--bind", hostAuthPath, "/tmp/auth.json");

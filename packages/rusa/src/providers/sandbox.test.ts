@@ -1715,6 +1715,38 @@ describe("sandbox bwrap args", () => {
 
     expect(joined).toContain(`--bind ${join(configured, "auth.json")} /tmp/auth.json`);
     expect(args).not.toContain(join(home, ".codex", "auth.json"));
+    // The rest of the configured home is shadowed, after the writable binds; the
+    // auth bind's source still resolves on the host. ~/.codex keeps the default.
+    const hide = args.findIndex((a, i) => a === "--tmpfs" && args[i + 1] === configured);
+    expect(args.slice(hide, hide + 4)).toEqual(["--tmpfs", configured, "--remount-ro", configured]);
+    const writableRoot = args.findIndex(
+      (a, i) => a === "--bind" && args[i + 1] === "/tmp/worktree" && args[i + 2] === "/tmp/worktree"
+    );
+    expect(writableRoot).toBeGreaterThan(-1);
+    expect(hide).toBeGreaterThan(writableRoot);
+    expect(args).not.toContain(join(home, ".codex"));
+  });
+
+  it("with the broker off and no configured home, shadows nothing and binds ~/.codex's auth file", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mc-home-"));
+    tempDirs.push(home, "/tmp/rusa-codex-sessions-worktree");
+    process.env.HOME = home;
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(join(home, ".codex", "auth.json"), "default-login");
+
+    execSyncMock.mockImplementation((command: string) => {
+      if (command === "pnpm store path") return "/tmp/pnpm-store\n";
+      const fallback = defaultExecSyncResponse(command);
+      if (fallback) return fallback;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const { buildActorBwrapArgs } = await import("./sandbox.js");
+    const { args } = buildActorBwrapArgs("/tmp/worktree", "codex");
+
+    expect(args.join(" ")).toContain(`--bind ${join(home, ".codex", "auth.json")} /tmp/auth.json`);
+    expect(args).not.toContain(join(home, ".codex"));
+    expect(args).not.toContain("--remount-ro");
   });
 
   it("persists codex session rollouts: binds a per-actor host-/tmp store over /tmp/sessions, after the tmpfs", async () => {

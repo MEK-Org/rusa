@@ -1588,6 +1588,52 @@ describe("E2EInstanceManager", () => {
       );
     }
   );
+
+  it.skipIf(!BWRAP_CAPABLE)(
+    "real bwrap: a configured Codex home reached through an absolute symlink is hidden at both paths (#782)",
+    () => {
+      // bwrap cannot mount over an absolute symlink, so the hide goes on the real path.
+      const realHome = join(actorWorktree, "codex-canary-real");
+      const configuredHome = join(actorWorktree, "codex-canary");
+      mkdirSync(realHome, { recursive: true });
+      symlinkSync(realHome, configuredHome);
+      writeFileSync(join(realHome, "auth.json"), '{"fixture":"configured"}');
+      writeFileSync(join(realHome, "config.toml"), "host-config");
+      configureCodexHome(configuredHome);
+
+      const runRoot = join(root, "run-1");
+      mkdirSync(runRoot, { recursive: true });
+      const args = (
+        manager({ flutterRoot: "" }) as unknown as {
+          buildBwrapArgs(worktree: string, root: string, resume: boolean): string[];
+        }
+      ).buildBwrapArgs(actorWorktree, runRoot, false);
+      const runtimeHome = join(mcHome, "e2e-instance", "runtime", "home");
+      const probe = [
+        `/bin/cat ${runtimeHome}/.codex/auth.json; echo`,
+        ...[configuredHome, realHome].map(
+          (dir) =>
+            `test -e ${dir}/config.toml && echo visible || echo hidden; ` +
+            `/usr/bin/touch ${dir}/planted 2>/dev/null && echo writable || echo readonly`
+        ),
+      ].join("; ");
+      const output = execFileSync(
+        "bwrap",
+        [...args.slice(0, args.indexOf("--")), "--", "/bin/sh", "-c", probe],
+        { encoding: "utf8" }
+      );
+
+      expect(output.split("\n")).toEqual([
+        '{"fixture":"configured"}',
+        "hidden",
+        "readonly",
+        "hidden",
+        "readonly",
+        "",
+      ]);
+      expect(existsSync(join(realHome, "planted"))).toBe(false);
+    }
+  );
 });
 
 describe.skipIf(!BWRAP_CAPABLE)(
