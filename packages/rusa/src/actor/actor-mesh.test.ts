@@ -532,7 +532,11 @@ function setup(
             prompt: buildWorkerPrompt(r.charter, {
               threadId: r.id,
               parentId: r.parentId ?? "human",
-              handles: resolveHandleLabels(r.handles, (hid) => registry.get(hid)?.charter),
+              handles: resolveHandleLabels(
+                r.handles,
+                (hid) => registry.get(hid)?.charter,
+                (hid) => registry.get(hid)?.title
+              ),
             }),
           };
         },
@@ -3875,6 +3879,101 @@ describe("ActorMesh", () => {
     );
   });
 
+  describe("responsive failure notices (#189)", () => {
+    it("wakes an idle parent on the responsive lane", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const admissions: Array<[string, boolean]> = [];
+      const { mesh, tick } = setup({
+        inboxStore,
+        onQueued: (actorId, ctx) => admissions.push([actorId, ctx.responsive]),
+      });
+      const child = mesh.spawn({ charter: "do work", parentId: "root" });
+
+      mesh.deliverMechanicalInboxNotice(
+        "root",
+        "[run failed] (exit 1)",
+        child,
+        { actorId: child, exitCode: 1 },
+        undefined,
+        { responsive: true }
+      );
+      await tick();
+
+      expect(inboxStore.entries.find((entry) => entry.actorId === "root")?.payload).toMatchObject({
+        type: "mesh.mechanical_note",
+        priority: "responsive",
+      });
+      expect(admissions).toEqual([["root", true]]);
+    });
+
+    it("keeps ordinary mechanical notices at normal priority", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const admissions: Array<[string, boolean]> = [];
+      const { mesh, tick } = setup({
+        inboxStore,
+        onQueued: (actorId, ctx) => admissions.push([actorId, ctx.responsive]),
+      });
+      const child = mesh.spawn({ charter: "do work", parentId: "root" });
+
+      mesh.deliverMechanicalInboxNotice("root", "[yield/complete] done", child, { actorId: child });
+      await tick();
+
+      const notice = inboxStore.entries.find((entry) => entry.actorId === "root");
+      expect(notice?.payload.priority).toBeUndefined();
+      expect(admissions).toEqual([["root", false]]);
+    });
+
+    it("does not abort the parent's run in flight; the notice earns a responsive follow-up", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const events: MeshEventInput[] = [];
+      const admissions: boolean[] = [];
+      let parent = "";
+      let firstSignal: AbortSignal | undefined;
+      let resolveFirst!: (result: Partial<RunResult>) => void;
+      let parentRuns = 0;
+      const provider = new FakeProvider((opts) => {
+        if (opts.cwd !== `/tmp/${parent}`) return { success: true, exitCode: 0, output: "ok" };
+        parentRuns++;
+        if (parentRuns > 1) return { success: true, exitCode: 0, output: "handled failure" };
+        firstSignal = opts.signal;
+        return new Promise<Partial<RunResult>>((resolve) => {
+          resolveFirst = resolve;
+        });
+      });
+      const { mesh, tick } = setup({
+        inboxStore,
+        sharedProvider: provider,
+        events: (event) => events.push(event),
+        onQueued: (actorId, ctx) => {
+          if (actorId === parent) admissions.push(ctx.responsive);
+        },
+      });
+      parent = mesh.spawn({ charter: "supervise", parentId: "root" });
+      const child = mesh.spawn({ charter: "do work", parentId: parent });
+      mesh.sendMessage(parent, "start", "root");
+      await tick();
+      expect(parentRuns).toBe(1);
+
+      mesh.deliverMechanicalInboxNotice(
+        parent,
+        "[run failed] (exit 1)",
+        child,
+        { actorId: child, exitCode: 1 },
+        undefined,
+        { responsive: true }
+      );
+      await tick();
+
+      expect(firstSignal?.aborted).toBe(false);
+      expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
+
+      resolveFirst({ success: true, exitCode: 0, output: "finished normally" });
+      await tick();
+      expect(parentRuns).toBe(2);
+      expect(admissions).toEqual([false, true]);
+    });
+  });
+
   it("hands a git-bridge deliverable to the parent when a parent-triggered run returns", async () => {
     const chat: { senderId: string; recipientId: string; body: string; sessionId?: string }[] = [];
     const inboxStore = createMemoryInboxStore();
@@ -4155,6 +4254,129 @@ describe("ActorMesh", () => {
     expect(last).toContain("Work from your inbox");
     // The coder's prompt advertises the reviewer handle it was granted.
     expect(last).toContain("code reviewer (high-tier)");
+  });
+
+  it("introduces a delivered peer sender with its handle and title", async () => {
+    const { mesh, registry, fake, tick } = setup();
+    const sender = mesh.spawn({
+      charter: "review this patch",
+      parentId: "root",
+      title: "Release reviewer",
+    });
+    const recipient = mesh.spawn({ charter: "implement the patch", parentId: "root" });
+
+    expect(registry.get(recipient)?.handles ?? []).toEqual([]);
+    expect(mesh.sendMessage(recipient, "Could you check this?", sender)).toEqual({
+      delivered: true,
+    });
+    expect(registry.get(recipient)?.handles).toEqual([{ id: sender, origin: "message" }]);
+
+    await tick();
+    const prompt = fake(recipient).calls.at(-1)?.prompt ?? "";
+    expect(prompt).toContain(`\`${sender}\``);
+    expect(prompt).toContain("title: Release reviewer");
+    expect(prompt).toContain("Not for me — I think this was intended for");
+  });
+
+  it("keeps the parent alias separate and never grants a human sender handle", () => {
+    const { mesh, registry } = setup();
+    const child = mesh.spawn({ charter: "child", parentId: "root" });
+
+    expect(mesh.sendMessage(child, "from your parent", "root")).toEqual({ delivered: true });
+    expect(registry.get(child)?.handles ?? []).toEqual([]);
+
+    expect(mesh.sendHumanMessage(child, "from the operator", "session-1")).toEqual({
+      delivered: true,
+    });
+    expect(registry.get(child)?.handles ?? []).toEqual([]);
+  });
+
+  it("introduces a scheduled sender only when delivery occurs and only once", () => {
+    const events: MeshEventInput[] = [];
+    const { mesh, registry, scheduledMessages } = setup({ events: (event) => events.push(event) });
+    const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+    const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+
+    expect(
+      mesh.sendMessage(
+        recipient,
+        "arrive later",
+        sender,
+        undefined,
+        new Date(Date.now() + 100_000).toISOString()
+      )
+    ).toEqual({ delivered: true });
+    expect(registry.get(recipient)?.handles ?? []).toEqual([]);
+
+    const scheduled = scheduledMessages.listForRecipient(recipient)[0];
+    expect(scheduled).toBeDefined();
+    mesh.deliverScheduledMessage(scheduled);
+    mesh.deliverScheduledMessage(scheduled);
+
+    expect(registry.get(recipient)?.handles).toEqual([{ id: sender, origin: "message" }]);
+    expect(
+      events.filter(
+        (event) =>
+          event.kind === "handle_granted" &&
+          event.actorId === recipient &&
+          JSON.parse(event.payload ?? "{}").handleId === sender &&
+          JSON.parse(event.payload ?? "{}").origin === "message"
+      )
+    ).toHaveLength(1);
+  });
+
+  it("allows replying to a delivery-introduced sender but refuses voice transfer unless separately authorized", () => {
+    let holder = "";
+    const { mesh, registry } = setup({
+      isVoiceSessionActive: (actorId) => actorId === holder,
+      voiceSessionTransfer: {
+        activeSessionIdFor: () => "walkie-session",
+        transferActiveSession: (_fromActorId, targetActorId) => {
+          holder = targetActorId;
+          return "walkie-session";
+        },
+        revertActiveSessionTransfer: () => {},
+        notifySessionTransferred: () => {},
+      },
+    });
+    const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+    const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+    holder = recipient;
+
+    expect(registry.get(recipient)?.handles ?? []).toEqual([]);
+
+    expect(mesh.sendMessage(recipient, "hello", sender)).toEqual({ delivered: true });
+    expect(mesh.sendMessage(sender, "replying to sender", recipient)).toEqual({ delivered: true });
+
+    expect(() => mesh.transferVoiceSession(recipient, sender)).toThrow("not a handle held");
+
+    mesh.grantHandle(recipient, { id: sender });
+    expect(mesh.transferVoiceSession(recipient, sender)).toEqual({
+      sessionId: "walkie-session",
+      targetActorId: sender,
+    });
+    expect(holder).toBe(sender);
+
+    // An actor with a previously authorized handle does not get downgraded by message delivery.
+    const authorizedRecipient = mesh.spawn({ charter: "recipient 2", parentId: "root" });
+    mesh.grantHandle(authorizedRecipient, { id: sender });
+    holder = authorizedRecipient;
+    expect(mesh.sendMessage(authorizedRecipient, "hello authorized", sender)).toEqual({
+      delivered: true,
+    });
+    expect(mesh.transferVoiceSession(authorizedRecipient, sender)).toEqual({
+      sessionId: "walkie-session",
+      targetActorId: sender,
+    });
+
+    // An explicit grant whose role text resembles the storage sentinel retains voice transfer authority
+    const explicitRoleRecipient = mesh.spawn({ charter: "recipient 3", parentId: "root" });
+    mesh.grantHandle(explicitRoleRecipient, { id: sender, role: "__origin:message" });
+    holder = explicitRoleRecipient;
+    expect(mesh.transferVoiceSession(explicitRoleRecipient, sender)).toEqual({
+      sessionId: "walkie-session",
+      targetActorId: sender,
+    });
   });
 
   it("calls onRetire for every node in a retired subtree", async () => {
@@ -10094,7 +10316,11 @@ describe("ActorMesh", () => {
       mesh.deliverScheduledMessage(message);
 
       expect(chatRows.get(message.id)).toBe(message.body);
-      expect(events.map((event) => event.kind)).toEqual(["message_sent", "message_received"]);
+      expect(events.map((event) => event.kind)).toEqual([
+        "message_sent",
+        "message_received",
+        "handle_granted",
+      ]);
     });
 
     it("makes callback retries idempotent without a local pending-message row", () => {
@@ -12567,7 +12793,7 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(notice).toContain("told-head");
     // The exits it names are the exits enforcement accepts, worded once.
     const exits =
-      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
+      "complete it, cancel it, schedule it, snooze it until a future time with `set_snooze`, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
     expect(notice).toContain(exits);
     expect(rejection(mesh, optedIn)).toMatch(exits);
 
@@ -12701,6 +12927,16 @@ describe("strict obligation handling experiment (#382)", () => {
       mesh.enrollActorInExperiment(id, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
       return id;
     }
+
+    it("names snooze as an exit in both the discipline notice and the rejection (#819)", () => {
+      const { mesh } = snoozeMesh();
+      const subject = enrolled(mesh, "told about snooze");
+      repo.create({ id: "head", title: "Head", ownerId: subject });
+      selectHead(mesh, subject, "head");
+      const snoozeExit = "snooze it until a future time with `set_snooze`";
+      expect(mesh.runDisciplineNotice(subject)).toContain(snoozeExit);
+      expect(rejection(mesh, subject)).toContain(snoozeExit);
+    });
 
     it("closes a ready head snoozed during the run", () => {
       const { mesh } = snoozeMesh();

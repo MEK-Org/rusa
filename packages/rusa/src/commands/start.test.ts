@@ -1867,7 +1867,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(String(strict.selection.discipline)).toContain(strictHeadId);
     expect(String(strict.selection.discipline)).toMatch(/every selected head/);
     expect(String(strict.selection.discipline)).toContain(
-      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor"
+      "complete it, cancel it, schedule it, snooze it until a future time with `set_snooze`, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor"
     );
     // The unenrolled control's selection carries no trace of the experiment.
     expect(controlSelection.selection).not.toHaveProperty("discipline");
@@ -2756,6 +2756,33 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       const notes = mechanicalNotes("root");
       expect(notes.some((note) => note.startsWith("[run failed]"))).toBe(true);
+    });
+
+    // #189: a capped run used to be filtered out before the failure route, so
+    // the parent never heard about it.
+    it("forwards a capped run to the parent as a responsive [capped] notice", async () => {
+      const workerId = "capped-worker";
+      const mesh = await bootWithWorker(workerId);
+      const actor = actorFor(mesh, workerId);
+
+      const runId = await startRun(actor);
+      await endLifecycleRun(actor, runId, {
+        success: false,
+        capped: true,
+        exitCode: 1,
+        output: "turn limit reached",
+      });
+
+      const notices = getRepositories()
+        .inbox.list("root", { status: "all" })
+        .entries.filter((entry) => entry.payload?.fromId === workerId);
+      expect(notices.map((entry) => entry.payload)).toEqual([
+        expect.objectContaining({
+          type: "mesh.mechanical_note",
+          note: expect.stringMatching(/^\[capped\] /),
+          priority: "responsive",
+        }),
+      ]);
     });
   });
 

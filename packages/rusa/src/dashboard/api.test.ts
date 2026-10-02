@@ -4102,6 +4102,63 @@ describe("handleMeshApiRequest", () => {
         });
       });
 
+      it("converges a pending Google Chat citation on re-fetch with one provider read (#595)", async () => {
+        const ref = "gchat:spaces/AAAA123/messages/BBBB.CCCC";
+        obligations.create({
+          title: "pending-gchat",
+          id: "pending-gchat",
+          ownerId: "actor-1",
+        });
+        obligations.attachArtifact("pending-gchat", ref);
+
+        let finishRead!: () => void;
+        const readGate = new Promise<void>((resolve) => {
+          finishRead = resolve;
+        });
+        const getMessage = vi.fn(async (name: string) => {
+          await readGate;
+          return { name, text: "Arrived after the deadline" };
+        });
+        const depsWithCache = {
+          ...deps,
+          referenceCache: new ReferenceCacheService({
+            repo: new ReferenceCacheRepository(db),
+            deadlineMs: 20,
+          }),
+          chatClient: {
+            getMessage,
+            getSpace: vi.fn(),
+          } as unknown as DashboardDataDeps["chatClient"],
+        };
+        const detail = async () => {
+          const { res } = await call(depsWithCache, "GET", "/api/mesh/obligations/pending-gchat");
+          expect(res.statusCode).toBe(200);
+          const data = JSON.parse(res.body);
+          return data.artifacts[0].reference;
+        };
+
+        // The first render and an overlapping client retry both meet the
+        // deadline while the single provider read is still out.
+        const [first, retry] = await Promise.all([detail(), detail()]);
+        for (const reference of [first, retry]) {
+          expect(reference.cacheState).toBe("pending");
+          expect(reference.unavailable).toBe("loading context");
+        }
+        expect(getMessage).toHaveBeenCalledTimes(1);
+
+        finishRead();
+        for (let i = 0; i < 5; i += 1) await new Promise((r) => setTimeout(r, 0));
+
+        const converged = await detail();
+        expect(converged.cacheState).toBe("fresh");
+        expect(converged.unavailable).toBeNull();
+        expect(converged.entity).toEqual({
+          type: "gchat_message",
+          contents: "Arrived after the deadline",
+        });
+        expect(getMessage).toHaveBeenCalledTimes(1);
+      });
+
       it("404s when obligation not found", async () => {
         const { res } = await call(deps, "GET", "/api/mesh/obligations/missing-task");
         expect(res.statusCode).toBe(404);

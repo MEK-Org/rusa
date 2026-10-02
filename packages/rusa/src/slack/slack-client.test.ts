@@ -64,3 +64,25 @@ describe("SlackClient.listRecentMessages", () => {
     expect(messages.map((m) => m.text)).toEqual(["b", "c"]);
   });
 });
+
+describe("SlackClient.react", () => {
+  it("invokes web.reactions.add with channel, timestamp, and name", async () => {
+    const add = vi.fn(async () => ({ ok: true }));
+    const client = new SlackClient("xoxb-test");
+    Object.defineProperty(client, "web", { value: { reactions: { add } } });
+
+    await client.react("C123", "1234567890.123456");
+    expect(add).toHaveBeenCalledWith({
+      channel: "C123",
+      timestamp: "1234567890.123456",
+      name: "eyes",
+    });
+
+    await client.react("C123", "1234567890.123456", "thumbsup");
+    expect(add).toHaveBeenCalledWith({
+      channel: "C123",
+      timestamp: "1234567890.123456",
+      name: "thumbsup",
+    });
+  });
+});

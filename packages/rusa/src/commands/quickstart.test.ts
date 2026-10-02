@@ -139,9 +139,70 @@ describe("quickstart command", () => {
 
     expect(doctorMocks.runQuickstartDoctor).toHaveBeenCalledWith({
       ports: [QUICKSTART_DASHBOARD_PORT, QUICKSTART_GIT_BRIDGE_PORT],
+      replaceablePorts: [],
     });
-    expect(spawnSyncMock).not.toHaveBeenCalled();
+    // Only the read-only `docker port` lookups run before the doctor.
+    for (const [cmd, args] of spawnSyncMock.mock.calls as [string, string[]][]) {
+      expect(cmd).toBe("docker");
+      expect(args[0]).toBe("port");
+    }
     expect(process.exitCode).toBe(1);
+  });
+
+  it("lets a rerun replace its own running container instead of failing the port check", async () => {
+    spawnSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "docker" && args[0] === "port" && args[1] === "rusa-quickstart") {
+        return {
+          status: 0,
+          stdout:
+            "8080/tcp -> 127.0.0.1:8080\n8085/tcp -> 127.0.0.1:8085\n9742/tcp -> 127.0.0.1:9742\n",
+          stderr: "",
+        };
+      }
+      if (cmd === "docker" && args[0] === "port") {
+        return { status: 1, stdout: "", stderr: "Error: No such container" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    await runQuickstart({ skipBuild: true });
+
+    expect(doctorMocks.runQuickstartDoctor).toHaveBeenCalledWith({
+      ports: [QUICKSTART_DASHBOARD_PORT, QUICKSTART_GIT_BRIDGE_PORT],
+      replaceablePorts: [QUICKSTART_DASHBOARD_PORT, QUICKSTART_GIT_BRIDGE_PORT],
+    });
+    const dockerArgs = spawnSyncMock.mock.calls
+      .filter((call: unknown[]) => call[0] === "docker")
+      .map((call: unknown[]) => (call[1] as string[]).join(" "));
+    const removeApp = dockerArgs.indexOf("rm -f rusa-quickstart");
+    const startApp = dockerArgs.findIndex(
+      (args) => args.startsWith("run ") && args.includes("--name rusa-quickstart ")
+    );
+    expect(removeApp).toBeGreaterThan(-1);
+    expect(startApp).toBeGreaterThan(removeApp);
+  });
+
+  it("still probes a port its own container publishes on another address or protocol", async () => {
+    spawnSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "docker" && args[0] === "port" && args[1] === "rusa-quickstart") {
+        return {
+          status: 0,
+          stdout: "8080/tcp -> 127.0.0.2:8080\n8085/udp -> 127.0.0.1:8085\n",
+          stderr: "",
+        };
+      }
+      if (cmd === "docker" && args[0] === "port") {
+        return { status: 1, stdout: "", stderr: "Error: No such container" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    await runQuickstart({ skipBuild: true });
+
+    expect(doctorMocks.runQuickstartDoctor).toHaveBeenCalledWith({
+      ports: [QUICKSTART_DASHBOARD_PORT, QUICKSTART_GIT_BRIDGE_PORT],
+      replaceablePorts: [],
+    });
   });
 
   it("writes quickstart config without the removed targets field", async () => {
@@ -179,7 +240,7 @@ describe("quickstart command", () => {
     expect(loadedConfig.rootActor?.effort).toBe("high");
   });
 
-  it("keeps the generated root handle when the handle prompt is blank", async () => {
+  it("keeps the generated root handle when a fresh-install handle prompt is blank", async () => {
     promptMocks.state.inputs = ["codex", "", "gpt-5.6-sol"];
     promptMocks.state.passwords = ["test-gemini-key"];
 
@@ -192,6 +253,42 @@ describe("quickstart command", () => {
     expect(config.github).toEqual({});
     expect(config).not.toHaveProperty("targets");
     expect(config.rootActor?.handle).toMatch(/^[a-z]+(?:-[a-z]+)+$/);
+    expect(promptMocks.input).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: `Root entity handle/name (leave blank for suggested: "${config.rootActor?.handle}"):`,
+        default: config.rootActor?.handle,
+      })
+    );
+  });
+
+  // The runtime resolves the stored handle byte-for-byte, so a padded handle
+  // must survive both a blank answer and acceptance of the displayed default.
+  it.each([
+    ["my-root", ""],
+    [" my-root ", ""],
+    [" my-root ", " my-root "],
+  ])("keeps the existing root handle %j on reconfigure when the answer is %j (#833)", async (handle, answer) => {
+    writeFileSync(
+      join(home, "config.yaml"),
+      toYaml({
+        profile: "quickstart",
+        providers: { codex: { cliCommand: "codex" } },
+        rootActor: { provider: "codex", model: "gpt-5.6-sol", handle },
+      })
+    );
+    promptMocks.state.inputs = ["codex", answer, "gpt-5.6-sol"];
+    promptMocks.state.passwords = ["test-gemini-key"];
+
+    await runQuickstartConfigure({ home, executeProviderCommand: () => 0 });
+
+    const config = parseYaml(readFileSync(join(home, "config.yaml"), "utf8")) as RusaConfig;
+    expect(config.rootActor?.handle).toBe(handle);
+    expect(promptMocks.input).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: `Root entity handle/name (leave blank to keep current: "${handle}"):`,
+        default: handle,
+      })
+    );
   });
 
   it("carries github.repos forward when configure rewrites an existing config", async () => {
@@ -292,9 +389,7 @@ describe("quickstart command", () => {
 
     expect(execute).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledWith(
-      expect.stringContaining(
-        "Quickstart login for kimi isn't supported yet (tracked in ISSUE_NUM)"
-      )
+      "[quickstart] Quickstart login for kimi isn't supported yet; complete auth via the vendor's own CLI."
     );
     log.mockRestore();
   });
@@ -825,14 +920,27 @@ describe("quickstart command", () => {
         }
       });
 
-      it("rejects a missing path before any container work", async () => {
-        await expect(
-          runQuickstart({
-            skipBuild: true,
-            localRepo: "/does/not/exist/at/all",
-          })
-        ).rejects.toThrow("Path does not exist");
-        expect(spawnSyncMock).not.toHaveBeenCalled();
+      it("exits 1 with only the friendly line and no container work for a missing path", async () => {
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          await expect(
+            runQuickstart({
+              skipBuild: true,
+              localRepo: "/does/not/exist/at/all",
+            })
+          ).resolves.toBeUndefined();
+          expect(process.exitCode).toBe(1);
+          expect(errorSpy).toHaveBeenCalledTimes(1);
+          expect(String(errorSpy.mock.calls[0]?.[0])).toMatch(
+            /^\[quickstart\] Invalid repository path: .*Path does not exist/
+          );
+          const containerWork = spawnSyncMock.mock.calls.filter(
+            (call: unknown[]) => !(call[0] === "docker" && (call[1] as string[])[0] === "port")
+          );
+          expect(containerWork).toHaveLength(0);
+        } finally {
+          errorSpy.mockRestore();
+        }
       });
     });
 

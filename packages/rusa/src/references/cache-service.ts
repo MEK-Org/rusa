@@ -45,10 +45,25 @@ function deriveDisplayTitle(reference: Reference, entity: ReferenceEntity): stri
   }
 }
 
+/** A provider read in flight, and whether some get answered "pending" on it. */
+interface InFlightRead {
+  read: Promise<ReferenceEntity | null>;
+  answeredPending: boolean;
+}
+
 export interface ReferenceCacheServiceOptions {
   repo: ReferenceCacheRepository;
   ttlMs?: number;
   deadlineMs?: number;
+  /**
+   * How long a provider read that was answered "pending" and then failed
+   * answers a cold get as unavailable before the provider is asked again.
+   * Long enough to outlast the dashboard's bounded retries of that pending
+   * card (about 15 s), so they settle on a terminal state (#595); short
+   * enough that a transient failure or a newly granted permission recovers
+   * on its own.
+   */
+  unavailableTtlMs?: number;
   logger?: {
     info: (event: string, data?: Record<string, unknown>) => void;
     error: (event: string, data?: Record<string, unknown>) => void;
@@ -59,12 +74,27 @@ export class ReferenceCacheService {
   private readonly repo: ReferenceCacheRepository;
   private readonly ttlMs: number;
   private readonly deadlineMs: number;
+  private readonly unavailableTtlMs: number;
   private readonly logger?: ReferenceCacheServiceOptions["logger"];
+  /**
+   * The provider read currently out for each canonical ref. A cold get, a
+   * stale refresh and a client retry that overlap all await this one read, so
+   * a pending card's retries can never multiply provider traffic (#595).
+   * `answeredPending` records that some get gave up waiting on it.
+   */
+  private readonly inFlight = new Map<string, InFlightRead>();
+  /**
+   * Canonical ref → epoch ms until which its last failed read stands. Only a
+   * read some caller was told is pending lands here: that caller retries,
+   * and has no other way to learn the outcome. In memory only.
+   */
+  private readonly unavailableUntil = new Map<string, number>();
 
   constructor(options: ReferenceCacheServiceOptions) {
     this.repo = options.repo;
     this.ttlMs = options.ttlMs ?? 1000 * 60 * 60; // 1 hour
     this.deadlineMs = options.deadlineMs ?? 250; // 250ms for UI deadline
+    this.unavailableTtlMs = options.unavailableTtlMs ?? 30_000;
     this.logger = options.logger;
   }
 
@@ -125,14 +155,35 @@ export class ReferenceCacheService {
       }
     }
 
+    // A read that outlived the deadline and then failed is reported
+    // unavailable without asking the provider again, so the retry of the
+    // caller told "pending" reaches a terminal state.
+    const failedUntil = this.unavailableUntil.get(key);
+    if (failedUntil !== undefined) {
+      if (now.getTime() < failedUntil) {
+        this.logger?.info("reference_cache_unavailable", {
+          scheme: reference.scheme,
+          type: getResourceShape(reference),
+          recent: true,
+        });
+        const base = resolveReferenceSync(key, deps);
+        return { ...base, unavailable: "could not load context", cacheState: "unavailable" };
+      }
+      this.unavailableUntil.delete(key);
+    }
+
     // Cold miss
     this.logger?.info("reference_cache_miss", {
       scheme: reference.scheme,
       type: getResourceShape(reference),
     });
-    const readPromise = this.performProviderRead(key, deps);
+    const shared = this.sharedProviderRead(key, deps);
+    const readPromise = shared.read;
     const deadlinePromise = new Promise<"deadline">((resolve) =>
-      setTimeout(() => resolve("deadline"), this.deadlineMs)
+      setTimeout(() => {
+        shared.answeredPending = true;
+        resolve("deadline");
+      }, this.deadlineMs)
     );
 
     const result = await Promise.race([readPromise, deadlinePromise]);
@@ -171,7 +222,7 @@ export class ReferenceCacheService {
   private async triggerRefresh(ref: string, deps: ReferenceResolverDeps): Promise<void> {
     const reference = parseReference(ref);
     try {
-      const result = await this.performProviderRead(ref, deps);
+      const result = await this.sharedProviderRead(ref, deps).read;
       if (result) {
         this.logger?.info("reference_cache_refresh", {
           scheme: reference.scheme,
@@ -187,6 +238,50 @@ export class ReferenceCacheService {
     } catch (_e) {
       this.logger?.error("reference_cache_refresh", { scheme: reference.scheme, outcome: "error" });
     }
+  }
+
+  /**
+   * Joins the read already out for `key`, or starts one. Either way its
+   * outcome is recorded once: a failure (null or thrown) of a read some get
+   * answered "pending" is remembered for `unavailableTtlMs`; a success clears
+   * that memory.
+   */
+  private sharedProviderRead(key: string, deps: ReferenceResolverDeps): InFlightRead {
+    const existing = this.inFlight.get(key);
+    if (existing) return existing;
+    // The handlers run only after the provider read settles, by which time
+    // `shared` exists and any get that gave up on it has marked it.
+    const failed = () => {
+      if (shared.answeredPending) this.rememberUnavailable(key);
+    };
+    const shared: InFlightRead = {
+      read: this.performProviderRead(key, deps)
+        .then(
+          (entity) => {
+            if (entity) this.unavailableUntil.delete(key);
+            else failed();
+            return entity;
+          },
+          (err: unknown) => {
+            failed();
+            throw err;
+          }
+        )
+        .finally(() => this.inFlight.delete(key)),
+      answeredPending: false,
+    };
+    this.inFlight.set(key, shared);
+    return shared;
+  }
+
+  private rememberUnavailable(key: string): void {
+    const now = Date.now();
+    // Bound the memo: refs that failed once and were never asked about again
+    // are dropped as soon as they have expired.
+    for (const [ref, until] of this.unavailableUntil) {
+      if (until <= now) this.unavailableUntil.delete(ref);
+    }
+    this.unavailableUntil.set(key, now + this.unavailableTtlMs);
   }
 
   /**

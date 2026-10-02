@@ -113,6 +113,22 @@ export interface QuotaLimit {
    * can observe the true age of carried model or provider readings (#763).
    */
   scrapedAt?: string;
+  /**
+   * Raw commanded start-pacer throttle period in seconds from the latest reasoned
+   * observation for this specific window (0 when unthrottled, null when no observation
+   * has been reasoned) (#336).
+   *
+   * Note: This is the raw per-window commanded period, NOT the effective lane admission
+   * interval enforced by the start pacer (which is the governing maximum across all of
+   * the lane's windows and may be widened to maxIntervalSeconds upon hard staleness via
+   * /v1/throttle).
+   */
+  throttleSeconds?: number | null;
+  /**
+   * Start-pacer controller pace error (positive = consuming faster than linear pace,
+   * negative = plenty of quota headroom), null when no observation has been reasoned (#336).
+   */
+  paceError?: number | null;
 }
 
 /**
@@ -1073,6 +1089,26 @@ export async function parseKimiQuota(
 }
 
 /**
+ * A provider run that was killed before it completed, so its output holds no
+ * panel to extract (#847). It fails the scrape the way a parser throw does, so
+ * history reports it `failed` and its cause survives in the scrape's
+ * `parse_error`. Every killed or signalled subprocess result is `cancelled`;
+ * an ordinary non-zero exit is not, and still goes to extraction.
+ */
+class QuotaCaptureError extends Error {
+  constructor(provider: string, command: string, result: RunResult) {
+    const flags = (["cancelled", "interrupted"] as const).filter((f) => result[f]);
+    const lastLine = result.output.trim().split("\n").pop()?.slice(-200) ?? "";
+    super(
+      `${provider} ${command} capture failed: exit ${result.exitCode}` +
+        (flags.length > 0 ? ` (${flags.join(", ")})` : "") +
+        (lastLine ? `; output ends: ${lastLine}` : "; no output")
+    );
+    this.name = "QuotaCaptureError";
+  }
+}
+
+/**
  * Whether a bad read may carry this previous window forward. Model-scoped
  * windows carry only for Claude, whose Fable window #763 asked to keep.
  */
@@ -1369,7 +1405,10 @@ export class QuotaService {
               status: "unknown",
               scrapedAt,
               raw: rawOutput,
-              message: `LLM quota parsing failed, preserving previous window assessment: ${error instanceof Error ? error.message : String(error)}`,
+              message:
+                error instanceof QuotaCaptureError
+                  ? `${error.message}; preserving previous window assessment`
+                  : `LLM quota parsing failed, preserving previous window assessment: ${error instanceof Error ? error.message : String(error)}`,
             },
             prevState,
             scrapedAt
@@ -1559,6 +1598,7 @@ export class QuotaService {
     // before the LLM parse, which is post-processing, not part of the scrape.
     const scrapedAt = this.scrapedAtNow();
     return this.parsePersistedScrape("claude", output, scrapedAt, async () => {
+      if (result.cancelled) throw new QuotaCaptureError("claude", "/usage", result);
       const apiKey = this.deps.config.geminiApiKey?.trim();
 
       if (!apiKey) {

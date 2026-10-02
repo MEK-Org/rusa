@@ -82,6 +82,8 @@ export interface GrantableServerDeps {
   logger?: Logger;
   /** Workdir for a grantee actor; confines chat-write attachment `filePath`s. */
   actorRootFor?: (actorId: string) => string;
+  /** Whether a grantee's file tools can access the host where it executes. */
+  fileToolsAvailableForActor?: (actorId: string) => boolean;
   driveClients: DriveClient;
   onDriveRead?: (actorId: string, observation: DriveReadObservation) => void;
   /**
@@ -213,9 +215,15 @@ export function buildGrantableServers(
     });
   }
   if (deps.slackClient) {
-    map.set(SLACK_WRITE_MCP_NAME, (_selfId, params) => {
+    map.set(SLACK_WRITE_MCP_NAME, (selfId, params) => {
       if (!deps.slackClient) throw new Error("slackClient is required for slack-write capability");
-      return createSlackWriteMcpServer(deps.slackClient, params.includes("*") ? "all" : params);
+      const workDir = deps.actorRootFor?.(selfId);
+      return createSlackWriteMcpServer(deps.slackClient, params.includes("*") ? "all" : params, {
+        ...(workDir ? { workDir } : {}),
+        ...(deps.fileToolsAvailableForActor
+          ? { fileToolsAvailable: () => deps.fileToolsAvailableForActor?.(selfId) ?? false }
+          : {}),
+      });
     });
   }
   const updateToolDepsFor = deps.hostMaintenance?.updateToolDepsFor;

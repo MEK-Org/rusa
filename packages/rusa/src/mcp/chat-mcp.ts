@@ -1,5 +1,4 @@
-import { readFile, realpath } from "node:fs/promises";
-import { basename, isAbsolute, relative, resolve } from "node:path";
+import { basename } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import mime from "mime";
 import { z } from "zod";
@@ -18,6 +17,7 @@ import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { formatVisibleActorSignature } from "./actor-signature.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
+import { readBoundedRegularFile, resolveAttachmentPath } from "./workdir-path.js";
 
 export const CHAT_WRITE_MCP_NAME = "chat-write";
 export const CHAT_READ_MCP_NAME = "chat-read";
@@ -454,32 +454,6 @@ function appendVisibleActorSignature(body: string, signature: string): string {
   return trailingSignature.test(body) ? body : body ? `${body}\n\n${signature}` : signature;
 }
 
-function isContained(parent: string, child: string): boolean {
-  const rel = relative(parent, child);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
-/**
- * Resolve an attachment `filePath` and confine it to the calling actor's
- * workdir. Without this boundary, `chat-write` is a host-file read-and-exfiltrate
- * primitive: any path the server process can see could be uploaded to a chat
- * space. Both the workdir and the target are realpath'd so `..` traversal and
- * symlinks pointing outside the workdir are rejected, not just lexical escapes;
- * realpath on the target also surfaces ENOENT for nonexistent files.
- */
-async function resolveAttachmentPath(workDir: string, filePath: string): Promise<string> {
-  const realRoot = await realpath(workDir);
-  const target = resolve(realRoot, filePath);
-  if (!isContained(realRoot, target)) {
-    throw new Error("access denied: filePath escapes the actor workdir");
-  }
-  const realTarget = await realpath(target);
-  if (!isContained(realRoot, realTarget)) {
-    throw new Error("access denied: filePath resolves outside the actor workdir");
-  }
-  return realTarget;
-}
-
 /**
  * In-process MCP server exposing outbound Google Chat actions (the
  * {@link ChatClient} seam) as tools. Production wires a `GchatClient`; the e2e
@@ -591,13 +565,12 @@ export function createChatWriteMcpServer(
               });
             } else if (att.filePath) {
               const confinedPath = await resolveAttachmentPath(workDir, att.filePath);
-              const maxBytes = options.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
-              const buf = await readFile(confinedPath);
-              if (buf.length > maxBytes) {
-                throw new Error(
-                  `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
-                );
-              }
+              const buf = await readBoundedRegularFile(
+                workDir,
+                confinedPath,
+                options.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES,
+                "attachment"
+              );
               const filename = att.filename || basename(att.filePath) || "attachment.bin";
               const mimeType = att.mimeType ?? inferChatMimeType(filename);
               const uploaded = await chatClient.uploadAttachment(
@@ -698,12 +671,12 @@ export function createChatWriteMcpServer(
         let effectiveFilename: string;
         if (filePath) {
           const confinedPath = await resolveAttachmentPath(workDir, filePath);
-          contentBuffer = await readFile(confinedPath);
-          if (contentBuffer.length > maxBytes) {
-            throw new Error(
-              `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
-            );
-          }
+          contentBuffer = await readBoundedRegularFile(
+            workDir,
+            confinedPath,
+            maxBytes,
+            "attachment"
+          );
           effectiveFilename = filename || basename(filePath) || "attachment.bin";
         } else if (contentBase64) {
           const estimatedBytes = Math.ceil((contentBase64.length * 3) / 4);

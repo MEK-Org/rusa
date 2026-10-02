@@ -5,6 +5,7 @@ node_modules
 .vscode
 .husky
 packages/rusa/dist
+third_party/glass_goals_devkit/packages/*/dist
 packages/rusa/flutter_dashboard/build
 packages/rusa/flutter_dashboard/.dart_tool
 packages/rusa/flutter_dashboard/.pub

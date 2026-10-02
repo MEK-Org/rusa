@@ -392,6 +392,24 @@ function seedLocalRepo(
   console.log(`[quickstart] Seeded ${repo.repoKey} from ${repo.branch} at ${repo.resolvedPath}`);
 }
 
+// Host ports published by an earlier run's containers. This run removes those
+// containers before starting its own, so the preflight must not count their
+// ports as taken. Only TCP mappings on 127.0.0.1 or 0.0.0.0 count: those are
+// the bindings that block the doctor's 127.0.0.1 TCP probe. Read-only: a
+// missing container or docker reports nothing.
+export function quickstartContainerPorts(containers: string[], ports: number[]): number[] {
+  const held = new Set<number>();
+  for (const container of containers) {
+    const res = spawnSync("docker", ["port", container], { encoding: "utf8", stdio: "pipe" });
+    if (res?.status !== 0) continue;
+    for (const line of res.stdout?.split("\n") ?? []) {
+      const match = /\/tcp -> (?:127\.0\.0\.1|0\.0\.0\.0):(\d+)\s*$/.exec(line);
+      if (match) held.add(Number(match[1]));
+    }
+  }
+  return ports.filter((port) => held.has(port));
+}
+
 export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void> {
   const image = opts.image ?? "rusa:quickstart";
   const container = opts.container ?? "rusa-quickstart";
@@ -401,8 +419,10 @@ export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void>
     opts.executeGit ?? ((args) => spawnSync("git", args, { encoding: "utf8", stdio: "pipe" }));
 
   console.log("\nRusa quickstart\n");
+  const ports = [QUICKSTART_DASHBOARD_PORT, QUICKSTART_GIT_BRIDGE_PORT];
   const doctorResults = await runQuickstartDoctor({
-    ports: [QUICKSTART_DASHBOARD_PORT, QUICKSTART_GIT_BRIDGE_PORT],
+    ports,
+    replaceablePorts: quickstartContainerPorts([container, setupContainer], ports),
   });
   console.log(formatDoctorResults(doctorResults));
   if (doctorResults.some((result) => result.status === "fail")) {
@@ -418,7 +438,8 @@ export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void>
     const validation = validateLocalGitRepo(opts.localRepo, executeGit);
     if (!validation.valid) {
       console.error(`[quickstart] Invalid repository path: ${validation.error}`);
-      throw new Error(validation.error);
+      process.exitCode = 1;
+      return;
     }
     localRepoValidation = validation;
     console.log(`[quickstart] Local repository selected: ${validation.resolvedPath}`);
@@ -577,7 +598,7 @@ export function runProviderLogins(
     if (!spec) {
       if (UNSUPPORTED_QUICKSTART_LOGIN_PROVIDERS.has(provider)) {
         console.log(
-          `[quickstart] Quickstart login for ${provider} isn't supported yet (tracked in ISSUE_NUM); complete auth via the vendor's own CLI.`
+          `[quickstart] Quickstart login for ${provider} isn't supported yet; complete auth via the vendor's own CLI.`
         );
         continue;
       }
@@ -607,18 +628,30 @@ export function runProviderLogins(
   }
 }
 
-export function readExistingRepos(configPath: string): string[] {
-  if (!existsSync(configPath)) return [];
-  let parsed: unknown;
+function readExistingConfig(configPath: string): RusaConfig | null {
+  if (!existsSync(configPath)) return null;
   try {
-    parsed = parseYaml(readFileSync(configPath, "utf8"));
+    return parseYaml(readFileSync(configPath, "utf8")) as RusaConfig | null;
   } catch (err) {
     throw new Error(
       `Could not read existing configuration at ${configPath}: ${err instanceof Error ? err.message : err}`
     );
   }
-  const repos = (parsed as RusaConfig | null)?.github?.repos;
+}
+
+export function readExistingRepos(configPath: string): string[] {
+  return reposFromConfig(readExistingConfig(configPath));
+}
+
+function reposFromConfig(config: RusaConfig | null): string[] {
+  const repos = config?.github?.repos;
   return Array.isArray(repos) ? repos.filter((repo) => typeof repo === "string") : [];
+}
+
+function rootHandleFromConfig(config: RusaConfig | null): string | undefined {
+  const handle = config?.rootActor?.handle;
+  // Kept verbatim: the runtime resolves the stored handle byte-for-byte.
+  return typeof handle === "string" && handle.trim() ? handle : undefined;
 }
 
 export interface QuickstartConfigureOptions {
@@ -629,7 +662,9 @@ export interface QuickstartConfigureOptions {
 export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = {}): Promise<void> {
   const mcHome = resolveHomeOverride(opts.home);
   const configPath = join(mcHome, "config.yaml");
-  const existingRepos = readExistingRepos(configPath);
+  const existingConfig = readExistingConfig(configPath);
+  const existingRepos = reposFromConfig(existingConfig);
+  const existingRootHandle = rootHandleFromConfig(existingConfig);
 
   console.log("\nRusa quickstart configuration\n");
   console.log("This writes configuration inside the container.\n");
@@ -671,12 +706,21 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
 
   writeHostSecret(GEMINI_API_KEY_SECRET_FILENAME, geminiApiKey.trim(), mcHome);
 
-  const suggestedRootHandle = generateRandomRootHandle();
+  // A reconfigure offers the current handle so accepting the default never
+  // renames root; only a fresh install gets a random suggestion.
+  const suggestedRootHandle = existingRootHandle ?? generateRandomRootHandle();
   const rootHandleAnswer = await input({
-    message: `Root entity handle/name (leave blank for suggested: "${suggestedRootHandle}"):`,
+    message: existingRootHandle
+      ? `Root entity handle/name (leave blank to keep current: "${existingRootHandle}"):`
+      : `Root entity handle/name (leave blank for suggested: "${suggestedRootHandle}"):`,
     default: suggestedRootHandle,
   });
-  const rootHandle = rootHandleAnswer.trim() || suggestedRootHandle;
+  // Accepting the displayed default returns it untrimmed; only a new answer
+  // is normalized.
+  const rootHandle =
+    rootHandleAnswer === suggestedRootHandle || !rootHandleAnswer.trim()
+      ? suggestedRootHandle
+      : rootHandleAnswer.trim();
   const rootProvider = providers[0];
   const rootModel = (
     await input({

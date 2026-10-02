@@ -54,9 +54,11 @@ import {
 } from "../actor/event-subscriptions.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import {
+  FailureEscalationBackoff,
   type FailureSinkDeps,
   formatProviderLabel,
   routeRunFailure,
+  routeSpawnFailure,
 } from "../actor/failure-sink.js";
 import { GracefulShutdown } from "../actor/graceful-shutdown.js";
 import {
@@ -1518,7 +1520,11 @@ async function composeStart(
   if (chatClient) {
     servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
   }
-  if (slackClient) servers[SLACK_READ_MCP_NAME] = () => createSlackReadMcpServer(slackClient);
+  if (slackClient) {
+    // Only root mounts the shared server, so its downloads land in root's workdir.
+    const workDir = join(mcHome, "root-agent");
+    servers[SLACK_READ_MCP_NAME] = () => createSlackReadMcpServer(slackClient, { workDir });
+  }
   // Read when an inbox server is built, so every actor's selection sees the
   // same chat backends the read tools do.
   const inboxChatContextSources = (): InboxChatContextSources => ({
@@ -2286,6 +2292,9 @@ async function composeStart(
     // mapping the pnpm-install and root wiring use for actor roots.
     actorRootFor: (actorId) =>
       actorId === rootId ? join(mcHome, "root-agent") : join(workersDir, actorId),
+    // File tools run on the leader. Recheck placement at each call so a
+    // follower-hosted actor cannot read a stale leader-side workdir.
+    fileToolsAvailableForActor: (actorId) => actors.get(actorId)?.executionTarget === undefined,
     driveClients,
     hostMaintenance: { updateToolDepsFor, pnpmHardlinks: pnpmHardlinksDeps },
     onDriveRead: (actorId, observation) =>
@@ -2628,7 +2637,7 @@ async function composeStart(
             body: JSON.stringify(compacted),
           });
         }
-        if (!result.success && !result.capped) {
+        if (!result.success) {
           await routeRunFailure(
             failureSink,
             id,
@@ -3027,11 +3036,7 @@ async function composeStart(
           body: errorMsg,
         });
 
-        if (rec.parentId) {
-          failureSink.sendToParent(rec.parentId, `[spawn failed] ${errorMsg}`, id);
-        } else {
-          failureSink.postToErrorChat?.(`⚠️ ${errorMsg}`);
-        }
+        routeSpawnFailure(failureSink, id, rec.parentId, errorMsg);
         throw new Error(errorMsg);
       }
 
@@ -3130,7 +3135,10 @@ async function composeStart(
         }
         if (slackClient) {
           const slackReadUrl = mcpHttp.addServer(`${id}:${SLACK_READ_MCP_NAME}`, () =>
-            createSlackReadMcpServer(slackClient)
+            createSlackReadMcpServer(slackClient, {
+              workDir: join(workersDir, id),
+              fileToolsAvailable: () => actors.get(id)?.executionTarget === undefined,
+            })
           );
           perActorShared.push({ name: SLACK_READ_MCP_NAME, url: slackReadUrl });
         }
@@ -3212,7 +3220,11 @@ async function composeStart(
           buildPrompt: () => {
             const r = actors.get(id);
             if (!r) return { prompt: "No active thread record." };
-            const handles = resolveHandleLabels(r.handles, (hid) => actors.get(hid)?.charter);
+            const handles = resolveHandleLabels(
+              r.handles,
+              (hid) => actors.get(hid)?.charter,
+              (hid) => actors.get(hid)?.title
+            );
             // Portable-context actors (design ISSUE_NUM) get their own recent run outputs
             // assembled into a stateless prefix; the per-run inject record rides on
             // this run's `run_start` event, not its own event kind.
@@ -3397,8 +3409,8 @@ async function composeStart(
   });
   const failureSink: FailureSinkDeps = {
     actors,
-    sendToParent: (toId, body, fromId, forensics) =>
-      mesh.deliverMechanicalInboxNotice(toId, body, fromId, forensics),
+    sendToParent: (toId, body, fromId, forensics, delivery) =>
+      mesh.deliverMechanicalInboxNotice(toId, body, fromId, forensics, undefined, delivery),
     postToErrorChat: errorNotifier ? (text) => errorNotifier.notify(text) : null,
     rootId: rootId,
     log: (m) => console.warn(`[failure-sink] ${m}`),
@@ -3407,6 +3419,9 @@ async function composeStart(
     // ISSUE_NUM: name quota exhaustion in the failure notice so a worker's parent
     // (who now owns the fallback judgment) can see the cause up front.
     classify: classifyExhaustion,
+    // #189: a child's failure wakes its parent past provider pacing, backed
+    // off per child so a crash loop cannot hammer the parent.
+    escalation: new FailureEscalationBackoff(),
   };
 
   // Publish the live callback port only after the shared MCP server is bound.
@@ -3561,7 +3576,7 @@ async function composeStart(
   const rootSlackUrl =
     slackClient && config.slack
       ? mcpHttp.addServer(`${rootId}:${SLACK_WRITE_MCP_NAME}`, () =>
-          createSlackWriteMcpServer(slackClient, "all")
+          createSlackWriteMcpServer(slackClient, "all", { workDir: rootAgentDir })
         )
       : undefined;
 
@@ -4552,7 +4567,7 @@ async function composeStart(
 
   raiseQuotaWindowMissedAlarm = (missed) => {
     const scrape = missed.scrapeFailed
-      ? "quota scrape failed to parse, so it no longer shows"
+      ? "quota scrape failed, so it no longer shows"
       : "quota scrape no longer shows";
     const message =
       `Quota window missed: the latest ${missed.provider} ${scrape} ` +

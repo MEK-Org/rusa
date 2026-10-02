@@ -174,6 +174,41 @@ describe("runQuickstartDoctor", () => {
     expect(formatDoctorResults(results)).toContain("localhost port(s) already in use: 8085");
   });
 
+  it("skips ports held by quickstart's own container but still fails on another holder", async () => {
+    // 8080 belongs to the container this run replaces; 8085 is held by something else.
+    const isPortAvailable = vi.fn(async () => false);
+    const results = await runQuickstartDoctor({
+      repoRoot: "/repo",
+      targetPath: "/repo",
+      ports: [8080, 8085],
+      replaceablePorts: [8080],
+      deps: deps(passingCommands, { isPortAvailable }),
+    });
+
+    const ports = results.find((result) => result.name === "loopback ports");
+    expect(ports?.status).toBe("fail");
+    expect(ports?.message).toBe("localhost port(s) already in use: 8085.");
+    expect(isPortAvailable.mock.calls).toEqual([[8085]]);
+  });
+
+  it("passes when every busy port belongs to quickstart's own container", async () => {
+    const isPortAvailable = vi.fn(async () => false);
+    const results = await runQuickstartDoctor({
+      repoRoot: "/repo",
+      targetPath: "/repo",
+      ports: [8080, 8085],
+      replaceablePorts: [8080, 8085],
+      deps: deps(passingCommands, { isPortAvailable }),
+    });
+
+    const ports = results.find((result) => result.name === "loopback ports");
+    expect(ports?.status).toBe("pass");
+    expect(ports?.message).toBe(
+      "localhost port(s) 8080, 8085 are held by the quickstart container this run replaces."
+    );
+    expect(isPortAvailable).not.toHaveBeenCalled();
+  });
+
   it("runs the flutter version check from the real flutter_dashboard/ directory", async () => {
     const expectedCwd = defaultFlutterDashboardDir();
     const { deps: loggedDeps, calls } = depsWithRunLog();
