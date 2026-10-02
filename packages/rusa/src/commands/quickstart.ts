@@ -629,7 +629,8 @@ function reposFromConfig(config: RusaConfig | null): string[] {
 
 function rootHandleFromConfig(config: RusaConfig | null): string | undefined {
   const handle = config?.rootActor?.handle;
-  return typeof handle === "string" && handle.trim() ? handle.trim() : undefined;
+  // Kept verbatim: the runtime resolves the stored handle byte-for-byte.
+  return typeof handle === "string" && handle.trim() ? handle : undefined;
 }
 
 export interface QuickstartConfigureOptions {
@@ -693,7 +694,12 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
       : `Root entity handle/name (leave blank for suggested: "${suggestedRootHandle}"):`,
     default: suggestedRootHandle,
   });
-  const rootHandle = rootHandleAnswer.trim() || suggestedRootHandle;
+  // Accepting the displayed default returns it untrimmed; only a new answer
+  // is normalized.
+  const rootHandle =
+    rootHandleAnswer === suggestedRootHandle || !rootHandleAnswer.trim()
+      ? suggestedRootHandle
+      : rootHandleAnswer.trim();
   const rootProvider = providers[0];
   const rootModel = (
     await input({

@@ -200,26 +200,32 @@ describe("quickstart command", () => {
     );
   });
 
-  it("keeps the existing root handle when a reconfigure handle prompt is blank (#833)", async () => {
+  // The runtime resolves the stored handle byte-for-byte, so a padded handle
+  // must survive both a blank answer and acceptance of the displayed default.
+  it.each([
+    ["my-root", ""],
+    [" my-root ", ""],
+    [" my-root ", " my-root "],
+  ])("keeps the existing root handle %j on reconfigure when the answer is %j (#833)", async (handle, answer) => {
     writeFileSync(
       join(home, "config.yaml"),
       toYaml({
         profile: "quickstart",
         providers: { codex: { cliCommand: "codex" } },
-        rootActor: { provider: "codex", model: "gpt-5.6-sol", handle: "my-root" },
+        rootActor: { provider: "codex", model: "gpt-5.6-sol", handle },
       })
     );
-    promptMocks.state.inputs = ["codex", "", "gpt-5.6-sol"];
+    promptMocks.state.inputs = ["codex", answer, "gpt-5.6-sol"];
     promptMocks.state.passwords = ["test-gemini-key"];
 
     await runQuickstartConfigure({ home, executeProviderCommand: () => 0 });
 
     const config = parseYaml(readFileSync(join(home, "config.yaml"), "utf8")) as RusaConfig;
-    expect(config.rootActor?.handle).toBe("my-root");
+    expect(config.rootActor?.handle).toBe(handle);
     expect(promptMocks.input).toHaveBeenCalledWith(
       expect.objectContaining({
-        message: 'Root entity handle/name (leave blank to keep current: "my-root"):',
-        default: "my-root",
+        message: `Root entity handle/name (leave blank to keep current: "${handle}"):`,
+        default: handle,
       })
     );
   });
