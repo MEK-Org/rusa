@@ -2139,6 +2139,7 @@ async function composeStart(
         ),
         coordinator: new SystemdCoordinatorRestarter({
           cliPath: join(packageDir, "dist", "cli.js"),
+          dialedSocketPath: coordinatorSocketPath,
           log: (m) => log.info("update_coordinator", { detail: m }),
         }),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),

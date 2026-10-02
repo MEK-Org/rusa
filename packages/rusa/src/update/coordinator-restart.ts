@@ -247,6 +247,8 @@ export interface SystemdCoordinatorRestarterOptions {
   cliPath: string;
   unit?: string;
   timeoutMs?: number;
+  /** The socket this instance dials (`quota.coordinator.socketPath`); read only to report its revision. */
+  dialedSocketPath?: string;
   /** Injection seams for tests; production runs systemctl and the built CLI. */
   showUnit?: (unit: string) => Promise<string | null>;
   restartUnit?: (unit: string) => Promise<void>;
@@ -312,6 +314,10 @@ export class SystemdCoordinatorRestarter implements CoordinatorRestartSeam {
 
   loadedRevision(target: CoordinatorTarget): Promise<string | null> {
     return readReadyRevision(target.socketPath);
+  }
+
+  async dialedRevision(): Promise<string | null> {
+    return this.options.dialedSocketPath ? readReadyRevision(this.options.dialedSocketPath) : null;
   }
 
   async backup(target: CoordinatorTarget): Promise<void> {

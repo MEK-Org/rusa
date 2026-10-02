@@ -155,8 +155,12 @@ socket:
   its home or config cannot be read. The update proceeds, does not restart the
   coordinator, and says so; it never reports a refresh it did not verify.
 
-A coordinator revision that differs from the client's is drift, reported by
-`loadedRevision`, not a reason to fail or roll back a client update.
+When the update does not refresh the coordinator, it reads the `loadedRevision`
+of the coordinator this instance dials (`quota.coordinator.socketPath`) once and
+reports it, or reports it unknown when the instance dials none or that read
+fails. The read is for the report only and never decides ownership. A revision
+that differs from the client's build is drift, logged as such, not a reason to
+fail or roll back a client update.
 
 For an owned unit, after a green build and before the client drain, the
 update:

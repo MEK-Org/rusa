@@ -98,6 +98,12 @@ export interface CoordinatorRestartSeam {
   artifactRevision(): string | null;
   /** The revision the running coordinator reports loaded, or null when it cannot say. */
   loadedRevision(target: CoordinatorTarget): Promise<string | null>;
+  /**
+   * The revision reported by the coordinator this instance dials, for the
+   * report when it does not own the unit. Never an input to ownership; null
+   * when it dials none or that coordinator cannot say.
+   */
+  dialedRevision(): Promise<string | null>;
   /** The runbook's pre-restart database backup. Throws to refuse the restart. */
   backup(target: CoordinatorTarget): Promise<void>;
   /** Restart the unit and require its readyz to report `expectedRevision`. */
@@ -106,7 +112,12 @@ export interface CoordinatorRestartSeam {
 
 /** What the update did about the pool coordinator, for the result and the action log. */
 export type CoordinatorRefresh =
-  | { outcome: "not-owner" | "unknown"; reason: string }
+  | {
+      outcome: "not-owner" | "unknown";
+      reason: string;
+      /** What the dialed coordinator reports loaded; a difference from this build is drift. */
+      loadedRevision: string | null;
+    }
   | {
       /** `refreshed`: confirmed on the new build. `restored`: confirmed back on the retained one. */
       outcome: "refreshed" | "restored";
@@ -119,7 +130,10 @@ export type CoordinatorRefresh =
 function describeCoordinator(refresh: CoordinatorRefresh): string {
   if ("reason" in refresh) {
     const why = refresh.outcome === "not-owner" ? "not owned" : "ownership unknown";
-    return `not refreshed, ${why}: ${refresh.reason}`;
+    const loaded = refresh.loadedRevision
+      ? `loaded ${shortSha(refresh.loadedRevision)}`
+      : "loaded revision unknown";
+    return `not refreshed, ${why}: ${refresh.reason}; ${loaded}`;
   }
   const was = refresh.previousLoadedRevision ? shortSha(refresh.previousLoadedRevision) : "unknown";
   return `${refresh.outcome} to ${shortSha(refresh.loadedRevision)} (previously loaded ${was})`;
@@ -342,8 +356,17 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
       step = "coordinator";
       const resolved = await deps.coordinator.resolve();
       if (resolved.ownership !== "owner") {
-        coordinator = { outcome: resolved.ownership, reason: resolved.reason };
-        log(`[update] pool coordinator ${describeCoordinator(coordinator)}`);
+        coordinator = {
+          outcome: resolved.ownership,
+          reason: resolved.reason,
+          loadedRevision: await deps.coordinator.dialedRevision(),
+        };
+        log(
+          `[update] pool coordinator ${describeCoordinator(coordinator)}` +
+            (coordinator.loadedRevision && coordinator.loadedRevision !== newSha
+              ? ` (drift from this build ${shortSha(newSha)}; not a rollback trigger)`
+              : "")
+        );
       } else {
         const { target } = resolved;
         const built = deps.coordinator.artifactRevision();

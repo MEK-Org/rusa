@@ -364,6 +364,8 @@ async function composedUpdate(opts: {
   updating: "owner" | "client";
   failDrain?: boolean;
   retainedSentinel?: string | null;
+  /** Whether the updating instance has a `quota.coordinator.socketPath` to dial. */
+  dials?: boolean;
 }) {
   const host = syntheticHost({ socketPath: join(socketDir(), "coordinator.sock") });
   const ownerDist = host.distDir(host.owner);
@@ -383,6 +385,7 @@ async function composedUpdate(opts: {
   const restarter = new SystemdCoordinatorRestarter({
     cliPath: host.cliPath(updatingCheckout),
     timeoutMs: 500,
+    dialedSocketPath: opts.dials === false ? undefined : configuredSocket,
     showUnit: async () => host.show(),
     restartUnit: async (unit) => {
       restarts.push(unit);
@@ -446,15 +449,25 @@ async function composedUpdate(opts: {
 }
 
 describe("composed update across an owner and a client checkout", () => {
-  it("a client checkout's update restarts the coordinator zero times", async () => {
-    const { result, restarts, exits } = await composedUpdate({ updating: "client" });
+  it("a client checkout's update restarts the coordinator zero times and reports its loaded revision", async () => {
+    const { result, restarts, exits, loaded } = await composedUpdate({ updating: "client" });
     expect(result.ok).toBe(true);
+    // C differs from the client's build D: drift, reported, not acted on.
     expect(result.coordinator).toEqual({
       outcome: "not-owner",
       reason: expect.stringContaining("owner-checkout"),
+      loadedRevision: LOADED_C,
     });
     expect(restarts).toEqual([]);
+    expect(loaded).toBe(LOADED_C);
     expect(exits).toEqual([0]);
+  });
+
+  it("a client that dials no coordinator reports its loaded revision as unknown", async () => {
+    const { result, restarts } = await composedUpdate({ updating: "client", dials: false });
+    expect(result.ok).toBe(true);
+    expect(result.coordinator).toMatchObject({ outcome: "not-owner", loadedRevision: null });
+    expect(restarts).toEqual([]);
   });
 
   it("the owner's update confirms the built artifact and records what was loaded before", async () => {

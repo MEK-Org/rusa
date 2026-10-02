@@ -33,6 +33,8 @@ function fakeCoordinator(
     /** The live dist sentinel before and after the build-seam rollback swaps dists. */
     artifact?: () => string | null;
     loaded?: string | null;
+    /** What the coordinator this instance dials reports (not-owner/unknown report). */
+    dialed?: string | null;
   } = {}
 ) {
   const calls: string[] = over.order ?? [];
@@ -47,6 +49,10 @@ function fakeCoordinator(
     async loadedRevision() {
       calls.push("loaded");
       return over.loaded === undefined ? OLD : over.loaded;
+    },
+    async dialedRevision() {
+      calls.push("dialed");
+      return over.dialed === undefined ? OLD : over.dialed;
     },
     async backup(target) {
       calls.push(`backup:${target.home}`);
@@ -308,16 +314,39 @@ describe("executeUpdate — happy path (green build → drain → exit)", () => 
     ["unknown", "daemon-reload pending", "not refreshed, ownership unknown"],
   ] as const)("a %s coordinator is left alone and reported, and the update proceeds", async (ownership, reason, logged) => {
     const { deps, exits, actions } = makeDeps();
+    const logs: string[] = [];
+    deps.log = (m) => void logs.push(m);
     const coordinator = fakeCoordinator({ resolved: { ownership, reason } });
     deps.coordinator = coordinator.seam;
 
     const res = await executeUpdate(plan(), deps);
 
     expect(res.ok).toBe(true);
-    expect(res.coordinator).toEqual({ outcome: ownership, reason });
-    expect(coordinator.calls).toEqual(["resolve"]);
-    expect(actions.at(-1)).toContain(`[coordinator: ${logged}: ${reason}]`);
+    expect(res.coordinator).toEqual({ outcome: ownership, reason, loadedRevision: OLD });
+    expect(coordinator.calls).toEqual(["resolve", "dialed"]);
+    expect(actions.at(-1)).toContain(`[coordinator: ${logged}: ${reason}; loaded 0000000]`);
+    expect(
+      logs.some((l) => l.includes("drift from this build 1111111; not a rollback trigger"))
+    ).toBe(true);
     expect(exits).toEqual([0]);
+  });
+
+  it("a dialed coordinator that cannot say is reported as unknown, not as drift", async () => {
+    const { deps, actions } = makeDeps();
+    const logs: string[] = [];
+    deps.log = (m) => void logs.push(m);
+    const coordinator = fakeCoordinator({
+      resolved: { ownership: "not-owner", reason: "no unit is installed" },
+      dialed: null,
+    });
+    deps.coordinator = coordinator.seam;
+
+    const res = await executeUpdate(plan(), deps);
+
+    expect(res.ok).toBe(true);
+    expect(res.coordinator).toMatchObject({ outcome: "not-owner", loadedRevision: null });
+    expect(actions.at(-1)).toContain("loaded revision unknown]");
+    expect(logs.some((l) => l.includes("drift"))).toBe(false);
   });
 
   it("still exits even if the drain times out (don't wedge on a stuck actor)", async () => {
