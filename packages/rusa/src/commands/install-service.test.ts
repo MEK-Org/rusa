@@ -1,12 +1,27 @@
+import { spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { POOL_COORDINATOR_UNIT } from "./coordinator-provisioning.js";
 import {
   buildAlertUnit,
+  buildLogRotateTimer,
+  buildLogRotateUnit,
   buildQuotaCoordinatorUnit,
   buildServiceUnit,
   unitOrdersAfter,
   withCoordinatorOrdering,
+  writeLogRotationUnits,
 } from "./install-service.js";
+import { logRotationUnitNames } from "./service-instance.js";
 
 const base = {
   description: "Rusa",
@@ -233,5 +248,200 @@ describe("withCoordinatorOrdering — the instance that was installed first", ()
 
   it("refuses a file that is not a unit rather than guessing where the section is", () => {
     expect(() => withCoordinatorOrdering("not a unit\n", coordinator)).toThrow(/\[Unit\]/);
+  });
+});
+
+/**
+ * Run a generated oneshot the way systemd assembles its process (systemd.exec(5),
+ * systemd.service(5)): `Environment=` first, then each `EnvironmentFile=` on top,
+ * whose values override `Environment=` regardless of order; then `${NAME}` / `$NAME`
+ * substitution in `ExecStart=`, with `$$` a literal `$`.
+ */
+function runOneshotAsSystemd(unitText: string) {
+  const env: Record<string, string> = {};
+  const envFiles: string[] = [];
+  let execStart = "";
+  for (const line of unitText.split("\n")) {
+    const eq = line.indexOf("=");
+    const key = line.slice(0, eq);
+    const value = line.slice(eq + 1);
+    if (key === "Environment") {
+      const at = value.indexOf("=");
+      env[value.slice(0, at)] = value.slice(at + 1);
+    } else if (key === "EnvironmentFile") {
+      envFiles.push(value);
+    } else if (key === "ExecStart") {
+      execStart = value;
+    }
+  }
+  for (const entry of envFiles) {
+    const path = entry.startsWith("-") ? entry.slice(1) : entry;
+    if (!existsSync(path) && entry.startsWith("-")) continue;
+    for (const raw of readFileSync(path, "utf8").split("\n")) {
+      const line = raw.trim();
+      if (line === "" || line.startsWith("#")) continue;
+      const at = line.indexOf("=");
+      env[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+    }
+  }
+  const argv = [...execStart.matchAll(/"((?:[^"\\]|\\.)*)"|(\S+)/g)].map((match) =>
+    (match[1] === undefined ? match[2] : match[1].replace(/\\(.)/g, "$1")).replace(
+      /\$\$|\$\{(\w+)\}|\$(\w+)/g,
+      (token, braced, bare) => (token === "$$" ? "$" : (env[braced ?? bare] ?? ""))
+    )
+  );
+  const [command, ...args] = argv;
+  return spawnSync(command, args, { env, encoding: "utf8" });
+}
+
+describe("service log rotation units (#580)", () => {
+  const rotate = {
+    description: "Rusa log rotation (rusa-staging)",
+    nodePath: "/usr/bin/node",
+    rotateScript: "/deploy/rusa/packages/rusa/scripts/rotate-log.mjs",
+    mcHome: "/home/x/.rusa-staging",
+    logPath: "/home/x/.rusa-staging/logs/rusa.log",
+  };
+
+  it("names the rotation units after the instance they belong to", () => {
+    expect(logRotationUnitNames("rusa")).toEqual({
+      service: "rusa-logrotate.service",
+      timer: "rusa-logrotate.timer",
+    });
+    expect(logRotationUnitNames("rusa-staging")).toEqual({
+      service: "rusa-staging-logrotate.service",
+      timer: "rusa-staging-logrotate.timer",
+    });
+  });
+
+  it("is a oneshot that runs the standalone rotator against this instance's log only", () => {
+    const unit = buildLogRotateUnit(rotate);
+    expect(unit).toContain("Type=oneshot");
+    // The log is an argument, so no environment value (and no .env) can retarget it.
+    expect(unit).toContain(
+      'ExecStart="/usr/bin/node" "/deploy/rusa/packages/rusa/scripts/rotate-log.mjs" "/home/x/.rusa-staging/logs/rusa.log"'
+    );
+    expect(unit).not.toContain("RUSA_LOG_PATH");
+    // Operator overrides (bound, retention, opt-out) come from the instance's own .env.
+    expect(unit).toContain("EnvironmentFile=-/home/x/.rusa-staging/.env");
+    // Started by the timer, never enabled on its own.
+    expect(unit).not.toContain("[Install]");
+  });
+
+  it("doubles a `$` in the log path so systemd cannot substitute the .env into it", () => {
+    const unit = buildLogRotateUnit({
+      ...rotate,
+      logPath: "/home/x/odd$RUSA_LOG_PATH/logs/rusa.log",
+    });
+    expect(unit).toContain('"/home/x/odd$$RUSA_LOG_PATH/logs/rusa.log"');
+  });
+
+  it("fires the rotation hourly, catching up a run missed while the host was down", () => {
+    const timer = buildLogRotateTimer({
+      description: "Rusa log rotation timer (rusa-staging)",
+      rotateUnit: "rusa-staging-logrotate.service",
+    });
+    expect(timer).toContain("[Timer]");
+    expect(timer).toContain("OnCalendar=hourly");
+    expect(timer).toContain("Persistent=true");
+    expect(timer).toContain("Unit=rusa-staging-logrotate.service");
+    expect(timer).toContain("WantedBy=timers.target");
+  });
+
+  it("writes both units, and rewriting them is a no-op", () => {
+    const systemdUserDir = mkdtempSync(join(tmpdir(), "rusa-units-"));
+    const write = () =>
+      writeLogRotationUnits({ systemdUserDir, serviceBasename: "rusa-staging", ...rotate });
+    const names = write();
+    expect(names).toEqual(logRotationUnitNames("rusa-staging"));
+    const first = readdirSync(systemdUserDir).map((f) => [
+      f,
+      readFileSync(join(systemdUserDir, f), "utf8"),
+    ]);
+    write();
+    const second = readdirSync(systemdUserDir).map((f) => [
+      f,
+      readFileSync(join(systemdUserDir, f), "utf8"),
+    ]);
+    expect(second).toEqual(first);
+    expect(first.map(([f]) => f).sort()).toEqual([
+      "rusa-staging-logrotate.service",
+      "rusa-staging-logrotate.timer",
+    ]);
+  });
+
+  it("keeps two instances' rotation apart: distinct units, each pinned to its own log", () => {
+    const systemdUserDir = mkdtempSync(join(tmpdir(), "rusa-units-"));
+    writeLogRotationUnits({
+      systemdUserDir,
+      serviceBasename: "rusa",
+      ...rotate,
+      mcHome: "/home/x/.rusa",
+      logPath: "/home/x/.rusa/logs/rusa.log",
+    });
+    writeLogRotationUnits({ systemdUserDir, serviceBasename: "rusa-staging", ...rotate });
+    const prod = readFileSync(join(systemdUserDir, "rusa-logrotate.service"), "utf8");
+    const staging = readFileSync(join(systemdUserDir, "rusa-staging-logrotate.service"), "utf8");
+    expect(prod).toContain('"/home/x/.rusa/logs/rusa.log"');
+    expect(prod).not.toContain(".rusa-staging");
+    expect(staging).toContain('"/home/x/.rusa-staging/logs/rusa.log"');
+    expect(readFileSync(join(systemdUserDir, "rusa-logrotate.timer"), "utf8")).toContain(
+      "Unit=rusa-logrotate.service"
+    );
+  });
+
+  it("rotates its own instance's log even when that instance's .env names another log", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-isolation-"));
+    const instance = (name: string) => {
+      const mcHome = join(root, name);
+      mkdirSync(join(mcHome, "logs"), { recursive: true });
+      const logPath = join(mcHome, "logs", "rusa.log");
+      writeFileSync(logPath, `${name} log, over the bound\n`);
+      return { mcHome, logPath };
+    };
+    const staging = instance(".rusa-staging");
+    const prod = instance(".rusa");
+    writeFileSync(`${staging.logPath}.2`, "staging generation past the retention count\n");
+    // The staging .env is wrong about the log path, and also carries the three
+    // rotation overrides the operator is meant to set there.
+    writeFileSync(
+      join(staging.mcHome, ".env"),
+      [
+        "# synthetic instance env",
+        `RUSA_LOG_PATH=${prod.logPath}`,
+        "RUSA_LOG_ROTATE_MAX_BYTES=10",
+        "RUSA_LOG_ROTATE_KEEP=1",
+        "RUSA_LOG_ROTATE=on",
+        "",
+      ].join("\n")
+    );
+    const systemdUserDir = mkdtempSync(join(tmpdir(), "rusa-units-"));
+    writeLogRotationUnits({
+      systemdUserDir,
+      serviceBasename: "rusa-staging",
+      nodePath: process.execPath,
+      rotateScript: resolve("scripts/rotate-log.mjs"),
+      ...staging,
+    });
+
+    const result = runOneshotAsSystemd(
+      readFileSync(join(systemdUserDir, "rusa-staging-logrotate.service"), "utf8")
+    );
+
+    expect(result.status).toBe(0);
+    // The other instance's log is untouched…
+    expect(readFileSync(prod.logPath, "utf8")).toBe(".rusa log, over the bound\n");
+    expect(existsSync(`${prod.logPath}.1`)).toBe(false);
+    // …and this instance's was rotated under the .env's bound and retention.
+    expect(readFileSync(`${staging.logPath}.1`, "utf8")).toBe(
+      ".rusa-staging log, over the bound\n"
+    );
+    expect(readFileSync(staging.logPath, "utf8")).toBe("");
+    expect(readdirSync(join(staging.mcHome, "logs")).sort()).toEqual(["rusa.log", "rusa.log.1"]);
+  });
+
+  it("ships the rotator in the package, beside the notifier", () => {
+    const packageJson = JSON.parse(readFileSync(resolve("package.json"), "utf8"));
+    expect(packageJson.files).toContain("scripts/rotate-log.mjs");
   });
 });

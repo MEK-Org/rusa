@@ -42,6 +42,7 @@ import {
 import {
   type DeploymentMode,
   type ExecutableSource,
+  logRotationUnitNames,
   type ProbePathEnv,
   readUnitEnvironment,
   resolveExecutableOnPath,
@@ -165,8 +166,9 @@ export function buildServiceUnit(opts: {
   execStartPre?: string;
   /**
    * Send stdout/stderr to the systemd journal (self-rotating, queryable with
-   * `journalctl`/`rusa logs`) instead of appending to a never-rotated file that
-   * can balloon. Default false (append-to-file) to preserve existing install behavior.
+   * `journalctl`/`rusa logs`) instead of appending to a file, which only the
+   * size-bounded logrotate timer keeps from ballooning (#580). Default false
+   * (append-to-file) to preserve existing install behavior.
    */
   logToJournal?: boolean;
 }): string {
@@ -249,6 +251,90 @@ export function buildAlertUnit(opts: {
     ""
   );
   return unit.join("\n");
+}
+
+/**
+ * The service-log rotation oneshot (#580). It runs the STANDALONE rotator
+ * against this instance's log, pinned by absolute path so it can never touch
+ * another instance's files. The bound, the retention count, and the opt-out are
+ * read from the instance's `.env` (see docs/logging.md).
+ *
+ * The log path is an ExecStart argument, not an `Environment=` line: systemd
+ * lets `EnvironmentFile=` values override `Environment=`, so a `RUSA_LOG_PATH`
+ * in the `.env` would otherwise retarget this unit at another instance's log.
+ * Its `$` is doubled so systemd's `${NAME}` substitution, which also reads the
+ * `.env`, cannot rewrite the path either.
+ */
+export function buildLogRotateUnit(opts: {
+  description: string;
+  nodePath: string;
+  rotateScript: string;
+  mcHome: string;
+  logPath: string;
+}): string {
+  return [
+    "[Unit]",
+    `Description=${opts.description}`,
+    "",
+    "[Service]",
+    "Type=oneshot",
+    `EnvironmentFile=-${join(opts.mcHome, ".env")}`,
+    `ExecStart=${quoteExecArg(opts.nodePath)} ${quoteExecArg(opts.rotateScript)} ${quoteExecArg(opts.logPath.replaceAll("$", () => "$$"))}`,
+    "",
+  ].join("\n");
+}
+
+/** Fires {@link buildLogRotateUnit} hourly; `Persistent=` catches up a run missed while the host was down. */
+export function buildLogRotateTimer(opts: { description: string; rotateUnit: string }): string {
+  return [
+    "[Unit]",
+    `Description=${opts.description}`,
+    "",
+    "[Timer]",
+    "OnCalendar=hourly",
+    "Persistent=true",
+    `Unit=${opts.rotateUnit}`,
+    "",
+    "[Install]",
+    "WantedBy=timers.target",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Write one instance's rotation service + timer. Rewriting identical content is
+ * a no-op, so a repeated install or upgrade changes nothing; enabling the timer
+ * is left to the caller, which owns the systemctl calls.
+ */
+export function writeLogRotationUnits(opts: {
+  systemdUserDir: string;
+  serviceBasename: string;
+  nodePath: string;
+  rotateScript: string;
+  mcHome: string;
+  logPath: string;
+}): { service: string; timer: string } {
+  const names = logRotationUnitNames(opts.serviceBasename);
+  installUnit(
+    opts.systemdUserDir,
+    names.service,
+    buildLogRotateUnit({
+      description: `Rusa log rotation (${opts.serviceBasename})`,
+      nodePath: opts.nodePath,
+      rotateScript: opts.rotateScript,
+      mcHome: opts.mcHome,
+      logPath: opts.logPath,
+    })
+  );
+  installUnit(
+    opts.systemdUserDir,
+    names.timer,
+    buildLogRotateTimer({
+      description: `Rusa log rotation timer (${opts.serviceBasename})`,
+      rotateUnit: names.service,
+    })
+  );
+  return names;
 }
 
 /**
@@ -621,7 +707,21 @@ function installSingleRusaService(opts: {
     })
   );
 
+  // #580: bound the append-to-file log. Installed even for a journal-logging
+  // instance, where it keeps any file left from an earlier install bounded too.
+  const logRotation = writeLogRotationUnits({
+    systemdUserDir: opts.systemdUserDir,
+    serviceBasename: instance.serviceBasename,
+    nodePath,
+    rotateScript: join(dirname(dirname(executableSource.cliPath)), "scripts", "rotate-log.mjs"),
+    mcHome: instance.mcHome,
+    logPath: instance.logPath,
+  });
+
   runOrThrow("systemctl", ["--user", "daemon-reload"]);
+  // Enabling the timer never touches the orchestrator, so it runs under --no-restart too.
+  runOrThrow("systemctl", ["--user", "enable", "--now", logRotation.timer]);
+  console.log(`✓ Enabled ${logRotation.timer}`);
   if (opts.restart === false) {
     // Non-disruptive re-apply: ensure enabled + reload (above) so the new unit is on
     // disk and known to systemd, but leave the running process alone. The new policy

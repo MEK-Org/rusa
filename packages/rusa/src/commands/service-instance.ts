@@ -49,6 +49,14 @@ export function resolveServiceHome(environment: ServiceEnvironment, homeOverride
   return environment === "production" ? join(homedir(), ".rusa") : join(homedir(), ".rusa-staging");
 }
 
+/** The rotation units for one instance, named after its service (#580). */
+export function logRotationUnitNames(serviceBasename: string): { service: string; timer: string } {
+  return {
+    service: `${serviceBasename}-logrotate.service`,
+    timer: `${serviceBasename}-logrotate.timer`,
+  };
+}
+
 export function resolveServiceInstance(
   environment: ServiceEnvironment,
   homeOverride?: string
