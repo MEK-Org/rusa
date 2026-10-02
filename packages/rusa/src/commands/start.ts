@@ -3055,6 +3055,7 @@ async function composeStart(
               validateModelConfigPool(config, input, { portable: true }),
             getFollowers: () => (followerHub ? followerHub.list() : []),
             chatRoom,
+            voices: () => supportedVoiceCatalog,
           })
         );
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
@@ -3489,6 +3490,7 @@ async function composeStart(
       },
       getFollowers: () => (followerHub ? followerHub.list() : []),
       chatRoom,
+      voices: () => supportedVoiceCatalog,
     })
   );
   const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
