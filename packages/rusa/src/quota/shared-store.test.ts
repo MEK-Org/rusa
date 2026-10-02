@@ -2043,7 +2043,6 @@ describe("SharedQuotaStore operator pacing reset", () => {
         if (!unreasonedLimit) throw new Error("expected unreasoned limit");
         expect(unreasonedLimit.throttleSeconds).toBeNull();
         expect(unreasonedLimit.paceError).toBeNull();
-        expect(unreasonedLimit.nextAdmitAt).toBeNull();
 
         // Configure controller
         store.configureController({ maxIntervalSeconds: 36000 });
@@ -2060,7 +2059,6 @@ describe("SharedQuotaStore operator pacing reset", () => {
         if (!throttledLimit) throw new Error("expected throttled limit");
         expect(throttledLimit.throttleSeconds).toBeGreaterThan(0);
         expect(throttledLimit.paceError).toBeGreaterThan(0);
-        expect(throttledLimit.nextAdmitAt).toBeNull();
 
         // 3. Unthrottled lane (plenty of quota -> negative pace error, interval_seconds = 0)
         const unthrottledScrapedAt = new Date(nowMs).toISOString();
@@ -2076,7 +2074,6 @@ describe("SharedQuotaStore operator pacing reset", () => {
         if (!unthrottledLimit) throw new Error("expected unthrottled limit");
         expect(unthrottledLimit.throttleSeconds).toBe(0);
         expect(unthrottledLimit.paceError).toBeLessThan(0);
-        expect(unthrottledLimit.nextAdmitAt).toBeNull();
       } finally {
         store.close();
       }
@@ -2128,12 +2125,100 @@ describe("SharedQuotaStore operator pacing reset", () => {
         expect(providerLimit).toBeDefined();
         expect(providerLimit?.throttleSeconds).toBe(0);
         expect(providerLimit?.paceError).toBeLessThan(0);
-        expect(providerLimit?.nextAdmitAt).toBeNull();
 
         expect(modelLimit).toBeDefined();
         expect(modelLimit?.throttleSeconds).toBeGreaterThan(0);
         expect(modelLimit?.paceError).toBeGreaterThan(0);
-        expect(modelLimit?.nextAdmitAt).toBeNull();
+      } finally {
+        store.close();
+      }
+    });
+
+    it("pins exact latest-row selection over older decisions, model/provider scope isolation, and ignores later unreasoned observations", () => {
+      const root = mkdtempSync(join(tmpdir(), "rusa-quota-pacer-exact-"));
+      roots.push(root);
+      const store = new SharedQuotaStore(join(root, "quota.db"));
+      try {
+        store.configureController({ maxIntervalSeconds: 36000 });
+        const t1Ms = Date.parse("2030-01-01T12:00:00.000Z");
+        const t1Scraped = new Date(t1Ms).toISOString();
+        const resetAtIso = new Date(t1Ms + 6 * 24 * 3600 * 1000).toISOString();
+
+        // 1. First observation (older reasoned row)
+        recordObservation(store, "claude", t1Scraped, 50, resetAtIso);
+        store.advancePendingController({ maxIntervalSeconds: 36000 }, "claude");
+
+        const row1 = store.db
+          .prepare(
+            `SELECT interval_seconds AS intervalSeconds, controller_error AS controllerError
+             FROM quota_observations
+             WHERE provider = 'claude' AND model_scope = '' AND kind = 'weekly'
+             ORDER BY rowid DESC LIMIT 1`
+          )
+          .get() as { intervalSeconds: number; controllerError: number };
+        expect(row1.intervalSeconds).toBeDefined();
+
+        const snap1 = store.getLatestSnapshot("claude");
+        expect(snap1?.limits?.[0].throttleSeconds).toBe(row1.intervalSeconds);
+        expect(snap1?.limits?.[0].paceError).toBe(row1.controllerError);
+
+        // 2. Second observation at t2 (newer reasoned row with different percentLeft)
+        const t2Ms = t1Ms + 3600 * 1000;
+        const t2Scraped = new Date(t2Ms).toISOString();
+        recordObservation(store, "claude", t2Scraped, 10, resetAtIso);
+        store.advancePendingController({ maxIntervalSeconds: 36000 }, "claude");
+
+        const row2 = store.db
+          .prepare(
+            `SELECT interval_seconds AS intervalSeconds, controller_error AS controllerError
+             FROM quota_observations
+             WHERE provider = 'claude' AND model_scope = '' AND kind = 'weekly'
+             ORDER BY rowid DESC LIMIT 1`
+          )
+          .get() as { intervalSeconds: number; controllerError: number };
+        expect(row2.intervalSeconds).not.toBe(row1.intervalSeconds);
+
+        const snap2 = store.getLatestSnapshot("claude");
+        // Pins exact latest-row selection over older decision:
+        expect(snap2?.limits?.[0].throttleSeconds).toBe(row2.intervalSeconds);
+        expect(snap2?.limits?.[0].paceError).toBe(row2.controllerError);
+
+        // 3. Third observation at t3 (later unreasoned observation: parsed but not reasoned by controller)
+        const t3Ms = t2Ms + 3600 * 1000;
+        const t3Scraped = new Date(t3Ms).toISOString();
+        const unreasonedState: ProviderQuotaSnapshot = {
+          provider: "claude",
+          status: "available",
+          scrapedAt: t3Scraped,
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 8,
+              resetAtIso,
+              scope: "provider",
+            },
+          ],
+        };
+        const rawId3 = store.recordRaw({
+          provider: "claude",
+          scrapedAt: t3Scraped,
+          rawOutput: "raw",
+        });
+        const storeAny = store as unknown as { controllerOptions?: unknown };
+        const savedOptions = storeAny.controllerOptions;
+        storeAny.controllerOptions = undefined;
+        try {
+          store.recordParsed(rawId3, unreasonedState, unreasonedState);
+        } finally {
+          storeAny.controllerOptions = savedOptions;
+        }
+
+        const snap3 = store.getLatestSnapshot("claude");
+        expect(snap3?.scrapedAt).toBe(t3Scraped);
+        // Latest reasoned row (row2) is retained and NOT overwritten by the unreasoned t3 reading:
+        expect(snap3?.limits?.[0].throttleSeconds).toBe(row2.intervalSeconds);
+        expect(snap3?.limits?.[0].paceError).toBe(row2.controllerError);
       } finally {
         store.close();
       }

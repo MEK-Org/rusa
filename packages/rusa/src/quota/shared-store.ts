@@ -986,7 +986,7 @@ export class SharedQuotaStore {
    * Project latest reasoned pacer observations onto a snapshot's limits (#336).
    * For each limit, resolves (provider, model_scope, kind) against quota_observations.
    * If an observation with a reasoned interval exists, projects throttleSeconds and
-   * paceError; otherwise projects null. nextAdmitAt is null (untracked centrally).
+   * paceError; otherwise projects null.
    */
   projectPacerState(provider: string, snapshot: ProviderQuotaSnapshot): ProviderQuotaSnapshot {
     if (!snapshot.limits || snapshot.limits.length === 0) {
@@ -1006,7 +1006,6 @@ export class SharedQuotaStore {
           ...limit,
           throttleSeconds: null,
           paceError: null,
-          nextAdmitAt: null,
         };
       }
       const kind = normalizeKind(limit.kind);
@@ -1017,7 +1016,6 @@ export class SharedQuotaStore {
         ...limit,
         throttleSeconds: row ? row.intervalSeconds : null,
         paceError: row ? (row.controllerError ?? null) : null,
-        nextAdmitAt: null,
       };
     });
     return {

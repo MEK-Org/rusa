@@ -644,10 +644,6 @@ function isOptionalNullableNumber(value: unknown): boolean {
   );
 }
 
-function isOptionalNullableString(value: unknown): boolean {
-  return value === undefined || value === null || typeof value === "string";
-}
-
 function isValidQuotaWindowScope(value: unknown): boolean {
   if (value === "provider" || value === "model") return true;
   if (typeof value !== "object" || value === null) return false;
@@ -671,8 +667,7 @@ function isValidQuotaLimit(value: unknown): boolean {
     isOptionalString(limit.resetAtIso) &&
     (limit.scope === undefined || isValidQuotaWindowScope(limit.scope)) &&
     isOptionalNullableNumber(limit.throttleSeconds) &&
-    isOptionalNullableNumber(limit.paceError) &&
-    isOptionalNullableString(limit.nextAdmitAt)
+    isOptionalNullableNumber(limit.paceError)
   );
 }
 

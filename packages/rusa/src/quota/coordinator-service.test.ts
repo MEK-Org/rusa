@@ -1222,17 +1222,15 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(warmRes.json.limits[0].percentLeft).toBe(75);
     expect(warmRes.json.limits[0].throttleSeconds).toBeNull();
     expect(warmRes.json.limits[0].paceError).toBeNull();
-    expect(warmRes.json.limits[0].nextAdmitAt).toBeNull();
     expect(warmRes.json.limits[1].scope).toEqual({
       provider: "claude",
       models: ["claude-fable"],
     });
     expect(warmRes.json.limits[1].throttleSeconds).toBeNull();
     expect(warmRes.json.limits[1].paceError).toBeNull();
-    expect(warmRes.json.limits[1].nextAdmitAt).toBeNull();
   });
 
-  it("GET /v1/quota returns limits carrying projected start-pacer throttleSeconds, paceError, and nextAdmitAt (#336)", async () => {
+  it("GET /v1/quota returns limits carrying projected start-pacer throttleSeconds and paceError (#336)", async () => {
     service = new QuotaCoordinatorService({
       socketPath,
       store,
@@ -1288,7 +1286,6 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(res.json.limits).toHaveLength(1);
     expect(res.json.limits[0].throttleSeconds).toBeGreaterThan(0);
     expect(res.json.limits[0].paceError).toBeGreaterThan(0);
-    expect(res.json.limits[0].nextAdmitAt).toBeNull();
   });
 
   // §5.5: GET /v1/history
