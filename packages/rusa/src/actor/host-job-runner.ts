@@ -176,8 +176,9 @@ export function buildHostJobBwrapArgs(o: BuildHostJobBwrapArgsOptions): string[]
   // target would otherwise stay reachable through the root ro-bind. A
   // configured home that does not exist yet is skipped, as in sandbox.ts:
   // there is nothing to hide, and bwrap cannot mkdir a mountpoint on the
-  // read-only root. Mounting a tmpfs inside an already-shadowed tree is a
-  // harmless no-op (still empty), so no ordering/overlap check is needed here.
+  // read-only root. If hostHome already contains the configured home, the
+  // hostHome tmpfs hides it; if the configured home is outside or an ancestor
+  // of hostHome, it is shadowed explicitly so it is not visible via ro-bind /.
   const realHostHome = realpathIfExists(hostHome);
   const realMcHome = realpathIfExists(o.mcHome);
   args.push("--tmpfs", hostHome);
@@ -187,7 +188,7 @@ export function buildHostJobBwrapArgs(o: BuildHostJobBwrapArgsOptions): string[]
   if (
     realConfiguredCodex &&
     existsSync(realConfiguredCodex) &&
-    !overlaps(realHostHome, realConfiguredCodex)
+    !isSelfOrAncestor(realHostHome, realConfiguredCodex)
   ) {
     args.push("--tmpfs", realConfiguredCodex);
   }

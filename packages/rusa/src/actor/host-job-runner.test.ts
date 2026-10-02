@@ -260,6 +260,29 @@ describe("buildHostJobBwrapArgs (pure argv)", () => {
     }
   });
 
+  it("shadows a configured Codex home when it is an ancestor of hostHome (inverse containment) (#782)", () => {
+    const fixtureRoot = join(dir, "codex-ancestor-root");
+    const configuredHome = fixtureRoot;
+    const testHostHome = join(fixtureRoot, "user");
+    mkdirSync(testHostHome, { recursive: true });
+    configureCodexHome(configuredHome);
+    try {
+      const args = buildHostJobBwrapArgs({
+        hostHome: testHostHome,
+        mcHome,
+        scratchDir,
+        manifest: { readPaths: [] },
+      });
+      const tmpfsTargets = args.reduce<string[]>((acc, arg, i) => {
+        if (arg === "--tmpfs") acc.push(args[i + 1]);
+        return acc;
+      }, []);
+      expect(tmpfsTargets).toContain(configuredHome);
+    } finally {
+      configureCodexHome(undefined);
+    }
+  });
+
   it("does not double-shadow mcHome when it is nested inside hostHome", () => {
     const nestedMcHome = join(hostHome, ".rusa");
     mkdirSync(nestedMcHome, { recursive: true });
@@ -564,6 +587,37 @@ describe.skipIf(!BWRAP_CAPABLE)("buildHostJobBwrapArgs + real bwrap (ack item 3 
     } finally {
       configureCodexHome(undefined);
       rmSync(realCodexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("shadows a configured Codex home when it is an ancestor of hostHome (#782)", () => {
+    // Outside /tmp so /tmp tmpfs cannot hide it; configured home is ancestor of hostHome
+    const fixtureRoot = mkdtempSync(join(process.cwd(), ".host-job-codex-ancestor-"));
+    const configuredHome = fixtureRoot;
+    const testHostHome = join(fixtureRoot, "user");
+    const testScratchDir = join(mcHome, "scratch-ancestor-test");
+    mkdirSync(testHostHome, { recursive: true });
+    mkdirSync(testScratchDir, { recursive: true });
+    writeFileSync(join(configuredHome, "auth.json"), "fixture-codex-login");
+    configureCodexHome(configuredHome);
+    try {
+      const args = buildHostJobBwrapArgs({
+        hostHome: testHostHome,
+        mcHome,
+        scratchDir: testScratchDir,
+        manifest: { readPaths: [] },
+      });
+      const probe = [
+        `test -r "${join(configuredHome, "auth.json")}" && echo ANCESTOR_READABLE || echo ANCESTOR_DENIED`,
+      ].join("\n");
+      const output = execFileSync("bwrap", [...args, "--", "/bin/sh", "-c", probe], {
+        encoding: "utf-8",
+      });
+      expect(output).toContain("ANCESTOR_DENIED");
+      expect(output).not.toContain("ANCESTOR_READABLE");
+    } finally {
+      configureCodexHome(undefined);
+      rmSync(fixtureRoot, { recursive: true, force: true });
     }
   });
 
