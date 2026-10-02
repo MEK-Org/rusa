@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,12 +20,12 @@ import { QUOTA_METRIC_EVENT, QUOTA_SERVICE_METRICS } from "../quota/coordinator-
 import { QuotaCoordinatorService } from "../quota/coordinator-service.js";
 import { DEFAULT_OLD_QUOTA_DB_NAME, DEFAULT_RELOCATED_QUOTA_DB_NAME } from "../quota/relocate.js";
 import { SharedQuotaStore } from "../quota/shared-store.js";
+import { writeBuildSentinel } from "../update/build-sentinel.js";
 import {
   coordinatorLoadedRevision,
   coordinatorProviderLanes,
   runQuotaCoordinator,
 } from "./quota-coordinator.js";
-import { writeBuildSentinel } from "../update/build-sentinel.js";
 
 const testDirs: string[] = [];
 

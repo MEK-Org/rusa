@@ -137,11 +137,34 @@ carries the per-provider scrape outcome (`status`, `attempts`, `failures`,
 Both envelopes also carry `service.loadedRevision`: the valid build sentinel
 captured by that process at startup, or `null` when no valid sentinel exists.
 It is not derived from checkout `HEAD`, which can change under a still-running
-coordinator. A successful self-update restarts only the fixed pool unit, then
-waits for `/v1/readyz` to report the newly built revision before draining and
-restarting the client instance. That preserves one coordinator per pool and
-uses the coordinator's ordinary startup path, including its schema guard and
-due backup; it neither creates a second unit nor changes the quota schema.
+coordinator.
+
+A successful self-update refreshes the coordinator only when this checkout owns
+it: the installed `rusa-quota-coordinator.service` must exist and its
+`ExecStart` must run this checkout's built CLI. A host with no pool unit, or
+whose unit runs another checkout's build, is a client of that coordinator and
+updates without touching it. For an owned unit, after a green build and before
+the client drain, the update:
+
+1. takes the runbook's pre-restart backup with `rusa quota-backup` into
+   `<backupDir>/pre-deploy` (its own retention, so frequent deploys never evict
+   the daily copies; skipped only when the database does not exist yet);
+2. restarts only the fixed pool unit;
+3. waits up to 60 seconds for `/v1/readyz` on the socket that coordinator's own
+   home configures to report the newly built revision.
+
+Any failure before the client exits restores the previous dist and checkout and,
+if the coordinator was restarted, restarts it onto the restored build and waits
+for the old revision. If that restore fails — including when the new build has
+already migrated the quota schema and the old build's guard refuses it — the
+update raises the durable rollback-failed alert; recover with the binary
+rollback procedure above using the pre-deploy backup.
+
+Between the coordinator restart and the client's own restart, the updating
+instance is an old client of the new coordinator for at most the drain timeout.
+Other clients in the pool remain on their own builds until they update; both
+rely on the design's `protocolMajor` compatibility rule (§5.2), which
+this change does not alter.
 
 ### Runtime manual quota readings
 

@@ -99,8 +99,9 @@ export function defaultQuotaBackupDir(databasePath: string): string {
   return join(dirname(databasePath), "backups");
 }
 
-export function defaultQuotaCoordinatorSocketPath(): string {
-  const runtimeDir = process.env.XDG_RUNTIME_DIR;
+export function defaultQuotaCoordinatorSocketPath(
+  runtimeDir: string | undefined = process.env.XDG_RUNTIME_DIR
+): string {
   if (runtimeDir && runtimeDir.trim().length > 0) {
     return join(runtimeDir.trim(), "rusa-quota", "coordinator.sock");
   }
@@ -266,7 +267,8 @@ export function coordinatorProviderLanes(config: RusaConfig): {
  */
 export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {}): Promise<void> {
   const log = opts.logger ?? createLogger({ context: { component: "quota-coordinator" } });
-  const loadedRevision = opts.loadedRevision === undefined ? coordinatorLoadedRevision() : opts.loadedRevision;
+  const loadedRevision =
+    opts.loadedRevision === undefined ? coordinatorLoadedRevision() : opts.loadedRevision;
   const mcHome = opts.home ?? resolveHome();
   const config = loadConfig(mcHome);
   // The coordinator's quota probes refresh the same login as the daemons do.

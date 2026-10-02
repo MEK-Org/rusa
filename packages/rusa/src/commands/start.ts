@@ -9,7 +9,7 @@ import {
   statSync,
   unlinkSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
@@ -339,7 +339,6 @@ import {
   WEBHOOK_SILENCE_CHECK_INTERVAL_MS,
   WebhookSilenceDetector,
 } from "../webhook/silence-detector.js";
-import { resolveQuotaCoordinatorSocketPath } from "./quota-coordinator.js";
 import { resolveRepoRoot } from "./service-instance.js";
 
 // `update` tool bounds . Per-step HARD timeouts so a hung build can't wedge
@@ -2139,7 +2138,8 @@ async function composeStart(
           (m) => console.log(m)
         ),
         coordinator: new SystemdCoordinatorRestarter({
-          socketPath: resolveQuotaCoordinatorSocketPath(config),
+          systemdUserDir: join(homedir(), ".config", "systemd", "user"),
+          cliPath: join(packageDir, "dist", "cli.js"),
           log: (m) => console.log(m),
         }),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),

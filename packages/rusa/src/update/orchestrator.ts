@@ -65,9 +65,28 @@ export interface BuildSeam {
   rollback?(): Promise<void>;
 }
 
-/** Restart the single pool coordinator and verify the process loaded this build. */
+/** The installed pool coordinator unit that this checkout's build runs. */
+export interface CoordinatorTarget {
+  unit: string;
+  /** The coordinator's own home, read from its unit. */
+  home: string;
+  /** The socket that coordinator listens on, resolved from its own home. */
+  socketPath: string;
+}
+
+/**
+ * Refresh the single pool coordinator when, and only when, this deployment
+ * owns its executable. A host with no pool unit, or whose unit runs another
+ * checkout's build, is a client of that coordinator: restarting it would load
+ * a build this update did not produce.
+ */
 export interface CoordinatorRestartSeam {
-  restart(expectedRevision: string): Promise<void>;
+  /** The owned unit, or why there is none. Throws when ownership cannot be established. */
+  resolve(): Promise<CoordinatorTarget | { skip: string }>;
+  /** The runbook's pre-restart database backup. Throws to refuse the restart. */
+  backup(target: CoordinatorTarget): Promise<void>;
+  /** Restart the unit and require its readyz to report `expectedRevision`. */
+  restart(target: CoordinatorTarget, expectedRevision: string): Promise<void>;
 }
 
 /** The in-memory graceful-shutdown brake + a self-excluding, bounded drain. */
@@ -137,6 +156,8 @@ export interface UpdateResult {
   alreadyCurrent?: boolean;
   /** True only after the pool coordinator reported the new loaded revision. */
   coordinatorRestarted?: boolean;
+  /** Why no coordinator restart was owed (absent unit, another checkout's build). */
+  coordinatorSkipped?: string;
   /** True once we've engaged drain + called exit(0) (the restart path). */
   restarting: boolean;
   /**
@@ -214,8 +235,9 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
   let newSha = "";
   let movedToNew = false;
   let builtNew = false;
-  let coordinatorRestartAttempted = false;
+  let coordinatorTarget: CoordinatorTarget | undefined;
   let coordinatorRestarted = false;
+  let coordinatorSkipped: string | undefined;
   let rollbackFailed = false;
 
   try {
@@ -284,11 +306,18 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     // it loaded; a successful systemctl invocation alone is not sufficient.
     if (deps.coordinator) {
       step = "coordinator";
-      coordinatorRestartAttempted = true;
-      log(`[update] restarting pool coordinator onto ${shortSha(newSha)}`);
-      await deps.coordinator.restart(newSha);
-      coordinatorRestarted = true;
-      log(`[update] pool coordinator confirmed ${shortSha(newSha)}`);
+      const resolved = await deps.coordinator.resolve();
+      if ("skip" in resolved) {
+        coordinatorSkipped = resolved.skip;
+        log(`[update] pool coordinator not refreshed: ${resolved.skip}`);
+      } else {
+        await deps.coordinator.backup(resolved);
+        log(`[update] pre-restart quota backup taken; restarting ${resolved.unit}`);
+        coordinatorTarget = resolved;
+        await deps.coordinator.restart(resolved, newSha);
+        coordinatorRestarted = true;
+        log(`[update] pool coordinator confirmed ${shortSha(newSha)}`);
+      }
     }
 
     // ── 3. GATE passed → quiesce + restart. Only now do we touch run-state. ─
@@ -341,6 +370,7 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
       subject,
       alreadyCurrent,
       coordinatorRestarted,
+      coordinatorSkipped,
       restarting: true,
     };
   } catch (err) {
@@ -369,10 +399,13 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
         // A restart command can fail after it has stopped or even started the
         // unit. Once old dist and checkout are restored, make a best-effort
         // second restart so the pool cannot keep a new in-memory coordinator
-        // beside an old deploy. Failure is surfaced as rollback-unsafe.
-        if (coordinatorRestartAttempted && deps.coordinator) {
+        // beside an old deploy. Failure is surfaced as rollback-unsafe. That
+        // includes a new build that already migrated the quota schema: the old
+        // build's guard refuses the newer database, and recovery is the
+        // runbook's restore from the pre-restart backup, never a silent retry.
+        if (coordinatorTarget && deps.coordinator) {
           try {
-            await deps.coordinator.restart(oldSha);
+            await deps.coordinator.restart(coordinatorTarget, oldSha);
             log(`[update] pool coordinator restored to ${shortSha(oldSha)}`);
           } catch (restoreCoordinatorErr) {
             throw new Error(
