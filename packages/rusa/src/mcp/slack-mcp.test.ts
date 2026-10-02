@@ -409,3 +409,46 @@ describe("Slack write MCP upload_file", () => {
     ).toBe(false);
   });
 });
+
+describe("Slack write MCP react", () => {
+  it("registers react tool and forwards reaction parameters", async () => {
+    const react = vi.fn(async () => {});
+    const client = slackWith({});
+    client.react = react;
+
+    const server = createSlackWriteMcpServer(client, ["C_ALLOWED"]);
+    const mcpClient = await connect(server);
+
+    const tools = await mcpClient.listTools();
+    const reactTool = tools.tools.find((t) => t.name === "react");
+    expect(reactTool).toBeDefined();
+    expect(reactTool?.description).toContain("default eyes");
+    expect(reactTool?.inputSchema.properties).toHaveProperty("emoji");
+
+    const result = await call(mcpClient, "react", {
+      channel: "C_ALLOWED",
+      ts: "1234567890.123456",
+      emoji: "eyes",
+    });
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.text)).toEqual({ ok: true });
+    expect(react).toHaveBeenCalledWith("C_ALLOWED", "1234567890.123456", "eyes");
+  });
+
+  it("enforces allowed channel restrictions", async () => {
+    const react = vi.fn(async () => {});
+    const client = slackWith({});
+    client.react = react;
+
+    const server = createSlackWriteMcpServer(client, ["C_ALLOWED"]);
+    const mcpClient = await connect(server);
+
+    const result = await call(mcpClient, "react", {
+      channel: "C_FORBIDDEN",
+      ts: "1234567890.123456",
+    });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("access denied: Slack channel C_FORBIDDEN");
+    expect(react).not.toHaveBeenCalled();
+  });
+});
