@@ -76,3 +76,40 @@ export function filterConfiguredVoices(
   const available = new Set(options.availableProviders);
   return configured.filter((v) => available.has(v.voiceConfig.provider));
 }
+
+/** The picker's display text for a catalog entry, e.g. "Puck (Gemini)". */
+export function voiceChoiceLabel(voice: SupportedVoice): string {
+  return `${voice.label} (${voice.providerLabel})`;
+}
+
+export type VoiceChoiceResolution =
+  | { ok: true; voice: SupportedVoice }
+  | { ok: false; error: string };
+
+/**
+ * Resolve a typed or spoken choice to exactly one catalog entry (#817). It may
+ * name a label, the picker's "label (provider)" text, a Google voice name in
+ * any case, or an ElevenLabs voice id. A choice that names more than one entry
+ * is ambiguous rather than first-wins, and the error lists the choices to use.
+ */
+export function resolveVoiceChoice(
+  catalog: readonly SupportedVoice[],
+  choice: string
+): VoiceChoiceResolution {
+  const wanted = choice.trim();
+  const folded = wanted.toLowerCase();
+  const googleName = canonicalSupportedVoiceName(wanted);
+  const matches = catalog.filter(
+    (voice) =>
+      voice.label.toLowerCase() === folded ||
+      voiceChoiceLabel(voice).toLowerCase() === folded ||
+      (voice.voiceConfig.provider === "google"
+        ? voice.voiceConfig.config.voiceName === googleName
+        : voice.voiceConfig.config.voiceId === wanted)
+  );
+  if (matches.length === 1) return { ok: true, voice: matches[0] };
+  if (catalog.length === 0) return { ok: false, error: "no voices are available" };
+  const problem = matches.length > 1 ? "is ambiguous" : "is not an available voice";
+  const choices = (matches.length > 1 ? matches : catalog).map(voiceChoiceLabel).join(", ");
+  return { ok: false, error: `voice '${wanted}' ${problem}; choose one of: ${choices}` };
+}

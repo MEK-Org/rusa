@@ -60,9 +60,23 @@ import type { RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
 import { ChatRoomService } from "../voice/chat-room.js";
-import { buildSupportedVoiceCatalog } from "../voice/voice-catalog.js";
-import { googleVoiceConfig } from "../voice/voice-config.js";
+import { buildSupportedVoiceCatalog, parseVoiceDefinitions } from "../voice/voice-catalog.js";
+import { googleVoiceConfig, type VoiceConfigDocument } from "../voice/voice-config.js";
+import { createVoiceService } from "../voice/wiring.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
+
+// The own-voice tests (#817) follow a stored choice to the next spoken reply;
+// they stop at the synthesis boundary, so no provider is ever called.
+const speechClients = vi.hoisted(() => ({
+  google: { transcribe: vi.fn(), streamSynthesize: vi.fn(), synthesize: vi.fn() },
+  elevenlabs: { transcribe: vi.fn(), streamSynthesize: vi.fn(), synthesize: vi.fn() },
+}));
+vi.mock("../voice/gemini-speech.js", () => ({
+  createGeminiSpeechClient: () => speechClients.google,
+}));
+vi.mock("../voice/elevenlabs-speech.js", () => ({
+  createElevenLabsSpeechClient: () => speechClients.elevenlabs,
+}));
 
 async function connect(server: McpServer): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -4851,5 +4865,166 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       expect(strangerClear.isError).toBe(true);
       expect(JSON.stringify(strangerClear.content)).toMatch(/Only the parent thread/i);
     });
+  });
+});
+
+describe("own voice tools (#817)", () => {
+  const christopher: VoiceConfigDocument = {
+    schemaVersion: 1,
+    provider: "elevenlabs",
+    config: { voiceId: "Puck" },
+  };
+  const configured = parseVoiceDefinitions([
+    { label: "Custom Puck", voiceConfig: googleVoiceConfig("puck") },
+    { label: "Christopher", voiceConfig: christopher },
+  ]);
+  const catalog = buildSupportedVoiceCatalog(configured, {
+    availableProviders: ["google", "elevenlabs"],
+  });
+
+  /** Two ungranted sibling workers, each with its own bound endpoint. */
+  async function twoWorkers() {
+    const fixture = setup({ seedRootGrants: false });
+    for (const id of ["worker-a", "worker-b"]) {
+      fixture.registry.upsert({
+        id,
+        charter: id,
+        parentId: "root",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    const endpoint = (id: string) =>
+      connect(
+        createAgentExecMcpServer(fixture.mesh, id, "root", undefined, { voices: () => catalog })
+      );
+    return { ...fixture, a: await endpoint("worker-a"), b: await endpoint("worker-b") };
+  }
+  const setVoice = (client: Client, voice: string | null, extra: Record<string, unknown> = {}) =>
+    client.callTool({
+      name: "set_voice",
+      arguments: { voice, ...extra },
+    }) as Promise<CallToolResult>;
+  const getVoice = (client: Client) =>
+    client.callTool({ name: "get_voice", arguments: {} }) as Promise<CallToolResult>;
+
+  it("offers the tools to an ungranted actor with no target-actor argument", async () => {
+    const { a } = await twoWorkers();
+    const { tools } = await a.listTools();
+    const setTool = tools.find((t) => t.name === "set_voice");
+    expect(tools.map((t) => t.name)).toContain("get_voice");
+    expect(Object.keys(setTool?.inputSchema.properties ?? {})).toEqual(["voice"]);
+  });
+
+  it("isolates two bound endpoints: each sets and clears only its own voice", async () => {
+    const { a, b, registry } = await twoWorkers();
+
+    const setA = await setVoice(a, "Christopher");
+    expect(setA.isError).toBeFalsy();
+    expect(dataOf(setA)).toEqual({
+      voice: { choice: "Christopher (ElevenLabs)", provider: "elevenlabs", voice: "Puck" },
+    });
+    expect((await setVoice(b, "kore")).isError).toBeFalsy();
+    expect(registry.get("worker-a")?.voiceConfig).toEqual(christopher);
+    expect(registry.get("worker-b")?.voiceConfig).toEqual(googleVoiceConfig("Kore"));
+
+    // The bound identity is the only target; a smuggled one is refused outright.
+    const smuggled = await setVoice(a, "Zephyr", { actor_id: "worker-b" });
+    expect(smuggled.isError).toBe(true);
+    expect(registry.get("worker-a")?.voiceConfig).toEqual(christopher);
+    expect(registry.get("worker-b")?.voiceConfig).toEqual(googleVoiceConfig("Kore"));
+
+    const readA = dataOf(await getVoice(a)) as { voice: unknown; choices: unknown[] };
+    expect(readA.voice).toEqual({
+      choice: "Christopher (ElevenLabs)",
+      provider: "elevenlabs",
+      voice: "Puck",
+    });
+    expect(readA.choices).toHaveLength(catalog.length);
+    expect(readA.choices).toContainEqual({
+      choice: "Custom Puck (Gemini)",
+      provider: "google",
+      voice: "Puck",
+    });
+
+    const cleared = await setVoice(a, null);
+    expect(cleared.isError).toBeFalsy();
+    expect(dataOf(cleared)).toEqual({ voice: null });
+    expect(registry.get("worker-a")?.voiceConfig).toBeUndefined();
+    expect(registry.get("worker-b")?.voiceConfig).toEqual(googleVoiceConfig("Kore"));
+    expect((dataOf(await getVoice(a)) as { voice: unknown }).voice).toBeNull();
+    expect((dataOf(await getVoice(b)) as { voice: unknown }).voice).toEqual({
+      choice: "Kore (Gemini)",
+      provider: "google",
+      voice: "Kore",
+    });
+  });
+
+  it("rejects ambiguous, unknown and unavailable choices without writing", async () => {
+    const { a, registry } = await twoWorkers();
+    await setVoice(a, "custom puck");
+    expect(registry.get("worker-a")?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
+
+    const ambiguous = await setVoice(a, "Puck");
+    expect(ambiguous.isError).toBe(true);
+    expect(dataOf(ambiguous)).toMatch(
+      /ambiguous.*Custom Puck \(Gemini\).*Christopher \(ElevenLabs\)/
+    );
+    const unknown = await setVoice(a, "Nobody");
+    expect(unknown.isError).toBe(true);
+    expect(dataOf(unknown)).toMatch(/not an available voice; choose one of: .*Kore \(Gemini\)/);
+    expect(registry.get("worker-a")?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
+
+    // A configured voice whose provider has no credentials is not in the catalog.
+    const googleOnly = buildSupportedVoiceCatalog(configured, { availableProviders: ["google"] });
+    const restricted = await connect(
+      createAgentExecMcpServer(setup().mesh, "root", "root", undefined, {
+        voices: () => googleOnly,
+      })
+    );
+    const unavailable = await setVoice(restricted, "Christopher");
+    expect(unavailable.isError).toBe(true);
+    expect(dataOf(unavailable)).toMatch(/not an available voice/);
+  });
+
+  it("speaks the next reply with the stored choice, and the default once cleared", async () => {
+    const { a, registry } = await twoWorkers();
+    const service = createVoiceService({
+      home: "/unused",
+      apiKey: "key",
+      elevenlabsApiKey: "key",
+      voice: { voiceName: "Laomedeia" },
+      // The production read path (start.ts): the actor record, per reply.
+      voiceConfigFor: (actorId) => registry.get(actorId)?.voiceConfig,
+    });
+    service.presenceConnect(["worker-a"]);
+    speechClients.google.streamSynthesize.mockRejectedValue(new Error("render"));
+    speechClients.elevenlabs.streamSynthesize.mockRejectedValue(new Error("render"));
+    const reply = (id: string) => ({
+      id,
+      ts: "now",
+      kind: "message_sent",
+      actorId: "worker-a",
+      detail: null,
+      body: "Hello",
+      payload: JSON.stringify({ to: "human:operator" }),
+      success: null,
+    });
+
+    await setVoice(a, "Christopher (ElevenLabs)");
+    await expect(service.handleMeshEvent(reply("one"))).rejects.toThrow("render");
+    await setVoice(a, null);
+    await expect(service.handleMeshEvent(reply("two"))).rejects.toThrow("render");
+
+    expect(speechClients.elevenlabs.streamSynthesize.mock.calls).toEqual([["Hello", "Puck"]]);
+    expect(speechClients.google.streamSynthesize.mock.calls).toEqual([["Hello", "Laomedeia"]]);
+  });
+
+  it("does not mount the tools when no catalog is wired", async () => {
+    const { mesh } = setup();
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const names = (await client.listTools()).tools.map((t) => t.name);
+    expect(names).not.toContain("set_voice");
+    expect(names).not.toContain("get_voice");
   });
 });

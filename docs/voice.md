@@ -79,6 +79,15 @@ The actor voice API also accepts `PATCH /api/mesh/actors/<actorId>/voice`:
 ```
 
 Send `{"voiceConfig":null}` to restore the Google instance default.
+
+An actor can also change its own voice with the `get_voice` and `set_voice`
+mesh tools. They act only on the calling actor, take no actor argument and need
+no capability. `get_voice` returns the stored voice (null for the instance
+default) and the same choices as the dashboard dropdown. `set_voice` accepts a
+label, the dropdown's `label (provider)` text, a Gemini voice name in any case
+or an ElevenLabs voice ID. A choice that matches several voices, or none, is
+rejected with the valid choices and nothing is stored. `null` restores the
+instance default. The change applies to the actor's next spoken reply.
 Keys stay on the host and are included in log secret redaction.
 
 ## Chat Room

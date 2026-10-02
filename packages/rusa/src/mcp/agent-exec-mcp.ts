@@ -23,6 +23,11 @@ import type { FollowerInfo } from "../experimental/remote-instances/follower-hub
 import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
 import type { ChatRoomService } from "../voice/chat-room.js";
+import {
+  resolveVoiceChoice,
+  type SupportedVoice,
+  voiceChoiceLabel,
+} from "../voice/voice-catalog.js";
 import type { VoiceConfigDocument } from "../voice/voice-config.js";
 import { MAX_VOICE_TRANSFER_NOTE_CHARS } from "../voice/voice-transfer-context.js";
 import { toolError, toolOk } from "./result.js";
@@ -138,6 +143,11 @@ export function createAgentExecMcpServer(
      * wired AND the endpoint's actor holds `room-admin`.
      */
     chatRoom?: Pick<ChatRoomService, "participants" | "add" | "remove">;
+    /**
+     * The dashboard picker's voice catalog (#817). When wired, every actor gets
+     * `get_voice`/`set_voice` for its own voice setting.
+     */
+    voices?: () => readonly SupportedVoice[];
   }
 ): McpServer {
   const server = createMcpServer({ name: AGENT_EXEC_MCP_NAME, version: "0.1.0" });
@@ -1640,6 +1650,79 @@ export function createAgentExecMcpServer(
           const removed = chatRoom.remove(actor_id);
           if (removed) options?.onWrite?.();
           return toolOk({ actor_id, removed });
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
+  }
+
+  // ── Own voice (#817) ── An actor reads and changes only its own walkie
+  // voice: the endpoint's bound identity is the target, so these tools take no
+  // actor argument and need no capability. Choices resolve against the same
+  // catalog the dashboard picker offers.
+  if (options?.voices) {
+    const voices = options.voices;
+    const describeVoice = (voice: VoiceConfigDocument) => {
+      const key = JSON.stringify(voice);
+      const entry = voices().find((v) => JSON.stringify(v.voiceConfig) === key);
+      const name = voice.provider === "google" ? voice.config.voiceName : voice.config.voiceId;
+      return {
+        // A stored voice no longer in the catalog still reads back, unlabelled.
+        choice: entry ? voiceChoiceLabel(entry) : null,
+        provider: voice.provider,
+        voice: name,
+      };
+    };
+
+    server.registerTool(
+      "get_voice",
+      {
+        title: "Read your walkie voice",
+        description:
+          "Read your own walkie-talkie voice and the voices you can choose. `voice` is null when you speak with the instance default. Each choice's `choice` text can be passed to set_voice.",
+        inputSchema: {},
+      },
+      async () => {
+        try {
+          const stored = mesh.actors.get(selfId)?.voiceConfig;
+          return toolOk({
+            voice: stored ? describeVoice(stored) : null,
+            choices: voices().map((v) => describeVoice(v.voiceConfig)),
+          });
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
+
+    server.registerTool(
+      "set_voice",
+      {
+        title: "Choose your walkie voice",
+        description:
+          "Choose your own walkie-talkie voice, used from your next spoken reply. Name a choice from get_voice: its label, its 'label (provider)' text, a Gemini voice name, or an ElevenLabs voice id. An ambiguous or unavailable choice is rejected with the valid choices and changes nothing. Pass null to restore the instance default.",
+        inputSchema: {
+          voice: z
+            .string()
+            .trim()
+            .min(1)
+            .nullable()
+            .describe("The voice to use, or null for the instance default."),
+        },
+      },
+      async ({ voice }) => {
+        try {
+          if (!mesh.actors.get(selfId)) throw new Error(`unknown actor ${selfId}`);
+          let voiceConfig: VoiceConfigDocument | undefined;
+          if (voice !== null) {
+            const resolved = resolveVoiceChoice(voices(), voice);
+            if (!resolved.ok) throw new Error(resolved.error);
+            voiceConfig = resolved.voice.voiceConfig;
+          }
+          mesh.actors.patch(selfId, { voiceConfig });
+          options?.onWrite?.();
+          return toolOk({ voice: voiceConfig ? describeVoice(voiceConfig) : null });
         } catch (err) {
           return toolError(err);
         }
