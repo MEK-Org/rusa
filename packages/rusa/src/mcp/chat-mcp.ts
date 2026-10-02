@@ -576,7 +576,8 @@ export function createChatWriteMcpServer(
               const buf = await readBoundedRegularFile(
                 workDir,
                 confinedPath,
-                options.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES
+                options.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES,
+                "attachment"
               );
               const filename = att.filename || basename(att.filePath) || "attachment.bin";
               const mimeType = att.mimeType ?? inferChatMimeType(filename);
@@ -678,7 +679,12 @@ export function createChatWriteMcpServer(
         let effectiveFilename: string;
         if (filePath) {
           const confinedPath = await resolveAttachmentPath(workDir, filePath);
-          contentBuffer = await readBoundedRegularFile(workDir, confinedPath, maxBytes);
+          contentBuffer = await readBoundedRegularFile(
+            workDir,
+            confinedPath,
+            maxBytes,
+            "attachment"
+          );
           effectiveFilename = filename || basename(filePath) || "attachment.bin";
         } else if (contentBase64) {
           const estimatedBytes = Math.ceil((contentBase64.length * 3) / 4);

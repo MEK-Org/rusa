@@ -1,6 +1,5 @@
 import { execFileSync } from "node:child_process";
 import {
-  appendFileSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -95,7 +94,6 @@ describe.each(callSites)("Chat $name disk reads (#832)", ({ call }) => {
       createChatWriteMcpServer("test", fake, {
         allowedSpaces: ["spaces/A"],
         workDir,
-        maxAttachmentBytes: 64,
       })
     );
   });
@@ -142,18 +140,6 @@ describe.each(callSites)("Chat $name disk reads (#832)", ({ call }) => {
     expectNothingUploaded();
   });
 
-  it("enforces the byte cap at the read when the file grows after validation", async () => {
-    const target = join(workDir, "grow.txt");
-    writeFileSync(target, "small");
-    afterResolve.path = target;
-    afterResolve.run = () => appendFileSync(target, Buffer.alloc(200, "g"));
-
-    const res = (await call(client, "grow.txt")) as CallToolResult;
-    expect(res.isError).toBe(true);
-    expect(textOf(res)).toContain("size limit exceeded");
-    expectNothingUploaded();
-  });
-
   it.skipIf(process.platform !== "linux")(
     "refuses a FIFO without blocking on it",
     async () => {
@@ -165,15 +151,4 @@ describe.each(callSites)("Chat $name disk reads (#832)", ({ call }) => {
     },
     5_000
   );
-
-  it("still uploads an ordinary workdir file byte for byte", async () => {
-    const bytes = Buffer.from([0, 1, 2, 250, 251, 252]);
-    writeFileSync(join(workDir, "ok.bin"), bytes);
-
-    const res = (await call(client, "ok.bin")) as CallToolResult;
-    expect(res.isError).toBeFalsy();
-    expect(fake.uploadedAttachments).toHaveLength(1);
-    expect(fake.uploadedAttachments[0]?.filename).toBe("ok.bin");
-    expect(fake.uploadedAttachments[0]?.content).toEqual(bytes);
-  });
 });

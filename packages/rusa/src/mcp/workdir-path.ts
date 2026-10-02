@@ -137,12 +137,14 @@ const READ_CHUNK_BYTES = 64 * 1024;
  * holds even if the file grows or is replaced after it was resolved. The
  * handle is opened within the workdir without following any symlink and
  * nonblocking (a FIFO cannot stall the open), then must be a regular file; at
- * most `maxBytes + 1` bytes are ever read.
+ * most `maxBytes + 1` bytes are ever read. `noun` names the file in the size
+ * error, so each caller keeps its existing wording.
  */
 export async function readBoundedRegularFile(
   workDir: string,
   path: string,
-  maxBytes: number
+  maxBytes: number,
+  noun = "file"
 ): Promise<Buffer> {
   const handle = await openInWorkdir(
     workDir,
@@ -162,7 +164,7 @@ export async function readBoundedRegularFile(
       chunks.push(chunk.subarray(0, bytesRead));
       length += bytesRead;
       if (length > maxBytes) {
-        throw new Error(`file size limit exceeded: file is larger than ${maxBytes} bytes`);
+        throw new Error(`${noun} size limit exceeded: ${noun} is larger than ${maxBytes} bytes`);
       }
     }
     return Buffer.concat(chunks, length);
