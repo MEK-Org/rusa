@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/chat_room.dart';
@@ -8,6 +11,8 @@ import 'fakes.dart';
 
 void main() {
   late FakeApi api;
+  late FakeStream stream;
+  late FakeWalkie walkie;
   late DashboardStore store;
 
   setUp(() async {
@@ -16,18 +21,19 @@ void main() {
         makeThread('root', voiceName: 'Puck'),
         makeThread('actor-b', voiceName: 'Kore'),
       ];
-    store = DashboardStore(
-      api: api,
-      stream: FakeStream(),
-      walkie: FakeWalkie(api).deps,
-    );
+    stream = FakeStream();
+    walkie = FakeWalkie(api);
+    store = DashboardStore(api: api, stream: stream, walkie: walkie.deps);
     await store.refreshThreads();
   });
 
   tearDown(() => store.dispose());
 
-  Future<void> pumpRoom(WidgetTester tester) async {
-    await tester.binding.setSurfaceSize(const Size(800, 900));
+  Future<void> pumpRoom(
+    WidgetTester tester, {
+    Size size = const Size(800, 900),
+  }) async {
+    await tester.binding.setSurfaceSize(size);
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.pumpWidget(
       MaterialApp(
@@ -60,7 +66,7 @@ void main() {
     final rootBounds = tester.getRect(
       find.byKey(const ValueKey('chat-room-avatar-root')),
     );
-    // Within layout rounding: the two-line header leaves a fractional height.
+    // Within layout rounding.
     expect(rootBounds.width, moreOrLessEquals(roomBounds.width, epsilon: 0.01));
     expect(
       rootBounds.height,
@@ -91,10 +97,6 @@ void main() {
       expect(find.byKey(const ValueKey('chat-room-add')), findsNothing);
       expect(find.byIcon(Icons.person_add_alt_1), findsNothing);
       expect(
-        find.byKey(const ValueKey('chat-room-membership')),
-        findsOneWidget,
-      );
-      expect(
         find.byKey(const ValueKey('chat-room-avatar-actor-b')),
         findsNothing,
       );
@@ -117,7 +119,8 @@ void main() {
       );
       final delegate =
           grid.gridDelegate as SliverGridDelegateWithFixedCrossAxisCount;
-      expect(delegate.crossAxisCount, 2);
+      // The 800x900 room is taller than wide, so the two-up stacks (#803).
+      expect(delegate.crossAxisCount, 1);
 
       await tester.tap(find.byKey(const ValueKey('chat-room-avatar-actor-b')));
       await tester.pump();
@@ -168,6 +171,268 @@ void main() {
       expect(find.text('Voice: Achernar'), findsOneWidget);
     },
   );
+
+  Color borderOf(WidgetTester tester, String id) {
+    final tile = tester.widget<AnimatedContainer>(
+      find.descendant(
+        of: find.byKey(ValueKey('chat-room-avatar-$id')),
+        matching: find.byType(AnimatedContainer),
+      ),
+    );
+    return ((tile.decoration! as BoxDecoration).border! as Border).top.color;
+  }
+
+  Rect tileRect(WidgetTester tester, String id) =>
+      tester.getRect(find.byKey(ValueKey('chat-room-avatar-$id')));
+
+  group('#803 appearance', () {
+    testWidgets('has no room header or idle prompt', (tester) async {
+      api.chatRoomParticipants = ['root', 'actor-b'];
+      await pumpRoom(tester);
+
+      expect(find.text('CHAT ROOM'), findsNothing);
+      expect(find.text('Root adds and removes participants'), findsNothing);
+      expect(find.textContaining('Tap an actor'), findsNothing);
+      expect(
+        tester
+            .widget<Text>(find.byKey(const ValueKey('chat-room-status')))
+            .data,
+        isEmpty,
+      );
+    });
+
+    testWidgets(
+      'tile borders follow the dashboard run state, and speaking wins',
+      (tester) async {
+        api
+          ..chatRoomParticipants = ['root', 'actor-b']
+          ..runtimeCursor = const RuntimeCursor(
+            streamId: 'stream-a',
+            revision: 0,
+          );
+        await store.init();
+        await pumpRoom(tester);
+
+        expect(borderOf(tester, 'root'), MeshColors.border);
+        expect(borderOf(tester, 'actor-b'), MeshColors.border);
+
+        // The same runtime deltas that drive the actor tree's status dots.
+        var revision = 0;
+        final runStates = {
+          'root': RunState.unknown,
+          'actor-b': RunState.unknown,
+        };
+        Future<void> runState(String id, RunState state) async {
+          revision++;
+          // Keep the fake server in agreement with the delta, in case the
+          // store re-fetches the snapshot.
+          runStates[id] = state;
+          api
+            ..threadsResult = [
+              makeThread(
+                'root',
+                voiceName: 'Puck',
+                runState: runStates['root']!,
+              ),
+              makeThread(
+                'actor-b',
+                voiceName: 'Kore',
+                runState: runStates['actor-b']!,
+              ),
+            ]
+            ..runtimeCursor = RuntimeCursor(
+              streamId: 'stream-a',
+              revision: revision,
+            );
+          stream.runtimeStatesCtrl.add(
+            ActorRuntimeStateDelta(
+              streamId: 'stream-a',
+              revision: revision,
+              actorId: id,
+              runState: state,
+            ),
+          );
+          await tester.pump(const Duration(milliseconds: 50));
+          await tester.pump(const Duration(milliseconds: 50));
+        }
+
+        await runState('root', RunState.running);
+        expect(store.dotFor('root'), DotState.active);
+        expect(borderOf(tester, 'root'), MeshColors.statusActive);
+
+        await runState('actor-b', RunState.queued);
+        expect(store.dotFor('actor-b'), DotState.queued);
+        expect(borderOf(tester, 'actor-b'), MeshColors.statusQueued);
+
+        await runState('root', RunState.queued);
+        expect(borderOf(tester, 'root'), MeshColors.statusQueued);
+
+        await runState('root', RunState.idle);
+        expect(borderOf(tester, 'root'), MeshColors.border);
+
+        // A queued actor that is speaking shows the speaking border; it
+        // returns to its state colour when playback ends.
+        await tester.tap(find.byKey(const ValueKey('chat-room-avatar-root')));
+        await tester.pump();
+        await tester.pump();
+        await tester.tap(find.byKey(const ValueKey('chat-room-cancel')));
+        await tester.pump();
+        walkie.stream.framesCtrl.add(
+          makeAnnouncement('reply-b', actor: 'actor-b'),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(find.text('Speaking'), findsOneWidget);
+        expect(borderOf(tester, 'actor-b'), MeshColors.accent);
+        expect(borderOf(tester, 'root'), MeshColors.border);
+
+        walkie.player.finishCurrent();
+        await tester.pump();
+        await tester.pump();
+        expect(find.text('Speaking'), findsNothing);
+        expect(borderOf(tester, 'actor-b'), MeshColors.statusQueued);
+
+        // init() started the store's polls; stop them before the pending
+        // timer check.
+        await tester.pumpWidget(const SizedBox());
+        await tester.runAsync(store.dispose);
+      },
+    );
+
+    testWidgets('recording an idle actor does not paint it active', (
+      tester,
+    ) async {
+      api.chatRoomParticipants = ['root', 'actor-b'];
+      await pumpRoom(tester);
+
+      await tester.tap(find.byKey(const ValueKey('chat-room-avatar-actor-b')));
+      await tester.pump();
+      await tester.pump();
+
+      expect(borderOf(tester, 'actor-b'), MeshColors.border);
+      expect(
+        find.descendant(
+          of: find.byKey(const ValueKey('chat-room-avatar-actor-b')),
+          matching: find.byKey(const ValueKey('chat-room-recording-badge')),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: find.byKey(const ValueKey('chat-room-avatar-actor-b')),
+          matching: find.text('Tap to send'),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('chat-room-recording-badge')),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('two participants stack when the room is taller than wide', (
+      tester,
+    ) async {
+      api.chatRoomParticipants = ['root', 'actor-b'];
+      await pumpRoom(tester, size: const Size(420, 860));
+
+      final root = tileRect(tester, 'root');
+      final other = tileRect(tester, 'actor-b');
+      expect(other.left, root.left);
+      expect(other.width, root.width);
+      expect(other.top, greaterThan(root.bottom));
+      expect(root.height, lessThan(root.width * 1.2));
+
+      await pumpRoom(tester, size: const Size(1180, 820));
+      final wideRoot = tileRect(tester, 'root');
+      final wideOther = tileRect(tester, 'actor-b');
+      expect(wideOther.top, wideRoot.top);
+      expect(wideOther.left, greaterThan(wideRoot.right));
+    });
+
+    test('chatRoomColumns keeps one- and three-actor layouts', () {
+      const tall = Size(400, 900);
+      const wide = Size(1200, 800);
+      expect(chatRoomColumns(1, tall), 1);
+      expect(chatRoomColumns(1, wide), 1);
+      expect(chatRoomColumns(2, tall), 1);
+      expect(chatRoomColumns(2, wide), 2);
+      expect(chatRoomColumns(2, const Size(800, 800)), 2);
+      expect(chatRoomColumns(3, tall), 2);
+      expect(chatRoomColumns(3, wide), 2);
+      expect(chatRoomColumns(5, wide), 3);
+    });
+
+    testWidgets(
+      'tiles hold still through starting, recording, sending, and cancel',
+      (tester) async {
+        api.chatRoomParticipants = ['root', 'actor-b'];
+        await pumpRoom(tester, size: const Size(420, 860));
+
+        final idle = {
+          for (final id in ['root', 'actor-b']) id: tileRect(tester, id),
+        };
+        void expectStill(String phase) {
+          for (final id in idle.keys) {
+            expect(tileRect(tester, id), idle[id], reason: '$id while $phase');
+          }
+        }
+
+        expect(find.byKey(const ValueKey('chat-room-cancel')), findsNothing);
+
+        // Starting: the mic is still opening, and cancel can discard it.
+        final mic = Completer<void>();
+        walkie.recorder.startCompleter = mic;
+        await tester.tap(find.byKey(const ValueKey('chat-room-avatar-root')));
+        await tester.pump();
+        await tester.pump();
+        expect(find.textContaining('Opening the mic'), findsOneWidget);
+        expect(find.byKey(const ValueKey('chat-room-cancel')), findsOneWidget);
+        expectStill('starting');
+
+        mic.complete();
+        walkie.recorder.startCompleter = null;
+        await tester.pump();
+        await tester.pump();
+        expect(
+          find.textContaining('Recording for root-handle'),
+          findsOneWidget,
+        );
+        expect(find.byKey(const ValueKey('chat-room-cancel')), findsOneWidget);
+        expectStill('recording');
+
+        await tester.tap(find.byKey(const ValueKey('chat-room-cancel')));
+        await tester.pump();
+        await tester.pump();
+        expect(find.byKey(const ValueKey('chat-room-cancel')), findsNothing);
+        expect(api.memoSends, isEmpty);
+        expectStill('cancelled');
+
+        // Record again and send: sending cannot be cancelled, so the control
+        // goes away while its space stays reserved.
+        await tester.tap(find.byKey(const ValueKey('chat-room-avatar-root')));
+        await tester.pump();
+        await tester.pump();
+        final sending = Completer<void>();
+        api.memoGate = sending;
+        await tester.tap(find.byKey(const ValueKey('chat-room-avatar-root')));
+        await tester.pump();
+        await tester.pump();
+        expect(find.textContaining('Sending the memo'), findsOneWidget);
+        expect(find.byKey(const ValueKey('chat-room-cancel')), findsNothing);
+        expectStill('sending');
+
+        sending.complete();
+        await tester.pump();
+        await tester.pump();
+        expect(api.memoSends, hasLength(1));
+        expect(find.text('Delivered to root-handle.'), findsOneWidget);
+        expectStill('delivered');
+        // Let the delivered banner's reset timer run out.
+        await tester.pump(const Duration(seconds: 10));
+      },
+    );
+  });
 }
 
 /// WCAG 2.x contrast ratio between two opaque colours.

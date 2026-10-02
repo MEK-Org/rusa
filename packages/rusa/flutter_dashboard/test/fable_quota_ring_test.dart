@@ -331,47 +331,243 @@ void main() {
       });
     });
 
-    testWidgets('leaves Claude pacing out of the Fable tooltip', (
-      tester,
-    ) async {
-      await tester.runAsync(() async {
-        final now = DateTime.now();
-        final base = _snapshot(
-          claudeWindows: [_claudeWeekly(now: now)],
-          modelWindows: [_fableWeekly(now: now)],
-          withCodex: false,
-        );
-        final claude = base.providers.single;
-        final store = await _pumpRings(
-          tester,
-          QuotaSnapshotDto(
-            generatedAt: base.generatedAt,
-            providers: [
-              ProviderQuotaDto(
-                provider: 'claude',
-                status: claude.status,
-                usedPercent: claude.usedPercent,
-                tier: null,
-                message: null,
-                windows: claude.windows,
-                modelWindows: claude.modelWindows,
-                throttle: const QuotaThrottleDto(
-                  intervalSeconds: 90,
-                  expired: false,
-                  capped: false,
-                  buckets: [],
-                  updatedAt: '2026-09-28T14:00:00.000Z',
+    testWidgets(
+      'shows Fable lane interval when it differs from Claude\'s (#811)',
+      (tester) async {
+        await tester.runAsync(() async {
+          final now = DateTime.now();
+          final base = _snapshot(
+            claudeWindows: [_claudeWeekly(now: now)],
+            modelWindows: [_fableWeekly(now: now)],
+            withCodex: false,
+          );
+          final claude = base.providers.single;
+          final store = await _pumpRings(
+            tester,
+            QuotaSnapshotDto(
+              generatedAt: base.generatedAt,
+              providers: [
+                ProviderQuotaDto(
+                  provider: 'claude',
+                  status: claude.status,
+                  usedPercent: claude.usedPercent,
+                  tier: null,
+                  message: null,
+                  windows: claude.windows,
+                  modelWindows: claude.modelWindows,
+                  throttle: QuotaThrottleDto(
+                    intervalSeconds: 90,
+                    expired: false,
+                    capped: false,
+                    buckets: const [],
+                    updatedAt: '2026-09-28T14:00:00.000Z',
+                    modelLanes: [
+                      QuotaThrottleModelLaneDto(
+                        models: const ['claude-fable-5-1'],
+                        intervalSeconds: 900,
+                        expired: false,
+                        capped: true,
+                        buckets: const [],
+                        updatedAt: '2026-09-28T14:00:00.000Z',
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-            ],
-          ),
-        );
+              ],
+            ),
+          );
 
-        expect(_tooltipOf(tester, 'Claude'), contains('Pacing: every'));
-        expect(_tooltipOf(tester, 'Fable'), isNot(contains('Pacing:')));
-        await store.dispose();
-      });
-    });
+          expect(_tooltipOf(tester, 'Claude'), contains('Pacing: every 1.5 minutes'));
+          expect(_tooltipOf(tester, 'Claude'), isNot(contains('Limited to the configured maximum interval')));
+
+          final fableTip = _tooltipOf(tester, 'Fable');
+          expect(fableTip, contains('Pacing: every 15 minutes'));
+          expect(fableTip, contains('Limited to the configured maximum interval'));
+          await store.dispose();
+        });
+      },
+    );
+
+    testWidgets(
+      'shows Pacing: n/a when Fable lane is absent and never borrows Claude\'s (#811)',
+      (tester) async {
+        await tester.runAsync(() async {
+          final now = DateTime.now();
+          final base = _snapshot(
+            claudeWindows: [_claudeWeekly(now: now)],
+            modelWindows: [_fableWeekly(now: now)],
+            withCodex: false,
+          );
+          final claude = base.providers.single;
+          final store = await _pumpRings(
+            tester,
+            QuotaSnapshotDto(
+              generatedAt: base.generatedAt,
+              providers: [
+                ProviderQuotaDto(
+                  provider: 'claude',
+                  status: claude.status,
+                  usedPercent: claude.usedPercent,
+                  tier: null,
+                  message: null,
+                  windows: claude.windows,
+                  modelWindows: claude.modelWindows,
+                  throttle: const QuotaThrottleDto(
+                    intervalSeconds: 90,
+                    expired: false,
+                    capped: false,
+                    buckets: [],
+                    updatedAt: '2026-09-28T14:00:00.000Z',
+                  ),
+                ),
+              ],
+            ),
+          );
+
+          expect(_tooltipOf(tester, 'Claude'), contains('Pacing: every 1.5 minutes'));
+          expect(_tooltipOf(tester, 'Fable'), contains('Pacing: n/a'));
+          expect(_tooltipOf(tester, 'Fable'), isNot(contains('90')));
+          await store.dispose();
+        });
+      },
+    );
+
+    testWidgets(
+      'shows Pacing: n/a when Fable lane is malformed or ambiguous (#811)',
+      (tester) async {
+        await tester.runAsync(() async {
+          final now = DateTime.now();
+          final base = _snapshot(
+            claudeWindows: [_claudeWeekly(now: now)],
+            modelWindows: [_fableWeekly(now: now)],
+            withCodex: false,
+          );
+          final claude = base.providers.single;
+
+          // 1. Negative interval
+          var store = await _pumpRings(
+            tester,
+            QuotaSnapshotDto(
+              generatedAt: base.generatedAt,
+              providers: [
+                ProviderQuotaDto(
+                  provider: 'claude',
+                  status: claude.status,
+                  usedPercent: claude.usedPercent,
+                  tier: null,
+                  message: null,
+                  windows: claude.windows,
+                  modelWindows: claude.modelWindows,
+                  throttle: QuotaThrottleDto(
+                    intervalSeconds: 90,
+                    expired: false,
+                    capped: false,
+                    buckets: const [],
+                    updatedAt: '2026-09-28T14:00:00.000Z',
+                    modelLanes: [
+                      QuotaThrottleModelLaneDto(
+                        models: const ['claude-fable-5-1'],
+                        intervalSeconds: -10,
+                        expired: false,
+                        capped: false,
+                        buckets: const [],
+                        updatedAt: '2026-09-28T14:00:00.000Z',
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          );
+          expect(_tooltipOf(tester, 'Fable'), contains('Pacing: n/a'));
+          await store.dispose();
+
+          // 2. Non-fable scope
+          store = await _pumpRings(
+            tester,
+            QuotaSnapshotDto(
+              generatedAt: base.generatedAt,
+              providers: [
+                ProviderQuotaDto(
+                  provider: 'claude',
+                  status: claude.status,
+                  usedPercent: claude.usedPercent,
+                  tier: null,
+                  message: null,
+                  windows: claude.windows,
+                  modelWindows: claude.modelWindows,
+                  throttle: QuotaThrottleDto(
+                    intervalSeconds: 90,
+                    expired: false,
+                    capped: false,
+                    buckets: const [],
+                    updatedAt: '2026-09-28T14:00:00.000Z',
+                    modelLanes: [
+                      QuotaThrottleModelLaneDto(
+                        models: const ['claude-opus-5-5'],
+                        intervalSeconds: 900,
+                        expired: false,
+                        capped: false,
+                        buckets: const [],
+                        updatedAt: '2026-09-28T14:00:00.000Z',
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          );
+          expect(_tooltipOf(tester, 'Fable'), contains('Pacing: n/a'));
+          await store.dispose();
+
+          // 3. Ambiguous multiple fable lanes
+          store = await _pumpRings(
+            tester,
+            QuotaSnapshotDto(
+              generatedAt: base.generatedAt,
+              providers: [
+                ProviderQuotaDto(
+                  provider: 'claude',
+                  status: claude.status,
+                  usedPercent: claude.usedPercent,
+                  tier: null,
+                  message: null,
+                  windows: claude.windows,
+                  modelWindows: claude.modelWindows,
+                  throttle: QuotaThrottleDto(
+                    intervalSeconds: 90,
+                    expired: false,
+                    capped: false,
+                    buckets: const [],
+                    updatedAt: '2026-09-28T14:00:00.000Z',
+                    modelLanes: [
+                      QuotaThrottleModelLaneDto(
+                        models: const ['claude-fable-5-1'],
+                        intervalSeconds: 300,
+                        expired: false,
+                        capped: false,
+                        buckets: const [],
+                        updatedAt: '2026-09-28T14:00:00.000Z',
+                      ),
+                      QuotaThrottleModelLaneDto(
+                        models: const ['claude-fable-5'],
+                        intervalSeconds: 600,
+                        expired: false,
+                        capped: false,
+                        buckets: const [],
+                        updatedAt: '2026-09-28T14:00:00.000Z',
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          );
+          expect(_tooltipOf(tester, 'Fable'), contains('Pacing: n/a'));
+          await store.dispose();
+        });
+      },
+    );
 
     testWidgets('shows no Fable ring without a Claude reading', (tester) async {
       await tester.runAsync(() async {

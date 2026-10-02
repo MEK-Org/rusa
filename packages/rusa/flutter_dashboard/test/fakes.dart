@@ -472,6 +472,9 @@ class FakeApi extends DashboardApi {
     delivered: true,
   );
   DashboardApiException? memoError;
+
+  /// Holds [sendVoiceMemo] open while set, so a test can observe sending.
+  Completer<void>? memoGate;
   final memoSends =
       <
         ({String actorId, int byteLength, String mimeType, String? sessionId})
@@ -510,6 +513,8 @@ class FakeApi extends DashboardApi {
       mimeType: mimeType,
       sessionId: sessionId,
     ));
+    final gate = memoGate;
+    if (gate != null) await gate.future;
     final err = memoError;
     if (err != null) throw err;
     return memoResult;

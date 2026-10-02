@@ -30,6 +30,7 @@ import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
+import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
 import { RootModelConfigStartupError } from "../actor/root-model-config.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
@@ -1042,6 +1043,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       appliedInterval: (provider: string) => number | undefined;
       pacerQuote: (provider: string) => number;
       triggerQuotaThrottleTick: () => Promise<void>;
+      getThrottle: (provider: string) => QuotaThrottleStatus | null;
       makeUnavailable: () => void;
       throttleRequestCount: () => number;
       close: () => Promise<void>;
@@ -1097,6 +1099,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       let appliedInterval: ((provider: string) => number | undefined) | undefined;
       let pacerQuote: ((provider: string) => number) | undefined;
       let triggerQuotaThrottleTick: (() => Promise<void>) | undefined;
+      let getThrottle: ((provider: string) => QuotaThrottleStatus | null) | undefined;
       await new Promise<void>((resolve) => {
         void runStart({
           e2e: {
@@ -1105,6 +1108,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
               appliedInterval = handles.coordinatorAppliedInterval;
               pacerQuote = handles.coordinatorPacerQuote;
               triggerQuotaThrottleTick = handles.triggerQuotaThrottleTick;
+              getThrottle = handles.getThrottle;
               shutdownFn = handles.shutdown;
               resolve();
             },
@@ -1119,6 +1123,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         appliedInterval,
         pacerQuote,
         triggerQuotaThrottleTick,
+        getThrottle: getThrottle ?? (() => null),
         makeUnavailable: () => {
           unavailable = true;
         },
@@ -1496,6 +1501,38 @@ describe("runStart webhook event routing (Phase 4)", () => {
           await close();
         }
       });
+
+      it("records published model lanes into the provider throttle status (#811)", async () => {
+        let publishFable = true;
+        const { close, triggerQuotaThrottleTick, getThrottle } = await bootWithCoordinator(() => ({
+          claude: publishFable
+            ? withFableLane(throttleStatus("claude", { intervalSeconds: 60 }), {
+                intervalSeconds: 300,
+              })
+            : throttleStatus("claude", { intervalSeconds: 60 }),
+        }));
+        try {
+          await triggerQuotaThrottleTick();
+          const claudeThrottle = getThrottle("claude");
+          expect(claudeThrottle?.intervalSeconds).toBe(60);
+          expect(claudeThrottle?.modelLanes).toEqual([
+            expect.objectContaining({
+              models: ["claude-fable-5-1"],
+              intervalSeconds: 300,
+            }),
+          ]);
+
+          publishFable = false;
+          await triggerQuotaThrottleTick();
+          const updatedThrottle = getThrottle("claude");
+          expect(updatedThrottle?.intervalSeconds).toBe(60);
+          expect(updatedThrottle?.modelLanes).toBeUndefined();
+        } finally {
+          await shutdownFn?.();
+          shutdownFn = undefined;
+          await close();
+        }
+      });
     });
   });
 
@@ -1820,7 +1857,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(String(strict.selection.discipline)).toContain(strictHeadId);
     expect(String(strict.selection.discipline)).toMatch(/every selected head/);
     expect(String(strict.selection.discipline)).toContain(
-      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor"
+      "complete it, cancel it, schedule it, snooze it until a future time with `set_snooze`, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor"
     );
     // The unenrolled control's selection carries no trace of the experiment.
     expect(controlSelection.selection).not.toHaveProperty("discipline");
@@ -2750,6 +2787,33 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       const notes = mechanicalNotes("root");
       expect(notes.some((note) => note.startsWith("[run failed]"))).toBe(true);
+    });
+
+    // #189: a capped run used to be filtered out before the failure route, so
+    // the parent never heard about it.
+    it("forwards a capped run to the parent as a responsive [capped] notice", async () => {
+      const workerId = "capped-worker";
+      const mesh = await bootWithWorker(workerId);
+      const actor = actorFor(mesh, workerId);
+
+      const runId = await startRun(actor);
+      await endLifecycleRun(actor, runId, {
+        success: false,
+        capped: true,
+        exitCode: 1,
+        output: "turn limit reached",
+      });
+
+      const notices = getRepositories()
+        .inbox.list("root", { status: "all" })
+        .entries.filter((entry) => entry.payload?.fromId === workerId);
+      expect(notices.map((entry) => entry.payload)).toEqual([
+        expect.objectContaining({
+          type: "mesh.mechanical_note",
+          note: expect.stringMatching(/^\[capped\] /),
+          priority: "responsive",
+        }),
+      ]);
     });
   });
 

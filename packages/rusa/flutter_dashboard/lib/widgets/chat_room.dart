@@ -120,12 +120,10 @@ class _ChatRoomTabState extends State<ChatRoomTab> {
       stream: Rx.combineLatestList<Object?>([
         widget.store.actorStates,
         controller.available,
-        controller.connection,
         controller.record,
         controller.participants,
         controller.recipient,
         controller.recordingRecipient,
-        controller.queueDepth,
         controller.nowPlaying,
         controller.lastError,
       ]),
@@ -138,11 +136,9 @@ class _ChatRoomTabState extends State<ChatRoomTab> {
             .toList();
         final available = controller.available.valueOrNull;
         final record = controller.record.valueOrNull ?? const RecordStatus();
-        final queueDepth = controller.queueDepth.valueOrNull ?? 0;
         final nowPlaying = controller.nowPlaying.valueOrNull;
         final selectedRecipient = controller.recipient.valueOrNull;
         final recordingRecipient = controller.recordingRecipient.valueOrNull;
-        final isRecording = controller.isRecording;
         final handleFor = <String, String>{
           for (final actor in actors) actor.id: actor.handle,
         };
@@ -153,6 +149,11 @@ class _ChatRoomTabState extends State<ChatRoomTab> {
           handles: handleFor,
           available: available,
         );
+        // cancelRecord() only discards a capture that is opening or live; a
+        // memo already sending cannot be pulled back.
+        final canCancel =
+            record.phase == RecordPhase.starting ||
+            record.phase == RecordPhase.recording;
 
         return Container(
           key: const ValueKey('chat-room'),
@@ -161,22 +162,10 @@ class _ChatRoomTabState extends State<ChatRoomTab> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              _RoomHeader(
-                controller: controller,
-                queueDepth: queueDepth,
-                nowPlaying: nowPlaying,
-              ),
-              const SizedBox(height: 12),
-              _StatusBanner(
-                status: status,
-                error: controller.lastError.valueOrNull,
-              ),
-              const SizedBox(height: 12),
               Expanded(
                 child: _AvatarGrid(
                   actors: actors,
                   store: widget.store,
-                  selectedRecipient: selectedRecipient,
                   recordingRecipient: recordingRecipient,
                   speakingActorId: nowPlaying?.actorId,
                   disabled:
@@ -187,18 +176,14 @@ class _ChatRoomTabState extends State<ChatRoomTab> {
                       unawaited(controller.tapParticipant(actorId)),
                 ),
               ),
-              if (isRecording) ...[
-                const SizedBox(height: 12),
-                FilledButton.tonalIcon(
-                  key: const ValueKey('chat-room-cancel'),
-                  onPressed: () => unawaited(controller.cancelRecord()),
-                  icon: const Icon(Icons.close),
-                  label: const Text('Cancel recording'),
-                  style: FilledButton.styleFrom(
-                    foregroundColor: MeshColors.statusHalted,
-                  ),
-                ),
-              ],
+              const SizedBox(height: 12),
+              _RoomControls(
+                status: status,
+                error: controller.lastError.valueOrNull,
+                onCancel: canCancel
+                    ? () => unawaited(controller.cancelRecord())
+                    : null,
+              ),
             ],
           ),
         );
@@ -224,122 +209,72 @@ String _roomStatus({
   return switch (record.phase) {
     RecordPhase.starting => 'Opening the mic for $recording…',
     RecordPhase.recording =>
-      'Recording for $recording — tap that avatar to send. X discards this clip.',
+      'Recording for $recording — tap the avatar again to send.',
     RecordPhase.sending => 'Sending the memo to $recording…',
     RecordPhase.delivered =>
       record.delivered
           ? 'Delivered to $selected.'
           : 'Queued for $selected while they are asleep.',
     RecordPhase.error => record.message ?? 'Voice action failed.',
-    RecordPhase.idle =>
-      'Tap an actor avatar to record a message for $selected.',
+    RecordPhase.idle => '',
   };
 }
 
-class _RoomHeader extends StatelessWidget {
-  const _RoomHeader({
-    required this.controller,
-    required this.queueDepth,
-    required this.nowPlaying,
-  });
+/// Height of the bottom status/cancel strip. It is reserved in every phase,
+/// idle included, so starting, sending, or cancelling a recording never moves
+/// or resizes the actor tiles (#803).
+const double _controlsHeight = 64;
 
-  final ChatRoomController controller;
-  final int queueDepth;
-  final VoiceAnnouncement? nowPlaying;
+class _RoomControls extends StatelessWidget {
+  const _RoomControls({required this.status, this.error, this.onCancel});
+  final String status;
+  final String? error;
+  final VoidCallback? onCancel;
 
   @override
   Widget build(BuildContext context) {
-    final state = controller.connection.valueOrNull ?? WalkieConnection.off;
-    final label = switch (state) {
-      WalkieConnection.connected => 'Connected',
-      WalkieConnection.connecting => 'Connecting…',
-      WalkieConnection.reconnecting => 'Reconnecting…',
-      WalkieConnection.off => 'Ready',
-    };
-    return Row(
-      children: [
-        const Icon(Icons.forum_outlined, color: MeshColors.accent),
-        const SizedBox(width: 8),
-        const Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'CHAT ROOM',
-                style: TextStyle(
-                  color: MeshColors.textPrimary,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 1.2,
-                ),
+    final onCancel = this.onCancel;
+    return SizedBox(
+      key: const ValueKey('chat-room-controls'),
+      height: _controlsHeight,
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              error ?? status,
+              key: const ValueKey('chat-room-status'),
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: error == null
+                    ? MeshColors.textSecondary
+                    : MeshColors.statusHalted,
+                fontSize: 13,
               ),
-              // Membership is mesh state; this page only reads it (#663).
-              Text(
-                'Root adds and removes participants',
-                key: ValueKey('chat-room-membership'),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
-              ),
-            ],
-          ),
-        ),
-        if (nowPlaying != null)
-          const Padding(
-            padding: EdgeInsets.only(right: 8),
-            child: Icon(Icons.volume_up, color: MeshColors.accent, size: 18),
-          ),
-        if (queueDepth > 0)
-          Text(
-            '$queueDepth queued',
-            style: const TextStyle(
-              color: MeshColors.textSecondary,
-              fontSize: 12,
             ),
           ),
-        const SizedBox(width: 8),
-        Text(
-          label,
-          style: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
-        ),
-      ],
+          if (onCancel != null) ...[
+            const SizedBox(width: 12),
+            FilledButton.tonalIcon(
+              key: const ValueKey('chat-room-cancel'),
+              onPressed: onCancel,
+              icon: const Icon(Icons.close),
+              label: const Text('Cancel recording'),
+              style: FilledButton.styleFrom(
+                foregroundColor: MeshColors.statusHalted,
+              ),
+            ),
+          ],
+        ],
+      ),
     );
   }
-}
-
-class _StatusBanner extends StatelessWidget {
-  const _StatusBanner({required this.status, this.error});
-  final String status;
-  final String? error;
-
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-    decoration: BoxDecoration(
-      color: MeshColors.bgSecondary,
-      borderRadius: BorderRadius.circular(10),
-      border: Border.all(
-        color: error == null ? MeshColors.border : MeshColors.statusHalted,
-      ),
-    ),
-    child: Text(
-      error ?? status,
-      key: const ValueKey('chat-room-status'),
-      textAlign: TextAlign.center,
-      style: TextStyle(
-        color: error == null
-            ? MeshColors.textSecondary
-            : MeshColors.statusHalted,
-        fontSize: 13,
-      ),
-    ),
-  );
 }
 
 class _AvatarGrid extends StatelessWidget {
   const _AvatarGrid({
     required this.actors,
     required this.store,
-    required this.selectedRecipient,
     required this.recordingRecipient,
     required this.speakingActorId,
     required this.disabled,
@@ -348,7 +283,6 @@ class _AvatarGrid extends StatelessWidget {
 
   final List<ThreadDto> actors;
   final DashboardStore store;
-  final String? selectedRecipient;
   final String? recordingRecipient;
   final String? speakingActorId;
   final bool disabled;
@@ -365,9 +299,9 @@ class _AvatarGrid extends StatelessWidget {
       );
     }
     final count = actors.length;
-    final columns = count == 1 ? 1 : math.sqrt(count).ceil();
     return LayoutBuilder(
       builder: (context, constraints) {
+        final columns = chatRoomColumns(count, constraints.biggest);
         final rows = (count / columns).ceil();
         const gap = 12.0;
         final tileWidth =
@@ -380,9 +314,8 @@ class _AvatarGrid extends StatelessWidget {
             crossAxisCount: columns,
             crossAxisSpacing: gap,
             mainAxisSpacing: gap,
-            // Fit the whole V1 room on screen: one actor occupies the room;
-            // three actors use the visible 2x2 with the last cell intentionally
-            // empty, rather than hiding the third below a scroll boundary.
+            // Fit the whole V1 room on screen rather than hiding a tile below
+            // a scroll boundary; see [chatRoomColumns].
             childAspectRatio: tileWidth / tileHeight,
           ),
           itemCount: count,
@@ -390,8 +323,8 @@ class _AvatarGrid extends StatelessWidget {
             final actor = actors[index];
             return _RoomAvatarButton(
               actor: actor,
+              state: store.dotFor(actor),
               store: store,
-              selected: actor.id == selectedRecipient,
               recording: actor.id == recordingRecipient,
               speaking: actor.id == speakingActorId,
               disabled: disabled,
@@ -407,8 +340,8 @@ class _AvatarGrid extends StatelessWidget {
 class _RoomAvatarButton extends StatelessWidget {
   const _RoomAvatarButton({
     required this.actor,
+    required this.state,
     required this.store,
-    required this.selected,
     required this.recording,
     required this.speaking,
     required this.disabled,
@@ -416,8 +349,8 @@ class _RoomAvatarButton extends StatelessWidget {
   });
 
   final ThreadDto actor;
+  final DotState state;
   final DashboardStore store;
-  final bool selected;
   final bool recording;
   final bool speaking;
   final bool disabled;
@@ -425,13 +358,7 @@ class _RoomAvatarButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final ring = recording
-        ? MeshColors.statusHalted
-        : speaking
-        ? MeshColors.accent
-        : selected
-        ? MeshColors.statusActive
-        : MeshColors.border;
+    final ring = chatRoomBorderColor(state: state, speaking: speaking);
     final action = recording ? 'Tap to send' : 'Tap to record';
     return Semantics(
       button: true,
@@ -449,7 +376,11 @@ class _RoomAvatarButton extends StatelessWidget {
               borderRadius: BorderRadius.circular(18),
               border: Border.all(
                 color: ring,
-                width: speaking || recording ? 3 : 1.5,
+                width: speaking
+                    ? 3
+                    : ring == MeshColors.border
+                    ? 1.5
+                    : 2.5,
               ),
               boxShadow: speaking
                   ? [
@@ -461,59 +392,68 @@ class _RoomAvatarButton extends StatelessWidget {
                   : const [],
             ),
             padding: const EdgeInsets.all(12),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
+            child: Stack(
+              fit: StackFit.expand,
               children: [
-                Expanded(
-                  child: AspectRatio(
-                    aspectRatio: 1,
-                    child: Center(
-                      child: LayoutBuilder(
-                        builder: (context, constraints) {
-                          final size = math.min(
-                            constraints.maxWidth,
-                            constraints.maxHeight,
-                          );
-                          return AbsorbPointer(
-                            child: ActorAvatar(
-                              id: actor.id,
-                              size: size,
-                              store: store,
-                            ),
-                          );
-                        },
+                Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Expanded(
+                      child: AspectRatio(
+                        aspectRatio: 1,
+                        child: Center(
+                          child: LayoutBuilder(
+                            builder: (context, constraints) {
+                              final size = math.min(
+                                constraints.maxWidth,
+                                constraints.maxHeight,
+                              );
+                              return AbsorbPointer(
+                                child: ActorAvatar(
+                                  id: actor.id,
+                                  size: size,
+                                  store: store,
+                                ),
+                              );
+                            },
+                          ),
+                        ),
                       ),
                     ),
-                  ),
+                    const SizedBox(height: 8),
+                    Text(
+                      actor.handle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: MeshColors.textPrimary,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      speaking
+                          ? 'Speaking'
+                          : recording
+                          ? 'Tap to send'
+                          : _voiceLabel(actor),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: speaking
+                            ? MeshColors.accent
+                            : recording
+                            ? MeshColors.statusHalted
+                            : MeshColors.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 8),
-                Text(
-                  actor.handle,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: MeshColors.textPrimary,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  speaking
-                      ? 'Speaking'
-                      : recording
-                      ? 'Tap to send'
-                      : _voiceLabel(actor),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  // Only the live states borrow the ring colour; an idle tile's
-                  // ring is the dim border, which is illegible as text.
-                  style: TextStyle(
-                    color: speaking || recording
-                        ? ring
-                        : MeshColors.textSecondary,
-                    fontSize: 12,
-                  ),
-                ),
+                // The border belongs to the actor's run state, so the capture
+                // this tile is recording is marked by a badge instead.
+                if (recording)
+                  const Positioned(top: 0, right: 0, child: _RecordingBadge()),
               ],
             ),
           ),
@@ -521,6 +461,60 @@ class _RoomAvatarButton extends StatelessWidget {
       ),
     );
   }
+}
+
+class _RecordingBadge extends StatelessWidget {
+  const _RecordingBadge();
+
+  @override
+  Widget build(BuildContext context) => Container(
+    key: const ValueKey('chat-room-recording-badge'),
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+    decoration: BoxDecoration(
+      color: MeshColors.statusHalted,
+      borderRadius: BorderRadius.circular(999),
+    ),
+    child: const Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.mic, size: 14, color: MeshColors.textPrimary),
+        SizedBox(width: 4),
+        Text(
+          'REC',
+          style: TextStyle(
+            color: MeshColors.textPrimary,
+            fontSize: 11,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 0.8,
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+/// Columns for [count] room tiles in an area of [size]: one actor fills the
+/// room; two sit side by side when the room is wider than tall and stack when
+/// it is taller (#803); three or more use the smallest square grid, so three
+/// show as a 2x2 with the last cell intentionally empty.
+@visibleForTesting
+int chatRoomColumns(int count, Size size) {
+  if (count <= 1) return 1;
+  if (count == 2) return size.height > size.width ? 1 : 2;
+  return math.sqrt(count).ceil();
+}
+
+/// A tile's border: the actor's run state in the dashboard's colours (green
+/// while active, amber while queued), except that a speaking actor keeps the
+/// speaking border (#803). Choosing a recipient does not change it.
+@visibleForTesting
+Color chatRoomBorderColor({required DotState state, required bool speaking}) {
+  if (speaking) return MeshColors.accent;
+  return switch (state) {
+    DotState.active => MeshColors.statusActive,
+    DotState.queued => MeshColors.statusQueued,
+    DotState.idle || DotState.retired => MeshColors.border,
+  };
 }
 
 String _voiceLabel(ThreadDto actor) {

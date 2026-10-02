@@ -1089,8 +1089,7 @@ describe("monolithic follower instance", () => {
   });
 
   it("drops retained ticket and books start-cancelled when pacing delay elapses during transport loss", async () => {
-    const pacer = new ProviderPacer(0);
-    pacer.deferUntil(Date.now() + 100);
+    const { pacer, release } = heldPacer();
     const h = setup({ pacer });
 
     const id = h.spawn("Pacing timeout while disconnected");
@@ -1100,7 +1099,9 @@ describe("monolithic follower instance", () => {
     h.remote.close();
     await h.runtime(id).exited;
 
-    // Do not reconnect; wait for pacing to turn while disconnected
+    // Do not reconnect. Turn pacing only after the transport loss is observed,
+    // so the retained ticket cannot leave the queue before the test reaches it.
+    release();
     await waitUntil(() =>
       h.meshEvents.some(
         (event) =>

@@ -491,8 +491,8 @@ export class QuotaCoordinatorService {
         return;
       }
 
-      const snapshot = this.options.store.getLatestSnapshot(provider);
-      if (!snapshot) {
+      const rawSnapshot = this.options.store.getLatestSnapshot(provider);
+      if (!rawSnapshot) {
         this.sendJson(res, 200, {
           service: serviceInfo,
           provider,
@@ -508,6 +508,7 @@ export class QuotaCoordinatorService {
         return;
       }
 
+      const snapshot = this.options.store.projectPacerState(provider, rawSnapshot);
       this.sendJson(res, 200, {
         service: serviceInfo,
         ...snapshot,
@@ -771,7 +772,8 @@ export class QuotaCoordinatorService {
       });
       return;
     }
-    if (nowMs - observedAtMs > this.hardStaleAfterMs) {
+    const manualHardStaleAfterMs = this.freshnessThresholds("manual").hardStaleAfterMs;
+    if (nowMs - observedAtMs > manualHardStaleAfterMs) {
       this.sendError(res, 409, {
         code: "stale_observation",
         message: "Observation is older than the coordinator hard-stale threshold",

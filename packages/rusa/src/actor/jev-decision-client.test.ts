@@ -2,9 +2,11 @@
 // The daemon is a Node process; under jsdom the SDK would see browser globals
 // and refuse to hold a credential.
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Fetch } from "@typesafe-ai/sdk";
+import { APITimeoutError, type Fetch } from "@typesafe-ai/sdk";
 import { describe, expect, it, vi } from "vitest";
 import {
   HttpJevDecisionClient,
@@ -227,19 +229,34 @@ describe("HttpJevDecisionClient", () => {
     expect(body.state.omittedCandidates).toBe(5);
   });
 
-  it("aborts the in-flight request when the signal is cancelled", async () => {
+  it("sends nothing when the signal fires while sources are being read", async () => {
     const controller = new AbortController();
-    const fetch = vi.fn<Fetch>(
-      (_url, init) =>
-        new Promise((_resolve, reject) => {
-          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
-          controller.abort();
-        })
-    );
-    const client = new HttpJevDecisionClient("synthetic-key", text, { fetch });
+    const fetch = vi.fn<Fetch>(async () => answer(0.1));
+    // A source read that ignores the signal, like the real source clients.
+    const resolve = vi.fn(async (actorId: string, id: string) => {
+      if (id === "candidate") controller.abort();
+      return text(actorId, id);
+    });
+    const client = new HttpJevDecisionClient("synthetic-key", resolve, { fetch });
 
     await expect(client.decide(request(), { signal: controller.signal })).rejects.toThrow();
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not cancel a request already sent when the signal fires", async () => {
+    const controller = new AbortController();
+    let transportSignal: AbortSignal | undefined;
+    const fetch = vi.fn<Fetch>(async (_url, init) => {
+      transportSignal = init?.signal ?? undefined;
+      controller.abort();
+      return answer(0.42);
+    });
+    const client = new HttpJevDecisionClient("synthetic-key", text, { fetch });
+
+    await expect(client.decide(request(), { signal: controller.signal })).resolves.toEqual({
+      interruptProbability: 0.42,
+    });
+    expect(transportSignal?.aborted).toBe(false);
   });
 });
 
@@ -492,4 +509,95 @@ describe("JEV interruption regressions (#710)", () => {
       expect(result).toEqual({ interruptProbability: 0.85 });
     });
   });
+});
+
+/**
+ * #813 regressions. A real loopback server sends response headers and part of
+ * the body, then stalls. The SDK buffers by draining `response.clone()`, and on
+ * Node 24 aborting that fetch mid-body leaves a rejection inside the tee that
+ * nothing handles: the process exits. Neither the policy deadline nor the SDK's
+ * own request timeout may be able to reach that path.
+ */
+describe("stalled response body (#813)", () => {
+  async function stalledBodyServer() {
+    let requests = 0;
+    const server = createServer((req, res) => {
+      requests += 1;
+      req.resume();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.write('{"model":"jev-test","answers":');
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    const target = `http://127.0.0.1:${port}/v1/systemone`;
+    return {
+      fetch: ((_url, init) => globalThis.fetch(target, init)) as Fetch,
+      requests: () => requests,
+      close: () => {
+        server.closeAllConnections();
+        server.close();
+      },
+    };
+  }
+
+  /** Counts rejections that nothing handled, for as long as `run` takes. */
+  async function unhandledRejectionsDuring(run: () => Promise<void>): Promise<unknown[]> {
+    const seen: unknown[] = [];
+    const listener = (reason: unknown) => seen.push(reason);
+    process.on("unhandledRejection", listener);
+    try {
+      await run();
+      // A floating rejection is reported after the microtask queue drains.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    } finally {
+      process.off("unhandledRejection", listener);
+    }
+    return seen;
+  }
+
+  it("records a timeout without an unhandled rejection when the deadline fires mid-body", async () => {
+    const server = await stalledBodyServer();
+    try {
+      const classifier = new ShadowResponsiveInterruptionClassifier({
+        threshold: 0.8,
+        timeoutMs: 300,
+        client: new HttpJevDecisionClient("synthetic-key", text, { fetch: server.fetch }),
+      });
+      let decision: unknown;
+      const unhandled = await unhandledRejectionsDuring(async () => {
+        decision = await classifier.evaluate({
+          actorId: "worker",
+          incomingEntryId: "incoming",
+          selectedEntryIds: ["candidate"],
+          pendingEntryIds: [],
+        });
+      });
+
+      expect(server.requests()).toBe(1);
+      expect(decision).toMatchObject({ outcome: "queue", reason: "timeout" });
+      expect(unhandled).toEqual([]);
+    } finally {
+      server.close();
+    }
+  });
+
+  it("fails with a timeout error and no unhandled rejection when the SDK's own timeout fires mid-body", async () => {
+    const server = await stalledBodyServer();
+    try {
+      const client = new HttpJevDecisionClient("synthetic-key", text, {
+        fetch: server.fetch,
+        requestTimeoutMs: 300,
+      });
+      let error: unknown;
+      const unhandled = await unhandledRejectionsDuring(async () => {
+        error = await client.decide(request()).catch((err: unknown) => err);
+      });
+
+      expect(server.requests()).toBe(1);
+      expect(error).toBeInstanceOf(APITimeoutError);
+      expect(unhandled).toEqual([]);
+    } finally {
+      server.close();
+    }
+  }, 15_000);
 });

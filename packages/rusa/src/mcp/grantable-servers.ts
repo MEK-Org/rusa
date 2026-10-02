@@ -39,6 +39,11 @@ import {
   PNPM_HARDLINKS_MCP_NAME,
   type PnpmHardlinksToolDeps,
 } from "./pnpm-hardlinks-mcp.js";
+import {
+  createQuotaManualServer,
+  QUOTA_MANUAL_MCP_NAME,
+  type QuotaManualMcpDeps,
+} from "./quota-manual-mcp.js";
 import { createSlackWriteMcpServer, SLACK_WRITE_MCP_NAME } from "./slack-mcp.js";
 import {
   createUnderstandingWriteServer,
@@ -81,8 +86,16 @@ export interface GrantableServerDeps {
   logger?: Logger;
   /** Workdir for a grantee actor; confines chat-write attachment `filePath`s. */
   actorRootFor?: (actorId: string) => string;
+  /** Whether a grantee's file tools can access the host where it executes. */
+  fileToolsAvailableForActor?: (actorId: string) => boolean;
   driveClients: DriveClient;
   onDriveRead?: (actorId: string, observation: DriveReadObservation) => void;
+  /**
+   * The leader's quota coordinator client for `quota-manual` (#690). Absent or
+   * `client: null` when no coordinator socket is configured; the capability
+   * stays registered and its tool reports that instead.
+   */
+  quotaManual?: QuotaManualMcpDeps;
   /**
    * Host-maintenance servers (#549). Formerly mounted on the configured root's
    * tool set by id; now capabilities named after their servers (`update`,
@@ -125,7 +138,9 @@ export interface GrantableServerDeps {
  * calendar IDs; ISSUE_NUM adds its identity-verified whole-account form. ISSUE_NUM
  * adds `email-send`, scoped to explicit recipients. #549 adds the host-maintenance
  * servers `update` and `pnpm-hardlinks` (when their deps are wired) so root's
- * former by-id mounts become grant-derived like everything else.
+ * former by-id mounts become grant-derived like everything else. #690 adds
+ * `quota-manual`, which submits one manual quota reading to the leader's
+ * coordinator.
  */
 export function buildGrantableServers(
   deps: GrantableServerDeps
@@ -194,6 +209,11 @@ export function buildGrantableServers(
         });
       },
     ],
+    [
+      QUOTA_MANUAL_MCP_NAME,
+      (_selfId, _params, options) =>
+        createQuotaManualServer(deps.quotaManual ?? { client: null }, options),
+    ],
   ]);
   if (deps.chatClient) {
     map.set(CHAT_WRITE_MCP_NAME, (selfId, params, options) => {
@@ -218,13 +238,16 @@ export function buildGrantableServers(
     });
   }
   if (deps.slackClient) {
-    map.set(SLACK_WRITE_MCP_NAME, (_selfId, params, options) => {
+    map.set(SLACK_WRITE_MCP_NAME, (selfId, params, options) => {
       if (!deps.slackClient) throw new Error("slackClient is required for slack-write capability");
-      return createSlackWriteMcpServer(
-        deps.slackClient,
-        params.includes("*") ? "all" : params,
-        options?.isFenced
-      );
+      const workDir = deps.actorRootFor?.(selfId);
+      return createSlackWriteMcpServer(deps.slackClient, params.includes("*") ? "all" : params, {
+        isFenced: options?.isFenced,
+        ...(workDir ? { workDir } : {}),
+        ...(deps.fileToolsAvailableForActor
+          ? { fileToolsAvailable: () => deps.fileToolsAvailableForActor?.(selfId) ?? false }
+          : {}),
+      });
     });
   }
   const updateToolDepsFor = deps.hostMaintenance?.updateToolDepsFor;

@@ -152,50 +152,36 @@ export function initEmptyBareRepo(mcHome: string, repoId: string): string {
 }
 
 /**
- * Seed or update a bare repository for the git bridge from a local filesystem git repository.
+ * Seed or update a git-bridge bare repository's base branch from a local
+ * repository path or bundle. Only `branch` is written, and only as a
+ * fast-forward, so agent `mc/*` branches already in the repo are kept.
+ * Throws if the source cannot be read or the update is not a fast-forward.
  */
 export function seedBareRepoFromLocalPath(opts: {
   mcHome: string;
   repoId: string;
   localPath: string;
+  branch: string;
 }): string {
   const repoKey = generateRepoKey(opts.repoId);
   const barePath = getBareClonePath(opts.mcHome, repoKey);
+  const ref = `refs/heads/${opts.branch}`;
 
-  const hasCommits = (path: string): boolean => {
-    try {
-      execFileSync("git", ["-C", path, "rev-parse", "HEAD"], {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "ignore"],
-      });
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  if (!existsSync(barePath) || !isValidBareRepo(barePath) || !hasCommits(barePath)) {
+  if (!existsSync(barePath) || !isValidBareRepo(barePath)) {
     mkdirSync(dirname(barePath), { recursive: true });
-    if (existsSync(barePath)) {
-      rmSync(barePath, { recursive: true, force: true });
-    }
-    execFileSync("git", ["clone", "--bare", opts.localPath, barePath], {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    hardenBareRepoForGitBridge(barePath);
-  } else {
-    try {
-      execFileSync("git", ["-C", barePath, "fetch", opts.localPath, "*:*"], {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "ignore"],
-      });
-    } catch {
-      /* best effort fetch */
-    }
-    hardenBareRepoForGitBridge(barePath);
+    rmSync(barePath, { recursive: true, force: true });
+    execFileSync("git", ["init", "--bare", barePath], { encoding: "utf8", stdio: "pipe" });
   }
-
+  try {
+    git(barePath, "fetch", "--no-tags", opts.localPath, `${ref}:${ref}`);
+  } catch (err) {
+    const stderr = (err as { stderr?: string }).stderr?.trim();
+    throw new Error(
+      `Could not seed ${opts.branch} into the bridge repo for ${opts.repoId}: ${stderr || err}`
+    );
+  }
+  git(barePath, "symbolic-ref", "HEAD", ref);
+  hardenBareRepoForGitBridge(barePath);
   return barePath;
 }
 

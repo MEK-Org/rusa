@@ -54,9 +54,11 @@ import {
 } from "../actor/event-subscriptions.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import {
+  FailureEscalationBackoff,
   type FailureSinkDeps,
   formatProviderLabel,
   routeRunFailure,
+  routeSpawnFailure,
 } from "../actor/failure-sink.js";
 import { GracefulShutdown } from "../actor/graceful-shutdown.js";
 import {
@@ -287,7 +289,11 @@ import {
 } from "../runtime/event-manager.js";
 import { ResourceScope } from "../runtime/resource-scope.js";
 import { readSlackToken, SlackClient } from "../slack/slack-client.js";
-import { SlackSocketSource } from "../slack/socket-source.js";
+import {
+  type SlackInboundMessage,
+  SlackSocketSource,
+  withReceiptReaction,
+} from "../slack/socket-source.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import {
   DistillerCursorStore,
@@ -640,6 +646,8 @@ export interface RunStartE2EHandles {
   coordinatorPacerQuote: (provider: string) => number;
   /** Test-only deterministic tick for asserting exhaustion and renewal transitions without a real cadence. */
   triggerQuotaThrottleTick?: () => Promise<void>;
+  /** Test-only read of the latest quota throttle status. */
+  getThrottle?: (provider: string) => QuotaThrottleStatus | null;
   root: MeshActor;
   rootControl: RootControlService;
   externalRoot: ExternalRootDriver | null;
@@ -1513,7 +1521,11 @@ async function composeStart(
   if (chatClient) {
     servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
   }
-  if (slackClient) servers[SLACK_READ_MCP_NAME] = () => createSlackReadMcpServer(slackClient);
+  if (slackClient) {
+    // Only root mounts the shared server, so its downloads land in root's workdir.
+    const workDir = join(mcHome, "root-agent");
+    servers[SLACK_READ_MCP_NAME] = () => createSlackReadMcpServer(slackClient, { workDir });
+  }
   // Read when an inbox server is built, so every actor's selection sees the
   // same chat backends the read tools do.
   const inboxChatContextSources = (): InboxChatContextSources => ({
@@ -1847,6 +1859,24 @@ async function composeStart(
     // Update the lanes before asking the shared admission list to re-scan them.
     applyThrottleStatusToPacer(pacer, status);
     applyModelLaneStatuses(providerName, status);
+    const validModelLanes = Array.isArray(status.modelLanes)
+      ? status.modelLanes.filter(isPublishedModelLane).map((lane) => ({
+          models: [...lane.models],
+          intervalSeconds: lane.intervalSeconds,
+          uncappedIntervalSeconds: lane.uncappedIntervalSeconds,
+          expired: lane.expired,
+          capped: lane.capped,
+          buckets: (lane.buckets ?? []).map((bucket) => ({
+            key: bucket.key,
+            percentLeft: bucket.percentLeft,
+            timeRemainingPct: bucket.timeRemainingPct,
+            error: bucket.error,
+            requiredIntervalSeconds: bucket.requiredIntervalSeconds,
+          })),
+          freshness: lane.freshness,
+          updatedAt: lane.updatedAt,
+        }))
+      : [];
     recordQuotaThrottleTick(
       providerName,
       {
@@ -1862,6 +1892,7 @@ async function composeStart(
           requiredIntervalSeconds: bucket.requiredIntervalSeconds,
         })),
         freshness: status.freshness,
+        ...(validModelLanes.length > 0 ? { modelLanes: validModelLanes } : {}),
       },
       status.updatedAt,
       status.exhaustedUntil,
@@ -2262,6 +2293,9 @@ async function composeStart(
     // mapping the pnpm-install and root wiring use for actor roots.
     actorRootFor: (actorId) =>
       actorId === rootId ? join(mcHome, "root-agent") : join(workersDir, actorId),
+    // File tools run on the leader. Recheck placement at each call so a
+    // follower-hosted actor cannot read a stale leader-side workdir.
+    fileToolsAvailableForActor: (actorId) => actors.get(actorId)?.executionTarget === undefined,
     driveClients,
     hostMaintenance: { updateToolDepsFor, pnpmHardlinks: pnpmHardlinksDeps },
     onDriveRead: (actorId, observation) =>
@@ -2276,6 +2310,7 @@ async function composeStart(
           ...(observation.mimeType ? { mimeType: observation.mimeType } : {}),
         }),
       }),
+    quotaManual: { client: quotaCoordinatorClient },
   });
   // Actor keeps this array by reference and hands its current contents to the
   // provider at run start. A live grant updates it synchronously, which is the
@@ -2605,7 +2640,7 @@ async function composeStart(
             body: JSON.stringify(compacted),
           });
         }
-        if (!result.success && !result.capped) {
+        if (!result.success) {
           await routeRunFailure(
             failureSink,
             id,
@@ -3010,11 +3045,7 @@ async function composeStart(
           body: errorMsg,
         });
 
-        if (rec.parentId) {
-          failureSink.sendToParent(rec.parentId, `[spawn failed] ${errorMsg}`, id);
-        } else {
-          failureSink.postToErrorChat?.(`⚠️ ${errorMsg}`);
-        }
+        routeSpawnFailure(failureSink, id, rec.parentId, errorMsg);
         throw new Error(errorMsg);
       }
 
@@ -3122,7 +3153,11 @@ async function composeStart(
         }
         if (slackClient) {
           const slackReadUrl = mcpHttp.addServer(`${id}:${SLACK_READ_MCP_NAME}`, () =>
-            createSlackReadMcpServer(slackClient, isFenced)
+            createSlackReadMcpServer(slackClient, {
+              isFenced,
+              workDir: join(workersDir, id),
+              fileToolsAvailable: () => actors.get(id)?.executionTarget === undefined,
+            })
           );
           perActorShared.push({ name: SLACK_READ_MCP_NAME, url: slackReadUrl });
         }
@@ -3397,8 +3432,8 @@ async function composeStart(
   });
   const failureSink: FailureSinkDeps = {
     actors,
-    sendToParent: (toId, body, fromId, forensics) =>
-      mesh.deliverMechanicalInboxNotice(toId, body, fromId, forensics),
+    sendToParent: (toId, body, fromId, forensics, delivery) =>
+      mesh.deliverMechanicalInboxNotice(toId, body, fromId, forensics, undefined, delivery),
     postToErrorChat: errorNotifier ? (text) => errorNotifier.notify(text) : null,
     rootId: rootId,
     log: (m) => console.warn(`[failure-sink] ${m}`),
@@ -3407,6 +3442,9 @@ async function composeStart(
     // ISSUE_NUM: name quota exhaustion in the failure notice so a worker's parent
     // (who now owns the fallback judgment) can see the cause up front.
     classify: classifyExhaustion,
+    // #189: a child's failure wakes its parent past provider pacing, backed
+    // off per child so a crash loop cannot hammer the parent.
+    escalation: new FailureEscalationBackoff(),
   };
 
   // Publish the live callback port only after the shared MCP server is bound.
@@ -3560,7 +3598,7 @@ async function composeStart(
   const rootSlackUrl =
     slackClient && config.slack
       ? mcpHttp.addServer(`${rootId}:${SLACK_WRITE_MCP_NAME}`, () =>
-          createSlackWriteMcpServer(slackClient, "all")
+          createSlackWriteMcpServer(slackClient, "all", { workDir: rootAgentDir })
         )
       : undefined;
 
@@ -4425,8 +4463,8 @@ async function composeStart(
           }),
         (event) => log.info("slack_event_received", event)
       );
-      await source.start(async (msg) => {
-        await mesh.deliverExternalEvent({
+      const deliver = async (msg: SlackInboundMessage) => {
+        const delivery = await mesh.deliverExternalEvent({
           sourceType: "slack",
           rawPayload: {
             channel: msg.channel,
@@ -4439,7 +4477,20 @@ async function composeStart(
           eventSummary: `Slack message from ${msg.user}`,
         });
         log.info("slack_message_delivered", { channel: msg.channel, eventId: msg.eventId });
-      });
+        return delivery;
+      };
+      await source.start(
+        withReceiptReaction(
+          deliver,
+          (channel, ts) => slackClient.react(channel, ts),
+          (err, msg) =>
+            log.warn("slack_receipt_reaction_failed", {
+              channel: msg.channel,
+              eventId: msg.eventId,
+              error: err instanceof Error ? err.message : String(err),
+            })
+        )
+      );
       resources.acquire("slack source", () => source?.close());
       log.info("slack_socket_active");
     } catch (err) {
@@ -4734,6 +4785,7 @@ async function composeStart(
       quotaCoordinatorClient?.getLastAppliedInterval(provider),
     coordinatorPacerQuote: (provider) => pacerFor(provider).quote(),
     triggerQuotaThrottleTick: tickQuotaThrottle,
+    getThrottle: (provider) => quotaThrottleStatuses.get(provider as QuotaThrottleProvider) ?? null,
     root,
     rootControl,
     externalRoot,

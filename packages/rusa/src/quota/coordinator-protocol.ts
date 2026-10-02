@@ -638,6 +638,12 @@ function isOptionalString(value: unknown): boolean {
   return value === undefined || typeof value === "string";
 }
 
+function isOptionalNullableNumber(value: unknown): boolean {
+  return (
+    value === undefined || value === null || (typeof value === "number" && Number.isFinite(value))
+  );
+}
+
 function isValidQuotaWindowScope(value: unknown): boolean {
   if (value === "provider" || value === "model") return true;
   if (typeof value !== "object" || value === null) return false;
@@ -659,7 +665,9 @@ function isValidQuotaLimit(value: unknown): boolean {
     (limit.kind === undefined ||
       (typeof limit.kind === "string" && QUOTA_WINDOW_KINDS.has(limit.kind))) &&
     isOptionalString(limit.resetAtIso) &&
-    (limit.scope === undefined || isValidQuotaWindowScope(limit.scope))
+    (limit.scope === undefined || isValidQuotaWindowScope(limit.scope)) &&
+    isOptionalNullableNumber(limit.throttleSeconds) &&
+    isOptionalNullableNumber(limit.paceError)
   );
 }
 

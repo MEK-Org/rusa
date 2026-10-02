@@ -2,7 +2,11 @@ import { execFileSync } from "node:child_process";
 import { existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { resolveServiceInstance, type ServiceEnvironment } from "./service-instance.js";
+import {
+  logRotationUnitNames,
+  resolveServiceInstance,
+  type ServiceEnvironment,
+} from "./service-instance.js";
 
 function runOrThrow(cmd: string, args: string[]): string {
   return execFileSync(cmd, args, {
@@ -53,6 +57,18 @@ export async function runUninstallService(opts?: {
     console.log(`✓ Removed ${unitPath}`);
   } else {
     console.log(`ℹ️  Unit file not found at ${unitPath}`);
+  }
+
+  // #580: the instance's log-rotation timer goes with it; rotated generations
+  // stay on disk for the operator to keep or delete.
+  const logRotation = logRotationUnitNames(instance.serviceBasename);
+  runSystemctlBestEffort(["--user", "disable", "--now", logRotation.timer]);
+  for (const unit of [logRotation.timer, logRotation.service]) {
+    const path = join(systemdUserDir, unit);
+    if (existsSync(path)) {
+      rmSync(path);
+      console.log(`✓ Removed ${path}`);
+    }
   }
 
   runOrThrow("systemctl", ["--user", "daemon-reload"]);

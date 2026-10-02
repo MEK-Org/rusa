@@ -4037,6 +4037,8 @@ describe("quota MCP server", () => {
                       label: "Weekly",
                       kind: "weekly",
                       percentLeft: 75,
+                      throttleSeconds: 120,
+                      paceError: 15.5,
                     },
                   ],
                 })
@@ -4073,6 +4075,8 @@ describe("quota MCP server", () => {
           expect(parsed.status).toBe("available");
           expect(parsed.provider).toBe("claude");
           expect(parsed.limits?.[0].percentLeft).toBe(75);
+          expect(parsed.limits?.[0].throttleSeconds).toBe(120);
+          expect(parsed.limits?.[0].paceError).toBe(15.5);
         });
 
         it("with service cold (or socket absent): returns status unknown with freshness block, triggering 0 probes", async () => {

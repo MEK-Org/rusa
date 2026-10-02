@@ -230,6 +230,36 @@ curl --unix-socket "$quota_socket" -sS 'http://localhost/v1/quota?provider=claud
 curl --unix-socket "$quota_socket" -sS 'http://localhost/v1/throttle?provider=claude'
 ```
 
+#### Submitting a reading from an actor (`quota-manual`, #690)
+
+An actor that takes a manual reading can submit it in the same run through the
+`submit_manual_reading` tool, part of the grantable `quota-manual` capability.
+The tool runs in the leader, which holds the coordinator socket, and makes the
+same `POST /v1/quota/observations` call as the `curl` above. A follower-hosted
+grantee reaches it through the follower hub's per-actor MCP proxy, like any
+other leader endpoint; it needs no access to the socket. When the leader has no
+`quota.coordinator.socketPath`, the capability still exists but the tool
+returns `No quota coordinator is configured on this instance`.
+
+Arguments are `provider`, `generation` (from the switch to `manual`),
+`observedAt`, and `limits` in the shape shown above. The tool does not rewrite or
+check anything:
+
+- `observedAt` is sent as the observation's `scrapedAt` exactly as given.
+- The snapshot's `status` is derived from `limits` the way a scrape derives it:
+  `exhausted` when any provider-wide window shows 0% left, otherwise
+  `available`. A model-scoped window at 0% does not mark the provider exhausted.
+- The `Idempotency-Key` is `manual-reading:<provider>:<generation>:<observedAt>`.
+  A retried call for the same reading is therefore `duplicate: true`, and a
+  different reading at the same instant is `idempotency_conflict`.
+- The coordinator's response body is returned verbatim as the tool result.
+  Anything other than HTTP 200 is marked as a tool error, so
+  `stale_observation`, `manual_mode_required` and `mode_generation_mismatch`
+  arrive exactly as listed above.
+
+Shipping the capability grants it to nobody. Granting `quota-manual` to the
+actor that takes readings is a separate operator or root step.
+
 #### Deploy and rollback order
 
 1. Take the normal coordinator SQLite backup, stop the coordinator, deploy the
