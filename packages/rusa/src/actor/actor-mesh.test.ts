@@ -3202,6 +3202,61 @@ describe("ActorMesh", () => {
     expect(shadow?.payload).not.toContain("private operator body");
   });
 
+  it("shadows each row of a mixed batch at its own stored baseline (#829)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let firstSignal: AbortSignal | undefined;
+    const provider = new FakeProvider((opts) => {
+      firstSignal = opts.signal;
+      return new Promise<Partial<RunResult>>(() => {});
+    });
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: {
+        decide: async () => ({ interruptProbability: 0.1, rationale: "", matchedCandidateIds: [] }),
+      },
+    });
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+
+    // One append, one dispatch: a joining Room notice beside a legacy responsive row.
+    inboxStore.append([
+      {
+        actorId: worker,
+        source: "room:entry",
+        payload: {
+          type: "room.human_entry",
+          version: 1,
+          priority: "responsive",
+          interruption: "join",
+          episodeId: "episode-1",
+          principalId: "principal-1",
+        },
+      },
+      {
+        actorId: worker,
+        source: "mesh:root",
+        payload: { type: "human.message", priority: "responsive" },
+      },
+    ]);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(firstSignal?.reason).toBe("interrupt:responsive-notification");
+    const baselines = events
+      .filter((event) => event.kind === "responsive_interruption_shadow")
+      .map((event) => JSON.parse(event.payload ?? "{}").baseline)
+      .sort();
+    expect(baselines).toEqual(["interrupt", "queue"]);
+  });
+
   it("leaves the dispatch path untouched when no classifier is configured", async () => {
     // The seam is described as inert without a classifier, so the thing to pin
     // is the wiring rather than the absence of events: a mesh that wires the
@@ -9413,7 +9468,7 @@ describe("ActorMesh", () => {
      * delivery's effect on each in-flight run is observable through the abort
      * signal the provider was handed.
      */
-    function setupTwoRunningActors() {
+    function setupTwoRunningActors(opts: { maxConcurrent?: number } = {}) {
       const inboxStore = createMemoryInboxStore();
       const events: MeshEventInput[] = [];
       const signals = new Map<string, AbortSignal | undefined>();
@@ -9439,6 +9494,7 @@ describe("ActorMesh", () => {
         inboxStore,
         events: (event) => events.push(event),
         sharedProvider: provider,
+        maxConcurrent: opts.maxConcurrent,
         onQueued: (actorId, ctx) => {
           admissions.set(actorId, [...(admissions.get(actorId) ?? []), ctx.responsive]);
         },
@@ -9699,6 +9755,89 @@ describe("ActorMesh", () => {
         expect(t.runs.get(watcher)).toBe(2);
         expect(t.admissions.get(owner)).toEqual([false, false]);
         expect(t.admissions.get(watcher)).toEqual([false, false]);
+      });
+    });
+
+    // A Room entry notice is responsive work that joins the run in flight
+    // rather than replacing it (#829). These go through ordinary dispatch, so
+    // the stored row, not an after-commit hint, carries the policy.
+    describe("Room entry notices join the active run (#829)", () => {
+      const roomEntryNotice = () => ({
+        type: "room.human_entry",
+        version: 1,
+        priority: "responsive" as const,
+        interruption: "join" as const,
+        episodeId: "episode-1",
+        principalId: "human-1",
+      });
+
+      it("reaches a running actor without an abort, then earns one responsive follow-up", async () => {
+        const t = setupTwoRunningActors();
+        const participant = t.mesh.spawn({ charter: "participant", parentId: "root" });
+        await t.startRun(participant);
+
+        t.inboxStore.append([
+          { actorId: participant, source: "room:entry", payload: roomEntryNotice() },
+        ]);
+        t.mesh.dispatch(participant);
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(t.signals.get(participant)?.aborted).toBe(false);
+        expect(t.preemptions()).toEqual([]);
+        expect(t.runs.get(participant)).toBe(1);
+        expect(t.unhandledResponsive(participant)).toHaveLength(1);
+
+        // Unrelated ordinary traffic re-reads the stored row; it still joins.
+        t.inboxStore.append([
+          { actorId: participant, source: "mesh:root", payload: payload("mesh.message") },
+        ]);
+        t.mesh.dispatch(participant);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(t.signals.get(participant)?.aborted).toBe(false);
+        expect(t.preemptions()).toEqual([]);
+
+        t.resolvers.get(participant)?.({ success: true, exitCode: 0, output: "finished" });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(t.runs.get(participant)).toBe(2);
+        expect(t.admissions.get(participant)).toEqual([false, true]);
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(t.runs.get(participant)).toBe(2);
+      });
+
+      it("promotes a queued run without preempting or adding a follow-up", async () => {
+        const t = setupTwoRunningActors({ maxConcurrent: 1 });
+        const busy = t.mesh.spawn({ charter: "busy", parentId: "root" });
+        const participant = t.mesh.spawn({ charter: "participant", parentId: "root" });
+        await t.startRun(busy);
+
+        t.inboxStore.append([
+          { actorId: participant, source: "mesh:root", payload: payload("mesh.message") },
+        ]);
+        t.mesh.dispatch(participant);
+        await t.tick();
+        expect(t.mesh.activeRunState(participant)).toEqual({
+          actorId: participant,
+          phase: "queued",
+        });
+        expect(t.runs.get(participant)).toBeUndefined();
+
+        t.inboxStore.append([
+          { actorId: participant, source: "room:entry", payload: roomEntryNotice() },
+        ]);
+        t.mesh.dispatch(participant);
+        await vi.advanceTimersByTimeAsync(0);
+
+        // Promoted out of the normal queue alongside the busy run.
+        expect(t.runs.get(participant)).toBe(1);
+        expect(t.signals.get(busy)?.aborted).toBe(false);
+        expect(t.preemptions()).toEqual([]);
+
+        // The notice joined the admitted opportunity: no second run for it.
+        t.resolvers.get(participant)?.({ success: true, exitCode: 0, output: "finished" });
+        t.resolvers.get(busy)?.({ success: true, exitCode: 0, output: "finished" });
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(t.runs.get(participant)).toBe(1);
+        expect(t.runs.get(busy)).toBe(1);
       });
     });
 

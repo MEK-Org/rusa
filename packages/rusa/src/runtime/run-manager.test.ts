@@ -259,6 +259,7 @@ describe("RunManager", () => {
       expect(h.manager.durableWork("a1")).toEqual({
         priority: "responsive",
         unseenResponsive: true,
+        unseenInterrupting: true,
       });
       expect(h.manager.dispatch("a1")).toBe(true);
       expect(actor.nudges).toEqual([{ priority: "responsive" }]);
@@ -347,6 +348,7 @@ describe("RunManager", () => {
       expect(h.manager.durableWork("a1")).toEqual({
         priority: "responsive",
         unseenResponsive: true,
+        unseenInterrupting: true,
         voiceAt: 1_000,
       });
 
@@ -383,6 +385,7 @@ describe("RunManager", () => {
       expect(noHook.manager.durableWork("a1")).toEqual({
         priority: "responsive",
         unseenResponsive: true,
+        unseenInterrupting: true,
         voiceAt: 9_000,
       });
       // The early exit is live: one page answered both questions.
@@ -392,8 +395,8 @@ describe("RunManager", () => {
       const arrivals: string[][] = [];
       const withHook = setup({
         inbox: observed.repo,
-        onResponsiveArrived: (_actorId, entries) => {
-          arrivals.push(entries.map((entry) => entry.id));
+        onResponsiveArrived: (_actorId, arrived) => {
+          arrivals.push(arrived.map(({ entry }) => entry.id));
         },
       });
       live(withHook, "a1");
@@ -409,8 +412,8 @@ describe("RunManager", () => {
     it("forgets an actor's observed responsive rows when it is released or forgotten", () => {
       const arrivals: string[][] = [];
       const h = setup({
-        onResponsiveArrived: (_actorId, entries) => {
-          arrivals.push(entries.map((entry) => entry.id));
+        onResponsiveArrived: (_actorId, arrived) => {
+          arrivals.push(arrived.map(({ entry }) => entry.id));
         },
       });
       live(h, "a1");
@@ -436,8 +439,8 @@ describe("RunManager", () => {
     it("reports target actor's running state accurately on responsive arrival", async () => {
       const observations: { actorId: string; entryIds: string[]; isRunning: boolean }[] = [];
       const h = setup({
-        onResponsiveArrived: (actorId, entries, _baseline, isRunning) => {
-          observations.push({ actorId, entryIds: entries.map((e) => e.id), isRunning });
+        onResponsiveArrived: (actorId, arrived, isRunning) => {
+          observations.push({ actorId, entryIds: arrived.map(({ entry }) => entry.id), isRunning });
         },
       });
 
@@ -638,6 +641,135 @@ describe("RunManager", () => {
       expect(h.preempted).toEqual([]);
       // Responsive scheduling and admission are kept; only the abort is not.
       expect(actor.nudges).toEqual([{ priority: "responsive" }]);
+    });
+  });
+
+  describe("durable interruption policy (#829)", () => {
+    const JOIN = { type: "test.join", priority: "responsive", interruption: "join" } as const;
+    const ROOM_ENTRY = {
+      type: "room.human_entry",
+      version: 1,
+      priority: "responsive",
+      interruption: "join",
+      episodeId: "episode-1",
+      principalId: "principal-1",
+    } as const;
+
+    it("admits a joining row at responsive priority without replacing the run", () => {
+      const h = setup();
+      const actor = live(h, "a1");
+      actor.preemptPhase = "running";
+      append("a1", JOIN);
+
+      expect(h.manager.durableWork("a1")).toEqual({
+        priority: "responsive",
+        unseenResponsive: true,
+        unseenInterrupting: false,
+      });
+      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(actor.preemptions).toBe(0);
+      expect(h.preempted).toEqual([]);
+      expect(actor.nudges).toEqual([{ priority: "responsive" }]);
+    });
+
+    it("never interrupts for a Room entry notice, on every dispatch and replay", () => {
+      const h = setup();
+      const actor = live(h, "a1");
+      actor.preemptPhase = "running";
+      append("a1", ROOM_ENTRY);
+
+      h.manager.dispatch("a1");
+      // Ordinary traffic arriving behind it re-reads the same unseen row.
+      append("a1", { type: "mesh.message" });
+      h.manager.dispatch("a1");
+      expect(actor.preemptions).toBe(0);
+      expect(h.preempted).toEqual([]);
+    });
+
+    it("lets a genuinely interrupting row in a mixed batch preempt, at each row's own baseline", () => {
+      const observed: Array<[string, string]> = [];
+      const h = setup({
+        onResponsiveArrived: (_actorId, arrived) => {
+          for (const { entry, baseline } of arrived) observed.push([entry.payload.type, baseline]);
+        },
+      });
+      const actor = live(h, "a1");
+      actor.preemptPhase = "running";
+      append("a1", ROOM_ENTRY);
+      append("a1", { type: "human.message", priority: "responsive" });
+
+      h.manager.dispatch("a1");
+      expect(actor.preemptions).toBe(1);
+      expect(h.preempted).toEqual([["a1", "running"]]);
+      expect(observed.sort()).toEqual([
+        ["human.message", "interrupt"],
+        ["room.human_entry", "queue"],
+      ]);
+    });
+
+    it("schedules a malformed stored Room notice conservatively and reports it once", () => {
+      const h = setup();
+      const actor = live(h, "a1");
+      actor.preemptPhase = "running";
+      // Written before validation existed, or by a newer producer.
+      db.prepare(
+        `INSERT INTO actor_inbox_entries
+          (id, actor_id, source, delivered_at, seen_at, handled_at, payload_json)
+         VALUES (?, ?, ?, ?, NULL, NULL, ?)`
+      ).run(
+        "room-entry:bad",
+        "a1",
+        "test",
+        new Date(1_000).toISOString(),
+        JSON.stringify({ ...ROOM_ENTRY, version: 2, interruption: undefined })
+      );
+
+      h.manager.dispatch("a1");
+      h.manager.dispatch("a1");
+      expect(actor.preemptions).toBe(0);
+      expect(actor.nudges).toEqual([{ priority: "responsive" }, { priority: "responsive" }]);
+      const diagnostics = h.logs.filter((line) => line.includes("malformed room.human_entry"));
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]).toContain("room-entry:bad");
+    });
+
+    it("refuses unsupported new writes", () => {
+      expect(() =>
+        append("a1", { type: "test", priority: "responsive", interruption: "maybe" } as never)
+      ).toThrow(/interruption/);
+      expect(() => append("a1", { ...ROOM_ENTRY, version: 2 })).toThrow(/room.human_entry/);
+      expect(() => append("a1", { ...ROOM_ENTRY, priority: undefined })).toThrow(/priority/);
+      expect(() => append("a1", { ...ROOM_ENTRY, interruption: undefined })).toThrow(
+        /interruption/
+      );
+      expect(() => append("a1", { ...ROOM_ENTRY, principalId: "" })).toThrow(/principalId/);
+      expect(inbox.countUnhandled("a1")).toBe(0);
+    });
+
+    it("keeps legacy behavior for rows with no interruption policy", () => {
+      const observed: Array<[string, string]> = [];
+      const h = setup({
+        onResponsiveArrived: (_actorId, arrived) => {
+          for (const { entry, baseline } of arrived) observed.push([entry.payload.type, baseline]);
+        },
+      });
+      const actor = live(h, "a1");
+      actor.preemptPhase = "running";
+      append("a1", { type: "human.message", priority: "responsive" });
+      h.manager.dispatch("a1");
+      expect(actor.preemptions).toBe(1);
+      expect(observed).toEqual([["human.message", "interrupt"]]);
+
+      // A subscriber copy keeps its join only through the after-commit seam. The
+      // human row is seen first, so only the copy's own policy can preempt here.
+      inbox.markSeen("a1");
+      append("a1", { type: "event.copy", priority: "responsive", deliveryRole: "subscriber" });
+      h.manager.dispatch("a1");
+      expect(actor.preemptions).toBe(2);
+      expect(observed).toEqual([
+        ["human.message", "interrupt"],
+        ["event.copy", "interrupt"],
+      ]);
     });
   });
 

@@ -16,6 +16,13 @@ export interface InboxPayload {
    * the row, so routing again could give a different answer for the same copy.
    */
   deliveryRole?: InboxDeliveryRole;
+  /**
+   * Whether this row may replace the recipient's run in flight. `"join"` is
+   * admitted at the row's priority but never aborts the current run; absent
+   * keeps the legacy behavior. Decoded only through
+   * `decodeInboxInterruption` (#829).
+   */
+  interruption?: "join";
   [key: string]: unknown;
 }
 

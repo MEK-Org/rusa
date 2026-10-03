@@ -4,7 +4,12 @@ import type { ActorLifecycleAbandonmentReason } from "../../actor/actor-lifecycl
 import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../actor/actor-mesh.js";
 import { COMPUTER_USE_CAPABILITY } from "../../actor/computer-use-lock.js";
 import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
-import { type ActorRunMode, mergeNudges, type RunNudge } from "../../actor/trigger-runner.js";
+import {
+  type ActorRunMode,
+  isResponsiveNudge,
+  mergeNudges,
+  type RunNudge,
+} from "../../actor/trigger-runner.js";
 import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../../providers/model-config.js";
 import type { RunResult } from "../../providers/types.js";
@@ -309,6 +314,11 @@ export class ActorHandle implements MeshActor {
   }
 
   requestRun(nudge?: RunNudge): void {
+    // A responsive wake raises the admission the leader holds for a queued
+    // run, as a local Actor promotes its pending start, without asking the
+    // follower to displace anything. Only preemptForResponsive does that, and
+    // only for durable work whose own policy allows it (#829).
+    if (nudge && isResponsiveNudge(nudge)) this.promoteQueuedRun();
     void this.ready
       .then(() => this.stateSettled)
       .then(() => {
@@ -872,17 +882,38 @@ export class ActorHandle implements MeshActor {
     }
   }
 
-  /** Promote the leader's real admission handle, not the follower's async gate wrapper. */
+  /**
+   * Raise a queued run to responsive admission without displacing anything.
+   * An unstarted ticket the leader holds — including one retained across a
+   * transport gap — is promoted in place. With no ticket yet, a follower that
+   * reported queued (or has not reported since reattaching) has its next
+   * admission request admitted responsive; a non-queued report clears that.
+   */
+  private promoteQueuedRun(): void {
+    if (this.terminated || this.promoteQueuedAdmissions()) return;
+    if (this.isQueued || this.stateStale || this.stateUnconfirmed) {
+      this.pendingQueuedPromotion = true;
+    }
+  }
+
+  /**
+   * Promote the leader's real admission handle, not the follower's async gate
+   * wrapper. True when the leader holds an unstarted ticket, whether this call
+   * promoted it or it was already responsive.
+   */
   private promoteQueuedAdmissions(): boolean {
+    let held = false;
     let promoted = false;
     for (const gate of this.gates.values()) {
       if (gate.handle.started) continue;
+      held = true;
+      if (gate.admission.responsive) continue;
       gate.admission.responsive = true;
       gate.handle.promote();
       promoted = true;
     }
     if (promoted) this.logAdmissionPromoted();
-    return promoted;
+    return held;
   }
 
   private logAdmissionPromoted(): void {

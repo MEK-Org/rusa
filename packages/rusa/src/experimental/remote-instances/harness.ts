@@ -238,6 +238,21 @@ export function createHarness(options: {
     return mesh.dispatch(actorId);
   };
 
+  /**
+   * Responsive work persisted as joining: admitted at responsive priority, but
+   * never allowed to replace a run in flight (#829).
+   */
+  const dispatchJoining = (actorId: string, source = "test:joining") => {
+    inboxStore.append([
+      {
+        actorId,
+        source,
+        payload: { type: "test.joining", priority: "responsive", interruption: "join" },
+      },
+    ]);
+    return mesh.dispatch(actorId);
+  };
+
   /** The same, at ordinary priority. */
   const dispatchNormal = (actorId: string, source = "test:normal") => {
     inboxStore.append([{ actorId, source, payload: { type: "test.normal" } }]);
@@ -248,6 +263,7 @@ export function createHarness(options: {
     mesh,
     inboxStore,
     dispatchResponsive,
+    dispatchJoining,
     dispatchNormal,
     actors,
     runtimes,

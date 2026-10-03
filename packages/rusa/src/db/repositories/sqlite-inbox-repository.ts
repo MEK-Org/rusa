@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import { validateInboxInterruptionForWrite } from "../../repositories/inbox-interruption.js";
 import {
   type InboxActorWork,
   type InboxAppendInput,
@@ -106,6 +107,7 @@ export class SqliteInboxRepository implements InboxRepository {
       if (!input.actorId.trim()) throw new Error("inbox actorId is required");
       if (!input.source.trim()) throw new Error("inbox source is required");
       validateInboxPayload(input.payload);
+      validateInboxInterruptionForWrite(input.payload);
       const deliveredAt = input.deliveredAt ?? this.now();
       if (!Number.isFinite(deliveredAt.getTime())) throw new Error("invalid deliveredAt");
       return {
@@ -340,6 +342,7 @@ export class SqliteInboxRepository implements InboxRepository {
       if (!input.actorId.trim()) throw new Error("inbox actorId is required");
       if (!input.source.trim()) throw new Error("inbox source is required");
       validateInboxPayload(input.payload);
+      validateInboxInterruptionForWrite(input.payload);
       const deliveredAt = input.deliveredAt ?? this.now();
       if (!Number.isFinite(deliveredAt.getTime())) throw new Error("invalid deliveredAt");
       return {
