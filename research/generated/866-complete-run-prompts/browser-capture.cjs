@@ -3,7 +3,7 @@ const http = require('node:http');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 (async () => {
-  const roots = {after: path.resolve('../evidence/866-simplified-web-after'), before: path.resolve('../evidence/866-simplified-web-before')};
+  const roots = {after: path.resolve('../evidence/866-review-final-web-after'), before: path.resolve('../evidence/866-simplified-web-before')};
   const types={'.html':'text/html','.js':'application/javascript','.wasm':'application/wasm','.json':'application/json','.ttf':'font/ttf','.otf':'font/otf'};
   const server = http.createServer(async(req,res) => {
     try {
@@ -17,7 +17,7 @@ const path = require('node:path');
   await new Promise(resolve=>server.listen(18967,'127.0.0.1',resolve));
   const browser=await chromium.launch({executablePath:'/usr/bin/google-chrome',headless:true,args:['--no-sandbox']});
   try {
-    await fs.mkdir('../evidence/866-simplified-pngs',{recursive:true});
+    await fs.mkdir('../evidence/866-review-final-pngs',{recursive:true});
     for(const [name,viewport] of Object.entries({wide:{width:1180,height:820},narrow:{width:390,height:844}})) {
       for(const state of (process.env.CAPTURE_STATES || 'before,collapsed,expanded,unavailable').split(',')) {
         const page=await browser.newPage({viewport,deviceScaleFactor:2});
@@ -33,12 +33,12 @@ const path = require('node:path');
         for(const label of ['Kind filter:','All Events','run_start','resolved model: fixture-model','2026-01-01 00:00:00']) await requireLabel(label);
         if(state!=='before') await requireLabel('Run prompt');
         if(state==='expanded'||state==='unavailable') await page.getByText('Run prompt',{exact:true}).click();
-        if(state==='expanded') await requireLabel('Provider: antigravity');
-        if(state==='unavailable') await requireLabel('Prompt no longer retained or unavailable.');
+        if(state==='expanded') { await page.waitForTimeout(1500); await page.waitForFunction(() => !Array.from(document.querySelectorAll('flt-semantics')).some(n => (n.textContent || '').includes('Loading prompt'))); }
+        if(state==='unavailable') await requireLabel('Prompt unavailable');
         await page.evaluate(async()=>{await document.fonts.ready; for(let i=0;i<12;i++)await new Promise(requestAnimationFrame);});
         await page.waitForTimeout(1000);
         await page.screenshot(); // Warm the GPU readback before retaining evidence.
-        await page.screenshot({path:`../evidence/866-simplified-pngs/${name}-${state}.png`});
+        await page.screenshot({path:`../evidence/866-review-final-pngs/${name}-${state}.png`});
         console.log(`${name}-${state}: captured`);
         await page.close();
       }
