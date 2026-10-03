@@ -1,9 +1,9 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import 'dashboard_title.dart';
-import 'route_scope.dart';
 import 'session.dart';
 import 'theme.dart';
 
@@ -56,30 +56,24 @@ class _DashboardRouteInformationParser
   }
 }
 
+/// Hosts the dashboard under a [Router] without letting the Router write the
+/// browser address. [currentConfiguration] stays null, the SDK's opt-out from
+/// route reporting, so `writeDashboardViewToUrl` is the only URL writer and the
+/// Router can never re-report a stale route over a view change it did not see.
+/// Platform pushes (browser back/forward, deep links) reach `DashboardBody`
+/// through the Router's [RouteInformationProvider], which it listens to directly.
 class _DashboardRouterDelegate extends RouterDelegate<RouteInformation>
     with ChangeNotifier, PopNavigatorRouterDelegateMixin<RouteInformation> {
-  _DashboardRouterDelegate({
-    required this.builder,
-    required this.routeNotifier,
-    required RouteInformation initialRoute,
-  }) : _currentRoute = initialRoute;
+  _DashboardRouterDelegate({required this.builder});
 
   final WidgetBuilder builder;
-  final ValueNotifier<RouteInformation?> routeNotifier;
 
   @override
   final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
-  RouteInformation _currentRoute;
-
   @override
-  RouteInformation get currentConfiguration => _currentRoute;
-
-  @override
-  Future<void> setNewRoutePath(RouteInformation configuration) async {
-    _currentRoute = configuration;
-    routeNotifier.value = configuration;
-  }
+  Future<void> setNewRoutePath(RouteInformation configuration) =>
+      SynchronousFuture<void>(null);
 
   @override
   Widget build(BuildContext context) {
@@ -100,24 +94,18 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
   DashboardSession? _resolvedSession;
   String? _authenticatedTitle;
   late final Future<DashboardSession> _session = _bootstrapSession();
-  final ValueNotifier<RouteInformation?> _routeNotifier =
-      ValueNotifier<RouteInformation?>(null);
   late final RouterConfig<RouteInformation> _routerConfig;
 
   @override
   void initState() {
     super.initState();
-    final initialUri = _resolveInitialUri();
-    final initialRoute = RouteInformation(uri: initialUri);
     _routerConfig = RouterConfig<RouteInformation>(
       routeInformationProvider: PlatformRouteInformationProvider(
-        initialRouteInformation: initialRoute,
+        initialRouteInformation: RouteInformation(uri: _resolveInitialUri()),
       ),
       routeInformationParser: const _DashboardRouteInformationParser(),
       routerDelegate: _DashboardRouterDelegate(
         builder: (context) => _buildHost(),
-        routeNotifier: _routeNotifier,
-        initialRoute: initialRoute,
       ),
     );
   }
@@ -150,7 +138,6 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
   void dispose() {
     _resolvedSession?.removeListener(_onSessionChanged);
     _resolvedSession?.dispose();
-    _routeNotifier.dispose();
     super.dispose();
   }
 
@@ -164,13 +151,10 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
       if (snapshot.hasError || session == null) {
         return const _AuthStartupError();
       }
-      return DashboardRouteScope(
-        routeNotifier: _routeNotifier,
-        child: _DashboardSessionHost(
-          session: session,
-          pageBuilder: widget.pageBuilder,
-          browserHooksBuilder: widget.browserHooksBuilder,
-        ),
+      return _DashboardSessionHost(
+        session: session,
+        pageBuilder: widget.pageBuilder,
+        browserHooksBuilder: widget.browserHooksBuilder,
       );
     },
   );
@@ -178,6 +162,9 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp.router(
+      // Flutter's Title widget owns document.title on rebuild. Once the
+      // authenticated manifest has supplied the instance title, feed it back
+      // into MaterialApp so route and window rebuilds retain it.
       title: _authenticatedTitle ?? widget.title,
       debugShowCheckedModeBanner: false,
       theme: buildMeshTheme(),

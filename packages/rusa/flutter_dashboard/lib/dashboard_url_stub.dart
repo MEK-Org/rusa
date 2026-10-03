@@ -51,5 +51,8 @@ void writeDashboardViewToUrl(
   if (url.path != baseUri.path || url.query != baseUri.query) {
     if (onNavigation != null) unawaited(onNavigation());
   }
-  unawaited(SystemNavigator.routeInformationUpdated(uri: url, replace: replace));
+  unawaited(SystemNavigator.selectMultiEntryHistory());
+  unawaited(
+    SystemNavigator.routeInformationUpdated(uri: url, replace: replace),
+  );
 }

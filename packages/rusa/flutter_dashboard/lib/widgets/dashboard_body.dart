@@ -1,8 +1,6 @@
 import 'dart:async';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
-import '../route_scope.dart';
 import '../breakpoints.dart';
 import '../dashboard_url.dart';
 import '../dashboard_url_core.dart';
@@ -129,21 +127,24 @@ class _DashboardBodyState extends State<DashboardBody> {
     );
   }
 
-  ValueListenable<RouteInformation?>? _routeNotifier;
+  /// Browser back/forward and other platform pushes, from the enclosing
+  /// [Router]. Null when the body is mounted without one (the screenshot
+  /// harness and widget tests), where there is no browser history to follow.
+  RouteInformationProvider? _routeProvider;
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    final notifier = DashboardRouteScope.maybeOf(context);
-    if (notifier != _routeNotifier) {
-      _routeNotifier?.removeListener(_onRouteChanged);
-      _routeNotifier = notifier;
-      _routeNotifier?.addListener(_onRouteChanged);
+    final provider = Router.maybeOf(context)?.routeInformationProvider;
+    if (provider != _routeProvider) {
+      _routeProvider?.removeListener(_onRouteChanged);
+      _routeProvider = provider;
+      _routeProvider?.addListener(_onRouteChanged);
     }
   }
 
   void _onRouteChanged() {
-    final routeInfo = _routeNotifier?.value;
+    final routeInfo = _routeProvider?.value;
     if (routeInfo != null) {
       _applyRouteInformation(routeInfo);
     }
@@ -151,7 +152,7 @@ class _DashboardBodyState extends State<DashboardBody> {
 
   @override
   void dispose() {
-    _routeNotifier?.removeListener(_onRouteChanged);
+    _routeProvider?.removeListener(_onRouteChanged);
     _focusSub?.cancel();
     _actorSub?.cancel();
     super.dispose();
@@ -171,6 +172,8 @@ class _DashboardBodyState extends State<DashboardBody> {
 
   void _applyRouteInformation(RouteInformation routeInformation) {
     final uri = routeInformation.uri;
+    // A bare `/` is never in this session's history: the replayed focus write
+    // replaces it with the settled landing view's path before any push.
     final targetView = parseDashboardView(uri) ?? DashboardView.overview;
     final obligationId = parseFocusedObligationId(uri);
     final actorId = parseFocusedActorId(uri);

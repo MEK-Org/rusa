@@ -46,6 +46,11 @@ void writeDashboardViewToUrl(
   // Let Flutter update its own browser-history entry. Calling the DOM History
   // API directly replaces the engine's serialized state and breaks teardown.
   // This is deliberately fire-and-forget: a view selection must not wait for
-  // best-effort address-bar synchronization.
-  unawaited(SystemNavigator.routeInformationUpdated(uri: url, replace: replace));
+  // best-effort address-bar synchronization. This is the dashboard's only URL
+  // writer (the Router opts out of reporting), so it also keeps the engine in
+  // multi-entry history, where pushes become real back/forward entries.
+  unawaited(SystemNavigator.selectMultiEntryHistory());
+  unawaited(
+    SystemNavigator.routeInformationUpdated(uri: url, replace: replace),
+  );
 }

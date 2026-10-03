@@ -12,359 +12,345 @@ import 'package:rusa_dashboard/widgets/work_tab.dart';
 
 import 'fakes.dart';
 
-Widget _testDashboardApp({required DashboardStore store}) {
-  return RusaDashboardApp(
-    bootstrapSession: () => Future.value(LocalDashboardSession()),
-    pageBuilder: (_, _) => Scaffold(
-      body: DashboardBody(
-        store: store,
-        understandingBuilder: (_) => const SizedBox(),
-        reportsBuilder: (_) => const SizedBox(),
+final _navCalls = <MethodCall>[];
+
+/// Session renewals requested through `DashboardBody.onNavigation`, which
+/// `main.dart` wires to `DashboardSession.visit`.
+var _visits = 0;
+
+/// The `routeInformationUpdated` calls recorded since the last clear, as
+/// `(uri, replace)` pairs.
+List<(String, bool)> _urlWrites() => [
+  for (final c in _navCalls)
+    if (c.method == 'routeInformationUpdated')
+      (
+        (c.arguments as Map)['uri'] as String,
+        (c.arguments as Map)['replace'] as bool,
       ),
-    ),
-  );
+];
+
+/// Mounts the real [RusaDashboardApp] (and so its Router) at [initialUrl],
+/// runs [body], and tears the store and test-view overrides down afterwards.
+Future<void> _withDashboard(
+  WidgetTester tester, {
+  required String initialUrl,
+  FakeApi? api,
+  required Future<void> Function(DashboardStore store) body,
+}) async {
+  await tester.runAsync(() async {
+    addTearDown(() {
+      tester.platformDispatcher.clearDefaultRouteNameTestValue();
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final store = DashboardStore(
+      api: api ?? (FakeApi()..chatRoomParticipants = ['root']),
+      stream: FakeStream(),
+    );
+    await store.init();
+
+    tester.platformDispatcher.defaultRouteNameTestValue = initialUrl;
+    debugDashboardUrl = initialUrl;
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1.0;
+    await tester.pumpWidget(
+      RusaDashboardApp(
+        bootstrapSession: () => Future.value(LocalDashboardSession()),
+        pageBuilder: (_, _) => Scaffold(
+          body: DashboardBody(
+            store: store,
+            onNavigation: () async => _visits++,
+            understandingBuilder: (_) => const SizedBox(),
+            reportsBuilder: (_) => const SizedBox(),
+          ),
+        ),
+      ),
+    );
+    await _settle(tester);
+
+    await body(store);
+    await store.dispose();
+  });
 }
 
-Future<void> _pumpDashboard(
-  WidgetTester tester, {
-  required DashboardStore store,
-  String initialUrl = '/overview',
-  Size size = const Size(1200, 800),
-}) async {
-  tester.platformDispatcher.defaultRouteNameTestValue = initialUrl;
-  debugDashboardUrl = initialUrl;
-  tester.view.physicalSize = size;
-  tester.view.devicePixelRatio = 1.0;
-
-  await tester.pumpWidget(_testDashboardApp(store: store));
+Future<void> _settle(WidgetTester tester) async {
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 50));
+}
+
+Future<void> _tapNav(WidgetTester tester, String label) async {
+  await tester.tap(find.widgetWithText(InkWell, label));
+  await _settle(tester);
+}
+
+/// Simulates the browser restoring [url] (back/forward popstate): the address
+/// bar changes first, then the engine pushes the route to the framework.
+Future<void> _popTo(WidgetTester tester, String url) async {
+  debugDashboardUrl = url;
+  final handled = await tester.binding.handlePushRoute(url);
+  expect(handled, isTrue, reason: 'the Router must accept the platform push');
+  await _settle(tester);
 }
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  final recordedNavCalls = <MethodCall>[];
-
   setUp(() {
     debugDashboardUrl = null;
-    recordedNavCalls.clear();
-    final messenger =
-        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-    messenger.setMockMethodCallHandler(SystemChannels.navigation, (call) async {
-      recordedNavCalls.add(call);
-      return null;
-    });
+    _navCalls.clear();
+    _visits = 0;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.navigation, (call) async {
+          _navCalls.add(call);
+          return null;
+        });
   });
 
   tearDown(() {
     debugDashboardUrl = null;
-    recordedNavCalls.clear();
-    final messenger =
-        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-    messenger.setMockMethodCallHandler(SystemChannels.navigation, null);
+    _navCalls.clear();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.navigation, null);
   });
 
   group('browser/system back navigation', () {
     testWidgets(
       'startup preserves multi-entry mode without selecting single-entry history',
       (tester) async {
-        await tester.runAsync(() async {
-          addTearDown(() {
-            tester.platformDispatcher.clearDefaultRouteNameTestValue();
-            tester.view.resetPhysicalSize();
-            tester.view.resetDevicePixelRatio();
-          });
-
-          final api = FakeApi()..chatRoomParticipants = ['root'];
-          final store = DashboardStore(api: api, stream: FakeStream());
-          await store.init();
-
-          // Pump dashboard without clearing initial calls
-          await _pumpDashboard(tester, store: store, initialUrl: '/overview');
-
-          final singleEntryCalls = recordedNavCalls
-              .where((c) => c.method == 'selectSingleEntryHistory')
-              .toList();
-
-          expect(
-            singleEntryCalls,
-            isEmpty,
-            reason:
-                'Startup must never select single-entry history or downgrade web engine history mode',
-          );
-
-          final multiEntryCalls = recordedNavCalls
-              .where((c) => c.method == 'selectMultiEntryHistory')
-              .toList();
-
-          expect(
-            multiEntryCalls,
-            isNotEmpty,
-            reason: 'Engine must be placed in multi-entry history mode',
-          );
-
-          await store.dispose();
-        });
+        await _withDashboard(
+          tester,
+          initialUrl: '/overview',
+          body: (_) async {
+            final methods = _navCalls.map((c) => c.method);
+            expect(
+              methods,
+              isNot(contains('selectSingleEntryHistory')),
+              reason:
+                  'Startup must never select single-entry history or downgrade web engine history mode',
+            );
+            expect(
+              methods,
+              contains('selectMultiEntryHistory'),
+              reason: 'Engine must be placed in multi-entry history mode',
+            );
+          },
+        );
       },
     );
 
     testWidgets(
       'navigating A -> Room pushes history with multi-entry mode, and system back returns to A',
       (tester) async {
-        await tester.runAsync(() async {
-          addTearDown(() {
-            tester.platformDispatcher.clearDefaultRouteNameTestValue();
-            tester.view.resetPhysicalSize();
-            tester.view.resetDevicePixelRatio();
-          });
+        await _withDashboard(
+          tester,
+          initialUrl: '/overview',
+          body: (_) async {
+            expect(find.byType(OverviewTab), findsOneWidget);
+            expect(find.byType(ChatRoomTab), findsNothing);
+            expect(
+              _visits,
+              0,
+              reason: 'Loading the addressed view is no visit',
+            );
+            _navCalls.clear();
 
-          final api = FakeApi()..chatRoomParticipants = ['root'];
-          final store = DashboardStore(api: api, stream: FakeStream());
-          await store.init();
+            await _tapNav(tester, 'Room');
+            expect(_visits, 1, reason: 'The Room tap renews the session');
+            expect(find.byType(ChatRoomTab), findsOneWidget);
+            expect(find.byType(OverviewTab), findsNothing);
+            expect(
+              _urlWrites(),
+              contains(('/chat-room', false)),
+              reason:
+                  'Navigation to Room must push history entry with replace: false',
+            );
 
-          await _pumpDashboard(tester, store: store, initialUrl: '/overview');
+            await _popTo(tester, '/overview');
+            expect(
+              find.byType(OverviewTab),
+              findsOneWidget,
+              reason:
+                  'System back after Room must return to prior in-app location A (Overview)',
+            );
+            expect(find.byType(ChatRoomTab), findsNothing);
+            expect(_visits, 2, reason: 'Browser back renews the session too');
+          },
+        );
+      },
+    );
 
-          // Initially on Overview
-          expect(find.byType(OverviewTab), findsOneWidget);
-          expect(find.byType(ChatRoomTab), findsNothing);
+    testWidgets(
+      'the Router never writes the address, so in-app navigation has one URL writer',
+      (tester) async {
+        await _withDashboard(
+          tester,
+          initialUrl: '/overview',
+          body: (_) async {
+            final router = Router.of(
+              tester.element(find.byType(DashboardBody)),
+            );
+            expect(
+              router.routerDelegate.currentConfiguration,
+              isNull,
+              reason:
+                  'A non-null configuration opts the Router into reporting, '
+                  'and its copy goes stale after every in-app view change',
+            );
 
-          recordedNavCalls.clear();
+            _navCalls.clear();
+            await _tapNav(tester, 'Room');
+            await _popTo(tester, '/overview');
+            await _popTo(tester, '/chat-room');
+            // Extra frames give any post-frame Router report a chance to run.
+            await _settle(tester);
 
-          // Navigate from Overview (A) to Room
-          final roomNavButton = find.widgetWithText(InkWell, 'Room');
-          expect(roomNavButton, findsOneWidget);
-          await tester.tap(roomNavButton);
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-
-          // Verify Room is now displayed
-          expect(find.byType(ChatRoomTab), findsOneWidget);
-          expect(find.byType(OverviewTab), findsNothing);
-
-          // Verify that navigation pushed history (replace: false)
-          final pushUpdates = recordedNavCalls.where(
-            (c) =>
-                c.method == 'routeInformationUpdated' &&
-                c.arguments is Map &&
-                (c.arguments as Map)['uri'] == '/chat-room' &&
-                (c.arguments as Map)['replace'] == false,
-          );
-          expect(
-            pushUpdates,
-            isNotEmpty,
-            reason: 'Navigation to Room must push history entry with replace: false',
-          );
-
-          // Simulate browser / system back popping back to /overview
-          final handled = await tester.binding.handlePushRoute('/overview');
-          expect(handled, isTrue, reason: 'DashboardRouteScope must handle push route');
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-
-          // Acceptance criterion: system back returns to prior location A (Overview)
-          expect(
-            find.byType(OverviewTab),
-            findsOneWidget,
-            reason: 'System back after Room must return to prior in-app location A (Overview)',
-          );
-          expect(find.byType(ChatRoomTab), findsNothing);
-
-          await store.dispose();
-        });
+            expect(
+              _urlWrites(),
+              [('/chat-room', false)],
+              reason:
+                  'The Room tap is the only write; restoring views on '
+                  'popstate must not write, and the Router must not re-report',
+            );
+          },
+        );
       },
     );
 
     testWidgets(
       'successive navigation Overview -> Work -> Room steps back through each location',
       (tester) async {
-        await tester.runAsync(() async {
-          addTearDown(() {
-            tester.platformDispatcher.clearDefaultRouteNameTestValue();
-            tester.view.resetPhysicalSize();
-            tester.view.resetDevicePixelRatio();
-          });
+        await _withDashboard(
+          tester,
+          initialUrl: '/overview',
+          body: (_) async {
+            expect(find.byType(OverviewTab), findsOneWidget);
 
-          final api = FakeApi()..chatRoomParticipants = ['root'];
-          final store = DashboardStore(api: api, stream: FakeStream());
-          await store.init();
+            await _tapNav(tester, 'Work');
+            expect(find.byType(WorkTab), findsOneWidget);
+            await _tapNav(tester, 'Room');
+            expect(find.byType(ChatRoomTab), findsOneWidget);
 
-          await _pumpDashboard(tester, store: store, initialUrl: '/overview');
+            await _popTo(tester, '/work');
+            expect(find.byType(WorkTab), findsOneWidget);
+            expect(find.byType(ChatRoomTab), findsNothing);
 
-          expect(find.byType(OverviewTab), findsOneWidget);
-
-          // 1. Navigate to Work
-          await tester.tap(find.widgetWithText(InkWell, 'Work'));
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-          expect(find.byType(WorkTab), findsOneWidget);
-
-          // 2. Navigate to Room
-          await tester.tap(find.widgetWithText(InkWell, 'Room'));
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-          expect(find.byType(ChatRoomTab), findsOneWidget);
-
-          // 3. First back -> returns to Work
-          await tester.binding.handlePushRoute('/work');
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-          expect(find.byType(WorkTab), findsOneWidget);
-          expect(find.byType(ChatRoomTab), findsNothing);
-
-          // 4. Second back -> returns to Overview
-          await tester.binding.handlePushRoute('/overview');
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-          expect(find.byType(OverviewTab), findsOneWidget);
-          expect(find.byType(WorkTab), findsNothing);
-
-          await store.dispose();
-        });
+            await _popTo(tester, '/overview');
+            expect(find.byType(OverviewTab), findsOneWidget);
+            expect(find.byType(WorkTab), findsNothing);
+          },
+        );
       },
     );
 
     testWidgets(
       'restoring URL without obligation focus clears focused obligation in store, UI pane, and URL',
       (tester) async {
-        await tester.runAsync(() async {
-          addTearDown(() {
-            tester.platformDispatcher.clearDefaultRouteNameTestValue();
-            tester.view.resetPhysicalSize();
-            tester.view.resetDevicePixelRatio();
-          });
-
-          final api = FakeApi()
+        await _withDashboard(
+          tester,
+          initialUrl: '/work',
+          api: FakeApi()
             ..chatRoomParticipants = ['root']
-            ..obligationsResult = [
-              makeObligation('ob-q', title: 'Task Q'),
-            ];
-          final store = DashboardStore(api: api, stream: FakeStream());
-          await store.init();
+            ..obligationsResult = [makeObligation('ob-q', title: 'Task Q')],
+          body: (store) async {
+            expect(find.byType(WorkTab), findsOneWidget);
+            expect(
+              find.text('Select an obligation from the tree.'),
+              findsOneWidget,
+            );
 
-          await _pumpDashboard(tester, store: store, initialUrl: '/work');
-          expect(find.byType(WorkTab), findsOneWidget);
-          expect(find.text('Select an obligation from the tree.'), findsOneWidget);
-          expect(debugDashboardUrl, '/work');
+            _navCalls.clear();
+            store.setFocusedObligationId('ob-q');
+            await _settle(tester);
+            expect(store.focusedObligationId.valueOrNull, 'ob-q');
+            expect(find.text('Task Q'), findsWidgets);
+            expect(
+              find.text('Select an obligation from the tree.'),
+              findsNothing,
+            );
+            expect(_urlWrites().last, ('/work/ob-q', true));
 
-          // Focus obligation Q (simulating in-view focus selection)
-          store.setFocusedObligationId('ob-q');
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-          expect(store.focusedObligationId.valueOrNull, 'ob-q');
-          expect(find.text('Task Q'), findsWidgets);
-          expect(find.text('Select an obligation from the tree.'), findsNothing);
-          expect(debugDashboardUrl, '/work/ob-q');
+            await _tapNav(tester, 'Room');
+            expect(find.byType(ChatRoomTab), findsOneWidget);
+            expect(_urlWrites().last, ('/chat-room', false));
 
-          // Navigate to Room
-          await tester.tap(find.widgetWithText(InkWell, 'Room'));
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-          expect(find.byType(ChatRoomTab), findsOneWidget);
-          expect(debugDashboardUrl, '/chat-room');
+            await _popTo(tester, '/work/ob-q');
+            expect(find.byType(WorkTab), findsOneWidget);
+            expect(store.focusedObligationId.valueOrNull, 'ob-q');
+            expect(find.text('Task Q'), findsWidgets);
+            expect(
+              find.text('Select an obligation from the tree.'),
+              findsNothing,
+            );
 
-          // Back to /work/ob-q restores WorkTab with obligation focused
-          debugDashboardUrl = '/work/ob-q';
-          await tester.binding.handlePushRoute('/work/ob-q');
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-          expect(find.byType(WorkTab), findsOneWidget);
-          expect(store.focusedObligationId.valueOrNull, 'ob-q');
-          expect(find.text('Task Q'), findsWidgets);
-          expect(find.text('Select an obligation from the tree.'), findsNothing);
-          expect(debugDashboardUrl, '/work/ob-q');
-
-          // Back to original bare /work clears focused obligation in store, detail pane, and URL
-          debugDashboardUrl = '/work';
-          await tester.binding.handlePushRoute('/work');
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-          expect(find.byType(WorkTab), findsOneWidget);
-          expect(
-            store.focusedObligationId.valueOrNull,
-            isNull,
-            reason: 'Popping to bare /work must clear focused obligation in store',
-          );
-          expect(
-            find.text('Select an obligation from the tree.'),
-            findsOneWidget,
-            reason: 'Detail pane must be cleared back to empty selection state',
-          );
-          expect(
-            debugDashboardUrl,
-            '/work',
-            reason: 'Restored URL must reflect bare /work',
-          );
-
-          await store.dispose();
-        });
+            _navCalls.clear();
+            await _popTo(tester, '/work');
+            expect(find.byType(WorkTab), findsOneWidget);
+            expect(
+              store.focusedObligationId.valueOrNull,
+              isNull,
+              reason:
+                  'Popping to bare /work must clear focused obligation in store',
+            );
+            expect(
+              find.text('Select an obligation from the tree.'),
+              findsOneWidget,
+              reason:
+                  'Detail pane must be cleared back to empty selection state',
+            );
+            expect(
+              _urlWrites(),
+              everyElement(('/work', true)),
+              reason:
+                  'Clearing the focus re-states bare /work in place, never '
+                  'pushing or writing a stale focused address',
+            );
+          },
+        );
       },
     );
 
     testWidgets(
       'focus updates within tab update URL in place with replace: true',
       (tester) async {
-        await tester.runAsync(() async {
-          addTearDown(() {
-            tester.platformDispatcher.clearDefaultRouteNameTestValue();
-            tester.view.resetPhysicalSize();
-            tester.view.resetDevicePixelRatio();
-          });
+        await _withDashboard(
+          tester,
+          initialUrl: '/work',
+          api: FakeApi(),
+          body: (store) async {
+            _navCalls.clear();
+            store.setFocusedObligationId('ob-focused-1');
+            await _settle(tester);
 
-          final api = FakeApi();
-          final store = DashboardStore(api: api, stream: FakeStream());
-          await store.init();
-
-          await _pumpDashboard(tester, store: store, initialUrl: '/work');
-
-          recordedNavCalls.clear();
-
-          // Change obligation focus within Work tab
-          store.setFocusedObligationId('ob-focused-1');
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-
-          // Focus change must use replace: true (does not push history)
-          final focusCalls = recordedNavCalls.where(
-            (c) =>
-                c.method == 'routeInformationUpdated' &&
-                c.arguments is Map &&
-                (c.arguments as Map)['uri'] == '/work/ob-focused-1',
-          );
-          expect(focusCalls, isNotEmpty);
-          expect(
-            (focusCalls.last.arguments as Map)['replace'],
-            isTrue,
-            reason: 'In-view focus updates must use replace: true',
-          );
-
-          await store.dispose();
-        });
+            final focusWrites = _urlWrites().where(
+              (w) => w.$1 == '/work/ob-focused-1',
+            );
+            expect(focusWrites, isNotEmpty);
+            expect(
+              focusWrites.last.$2,
+              isTrue,
+              reason: 'In-view focus updates must use replace: true',
+            );
+          },
+        );
       },
     );
 
     testWidgets(
       'direct deep link to /chat-room lands on Room without fabricating Overview',
       (tester) async {
-        await tester.runAsync(() async {
-          addTearDown(() {
-            tester.platformDispatcher.clearDefaultRouteNameTestValue();
-            tester.view.resetPhysicalSize();
-            tester.view.resetDevicePixelRatio();
-          });
-
-          final api = FakeApi()..chatRoomParticipants = ['root'];
-          final store = DashboardStore(api: api, stream: FakeStream());
-          await store.init();
-
-          await _pumpDashboard(tester, store: store, initialUrl: '/chat-room');
-
-          // Direct deep link displays ChatRoomTab
-          expect(find.byType(ChatRoomTab), findsOneWidget);
-          expect(find.byType(OverviewTab), findsNothing);
-
-          await store.dispose();
-        });
+        await _withDashboard(
+          tester,
+          initialUrl: '/chat-room',
+          body: (_) async {
+            expect(find.byType(ChatRoomTab), findsOneWidget);
+            expect(find.byType(OverviewTab), findsNothing);
+            expect(
+              _urlWrites().map((w) => w.$1),
+              everyElement('/chat-room'),
+              reason: 'Startup must not rewrite the deep link to another view',
+            );
+          },
+        );
       },
     );
   });
