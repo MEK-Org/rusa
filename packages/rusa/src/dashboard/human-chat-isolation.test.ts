@@ -95,6 +95,7 @@ describe("human chat isolation (#590)", () => {
   let deps: DashboardDataDeps;
   let alice: Person;
   let bob: Person;
+  let firebase: ConstructorParameters<typeof DashboardAuth>[1];
   /** Session cookie → the person it authenticates. */
   const cookies = new Map<string, Person>();
 
@@ -147,7 +148,7 @@ describe("human chat isolation (#590)", () => {
       ["alice-token", alice],
       ["bob-token", bob],
     ]);
-    const firebase = {
+    firebase = {
       verifyIdToken: async (value: string) => {
         const who = byIdToken.get(value);
         if (!who) throw new Error("unknown id token");
@@ -345,9 +346,22 @@ describe("human chat isolation (#590)", () => {
 
   it("#866 serves exact bytes through sole-email auth and the supported auth-disabled local path", async () => {
     // Engineering boundary: #866 comment5972967230; no multi-human exception to #590.
-    delete auth.config.allowedEmails;
-    auth.config.email = alice.email;
+    // Rebuild this fixture as a real sole-email instance: authenticator and options agree.
+    await auth.close();
+    const soleEmail = { firebase: firebaseConfig, email: alice.email };
+    auth = new DashboardAuth(
+      soleEmail,
+      firebase,
+      new DashboardIdentityResolver(() => principals, PROJECT),
+      () => now
+    );
+    server.removeAllListeners("request");
+    server.on(
+      "request",
+      createDashboardRequestHandler({ port: 0, auth: soleEmail }, deps, null, auth)
+    );
     const a = await login(alice);
+    expect((await post("/api/auth/session", { idToken: "bob-token" })).status).toBe(401);
     const runId = new ActorRunRepository(db).start({
       actorId: ACTOR,
       modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
@@ -366,6 +380,13 @@ describe("human chat isolation (#590)", () => {
     const local = await fetch(origin + path);
     expect(local.status).toBe(200);
     expect(await local.json()).toEqual(prompts.getById(runId));
+    // A second active user leaves auth-disabled mode unable to identify its viewer.
+    principals.createUser({ email: "second@example.com", createdAt: new Date(now).toISOString() });
+    const ambiguous = await fetch(origin + path);
+    expect(ambiguous.status).toBe(404);
+    const unavailable = await ambiguous.text();
+    expect(unavailable).toBe(JSON.stringify({ error: "prompt not retained" }));
+    expect(unavailable).not.toContain("Synthetic charter");
     expect(prompts.getById(runId)?.prompt).toBe(prompt);
   });
 
