@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import 'dashboard_title.dart';
@@ -38,10 +39,19 @@ class RusaDashboardApp extends StatefulWidget {
   State<RusaDashboardApp> createState() => _RusaDashboardAppState();
 }
 
-class _RusaDashboardAppState extends State<RusaDashboardApp> {
+class _RusaDashboardAppState extends State<RusaDashboardApp>
+    with WidgetsBindingObserver {
   DashboardSession? _resolvedSession;
   String? _authenticatedTitle;
   late final Future<DashboardSession> _session = _bootstrapSession();
+  final ValueNotifier<RouteInformation?> _routeNotifier =
+      ValueNotifier<RouteInformation?>(null);
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
 
   Future<DashboardSession> _bootstrapSession() async {
     final session = await widget.bootstrapSession();
@@ -63,9 +73,17 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _resolvedSession?.removeListener(_onSessionChanged);
     _resolvedSession?.dispose();
+    _routeNotifier.dispose();
     super.dispose();
+  }
+
+  @override
+  Future<bool> didPushRouteInformation(RouteInformation routeInformation) async {
+    _routeNotifier.value = routeInformation;
+    return true;
   }
 
   Widget _buildHost() => FutureBuilder<DashboardSession>(
@@ -78,10 +96,13 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
       if (snapshot.hasError || session == null) {
         return const _AuthStartupError();
       }
-      return _DashboardSessionHost(
-        session: session,
-        pageBuilder: widget.pageBuilder,
-        browserHooksBuilder: widget.browserHooksBuilder,
+      return DashboardRouteScope(
+        routeNotifier: _routeNotifier,
+        child: _DashboardSessionHost(
+          session: session,
+          pageBuilder: widget.pageBuilder,
+          browserHooksBuilder: widget.browserHooksBuilder,
+        ),
       );
     },
   );
@@ -258,3 +279,25 @@ class _SignInPageState extends State<SignInPage> {
     ),
   );
 }
+
+/// Injects route updates from platform popstate/back navigation to descendant dashboard widgets.
+class DashboardRouteScope extends InheritedWidget {
+  const DashboardRouteScope({
+    super.key,
+    required this.routeNotifier,
+    required super.child,
+  });
+
+  final ValueListenable<RouteInformation?> routeNotifier;
+
+  static ValueListenable<RouteInformation?>? maybeOf(BuildContext context) {
+    return context
+        .dependOnInheritedWidgetOfExactType<DashboardRouteScope>()
+        ?.routeNotifier;
+  }
+
+  @override
+  bool updateShouldNotify(DashboardRouteScope oldWidget) =>
+      routeNotifier != oldWidget.routeNotifier;
+}
+

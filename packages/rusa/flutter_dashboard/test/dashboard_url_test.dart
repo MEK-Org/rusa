@@ -35,4 +35,38 @@ void main() {
       });
     },
   );
+
+  test(
+    'writes dashboard URLs through Flutter navigation with push',
+    () async {
+      final calls = <MethodCall>[];
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(SystemChannels.navigation, (
+        call,
+      ) async {
+        calls.add(call);
+        return null;
+      });
+      addTearDown(
+        () =>
+            messenger.setMockMethodCallHandler(SystemChannels.navigation, null),
+      );
+
+      writeDashboardViewToUrl(
+        DashboardView.chatRoom,
+        replace: false,
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      expect(calls, hasLength(2));
+      expect(calls[0].method, 'selectMultiEntryHistory');
+      expect(calls[1].method, 'routeInformationUpdated');
+      expect(calls[1].arguments, <String, Object?>{
+        'uri': '/chat-room',
+        'state': null,
+        'replace': false,
+      });
+    },
+  );
 }

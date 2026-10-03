@@ -28,6 +28,7 @@ void writeDashboardViewToUrl(
   String? focusedObligationId,
   String? focusedActorId,
   Future<void> Function()? onNavigation,
+  bool replace = true,
 }) {
   final baseUri = _currentUri();
   final url = buildDashboardUri(
@@ -46,5 +47,8 @@ void writeDashboardViewToUrl(
   // API directly replaces the engine's serialized state and breaks teardown.
   // This is deliberately fire-and-forget: a view selection must not wait for
   // best-effort address-bar synchronization.
-  unawaited(SystemNavigator.routeInformationUpdated(uri: url, replace: true));
+  if (!replace) {
+    unawaited(SystemNavigator.selectMultiEntryHistory());
+  }
+  unawaited(SystemNavigator.routeInformationUpdated(uri: url, replace: replace));
 }

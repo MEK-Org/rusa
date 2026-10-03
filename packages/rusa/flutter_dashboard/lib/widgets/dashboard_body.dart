@@ -1,8 +1,12 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
+import '../app.dart';
 import '../breakpoints.dart';
 import '../dashboard_url.dart';
+import '../dashboard_url_core.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -55,7 +59,8 @@ class DashboardBody extends StatefulWidget {
   State<DashboardBody> createState() => _DashboardBodyState();
 }
 
-class _DashboardBodyState extends State<DashboardBody> {
+class _DashboardBodyState extends State<DashboardBody>
+    with WidgetsBindingObserver {
   late DashboardView _view;
   StreamSubscription<String?>? _focusSub;
   StreamSubscription<String?>? _actorSub;
@@ -75,6 +80,8 @@ class _DashboardBodyState extends State<DashboardBody> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(SystemNavigator.selectMultiEntryHistory());
     _urlNamedView = dashboardViewFromUrl();
     _view = _urlNamedView ?? DashboardView.overview;
     final initialObligation = focusedObligationIdFromUrl();
@@ -94,6 +101,7 @@ class _DashboardBodyState extends State<DashboardBody> {
           focusedObligationId: id,
           focusedActorId: widget.store.primary.valueOrNull,
           onNavigation: widget.onNavigation,
+          replace: true,
         );
       }
     });
@@ -105,6 +113,7 @@ class _DashboardBodyState extends State<DashboardBody> {
           focusedObligationId: widget.store.focusedObligationId.valueOrNull,
           focusedActorId: id,
           onNavigation: widget.onNavigation,
+          replace: true,
         );
       }
     });
@@ -124,8 +133,30 @@ class _DashboardBodyState extends State<DashboardBody> {
     );
   }
 
+  ValueListenable<RouteInformation?>? _routeNotifier;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final notifier = DashboardRouteScope.maybeOf(context);
+    if (notifier != _routeNotifier) {
+      _routeNotifier?.removeListener(_onRouteChanged);
+      _routeNotifier = notifier;
+      _routeNotifier?.addListener(_onRouteChanged);
+    }
+  }
+
+  void _onRouteChanged() {
+    final routeInfo = _routeNotifier?.value;
+    if (routeInfo != null) {
+      _applyRouteInformation(routeInfo);
+    }
+  }
+
   @override
   void dispose() {
+    _routeNotifier?.removeListener(_onRouteChanged);
+    WidgetsBinding.instance.removeObserver(this);
     _focusSub?.cancel();
     _actorSub?.cancel();
     super.dispose();
@@ -139,7 +170,56 @@ class _DashboardBodyState extends State<DashboardBody> {
       focusedObligationId: widget.store.focusedObligationId.valueOrNull,
       focusedActorId: widget.store.primary.valueOrNull,
       onNavigation: widget.onNavigation,
+      replace: false,
     );
+  }
+
+  void _applyRouteInformation(RouteInformation routeInformation) {
+    final uri = routeInformation.uri;
+    final targetView = parseDashboardView(uri) ?? DashboardView.overview;
+    final obligationId = parseFocusedObligationId(uri);
+    final actorId = parseFocusedActorId(uri);
+
+    if (obligationId != widget.store.focusedObligationId.valueOrNull) {
+      if (obligationId != null) {
+        widget.store.setFocusedObligationId(obligationId);
+      }
+    }
+    if (actorId != widget.store.primary.valueOrNull) {
+      if (actorId != null) {
+        widget.store.clickActor(actorId);
+      } else if (targetView == DashboardView.actors) {
+        widget.store.clearSelection();
+      }
+    }
+
+    if (_view != targetView) {
+      setState(() => _view = targetView);
+      if (widget.onNavigation != null) {
+        unawaited(widget.onNavigation!());
+      }
+    }
+  }
+
+  @override
+  Future<bool> didPushRouteInformation(RouteInformation routeInformation) async {
+    _applyRouteInformation(routeInformation);
+    return true;
+  }
+
+  @override
+  Future<bool> didPopRoute() async {
+    final inActorDetail =
+        _view == DashboardView.actors && widget.store.primary.valueOrNull != null;
+    if (inActorDetail) {
+      widget.store.clearSelection();
+      return true;
+    }
+    if (_view != DashboardView.overview) {
+      _selectView(DashboardView.overview);
+      return true;
+    }
+    return false;
   }
 
   @override
