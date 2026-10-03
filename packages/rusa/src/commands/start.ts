@@ -320,6 +320,7 @@ import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { BuildRunner, GitRunner } from "../update/runner.js";
 import { ChatRoomService } from "../voice/chat-room.js";
 import { DEFAULT_VOICE_NAME } from "../voice/gemini-speech.js";
+import { ROOM_ENTRY_DRAIN_INTERVAL_MS, RoomEntryService } from "../voice/room-entry.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import { buildSupportedVoiceCatalog, filterConfiguredVoices } from "../voice/voice-catalog.js";
 import { googleVoiceConfig } from "../voice/voice-config.js";
@@ -2515,6 +2516,22 @@ async function composeStart(
         DEFAULT_VOICE_NAME
     ),
     isHumanPrincipal: (id) => getRepositories().principals.getUser(id) !== undefined,
+    onRemoved: (actorId) => roomEntry.invalidateRecipient(actorId),
+  });
+  // Human entry episodes for the Chat Room (#829): one notice per participant
+  // per episode, appended after the episode commits and retried by the
+  // lifecycle-owned drain below until each is confirmed or terminal.
+  const roomEntry = new RoomEntryService({
+    store: getRepositories().roomEntryEpisodes,
+    inbox: getRepositories().inbox,
+    roster: () =>
+      chatRoom
+        .participants()
+        .filter((participant) => actors.get(participant.actorId)?.status === "active")
+        .map((participant) => participant.actorId),
+    isParticipant: (actorId) =>
+      chatRoom.isParticipant(actorId) && actors.get(actorId)?.status === "active",
+    log: (message) => log.warn("room_entry", { message }),
   });
 
   // Mechanical failure forwarding: a failed run goes to its parent's inbox, or —
@@ -3073,6 +3090,8 @@ async function composeStart(
             assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(id, entryIds),
             isVoiceSessionActive: () => voiceService?.hasActiveSession(id) ?? false,
             chatContext: inboxChatContextSources(),
+            roomEntryPresence: (episodeId, actorId, principalId) =>
+              roomEntry.noticePresence(episodeId, actorId, principalId),
           })
         );
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
@@ -3508,6 +3527,8 @@ async function composeStart(
       assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(rootId, entryIds),
       isVoiceSessionActive: () => voiceService?.hasActiveSession(rootId) ?? false,
       chatContext: inboxChatContextSources(),
+      roomEntryPresence: (episodeId, actorId, principalId) =>
+        roomEntry.noticePresence(episodeId, actorId, principalId),
     })
   );
   const rootMeshChatUrl = mcpHttp.addServer(`${rootId}:${MESH_CHAT_MCP_NAME}`, () =>
@@ -4134,6 +4155,8 @@ async function composeStart(
           geminiApiKey,
           supportedVoices: supportedVoiceCatalog,
           chatRoom,
+          roomEntry,
+          onDashboardSessionEnded: (sessionKey) => roomEntry.invalidateSession(sessionKey),
           getFollowers: () => (followerHub ? followerHub.list() : []),
           updateFollower: (id, opts) => {
             if (!followerHub) throw new Error("Follower gateway not enabled");
@@ -4538,6 +4561,19 @@ async function composeStart(
 
   // Webhook delivery silence needs sub-hour signal: a 10-minute check keeps the
   // default 45-minute threshold close to its intended alert window.
+  // Room entry notices (#829): finish any fanout a crash or failed append left
+  // pending, then collect episodes that no longer carry anything.
+  const roomEntryMaintenance = () => {
+    try {
+      roomEntry.drain();
+      roomEntry.collect();
+    } catch (err) {
+      log.warn("room_entry_maintenance_failed", { err });
+    }
+  };
+  roomEntryMaintenance();
+  everyInterval("room entry maintenance", roomEntryMaintenance, ROOM_ENTRY_DRAIN_INTERVAL_MS);
+
   everyInterval(
     "webhook silence check",
     () => void webhookSilenceDetector?.check(),

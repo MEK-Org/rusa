@@ -1,10 +1,13 @@
 import Database from "better-sqlite3";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ChatRoomRepository } from "../db/repositories/chat-room-repository.js";
+import { RoomEntryEpisodeRepository } from "../db/repositories/room-entry-episode-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { ChatRoomService } from "./chat-room.js";
+import { RoomEntryService } from "./room-entry.js";
 import { buildSupportedVoiceCatalog } from "./voice-catalog.js";
 import { googleVoiceConfig } from "./voice-config.js";
 
@@ -28,7 +31,7 @@ describe("ChatRoomService", () => {
   let actors: SqliteActorRepository;
   let clock: number;
 
-  const service = () =>
+  const service = (onRemoved?: (actorId: string) => void) =>
     new ChatRoomService({
       store: new ChatRoomRepository(db),
       actors,
@@ -36,6 +39,7 @@ describe("ChatRoomService", () => {
       voices: () => buildSupportedVoiceCatalog(),
       defaultVoice: DEFAULT,
       isHumanPrincipal: (id) => id === "user-operator",
+      onRemoved,
       now: () => new Date(Date.UTC(2026, 8, 30, 12, 0, clock++)).toISOString(),
     });
 
@@ -46,6 +50,73 @@ describe("ChatRoomService", () => {
     actors = new SqliteActorRepository(db);
     actors.upsert(actor("root"));
     clock = 0;
+  });
+
+  it("rolls roster deletion and invitation invalidation back together on failure", () => {
+    actors.upsert(actor("a", { voiceConfig: googleVoiceConfig("Kore") }));
+    const store = new RoomEntryEpisodeRepository(db);
+    const room = service((id) => entries.invalidateRecipient(id));
+    const entries = new RoomEntryService({
+      store,
+      inbox: new SqliteInboxRepository(db),
+      roster: () => room.participants().map((member) => member.actorId),
+      isParticipant: (id) => room.isParticipant(id) && actors.get(id)?.status === "active",
+    });
+    room.add("a", "root");
+    const entered = entries.enter({ principalId: "user-a", clientId: "tab-1", sessionKey: "s1" });
+    if (entered.status !== "entered") throw new Error("not entered");
+    const before = store.get(entered.episodeId);
+    const original = store.update.bind(store);
+    const failure = vi.spyOn(store, "update").mockImplementationOnce((id, patch) => {
+      original(id, patch);
+      throw new Error("injected invalidation failure");
+    });
+    expect(() => room.remove("a")).toThrow("injected invalidation failure");
+    expect(room.participants().map((member) => member.actorId)).toContain("a");
+    expect(store.get(entered.episodeId)).toEqual(before);
+    failure.mockRestore();
+    expect(room.remove("a")).toBe(true);
+    room.add("a", "root");
+    expect(entries.isEligibleRecipient(entered.episodeId, "a")).toBe(false);
+  });
+
+  it("rechecks real SQLite invitations after reentrant remove/re-add and retirement during delivery", () => {
+    for (const id of ["a", "b", "c"]) actors.upsert(actor(id));
+    const room = service((id) => entries.invalidateRecipient(id));
+    for (const id of ["a", "b", "c"]) room.add(id, "root");
+    const inbox = new SqliteInboxRepository(db);
+    const snapshot = vi.fn(() =>
+      room
+        .participants()
+        .filter((member) => actors.get(member.actorId)?.status === "active")
+        .map((member) => member.actorId)
+    );
+    const entries = new RoomEntryService({
+      store: new RoomEntryEpisodeRepository(db),
+      inbox: {
+        append: (inputs) => {
+          const result = inbox.append(inputs);
+          if (inputs[0].actorId === "root") {
+            room.remove("a");
+            room.add("a", "root");
+            actors.patch("b", { status: "retired" });
+          }
+          return result;
+        },
+        read: (id, noticeId) => inbox.read(id, noticeId),
+      },
+      roster: snapshot,
+      isParticipant: (id) => room.isParticipant(id) && actors.get(id)?.status === "active",
+    });
+    const entered = entries.enter({ principalId: "user-a", clientId: "tab-1", sessionKey: "s1" });
+    if (entered.status !== "entered") throw new Error("not entered");
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    expect(room.isParticipant("a")).toBe(true);
+    expect(inbox.list("a", { status: "all" }).entries).toHaveLength(0);
+    expect(inbox.list("b", { status: "all" }).entries).toHaveLength(0);
+    expect(inbox.list("c", { status: "all" }).entries).toHaveLength(1);
+    expect(entries.isEligibleRecipient(entered.episodeId, "a")).toBe(false);
+    expect(entries.isEligibleRecipient(entered.episodeId, "b")).toBe(false);
   });
 
   it("starts as root alone", () => {
@@ -168,11 +239,25 @@ describe("ChatRoomService", () => {
     expect(() => room.remove("parent")).toThrow(/use an actor id, not an alias/);
   });
 
+  it("tells its observer only when an actor actually left (#829)", () => {
+    actors.upsert(actor("a"));
+    const removed: string[] = [];
+    const room = service((actorId) => removed.push(actorId));
+    room.add("a", "root");
+    room.remove("a");
+    room.remove("a");
+    expect(() => room.remove("root")).toThrow(/cannot be removed/);
+    expect(removed).toEqual(["a"]);
+  });
+
   it("hides a participant once it retires", () => {
     actors.upsert(actor("a", { voiceConfig: googleVoiceConfig("Kore") }));
     const room = service();
     room.add("a", "root");
+    expect(room.isParticipant("a")).toBe(true);
+    expect(room.isParticipant("root")).toBe(true);
     actors.patch("a", { status: "retired" });
+    expect(room.isParticipant("a")).toBe(false);
 
     expect(room.participants()).toEqual([{ actorId: "root", addedBy: null, addedAt: null }]);
   });

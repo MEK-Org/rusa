@@ -1,5 +1,10 @@
 import { isHumanOperator } from "../mcp/stamp.js";
+import {
+  ROOM_HUMAN_ENTRY_PAYLOAD_TYPE,
+  roomHumanEntryProblem,
+} from "../repositories/inbox-interruption.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
+import type { RoomEntryPresence } from "../voice/room-entry.js";
 import type { ChatContextWindow } from "./inbox-chat-context.js";
 
 /**
@@ -11,6 +16,54 @@ export interface SelectedInboxEntry extends InboxEntry {
   hint?: string;
   chatContext?: ChatContextWindow | { sameAsEntryId: string };
   chatContextError?: string;
+  /** Current presence of a Room entry notice's episode, read when it was listed or selected (#829). */
+  roomEntryPresence?: RoomEntryPresence;
+}
+
+/** Live state the hints may project; each source is optional. */
+export interface InboxHintContext {
+  /** Presence of a Room entry episode; absent → Room entry notices project as departed. */
+  roomEntryPresence?: (
+    episodeId: string,
+    actorId: string,
+    principalId: string
+  ) => RoomEntryPresence;
+}
+
+/**
+ * The presence a Room entry notice projects: the episode's current state, or
+ * `departed` when that state is unknown or gone. Undefined for other entries.
+ */
+export function projectRoomEntryPresence(
+  entry: InboxEntry,
+  context: InboxHintContext = {}
+): RoomEntryPresence | undefined {
+  if (entry.payload.type !== ROOM_HUMAN_ENTRY_PAYLOAD_TYPE) return undefined;
+  if (roomHumanEntryProblem(entry.payload)) return "departed";
+  const { episodeId, principalId } = entry.payload;
+  if (typeof episodeId !== "string" || typeof principalId !== "string") return "departed";
+  try {
+    return context.roomEntryPresence?.(episodeId, entry.actorId, principalId) ?? "departed";
+  } catch {
+    return "departed";
+  }
+}
+
+function roomEntryHint(entry: InboxEntry, presence: RoomEntryPresence): string {
+  const principal =
+    typeof entry.payload.principalId === "string" ? entry.payload.principalId : "a human";
+  const enteredAt =
+    typeof entry.payload.enteredAt === "string" ? ` at ${entry.payload.enteredAt}` : "";
+  const lead = `A Room entry notice records that the human ${principal} entered the Chat Room${enteredAt}. This is a notice, not a message from them: it asks nothing and completes no obligation.`;
+  const close =
+    "When nothing useful remains, mark this entry handled with an honest note; staying silent is fine.";
+  const state =
+    presence === "present"
+      ? "in the Room now"
+      : presence === "reconnecting"
+        ? "reconnecting, not confirmed listening"
+        : "not confirmed present for this invitation";
+  return `${lead} They are ${state}. In phase B, do not greet them or send an entry reply: this notice grants no permission to use ordinary reply or audio tools, which may address a different conversation. Selected-entry routing comes in phase C. ${close}`;
 }
 
 function extractThreadId(threadName: string): string | undefined {
@@ -43,8 +96,19 @@ export function isGchatThreadHead(messageName?: string, threadName?: string): bo
  * Resolve a concise handling hint for an inbox entry based on its source and payload.
  * Returns undefined when no special handling reminder is needed.
  */
-export function resolveInboxHint(entry: InboxEntry): string | undefined {
+export function resolveInboxHint(
+  entry: InboxEntry,
+  context: InboxHintContext = {}
+): string | undefined {
   const { source, payload } = entry;
+
+  const roomPresence = projectRoomEntryPresence(entry, context);
+  if (roomPresence !== undefined) {
+    if (roomHumanEntryProblem(payload)) {
+      return "Unverified Room entry notice: its stored payload is malformed or unsupported. It establishes no participation or reply/audio authority; do not greet them or send an entry reply. Mark it handled with an honest note when nothing useful remains.";
+    }
+    return roomEntryHint(entry, roomPresence);
+  }
   const fromId = typeof payload.fromId === "string" ? payload.fromId : undefined;
 
   // Voice needs its own contract before the general human-message branch:
@@ -137,9 +201,17 @@ export function resolveInboxHint(entry: InboxEntry): string | undefined {
 /**
  * Enriches a list of inbox entries with handling hints.
  */
-export function attachInboxHints(entries: InboxEntry[]): SelectedInboxEntry[] {
+export function attachInboxHints(
+  entries: InboxEntry[],
+  context: InboxHintContext = {}
+): SelectedInboxEntry[] {
   return entries.map((entry) => {
-    const hint = resolveInboxHint(entry);
-    return hint !== undefined ? { ...entry, hint } : { ...entry };
+    const roomEntryPresence = projectRoomEntryPresence(entry, context);
+    const hint = resolveInboxHint(entry, context);
+    return {
+      ...entry,
+      ...(hint !== undefined ? { hint } : {}),
+      ...(roomEntryPresence !== undefined ? { roomEntryPresence } : {}),
+    };
   });
 }

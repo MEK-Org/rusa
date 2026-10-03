@@ -2,8 +2,13 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { attachChatContext, type InboxChatContextSources } from "../actor/inbox-chat-context.js";
 import type { ResolvedInboxFocus } from "../actor/inbox-focus.js";
-import { attachInboxHints, type SelectedInboxEntry } from "../actor/inbox-hints.js";
+import {
+  attachInboxHints,
+  projectRoomEntryPresence,
+  type SelectedInboxEntry,
+} from "../actor/inbox-hints.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
+import type { RoomEntryPresence } from "../voice/room-entry.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 
@@ -33,6 +38,12 @@ export interface InboxMcpRunScope {
   isVoiceSessionActive?: () => boolean;
   /** Where selected chat entries read their recent conversation from (#651). Omitted: no chat context. */
   chatContext?: InboxChatContextSources;
+  /** Presence of a Room entry episode, projected onto entry notices (#829). Omitted: departed. */
+  roomEntryPresence?: (
+    episodeId: string,
+    actorId: string,
+    principalId: string
+  ) => RoomEntryPresence;
 }
 
 /** Actor-bound durable notification tools. The model never supplies actor_id. */
@@ -59,7 +70,7 @@ export function createInboxMcpServer(
       selected: () => localSelection,
     } satisfies InboxMcpRunScope);
   const enrich = async (entries: InboxEntry[]): Promise<SelectedInboxEntry[]> => {
-    const hinted = attachInboxHints(entries);
+    const hinted = attachInboxHints(entries, { roomEntryPresence: scope.roomEntryPresence });
     return scope.chatContext ? attachChatContext(hinted, actorId, scope.chatContext) : hinted;
   };
   server.registerTool(
@@ -77,15 +88,22 @@ export function createInboxMcpServer(
     },
     async ({ status, source, limit, cursor }) => {
       try {
-        return toolOk(
-          store.list(actorId, {
-            status,
-            source,
-            limit,
-            cursor,
-            responsiveOnly: scope.isVoiceSessionActive?.() === true,
-          })
-        );
+        const page = store.list(actorId, {
+          status,
+          source,
+          limit,
+          cursor,
+          responsiveOnly: scope.isVoiceSessionActive?.() === true,
+        });
+        return toolOk({
+          ...page,
+          entries: page.entries.map((entry) => {
+            const roomEntryPresence = projectRoomEntryPresence(entry, {
+              roomEntryPresence: scope.roomEntryPresence,
+            });
+            return roomEntryPresence === undefined ? entry : { ...entry, roomEntryPresence };
+          }),
+        });
       } catch (err) {
         return toolError(err);
       }

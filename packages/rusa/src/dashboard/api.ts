@@ -51,6 +51,7 @@ import type {
   InboxRepository,
 } from "../repositories/inbox-repository.js";
 import type { ChatRoomService } from "../voice/chat-room.js";
+import type { RoomEntryService } from "../voice/room-entry.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import { buildSupportedVoiceCatalog, type SupportedVoice } from "../voice/voice-catalog.js";
 import {
@@ -58,7 +59,7 @@ import {
   type VoiceConfigDocument,
   voiceConfigSchema,
 } from "../voice/voice-config.js";
-import { getDashboardRequestPrincipal } from "./auth.js";
+import { dashboardSessionKey, getDashboardRequestPrincipal } from "./auth.js";
 import {
   type HumanChatScope,
   humanChatViewer,
@@ -95,6 +96,11 @@ export interface DashboardDataDeps {
    * is changed only by the `room-admin` tools, never through this API.
    */
   chatRoom?: Pick<ChatRoomService, "participants">;
+  /**
+   * Human entry episodes for the Chat Room (#829). Only a verified durable
+   * principal can enter; auth-disabled local mode answers `disabled`.
+   */
+  roomEntry?: Pick<RoomEntryService, "enter" | "renew" | "leave">;
   /** Root-authorized commands exposed to trusted dashboard operators. */
   rootControl?: RootControlService;
   /**
@@ -529,13 +535,115 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   );
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+/** A reader limit, distinct from malformed JSON or a failed transport. */
+class RequestBodyTooLargeError extends Error {
+  constructor() {
+    super("Request body too large");
+  }
+}
+
+/** Read a request, optionally capping accumulated bytes before concatenation. */
+export function readBody(
+  req: IncomingMessage,
+  maxBytes = Number.POSITIVE_INFINITY
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
-    req.on("error", reject);
+    let bytes = 0;
+    let exceeded = false;
+    const onData = (chunk: Buffer) => {
+      if (exceeded) return; // Drain later transport chunks without retaining them.
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        exceeded = true;
+        chunks.length = 0;
+        reject(new RequestBodyTooLargeError());
+        return;
+      }
+      chunks.push(chunk);
+    };
+    req.on("data", onData);
+    req.once("end", () => {
+      req.off("data", onData);
+      req.off("error", reject);
+      if (!exceeded) resolve(Buffer.concat(chunks).toString("utf-8"));
+    });
+    req.once("error", reject);
   });
+}
+
+/** Largest Room entry request body; the real ones are a few hundred bytes. */
+const MAX_ROOM_ENTRY_BODY_BYTES = 4 * 1024;
+
+/**
+ * Room entry lifecycle (#829): `POST /api/mesh/chat-room/entry` enters (or
+ * reattaches) one tab, `.../entry/renew` proves it live, `.../entry/leave`
+ * releases it. Identity is the verified request principal and its session,
+ * never the body. Without a verified durable principal — auth-disabled local
+ * mode — entry is `disabled` and nothing is recorded.
+ */
+async function handleRoomEntryRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pathname: string,
+  deps: DashboardDataDeps | null
+): Promise<boolean> {
+  const action =
+    pathname === "/api/mesh/chat-room/entry"
+      ? "enter"
+      : pathname === "/api/mesh/chat-room/entry/renew"
+        ? "renew"
+        : pathname === "/api/mesh/chat-room/entry/leave"
+          ? "leave"
+          : null;
+  if (!action) return false;
+  const principal = getDashboardRequestPrincipal(req);
+  const sessionKey = dashboardSessionKey(req);
+  if (!principal || !sessionKey) {
+    sendJson(res, 200, { status: "disabled" });
+    return true;
+  }
+  if (!deps?.roomEntry) {
+    sendJson(res, 503, { status: "unavailable", reason: "room entry unavailable" });
+    return true;
+  }
+  let raw: string;
+  try {
+    raw = await readBody(req, MAX_ROOM_ENTRY_BODY_BYTES);
+  } catch (error) {
+    if (!(error instanceof RequestBodyTooLargeError)) throw error;
+    sendJson(res, 413, { error: "Request body too large" });
+    return true;
+  }
+  let body: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+    body = parsed as Record<string, unknown>;
+  } catch {
+    sendJson(res, 400, { error: "Expected a JSON object body" });
+    return true;
+  }
+  const clientId = typeof body.clientId === "string" ? body.clientId : "";
+  const client = { principalId: principal.id, clientId, sessionKey };
+  if (action === "enter") {
+    sendJson(res, 200, deps.roomEntry.enter(client));
+    return true;
+  }
+  const episodeId = typeof body.episodeId === "string" ? body.episodeId : "";
+  const generation = typeof body.generation === "string" ? body.generation : "";
+  if (!clientId || !episodeId || !generation) {
+    sendJson(res, 400, { error: "clientId, episodeId and generation are required" });
+    return true;
+  }
+  sendJson(
+    res,
+    200,
+    action === "renew"
+      ? deps.roomEntry.renew({ ...client, episodeId, generation })
+      : deps.roomEntry.leave({ principalId: principal.id, clientId, episodeId, generation })
+  );
+  return true;
 }
 
 /** Parse a comma-separated `actors` param into a de-duped, capped list. */
@@ -759,6 +867,7 @@ export async function handleMeshApiRequest(
   if (!pathname.startsWith("/api/mesh/")) return false;
 
   if (req.method === "POST") {
+    if (await handleRoomEntryRequest(req, res, pathname, deps)) return true;
     if (pathname === "/api/mesh/actors") {
       if (!deps?.rootControl) {
         sendJson(res, 503, { error: "root control unavailable" });

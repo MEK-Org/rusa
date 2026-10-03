@@ -40,6 +40,8 @@ export interface ChatRoomServiceDeps {
   defaultVoice: VoiceConfigDocument;
   /** True for durable human principals, which are never room participants. */
   isHumanPrincipal: (id: string) => boolean;
+  /** Runs inside roster removal’s transaction to void entry invitations on the shared DB (#829). */
+  onRemoved?: (actorId: string) => void;
   now?: () => string;
 }
 
@@ -77,6 +79,14 @@ export class ChatRoomService {
       { actorId: this.deps.rootId, addedBy: null, addedAt: null },
       ...stored.map(({ actorId, addedBy, addedAt }) => ({ actorId, addedBy, addedAt })),
     ];
+  }
+
+  /** Cheap live membership check for one recipient; root remains implicit. */
+  isParticipant(actorId: string): boolean {
+    return (
+      actorId === this.deps.rootId ||
+      (this.deps.store.has(actorId) && this.deps.actors.get(actorId)?.status === "active")
+    );
   }
 
   add(target: string, addedBy: string): ChatRoomAddResult {
@@ -119,7 +129,11 @@ export class ChatRoomService {
     if (ALIASES.has(id.toLowerCase())) {
       throw new Error("use an actor id, not an alias");
     }
-    return this.deps.store.remove(id);
+    return this.deps.store.transaction(() => {
+      const removed = this.deps.store.remove(id);
+      if (removed) this.deps.onRemoved?.(id);
+      return removed;
+    });
   }
 
   private resolveAddable(target: string): ActorRecord {

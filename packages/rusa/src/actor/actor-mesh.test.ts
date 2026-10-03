@@ -10,6 +10,7 @@ import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import type { RoomEntryEpisodeRow } from "../db/repositories/room-entry-episode-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
@@ -45,6 +46,7 @@ import {
   EventManager,
   HierarchicalEventSourceResolver,
 } from "../runtime/event-manager.js";
+import { RoomEntryService } from "../voice/room-entry.js";
 import { isSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { Actor } from "./actor.js";
@@ -9868,6 +9870,46 @@ describe("ActorMesh", () => {
         expect(t.admissions.get(participant)).toEqual([false, true]);
         await vi.advanceTimersByTimeAsync(10_000);
         expect(t.runs.get(participant)).toBe(2);
+      });
+
+      it("reaches running participants from a real entry through the append seam alone", async () => {
+        const t = setupTwoRunningActors();
+        const first = t.mesh.spawn({ charter: "first", parentId: "root" });
+        const second = t.mesh.spawn({ charter: "second", parentId: "root" });
+        await t.startRun(first);
+        await t.startRun(second);
+        const episodes = new Map<string, RoomEntryEpisodeRow>();
+        const rooms = new RoomEntryService({
+          store: {
+            get: (id) => episodes.get(id) ?? null,
+            current: (principalId) =>
+              [...episodes.values()].find(
+                (row) => row.principalId === principalId && row.endedAt === null
+              ) ?? null,
+            list: () => [...episodes.values()],
+            insert: (row) => void episodes.set(row.id, row),
+            update: (id, patch) => {
+              const row = episodes.get(id);
+              if (row) episodes.set(id, { ...row, ...patch });
+            },
+            delete: (id) => episodes.delete(id),
+            transaction: (fn) => fn(),
+          },
+          inbox: t.inboxStore,
+          roster: () => [first, second],
+        });
+
+        // Two tabs: one episode, one notice per participant, no explicit dispatch.
+        rooms.enter({ principalId: "human-1", clientId: "tab-1", sessionKey: "s" });
+        rooms.enter({ principalId: "human-1", clientId: "tab-2", sessionKey: "s" });
+        await vi.advanceTimersByTimeAsync(0);
+
+        for (const actorId of [first, second]) {
+          expect(t.signals.get(actorId)?.aborted).toBe(false);
+          expect(t.runs.get(actorId)).toBe(1);
+          expect(t.unhandledResponsive(actorId)).toHaveLength(1);
+        }
+        expect(t.preemptions()).toEqual([]);
       });
 
       it("promotes a queued run without preempting or adding a follow-up", async () => {
