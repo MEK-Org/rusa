@@ -67,6 +67,50 @@ void main() {
 
   group('browser/system back navigation', () {
     testWidgets(
+      'startup channel sequence establishes multi-entry mode after Navigator single-entry initialization',
+      (tester) async {
+        await tester.runAsync(() async {
+          addTearDown(() {
+            tester.platformDispatcher.clearDefaultRouteNameTestValue();
+            tester.view.resetPhysicalSize();
+            tester.view.resetDevicePixelRatio();
+          });
+
+          final api = FakeApi()..chatRoomParticipants = ['root'];
+          final store = DashboardStore(api: api, stream: FakeStream());
+          await store.init();
+
+          // Pump dashboard without clearing initial calls
+          await _pumpDashboard(tester, store: store, initialUrl: '/overview');
+
+          final historyCalls = recordedNavCalls
+              .map((c) => c.method)
+              .where((m) =>
+                  m == 'selectSingleEntryHistory' ||
+                  m == 'selectMultiEntryHistory')
+              .toList();
+
+          expect(
+            historyCalls,
+            containsAllInOrder([
+              'selectSingleEntryHistory',
+              'selectMultiEntryHistory',
+            ]),
+            reason:
+                'Descendant Navigator initial single-entry mode must be followed by selectMultiEntryHistory',
+          );
+          expect(
+            historyCalls.last,
+            'selectMultiEntryHistory',
+            reason: 'Final startup engine mode must be multi-entry history',
+          );
+
+          await store.dispose();
+        });
+      },
+    );
+
+    testWidgets(
       'navigating A -> Room pushes history with multi-entry mode, and system back returns to A',
       (tester) async {
         await tester.runAsync(() async {
@@ -182,7 +226,7 @@ void main() {
     );
 
     testWidgets(
-      'restoring URL without obligation focus clears focused obligation in store and UI',
+      'restoring URL without obligation focus clears focused obligation in store, UI pane, and URL',
       (tester) async {
         await tester.runAsync(() async {
           addTearDown(() {
@@ -191,33 +235,48 @@ void main() {
             tester.view.resetDevicePixelRatio();
           });
 
-          final api = FakeApi()..chatRoomParticipants = ['root'];
+          final api = FakeApi()
+            ..chatRoomParticipants = ['root']
+            ..obligationsResult = [
+              makeObligation('ob-q', title: 'Task Q'),
+            ];
           final store = DashboardStore(api: api, stream: FakeStream());
           await store.init();
 
           await _pumpDashboard(tester, store: store, initialUrl: '/work');
           expect(find.byType(WorkTab), findsOneWidget);
+          expect(find.text('Select an obligation from the tree.'), findsOneWidget);
+          expect(debugDashboardUrl, '/work');
 
           // Focus obligation Q (simulating in-view focus selection)
           store.setFocusedObligationId('ob-q');
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 50));
           expect(store.focusedObligationId.valueOrNull, 'ob-q');
+          expect(find.text('Task Q'), findsWidgets);
+          expect(find.text('Select an obligation from the tree.'), findsNothing);
+          expect(debugDashboardUrl, '/work/ob-q');
 
           // Navigate to Room
           await tester.tap(find.widgetWithText(InkWell, 'Room'));
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 50));
           expect(find.byType(ChatRoomTab), findsOneWidget);
+          expect(debugDashboardUrl, '/chat-room');
 
           // Back to /work/ob-q restores WorkTab with obligation focused
+          debugDashboardUrl = '/work/ob-q';
           await tester.binding.handlePushRoute('/work/ob-q');
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 50));
           expect(find.byType(WorkTab), findsOneWidget);
           expect(store.focusedObligationId.valueOrNull, 'ob-q');
+          expect(find.text('Task Q'), findsWidgets);
+          expect(find.text('Select an obligation from the tree.'), findsNothing);
+          expect(debugDashboardUrl, '/work/ob-q');
 
-          // Back to original bare /work clears focused obligation in store
+          // Back to original bare /work clears focused obligation in store, detail pane, and URL
+          debugDashboardUrl = '/work';
           await tester.binding.handlePushRoute('/work');
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 50));
@@ -226,6 +285,16 @@ void main() {
             store.focusedObligationId.valueOrNull,
             isNull,
             reason: 'Popping to bare /work must clear focused obligation in store',
+          );
+          expect(
+            find.text('Select an obligation from the tree.'),
+            findsOneWidget,
+            reason: 'Detail pane must be cleared back to empty selection state',
+          );
+          expect(
+            debugDashboardUrl,
+            '/work',
+            reason: 'Restored URL must reflect bare /work',
           );
 
           await store.dispose();

@@ -54,7 +54,16 @@ class _RusaDashboardAppState extends State<RusaDashboardApp>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    unawaited(SystemNavigator.selectMultiEntryHistory());
+    // MaterialApp's internal NavigatorState.initState() automatically calls
+    // SystemNavigator.selectSingleEntryHistory() when reportsRouteUpdateToEngine
+    // is true (the default in WidgetsApp). Scheduling selectMultiEntryHistory
+    // in a post-frame callback ensures the web engine is placed in multi-entry
+    // mode immediately after Navigator mounts, without per-push churn.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        unawaited(SystemNavigator.selectMultiEntryHistory());
+      }
+    });
   }
 
   Future<DashboardSession> _bootstrapSession() async {
