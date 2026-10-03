@@ -91,6 +91,8 @@ export interface QuotaCoordinatorServiceOptions {
   hardStaleAfterMs?: number;
   manualHardStaleAfterMs?: number;
   version?: string;
+  /** Immutable revision captured by the coordinator command before service startup. */
+  loadedRevision?: string | null;
   now?: () => number;
   /** Metric sink; defaults to the discarding one. */
   metrics?: QuotaMetrics;
@@ -139,6 +141,7 @@ export class QuotaCoordinatorService {
       protocolMinor: COORDINATOR_PROTOCOL_MINOR,
       serverVersion: this.options.version ?? "0.1.0",
       serverTime: new Date(nowMs).toISOString(),
+      loadedRevision: this.options.loadedRevision ?? null,
     };
   }
 

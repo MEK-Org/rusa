@@ -274,4 +274,50 @@ export class BuildRunner implements BuildSeam {
     renameSync(staging, live);
     this.log(`[update] atomically swapped dist → ${sha.slice(0, 7)} (previous at dist.old)`);
   }
+
+  /**
+   * Put the retained bootable dist back after a failure that occurs after a
+   * green build but before the update commits. Like the forward swap this is
+   * two renames, not an atomic exchange: between them the live dist path is
+   * briefly absent, and a boot in that window refuses and is retried. If the
+   * retained tree cannot be promoted, the new dist is renamed back so the new
+   * checkout and new dist stay paired.
+   */
+  async rollback(): Promise<void> {
+    const live = this.distDir;
+    const previous = `${live}.old`;
+    const failed = `${live}.failed-rollback`;
+    if (!existsSync(previous)) {
+      throw new Error(`cannot restore previous dist: ${previous} is absent`);
+    }
+    rmSync(failed, { recursive: true, force: true });
+    // A failure here leaves the live dist where it was.
+    renameSync(live, failed);
+    try {
+      renameSync(previous, live);
+    } catch (err) {
+      // Preserve the new pair if the old one cannot be promoted. Leaving the
+      // live path absent would turn a recoverable failed update into a boot
+      // outage, and keeping the new pair avoids a HEAD/sentinel mismatch.
+      const why = err instanceof Error ? err.message : String(err);
+      try {
+        renameSync(failed, live);
+      } catch (restoreErr) {
+        throw new Error(
+          `cannot promote ${previous} (${why}) nor put the new dist back ` +
+            `(${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}); ${live} is absent`
+        );
+      }
+      throw err;
+    }
+    // The restore has happened; a leftover directory must not report it failed.
+    try {
+      rmSync(failed, { recursive: true, force: true });
+    } catch (err) {
+      this.log(
+        `[update] could not remove ${failed}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    this.log("[update] restored previous dist after post-build failure");
+  }
 }

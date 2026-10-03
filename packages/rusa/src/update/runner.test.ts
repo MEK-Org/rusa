@@ -1,8 +1,9 @@
+// @vitest-environment node
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildSentinelPath, readBuildSentinel, verifyBuildSentinel } from "./build-sentinel.js";
 import {
   assertSubmodulesMaterialized,
@@ -11,6 +12,17 @@ import {
   runTimedStep,
   submodulePathsFromGitmodules,
 } from "./runner.js";
+
+/** Source paths whose rename fails, to drive BuildRunner.rollback's recovery branches. */
+const failRenameFrom = vi.hoisted(() => new Set<string>());
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const renameSync = (from: string, to: string) => {
+    if (failRenameFrom.has(from)) throw new Error(`synthetic rename failure: ${from}`);
+    return actual.renameSync(from, to);
+  };
+  return { ...actual, default: { ...actual, renameSync }, renameSync };
+});
 
 const SHA = "1111111111111111111111111111111111111111";
 const OLD_SHA = "0000000000000000000000000000000000000000";
@@ -167,6 +179,67 @@ describe("BuildRunner — staging + atomic swap (elder require #1: failed build 
     expect(verifyBuildSentinel(dist, SHA).ok).toBe(true);
     // Previous build retained at dist.old.
     expect(readFileSync(join(`${dist}.old`, "cli.js"), "utf8")).toBe(`built@${OLD_SHA}`);
+  });
+
+  it("restores the retained build when deployment fails after a green swap", async () => {
+    const { pkgDir, dist } = pkgWithLiveDist(OLD_SHA);
+    const { fn } = fakeSpawn({
+      codes: [0, 0, 0],
+      onStep: (args, spawnOpts) => {
+        if (args.includes("build")) {
+          const staging = spawnOpts.env?.RUSA_DIST_DIR as string;
+          mkdirSync(staging, { recursive: true });
+          writeFileSync(join(staging, "cli.js"), `built@${SHA}`);
+        }
+      },
+    });
+    const runner = new BuildRunner(pkgDir, timeouts, () => {}, "pnpm", fn);
+    await runner.build(SHA);
+    await runner.rollback();
+
+    expect(readFileSync(join(dist, "cli.js"), "utf8")).toBe(`built@${OLD_SHA}`);
+    expect(readBuildSentinel(dist)).toBe(OLD_SHA);
+    expect(verifyBuildSentinel(dist, OLD_SHA).ok).toBe(true);
+  });
+
+  async function swappedRunner() {
+    const { pkgDir, dist } = pkgWithLiveDist(OLD_SHA);
+    const { fn } = fakeSpawn({
+      codes: [0, 0, 0],
+      onStep: (args, spawnOpts) => {
+        if (args.includes("build")) {
+          const staging = spawnOpts.env?.RUSA_DIST_DIR as string;
+          mkdirSync(staging, { recursive: true });
+          writeFileSync(join(staging, "cli.js"), `built@${SHA}`);
+        }
+      },
+    });
+    const runner = new BuildRunner(pkgDir, timeouts, () => {}, "pnpm", fn);
+    await runner.build(SHA);
+    return { runner, dist };
+  }
+
+  it("keeps the new pair live when the retained build cannot be promoted", async () => {
+    const { runner, dist } = await swappedRunner();
+    failRenameFrom.add(`${dist}.old`);
+    try {
+      await expect(runner.rollback()).rejects.toThrow(/synthetic rename failure/);
+    } finally {
+      failRenameFrom.clear();
+    }
+    expect(readFileSync(join(dist, "cli.js"), "utf8")).toBe(`built@${SHA}`);
+    expect(verifyBuildSentinel(dist, SHA).ok).toBe(true);
+  });
+
+  it("names the absent live dist when neither build can be put back", async () => {
+    const { runner, dist } = await swappedRunner();
+    failRenameFrom.add(`${dist}.old`);
+    failRenameFrom.add(`${dist}.failed-rollback`);
+    try {
+      await expect(runner.rollback()).rejects.toThrow(`${dist} is absent`);
+    } finally {
+      failRenameFrom.clear();
+    }
   });
 
   it("FAILED build: live dist + sentinel are BYTE-IDENTICAL (never touched), staging discarded", async () => {

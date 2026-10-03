@@ -1554,6 +1554,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(healthRes.status).toBe(200);
     expect(healthRes.json.ok).toBe(true);
     expect(healthRes.json.service.protocolMajor).toBe(COORDINATOR_PROTOCOL_MAJOR);
+    expect(healthRes.json.service.loadedRevision).toBeNull();
 
     // Readyz when cold
     const coldReadyRes = await makeRequest(socketPath, "/v1/readyz");
@@ -1561,6 +1562,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(coldReadyRes.json.ready).toBe(true);
     expect(coldReadyRes.json.cold).toBe(true);
     expect(coldReadyRes.json.schemaVersion).toBe(QUOTA_SCHEMA_VERSION);
+    expect(coldReadyRes.json.service.loadedRevision).toBeNull();
 
     // Record observation to make it warm
     const nowMs = Date.now();
@@ -1590,6 +1592,23 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(warmReadyRes.json.ready).toBe(true);
     expect(warmReadyRes.json.cold).toBe(false);
     expect(warmReadyRes.json.scrapes.claude.status).toBe("ok");
+  });
+
+  it("reports the immutable revision captured at coordinator startup on healthz and readyz", async () => {
+    const loadedRevision = "1".repeat(40);
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+      loadedRevision,
+    });
+    await service.start();
+
+    const health = await makeRequest(socketPath, "/v1/healthz");
+    const ready = await makeRequest(socketPath, "/v1/readyz");
+
+    expect(health.json.service).toMatchObject({ loadedRevision });
+    expect(ready.json.service).toMatchObject({ loadedRevision });
   });
 
   // §5.1: Socket collision refusal

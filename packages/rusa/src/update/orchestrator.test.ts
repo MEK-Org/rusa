@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   type BuildSeam,
+  type CoordinatorOwnership,
+  type CoordinatorRestartSeam,
+  type CoordinatorTarget,
   type DrainSeam,
   executeUpdate,
   type GitSeam,
@@ -12,6 +15,64 @@ import {
 
 const OLD = "0000000000000000000000000000000000000000";
 const NEW = "1111111111111111111111111111111111111111";
+/** A sentinel that is neither checkout HEAD (OLD) nor the build (NEW). */
+const RETAINED = "2222222222222222222222222222222222222222";
+
+const TARGET: CoordinatorTarget = {
+  unit: "rusa-quota-coordinator.service",
+  home: "/synthetic/coordinator-home",
+  socketPath: "/synthetic/coordinator.sock",
+};
+
+/**
+ * A coordinator seam that records its calls; `fail` names the call that throws.
+ * Its artifact is the fake build's live dist sentinel unless overridden.
+ */
+function fakeCoordinator(
+  over: {
+    resolved?: CoordinatorOwnership;
+    fail?: "backup" | `restart:${string}`;
+    order?: string[];
+    /** The live dist sentinel before and after the build-seam rollback swaps dists. */
+    artifact?: () => string | null;
+    /** What the running coordinator reports loaded, per read. */
+    loaded?: string | null | (() => string | null);
+    /** What the coordinator this instance dials reports (not-owner/unknown report). */
+    dialed?: string | null;
+  } = {},
+  dist: { live: string | null } = { live: OLD }
+) {
+  const calls: string[] = over.order ?? [];
+  const seam: CoordinatorRestartSeam = {
+    async resolve() {
+      calls.push("resolve");
+      return over.resolved ?? { ownership: "owner", target: TARGET };
+    },
+    artifactRevision() {
+      return over.artifact ? over.artifact() : dist.live;
+    },
+    async loadedRevision() {
+      calls.push("loaded");
+      if (typeof over.loaded === "function") return over.loaded();
+      return over.loaded === undefined ? OLD : over.loaded;
+    },
+    async dialedRevision() {
+      calls.push("dialed");
+      return over.dialed === undefined ? OLD : over.dialed;
+    },
+    async backup(target) {
+      calls.push(`backup:${target.home}`);
+      if (over.fail === "backup") throw new Error("quota backup failed");
+    },
+    async restart(target, revision) {
+      calls.push(`restart:${target.socketPath}:${revision}`);
+      if (over.fail === `restart:${revision}`) {
+        throw new Error(`readyz did not report ${revision.slice(0, 7)}`);
+      }
+    },
+  };
+  return { seam, calls };
+}
 
 class FakeGit implements GitSeam {
   head = OLD;
@@ -69,12 +130,28 @@ class FakeDrain implements DrainSeam {
 function makeDeps(over: Partial<UpdateDeps> = {}) {
   const git = new FakeGit();
   const drain = new FakeDrain();
-  const build: BuildSeam & { builtSha?: string; fail?: Error } = {
+  // `live`/`retained` model the dist sentinels the production swap moves.
+  const build: BuildSeam & {
+    builtSha?: string;
+    fail?: Error;
+    rollbackCalls: number;
+    live: string | null;
+    retained: string | null;
+  } = {
     fail: undefined,
     builtSha: undefined,
+    rollbackCalls: 0,
+    live: OLD,
+    retained: null,
     async build(sha: string) {
       if (this.fail) throw this.fail;
       this.builtSha = sha;
+      this.retained = this.live;
+      this.live = sha;
+    },
+    async rollback() {
+      this.rollbackCalls++;
+      this.live = this.retained;
     },
   };
   const exits: number[] = [];
@@ -221,6 +298,83 @@ describe("executeUpdate — happy path (green build → drain → exit)", () => 
     expect(order).toEqual(["build", "engage"]);
   });
 
+  it("backs up, restarts, and confirms the owned coordinator before draining", async () => {
+    const { deps, build, drain, exits } = makeDeps();
+    const order: string[] = [];
+    const swap = build.build.bind(build);
+    build.build = async (sha) => {
+      order.push("build");
+      await swap(sha);
+    };
+    deps.coordinator = fakeCoordinator({ order }, build).seam;
+    const engage = drain.engage.bind(drain);
+    drain.engage = (reason) => {
+      order.push("drain");
+      engage(reason);
+    };
+
+    const res = await executeUpdate(plan(), deps);
+
+    expect(res.coordinator).toEqual({
+      outcome: "refreshed",
+      previousLoadedRevision: OLD,
+      loadedRevision: NEW,
+    });
+    // Ownership and rollback assurance come before the build can retire the
+    // loaded artifact; the loaded revision is re-read just before the restart.
+    expect(order).toEqual([
+      "resolve",
+      "loaded",
+      "build",
+      "loaded",
+      `backup:${TARGET.home}`,
+      `restart:${TARGET.socketPath}:${NEW}`,
+      "drain",
+    ]);
+    expect(exits).toEqual([0]);
+  });
+
+  it.each([
+    ["not-owner", "no unit is installed", "not refreshed, not owned"],
+    ["unknown", "daemon-reload pending", "not refreshed, ownership unknown"],
+  ] as const)("a %s coordinator is left alone and reported, and the update proceeds", async (ownership, reason, logged) => {
+    const { deps, exits, actions, notify } = makeDeps();
+    const logs: string[] = [];
+    deps.log = (m) => void logs.push(m);
+    const coordinator = fakeCoordinator({ resolved: { ownership, reason } });
+    deps.coordinator = coordinator.seam;
+
+    const res = await executeUpdate(plan(), deps);
+
+    expect(res.ok).toBe(true);
+    expect(res.coordinator).toEqual({ outcome: ownership, reason, loadedRevision: OLD });
+    expect(coordinator.calls).toEqual(["resolve", "dialed"]);
+    expect(actions.at(-1)).toContain(`[coordinator: ${logged}: ${reason}; loaded 0000000]`);
+    expect(notify.messages.at(-1)).toContain(`[coordinator: ${logged}: ${reason}`);
+    expect(
+      logs.some((l) => l.includes("drift from this build 1111111; not a rollback trigger"))
+    ).toBe(true);
+    expect(exits).toEqual([0]);
+  });
+
+  it("a dialed coordinator that cannot say is reported as unknown, not as drift", async () => {
+    const { deps, actions } = makeDeps();
+    const logs: string[] = [];
+    deps.log = (m) => void logs.push(m);
+    const coordinator = fakeCoordinator({
+      resolved: { ownership: "not-owner", reason: "no unit is installed" },
+      dialed: null,
+    });
+    deps.coordinator = coordinator.seam;
+
+    const res = await executeUpdate(plan(), deps);
+
+    expect(res.ok).toBe(true);
+    expect(res.coordinator).toMatchObject({ outcome: "not-owner", loadedRevision: null });
+    expect(actions.at(-1)).toContain("loaded revision unknown]");
+    expect(logs.some((l) => l.includes("drift"))).toBe(false);
+  });
+
   it("still exits even if the drain times out (don't wedge on a stuck actor)", async () => {
     const { deps, drain, exits, actions } = makeDeps();
     drain.quiesced = false; // bounded wait expired
@@ -321,6 +475,196 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     ]);
   });
 
+  it("never backs up or restarts the coordinator when the build is red", async () => {
+    const { deps } = makeDeps();
+    deps.build = {
+      async build() {
+        throw new StepError("build", "tsc: type error", false);
+      },
+    };
+    const coordinator = fakeCoordinator();
+    deps.coordinator = coordinator.seam;
+
+    const res = await executeUpdate(plan(), deps);
+
+    expect(res.failedStep).toBe("build");
+    expect(coordinator.calls).toEqual(["resolve", "loaded"]); // the preflight only
+  });
+
+  it.each([
+    [
+      "the live dist is not the loaded artifact",
+      { live: RETAINED, loaded: OLD },
+      "the live dist is not the artifact the coordinator has loaded",
+    ],
+    [
+      "the coordinator cannot say what it loaded",
+      { live: OLD, loaded: null },
+      "the running coordinator does not report its loaded revision",
+    ],
+    [
+      "the live dist has no identity",
+      { live: null, loaded: OLD },
+      "the live dist records no valid revision",
+    ],
+  ] as const)("stops before moving, building, or restarting when %s", async (_label, state, reason) => {
+    const { deps, git, build, drain, exits, actions } = makeDeps();
+    build.live = state.live;
+    const coordinator = fakeCoordinator({ loaded: state.loaded }, build);
+    deps.coordinator = coordinator.seam;
+
+    const res = await executeUpdate(plan(), deps);
+
+    expect(res.ok).toBe(false);
+    expect(res.failedStep).toBe("coordinator");
+    expect(res.error).toBe(`rollback protection unavailable: ${reason}`);
+    expect(res.rollbackFailed).toBe(false);
+    expect(res.coordinator).toEqual({
+      outcome: "rollback-unavailable",
+      reason,
+      loadedRevision: state.loaded,
+      artifactRevision: state.live,
+    });
+    expect(coordinator.calls).toEqual(["resolve", "loaded"]); // zero backups, zero restarts
+    expect(git.resets).toEqual([]);
+    expect(build.builtSha).toBeUndefined();
+    expect(build.live).toBe(state.live); // the loaded artifact's dist is untouched
+    expect(build.rollbackCalls).toBe(0);
+    expect(drain.engaged).toBe(false);
+    expect(exits).toEqual([]);
+    expect(actions.at(-1)).toContain("no rollback needed");
+    expect(actions.at(-1)).toContain(
+      "[coordinator: not refreshed, rollback protection unavailable"
+    );
+  });
+
+  it.each([
+    ["an artifact/build mismatch", { artifact: (): string | null => OLD }, ["resolve", "loaded"]],
+    [
+      "a coordinator that changed what it loaded during the build",
+      {
+        loaded: (() => {
+          let reads = 0;
+          return () => (reads++ ? RETAINED : OLD);
+        })(),
+      },
+      ["resolve", "loaded", "loaded"],
+    ],
+    [
+      "a backup failure",
+      { fail: "backup" },
+      ["resolve", "loaded", "loaded", `backup:${TARGET.home}`],
+    ],
+  ] as const)("%s refuses the restart and rolls back cleanly", async (_label, over, calls) => {
+    const { deps, git, build, drain, exits } = makeDeps();
+    const coordinator = fakeCoordinator(over, build);
+    deps.coordinator = coordinator.seam;
+
+    const res = await executeUpdate(plan(), deps);
+
+    expect(res.ok).toBe(false);
+    expect(res.failedStep).toBe("coordinator");
+    expect(res.rollbackFailed).toBe(false);
+    expect(coordinator.calls).toEqual(calls); // the running coordinator is never restarted
+    expect(build.rollbackCalls).toBe(1);
+    expect(git.resets).toEqual([NEW, OLD]);
+    expect(drain.engaged).toBe(false);
+    expect(exits).toEqual([]);
+  });
+
+  it("restores dist, checkout, and coordinator when readiness never confirms the new revision", async () => {
+    const { deps, git, build, drain, exits } = makeDeps();
+    const coordinator = fakeCoordinator({ fail: `restart:${NEW}` }, build);
+    deps.coordinator = coordinator.seam;
+
+    const res = await executeUpdate(plan(), deps);
+
+    expect(res.ok).toBe(false);
+    expect(res.failedStep).toBe("coordinator");
+    expect(res.rollbackFailed).toBe(false);
+    expect(build.rollbackCalls).toBe(1);
+    expect(git.resets).toEqual([NEW, OLD]);
+    expect(coordinator.calls.filter((c) => c.startsWith("restart"))).toEqual([
+      `restart:${TARGET.socketPath}:${NEW}`,
+      `restart:${TARGET.socketPath}:${OLD}`,
+    ]);
+    expect(res.coordinator).toEqual({
+      outcome: "restored",
+      previousLoadedRevision: OLD,
+      loadedRevision: OLD,
+    });
+    expect(drain.engaged).toBe(false);
+    expect(exits).toEqual([]);
+  });
+
+  it("reports a recovery onto a retained artifact other than the loaded one as degraded and unsafe", async () => {
+    const { deps, build, markers } = makeDeps();
+    // Passes the preflight, then the retained dist changes before the rollback.
+    const coordinator = fakeCoordinator(
+      { fail: `restart:${NEW}`, artifact: () => (build.rollbackCalls ? RETAINED : build.live) },
+      build
+    );
+    deps.coordinator = coordinator.seam;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await executeUpdate(plan(), deps);
+    errorSpy.mockRestore();
+
+    expect(res.rollbackFailed).toBe(true);
+    expect(res.coordinator).toEqual({
+      outcome: "degraded",
+      previousLoadedRevision: OLD,
+      loadedRevision: RETAINED,
+    });
+    expect(markers.some((message) => message.includes("not the previously loaded 0000000"))).toBe(
+      true
+    );
+  });
+
+  it("returns a confirmed-new coordinator to the old build when the drain then fails", async () => {
+    const { deps, git, build, drain, exits } = makeDeps();
+    const coordinator = fakeCoordinator({}, build);
+    deps.coordinator = coordinator.seam;
+    drain.waitForQuiescence = async () => {
+      throw new StepError("drain", "drain exploded", false);
+    };
+
+    const res = await executeUpdate(plan(), deps);
+
+    expect(res.ok).toBe(false);
+    expect(res.failedStep).toBe("drain");
+    expect(res.rollbackFailed).toBe(false);
+    expect(build.rollbackCalls).toBe(1);
+    expect(git.resets).toEqual([NEW, OLD]);
+    expect(coordinator.calls.filter((c) => c.startsWith("restart"))).toEqual([
+      `restart:${TARGET.socketPath}:${NEW}`,
+      `restart:${TARGET.socketPath}:${OLD}`,
+    ]);
+    expect(exits).toEqual([]);
+  });
+
+  it("raises the durable rollback alert when the old coordinator cannot be restored", async () => {
+    const { deps, build, markers, git, notify } = makeDeps();
+    deps.coordinator = fakeCoordinator({ fail: `restart:${OLD}` }, build).seam;
+    deps.drain.waitForQuiescence = async () => {
+      throw new StepError("drain", "drain exploded", false);
+    };
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args) => {
+      errors.push(args.join(" "));
+    });
+
+    const res = await executeUpdate(plan(), deps);
+    errorSpy.mockRestore();
+
+    expect(res.rollbackFailed).toBe(true);
+    expect(build.rollbackCalls).toBe(1);
+    expect(git.resets).toEqual([NEW, OLD]);
+    expect(errors.some((message) => message.includes("rollback FAILED"))).toBe(true);
+    expect(markers.some((message) => message.includes("restart-fragile"))).toBe(true);
+    expect(notify.messages.some((message) => message.includes("rollback FAILED"))).toBe(true);
+  });
+
   it("a pull failure aborts before build, drain and exit (no rollback — never moved)", async () => {
     const { deps, git, drain, build, exits, actions, notify } = makeDeps();
     git.failFetch = new Error("network down");
@@ -397,7 +741,7 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     // The reason the hook moved off build-green: a drain failure resets the checkout to
     // oldSha, so anything persisted at build time would name a revision this leader
     // reverted — and would later deploy followers onto it.
-    const { deps, git, drain } = makeDeps();
+    const { deps, git, drain, build } = makeDeps();
     const committed: { sha: string; branch: string }[] = [];
     deps.onCommitted = (sha, branch) => {
       committed.push({ sha, branch });
@@ -411,6 +755,7 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     expect(res.ok).toBe(false);
     expect(committed).toHaveLength(0);
     expect(git.resets).toEqual([NEW, OLD]); // rolled back off the revision no trigger names
+    expect(build.rollbackCalls).toBe(1); // returned to the last bootable dist as well
   });
 
   it("still restarts when onCommitted throws", async () => {

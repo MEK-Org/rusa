@@ -725,7 +725,10 @@ one published throttle, as they do now.
   listing paths in a test.
 - **Versioning rides on every response, and there is no handshake path.**
   Every v1 response carries `"service": { "protocolMajor", "protocolMinor",
-  "serverVersion", "serverTime" }`. Revision 8 removes the separate
+  "serverVersion", "serverTime", "loadedRevision" }`. `loadedRevision` is the
+  build sentinel captured when the coordinator process starts (or `null` when
+  no valid sentinel is available), never a later checkout `HEAD`; it makes a
+  running-process/build mismatch observable. Revision 8 removes the separate
   `GET /v1/hello` that revisions 6 and 7 had, for two reasons review made plain.
   First,
   a handshake that takes no client version cannot refuse anything: `hello` had
@@ -824,7 +827,8 @@ the server clock:
 ```jsonc
 {
   "service": { "protocolMajor": 1, "protocolMinor": 0, "serverVersion": "…",
-               "serverTime": "2026-09-07T16:15:00.000Z" },
+               "serverTime": "2026-09-07T16:15:00.000Z",
+               "loadedRevision": "<40-hex-sha-or-null>" },
   "provider": "claude",
   "intervalSeconds": 612.4,
   "uncappedIntervalSeconds": 900.1,

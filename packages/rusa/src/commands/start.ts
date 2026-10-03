@@ -314,6 +314,7 @@ import {
 } from "../understanding/root-scope.js";
 import { renderUnderstandingSnapshot } from "../understanding/snapshot.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
+import { SystemdCoordinatorRestarter } from "../update/coordinator-restart.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { BuildRunner, GitRunner } from "../update/runner.js";
@@ -2136,6 +2137,11 @@ async function composeStart(
           { installMs: UPDATE_INSTALL_TIMEOUT_MS, buildMs: UPDATE_BUILD_TIMEOUT_MS },
           (m) => console.log(m)
         ),
+        coordinator: new SystemdCoordinatorRestarter({
+          cliPath: join(packageDir, "dist", "cli.js"),
+          dialedSocketPath: coordinatorSocketPath,
+          log: (m) => log.info("update_coordinator", { detail: m }),
+        }),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
         onCommitted: (newSha, branch) => {
           try {

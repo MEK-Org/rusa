@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,7 +20,12 @@ import { QUOTA_METRIC_EVENT, QUOTA_SERVICE_METRICS } from "../quota/coordinator-
 import { QuotaCoordinatorService } from "../quota/coordinator-service.js";
 import { DEFAULT_OLD_QUOTA_DB_NAME, DEFAULT_RELOCATED_QUOTA_DB_NAME } from "../quota/relocate.js";
 import { SharedQuotaStore } from "../quota/shared-store.js";
-import { coordinatorProviderLanes, runQuotaCoordinator } from "./quota-coordinator.js";
+import { writeBuildSentinel } from "../update/build-sentinel.js";
+import {
+  coordinatorLoadedRevision,
+  coordinatorProviderLanes,
+  runQuotaCoordinator,
+} from "./quota-coordinator.js";
 
 const testDirs: string[] = [];
 
@@ -86,6 +99,17 @@ describe("coordinatorProviderLanes", () => {
       configuredProviders: undefined,
       collectionProviders: ["claude", "codex", "agy", "kimi"],
     });
+  });
+});
+
+describe("coordinatorLoadedRevision", () => {
+  it("uses the build sentinel beside the loaded dist and rejects malformed values", () => {
+    const dist = mkdtempSync(join(tmpdir(), "rusa-coordinator-dist-"));
+    testDirs.push(dist);
+    writeBuildSentinel(dist, "2".repeat(40));
+    expect(coordinatorLoadedRevision(dist)).toBe("2".repeat(40));
+    writeFileSync(join(dist, ".build-ok"), "not-a-revision\n");
+    expect(coordinatorLoadedRevision(dist)).toBeNull();
   });
 });
 
