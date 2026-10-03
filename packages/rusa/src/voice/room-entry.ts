@@ -503,6 +503,9 @@ export class RoomEntryService {
         this.deps.store.transaction(() => this.setRecipientStatus(row, actorId, "skipped"));
         return;
       }
+      // An earlier append callback may remove and re-add this participant.
+      // Live membership cannot restore its permanently invalidated invitation.
+      if (!this.isEligibleRecipient(row.id, actorId)) return;
       const id = roomEntryNoticeId(row.id, actorId);
       const inserted = this.deps.inbox.append([
         {

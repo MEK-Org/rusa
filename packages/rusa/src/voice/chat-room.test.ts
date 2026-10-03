@@ -80,7 +80,7 @@ describe("ChatRoomService", () => {
     expect(entries.isEligibleRecipient(entered.episodeId, "a")).toBe(false);
   });
 
-  it("rechecks real SQLite membership after reentrant removal and retirement during delivery", () => {
+  it("rechecks real SQLite invitations after reentrant remove/re-add and retirement during delivery", () => {
     for (const id of ["a", "b", "c"]) actors.upsert(actor(id));
     const room = service((id) => entries.invalidateRecipient(id));
     for (const id of ["a", "b", "c"]) room.add(id, "root");
@@ -98,6 +98,7 @@ describe("ChatRoomService", () => {
           const result = inbox.append(inputs);
           if (inputs[0].actorId === "root") {
             room.remove("a");
+            room.add("a", "root");
             actors.patch("b", { status: "retired" });
           }
           return result;
@@ -110,6 +111,7 @@ describe("ChatRoomService", () => {
     const entered = entries.enter({ principalId: "user-a", clientId: "tab-1", sessionKey: "s1" });
     if (entered.status !== "entered") throw new Error("not entered");
     expect(snapshot).toHaveBeenCalledTimes(1);
+    expect(room.isParticipant("a")).toBe(true);
     expect(inbox.list("a", { status: "all" }).entries).toHaveLength(0);
     expect(inbox.list("b", { status: "all" }).entries).toHaveLength(0);
     expect(inbox.list("c", { status: "all" }).entries).toHaveLength(1);
