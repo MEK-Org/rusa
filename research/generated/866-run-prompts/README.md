@@ -1,15 +1,14 @@
 # Run prompt disclosure appearance evidence
 
 Synthetic fixtures only; no live actors, user prompts, credentials or private data.
+These eight browser captures replace the incomplete widget-test rasters at evidence commit d7a451fa. Product UI was unchanged during this evidence repair.
 
 Before source: `53b52993d858ca8b932811ded654016525eab54b`.
-After product source: `709ab01710387832693490f04c362a433ca8dece` (PR #874).
-The six after captures were rerun at that exact committed product head.
-The same screenshot harness was copied unchanged to the detached before tree for its two captures.
+After product source: `212c0d0bfd8ad5813477bde8b28ec0a44a083e6b` (PR #874).
+[Source pins](source-pins.json) contain hashes of the actual UI/theme/fixture dependencies, each checked against the named committed tree. The same [web fixture](run_prompt_web_capture.dart) renders the real EventsTab in both trees using a FakeApi synthetic run_start event and prompt response.
 
-Harness: `packages/rusa/flutter_dashboard/test/run_prompt_screenshot_test.dart`.
-It renders the real EventsTab with a synthetic FakeApi run_start event and synthetic prompt response.
-Wide viewport: 1180 x 820 logical pixels; narrow: 390 x 844; capture DPR: 2.
+Wide viewport: 1180 x 820 logical pixels; narrow: 390 x 844; DPR: 2.
+Renderer: Flutter CanvasKit release web build; Google Chrome 146.0.7680.164; Playwright 1.58.2. Fonts are the private Flutter SDK's Roboto-Regular.ttf, locally registered for Roboto/system-ui/monospace in the synthetic fixture. This deterministic fixture font mapping is used identically before and after; it does not modify the product theme.
 
 | State | Wide | Narrow |
 | --- | --- | --- |
@@ -18,17 +17,23 @@ Wide viewport: 1180 x 820 logical pixels; narrow: 390 x 844; capture DPR: 2.
 | After expanded | [wide-expanded.png](wide-expanded.png) | [narrow-expanded.png](narrow-expanded.png) |
 | After unavailable | [wide-unavailable.png](wide-unavailable.png) | [narrow-unavailable.png](narrow-unavailable.png) |
 
-The expanded capture intentionally uses a short synthetic prompt with the truncation banner's synthetic 300000-byte metadata. It demonstrates the banner and layout, not a real 256-KiB retained row. Byte-boundary and original-count behavior are separately covered by repository tests.
+The expanded capture uses a short synthetic prompt with synthetic 300000-byte metadata to demonstrate the truncation banner and layout. Repository tests establish real retention byte boundaries. Production captures have unknown provenance and remain unavailable through the endpoint; expanded fixtures do not imply production disclosure is usable. No appearance approval is claimed.
 
-Current production captures have unknown provenance and are unavailable through the endpoint. The expanded response is a synthetic fixture; these pictures do not imply production disclosure is currently available. No appearance approval is claimed.
-
-Commands (private Flutter SDK overlay, supported tools; no modification of shared SDK):
+Reproduction uses a private Flutter SDK overlay and local browser. Copy the web fixture into each source tree at packages/rusa/flutter_dashboard/test/run_prompt_web_capture.dart. From each flutter_dashboard directory, build with the supported tool (substitute that tree's output path):
 
 ```sh
-RUSA_866_SCREENSHOTS=<output> <sdk>/bin/cache/dart-sdk/bin/dart <sdk>/bin/cache/flutter_tools.snapshot --no-version-check test --no-pub test/run_prompt_screenshot_test.dart
-RUSA_866_CAPTURE_SOURCE=before RUSA_866_SCREENSHOTS=<output> <sdk>/bin/cache/dart-sdk/bin/dart <sdk>/bin/cache/flutter_tools.snapshot --no-version-check test --no-pub test/run_prompt_screenshot_test.dart
+<private-sdk>/bin/cache/dart-sdk/bin/dart <private-sdk>/bin/cache/flutter_tools.snapshot --no-version-check build web --release --no-pub --no-web-resources-cdn --target test/run_prompt_web_capture.dart --output-dir <workspace>/evidence/866-browser-after
+python3 configure-browser-assets.py <workspace>/evidence/866-browser-after <private-sdk>/bin/cache/artifacts/material_fonts/Roboto-Regular.ttf after
 ```
 
-Observed: six after tests and two before tests passed, exit 0. All eight PNGs visually inspected. SHA-256 digests are in [SHA256SUMS](SHA256SUMS).
+Repeat for before source using output 866-browser-before and base before. Both observed release builds exited 0 (74.0s after, 92.7s before). The build reported the existing flutter_dropzone JS interoperability warning for optional Wasm; these captures use CanvasKit.
 
-This branch contains evidence only beyond the product head. It is not intended for a product merge.
+Copy [browser-capture.cjs](browser-capture.cjs) to the after checkout's packages/rusa/866-browser-capture.cjs. From that checkout root:
+
+```sh
+node packages/rusa/866-browser-capture.cjs > ../evidence/866-validation/browser-final-capture.log 2>&1
+```
+
+The script serves only the two compiled fixture directories on 127.0.0.1, blocks external browser requests, requires existing filter/timestamp/run-kind/model labels, clicks the disclosure for expanded/unavailable states, waits for font/raster work and warms GPU readback before retaining each PNG. [Observed capture log](capture.log): all eight states captured, exit 0. All eight retained PNGs were visually inspected for those labels, provider/banner/prompt and unavailable notice. No screenshot pixels were edited. [SHA256SUMS](SHA256SUMS) pins PNGs, fixture, script and source manifest.
+
+This branch contains evidence only beyond the original product head; it is not intended for a product merge. Review PR #874 at the after product SHA above.

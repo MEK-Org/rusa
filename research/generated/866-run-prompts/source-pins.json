@@ -1,0 +1,19 @@
+{
+  "before": {
+    "head": "53b52993d858ca8b932811ded654016525eab54b",
+    "files": {
+      "packages/rusa/flutter_dashboard/lib/widgets/events_tab.dart": "8daadf4322f4e2c131dc662fbea9445ae4ad7d56ff429ff8cbb2ad14049367c5",
+      "packages/rusa/flutter_dashboard/lib/theme.dart": "89b014ecffee8ffb1a228ab085e3332a45c011471ac0bc8c7cce6be3536e073e",
+      "packages/rusa/flutter_dashboard/test/fakes.dart": "1f15661187c4b96af5f1be892f51e09322a050c52659d39ffbee41746f6b9a98"
+    }
+  },
+  "after": {
+    "head": "212c0d0bfd8ad5813477bde8b28ec0a44a083e6b",
+    "files": {
+      "packages/rusa/flutter_dashboard/lib/widgets/events_tab.dart": "c54ec90e437a18c6fef03f452852269e1f1eda70a72077b503030fc39b1bb365",
+      "packages/rusa/flutter_dashboard/lib/widgets/run_prompt_disclosure.dart": "83448294cb65a71f6da32b471333055ec9e4f84beaf9c599970e972a34c51baa",
+      "packages/rusa/flutter_dashboard/lib/theme.dart": "89b014ecffee8ffb1a228ab085e3332a45c011471ac0bc8c7cce6be3536e073e",
+      "packages/rusa/flutter_dashboard/test/fakes.dart": "1f15661187c4b96af5f1be892f51e09322a050c52659d39ffbee41746f6b9a98"
+    }
+  }
+}
