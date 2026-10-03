@@ -14,7 +14,9 @@ export class RunPromptRepository {
 
   /** Replace the previous attempt with the complete prompt supplied to this launch. */
   record(runId: string, prompt: string, provider: string, nowMs = Date.now()): void {
-    // Invalidate before writing so a failed fallback receipt never serves older text.
+    // Suppress stale reads in this repository if DELETE fails. After a successful
+    // DELETE, INSERT failure leaves no row even across restart. DELETE failure
+    // cannot durably invalidate storage that refused the write.
     this.failedWrites.add(runId);
     this.db.prepare("DELETE FROM run_prompts WHERE run_id = ?").run(runId);
     this.db

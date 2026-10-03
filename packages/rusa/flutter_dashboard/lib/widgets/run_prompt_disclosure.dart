@@ -72,30 +72,17 @@ class _RunPromptDisclosureState extends State<RunPromptDisclosure> {
               width: double.infinity,
               padding: const EdgeInsets.all(10),
               color: MeshColors.bgTertiary,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Provider: ${data['provider']}',
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 400),
+                child: SingleChildScrollView(
+                  child: SelectableText(
+                    prompt,
                     style: kMonoStyle.copyWith(
-                      color: MeshColors.textMuted,
-                      fontSize: 11,
+                      color: MeshColors.textPrimary,
+                      fontSize: 12,
                     ),
                   ),
-                  const SizedBox(height: 6),
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(maxHeight: 400),
-                    child: SingleChildScrollView(
-                      child: SelectableText(
-                        prompt,
-                        style: kMonoStyle.copyWith(
-                          color: MeshColors.textPrimary,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
+                ),
               ),
             );
           },

@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Logger } from "../../observability/logger.js";
-import { FollowerHub } from "./follower-hub.js";
+import { FollowerEventQueue } from "./follower-event-queue.js";
+import { type FollowerEvent, FollowerHub } from "./follower-hub.js";
 import { FollowerUpdateTriggerStore } from "./follower-update-trigger-store.js";
 import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
@@ -64,6 +65,57 @@ async function setup(options?: { logger?: Logger; triggerStore?: FollowerUpdateT
 }
 
 describe("leader follower gateway", () => {
+  it("delivers complete escaped prompt receipts and the following terminal event within the HTTP limit", async () => {
+    const h = await setup();
+    const identity = await h.register("mac");
+    const host = h.hub.createHost("mac", "actor-1");
+    const prompt = `${"\u0001".repeat(60_000)}synthetic tail ✓`;
+    const received: string[] = [];
+    let terminal = false;
+    host.on("message", (message) => {
+      if (message.type === "runPrompt") received.push(message.prompt);
+    });
+    host.on("exit", () => {
+      terminal = true;
+    });
+    const queue = new FollowerEventQueue();
+    for (let index = 0; index < 100; index++) {
+      queue.enqueue({
+        eventId: `prompt-${index}`,
+        actorId: "actor-1",
+        message: { type: "runPrompt", runId: `run-${index}`, provider: "claude", prompt },
+      });
+    }
+    queue.enqueue({
+      eventId: "terminal",
+      actorId: "actor-1",
+      message: { type: "exit", code: 0, signal: null },
+    });
+    const requestBytes: number[] = [];
+    let loseAcknowledgement = true;
+    const batchIds: string[] = [];
+    const deliver = async (batch: { batchId: string; events: FollowerEvent[] }) => {
+      batchIds.push(batch.batchId);
+      requestBytes.push(Buffer.byteLength(JSON.stringify({ ...identity, ...batch })));
+      const response = await h.post("/events", { ...identity, ...batch });
+      expect(response.status).toBe(200);
+      await response.json();
+      if (loseAcknowledgement) {
+        loseAcknowledgement = false;
+        throw new Error("synthetic lost acknowledgement");
+      }
+    };
+    await expect(queue.flush(deliver, identity)).rejects.toThrow("synthetic lost acknowledgement");
+    expect(queue.hasPending).toBe(true);
+    await queue.flush(deliver, identity);
+    expect(batchIds[0]).toBe(batchIds[1]);
+    console.info("synthetic follower HTTP request bytes", JSON.stringify(requestBytes));
+    expect(requestBytes.length).toBeGreaterThan(1);
+    expect(Math.max(...requestBytes)).toBeLessThanOrEqual(8 * 1024 * 1024);
+    expect(received).toEqual(Array(100).fill(prompt));
+    expect(terminal).toBe(true);
+    expect(queue.hasPending).toBe(false);
+  });
   it("rolls a same-process registration forward without dropping its actor channel", async () => {
     const h = await setup();
     const registrations: string[] = [];

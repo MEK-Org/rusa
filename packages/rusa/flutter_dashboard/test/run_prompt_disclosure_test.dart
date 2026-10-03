@@ -43,7 +43,7 @@ void main() {
         tester.widget<SelectableText>(find.byType(SelectableText)).data,
         'Fixture charter\nFixture task',
       );
-      expect(find.text('Provider: antigravity'), findsOneWidget);
+      expect(find.text('Provider: antigravity'), findsNothing);
       await tester.tap(find.text('Run prompt'));
       await tester.pumpAndSettle();
       expect(find.byType(SelectableText), findsNothing);

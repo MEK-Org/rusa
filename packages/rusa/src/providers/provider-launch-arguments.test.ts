@@ -33,14 +33,9 @@
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildWorkerPrompt } from "../actor/worker-prompt.js";
 import type { ProviderConfig } from "../config/types.js";
-import { runMigrations } from "../db/migrations/runner.js";
-import { createActorRunModelConfig } from "../db/repositories/actor-run-model-config.js";
-import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
-import { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import { AntigravityProvider } from "./antigravity.js";
 import { buildClaudeArgs, ClaudeProvider } from "./claude.js";
 import { CodexProvider } from "./codex.js";
@@ -207,10 +202,14 @@ describe("provider launch boundary — a NUL in assembled actor context", () => 
       const cli = fakeCliRecordingArgv();
       const provider = adapter.create({ cliCommand: cli.command });
 
+      let retained: string | undefined;
       const result = await provider.run({
         prompt: assembledActorContext(),
         cwd: cli.cwd,
         timeoutMs: 30_000,
+        onPromptLaunched: (prompt) => {
+          retained = prompt;
+        },
       });
 
       // The launch happened at all — the pre-fix behavior was a spawn failure,
@@ -222,6 +221,14 @@ describe("provider launch boundary — a NUL in assembled actor context", () => 
       // Replacement, not truncation: the surrounding charter arrives intact.
       expect(joined).toContain(`stray byte here: [${ARGV_NUL_REPLACEMENT}]`);
       expect(joined).toContain("leave the rest of the file alone");
+      const argv = cli.readArgv() ?? [];
+      const promptArg =
+        adapter.name === "codex"
+          ? argv.at(-1)
+          : argv[argv.indexOf(adapter.name === "copilot" ? "--prompt" : "-p") + 1];
+      expect(retained).toBe(promptArg);
+      if (adapter.name === "antigravity")
+        expect(retained).toContain("## Antigravity command discipline");
     });
   }
 
@@ -390,42 +397,6 @@ describe("provider launch boundary — synchronous spawn rejection", () => {
 });
 
 describe("#866 retained prompt equals the actual launched argv", () => {
-  for (const adapter of adapters) {
-    it(`retains ${adapter.name}'s exact post-adapter post-NUL text`, async () => {
-      const cli = fakeCliRecordingArgv();
-      const provider = adapter.create({ cliCommand: cli.command });
-      const db = new Database(":memory:");
-      try {
-        runMigrations(db);
-        const prompts = new RunPromptRepository(db);
-        const runId = new ActorRunRepository(db).start({
-          actorId: "fixture-actor",
-          modelConfig: createActorRunModelConfig({
-            provider: adapter.name,
-            model: "fixture-model",
-          }),
-        });
-        await provider.run({
-          prompt: assembledActorContext(),
-          cwd: cli.cwd,
-          onPromptLaunched: (prompt) => prompts.record(runId, prompt, adapter.name),
-        });
-        const argv = cli.readArgv();
-        if (!argv) throw new Error("missing launched argv");
-        const promptArg =
-          adapter.name === "codex"
-            ? argv.at(-1)
-            : argv[argv.indexOf(adapter.name === "copilot" ? "--prompt" : "-p") + 1];
-        expect(prompts.getById(runId)?.prompt).toBe(promptArg);
-        expect(prompts.getById(runId)?.provider).toBe(adapter.name);
-        expect(promptArg).not.toContain(NUL);
-        if (adapter.name === "antigravity")
-          expect(promptArg).toContain("## Antigravity command discipline");
-      } finally {
-        db.close();
-      }
-    });
-  }
   it("does not observe a failed spawn as a launched attempt", async () => {
     const cli = fakeCliRecordingArgv();
     let observed = false;

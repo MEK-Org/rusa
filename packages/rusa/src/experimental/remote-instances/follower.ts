@@ -118,7 +118,7 @@ function emit(actorId: string, message: FollowerEvent["message"], eventId?: stri
 async function flush(): Promise<void> {
   if (stopped) return;
   try {
-    await eventQueue.flush((batch) => post("/events", batch));
+    await eventQueue.flush((batch) => post("/events", batch), { id: values.id, session });
   } catch (error) {
     log.warn("follower_event_flush_failed", { err: error });
     if (error instanceof FollowerHttpError && error.status === 410) {

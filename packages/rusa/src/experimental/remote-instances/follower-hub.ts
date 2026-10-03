@@ -21,7 +21,11 @@ import type {
   FollowerUpdateStatusEvent,
   LeaderCommand,
 } from "./protocol.js";
-import { INSTANCE_PROTOCOL_VERSION, OLDEST_FOLLOWER_PROTOCOL_VERSION } from "./protocol.js";
+import {
+  FOLLOWER_HTTP_BODY_LIMIT_BYTES,
+  INSTANCE_PROTOCOL_VERSION,
+  OLDEST_FOLLOWER_PROTOCOL_VERSION,
+} from "./protocol.js";
 import { FollowerDedupeTracker, RemoteInstance } from "./remote-instance.js";
 import { isSafeFollowerBind } from "./safe-bind.js";
 
@@ -62,7 +66,7 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 8 * 1024 * 1024) throw new Error("Request too large");
+    if (size > FOLLOWER_HTTP_BODY_LIMIT_BYTES) throw new Error("Request too large");
     chunks.push(chunk);
   }
   return JSON.parse(Buffer.concat(chunks).toString());
