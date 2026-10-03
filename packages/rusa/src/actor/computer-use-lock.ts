@@ -17,7 +17,6 @@ interface LockEntry<T> {
   state: "queued" | "locked" | "settled";
   inner?: RunStartHandle<T>;
   readonly enqueuedAt: number;
-  waited: boolean;
   blockerActorId?: string;
 }
 
@@ -64,7 +63,6 @@ export class ComputerUseLock {
       reject,
       state: "queued",
       enqueuedAt: Date.now(),
-      waited: false,
     };
     if (this.closed) {
       entry.state = "settled";
@@ -223,7 +221,7 @@ export class ComputerUseLock {
     entry.state = "locked";
     const token = Symbol(`computer-use-lock:${entry.actorId}`);
     this.holder = { entry, token };
-    const waited = entry.waited;
+    const waited = entry.blockerActorId !== undefined;
     const waitedMs = waited ? Math.max(0, Date.now() - entry.enqueuedAt) : undefined;
     // Even an immediate acquisition proves this instance received the run and
     // passed provider admission; silence alone cannot identify provider pacing.
@@ -248,7 +246,6 @@ export class ComputerUseLock {
   private reportWait<T>(entry: LockEntry<T>): void {
     const holder = this.holder?.entry;
     if (!holder || entry.blockerActorId === holder.actorId) return;
-    entry.waited = true;
     entry.blockerActorId = holder.actorId;
     this.report("computer_use_wait", {
       actorId: entry.actorId,
@@ -259,7 +256,7 @@ export class ComputerUseLock {
   }
 
   private reportWaitEnded<T>(entry: LockEntry<T>, outcome: "cancelled" | "closed"): void {
-    if (!entry.waited) return;
+    if (entry.blockerActorId === undefined) return;
     this.report("computer_use_wait_ended", {
       actorId: entry.actorId,
       responsive: entry.responsive,

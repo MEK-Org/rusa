@@ -39,6 +39,9 @@ execution. The follower emits its own phases; leader selection does not prove
 follower receipt.
 
 Phase records include `actorId`, `responsive` and `elapsedMs` since gate entry.
+At admitted, elapsed time measures the wait until the start callback; at ended,
+it includes any computer-use wait and execution until the gate result settles.
+Ended elapsed time is not provider admission latency.
 Ended includes `admitted` and `outcome`: `cancelled` for RunStartCancelledError,
 `failed` for other thrown/rejected gate results, or `resolved` for fulfillment.
 Resolved does not assert run success: the existing execution lifecycle owns
@@ -56,6 +59,8 @@ and secret scrubbing; the leader does not manufacture follower lock records.
 These records contain identifiers, flags and elapsed time, without prompts or
 tool arguments. They are transition breadcrumbs, not a durable current-state
 view: logging can be filtered or fail, and diagnostics cannot block admission.
+The guarded calls contain synchronous logger exceptions; asynchronous errors
+from a custom destination remain that destination's responsibility.
 Acquisition precedes provider execution; the execution lifecycle confirms
 execution. A missing lock record does not establish provider pacing or
 follower receipt. A pending provider phase marks unresolved admission, while

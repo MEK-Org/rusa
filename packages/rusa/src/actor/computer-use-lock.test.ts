@@ -676,11 +676,14 @@ describe("ComputerUseLock", () => {
     const next = lock.gateAfterProvider(
       "next",
       true,
-      (start) => start("selected"),
+      (start) => ({ result: start("selected"), started: true, promote: () => {} }),
       async () => "next",
       () => true
     );
-    await expect(next instanceof Promise ? next : next.result).resolves.toBe("next");
+    expect(next).not.toBeInstanceOf(Promise);
+    if (next instanceof Promise) throw new Error("expected successful handle");
+    expect(next.started).toBe(true);
+    await expect(next.result).resolves.toBe("next");
     expect(attempted).toEqual([
       "pending",
       "admitted",
