@@ -39,6 +39,10 @@ import type { ObligationRepository } from "../db/repositories/obligation-reposit
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import type { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import {
+  type OperatorPrincipalSource,
+  resolveSoleActiveUser,
+} from "../principals/operator-principal.js";
 import type { QuotaCoordinatorClientHealth } from "../quota/coordinator-client.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { InboxRepository } from "../repositories/inbox-repository.js";
@@ -280,6 +284,12 @@ export function parseJsonObjectBody(body: string): JsonObjectParseResult {
   return { ok: true, value: parsed as Record<string, unknown> };
 }
 
+/** Auth-disabled mode cannot identify its viewer once several active users exist. */
+function localViewerIsAmbiguous(principals: OperatorPrincipalSource | undefined): boolean {
+  const sole = resolveSoleActiveUser(principals);
+  return !sole.ok && sole.reason === "ambiguous";
+}
+
 /**
  * Create the dashboard HTTP request handler.
  *
@@ -341,10 +351,11 @@ export function createDashboardRequestHandler(
         return;
       // #866: complete prompts are available in sole-email/local mode only.
       // Keep allowlist refusal at the established auth boundary, before storage reads.
+      // Auth-disabled mode with several active users cannot identify its viewer (#590).
       if (
         req.method === "GET" &&
-        auth?.config?.allowedEmails &&
-        /^\/api\/mesh\/runs\/[^/]+\/prompt$/.test(pathname)
+        /^\/api\/mesh\/runs\/[^/]+\/prompt$/.test(pathname) &&
+        (auth ? auth.config?.allowedEmails : localViewerIsAmbiguous(dataDeps?.principals))
       ) {
         res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify({ error: "prompt not retained" }));
