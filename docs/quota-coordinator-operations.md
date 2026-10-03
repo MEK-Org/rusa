@@ -170,16 +170,25 @@ dist to `dist.old` and deletes the previous `dist.old`, so the live dist is the
 only artifact a failed refresh could restart onto. If the coordinator cannot say
 what it loaded, the live dist has no valid sentinel, or the two differ, the
 update stops with `rollback protection unavailable`: nothing is moved, built,
-backed up, or restarted, and the running coordinator is not disturbed. To
-clear it, restart the coordinator onto the live dist
-(`systemctl --user restart rusa-quota-coordinator.service`) once that build is
-acceptable, confirm `/v1/readyz` reports it, then update again.
+backed up, or restarted, and the running coordinator is not disturbed. Every
+later owner update stops the same way until the coordinator is deliberately
+bootstrapped onto an acceptable dist, as described next; an update never
+clears the stop by itself.
 
-The first owner update after this behavior lands always stops this way.
-Coordinators built before it do not report `loadedRevision`, and the update
-that lands it runs the previous orchestrator, which leaves the coordinator
-alone. Expect that stop once per owning host; it is not a regression. Clear it
-with the restart above, then update again.
+Coordinators built before this behavior do not report `loadedRevision`, and the
+update that lands it runs the previous orchestrator, which leaves the
+coordinator alone. So after it lands, every owner update on an owning host
+stops this way. The stop repeats on each update; it is not a first-run
+condition that goes away, and it is not a regression. It clears only after a
+bootstrap: a separately planned, root-owned deployment operation, not a
+routine runbook step. The bootstrap needs an acceptable target artifact in the
+live dist and an explicit recovery and backup plan before the coordinator is
+restarted onto it (`systemctl --user restart rusa-quota-coordinator.service`,
+then confirm `/v1/readyz` reports that dist's revision). Landing this behavior
+authorizes no live restart or deploy. A successful bootstrap satisfies neither
+acceptance leg of #852: an actual owning update must still refresh the
+coordinator and verify its new loaded revision with no separate coordinator
+step, and an actual client-only update must still leave it alone.
 
 After a green build and before the client drain, the update then:
 
