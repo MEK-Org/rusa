@@ -315,7 +315,46 @@ describe("human chat isolation (#590)", () => {
       actorId: ACTOR,
       modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
     });
-    prompts.record(runId, "private fixture prompt", "claude", [a.id]);
+    prompts.record(runId, "private fixture prompt", "claude", {
+      version: 1,
+      complete: true,
+      sources: [
+        { id: "fixture-scaffold", classification: "shared" },
+        {
+          id: "fixture-inherited-ledger-message",
+          classification: "human_chat",
+          participants: [
+            { id: a.id, kind: "user" },
+            { id: ACTOR, kind: "actor" },
+          ],
+        },
+      ],
+    });
+    meshEvents.record({ kind: "run_start", actorId: ACTOR, payload: JSON.stringify({ runId }) });
+    for (const cookie of [a.cookie, b.cookie]) {
+      const visible = await fetch(`${origin}/api/mesh/events?actors=${ACTOR}`, {
+        headers: { Cookie: cookie },
+      });
+      expect(JSON.stringify(await visible.json())).toContain(runId);
+    }
+    const sharedRunId = runs.start({
+      actorId: ACTOR,
+      modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
+    });
+    prompts.record(sharedRunId, "shared fixture", "claude", {
+      version: 1,
+      complete: true,
+      sources: [{ id: "positively-complete-synthetic-shared-inputs", classification: "shared" }],
+    });
+    for (const cookie of [a.cookie, b.cookie]) {
+      expect(
+        (
+          await fetch(`${origin}/api/mesh/runs/${sharedRunId}/prompt`, {
+            headers: { Cookie: cookie },
+          })
+        ).status
+      ).toBe(200);
+    }
     const unknownRunId = runs.start({
       actorId: ACTOR,
       modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
@@ -350,6 +389,11 @@ describe("human chat isolation (#590)", () => {
     });
     const events: EventPage = (await feed.json()) as EventPage;
     expect(JSON.stringify(events)).not.toContain("private fixture prompt");
+    // Synthetic source/history deletion and user reclassification cannot widen a preserved private requirement.
+    db.exec("DELETE FROM mesh_chat; DELETE FROM mesh_events;");
+    db.prepare("DELETE FROM users WHERE principal_id = ?").run(a.id);
+    db.prepare("UPDATE principals SET kind = 'actor' WHERE id = ?").run(a.id);
+    expect((await fetch(origin + path, { headers: { Cookie: b.cookie } })).status).toBe(404);
   });
 
   /** Two humans each talk to the actor and the actor answers each of them. */

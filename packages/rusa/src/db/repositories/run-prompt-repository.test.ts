@@ -27,8 +27,8 @@ describe("#866 retained launch prompts", () => {
   });
   afterEach(() => db.close());
   it("retains the last launched fallback including provider and original byte count", () => {
-    prompts.record(runId, "first", "claude", ["viewer"], now);
-    prompts.record(runId, "second ✓", "antigravity", ["viewer"], now);
+    prompts.record(runId, "first", "claude", null, now);
+    prompts.record(runId, "second ✓", "antigravity", null, now);
     expect(prompts.getById(runId, now)).toMatchObject({
       prompt: "second ✓",
       promptBytes: 10,
@@ -39,7 +39,7 @@ describe("#866 retained launch prompts", () => {
   });
   it("caps the UTF-8 head on a code point boundary", () => {
     const text = "a".repeat(RUN_PROMPT_MAX_BYTES - 1) + "😀tail";
-    prompts.record(runId, text, "claude", [], now);
+    prompts.record(runId, text, "claude", null, now);
     const retained = prompts.getById(runId, now);
     if (!retained) throw new Error("missing retained prompt");
     expect(retained.prompt).toBe("a".repeat(RUN_PROMPT_MAX_BYTES - 1));
@@ -47,7 +47,7 @@ describe("#866 retained launch prompts", () => {
     expect(retained.truncated).toBe(true);
   });
   it("expires reads immediately and prunes after 30 days with an injected clock", () => {
-    prompts.record(runId, "fixture", "claude", [], now);
+    prompts.record(runId, "fixture", "claude", null, now);
     expect(prompts.getById(runId, now + RUN_PROMPT_RETENTION_MS)).not.toBeNull();
     expect(prompts.getById(runId, now + RUN_PROMPT_RETENTION_MS + 1)).toBeNull();
     expect(prompts.prune(now + RUN_PROMPT_RETENTION_MS)).toBe(0);
@@ -55,12 +55,12 @@ describe("#866 retained launch prompts", () => {
     expect(new ActorRunRepository(db).getById(runId)).not.toBeNull();
   });
   it("cascades a deleted run without changing event rows", () => {
-    prompts.record(runId, "fixture", "claude", [], now);
+    prompts.record(runId, "fixture", "claude", null, now);
     db.prepare("DELETE FROM actor_runs WHERE id = ?").run(runId);
     expect(prompts.getById(runId, now)).toBeNull();
   });
   it("retains unknown launch provenance as ineligible rather than inventing shared visibility", () => {
     prompts.recordForActor("actor", runId, "fixture", "claude");
-    expect(prompts.getById(runId)?.eligibleViewerIds).toBeNull();
+    expect(prompts.getById(runId)?.provenance).toBeNull();
   });
 });
