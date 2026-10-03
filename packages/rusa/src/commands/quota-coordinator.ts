@@ -43,7 +43,9 @@ const __dirname = dirname(__filename);
  * loaded. The result is captured once at startup, so a later checkout or dist
  * swap cannot make an already-running coordinator claim the new revision.
  */
-export function coordinatorLoadedRevision(distDir = join(__dirname, "..")): string | null {
+// tsup places this module in a root-level dist chunk shared by CLI and E2E.
+// Source execution has no built-code identity; do not borrow a checkout sentinel.
+export function coordinatorLoadedRevision(distDir = __dirname): string | null {
   const revision = readBuildSentinel(distDir);
   return revision && /^[0-9a-f]{40}$/.test(revision) ? revision : null;
 }
