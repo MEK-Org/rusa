@@ -301,6 +301,13 @@ export function createActorRuntime(
               selected: event.selected,
               runId: event.runId,
             }),
+          onPrompt: (event) =>
+            send({
+              type: "runPrompt",
+              runId: event.runId,
+              prompt: event.prompt,
+              provider: event.provider,
+            }),
           onError: (event) =>
             send({
               type: "error",

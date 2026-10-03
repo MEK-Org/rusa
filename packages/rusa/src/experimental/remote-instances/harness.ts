@@ -1,5 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
+import type { ActorLifecyclePromptEvent } from "../../actor/actor-lifecycle.js";
 import { ActorMesh, type ActorMeshOptions } from "../../actor/actor-mesh.js";
 import { InMemoryCapabilityGrantStore } from "../../actor/capability-grants.js";
 import { COMPUTER_USE_CAPABILITY } from "../../actor/computer-use-lock.js";
@@ -50,6 +51,7 @@ export function createHarness(options: {
   obligations?: ActorMeshOptions["obligations"];
   experimentEnrollments?: ActorMeshOptions["experimentEnrollments"];
 }) {
+  const promptEvents: ActorLifecyclePromptEvent[] = [];
   const actors = new InMemoryActorRepository();
   const runtimes = new Map<string, ActorHandle>();
   let remote = new RemoteInstance("test-follower", process.platform, process.pid);
@@ -162,6 +164,9 @@ export function createHarness(options: {
       let cursor = 0;
       let admittedCursor = 0;
       context.lifecycle.add({
+        onPrompt: (event) => {
+          promptEvents.push(event);
+        },
         onEnd: (event) => {
           if (event.terminal.kind === "abandoned") {
             mesh.recordEvent({
@@ -268,6 +273,7 @@ export function createHarness(options: {
     actors,
     runtimes,
     messages,
+    promptEvents,
     events,
     meshEvents,
     logs,

@@ -748,6 +748,16 @@ export class Actor {
       await this.opts.onProviderAttempt?.(provider);
       return provider.run({
         prompt: built.prompt,
+        onPromptLaunched: (prompt) => {
+          const runId = this.currentRunId;
+          if (runId)
+            void this.lifecycle.emit("onPrompt", {
+              actorId: this.id,
+              runId,
+              prompt,
+              provider: provider.providerName,
+            });
+        },
         cwd: this.opts.cwd,
         // Continue this actor's own session (id undefined on first run → created).
         session: { id: sessionId },
