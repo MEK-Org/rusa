@@ -51,6 +51,7 @@ import {
   RunManager,
   VOICE_INBOX_PAYLOAD_TYPE,
 } from "../runtime/run-manager.js";
+import { assertHumanVoiceAdmission } from "../voice/human-admission.js";
 import { randomSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { googleVoiceConfig } from "../voice/voice-config.js";
@@ -238,6 +239,8 @@ export interface VoiceSessionTransferPort {
   activeSessionIdFor(actorId: string): string;
   /** Read the caller's active session and bound human principal together. */
   activeSessionFor?(actorId: string): { sessionId: string; principalId?: string };
+  /** Whether any live lease for this actor belongs to another human. */
+  heldByOtherPrincipal?(actorId: string, principalId: string): boolean;
   /** Atomically rebind the caller's active session and return its same UUID. */
   transferActiveSession(fromActorId: string, targetActorId: string): string;
   /** Restore a just-rebound session before its durable handoff was accepted. */
@@ -4214,6 +4217,13 @@ export class ActorMesh {
     if (!user || user.disabledAt) {
       throw new Error("human message requires an active durable user principal");
     }
+    const registry = this.voiceSessionTransfer;
+    const binding = registry?.heldByOtherPrincipal ? undefined : this.activeVoiceSessionFor(toId);
+    assertHumanVoiceAdmission(
+      registry?.heldByOtherPrincipal
+        ? registry.heldByOtherPrincipal(toId, fromId)
+        : Boolean(binding && binding.principalId !== fromId)
+    );
     const rec = this.actors.get(toId);
     if (!rec || rec.status !== "active") {
       this.log(`message to ${toId} from ${fromId} dropped — recipient not active`);

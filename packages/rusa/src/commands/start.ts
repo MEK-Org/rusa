@@ -2928,6 +2928,8 @@ async function composeStart(
     // this host-owned port closes over it. ActorMesh keeps authorization and
     // durable handoff delivery; VoiceService keeps the one live-session map.
     voiceSessionTransfer: {
+      heldByOtherPrincipal: (actorId, principalId) =>
+        voiceService?.heldByOtherPrincipal(actorId, principalId) ?? false,
       activeSessionIdFor: (actorId) => {
         if (!voiceService)
           throw new Error("voice session transfer is unavailable on this instance");

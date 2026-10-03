@@ -5,10 +5,12 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import Database from "better-sqlite3";
 import type { DecodedIdToken } from "firebase-admin/auth";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ActorMesh } from "../actor/actor-mesh.js";
+import { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { createActorRunModelConfig } from "../db/repositories/actor-run-model-config.js";
@@ -19,6 +21,7 @@ import { ObligationRepository } from "../db/repositories/obligation-repository.j
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
+import { createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { VoiceService } from "../voice/voice-service.js";
@@ -465,6 +468,135 @@ describe("human chat isolation (#590)", () => {
       expect(service.activeSessionFor(ACTOR)).toEqual(binding);
     } finally {
       for (const controller of streams) controller.abort();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses another human's typed input before write, wake and actual reply while a voice lease is held (#597)", async () => {
+    const a = await login(alice);
+    const b = await login(bob);
+    const home = mkdtempSync(join(tmpdir(), "typed-voice-auth-fixture-"));
+    const service = new VoiceService({
+      home,
+      speech: {
+        transcribe: async () => "",
+        synthesize: async () => ({ pcm: Buffer.alloc(0), sampleRate: 24000 }),
+        streamSynthesize: async () => ({
+          sampleRate: 24000,
+          pcmStream: (async function* () {
+            yield Buffer.alloc(0);
+          })(),
+        }),
+      },
+    });
+    const mesh = new ActorMesh({
+      actors: deps.actors,
+      principals,
+      inboxStore: inbox,
+      recordChat: (entry) => meshChat.record(entry),
+      voiceSessionTransfer: service,
+      createActor: () => {
+        throw new Error("synthetic fixture must not spawn providers");
+      },
+    });
+    // Retain the actual durable admission/dispatch spine while observing wakes.
+    const dispatch = vi.spyOn(mesh, "dispatch").mockImplementation(() => false);
+    deps.mesh = mesh;
+    const reply = async (body: string) => {
+      const server = createAgentExecMcpServer(mesh, ACTOR, ACTOR);
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverTransport);
+      const client = new Client({ name: "synthetic-reply-fixture", version: "1" });
+      await client.connect(clientTransport);
+      try {
+        const result = await client.callTool({ name: "reply", arguments: { message: body } });
+        expect(result.isError).not.toBe(true);
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    };
+    // A live recipient makes accepted admission observable without any provider run.
+    mesh.adopt(rec(ACTOR, null), {
+      id: ACTOR,
+      isRunning: false,
+      requestRun: () => {},
+      markUnkillable: () => {},
+      close: () => {},
+      preemptForResponsive: () => ({ preempted: false as const }),
+    } as Parameters<ActorMesh["adopt"]>[1]);
+    const lease = "synthetic-alice-lease";
+    service.openSession(lease, ACTOR, a.id);
+    dispatch.mockClear();
+    try {
+      const refused = await post(
+        `/api/mesh/actors/${ACTOR}/chat`,
+        {
+          body: "synthetic bob private input",
+          sessionId: "synthetic-bob-text",
+        },
+        b.cookie
+      );
+      // On the unfixed product this executes the real reply tool after Bob's
+      // admitted input, exposing that the recorded reply goes to Alice.
+      if (refused.ok) await reply("synthetic response to bob private input");
+      expect({
+        status: refused.status,
+        leakedReply: db
+          .prepare(
+            "SELECT COUNT(*) AS n FROM mesh_chat WHERE sender_id = ? AND recipient_id = ? AND body = ?"
+          )
+          .get(ACTOR, a.id, "synthetic response to bob private input"),
+        persisted: db.prepare("SELECT COUNT(*) AS n FROM mesh_chat").get(),
+        wakes: dispatch.mock.calls.length,
+        conversation: deps.actors.lastHumanChat(ACTOR),
+        inbox: inbox.list(ACTOR, { status: "all" }).entries.length,
+      }).toEqual({
+        status: 409,
+        leakedReply: { n: 0 },
+        persisted: { n: 0 },
+        wakes: 0,
+        conversation: undefined,
+        inbox: 0,
+      });
+      expect(await refused.json()).toEqual({
+        error: "voice session is held by a different principal",
+      });
+      expect(() =>
+        mesh.sendHumanMessage(ACTOR, "synthetic bob direct", "direct", { fromId: b.id })
+      ).toThrow("voice session is held by a different principal");
+      expect(service.activeSessionFor(ACTOR)).toEqual({ sessionId: lease, principalId: a.id });
+
+      expect(
+        (await post(`/api/mesh/actors/${ACTOR}/chat`, { body: "synthetic alice input" }, a.cookie))
+          .status
+      ).toBe(200);
+      await reply("synthetic alice reply");
+      expect(
+        meshChat.listForSession(lease, { limit: 100 }).map((m) => [m.recipientId, m.body])
+      ).toEqual([[a.id, "synthetic alice reply"]]);
+      service.closeSession(lease);
+      expect(
+        (
+          await post(
+            `/api/mesh/actors/${ACTOR}/chat`,
+            { body: "synthetic bob unheld", sessionId: "synthetic-unheld" },
+            b.cookie
+          )
+        ).status
+      ).toBe(200);
+      await reply("synthetic bob unheld reply");
+      expect(
+        meshChat
+          .listForSession("synthetic-unheld", { limit: 100 })
+          .map((m) => [m.senderId, m.recipientId, m.body])
+      ).toEqual([
+        [b.id, ACTOR, "synthetic bob unheld"],
+        [ACTOR, b.id, "synthetic bob unheld reply"],
+      ]);
+      expect(dispatch).toHaveBeenCalled();
+    } finally {
+      service.closeSession(lease);
       rmSync(home, { recursive: true, force: true });
     }
   });

@@ -50,6 +50,7 @@ import type {
   InboxRepository,
 } from "../repositories/inbox-repository.js";
 import type { ChatRoomService } from "../voice/chat-room.js";
+import { HumanVoiceAdmissionError } from "../voice/human-admission.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import { buildSupportedVoiceCatalog, type SupportedVoice } from "../voice/voice-catalog.js";
 import {
@@ -1112,7 +1113,9 @@ export async function handleMeshApiRequest(
           }
         })
         .catch((err) => {
-          sendJson(res, 500, { error: String(err) });
+          sendJson(res, err instanceof HumanVoiceAdmissionError ? 409 : 500, {
+            error: err instanceof HumanVoiceAdmissionError ? err.message : String(err),
+          });
         });
       return true;
     }

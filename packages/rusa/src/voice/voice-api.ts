@@ -22,6 +22,7 @@ import type { SseHub } from "../dashboard/sse.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import type { Logger } from "../observability/logger.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
+import { assertHumanVoiceAdmission, HumanVoiceAdmissionError } from "./human-admission.js";
 import { toFrame, VOICE_MEMO_PREFIX, type VoiceService } from "./voice-service.js";
 
 /** Everything the voice routes need, injected by the server wiring. */
@@ -185,10 +186,12 @@ export function handleVoiceApiRequest(
     // The reply tool answers the actor's leased human, so another principal's
     // memo would be answered to them: refuse it before save and again before
     // write, since a lease can be taken while this memo transcribes.
-    const heldByOther = () => service.heldByOtherPrincipal(actorId, fromId);
-    const HELD = "voice session is held by a different principal";
-    if (heldByOther()) {
-      sendJson(res, 409, { error: HELD });
+    const admit = () => assertHumanVoiceAdmission(service.heldByOtherPrincipal(actorId, fromId));
+    try {
+      admit();
+    } catch (err) {
+      if (!(err instanceof HumanVoiceAdmissionError)) throw err;
+      sendJson(res, 409, { error: err.message });
       return true;
     }
 
@@ -214,8 +217,11 @@ export function handleVoiceApiRequest(
       // A memo to a non-live actor still transcribes and records (the mesh
       // event is durable), mirroring chat semantics — `delivered` tells the
       // client whether the actor was actually woken.
-      if (heldByOther()) {
-        sendJson(res, 409, { error: HELD, audioSaved: true });
+      try {
+        admit();
+      } catch (err) {
+        if (!(err instanceof HumanVoiceAdmissionError)) throw err;
+        sendJson(res, 409, { error: err.message, audioSaved: true });
         return;
       }
 
