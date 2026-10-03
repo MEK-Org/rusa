@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { LogFields, Logger } from "../observability/logger.js";
 import { ComputerUseLock } from "./computer-use-lock.js";
 
 function deferred<T>() {
@@ -369,5 +370,126 @@ describe("ComputerUseLock", () => {
     await flush();
 
     expect(onError).toHaveBeenCalledWith(thrownError);
+  });
+
+  it("reports a computer-use wait when a responsive waiter queues behind a responsive holder, then starts after natural holder settlement", async () => {
+    const waitEvents: Array<{
+      actorId: string;
+      holderActorId: string;
+      responsive: boolean;
+      holderResponsive?: boolean;
+    }> = [];
+    const acquiredEvents: Array<{
+      actorId: string;
+      responsive: boolean;
+      waited: boolean;
+      waitedMs?: number;
+    }> = [];
+    const lock = new ComputerUseLock({
+      onWait: (event) => waitEvents.push(event),
+      onAcquired: (event) => acquiredEvents.push(event),
+    });
+    const first = deferred<string>();
+    const second = deferred<string>();
+    const events: string[] = [];
+    const interruptHolder = vi.fn();
+
+    const holder = lock.gate(
+      "holder",
+      true,
+      () => {
+        events.push("holder:start");
+        return first.promise;
+      },
+      interruptHolder
+    );
+    await flush();
+
+    expect(lock.currentHolder).toEqual({ actorId: "holder", responsive: true });
+    expect(acquiredEvents).toEqual([
+      { actorId: "holder", responsive: true, waited: false, waitedMs: undefined },
+    ]);
+    expect(events).toEqual(["holder:start"]);
+    expect(waitEvents).toEqual([]);
+
+    const waiter = lock.gate("waiter", true, () => {
+      events.push("waiter:start");
+      return second.promise;
+    });
+    await flush();
+
+    // The responsive waiter reports a computer-use wait behind the responsive holder
+    expect(waitEvents).toEqual([
+      { actorId: "waiter", holderActorId: "holder", responsive: true, holderResponsive: true },
+    ]);
+    // The responsive holder was not interrupted (#689 policy)
+    expect(interruptHolder).not.toHaveBeenCalled();
+    expect(events).toEqual(["holder:start"]);
+    expect(acquiredEvents).toHaveLength(1);
+    expect(lock.queueDepth).toEqual({ responsive: 1, normal: 0 });
+
+    // Natural settlement of the responsive holder
+    first.resolve("holder:done");
+    await expect(holder.result).resolves.toBe("holder:done");
+
+    // After natural settlement, waiter starts
+    await flush();
+    expect(events).toEqual(["holder:start", "waiter:start"]);
+    expect(acquiredEvents).toHaveLength(2);
+    expect(acquiredEvents[1]).toMatchObject({
+      actorId: "waiter",
+      responsive: true,
+      waited: true,
+    });
+    expect(typeof acquiredEvents[1].waitedMs).toBe("number");
+    expect(lock.currentHolder).toEqual({ actorId: "waiter", responsive: true });
+    expect(lock.queueDepth).toEqual({ responsive: 0, normal: 0 });
+
+    second.resolve("waiter:done");
+    await expect(waiter.result).resolves.toBe("waiter:done");
+  });
+
+  it("logs computer_use_wait and computer_use_acquired via the provided Logger", async () => {
+    const logs: Array<{ event: string; fields?: LogFields }> = [];
+    const logger: Logger = {
+      debug: () => {},
+      info: (event, fields) => logs.push({ event, fields }),
+      warn: () => {},
+      error: () => {},
+      child: () => logger,
+    };
+    const lock = new ComputerUseLock({ logger });
+    const first = deferred<string>();
+
+    const h = lock.gate("h", true, () => first.promise);
+    await flush();
+
+    const w = lock.gate("w", true, async () => "w:done");
+    await flush();
+
+    expect(logs).toContainEqual({
+      event: "computer_use_wait",
+      fields: {
+        actorId: "w",
+        holderActorId: "h",
+        responsive: true,
+        holderResponsive: true,
+      },
+    });
+
+    first.resolve("h:done");
+    await h.result;
+    await w.result;
+
+    expect(logs).toContainEqual(
+      expect.objectContaining({
+        event: "computer_use_acquired",
+        fields: expect.objectContaining({
+          actorId: "w",
+          responsive: true,
+          waited: true,
+        }),
+      })
+    );
   });
 });

@@ -54,11 +54,30 @@ export function createHarness(options: {
   const runtimes = new Map<string, ActorHandle>();
   let remote = new RemoteInstance("test-follower", process.platform, process.pid);
   const remotes = [remote];
+  const messages: Array<{ fromId: string; toId: string; body: string }> = [];
+  const events: Array<{ actorId: string; event: ActorEvent }> = [];
+  const meshEvents: MeshEventInput[] = [];
+  // The leader's request/outcome distinction is only visible in its structured logs.
+  const logs: Array<{ event: string; fields?: LogFields }> = [];
+  const logger: Logger = {
+    debug: () => {},
+    info: (event, fields) => {
+      logs.push({ event, fields });
+    },
+    warn: (event, fields) => {
+      logs.push({ event, fields });
+    },
+    error: (event, fields) => {
+      logs.push({ event, fields });
+    },
+    child: () => logger,
+  };
   const follower = new FollowerInstance(
     options.cwd,
     false,
     (event) => queueMicrotask(() => remote.receive(structuredClone(event))),
-    options.providerFactory ?? createProvider
+    options.providerFactory ?? createProvider,
+    { logger }
   );
   // Exercise the same instance commands without opening a port in unit tests.
   const wire = (instance: RemoteInstance) => {
@@ -85,24 +104,6 @@ export function createHarness(options: {
     };
   };
   wire(remote);
-  const messages: Array<{ fromId: string; toId: string; body: string }> = [];
-  const events: Array<{ actorId: string; event: ActorEvent }> = [];
-  const meshEvents: MeshEventInput[] = [];
-  // The leader's request/outcome distinction is only visible in its structured logs.
-  const logs: Array<{ event: string; fields?: LogFields }> = [];
-  const logger: Logger = {
-    debug: () => {},
-    info: (event, fields) => {
-      logs.push({ event, fields });
-    },
-    warn: (event, fields) => {
-      logs.push({ event, fields });
-    },
-    error: (event, fields) => {
-      logs.push({ event, fields });
-    },
-    child: () => logger,
-  };
   const failures: Error[] = [];
   let sequence = 0;
   const eventSourceOwners = new InMemoryEventSourceOwnerStore();
