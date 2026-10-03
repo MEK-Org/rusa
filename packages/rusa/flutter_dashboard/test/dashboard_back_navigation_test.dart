@@ -374,5 +374,117 @@ void main() {
         });
       },
     );
+
+    testWidgets(
+      'direct deep link to /chat-room leaves app on system back (didPopRoute returns false)',
+      (tester) async {
+        await tester.runAsync(() async {
+          addTearDown(() {
+            tester.platformDispatcher.clearDefaultRouteNameTestValue();
+          });
+
+          tester.platformDispatcher.defaultRouteNameTestValue = '/chat-room';
+          debugDashboardUrl = '/chat-room';
+
+          final api = FakeApi()..chatRoomParticipants = ['root'];
+          final store = DashboardStore(api: api, stream: FakeStream());
+          await store.init();
+
+          final session = _TestSession();
+
+          tester.view.physicalSize = const Size(1200, 800);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(() {
+            tester.view.resetPhysicalSize();
+            tester.view.resetDevicePixelRatio();
+          });
+
+          await tester.pumpWidget(
+            _testDashboardApp(store: store, session: session),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 50));
+
+          // Verifies direct deep link loaded Room view
+          expect(find.byType(ChatRoomTab), findsOneWidget);
+          expect(find.byType(OverviewTab), findsNothing);
+
+          // System back at first entry (no prior browser history) invokes didPopRoute
+          final handled = await tester.binding.handlePopRoute();
+          expect(
+            handled,
+            isFalse,
+            reason:
+                'didPopRoute must return false on first entry to let platform exit PWA',
+          );
+
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 50));
+
+          // Must NOT fabricate navigation to OverviewTab
+          expect(
+            find.byType(OverviewTab),
+            findsNothing,
+            reason: 'Must not fabricate navigation to Overview on first-entry back',
+          );
+          expect(find.byType(ChatRoomTab), findsOneWidget);
+
+          await store.dispose();
+        });
+      },
+    );
+
+    testWidgets(
+      'actor detail selection on Actors tab: system back clears selection and consumes event',
+      (tester) async {
+        await tester.runAsync(() async {
+          addTearDown(() {
+            tester.platformDispatcher.clearDefaultRouteNameTestValue();
+          });
+
+          tester.platformDispatcher.defaultRouteNameTestValue = '/actors';
+          debugDashboardUrl = '/actors';
+
+          final api = FakeApi();
+          final store = DashboardStore(api: api, stream: FakeStream());
+          await store.init();
+
+          final session = _TestSession();
+
+          tester.view.physicalSize = const Size(1200, 800);
+          tester.view.devicePixelRatio = 1.0;
+          addTearDown(() {
+            tester.view.resetPhysicalSize();
+            tester.view.resetDevicePixelRatio();
+          });
+
+          await tester.pumpWidget(
+            _testDashboardApp(store: store, session: session),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 50));
+
+          // Select an actor
+          store.clickActor('actor-1');
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 50));
+          expect(store.primary.valueOrNull, 'actor-1');
+
+          // System back in actor detail clears selection and returns true
+          final handled = await tester.binding.handlePopRoute();
+          expect(handled, isTrue);
+
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 50));
+          expect(store.primary.valueOrNull, isNull);
+
+          // Second system back now has no selection to clear, returns false to exit
+          final secondHandled = await tester.binding.handlePopRoute();
+          expect(secondHandled, isFalse);
+
+          await store.dispose();
+        });
+      },
+    );
   });
 }

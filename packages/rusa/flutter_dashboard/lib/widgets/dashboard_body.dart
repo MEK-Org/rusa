@@ -215,10 +215,6 @@ class _DashboardBodyState extends State<DashboardBody>
       widget.store.clearSelection();
       return true;
     }
-    if (_view != DashboardView.overview) {
-      _selectView(DashboardView.overview);
-      return true;
-    }
     return false;
   }
 
