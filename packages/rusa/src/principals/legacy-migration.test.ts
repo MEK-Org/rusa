@@ -12,13 +12,13 @@ import { PrincipalRepository } from "../db/repositories/principal-repository.js"
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
-import { IMPLICIT_USER_EMAIL } from "./implicit-user.js";
 import {
   backupDatabase,
   executeLegacyPrincipalMigration,
   generateMigrationReport,
   inventoryLegacyReferences,
 } from "./legacy-migration.js";
+import { IMPLICIT_USER_EMAIL } from "./operator-principal.js";
 
 function required<T>(value: T | undefined | null): T {
   if (value === undefined || value === null) throw new Error("value is required");
@@ -1167,31 +1167,57 @@ describe("legacy-migration", () => {
         sessionId: "sess-legacy-fail",
       });
 
-      // Create a conflicting external identity holder to cause conflict
-      principals.createUser({
-        email: "other@example.com",
-        identity: { issuer: "https://auth.example.com", subject: "clashing-sub" },
-        createdAt: "2026-09-01T01:00:00.000Z",
-      });
+      db.prepare(`
+        INSERT INTO actors (id, charter, parent_id, title, created_at)
+        VALUES ('root', 'Root actor', NULL, 'Root', '2026-09-01T00:00:00.000Z')
+      `).run();
 
-      // Cutover with clashing external identity will fail in precheck or in-transaction
+      db.prepare(`
+        INSERT INTO obligations (id, title, intent, status, owner_id, creator_id, created_at, updated_at)
+        VALUES ('ob-fail', 'Preserved obligation', 'Intent', 'ready', ?, ?, '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z')
+      `).run(HUMAN_OPERATOR, HUMAN_OPERATOR);
+
+      // Trigger an in-transaction failure during authoritative table rewrite
+      db.exec(`
+        CREATE TRIGGER fail_on_chat_update
+        BEFORE UPDATE ON mesh_chat
+        BEGIN
+          SELECT RAISE(FAIL, 'simulated mid-migration failure');
+        END;
+      `);
+
+      // Cutover with sole implicit candidate fails in-transaction during chat rewrite
       expect(() =>
         executeLegacyPrincipalMigration(db, {
           email: "charlie@example.com",
           issuer: "https://auth.example.com",
-          subject: "clashing-sub",
+          subject: "charlie-sub",
           apply: true,
         })
-      ).toThrow(/ambiguous users exist alongside implicit user|Conflicting identity binding/);
+      ).toThrow(/simulated mid-migration failure/);
 
-      // Verify implicit user remains completely untouched
+      // Verify original email, identity, and ID survive completely untouched
       const implicitAfter = principals.getUser(implicit.id);
+      expect(implicitAfter?.id).toBe(implicit.id);
       expect(implicitAfter?.email).toBe(IMPLICIT_USER_EMAIL);
       expect(implicitAfter?.identity).toBeUndefined();
+      expect(principals.findUserByEmail("charlie@example.com")).toBeUndefined();
 
-      // Verify legacy chat row remains untouched
+      // Verify root actor survives untouched
+      const root = db
+        .prepare("SELECT id, parent_id, title FROM actors WHERE id = 'root'")
+        .get() as { id: string; parent_id: string | null; title: string };
+      expect(root).toEqual({ id: "root", parent_id: null, title: "Root" });
+
+      // Verify legacy refs survive untouched
       const chats = chatRepo.listForSession("sess-legacy-fail", { limit: 10 });
       expect(chats[0].senderId).toBe(HUMAN_OPERATOR);
+
+      const ob = db
+        .prepare("SELECT owner_id, creator_id FROM obligations WHERE id = 'ob-fail'")
+        .get() as { owner_id: string; creator_id: string };
+      expect(ob.owner_id).toBe(HUMAN_OPERATOR);
+      expect(ob.creator_id).toBe(HUMAN_OPERATOR);
 
       db.close();
     });
@@ -1269,6 +1295,46 @@ describe("legacy-migration", () => {
             apply: true,
           })
         ).toThrow(/Cannot migrate to reserved admission email: local-operator@rusa.invalid/);
+        db.close();
+      }
+
+      // 5. Matched existing user alongside unbound implicit user (#597 / r4174919568)
+      {
+        const db = new Database(":memory:");
+        db.pragma("foreign_keys = ON");
+        runMigrations(db);
+        const principals = new PrincipalRepository(db);
+        const implicit = required(principals.ensureImplicitUser("2026-09-01T00:00:00.000Z"));
+        const existing = principals.createUser({
+          email: "existing@example.com",
+          createdAt: "2026-09-01T01:00:00.000Z",
+        });
+
+        // Refuses in both dry-run and apply mode before any writes
+        expect(() =>
+          executeLegacyPrincipalMigration(db, {
+            email: "existing@example.com",
+            apply: false,
+          })
+        ).toThrow(
+          new RegExp(
+            `Cannot cut over: an unbound implicit user exists alongside matched user '${existing.id}'`
+          )
+        );
+
+        expect(() =>
+          executeLegacyPrincipalMigration(db, {
+            email: "existing@example.com",
+            apply: true,
+          })
+        ).toThrow(
+          new RegExp(
+            `Cannot cut over: an unbound implicit user exists alongside matched user '${existing.id}'`
+          )
+        );
+
+        // Zero writes occurred: implicit user survives untouched
+        expect(principals.getUser(implicit.id)?.email).toBe(IMPLICIT_USER_EMAIL);
         db.close();
       }
     });

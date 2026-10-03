@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
-import { IMPLICIT_USER_EMAIL } from "../../principals/implicit-user.js";
+import { IMPLICIT_USER_EMAIL } from "../../principals/operator-principal.js";
 import { runMigrations } from "../migrations/runner.js";
 import { PrincipalRepository } from "./principal-repository.js";
 

@@ -465,19 +465,17 @@ describe("attachVoiceOutbound", () => {
 });
 
 describe("VoiceService session lease and principal binding (#597)", () => {
-  it("binds principalId to active voice session upon openSession and exposes it via activeSessionFor and activeSessionPrincipalIdFor", () => {
+  it("binds principalId to active voice session upon openSession and exposes it via activeSessionFor", () => {
     const { service } = makeService();
     expect(() => service.activeSessionFor(ACTOR)).toThrow(
       "caller does not hold an active voice session"
     );
-    expect(service.activeSessionPrincipalIdFor(ACTOR)).toBeUndefined();
 
     service.openSession("session-1", ACTOR, "user-alice");
     expect(service.activeSessionFor(ACTOR)).toEqual({
       sessionId: "session-1",
       principalId: "user-alice",
     });
-    expect(service.activeSessionPrincipalIdFor(ACTOR)).toBe("user-alice");
     expect(service.activeSessionIdFor(ACTOR)).toBe("session-1");
   });
 
@@ -520,7 +518,6 @@ describe("VoiceService session lease and principal binding (#597)", () => {
       sessionId: "session-1",
       principalId: "user-alice",
     });
-    expect(service.activeSessionPrincipalIdFor(TARGET)).toBe("user-alice");
 
     // Revert transfer back from TARGET to ACTOR
     service.revertActiveSessionTransfer("session-1", ACTOR, TARGET);
@@ -531,7 +528,6 @@ describe("VoiceService session lease and principal binding (#597)", () => {
       sessionId: "session-1",
       principalId: "user-alice",
     });
-    expect(service.activeSessionPrincipalIdFor(ACTOR)).toBe("user-alice");
   });
 
   it("supports auth-disabled path with undefined principalId", () => {
@@ -542,7 +538,6 @@ describe("VoiceService session lease and principal binding (#597)", () => {
       sessionId: "session-open",
       principalId: undefined,
     });
-    expect(service.activeSessionPrincipalIdFor(ACTOR)).toBeUndefined();
 
     // Reconnect without principalId succeeds
     expect(() => service.validateSession("session-open", ACTOR)).not.toThrow();

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { nullLogger } from "../observability/logger.js";
-import { IMPLICIT_USER_EMAIL } from "../principals/implicit-user.js";
+import { IMPLICIT_USER_EMAIL } from "../principals/operator-principal.js";
 import { DashboardIdentityClaimError, DashboardIdentityResolver } from "./identity.js";
 
 function required<T>(value: T | undefined): T {

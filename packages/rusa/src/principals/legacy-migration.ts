@@ -3,7 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { normalizeEmail, PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
-import { IMPLICIT_USER_EMAIL } from "./implicit-user.js";
+import { IMPLICIT_USER_EMAIL } from "./operator-principal.js";
 
 /** Exact authoritative references whose value is migrated to the durable principal ID. */
 export const AUTHORITATIVE_REFERENCES = [
@@ -243,6 +243,12 @@ export function executeLegacyPrincipalMigration(
   let externalIdentityBound = false;
 
   if (existingUser) {
+    const implicitUser = repo.findUserByEmail(IMPLICIT_USER_EMAIL);
+    if (implicitUser && !implicitUser.identity) {
+      throw new Error(
+        `Cannot cut over: an unbound implicit user exists alongside matched user '${existingUser.id}'; resolve ambiguous implicit user before migrating`
+      );
+    }
     principalId = existingUser.id;
     principalReused = true;
 
@@ -373,6 +379,15 @@ export function executeLegacyPrincipalMigration(
       principalId = created.id;
     } else if (externalIdentityBound && externalIdentity) {
       repo.bindExternalIdentity(principalId, externalIdentity, now);
+    }
+
+    if (existingUser) {
+      const inTxImplicit = repo.findUserByEmail(IMPLICIT_USER_EMAIL);
+      if (inTxImplicit && !inTxImplicit.identity) {
+        throw new Error(
+          `Cannot cut over: an unbound implicit user exists alongside matched user '${existingUser.id}'; resolve ambiguous implicit user before migrating`
+        );
+      }
     }
 
     // Rewrite each authoritative reference column whose value is exactly `human:operator`

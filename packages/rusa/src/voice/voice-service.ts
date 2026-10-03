@@ -244,9 +244,6 @@ export class VoiceService {
       existing.timer = null;
       existing.expiresAt = null;
       existing.connections++;
-      if (principalId && !existing.principalId) {
-        existing.principalId = principalId;
-      }
       return;
     }
     this.sessions.set(sessionId, {
@@ -319,12 +316,18 @@ export class VoiceService {
     }
   }
 
-  /** Whether this stable UUID currently authorizes voice memos for its actor. */
-  hasSession(sessionId: string, actorId: string): boolean {
+  /** Whether this stable UUID currently authorizes voice memos for its actor and principal. */
+  hasSession(sessionId: string, actorId: string, principalId?: string): boolean {
     const session = this.sessions.get(sessionId);
-    return (
-      session?.actorId === actorId && (session.expiresAt === null || session.expiresAt > this.now())
-    );
+    if (!session || session.actorId !== actorId) return false;
+    if (
+      principalId !== undefined &&
+      session.principalId !== undefined &&
+      session.principalId !== principalId
+    ) {
+      return false;
+    }
+    return session.expiresAt === null || session.expiresAt > this.now();
   }
 
   /** The caller's sole active session UUID and principal, or an error when transfer is ambiguous. */
@@ -345,15 +348,6 @@ export class VoiceService {
   /** The caller's sole active session UUID, or an error when transfer is ambiguous. */
   activeSessionIdFor(actorId: string): string {
     return this.activeSessionFor(actorId).sessionId;
-  }
-
-  /** The caller's sole active session principal, or undefined when absent or unheld. */
-  activeSessionPrincipalIdFor(actorId: string): string | undefined {
-    try {
-      return this.activeSessionFor(actorId).principalId;
-    } catch {
-      return undefined;
-    }
   }
 
   /**

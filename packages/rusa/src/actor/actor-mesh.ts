@@ -3005,11 +3005,6 @@ export class ActorMesh {
     return this.activeVoiceSessionFor(actorId)?.sessionId;
   }
 
-  /** Resolve the human side of the currently leased conversation from the session binding. */
-  activeVoicePrincipalIdFor(actorId: string): string | undefined {
-    return this.activeVoiceSessionFor(actorId)?.principalId;
-  }
-
   /** Resolve an active live actor from the caller's own handle set. */
   private resolveHeldActiveActor(requesterId: string, targetHandleOrId: string): ActorRecord {
     const requested = targetHandleOrId.trim();
@@ -4215,7 +4210,8 @@ export class ActorMesh {
   ): MessageDeliveryResult {
     toId = this.resolveThreadId(toId);
     const fromId = opts.fromId;
-    if (!this.principals?.getUser(fromId) || this.principals.getUser(fromId)?.disabledAt) {
+    const user = this.principals?.getUser(fromId);
+    if (!user || user.disabledAt) {
       throw new Error("human message requires an active durable user principal");
     }
     const rec = this.actors.get(toId);

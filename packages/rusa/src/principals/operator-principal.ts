@@ -1,6 +1,13 @@
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import type { UserPrincipal } from "./principal-ref.js";
 
+/**
+ * Reserved admission metadata for the auth-disabled zero-user bootstrap.
+ * This address never names an admitted login. The first verified named login
+ * replaces it atomically while preserving the durable principal id.
+ */
+export const IMPLICIT_USER_EMAIL = "local-operator@rusa.invalid";
+
 /** The slice of principal storage the local-mode resolver reads. */
 export type OperatorPrincipalSource = Pick<PrincipalRepository, "listUsers">;
 

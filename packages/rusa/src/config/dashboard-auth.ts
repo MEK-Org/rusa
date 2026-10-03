@@ -1,5 +1,5 @@
 import { normalizeEmail } from "../db/repositories/principal-repository.js";
-import { IMPLICIT_USER_EMAIL } from "../principals/implicit-user.js";
+import { IMPLICIT_USER_EMAIL } from "../principals/operator-principal.js";
 import type { DashboardAuthConfig } from "./types.js";
 
 /** Reject malformed auth rather than silently starting an unprotected dashboard. */

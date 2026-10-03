@@ -10,7 +10,7 @@ import {
   type PrincipalRepository,
 } from "../db/repositories/principal-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
-import { IMPLICIT_USER_EMAIL } from "../principals/implicit-user.js";
+import { IMPLICIT_USER_EMAIL } from "../principals/operator-principal.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
 import { DashboardCsrf } from "./csrf.js";
 import {

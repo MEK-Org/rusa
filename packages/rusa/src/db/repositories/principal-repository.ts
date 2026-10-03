@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import { IMPLICIT_USER_EMAIL } from "../../principals/implicit-user.js";
+import { IMPLICIT_USER_EMAIL } from "../../principals/operator-principal.js";
 import type {
   ExternalIdentity,
   PrincipalRef,
@@ -253,9 +253,13 @@ export class PrincipalRepository {
       .transaction(() => {
         let user = this.findUserByEmail(normalizedEmail);
         if (!user) {
-          const users = this.listUsers();
-          const only = users.length === 1 ? users[0] : undefined;
-          if (only?.email === IMPLICIT_USER_EMAIL && !only.identity) user = only;
+          const countRow = this.db.prepare("SELECT COUNT(*) AS count FROM users").get() as {
+            count: number | bigint;
+          };
+          if (Number(countRow?.count ?? 0) === 1) {
+            const only = this.findUserByEmail(IMPLICIT_USER_EMAIL);
+            if (only && !only.identity) user = only;
+          }
         }
         if (!user) return undefined;
         // Let the resolver apply the same disabled-user refusal as an already

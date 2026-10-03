@@ -180,13 +180,6 @@ export function handleVoiceApiRequest(
       return true;
     }
     const suppliedSessionId = url.searchParams.get("sessionId");
-    // The stream route alone grants session authority. Keep the pre-session
-    // delivery behavior for a stale/unknown supplied id (including a restart
-    // race): rekey this one memo, deliver it, and do not create a lease.
-    const sessionId =
-      suppliedSessionId && service.hasSession(suppliedSessionId, actorId)
-        ? suppliedSessionId
-        : randomUUID();
 
     void (async () => {
       const audio = await readRawBody(req, MAX_MEMO_BYTES);
@@ -212,6 +205,16 @@ export function handleVoiceApiRequest(
       // client whether the actor was actually woken.
       const fromId = requireOperatorPrincipal(req, res, deps);
       if (!fromId) return;
+
+      // The stream route alone grants session authority. Keep the pre-session
+      // delivery behavior for a stale/unknown supplied id, principal mismatch,
+      // or lease expiration during transcription: rekey this one memo to a
+      // fresh UUID, deliver it, and do not mutate or lease the session.
+      const sessionId =
+        suppliedSessionId && service.hasSession(suppliedSessionId, actorId, fromId)
+          ? suppliedSessionId
+          : randomUUID();
+
       const result = mesh.sendHumanMessage(actorId, VOICE_MEMO_PREFIX + transcript, sessionId, {
         fromId,
       });

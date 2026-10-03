@@ -12,8 +12,8 @@ import { runMigrations } from "../db/migrations/runner.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
-import { IMPLICIT_USER_EMAIL } from "../principals/implicit-user.js";
 import { executeLegacyPrincipalMigration } from "../principals/legacy-migration.js";
+import { IMPLICIT_USER_EMAIL } from "../principals/operator-principal.js";
 import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
 import {

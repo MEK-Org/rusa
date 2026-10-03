@@ -353,6 +353,74 @@ describe("handleVoiceApiRequest", () => {
       ]);
     });
 
+    it("rekeys memo to fresh session when caller is mismatched or lease changed during transcription (#597)", async () => {
+      const sessionId = "bound-to-alice";
+      // 1. Alice connects and opens session
+      call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`);
+      expect(service.activeSessionFor(UUID_A)).toEqual({
+        sessionId,
+        principalId: LOCAL_USER,
+      });
+
+      // 2. Bob (a different admitted principal) posts a memo claiming Alice's sessionId
+      const OTHER_USER = "22222222-0000-4000-8000-000000000002";
+      const otherPrincipals = {
+        listUsers: () => [
+          {
+            kind: "user",
+            id: OTHER_USER,
+            email: "bob@example.com",
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+        ],
+      } as unknown as PrincipalRepository;
+      const otherDeps = { ...deps, principals: otherPrincipals };
+
+      const bobMemo = call(
+        otherDeps,
+        "POST",
+        `/api/mesh/actors/${UUID_A}/voice-memo?sessionId=${sessionId}`,
+        { body: Buffer.from("bob-memo"), contentType: "audio/webm" }
+      );
+      await settled(bobMemo.res);
+
+      expect(bobMemo.res.statusCode).toBe(200);
+      // Mismatched caller is rekeyed to a fresh UUID and delivered with their own fromId
+      expect(sendHumanMessage.mock.calls[0]?.[2]).toMatch(/^[0-9a-f-]{36}$/);
+      expect(sendHumanMessage.mock.calls[0]?.[2]).not.toBe(sessionId);
+      expect(sendHumanMessage.mock.calls[0]?.[3]).toEqual({ fromId: OTHER_USER });
+
+      // Alice's session sees zero mutation
+      expect(service.activeSessionFor(UUID_A)).toEqual({
+        sessionId,
+        principalId: LOCAL_USER,
+      });
+
+      // 3. Alice posts a memo with her bound sessionId, but the lease expires during transcription
+      sendHumanMessage.mockClear();
+      transcribe.mockImplementationOnce(async () => {
+        // Lease expires or disconnects during transcription
+        service.disconnectSession(sessionId);
+        now += 60_000;
+        service.expireSessions();
+        return "late transcript";
+      });
+
+      const expiredMemo = call(
+        deps,
+        "POST",
+        `/api/mesh/actors/${UUID_A}/voice-memo?sessionId=${sessionId}`,
+        { body: Buffer.from("alice-memo"), contentType: "audio/webm" }
+      );
+      await settled(expiredMemo.res);
+
+      expect(expiredMemo.res.statusCode).toBe(200);
+      // Rekeyed to fresh UUID because lease expired
+      expect(sendHumanMessage.mock.calls[0]?.[2]).toMatch(/^[0-9a-f-]{36}$/);
+      expect(sendHumanMessage.mock.calls[0]?.[2]).not.toBe(sessionId);
+      expect(sendHumanMessage.mock.calls[0]?.[3]).toEqual({ fromId: LOCAL_USER });
+    });
+
     it("reports delivered: false for a non-live actor (memo still transcribed)", async () => {
       sendHumanMessage.mockReturnValue({ delivered: false, status: "active" });
       const { res } = call(deps, "POST", `/api/mesh/actors/${UUID_A}/voice-memo`, {
@@ -558,7 +626,6 @@ describe("handleVoiceApiRequest", () => {
         sessionId: "walkie-auth-1",
         principalId: LOCAL_USER,
       });
-      expect(service.activeSessionPrincipalIdFor(UUID_A)).toBe(LOCAL_USER);
     });
 
     it("allows matching reconnect from the same principal without altering session authority", () => {
