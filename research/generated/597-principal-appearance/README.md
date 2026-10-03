@@ -13,7 +13,7 @@ Observed appearance change: the Events Log's `to`/`from` labels show a durable U
 | Wide 1180×820 | [wide-before.png](wide-before.png) | [wide-after.png](wide-after.png) |
 | Narrow 390×844 | [narrow-before.png](narrow-before.png) | [narrow-after.png](narrow-after.png) |
 
-All four original-resolution frames were visually inspected. They show the avatar fallback, Kind filter, All Events, timestamps, message_sent/message_received badges, complete synthetic text and direction labels. DPR 2; Flutter CanvasKit release; Playwright with local headless Google Chrome. No pixels were edited or synthesized. External browser requests are blocked.
+All four original-resolution frames were visually inspected. They show the avatar fallback, Kind filter, All Events, timestamps, root_control_action and message_sent/message_received badges, complete synthetic text and direction labels. DPR 2; Flutter CanvasKit release; Playwright with local headless Google Chrome. No pixels were edited or synthesized. External browser requests are blocked.
 
 Copy the fixture into the after checkout at packages/rusa/flutter_dashboard/test/principal_web_capture.dart. From flutter_dashboard, run:
 
@@ -22,7 +22,7 @@ Copy the fixture into the after checkout at packages/rusa/flutter_dashboard/test
 python3 configure-browser-assets.py <workspace>/evidence/597-appearance-web <private-sdk>/bin/cache/artifacts/material_fonts/Roboto-Regular.ttf after
 ```
 
-Observed build: 70.8s, exit 0. Retained build stdout SHA256 `c70442b157dc8768888cab061b1fbaf4c2fd2e91ae141192e978a93c7ad82ae0`. Roboto-Regular.ttf is registered locally for Roboto/system-ui/monospace in both states; MaterialIcons comes from the compiled SDK asset. The first capture attempt failed because the helper did not serve the configured `/after/` asset prefix; the corrected helper maps that prefix and completed all four states. The failed attempt remains private evidence and is not a successful receipt.
+Observed build: 73.1s, exit 0. Retained build stdout SHA256 `6be4038ab5c2f555eeb429970e42ee0b2d1781261e5879e4593a73e67494d890`. Roboto-Regular.ttf is registered locally for Roboto/system-ui/monospace in both states; MaterialIcons comes from the compiled SDK asset. The first capture attempt failed because the helper did not serve the configured `/after/` asset prefix; the corrected helper maps that prefix and completed all four states. The failed attempt remains private evidence and is not a successful receipt.
 
 Copy browser-capture.cjs to the after checkout and run from its repository root:
 

@@ -26,6 +26,9 @@ Future<void> main() async {
       quotaProviders: {}, userPrincipalId: after ? principal : null)
     ..threadsResult = [makeThread('fixture-actor')]
     ..eventPages = [EventPage(events: [
+      makeEvent('fixture-control', 'root_control_action', actor: 'fixture-actor',
+        detail: '$principal interrupt_child',
+        payload: '{"principal":"$principal","action":"interrupt_child","targetId":"fixture-actor"}'),
       makeEvent('fixture-reply', 'message_sent', actor: 'fixture-actor',
         body: 'Synthetic local reply.', payload: '{"to":"$principal"}'),
       makeEvent('fixture-message', 'message_received', actor: 'fixture-actor',
