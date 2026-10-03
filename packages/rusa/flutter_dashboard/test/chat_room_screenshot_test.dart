@@ -149,6 +149,7 @@ void main() {
       await tester.pump(const Duration(milliseconds: 250));
 
       expect(find.text('Tap to send'), findsNothing);
+      expect(find.textContaining('Voice'), findsNothing);
       expect(find.byKey(const ValueKey('chat-room-cancel')), findsOneWidget);
       expect(find.text('Cancel recording'), findsOneWidget);
       await captureBoundary(key, '$_outDir/chat_room_recording.png');

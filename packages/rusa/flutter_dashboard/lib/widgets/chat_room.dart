@@ -462,14 +462,15 @@ class _RoomAvatarButton extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 2),
+                    // The tile shows only the avatar and name (#825 operator
+                    // feedback). The line below stays reserved, empty unless
+                    // the actor is speaking, so the avatar never shrinks.
                     Text(
-                      speaking ? 'Speaking' : _voiceLabel(actor),
+                      speaking ? 'Speaking' : '',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: speaking
-                            ? MeshColors.accent
-                            : MeshColors.textSecondary,
+                      style: const TextStyle(
+                        color: MeshColors.accent,
                         fontSize: 12,
                       ),
                     ),
