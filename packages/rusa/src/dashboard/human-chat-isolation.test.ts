@@ -524,7 +524,8 @@ describe("human chat isolation (#590)", () => {
       beforeReply?: () => Promise<void>,
       checkSuccess = true,
       inputRef: string | null | undefined = newestHumanInput,
-      actorId = ACTOR
+      actorId = ACTOR,
+      omitInputRef = false
     ) => {
       const server = createAgentExecMcpServer(mesh, actorId, ACTOR, undefined, { onWrite });
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -533,9 +534,13 @@ describe("human chat isolation (#590)", () => {
       await client.connect(clientTransport);
       try {
         await beforeReply?.();
+        const args: { message: string; input_ref?: string } = { message: body };
+        if (!omitInputRef && inputRef !== null) {
+          args.input_ref = inputRef;
+        }
         const result = await client.callTool({
           name: "reply",
-          arguments: { message: body, ...(inputRef === null ? {} : { input_ref: inputRef }) },
+          arguments: args,
         });
         if (checkSuccess) expect(result.isError).not.toBe(true);
         return result;
@@ -785,6 +790,7 @@ describe("human chat isolation (#590)", () => {
       );
       await reply("synthetic returned reply", undefined, true, returned.id);
 
+      const emittedObserver = vi.spyOn(mesh, "recordMessageEmitted");
       const snapshot = () => ({
         rows: (db.prepare("SELECT COUNT(*) AS n FROM mesh_chat").get() as { n: number }).n,
         writes: onWrite.mock.calls.length,
@@ -792,41 +798,76 @@ describe("human chat isolation (#590)", () => {
         entries: (
           db.prepare("SELECT COUNT(*) AS n FROM actor_inbox_entries").get() as { n: number }
         ).n,
+        emits: emittedObserver.mock.calls.length,
       });
-      const assertRefused = async (ref: string | null | undefined, actorId = ACTOR) => {
+      const assertRefused = async (
+        ref: string | null | undefined,
+        actorId = ACTOR,
+        omitRef = false
+      ) => {
         await Promise.resolve(); // Drain the admission/append nudge before measuring reply effects.
         const before = snapshot();
-        const result = await reply("synthetic must not emit", undefined, false, ref, actorId);
+        const result = await reply(
+          "synthetic must not emit",
+          undefined,
+          false,
+          ref,
+          actorId,
+          omitRef
+        );
         expect(result.isError).toBe(true);
         expect(snapshot()).toEqual(before);
       };
-      // Own handled entries, foreign entries, legacy handoffs, and malformed payloads.
+
+      // Delayed completion: caller's own handled entry remains usable by explicit input_ref.
       inbox.markHandled(ACTOR, [sourceRef]);
-      await assertRefused(sourceRef);
-      await assertRefused(handoff.id);
+      await reply("synthetic delayed response to handled input", undefined, true, sourceRef);
+      expect(
+        meshChat
+          .listForSession(lease, { limit: 100 })
+          .find((entry) => entry.body === "synthetic delayed response to handled input")
+      ).toMatchObject({ recipientId: a.id });
+
+      // Refusal when unhandled candidate is missing/ambiguous/foreign
+      await assertRefused(undefined, ACTOR, true);
+      await assertRefused("", ACTOR, false);
+      await assertRefused(null, ACTOR, false);
       await assertRefused("unknown-input");
-      await assertRefused("");
-      await assertRefused(null);
-      for (const payload of [
-        { type: "voice.transfer", fromId: PEER, sessionId: lease, context: "legacy" },
-        { type: "human.message", fromId: a.id, sessionId: lease },
-        { type: "mesh.message", messageId: "fake", fromId: a.id, sessionId: lease },
+      await assertRefused(handoff.id); // foreign entry from PEER
+
+      // Unique selected unhandled candidate defaults without input_ref
+      mesh.selectInboxEntries(ACTOR, [returned.id]);
+      await reply(
+        "synthetic implicit reply from unique selection",
+        undefined,
+        true,
+        undefined,
+        ACTOR,
+        true
+      );
+      expect(
+        meshChat
+          .listForSession(lease, { limit: 100 })
+          .find((entry) => entry.body === "synthetic implicit reply from unique selection")
+      ).toMatchObject({ recipientId: a.id });
+
+      // Multiple selected entries refuse implicit reply (ambiguity)
+      const [secondHandoff] = inbox.append([
         {
-          ...handoff.payload,
-          fromId: PEER,
-          replyInput: { actorId: "foreign", entryId: sourceRef },
+          actorId: ACTOR,
+          source: `voice:transfer:${PEER}`,
+          payload: {
+            ...handoff.payload,
+            fromId: PEER,
+            sessionId: lease,
+            replyInput: { actorId: PEER, entryId: handoff.id },
+            replyBinding: { principalId: a.id, sessionId: lease, leaseBound: true },
+          },
         },
-        {
-          ...handoff.payload,
-          fromId: PEER,
-          replyBinding: { principalId: b.id, sessionId: lease, leaseBound: true },
-        },
-      ]) {
-        const [entry] = inbox.append([
-          { actorId: ACTOR, source: `voice:transfer:${PEER}`, payload },
-        ]);
-        await assertRefused(required(entry).id);
-      }
+      ]);
+      mesh.selectInboxEntries(ACTOR, [returned.id, secondHandoff.id]);
+      await assertRefused(undefined, ACTOR, true);
+      mesh.selectInboxEntries(ACTOR, [returned.id]);
       const cyclicId = "synthetic-cyclic-input";
       inbox.append([
         {
@@ -857,10 +898,23 @@ describe("human chat isolation (#590)", () => {
       inbox.append(deep);
       await assertRefused(required(deep[0]).id);
       // A handled ancestor keeps its proof; the still-unhandled own handoff works.
-      await reply("synthetic proven handled origin", undefined, true, returned.id);
       principals.setDisabled(a.id, new Date().toISOString());
       await assertRefused(returned.id);
       principals.setDisabled(a.id, null);
+
+      // Ended voice lease fallback: typed input falls back to its original frozen text route.
+      // Voice-only inputs (like voice.transfer) refuse because voice gets no invented text route.
+      service.closeSession(lease);
+      await assertRefused(returned.id); // voice-only transfer refused when voice lease ended
+
+      // But typed input falls back to its original frozen text route:
+      await reply("synthetic ended voice lease fallback", undefined, true, sourceRef);
+      expect(
+        meshChat
+          .listForSession("synthetic-text-during-voice", { limit: 100 })
+          .find((entry) => entry.body === "synthetic ended voice lease fallback")
+      ).toMatchObject({ recipientId: a.id });
+      service.openSession(lease, ACTOR, a.id);
 
       // The selected source must be unambiguous and current, before any rebind/write.
       mesh.selectInboxEntries(ACTOR, [returned.id]);

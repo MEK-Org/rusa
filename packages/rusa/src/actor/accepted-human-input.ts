@@ -4,6 +4,7 @@ export interface HumanReplyBinding {
   principalId: string;
   sessionId: string;
   leaseBound: boolean;
+  textSessionId?: string;
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -47,7 +48,10 @@ function direct(entry: InboxEntry): HumanReplyBinding {
   ) {
     throw new Error("human input has conflicting provenance; ask for fresh input");
   }
-  return value;
+  return {
+    ...value,
+    ...(entry.payload.type === "human.message" ? { textSessionId: sessionId } : {}),
+  };
 }
 
 /** Reads immutable delivery proof; selection and rendered/history text confer no authority. */
@@ -56,16 +60,16 @@ export function readAcceptedHumanInput(
   actorId: string,
   entryId: string,
   ancestors: readonly string[] = []
-): { binding: HumanReplyBinding; origin: { actorId: string; entryId: string } } {
+): { binding: HumanReplyBinding } {
   const entry = store.read(actorId, entryId);
   if (ancestors.includes(entryId) || ancestors.length >= 100) {
     throw new Error("voice handoff source reference is cyclic or too deep; ask for fresh input");
   }
-  if (!entry || (ancestors.length === 0 && entry.handledAt)) {
-    throw new Error("reply input_ref must name your own unhandled human input entry");
+  if (!entry) {
+    throw new Error("reply input_ref must name your own accepted human input entry");
   }
   if (entry.payload.type !== "voice.transfer") {
-    return { binding: direct(entry), origin: { actorId, entryId } };
+    return { binding: direct(entry) };
   }
   const origin = object(entry.payload.replyInput);
   const originActor = string(origin.actorId);
@@ -81,7 +85,8 @@ export function readAcceptedHumanInput(
     throw new Error("voice handoff has conflicting input provenance; ask for fresh input");
   }
   // Prior handling does not erase source acceptance proof. Every hop is still
-  // actor-scoped and checked; only the caller's own reference must be unhandled.
+  // actor-scoped and checked; the caller's own reference to a handled input
+  // remains valid for delayed task completion.
   const accepted = readAcceptedHumanInput(store, originActor, originId, [...ancestors, entryId]);
   if (
     accepted.binding.principalId !== value.principalId ||
@@ -90,5 +95,11 @@ export function readAcceptedHumanInput(
   ) {
     throw new Error("voice handoff conflicts with its accepted source input");
   }
-  return accepted;
+  return {
+    binding: {
+      principalId: value.principalId,
+      sessionId: value.sessionId,
+      leaseBound: value.leaseBound,
+    },
+  };
 }

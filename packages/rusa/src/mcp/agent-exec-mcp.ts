@@ -253,14 +253,14 @@ export function createAgentExecMcpServer(
       {
         title: "Reply to the human operator",
         description:
-          "Reply to the accepted human input identified by your own unhandled inbox entry. Supply input_ref for the input you are answering; later inputs require their own reference. Missing, legacy or changed voice bindings are refused until fresh input.",
+          "Reply to the human operator in your conversation thread. Defaults to your single uniquely selected accepted human input; specify input_ref when multiple inputs are selected or when answering an earlier handled input.",
         inputSchema: {
           message: z.string().describe("The message to send back to the human operator."),
           input_ref: z
             .string()
             .optional()
             .describe(
-              "Your own unhandled human input or verified voice-transfer inbox entry id, as returned by inbox list/select."
+              "Your own accepted human input or verified voice-transfer inbox entry id, as returned by inbox list/select. Required when multiple human inputs are selected or when completing a delayed response to an earlier input."
             ),
         },
       },

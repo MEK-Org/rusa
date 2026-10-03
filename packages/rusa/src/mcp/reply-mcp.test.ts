@@ -181,5 +181,145 @@ describe("Mesh Chat Security Invariant Tests", () => {
       const { tools: toolsB } = await clientB.listTools();
       expect(toolsB.map((t) => t.name)).not.toContain("reply");
     });
+
+    it("defaults reply(message) to a uniquely selected accepted human input", async () => {
+      const { mesh, inboxStore, recordedEvents } = setupTestMesh();
+      const actor = mesh.actors.get("actor-A");
+      if (!actor) throw new Error("missing synthetic actor");
+      mesh.adopt(actor, {
+        id: "actor-A",
+        requestRun: () => {},
+        markUnkillable: () => {},
+        close: () => {},
+        isRunning: false,
+        preemptForResponsive: () => ({ preempted: false as const }),
+      } as unknown as Actor);
+
+      mesh.sendHumanMessage("actor-A", "operator ping", "session-XYZ", {
+        fromId: testHumanId(mesh),
+      });
+      const [input] = inboxStore.list("actor-A").entries;
+      if (!input) throw new Error("missing accepted human input");
+
+      // Select the single unhandled entry
+      mesh.selectInboxEntries("actor-A", [input.id]);
+
+      const server = createAgentExecMcpServer(mesh, "actor-A", "root");
+      const client = await connect(server);
+      recordedEvents.length = 0;
+
+      // Calling reply without input_ref succeeds via the unique selected candidate
+      const res = (await client.callTool({
+        name: "reply",
+        arguments: { message: "implicit reply to operator" },
+      })) as CallToolResult;
+
+      expect(res.isError).toBeFalsy();
+      expect(recordedEvents).toHaveLength(2);
+      expect(recordedEvents[0]).toMatchObject({
+        kind: "message_sent",
+        actorId: "actor-A",
+      });
+      expect(recordedEvents[1]).toMatchObject({
+        kind: "message_received",
+        actorId: testHumanId(mesh),
+      });
+    });
+
+    it("refuses implicit reply when multiple accepted human inputs are selected (ambiguity refusal)", async () => {
+      const { mesh, inboxStore } = setupTestMesh();
+      const actor = mesh.actors.get("actor-A");
+      if (!actor) throw new Error("missing synthetic actor");
+      mesh.adopt(actor, {
+        id: "actor-A",
+        requestRun: () => {},
+        markUnkillable: () => {},
+        close: () => {},
+        isRunning: false,
+        preemptForResponsive: () => ({ preempted: false as const }),
+      } as unknown as Actor);
+
+      mesh.sendHumanMessage("actor-A", "first ping", "session-1", {
+        fromId: testHumanId(mesh),
+      });
+      mesh.sendHumanMessage("actor-A", "second ping", "session-2", {
+        fromId: testHumanId(mesh),
+      });
+      const entries = inboxStore.list("actor-A").entries;
+      expect(entries).toHaveLength(2);
+
+      // Select both entries
+      mesh.selectInboxEntries("actor-A", [entries[0].id, entries[1].id]);
+
+      const server = createAgentExecMcpServer(mesh, "actor-A", "root");
+      const client = await connect(server);
+
+      // Implicit reply must be refused due to ambiguity
+      const res = (await client.callTool({
+        name: "reply",
+        arguments: { message: "ambiguous reply" },
+      })) as CallToolResult;
+
+      expect(res.isError).toBe(true);
+      expect((res.content[0] as { text: string }).text).toContain(
+        "reply requires explicit input_ref when multiple human inputs are selected"
+      );
+
+      // Explicit reply naming one candidate succeeds
+      const explicitRes = (await client.callTool({
+        name: "reply",
+        arguments: { message: "explicit reply", input_ref: entries[0].id },
+      })) as CallToolResult;
+      expect(explicitRes.isError).toBeFalsy();
+    });
+
+    it("permits explicit input_ref to own HANDLED input for delayed task completion", async () => {
+      const { mesh, inboxStore, recordedEvents } = setupTestMesh();
+      const actor = mesh.actors.get("actor-A");
+      if (!actor) throw new Error("missing synthetic actor");
+      mesh.adopt(actor, {
+        id: "actor-A",
+        requestRun: () => {},
+        markUnkillable: () => {},
+        close: () => {},
+        isRunning: false,
+        preemptForResponsive: () => ({ preempted: false as const }),
+      } as unknown as Actor);
+
+      mesh.sendHumanMessage("actor-A", "slow task request", "session-XYZ", {
+        fromId: testHumanId(mesh),
+      });
+      const [input] = inboxStore.list("actor-A").entries;
+      if (!input) throw new Error("missing accepted human input");
+
+      // Mark the entry handled (bookkeeping during initial run)
+      inboxStore.markHandled("actor-A", [input.id]);
+      expect(inboxStore.read("actor-A", input.id)?.handledAt).not.toBeNull();
+
+      // Later run / wake:
+      const server = createAgentExecMcpServer(mesh, "actor-A", "root");
+      const client = await connect(server);
+      recordedEvents.length = 0;
+
+      // Calling without input_ref fails because the entry is handled (not an unhandled candidate)
+      const unref = (await client.callTool({
+        name: "reply",
+        arguments: { message: "cannot guess handled input" },
+      })) as CallToolResult;
+      expect(unref.isError).toBe(true);
+
+      // Explicit input_ref to caller's own handled input succeeds
+      const res = (await client.callTool({
+        name: "reply",
+        arguments: { message: "slow task completed", input_ref: input.id },
+      })) as CallToolResult;
+
+      expect(res.isError).toBeFalsy();
+      expect(recordedEvents).toHaveLength(2);
+      expect(recordedEvents[1]).toMatchObject({
+        kind: "message_received",
+        actorId: testHumanId(mesh),
+      });
+    });
   });
 });

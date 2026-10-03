@@ -51,7 +51,7 @@ import {
   RunManager,
   VOICE_INBOX_PAYLOAD_TYPE,
 } from "../runtime/run-manager.js";
-import { assertHumanVoiceAdmission } from "../voice/human-admission.js";
+import { assertHumanVoiceAdmission, HumanVoiceAdmissionError } from "../voice/human-admission.js";
 import { randomSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { googleVoiceConfig } from "../voice/voice-config.js";
@@ -2934,6 +2934,9 @@ export class ActorMesh {
       this.listVoiceSessionChat?.(sessionId) ?? [],
       handoffNote
     );
+    // Prospective depth check: verify that handing off this input will not exceed the
+    // depth limit for the recipient before any lease rebind takes place.
+    readAcceptedHumanInput(inboxStore, fromActorId, input.entryId, ["prospective-transfer"]);
     transfer.transferActiveSession(fromActorId, target.id, {
       sessionId,
       principalId: lease.principalId,
@@ -3050,14 +3053,36 @@ export class ActorMesh {
     }
   }
 
-  /** Resolve the caller's explicit accepted input before any reply effects. */
+  /** Resolve the caller's explicit or uniquely selected accepted input before any reply effects. */
   resolveHumanReplyInput(actorId: string, inputRef?: string) {
     actorId = this.resolveThreadId(actorId);
-    if (!inputRef || !this.inboxStore) {
-      throw new Error("reply requires input_ref naming your unhandled human input inbox entry");
+    const store = this.inboxStore;
+    if (!store) {
+      throw new Error("reply requires a durable inbox");
     }
-    const input = readAcceptedHumanInput(this.inboxStore, actorId, inputRef);
-    const { principalId, sessionId, leaseBound } = input.binding;
+    if (!inputRef) {
+      const candidates = this.selectedInboxEntries(actorId)
+        .map((id) => store.read(actorId, id))
+        .filter(
+          (entry): entry is InboxEntry =>
+            entry !== null &&
+            !entry.handledAt &&
+            ["human.message", VOICE_INBOX_PAYLOAD_TYPE, "voice.transfer"].includes(
+              entry.payload.type
+            )
+        );
+      if (candidates.length === 1) {
+        inputRef = candidates[0].id;
+      } else if (candidates.length === 0) {
+        throw new Error("reply requires input_ref naming your accepted human input inbox entry");
+      } else {
+        throw new Error(
+          "reply requires explicit input_ref when multiple human inputs are selected"
+        );
+      }
+    }
+    const input = readAcceptedHumanInput(store, actorId, inputRef);
+    const { principalId, sessionId, leaseBound, textSessionId } = input.binding;
     const user = this.principals?.getUser(principalId);
     if (!user || user.disabledAt) {
       throw new Error("reply requires an active durable human conversation principal");
@@ -3066,12 +3091,27 @@ export class ActorMesh {
     assertHumanVoiceAdmission(
       this.voiceSessionTransfer?.heldByOtherPrincipal(actorId, principalId) ?? false
     );
-    if (leaseBound && (lease?.sessionId !== sessionId || lease.principalId !== principalId)) {
-      throw new Error(
-        "accepted input's voice lease changed or ended; ask the human to send fresh input"
-      );
+    let resolvedSessionId = sessionId;
+    if (leaseBound) {
+      if (lease && lease.sessionId === sessionId && lease.principalId === principalId) {
+        resolvedSessionId = lease.sessionId;
+      } else if (!lease && textSessionId) {
+        // Typed input with ended same-principal voice lease falls back ONLY to its original
+        // independently verified frozen TEXT route with no conflicting active lease.
+        resolvedSessionId = textSessionId;
+      } else {
+        throw new Error(
+          "accepted input's voice lease changed or ended; ask the human to send fresh input"
+        );
+      }
     }
-    return input;
+    return {
+      binding: {
+        principalId,
+        sessionId: resolvedSessionId,
+        leaseBound: Boolean(lease && lease.sessionId === sessionId),
+      },
+    };
   }
 
   /** Resolve an active live actor from the caller's own handle set. */
@@ -4286,8 +4326,8 @@ export class ActorMesh {
     const registry = this.voiceSessionTransfer;
     const binding = this.replyVoiceSessionFor(toId);
     assertHumanVoiceAdmission(registry?.heldByOtherPrincipal(toId, fromId) ?? false);
-    if (binding && binding.principalId !== fromId) {
-      throw new Error("voice session is not bound to this human; reconnect the voice stream");
+    if (binding?.principalId && binding.principalId !== fromId) {
+      throw new HumanVoiceAdmissionError();
     }
     const replyBinding = {
       principalId: fromId,
