@@ -38,17 +38,17 @@ describe("resolveObligationOwner — durable attribution", () => {
     for (const users of [[], [user(USER_A)], [user(USER_A), user(USER_B)]]) {
       const result = resolveObligationOwner(actors, HUMAN_OPERATOR, principals(users));
       expect(result.ok).toBe(false);
-      if (!result.ok) expect(result.error).toContain("/api/mesh/threads userPrincipalId");
+      if (!result.ok) expect(result.error).toContain("verified human message fromId");
     }
   });
-  it("accepts active durable users and actors, refusing disabled or unknown owners", () => {
+  it("preserves durable user ownership while refusing unknown owners", () => {
     expect(
       resolveObligationOwner(actors, USER_B, principals([user(USER_A), user(USER_B)]))
     ).toEqual({ ok: true, ownerId: USER_B });
     expect(resolveObligationOwner(actors, ACTOR)).toEqual({ ok: true, ownerId: ACTOR });
     expect(
-      resolveObligationOwner(actors, USER_A, principals([user(USER_A, "2026-02-01")])).ok
-    ).toBe(false);
+      resolveObligationOwner(actors, USER_A, principals([user(USER_A, "2026-02-01")]))
+    ).toEqual({ ok: true, ownerId: USER_A });
     expect(resolveObligationOwner(actors, "nobody").ok).toBe(false);
   });
 });

@@ -236,7 +236,7 @@ describe("turn-based actor chat", () => {
     expect(output).toContain("\u001B[33m[cloudy-porpoise is running]\u001B[39m\n\n");
   });
 
-  it("renders replies addressed to authenticated userPrincipalId", async () => {
+  it("retains legacy history reads alongside replies addressed to authenticated userPrincipalId", async () => {
     let sent = false;
     const userPrincipalId = "durable-user-uuid-123";
     const fetchMock = async (input: string | URL | Request) => {
@@ -249,6 +249,9 @@ describe("turn-based actor chat", () => {
       }
       if (url.includes("/api/mesh/events?")) {
         expect(url).toContain(userPrincipalId);
+        expect(new URL(url).searchParams.get("actors")).toBe(
+          `thread-1,human:operator,${userPrincipalId}`
+        );
         return Response.json({
           events: sent
             ? [
