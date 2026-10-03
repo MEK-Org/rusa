@@ -49,6 +49,57 @@ describe("inbox MCP server", () => {
     ]);
   });
 
+  it("projects live Room entry presence onto listed and selected notices (#829)", async () => {
+    store.append([
+      {
+        id: "room-entry:ep-1:actor-a",
+        actorId: "actor-a",
+        source: "room:entry",
+        payload: {
+          type: "room.human_entry",
+          version: 1,
+          priority: "responsive",
+          interruption: "join",
+          episodeId: "ep-1",
+          principalId: "user-1",
+          enteredAt: "2026-07-13T12:00:00.000Z",
+        },
+      },
+    ]);
+    let presence: "present" | "departed" = "present";
+    const client = await connect(
+      createInboxMcpServer(store, "actor-a", {
+        select: (ids) =>
+          ids.map((id) => {
+            const entry = store.read("actor-a", id);
+            if (!entry) throw new Error("missing test entry");
+            return entry;
+          }),
+        selected: () => [],
+        roomEntryPresence: (episodeId) => (episodeId === "ep-1" ? presence : "departed"),
+      })
+    );
+    type Listed = { entries: Array<{ id: string; roomEntryPresence?: string }> };
+    const listed = dataOf(
+      (await client.callTool({ name: "list", arguments: {} })) as CallToolResult
+    ) as Listed;
+    expect(listed.entries.map((entry) => [entry.id, entry.roomEntryPresence])).toEqual([
+      ["room-entry:ep-1:actor-a", "present"],
+      ["own", undefined],
+    ]);
+
+    // Selection reads presence again, so a human who left meanwhile is not greeted.
+    presence = "departed";
+    const selected = dataOf(
+      (await client.callTool({
+        name: "select",
+        arguments: { entry_ids: ["room-entry:ep-1:actor-a"] },
+      })) as CallToolResult
+    );
+    expect(JSON.stringify(selected)).toContain('"roomEntryPresence":"departed"');
+    expect(JSON.stringify(selected)).toContain("do not greet them");
+  });
+
   it("bakes actor identity into list/read and hides foreign ids as not found", async () => {
     const client = await connect(createInboxMcpServer(store, "actor-a"));
     const listed = (await client.callTool({ name: "list", arguments: {} })) as CallToolResult;

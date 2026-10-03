@@ -166,6 +166,12 @@ export interface DashboardMeshRefs {
   geminiApiKey?: DashboardDataDeps["geminiApiKey"];
   supportedVoices?: DashboardDataDeps["supportedVoices"];
   chatRoom?: DashboardDataDeps["chatRoom"];
+  roomEntry?: DashboardDataDeps["roomEntry"];
+  /**
+   * Told the session key of each dashboard session that ended (logout,
+   * revocation), so state bound to that session can be released (#829).
+   */
+  onDashboardSessionEnded?: (sessionKey: string) => void;
   referenceCache?: DashboardDataDeps["referenceCache"];
   chatClient?: DashboardDataDeps["chatClient"];
   slackClient?: DashboardDataDeps["slackClient"];
@@ -619,6 +625,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           avatarGeneration,
           supportedVoices: options.mesh.supportedVoices,
           chatRoom: options.mesh.chatRoom,
+          roomEntry: options.mesh.roomEntry,
           referenceCache: options.mesh.referenceCache,
           chatClient: options.mesh.chatClient,
           slackClient: options.mesh.slackClient,
@@ -662,6 +669,8 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
       sseHub.pushVoiceControl(sessionId, targetActorId)
     );
   }
+  const onSessionEnded = options.mesh?.onDashboardSessionEnded;
+  const detachSessionEnded = auth && onSessionEnded ? auth.onSessionEnded(onSessionEnded) : null;
   const server = createServer(createDashboardRequestHandler(options, dataDeps, voiceDeps, auth));
 
   await new Promise<void>((resolve, reject) => {
@@ -681,6 +690,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
     });
   }).catch(async (error) => {
     detachVoiceOutbound?.();
+    detachSessionEnded?.();
     options.voice?.service.setSessionTransferNotifier(undefined);
     sseHub?.close();
     await auth?.close();
@@ -689,6 +699,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
 
   return {
     close: async () => {
+      detachSessionEnded?.();
       await auth?.close();
       await new Promise<void>((resolve, reject) => {
         detachVoiceOutbound?.();

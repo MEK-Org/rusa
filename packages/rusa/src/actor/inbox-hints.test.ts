@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
-import { attachInboxHints, isGchatThreadHead, resolveInboxHint } from "./inbox-hints.js";
+import {
+  attachInboxHints,
+  isGchatThreadHead,
+  projectRoomEntryPresence,
+  resolveInboxHint,
+} from "./inbox-hints.js";
 
 function makeEntry(partial: Partial<InboxEntry> = {}): InboxEntry {
   return {
@@ -311,6 +316,62 @@ describe("inbox hints", () => {
 
       expect(hinted[1].id).toBe("e2");
       expect(hinted[1].hint).toBeUndefined();
+    });
+  });
+
+  describe("Room entry notices (#829)", () => {
+    const notice = (payload: Record<string, unknown> = {}) =>
+      makeEntry({
+        source: "room:entry",
+        payload: {
+          type: "room.human_entry",
+          version: 1,
+          priority: "responsive",
+          interruption: "join",
+          episodeId: "ep-1",
+          principalId: "user-1",
+          enteredAt: "2026-10-03T12:00:00.000Z",
+          ...payload,
+        },
+      });
+
+    it("projects the episode's live presence, defaulting to departed", () => {
+      const live = { roomEntryPresence: () => "present" as const };
+      expect(projectRoomEntryPresence(makeEntry(), live)).toBeUndefined();
+      expect(projectRoomEntryPresence(notice(), live)).toBe("present");
+      expect(projectRoomEntryPresence(notice())).toBe("departed");
+      expect(projectRoomEntryPresence(notice({ episodeId: undefined }), live)).toBe("departed");
+      expect(
+        projectRoomEntryPresence(notice(), {
+          roomEntryPresence: () => {
+            throw new Error("store unavailable");
+          },
+        })
+      ).toBe("departed");
+    });
+
+    it("invites one concise update only while the human is present", () => {
+      const present = resolveInboxHint(notice(), { roomEntryPresence: () => "present" });
+      expect(present).toContain("user-1 entered the Chat Room at 2026-10-03T12:00:00.000Z");
+      expect(present).toContain("notice, not a message");
+      expect(present).toContain("one concise, relevant update or unresolved question");
+      expect(present).toContain("otherwise say nothing");
+      expect(present).toContain("honest note; staying silent is fine");
+      for (const presence of ["reconnecting", "departed"] as const) {
+        const hint = resolveInboxHint(notice(), { roomEntryPresence: () => presence });
+        expect(hint).toContain("do not greet them or send an entry reply");
+        expect(hint).toContain("honest note; staying silent is fine");
+        expect(hint).not.toContain("one concise");
+      }
+    });
+
+    it("adds the projected presence beside the hint, and only to entry notices", () => {
+      const [room, other] = attachInboxHints([notice(), makeEntry({ id: "e2" })], {
+        roomEntryPresence: () => "reconnecting",
+      });
+      expect(room.roomEntryPresence).toBe("reconnecting");
+      expect(room.hint).toContain("reconnecting, not confirmed listening");
+      expect(other).not.toHaveProperty("roomEntryPresence");
     });
   });
 });

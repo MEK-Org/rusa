@@ -40,6 +40,8 @@ export interface ChatRoomServiceDeps {
   defaultVoice: VoiceConfigDocument;
   /** True for durable human principals, which are never room participants. */
   isHumanPrincipal: (id: string) => boolean;
+  /** Told after an actor actually left the room, e.g. to void its entry invitations (#829). */
+  onRemoved?: (actorId: string) => void;
   now?: () => string;
 }
 
@@ -119,7 +121,9 @@ export class ChatRoomService {
     if (ALIASES.has(id.toLowerCase())) {
       throw new Error("use an actor id, not an alias");
     }
-    return this.deps.store.remove(id);
+    const removed = this.deps.store.remove(id);
+    if (removed) this.deps.onRemoved?.(id);
+    return removed;
   }
 
   private resolveAddable(target: string): ActorRecord {

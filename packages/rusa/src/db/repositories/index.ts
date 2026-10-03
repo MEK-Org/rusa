@@ -25,6 +25,7 @@ import { PrincipalRepository } from "./principal-repository.js";
 import { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 import { RawInputRepository } from "./raw-input-repository.js";
 import { ReferenceCacheRepository } from "./reference-cache-repository.js";
+import { RoomEntryEpisodeRepository } from "./room-entry-episode-repository.js";
 import { SqliteActorRepository } from "./sqlite-actor-repository.js";
 import {
   type InboxListenerErrorHandler,
@@ -68,6 +69,7 @@ export class Repositories {
   readonly portableContext: DbPortableContextStore;
   readonly principals: PrincipalRepository;
   readonly referenceCache: ReferenceCacheRepository;
+  readonly roomEntryEpisodes: RoomEntryEpisodeRepository;
 
   constructor(db: Database.Database) {
     this.actorRuns = new ActorRunRepository(db);
@@ -98,6 +100,7 @@ export class Repositories {
     this.obligations.setPrincipalKind((principalId) => this.principals.get(principalId)?.kind);
     this.portableContext = new DbPortableContextStore(db);
     this.referenceCache = new ReferenceCacheRepository(db);
+    this.roomEntryEpisodes = new RoomEntryEpisodeRepository(db);
   }
 
   /**

@@ -28,7 +28,7 @@ describe("ChatRoomService", () => {
   let actors: SqliteActorRepository;
   let clock: number;
 
-  const service = () =>
+  const service = (onRemoved?: (actorId: string) => void) =>
     new ChatRoomService({
       store: new ChatRoomRepository(db),
       actors,
@@ -36,6 +36,7 @@ describe("ChatRoomService", () => {
       voices: () => buildSupportedVoiceCatalog(),
       defaultVoice: DEFAULT,
       isHumanPrincipal: (id) => id === "user-operator",
+      onRemoved,
       now: () => new Date(Date.UTC(2026, 8, 30, 12, 0, clock++)).toISOString(),
     });
 
@@ -166,6 +167,17 @@ describe("ChatRoomService", () => {
     expect(actors.get("a")?.voiceConfig).toEqual(assigned);
     expect(() => room.remove("root")).toThrow(/cannot be removed/);
     expect(() => room.remove("parent")).toThrow(/use an actor id, not an alias/);
+  });
+
+  it("tells its observer only when an actor actually left (#829)", () => {
+    actors.upsert(actor("a"));
+    const removed: string[] = [];
+    const room = service((actorId) => removed.push(actorId));
+    room.add("a", "root");
+    room.remove("a");
+    room.remove("a");
+    expect(() => room.remove("root")).toThrow(/cannot be removed/);
+    expect(removed).toEqual(["a"]);
   });
 
   it("hides a participant once it retires", () => {
