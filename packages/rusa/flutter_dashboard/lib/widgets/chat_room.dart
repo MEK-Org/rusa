@@ -463,18 +463,12 @@ class _RoomAvatarButton extends StatelessWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      speaking
-                          ? 'Speaking'
-                          : recording
-                          ? 'Tap to send'
-                          : _voiceLabel(actor),
+                      speaking ? 'Speaking' : _voiceLabel(actor),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         color: speaking
                             ? MeshColors.accent
-                            : recording
-                            ? MeshColors.statusHalted
                             : MeshColors.textSecondary,
                         fontSize: 12,
                       ),

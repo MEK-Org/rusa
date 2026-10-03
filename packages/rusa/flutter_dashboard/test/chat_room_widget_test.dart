@@ -318,10 +318,13 @@ void main() {
         ),
         findsOneWidget,
       );
+      // The operator asked for no "Tap to send" line under the name; the
+      // tile keeps its voice label while recording.
+      expect(find.text('Tap to send'), findsNothing);
       expect(
         find.descendant(
           of: find.byKey(const ValueKey('chat-room-avatar-actor-b')),
-          matching: find.text('Tap to send'),
+          matching: find.text('Voice: Kore'),
         ),
         findsOneWidget,
       );
