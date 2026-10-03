@@ -19,6 +19,11 @@ export type ContextConfig = NativeContextConfig | PortableContextConfig;
 /** A capability to message another actor. The unguessable id is the capability. */
 export interface ActorHandle {
   id: string;
+  /**
+   * Pairwise label written by earlier releases. Still read and re-saved so
+   * existing rows keep their stored form, but never rendered or newly granted:
+   * the target's own title or charter describes it (#814).
+   */
   role?: string;
   /**
    * Provenance of the handle capability. A delivery-introduced handle (#187) is

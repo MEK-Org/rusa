@@ -1252,7 +1252,7 @@ describe("agent-execution MCP server", () => {
     expect(registry.list().map((r) => r.id)).toEqual(["root"]);
   });
 
-  it("introduce grants the holder a handle to the target (with optional role)", async () => {
+  it("introduce grants the holder a plain handle and takes no pairwise role (#814)", async () => {
     const { mesh, registry } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const a = dataOf(
@@ -1273,11 +1273,24 @@ describe("agent-execution MCP server", () => {
         },
       })) as CallToolResult
     ) as { thread_id: string };
-    await client.callTool({
+    // A reply-only handle minted by message delivery (#796) ...
+    mesh.sendMessage(a.thread_id, "hello", b.thread_id);
+    expect(registry.get(a.thread_id)?.handles).toEqual([{ id: b.thread_id, origin: "message" }]);
+
+    // ... is untouched by an introduction that tries to label the target ...
+    const labelled = (await client.callTool({
       name: "introduce",
       arguments: { holder_thread_id: a.thread_id, target_thread_id: b.thread_id, role: "reviewer" },
+    })) as CallToolResult;
+    expect(labelled.isError).toBe(true);
+    expect(registry.get(a.thread_id)?.handles).toEqual([{ id: b.thread_id, origin: "message" }]);
+
+    // ... and becomes an explicit grant on a plain introduction.
+    await client.callTool({
+      name: "introduce",
+      arguments: { holder_thread_id: a.thread_id, target_thread_id: b.thread_id },
     });
-    expect(registry.get(a.thread_id)?.handles).toEqual([{ id: b.thread_id, role: "reviewer" }]);
+    expect(registry.get(a.thread_id)?.handles).toEqual([{ id: b.thread_id }]);
   });
 
   it("list_threads returns the caller's direct reports", async () => {

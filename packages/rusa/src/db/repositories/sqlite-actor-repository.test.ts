@@ -4,6 +4,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorRecord } from "../../actor/actor-record.js";
+import { resolveHandleLabels } from "../../actor/worker-prompt.js";
 import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 import { runMigrations } from "../migrations/runner.js";
 import { ModelClassRepository } from "./model-class-repository.js";
@@ -437,6 +438,70 @@ describe("SqliteActorRepository", () => {
       id: "peer-7",
       role: "__origin:legacy_unmatched",
     });
+  });
+
+  it("describes existing handle rows by target title or charter while keeping their provenance (#814)", () => {
+    repository.upsert(root);
+    repository.upsert({
+      id: "titled-peer",
+      charter: "Review release candidates\nand more",
+      parentId: "root",
+      status: "active",
+      title: "Release reviewer",
+      createdAt: "2026-09-03T13:00:00.000Z",
+    });
+    repository.upsert({
+      id: "untitled-peer",
+      charter: "Triage incoming issues",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-09-03T13:00:00.000Z",
+    });
+    repository.upsert({
+      id: "holder",
+      charter: "Hold handles",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-09-03T13:01:00.000Z",
+    });
+    // Rows as earlier releases wrote them: a pairwise label, and a
+    // delivery-introduced handle (#796) that also carries one.
+    const insert = db.prepare(
+      "INSERT INTO actor_handles (actor_id, target_id, role) VALUES ('holder', ?, ?)"
+    );
+    insert.run("titled-peer", "__origin:message:the boss");
+    insert.run("untitled-peer", "trusted operator");
+
+    const loaded = repository.get("holder");
+    expect(loaded?.handles).toEqual([
+      { id: "titled-peer", origin: "message", role: "the boss" },
+      { id: "untitled-peer", role: "trusted operator" },
+    ]);
+    expect(
+      resolveHandleLabels(
+        loaded?.handles,
+        (id) => repository.get(id)?.charter,
+        (id) => repository.get(id)?.title
+      )
+    ).toEqual([
+      { id: "titled-peer", label: "Release reviewer" },
+      { id: "untitled-peer", label: "Triage incoming issues" },
+    ]);
+
+    // Re-saving the record keeps the stored provenance that sender display
+    // and voice-transfer authority read.
+    if (!loaded) throw new Error("expected holder to exist");
+    repository.upsert(loaded);
+    expect(
+      db
+        .prepare(
+          "SELECT target_id, role FROM actor_handles WHERE actor_id = 'holder' ORDER BY target_id"
+        )
+        .all()
+    ).toEqual([
+      { target_id: "titled-peer", role: "__origin:message:the boss" },
+      { target_id: "untitled-peer", role: "trusted operator" },
+    ]);
   });
 
   it("preserves the original retired_at across repeated upserts of an already-retired record", () => {

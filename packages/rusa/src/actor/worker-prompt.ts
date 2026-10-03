@@ -5,8 +5,6 @@ import { generateHandle } from "./handle-generator.js";
 export interface ResolvedHandle {
   id: string;
   label: string;
-  /** Parent-authored thread title, when one is available. */
-  title?: string;
 }
 
 /**
@@ -264,28 +262,27 @@ export function summarizeCharter(charter: string | undefined, max = 100): string
 }
 
 /**
- * Resolve raw handles to display labels: the granter-set `role` if present, else
- * a summary of the target's own charter (looked up via `charterOf`). This keeps
- * the label truthful by default and lets a role override it with intent — and
- * means the role is never a stale copy of the charter.
+ * Resolve raw handles to display labels from the target actor itself: its title,
+ * else a summary of its charter for older untitled actors. A pairwise `role` on
+ * the handle is never shown, so no granter can put its own text into the
+ * holder's prompt as a description of someone else (#814).
  */
 export function resolveHandleLabels(
   handles: ActorHandle[] | undefined,
   charterOf: (id: string) => string | undefined,
-  titleOf?: (id: string) => string | undefined
+  titleOf: (id: string) => string | undefined
 ): ResolvedHandle[] {
-  return (handles ?? []).map((h) => {
-    const label = h.role ?? summarizeCharter(charterOf(h.id));
-    const title = titleOf?.(h.id);
-    return { id: h.id, label, ...(title ? { title } : {}) };
-  });
+  return (handles ?? []).map((h) => ({
+    id: h.id,
+    label: titleOf(h.id)?.trim() || summarizeCharter(charterOf(h.id)),
+  }));
 }
 
 /** Render the reachable actors as a bullet list: parent first, then granted handles. */
 function renderAddressBook(ctx: WorkerPromptContext): string {
   const lines = [`- \`${ctx.parentId}\` — your **parent** (report results here)`];
   for (const h of ctx.handles ?? []) {
-    lines.push(`- \`${h.id}\` — ${h.label}${h.title ? ` (title: ${h.title})` : ""}`);
+    lines.push(`- \`${h.id}\` — ${h.label}`);
   }
   return lines.join("\n");
 }

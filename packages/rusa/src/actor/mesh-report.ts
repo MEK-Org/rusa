@@ -283,7 +283,7 @@ function renderTopology(records: ActorRecord[], counts: Map<string, number>): st
         ? `<div class="handles">↔ ${r.handles
             .map(
               (h) =>
-                `<button class="actor-link" title="${esc(h.id)}" data-actor="${esc(h.id)}">${esc(shortId(h.id))}</button>${h.role ? ` <span class="muted">(${esc(h.role)})</span>` : ""}`
+                `<button class="actor-link" title="${esc(h.id)}" data-actor="${esc(h.id)}">${esc(shortId(h.id))}</button>`
             )
             .join(", ")}</div>`
         : "";
