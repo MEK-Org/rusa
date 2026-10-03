@@ -785,6 +785,11 @@ class _DetailViewState extends State<_DetailView> {
   List<ObligationHistoryDto> _history = const [];
   String? _historyNextBefore;
   bool _loadingHistory = false;
+
+  /// The newest "Show more updates" request. A newer load can supersede it
+  /// (#772); if nothing has started another history page since, its stale
+  /// answer still has to release the busy control.
+  int _historyRequest = 0;
   bool _historyPaged = false;
   String? _historyError;
   List<ObligationCompletionDto> _completions = const [];
@@ -1371,17 +1376,27 @@ class _DetailViewState extends State<_DetailView> {
   void _loadMoreHistory() {
     if (_loadingHistory || _historyNextBefore == null) return;
     final gen = _fetchGeneration;
+    final request = ++_historyRequest;
     setState(() {
       _loadingHistory = true;
       _historyError = null;
     });
+    bool superseded() {
+      if (!mounted) return true;
+      if (gen == _fetchGeneration) return false;
+      if (request == _historyRequest && _loadingHistory) {
+        setState(() => _loadingHistory = false);
+      }
+      return true;
+    }
+
     store.api
         .fetchObligationDetail(
           widget.obligationId,
           historyBefore: _historyNextBefore,
         )
         .then((data) {
-          if (!mounted || gen != _fetchGeneration) return;
+          if (superseded()) return;
           setState(() {
             _history = _mergeHistory(data.history, _history);
             _historyPaged = true;
@@ -1390,7 +1405,7 @@ class _DetailViewState extends State<_DetailView> {
           });
         })
         .catchError((Object error) {
-          if (!mounted || gen != _fetchGeneration) return;
+          if (superseded()) return;
           setState(() {
             _loadingHistory = false;
             _historyError = 'Earlier history unavailable. Try again.';

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
@@ -35,6 +36,9 @@ Future<void> showDetail(
 }
 
 class MixedHistoryApi extends FakeApi {
+  /// When set, the next earlier-history page waits for this before answering.
+  Completer<void>? holdHistory;
+
   @override
   Future<ObligationDetailSnapshot> fetchObligationDetail(
     String id, {
@@ -44,7 +48,18 @@ class MixedHistoryApi extends FakeApi {
     int? blockingOffset,
     int? completionsOffset,
     int? limit,
-  }) async => ObligationDetailSnapshot(
+  }) async {
+    final hold = historyBefore == null ? null : holdHistory;
+    holdHistory = null;
+    await hold?.future;
+    return _snapshot(id, historyBefore, completionsOffset);
+  }
+
+  ObligationDetailSnapshot _snapshot(
+    String id,
+    String? historyBefore,
+    int? completionsOffset,
+  ) => ObligationDetailSnapshot(
     obligation: obligationsResult.first,
     children: const [],
     blockingChildren: const [],
@@ -95,6 +110,36 @@ void main() {
       });
     });
   }
+  testWidgets('completion page during history load releases Loading…', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = MixedHistoryApi()
+        ..threadsResult = [makeThread('root')]
+        ..obligationsResult = [
+          makeObligation('detail', ownerId: 'root', title: 'Mixed history'),
+        ];
+      await showDetail(tester, api);
+      final hold = api.holdHistory = Completer<void>();
+      await tester.ensureVisible(find.text('Show more updates'));
+      await tester.tap(find.text('Show more updates'));
+      await tester.pump();
+      expect(find.text('Loading…'), findsOneWidget);
+      final completions = find.text('Load earlier completions (1 remaining)');
+      await tester.ensureVisible(completions);
+      await tester.tap(completions);
+      await tester.pumpAndSettle();
+      hold.complete();
+      await tester.pumpAndSettle();
+      expect(find.text('Loading…'), findsNothing);
+      await tester.ensureVisible(find.text('Show more updates'));
+      await tester.tap(find.text('Show more updates'));
+      await tester.pumpAndSettle();
+      expect(find.text('Show more updates'), findsNothing);
+      expect(find.text('standing 2'), findsOneWidget);
+      expect(find.text('old cycle'), findsOneWidget);
+    });
+  });
   for (final exhausted in [false, true]) {
     testWidgets('refresh burst bridges history gap, exhausted=$exhausted', (
       tester,
