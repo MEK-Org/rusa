@@ -361,42 +361,29 @@ export function setProviderModelCatalog(provider: string, entries: readonly Mode
   catalogs.set(provider, normalizeModelEntries(provider, entries));
 }
 
-const normalizedCatalogSnapshot = z.record(
-  z.string().min(1),
-  z.array(
-    z.object({
-      identifier: z
-        .string()
-        .min(1)
-        .refine((value) => value === value.trim()),
-      displayLabel: z
-        .string()
-        .min(1)
-        .refine((value) => value === value.trim()),
-      passable: z.boolean().optional(),
-      efforts: z
-        .array(
-          z
-            .string()
-            .min(1)
-            .refine((effort) => effort === effort.trim().toLowerCase())
-        )
-        .optional(),
-    })
-  )
-);
+const normalizedModelEntrySchema = z
+  .object({
+    identifier: z.string().min(1),
+    displayLabel: z.string().min(1),
+    passable: z.boolean().optional(),
+    efforts: z.array(z.string().min(1)).optional(),
+  })
+  .passthrough();
+
+const normalizedCatalogSnapshot = z.record(z.string().min(1), z.array(normalizedModelEntrySchema));
 
 /** Replace process-local state from a normalized bootstrap, preserving effort metadata. */
 export function replaceProviderModelCatalogs(snapshot: unknown): void {
-  // Omission is an old bootstrap with no known catalog, never permission to keep stale pins.
-  // Clear before validation so malformed reconnect metadata cannot retain earlier selections.
-  catalogs.clear();
+  // Validate before mutating process-global state so an unparseable snapshot fails
+  // without stripping co-resident actors sharing this map.
   const parsed = normalizedCatalogSnapshot.safeParse(snapshot === undefined ? {} : snapshot);
   if (!parsed.success) {
     throw new Error(
-      "Invalid model catalog snapshot: expected provider arrays of normalized model entries with identifier, displayLabel, boolean passable and lowercase efforts"
+      "Invalid model catalog snapshot: expected provider arrays of normalized model entries with identifier, displayLabel, optional boolean passable and string efforts"
     );
   }
+  // Omission is an old bootstrap with no known catalog, never permission to keep stale pins.
+  catalogs.clear();
   for (const [provider, entries] of Object.entries(parsed.data)) catalogs.set(provider, entries);
 }
 

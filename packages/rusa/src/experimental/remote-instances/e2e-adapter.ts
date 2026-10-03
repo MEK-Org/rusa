@@ -27,6 +27,8 @@ export function instanceWorkerFactory(
     const toolUrls = () => hub.toolUrls(target, record.id, options.mcpServers);
     const providerOptions = () => ({
       // Adapter metadata and normalized catalogs are sufficient for follower selection.
+      // Transmit all configured provider catalogs so multi-candidate or staged cross-provider
+      // model selections in options.modelConfig remain resolvable on the follower.
       providers: config.providers,
       name,
       modelCatalogs: Object.fromEntries(getAllProviderModelCatalogs()),

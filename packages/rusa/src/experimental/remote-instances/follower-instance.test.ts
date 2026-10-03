@@ -14,6 +14,10 @@ import {
 import { ProviderPacer } from "../../actor/provider-pacer.js";
 import { runMigrations } from "../../db/migrations/runner.js";
 import { ObligationRepository } from "../../db/repositories/obligation-repository.js";
+import {
+  clearProviderModelCatalog,
+  getProviderModelCatalog,
+} from "../../providers/model-catalog.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { createHarness, waitUntil } from "./harness.js";
 import type { ActorEvent, LeaderCommand, ProviderFactory } from "./protocol.js";
@@ -2486,5 +2490,79 @@ describe("monolithic follower instance", () => {
     });
     expect(h.mesh.activeRunState(id)).toEqual({ actorId: id, phase: "running" });
     expect(() => h.mesh.retire(id)).toThrow(/cannot retire/);
+  });
+
+  it("preserves co-resident actor catalogs when another actor receives a malformed snapshot", () => {
+    const events: { actorId: string; message: unknown }[] = [];
+    const follower = new FollowerInstance(
+      "/tmp/rusa-follower-twoactor",
+      false,
+      (event) => events.push({ actorId: event.actorId, message: event.message }),
+      () => ({ run: () => Promise.resolve({ status: "SUCCESS" }) }) as never
+    );
+    try {
+      // Actor A initializes with a valid Antigravity catalog
+      follower.dispatch({
+        actorId: "actor-a",
+        message: {
+          type: "init",
+          bootstrap: {
+            id: "actor-a",
+            cwd: "/tmp/rusa-follower-twoactor",
+            providerOptions: {
+              modelCatalogs: {
+                agy: [
+                  {
+                    identifier: "gemini-fixture-high",
+                    displayLabel: "Fixture (High)",
+                    passable: true,
+                  },
+                ],
+              },
+            },
+          },
+        },
+      });
+      expect(getProviderModelCatalog("agy")).toEqual([
+        { identifier: "gemini-fixture-high", displayLabel: "Fixture (High)", passable: true },
+      ]);
+
+      // Actor B initializes with a malformed catalog
+      follower.dispatch({
+        actorId: "actor-b",
+        message: {
+          type: "init",
+          bootstrap: {
+            id: "actor-b",
+            cwd: "/tmp/rusa-follower-twoactor",
+            providerOptions: {
+              modelCatalogs: {
+                agy: [{ identifier: 123 }],
+              },
+            },
+          },
+        },
+      });
+
+      // Actor B receives fatal event and is refused/closed
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          actorId: "actor-b",
+          message: expect.objectContaining({
+            type: "fatal",
+            error: expect.stringContaining("Invalid model catalog snapshot"),
+          }),
+        })
+      );
+      expect(follower.actorIds).not.toContain("actor-b");
+
+      // Actor A's catalog remains intact in the shared process-global catalog map
+      expect(getProviderModelCatalog("agy")).toEqual([
+        { identifier: "gemini-fixture-high", displayLabel: "Fixture (High)", passable: true },
+      ]);
+    } finally {
+      follower.close();
+      clearProviderModelCatalog();
+    }
   });
 });

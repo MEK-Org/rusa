@@ -1065,7 +1065,7 @@ it("preserves normalized Antigravity catalog efforts across serialization and re
   expect(getProviderModelCatalog("antigravity")).toEqual(normalized);
 });
 
-it("normalized snapshots replace aliases, clear on omission or invalid shape, and own their entries", () => {
+it("normalized snapshots replace aliases, clear on omission, and own their entries", () => {
   const snapshot = {
     agy: [{ identifier: "gemini-fixture-high", displayLabel: "Gemini Fixture", efforts: ["high"] }],
   };
@@ -1079,9 +1079,49 @@ it("normalized snapshots replace aliases, clear on omission or invalid shape, an
   expect(getProviderModelCatalog("agy")).toEqual([]);
   replaceProviderModelCatalogs(undefined);
   expect(getAllProviderModelCatalogs().size).toBe(0);
+});
+
+it("validation occurs before clearing, preserving healthy shared catalog state on refusal", () => {
   replaceProviderModelCatalogs({ codex: [{ identifier: "fixture", displayLabel: "Fixture" }] });
   expect(() => replaceProviderModelCatalogs({ codex: [{}] })).toThrow(
     "Invalid model catalog snapshot"
   );
-  expect(getAllProviderModelCatalogs().size).toBe(0);
+  expect(getAllProviderModelCatalogs().size).toBe(1);
+  expect(getProviderModelCatalog("codex")).toEqual([
+    { identifier: "fixture", displayLabel: "Fixture" },
+  ]);
+});
+
+it("accepts relaxed consumer shapes and preserves forward-compatible fields in transit", () => {
+  replaceProviderModelCatalogs({
+    agy: [
+      {
+        identifier: "gemini-fixture",
+        displayLabel: "Gemini Fixture with trailing space ",
+        passable: true,
+        efforts: ["HIGH", "low"],
+        futureContextWindow: 1_000_000,
+      },
+    ],
+  });
+  expect(getProviderModelCatalog("agy")?.[0]).toMatchObject({
+    identifier: "gemini-fixture",
+    displayLabel: "Gemini Fixture with trailing space ",
+    passable: true,
+    efforts: ["HIGH", "low"],
+    futureContextWindow: 1_000_000,
+  });
+});
+
+it.each([
+  null,
+  [],
+  { agy: null },
+  { agy: [{ identifier: 17, displayLabel: "fixture" }] },
+  { agy: [{ identifier: "", displayLabel: "fixture" }] },
+  { agy: [{ identifier: "gemini-fixture", displayLabel: "" }] },
+  { agy: [{ identifier: "gemini-fixture", displayLabel: "fixture", passable: "yes" }] },
+  { agy: [{ identifier: "gemini-fixture", displayLabel: "fixture", efforts: "high" }] },
+])("refuses malformed catalog snapshot shape in-process: %j", (catalogs) => {
+  expect(() => replaceProviderModelCatalogs(catalogs)).toThrow("Invalid model catalog snapshot");
 });

@@ -330,18 +330,9 @@ it("reconnect omission keeps an old bootstrap's default-provider execution compa
   expect(observed.events.filter((e) => e.type === "error" || e.type === "fatal")).toEqual([]);
 }, 30_000);
 
-it.each(
-  [
-    null,
-    [],
-    { agy: null },
-    { agy: [{ identifier: 17, displayLabel: "fixture" }] },
-    { agy: [{ identifier: "gemini-fixture", displayLabel: "fixture", efforts: ["HIGH"] }] },
-    { agy: [{ identifier: "gemini-fixture", displayLabel: "fixture", passable: "yes" }] },
-  ].map((catalogs) => ({ catalogs }))
-)("refuses malformed normalized catalog metadata: $catalogs", async ({ catalogs }) => {
+it("refuses malformed normalized catalog metadata on initial bootstrap", async () => {
   const bootstrap = populatedBootstrap();
-  if (bootstrap.providerOptions) bootstrap.providerOptions.modelCatalogs = catalogs;
+  if (bootstrap.providerOptions) bootstrap.providerOptions.modelCatalogs = { agy: [{}] };
   const observed = await runFollower(bootstrap);
   expect(observed.launches).toEqual([]);
   expect(observed.events).toContainEqual(

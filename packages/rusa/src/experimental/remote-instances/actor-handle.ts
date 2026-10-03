@@ -293,6 +293,8 @@ export class ActorHandle implements MeshActor {
       type: "init",
       bootstrap: {
         ...this.opts.bootstrap,
+        // Refresh catalog and provider options on reconnect. Mid-life catalog additions
+        // without an init take effect on next reconnect or process restart (#878 scope limitation).
         providerOptions: this.opts.getProviderOptions?.() ?? this.opts.bootstrap.providerOptions,
         ...(sessionId ? { sessionId } : {}),
         modelConfig: freshSnapshot.record.modelConfig ?? this.modelConfig,
