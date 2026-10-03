@@ -119,6 +119,15 @@ class EventsTab extends StatelessWidget {
         ? (row.yielded!.body ?? e.detail)
         : (isMessage ? (e.body ?? e.detail) : e.detail);
     final resolvedRunModel = e.resolvedRunModel;
+    String? runId;
+    if (e.kind == 'run_start' && e.payload != null) {
+      try {
+        final payload = jsonDecode(e.payload!) as Map<String, dynamic>;
+        if (payload['runId'] is String && (payload['runId'] as String).isNotEmpty) {
+          runId = payload['runId'] as String;
+        }
+      } catch (_) {}
+    }
 
     Widget? peerLabel;
     String? directionPeer;
