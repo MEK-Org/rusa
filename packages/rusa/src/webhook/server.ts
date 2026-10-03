@@ -343,7 +343,7 @@ export function createDashboardRequestHandler(
       // Keep allowlist refusal at the established auth boundary, before storage reads.
       if (
         req.method === "GET" &&
-        auth?.config.allowedEmails &&
+        auth?.config?.allowedEmails &&
         /^\/api\/mesh\/runs\/[^/]+\/prompt$/.test(pathname)
       ) {
         res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
