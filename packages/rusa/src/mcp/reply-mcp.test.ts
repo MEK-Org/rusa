@@ -7,7 +7,9 @@ import { describe, expect, it, onTestFinished } from "vitest";
 import type { Actor } from "../actor/actor.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
 import { HUMAN_OPERATOR } from "./stamp.js";
@@ -31,6 +33,8 @@ function setupTestMesh() {
   const db = new Database(":memory:");
   runMigrations(db);
   const principals = new PrincipalRepository(db);
+  const inboxStore = new SqliteInboxRepository(db);
+  const chatStore = new MeshChatRepository(db);
   principals.ensureImplicitUser("2026-01-01T00:00:00Z");
   onTestFinished(() => {
     db.close();
@@ -43,6 +47,8 @@ function setupTestMesh() {
   }[] = [];
   const mesh = new ActorMesh({
     principals,
+    inboxStore,
+    recordChat: (entry) => chatStore.record(entry),
     actors: registry,
     events: (e) => recordedEvents.push(e),
     grantableCapabilities: new Set(),
@@ -67,7 +73,7 @@ function setupTestMesh() {
     createdAt: "2026-07-05T00:00:00Z",
   });
 
-  return { registry, mesh, recordedEvents };
+  return { registry, mesh, inboxStore, recordedEvents };
 }
 
 describe("Mesh Chat Security Invariant Tests", () => {
@@ -102,7 +108,7 @@ describe("Mesh Chat Security Invariant Tests", () => {
 
   describe("Negative Test #2: Reply Tool Scoped by Mount/Construction", () => {
     it("hides the reply tool until the operator has pinged the actor, and scopes reply to the actor's thread", async () => {
-      const { mesh, recordedEvents } = setupTestMesh();
+      const { mesh, inboxStore, recordedEvents } = setupTestMesh();
 
       // Before human messages actor-A, its server has no reply tool
       const serverBefore = createAgentExecMcpServer(mesh, "actor-A", "root");
@@ -110,10 +116,23 @@ describe("Mesh Chat Security Invariant Tests", () => {
       const { tools: toolsBefore } = await clientBefore.listTools();
       expect(toolsBefore.map((t) => t.name)).not.toContain("reply");
 
-      // Send message from human operator to actor-A
-      mesh.sendHumanMessage("actor-A", "operator ping", "session-XYZ", {
-        fromId: testHumanId(mesh),
-      });
+      const actor = mesh.actors.get("actor-A");
+      if (!actor) throw new Error("missing synthetic actor");
+      mesh.adopt(actor, {
+        id: "actor-A",
+        requestRun: () => {},
+        markUnkillable: () => {},
+        close: () => {},
+        isRunning: false,
+        preemptForResponsive: () => ({ preempted: false as const }),
+      } as unknown as Actor);
+      expect(
+        mesh.sendHumanMessage("actor-A", "operator ping", "session-XYZ", {
+          fromId: testHumanId(mesh),
+        }).delivered
+      ).toBe(true);
+      const [input] = inboxStore.list("actor-A").entries;
+      if (!input) throw new Error("missing accepted human input");
 
       // Now the server should have the reply tool
       const serverAfter = createAgentExecMcpServer(mesh, "actor-A", "root");
@@ -132,10 +151,17 @@ describe("Mesh Chat Security Invariant Tests", () => {
       // Clear recorded events to verify only the reply event
       recordedEvents.length = 0;
 
+      const missingRef = (await clientAfter.callTool({
+        name: "reply",
+        arguments: { message: "unbound reply" },
+      })) as CallToolResult;
+      expect(missingRef.isError).toBe(true);
+      expect(recordedEvents).toHaveLength(0);
+
       // Call reply tool on actor-A and verify the recorded event
       const res = (await clientAfter.callTool({
         name: "reply",
-        arguments: { message: "reply from actor-A" },
+        arguments: { message: "reply from actor-A", input_ref: input.id },
       })) as CallToolResult;
 
       expect(res.isError).toBeFalsy();
