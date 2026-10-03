@@ -1,0 +1,18 @@
+CONSOLE Injecting <script> tag. Using callback.
+CONSOLE [.WebGL-0x3bfc059e1400]GL Driver Message (OpenGL, Performance, GL_CLOSE_PATH_NV, High): GPU stall due to ReadPixels
+wide-before: captured
+CONSOLE Injecting <script> tag. Using callback.
+CONSOLE [.WebGL-0x3bfc02f98800]GL Driver Message (OpenGL, Performance, GL_CLOSE_PATH_NV, High): GPU stall due to ReadPixels
+wide-collapsed: captured
+CONSOLE Injecting <script> tag. Using callback.
+wide-expanded: captured
+CONSOLE Injecting <script> tag. Using callback.
+wide-unavailable: captured
+CONSOLE Injecting <script> tag. Using callback.
+narrow-before: captured
+CONSOLE Injecting <script> tag. Using callback.
+narrow-collapsed: captured
+CONSOLE Injecting <script> tag. Using callback.
+narrow-expanded: captured
+CONSOLE Injecting <script> tag. Using callback.
+narrow-unavailable: captured
