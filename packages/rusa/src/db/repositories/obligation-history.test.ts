@@ -155,7 +155,7 @@ describe("Obligation mutation history", () => {
     expect(projected.map((h) => h.mutationKind)).toEqual([
       "artifact",
       "status",
-      "child_added",
+      "current_child_created",
       "created",
     ]);
     expect(projected[0]).toMatchObject({
@@ -173,6 +173,36 @@ describe("Obligation mutation history", () => {
       "history failed"
     );
     expect(repository.get(child.id)?.checkpoint).toBeNull();
+  });
+
+  it("labels child creation as current membership after A-to-B reparenting", () => {
+    const a = repository.create({ title: "A", ownerId: "actor-a" });
+    const b = repository.create({ title: "B", ownerId: "actor-a" });
+    now += 1_000;
+    const child = repository.create({
+      title: "Child",
+      ownerId: "actor-b",
+      parentId: a.id,
+      creatorId: "actor-c",
+    });
+    now += 1_000;
+    repository.reparent(child.id, b.id, "actor-a");
+    repository.reassign(child.id, "actor-a", "actor-a");
+    const inA = repository.listHistoryPage(a.id).entries;
+    const inB = repository.listHistoryPage(b.id).entries;
+    expect(inA.some((e) => e.after.child?.id === child.id)).toBe(false);
+    expect(inB.find((e) => e.after.child?.id === child.id)).toMatchObject({
+      mutationKind: "current_child_created",
+      timestamp: child.createdAt,
+      actingPrincipal: "actor-c",
+      after: { child: { title: "Child", ownerId: "actor-a" } },
+    });
+    expect(
+      repository.listHistory(child.id).find((e) => e.mutationKind === "reparent")
+    ).toMatchObject({
+      before: { parentId: a.id },
+      after: { parentId: b.id },
+    });
   });
 
   it("pages history with a stable exclusive id boundary across concurrent writes", () => {

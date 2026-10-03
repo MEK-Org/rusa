@@ -2675,9 +2675,10 @@ export class ObligationRepository {
   }
 
   /**
-   * A paged, newest-first detail trail. Child creation and artifacts already
-   * carry author/time in their source tables: project them without duplicate
-   * audit writes. A timestamp plus source-qualified key keeps pages stable
+   * A paged, newest-first detail trail. Artifacts and creation of current
+   * children project their source timestamps without duplicate audit writes.
+   * Current child membership/title/owner is not historical addition to this parent.
+   * A timestamp plus source-qualified key keeps pages stable
    * when newer events arrive (including several mutations in one millisecond).
    */
   listHistoryPage(
@@ -2688,7 +2689,7 @@ export class ObligationRepository {
       Omit<ObligationHistoryEntry, "id" | "mutationKind" | "actingPrincipal"> & {
         id: string;
         actingPrincipal: string | null;
-        mutationKind: ObligationMutationKind | "artifact" | "child_added" | "created";
+        mutationKind: ObligationMutationKind | "artifact" | "current_child_created" | "created";
         after: ObligationHistoryState & {
           artifact?: { ref: string; label: string | null };
           child?: { id: string; title: string | null; ownerId: string };
@@ -2707,37 +2708,49 @@ export class ObligationRepository {
       SELECT * FROM (
         SELECT 'history:' || printf('%016d', id) AS event_key, timestamp,
           'history' AS source, id AS source_id, NULL AS principal, NULL AS title,
-          NULL AS owner_id, NULL AS ref, NULL AS label
+          NULL AS owner_id, NULL AS ref, NULL AS label,
+          obligation_id, mutation_kind, acting_principal, payload
         FROM obligation_history WHERE obligation_id = @id
         UNION ALL
         SELECT 'artifact:' || id, attached_at, 'artifact', id, attached_by,
-          NULL, NULL, ref, label FROM obligation_artifacts WHERE obligation_id = @id
+          NULL, NULL, ref, label, NULL, NULL, NULL, NULL FROM obligation_artifacts WHERE obligation_id = @id
         UNION ALL
-        SELECT 'child:' || id, created_at, 'child_added', id, creator_id,
-          title, owner_id, NULL, NULL FROM obligations WHERE parent_id = @id AND created_at IS NOT NULL
+        SELECT 'child:' || id, created_at, 'current_child_created', id, creator_id,
+          title, owner_id, NULL, NULL, NULL, NULL, NULL, NULL FROM obligations WHERE parent_id = @id AND created_at IS NOT NULL
         UNION ALL
         SELECT 'created:' || id, created_at, 'created', id, creator_id,
-          title, owner_id, NULL, NULL FROM obligations WHERE id = @id AND created_at IS NOT NULL
+          title, owner_id, NULL, NULL, NULL, NULL, NULL, NULL FROM obligations WHERE id = @id AND created_at IS NOT NULL
       ) WHERE timestamp < @beforeTime OR (timestamp = @beforeTime AND event_key < @beforeKey)
       ORDER BY timestamp DESC, event_key DESC LIMIT @limit
     `)
       .all({ id, beforeTime, beforeKey, limit: limit + 1 }) as Array<{
       event_key: string;
       timestamp: string;
-      source: "history" | "artifact" | "child_added" | "created";
+      source: "history" | "artifact" | "current_child_created" | "created";
       source_id: string | number;
       principal: string | null;
       title: string | null;
       owner_id: string;
       ref: string;
       label: string | null;
+      obligation_id: string;
+      mutation_kind: ObligationMutationKind;
+      acting_principal: string;
+      payload: string;
     }>;
     const entries = rows.slice(0, limit).map((row) => {
       if (row.source === "history") {
-        const stored = this.db
-          .prepare("SELECT * FROM obligation_history WHERE id = ?")
-          .get(row.source_id);
-        return { ...parseHistoryRow(stored), id: row.event_key };
+        return {
+          ...parseHistoryRow({
+            id: row.source_id,
+            obligation_id: row.obligation_id,
+            mutation_kind: row.mutation_kind,
+            acting_principal: row.acting_principal,
+            timestamp: row.timestamp,
+            payload: row.payload,
+          }),
+          id: row.event_key,
+        };
       }
       return {
         id: row.event_key,
@@ -2749,7 +2762,7 @@ export class ObligationRepository {
         after:
           row.source === "artifact"
             ? { artifact: { ref: row.ref, label: row.label } }
-            : row.source === "child_added"
+            : row.source === "current_child_created"
               ? { child: { id: String(row.source_id), title: row.title, ownerId: row.owner_id } }
               : {},
       };
