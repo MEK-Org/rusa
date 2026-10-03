@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createLogger, type Logger } from "../observability/logger.js";
+import type { AbortReason } from "../providers/termination-attribution.js";
 import type { RunResult } from "../providers/types.js";
 import { logRunEnd } from "./start.js";
 
@@ -73,7 +74,10 @@ describe("logRunEnd", () => {
     });
   });
 
-  it.each(["stall-watchdog", "run-ceiling"])("records %s abortReason on run_end", (abortReason) => {
+  it.each<AbortReason>([
+    "stall-watchdog",
+    "run-ceiling",
+  ])("records %s abortReason on run_end", (abortReason) => {
     const { logger, records } = recordingLogger();
 
     logRunEnd(

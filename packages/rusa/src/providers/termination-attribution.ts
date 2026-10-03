@@ -38,7 +38,24 @@ export interface TerminationAttribution {
   cancelled: boolean;
   interrupted?: boolean;
   interruptSource?: string;
-  abortReason?: AbortReason | string;
+  abortReason: AbortReason;
+}
+
+/**
+ * Extract the typed AbortReason from an AbortSignal without string formatting.
+ */
+export function extractAbortReason(signal?: AbortSignal): AbortReason {
+  const reason = signal?.aborted ? signal.reason : undefined;
+  if (isInterruptAbortReason(reason)) {
+    return reason as AbortReason;
+  }
+  if (reason === STALL_WATCHDOG_ABORT_REASON) {
+    return STALL_WATCHDOG_ABORT_REASON;
+  }
+  if (reason === RUN_CEILING_ABORT_REASON) {
+    return RUN_CEILING_ABORT_REASON;
+  }
+  return "unknown";
 }
 
 /**
@@ -59,7 +76,7 @@ export function formatSigtermResult(
       cancelled: true,
       interrupted: true,
       interruptSource: by,
-      abortReason: reason as string,
+      abortReason: reason as AbortReason,
     };
   }
 

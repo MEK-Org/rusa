@@ -115,20 +115,31 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
       resolve(resolvedValue);
     };
 
+    const settleKilled = (
+      build: (sig: TerminationAttribution) => RunResult,
+      sigtermResult: TerminationAttribution
+    ) => {
+      const res = build(sigtermResult);
+      if (sigtermResult.abortReason !== undefined && res.abortReason === undefined) {
+        res.abortReason = sigtermResult.abortReason;
+      }
+      settle(res);
+    };
+
     // Own the timeout in Node (not spawn's `timeout`, whose SIGTERM leaves the
     // detached group alive) so we can kill the whole group on expiry.
     timer = setTimeout(() => {
       killGroup();
       config.onStdoutEnd?.(chunks);
       const sigtermResult = formatSigtermResult(chunks.join(""), config.signal);
-      settle(config.buildKilledResult(sigtermResult));
+      settleKilled(config.buildKilledResult, sigtermResult);
     }, config.timeoutMs);
 
     const onAbort = () => {
       killGroup();
       config.onStdoutEnd?.(chunks);
       const sigtermResult = formatSigtermResult(chunks.join(""), config.signal);
-      settle(config.buildKilledResult(sigtermResult));
+      settleKilled(config.buildKilledResult, sigtermResult);
     };
     if (config.signal?.aborted) {
       // Signal was already aborted before we registered — handle immediately.
@@ -176,7 +187,7 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
       if (signal === "SIGTERM" || signal === "SIGKILL") {
         config.onStdoutEnd?.(chunks);
         const sigtermResult = formatSigtermResult(chunks.join(""), config.signal);
-        settle(config.buildSignalResult(sigtermResult, signal));
+        settleKilled((sig) => config.buildSignalResult(sig, signal), sigtermResult);
         return;
       }
       const exitCode = code ?? 1;

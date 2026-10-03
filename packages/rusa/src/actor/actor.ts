@@ -8,6 +8,7 @@ import {
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
 import {
   createInterruptAbortReason,
+  extractAbortReason,
   formatSigtermResult,
   RUN_CEILING_ABORT_REASON,
   STALL_WATCHDOG_ABORT_REASON,
@@ -947,8 +948,7 @@ export class Actor {
         result.success = false;
         Object.assign(result, formatSigtermResult(result.output, abortController.signal));
       } else if (!result.abortReason) {
-        const attribution = formatSigtermResult(result.output, abortController.signal);
-        result.abortReason = attribution.abortReason;
+        result.abortReason = extractAbortReason(abortController.signal);
       }
     }
 

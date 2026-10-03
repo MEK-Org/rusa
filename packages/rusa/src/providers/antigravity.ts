@@ -726,40 +726,18 @@ export class AntigravityProvider implements CodingProvider {
         }
       },
       cleanup,
-      buildKilledResult: ({
-        output,
-        exitCode,
-        cancelled,
-        interrupted,
-        interruptSource,
-        abortReason,
-      }) =>
+      buildKilledResult: (sigtermResult) =>
         withTokenUsage({
+          ...sigtermResult,
           success: false,
-          output: finalResultText && !opts.signal?.aborted ? finalResultText : output,
-          exitCode,
-          cancelled,
-          interrupted,
-          interruptSource,
-          abortReason,
+          output: finalResultText && !opts.signal?.aborted ? finalResultText : sigtermResult.output,
           sessionId: opts.session?.id,
         }),
-      buildSignalResult: ({
-        output,
-        exitCode,
-        cancelled,
-        interrupted,
-        interruptSource,
-        abortReason,
-      }) =>
+      buildSignalResult: (sigtermResult) =>
         withTokenUsage({
+          ...sigtermResult,
           success: false,
-          output: finalResultText && !opts.signal?.aborted ? finalResultText : output,
-          exitCode,
-          cancelled,
-          interrupted,
-          interruptSource,
-          abortReason,
+          output: finalResultText && !opts.signal?.aborted ? finalResultText : sigtermResult.output,
           sessionId: captureSessionFromLog(),
         }),
       buildExitResult: (output, exitCode) => {

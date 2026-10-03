@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { AbortReason } from "../providers/termination-attribution.js";
 import type { RunResult } from "../providers/types.js";
 import type { MechanicalInboxForensics } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
@@ -733,7 +734,7 @@ describe("routeRunFailure", () => {
       expect(toChat).toHaveLength(0);
     });
 
-    it.each([
+    it.each<[AbortReason, string]>([
       ["stall-watchdog", "[Task killed by stall watchdog (no output for 15 minutes)]"],
       ["run-ceiling", "[Task killed by run ceiling timeout]"],
     ])("distinguishes %s abort in parent notice", async (abortReason, output) => {

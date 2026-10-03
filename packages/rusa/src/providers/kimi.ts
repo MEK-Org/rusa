@@ -365,40 +365,16 @@ export class KimiProvider implements CodingProvider {
             teardownFlutterOverlay(opts.sandbox.worktreePath);
           }
         },
-        buildKilledResult: ({
-          output,
-          exitCode,
-          cancelled,
-          interrupted,
-          interruptSource,
-          abortReason,
-        }) =>
+        buildKilledResult: (sigtermResult) =>
           withTokenUsage({
+            ...sigtermResult,
             success: false,
-            output,
-            exitCode,
-            cancelled,
-            interrupted,
-            interruptSource,
-            abortReason,
           }),
-        buildSignalResult: ({
-          output,
-          exitCode,
-          cancelled,
-          interrupted,
-          interruptSource,
-          abortReason,
-        }) =>
+        buildSignalResult: (sigtermResult) =>
           withTokenUsage({
+            ...sigtermResult,
             success: false,
-            output,
-            exitCode,
-            cancelled,
-            interrupted,
-            interruptSource,
-            abortReason,
-            sessionId: parseStreamJson(output).sessionId,
+            sessionId: parseStreamJson(sigtermResult.output).sessionId,
           }),
         buildExitResult: (rawOutput, exitCode) => {
           const { responseText, sessionId } = parseStreamJson(rawOutput);

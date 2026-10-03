@@ -9,6 +9,8 @@
  * one-line adapter.
  */
 
+import type { AbortReason } from "../providers/termination-attribution.js";
+
 // Across every kind the convention is kind-specific. Say which field is which on
 // every new kind; the notes here were backfilled after the names misled two
 // readers into opposite conclusions about who sent what .
@@ -273,7 +275,7 @@ export interface RunEndPayload {
   /** What the provider reported this run ran on. Absent = not reported. */
   model?: string;
   /** The typed reason for termination/abort (e.g. 'stall-watchdog', 'run-ceiling', 'interrupt:<by>', 'unknown'). */
-  abortReason?: string;
+  abortReason?: AbortReason;
 }
 
 /**

@@ -89,6 +89,7 @@ describe("runSubprocess helper-level unit coverage ", () => {
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(143);
     expect(result.output).toContain("unattributed");
+    expect(result.abortReason).toBe("unknown");
   });
 
   it("handles already-aborted cancellation -> immediate settlement and teardown", async () => {
@@ -108,6 +109,7 @@ describe("runSubprocess helper-level unit coverage ", () => {
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(143);
     expect(result.output).toContain("run ceiling");
+    expect(result.abortReason).toBe(RUN_CEILING_ABORT_REASON);
   });
 
   it("handles abort firing before first output -> teardown and cancellation", async () => {
@@ -131,6 +133,7 @@ describe("runSubprocess helper-level unit coverage ", () => {
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(143);
     expect(result.output).toContain("stall watchdog");
+    expect(result.abortReason).toBe(STALL_WATCHDOG_ABORT_REASON);
   });
 
   it("handles spawn error event -> teardown and shaped error result", async () => {
@@ -197,6 +200,7 @@ describe("runSubprocess helper-level unit coverage ", () => {
     const result = await runPromise;
     expect(result.output).toContain("trailing error diagnostic");
     expect(result.output).toContain("unattributed");
+    expect(result.abortReason).toBe("unknown");
   });
 
   it("flushes onStdoutEnd before formatting termination on timeout", async () => {
@@ -222,5 +226,27 @@ describe("runSubprocess helper-level unit coverage ", () => {
     const result = await runPromise;
     expect(result.output).toContain("buffered output before timeout");
     expect(result.output).toContain("unattributed");
+    expect(result.abortReason).toBe("unknown");
+  });
+
+  it("automatically merges abortReason from sigtermResult into settled RunResult even if builder omits it", async () => {
+    const mockChild = new MockChild();
+    spawnFn.mockReturnValue(mockChild as unknown as ChildProcessWithoutNullStreams);
+
+    const controller = new AbortController();
+    controller.abort(STALL_WATCHDOG_ABORT_REASON);
+
+    const result = await runSubprocess({
+      ...baseConfig,
+      signal: controller.signal,
+      buildKilledResult: (sigtermResult) => ({
+        success: false,
+        output: sigtermResult.output,
+        exitCode: sigtermResult.exitCode,
+        // Intentionally omit abortReason
+      }),
+    });
+
+    expect(result.abortReason).toBe(STALL_WATCHDOG_ABORT_REASON);
   });
 });

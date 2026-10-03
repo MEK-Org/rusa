@@ -622,7 +622,6 @@ describe("AntigravityProvider", () => {
     const promptArg = spawnArgs[pIdx + 1];
     expect(promptArg).toContain("Execute migration script");
     expect(promptArg).toContain(ANTIGRAVITY_COMMAND_DISCIPLINE);
-    expect(promptArg).toContain("manage_task");
 
     child.emit("close", 0, null);
     await runPromise;

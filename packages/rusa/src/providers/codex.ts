@@ -700,39 +700,15 @@ export class CodexProvider implements CodingProvider {
           chunks.push(text);
         },
         // Temp cleanup is owned by run() below, not per-spawn.
-        buildKilledResult: ({
-          output,
-          exitCode,
-          cancelled,
-          interrupted,
-          interruptSource,
-          abortReason,
-        }) =>
+        buildKilledResult: (sigtermResult) =>
           buildResultWithSession({
+            ...sigtermResult,
             success: false,
-            output,
-            exitCode,
-            cancelled,
-            interrupted,
-            interruptSource,
-            abortReason,
           }),
-        buildSignalResult: ({
-          output,
-          exitCode,
-          cancelled,
-          interrupted,
-          interruptSource,
-          abortReason,
-        }) =>
+        buildSignalResult: (sigtermResult) =>
           buildResultWithSession({
+            ...sigtermResult,
             success: false,
-            output,
-            exitCode,
-            cancelled,
-            interrupted,
-            interruptSource,
-            abortReason,
           }),
         buildExitResult: (output, exitCode) => {
           if (lineBuffer) {

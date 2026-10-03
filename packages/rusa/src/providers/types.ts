@@ -2,6 +2,7 @@
  * Provider abstraction for CLI-based coding agents.
  */
 
+import type { AbortReason } from "./termination-attribution.js";
 import type { RunTokenUsage } from "./token-accounting.js";
 
 export type SandboxOptions = {
@@ -82,7 +83,7 @@ export interface RunResult {
   /** The typed source of the interrupt, if applicable (e.g. 'human:operator', 'responsive-notification'). */
   interruptSource?: string;
   /** The typed reason for termination/abort (e.g. 'stall-watchdog', 'run-ceiling', 'interrupt:<by>', 'unknown'). */
-  abortReason?: string;
+  abortReason?: AbortReason;
   /** True when the run failure is due to continuation-cap exhaustion. */
   capped?: boolean;
   /**

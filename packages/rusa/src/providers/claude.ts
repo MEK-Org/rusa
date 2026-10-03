@@ -311,39 +311,15 @@ export class ClaudeProvider implements CodingProvider {
           teardownFlutterOverlay(opts.sandbox.worktreePath);
         }
       },
-      buildKilledResult: ({
-        output,
-        exitCode,
-        cancelled,
-        interrupted,
-        interruptSource,
-        abortReason,
-      }) => ({
+      buildKilledResult: (sigtermResult) => ({
+        ...sigtermResult,
         success: false,
-        output,
-        exitCode,
-        cancelled,
-        interrupted,
-        interruptSource,
-        abortReason,
         sessionId,
         tokenUsage: captureTokenUsage(),
       }),
-      buildSignalResult: ({
-        output,
-        exitCode,
-        cancelled,
-        interrupted,
-        interruptSource,
-        abortReason,
-      }) => ({
+      buildSignalResult: (sigtermResult) => ({
+        ...sigtermResult,
         success: false,
-        output,
-        exitCode,
-        cancelled,
-        interrupted,
-        interruptSource,
-        abortReason,
         sessionId,
         tokenUsage: captureTokenUsage(),
       }),
