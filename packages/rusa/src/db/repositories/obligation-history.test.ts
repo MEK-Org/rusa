@@ -118,6 +118,21 @@ describe("Obligation mutation history", () => {
     expect(history.every((h) => h.timestamp === new Date(now).toISOString())).toBe(true);
   });
 
+  it("records an identical-text standing rewrite with its new actor and exact checkpoint time", () => {
+    const ob = repository.create({ title: "History", ownerId: "actor-a" });
+    repository.setCheckpoint(ob.id, "same text", "actor-a");
+    now += 1_000;
+    const updated = repository.setCheckpoint(ob.id, "same text", "actor-b");
+    const history = repository.listHistory(ob.id);
+    expect(history).toHaveLength(2);
+    expect(history[0]).toMatchObject({
+      actingPrincipal: "actor-b",
+      timestamp: updated.checkpointAt,
+      before: { checkpoint: "same text" },
+      after: { checkpoint: "same text" },
+    });
+  });
+
   it("projects existing artifact and child timestamps without duplicate audit writes", () => {
     const parent = repository.create({ title: "Parent", ownerId: "actor-a" });
     now += 1_000;

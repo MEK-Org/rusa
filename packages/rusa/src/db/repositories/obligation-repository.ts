@@ -98,6 +98,8 @@ interface TrackedObligationRow {
   resolution_ref: string | null;
   snoozed_until: string | null;
   checkpoint: string | null;
+  checkpoint_at: string | null;
+  checkpoint_by: string | null;
 }
 
 /** One captured UPDATE, as the TEMP history-capture trigger records it. */
@@ -112,6 +114,8 @@ interface ObligationDeltaRow {
   before_resolution_ref: string | null;
   before_snoozed_until: string | null;
   before_checkpoint: string | null;
+  before_checkpoint_at: string | null;
+  before_checkpoint_by: string | null;
   after_owner_id: string;
   after_parent_id: string | null;
   after_priority: number | null;
@@ -121,6 +125,8 @@ interface ObligationDeltaRow {
   after_resolution_ref: string | null;
   after_snoozed_until: string | null;
   after_checkpoint: string | null;
+  after_checkpoint_at: string | null;
+  after_checkpoint_by: string | null;
 }
 
 export interface CreateObligationInput {
@@ -593,6 +599,8 @@ export class ObligationRepository {
         before_resolution_ref TEXT,
         before_snoozed_until TEXT,
         before_checkpoint TEXT,
+        before_checkpoint_at TEXT,
+        before_checkpoint_by TEXT,
         after_owner_id      TEXT NOT NULL,
         after_parent_id     TEXT,
         after_priority      REAL,
@@ -601,7 +609,9 @@ export class ObligationRepository {
         after_terminal_note TEXT,
         after_resolution_ref TEXT,
         after_snoozed_until TEXT,
-        after_checkpoint TEXT
+        after_checkpoint TEXT,
+        after_checkpoint_at TEXT,
+        after_checkpoint_by TEXT
       );
 
       CREATE TEMP TRIGGER IF NOT EXISTS obligation_history_capture
@@ -615,19 +625,21 @@ export class ObligationRepository {
         OR old.resolution_ref IS NOT new.resolution_ref
         OR old.snoozed_until IS NOT new.snoozed_until
         OR old.checkpoint IS NOT new.checkpoint
+        OR old.checkpoint_at IS NOT new.checkpoint_at
+        OR old.checkpoint_by IS NOT new.checkpoint_by
       BEGIN
         INSERT INTO obligation_history_delta (
           obligation_id,
           before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
-          before_terminal_note, before_resolution_ref, before_snoozed_until, before_checkpoint,
+          before_terminal_note, before_resolution_ref, before_snoozed_until, before_checkpoint, before_checkpoint_at, before_checkpoint_by,
           after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
-          after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint
+          after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint, after_checkpoint_at, after_checkpoint_by
         ) VALUES (
           new.id,
           old.owner_id, old.parent_id, old.priority, old.status, old.external_ref,
-          old.terminal_note, old.resolution_ref, old.snoozed_until, old.checkpoint,
+          old.terminal_note, old.resolution_ref, old.snoozed_until, old.checkpoint, old.checkpoint_at, old.checkpoint_by,
           new.owner_id, new.parent_id, new.priority, new.status, new.external_ref,
-          new.terminal_note, new.resolution_ref, new.snoozed_until, new.checkpoint
+          new.terminal_note, new.resolution_ref, new.snoozed_until, new.checkpoint, new.checkpoint_at, new.checkpoint_by
         );
       END;
     `);
@@ -1380,9 +1392,9 @@ export class ObligationRepository {
       .prepare(
         `SELECT obligation_id,
                 before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
-                before_terminal_note, before_resolution_ref, before_snoozed_until, before_checkpoint,
+                before_terminal_note, before_resolution_ref, before_snoozed_until, before_checkpoint, before_checkpoint_at, before_checkpoint_by,
                 after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
-                after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint
+                after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint, after_checkpoint_at, after_checkpoint_by
          FROM obligation_history_delta
          ORDER BY seq`
       )
@@ -1403,6 +1415,8 @@ export class ObligationRepository {
         resolution_ref: delta.after_resolution_ref,
         snoozed_until: delta.after_snoozed_until,
         checkpoint: delta.after_checkpoint,
+        checkpoint_at: delta.after_checkpoint_at,
+        checkpoint_by: delta.after_checkpoint_by,
       };
       const existing = net.get(delta.obligation_id);
       if (existing) {
@@ -1421,6 +1435,8 @@ export class ObligationRepository {
           resolution_ref: delta.before_resolution_ref,
           snoozed_until: delta.before_snoozed_until,
           checkpoint: delta.before_checkpoint,
+          checkpoint_at: delta.before_checkpoint_at,
+          checkpoint_by: delta.before_checkpoint_by,
         },
         after,
       });
@@ -1440,7 +1456,10 @@ export class ObligationRepository {
       const terminalNoteChanged = b.terminal_note !== a.terminal_note;
       const resolutionRefChanged = b.resolution_ref !== a.resolution_ref;
       const snoozeChanged = b.snoozed_until !== a.snoozed_until;
-      const checkpointChanged = b.checkpoint !== a.checkpoint;
+      const checkpointChanged =
+        b.checkpoint !== a.checkpoint ||
+        b.checkpoint_at !== a.checkpoint_at ||
+        b.checkpoint_by !== a.checkpoint_by;
 
       if (
         !ownerChanged &&
@@ -1517,7 +1536,7 @@ export class ObligationRepository {
         id,
         kind,
         actingPrincipal,
-        this.stamp(),
+        kind === "checkpoint" && a.checkpoint_at !== null ? a.checkpoint_at : this.stamp(),
         buildHistoryPayload(beforeState, afterState)
       );
     }
