@@ -308,6 +308,21 @@ export class VoiceService {
     return false;
   }
 
+  /** True while a live or unexpired session for this actor is bound to a different principal. */
+  heldByOtherPrincipal(actorId: string, principalId: string): boolean {
+    const now = this.now();
+    for (const session of this.sessions.values()) {
+      if (
+        session.actorId === actorId &&
+        session.principalId !== principalId &&
+        (session.expiresAt === null || session.expiresAt > now)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** Testable expiry sweep; production timers invoke this at each lease boundary. */
   expireSessions(): void {
     const now = this.now();

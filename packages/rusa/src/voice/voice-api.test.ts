@@ -353,71 +353,74 @@ describe("handleVoiceApiRequest", () => {
       ]);
     });
 
-    it("rekeys memo to fresh session when caller is mismatched or lease changed during transcription (#597)", async () => {
+    it("refuses a memo while another principal holds the actor's voice lease, at admission and before write (#597)", async () => {
       const sessionId = "bound-to-alice";
-      // 1. Alice connects and opens session
-      call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`);
-      expect(service.activeSessionFor(UUID_A)).toEqual({
-        sessionId,
-        principalId: LOCAL_USER,
-      });
-
-      // 2. Bob (a different admitted principal) posts a memo claiming Alice's sessionId
       const OTHER_USER = "22222222-0000-4000-8000-000000000002";
-      const otherPrincipals = {
-        listUsers: () => [
-          {
-            kind: "user",
-            id: OTHER_USER,
-            email: "bob@example.com",
-            createdAt: "2026-01-01T00:00:00Z",
-          },
-        ],
-      } as unknown as PrincipalRepository;
-      const otherDeps = { ...deps, principals: otherPrincipals };
+      const bobDeps = {
+        ...deps,
+        principals: {
+          listUsers: () => [
+            {
+              kind: "user",
+              id: OTHER_USER,
+              email: "bob@example.com",
+              createdAt: "2026-01-01T00:00:00Z",
+            },
+          ],
+        } as unknown as PrincipalRepository,
+      };
+      const memoFiles = () =>
+        existsSync(join(home, "voice", "inbox")) ? readdirSync(join(home, "voice", "inbox")) : [];
+      const postMemo = async (memoDeps: VoiceApiDeps, query: string) => {
+        const { res } = call(memoDeps, "POST", `/api/mesh/actors/${UUID_A}/voice-memo${query}`, {
+          body: Buffer.from("memo"),
+          contentType: "audio/webm",
+        });
+        await settled(res);
+        return res;
+      };
+      const HELD = { error: "voice session is held by a different principal" };
 
-      const bobMemo = call(
-        otherDeps,
-        "POST",
-        `/api/mesh/actors/${UUID_A}/voice-memo?sessionId=${sessionId}`,
-        { body: Buffer.from("bob-memo"), contentType: "audio/webm" }
-      );
-      await settled(bobMemo.res);
+      // Alice holds the lease; the reply tool targets its principal.
+      call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`);
 
-      expect(bobMemo.res.statusCode).toBe(200);
-      // Mismatched caller is rekeyed to a fresh UUID and delivered with their own fromId
-      expect(sendHumanMessage.mock.calls[0]?.[2]).toMatch(/^[0-9a-f-]{36}$/);
-      expect(sendHumanMessage.mock.calls[0]?.[2]).not.toBe(sessionId);
-      expect(sendHumanMessage.mock.calls[0]?.[3]).toEqual({ fromId: OTHER_USER });
+      // Admission: Bob is refused with or without Alice's session id, before save or transcription.
+      for (const query of [`?sessionId=${sessionId}`, ""]) {
+        const res = await postMemo(bobDeps, query);
+        expect(res.statusCode).toBe(409);
+        expect(JSON.parse(res.body)).toEqual(HELD);
+      }
+      expect(memoFiles()).toHaveLength(0);
+      expect(transcribe).not.toHaveBeenCalled();
+      expect(sendHumanMessage).not.toHaveBeenCalled();
+      expect(service.activeSessionFor(UUID_A)).toEqual({ sessionId, principalId: LOCAL_USER });
 
-      // Alice's session sees zero mutation
+      // Before write: Alice takes the lease while Bob's memo transcribes; the saved memo is not delivered.
+      service.disconnectSession(sessionId);
+      now += VOICE_SESSION_LEASE_MS + 1;
+      transcribe.mockImplementationOnce(async () => {
+        call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=alice-again`);
+        return "bob transcript";
+      });
+      const late = await postMemo(bobDeps, "");
+      expect(late.statusCode).toBe(409);
+      expect(JSON.parse(late.body)).toEqual({ ...HELD, audioSaved: true });
+      expect(memoFiles()).toHaveLength(1);
+      expect(sendHumanMessage).not.toHaveBeenCalled();
       expect(service.activeSessionFor(UUID_A)).toEqual({
-        sessionId,
+        sessionId: "alice-again",
         principalId: LOCAL_USER,
       });
 
-      // 3. Alice posts a memo with her bound sessionId, but the lease expires during transcription
-      sendHumanMessage.mockClear();
+      // Alice's own lease lapsing mid-transcription keeps the unheld-session rekey.
       transcribe.mockImplementationOnce(async () => {
-        // Lease expires or disconnects during transcription
-        service.disconnectSession(sessionId);
-        now += 60_000;
-        service.expireSessions();
+        service.disconnectSession("alice-again");
+        now += VOICE_SESSION_LEASE_MS + 1;
         return "late transcript";
       });
-
-      const expiredMemo = call(
-        deps,
-        "POST",
-        `/api/mesh/actors/${UUID_A}/voice-memo?sessionId=${sessionId}`,
-        { body: Buffer.from("alice-memo"), contentType: "audio/webm" }
-      );
-      await settled(expiredMemo.res);
-
-      expect(expiredMemo.res.statusCode).toBe(200);
-      // Rekeyed to fresh UUID because lease expired
+      const own = await postMemo(deps, "?sessionId=alice-again");
+      expect(own.statusCode).toBe(200);
       expect(sendHumanMessage.mock.calls[0]?.[2]).toMatch(/^[0-9a-f-]{36}$/);
-      expect(sendHumanMessage.mock.calls[0]?.[2]).not.toBe(sessionId);
       expect(sendHumanMessage.mock.calls[0]?.[3]).toEqual({ fromId: LOCAL_USER });
     });
 

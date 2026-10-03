@@ -180,6 +180,17 @@ export function handleVoiceApiRequest(
       return true;
     }
     const suppliedSessionId = url.searchParams.get("sessionId");
+    const fromId = requireOperatorPrincipal(req, res, deps);
+    if (!fromId) return true;
+    // The reply tool answers the actor's leased human, so another principal's
+    // memo would be answered to them: refuse it before save and again before
+    // write, since a lease can be taken while this memo transcribes.
+    const heldByOther = () => service.heldByOtherPrincipal(actorId, fromId);
+    const HELD = "voice session is held by a different principal";
+    if (heldByOther()) {
+      sendJson(res, 409, { error: HELD });
+      return true;
+    }
 
     void (async () => {
       const audio = await readRawBody(req, MAX_MEMO_BYTES);
@@ -203,13 +214,15 @@ export function handleVoiceApiRequest(
       // A memo to a non-live actor still transcribes and records (the mesh
       // event is durable), mirroring chat semantics — `delivered` tells the
       // client whether the actor was actually woken.
-      const fromId = requireOperatorPrincipal(req, res, deps);
-      if (!fromId) return;
+      if (heldByOther()) {
+        sendJson(res, 409, { error: HELD, audioSaved: true });
+        return;
+      }
 
       // The stream route alone grants session authority. Keep the pre-session
-      // delivery behavior for a stale/unknown supplied id, principal mismatch,
-      // or lease expiration during transcription: rekey this one memo to a
-      // fresh UUID, deliver it, and do not mutate or lease the session.
+      // delivery behavior for a stale/unknown supplied id or the caller's own
+      // lease lapsing during transcription: rekey this one memo to a fresh
+      // UUID, deliver it, and do not mutate or lease the session.
       const sessionId =
         suppliedSessionId && service.hasSession(suppliedSessionId, actorId, fromId)
           ? suppliedSessionId
