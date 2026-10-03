@@ -459,7 +459,9 @@ describe("obligations MCP", () => {
       arguments: { title: "legacy owner", owner_id: "human:operator" },
     })) as CallToolResult;
     expect(rejected.isError).toBe(true);
-    expect(JSON.stringify(rejected.content)).toContain("userPrincipalId");
+    expect(JSON.stringify(rejected.content)).toContain(
+      "use the verified human message fromId, ask your parent for its durable principal mapping, or name an active actor id"
+    );
 
     expect(
       db
