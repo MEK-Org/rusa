@@ -1038,11 +1038,14 @@ async function composeStart(
   }
   // This process owns one local desktop. Followers construct their own lock
   // inside their process, so no coordinator-wide lock serializes separate hosts.
-  const computerUseLock = new ComputerUseLock((err) => {
-    log.warn("preempted_computer_use_re_request_failed", {
-      err: err instanceof Error ? err.message : String(err),
-    });
-  });
+  const computerUseLock = new ComputerUseLock(
+    (err) => {
+      log.warn("preempted_computer_use_re_request_failed", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    },
+    log.child({ component: "computer-use-lock" })
+  );
   resources.acquire("computer-use lock", () => computerUseLock.close());
   resources.reportFailuresTo(({ resource, error }) =>
     log.error("shutdown_disposer_failed", { resource, err: error })

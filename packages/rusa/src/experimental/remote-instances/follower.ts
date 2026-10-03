@@ -73,8 +73,12 @@ try {
   );
 }
 
-const instance = new FollowerInstance(root, values.sandbox === "bwrap", (event) =>
-  emit(event.actorId, event.message, event.eventId)
+const instance = new FollowerInstance(
+  root,
+  values.sandbox === "bwrap",
+  (event) => emit(event.actorId, event.message, event.eventId),
+  undefined,
+  log
 );
 // A registration can renew after an HTTP fault. It identifies this running
 // process, not its short-lived server session or the reusable enrollment token.

@@ -384,6 +384,103 @@ describe("monolithic follower instance", () => {
     expect(h.failures).toEqual([]);
   });
 
+  it("reports a computer-use wait when a responsive waiter queues behind a responsive holder, then starts after natural holder settlement", async () => {
+    const provider = releasableCapabilityProvider();
+    const h = setup({
+      maxConcurrent: 3,
+      providerFactory: provider.factory,
+    });
+    const holder = h.spawn("Responsive holder run");
+    grantComputerUse(h, holder);
+    h.dispatchResponsive(holder);
+    await waitUntil(() => h.runtime(holder).isRunning);
+
+    // Holder has acquired the computer-use lock immediately
+    expect(h.followerLogs).toContainEqual(
+      expect.objectContaining({
+        event: "computer_use_acquired",
+        fields: expect.objectContaining({
+          actorId: holder,
+          id: "test-follower",
+          component: "computer-use-lock",
+          responsive: true,
+          waited: false,
+        }),
+      })
+    );
+
+    const waiter = h.spawn("Responsive waiter run");
+    grantComputerUse(h, waiter);
+    h.dispatchResponsive(waiter);
+
+    // Wait until waiter reports a computer_use_wait behind holder
+    await waitUntil(() =>
+      h.followerLogs.some(
+        (log) =>
+          log.event === "computer_use_wait" &&
+          log.fields?.actorId === waiter &&
+          log.fields?.holderActorId === holder &&
+          log.fields?.responsive === true
+      )
+    );
+
+    expect(
+      h.followerLogs
+        .filter(
+          (log) => log.fields?.component === "computer-use-lock" && log.fields?.actorId === waiter
+        )
+        .map((log) => [log.event, log.fields?.id])
+    ).toEqual([["computer_use_wait", "test-follower"]]);
+
+    // The responsive holder was not interrupted (#689 policy) and continues running
+    expect(h.runtime(holder).isRunning).toBe(true);
+    // The waiter has not started provider execution
+    expect(
+      h.events.some((event) => event.actorId === waiter && event.event.type === "runStart")
+    ).toBe(false);
+
+    // Natural settlement of the responsive holder
+    provider.release("Responsive holder run");
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === holder && event.event.type === "result")
+    );
+
+    // After natural holder settlement, waiter acquires the lock and starts
+    await waitUntil(() =>
+      h.followerLogs.some(
+        (log) =>
+          log.event === "computer_use_acquired" &&
+          log.fields?.actorId === waiter &&
+          log.fields?.responsive === true &&
+          log.fields?.waited === true
+      )
+    );
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === waiter && event.event.type === "runStart")
+    );
+
+    provider.release("Responsive waiter run");
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === waiter && event.event.type === "result")
+    );
+
+    expect(
+      h.followerLogs
+        .filter(
+          (log) => log.fields?.component === "computer-use-lock" && log.fields?.actorId === waiter
+        )
+        .map((log) => [log.event, log.fields?.id])
+    ).toEqual([
+      ["computer_use_wait", "test-follower"],
+      ["computer_use_acquired", "test-follower"],
+    ]);
+
+    // The provider runStart arrives over the real follower runtime path; leader
+    // selection alone cannot produce the follower-only lock records above.
+    expect(h.logs.some((log) => log.event.startsWith("computer_use_"))).toBe(false);
+    expect(h.failures).toEqual([]);
+  });
+
   it("cancels queued computer work when the follower disconnects", async () => {
     const h = setup({ delayMs: 1000, maxConcurrent: 3 });
     const holder = h.spawn("Long computer run");

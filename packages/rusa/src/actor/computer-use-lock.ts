@@ -1,3 +1,4 @@
+import type { LogFields, Logger } from "../observability/logger.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
 
 /** Capability required for a run to reserve exclusive computer control on its instance. */
@@ -15,6 +16,8 @@ interface LockEntry<T> {
   readonly reject: (reason?: unknown) => void;
   state: "queued" | "locked" | "settled";
   inner?: RunStartHandle<T>;
+  readonly enqueuedAt: number;
+  blockerActorId?: string;
 }
 
 /**
@@ -26,7 +29,10 @@ interface LockEntry<T> {
  * until that holder's gate has actually settled and released its token.
  */
 export class ComputerUseLock {
-  constructor(private readonly onError?: (error: unknown) => void) {}
+  constructor(
+    private readonly onError?: (error: unknown) => void,
+    private readonly logger?: Logger
+  ) {}
 
   private holder: { entry: LockEntry<unknown>; token: symbol; preempted?: boolean } | undefined;
   private readonly responsiveQueue: LockEntry<unknown>[] = [];
@@ -56,11 +62,13 @@ export class ComputerUseLock {
       resolve,
       reject,
       state: "queued",
+      enqueuedAt: Date.now(),
     };
     if (this.closed) {
       entry.state = "settled";
       reject(new RunStartCancelledError());
     } else {
+      this.reportWait(entry);
       this.enqueue(entry);
       this.requestResponsivePreemption(entry);
       this.pump();
@@ -86,6 +94,7 @@ export class ComputerUseLock {
         if (entry.state === "queued") {
           this.remove(entry);
           entry.state = "settled";
+          this.reportWaitEnded(entry, "cancelled");
           reject(new RunStartCancelledError());
           return true;
         }
@@ -140,6 +149,7 @@ export class ComputerUseLock {
     this.closed = true;
     for (const entry of [...this.responsiveQueue, ...this.normalQueue]) {
       entry.state = "settled";
+      this.reportWaitEnded(entry, "closed");
       entry.reject(new RunStartCancelledError());
     }
     this.responsiveQueue.length = 0;
@@ -176,6 +186,17 @@ export class ComputerUseLock {
     entry.state = "locked";
     const token = Symbol(`computer-use-lock:${entry.actorId}`);
     this.holder = { entry, token };
+    const waited = entry.blockerActorId !== undefined;
+    const waitedMs = waited ? Math.max(0, Date.now() - entry.enqueuedAt) : undefined;
+    // Even an immediate acquisition proves this instance received the run and
+    // passed provider admission; silence alone cannot identify provider pacing.
+    this.report("computer_use_acquired", {
+      actorId: entry.actorId,
+      responsive: entry.responsive,
+      waited,
+      waitedMs,
+    });
+    for (const queued of [...this.responsiveQueue, ...this.normalQueue]) this.reportWait(queued);
     let started: Promise<unknown>;
     try {
       const inner = entry.start();
@@ -185,6 +206,37 @@ export class ComputerUseLock {
       started = Promise.reject(err);
     }
     void started.then(entry.resolve, entry.reject).finally(() => this.release(entry, token));
+  }
+
+  private reportWait<T>(entry: LockEntry<T>): void {
+    const holder = this.holder?.entry;
+    if (!holder || entry.blockerActorId === holder.actorId) return;
+    entry.blockerActorId = holder.actorId;
+    this.report("computer_use_wait", {
+      actorId: entry.actorId,
+      holderActorId: holder.actorId,
+      responsive: entry.responsive,
+      holderResponsive: holder.responsive,
+    });
+  }
+
+  private reportWaitEnded<T>(entry: LockEntry<T>, outcome: "cancelled" | "closed"): void {
+    if (entry.blockerActorId === undefined) return;
+    this.report("computer_use_wait_ended", {
+      actorId: entry.actorId,
+      responsive: entry.responsive,
+      outcome,
+      waitedMs: Math.max(0, Date.now() - entry.enqueuedAt),
+    });
+  }
+
+  private report(event: string, fields: LogFields): void {
+    try {
+      this.logger?.info(event, fields);
+    } catch {
+      // Observability must not prevent enqueue, start, cancellation or release.
+      // Retrying through the same failed sink would risk admission progress again.
+    }
   }
 
   private release(entry: LockEntry<unknown>, token: symbol): void {
