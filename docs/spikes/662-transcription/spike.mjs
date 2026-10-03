@@ -31,7 +31,8 @@ function render() {
   $("cancel").disabled = !active || active.stopping;
   $("stop").disabled = !active?.recorder || active.stopping;
   $("mark").disabled = !active?.recorder || active.stopping;
-  for (const id of ["mode", "language", "probe", "install"]) $(id).disabled = Boolean(active);
+  for (const id of ["mode", "order", "language", "probe", "install"])
+    $(id).disabled = Boolean(active);
   $("status").textContent = r ? `Trial ${r.id}: ${r.phase}` : "Idle";
   $("preview").textContent = r?.preview || "No transcript yet";
   $("report").textContent = JSON.stringify(report(), null, 2);
@@ -39,6 +40,8 @@ function render() {
 function report() {
   return {
     format: "662-spike-v1",
+    fixtureVersion: self.FIXTURE_VERSION,
+    servedCheckoutSha: $("revision").value || "UNTESTED",
     device: $("device").value || "UNTESTED",
     network: $("network").value,
     capabilities: { ...initialCapabilities, displayMode: displayMode() },
@@ -76,6 +79,7 @@ function maybeFinish(s) {
   s.finishing = true;
   clearTimeout(s.deadline);
   clearTimeout(s.drain);
+  clearTimeout(s.recorderDrain);
   stopTracks(s);
   s.r.finalRecognition = s.r.results
     .filter((v) => v.final)
@@ -85,8 +89,15 @@ function maybeFinish(s) {
     .filter((v) => !v.final)
     .map((v) => v.text)
     .join(" ");
-  s.r.phase = s.r.cancelled ? "cancelled: clip discarded" : "completed: review final revisions";
-  if (!s.r.cancelled && s.chunks.length) {
+  s.r.phase = s.r.cancelled
+    ? "cancelled: clip discarded"
+    : s.r.recognitionIncomplete ||
+        s.r.recorderTimedOut ||
+        s.r.pendingInterimAtEnd ||
+        s.r.droppedEvents
+      ? "incomplete: deadline/error; review diagnostics"
+      : "completed: review final revisions";
+  if (!s.r.cancelled && !s.r.recorderTimedOut && s.chunks.length) {
     const blob = new Blob(s.chunks, { type: s.recorder.mimeType });
     s.r.audio = {
       bytes: blob.size,
@@ -144,6 +155,29 @@ function stop(cancelled = false, reason = "user") {
   s.r.previewAtStop = s.r.preview;
   s.r.stopMs = event(s, cancelled ? "cancel" : "stop", { reason });
   s.r.phase = cancelled ? "cancelling" : "awaiting recorder stop and recognition end";
+  // The recorder's own stop event is authoritative; bound a separate failure.
+  s.recorderDrain = setTimeout(() => {
+    if (s.recorderEnded) return;
+    s.r.recorderTimedOut = true;
+    s.chunks = [];
+    s.recorderEnded = true;
+    event(s, "recorder-stop-timeout", { audioDiscarded: true });
+    stopTracks(s);
+    maybeFinish(s);
+  }, 10000);
+  s.drain = setTimeout(() => {
+    if (s.recognitionEnded) return;
+    s.r.recognitionIncomplete = true;
+    s.r.phase = "incomplete: recognition deadline; awaiting recorder";
+    closeRecognition(s, "drain-timeout");
+    event(s, "drain-timeout", { recorderEnded: s.recorderEnded });
+    try {
+      s.recognition?.abort();
+    } catch {
+      /* The accepted summary is already frozen. */
+    }
+    maybeFinish(s);
+  }, 5000);
   if (!s.recorder)
     s.recorderEnded = true; // Pending acquisition releases its stale stream below.
   else if (s.recorder.state !== "inactive") s.recorder.stop();
@@ -151,27 +185,82 @@ function stop(cancelled = false, reason = "user") {
     try {
       cancelled ? s.recognition.abort() : s.recognition.stop();
     } catch (error) {
+      s.r.recognitionIncomplete = true;
+      closeRecognition(s, "stop-error");
       event(s, "recognition-stop-error", { error: error.message });
-      s.recognitionEnded = true;
     }
   }
-  // Preserve post-stop final updates until end; record a bounded drain failure.
-  s.drain = setTimeout(() => {
-    event(s, "drain-timeout", {
-      recorderEnded: s.recorderEnded,
-      recognitionEnded: s.recognitionEnded,
-    });
-    try {
-      s.recognition?.abort();
-    } catch {
-      /* Already ended. */
-    }
-    s.recognitionEnded = true;
-    s.recorderEnded = true;
-    maybeFinish(s);
-  }, 5000);
   maybeFinish(s);
   render();
+}
+function closeRecognition(s, reason) {
+  s.acceptingResults = false;
+  s.recognitionEnded = true;
+  s.r.recognitionSummaryBoundary = { reason, ms: Math.round(performance.now() - s.origin) };
+}
+function attachRecognition(s) {
+  const r = s.r;
+  for (const type of [
+    "start",
+    "audiostart",
+    "soundstart",
+    "speechstart",
+    "speechend",
+    "soundend",
+    "audioend",
+    "nomatch",
+  ]) {
+    s.recognition.addEventListener(type, () => event(s, `recognition-${type}`));
+  }
+  s.recognition.addEventListener("result", (e) => {
+    const accepted = s.acceptingResults;
+    const ms = event(s, accepted ? "recognition-result" : "late-recognition-result", {
+      resultIndex: e.resultIndex,
+      results: Array.from(e.results, (v) => ({ text: v[0].transcript, final: v.isFinal })),
+    });
+    if (!accepted) return;
+    // Each event is the COMPLETE current result list. Interim entries can be removed/revised.
+    r.results = Array.from(e.results, (v) => ({ text: v[0].transcript, final: v.isFinal }));
+    r.preview = r.results.map((v) => v.text).join(" ");
+    r.firstResultMs ??= ms;
+    if (r.results.some((v) => !v.final) && r.firstPartialMs === null) {
+      r.firstPartialMs = ms;
+      r.firstPartialBeforeStop = !s.stopping;
+      if (r.manualSpeechOnsetMs !== null)
+        r.firstPartialFromManualOnsetMs = ms - r.manualSpeechOnsetMs;
+    }
+    if (s.stopping) r.resultEventsAfterStop++;
+    render();
+  });
+  s.recognition.addEventListener("error", (e) => {
+    if (s.acceptingResults) r.recognitionIncomplete = true;
+    event(s, "recognition-error", { code: e.error, message: e.message });
+  });
+  s.recognition.addEventListener("end", () => {
+    if (!s.acceptingResults) {
+      event(s, "late-recognition-end");
+      return;
+    }
+    closeRecognition(s, "end");
+    r.recognitionEndMs = event(s, "recognition-end");
+    if (!s.stopping) r.phase = "recognition ended early; recorder continues (no auto-restart)";
+    maybeFinish(s);
+    render();
+  });
+}
+function startRecognition(s) {
+  const r = s.r;
+  try {
+    s.recognitionEnded = false;
+    s.acceptingResults = true;
+    r.recognitionStartCallMs = event(s, "recognition-start-call");
+    s.recognition.start();
+  } catch (error) {
+    s.r.recognitionIncomplete = true;
+    closeRecognition(s, "start-error");
+    event(s, "recognition-start-error", { error: error.message });
+    r.phase = "recognition unavailable; recorder continues";
+  }
 }
 async function start() {
   if (active || trials.length >= 20) return;
@@ -185,6 +274,13 @@ async function start() {
     startedAt: new Date().toISOString(),
     mode: $("mode").value,
     language: $("language").value,
+    acquisitionOrder: $("order").value,
+    fixtureVersion: self.FIXTURE_VERSION,
+    servedCheckoutSha: $("revision").value || "UNTESTED",
+    device: $("device").value || "UNTESTED",
+    network: $("network").value,
+    navigatorOnline: navigator.onLine,
+    localProbe: structuredClone(support),
     displayMode: displayMode(),
     phase: "acquiring microphone",
     results: [],
@@ -231,6 +327,11 @@ async function start() {
       r.processLocally =
         "processLocally" in s.recognition ? s.recognition.processLocally : "unsupported";
     }
+    if (s.recognition) {
+      attachRecognition(s);
+      if (r.acquisitionOrder === "recognizer-first") startRecognition(s);
+    }
+    r.recorderAcquireCallMs = event(s, "recorder-acquire-call");
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     if (active !== s || s.stopping) {
       for (const track of stream.getTracks()) track.stop();
@@ -250,7 +351,7 @@ async function start() {
     ].find((mime) => MediaRecorder.isTypeSupported(mime));
     s.recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
     s.recorder.addEventListener("dataavailable", (e) => {
-      if (!r.cancelled && e.data.size) s.chunks.push(e.data);
+      if (!s.finishing && !r.cancelled && e.data.size) s.chunks.push(e.data);
       event(s, "recorder-data", { bytes: e.data.size });
     });
     s.recorder.addEventListener("error", (e) => {
@@ -264,58 +365,11 @@ async function start() {
     });
     s.recorder.start(); // Same non-timesliced capture as WebVoiceRecorder.
     r.recorderStartMs = event(s, "recorder-start");
-    r.phase = "recording";
-    if (s.recognition) {
-      for (const type of [
-        "start",
-        "audiostart",
-        "soundstart",
-        "speechstart",
-        "speechend",
-        "soundend",
-        "audioend",
-        "nomatch",
-      ]) {
-        s.recognition.addEventListener(type, () => event(s, `recognition-${type}`));
-      }
-      s.recognition.addEventListener("result", (e) => {
-        const ms = event(s, "recognition-result", {
-          resultIndex: e.resultIndex,
-          results: Array.from(e.results, (v) => ({ text: v[0].transcript, final: v.isFinal })),
-        });
-        // Each event is the COMPLETE current result list. Interim entries can be removed/revised.
-        r.results = Array.from(e.results, (v) => ({ text: v[0].transcript, final: v.isFinal }));
-        r.preview = r.results.map((v) => v.text).join(" ");
-        r.firstResultMs ??= ms;
-        if (r.results.some((v) => !v.final) && r.firstPartialMs === null) {
-          r.firstPartialMs = ms;
-          r.firstPartialBeforeStop = !s.stopping;
-          if (r.manualSpeechOnsetMs !== null)
-            r.firstPartialFromManualOnsetMs = ms - r.manualSpeechOnsetMs;
-        }
-        if (s.stopping) r.resultEventsAfterStop++;
-        render();
-      });
-      s.recognition.addEventListener("error", (e) =>
-        event(s, "recognition-error", { code: e.error, message: e.message })
-      );
-      s.recognition.addEventListener("end", () => {
-        s.recognitionEnded = true;
-        r.recognitionEndMs = event(s, "recognition-end");
-        if (!s.stopping) r.phase = "recognition ended early; recorder continues (no auto-restart)";
-        maybeFinish(s);
-        render();
-      });
-      try {
-        s.recognitionEnded = false;
-        r.recognitionStartCallMs = event(s, "recognition-start-call");
-        s.recognition.start();
-      } catch (error) {
-        s.recognitionEnded = true;
-        event(s, "recognition-start-error", { error: error.message });
-        r.phase = "recognition unavailable; recorder continues";
-      }
-    }
+    r.phase =
+      s.recognition && s.recognitionEnded && r.recognitionStartCallMs !== undefined
+        ? "recognition ended early; recorder continues (no auto-restart)"
+        : "recording";
+    if (s.recognition && r.acquisitionOrder === "recorder-first") startRecognition(s);
     render();
   } catch (error) {
     event(s, "start-error", { error: `${error.name}: ${error.message}` });
@@ -366,4 +420,5 @@ if ("serviceWorker" in navigator) {
     $("support").textContent = `Service worker registration failed: ${error.message}`;
   });
 }
+$("fixture-version").textContent = self.FIXTURE_VERSION;
 render();

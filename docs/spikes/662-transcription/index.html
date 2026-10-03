@@ -27,12 +27,20 @@
   <label>Device model / Android version / exact Chrome version (no device serial)
     <input id="device" placeholder="UNTESTED until filled on target device">
   </label>
+  <label>Served checkout SHA (from git rev-parse HEAD) <input id="revision" placeholder="UNTESTED"></label>
+  <p>Fixture <strong id="fixture-version"></strong>; clear site data and reinstall after updates.</p>
   <label>Network / offline test condition <input id="network" value="not recorded"></label>
   <label>Capture mode
     <select id="mode">
       <option value="recorder">Recorder only (baseline)</option>
       <option value="browser">Concurrent recorder + browser-default recognition (may be remote)</option>
       <option value="local">Concurrent recorder + local-required recognition</option>
+    </select>
+  </label>
+  <label>Concurrent acquisition order (architecture undecided)
+    <select id="order">
+      <option value="recorder-first">Recorder first (existing capture sequence)</option>
+      <option value="recognizer-first">Recognizer first (comparison)</option>
     </select>
   </label>
   <label>Recognition language <input id="language" value="en-US"></label>
@@ -69,6 +77,7 @@
   <button type="button" id="annotate">Save notes to latest completed trial</button>
   <button type="button" id="export">Download JSON report</button>
   <pre id="report"></pre>
+  <script src="fixture-version.js"></script>
   <script type="module" src="spike.mjs"></script>
 </body>
 </html>

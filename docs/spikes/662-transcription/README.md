@@ -6,6 +6,27 @@ addressing [architectural feedback 5968236865](https://github.com/MEK-Org/rusa/i
 It does not implement Room transcription or choose its architecture. Room-first scope,
 one-on-one deferral and the eventual dashboard appearance review remain in force.
 
+## Fixture lifetime and revision receipt
+
+The [steward accepted this temporary staging fixture](https://github.com/MEK-Org/rusa/pull/873#discussion_r4174040251)
+to preserve one reviewed, reproducible procedure through the device comparison.
+A clean commit permalink is sufficient for initial harness delivery and remains
+the smaller alternative if iteration stops; the runner preserves repeatable
+synthetic evidence while review repairs and device procedure amendments continue. Remove this directory, including the manual
+smoke runner and screenshots, in the PR that revises the #662 proposal or implements
+the chosen approach after the device decision. The runner guards pending fixture
+changes only; it is outside product test discovery and CI.
+
+The fixture identifier is `662-spike-v2` (shared by the page and worker). Bump
+`fixture-version.js` for every asset/procedure change. Record `git rev-parse HEAD`
+in the page's **Served checkout SHA** field; serve a clean checkout and export that
+field with the fixture identifier. An unfilled SHA is UNTESTED revision evidence.
+Before updating files on the same origin, export all receipts/clips, clear that
+origin's Chrome site data (including service worker/cache), remove the installed
+app, then reinstall from the new clean checkout. Verify the exported fixture
+identifier before recording. The fixed versioned cache supports offline evidence,
+not automatic updates; a page left open during a file update is invalid evidence.
+
 ## Run on the target Android PWA
 
 Serve **only this directory**, from the repository root:
@@ -46,36 +67,54 @@ That marker gives a human-timed approximation, not an acoustic measurement.
 from that marker. `recognition-speechstart` is a separate recognizer event and must
 not be relabeled as ground-truth speech onset. Null means no measurement, not zero.
 
-Run the following matrix in the installed app and also in a Chrome tab:
+The minimum decision-relevant matrix is in the **installed app**. There is no
+verified operator agreement to perform these device checks yet; the steward owns
+that request. Browser-tab comparison is optional and cannot replace installed-PWA
+results. Set the network condition before each trial and probe after installing a
+pack; each trial snapshots those conditions and the current probe receipt.
 
 | Trial | Required receipt |
 | --- | --- |
 | Recorder only, 3 full phrases | Download/listen to each clip, including its last words; baseline duration and decoded RMS/peak |
-| Browser-default + recorder, 3 full phrases | First partial **before Stop**, result snapshots/revisions, audible complete independent audio |
+| Browser-default + recorder, both acquisition orders, 3 full phrases each | First partial **before Stop**, result snapshots/revisions, audible complete independent audio |
 | Stop mid-phrase | Compare `previewAtStop`, later result events and `finalRecognition`; keep all final revisions visible after Stop |
 | Cancel mid-phrase, then immediate Start | Cancelled trial has no playable/downloadable clip; next trial acquires mic and records normally |
-| Cancel while mic permission/acquisition is pending | Later acquired tracks are stopped and recording does not resume |
-| Silence, denied permission, recognition error/early end | Explicit events/failures; recognizer end leaves recorder running without silent auto-restart |
-| Background/resume, lock/unlock | Visibility and track events, recognition gaps, complete/not-complete audio; page close cancels capture |
 | Local-required, online then offline | Exact local property/probe/install result; offline successful recognition or concrete error, no remote fallback |
 
+Optional robustness checks: cancel during microphone acquisition; silence/denied
+permission/recognition error or early end; background/resume and lock/unlock. Log
+visibility/track events and whether the clip is complete. Those checks inform a
+later implementation, without expanding the minimum architecture decision.
+
 Each trial is bounded to 60 seconds and recognition drains for at most 5 seconds
-after Stop. A `drain-timeout`, remaining interim text or dropped-event count is an
+after Stop. At recognizer end/deadline, accepted result/preview summaries freeze;
+late events remain separately labeled diagnostics. A deadline labels the trial
+**incomplete**, while recorder final data/stop is still awaited. A separate 10s
+recorder-stop bound discards unfinalized audio and records a recorder timeout. A `drain-timeout`, remaining interim text or dropped-event count is an
 incomplete-evidence result, not an accepted final. Up to 20 trials and 500 logged
 events per trial are retained in memory. Download the report before reloading.
 Reports contain transcript snapshots and manually entered notes; inspect them for
-public safety before sharing. Cancel discards audio but keeps diagnostic text/events.
+public safety before sharing. **Voice clips stay private even for invented
+sentences: keep them off public issues/PRs.** Share only reviewed synthetic
+transcripts, hashes and decoder metrics publicly. Cancel discards audio but keeps diagnostic text/events.
 Only the latest completed clip is available: download it before starting the next
 trial. The service worker caches static assets only; it stores no clips/reports.
 
 ## Pair preview with the existing batch transcript
 
-For a completed trial, download its exact audio clip and retain its report SHA-256.
+Before the next Start or any reload, download the exact audio clip and JSON report.
+Keep the clip private; retain its `audio.sha256` and trial ID/fixture revision from
+the report. Export after hash/decode inspection finishes (or record its error).
 Listen to it and annotate audible completeness; decoding/nonzero RMS alone cannot
 establish that all words survived concurrent microphone use. Under separate
 authorization, transcribe **that same clip** using the configured server adapter in
 an isolated fixture, then paste its returned text and provider/model/evidence source
-into the harness. Save notes, export JSON, and compare:
+into the harness **only if that trial is still the latest in the same page
+session**. Save notes and export again before Start/reload, which clears the fields.
+For later batch processing, pair outside the page using the exported trial ID and
+exact clip SHA-256; retain the returned transcript/provider/model/source in a
+separate receipt naming that hash. The page does not persist or import old trials.
+Compare:
 
 1. The preview visible when Stop was pressed (`previewAtStop`).
 2. The recognizer's final result after its end event (`finalRecognition`).
@@ -89,8 +128,9 @@ performed remains **UNTESTED**. No fake batch text is prefilled.
 At baseline staging `53b52993`,
 [WebVoiceRecorder](../../../packages/rusa/flutter_dashboard/lib/voice_web.dart)
 uses `getUserMedia` and a non-timesliced `MediaRecorder`, then returns full audio on
-Stop. This harness uses that capture sequence, starting a separate recognizer after
-recorder start to examine concurrent acquisition. It is a separate page, so success
+Stop. This harness defaults to that recorder-first sequence but also offers
+recognizer-first acquisition. Per-trial order/start-call timestamps make the
+comparison explicit; neither order is chosen for the eventual feature. It is a separate page, so success
 here still requires verification in the actual Room before feature acceptance.
 [voice-api.ts](../../../packages/rusa/src/voice/voice-api.ts) saves the clip, calls
 `service.transcribeMemo` and then `mesh.sendHumanMessage` (baseline lines 199–222).
@@ -136,9 +176,23 @@ outside the standard runtime/Flutter suites.
 | Real recorder, generated tone | **5126 bytes**, WebM/Opus; decoded **0.299977 s**, mono, 44100 Hz, RMS **0.229146**, peak **0.389070** in one observed run |
 | Scripted recognizer | Three start/stop cycles: “eleven boats” at Stop, post-stop final “eleven paper boats”; interim removal handled; all assertions passed |
 | Lifecycle | Cancel discards clip; early recognition end keeps recorder alive; absent local-required support fails before capture; cancel during acquisition releases late tracks |
+| Review regression | Before repair, a recorder stop delayed to 5.5s was labeled completed at 5s (assertion failed). After repair, nine scripted trials passed; the recorder stays pending until its stop event, late recognition results are diagnostic-only and accepted summary stays frozen/incomplete; separate 10s recorder timeout releases tracks and discards unfinished audio |
+| Conditions/order | Recorder-first and recognizer-first event order verified; individual online/offline descriptions, navigator status and probe results survive later field/probe changes |
 | Offline fixture | Service worker served the harness on offline reload |
 | Initial red receipt | First smoke run failed early-end status assertion; explicit rerender repaired the harness; subsequent smoke exited **0 / PASS** |
 | Actor delivery | None attempted; harness has no delivery path |
+
+Review captures from real Linux headless Chrome, with generated audio and scripted
+recognition (these are not Android/device evidence):
+
+- [Idle diagnostic page](screenshots/idle.png)
+- [Completed scripted trial](screenshots/scripted-completed.png)
+
+To regenerate them with the manual runner, set
+`SPIKE_SCREENSHOT_DIR=docs/spikes/662-transcription/screenshots` for the smoke command.
+The runner is retained only through the device decision, then removed with this
+fixture. Screenshots show the fixture identifier; their unfilled checkout SHA is
+UNTESTED and does not claim a served clean-commit device receipt.
 
 `adb` is unavailable on this worker (`command -v adb` has no executable). No target
 Android device was accessed. Installed-PWA device/OS/Chrome versions, actual first

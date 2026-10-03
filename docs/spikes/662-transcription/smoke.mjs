@@ -1,7 +1,7 @@
 // Synthetic harness validation only: fake Chrome microphone + scripted recognizer.
 // No remote recognizer, real speech, Android device or actor delivery is exercised.
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -9,6 +9,8 @@ import { resolve } from "node:path";
 
 const require = createRequire(resolve("packages/rusa/package.json"));
 const { chromium } = require("@playwright/test");
+const screenshotDir = process.env.SPIKE_SCREENSHOT_DIR;
+if (screenshotDir) await mkdir(screenshotDir, { recursive: true });
 const scratch = await mkdtemp(resolve(tmpdir(), "662-synthetic-"));
 // Four seconds of generated 440 Hz tone, mono signed 16-bit PCM; no human voice.
 const wav = Buffer.alloc(44 + 16000 * 4 * 2);
@@ -35,7 +37,14 @@ const types = {
   ".webmanifest": "application/manifest+json",
   ".svg": "image/svg+xml",
 };
-const files = ["index.html", "spike.mjs", "sw.js", "manifest.webmanifest", "icon.svg"];
+const files = [
+  "index.html",
+  "spike.mjs",
+  "sw.js",
+  "manifest.webmanifest",
+  "icon.svg",
+  "fixture-version.js",
+];
 const server = createServer(async (req, res) => {
   const name = req.url === "/" ? "index.html" : req.url.slice(1);
   if (!files.includes(name)) {
@@ -110,6 +119,9 @@ try {
         if (!window.omitLocalSupport) this.processLocally = false;
         window.fakeRecognition = this;
       }
+      static async available() {
+        return navigator.onLine ? "downloadable" : "unavailable";
+      }
       start() {
         this.dispatchEvent(new Event("start"));
       }
@@ -122,8 +134,9 @@ try {
         this.dispatchEvent(e);
       }
       stop() {
-        setTimeout(() => this.result("eleven paper boats", true), 10);
-        setTimeout(() => this.dispatchEvent(new Event("end")), 20);
+        const delay = window.delayFinal ? 5500 : 10;
+        setTimeout(() => this.result("eleven paper boats", true), delay);
+        setTimeout(() => this.dispatchEvent(new Event("end")), delay + 10);
       }
       abort() {
         this.dispatchEvent(new Event("end"));
@@ -134,9 +147,21 @@ try {
   const fakePage = await fakeContext.newPage();
   fakePage.on("pageerror", (error) => errors.push(error.message));
   await fakePage.goto(url);
+  if (screenshotDir)
+    await fakePage.screenshot({ path: resolve(screenshotDir, "idle.png"), fullPage: true });
   const fakeSnapshot = () => fakePage.locator("#report").textContent().then(JSON.parse);
   await fakePage.selectOption("#mode", "browser");
   for (let i = 0; i < 3; i++) {
+    await fakePage.selectOption("#order", i === 1 ? "recognizer-first" : "recorder-first");
+    await fakePage.fill(
+      "#network",
+      i === 1 ? "scripted offline condition" : "scripted online condition"
+    );
+    await fakeContext.setOffline(i === 1);
+    await fakePage.click("#probe");
+    await fakePage.waitForFunction(() =>
+      document.getElementById("support").textContent.includes("available")
+    );
     await fakePage.click("#start");
     await fakePage.waitForFunction(() => !document.getElementById("stop").disabled);
     await fakePage.click("#mark");
@@ -155,7 +180,76 @@ try {
     assert.equal(r.resultEventsAfterStop, 1);
     assert.equal(r.firstPartialBeforeStop, true);
     assert.ok(r.firstPartialFromManualOnsetMs >= 0);
+    assert.equal(r.navigatorOnline, i !== 1);
+    assert.equal(r.network, i === 1 ? "scripted offline condition" : "scripted online condition");
+    assert.equal(r.localProbe.available, i === 1 ? "unavailable" : "downloadable");
+    const types = r.events.map((e) => e.type);
+    assert.equal(
+      types.indexOf("recognition-start-call") < types.indexOf("recorder-acquire-call"),
+      i === 1
+    );
+    if (i === 0 && screenshotDir)
+      await fakePage.screenshot({
+        path: resolve(screenshotDir, "scripted-completed.png"),
+        fullPage: true,
+      });
   }
+  // Real 5s drain deadline: a delayed recorder is not prematurely finalized,
+  // and a late recognizer result cannot rewrite the frozen accepted summary.
+  await fakePage.evaluate(() => {
+    window.delayFinal = true;
+    const nativeStop = MediaRecorder.prototype.stop;
+    MediaRecorder.prototype.stop = function () {
+      setTimeout(() => nativeStop.call(this), 5500);
+      MediaRecorder.prototype.stop = nativeStop;
+    };
+  });
+  await fakePage.click("#start");
+  await fakePage.waitForFunction(() => !document.getElementById("stop").disabled);
+  await fakePage.evaluate(() => window.fakeRecognition.result("pending before deadline"));
+  await fakePage.click("#stop");
+  await fakePage.waitForTimeout(5150);
+  const draining = (await fakeSnapshot()).trials.at(-1);
+  assert.equal(draining.audio, null);
+  assert.ok(draining.phase.includes("awaiting recorder"), draining.phase);
+  await fakePage.waitForFunction(
+    () => JSON.parse(document.getElementById("report").textContent).trials.at(-1).audio?.bytes > 0
+  );
+  await fakePage.waitForTimeout(150);
+  const timedOut = (await fakeSnapshot()).trials.at(-1);
+  assert.equal(timedOut.preview, "pending before deadline");
+  assert.equal(timedOut.finalRecognition, "");
+  assert.equal(timedOut.pendingInterimAtEnd, "pending before deadline");
+  assert.ok(timedOut.events.some((e) => e.type === "late-recognition-result"));
+  assert.ok(timedOut.audio.bytes > 0);
+  assert.ok(timedOut.events.some((e) => e.type === "recorder-end"));
+  await fakePage.evaluate(() => {
+    window.delayFinal = false;
+  });
+  // A recorder that never stops has its own deadline and no accepted clip.
+  await fakePage.evaluate(() => {
+    const nativeStop = MediaRecorder.prototype.stop;
+    MediaRecorder.prototype.stop = function () {
+      window.stalledRecorder = this;
+      MediaRecorder.prototype.stop = nativeStop;
+    };
+  });
+  await fakePage.click("#start");
+  await fakePage.waitForFunction(() => !document.getElementById("stop").disabled);
+  await fakePage.click("#stop");
+  await fakePage.waitForFunction(
+    () => JSON.parse(document.getElementById("report").textContent).trials.at(-1).recorderTimedOut
+  );
+  const recorderTimeout = (await fakeSnapshot()).trials.at(-1);
+  assert.ok(recorderTimeout.phase.includes("incomplete:"));
+  assert.equal(recorderTimeout.audio, null);
+  assert.ok(recorderTimeout.events.some((e) => e.type === "recorder-stop-timeout"));
+  assert.equal(
+    await fakePage.evaluate(() =>
+      window.stalledRecorder.stream.getTracks().every((t) => t.readyState === "ended")
+    ),
+    true
+  );
   await fakePage.click("#start");
   await fakePage.waitForFunction(() => !document.getElementById("stop").disabled);
   await fakePage.click("#cancel");
@@ -221,6 +315,7 @@ try {
       {
         result: "PASS",
         scope: "synthetic desktop harness only",
+        fixtureVersion: fakeReceipt.fixtureVersion,
         baseline: baselineReceipt,
         scriptedTrials: fakeReceipt.trials.length,
         assertions: [
@@ -228,6 +323,10 @@ try {
           "3 start/stop cycles",
           "interim removal",
           "post-stop final revision",
+          "both acquisition orders",
+          "per-trial online/offline/probe snapshots",
+          "5s deadline freezes accepted results and preserves delayed recorder stop",
+          "independent 10s recorder timeout releases tracks and discards unfinished audio",
           "cancel discards clip",
           "early recognition end keeps recording",
           "local-required unsupported fails closed",
