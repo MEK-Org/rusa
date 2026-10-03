@@ -7,7 +7,7 @@ import {
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
-import { HUMAN_OPERATOR, isHumanOperator, MESH_SYSTEM } from "../mcp/stamp.js";
+import { isHumanOperator, MESH_SYSTEM } from "../mcp/stamp.js";
 import {
   isBlockingObligationStatus,
   isReadyForAttention,
@@ -233,6 +233,8 @@ export interface RetireOptions {
 export interface VoiceSessionTransferPort {
   /** Read the caller's unambiguous active session before any authority moves. */
   activeSessionIdFor(actorId: string): string;
+  /** Read the caller's active session and bound human principal together. */
+  activeSessionFor?(actorId: string): { sessionId: string; principalId?: string };
   /** Atomically rebind the caller's active session and return its same UUID. */
   transferActiveSession(fromActorId: string, targetActorId: string): string;
   /** Restore a just-rebound session before its durable handoff was accepted. */
@@ -507,10 +509,8 @@ function isTrustedControlPrincipal(
 ): boolean {
   return (
     by === "root-llm" ||
-    by === "human:operator" ||
-    by.startsWith("human:") ||
     by === "e2e-controller" ||
-    (principals !== undefined && principals.getUser(by) !== undefined)
+    (principals !== undefined && !!principals.getUser(by))
   );
 }
 
@@ -2926,14 +2926,30 @@ export class ActorMesh {
    * a recipient of a transfer may reply during the live handoff without
    * permanently gaining direct-human authority.
    */
-  activeVoiceSessionIdFor(actorId: string): string | undefined {
+  /**
+   * The caller's active voice session UUID and bound human principal, if any.
+   */
+  activeVoiceSessionFor(actorId: string): { sessionId: string; principalId?: string } | undefined {
     const transfer = this.voiceSessionTransfer;
     if (!transfer) return undefined;
     try {
-      return transfer.activeSessionIdFor(this.resolveThreadId(actorId));
+      if (transfer.activeSessionFor) {
+        return transfer.activeSessionFor(this.resolveThreadId(actorId));
+      }
+      const sessionId = transfer.activeSessionIdFor(this.resolveThreadId(actorId));
+      return { sessionId };
     } catch {
       return undefined;
     }
+  }
+
+  activeVoiceSessionIdFor(actorId: string): string | undefined {
+    return this.activeVoiceSessionFor(actorId)?.sessionId;
+  }
+
+  /** Resolve the human side of the currently leased conversation from the session binding. */
+  activeVoicePrincipalIdFor(actorId: string): string | undefined {
+    return this.activeVoiceSessionFor(actorId)?.principalId;
   }
 
   /** Resolve an active live actor from the caller's own handle set. */
@@ -4129,10 +4145,13 @@ export class ActorMesh {
     toId: string,
     body: string,
     sessionId: string,
-    opts?: { voice?: boolean; fromId?: string }
+    opts: { voice?: boolean; fromId: string }
   ): MessageDeliveryResult {
     toId = this.resolveThreadId(toId);
-    const fromId = opts?.fromId ?? HUMAN_OPERATOR;
+    const fromId = opts.fromId;
+    if (!this.principals?.getUser(fromId) || this.principals.getUser(fromId)?.disabledAt) {
+      throw new Error("human message requires an active durable user principal");
+    }
     const rec = this.actors.get(toId);
     if (!rec || rec.status !== "active") {
       this.log(`message to ${toId} from ${fromId} dropped — recipient not active`);
@@ -4352,10 +4371,7 @@ export class ActorMesh {
    * interrupted run's start time, and only schedules a re-run if newer unhandled inbox
    * items have arrived after the interrupted run started.
    */
-  interrupt(
-    targetId: string,
-    by: string = "human:operator"
-  ): { interrupted: boolean; status?: string } {
+  interrupt(targetId: string, by: string): { interrupted: boolean; status?: string } {
     targetId = this.resolveThreadId(targetId);
     by = this.resolveThreadId(by);
     const target = this.runs.liveActor(targetId);

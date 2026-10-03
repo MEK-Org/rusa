@@ -1,6 +1,4 @@
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
-import { resolveLegacyOperatorAlias } from "../principals/operator-principal.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { Obligation } from "./obligation.js";
 
@@ -13,28 +11,25 @@ import type { Obligation } from "./obligation.js";
  * pressure only exists if every write boundary applies the same rule, so this
  * is the rule, in one place.
  *
- * Accepts a live actor, a durable user principal, or the legacy operator alias
- * — which, once a sole active user exists, resolves to that user rather than
- * minting a fresh `human:operator` row (#460). Everything else is refused: a
- * retired actor, an id that names nothing, and any `system:*` id, since nothing
- * mints a system owner today and admitting one would create work that appears
- * in no queue and wakes nobody.
+ * Accepts a live actor or a durable user principal. Unknown ids, retired
+ * actors and infrastructure ids cannot own work.
  */
 export function resolveObligationOwner(
   actors: Pick<ActorRepository, "get">,
   rawOwnerId: string,
   principals?: Pick<PrincipalRepository, "get" | "listUsers">
 ): { ok: true; ownerId: string } | { ok: false; error: string } {
-  const alias = resolveLegacyOperatorAlias(rawOwnerId.trim(), principals);
-  if (!alias.ok) return alias;
-  const ownerId = alias.ownerId;
-  if (ownerId === HUMAN_OPERATOR) return { ok: true, ownerId };
+  const ownerId = rawOwnerId.trim();
   if (principals) {
     const p = principals.get(ownerId);
     if (p && p.kind === "user") return { ok: true, ownerId };
   }
   const record = actors.get(ownerId);
-  if (!record) return { ok: false, error: `unknown obligation owner: ${ownerId}` };
+  if (!record)
+    return {
+      ok: false,
+      error: `unknown obligation owner: ${ownerId}; use the verified human message fromId, ask your parent for its durable principal mapping, or name an active actor id`,
+    };
   if (record.status !== "active") {
     return { ok: false, error: `obligation owner is not active: ${ownerId}` };
   }

@@ -139,8 +139,11 @@ to hold a single task should have been that task under its parent. Work you will
 finish in this run needs no obligation at all.
 
 **A question for a human is an obligation too.** When you need a decision only a
-person can make, create the obligation and own it to them (\`human:operator\`)
-instead of only asking in chat. A question asked in a message is gone at the next
+person can make, create the obligation and own it to their durable principal id
+instead of only asking in chat. Copy the verified \`fromId\` of their human mesh
+message, or ask your parent for the verified durable principal mapping if you
+only have a delegated task or an external sender. Google Chat, Slack and GitHub
+sender identifiers are not mesh principal ids. A question asked in a message is gone at the next
 compaction; one in the tree is a standing call-list they can work through. **One
 obligation per question** — four questions in one node cannot be answered,
 reordered, or finished separately, which is the whole point of having them.

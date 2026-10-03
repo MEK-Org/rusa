@@ -1095,6 +1095,7 @@ async function composeStart(
   const database = initDb(mcHome);
   resources.acquire("database", () => closeDb());
   log.info("database_ready", { home: mcHome });
+  if (!config.auth) getRepositories().principals.ensureImplicitUser(new Date().toISOString());
 
   const modelClasses = getRepositories().modelClasses;
 
@@ -2798,6 +2799,11 @@ async function composeStart(
         if (!voiceService)
           throw new Error("voice session transfer is unavailable on this instance");
         return voiceService.activeSessionIdFor(actorId);
+      },
+      activeSessionFor: (actorId) => {
+        if (!voiceService)
+          throw new Error("voice session transfer is unavailable on this instance");
+        return voiceService.activeSessionFor(actorId);
       },
       transferActiveSession: (fromActorId, targetActorId) => {
         if (!voiceService)

@@ -12,12 +12,18 @@ import { PrincipalRepository } from "../db/repositories/principal-repository.js"
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import { IMPLICIT_USER_EMAIL } from "./implicit-user.js";
 import {
   backupDatabase,
   executeLegacyPrincipalMigration,
   generateMigrationReport,
   inventoryLegacyReferences,
 } from "./legacy-migration.js";
+
+function required<T>(value: T | undefined | null): T {
+  if (value === undefined || value === null) throw new Error("value is required");
+  return value;
+}
 
 const ROOT_ID = "root";
 const WORKER_ID = "worker-1";
@@ -991,6 +997,280 @@ describe("legacy-migration", () => {
       expect(repo.readyHeads().has(HUMAN_OPERATOR)).toBe(false);
 
       db.close();
+    });
+  });
+
+  describe("composed cutover and implicit user lifecycle regressions (#597)", () => {
+    it("executes the full lifecycle: zero users -> pre-cutover reply failure -> bootstrap -> post-bootstrap writes -> dry run -> apply reusing implicit principal -> reply succeeds -> idempotent rerun", () => {
+      const db = new Database(":memory:");
+      db.pragma("foreign_keys = ON");
+      runMigrations(db);
+
+      const actorRepo = new SqliteActorRepository(db);
+      actorRepo.upsert({
+        id: ROOT_ID,
+        charter: "root actor",
+        parentId: null,
+        isRoot: true,
+        status: "active",
+        createdAt: "2026-09-01T00:00:00.000Z",
+      });
+      actorRepo.upsert({
+        id: WORKER_ID,
+        charter: "worker actor",
+        parentId: ROOT_ID,
+        status: "active",
+        createdAt: "2026-09-01T01:00:00.000Z",
+      });
+
+      const principals = new PrincipalRepository(db);
+      const chatRepo = new MeshChatRepository(db);
+
+      // 1. Zero users initially
+      expect(principals.listUsers()).toHaveLength(0);
+
+      // Pre-upgrade legacy chat row from human:operator
+      chatRepo.record({
+        senderId: HUMAN_OPERATOR,
+        recipientId: WORKER_ID,
+        body: "Pre-upgrade legacy message",
+        sessionId: "sess-legacy",
+        ts: "2026-09-01T02:00:00.000Z",
+      });
+
+      // Pre-cutover state: lastHumanChat sees human:operator, but there is no active durable principal
+      const preChat = actorRepo.lastHumanChat(WORKER_ID);
+      expect(preChat?.principalId).toBe(HUMAN_OPERATOR);
+      const preUser = principals.getUser(preChat?.principalId ?? "");
+      expect(preUser).toBeUndefined(); // Reply would fail here because human:operator is not a durable user
+
+      // 2. Bootstrap implicit user
+      const implicit = principals.ensureImplicitUser("2026-09-01T03:00:00.000Z");
+      expect(implicit).toBeDefined();
+      expect(implicit?.email).toBe(IMPLICIT_USER_EMAIL);
+      expect(implicit?.identity).toBeUndefined();
+      const implicitId = required(implicit).id;
+
+      // 3. Post-bootstrap writes occur under implicit durable user
+      chatRepo.record({
+        senderId: implicitId,
+        recipientId: WORKER_ID,
+        body: "Post-bootstrap message under implicit user",
+        sessionId: "sess-implicit",
+        ts: "2026-09-01T03:05:00.000Z",
+      });
+
+      // 4. Dry run: verifies zero mutation
+      const dryRun = executeLegacyPrincipalMigration(db, {
+        email: "alice@example.com",
+        issuer: "https://auth.example.com",
+        subject: "alice-sub",
+        apply: false,
+      });
+      expect(dryRun.applied).toBe(false);
+      expect(dryRun.principalReused).toBe(true);
+      expect(dryRun.principalId).toBe(implicitId);
+      expect(principals.getUser(implicitId)?.email).toBe(IMPLICIT_USER_EMAIL);
+      expect(principals.getUser(implicitId)?.identity).toBeUndefined();
+
+      // 5. Cutover apply: reuses implicit user in-place, updates email and external identity
+      const applyResult = executeLegacyPrincipalMigration(db, {
+        email: "alice@example.com",
+        issuer: "https://auth.example.com",
+        subject: "alice-sub",
+        apply: true,
+      });
+      expect(applyResult.applied).toBe(true);
+      expect(applyResult.principalReused).toBe(true);
+      expect(applyResult.principalCreated).toBe(false);
+      expect(applyResult.principalId).toBe(implicitId); // Exact same principal ID retained!
+      expect(applyResult.externalIdentityBound).toBe(true);
+
+      // Verify the user was enriched in-place
+      const enrichedUser = principals.getUser(implicitId);
+      expect(enrichedUser?.email).toBe("alice@example.com");
+      expect(enrichedUser?.identity).toEqual({
+        issuer: "https://auth.example.com",
+        subject: "alice-sub",
+      });
+      expect(principals.listUsers()).toHaveLength(1);
+
+      // Verify legacy authoritative references were rewritten to implicitId
+      const legacyChat = chatRepo.listForSession("sess-legacy", { limit: 10 });
+      expect(legacyChat[0].senderId).toBe(implicitId);
+
+      const postChat = chatRepo.listForSession("sess-implicit", { limit: 10 });
+      expect(postChat[0].senderId).toBe(implicitId);
+
+      // Both conversations now resolve to the exact same active durable principal
+      expect(principals.getUser(legacyChat[0].senderId)?.id).toBe(implicitId);
+      expect(principals.getUser(postChat[0].senderId)?.id).toBe(implicitId);
+
+      // 0 legacy authoritative references remain
+      const inventory = inventoryLegacyReferences(db);
+      expect(inventory.totalAuthoritative).toBe(0);
+      expect(inventory.totalDangling).toBe(0);
+
+      // 6. Idempotent rerun: re-running cutover with same email reuses the principal without error
+      const rerun = executeLegacyPrincipalMigration(db, {
+        email: "alice@example.com",
+        apply: true,
+      });
+      expect(rerun.applied).toBe(true);
+      expect(rerun.principalReused).toBe(true);
+      expect(rerun.principalId).toBe(implicitId);
+      expect(rerun.rewritesApplied).toBe(0);
+
+      db.close();
+    });
+
+    it("supports cutover before bootstrap: creates new principal and prevents duplicate implicit user", () => {
+      const db = new Database(":memory:");
+      db.pragma("foreign_keys = ON");
+      runMigrations(db);
+
+      const principals = new PrincipalRepository(db);
+      expect(principals.listUsers()).toHaveLength(0);
+
+      // Cutover runs on zero-user database
+      const result = executeLegacyPrincipalMigration(db, {
+        email: "bob@example.com",
+        apply: true,
+      });
+      expect(result.applied).toBe(true);
+      expect(result.principalCreated).toBe(true);
+      expect(result.principalReused).toBe(false);
+      expect(principals.listUsers()).toHaveLength(1);
+
+      // Subsequent bootstrap sees that users already exist and returns undefined
+      const implicit = principals.ensureImplicitUser("2026-09-01T04:00:00.000Z");
+      expect(implicit).toBeUndefined();
+      expect(principals.listUsers()).toHaveLength(1);
+
+      db.close();
+    });
+
+    it("rolls back completely on in-transaction failure leaving implicit user and legacy rows unchanged", () => {
+      const db = new Database(":memory:");
+      db.pragma("foreign_keys = ON");
+      runMigrations(db);
+
+      const principals = new PrincipalRepository(db);
+      const implicit = required(principals.ensureImplicitUser("2026-09-01T00:00:00.000Z"));
+      expect(implicit).toBeDefined();
+
+      const chatRepo = new MeshChatRepository(db);
+      chatRepo.record({
+        senderId: HUMAN_OPERATOR,
+        recipientId: WORKER_ID,
+        body: "Preserved legacy message",
+        sessionId: "sess-legacy-fail",
+      });
+
+      // Create a conflicting external identity holder to cause conflict
+      principals.createUser({
+        email: "other@example.com",
+        identity: { issuer: "https://auth.example.com", subject: "clashing-sub" },
+        createdAt: "2026-09-01T01:00:00.000Z",
+      });
+
+      // Cutover with clashing external identity will fail in precheck or in-transaction
+      expect(() =>
+        executeLegacyPrincipalMigration(db, {
+          email: "charlie@example.com",
+          issuer: "https://auth.example.com",
+          subject: "clashing-sub",
+          apply: true,
+        })
+      ).toThrow(/ambiguous users exist alongside implicit user|Conflicting identity binding/);
+
+      // Verify implicit user remains completely untouched
+      const implicitAfter = principals.getUser(implicit.id);
+      expect(implicitAfter?.email).toBe(IMPLICIT_USER_EMAIL);
+      expect(implicitAfter?.identity).toBeUndefined();
+
+      // Verify legacy chat row remains untouched
+      const chats = chatRepo.listForSession("sess-legacy-fail", { limit: 10 });
+      expect(chats[0].senderId).toBe(HUMAN_OPERATOR);
+
+      db.close();
+    });
+
+    it("actionable refusals: rejects ambiguous users, bound candidates, disabled candidates, and reserved email", () => {
+      // 1. Ambiguous users alongside implicit candidate
+      {
+        const db = new Database(":memory:");
+        db.pragma("foreign_keys = ON");
+        runMigrations(db);
+        const principals = new PrincipalRepository(db);
+        principals.ensureImplicitUser("2026-09-01T00:00:00.000Z");
+        principals.createUser({
+          email: "second@example.com",
+          createdAt: "2026-09-01T01:00:00.000Z",
+        });
+
+        expect(() =>
+          executeLegacyPrincipalMigration(db, {
+            email: "target@example.com",
+            apply: true,
+          })
+        ).toThrow(
+          /Cannot cut over: ambiguous users exist alongside implicit user \(2 total users\)/
+        );
+        db.close();
+      }
+
+      // 2. Bound implicit candidate
+      {
+        const db = new Database(":memory:");
+        db.pragma("foreign_keys = ON");
+        runMigrations(db);
+        const principals = new PrincipalRepository(db);
+        const user = required(principals.ensureImplicitUser("2026-09-01T00:00:00.000Z"));
+        db.prepare(
+          "UPDATE users SET firebase_issuer = ?, firebase_subject = ? WHERE principal_id = ?"
+        ).run("iss", "sub", user.id);
+
+        expect(() =>
+          executeLegacyPrincipalMigration(db, {
+            email: "target@example.com",
+            apply: true,
+          })
+        ).toThrow(/Cannot cut over: implicit user '.*' is already bound to an external identity/);
+        db.close();
+      }
+
+      // 3. Disabled implicit candidate
+      {
+        const db = new Database(":memory:");
+        db.pragma("foreign_keys = ON");
+        runMigrations(db);
+        const principals = new PrincipalRepository(db);
+        const user = required(principals.ensureImplicitUser("2026-09-01T00:00:00.000Z"));
+        principals.setDisabled(user.id, "2026-09-01T01:00:00.000Z");
+
+        expect(() =>
+          executeLegacyPrincipalMigration(db, {
+            email: "target@example.com",
+            apply: true,
+          })
+        ).toThrow(/Cannot cut over: implicit user '.*' is disabled/);
+        db.close();
+      }
+
+      // 4. Reserved email target
+      {
+        const db = new Database(":memory:");
+        db.pragma("foreign_keys = ON");
+        runMigrations(db);
+        expect(() =>
+          executeLegacyPrincipalMigration(db, {
+            email: IMPLICIT_USER_EMAIL,
+            apply: true,
+          })
+        ).toThrow(/Cannot migrate to reserved admission email: local-operator@rusa.invalid/);
+        db.close();
+      }
     });
   });
 });

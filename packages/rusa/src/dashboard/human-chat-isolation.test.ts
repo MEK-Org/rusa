@@ -1,9 +1,13 @@
 // @vitest-environment node
+
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import type { DecodedIdToken } from "firebase-admin/auth";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { runMigrations } from "../db/migrations/runner.js";
@@ -14,6 +18,7 @@ import { PrincipalRepository } from "../db/repositories/principal-repository.js"
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import { VoiceService } from "../voice/voice-service.js";
 import { createDashboardRequestHandler } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
 import { DashboardAuth, SESSION_MS } from "./auth.js";
@@ -89,6 +94,7 @@ describe("human chat isolation (#590)", () => {
   let auth: DashboardAuth;
   let server: ReturnType<typeof createServer>;
   let origin: string;
+  let deps: DashboardDataDeps;
   let alice: Person;
   let bob: Person;
   /** Session cookie → the person it authenticates. */
@@ -197,7 +203,7 @@ describe("human chat isolation (#590)", () => {
       },
       getSelection: () => undefined,
     };
-    const deps: DashboardDataDeps = {
+    deps = {
       actors,
       principals,
       meshEvents,
@@ -300,6 +306,69 @@ describe("human chat isolation (#590)", () => {
       moreInboxItemsCount?: number;
     }>;
   };
+
+  it("binds leased voice streams to the authenticated human across matching and mismatched reconnects", async () => {
+    const a = await login(alice);
+    const b = await login(bob);
+    const home = mkdtempSync(join(tmpdir(), "voice-auth-fixture-"));
+    const service = new VoiceService({
+      home,
+      speech: {
+        transcribe: async () => "",
+        synthesize: async () => ({ pcm: Buffer.alloc(0), sampleRate: 24000 }),
+        streamSynthesize: async () => ({
+          sampleRate: 24000,
+          pcmStream: (async function* () {
+            yield Buffer.alloc(0);
+          })(),
+        }),
+      },
+    });
+    server.removeAllListeners("request");
+    server.on(
+      "request",
+      createDashboardRequestHandler(
+        { port: 0, auth: auth.config },
+        deps,
+        { actors: deps.actors, mesh: deps.mesh, principals, sseHub: deps.sseHub, service },
+        auth
+      )
+    );
+    const path = `${origin}/api/mesh/voice/stream?actors=${ACTOR}&sessionId=synthetic-voice-lease`;
+    const streams: AbortController[] = [];
+    const open = (cookie: string) => {
+      const controller = new AbortController();
+      streams.push(controller);
+      return {
+        controller,
+        response: fetch(path, { headers: { Cookie: cookie }, signal: controller.signal }),
+      };
+    };
+    try {
+      expect((await fetch(path)).status).toBe(401);
+      const first = open(a.cookie);
+      expect((await first.response).status).toBe(200);
+      const binding = { sessionId: "synthetic-voice-lease", principalId: a.id };
+      expect(service.activeSessionFor(ACTOR)).toEqual(binding);
+      first.controller.abort();
+      await vi.waitFor(() => expect(deps.sseHub.connectionCount).toBe(0));
+      const matching = open(a.cookie);
+      expect((await matching.response).status).toBe(200);
+      expect(service.activeSessionFor(ACTOR)).toEqual(binding);
+      matching.controller.abort();
+      await vi.waitFor(() => expect(deps.sseHub.connectionCount).toBe(0));
+      const mismatch = await fetch(path, { headers: { Cookie: b.cookie } });
+      expect(mismatch.status).toBe(409);
+      expect(await mismatch.json()).toEqual({
+        error: "sessionId is already bound to a different principal",
+      });
+      expect(deps.sseHub.connectionCount).toBe(0);
+      expect(service.activeSessionFor(ACTOR)).toEqual(binding);
+    } finally {
+      for (const controller of streams) controller.abort();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 
   /** Two humans each talk to the actor and the actor answers each of them. */
   async function seedBothConversations(a: { cookie: string; id: string }, b: typeof a) {

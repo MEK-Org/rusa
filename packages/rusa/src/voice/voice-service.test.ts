@@ -463,3 +463,93 @@ describe("attachVoiceOutbound", () => {
     expect(pushVoice).not.toHaveBeenCalled();
   });
 });
+
+describe("VoiceService session lease and principal binding (#597)", () => {
+  it("binds principalId to active voice session upon openSession and exposes it via activeSessionFor and activeSessionPrincipalIdFor", () => {
+    const { service } = makeService();
+    expect(() => service.activeSessionFor(ACTOR)).toThrow(
+      "caller does not hold an active voice session"
+    );
+    expect(service.activeSessionPrincipalIdFor(ACTOR)).toBeUndefined();
+
+    service.openSession("session-1", ACTOR, "user-alice");
+    expect(service.activeSessionFor(ACTOR)).toEqual({
+      sessionId: "session-1",
+      principalId: "user-alice",
+    });
+    expect(service.activeSessionPrincipalIdFor(ACTOR)).toBe("user-alice");
+    expect(service.activeSessionIdFor(ACTOR)).toBe("session-1");
+  });
+
+  it("allows matching reconnect with same principalId without altering session state", () => {
+    const { service } = makeService();
+    service.openSession("session-1", ACTOR, "user-alice");
+
+    expect(() => service.validateSession("session-1", ACTOR, "user-alice")).not.toThrow();
+    expect(service.activeSessionFor(ACTOR)).toEqual({
+      sessionId: "session-1",
+      principalId: "user-alice",
+    });
+  });
+
+  it("rejects mismatched reconnect with 409 error and leaves active session and principal unchanged with zero mutation", () => {
+    const { service } = makeService();
+    service.openSession("session-1", ACTOR, "user-alice");
+
+    expect(() => service.validateSession("session-1", ACTOR, "user-bob")).toThrow(
+      "sessionId is already bound to a different principal"
+    );
+
+    // Verify zero mutation: original session and principal are preserved
+    expect(service.activeSessionFor(ACTOR)).toEqual({
+      sessionId: "session-1",
+      principalId: "user-alice",
+    });
+  });
+
+  it("preserves principal binding across transferActiveSession and revertActiveSessionTransfer", () => {
+    const { service } = makeService();
+    service.openSession("session-1", ACTOR, "user-alice");
+
+    // Transfer session from ACTOR to TARGET
+    expect(service.transferActiveSession(ACTOR, TARGET)).toBe("session-1");
+    expect(() => service.activeSessionFor(ACTOR)).toThrow(
+      "caller does not hold an active voice session"
+    );
+    expect(service.activeSessionFor(TARGET)).toEqual({
+      sessionId: "session-1",
+      principalId: "user-alice",
+    });
+    expect(service.activeSessionPrincipalIdFor(TARGET)).toBe("user-alice");
+
+    // Revert transfer back from TARGET to ACTOR
+    service.revertActiveSessionTransfer("session-1", ACTOR, TARGET);
+    expect(() => service.activeSessionFor(TARGET)).toThrow(
+      "caller does not hold an active voice session"
+    );
+    expect(service.activeSessionFor(ACTOR)).toEqual({
+      sessionId: "session-1",
+      principalId: "user-alice",
+    });
+    expect(service.activeSessionPrincipalIdFor(ACTOR)).toBe("user-alice");
+  });
+
+  it("supports auth-disabled path with undefined principalId", () => {
+    const { service } = makeService();
+    service.openSession("session-open", ACTOR);
+
+    expect(service.activeSessionFor(ACTOR)).toEqual({
+      sessionId: "session-open",
+      principalId: undefined,
+    });
+    expect(service.activeSessionPrincipalIdFor(ACTOR)).toBeUndefined();
+
+    // Reconnect without principalId succeeds
+    expect(() => service.validateSession("session-open", ACTOR)).not.toThrow();
+
+    // Attempting to reconnect with a principalId when session had none throws
+    expect(() => service.validateSession("session-open", ACTOR, "user-charlie")).toThrow(
+      "sessionId is already bound to a different principal"
+    );
+  });
+});

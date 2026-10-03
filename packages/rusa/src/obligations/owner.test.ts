@@ -33,63 +33,22 @@ function principals(users: UserPrincipal[]): Pick<PrincipalRepository, "get" | "
   };
 }
 
-describe("resolveObligationOwner — legacy operator alias after #460", () => {
-  it("resolves the alias to the sole active durable user instead of minting the legacy row", () => {
-    expect(resolveObligationOwner(actors, HUMAN_OPERATOR, principals([user(USER_A)]))).toEqual({
-      ok: true,
-      ownerId: USER_A,
-    });
-    // Whitespace around the alias is still the alias.
-    expect(
-      resolveObligationOwner(actors, `  ${HUMAN_OPERATOR} `, principals([user(USER_A)]))
-    ).toEqual({
-      ok: true,
-      ownerId: USER_A,
-    });
-  });
-
-  it("ignores a disabled user when choosing the sole active one", () => {
-    expect(
-      resolveObligationOwner(
-        actors,
-        HUMAN_OPERATOR,
-        principals([user(USER_A, "2026-02-01T00:00:00Z"), user(USER_B)])
-      )
-    ).toEqual({ ok: true, ownerId: USER_B });
-  });
-
-  it("refuses the alias as ambiguous when several users are active", () => {
-    const result = resolveObligationOwner(
-      actors,
-      HUMAN_OPERATOR,
-      principals([user(USER_A), user(USER_B)])
-    );
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error).toContain("ambiguous");
-      expect(result.error).toContain("durable user principal id");
+describe("resolveObligationOwner — durable attribution", () => {
+  it("refuses the retired alias with actionable guidance at every user count", () => {
+    for (const users of [[], [user(USER_A)], [user(USER_A), user(USER_B)]]) {
+      const result = resolveObligationOwner(actors, HUMAN_OPERATOR, principals(users));
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain("verified human message fromId");
     }
   });
-
-  it("keeps the literal alias only while no durable user exists yet", () => {
-    expect(resolveObligationOwner(actors, HUMAN_OPERATOR, principals([]))).toEqual({
-      ok: true,
-      ownerId: HUMAN_OPERATOR,
-    });
-    expect(resolveObligationOwner(actors, HUMAN_OPERATOR)).toEqual({
-      ok: true,
-      ownerId: HUMAN_OPERATOR,
-    });
-  });
-
-  it("accepts a durable user id directly and a live actor as before", () => {
+  it("preserves durable user ownership while refusing unknown owners", () => {
     expect(
       resolveObligationOwner(actors, USER_B, principals([user(USER_A), user(USER_B)]))
     ).toEqual({ ok: true, ownerId: USER_B });
-    expect(resolveObligationOwner(actors, ACTOR, principals([user(USER_A)]))).toEqual({
-      ok: true,
-      ownerId: ACTOR,
-    });
-    expect(resolveObligationOwner(actors, "nobody", principals([user(USER_A)])).ok).toBe(false);
+    expect(resolveObligationOwner(actors, ACTOR)).toEqual({ ok: true, ownerId: ACTOR });
+    expect(
+      resolveObligationOwner(actors, USER_A, principals([user(USER_A, "2026-02-01")]))
+    ).toEqual({ ok: true, ownerId: USER_A });
+    expect(resolveObligationOwner(actors, "nobody").ok).toBe(false);
   });
 });

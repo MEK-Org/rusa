@@ -3,7 +3,6 @@ import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import {
   type OperatorPrincipalSource,
-  resolveLegacyOperatorAlias,
   resolveSoleActiveUser,
 } from "../principals/operator-principal.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
@@ -66,12 +65,12 @@ export function humanChatScope(req: IncomingMessage, users: UserPrincipal[]): Hu
   // `human:operator` names the viewer only while the alias still resolves to
   // them (or to itself, when nothing durable exists yet). With several durable
   // users the alias is ambiguous and belongs to nobody until migrated.
-  const alias = resolveLegacyOperatorAlias(HUMAN_OPERATOR, principals);
+  const sole = resolveSoleActiveUser(principals);
   const viewerIds = new Set<string>();
   if (me) viewerIds.add(me);
-  if (alias.ok && (alias.ownerId === HUMAN_OPERATOR || alias.ownerId === me)) {
+  // Historical read compatibility stays here until the measured privacy PR.
+  if ((sole.ok && sole.user.id === me) || (!sole.ok && sole.reason === "none"))
     viewerIds.add(HUMAN_OPERATOR);
-  }
   const humans = new Set<string>([HUMAN_OPERATOR, ...users.map((u) => u.id)]);
   return {
     viewerIds,

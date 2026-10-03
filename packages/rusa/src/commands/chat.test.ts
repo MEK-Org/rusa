@@ -70,6 +70,7 @@ describe("turn-based actor chat", () => {
       requests.push({ url, init });
       if (url.endsWith("/api/mesh/threads")) {
         return Response.json({
+          userPrincipalId: "11111111-0000-4000-8000-000000000001",
           threads: [
             actor("thread-1", "cloudy-porpoise", {
               title: "Own interactive CLI design",
@@ -88,7 +89,10 @@ describe("turn-based actor chat", () => {
                   actorId: "thread-1",
                   detail: "session-1",
                   body: "I handled it.",
-                  payload: JSON.stringify({ messageId: "message-1", to: "human:operator" }),
+                  payload: JSON.stringify({
+                    messageId: "message-1",
+                    to: "11111111-0000-4000-8000-000000000001",
+                  }),
                 },
               ]
             : [],
@@ -177,6 +181,7 @@ describe("turn-based actor chat", () => {
       const url = String(input);
       if (url.endsWith("/api/mesh/threads")) {
         return Response.json({
+          userPrincipalId: "11111111-0000-4000-8000-000000000001",
           threads: [actor("thread-1", "cloudy-porpoise", { runState: sent ? "running" : "idle" })],
         });
       }
@@ -190,7 +195,7 @@ describe("turn-based actor chat", () => {
                   actorId: "thread-1",
                   detail: "session-1",
                   body: "Reply",
-                  payload: JSON.stringify({ to: "human:operator" }),
+                  payload: JSON.stringify({ to: "11111111-0000-4000-8000-000000000001" }),
                 },
               ]
             : [],
@@ -231,7 +236,7 @@ describe("turn-based actor chat", () => {
     expect(output).toContain("\u001B[33m[cloudy-porpoise is running]\u001B[39m\n\n");
   });
 
-  it("renders replies addressed to authenticated userPrincipalId", async () => {
+  it("retains legacy history reads alongside replies addressed to authenticated userPrincipalId", async () => {
     let sent = false;
     const userPrincipalId = "durable-user-uuid-123";
     const fetchMock = async (input: string | URL | Request) => {
@@ -244,6 +249,9 @@ describe("turn-based actor chat", () => {
       }
       if (url.includes("/api/mesh/events?")) {
         expect(url).toContain(userPrincipalId);
+        expect(new URL(url).searchParams.get("actors")).toBe(
+          `thread-1,human:operator,${userPrincipalId}`
+        );
         return Response.json({
           events: sent
             ? [

@@ -31,7 +31,7 @@ import {
 import type { VoiceConfigDocument } from "../voice/voice-config.js";
 import { MAX_VOICE_TRANSFER_NOTE_CHARS } from "../voice/voice-transfer-context.js";
 import { toolError, toolOk } from "./result.js";
-import { HUMAN_OPERATOR, isHumanOperator } from "./stamp.js";
+import { isHumanOperator } from "./stamp.js";
 import { createMcpServer } from "./strict-server.js";
 
 class ModelClassInUseError extends Error {
@@ -261,9 +261,35 @@ export function createAgentExecMcpServer(
       async ({ message }) => {
         try {
           const chat = mesh.actors.lastHumanChat(selfId);
-          const sessionId = mesh.activeVoiceSessionIdFor(selfId) ?? chat?.sessionId;
+          const currentVoiceSession = mesh.activeVoiceSessionFor?.(selfId);
+          let sessionId: string | undefined;
+          let toId: string | undefined;
+
+          if (currentVoiceSession) {
+            sessionId = currentVoiceSession.sessionId;
+            toId = currentVoiceSession.principalId;
+            if (!toId) {
+              throw new Error(
+                "voice session is not bound to an active human principal; reconnect the voice stream to continue"
+              );
+            }
+          } else if (voiceSessionId) {
+            throw new Error(
+              "voice session lease expired or was released; reconnect the voice stream to continue"
+            );
+          } else {
+            sessionId = chat?.sessionId;
+            toId = chat?.principalId;
+          }
+
           if (!sessionId) throw new Error("reply requires an active human conversation");
-          const toId = chat?.principalId ?? HUMAN_OPERATOR;
+          if (!toId) {
+            throw new Error("reply requires a known durable human conversation principal");
+          }
+          const user = mesh.principals?.getUser(toId);
+          if (!user || user.disabledAt) {
+            throw new Error("reply requires an active durable human conversation principal");
+          }
           mesh.recordMessageEmitted({
             fromId: selfId,
             toId,
