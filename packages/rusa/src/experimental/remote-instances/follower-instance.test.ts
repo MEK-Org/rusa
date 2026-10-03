@@ -426,14 +426,11 @@ describe("monolithic follower instance", () => {
 
     expect(
       h.followerLogs
-        .filter((log) => log.event === "provider_admission" && log.fields?.actorId === waiter)
-        .map((log) => log.fields?.phase)
-    ).toEqual(["pending", "admitted"]);
-    expect(
-      h.followerLogs
-        .filter((log) => log.event === "provider_admission" && log.fields?.actorId === waiter)
-        .every((log) => log.fields?.id === "test-follower")
-    ).toBe(true);
+        .filter(
+          (log) => log.fields?.component === "computer-use-lock" && log.fields?.actorId === waiter
+        )
+        .map((log) => [log.event, log.fields?.id])
+    ).toEqual([["computer_use_wait", "test-follower"]]);
 
     // The responsive holder was not interrupted (#689 policy) and continues running
     expect(h.runtime(holder).isRunning).toBe(true);
@@ -467,20 +464,16 @@ describe("monolithic follower instance", () => {
       h.events.some((event) => event.actorId === waiter && event.event.type === "result")
     );
 
-    await waitUntil(() =>
-      h.followerLogs.some(
-        (log) =>
-          log.event === "provider_admission" &&
-          log.fields?.actorId === waiter &&
-          log.fields?.phase === "ended"
-      )
-    );
     expect(
       h.followerLogs
-        .filter((log) => log.event === "provider_admission" && log.fields?.actorId === waiter)
-        .map((log) => log.fields?.phase)
-    ).toEqual(["pending", "admitted", "ended"]);
-    expect(h.logs.some((log) => log.event === "provider_admission")).toBe(false);
+        .filter(
+          (log) => log.fields?.component === "computer-use-lock" && log.fields?.actorId === waiter
+        )
+        .map((log) => [log.event, log.fields?.id])
+    ).toEqual([
+      ["computer_use_wait", "test-follower"],
+      ["computer_use_acquired", "test-follower"],
+    ]);
 
     // The provider runStart arrives over the real follower runtime path; leader
     // selection alone cannot produce the follower-only lock records above.
