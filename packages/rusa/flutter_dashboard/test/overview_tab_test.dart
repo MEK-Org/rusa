@@ -379,8 +379,8 @@ void main() {
         await tester.pump();
         await tester.pump();
 
-        expect(find.text('View Owner Queue →'), findsOneWidget);
-        await tester.tap(find.text('View Owner Queue →'));
+        expect(find.byTooltip('View Owner Queue →'), findsOneWidget);
+        await tester.tap(find.byTooltip('View Owner Queue →'));
         await tester.pump();
 
         expect(selectedView, DashboardView.overview);

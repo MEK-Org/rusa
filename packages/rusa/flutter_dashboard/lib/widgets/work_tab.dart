@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:flutter/material.dart';
 
 import '../breakpoints.dart';
@@ -781,6 +782,11 @@ class _DetailViewState extends State<_DetailView> {
   // Completion history accumulates across "Load earlier completions" clicks
   // instead of being replaced by each new page, so an earlier page stays on
   // screen (extending the history, not losing access to it).
+  List<ObligationHistoryDto> _history = const [];
+  String? _historyNextBefore;
+  bool _loadingHistory = false;
+  bool _historyPaged = false;
+  String? _historyError;
   List<ObligationCompletionDto> _completions = const [];
   int _completionsTotal = 0;
   bool _completionsHasMore = false;
@@ -838,6 +844,11 @@ class _DetailViewState extends State<_DetailView> {
     }
     if (oldWidget.obligationId != widget.obligationId) {
       _shownIds = const {};
+      _history = const [];
+      _historyPaged = false;
+      _historyNextBefore = null;
+      _loadingHistory = false;
+      _historyError = null;
       _completions = const [];
       _completionsTotal = 0;
       _completionsHasMore = false;
@@ -941,6 +952,8 @@ class _DetailViewState extends State<_DetailView> {
           if (!mounted || gen != _fetchGeneration) return;
           _shownIds = _idsOf(data);
           setState(() {
+            _history = data.history;
+            _historyNextBefore = data.historyNextBefore;
             _completions = data.completions;
             _completionsTotal = data.completionsTotal;
             _completionsHasMore = data.completionsHasMore;
@@ -985,6 +998,7 @@ class _DetailViewState extends State<_DetailView> {
   }
 
   static Set<String> _idsOf(ObligationDetailSnapshot data) => {
+    for (final ancestor in data.ancestors) ancestor.id,
     if (data.parent != null) data.parent!.id,
     for (final o in [
       ...data.children,
@@ -1013,6 +1027,10 @@ class _DetailViewState extends State<_DetailView> {
   /// Takes a refetched first page without dropping earlier completion pages
   /// already loaded; called inside setState.
   void _applyRefreshed(ObligationDetailSnapshot data) {
+    final hadEarlierPages = _historyPaged;
+    _history = _mergeHistory(data.history, _history);
+    if (!hadEarlierPages) _historyNextBefore = data.historyNextBefore;
+    _loadingHistory = false;
     if (!data.completionsHasMore ||
         _completions.length <= data.completions.length) {
       _completions = data.completions;
@@ -1046,12 +1064,11 @@ class _DetailViewState extends State<_DetailView> {
         final data = snapshot.data!;
         final o = data.obligation;
 
-        return ListView(
-          padding: const EdgeInsets.all(24),
+        final description = Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _detailHeader(context, data),
-            if (o.body != null) ...[
-              const SizedBox(height: 10),
+            _SectionHeader('DESCRIPTION'),
+            if (o.body != null)
               SelectableText(
                 o.body!,
                 style: const TextStyle(
@@ -1060,96 +1077,545 @@ class _DetailViewState extends State<_DetailView> {
                   height: 1.5,
                 ),
               ),
-            ],
-            if (o.hasCheckpoint) ...[
-              const SizedBox(height: 16),
-              ObligationCheckpointPanel(
-                obligation: o,
-                lookupHandle: (id) => store.actor(id)?.handle,
-                isViewer: (id) => store.isViewer(id),
-                humanDisplayName: store.operatorDisplayName,
-                selectable: true,
-              ),
-            ],
-            const SizedBox(height: 24),
-            if (data.artifacts.isNotEmpty) ...[
-              _SectionHeader('CITED ARTIFACTS'),
-              for (final artifact in data.artifacts)
-                ReferencePreview(
-                  reference:
-                      _settled(artifact.reference) ??
-                      // Unresolvable in v1 (anything but mesh chat). Still shown:
-                      // the citation exists and is worth seeing even when we
-                      // cannot expand it.
-                      ReferenceDto(
-                        ref: artifact.ref,
-                        scheme: artifact.ref.split(':').first,
-                        title: artifact.ref,
-                        unavailable:
-                            'Not resolvable yet — only mesh chat is read back so far.',
-                      ),
-                  label: artifact.label,
-                  attachedBy: artifact.attachedBy,
-                  lookupActorHandle: (id) => store.actor(id)?.handle,
-                  isViewer: (id) => store.isViewer(id),
-                  humanDisplayName: store.operatorDisplayName,
-                  openLink: openLink,
-                ),
-              const SizedBox(height: 16),
-            ],
-            _SectionHeader('OWNER'),
-            _ownerPanel(o.ownerId),
-            const SizedBox(height: 24),
-            _SectionHeader('CREATOR'),
-            _creatorPanel(o.creatorId),
-            // Shown even when absent: linking an obligation to the issue it
-            // turned into is a normal later step, and a section that only
-            // appears once a ref exists gives no way to add the first one.
-            const SizedBox(height: 24),
-            _SectionHeader('EXTERNAL LINK'),
-            _externalRefPanel(context, data),
-            const SizedBox(height: 24),
-            if (o.isScheduled) ...[
-              _SectionHeader('SCHEDULE'),
-              _schedulePanel(o),
-              const SizedBox(height: 24),
-            ],
-            // Disabling recurrence finalizes a scheduled row but deliberately
-            // retains its ledger.  History belongs to the durable obligation,
-            // not to its current recurrence setting.
-            if (o.isRecurring || o.hasCompletionHistory) ...[
-              _SectionHeader('COMPLETION HISTORY'),
-              _completionsPanel(),
-              const SizedBox(height: 24),
-            ],
-            if (data.parent != null) ...[
-              _SectionHeader('PARENT'),
-              _parentPanel(data.parent!),
-              const SizedBox(height: 24),
-            ],
-            _SectionHeader('CHILDREN'),
-            _childrenPanel(context, data),
-            const SizedBox(height: 24),
-            _SectionHeader('BLOCKED BY'),
-            _dependencyPanel(
-              data.blockedBy,
-              total: data.blockedByTotal,
-              hasMore: data.blockedByHasMore,
-              emptyText: 'Not blocked by any obligations or issues.',
-            ),
-            const SizedBox(height: 24),
-            _SectionHeader('BLOCKS'),
-            _dependencyPanel(
-              data.blocks,
-              total: data.blocksTotal,
-              hasMore: data.blocksHasMore,
-              emptyText: 'Does not block any obligations or issues.',
-            ),
           ],
+        );
+        final children = Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [_SectionHeader('CHILDREN'), _childrenPanel(context, data)],
+        );
+        final history = Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [_SectionHeader('HISTORY'), _historyPanel(data)],
+        );
+        final facts = _facts(context, data);
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            final wide = constraints.maxWidth >= 900;
+            return SingleChildScrollView(
+              padding: EdgeInsets.all(wide ? 32 : 20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _breadcrumbs(data),
+                  const SizedBox(height: 12),
+                  _detailHeader(context, data),
+                  const SizedBox(height: 18),
+                  const Divider(color: MeshColors.border),
+                  const SizedBox(height: 18),
+                  if (wide)
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              description,
+                              const SizedBox(height: 28),
+                              children,
+                              const SizedBox(height: 28),
+                              history,
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 36),
+                        SizedBox(width: 300, child: facts),
+                      ],
+                    )
+                  else ...[
+                    description,
+                    const SizedBox(height: 24),
+                    facts,
+                    const SizedBox(height: 24),
+                    children,
+                    const SizedBox(height: 24),
+                    history,
+                  ],
+                ],
+              ),
+            );
+          },
         );
       },
     );
   }
+
+  Widget _breadcrumbs(ObligationDetailSnapshot data) {
+    final ancestors = data.ancestors.isNotEmpty
+        ? data.ancestors
+        : [if (data.parent != null) data.parent!];
+    return Wrap(
+      crossAxisAlignment: WrapCrossAlignment.center,
+      spacing: 2,
+      children: [
+        for (var i = 0; i < ancestors.length; i++) ...[
+          if (i > 0)
+            const Icon(
+              Icons.chevron_right,
+              size: 14,
+              color: MeshColors.textMuted,
+            ),
+          TextButton(
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              minimumSize: const Size(0, 28),
+            ),
+            onPressed: () => store.setFocusedObligationId(ancestors[i].id),
+            child: Text(
+              ancestors[i].heading,
+              style: const TextStyle(
+                color: MeshColors.textSecondary,
+                fontSize: 12,
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _facts(BuildContext context, ObligationDetailSnapshot data) => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      _SectionHeader('PEOPLE'),
+      _ownerPanel(data.obligation.ownerId),
+      _creatorPanel(data.obligation.creatorId),
+      const Divider(height: 32, color: MeshColors.border),
+      _SectionHeader('EXTERNAL LINK'),
+      _externalRefPanel(context, data),
+      if (data.artifacts.isNotEmpty) ...[
+        const Divider(height: 32, color: MeshColors.border),
+        _SectionHeader('ARTIFACTS'),
+        for (final artifact in data.artifacts)
+          _referenceLine(
+            _settled(artifact.reference) ??
+                ReferenceDto(
+                  ref: artifact.ref,
+                  scheme: artifact.ref.split(':').first,
+                  title: artifact.ref,
+                  unavailable: 'Not resolvable yet.',
+                ),
+            label: artifact.label,
+            attachedBy: artifact.attachedBy,
+          ),
+      ],
+      if (data.obligation.isScheduled) ...[
+        const Divider(height: 32, color: MeshColors.border),
+        _SectionHeader('SCHEDULE'),
+        _schedulePanel(data.obligation),
+      ],
+      const Divider(height: 32, color: MeshColors.border),
+      _SectionHeader('BLOCKED BY'),
+      _dependencyPanel(
+        data.blockedBy,
+        total: data.blockedByTotal,
+        hasMore: data.blockedByHasMore,
+        emptyText: 'Not blocked by any obligations or issues.',
+      ),
+      const SizedBox(height: 28),
+      _SectionHeader('BLOCKS'),
+      _dependencyPanel(
+        data.blocks,
+        total: data.blocksTotal,
+        hasMore: data.blocksHasMore,
+        emptyText: 'Does not block any obligations or issues.',
+      ),
+    ],
+  );
+
+  Widget _referenceLine(
+    ReferenceDto reference, {
+    String? label,
+    String? attachedBy,
+    Widget? action,
+  }) {
+    final title = reference.title == reference.ref
+        ? referenceKindLabel(
+            reference.scheme,
+            reference.entity?['type'] as String?,
+          )
+        : reference.title;
+    final icon = switch (reference.scheme) {
+      'github' => Icons.code,
+      'gchat' => Icons.chat,
+      'slack' => Icons.tag,
+      'mesh' => Icons.hub_outlined,
+      _ => Icons.link,
+    };
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              if (['github', 'gchat', 'slack'].contains(reference.scheme))
+                SvgPicture.asset(
+                  'assets/reference_icons/${reference.scheme == 'gchat' ? 'googlechat' : reference.scheme}.svg',
+                  width: 18,
+                  height: 18,
+                  colorFilter: const ColorFilter.mode(
+                    MeshColors.textSecondary,
+                    BlendMode.srcIn,
+                  ),
+                  semanticsLabel: reference.scheme,
+                )
+              else
+                Icon(icon, size: 18, color: MeshColors.accent),
+              const SizedBox(width: 8),
+              Expanded(
+                child: InkWell(
+                  onTap: reference.url == null
+                      ? null
+                      : () => openLink(reference.url!),
+                  child: Text(
+                    title,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: MeshColors.textPrimary,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+              ),
+              if (attachedBy != null)
+                Tooltip(
+                  message: 'Attached by ${store.actorDisplay(attachedBy)}',
+                  child: _personAvatar(attachedBy),
+                ),
+              IconButton(
+                tooltip: 'View reference context',
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(
+                  Icons.info_outline,
+                  size: 16,
+                  color: MeshColors.textMuted,
+                ),
+                onPressed: () => showDialog<void>(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    content: SizedBox(
+                      width: 600,
+                      child: SingleChildScrollView(
+                        child: ReferencePreview(
+                          reference: reference,
+                          label: label,
+                          attachedBy: attachedBy,
+                          lookupActorHandle: (id) => store.actor(id)?.handle,
+                          isViewer: store.isViewer,
+                          humanDisplayName: store.operatorDisplayName,
+                          openLink: openLink,
+                        ),
+                      ),
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('Close'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              ?action,
+            ],
+          ),
+          if (reference.unavailable != null)
+            Padding(
+              padding: const EdgeInsets.only(left: 26, top: 3),
+              child: Text(
+                reference.unavailable!,
+                style: const TextStyle(
+                  color: MeshColors.textMuted,
+                  fontSize: 12,
+                ),
+              ),
+            ),
+          if (label != null)
+            Padding(
+              padding: const EdgeInsets.only(left: 26, top: 3),
+              child: Text(
+                label,
+                style: const TextStyle(
+                  color: MeshColors.textMuted,
+                  fontSize: 12,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  static List<ObligationHistoryDto> _mergeHistory(
+    List<ObligationHistoryDto> newest,
+    List<ObligationHistoryDto> earlier,
+  ) {
+    final byId = {
+      for (final entry in earlier) entry.id: entry,
+      for (final entry in newest) entry.id: entry,
+    };
+    return byId.values.toList()..sort((a, b) {
+      final time = b.timestamp.compareTo(a.timestamp);
+      return time != 0 ? time : b.id.compareTo(a.id);
+    });
+  }
+
+  void _loadMoreHistory() {
+    if (_loadingHistory || _historyNextBefore == null) return;
+    final gen = _fetchGeneration;
+    setState(() {
+      _loadingHistory = true;
+      _historyError = null;
+    });
+    store.api
+        .fetchObligationDetail(
+          widget.obligationId,
+          historyBefore: _historyNextBefore,
+        )
+        .then((data) {
+          if (!mounted || gen != _fetchGeneration) return;
+          setState(() {
+            _history = _mergeHistory(data.history, _history);
+            _historyPaged = true;
+            _historyNextBefore = data.historyNextBefore;
+            _loadingHistory = false;
+          });
+        })
+        .catchError((Object error) {
+          if (!mounted || gen != _fetchGeneration) return;
+          setState(() {
+            _loadingHistory = false;
+            _historyError = 'Earlier history unavailable. Try again.';
+          });
+        });
+  }
+
+  Widget _historyPanel(ObligationDetailSnapshot data) {
+    final o = data.obligation;
+    final currentRecorded = _history.any(
+      (h) =>
+          h.after['checkpoint'] == o.checkpoint &&
+          h.timestamp == o.checkpointAt,
+    );
+    final timeline =
+        <(String, String, Widget)>[
+          for (final h in _history)
+            (
+              h.timestamp,
+              h.id,
+              _historyEntry(
+                by: h.by,
+                timestamp: h.timestamp,
+                label: _historyLabel(h),
+                body:
+                    h.after['checkpoint'] as String? ??
+                    h.after['terminalNote'] as String?,
+                latest:
+                    o.hasCheckpoint &&
+                    h.after['checkpoint'] == o.checkpoint &&
+                    h.timestamp == o.checkpointAt,
+              ),
+            ),
+          for (final completion in _completions)
+            (
+              completion.completedAt,
+              'cycle:${completion.sequence}',
+              _historyEntry(
+                timestamp: completion.completedAt,
+                label: 'Cycle ${completion.sequence}',
+                body: completion.note,
+                extra: completion.resolutionRef == null
+                    ? null
+                    : Text(
+                        completion.resolutionRef!,
+                        style: const TextStyle(
+                          color: MeshColors.accent,
+                          fontSize: 11.5,
+                        ),
+                      ),
+              ),
+            ),
+        ]..sort((a, b) {
+          final time = b.$1.compareTo(a.$1);
+          return time != 0 ? time : b.$2.compareTo(a.$2);
+        });
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (o.hasCheckpoint && !currentRecorded)
+          _historyEntry(
+            by: o.checkpointBy,
+            timestamp: o.checkpointAt,
+            label: 'current standing',
+            body: o.checkpoint,
+            latest: true,
+          ),
+        if (o.hasCheckpoint && !currentRecorded)
+          const Padding(
+            padding: EdgeInsets.only(bottom: 12, left: 36),
+            child: Text(
+              'Standing text from before history recording is unavailable.',
+              style: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+            ),
+          ),
+        for (final event in timeline) event.$3,
+        if (timeline.isEmpty && !o.hasCheckpoint)
+          const Text(
+            'No recorded updates yet.',
+            style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
+          ),
+        if (_historyError != null)
+          Text(
+            _historyError!,
+            style: const TextStyle(color: MeshColors.textSecondary),
+          ),
+        if (_historyNextBefore != null)
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton(
+              onPressed: _loadingHistory ? null : _loadMoreHistory,
+              child: Text(_loadingHistory ? 'Loading…' : 'Show more updates'),
+            ),
+          ),
+        if (_completionsHasMore)
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton(
+              onPressed: _loadMoreCompletions,
+              child: Text(
+                'Load earlier completions (${_completionsTotal - _completions.length} remaining)',
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  String _historyLabel(ObligationHistoryDto h) {
+    if (h.kind == 'status') {
+      return 'changed status ${h.before['status']} → ${h.after['status']}';
+    }
+    if (h.after.containsKey('checkpoint')) {
+      return h.after['checkpoint'] == null
+          ? 'cleared standing'
+          : 'updated standing';
+    }
+    if (h.after['child'] case final Map<String, dynamic> child) {
+      return 'added child ${child['title'] ?? child['id']}, owned by ${store.actorDisplay(child['ownerId'] as String)}';
+    }
+    if (h.after['artifact'] case final Map<String, dynamic> artifact) {
+      return 'attached ${artifact['label'] ?? referenceKindLabel((artifact['ref'] as String).split(':').first, null)}';
+    }
+    if (h.after['ownerId'] case final String owner) {
+      return 'reassigned from ${store.actorDisplay(h.before['ownerId'] as String? ?? 'unknown')} to ${store.actorDisplay(owner)}';
+    }
+    if (h.after['status'] case final String status) {
+      return 'changed status ${h.before['status']} → $status';
+    }
+    return switch (h.kind) {
+      'created' => 'created this obligation',
+      'reparent' => 'moved this obligation',
+      'priority' => 'changed queue order',
+      'external_ref' => 'changed external link',
+      'snooze' => 'changed snooze',
+      _ => 'updated obligation',
+    };
+  }
+
+  Widget _historyEntry({
+    String? by,
+    String? timestamp,
+    required String label,
+    String? body,
+    bool latest = false,
+    Widget? extra,
+  }) => IntrinsicHeight(
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        SizedBox(
+          width: 28,
+          child: Column(
+            children: [
+              if (by != null)
+                _personAvatar(by)
+              else
+                const Icon(
+                  Icons.history,
+                  size: 20,
+                  color: MeshColors.textMuted,
+                ),
+              Expanded(
+                child: Container(
+                  width: 1,
+                  margin: const EdgeInsets.symmetric(vertical: 4),
+                  color: MeshColors.border,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 18),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  '${by == null ? 'Unknown author' : store.actorDisplay(by)} $label${timestamp == null ? '' : ' · ${formatTs(timestamp)}'}',
+                  style: const TextStyle(
+                    color: MeshColors.textSecondary,
+                    fontSize: 12,
+                    height: 1.4,
+                  ),
+                ),
+                if (extra != null)
+                  Padding(padding: const EdgeInsets.only(top: 4), child: extra),
+                if (body != null)
+                  Container(
+                    margin: const EdgeInsets.only(top: 8),
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: MeshColors.bgSecondary,
+                      border: Border.all(color: MeshColors.border),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (latest)
+                          const Padding(
+                            padding: EdgeInsets.only(bottom: 6),
+                            child: Text(
+                              'LATEST',
+                              style: TextStyle(
+                                color: MeshColors.accent,
+                                fontSize: 10,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                        SelectableText(
+                          body,
+                          style: const TextStyle(
+                            color: MeshColors.textSecondary,
+                            fontSize: 13,
+                            height: 1.5,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
 
   Widget _ownerPanel(String ownerId) {
     final isHuman = store.isHuman(ownerId);
@@ -1159,25 +1625,29 @@ class _DetailViewState extends State<_DetailView> {
     return _identityPanel(
       ownerId,
       action: isActor
-          ? TextButton(
+          ? IconButton(
+              tooltip: 'View Owner Inbox →',
               onPressed: () {
                 store.clickActor(ownerId);
                 store.setDetailPanelIndex(4); // Select Inbox tab
                 onSelectView(DashboardView.actors);
               },
-              child: const Text(
-                'View Owner Inbox →',
-                style: TextStyle(color: MeshColors.accent),
+              icon: const Icon(
+                Icons.inbox_outlined,
+                size: 16,
+                color: MeshColors.accent,
               ),
             )
           : isHuman
-          ? TextButton(
+          ? IconButton(
+              tooltip: 'View Owner Queue →',
               onPressed: () {
                 onSelectView(DashboardView.overview);
               },
-              child: const Text(
-                'View Owner Queue →',
-                style: TextStyle(color: MeshColors.accent),
+              icon: const Icon(
+                Icons.list_alt,
+                size: 16,
+                color: MeshColors.accent,
               ),
             )
           : null,
@@ -1187,116 +1657,63 @@ class _DetailViewState extends State<_DetailView> {
   /// Who raised this obligation. Null is a real, honest state — a row that
   /// predates creator attribution — not something to paper over by falling
   /// back to the owner or guessing.
-  Widget _creatorPanel(String? creatorId) {
-    if (creatorId == null) {
-      return Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: MeshColors.bgSecondary,
-          border: Border.all(color: MeshColors.border),
-          borderRadius: BorderRadius.circular(8),
-        ),
+  Widget _creatorPanel(String? creatorId) => creatorId == null
+      ? const Padding(
+          padding: EdgeInsets.symmetric(vertical: 8),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Unknown — predates creator attribution',
+                  style: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                ),
+              ),
+              Text(
+                'Creator',
+                style: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+              ),
+            ],
+          ),
+        )
+      : _identityPanel(creatorId, role: 'Creator');
+
+  Widget _identityPanel(String id, {Widget? action, String role = 'Owner'}) =>
+      Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
         child: Row(
           children: [
-            const CircleAvatar(
-              radius: 14,
-              backgroundColor: Color(0xFF1E293B),
-              child: Icon(
-                Icons.person_off_outlined,
-                size: 16,
-                color: MeshColors.textMuted,
-              ),
-            ),
-            const SizedBox(width: 12),
-            const Expanded(
+            _personAvatar(id),
+            const SizedBox(width: 8),
+            Expanded(
               child: Text(
-                'Unknown — predates creator attribution',
-                style: TextStyle(
-                  color: MeshColors.textMuted,
-                  fontSize: 12,
-                  fontStyle: FontStyle.italic,
+                store.actorDisplay(id),
+                style: const TextStyle(
+                  color: MeshColors.textPrimary,
+                  fontSize: 13,
                 ),
               ),
             ),
+            Text(
+              role,
+              style: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
+            ),
+            ?action,
           ],
         ),
       );
-    }
-    return _identityPanel(creatorId);
-  }
 
-  /// One id space: the category is read off the id's prefix, the same way
-  /// `isHumanOperator` does server-side. A known actor renders as its handle;
-  /// anything else falls back to "Unknown actor" — never the raw id. Shared
-  /// by Owner (always present) and Creator (rendered separately when null,
-  /// above).
-  Widget _identityPanel(String id, {Widget? action}) {
-    final isHuman = store.isHuman(id);
-    final isSystem = id.startsWith('system:');
-    final isActor = !isHuman && !isSystem;
-    final displayId = store.actorDisplay(id);
-    // The second line adds category context beyond the primary label — for
-    // human/system ids the primary label already says it, so there is
-    // nothing more to add. Raw actor/thread ids only belong under the handle
-    // in actor detail view, never bare here.
-    final subtitle = isHuman || isSystem
-        ? null
-        : displayId != 'Unknown actor'
-        ? 'Actor'
-        : 'Actor — not in this mesh view';
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: MeshColors.bgSecondary,
-        border: Border.all(color: MeshColors.border),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        children: [
-          if (isActor)
-            ActorAvatar(id: id, size: 28)
-          else
-            const CircleAvatar(
-              radius: 14,
-              backgroundColor: Color(0xFF1E293B),
-              child: Icon(
-                Icons.person,
-                size: 16,
-                color: MeshColors.textSecondary,
-              ),
-            ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  displayId,
-                  style: const TextStyle(
-                    color: MeshColors.textPrimary,
-                    fontWeight: FontWeight.w600,
-                    fontFamily: kMonoFontFamily,
-                  ),
-                ),
-                if (subtitle != null) ...[
-                  const SizedBox(height: 2),
-                  Text(
-                    subtitle,
-                    style: const TextStyle(
-                      color: MeshColors.textMuted,
-                      fontSize: 11,
-                    ),
-                  ),
-                ],
-              ],
-            ),
+  Widget _personAvatar(String id) =>
+      store.isHuman(id) || id.startsWith('system:')
+      ? const CircleAvatar(
+          radius: 12,
+          backgroundColor: MeshColors.bgTertiary,
+          child: Icon(
+            Icons.person_outline,
+            size: 16,
+            color: MeshColors.textSecondary,
           ),
-          ?action,
-        ],
-      ),
-    );
-  }
+        )
+      : ActorAvatar(id: id, size: 24);
 
   Widget _schedulePanel(ObligationDto o) {
     final policyLabel = o.recurrencePolicy == 'cron'
@@ -1344,90 +1761,6 @@ class _DetailViewState extends State<_DetailView> {
     );
   }
 
-  Widget _completionsPanel() {
-    final completions = _completions;
-
-    if (completions.isEmpty) {
-      return Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: MeshColors.bgSecondary,
-          border: Border.all(color: MeshColors.border),
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: const Text(
-          'No completed cycles yet.',
-          style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
-        ),
-      );
-    }
-
-    final remaining = _completionsTotal - completions.length;
-
-    return Container(
-      decoration: BoxDecoration(
-        color: MeshColors.bgSecondary,
-        border: Border.all(color: MeshColors.border),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          for (final completion in completions) ...[
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Cycle ${completion.sequence} — ${formatTs(completion.completedAt)}',
-                    style: const TextStyle(
-                      color: MeshColors.textPrimary,
-                      fontSize: 12.5,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  if (completion.note != null &&
-                      completion.note!.trim().isNotEmpty) ...[
-                    const SizedBox(height: 4),
-                    Text(
-                      completion.note!,
-                      style: const TextStyle(
-                        color: MeshColors.textSecondary,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
-                  if (completion.resolutionRef != null &&
-                      completion.resolutionRef!.trim().isNotEmpty) ...[
-                    const SizedBox(height: 4),
-                    Text(
-                      completion.resolutionRef!,
-                      style: const TextStyle(
-                        color: MeshColors.accent,
-                        fontSize: 11.5,
-                        fontFamily: kMonoFontFamily,
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-            const Divider(height: 1, color: MeshColors.border),
-          ],
-          if (_completionsHasMore)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              child: TextButton(
-                onPressed: _loadMoreCompletions,
-                child: Text('Load earlier completions ($remaining remaining)'),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
   Widget _externalRefPanel(
     BuildContext context,
     ObligationDetailSnapshot data,
@@ -1455,26 +1788,18 @@ class _DetailViewState extends State<_DetailView> {
             ),
           );
     if (ref.isEmpty) {
-      return Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: MeshColors.bgSecondary,
-          border: Border.all(color: MeshColors.border),
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Row(
-          children: [
-            const Icon(Icons.link_off, color: MeshColors.textMuted, size: 20),
-            const SizedBox(width: 12),
-            const Expanded(
-              child: Text(
-                'Not linked to an issue, PR or repository.',
-                style: TextStyle(color: MeshColors.textMuted, fontSize: 12.5),
-              ),
+      return Row(
+        children: [
+          const Icon(Icons.link_off, color: MeshColors.textMuted, size: 18),
+          const SizedBox(width: 8),
+          const Expanded(
+            child: Text(
+              'Not linked to an issue, PR or repository.',
+              style: TextStyle(color: MeshColors.textMuted, fontSize: 12.5),
             ),
-            ?edit,
-          ],
-        ),
+          ),
+          ?edit,
+        ],
       );
     }
     final reference =
@@ -1485,36 +1810,7 @@ class _DetailViewState extends State<_DetailView> {
           title: ref,
           unavailable: 'Not resolvable yet.',
         );
-    return ReferencePreview(
-      reference: reference,
-      action: edit,
-      lookupActorHandle: (id) => store.actor(id)?.handle,
-      isViewer: store.isViewer,
-      humanDisplayName: store.operatorDisplayName,
-      openLink: openLink,
-    );
-  }
-
-  Widget _parentPanel(ObligationDto parent) {
-    return Container(
-      decoration: BoxDecoration(
-        color: MeshColors.bgSecondary,
-        border: Border.all(color: MeshColors.border),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: ObligationRow(
-        obligation: parent,
-        store: store,
-        showOwner: true,
-        showActions: false,
-        showKindChip: false,
-        onSelectView: onSelectView,
-        contentPadding: const EdgeInsets.symmetric(
-          horizontal: 16,
-          vertical: 12,
-        ),
-      ),
-    );
+    return _referenceLine(reference, action: edit);
   }
 
   Widget _childrenPanel(BuildContext context, ObligationDetailSnapshot data) {
