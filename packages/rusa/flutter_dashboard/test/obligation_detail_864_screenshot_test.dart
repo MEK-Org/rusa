@@ -125,7 +125,7 @@ void main() {
               },
               {
                 'id': 2,
-                'mutationKind': 'child_added',
+                'mutationKind': 'current_child_created',
                 'actingPrincipal': 'coder',
                 'timestamp': '2026-10-03T11:00:00.000Z',
                 'before': {},

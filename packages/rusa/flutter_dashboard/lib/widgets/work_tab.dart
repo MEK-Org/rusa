@@ -1027,9 +1027,15 @@ class _DetailViewState extends State<_DetailView> {
   /// Takes a refetched first page without dropping earlier completion pages
   /// already loaded; called inside setState.
   void _applyRefreshed(ObligationDetailSnapshot data) {
-    final hadEarlierPages = _historyPaged;
+    final overlapsLoaded = data.history.any(
+      (entry) => _history.any((loaded) => loaded.id == entry.id),
+    );
+    // A non-overlapping head can hide a whole page of intervening writes.
+    // Walk from its cursor even if the retained old tail was exhausted.
+    if (!_historyPaged || !overlapsLoaded) {
+      _historyNextBefore = data.historyNextBefore;
+    }
     _history = _mergeHistory(data.history, _history);
-    if (!hadEarlierPages) _historyNextBefore = data.historyNextBefore;
     _loadingHistory = false;
     if (!data.completionsHasMore ||
         _completions.length <= data.completions.length) {
@@ -1229,12 +1235,12 @@ class _DetailViewState extends State<_DetailView> {
     String? attachedBy,
     Widget? action,
   }) {
-    final title = reference.title == reference.ref
-        ? referenceKindLabel(
-            reference.scheme,
-            reference.entity?['type'] as String?,
-          )
-        : reference.title;
+    final title = referenceDisplayTitle(
+      reference,
+      lookupActorHandle: (id) => store.actor(id)?.handle,
+      isViewer: store.isViewer,
+      humanDisplayName: store.operatorDisplayName,
+    );
     final icon = switch (reference.scheme) {
       'github' => Icons.code,
       'gchat' => Icons.chat,
@@ -1453,11 +1459,13 @@ class _DetailViewState extends State<_DetailView> {
             latest: true,
           ),
         if (o.hasCheckpoint && !currentRecorded)
-          const Padding(
-            padding: EdgeInsets.only(bottom: 12, left: 36),
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12, left: 36),
             child: Text(
-              'Standing text from before history recording is unavailable.',
-              style: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+              _historyNextBefore != null
+                  ? 'This standing update is not in the loaded history.'
+                  : 'Standing text from before history recording is unavailable.',
+              style: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
             ),
           ),
         for (final event in timeline) event.$3,
@@ -1503,7 +1511,7 @@ class _DetailViewState extends State<_DetailView> {
           : 'updated standing';
     }
     if (h.after['child'] case final Map<String, dynamic> child) {
-      return 'added child ${child['title'] ?? child['id']}, owned by ${store.actorDisplay(child['ownerId'] as String)}';
+      return 'created child currently here: ${child['title'] ?? child['id']} (current owner: ${store.actorDisplay(child['ownerId'] as String)})';
     }
     if (h.after['artifact'] case final Map<String, dynamic> artifact) {
       return 'attached ${artifact['label'] ?? referenceKindLabel((artifact['ref'] as String).split(':').first, null)}';

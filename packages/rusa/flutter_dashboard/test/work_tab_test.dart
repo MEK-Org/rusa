@@ -1303,8 +1303,8 @@ void main() {
         expect(find.byTooltip('View reference context'), findsOneWidget);
         await tester.tap(find.byTooltip('View reference context'));
         await tester.pumpAndSettle();
-        expect(find.text('GITHUB'), findsNWidgets(2));
-        expect(find.text('GitHub reference'), findsOneWidget);
+        expect(find.text('GITHUB'), findsOneWidget);
+        expect(find.text('GitHub reference'), findsNWidgets(2));
         expect(find.descendant(of: find.byType(AlertDialog), matching: find.text('Not resolvable yet.')), findsOneWidget);
         expect(find.byTooltip('Change or unlink'), findsOneWidget);
 

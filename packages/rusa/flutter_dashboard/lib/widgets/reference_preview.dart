@@ -6,6 +6,54 @@ import '../models.dart';
 import '../theme.dart';
 import '../util.dart';
 
+/// Shared human-safe title for compact lines and full reference previews.
+String referenceDisplayTitle(
+  ReferenceDto reference, {
+  String? Function(String)? lookupActorHandle,
+  bool Function(String)? isViewer,
+  String? humanDisplayName,
+}) {
+  final entity = reference.entity;
+  final type = entity?['type'] as String?;
+  var title = reference.title;
+  if (type == 'mesh_message') {
+    final participants = meshReferenceParticipants(
+      reference,
+      lookupActorHandle: lookupActorHandle,
+      isViewer: isViewer,
+      humanDisplayName: humanDisplayName,
+    );
+    return participants ?? _genericTitle(reference.scheme, type);
+  }
+  if (type == 'github_issue' || type == 'github_pull_request') {
+    title = entity?['title'] as String? ?? title;
+  } else if (type == 'gchat_space' || type == 'slack_channel') {
+    title = entity?['name'] as String? ?? title;
+  }
+  return title == reference.ref ? _genericTitle(reference.scheme, type) : title;
+}
+
+String? meshReferenceParticipants(
+  ReferenceDto reference, {
+  String? Function(String)? lookupActorHandle,
+  bool Function(String)? isViewer,
+  String? humanDisplayName,
+}) {
+  final participants =
+      [reference.entity?['senderId'], reference.entity?['recipientId']]
+          .whereType<String>()
+          .map(
+            (id) => actorDisplayLabel(
+              id,
+              lookupActorHandle,
+              isViewer,
+              humanDisplayName,
+            ),
+          )
+          .join(' → ');
+  return participants.isEmpty ? null : participants;
+}
+
 /// One rendering for any resolved reference.
 class ReferencePreview extends StatefulWidget {
   const ReferencePreview({
@@ -93,12 +141,21 @@ class _ReferencePreviewState extends State<ReferencePreview> {
   bool _expanded = false;
   bool _overflows = false;
 
-  String _handle(String id) =>
-      actorDisplayLabel(id, widget.lookupActorHandle, widget.isViewer, widget.humanDisplayName);
+  String _handle(String id) => actorDisplayLabel(
+    id,
+    widget.lookupActorHandle,
+    widget.isViewer,
+    widget.humanDisplayName,
+  );
 
   @override
   Widget build(BuildContext context) {
-    var displayTitle = widget.reference.title;
+    var displayTitle = referenceDisplayTitle(
+      widget.reference,
+      lookupActorHandle: widget.lookupActorHandle,
+      isViewer: widget.isViewer,
+      humanDisplayName: widget.humanDisplayName,
+    );
     var displayBody = widget.reference.body?.trim() ?? '';
     final entity = widget.reference.entity;
     final entityType = entity?['type'] as String?;
@@ -120,18 +177,12 @@ class _ReferencePreviewState extends State<ReferencePreview> {
     } else if (entityType == 'gchat_message' || entityType == 'slack_message') {
       displayBody = (entity?['contents'] as String?)?.trim() ?? displayBody;
     } else if (entityType == 'mesh_message') {
-      final senderId = entity?['senderId'] as String?;
-      final recipientId = entity?['recipientId'] as String?;
-      final senderHandle = senderId != null ? _handle(senderId) : null;
-      final recipientHandle = recipientId != null ? _handle(recipientId) : null;
-      meshParticipants = [
-        senderHandle,
-        recipientHandle,
-      ].whereType<String>().join(' → ');
-      if (meshParticipants.isEmpty) meshParticipants = null;
-      // The server's raw "senderId → recipientId" title is never rendered —
-      // both ids are resolved through the actor projection before display.
-      if (meshParticipants != null) displayTitle = meshParticipants;
+      meshParticipants = meshReferenceParticipants(
+        widget.reference,
+        lookupActorHandle: widget.lookupActorHandle,
+        isViewer: widget.isViewer,
+        humanDisplayName: widget.humanDisplayName,
+      );
     }
 
     // Defense in depth: whatever the entity-specific overrides above did,
