@@ -3,6 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { normalizeEmail, PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import { IMPLICIT_USER_EMAIL } from "./implicit-user.js";
 
 /** Exact authoritative references whose value is migrated to the durable principal ID. */
 export const AUTHORITATIVE_REFERENCES = [
@@ -215,6 +216,9 @@ export function executeLegacyPrincipalMigration(
   if (!email.includes("@") || email.startsWith("@") || email.endsWith("@")) {
     throw new Error(`Invalid email address: ${options.email}`);
   }
+  if (email === IMPLICIT_USER_EMAIL) {
+    throw new Error(`Cannot migrate to reserved admission email: ${options.email}`);
+  }
 
   const issuer = typeof options.issuer === "string" ? options.issuer.trim() : "";
   const subject = typeof options.subject === "string" ? options.subject.trim() : "";
@@ -235,6 +239,7 @@ export function executeLegacyPrincipalMigration(
   let principalId: string;
   let principalCreated = false;
   let principalReused = false;
+  let implicitUserReused = false;
   let externalIdentityBound = false;
 
   if (existingUser) {
@@ -263,18 +268,49 @@ export function executeLegacyPrincipalMigration(
       }
     }
   } else {
-    // New user
-    principalCreated = true;
-    if (externalIdentity) {
-      const conflictingHolder = repo.findUserByExternalIdentity(externalIdentity);
-      if (conflictingHolder) {
+    const allUsers = repo.listUsers();
+    const implicitCandidate = allUsers.find((u) => u.email === IMPLICIT_USER_EMAIL);
+
+    if (implicitCandidate) {
+      if (allUsers.length > 1) {
         throw new Error(
-          `Conflicting identity binding: external identity is already bound to user '${conflictingHolder.id}'`
+          `Cannot cut over: ambiguous users exist alongside implicit user (${allUsers.length} total users)`
         );
       }
+      if (implicitCandidate.identity) {
+        throw new Error(
+          `Cannot cut over: implicit user '${implicitCandidate.id}' is already bound to an external identity`
+        );
+      }
+      if (implicitCandidate.disabledAt) {
+        throw new Error(`Cannot cut over: implicit user '${implicitCandidate.id}' is disabled`);
+      }
+      if (externalIdentity) {
+        const conflictingHolder = repo.findUserByExternalIdentity(externalIdentity);
+        if (conflictingHolder && conflictingHolder.id !== implicitCandidate.id) {
+          throw new Error(
+            `Conflicting identity binding: external identity is already bound to user '${conflictingHolder.id}'`
+          );
+        }
+        externalIdentityBound = true;
+      }
+      principalId = implicitCandidate.id;
+      principalReused = true;
+      implicitUserReused = true;
+    } else {
+      // New user
+      principalCreated = true;
+      if (externalIdentity) {
+        const conflictingHolder = repo.findUserByExternalIdentity(externalIdentity);
+        if (conflictingHolder) {
+          throw new Error(
+            `Conflicting identity binding: external identity is already bound to user '${conflictingHolder.id}'`
+          );
+        }
+      }
+      // Mint temporary id for dry-run preview if needed
+      principalId = "";
     }
-    // Mint temporary id for dry-run preview if needed
-    principalId = "";
   }
 
   if (!options.apply) {
@@ -293,7 +329,42 @@ export function executeLegacyPrincipalMigration(
   // Apply all rewrites and principal initialization atomically in one transaction
   const now = new Date().toISOString();
   db.transaction(() => {
-    if (principalCreated) {
+    if (implicitUserReused) {
+      const inTxUsers = repo.listUsers();
+      if (inTxUsers.length !== 1) {
+        throw new Error(
+          `Cannot cut over: expected exactly one implicit user, found ${inTxUsers.length} users`
+        );
+      }
+      const inTxUser = inTxUsers[0];
+      if (inTxUser.id !== principalId || inTxUser.email !== IMPLICIT_USER_EMAIL) {
+        throw new Error("Cannot cut over: implicit user state changed concurrently");
+      }
+      if (inTxUser.identity) {
+        throw new Error(
+          `Cannot cut over: implicit user '${principalId}' is already bound to an external identity`
+        );
+      }
+      if (inTxUser.disabledAt) {
+        throw new Error(`Cannot cut over: implicit user '${principalId}' is disabled`);
+      }
+      if (repo.findUserByEmail(email)) {
+        throw new Error(`Cannot cut over: user with email '${email}' was created concurrently`);
+      }
+      if (externalIdentity) {
+        const holder = repo.findUserByExternalIdentity(externalIdentity);
+        if (holder && holder.id !== principalId) {
+          throw new Error(
+            `Conflicting identity binding: external identity is already bound to user '${holder.id}'`
+          );
+        }
+        db.prepare(
+          `UPDATE users SET email = ?, firebase_issuer = ?, firebase_subject = ?, last_authenticated_at = ? WHERE principal_id = ?`
+        ).run(email, externalIdentity.issuer, externalIdentity.subject, now, principalId);
+      } else {
+        db.prepare(`UPDATE users SET email = ? WHERE principal_id = ?`).run(email, principalId);
+      }
+    } else if (principalCreated) {
       const created = repo.createUser({
         email,
         identity: externalIdentity,

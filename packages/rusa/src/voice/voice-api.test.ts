@@ -546,6 +546,113 @@ describe("handleVoiceApiRequest", () => {
       expect(voice.frames().some((f) => f.startsWith("event: mesh_event"))).toBe(false);
       detach();
     });
+
+    it("binds the caller's active durable principal to the leased voice session", () => {
+      const { res } = call(
+        deps,
+        "GET",
+        `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-auth-1`
+      );
+      expect(res.statusCode).toBe(200);
+      expect(service.activeSessionFor(UUID_A)).toEqual({
+        sessionId: "walkie-auth-1",
+        principalId: LOCAL_USER,
+      });
+      expect(service.activeSessionPrincipalIdFor(UUID_A)).toBe(LOCAL_USER);
+    });
+
+    it("allows matching reconnect from the same principal without altering session authority", () => {
+      const first = call(
+        deps,
+        "GET",
+        `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-auth-2`
+      );
+      expect(first.res.statusCode).toBe(200);
+      first.res.req.emit("close");
+
+      const reconnect = call(
+        deps,
+        "GET",
+        `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-auth-2`
+      );
+      expect(reconnect.res.statusCode).toBe(200);
+      expect(service.activeSessionFor(UUID_A)).toEqual({
+        sessionId: "walkie-auth-2",
+        principalId: LOCAL_USER,
+      });
+    });
+
+    it("rejects mismatched reconnect with 409 conflict and zero connection attachment or state change", () => {
+      const first = call(
+        deps,
+        "GET",
+        `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-auth-3`
+      );
+      expect(first.res.statusCode).toBe(200);
+      first.res.req.emit("close");
+
+      // Simulate reconnect under a different principal
+      const OTHER_USER = "22222222-0000-4000-8000-000000000002";
+      const multiPrincipals = {
+        listUsers: () => [
+          {
+            kind: "user",
+            id: OTHER_USER,
+            email: "other@example.com",
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+        ],
+      } as unknown as PrincipalRepository;
+      const mismatchDeps = { ...deps, principals: multiPrincipals };
+
+      const mismatch = call(
+        mismatchDeps,
+        "GET",
+        `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-auth-3`
+      );
+      expect(mismatch.res.statusCode).toBe(409);
+      expect(JSON.parse(mismatch.res.body)).toEqual({
+        error: "sessionId is already bound to a different principal",
+      });
+
+      // Verify zero mutation: original session and principal remain bound
+      expect(service.activeSessionFor(UUID_A)).toEqual({
+        sessionId: "walkie-auth-3",
+        principalId: LOCAL_USER,
+      });
+    });
+
+    it("refuses leased voice stream with 403 when caller principal cannot be resolved", () => {
+      // Multiple users in auth-disabled mode creates ambiguous attribution
+      const ambiguousPrincipals = {
+        listUsers: () => [
+          {
+            kind: "user",
+            id: LOCAL_USER,
+            email: "op@example.com",
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+          {
+            kind: "user",
+            id: "22222222-0000-4000-8000-000000000002",
+            email: "other@example.com",
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+        ],
+      } as unknown as PrincipalRepository;
+      const ambiguousDeps = { ...deps, principals: ambiguousPrincipals };
+
+      const { res } = call(
+        ambiguousDeps,
+        "GET",
+        `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-ambiguous`
+      );
+      expect(res.statusCode).toBe(403);
+      expect(JSON.parse(res.body).error).toContain(
+        "active durable user principals exist, so an unauthenticated action cannot be attributed"
+      );
+      expect(service.hasActiveSession(UUID_A)).toBe(false);
+    });
   });
 
   describe("audio / backlog / ack", () => {

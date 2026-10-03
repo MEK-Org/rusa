@@ -232,13 +232,17 @@ export function handleVoiceApiRequest(
       return true;
     }
     const sessionId = url.searchParams.get("sessionId");
+    let principalId: string | undefined;
     if (sessionId) {
       if (actors.size !== 1) {
         sendJson(res, 400, { error: "a leased voice session requires exactly one actor" });
         return true;
       }
+      const operator = requireOperatorPrincipal(req, res, deps);
+      if (!operator) return true;
+      principalId = operator;
       try {
-        service.validateSession(sessionId, [...actors][0]);
+        service.validateSession(sessionId, [...actors][0], principalId);
       } catch (err) {
         sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
         return true;
@@ -260,7 +264,7 @@ export function handleVoiceApiRequest(
     }
     // Grant authority only after the stream has actually attached; a rejected
     // connection must not create a reconnect lease on its own.
-    if (sessionId) service.openSession(sessionId, [...actors][0]);
+    if (sessionId) service.openSession(sessionId, [...actors][0], principalId);
     return true;
   }
 
