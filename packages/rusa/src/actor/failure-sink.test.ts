@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { AbortReason } from "../providers/termination-attribution.js";
 import type { RunResult } from "../providers/types.js";
 import type { MechanicalInboxForensics } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
@@ -731,6 +732,33 @@ describe("routeRunFailure", () => {
       expect(toParent[0]?.toId).toBe("root");
       expect(toParent[0]?.body).toContain("interrupted by human:operator");
       expect(toChat).toHaveLength(0);
+    });
+
+    it.each<[AbortReason, string]>([
+      ["stall-watchdog", "[Task killed by stall watchdog (no output for 15 minutes)]"],
+      ["run-ceiling", "[Task killed by run ceiling timeout]"],
+    ])("distinguishes %s abort in parent notice", async (abortReason, output) => {
+      const { deps, toParent } = makeDeps({
+        w1: { id: "w1", parentId: "root" },
+      });
+      const failResult: RunResult = {
+        success: false,
+        exitCode: 143,
+        cancelled: true,
+        abortReason,
+        output,
+      };
+      await routeRunFailure(
+        deps,
+        "w1",
+        failResult,
+        "antigravity/gemini-3.8-flash @ high",
+        `run-${abortReason}`
+      );
+      expect(toParent).toHaveLength(1);
+      expect(toParent[0]?.toId).toBe("root");
+      expect(toParent[0]?.body).toContain(`(exit 143, ${abortReason})`);
+      expect(toParent[0]?.forensics?.abortReason).toBe(abortReason);
     });
   });
 

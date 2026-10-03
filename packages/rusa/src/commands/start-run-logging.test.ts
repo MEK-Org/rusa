@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createLogger, type Logger } from "../observability/logger.js";
+import type { AbortReason } from "../providers/termination-attribution.js";
 import type { RunResult } from "../providers/types.js";
 import { logRunEnd } from "./start.js";
 
@@ -70,6 +71,32 @@ describe("logRunEnd", () => {
       success: false,
       exitCode: 137,
       interrupted: true,
+    });
+  });
+
+  it.each<AbortReason>([
+    "stall-watchdog",
+    "run-ceiling",
+  ])("records %s abortReason on run_end", (abortReason) => {
+    const { logger, records } = recordingLogger();
+
+    logRunEnd(
+      logger,
+      runResult({
+        success: false,
+        exitCode: 143,
+        cancelled: true,
+        abortReason,
+      })
+    );
+
+    expect(records()[0]).toMatchObject({
+      level: "error",
+      msg: "run_end",
+      success: false,
+      exitCode: 143,
+      cancelled: true,
+      abortReason,
     });
   });
 

@@ -13,7 +13,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProviderConfig } from "../config/types.js";
-import { AntigravityProvider, formatAgyToolInvocation } from "./antigravity.js";
+import {
+  ANTIGRAVITY_COMMAND_DISCIPLINE,
+  AntigravityProvider,
+  formatAgyToolInvocation,
+} from "./antigravity.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "./model-catalog.js";
 import {
   RUN_CEILING_ABORT_REASON,
@@ -97,7 +101,7 @@ describe("AntigravityProvider", () => {
       "agy",
       expect.arrayContaining([
         "-p",
-        "test prompt",
+        expect.stringContaining("test prompt"),
         "--dangerously-skip-permissions",
         "--model",
         "gemini-3.1-pro",
@@ -255,7 +259,13 @@ describe("AntigravityProvider", () => {
 
     expect(spawn).toHaveBeenCalledWith(
       "bwrap",
-      expect.arrayContaining(["--", "agy", "-p", "test prompt", "--dangerously-skip-permissions"]),
+      expect.arrayContaining([
+        "--",
+        "agy",
+        "-p",
+        expect.stringContaining("test prompt"),
+        "--dangerously-skip-permissions",
+      ]),
       expect.objectContaining({ cwd: "/" })
     );
   });
@@ -406,6 +416,7 @@ describe("AntigravityProvider", () => {
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(143);
     expect(result.output).toContain("[Task killed by stall watchdog (no output for 15 minutes)]");
+    expect(result.abortReason).toBe("stall-watchdog");
   });
 
   it("reports run-ceiling attribution when aborted with the ceiling reason", async () => {
@@ -431,6 +442,7 @@ describe("AntigravityProvider", () => {
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(143);
     expect(result.output).toContain("[Task killed by run ceiling timeout]");
+    expect(result.abortReason).toBe("run-ceiling");
   });
 
   it("reports an unattributed SIGTERM for a generic abort", async () => {
@@ -456,6 +468,7 @@ describe("AntigravityProvider", () => {
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(143);
     expect(result.output).toContain("[Task terminated by SIGTERM (source unattributed)]");
+    expect(result.abortReason).toBe("unknown");
   });
 
   it("reports an unattributed SIGTERM when SIGTERM arrives without an abort signal", async () => {
@@ -477,6 +490,141 @@ describe("AntigravityProvider", () => {
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(143);
     expect(result.output).toContain("[Task terminated by SIGTERM (source unattributed)]");
+    expect(result.abortReason).toBe("unknown");
+  });
+
+  it("preserves unattributed SIGTERM failure attribution even after a SUCCESS result event", async () => {
+    const config: ProviderConfig = { cliCommand: "agy" };
+    const provider = new AntigravityProvider("antigravity", config, "Gemini 3.1 Pro (High)");
+
+    const child = mockChildProcess() as unknown as ChildProcessWithoutNullStreams;
+    vi.mocked(spawn).mockReturnValue(child);
+
+    const runPromise = provider.run({
+      prompt: "test prompt",
+      cwd: "/tmp",
+    });
+
+    child.stdout.emit(
+      "data",
+      `${JSON.stringify({
+        event: "result",
+        result: {
+          status: "SUCCESS",
+          response: "Turn completed.",
+        },
+      })}\n`
+    );
+
+    // Unattributed SIGTERM arrives (e.g. external kill) — must NOT be converted to success: true
+    child.emit("close", null, "SIGTERM");
+
+    const result = await runPromise;
+    expect(result.success).toBe(false);
+    expect(result.cancelled).toBe(true);
+    expect(result.exitCode).toBe(143);
+    expect(result.output).toBe("Turn completed.");
+    expect(result.abortReason).toBe("unknown");
+  });
+
+  it("preserves stall-watchdog attribution and response even without trailing newline", async () => {
+    const config: ProviderConfig = { cliCommand: "agy" };
+    const provider = new AntigravityProvider("antigravity", config, "Gemini 3.1 Pro (High)");
+
+    const child = mockChildProcess() as unknown as ChildProcessWithoutNullStreams;
+    vi.mocked(spawn).mockReturnValue(child);
+
+    const controller = new AbortController();
+    const runPromise = provider.run({
+      prompt: "test prompt",
+      cwd: "/tmp",
+      signal: controller.signal,
+    });
+
+    // Valid result event WITHOUT trailing newline
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        event: "result",
+        result: {
+          status: "SUCCESS",
+          response: "Awaiting completion.",
+        },
+      })
+    );
+
+    controller.abort(STALL_WATCHDOG_ABORT_REASON);
+    child.emit("close", null, "SIGTERM");
+
+    const result = await runPromise;
+    expect(result.success).toBe(false);
+    expect(result.cancelled).toBe(true);
+    expect(result.exitCode).toBe(143);
+    expect(result.output).toContain("Awaiting completion.");
+    expect(result.output).toContain("[Task killed by stall watchdog (no output for 15 minutes)]");
+    expect(result.abortReason).toBe("stall-watchdog");
+  });
+
+  it("preserves unterminated buffer error diagnostics and stall-watchdog attribution", async () => {
+    const config: ProviderConfig = { cliCommand: "agy" };
+    const provider = new AntigravityProvider("antigravity", config, "Gemini 3.1 Pro (High)");
+
+    const child = mockChildProcess() as unknown as ChildProcessWithoutNullStreams;
+    vi.mocked(spawn).mockReturnValue(child);
+
+    const controller = new AbortController();
+    const runPromise = provider.run({
+      prompt: "test prompt",
+      cwd: "/tmp",
+      signal: controller.signal,
+    });
+
+    // Valid final error event WITHOUT trailing newline
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        event: "result",
+        result: {
+          status: "ERROR",
+          error: "fatal unhandled crash",
+        },
+      })
+    );
+
+    controller.abort(STALL_WATCHDOG_ABORT_REASON);
+    child.emit("close", null, "SIGTERM");
+
+    const result = await runPromise;
+    expect(result.success).toBe(false);
+    expect(result.cancelled).toBe(true);
+    expect(result.exitCode).toBe(143);
+    expect(result.output).toContain("[Error]: fatal unhandled crash");
+    expect(result.output).toContain("[Task killed by stall watchdog (no output for 15 minutes)]");
+    expect(result.abortReason).toBe("stall-watchdog");
+  });
+
+  it("appends Antigravity command discipline to the prompt", async () => {
+    const config: ProviderConfig = { cliCommand: "agy" };
+    const provider = new AntigravityProvider("antigravity", config, "Gemini 3.1 Pro (High)");
+
+    const child = mockChildProcess() as unknown as ChildProcessWithoutNullStreams;
+    vi.mocked(spawn).mockReturnValue(child);
+
+    const runPromise = provider.run({
+      prompt: "Execute migration script",
+      cwd: "/tmp",
+    });
+
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const spawnArgs = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+    const pIdx = spawnArgs.indexOf("-p");
+    expect(pIdx).toBeGreaterThanOrEqual(0);
+    const promptArg = spawnArgs[pIdx + 1];
+    expect(promptArg).toContain("Execute migration script");
+    expect(promptArg).toContain(ANTIGRAVITY_COMMAND_DISCIPLINE);
+
+    child.emit("close", 0, null);
+    await runPromise;
   });
 
   it("classifies exit-0 empty-output QUOTA_EXHAUSTED conversation tails as failure", async () => {

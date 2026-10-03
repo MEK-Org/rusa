@@ -9,6 +9,8 @@
  * one-line adapter.
  */
 
+import type { AbortReason } from "../providers/termination-attribution.js";
+
 // Across every kind the convention is kind-specific. Say which field is which on
 // every new kind; the notes here were backfilled after the names misled two
 // readers into opposite conclusions about who sent what .
@@ -272,6 +274,8 @@ export interface RunEndPayload {
   yieldStatus?: string;
   /** What the provider reported this run ran on. Absent = not reported. */
   model?: string;
+  /** The typed reason for termination/abort (e.g. 'stall-watchdog', 'run-ceiling', 'interrupt:<by>', 'unknown'). */
+  abortReason?: AbortReason;
 }
 
 /**
@@ -285,9 +289,15 @@ export interface RunEndPayload {
  * `undefined` when there is nothing to say, so an ordinary run still records no payload
  * rather than an object of nulls. The historical keys are read, never written.
  */
-export function runEndPayload(result: Pick<RunEndPayload, "runId" | "model">): string | undefined {
-  if (!result.runId && !result.model) return undefined;
-  return JSON.stringify({ runId: result.runId, model: result.model } satisfies RunEndPayload);
+export function runEndPayload(
+  result: Pick<RunEndPayload, "runId" | "model" | "abortReason">
+): string | undefined {
+  if (!result.runId && !result.model && !result.abortReason) return undefined;
+  const payload: RunEndPayload = {};
+  if (result.runId) payload.runId = result.runId;
+  if (result.model) payload.model = result.model;
+  if (result.abortReason) payload.abortReason = result.abortReason;
+  return JSON.stringify(payload);
 }
 
 /**

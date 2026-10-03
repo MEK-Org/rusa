@@ -25,6 +25,7 @@ import {
   type ProviderModelConfig,
   type RawProviderModelConfig,
 } from "../providers/model-config.js";
+import type { AbortReason } from "../providers/termination-attribution.js";
 import type { RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import {
@@ -519,6 +520,7 @@ export interface MechanicalInboxForensics {
   pendingMessageId?: string;
   exitCode?: number;
   status?: string;
+  abortReason?: AbortReason;
 }
 
 /** What the mesh hands the factory to build a live {@link Actor} for a record. */

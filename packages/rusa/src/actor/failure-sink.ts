@@ -228,7 +228,10 @@ export async function routeRunFailure(
   const tail = sanitizeFailureText(result.output ?? "")
     .slice(-TAIL_LEN)
     .trim();
-  const summary = `(exit ${result.exitCode})${tail ? `\n\n${tail}` : ""}`;
+  const exitDesc = result.abortReason
+    ? `exit ${result.exitCode}, ${result.abortReason}`
+    : `exit ${result.exitCode}`;
+  const summary = `(${exitDesc})${tail ? `\n\n${tail}` : ""}`;
 
   let leadLine: string | undefined;
   if (deps.classify) {
@@ -388,6 +391,7 @@ function routeMechanicalFailureNotice(
       runId: runId ?? actorId,
       actorId,
       exitCode,
+      abortReason: result?.abortReason,
     });
     return;
   }
