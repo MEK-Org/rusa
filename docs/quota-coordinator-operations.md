@@ -211,7 +211,9 @@ A restored dist with no valid sentinel is not restarted onto. Those cases, a
 failed restore, and a new build that already
 migrated the quota schema (whose old build's guard refuses it) raise the
 durable rollback-failed alert; recover with the binary rollback procedure
-above using the pre-deploy backup.
+above using the pre-deploy backup. `rusa quota-restore` restores the newest
+copy in `<backupDir>` by default, so name the pre-deploy one with
+`--backup-dir <backupDir>/pre-deploy` (or `--from`).
 
 Between the coordinator restart and the client's own restart, the updating
 instance is an old client of the new coordinator for at most the drain timeout.
@@ -749,6 +751,7 @@ rusa quota-backup                 # take one now; safe against a running coordin
 rusa quota-backup --list          # what retention currently holds, newest last
 rusa quota-restore                # restore the newest backup
 rusa quota-restore --from /path/to/quota-20260915T205722Z.db
+rusa quota-restore --backup-dir <backupDir>/pre-deploy   # newest pre-restart copy from an update
 ```
 
 `rusa quota-backup` is the same code path the daily timer runs, exposed as a
