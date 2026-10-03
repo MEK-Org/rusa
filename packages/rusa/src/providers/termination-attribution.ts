@@ -66,21 +66,21 @@ export function formatSigtermResult(
   baseOutput: string,
   signal?: AbortSignal
 ): TerminationAttribution {
-  const reason = signal?.aborted ? signal.reason : undefined;
+  const abortReason = extractAbortReason(signal);
 
-  if (isInterruptAbortReason(reason)) {
-    const by = parseInterruptSource(reason) ?? "operator";
+  if (isInterruptAbortReason(abortReason)) {
+    const by = parseInterruptSource(abortReason) ?? "operator";
     return {
       output: `${baseOutput}\n[Task interrupted by ${by}]`,
       exitCode: 143, // 128 + SIGTERM (15)
       cancelled: true,
       interrupted: true,
       interruptSource: by,
-      abortReason: reason as AbortReason,
+      abortReason,
     };
   }
 
-  if (reason === STALL_WATCHDOG_ABORT_REASON) {
+  if (abortReason === STALL_WATCHDOG_ABORT_REASON) {
     return {
       output: `${baseOutput}\n[Task killed by stall watchdog (no output for 15 minutes)]`,
       exitCode: 143, // 128 + SIGTERM (15)
@@ -89,7 +89,7 @@ export function formatSigtermResult(
     };
   }
 
-  if (reason === RUN_CEILING_ABORT_REASON) {
+  if (abortReason === RUN_CEILING_ABORT_REASON) {
     return {
       output: `${baseOutput}\n[Task killed by run ceiling timeout]`,
       exitCode: 143, // 128 + SIGTERM (15)

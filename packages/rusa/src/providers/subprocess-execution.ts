@@ -120,7 +120,7 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
       sigtermResult: TerminationAttribution
     ) => {
       const res = build(sigtermResult);
-      if (sigtermResult.abortReason !== undefined && res.abortReason === undefined) {
+      if (res.abortReason === undefined) {
         res.abortReason = sigtermResult.abortReason;
       }
       settle(res);

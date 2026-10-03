@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  extractAbortReason,
   formatSigtermResult,
   RUN_CEILING_ABORT_REASON,
   STALL_WATCHDOG_ABORT_REASON,
@@ -46,5 +47,37 @@ describe("formatSigtermResult", () => {
     expect(result.exitCode).toBe(143);
     expect(result.cancelled).toBe(true);
     expect(result.abortReason).toBe("unknown");
+  });
+});
+
+describe("extractAbortReason", () => {
+  it("extracts stall-watchdog abort reason", () => {
+    const controller = new AbortController();
+    controller.abort(STALL_WATCHDOG_ABORT_REASON);
+    expect(extractAbortReason(controller.signal)).toBe("stall-watchdog");
+  });
+
+  it("extracts run-ceiling abort reason", () => {
+    const controller = new AbortController();
+    controller.abort(RUN_CEILING_ABORT_REASON);
+    expect(extractAbortReason(controller.signal)).toBe("run-ceiling");
+  });
+
+  it("extracts interrupt abort reason with prefix", () => {
+    const controller = new AbortController();
+    controller.abort("interrupt:human:operator");
+    expect(extractAbortReason(controller.signal)).toBe("interrupt:human:operator");
+  });
+
+  it("extracts unknown for unattributed abort", () => {
+    const controller = new AbortController();
+    controller.abort();
+    expect(extractAbortReason(controller.signal)).toBe("unknown");
+  });
+
+  it("returns unknown when signal is undefined or not aborted", () => {
+    expect(extractAbortReason(undefined)).toBe("unknown");
+    const controller = new AbortController();
+    expect(extractAbortReason(controller.signal)).toBe("unknown");
   });
 });
