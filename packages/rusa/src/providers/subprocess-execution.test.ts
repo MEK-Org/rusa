@@ -150,4 +150,77 @@ describe("runSubprocess helper-level unit coverage ", () => {
     expect(result.exitCode).toBe(-1);
     expect(result.output).toBe("Spawn error: ENOENT: command not found");
   });
+
+  it("flushes onStdoutEnd before formatting termination on abort", async () => {
+    const mockChild = new MockChild();
+    spawnFn.mockReturnValue(mockChild as unknown as ChildProcessWithoutNullStreams);
+
+    const controller = new AbortController();
+    let buffered = "trailing unterminated text";
+
+    const runPromise = runSubprocess({
+      ...baseConfig,
+      signal: controller.signal,
+      onStdoutEnd: (chunks) => {
+        if (buffered) {
+          chunks.push(buffered);
+          buffered = "";
+        }
+      },
+    });
+
+    controller.abort(STALL_WATCHDOG_ABORT_REASON);
+
+    const result = await runPromise;
+    expect(result.output).toContain("trailing unterminated text");
+    expect(result.output).toContain("stall watchdog");
+  });
+
+  it("flushes onStdoutEnd before formatting termination on SIGTERM close", async () => {
+    const mockChild = new MockChild();
+    spawnFn.mockReturnValue(mockChild as unknown as ChildProcessWithoutNullStreams);
+
+    let buffered = "trailing error diagnostic";
+
+    const runPromise = runSubprocess({
+      ...baseConfig,
+      onStdoutEnd: (chunks) => {
+        if (buffered) {
+          chunks.push(buffered);
+          buffered = "";
+        }
+      },
+    });
+
+    mockChild.emit("close", null, "SIGTERM");
+
+    const result = await runPromise;
+    expect(result.output).toContain("trailing error diagnostic");
+    expect(result.output).toContain("unattributed");
+  });
+
+  it("flushes onStdoutEnd before formatting termination on timeout", async () => {
+    vi.useFakeTimers();
+    const mockChild = new MockChild();
+    spawnFn.mockReturnValue(mockChild as unknown as ChildProcessWithoutNullStreams);
+
+    let buffered = "buffered output before timeout";
+
+    const runPromise = runSubprocess({
+      ...baseConfig,
+      timeoutMs: 50,
+      onStdoutEnd: (chunks) => {
+        if (buffered) {
+          chunks.push(buffered);
+          buffered = "";
+        }
+      },
+    });
+
+    vi.advanceTimersByTime(50);
+
+    const result = await runPromise;
+    expect(result.output).toContain("buffered output before timeout");
+    expect(result.output).toContain("unattributed");
+  });
 });

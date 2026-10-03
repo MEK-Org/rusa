@@ -427,17 +427,6 @@ export function appendAntigravityCommandDiscipline(prompt: string): string {
   return `${prompt.trim()}\n\n${ANTIGRAVITY_COMMAND_DISCIPLINE}\n`;
 }
 
-export function appendBeforeTerminationMarker(output: string, additional: string): string {
-  if (!additional || output.includes(additional)) {
-    return output;
-  }
-  const markerIndex = output.lastIndexOf("\n[Task ");
-  if (markerIndex !== -1) {
-    return `${output.slice(0, markerIndex)}${additional}${output.slice(markerIndex)}`;
-  }
-  return `${output}${additional}`;
-}
-
 /**
  * Google Antigravity CLI provider.
  *
@@ -744,25 +733,17 @@ export class AntigravityProvider implements CodingProvider {
         interrupted,
         interruptSource,
         abortReason,
-      }) => {
-        const chunksBefore = emittedChunks.length;
-        if (buffer) {
-          processLine(buffer);
-          buffer = "";
-        }
-        const flushed = emittedChunks.slice(chunksBefore).join("");
-        const finalOutput = appendBeforeTerminationMarker(output, flushed);
-        return withTokenUsage({
+      }) =>
+        withTokenUsage({
           success: false,
-          output: finalResultText && !opts.signal?.aborted ? finalResultText : finalOutput,
+          output: finalResultText && !opts.signal?.aborted ? finalResultText : output,
           exitCode,
           cancelled,
           interrupted,
           interruptSource,
           abortReason,
           sessionId: opts.session?.id,
-        });
-      },
+        }),
       buildSignalResult: ({
         output,
         exitCode,
@@ -770,25 +751,17 @@ export class AntigravityProvider implements CodingProvider {
         interrupted,
         interruptSource,
         abortReason,
-      }) => {
-        const chunksBefore = emittedChunks.length;
-        if (buffer) {
-          processLine(buffer);
-          buffer = "";
-        }
-        const flushed = emittedChunks.slice(chunksBefore).join("");
-        const finalOutput = appendBeforeTerminationMarker(output, flushed);
-        return withTokenUsage({
+      }) =>
+        withTokenUsage({
           success: false,
-          output: finalResultText && !opts.signal?.aborted ? finalResultText : finalOutput,
+          output: finalResultText && !opts.signal?.aborted ? finalResultText : output,
           exitCode,
           cancelled,
           interrupted,
           interruptSource,
           abortReason,
           sessionId: captureSessionFromLog(),
-        });
-      },
+        }),
       buildExitResult: (output, exitCode) => {
         if (buffer) {
           processLine(buffer);
