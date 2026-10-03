@@ -339,6 +339,17 @@ export function createDashboardRequestHandler(
         !(await auth.authorize(req, res))
       )
         return;
+      // #866: complete prompts are available in sole-email/local mode only.
+      // Keep allowlist refusal at the established auth boundary, before storage reads.
+      if (
+        req.method === "GET" &&
+        auth?.config.allowedEmails &&
+        /^\/api\/mesh\/runs\/[^/]+\/prompt$/.test(pathname)
+      ) {
+        res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: "prompt not retained" }));
+        return;
+      }
       if (auth && (pathname === "/api/mesh/stream" || pathname === "/api/mesh/voice/stream")) {
         auth.guardStream(req, res);
       }

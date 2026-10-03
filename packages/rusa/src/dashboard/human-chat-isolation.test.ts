@@ -92,6 +92,7 @@ describe("human chat isolation (#590)", () => {
   let auth: DashboardAuth;
   let server: ReturnType<typeof createServer>;
   let origin: string;
+  let deps: DashboardDataDeps;
   let alice: Person;
   let bob: Person;
   /** Session cookie → the person it authenticates. */
@@ -200,7 +201,7 @@ describe("human chat isolation (#590)", () => {
       },
       getSelection: () => undefined,
     };
-    const deps: DashboardDataDeps = {
+    deps = {
       actors,
       runPrompts: new RunPromptRepository(db),
       principals,
@@ -305,7 +306,7 @@ describe("human chat isolation (#590)", () => {
     }>;
   };
 
-  it("#866 displays complete launch text through existing authenticated dashboard access", async () => {
+  it("#866 withholds complete launch prompts from both allowedEmails viewers", async () => {
     const a = await login(alice);
     const b = await login(bob);
     const runs = new ActorRunRepository(db);
@@ -314,7 +315,7 @@ describe("human chat isolation (#590)", () => {
       actorId: ACTOR,
       modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
     });
-    const prompt = "# Synthetic charter\n\n  Preserve whitespace ✓\r\n" + "x".repeat(300_000);
+    const prompt = `# Synthetic charter\n\n  Preserve whitespace ✓\r\n${"x".repeat(300_000)}`;
     prompts.recordForActor(ACTOR, runId, prompt, "claude");
     meshEvents.record({ kind: "run_start", actorId: ACTOR, payload: JSON.stringify({ runId }) });
     const path = `/api/mesh/runs/${runId}/prompt`;
@@ -323,17 +324,49 @@ describe("human chat isolation (#590)", () => {
     expect(await anonymous.text()).not.toContain("Synthetic charter");
     for (const cookie of [a.cookie, b.cookie]) {
       const response = await fetch(origin + path, { headers: { Cookie: cookie } });
-      expect(response.status).toBe(200);
-      expect(await response.json()).toMatchObject({ prompt, provider: "claude" });
+      expect(response.status).toBe(404);
+      const unavailable = await response.text();
+      expect(unavailable).toBe(JSON.stringify({ error: "prompt not retained" }));
+      expect(unavailable).not.toContain(prompt);
+      expect(unavailable).not.toContain("provider");
+      expect(unavailable).not.toContain("createdAt");
       const missing = await fetch(origin + "/api/mesh/runs/pre-feature/prompt", {
         headers: { Cookie: cookie },
       });
       expect(missing.status).toBe(404);
+      expect(await missing.text()).toBe(unavailable);
     }
+    expect(prompts.getById(runId)?.prompt).toBe(prompt);
     const feed = await fetch(`${origin}/api/mesh/events?actors=${ACTOR}`, {
       headers: { Cookie: a.cookie },
     });
     expect(JSON.stringify(await feed.json())).not.toContain("Synthetic charter");
+  });
+
+  it("#866 serves exact bytes through sole-email auth and the supported auth-disabled local path", async () => {
+    // Engineering boundary: #866 comment5972967230; no multi-human exception to #590.
+    delete auth.config.allowedEmails;
+    auth.config.email = alice.email;
+    const a = await login(alice);
+    const runId = new ActorRunRepository(db).start({
+      actorId: ACTOR,
+      modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
+    });
+    const prompt = `# Synthetic charter\n\n  Preserve whitespace ✓\r\n${"x".repeat(300_000)}`;
+    const prompts = new RunPromptRepository(db);
+    prompts.recordForActor(ACTOR, runId, prompt, "claude");
+    const path = `/api/mesh/runs/${runId}/prompt`;
+    expect((await fetch(origin + path)).status).toBe(401);
+    const authenticated = await fetch(origin + path, { headers: { Cookie: a.cookie } });
+    expect(authenticated.status).toBe(200);
+    expect(await authenticated.json()).toEqual(prompts.getById(runId));
+    // Replace only this isolated fixture's request handler; Alice is its sole durable user.
+    server.removeAllListeners("request");
+    server.on("request", createDashboardRequestHandler({ port: 0 }, deps));
+    const local = await fetch(origin + path);
+    expect(local.status).toBe(200);
+    expect(await local.json()).toEqual(prompts.getById(runId));
+    expect(prompts.getById(runId)?.prompt).toBe(prompt);
   });
 
   /** Two humans each talk to the actor and the actor answers each of them. */
