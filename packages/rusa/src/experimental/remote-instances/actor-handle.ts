@@ -27,6 +27,8 @@ import {
 export interface ActorHandleOptions {
   host: ActorChannel;
   bootstrap: Bootstrap;
+  /** Refresh startup metadata when a transport reconnect sends another init. */
+  getProviderOptions?: () => Record<string, unknown>;
   context: ActorFactoryContext;
   // Read only after central scheduler admission, so queued runs get fresh work.
   snapshot: () => RunSnapshot;
@@ -291,6 +293,7 @@ export class ActorHandle implements MeshActor {
       type: "init",
       bootstrap: {
         ...this.opts.bootstrap,
+        providerOptions: this.opts.getProviderOptions?.() ?? this.opts.bootstrap.providerOptions,
         ...(sessionId ? { sessionId } : {}),
         modelConfig: freshSnapshot.record.modelConfig ?? this.modelConfig,
         modelConfigGeneration: this.modelConfigGeneration,

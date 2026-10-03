@@ -2,6 +2,7 @@ import { Actor } from "../../actor/actor.js";
 import type { RunStartE2EHooks } from "../../commands/start.js";
 import type { RusaConfig } from "../../config/types.js";
 import type { Logger } from "../../observability/logger.js";
+import { getAllProviderModelCatalogs } from "../../providers/model-catalog.js";
 import { ActorHandle } from "./actor-handle.js";
 import type { FollowerHub } from "./follower-hub.js";
 
@@ -24,6 +25,12 @@ export function instanceWorkerFactory(
     const name = options.modelConfig[0]?.provider ?? config.rootActor?.provider ?? "antigravity";
     const host = hub.createHost(target, record.id);
     const toolUrls = () => hub.toolUrls(target, record.id, options.mcpServers);
+    const providerOptions = () => ({
+      // Adapter metadata and normalized catalogs are sufficient for follower selection.
+      providers: config.providers,
+      name,
+      modelCatalogs: Object.fromEntries(getAllProviderModelCatalogs()),
+    });
     const runtime = new ActorHandle({
       host,
       bootstrap: {
@@ -31,13 +38,7 @@ export function instanceWorkerFactory(
         cwd: options.cwd,
         sessionId: options.loadSessionId(),
         modelConfig: [...options.modelConfig],
-        providerOptions: {
-          // Provider definitions contain only adapter metadata. The follower
-          // selects this map at the next-run boundary, including a valid
-          // cross-provider staged pin, without reading leader configuration.
-          providers: config.providers,
-          name,
-        },
+        providerOptions: providerOptions(),
         mcpServers: toolUrls(),
         actorOptions: {
           sandbox: options.sandbox,
@@ -47,6 +48,7 @@ export function instanceWorkerFactory(
         },
         reconnect: Boolean(options.loadSessionId() || record.sessionId),
       },
+      getProviderOptions: providerOptions,
       context,
       actorOptions: options,
       snapshot: () => {

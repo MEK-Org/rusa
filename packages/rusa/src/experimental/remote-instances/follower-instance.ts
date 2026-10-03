@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { ComputerUseLock } from "../../actor/computer-use-lock.js";
+import { replaceProviderModelCatalogs } from "../../providers/model-catalog.js";
 import { createActorRuntime } from "./actor-runtime.js";
 import { createProvider } from "./configured-provider.js";
 import type { FollowerActorCommand, FollowerEvent } from "./follower-hub.js";
@@ -37,14 +38,22 @@ export class FollowerInstance {
     // Existing actors may finish normally during an update, but no new actor
     // is admitted once the follower has begun its bounded quiescence window.
     if (this.draining) return;
+    let actor = this.actors.get(actorId);
+    if (actor && !message.bootstrap.reconnect) throw new Error("Actor already exists on follower");
+    try {
+      replaceProviderModelCatalogs(message.bootstrap.providerOptions?.modelCatalogs);
+    } catch (error) {
+      this.emit({
+        eventId: randomUUID(),
+        actorId,
+        message: { type: "fatal", error: String(error) },
+      });
+      this.actors.get(actorId)?.close();
+      return;
+    }
     const cwd = join(this.home, "workers", actorId);
     mkdirSync(cwd, { recursive: true });
-    let actor = this.actors.get(actorId);
-    if (actor) {
-      if (!message.bootstrap.reconnect) {
-        throw new Error("Actor already exists on follower");
-      }
-    } else {
+    if (!actor) {
       actor = createActorRuntime(
         this.providerFactory,
         (event) => this.emit({ eventId: randomUUID(), actorId, message: event }),

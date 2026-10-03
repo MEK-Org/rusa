@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "@google/genai";
 import { parse as parseToml } from "smol-toml";
+import { z } from "zod";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
 import { parseCodexModel } from "./reasoning-effort.js";
 
@@ -358,6 +359,45 @@ export function normalizeModelEntries(
 /** Host-enumeration seam for a later slice. An absent provider is unknown. */
 export function setProviderModelCatalog(provider: string, entries: readonly ModelEntry[]): void {
   catalogs.set(provider, normalizeModelEntries(provider, entries));
+}
+
+const normalizedCatalogSnapshot = z.record(
+  z.string().min(1),
+  z.array(
+    z.object({
+      identifier: z
+        .string()
+        .min(1)
+        .refine((value) => value === value.trim()),
+      displayLabel: z
+        .string()
+        .min(1)
+        .refine((value) => value === value.trim()),
+      passable: z.boolean().optional(),
+      efforts: z
+        .array(
+          z
+            .string()
+            .min(1)
+            .refine((effort) => effort === effort.trim().toLowerCase())
+        )
+        .optional(),
+    })
+  )
+);
+
+/** Replace process-local state from a normalized bootstrap, preserving effort metadata. */
+export function replaceProviderModelCatalogs(snapshot: unknown): void {
+  // Omission is an old bootstrap with no known catalog, never permission to keep stale pins.
+  // Clear before validation so malformed reconnect metadata cannot retain earlier selections.
+  catalogs.clear();
+  const parsed = normalizedCatalogSnapshot.safeParse(snapshot === undefined ? {} : snapshot);
+  if (!parsed.success) {
+    throw new Error(
+      "Invalid model catalog snapshot: expected provider arrays of normalized model entries with identifier, displayLabel, boolean passable and lowercase efforts"
+    );
+  }
+  for (const [provider, entries] of Object.entries(parsed.data)) catalogs.set(provider, entries);
 }
 
 export function clearProviderModelCatalog(provider?: string): void {

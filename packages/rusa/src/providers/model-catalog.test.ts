@@ -20,6 +20,7 @@ import {
   populateModelCatalogsFromDb,
   readCodexModelsCache,
   recordAndExtractModelCatalog,
+  replaceProviderModelCatalogs,
   setProviderModelCatalog,
   validateModelPin,
 } from "./model-catalog.js";
@@ -1049,4 +1050,38 @@ describe("PROVIDER_MODEL_DESCRIPTORS", () => {
     expect(guidance).toContain("Claude Opus 4.8");
     expect(guidance).toContain("claude-opus-4-8");
   });
+});
+
+it("preserves normalized Antigravity catalog efforts across serialization and repeated initialization", () => {
+  setProviderModelCatalog("agy", [
+    { identifier: "gemini-fixture-high", displayLabel: "Gemini Fixture (High)", passable: true },
+    { identifier: "gemini-fixture-low", displayLabel: "Gemini Fixture (Low)", passable: true },
+    { identifier: "gemini-group", displayLabel: "Gemini Group", passable: false },
+  ]);
+  const normalized = JSON.parse(JSON.stringify(getProviderModelCatalog("agy")));
+  replaceProviderModelCatalogs({ antigravity: normalized });
+  expect(getProviderModelCatalog("antigravity")).toEqual(normalized);
+  replaceProviderModelCatalogs({ antigravity: getProviderModelCatalog("antigravity") ?? [] });
+  expect(getProviderModelCatalog("antigravity")).toEqual(normalized);
+});
+
+it("normalized snapshots replace aliases, clear on omission or invalid shape, and own their entries", () => {
+  const snapshot = {
+    agy: [{ identifier: "gemini-fixture-high", displayLabel: "Gemini Fixture", efforts: ["high"] }],
+  };
+  replaceProviderModelCatalogs(snapshot);
+  snapshot.agy[0].efforts.push("low");
+  expect(getProviderModelCatalog("antigravity")?.[0]).toMatchObject({
+    identifier: "gemini-fixture-high",
+    efforts: ["high"],
+  });
+  replaceProviderModelCatalogs({ antigravity: [] });
+  expect(getProviderModelCatalog("agy")).toEqual([]);
+  replaceProviderModelCatalogs(undefined);
+  expect(getAllProviderModelCatalogs().size).toBe(0);
+  replaceProviderModelCatalogs({ codex: [{ identifier: "fixture", displayLabel: "Fixture" }] });
+  expect(() => replaceProviderModelCatalogs({ codex: [{}] })).toThrow(
+    "Invalid model catalog snapshot"
+  );
+  expect(getAllProviderModelCatalogs().size).toBe(0);
 });
