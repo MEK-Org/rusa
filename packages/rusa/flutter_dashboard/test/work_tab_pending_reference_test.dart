@@ -112,7 +112,12 @@ void main() {
     await tester.pump();
 
     expect(find.text('loading context'), findsNothing);
+    expect(find.text('Chat message'), findsOneWidget);
+    await tester.tap(find.byTooltip('View reference context'));
+    await tester.pumpAndSettle();
     expect(find.text('Late but real'), findsOneWidget);
+    await tester.tap(find.text('Close'));
+    await tester.pumpAndSettle();
 
     // Resolved is terminal: nothing more is fetched.
     final settled = detailCalls.length;

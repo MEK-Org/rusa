@@ -11,7 +11,6 @@ import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/inbox_tab.dart';
 import 'package:rusa_dashboard/widgets/obligation_card.dart';
-import 'package:rusa_dashboard/widgets/reference_preview.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 
 import 'fakes.dart';
@@ -861,13 +860,13 @@ void main() {
 
       await tester.tap(find.text('Operator Work'));
       await tester.pumpAndSettle();
-      expect(find.text('OWNER'), findsOneWidget);
+      expect(find.text('Owner'), findsOneWidget);
       expect(find.text('Operator'), findsOneWidget);
 
       await tester.tap(find.text('Ghost Work'));
       await tester.pumpAndSettle();
       expect(find.text('Unknown actor'), findsOneWidget);
-      expect(find.text('Actor — not in this mesh view'), findsOneWidget);
+      expect(find.text('Owner'), findsOneWidget);
     });
 
     testWidgets('opens the external-ref dialog and unlinks through the API', (
@@ -981,7 +980,7 @@ void main() {
         await tester.tap(find.text('Finished work'));
         await tester.pumpAndSettle();
 
-        expect(find.byType(ReferencePreview), findsOneWidget);
+        expect(find.byTooltip('View reference context'), findsOneWidget);
         expect(find.byTooltip('Change or unlink'), findsNothing);
         expect(find.byTooltip('Link an issue, PR or repo'), findsNothing);
       },

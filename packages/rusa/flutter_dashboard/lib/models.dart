@@ -549,6 +549,7 @@ class RecentActivityItem {
   });
 
   final String id;
+
   /// 'handled_inbox' | 'terminal_obligation'
   final String kind;
   final String time;
@@ -1330,15 +1331,16 @@ class QuotaFreshnessDto {
   final int? hardStaleAfterMs;
   final bool resetWaiting;
 
-  factory QuotaFreshnessDto.fromJson(Map<String, dynamic> j) => QuotaFreshnessDto(
-    ageMs: (j['ageMs'] as num?)?.toInt(),
-    stale: j['stale'] as bool? ?? false,
-    hardStale: j['hardStale'] as bool? ?? false,
-    mode: j['mode'] as String?,
-    staleAfterMs: (j['staleAfterMs'] as num?)?.toInt(),
-    hardStaleAfterMs: (j['hardStaleAfterMs'] as num?)?.toInt(),
-    resetWaiting: j['resetWaiting'] as bool? ?? false,
-  );
+  factory QuotaFreshnessDto.fromJson(Map<String, dynamic> j) =>
+      QuotaFreshnessDto(
+        ageMs: (j['ageMs'] as num?)?.toInt(),
+        stale: j['stale'] as bool? ?? false,
+        hardStale: j['hardStale'] as bool? ?? false,
+        mode: j['mode'] as String?,
+        staleAfterMs: (j['staleAfterMs'] as num?)?.toInt(),
+        hardStaleAfterMs: (j['hardStaleAfterMs'] as num?)?.toInt(),
+        resetWaiting: j['resetWaiting'] as bool? ?? false,
+      );
 
   Map<String, dynamic> toJson() => {
     'ageMs': ageMs,
@@ -1373,9 +1375,8 @@ class QuotaThrottleModelLaneDto extends QuotaThrottleDto {
         buckets: (j['buckets'] as List<dynamic>? ?? const [])
             .whereType<Map<dynamic, dynamic>>()
             .map(
-              (e) => QuotaThrottleBucketDto.fromJson(
-                Map<String, dynamic>.from(e),
-              ),
+              (e) =>
+                  QuotaThrottleBucketDto.fromJson(Map<String, dynamic>.from(e)),
             )
             .toList(),
         updatedAt: j['updatedAt'] as String? ?? '',
@@ -1392,10 +1393,7 @@ class QuotaThrottleModelLaneDto extends QuotaThrottleDto {
       );
 
   @override
-  Map<String, dynamic> toJson() => {
-    ...super.toJson(),
-    'models': models,
-  };
+  Map<String, dynamic> toJson() => {...super.toJson(), 'models': models};
 }
 
 /// Latest adaptive start interval for one provider, when quota pacing is enabled.
@@ -1437,9 +1435,8 @@ class QuotaThrottleDto {
     modelLanes: (j['modelLanes'] as List<dynamic>? ?? const [])
         .whereType<Map<dynamic, dynamic>>()
         .map(
-          (e) => QuotaThrottleModelLaneDto.fromJson(
-            Map<String, dynamic>.from(e),
-          ),
+          (e) =>
+              QuotaThrottleModelLaneDto.fromJson(Map<String, dynamic>.from(e)),
         )
         .toList(),
   );
@@ -2222,9 +2219,39 @@ class ObligationCompletionDto {
       );
 }
 
+/// An attributable, immutable update in the obligation history stream.
+class ObligationHistoryDto {
+  const ObligationHistoryDto({
+    required this.id,
+    required this.kind,
+    required this.by,
+    required this.timestamp,
+    this.before = const {},
+    this.after = const {},
+  });
+  final String id;
+  final String kind;
+  final String? by;
+  final String timestamp;
+  final Map<String, dynamic> before;
+  final Map<String, dynamic> after;
+  factory ObligationHistoryDto.fromJson(Map<String, dynamic> j) =>
+      ObligationHistoryDto(
+        id: '${j['id']}',
+        kind: j['mutationKind'] as String,
+        by: j['actingPrincipal'] as String?,
+        timestamp: j['timestamp'] as String,
+        before: Map<String, dynamic>.from(j['before'] as Map? ?? const {}),
+        after: Map<String, dynamic>.from(j['after'] as Map? ?? const {}),
+      );
+}
+
 class ObligationDetailSnapshot {
   const ObligationDetailSnapshot({
     required this.obligation,
+    this.ancestors = const [],
+    this.history = const [],
+    this.historyNextBefore,
     this.parent,
     required this.children,
     required this.blockingChildren,
@@ -2242,6 +2269,9 @@ class ObligationDetailSnapshot {
   });
 
   final ObligationDto obligation;
+  final List<ObligationDto> ancestors;
+  final List<ObligationHistoryDto> history;
+  final String? historyNextBefore;
   final ObligationDto? parent;
   final List<ObligationDto> children;
   final List<ObligationDto> blockingChildren;
@@ -2261,6 +2291,13 @@ class ObligationDetailSnapshot {
     Map<String, dynamic> j,
   ) => ObligationDetailSnapshot(
     obligation: ObligationDto.fromJson(j['obligation'] as Map<String, dynamic>),
+    ancestors: (j['ancestors'] as List<dynamic>? ?? const [])
+        .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    history: (j['history'] as List<dynamic>? ?? const [])
+        .map((e) => ObligationHistoryDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    historyNextBefore: j['historyNextBefore'] as String?,
     parent: j['parent'] == null
         ? null
         : ObligationDto.fromJson(j['parent'] as Map<String, dynamic>),

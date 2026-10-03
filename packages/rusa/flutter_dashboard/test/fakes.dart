@@ -102,11 +102,7 @@ InboxEntryDto makeInboxEntry(
   actorId: actorId,
   source: source,
   deliveredAt: deliveredAt,
-  payload: {
-    'type': type,
-    'priority': ?priority,
-    'content': ?content,
-  },
+  payload: {'type': type, 'priority': ?priority, 'content': ?content},
   reference: reference,
 );
 
@@ -733,17 +729,24 @@ class FakeApi extends DashboardApi {
     );
   }
 
+  ObligationDetailSnapshot Function(String id, String? historyBefore)?
+  obligationDetailByHistory;
   int obligationDetailCallCount = 0;
 
   @override
   Future<ObligationDetailSnapshot> fetchObligationDetail(
     String id, {
+    String? historyBefore,
+    int? historyLimit,
     int? childrenOffset,
     int? blockingOffset,
     int? completionsOffset,
     int? limit,
   }) async {
     obligationDetailCallCount++;
+    if (obligationDetailByHistory != null) {
+      return obligationDetailByHistory!(id, historyBefore);
+    }
     final byOffset = obligationDetailByOffset;
     if (byOffset != null) {
       return byOffset(id, completionsOffset);
@@ -1222,10 +1225,7 @@ class FakeObligationsCache implements ObligationsCache {
   }
 
   @override
-  void invalidate({
-    required String scope,
-    required String principalId,
-  }) {
+  void invalidate({required String scope, required String principalId}) {
     _entries.remove('$scope.$principalId');
     if (stored?.scope == scope && stored?.principalId == principalId) {
       stored = null;
@@ -1291,7 +1291,9 @@ class FakeVoiceRecorder implements VoiceRecorder {
     final c = startCompleter;
     if (c != null) await c.future;
     if (generation != _generation) {
-      throw StateError('mic acquisition superseded by a newer recording session');
+      throw StateError(
+        'mic acquisition superseded by a newer recording session',
+      );
     }
   }
 

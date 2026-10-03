@@ -492,12 +492,16 @@ class DashboardApi {
 
   Future<ObligationDetailSnapshot> fetchObligationDetail(
     String id, {
+    String? historyBefore,
+    int? historyLimit,
     int? childrenOffset,
     int? blockingOffset,
     int? completionsOffset,
     int? limit,
   }) async {
     final q = <String, String>{
+      'history_before': ?historyBefore,
+      if (historyLimit != null) 'history_limit': '$historyLimit',
       if (childrenOffset != null) 'children_offset': '$childrenOffset',
       if (blockingOffset != null) 'blocking_offset': '$blockingOffset',
       if (completionsOffset != null) 'completions_offset': '$completionsOffset',
