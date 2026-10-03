@@ -35,6 +35,7 @@ Future<void> _withDashboard(
   WidgetTester tester, {
   required String initialUrl,
   FakeApi? api,
+  Size size = const Size(1200, 800),
   required Future<void> Function(DashboardStore store) body,
 }) async {
   await tester.runAsync(() async {
@@ -51,7 +52,7 @@ Future<void> _withDashboard(
 
     tester.platformDispatcher.defaultRouteNameTestValue = initialUrl;
     debugDashboardUrl = initialUrl;
-    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.physicalSize = size;
     tester.view.devicePixelRatio = 1.0;
     await tester.pumpWidget(
       RusaDashboardApp(
@@ -244,6 +245,74 @@ void main() {
             expect(find.text('probe dialog'), findsNothing);
             expect(find.byType(OverviewTab), findsOneWidget);
             expect(_urlWrites(), isEmpty);
+          },
+        );
+      },
+    );
+
+    testWidgets(
+      'browser popstate closes stacked dialogs and restores the addressed view',
+      (tester) async {
+        await _withDashboard(
+          tester,
+          initialUrl: '/overview',
+          body: (_) async {
+            await _tapNav(tester, 'Room');
+            for (final label in ['outer dialog', 'inner dialog']) {
+              showDialog<void>(
+                context: tester.element(find.byType(DashboardBody)),
+                builder: (_) => AlertDialog(content: Text(label)),
+              );
+              await _settle(tester);
+            }
+            expect(find.text('inner dialog'), findsOneWidget);
+            _navCalls.clear();
+
+            await _popTo(tester, '/overview');
+            await tester.pump(const Duration(milliseconds: 300));
+            expect(find.text('outer dialog'), findsNothing);
+            expect(find.text('inner dialog'), findsNothing);
+            expect(find.byType(OverviewTab), findsOneWidget);
+            expect(_urlWrites(), isEmpty);
+            expect(_visits, 2);
+          },
+        );
+      },
+    );
+
+    testWidgets(
+      'browser popstate closes the mobile drawer and restores the addressed view',
+      (tester) async {
+        await _withDashboard(
+          tester,
+          initialUrl: '/overview',
+          size: const Size(390, 800),
+          body: (_) async {
+            await tester.tap(find.byTooltip('Navigation'));
+            await tester.pump();
+            await tester.pump(const Duration(milliseconds: 300));
+            await tester.tap(find.byKey(const ValueKey('drawer-nav-chatRoom')));
+            await tester.pump();
+            await tester.pump(const Duration(milliseconds: 300));
+            expect(find.byType(ChatRoomTab), findsOneWidget);
+            await tester.tap(find.byTooltip('Navigation'));
+            await tester.pump();
+            await tester.pump(const Duration(milliseconds: 300));
+            final scaffold = tester.state<ScaffoldState>(
+              find.descendant(
+                of: find.byType(DashboardBody),
+                matching: find.byType(Scaffold),
+              ),
+            );
+            expect(scaffold.isDrawerOpen, isTrue);
+            _navCalls.clear();
+
+            await _popTo(tester, '/overview');
+            await tester.pump(const Duration(milliseconds: 300));
+            expect(scaffold.isDrawerOpen, isFalse);
+            expect(find.byType(OverviewTab), findsOneWidget);
+            expect(_urlWrites(), isEmpty);
+            expect(_visits, 2);
           },
         );
       },

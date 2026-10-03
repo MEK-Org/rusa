@@ -148,6 +148,15 @@ class _DashboardBodyState extends State<DashboardBody> {
   void _onRouteChanged() {
     final routeInfo = _routeProvider?.value;
     if (routeInfo != null) {
+      // Multi-entry browser back arrives here as a route push, not popRoute,
+      // so the Navigator never sees it. Close any dialogs and the drawer, then
+      // show the address the browser moved to, so view and URL stay in step
+      // without rewriting the entry the browser just reached.
+      final page = ModalRoute.of(context);
+      if (page != null && !page.isCurrent) {
+        Navigator.of(context).popUntil((route) => route == page);
+      }
+      _scaffoldKey.currentState?.closeDrawer();
       _applyRouteInformation(routeInfo);
     }
   }
