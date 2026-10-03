@@ -59,6 +59,7 @@ import {
   MAX_VOICE_TRANSFER_NOTE_CHARS,
   renderVoiceTransferContext,
 } from "../voice/voice-transfer-context.js";
+import { readAcceptedHumanInput } from "./accepted-human-input.js";
 import {
   type ActorLifecycle,
   type ActorLifecycleListener,
@@ -235,14 +236,16 @@ export interface RetireOptions {
 
 /** Host-owned live-session operations used by the actor transfer primitive. */
 export interface VoiceSessionTransferPort {
-  /** Read the caller's unambiguous active session before any authority moves. */
-  activeSessionIdFor(actorId: string): string;
   /** Read the caller's active session and bound human principal together. */
-  activeSessionFor?(actorId: string): { sessionId: string; principalId?: string };
+  activeSessionFor(actorId: string): { sessionId: string; principalId?: string } | undefined;
   /** Whether any live lease for this actor belongs to another human. */
-  heldByOtherPrincipal?(actorId: string, principalId: string): boolean;
+  heldByOtherPrincipal(actorId: string, principalId: string): boolean;
   /** Atomically rebind the caller's active session and return its same UUID. */
-  transferActiveSession(fromActorId: string, targetActorId: string): string;
+  transferActiveSession(
+    fromActorId: string,
+    targetActorId: string,
+    expected?: { sessionId: string; principalId: string }
+  ): string;
   /** Restore a just-rebound session before its durable handoff was accepted. */
   revertActiveSessionTransfer(sessionId: string, fromActorId: string, targetActorId: string): void;
   /** Tell the dashboard browser that owns this session to reconnect to target. */
@@ -2900,12 +2903,41 @@ export class ActorMesh {
 
     // Read and render before rebinding. If the durable context projection is
     // unavailable, no live authority moves and the caller can retry safely.
-    const sessionId = transfer.activeSessionIdFor(fromActorId);
+    const lease = this.replyVoiceSessionFor(fromActorId);
+    if (!lease?.principalId) throw new Error("voice transfer requires a bound human session");
+    const candidates = this.selectedInboxEntries(fromActorId)
+      .map((id) => inboxStore.read(fromActorId, id))
+      .filter(
+        (entry): entry is InboxEntry =>
+          entry !== null &&
+          !entry.handledAt &&
+          ["human.message", VOICE_INBOX_PAYLOAD_TYPE, "voice.transfer"].includes(entry.payload.type)
+      );
+    const inputs = candidates.map((entry) => ({
+      entryId: entry.id,
+      ...this.resolveHumanReplyInput(fromActorId, entry.id),
+    }));
+    const matching = inputs.filter(
+      (input) =>
+        input.binding.leaseBound &&
+        input.binding.sessionId === lease.sessionId &&
+        input.binding.principalId === lease.principalId
+    );
+    if (matching.length !== 1) {
+      throw new Error(
+        "voice transfer requires one unambiguous selected human input; select that input first"
+      );
+    }
+    const input = matching[0];
+    const sessionId = lease.sessionId;
     const context = renderVoiceTransferContext(
       this.listVoiceSessionChat?.(sessionId) ?? [],
       handoffNote
     );
-    transfer.transferActiveSession(fromActorId, target.id);
+    transfer.transferActiveSession(fromActorId, target.id, {
+      sessionId,
+      principalId: lease.principalId,
+    });
     let inserted: InboxEntry[];
     try {
       inserted = inboxStore.append([
@@ -2918,6 +2950,8 @@ export class ActorMesh {
             fromId: fromActorId,
             sessionId,
             context,
+            replyInput: { actorId: fromActorId, entryId: input.entryId },
+            replyBinding: input.binding,
           },
         },
       ]);
@@ -2987,25 +3021,57 @@ export class ActorMesh {
    * a recipient of a transfer may reply during the live handoff without
    * permanently gaining direct-human authority.
    */
-  /**
-   * The caller's active voice session UUID and bound human principal, if any.
-   */
   activeVoiceSessionFor(actorId: string): { sessionId: string; principalId?: string } | undefined {
     const transfer = this.voiceSessionTransfer;
     if (!transfer) return undefined;
     try {
-      if (transfer.activeSessionFor) {
-        return transfer.activeSessionFor(this.resolveThreadId(actorId));
-      }
-      const sessionId = transfer.activeSessionIdFor(this.resolveThreadId(actorId));
-      return { sessionId };
+      return transfer.activeSessionFor(this.resolveThreadId(actorId));
     } catch {
       return undefined;
     }
   }
 
-  activeVoiceSessionIdFor(actorId: string): string | undefined {
-    return this.activeVoiceSessionFor(actorId)?.sessionId;
+  /** A lease snapshot for authority checks; ambiguous/failed registries fail closed. */
+  private replyVoiceSessionFor(
+    actorId: string
+  ): { sessionId: string; principalId?: string } | undefined {
+    const registry = this.voiceSessionTransfer;
+    if (!registry) return undefined;
+    try {
+      return registry.activeSessionFor(actorId);
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === "caller does not hold an active voice session"
+      ) {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  /** Resolve the caller's explicit accepted input before any reply effects. */
+  resolveHumanReplyInput(actorId: string, inputRef?: string) {
+    actorId = this.resolveThreadId(actorId);
+    if (!inputRef || !this.inboxStore) {
+      throw new Error("reply requires input_ref naming your unhandled human input inbox entry");
+    }
+    const input = readAcceptedHumanInput(this.inboxStore, actorId, inputRef);
+    const { principalId, sessionId, leaseBound } = input.binding;
+    const user = this.principals?.getUser(principalId);
+    if (!user || user.disabledAt) {
+      throw new Error("reply requires an active durable human conversation principal");
+    }
+    const lease = this.replyVoiceSessionFor(actorId);
+    assertHumanVoiceAdmission(
+      this.voiceSessionTransfer?.heldByOtherPrincipal(actorId, principalId) ?? false
+    );
+    if (leaseBound && (lease?.sessionId !== sessionId || lease.principalId !== principalId)) {
+      throw new Error(
+        "accepted input's voice lease changed or ended; ask the human to send fresh input"
+      );
+    }
+    return input;
   }
 
   /** Resolve an active live actor from the caller's own handle set. */
@@ -4218,12 +4284,16 @@ export class ActorMesh {
       throw new Error("human message requires an active durable user principal");
     }
     const registry = this.voiceSessionTransfer;
-    const binding = registry?.heldByOtherPrincipal ? undefined : this.activeVoiceSessionFor(toId);
-    assertHumanVoiceAdmission(
-      registry?.heldByOtherPrincipal
-        ? registry.heldByOtherPrincipal(toId, fromId)
-        : Boolean(binding && binding.principalId !== fromId)
-    );
+    const binding = this.replyVoiceSessionFor(toId);
+    assertHumanVoiceAdmission(registry?.heldByOtherPrincipal(toId, fromId) ?? false);
+    if (binding && binding.principalId !== fromId) {
+      throw new Error("voice session is not bound to this human; reconnect the voice stream");
+    }
+    const replyBinding = {
+      principalId: fromId,
+      sessionId: binding?.sessionId ?? sessionId,
+      leaseBound: Boolean(binding),
+    };
     const rec = this.actors.get(toId);
     if (!rec || rec.status !== "active") {
       this.log(`message to ${toId} from ${fromId} dropped — recipient not active`);
@@ -4255,6 +4325,7 @@ export class ActorMesh {
             messageId,
             fromId,
             sessionId,
+            replyBinding,
           },
         },
       ]);

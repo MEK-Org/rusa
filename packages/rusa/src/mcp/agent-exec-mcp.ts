@@ -246,49 +246,28 @@ export function createAgentExecMcpServer(
     return `github:${repo}/${kind === "github_pr" ? "pulls" : "issues"}/${number}`;
   };
 
-  const voiceSessionId = mesh.activeVoiceSessionIdFor(selfId);
+  const voiceSessionId = mesh.activeVoiceSessionFor(selfId)?.sessionId;
   if (voiceSessionId || mesh.actors.lastHumanChat(selfId)) {
     server.registerTool(
       "reply",
       {
         title: "Reply to the human operator",
-        description: "Reply to the human operator in your conversation thread.",
+        description:
+          "Reply to the accepted human input identified by your own unhandled inbox entry. Supply input_ref for the input you are answering; later inputs require their own reference. Missing, legacy or changed voice bindings are refused until fresh input.",
         inputSchema: {
           message: z.string().describe("The message to send back to the human operator."),
+          input_ref: z
+            .string()
+            .optional()
+            .describe(
+              "Your own unhandled human input or verified voice-transfer inbox entry id, as returned by inbox list/select."
+            ),
         },
       },
-      async ({ message }) => {
+      async ({ message, input_ref }) => {
         try {
-          const chat = mesh.actors.lastHumanChat(selfId);
-          const currentVoiceSession = mesh.activeVoiceSessionFor?.(selfId);
-          let sessionId: string | undefined;
-          let toId: string | undefined;
-
-          if (currentVoiceSession) {
-            sessionId = currentVoiceSession.sessionId;
-            toId = currentVoiceSession.principalId;
-            if (!toId) {
-              throw new Error(
-                "voice session is not bound to an active human principal; reconnect the voice stream to continue"
-              );
-            }
-          } else if (voiceSessionId) {
-            throw new Error(
-              "voice session lease expired or was released; reconnect the voice stream to continue"
-            );
-          } else {
-            sessionId = chat?.sessionId;
-            toId = chat?.principalId;
-          }
-
-          if (!sessionId) throw new Error("reply requires an active human conversation");
-          if (!toId) {
-            throw new Error("reply requires a known durable human conversation principal");
-          }
-          const user = mesh.principals?.getUser(toId);
-          if (!user || user.disabledAt) {
-            throw new Error("reply requires an active durable human conversation principal");
-          }
+          const { binding } = mesh.resolveHumanReplyInput(selfId, input_ref);
+          const { sessionId, principalId: toId } = binding;
           mesh.recordMessageEmitted({
             fromId: selfId,
             toId,

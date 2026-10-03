@@ -372,13 +372,24 @@ export class VoiceService {
    * has durably accepted the recipient's handoff, allowing a failed write to
    * be rolled back without prematurely admitting ordinary source work.
    */
-  transferActiveSession(fromActorId: string, targetActorId: string): string {
+  transferActiveSession(
+    fromActorId: string,
+    targetActorId: string,
+    expected?: { sessionId: string; principalId: string }
+  ): string {
     if (!fromActorId.trim()) throw new Error("source actor id is required");
     if (!targetActorId.trim()) throw new Error("target actor id is required");
     if (fromActorId === targetActorId) throw new Error("cannot transfer a voice session to itself");
     this.expireSessions();
 
-    const sessionId = this.activeSessionIdFor(fromActorId);
+    const binding = this.activeSessionFor(fromActorId);
+    if (
+      expected &&
+      (binding.sessionId !== expected.sessionId || binding.principalId !== expected.principalId)
+    ) {
+      throw new Error("voice session changed before transfer; select fresh human input");
+    }
+    const sessionId = binding.sessionId;
     if (this.hasActiveSession(targetActorId)) {
       throw new Error("target actor already holds an active voice session");
     }

@@ -201,11 +201,14 @@ function setup(
   runMigrations(eventDb);
   const inboxStore = new SqliteInboxRepository(eventDb);
   const chatStore = new MeshChatRepository(eventDb);
+  const principals = new PrincipalRepository(eventDb);
+  principals.ensureImplicitUser("2026-01-01T00:00:00Z");
   const eventManager = new EventManager({
     inboxStore,
     resolver: eventSourceResolver,
   });
   mesh = new ActorMesh({
+    principals,
     recordChat: (entry) => chatStore.record(entry),
     actors: registry,
     rootId: opts.rootId,
@@ -820,9 +823,10 @@ describe("agent-execution MCP server", () => {
     const { inboxStore, mesh } = setup({
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceSessionTransfer: {
-        activeSessionIdFor: (actorId) => {
+        heldByOtherPrincipal: () => false,
+        activeSessionFor: (actorId) => {
           if (actorId !== holder) throw new Error("caller does not hold an active voice session");
-          return "session-a";
+          return { sessionId: "session-a", principalId: testHumanId(mesh) };
         },
         transferActiveSession: (fromActorId, targetActorId) => {
           if (fromActorId !== holder)
@@ -850,7 +854,12 @@ describe("agent-execution MCP server", () => {
       parentId: source,
       modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
     });
+    vi.spyOn(mesh, "dispatch").mockImplementation(() => false);
     holder = source;
+    mesh.sendHumanMessage(source, "synthetic accepted transfer input", "session-a", {
+      fromId: testHumanId(mesh),
+    });
+    mesh.selectInboxEntries(source, [required(inboxStore.list(source).entries[0]).id]);
     const client = await connect(createAgentExecMcpServer(mesh, source, "root"));
 
     const result = (await client.callTool({
@@ -885,10 +894,7 @@ describe("agent-execution MCP server", () => {
       recordChat: (entry) => chat.record(entry),
       listVoiceSessionChat: (sessionId) => chat.listForSession(sessionId, { limit: 100 }),
       voiceSessionTransfer: {
-        activeSessionIdFor: (actorId) => {
-          if (actorId !== holder) throw new Error("caller does not hold an active voice session");
-          return "transferred-session";
-        },
+        heldByOtherPrincipal: () => false,
         activeSessionFor: (actorId) => {
           if (actorId !== holder) throw new Error("caller does not hold an active voice session");
           return { sessionId: "transferred-session", principalId: firstHuman.id };
@@ -945,12 +951,8 @@ describe("agent-execution MCP server", () => {
     actors.patch(source.id, { handles: [{ id: target.id }] });
     holder = source.id;
 
-    chat.record({
-      senderId: firstHuman.id,
-      recipientId: source.id,
-      body: "Hello",
-      sessionId: "transferred-session",
-    });
+    mesh.sendHumanMessage(source.id, "Hello", "transferred-session", { fromId: firstHuman.id });
+    mesh.selectInboxEntries(source.id, [required(inboxStore.list(source.id).entries[0]).id]);
     mesh.transferVoiceSession(source.id, target.id);
     expect(actors.lastHumanChat(target.id)).toBeUndefined();
     const otherHuman = principals.createUser({
@@ -970,7 +972,10 @@ describe("agent-execution MCP server", () => {
 
     const reply = (await client.callTool({
       name: "reply",
-      arguments: { message: "I have the call." },
+      arguments: {
+        message: "I have the call.",
+        input_ref: required(inboxStore.list(target.id).entries[0]).id,
+      },
     })) as CallToolResult;
     expect(reply.isError).not.toBe(true);
     expect(
@@ -986,8 +991,7 @@ describe("agent-execution MCP server", () => {
       setup: () => ({
         session: () => ({ sessionId: "unbound-session", principalId: undefined }),
       }),
-      expectedError:
-        "voice session is not bound to an active human principal; reconnect the voice stream to continue",
+      expectedError: "reply requires an active durable human conversation principal",
     },
     {
       case: "lease expired or was released",
@@ -1004,8 +1008,7 @@ describe("agent-execution MCP server", () => {
           },
         };
       },
-      expectedError:
-        "voice session lease expired or was released; reconnect the voice stream to continue",
+      expectedError: "accepted input's voice lease changed or ended",
     },
     {
       case: "leased durable user is disabled",
@@ -1035,14 +1038,16 @@ describe("agent-execution MCP server", () => {
       session: () => { sessionId: string; principalId?: string };
       beforeCall?: () => void;
     } = setup(principals, db);
+    const inboxStore = new SqliteInboxRepository(db);
     const mesh = new ActorMesh({
       principals,
       actors,
-      inboxStore: new SqliteInboxRepository(db),
+      inboxStore,
       recordChat: (entry) => chat.record(entry),
       listVoiceSessionChat: (sessionId) => chat.listForSession(sessionId, { limit: 100 }),
       voiceSessionTransfer: {
-        activeSessionIdFor: () => plan.session().sessionId,
+        heldByOtherPrincipal: () => false,
+
         activeSessionFor: () => plan.session(),
         transferActiveSession: () => plan.session().sessionId,
         revertActiveSessionTransfer: () => {},
@@ -1067,12 +1072,30 @@ describe("agent-execution MCP server", () => {
       preemptForResponsive: () => ({ preempted: false as const }),
     } as unknown as Actor);
 
+    const admitted = plan.session();
+    const [input] = inboxStore.append([
+      {
+        actorId: "root",
+        source: `mesh:${admitted.principalId ?? "unknown"}`,
+        payload: {
+          type: "human.voice",
+          messageId: "synthetic-delivered-input",
+          fromId: admitted.principalId ?? "unknown",
+          sessionId: admitted.sessionId,
+          replyBinding: {
+            principalId: admitted.principalId ?? "unknown",
+            sessionId: admitted.sessionId,
+            leaseBound: true,
+          },
+        },
+      },
+    ]);
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     plan.beforeCall?.();
 
     const reply = (await client.callTool({
       name: "reply",
-      arguments: { message: "Test reply" },
+      arguments: { message: "Test reply", input_ref: required(input).id },
     })) as CallToolResult;
     expect(reply.isError).toBe(true);
     expect((reply.content[0] as { text: string }).text).toContain(expectedError);
@@ -1083,7 +1106,7 @@ describe("agent-execution MCP server", () => {
     "empty",
     "truncated",
     "mixed",
-  ])("replies from the lease binding with %s history (#597)", async (history) => {
+  ])("replies from accepted input with %s unrelated history (#597)", async (history) => {
     const db = new Database(":memory:");
     runMigrations(db);
     const actors = new SqliteActorRepository(db);
@@ -1107,14 +1130,16 @@ describe("agent-execution MCP server", () => {
     const projection = vi.fn((sessionId: string) =>
       chat.listForSession(sessionId, { limit: history === "truncated" ? 1 : 100 })
     );
+    const inboxStore = new SqliteInboxRepository(db);
     const mesh = new ActorMesh({
       principals,
       actors,
-      inboxStore: new SqliteInboxRepository(db),
+      inboxStore,
       recordChat: (entry) => chat.record(entry),
       listVoiceSessionChat: projection,
       voiceSessionTransfer: {
-        activeSessionIdFor: () => "history-free-session",
+        heldByOtherPrincipal: () => false,
+
         activeSessionFor: () => ({ sessionId: "history-free-session", principalId: firstHuman.id }),
         transferActiveSession: () => "history-free-session",
         revertActiveSessionTransfer: () => {},
@@ -1143,10 +1168,16 @@ describe("agent-execution MCP server", () => {
       history === "empty" ? 0 : 2
     );
 
+    mesh.sendHumanMessage("root", "synthetic current input", "history-free-session", {
+      fromId: firstHuman.id,
+    });
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const reply = (await client.callTool({
       name: "reply",
-      arguments: { message: "Direct reply from session binding." },
+      arguments: {
+        message: "Direct reply from session binding.",
+        input_ref: required(inboxStore.list("root").entries[0]).id,
+      },
     })) as CallToolResult;
     expect(reply.isError).not.toBe(true);
 
@@ -1170,10 +1201,11 @@ describe("agent-execution MCP server", () => {
     const firstHuman = required(principals.ensureImplicitUser("2026-01-01T00:00:00Z"));
     // Distinct, increasing timestamps so the newest-by-(ts, id) order is fixed.
     let tick = 0;
+    const inboxStore = new SqliteInboxRepository(db);
     const mesh = new ActorMesh({
       principals,
       actors,
-      inboxStore: new SqliteInboxRepository(db),
+      inboxStore,
       recordChat: (entry) =>
         chat.record({ ...entry, ts: new Date(Date.UTC(2026, 0, 1, 0, 0, ++tick)).toISOString() }),
       createActor: () => ({}) as unknown as Actor,
@@ -1230,17 +1262,23 @@ describe("agent-execution MCP server", () => {
       arguments: { message: "Nowhere to send." },
     })) as CallToolResult;
     expect(rejected.isError).toBe(true);
-    expect(JSON.stringify(rejected.content)).toContain("requires an active human conversation");
+    expect(JSON.stringify(rejected.content)).toContain("requires input_ref");
 
     mesh.sendHumanMessage("worker", "first", "session-a", {
       fromId: testHumanId(mesh),
     });
 
-    // A second human writes mid-run; the next reply must follow them.
+    const firstRef = required(inboxStore.list("worker").entries[0]).id;
+    // Explicitly answer the second accepted input, preserving the first reference.
     mesh.sendHumanMessage("worker", "second", "session-b", { fromId: user.id });
     const reply = (await client.callTool({
       name: "reply",
-      arguments: { message: "On it." },
+      arguments: {
+        message: "On it.",
+        input_ref: required(
+          inboxStore.list("worker").entries.find((entry) => entry.payload.fromId === user.id)
+        ).id,
+      },
     })) as CallToolResult;
 
     expect(reply.isError).not.toBe(true);
@@ -1250,6 +1288,14 @@ describe("agent-execution MCP server", () => {
       expect.objectContaining({ recipientId: user.id, body: "On it." }),
     ]);
     expect(sent("session-a")).toEqual([]);
+    const earlier = await client.callTool({
+      name: "reply",
+      arguments: { message: "Earlier answer.", input_ref: firstRef },
+    });
+    expect(earlier.isError).not.toBe(true);
+    expect(sent("session-a")).toEqual([
+      expect.objectContaining({ recipientId: firstHuman.id, body: "Earlier answer." }),
+    ]);
   });
 
   it("describes live capability grants as effective on the next run", async () => {

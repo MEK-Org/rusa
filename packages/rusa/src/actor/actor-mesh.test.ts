@@ -100,10 +100,29 @@ import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
 const DEBOUNCE = 10;
 
+function required<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error("missing synthetic input fixture");
+  return value;
+}
+
 function testHumanId(mesh: ActorMesh): string {
   const user = mesh.principals?.listUsers()[0];
   if (!user) throw new Error("missing synthetic durable user");
   return user.id;
+}
+
+/** Use admitted actor-owned provenance for transfer fixtures. */
+function selectVoiceInput(
+  mesh: ActorMesh,
+  inbox: InboxRepository,
+  actorId: string,
+  sessionId = "walkie-session"
+) {
+  mesh.sendHumanMessage(actorId, "synthetic accepted voice input", sessionId, {
+    fromId: testHumanId(mesh),
+  });
+  const input = inbox.list(actorId).entries.find((entry) => entry.payload.type === "human.message");
+  mesh.selectInboxEntries(actorId, [required(input).id]);
 }
 
 /**
@@ -2980,9 +2999,10 @@ describe("ActorMesh", () => {
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceTransferLogger: captureLogger(transferLogs),
       voiceSessionTransfer: {
-        activeSessionIdFor: (actorId) => {
+        heldByOtherPrincipal: () => false,
+        activeSessionFor: (actorId) => {
           if (actorId !== holder) throw new Error("caller does not hold an active voice session");
-          return "walkie-session";
+          return { sessionId: "walkie-session", principalId: testHumanId(mesh) };
         },
         transferActiveSession: (fromActorId, targetActorId) => {
           if (fromActorId !== holder)
@@ -3003,11 +3023,19 @@ describe("ActorMesh", () => {
     const source = mesh.spawn({ charter: "source", parentId: "root" });
     const target = mesh.spawn({ charter: "target", parentId: source });
     holder = source;
+    selectVoiceInput(mesh, inboxStore, source);
 
     const [sourceNormal] = inboxStore.append([
       { actorId: source, source: "github:MEK-Org/rusa", payload: { type: "github.issue" } },
     ]);
+    // The accepted responsive input is handled; its selected proof is retained
+    // below by replacing it with a fresh input just before the transfer.
+    const sourceInput = required(
+      inboxStore.list(source).entries.find((entry) => entry.payload.type === "human.message")
+    );
+    inboxStore.markHandled(source, [sourceInput.id]);
     expect(mesh.dispatch(source)).toBe(false);
+    selectVoiceInput(mesh, inboxStore, source);
 
     const result = mesh.transferVoiceSession(source, target, "take over the review");
     expect(result).toEqual({ sessionId: "walkie-session", targetActorId: target });
@@ -3054,7 +3082,9 @@ describe("ActorMesh", () => {
     const { mesh } = setup({
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceSessionTransfer: {
-        activeSessionIdFor: () => "walkie-session",
+        heldByOtherPrincipal: () => false,
+
+        activeSessionFor: () => ({ sessionId: "walkie-session", principalId: testHumanId(mesh) }),
         transferActiveSession: (_fromActorId, targetActorId) => {
           holder = targetActorId;
           return "walkie-session";
@@ -3079,17 +3109,20 @@ describe("ActorMesh", () => {
     const backingStore = createMemoryInboxStore();
     const failingInbox: InboxRepository = {
       ...backingStore,
-      append: () => {
-        throw new Error("disk full");
+      append: (entries) => {
+        if (entries.some((entry) => entry.payload.type === "voice.transfer"))
+          throw new Error("disk full");
+        return backingStore.append(entries);
       },
     };
     const { mesh } = setup({
       inboxStore: failingInbox,
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceSessionTransfer: {
-        activeSessionIdFor: (actorId) => {
+        heldByOtherPrincipal: () => false,
+        activeSessionFor: (actorId) => {
           if (actorId !== holder) throw new Error("caller does not hold an active voice session");
-          return "walkie-session";
+          return { sessionId: "walkie-session", principalId: testHumanId(mesh) };
         },
         transferActiveSession: (fromActorId, targetActorId) => {
           if (fromActorId !== holder)
@@ -3110,10 +3143,13 @@ describe("ActorMesh", () => {
     const source = mesh.spawn({ charter: "source", parentId: "root" });
     const target = mesh.spawn({ charter: "target", parentId: source });
     holder = source;
+    selectVoiceInput(mesh, backingStore, source);
 
     expect(() => mesh.transferVoiceSession(source, target)).toThrow("disk full");
     expect(holder).toBe(source);
-    expect(backingStore.entries).toEqual([]);
+    expect(backingStore.entries.some((entry) => entry.payload.type === "voice.transfer")).toBe(
+      false
+    );
   });
 
   it("defers a normal run queued before voice authority opens at final admission", async () => {
@@ -4481,10 +4517,17 @@ describe("ActorMesh", () => {
 
   it("allows replying to a delivery-introduced sender but refuses voice transfer unless separately authorized", () => {
     let holder = "";
+    const inboxStore = createMemoryInboxStore();
     const { mesh, registry } = setup({
+      inboxStore,
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceSessionTransfer: {
-        activeSessionIdFor: () => "walkie-session",
+        heldByOtherPrincipal: () => false,
+
+        activeSessionFor: (actorId) => {
+          if (actorId !== holder) throw new Error("caller does not hold an active voice session");
+          return { sessionId: "walkie-session", principalId: testHumanId(mesh) };
+        },
         transferActiveSession: (_fromActorId, targetActorId) => {
           holder = targetActorId;
           return "walkie-session";
@@ -4496,6 +4539,7 @@ describe("ActorMesh", () => {
     const sender = mesh.spawn({ charter: "sender", parentId: "root" });
     const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
     holder = recipient;
+    selectVoiceInput(mesh, inboxStore, recipient);
 
     expect(registry.get(recipient)?.handles ?? []).toEqual([]);
 
@@ -4515,6 +4559,7 @@ describe("ActorMesh", () => {
     const authorizedRecipient = mesh.spawn({ charter: "recipient 2", parentId: "root" });
     mesh.grantHandle(authorizedRecipient, { id: sender });
     holder = authorizedRecipient;
+    selectVoiceInput(mesh, inboxStore, authorizedRecipient);
     expect(mesh.sendMessage(authorizedRecipient, "hello authorized", sender)).toEqual({
       delivered: true,
     });
@@ -4527,6 +4572,7 @@ describe("ActorMesh", () => {
     const explicitRoleRecipient = mesh.spawn({ charter: "recipient 3", parentId: "root" });
     mesh.grantHandle(explicitRoleRecipient, { id: sender, role: "__origin:message" });
     holder = explicitRoleRecipient;
+    selectVoiceInput(mesh, inboxStore, explicitRoleRecipient);
     expect(mesh.transferVoiceSession(explicitRoleRecipient, sender)).toEqual({
       sessionId: "walkie-session",
       targetActorId: sender,

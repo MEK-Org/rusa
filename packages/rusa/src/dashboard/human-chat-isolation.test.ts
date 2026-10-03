@@ -58,6 +58,11 @@ interface Person {
   token: DecodedIdToken;
 }
 
+function required<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error("missing synthetic input fixture");
+  return value;
+}
+
 function person(name: string, now: number): Person {
   const email = `${name}@example.com`;
   return {
@@ -502,15 +507,38 @@ describe("human chat isolation (#590)", () => {
     // Retain the actual durable admission/dispatch spine while observing wakes.
     const dispatch = vi.spyOn(mesh, "dispatch").mockImplementation(() => false);
     deps.mesh = mesh;
-    const reply = async (body: string) => {
-      const server = createAgentExecMcpServer(mesh, ACTOR, ACTOR);
+    const onWrite = vi.fn();
+    let newestHumanInput: string | undefined;
+    const unsubscribe = inbox.onItemsAppended((entries) => {
+      for (const entry of entries) {
+        if (
+          entry.actorId === ACTOR &&
+          ["human.message", "human.voice"].includes(entry.payload.type)
+        ) {
+          newestHumanInput = entry.id;
+        }
+      }
+    });
+    const reply = async (
+      body: string,
+      beforeReply?: () => Promise<void>,
+      checkSuccess = true,
+      inputRef: string | null | undefined = newestHumanInput,
+      actorId = ACTOR
+    ) => {
+      const server = createAgentExecMcpServer(mesh, actorId, ACTOR, undefined, { onWrite });
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       await server.connect(serverTransport);
       const client = new Client({ name: "synthetic-reply-fixture", version: "1" });
       await client.connect(clientTransport);
       try {
-        const result = await client.callTool({ name: "reply", arguments: { message: body } });
-        expect(result.isError).not.toBe(true);
+        await beforeReply?.();
+        const result = await client.callTool({
+          name: "reply",
+          arguments: { message: body, ...(inputRef === null ? {} : { input_ref: inputRef }) },
+        });
+        if (checkSuccess) expect(result.isError).not.toBe(true);
+        return result;
       } finally {
         await client.close();
         await server.close();
@@ -595,7 +623,302 @@ describe("human chat isolation (#590)", () => {
         [ACTOR, b.id, "synthetic bob unheld reply"],
       ]);
       expect(dispatch).toHaveBeenCalled();
+
+      const outcomes = [];
+      for (const mode of [
+        "unheld-to-alice",
+        "bob-lease-to-alice",
+        "intervening-alice-chat",
+      ] as const) {
+        service.closeSession(lease);
+        const bobLease = `synthetic-bob-${mode}`;
+        if (mode === "bob-lease-to-alice") service.openSession(bobLease, ACTOR, b.id);
+        expect(
+          (
+            await post(
+              `/api/mesh/actors/${ACTOR}/chat`,
+              {
+                body: `synthetic accepted bob ${mode}`,
+                sessionId: `synthetic-text-${mode}`,
+              },
+              b.cookie
+            )
+          ).status
+        ).toBe(200);
+        let rowsBefore = 0;
+        let writesBefore = 0;
+        let wakesBefore = 0;
+        let inboxBefore = 0;
+        let emitsBefore = 0;
+        const emitted = vi.spyOn(mesh, "recordMessageEmitted");
+        const result = await reply(
+          `synthetic pending bob response ${mode}`,
+          async () => {
+            service.closeSession(bobLease);
+            service.openSession(lease, ACTOR, a.id);
+            if (mode === "intervening-alice-chat") {
+              expect(
+                (
+                  await post(
+                    `/api/mesh/actors/${ACTOR}/chat`,
+                    {
+                      body: "synthetic alice intervenes before pending bob response",
+                    },
+                    a.cookie
+                  )
+                ).status
+              ).toBe(200);
+            }
+            rowsBefore = (db.prepare("SELECT COUNT(*) AS n FROM mesh_chat").get() as { n: number })
+              .n;
+            writesBefore = onWrite.mock.calls.length;
+            wakesBefore = dispatch.mock.calls.length;
+            inboxBefore = inbox.list(ACTOR, { status: "all" }).entries.length;
+            emitsBefore = emitted.mock.calls.length;
+          },
+          false
+        );
+        outcomes.push({
+          mode,
+          refused: result.isError === true,
+          aliceReplies: (
+            db
+              .prepare(
+                "SELECT COUNT(*) AS n FROM mesh_chat WHERE sender_id = ? AND recipient_id = ? AND body = ?"
+              )
+              .get(ACTOR, a.id, `synthetic pending bob response ${mode}`) as { n: number }
+          ).n,
+          replyRows:
+            (db.prepare("SELECT COUNT(*) AS n FROM mesh_chat").get() as { n: number }).n -
+            rowsBefore,
+          writeSignals: onWrite.mock.calls.length - writesBefore,
+          emits: emitted.mock.calls.length - emitsBefore,
+          wakes: dispatch.mock.calls.length - wakesBefore,
+          inbox: inbox.list(ACTOR, { status: "all" }).entries.length - inboxBefore,
+        });
+        emitted.mockRestore();
+        if (mode === "intervening-alice-chat") {
+          await reply("synthetic explicit later alice reply");
+          expect(
+            meshChat
+              .listForSession(lease, { limit: 100 })
+              .find((entry) => entry.body === "synthetic explicit later alice reply")
+          ).toMatchObject({ recipientId: a.id });
+        }
+        service.closeSession(lease);
+      }
+      expect(outcomes).toEqual(
+        ["unheld-to-alice", "bob-lease-to-alice", "intervening-alice-chat"].map((mode) => ({
+          mode,
+          refused: true,
+          aliceReplies: 0,
+          replyRows: 0,
+          writeSignals: 0,
+          emits: 0,
+          wakes: 0,
+          inbox: 0,
+        }))
+      );
+
+      // A later same-human lease cannot retarget an unheld accepted input.
+      expect(
+        (
+          await post(
+            `/api/mesh/actors/${ACTOR}/chat`,
+            {
+              body: "synthetic frozen unheld alice",
+              sessionId: "synthetic-frozen-text",
+            },
+            a.cookie
+          )
+        ).status
+      ).toBe(200);
+      service.openSession(lease, ACTOR, a.id);
+      await reply("synthetic frozen text reply");
+      expect(
+        meshChat
+          .listForSession("synthetic-frozen-text", { limit: 100 })
+          .find((entry) => entry.body === "synthetic frozen text reply")
+      ).toMatchObject({ recipientId: a.id });
+
+      // Actual typed voice acceptance freezes the voice route rather than the text route.
+      expect(
+        (
+          await post(
+            `/api/mesh/actors/${ACTOR}/chat`,
+            {
+              body: "synthetic transfer input",
+              sessionId: "synthetic-text-during-voice",
+            },
+            a.cookie
+          )
+        ).status
+      ).toBe(200);
+      const sourceRef = required(newestHumanInput);
+      await reply("synthetic accepted voice reply", undefined, true, sourceRef);
+      expect(
+        meshChat
+          .listForSession(lease, { limit: 100 })
+          .find((entry) => entry.body === "synthetic accepted voice reply")
+      ).toMatchObject({ recipientId: a.id });
+      mesh.adopt(rec(PEER, ACTOR), {
+        id: PEER,
+        isRunning: false,
+        requestRun: () => {},
+        markUnkillable: () => {},
+        close: () => {},
+        preemptForResponsive: () => ({ preempted: false as const }),
+      } as Parameters<ActorMesh["adopt"]>[1]);
+      mesh.grantHandle(ACTOR, { id: PEER });
+      mesh.grantHandle(PEER, { id: ACTOR });
+      mesh.selectInboxEntries(ACTOR, [sourceRef]);
+      mesh.transferVoiceSession(ACTOR, PEER);
+      const handoff = required(
+        inbox.list(PEER).entries.find((entry) => entry.payload.type === "voice.transfer")
+      );
+      expect(handoff.payload.replyInput).toEqual({ actorId: ACTOR, entryId: sourceRef });
+      await reply("synthetic target reply", undefined, true, handoff.id, PEER);
+      mesh.selectInboxEntries(PEER, [handoff.id]);
+      mesh.transferVoiceSession(PEER, ACTOR);
+      const returned = required(
+        inbox.list(ACTOR).entries.find((entry) => entry.payload.type === "voice.transfer")
+      );
+      await reply("synthetic returned reply", undefined, true, returned.id);
+
+      const snapshot = () => ({
+        rows: (db.prepare("SELECT COUNT(*) AS n FROM mesh_chat").get() as { n: number }).n,
+        writes: onWrite.mock.calls.length,
+        wakes: dispatch.mock.calls.length,
+        entries: (
+          db.prepare("SELECT COUNT(*) AS n FROM actor_inbox_entries").get() as { n: number }
+        ).n,
+      });
+      const assertRefused = async (ref: string | null | undefined, actorId = ACTOR) => {
+        await Promise.resolve(); // Drain the admission/append nudge before measuring reply effects.
+        const before = snapshot();
+        const result = await reply("synthetic must not emit", undefined, false, ref, actorId);
+        expect(result.isError).toBe(true);
+        expect(snapshot()).toEqual(before);
+      };
+      // Own handled entries, foreign entries, legacy handoffs, and malformed payloads.
+      inbox.markHandled(ACTOR, [sourceRef]);
+      await assertRefused(sourceRef);
+      await assertRefused(handoff.id);
+      await assertRefused("unknown-input");
+      await assertRefused("");
+      await assertRefused(null);
+      for (const payload of [
+        { type: "voice.transfer", fromId: PEER, sessionId: lease, context: "legacy" },
+        { type: "human.message", fromId: a.id, sessionId: lease },
+        { type: "mesh.message", messageId: "fake", fromId: a.id, sessionId: lease },
+        {
+          ...handoff.payload,
+          fromId: PEER,
+          replyInput: { actorId: "foreign", entryId: sourceRef },
+        },
+        {
+          ...handoff.payload,
+          fromId: PEER,
+          replyBinding: { principalId: b.id, sessionId: lease, leaseBound: true },
+        },
+      ]) {
+        const [entry] = inbox.append([
+          { actorId: ACTOR, source: `voice:transfer:${PEER}`, payload },
+        ]);
+        await assertRefused(required(entry).id);
+      }
+      const cyclicId = "synthetic-cyclic-input";
+      inbox.append([
+        {
+          id: cyclicId,
+          actorId: ACTOR,
+          source: `voice:transfer:${ACTOR}`,
+          payload: {
+            ...handoff.payload,
+            fromId: ACTOR,
+            replyInput: { actorId: ACTOR, entryId: cyclicId },
+          },
+        },
+      ]);
+      await assertRefused(cyclicId);
+      const deep = Array.from({ length: 101 }, (_, index) => ({
+        id: `synthetic-deep-${index}`,
+        actorId: ACTOR,
+        source: `voice:transfer:${ACTOR}`,
+        payload: {
+          ...handoff.payload,
+          fromId: ACTOR,
+          replyInput: {
+            actorId: ACTOR,
+            entryId: index === 100 ? sourceRef : `synthetic-deep-${index + 1}`,
+          },
+        },
+      }));
+      inbox.append(deep);
+      await assertRefused(required(deep[0]).id);
+      // A handled ancestor keeps its proof; the still-unhandled own handoff works.
+      await reply("synthetic proven handled origin", undefined, true, returned.id);
+      principals.setDisabled(a.id, new Date().toISOString());
+      await assertRefused(returned.id);
+      principals.setDisabled(a.id, null);
+
+      // The selected source must be unambiguous and current, before any rebind/write.
+      mesh.selectInboxEntries(ACTOR, [returned.id]);
+      const append = vi.spyOn(inbox, "append").mockImplementation(() => {
+        throw new Error("synthetic disk full");
+      });
+      expect(() => mesh.transferVoiceSession(ACTOR, PEER)).toThrow("synthetic disk full");
+      append.mockRestore();
+      expect(service.activeSessionFor(ACTOR)).toEqual({ sessionId: lease, principalId: a.id });
+      expect(
+        (
+          await post(
+            `/api/mesh/actors/${ACTOR}/chat`,
+            {
+              body: "synthetic second matching voice input",
+            },
+            a.cookie
+          )
+        ).status
+      ).toBe(200);
+      mesh.selectInboxEntries(ACTOR, [returned.id, required(newestHumanInput)]);
+      const beforeAmbiguous = snapshot();
+      expect(() => mesh.transferVoiceSession(ACTOR, PEER)).toThrow("unambiguous");
+      expect(snapshot()).toEqual(beforeAmbiguous);
+      // Cyclic and over-depth selected proofs confer no transfer authority.
+      mesh.selectInboxEntries(ACTOR, [cyclicId]);
+      expect(() => mesh.transferVoiceSession(ACTOR, PEER)).toThrow("cyclic");
+      mesh.selectInboxEntries(ACTOR, [required(deep[0]).id]);
+      expect(() => mesh.transferVoiceSession(ACTOR, PEER)).toThrow("too deep");
+      mesh.selectInboxEntries(ACTOR, [returned.id]);
+      service.openSession("synthetic-ambiguous-alice", ACTOR, a.id);
+      const beforeAmbiguousLease = snapshot();
+      expect(() =>
+        mesh.sendHumanMessage(ACTOR, "synthetic must not admit", "text", { fromId: a.id })
+      ).toThrow("multiple active");
+      await assertRefused(returned.id);
+      expect(snapshot()).toEqual(beforeAmbiguousLease);
+      service.closeSession("synthetic-ambiguous-alice");
+      // Mutate the lease at the context-render seam. Expected snapshot rejects it.
+      const raced = vi
+        .spyOn(service, "transferActiveSession")
+        .mockImplementation((from, to, expected) => {
+          service.closeSession(lease);
+          service.openSession("synthetic-replacement", ACTOR, b.id);
+          raced.mockRestore();
+          return service.transferActiveSession(from, to, expected);
+        });
+      const beforeRace = snapshot();
+      expect(() => mesh.transferVoiceSession(ACTOR, PEER)).toThrow("changed before transfer");
+      expect(snapshot()).toEqual(beforeRace);
+      await assertRefused(returned.id);
+      service.closeSession("synthetic-replacement");
+      service.openSession("synthetic-new-alice", ACTOR, a.id);
+      await assertRefused(returned.id);
+      service.closeSession("synthetic-new-alice");
+      await assertRefused(returned.id);
     } finally {
+      unsubscribe();
       service.closeSession(lease);
       rmSync(home, { recursive: true, force: true });
     }

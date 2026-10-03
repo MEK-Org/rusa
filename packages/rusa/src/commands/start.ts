@@ -2930,20 +2930,11 @@ async function composeStart(
     voiceSessionTransfer: {
       heldByOtherPrincipal: (actorId, principalId) =>
         voiceService?.heldByOtherPrincipal(actorId, principalId) ?? false,
-      activeSessionIdFor: (actorId) => {
+      activeSessionFor: (actorId) => voiceService?.activeSessionFor(actorId),
+      transferActiveSession: (fromActorId, targetActorId, expected) => {
         if (!voiceService)
           throw new Error("voice session transfer is unavailable on this instance");
-        return voiceService.activeSessionIdFor(actorId);
-      },
-      activeSessionFor: (actorId) => {
-        if (!voiceService)
-          throw new Error("voice session transfer is unavailable on this instance");
-        return voiceService.activeSessionFor(actorId);
-      },
-      transferActiveSession: (fromActorId, targetActorId) => {
-        if (!voiceService)
-          throw new Error("voice session transfer is unavailable on this instance");
-        return voiceService.transferActiveSession(fromActorId, targetActorId);
+        return voiceService.transferActiveSession(fromActorId, targetActorId, expected);
       },
       revertActiveSessionTransfer: (sessionId, fromActorId, targetActorId) => {
         if (!voiceService)
