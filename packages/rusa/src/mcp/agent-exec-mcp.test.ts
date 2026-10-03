@@ -953,6 +953,16 @@ describe("agent-execution MCP server", () => {
     });
     mesh.transferVoiceSession(source.id, target.id);
     expect(actors.lastHumanChat(target.id)).toBeUndefined();
+    const otherHuman = principals.createUser({
+      email: "other@example.com",
+      createdAt: "2026-01-01T00:00:01Z",
+    });
+    chat.record({
+      senderId: otherHuman.id,
+      recipientId: target.id,
+      body: "unrelated synthetic conversation",
+      sessionId: "unrelated-session",
+    });
 
     const client = await connect(createAgentExecMcpServer(mesh, target.id, root.id));
     const { tools } = await client.listTools();
@@ -1081,7 +1091,10 @@ describe("agent-execution MCP server", () => {
     );
   });
 
-  it("refuses reply when durable principal user is disabled (#597)", async () => {
+  it.each([
+    "disabled",
+    "deleted",
+  ])("refuses reply when the leased durable user is %s (#597)", async (state) => {
     const db = new Database(":memory:");
     runMigrations(db);
     const actors = new SqliteActorRepository(db);
@@ -1120,8 +1133,8 @@ describe("agent-execution MCP server", () => {
       preemptForResponsive: () => ({ preempted: false as const }),
     } as unknown as Actor);
 
-    // Disable the user
-    principals.setDisabled(firstHuman.id, new Date().toISOString());
+    if (state === "disabled") principals.setDisabled(firstHuman.id, new Date().toISOString());
+    else db.prepare("DELETE FROM users WHERE principal_id = ?").run(firstHuman.id);
 
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const reply = (await client.callTool({
@@ -1134,19 +1147,40 @@ describe("agent-execution MCP server", () => {
     );
   });
 
-  it("replies successfully with empty, truncated, or mixed chat history by reading principal directly from voice session lease (#597)", async () => {
+  it.each([
+    "empty",
+    "truncated",
+    "mixed",
+  ])("replies from the lease binding with %s history (#597)", async (history) => {
     const db = new Database(":memory:");
     runMigrations(db);
     const actors = new SqliteActorRepository(db);
     const chat = new MeshChatRepository(db);
     const principals = new PrincipalRepository(db);
     const firstHuman = required(principals.ensureImplicitUser("2026-01-01T00:00:00Z"));
+    if (history !== "empty") {
+      const otherHuman = principals.createUser({
+        email: "other@example.com",
+        createdAt: "2026-01-01T00:00:01Z",
+      });
+      for (const [index, senderId] of [firstHuman.id, otherHuman.id].entries())
+        chat.record({
+          senderId,
+          recipientId: "root",
+          body: "synthetic remembered input",
+          sessionId: "history-free-session",
+          ts: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+        });
+    }
+    const projection = vi.fn((sessionId: string) =>
+      chat.listForSession(sessionId, { limit: history === "truncated" ? 1 : 100 })
+    );
     const mesh = new ActorMesh({
       principals,
       actors,
       inboxStore: new SqliteInboxRepository(db),
       recordChat: (entry) => chat.record(entry),
-      listVoiceSessionChat: (sessionId) => chat.listForSession(sessionId, { limit: 100 }),
+      listVoiceSessionChat: projection,
       voiceSessionTransfer: {
         activeSessionIdFor: () => "history-free-session",
         activeSessionFor: () => ({ sessionId: "history-free-session", principalId: firstHuman.id }),
@@ -1173,8 +1207,9 @@ describe("agent-execution MCP server", () => {
       preemptForResponsive: () => ({ preempted: false as const }),
     } as unknown as Actor);
 
-    // Zero prior chat in history!
-    expect(chat.listForSession("history-free-session", { limit: 10 })).toHaveLength(0);
+    expect(chat.listForSession("history-free-session", { limit: 10 })).toHaveLength(
+      history === "empty" ? 0 : 2
+    );
 
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const reply = (await client.callTool({
@@ -1184,8 +1219,9 @@ describe("agent-execution MCP server", () => {
     expect(reply.isError).not.toBe(true);
 
     const emitted = chat.listForSession("history-free-session", { limit: 10 });
-    expect(emitted).toHaveLength(1);
-    expect(emitted[0]).toMatchObject({
+    expect(projection).not.toHaveBeenCalled();
+    expect(emitted.filter((entry) => entry.senderId === "root")).toHaveLength(1);
+    expect(emitted.find((entry) => entry.senderId === "root")).toMatchObject({
       senderId: "root",
       recipientId: firstHuman.id,
       sessionId: "history-free-session",
