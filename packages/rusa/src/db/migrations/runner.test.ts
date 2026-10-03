@@ -109,6 +109,7 @@ describe("Database Migration System", () => {
       "0051_event_source_config",
       "0052_obligation_snooze",
       "0053_chat_room_participants",
+      "0055_run_prompts",
     ]);
 
     const tableNames = (
