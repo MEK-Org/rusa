@@ -8,11 +8,6 @@ import { createProvider } from "./configured-provider.js";
 import type { FollowerActorCommand, FollowerEvent } from "./follower-hub.js";
 import type { ProviderFactory } from "./protocol.js";
 
-export interface FollowerInstanceOptions {
-  logger?: Logger;
-  computerUseLock?: ComputerUseLock;
-}
-
 /** Execution half of an instance: many ordinary Actors, one Node process. */
 export class FollowerInstance {
   private actors = new Map<string, ReturnType<typeof createActorRuntime>>();
@@ -25,23 +20,16 @@ export class FollowerInstance {
     private readonly sandbox: boolean,
     private readonly emit: (event: FollowerEvent) => void,
     private readonly providerFactory: ProviderFactory = createProvider,
-    options?: FollowerInstanceOptions
+    logger?: Logger
   ) {
     mkdirSync(home, { recursive: true });
-    const log = (
-      options?.logger ?? createLogger({ context: { component: "follower-instance" } })
-    ).child({
+    const log = (logger ?? createLogger({ context: { component: "follower-instance" } })).child({
       component: "follower-instance",
     });
-    this.computerUseLock =
-      options?.computerUseLock ??
-      new ComputerUseLock({
-        logger: log.child({ component: "computer-use-lock" }),
-      });
-  }
-
-  get lock(): ComputerUseLock {
-    return this.computerUseLock;
+    this.computerUseLock = new ComputerUseLock(
+      undefined,
+      log.child({ component: "computer-use-lock" })
+    );
   }
 
   get actorIds(): string[] {

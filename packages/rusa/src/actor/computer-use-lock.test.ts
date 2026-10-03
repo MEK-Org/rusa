@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { LogFields, Logger } from "../observability/logger.js";
+import { createLogger } from "../observability/logger.js";
 import { ComputerUseLock } from "./computer-use-lock.js";
 
 function deferred<T>() {
@@ -372,124 +372,110 @@ describe("ComputerUseLock", () => {
     expect(onError).toHaveBeenCalledWith(thrownError);
   });
 
-  it("reports a computer-use wait when a responsive waiter queues behind a responsive holder, then starts after natural holder settlement", async () => {
-    const waitEvents: Array<{
-      actorId: string;
-      holderActorId: string;
-      responsive: boolean;
-      holderResponsive?: boolean;
-    }> = [];
-    const acquiredEvents: Array<{
-      actorId: string;
-      responsive: boolean;
-      waited: boolean;
-      waitedMs?: number;
-    }> = [];
-    const lock = new ComputerUseLock({
-      onWait: (event) => waitEvents.push(event),
-      onAcquired: (event) => acquiredEvents.push(event),
+  it("logs a responsive wait, cancellation and acquisition after natural holder settlement", async () => {
+    const records: Record<string, unknown>[] = [];
+    const logger = createLogger({
+      format: "json",
+      destination: { write: (line: string) => records.push(JSON.parse(line)) },
+      context: { component: "computer-use-lock" },
     });
+    const lock = new ComputerUseLock(undefined, logger);
     const first = deferred<string>();
     const second = deferred<string>();
-    const events: string[] = [];
+    const starts: string[] = [];
     const interruptHolder = vi.fn();
-
     const holder = lock.gate(
       "holder",
       true,
       () => {
-        events.push("holder:start");
+        starts.push("holder");
         return first.promise;
       },
       interruptHolder
     );
-    await flush();
-
-    expect(lock.currentHolder).toEqual({ actorId: "holder", responsive: true });
-    expect(acquiredEvents).toEqual([
-      { actorId: "holder", responsive: true, waited: false, waitedMs: undefined },
-    ]);
-    expect(events).toEqual(["holder:start"]);
-    expect(waitEvents).toEqual([]);
-
     const waiter = lock.gate("waiter", true, () => {
-      events.push("waiter:start");
+      starts.push("waiter");
       return second.promise;
     });
-    await flush();
+    const cancelledStart = vi.fn(async () => "cancelled");
+    const cancelled = lock.gate("cancelled", true, cancelledStart);
+    expect(cancelled.cancel?.()).toBe(true);
+    await expect(cancelled.result).rejects.toMatchObject({ name: "RunStartCancelledError" });
 
-    // The responsive waiter reports a computer-use wait behind the responsive holder
-    expect(waitEvents).toEqual([
-      { actorId: "waiter", holderActorId: "holder", responsive: true, holderResponsive: true },
+    expect(records.map(({ msg, actorId }) => [msg, actorId])).toEqual([
+      ["computer_use_acquired", "holder"],
+      ["computer_use_wait", "waiter"],
+      ["computer_use_wait", "cancelled"],
     ]);
-    // The responsive holder was not interrupted (#689 policy)
+    expect(records[1]).toMatchObject({
+      component: "computer-use-lock",
+      actorId: "waiter",
+      holderActorId: "holder",
+      responsive: true,
+      holderResponsive: true,
+    });
     expect(interruptHolder).not.toHaveBeenCalled();
-    expect(events).toEqual(["holder:start"]);
-    expect(acquiredEvents).toHaveLength(1);
-    expect(lock.queueDepth).toEqual({ responsive: 1, normal: 0 });
+    expect(starts).toEqual(["holder"]);
+    expect(waiter.started).toBe(false);
 
-    // Natural settlement of the responsive holder
     first.resolve("holder:done");
     await expect(holder.result).resolves.toBe("holder:done");
-
-    // After natural settlement, waiter starts
     await flush();
-    expect(events).toEqual(["holder:start", "waiter:start"]);
-    expect(acquiredEvents).toHaveLength(2);
-    expect(acquiredEvents[1]).toMatchObject({
+    expect(starts).toEqual(["holder", "waiter"]);
+    expect(records[3]).toMatchObject({
+      msg: "computer_use_acquired",
       actorId: "waiter",
       responsive: true,
       waited: true,
+      waitedMs: expect.any(Number),
     });
-    expect(typeof acquiredEvents[1].waitedMs).toBe("number");
-    expect(lock.currentHolder).toEqual({ actorId: "waiter", responsive: true });
-    expect(lock.queueDepth).toEqual({ responsive: 0, normal: 0 });
-
+    expect(records).toHaveLength(4);
+    expect(cancelledStart).not.toHaveBeenCalled();
     second.resolve("waiter:done");
     await expect(waiter.result).resolves.toBe("waiter:done");
   });
 
-  it("logs computer_use_wait and computer_use_acquired via the provided Logger", async () => {
-    const logs: Array<{ event: string; fields?: LogFields }> = [];
-    const logger: Logger = {
-      debug: () => {},
-      info: (event, fields) => logs.push({ event, fields }),
-      warn: () => {},
-      error: () => {},
-      child: () => logger,
-    };
-    const lock = new ComputerUseLock({ logger });
-    const first = deferred<string>();
-
-    const h = lock.gate("h", true, () => first.promise);
-    await flush();
-
-    const w = lock.gate("w", true, async () => "w:done");
-    await flush();
-
-    expect(logs).toContainEqual({
-      event: "computer_use_wait",
-      fields: {
-        actorId: "w",
-        holderActorId: "h",
-        responsive: true,
-        holderResponsive: true,
+  it.each([
+    "computer_use_wait",
+    "computer_use_acquired",
+  ])("preserves admission, cancellation and release when the %s logger sink throws", async (throwOn) => {
+    const attempted: string[] = [];
+    const logger = createLogger({
+      format: "json",
+      destination: {
+        write: (line: string) => {
+          const { msg } = JSON.parse(line);
+          attempted.push(msg);
+          if (msg === throwOn) throw new Error("synthetic sink failure");
+        },
       },
     });
-
-    first.resolve("h:done");
-    await h.result;
-    await w.result;
-
-    expect(logs).toContainEqual(
-      expect.objectContaining({
-        event: "computer_use_acquired",
-        fields: expect.objectContaining({
-          actorId: "w",
-          responsive: true,
-          waited: true,
-        }),
-      })
-    );
+    const lock = new ComputerUseLock(undefined, logger);
+    const held = deferred<string>();
+    const interrupt = vi.fn();
+    let holder!: ReturnType<typeof lock.gate<string>>;
+    expect(() => {
+      holder = lock.gate("holder", true, () => held.promise, interrupt);
+    }).not.toThrow();
+    const start = vi.fn(async () => "waiter:done");
+    let waiter!: ReturnType<typeof lock.gate<string>>;
+    expect(() => {
+      waiter = lock.gate("waiter", true, start);
+    }).not.toThrow();
+    const cancelledStart = vi.fn(async () => "cancelled");
+    const cancelled = lock.gate("cancelled", true, cancelledStart);
+    expect(cancelled.cancel?.()).toBe(true);
+    await expect(cancelled.result).rejects.toMatchObject({ name: "RunStartCancelledError" });
+    expect(start).not.toHaveBeenCalled();
+    expect(interrupt).not.toHaveBeenCalled();
+    held.resolve("holder:done");
+    await expect(holder.result).resolves.toBe("holder:done");
+    await expect(waiter.result).resolves.toBe("waiter:done");
+    await flush();
+    const next = lock.gate("next", false, async () => "next:done");
+    await expect(next.result).resolves.toBe("next:done");
+    expect(start).toHaveBeenCalledOnce();
+    expect(cancelledStart).not.toHaveBeenCalled();
+    expect(attempted).toContain(throwOn);
   });
 });

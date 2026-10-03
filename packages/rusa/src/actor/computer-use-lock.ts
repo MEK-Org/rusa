@@ -1,33 +1,10 @@
-import type { Logger } from "../observability/logger.js";
+import type { LogFields, Logger } from "../observability/logger.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
 
 /** Capability required for a run to reserve exclusive computer control on its instance. */
 export const COMPUTER_USE_CAPABILITY = "computer-use";
 
 type Start<T> = () => Promise<T> | RunStartHandle<T>;
-
-export interface ComputerUseLockWaitEvent {
-  actorId: string;
-  holderActorId: string;
-  responsive: boolean;
-  holderResponsive?: boolean;
-}
-
-export interface ComputerUseLockAcquiredEvent {
-  actorId: string;
-  responsive: boolean;
-  waited: boolean;
-  waitedMs?: number;
-}
-
-export type ComputerUseLockOnError = (error: unknown) => void;
-
-export interface ComputerUseLockOptions {
-  onError?: ComputerUseLockOnError;
-  logger?: Logger;
-  onWait?: (event: ComputerUseLockWaitEvent) => void;
-  onAcquired?: (event: ComputerUseLockAcquiredEvent) => void;
-}
 
 interface LockEntry<T> {
   readonly actorId: string;
@@ -52,46 +29,16 @@ interface LockEntry<T> {
  * until that holder's gate has actually settled and released its token.
  */
 export class ComputerUseLock {
-  private readonly onError?: ComputerUseLockOnError;
-  private readonly logger?: Logger;
-  private readonly onWait?: (event: ComputerUseLockWaitEvent) => void;
-  private readonly onAcquired?: (event: ComputerUseLockAcquiredEvent) => void;
-
-  constructor(options?: ComputerUseLockOnError | ComputerUseLockOptions) {
-    if (typeof options === "function") {
-      this.onError = options;
-    } else if (options) {
-      this.onError = options.onError;
-      this.logger = options.logger;
-      this.onWait = options.onWait;
-      this.onAcquired = options.onAcquired;
-    }
-  }
+  constructor(
+    private readonly onError?: (error: unknown) => void,
+    private readonly logger?: Logger
+  ) {}
 
   private holder: { entry: LockEntry<unknown>; token: symbol; preempted?: boolean } | undefined;
   private readonly responsiveQueue: LockEntry<unknown>[] = [];
   private readonly normalQueue: LockEntry<unknown>[] = [];
   private readonly pendingReRequests: Array<() => void> = [];
   private closed = false;
-
-  get currentHolder(): { readonly actorId: string; readonly responsive: boolean } | undefined {
-    if (!this.holder) return undefined;
-    return {
-      actorId: this.holder.entry.actorId,
-      responsive: this.holder.entry.responsive,
-    };
-  }
-
-  get isLocked(): boolean {
-    return this.holder !== undefined;
-  }
-
-  get queueDepth(): { responsive: number; normal: number } {
-    return {
-      responsive: this.responsiveQueue.length,
-      normal: this.normalQueue.length,
-    };
-  }
 
   gate<T>(
     actorId: string,
@@ -124,12 +71,12 @@ export class ComputerUseLock {
     } else {
       if (this.holder !== undefined) {
         entry.waited = true;
-        this.reportWait(
-          entry.actorId,
-          this.holder.entry.actorId,
-          entry.responsive,
-          this.holder.entry.responsive
-        );
+        this.report("computer_use_wait", {
+          actorId: entry.actorId,
+          holderActorId: this.holder.entry.actorId,
+          responsive: entry.responsive,
+          holderResponsive: this.holder.entry.responsive,
+        });
       }
       this.enqueue(entry);
       this.requestResponsivePreemption(entry);
@@ -248,7 +195,12 @@ export class ComputerUseLock {
     this.holder = { entry, token };
     const waited = entry.waited;
     const waitedMs = waited ? Math.max(0, Date.now() - entry.enqueuedAt) : undefined;
-    this.reportAcquired(entry.actorId, entry.responsive, waited, waitedMs);
+    this.report("computer_use_acquired", {
+      actorId: entry.actorId,
+      responsive: entry.responsive,
+      waited,
+      waitedMs,
+    });
     let started: Promise<unknown>;
     try {
       const inner = entry.start();
@@ -260,44 +212,13 @@ export class ComputerUseLock {
     void started.then(entry.resolve, entry.reject).finally(() => this.release(entry, token));
   }
 
-  private reportWait(
-    actorId: string,
-    holderActorId: string,
-    responsive: boolean,
-    holderResponsive?: boolean
-  ): void {
-    this.logger?.info("computer_use_wait", {
-      actorId,
-      holderActorId,
-      responsive,
-      holderResponsive,
-    });
-    this.onWait?.({
-      actorId,
-      holderActorId,
-      responsive,
-      holderResponsive,
-    });
-  }
-
-  private reportAcquired(
-    actorId: string,
-    responsive: boolean,
-    waited: boolean,
-    waitedMs?: number
-  ): void {
-    this.logger?.info("computer_use_acquired", {
-      actorId,
-      responsive,
-      waited,
-      waitedMs,
-    });
-    this.onAcquired?.({
-      actorId,
-      responsive,
-      waited,
-      waitedMs,
-    });
+  private report(event: string, fields: LogFields): void {
+    try {
+      this.logger?.info(event, fields);
+    } catch {
+      // Observability must not prevent enqueue, start, cancellation or release.
+      // Retrying through the same failed sink would risk admission progress again.
+    }
   }
 
   private release(entry: LockEntry<unknown>, token: symbol): void {

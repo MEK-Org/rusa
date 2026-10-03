@@ -77,7 +77,7 @@ export function createHarness(options: {
     false,
     (event) => queueMicrotask(() => remote.receive(structuredClone(event))),
     options.providerFactory ?? createProvider,
-    { logger }
+    logger
   );
   // Exercise the same instance commands without opening a port in unit tests.
   const wire = (instance: RemoteInstance) => {
