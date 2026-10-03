@@ -45,6 +45,11 @@ export interface InboxInterruptionDecision {
  * - Absent policy keeps legacy behavior: responsive rows interrupt. Event
  *   copies persisted with `deliveryRole: "subscriber"` keep the join they get
  *   from the after-commit seam and are deliberately not reinterpreted here.
+ *
+ * The scheduler decodes only rows stored at responsive priority, since only
+ * those can preempt. A stored Room notice whose priority is missing or wrong
+ * is therefore ordinary normal-priority work: it cannot interrupt, and it is
+ * not diagnosed here.
  */
 export function decodeInboxInterruption(payload: InboxPayload): InboxInterruptionDecision {
   if (payload.type === ROOM_HUMAN_ENTRY_PAYLOAD_TYPE) {

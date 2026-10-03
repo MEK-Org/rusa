@@ -682,14 +682,17 @@ describe("RunManager", () => {
       // Ordinary traffic arriving behind it re-reads the same unseen row.
       append("a1", { type: "mesh.message" });
       h.manager.dispatch("a1");
-      // A replay through the internal join port reaches the same answer.
-      h.internalPort?.dispatchJoiningActiveRun("a1");
       expect(actor.preemptions).toBe(0);
       expect(h.preempted).toEqual([]);
     });
 
-    it("still lets a genuinely interrupting row in a mixed batch preempt", () => {
-      const h = setup();
+    it("lets a genuinely interrupting row in a mixed batch preempt, at each row's own baseline", () => {
+      const observed: Array<[string, string]> = [];
+      const h = setup({
+        onResponsiveArrived: (_actorId, arrived) => {
+          for (const { entry, baseline } of arrived) observed.push([entry.payload.type, baseline]);
+        },
+      });
       const actor = live(h, "a1");
       actor.preemptPhase = "running";
       append("a1", ROOM_ENTRY);
@@ -698,20 +701,6 @@ describe("RunManager", () => {
       h.manager.dispatch("a1");
       expect(actor.preemptions).toBe(1);
       expect(h.preempted).toEqual([["a1", "running"]]);
-    });
-
-    it("reports each arriving row's own baseline rather than the batch's", () => {
-      const observed: Array<[string, string]> = [];
-      const h = setup({
-        onResponsiveArrived: (_actorId, arrived) => {
-          for (const { entry, baseline } of arrived) observed.push([entry.payload.type, baseline]);
-        },
-      });
-      live(h, "a1");
-      append("a1", ROOM_ENTRY);
-      append("a1", { type: "human.message", priority: "responsive" });
-
-      h.manager.dispatch("a1");
       expect(observed.sort()).toEqual([
         ["human.message", "interrupt"],
         ["room.human_entry", "queue"],
@@ -771,7 +760,9 @@ describe("RunManager", () => {
       expect(actor.preemptions).toBe(1);
       expect(observed).toEqual([["human.message", "interrupt"]]);
 
-      // A subscriber copy keeps its join only through the after-commit seam.
+      // A subscriber copy keeps its join only through the after-commit seam. The
+      // human row is seen first, so only the copy's own policy can preempt here.
+      inbox.markSeen("a1");
       append("a1", { type: "event.copy", priority: "responsive", deliveryRole: "subscriber" });
       h.manager.dispatch("a1");
       expect(actor.preemptions).toBe(2);

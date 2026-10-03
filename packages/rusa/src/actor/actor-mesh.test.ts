@@ -3203,6 +3203,61 @@ describe("ActorMesh", () => {
     expect(shadow?.payload).not.toContain("private operator body");
   });
 
+  it("shadows each row of a mixed batch at its own stored baseline (#829)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let firstSignal: AbortSignal | undefined;
+    const provider = new FakeProvider((opts) => {
+      firstSignal = opts.signal;
+      return new Promise<Partial<RunResult>>(() => {});
+    });
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: {
+        decide: async () => ({ interruptProbability: 0.1, rationale: "", matchedCandidateIds: [] }),
+      },
+    });
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+
+    // One append, one dispatch: a joining Room notice beside a legacy responsive row.
+    inboxStore.append([
+      {
+        actorId: worker,
+        source: "room:entry",
+        payload: {
+          type: "room.human_entry",
+          version: 1,
+          priority: "responsive",
+          interruption: "join",
+          episodeId: "episode-1",
+          principalId: "principal-1",
+        },
+      },
+      {
+        actorId: worker,
+        source: "mesh:root",
+        payload: { type: "human.message", priority: "responsive" },
+      },
+    ]);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(firstSignal?.reason).toBe("interrupt:responsive-notification");
+    const baselines = events
+      .filter((event) => event.kind === "responsive_interruption_shadow")
+      .map((event) => JSON.parse(event.payload ?? "{}").baseline)
+      .sort();
+    expect(baselines).toEqual(["interrupt", "queue"]);
+  });
+
   it("leaves the dispatch path untouched when no classifier is configured", async () => {
     // The seam is described as inert without a classifier, so the thing to pin
     // is the wiring rather than the absence of events: a mesh that wires the

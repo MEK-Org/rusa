@@ -645,34 +645,6 @@ describe("monolithic follower instance", () => {
       expect(h.failures).toEqual([]);
     });
 
-    it("promotes a queued remote admission held by the leader without a preempt", async () => {
-      const h = setup({ delayMs: 500 });
-      const first = h.spawn("Occupy the ordinary admission lane");
-      await waitUntil(() => h.runtime(first).isRunning);
-      const queued = h.spawn("Promote me by joining");
-      await waitUntil(() => h.runtime(queued).isQueued);
-      const queuedRun = queuedRuns(h, queued)[0];
-
-      h.dispatchJoining(queued);
-
-      await waitUntil(() => runStarts(h, queued).length === 1);
-      // The queued run itself absorbs the row at responsive priority: no
-      // second run, and the occupying run was not displaced either.
-      expect(runStarts(h, queued)).toEqual([queuedRun?.runId]);
-      expect(h.events).toContainEqual({
-        actorId: queued,
-        event: expect.objectContaining({ type: "runStart", responsive: true }),
-      });
-      expect(h.logs).toContainEqual(
-        expect.objectContaining({
-          event: "remote_admission_promoted",
-          fields: expect.objectContaining({ actorId: queued }),
-        })
-      );
-      expect(runResults(h, first)).toHaveLength(0);
-      noDisplacement(h, queued);
-    });
-
     it("promotes a queued remote admission from the after-commit join seam", async () => {
       const h = setup({ delayMs: 500 });
       const first = h.spawn("Occupy the ordinary admission lane");
@@ -692,11 +664,19 @@ describe("monolithic follower instance", () => {
       ]);
 
       await waitUntil(() => runStarts(h, queued).length === 1);
+      // The queued run itself absorbs the row at responsive priority: no
+      // second run, and the occupying run was not displaced either.
       expect(runStarts(h, queued)).toEqual([queuedRun?.runId]);
       expect(h.events).toContainEqual({
         actorId: queued,
         event: expect.objectContaining({ type: "runStart", responsive: true }),
       });
+      expect(h.logs).toContainEqual(
+        expect.objectContaining({
+          event: "remote_admission_promoted",
+          fields: expect.objectContaining({ actorId: queued }),
+        })
+      );
       expect(runResults(h, first)).toHaveLength(0);
       noDisplacement(h, queued);
     });

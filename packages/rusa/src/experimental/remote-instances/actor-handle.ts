@@ -890,7 +890,18 @@ export class ActorHandle implements MeshActor {
    * admission request admitted responsive; a non-queued report clears that.
    */
   private promoteQueuedRun(): void {
-    if (this.terminated) return;
+    if (this.terminated || this.promoteQueuedAdmissions()) return;
+    if (this.isQueued || this.stateStale || this.stateUnconfirmed) {
+      this.pendingQueuedPromotion = true;
+    }
+  }
+
+  /**
+   * Promote the leader's real admission handle, not the follower's async gate
+   * wrapper. True when the leader holds an unstarted ticket, whether this call
+   * promoted it or it was already responsive.
+   */
+  private promoteQueuedAdmissions(): boolean {
     let held = false;
     let promoted = false;
     for (const gate of this.gates.values()) {
@@ -902,23 +913,7 @@ export class ActorHandle implements MeshActor {
       promoted = true;
     }
     if (promoted) this.logAdmissionPromoted();
-    if (held) return;
-    if (this.isQueued || this.stateStale || this.stateUnconfirmed) {
-      this.pendingQueuedPromotion = true;
-    }
-  }
-
-  /** Promote the leader's real admission handle, not the follower's async gate wrapper. */
-  private promoteQueuedAdmissions(): boolean {
-    let promoted = false;
-    for (const gate of this.gates.values()) {
-      if (gate.handle.started) continue;
-      gate.admission.responsive = true;
-      gate.handle.promote();
-      promoted = true;
-    }
-    if (promoted) this.logAdmissionPromoted();
-    return promoted;
+    return held;
   }
 
   private logAdmissionPromoted(): void {
