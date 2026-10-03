@@ -67,7 +67,7 @@ void main() {
 
   group('browser/system back navigation', () {
     testWidgets(
-      'startup channel sequence establishes multi-entry mode after Navigator single-entry initialization',
+      'startup preserves multi-entry mode without selecting single-entry history',
       (tester) async {
         await tester.runAsync(() async {
           addTearDown(() {
@@ -83,26 +83,25 @@ void main() {
           // Pump dashboard without clearing initial calls
           await _pumpDashboard(tester, store: store, initialUrl: '/overview');
 
-          final historyCalls = recordedNavCalls
-              .map((c) => c.method)
-              .where((m) =>
-                  m == 'selectSingleEntryHistory' ||
-                  m == 'selectMultiEntryHistory')
+          final singleEntryCalls = recordedNavCalls
+              .where((c) => c.method == 'selectSingleEntryHistory')
               .toList();
 
           expect(
-            historyCalls,
-            containsAllInOrder([
-              'selectSingleEntryHistory',
-              'selectMultiEntryHistory',
-            ]),
+            singleEntryCalls,
+            isEmpty,
             reason:
-                'Descendant Navigator initial single-entry mode must be followed by selectMultiEntryHistory',
+                'Startup must never select single-entry history or downgrade web engine history mode',
           );
+
+          final multiEntryCalls = recordedNavCalls
+              .where((c) => c.method == 'selectMultiEntryHistory')
+              .toList();
+
           expect(
-            historyCalls.last,
-            'selectMultiEntryHistory',
-            reason: 'Final startup engine mode must be multi-entry history',
+            multiEntryCalls,
+            isNotEmpty,
+            reason: 'Engine must be placed in multi-entry history mode',
           );
 
           await store.dispose();

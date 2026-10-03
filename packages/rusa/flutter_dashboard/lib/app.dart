@@ -1,14 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import 'dashboard_title.dart';
 import 'route_scope.dart';
 import 'session.dart';
 import 'theme.dart';
-
-export 'route_scope.dart';
 
 typedef DashboardPageBuilder =
     Widget Function(BuildContext context, DashboardSession session);
@@ -42,28 +39,93 @@ class RusaDashboardApp extends StatefulWidget {
   State<RusaDashboardApp> createState() => _RusaDashboardAppState();
 }
 
-class _RusaDashboardAppState extends State<RusaDashboardApp>
-    with WidgetsBindingObserver {
+class _DashboardRouteInformationParser
+    extends RouteInformationParser<RouteInformation> {
+  const _DashboardRouteInformationParser();
+
+  @override
+  Future<RouteInformation> parseRouteInformation(
+    RouteInformation routeInformation,
+  ) async {
+    return routeInformation;
+  }
+
+  @override
+  RouteInformation restoreRouteInformation(RouteInformation configuration) {
+    return configuration;
+  }
+}
+
+class _DashboardRouterDelegate extends RouterDelegate<RouteInformation>
+    with ChangeNotifier, PopNavigatorRouterDelegateMixin<RouteInformation> {
+  _DashboardRouterDelegate({
+    required this.builder,
+    required this.routeNotifier,
+    required RouteInformation initialRoute,
+  }) : _currentRoute = initialRoute;
+
+  final WidgetBuilder builder;
+  final ValueNotifier<RouteInformation?> routeNotifier;
+
+  @override
+  final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
+  RouteInformation _currentRoute;
+
+  @override
+  RouteInformation get currentConfiguration => _currentRoute;
+
+  @override
+  Future<void> setNewRoutePath(RouteInformation configuration) async {
+    _currentRoute = configuration;
+    routeNotifier.value = configuration;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Navigator(
+      key: navigatorKey,
+      pages: [
+        MaterialPage<void>(
+          key: const ValueKey('dashboard-root'),
+          child: builder(context),
+        ),
+      ],
+      onDidRemovePage: (page) {},
+    );
+  }
+}
+
+class _RusaDashboardAppState extends State<RusaDashboardApp> {
   DashboardSession? _resolvedSession;
   String? _authenticatedTitle;
   late final Future<DashboardSession> _session = _bootstrapSession();
   final ValueNotifier<RouteInformation?> _routeNotifier =
       ValueNotifier<RouteInformation?>(null);
+  late final RouterConfig<RouteInformation> _routerConfig;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    // MaterialApp's internal NavigatorState.initState() automatically calls
-    // SystemNavigator.selectSingleEntryHistory() when reportsRouteUpdateToEngine
-    // is true (the default in WidgetsApp). Scheduling selectMultiEntryHistory
-    // in a post-frame callback ensures the web engine is placed in multi-entry
-    // mode immediately after Navigator mounts, without per-push churn.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
-        unawaited(SystemNavigator.selectMultiEntryHistory());
-      }
-    });
+    final initialUri = _resolveInitialUri();
+    final initialRoute = RouteInformation(uri: initialUri);
+    _routerConfig = RouterConfig<RouteInformation>(
+      routeInformationProvider: PlatformRouteInformationProvider(
+        initialRouteInformation: initialRoute,
+      ),
+      routeInformationParser: const _DashboardRouteInformationParser(),
+      routerDelegate: _DashboardRouterDelegate(
+        builder: (context) => _buildHost(),
+        routeNotifier: _routeNotifier,
+        initialRoute: initialRoute,
+      ),
+    );
+  }
+
+  static Uri _resolveInitialUri() {
+    final defaultRoute =
+        WidgetsBinding.instance.platformDispatcher.defaultRouteName;
+    return Uri.parse(defaultRoute.isEmpty ? '/' : defaultRoute);
   }
 
   Future<DashboardSession> _bootstrapSession() async {
@@ -86,17 +148,10 @@ class _RusaDashboardAppState extends State<RusaDashboardApp>
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
     _resolvedSession?.removeListener(_onSessionChanged);
     _resolvedSession?.dispose();
     _routeNotifier.dispose();
     super.dispose();
-  }
-
-  @override
-  Future<bool> didPushRouteInformation(RouteInformation routeInformation) async {
-    _routeNotifier.value = routeInformation;
-    return true;
   }
 
   Widget _buildHost() => FutureBuilder<DashboardSession>(
@@ -122,29 +177,11 @@ class _RusaDashboardAppState extends State<RusaDashboardApp>
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      // Flutter's Title widget owns document.title on rebuild. Once the
-      // authenticated manifest has supplied the instance title, feed it back
-      // into MaterialApp so route and window rebuilds retain it.
+    return MaterialApp.router(
       title: _authenticatedTitle ?? widget.title,
       debugShowCheckedModeBanner: false,
       theme: buildMeshTheme(),
-      // Keep one DashboardPage for every initial path. With path URL strategy,
-      // Navigator's default initial-route expansion asks for each path prefix;
-      // providing onGenerateInitialRoutes generates exactly one page matching
-      // the requested deep link without falling back to "/" or replacing the
-      // browser URL during asynchronous session bootstrap or sign-in.
-      // onGenerateRoute returns null to satisfy WidgetsApp assertion while
-      // ensuring no duplicate session host or stores are built on named pushes.
-      onGenerateInitialRoutes: (initialRoute) => [
-        MaterialPageRoute<void>(
-          settings: RouteSettings(
-            name: initialRoute.isEmpty ? '/' : initialRoute,
-          ),
-          builder: (context) => _buildHost(),
-        ),
-      ],
-      onGenerateRoute: (settings) => null,
+      routerConfig: _routerConfig,
     );
   }
 }
@@ -292,5 +329,3 @@ class _SignInPageState extends State<SignInPage> {
     ),
   );
 }
-
-

@@ -176,7 +176,9 @@ class _DashboardBodyState extends State<DashboardBody> {
     final actorId = parseFocusedActorId(uri);
 
     if (obligationId != widget.store.focusedObligationId.valueOrNull) {
-      widget.store.setFocusedObligationId(obligationId);
+      if (obligationId != null || targetView == DashboardView.work) {
+        widget.store.setFocusedObligationId(obligationId);
+      }
     }
     if (actorId != widget.store.primary.valueOrNull) {
       if (actorId != null) {
