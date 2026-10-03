@@ -47,6 +47,8 @@ export interface RoomEntryServiceDeps {
   inbox: Pick<InboxRepository, "append" | "read">;
   /** Active Room participants right now: the server roster, never a client list. */
   roster: () => readonly string[];
+  /** Cheap current membership; falls back to the roster for small standalone callers. */
+  isParticipant?: (actorId: string) => boolean;
   now?: () => number;
   newId?: () => string;
   log?: (message: string) => void;
@@ -111,6 +113,8 @@ export class RoomEntryService {
    * is `reconnecting` until its next authenticated renewal reaches us.
    */
   private readonly attached = new Set<string>();
+  /** Known live lease sessions, also hydrated on restart; unknown cookies need no DB scan. */
+  private sessionKeys = new Set<string>();
   private draining = false;
   /** Last attempted notice, including failures; the next pass starts after it. */
   private lastDrainAttempt: string | null = null;
@@ -119,6 +123,12 @@ export class RoomEntryService {
     this.now = deps.now ?? Date.now;
     this.newId = deps.newId ?? randomUUID;
     this.log = deps.log ?? (() => {});
+    for (const row of deps.store.list()) {
+      if (row.endedAt !== null) continue;
+      const document = this.parse(row);
+      if (!document) continue;
+      for (const held of liveLeases(document, this.now())) this.sessionKeys.add(held.sessionKey);
+    }
   }
 
   /**
@@ -184,6 +194,7 @@ export class RoomEntryService {
     }
     this.pruneAttachments();
     if (result.status === "entered") {
+      this.sessionKeys.add(client.sessionKey);
       const replacedPrefix = `${result.episodeId}\u0000${client.clientId}\u0000`;
       for (const key of this.attached) {
         if (key.startsWith(replacedPrefix)) this.attached.delete(key);
@@ -222,6 +233,7 @@ export class RoomEntryService {
     });
     this.pruneAttachments();
     if (result.status === "renewed") {
+      this.sessionKeys.add(client.sessionKey);
       this.attached.add(attachmentKey(result.episodeId, client.clientId, result.generation));
     }
     return result;
@@ -286,6 +298,7 @@ export class RoomEntryService {
    * same principal keeps the episode alive; if none remains, it departs.
    */
   invalidateSession(sessionKey: string): void {
+    if (!this.sessionKeys.has(sessionKey)) return;
     const now = this.now();
     this.deps.store.transaction(() => {
       for (const row of this.deps.store.list()) {
@@ -307,6 +320,7 @@ export class RoomEntryService {
         });
       }
     });
+    this.sessionKeys.delete(sessionKey);
     this.pruneAttachments();
   }
 
@@ -368,31 +382,38 @@ export class RoomEntryService {
       const queues = this.deps.store
         .list()
         .map((row) => ({ row, document: this.parse(row) }))
-        .filter((item): item is Loaded => item.document !== null)
-        .map(({ row, document }) => ({
-          row,
-          pending: document.recipients
-            .filter((recipient) => recipient.status === "pending")
-            .map((recipient) => recipient.actorId),
-        }))
-        .filter((queue) => queue.pending.length > 0);
-      // Interleave episodes, then continue after the last attempted notice.
-      // Starting at the oldest episode/recipient on every pass lets a full
-      // batch of persistent failures starve everything that follows it.
-      const candidates: Array<{ row: RoomEntryEpisodeRow; actorId: string }> = [];
-      const maxPending = Math.max(0, ...queues.map((queue) => queue.pending.length));
-      for (let index = 0; index < maxPending; index += 1) {
-        for (const queue of queues) {
-          const actorId = queue.pending[index];
-          if (actorId !== undefined) candidates.push({ row: queue.row, actorId });
+        .filter((item): item is Loaded => item.document !== null);
+      // Keep terminal recipients in the frozen order: a successful last attempt
+      // must retain its cursor position on the next pass. Only pending rows consume
+      // an attempt; interleaving episodes still prevents large-roster starvation.
+      const candidates: Array<{ row: RoomEntryEpisodeRow; actorId: string; pending: boolean }> = [];
+      const maxRecipients = Math.max(
+        0,
+        ...queues.map(({ document }) => document.recipients.length)
+      );
+      for (let index = 0; index < maxRecipients; index += 1) {
+        for (const { row, document } of queues) {
+          const recipient = document.recipients[index];
+          if (recipient)
+            candidates.push({
+              row,
+              actorId: recipient.actorId,
+              pending: recipient.status === "pending",
+            });
         }
       }
       const previous = candidates.findIndex(
         ({ row, actorId }) => roomEntryNoticeId(row.id, actorId) === this.lastDrainAttempt
       );
-      const count = Math.min(ROOM_ENTRY_DRAIN_BATCH, candidates.length);
-      for (let offset = 0; offset < count; offset += 1) {
-        const { row, actorId } = candidates[(previous + 1 + offset) % candidates.length];
+      let attempted = 0;
+      for (
+        let offset = 0;
+        offset < candidates.length && attempted < ROOM_ENTRY_DRAIN_BATCH;
+        offset += 1
+      ) {
+        const { row, actorId, pending } = candidates[(previous + 1 + offset) % candidates.length];
+        if (!pending) continue;
+        attempted += 1;
         this.lastDrainAttempt = roomEntryNoticeId(row.id, actorId);
         this.deliver(row, actorId);
       }
@@ -414,12 +435,16 @@ export class RoomEntryService {
     let removed = 0;
     try {
       const now = this.now();
+      const liveSessions = new Set<string>();
       for (const candidate of this.deps.store.list()) {
         const deleted = this.deps.store.transaction(() => {
           const row = this.deps.store.get(candidate.id);
           if (!row) return false;
           const document = this.parse(row);
           if (!document) return false;
+          if (row.endedAt === null) {
+            for (const held of liveLeases(document, now)) liveSessions.add(held.sessionKey);
+          }
           if (row.endedAt === null && !this.expireIfLapsed({ row, document }, now)) return false;
           if (document.recipients.some((recipient) => recipient.status === "pending")) return false;
           const unhandled = document.recipients.some((recipient) => {
@@ -439,6 +464,7 @@ export class RoomEntryService {
           removed += 1;
         }
       }
+      this.sessionKeys = liveSessions;
     } finally {
       this.draining = false;
       this.pruneAttachments();
@@ -472,7 +498,7 @@ export class RoomEntryService {
   /** Deliver one recipient's notice and stamp it; never throws. */
   private deliver(row: RoomEntryEpisodeRow, actorId: string): void {
     try {
-      if (!this.deps.roster().includes(actorId)) {
+      if (!(this.deps.isParticipant?.(actorId) ?? this.deps.roster().includes(actorId))) {
         // Removed or retired since the snapshot: its invitation is void.
         this.deps.store.transaction(() => this.setRecipientStatus(row, actorId, "skipped"));
         return;

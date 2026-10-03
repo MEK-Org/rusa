@@ -2529,6 +2529,8 @@ async function composeStart(
         .participants()
         .filter((participant) => actors.get(participant.actorId)?.status === "active")
         .map((participant) => participant.actorId),
+    isParticipant: (actorId) =>
+      chatRoom.isParticipant(actorId) && actors.get(actorId)?.status === "active",
     log: (message) => log.warn("room_entry", { message }),
   });
 

@@ -1,7 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { parseRoomEntryDocument, ROOM_ENTRY_LIMITS } from "./room-entry-document.js";
 
 describe("stored Room entry bounds (#829)", () => {
+  it("validates stored shape and bounds without serializing the parsed document", () => {
+    const json = '{"version":1,"leases":[],"recipients":[]}';
+    const stringify = vi.spyOn(JSON, "stringify");
+    try {
+      expect(parseRoomEntryDocument(json)).toEqual({ version: 1, leases: [], recipients: [] });
+      expect(stringify).not.toHaveBeenCalled();
+    } finally {
+      stringify.mockRestore();
+    }
+  });
+
   it("rejects a stored document with too many leases", () => {
     const leases = Array.from({ length: ROOM_ENTRY_LIMITS.maxLeases + 1 }, (_, i) => ({
       clientId: `tab-${i}`,

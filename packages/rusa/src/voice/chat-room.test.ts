@@ -60,6 +60,7 @@ describe("ChatRoomService", () => {
       store,
       inbox: new SqliteInboxRepository(db),
       roster: () => room.participants().map((member) => member.actorId),
+      isParticipant: (id) => room.isParticipant(id) && actors.get(id)?.status === "active",
     });
     room.add("a", "root");
     const entered = entries.enter({ principalId: "user-a", clientId: "tab-1", sessionKey: "s1" });
@@ -77,6 +78,43 @@ describe("ChatRoomService", () => {
     expect(room.remove("a")).toBe(true);
     room.add("a", "root");
     expect(entries.isEligibleRecipient(entered.episodeId, "a")).toBe(false);
+  });
+
+  it("rechecks real SQLite membership after reentrant removal and retirement during delivery", () => {
+    for (const id of ["a", "b", "c"]) actors.upsert(actor(id));
+    const room = service((id) => entries.invalidateRecipient(id));
+    for (const id of ["a", "b", "c"]) room.add(id, "root");
+    const inbox = new SqliteInboxRepository(db);
+    const snapshot = vi.fn(() =>
+      room
+        .participants()
+        .filter((member) => actors.get(member.actorId)?.status === "active")
+        .map((member) => member.actorId)
+    );
+    const entries = new RoomEntryService({
+      store: new RoomEntryEpisodeRepository(db),
+      inbox: {
+        append: (inputs) => {
+          const result = inbox.append(inputs);
+          if (inputs[0].actorId === "root") {
+            room.remove("a");
+            actors.patch("b", { status: "retired" });
+          }
+          return result;
+        },
+        read: (id, noticeId) => inbox.read(id, noticeId),
+      },
+      roster: snapshot,
+      isParticipant: (id) => room.isParticipant(id) && actors.get(id)?.status === "active",
+    });
+    const entered = entries.enter({ principalId: "user-a", clientId: "tab-1", sessionKey: "s1" });
+    if (entered.status !== "entered") throw new Error("not entered");
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    expect(inbox.list("a", { status: "all" }).entries).toHaveLength(0);
+    expect(inbox.list("b", { status: "all" }).entries).toHaveLength(0);
+    expect(inbox.list("c", { status: "all" }).entries).toHaveLength(1);
+    expect(entries.isEligibleRecipient(entered.episodeId, "a")).toBe(false);
+    expect(entries.isEligibleRecipient(entered.episodeId, "b")).toBe(false);
   });
 
   it("starts as root alone", () => {
@@ -214,7 +252,10 @@ describe("ChatRoomService", () => {
     actors.upsert(actor("a", { voiceConfig: googleVoiceConfig("Kore") }));
     const room = service();
     room.add("a", "root");
+    expect(room.isParticipant("a")).toBe(true);
+    expect(room.isParticipant("root")).toBe(true);
     actors.patch("a", { status: "retired" });
+    expect(room.isParticipant("a")).toBe(false);
 
     expect(room.participants()).toEqual([{ actorId: "root", addedBy: null, addedAt: null }]);
   });

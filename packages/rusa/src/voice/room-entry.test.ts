@@ -82,6 +82,34 @@ describe("RoomEntryService (#829)", () => {
     expect(recipients(entry.episodeId).every((r) => r.status === "delivered")).toBe(true);
   });
 
+  it("ignores unknown session invalidation without database reads or transactions", () => {
+    const rooms = service();
+    rooms.enter(tab("tab-1"));
+    const list = vi.spyOn(store, "list");
+    const transaction = vi.spyOn(store, "transaction");
+    for (let i = 0; i < 10; i += 1) rooms.invalidateSession(`invalid-cookie-${i}`);
+    expect(list).not.toHaveBeenCalled();
+    expect(transaction).not.toHaveBeenCalled();
+  });
+
+  it("invalidates a known persisted session after restart once, independent of auth cache", () => {
+    const entered = service().enter(tab("tab-1"));
+    if (entered.status !== "entered") throw new Error("not entered");
+    const restarted = service();
+    const list = vi.spyOn(store, "list");
+    restarted.invalidateSession("session-1");
+    expect(restarted.presence(entered.episodeId)).toBe("departed");
+    list.mockClear();
+    restarted.invalidateSession("session-1");
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it("refuses a NUL client id before it can affect sibling attachment prefixes", () => {
+    const rooms = service();
+    expect(rooms.enter(tab("a\u0000b"))).toMatchObject({ status: "unavailable" });
+    expect(store.list()).toHaveLength(0);
+  });
+
   it("projects notice presence only for the matching principal and eligible recipient", () => {
     const rooms = service();
     const entered = rooms.enter(tab("tab-1"));
@@ -118,6 +146,7 @@ describe("RoomEntryService (#829)", () => {
     expect(rooms.collect()).toBe(0); // Unhandled notices retain the audit row.
     expect(store.get(stable.episodeId)).not.toBeNull();
     expect(attached.size).toBe(0);
+    expect((rooms as unknown as { sessionKeys: Set<string> }).sessionKeys.size).toBe(0);
   });
 
   it("releases expired sibling attachments on last explicit leave", () => {
@@ -419,6 +448,56 @@ describe("RoomEntryService (#829)", () => {
       expect(notices("actor-2")).toEqual([]);
       expect(rooms.isEligibleRecipient(entry.episodeId, "actor-1")).toBe(false);
       expect(rooms.isEligibleRecipient(entry.episodeId, "root")).toBe(true);
+    });
+
+    it("reads the snapshot once and rechecks cheap live membership after an append callback", () => {
+      const snapshot = vi.fn(() => roster);
+      const rooms = new RoomEntryService({
+        store,
+        inbox: {
+          append: (inputs) => {
+            if (inputs[0].actorId === "root") roster = ["root", "actor-2"];
+            return inbox.append(inputs);
+          },
+          read: (actorId, id) => inbox.read(actorId, id),
+        },
+        roster: snapshot,
+        isParticipant: (actorId) => roster.includes(actorId),
+        now: () => now,
+      });
+      const entered = rooms.enter(tab("tab-1"));
+      if (entered.status !== "entered") throw new Error("not entered");
+      expect(snapshot).toHaveBeenCalledTimes(1);
+      expect(notices("actor-1")).toHaveLength(0);
+      expect(recipients(entered.episodeId)).toContainEqual({
+        actorId: "actor-1",
+        status: "skipped",
+      });
+      expect(notices("actor-2")).toHaveLength(1);
+    });
+
+    it("continues after a successful last attempt instead of replaying the failed prefix", () => {
+      roster = Array.from({ length: 100 }, (_, i) => `actor-${i}`);
+      const attempts: string[] = [];
+      const rooms = service({
+        inbox: {
+          append: (inputs) => {
+            const actorId = inputs[0].actorId;
+            attempts.push(actorId);
+            if (Number(actorId.split("-")[1]) < ROOM_ENTRY_DRAIN_BATCH - 1)
+              throw new Error("persistent failure");
+            return inbox.append(inputs);
+          },
+          read: (actorId, id) => inbox.read(actorId, id),
+        },
+      });
+      rooms.enter(tab("tab-1"));
+      expect(attempts.at(-1)).toBe("actor-63");
+      attempts.length = 0;
+      rooms.drain();
+      expect(attempts[0]).toBe("actor-64");
+      expect(notices("actor-99")).toHaveLength(1);
+      expect(attempts).toHaveLength(ROOM_ENTRY_DRAIN_BATCH);
     });
 
     it("advances past persistent failures to later recipients on the next pass", () => {

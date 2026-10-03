@@ -85,6 +85,7 @@ export function isValidRoomClientId(clientId: unknown): clientId is string {
   return (
     typeof clientId === "string" &&
     clientId.length > 0 &&
+    !clientId.includes("\u0000") &&
     Buffer.byteLength(clientId, "utf8") <= ROOM_ENTRY_LIMITS.maxClientIdBytes
   );
 }
@@ -96,8 +97,8 @@ export function parseRoomEntryDocument(json: string): RoomEntryDocument {
   }
   const value: unknown = JSON.parse(json);
   // Stored rows obey the same consumer bounds as newly written candidates.
-  serializeRoomEntryDocument(value as RoomEntryDocument);
-  return value as RoomEntryDocument;
+  validateRoomEntryDocument(value);
+  return value;
 }
 
 /**
@@ -106,8 +107,19 @@ export function parseRoomEntryDocument(json: string): RoomEntryDocument {
  * shape, which is a programming error rather than a request problem.
  */
 export function serializeRoomEntryDocument(document: RoomEntryDocument): string {
-  const problem = documentProblem(document);
+  validateRoomEntryDocument(document);
+  const json = JSON.stringify(document);
+  if (Buffer.byteLength(json, "utf8") > ROOM_ENTRY_LIMITS.maxDocumentBytes) {
+    throw new RoomEntryLimitError("room entry episode document exceeds its size bound");
+  }
+  return json;
+}
+
+/** Shared structural/count checks; reads already checked their raw byte bound. */
+function validateRoomEntryDocument(value: unknown): asserts value is RoomEntryDocument {
+  const problem = documentProblem(value);
   if (problem) throw new Error(`invalid room entry document: ${problem}`);
+  const document = value as RoomEntryDocument;
   if (document.leases.length > ROOM_ENTRY_LIMITS.maxLeases) {
     throw new RoomEntryLimitError(
       `room entry episode already holds ${ROOM_ENTRY_LIMITS.maxLeases} client leases`
@@ -118,11 +130,6 @@ export function serializeRoomEntryDocument(document: RoomEntryDocument): string 
       `room roster exceeds ${ROOM_ENTRY_LIMITS.maxRecipients} entry notice recipients`
     );
   }
-  const json = JSON.stringify(document);
-  if (Buffer.byteLength(json, "utf8") > ROOM_ENTRY_LIMITS.maxDocumentBytes) {
-    throw new RoomEntryLimitError("room entry episode document exceeds its size bound");
-  }
-  return json;
 }
 
 function documentProblem(value: unknown): string | null {

@@ -81,6 +81,14 @@ export class ChatRoomService {
     ];
   }
 
+  /** Cheap live membership check for one recipient; root remains implicit. */
+  isParticipant(actorId: string): boolean {
+    return (
+      actorId === this.deps.rootId ||
+      (this.deps.store.has(actorId) && this.deps.actors.get(actorId)?.status === "active")
+    );
+  }
+
   add(target: string, addedBy: string): ChatRoomAddResult {
     const actor = this.resolveAddable(target);
     return this.deps.store.transaction(() => {
