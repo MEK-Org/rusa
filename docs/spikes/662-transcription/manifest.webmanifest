@@ -1,0 +1,11 @@
+{
+  "id": "./",
+  "name": "662 synthetic transcription spike",
+  "short_name": "662 spike",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#18202b",
+  "theme_color": "#18202b",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}
