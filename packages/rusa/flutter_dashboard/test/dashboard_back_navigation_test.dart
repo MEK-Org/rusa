@@ -7,6 +7,8 @@ import 'package:rusa_dashboard/session.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/chat_room.dart';
 import 'package:rusa_dashboard/widgets/dashboard_body.dart';
+import 'package:rusa_dashboard/widgets/header.dart';
+import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 
@@ -79,6 +81,11 @@ Future<void> _settle(WidgetTester tester) async {
   await tester.pump(const Duration(milliseconds: 50));
 }
 
+Future<void> _settleDrawer(WidgetTester tester) async {
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 400));
+}
+
 Future<void> _tapNav(WidgetTester tester, String label) async {
   await tester.tap(find.widgetWithText(InkWell, label));
   await _settle(tester);
@@ -115,6 +122,71 @@ void main() {
   });
 
   group('browser/system back navigation', () {
+    for (final size in [const Size(390, 800), const Size(1200, 800)]) {
+      testWidgets(
+        'headerless Room retains edge drawer and back exits at ${size.width}px (#859)',
+        (tester) async {
+          await _withDashboard(
+            tester,
+            initialUrl: '/overview',
+            size: size,
+            body: (_) async {
+              expect(find.byType(MeshHeader), findsOneWidget);
+              if (size.width < 700) {
+                await tester.tap(find.byIcon(Icons.menu));
+                await _settleDrawer(tester);
+                await tester.tap(
+                  find.byKey(const ValueKey('drawer-nav-chatRoom')),
+                );
+                await _settleDrawer(tester);
+              } else {
+                await _tapNav(tester, 'Room');
+              }
+              expect(find.byType(ChatRoomTab), findsOneWidget);
+              expect(
+                find.byType(MeshHeader),
+                findsNothing,
+                reason: 'Room uses the full screen without a header',
+              );
+
+              await tester.dragFrom(const Offset(1, 200), const Offset(300, 0));
+              await _settleDrawer(tester);
+              expect(find.byType(MobileNavDrawer), findsOneWidget);
+              final scaffold = tester.state<ScaffoldState>(
+                find.byType(Scaffold).last,
+              );
+              expect(scaffold.isDrawerOpen, isTrue);
+
+              // Native back dismisses the gesture-opened drawer first.
+              expect(await tester.binding.handlePopRoute(), isTrue);
+              await _settleDrawer(tester);
+              expect(scaffold.isDrawerOpen, isFalse);
+              expect(find.byType(ChatRoomTab), findsOneWidget);
+
+              // Browser back restores the previous destination and its header;
+              // forward restores Room with no header again.
+              await _popTo(tester, '/overview');
+              expect(find.byType(OverviewTab), findsOneWidget);
+              expect(find.byType(MeshHeader), findsOneWidget);
+              await _popTo(tester, '/chat-room');
+              expect(find.byType(ChatRoomTab), findsOneWidget);
+              expect(find.byType(MeshHeader), findsNothing);
+
+              // The second exit actually reaches another destination.
+              await tester.dragFrom(const Offset(1, 200), const Offset(300, 0));
+              await _settleDrawer(tester);
+              await tester.tap(
+                find.byKey(const ValueKey('drawer-nav-overview')),
+              );
+              await _settleDrawer(tester);
+              expect(find.byType(OverviewTab), findsOneWidget);
+              expect(find.byType(MeshHeader), findsOneWidget);
+            },
+          );
+        },
+      );
+    }
+
     testWidgets(
       'startup preserves multi-entry mode without selecting single-entry history',
       (tester) async {
@@ -295,7 +367,7 @@ void main() {
             await tester.pump();
             await tester.pump(const Duration(milliseconds: 300));
             expect(find.byType(ChatRoomTab), findsOneWidget);
-            await tester.tap(find.byTooltip('Navigation'));
+            await tester.dragFrom(const Offset(1, 200), const Offset(300, 0));
             await tester.pump();
             await tester.pump(const Duration(milliseconds: 300));
             final scaffold = tester.state<ScaffoldState>(
