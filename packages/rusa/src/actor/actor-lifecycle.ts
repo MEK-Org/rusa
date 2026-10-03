@@ -8,6 +8,7 @@ export interface ActorLifecycleListener {
   onSpawn?(event: ActorLifecycleActorEvent): void | Promise<void>;
   onQueued?(event: ActorLifecycleQueuedEvent): void | Promise<void>;
   onStart?(event: ActorLifecycleStartEvent): void | Promise<void>;
+  onPrompt?(event: ActorLifecyclePromptEvent): void | Promise<void>;
   onError?(event: ActorLifecycleErrorEvent): void | Promise<void>;
   onEnd?(event: ActorLifecycleEndEvent): void | Promise<void>;
   onRetire?(event: ActorLifecycleActorEvent): void | Promise<void>;
@@ -30,6 +31,12 @@ export interface ActorLifecycleQueuedEvent extends ActorLifecycleRunEvent {
 export interface ActorLifecycleStartEvent extends ActorLifecycleQueuedEvent {
   injectRecord?: InjectRecord;
   selected: RawProviderModelConfig;
+}
+
+/** Internal observation only: never added to mesh_events or run logs. */
+export interface ActorLifecyclePromptEvent extends ActorLifecycleRunEvent {
+  prompt: string;
+  provider: string;
 }
 
 export interface ActorLifecycleErrorEvent extends ActorLifecycleRunEvent {
@@ -61,6 +68,7 @@ type ActorLifecycleEvent =
   | ActorLifecycleActorEvent
   | ActorLifecycleQueuedEvent
   | ActorLifecycleStartEvent
+  | ActorLifecyclePromptEvent
   | ActorLifecycleErrorEvent
   | ActorLifecycleEndEvent;
 

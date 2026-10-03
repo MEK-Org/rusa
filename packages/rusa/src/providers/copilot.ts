@@ -68,6 +68,7 @@ export class CopilotProvider implements CodingProvider {
     };
 
     return runSubprocess({
+      onSpawn: () => opts.onPromptLaunched?.(args[args.indexOf("--prompt") + 1]),
       command: spawnCommand,
       args: spawnArgs,
       cwd: spawnCwd,

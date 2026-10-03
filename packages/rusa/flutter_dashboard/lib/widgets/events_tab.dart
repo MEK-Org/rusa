@@ -7,6 +7,7 @@ import '../store.dart';
 import '../theme.dart';
 import '../util.dart';
 import 'kind_chip.dart';
+import 'run_prompt_disclosure.dart';
 
 /// All mesh event kinds, for the filter dropdown (mirrors MeshEventKind).
 const _kKinds = [
@@ -118,6 +119,15 @@ class EventsTab extends StatelessWidget {
         ? (row.yielded!.body ?? e.detail)
         : (isMessage ? (e.body ?? e.detail) : e.detail);
     final resolvedRunModel = e.resolvedRunModel;
+    String? runId;
+    if (e.kind == 'run_start' && e.payload != null) {
+      try {
+        final payload = jsonDecode(e.payload!) as Map<String, dynamic>;
+        if (payload['runId'] is String && (payload['runId'] as String).isNotEmpty) {
+          runId = payload['runId'] as String;
+        }
+      } catch (_) {}
+    }
 
     Widget? peerLabel;
     String? directionPeer;
@@ -222,6 +232,12 @@ class EventsTab extends StatelessWidget {
                     ),
                   ),
                 ],
+                if (runId != null)
+                  RunPromptDisclosure(
+                    key: ValueKey(runId),
+                    runId: runId,
+                    api: store.api,
+                  ),
                 if ((detail ?? '').isNotEmpty) ...[
                   const SizedBox(height: 4),
                   Text(

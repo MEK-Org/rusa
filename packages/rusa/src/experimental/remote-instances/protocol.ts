@@ -5,6 +5,9 @@ import type { ActorRunMode, RunNudge } from "../../actor/trigger-runner.js";
 import type { RawProviderModelConfig } from "../../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
 
+/** Existing follower gateway request-body bound, including the JSON envelope. */
+export const FOLLOWER_HTTP_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
+
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
 //
 // Compatibility rule (#719): the leader deploys first and must keep followers on the
@@ -158,6 +161,7 @@ export type ActorEvent =
       selected: RawProviderModelConfig;
       runId?: string;
     }
+  | { type: "runPrompt"; runId: string; prompt: string; provider: string }
   | { type: "firstChunk" }
   | { type: "abandoned"; abandon: RunAbandon }
   | { type: "coalesced"; count: number; ageMs: number }

@@ -37,7 +37,12 @@ import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import type { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import {
+  type OperatorPrincipalSource,
+  resolveSoleActiveUser,
+} from "../principals/operator-principal.js";
 import type { QuotaCoordinatorClientHealth } from "../quota/coordinator-client.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { InboxRepository } from "../repositories/inbox-repository.js";
@@ -137,6 +142,7 @@ export interface DashboardMeshRefs {
   inbox?: InboxRepository;
   /** Completed selection intervals used to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
+  runPrompts?: RunPromptRepository;
   /** Durable per-entry obligation associations for activity correlation. */
   inboxFocus?: InboxFocusRepository;
   emitter: MeshEventEmitter;
@@ -278,6 +284,12 @@ export function parseJsonObjectBody(body: string): JsonObjectParseResult {
   return { ok: true, value: parsed as Record<string, unknown> };
 }
 
+/** Auth-disabled mode cannot identify its viewer once several active users exist. */
+function localViewerIsAmbiguous(principals: OperatorPrincipalSource | undefined): boolean {
+  const sole = resolveSoleActiveUser(principals);
+  return !sole.ok && sole.reason === "ambiguous";
+}
+
 /**
  * Create the dashboard HTTP request handler.
  *
@@ -337,6 +349,18 @@ export function createDashboardRequestHandler(
         !(await auth.authorize(req, res))
       )
         return;
+      // #866: complete prompts are available in sole-email/local mode only.
+      // Keep allowlist refusal at the established auth boundary, before storage reads.
+      // Auth-disabled mode with several active users cannot identify its viewer (#590).
+      if (
+        req.method === "GET" &&
+        /^\/api\/mesh\/runs\/[^/]+\/prompt$/.test(pathname) &&
+        (auth ? auth.config?.allowedEmails : localViewerIsAmbiguous(dataDeps?.principals))
+      ) {
+        res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: "prompt not retained" }));
+        return;
+      }
       if (auth && (pathname === "/api/mesh/stream" || pathname === "/api/mesh/voice/stream")) {
         auth.guardStream(req, res);
       }
@@ -602,6 +626,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           obligations: options.mesh.obligations,
           inbox: options.mesh.inbox,
           actorRuns: options.mesh.actorRuns,
+          runPrompts: options.mesh.runPrompts,
           inboxFocus: options.mesh.inboxFocus,
           sseHub,
           mesh: options.mesh.mesh,
