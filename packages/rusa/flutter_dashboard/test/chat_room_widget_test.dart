@@ -327,9 +327,17 @@ void main() {
         );
         await tester.pump();
         await tester.pump();
-        // Speaking is shown by the border alone; no line is added under the
-        // name, so the avatar does not shrink or move while the actor speaks.
-        expect(find.text('Speaking'), findsNothing);
+        // Speaking is marked by the border and a corner badge over the
+        // avatar (#825 operator feedback); no line is added under the name,
+        // so the avatar does not shrink or move while the actor speaks.
+        expect(
+          find.descendant(
+            of: find.byKey(const ValueKey('chat-room-avatar-actor-b')),
+            matching: find.byKey(const ValueKey('chat-room-speaking-badge')),
+          ),
+          findsOneWidget,
+        );
+        expect(find.text('Speaking'), findsOneWidget);
         expect(borderOf(tester, 'actor-b'), MeshColors.accent);
         expect(avatarRect(tester, 'actor-b'), quietAvatar);
         expect(borderOf(tester, 'root'), MeshColors.border);
@@ -337,6 +345,10 @@ void main() {
         walkie.player.finishCurrent();
         await tester.pump();
         await tester.pump();
+        expect(
+          find.byKey(const ValueKey('chat-room-speaking-badge')),
+          findsNothing,
+        );
         expect(find.text('Speaking'), findsNothing);
         expect(borderOf(tester, 'actor-b'), MeshColors.statusQueued);
         expect(avatarRect(tester, 'actor-b'), quietAvatar);

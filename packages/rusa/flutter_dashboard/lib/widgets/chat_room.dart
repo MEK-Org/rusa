@@ -463,13 +463,35 @@ class _RoomAvatarButton extends StatelessWidget {
                     ),
                     // The tile shows only the avatar and name (#825 operator
                     // feedback), so the avatar takes the height a second line
-                    // would hold; speaking is marked by the border alone.
+                    // would hold; badges overlay the corners instead.
                   ],
                 ),
                 // The border belongs to the actor's run state, so the capture
                 // this tile is recording is marked by a badge instead.
                 if (recording)
-                  const Positioned(top: 0, right: 0, child: _RecordingBadge()),
+                  const Positioned(
+                    top: 0,
+                    right: 0,
+                    child: _TileBadge(
+                      key: ValueKey('chat-room-recording-badge'),
+                      icon: Icons.mic,
+                      label: 'REC',
+                      background: MeshColors.statusHalted,
+                      foreground: MeshColors.textPrimary,
+                    ),
+                  ),
+                if (speaking)
+                  const Positioned(
+                    top: 0,
+                    left: 0,
+                    child: _TileBadge(
+                      key: ValueKey('chat-room-speaking-badge'),
+                      icon: Icons.volume_up,
+                      label: 'Speaking',
+                      background: MeshColors.accent,
+                      foreground: MeshColors.bgPrimary,
+                    ),
+                  ),
               ],
             ),
           ),
@@ -479,26 +501,38 @@ class _RoomAvatarButton extends StatelessWidget {
   }
 }
 
-class _RecordingBadge extends StatelessWidget {
-  const _RecordingBadge();
+/// A pill in a tile corner. It overlays the avatar, so showing or hiding it
+/// never moves or resizes the tile's contents.
+class _TileBadge extends StatelessWidget {
+  const _TileBadge({
+    super.key,
+    required this.icon,
+    required this.label,
+    required this.background,
+    required this.foreground,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color background;
+  final Color foreground;
 
   @override
   Widget build(BuildContext context) => Container(
-    key: const ValueKey('chat-room-recording-badge'),
     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
     decoration: BoxDecoration(
-      color: MeshColors.statusHalted,
+      color: background,
       borderRadius: BorderRadius.circular(999),
     ),
-    child: const Row(
+    child: Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Icon(Icons.mic, size: 14, color: MeshColors.textPrimary),
-        SizedBox(width: 4),
+        Icon(icon, size: 14, color: foreground),
+        const SizedBox(width: 4),
         Text(
-          'REC',
+          label,
           style: TextStyle(
-            color: MeshColors.textPrimary,
+            color: foreground,
             fontSize: 11,
             fontWeight: FontWeight.w800,
             letterSpacing: 0.8,
