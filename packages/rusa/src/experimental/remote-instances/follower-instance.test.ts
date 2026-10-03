@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -14,6 +14,7 @@ import {
 import { ProviderPacer } from "../../actor/provider-pacer.js";
 import { runMigrations } from "../../db/migrations/runner.js";
 import { ObligationRepository } from "../../db/repositories/obligation-repository.js";
+import { ClaudeProvider } from "../../providers/claude.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { createHarness, waitUntil } from "./harness.js";
 import type { ActorEvent, LeaderCommand, ProviderFactory } from "./protocol.js";
@@ -173,28 +174,31 @@ function abandonedRuns(h: Harness, id: string) {
 }
 
 describe("monolithic follower instance", () => {
-  it("#866 forwards actual follower launch text to leader lifecycle and rejects stale run receipts", async () => {
+  it("#866 forwards exact real follower argv to leader and rejects stale receipts", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-prompt-"));
+    dirs.push(cwd);
+    const dump = join(cwd, "argv.json");
+    const cli = join(cwd, "synthetic-cli");
+    writeFileSync(
+      cli,
+      `#!/usr/bin/env node
+require("node:fs").writeFileSync(${JSON.stringify(dump)}, JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic result"}));
+`
+    );
+    chmodSync(cli, 0o755);
     const h = setup({
-      providerFactory: (_bridge, _options, selected) => ({
-        name: "fixture",
-        providerName: selected?.provider ?? "instance-fixture",
-        async run(opts) {
-          opts.onPromptLaunched?.(`${opts.prompt}\nfixture adapter suffix`);
-          return { success: true, exitCode: 0, output: "fixture result" };
-        },
-      }),
+      providerFactory: () => new ClaudeProvider("fixture", { cliCommand: cli }),
     });
-    const id = h.spawn("Fixture charter");
-    await waitUntil(() => h.promptEvents.length === 1);
+    const id = h.spawn("Synthetic charter ✓\n  indentation");
+    await waitUntil(() => h.promptEvents.length === 1 && existsSync(dump));
     const event = h.promptEvents[0];
-    expect(event).toMatchObject({
-      actorId: id,
-      runId: runStarts(h, id)[0],
-      provider: "instance-fixture",
-    });
-    expect(event?.prompt).toContain("fixture adapter suffix");
-    expect(event?.prompt).toContain("Fixture charter");
-    expect(JSON.stringify(h.meshEvents)).not.toContain("fixture adapter suffix");
+    const argv = JSON.parse(readFileSync(dump, "utf8")) as string[];
+    expect(event).toMatchObject({ actorId: id, runId: runStarts(h, id)[0], provider: "claude" });
+    expect(event?.prompt).toBe(argv[argv.indexOf("-p") + 1]);
+    expect(event?.prompt).toContain("Synthetic charter");
+    expect(JSON.stringify(h.meshEvents.filter((entry) => entry.kind === "run_start")))
+      .not.toContain(JSON.stringify(event?.prompt));
     h.remote.receive({
       actorId: id,
       message: { type: "runPrompt", runId: "stale-run", prompt: "stale", provider: "fixture" },

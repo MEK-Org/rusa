@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import '../api.dart';
 import '../theme.dart';
 
-/// A run's bounded, retained launch text. No request occurs before expansion.
+/// A run's complete retained launch text. No request occurs before expansion.
 class RunPromptDisclosure extends StatefulWidget {
   const RunPromptDisclosure({
     super.key,
@@ -43,7 +43,7 @@ class _RunPromptDisclosureState extends State<RunPromptDisclosure> {
       TextButton.icon(
         onPressed: () => setState(() {
           _expanded = !_expanded;
-          if (_expanded) _prompt ??= _fetch();
+          if (_expanded) _prompt = _fetch();
         }),
         icon: Icon(_expanded ? Icons.expand_less : Icons.expand_more, size: 18),
         label: const Text('Run prompt'),
@@ -76,17 +76,12 @@ class _RunPromptDisclosureState extends State<RunPromptDisclosure> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Launched provider: ${data['provider']}',
+                    'Provider: ${data['provider']}',
                     style: kMonoStyle.copyWith(
                       color: MeshColors.textMuted,
                       fontSize: 11,
                     ),
                   ),
-                  if (data['truncated'] == true)
-                    Text(
-                      'Showing the first 256 KiB of ${data['promptBytes']} bytes.',
-                      style: const TextStyle(color: MeshColors.textSecondary),
-                    ),
                   const SizedBox(height: 6),
                   ConstrainedBox(
                     constraints: const BoxConstraints(maxHeight: 400),
