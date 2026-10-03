@@ -18,6 +18,7 @@ interface LockEntry<T> {
   inner?: RunStartHandle<T>;
   readonly enqueuedAt: number;
   waited: boolean;
+  blockerActorId?: string;
 }
 
 /**
@@ -69,15 +70,7 @@ export class ComputerUseLock {
       entry.state = "settled";
       reject(new RunStartCancelledError());
     } else {
-      if (this.holder !== undefined) {
-        entry.waited = true;
-        this.report("computer_use_wait", {
-          actorId: entry.actorId,
-          holderActorId: this.holder.entry.actorId,
-          responsive: entry.responsive,
-          holderResponsive: this.holder.entry.responsive,
-        });
-      }
+      this.reportWait(entry);
       this.enqueue(entry);
       this.requestResponsivePreemption(entry);
       this.pump();
@@ -103,6 +96,7 @@ export class ComputerUseLock {
         if (entry.state === "queued") {
           this.remove(entry);
           entry.state = "settled";
+          this.reportWaitEnded(entry, "cancelled");
           reject(new RunStartCancelledError());
           return true;
         }
@@ -157,6 +151,7 @@ export class ComputerUseLock {
     this.closed = true;
     for (const entry of [...this.responsiveQueue, ...this.normalQueue]) {
       entry.state = "settled";
+      this.reportWaitEnded(entry, "closed");
       entry.reject(new RunStartCancelledError());
     }
     this.responsiveQueue.length = 0;
@@ -195,12 +190,15 @@ export class ComputerUseLock {
     this.holder = { entry, token };
     const waited = entry.waited;
     const waitedMs = waited ? Math.max(0, Date.now() - entry.enqueuedAt) : undefined;
+    // Even an immediate acquisition proves this instance received the run and
+    // passed provider admission; silence alone cannot identify provider pacing.
     this.report("computer_use_acquired", {
       actorId: entry.actorId,
       responsive: entry.responsive,
       waited,
       waitedMs,
     });
+    for (const queued of [...this.responsiveQueue, ...this.normalQueue]) this.reportWait(queued);
     let started: Promise<unknown>;
     try {
       const inner = entry.start();
@@ -210,6 +208,29 @@ export class ComputerUseLock {
       started = Promise.reject(err);
     }
     void started.then(entry.resolve, entry.reject).finally(() => this.release(entry, token));
+  }
+
+  private reportWait<T>(entry: LockEntry<T>): void {
+    const holder = this.holder?.entry;
+    if (!holder || entry.blockerActorId === holder.actorId) return;
+    entry.waited = true;
+    entry.blockerActorId = holder.actorId;
+    this.report("computer_use_wait", {
+      actorId: entry.actorId,
+      holderActorId: holder.actorId,
+      responsive: entry.responsive,
+      holderResponsive: holder.responsive,
+    });
+  }
+
+  private reportWaitEnded<T>(entry: LockEntry<T>, outcome: "cancelled" | "closed"): void {
+    if (!entry.waited) return;
+    this.report("computer_use_wait_ended", {
+      actorId: entry.actorId,
+      responsive: entry.responsive,
+      outcome,
+      waitedMs: Math.max(0, Date.now() - entry.enqueuedAt),
+    });
   }
 
   private report(event: string, fields: LogFields): void {

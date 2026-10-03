@@ -27,6 +27,25 @@ export function startThing(deps: { logger: Logger }) {
 
 The composition root — `rusa start` — builds the real one and hands it down.
 
+## Computer-use admission records
+
+The instance owning the computer-use lock writes `computer_use_wait` when a
+provider-admitted run waits behind a holder, and again when its blocker changes.
+`holderActorId` identifies the holder at that transition. `computer_use_acquired`
+ends that wait and reports total `waitedMs` from entering the lock gate; it also
+marks immediate acquisition with `waited: false`. Cancelled or closed queued
+waits end with `computer_use_wait_ended`, an `outcome` of `cancelled` or `closed`,
+and elapsed time. The follower inherits its existing logger's `id`, destination
+and secret scrubbing; the leader does not manufacture follower lock records.
+
+These records contain identifiers, flags and elapsed time, without prompts or
+tool arguments. They are transition breadcrumbs, not a durable current-state
+view: logging can be filtered or fail, and diagnostics cannot block admission.
+Acquisition precedes provider execution; `run_start` or `remote_run_start`
+confirms execution. A missing lock record does not establish provider pacing or
+follower receipt. Before an observed lock transition, the admission reason
+remains unknown from these records alone.
+
 ## Levels
 
 | Level   | Use it for                                                         |

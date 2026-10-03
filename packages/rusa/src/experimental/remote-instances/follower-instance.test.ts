@@ -396,11 +396,13 @@ describe("monolithic follower instance", () => {
     await waitUntil(() => h.runtime(holder).isRunning);
 
     // Holder has acquired the computer-use lock immediately
-    expect(h.logs).toContainEqual(
+    expect(h.followerLogs).toContainEqual(
       expect.objectContaining({
         event: "computer_use_acquired",
         fields: expect.objectContaining({
           actorId: holder,
+          id: "test-follower",
+          component: "computer-use-lock",
           responsive: true,
           waited: false,
         }),
@@ -413,7 +415,7 @@ describe("monolithic follower instance", () => {
 
     // Wait until waiter reports a computer_use_wait behind holder
     await waitUntil(() =>
-      h.logs.some(
+      h.followerLogs.some(
         (log) =>
           log.event === "computer_use_wait" &&
           log.fields?.actorId === waiter &&
@@ -437,7 +439,7 @@ describe("monolithic follower instance", () => {
 
     // After natural holder settlement, waiter acquires the lock and starts
     await waitUntil(() =>
-      h.logs.some(
+      h.followerLogs.some(
         (log) =>
           log.event === "computer_use_acquired" &&
           log.fields?.actorId === waiter &&
@@ -454,6 +456,9 @@ describe("monolithic follower instance", () => {
       h.events.some((event) => event.actorId === waiter && event.event.type === "result")
     );
 
+    // The provider runStart arrives over the real follower runtime path; leader
+    // selection alone cannot produce the follower-only lock records above.
+    expect(h.logs.some((log) => log.event.startsWith("computer_use_"))).toBe(false);
     expect(h.failures).toEqual([]);
   });
 

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { ComputerUseLock } from "../../actor/computer-use-lock.js";
-import { createLogger, type Logger } from "../../observability/logger.js";
+import { type Logger, nullLogger } from "../../observability/logger.js";
 import { createActorRuntime } from "./actor-runtime.js";
 import { createProvider } from "./configured-provider.js";
 import type { FollowerActorCommand, FollowerEvent } from "./follower-hub.js";
@@ -20,15 +20,12 @@ export class FollowerInstance {
     private readonly sandbox: boolean,
     private readonly emit: (event: FollowerEvent) => void,
     private readonly providerFactory: ProviderFactory = createProvider,
-    logger?: Logger
+    logger: Logger = nullLogger
   ) {
     mkdirSync(home, { recursive: true });
-    const log = (logger ?? createLogger({ context: { component: "follower-instance" } })).child({
-      component: "follower-instance",
-    });
     this.computerUseLock = new ComputerUseLock(
       undefined,
-      log.child({ component: "computer-use-lock" })
+      logger.child({ component: "computer-use-lock" })
     );
   }
 
