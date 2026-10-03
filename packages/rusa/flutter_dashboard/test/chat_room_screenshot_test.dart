@@ -82,7 +82,19 @@ void main() {
       // speaking ring rather than a mid-transition blend.
       await tester.pump(const Duration(milliseconds: 250));
 
-      expect(find.text('Speaking'), findsOneWidget);
+      // Reply A is speaking: its tile carries the speaking border (#803),
+      // with no text line added under the name (#825).
+      final rootTile = tester.widget<AnimatedContainer>(
+        find.descendant(
+          of: find.byKey(const ValueKey('chat-room-avatar-root')),
+          matching: find.byType(AnimatedContainer),
+        ),
+      );
+      expect(
+        ((rootTile.decoration! as BoxDecoration).border! as Border).top.color,
+        MeshColors.accent,
+      );
+      expect(find.text('Speaking'), findsNothing);
       // Reply B waits in the shared queue; the room no longer has a header to
       // count it in (#803).
       expect(find.text('CHAT ROOM'), findsNothing);

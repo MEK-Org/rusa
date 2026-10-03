@@ -94,6 +94,30 @@ void main() {
         findsNothing,
         reason: id,
       );
+      // The name is the tile's last line: no empty slot is held under it, so
+      // the avatar grows into that height (#825 operator feedback).
+      expect(
+        find.descendant(of: tile, matching: find.byType(Text)),
+        findsOneWidget,
+        reason: id,
+      );
+      final container = tester.widget<AnimatedContainer>(
+        find.descendant(of: tile, matching: find.byType(AnimatedContainer)),
+      );
+      final border =
+          ((container.decoration! as BoxDecoration).border! as Border).bottom;
+      expect(
+        tester
+            .getRect(
+              find.descendant(of: tile, matching: find.text('$id-handle')),
+            )
+            .bottom,
+        moreOrLessEquals(
+          tester.getRect(tile).bottom - 12 - border.width,
+          epsilon: 0.01,
+        ),
+        reason: id,
+      );
     }
   });
 
@@ -303,10 +327,10 @@ void main() {
         );
         await tester.pump();
         await tester.pump();
-        expect(find.text('Speaking'), findsOneWidget);
+        // Speaking is shown by the border alone; no line is added under the
+        // name, so the avatar does not shrink or move while the actor speaks.
+        expect(find.text('Speaking'), findsNothing);
         expect(borderOf(tester, 'actor-b'), MeshColors.accent);
-        // The speaking line takes a slot reserved under the name, so the
-        // avatar does not shrink or move while the actor speaks.
         expect(avatarRect(tester, 'actor-b'), quietAvatar);
         expect(borderOf(tester, 'root'), MeshColors.border);
 
