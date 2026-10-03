@@ -527,7 +527,7 @@ describe("AntigravityProvider", () => {
     expect(result.abortReason).toBe("unknown");
   });
 
-  it("preserves stall-watchdog attribution even after a SUCCESS result event", async () => {
+  it("preserves stall-watchdog attribution and response even without trailing newline", async () => {
     const config: ProviderConfig = { cliCommand: "agy" };
     const provider = new AntigravityProvider("antigravity", config, "Gemini 3.1 Pro (High)");
 
@@ -541,15 +541,16 @@ describe("AntigravityProvider", () => {
       signal: controller.signal,
     });
 
+    // Valid result event WITHOUT trailing newline
     child.stdout.emit(
       "data",
-      `${JSON.stringify({
+      JSON.stringify({
         event: "result",
         result: {
           status: "SUCCESS",
           response: "Awaiting completion.",
         },
-      })}\n`
+      })
     );
 
     controller.abort(STALL_WATCHDOG_ABORT_REASON);
@@ -559,6 +560,45 @@ describe("AntigravityProvider", () => {
     expect(result.success).toBe(false);
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(143);
+    expect(result.output).toContain("Awaiting completion.");
+    expect(result.output).toContain("[Task killed by stall watchdog (no output for 15 minutes)]");
+    expect(result.abortReason).toBe("stall-watchdog");
+  });
+
+  it("preserves unterminated buffer error diagnostics and stall-watchdog attribution", async () => {
+    const config: ProviderConfig = { cliCommand: "agy" };
+    const provider = new AntigravityProvider("antigravity", config, "Gemini 3.1 Pro (High)");
+
+    const child = mockChildProcess() as unknown as ChildProcessWithoutNullStreams;
+    vi.mocked(spawn).mockReturnValue(child);
+
+    const controller = new AbortController();
+    const runPromise = provider.run({
+      prompt: "test prompt",
+      cwd: "/tmp",
+      signal: controller.signal,
+    });
+
+    // Valid final error event WITHOUT trailing newline
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        event: "result",
+        result: {
+          status: "ERROR",
+          error: "fatal unhandled crash",
+        },
+      })
+    );
+
+    controller.abort(STALL_WATCHDOG_ABORT_REASON);
+    child.emit("close", null, "SIGTERM");
+
+    const result = await runPromise;
+    expect(result.success).toBe(false);
+    expect(result.cancelled).toBe(true);
+    expect(result.exitCode).toBe(143);
+    expect(result.output).toContain("[Error]: fatal unhandled crash");
     expect(result.output).toContain("[Task killed by stall watchdog (no output for 15 minutes)]");
     expect(result.abortReason).toBe("stall-watchdog");
   });

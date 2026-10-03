@@ -119,12 +119,14 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
     // detached group alive) so we can kill the whole group on expiry.
     timer = setTimeout(() => {
       killGroup();
+      config.onStdoutEnd?.(chunks);
       const sigtermResult = formatSigtermResult(chunks.join(""), config.signal);
       settle(config.buildKilledResult(sigtermResult));
     }, config.timeoutMs);
 
     const onAbort = () => {
       killGroup();
+      config.onStdoutEnd?.(chunks);
       const sigtermResult = formatSigtermResult(chunks.join(""), config.signal);
       settle(config.buildKilledResult(sigtermResult));
     };
@@ -172,6 +174,7 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
     child.on("close", (code, signal) => {
       // Check if the process was terminated by a kill signal from our paths.
       if (signal === "SIGTERM" || signal === "SIGKILL") {
+        config.onStdoutEnd?.(chunks);
         const sigtermResult = formatSigtermResult(chunks.join(""), config.signal);
         settle(config.buildSignalResult(sigtermResult, signal));
         return;

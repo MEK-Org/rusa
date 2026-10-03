@@ -13,6 +13,12 @@ export const STALL_WATCHDOG_ABORT_REASON = "stall-watchdog";
 export const RUN_CEILING_ABORT_REASON = "run-ceiling";
 export const INTERRUPT_ABORT_REASON_PREFIX = "interrupt:";
 
+export type AbortReason =
+  | typeof STALL_WATCHDOG_ABORT_REASON
+  | typeof RUN_CEILING_ABORT_REASON
+  | `${typeof INTERRUPT_ABORT_REASON_PREFIX}${string}`
+  | "unknown";
+
 export function createInterruptAbortReason(by: string): string {
   return `${INTERRUPT_ABORT_REASON_PREFIX}${by}`;
 }
@@ -32,7 +38,7 @@ export interface TerminationAttribution {
   cancelled: boolean;
   interrupted?: boolean;
   interruptSource?: string;
-  abortReason?: string;
+  abortReason?: AbortReason | string;
 }
 
 /**
@@ -53,7 +59,7 @@ export function formatSigtermResult(
       cancelled: true,
       interrupted: true,
       interruptSource: by,
-      abortReason: typeof reason === "string" ? reason : createInterruptAbortReason(by),
+      abortReason: reason as string,
     };
   }
 

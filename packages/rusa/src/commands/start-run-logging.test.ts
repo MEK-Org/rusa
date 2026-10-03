@@ -73,7 +73,7 @@ describe("logRunEnd", () => {
     });
   });
 
-  it("records stall-watchdog abortReason on run_end", () => {
+  it.each(["stall-watchdog", "run-ceiling"])("records %s abortReason on run_end", (abortReason) => {
     const { logger, records } = recordingLogger();
 
     logRunEnd(
@@ -82,7 +82,7 @@ describe("logRunEnd", () => {
         success: false,
         exitCode: 143,
         cancelled: true,
-        abortReason: "stall-watchdog",
+        abortReason,
       })
     );
 
@@ -92,30 +92,7 @@ describe("logRunEnd", () => {
       success: false,
       exitCode: 143,
       cancelled: true,
-      abortReason: "stall-watchdog",
-    });
-  });
-
-  it("records run-ceiling abortReason on run_end", () => {
-    const { logger, records } = recordingLogger();
-
-    logRunEnd(
-      logger,
-      runResult({
-        success: false,
-        exitCode: 143,
-        cancelled: true,
-        abortReason: "run-ceiling",
-      })
-    );
-
-    expect(records()[0]).toMatchObject({
-      level: "error",
-      msg: "run_end",
-      success: false,
-      exitCode: 143,
-      cancelled: true,
-      abortReason: "run-ceiling",
+      abortReason,
     });
   });
 
