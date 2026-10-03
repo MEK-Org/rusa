@@ -92,7 +92,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byType(SelectableText), findsNothing);
     expect(
-      find.text('Prompt no longer retained or unavailable.'),
+      find.text('Prompt unavailable'),
       findsOneWidget,
     );
   });
@@ -119,7 +119,7 @@ void main() {
     await tester.tap(find.text('Run prompt'));
     await tester.pumpAndSettle();
     expect(
-      find.text('Prompt no longer retained or unavailable.'),
+      find.text('Prompt unavailable'),
       findsOneWidget,
     );
     status = 500;
@@ -141,7 +141,7 @@ void main() {
     await tester.tap(find.text('Could not load prompt. Retry'));
     await tester.pumpAndSettle();
     expect(
-      find.text('Prompt no longer retained or unavailable.'),
+      find.text('Prompt unavailable'),
       findsOneWidget,
     );
   });

@@ -65,7 +65,7 @@ class _RunPromptDisclosureState extends State<RunPromptDisclosure> {
             }
             final data = snapshot.data?.data;
             if (data == null) {
-              return const Text('Prompt no longer retained or unavailable.');
+              return const Text('Prompt unavailable');
             }
             final prompt = data['prompt'] as String;
             return Container(
