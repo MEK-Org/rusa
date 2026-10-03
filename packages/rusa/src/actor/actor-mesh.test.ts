@@ -1731,8 +1731,8 @@ describe("ActorMesh", () => {
     const { mesh, registry } = setup();
     const coder = mesh.spawn({ charter: "coder", parentId: "root" });
     const reviewer = mesh.spawn({ charter: "reviewer", parentId: "root" });
-    mesh.grantHandle(coder, { id: reviewer, role: "code reviewer" });
-    expect(registry.get(coder)?.handles).toEqual([{ id: reviewer, role: "code reviewer" }]);
+    mesh.grantHandle(coder, { id: reviewer });
+    expect(registry.get(coder)?.handles).toEqual([{ id: reviewer }]);
 
     mesh.revokeHandle(coder, reviewer);
     expect(registry.get(coder)?.handles).toEqual([]);
@@ -4231,14 +4231,16 @@ describe("ActorMesh", () => {
     const { mesh, registry, fake, tick } = setup();
     // Root spawns a coder and a high-tier reviewer, owns both.
     const coder = mesh.spawn({ charter: "implement in repo X", parentId: "root" });
-    const reviewer = mesh.spawn({ charter: "review code", parentId: "root" });
+    const reviewer = mesh.spawn({
+      charter: "review code",
+      parentId: "root",
+      title: "code reviewer (high-tier)",
+    });
     // Root introduces the reviewer to the coder.
-    mesh.grantHandle(coder, { id: reviewer, role: "code reviewer (high-tier)" });
+    mesh.grantHandle(coder, { id: reviewer });
     await tick();
 
-    expect(registry.get(coder)?.handles).toEqual([
-      { id: reviewer, role: "code reviewer (high-tier)" },
-    ]);
+    expect(registry.get(coder)?.handles).toEqual([{ id: reviewer }]);
 
     // Coder asks the reviewer for a review (a direct peer message, not via root).
     mesh.sendMessage(reviewer, "review PR #5 please", coder);
@@ -4274,7 +4276,7 @@ describe("ActorMesh", () => {
     await tick();
     const prompt = fake(recipient).calls.at(-1)?.prompt ?? "";
     expect(prompt).toContain(`\`${sender}\``);
-    expect(prompt).toContain("title: Release reviewer");
+    expect(prompt).toContain(`\`${sender}\` — Release reviewer`);
     expect(prompt).toContain("Not for me — I think this was intended for");
   });
 
@@ -4376,6 +4378,70 @@ describe("ActorMesh", () => {
     expect(mesh.transferVoiceSession(explicitRoleRecipient, sender)).toEqual({
       sessionId: "walkie-session",
       targetActorId: sender,
+    });
+  });
+
+  describe("address-book descriptions come from the target actor (#814)", () => {
+    it("describes a titled target by its own title", () => {
+      const { mesh, registry } = setup();
+      const coder = mesh.spawn({ charter: "implement the patch", parentId: "root" });
+      const reviewer = mesh.spawn({
+        charter: "review code\nwith care",
+        parentId: "root",
+        title: "Release reviewer",
+      });
+      mesh.grantHandle(coder, { id: reviewer });
+
+      expect(
+        resolveHandleLabels(
+          registry.get(coder)?.handles,
+          (hid) => registry.get(hid)?.charter,
+          (hid) => registry.get(hid)?.title
+        )
+      ).toEqual([{ id: reviewer, label: "Release reviewer" }]);
+    });
+
+    it("falls back to the first charter line for an untitled target", () => {
+      const { mesh, registry } = setup();
+      const coder = mesh.spawn({ charter: "implement the patch", parentId: "root" });
+      const reviewer = mesh.spawn({ charter: "\n  review code  \nwith care", parentId: "root" });
+      mesh.grantHandle(coder, { id: reviewer });
+
+      expect(
+        resolveHandleLabels(
+          registry.get(coder)?.handles,
+          (hid) => registry.get(hid)?.charter,
+          (hid) => registry.get(hid)?.title
+        )
+      ).toEqual([{ id: reviewer, label: "review code" }]);
+    });
+
+    it("never lets a pairwise role label override the target's description", () => {
+      const { mesh, registry } = setup();
+      const titled = mesh.spawn({ charter: "review code", parentId: "root", title: "Reviewer" });
+      const untitled = mesh.spawn({ charter: "triage issues", parentId: "root" });
+      const roleOf = (id: string) => (id === titled ? "root's supervisor" : "trusted operator");
+
+      // A grant carrying a role stores none.
+      const coder = mesh.spawn({ charter: "implement the patch", parentId: "root" });
+      mesh.grantHandle(coder, { id: titled, role: roleOf(titled) });
+      expect(registry.get(coder)?.handles).toEqual([{ id: titled }]);
+
+      // A role already persisted on an older row is not rendered.
+      const legacy = [
+        { id: titled, role: roleOf(titled) },
+        { id: untitled, role: roleOf(untitled) },
+      ];
+      expect(
+        resolveHandleLabels(
+          legacy,
+          (hid) => registry.get(hid)?.charter,
+          (hid) => registry.get(hid)?.title
+        )
+      ).toEqual([
+        { id: titled, label: "Reviewer" },
+        { id: untitled, label: "triage issues" },
+      ]);
     });
   });
 

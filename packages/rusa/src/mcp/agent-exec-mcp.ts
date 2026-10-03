@@ -524,17 +524,13 @@ export function createAgentExecMcpServer(
     {
       title: "Introduce one thread to another",
       description:
-        "Give `holder_thread_id` a handle to `target_thread_id` so it can message it directly (e.g. let a coder reach a reviewer). Optionally label the target for the holder's purpose; omit `role` to let the holder see the target's own charter.",
+        "Give `holder_thread_id` a handle to `target_thread_id` so it can message it directly (e.g. let a coder reach a reviewer). The holder sees the target described by its own title, or its charter's first line when it has none.",
       inputSchema: {
         holder_thread_id: z.string().describe("The actor that should gain the new handle."),
         target_thread_id: z.string().describe("The actor the handle points at."),
-        role: z
-          .string()
-          .optional()
-          .describe("Optional purpose-specific label for the target, from the holder's view."),
       },
     },
-    async ({ holder_thread_id, target_thread_id, role }) => {
+    async ({ holder_thread_id, target_thread_id }) => {
       try {
         if (!mesh.actors.get(holder_thread_id)) {
           return toolError(new Error(`unknown thread id: ${holder_thread_id}`));
@@ -542,7 +538,7 @@ export function createAgentExecMcpServer(
         if (!mesh.actors.get(target_thread_id)) {
           return toolError(new Error(`unknown thread id: ${target_thread_id}`));
         }
-        mesh.grantHandle(holder_thread_id, { id: target_thread_id, role });
+        mesh.grantHandle(holder_thread_id, { id: target_thread_id });
         return toolOk("introduced");
       } catch (err) {
         return toolError(err);

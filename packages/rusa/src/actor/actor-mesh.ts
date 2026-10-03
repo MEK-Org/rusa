@@ -3088,9 +3088,10 @@ export class ActorMesh {
     const rec = this.actors.get(toId);
     if (!rec) return;
     if (handle.id === toId) return; // don't hand an actor its own handle
+    // A pairwise role label is not stored: the holder sees the target's own
+    // title or charter (#814).
     const entry: ActorHandle = {
       id: handle.id,
-      ...(handle.role ? { role: handle.role } : {}),
       ...(handle.origin ? { origin: handle.origin } : {}),
     };
     const handles = (rec.handles ?? []).filter((h) => h.id !== handle.id);
@@ -3099,7 +3100,6 @@ export class ActorMesh {
     this.recordEvent({
       kind: "handle_granted",
       actorId: toId,
-      detail: entry.role,
       payload: JSON.stringify({
         handleId: handle.id,
         ...(entry.origin ? { origin: entry.origin } : {}),
