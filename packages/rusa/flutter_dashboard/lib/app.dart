@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import 'dashboard_title.dart';
@@ -38,10 +39,81 @@ class RusaDashboardApp extends StatefulWidget {
   State<RusaDashboardApp> createState() => _RusaDashboardAppState();
 }
 
+class _DashboardRouteInformationParser
+    extends RouteInformationParser<RouteInformation> {
+  const _DashboardRouteInformationParser();
+
+  @override
+  Future<RouteInformation> parseRouteInformation(
+    RouteInformation routeInformation,
+  ) async {
+    return routeInformation;
+  }
+}
+
+/// Hosts the dashboard under a [Router] without letting the Router write the
+/// browser address. [currentConfiguration] stays null, the SDK's opt-out from
+/// route reporting, so `writeDashboardViewToUrl` is the only URL writer and the
+/// Router can never re-report a stale route over a view change it did not see.
+/// Platform pushes (browser back/forward, deep links) reach `DashboardBody`
+/// through the Router's [RouteInformationProvider], which it listens to directly.
+class _DashboardRouterDelegate extends RouterDelegate<RouteInformation>
+    with ChangeNotifier, PopNavigatorRouterDelegateMixin<RouteInformation> {
+  _DashboardRouterDelegate({required this.builder});
+
+  final WidgetBuilder builder;
+
+  @override
+  final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
+  @override
+  Future<void> setNewRoutePath(RouteInformation configuration) =>
+      SynchronousFuture<void>(null);
+
+  @override
+  Widget build(BuildContext context) {
+    return Navigator(
+      key: navigatorKey,
+      pages: [
+        MaterialPage<void>(
+          key: const ValueKey('dashboard-root'),
+          child: builder(context),
+        ),
+      ],
+      onDidRemovePage: (page) {},
+    );
+  }
+}
+
 class _RusaDashboardAppState extends State<RusaDashboardApp> {
   DashboardSession? _resolvedSession;
   String? _authenticatedTitle;
   late final Future<DashboardSession> _session = _bootstrapSession();
+  late final RouterConfig<RouteInformation> _routerConfig;
+
+  @override
+  void initState() {
+    super.initState();
+    _routerConfig = RouterConfig<RouteInformation>(
+      routeInformationProvider: PlatformRouteInformationProvider(
+        initialRouteInformation: RouteInformation(uri: _resolveInitialUri()),
+      ),
+      routeInformationParser: const _DashboardRouteInformationParser(),
+      routerDelegate: _DashboardRouterDelegate(
+        builder: (context) => _buildHost(),
+      ),
+      // WidgetsApp only adds a default dispatcher for routerDelegate, not
+      // routerConfig. Without one, popRoute (single-entry history, a native
+      // back button) never reaches the Navigator, so open dialogs stay open.
+      backButtonDispatcher: RootBackButtonDispatcher(),
+    );
+  }
+
+  static Uri _resolveInitialUri() {
+    final defaultRoute =
+        WidgetsBinding.instance.platformDispatcher.defaultRouteName;
+    return Uri.parse(defaultRoute.isEmpty ? '/' : defaultRoute);
+  }
 
   Future<DashboardSession> _bootstrapSession() async {
     final session = await widget.bootstrapSession();
@@ -88,29 +160,14 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
+    return MaterialApp.router(
       // Flutter's Title widget owns document.title on rebuild. Once the
       // authenticated manifest has supplied the instance title, feed it back
       // into MaterialApp so route and window rebuilds retain it.
       title: _authenticatedTitle ?? widget.title,
       debugShowCheckedModeBanner: false,
       theme: buildMeshTheme(),
-      // Keep one DashboardPage for every initial path. With path URL strategy,
-      // Navigator's default initial-route expansion asks for each path prefix;
-      // providing onGenerateInitialRoutes generates exactly one page matching
-      // the requested deep link without falling back to "/" or replacing the
-      // browser URL during asynchronous session bootstrap or sign-in.
-      // onGenerateRoute returns null to satisfy WidgetsApp assertion while
-      // ensuring no duplicate session host or stores are built on named pushes.
-      onGenerateInitialRoutes: (initialRoute) => [
-        MaterialPageRoute<void>(
-          settings: RouteSettings(
-            name: initialRoute.isEmpty ? '/' : initialRoute,
-          ),
-          builder: (context) => _buildHost(),
-        ),
-      ],
-      onGenerateRoute: (settings) => null,
+      routerConfig: _routerConfig,
     );
   }
 }

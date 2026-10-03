@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 
 import '../breakpoints.dart';
 import '../dashboard_url.dart';
+import '../dashboard_url_core.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -94,6 +95,7 @@ class _DashboardBodyState extends State<DashboardBody> {
           focusedObligationId: id,
           focusedActorId: widget.store.primary.valueOrNull,
           onNavigation: widget.onNavigation,
+          replace: true,
         );
       }
     });
@@ -105,6 +107,7 @@ class _DashboardBodyState extends State<DashboardBody> {
           focusedObligationId: widget.store.focusedObligationId.valueOrNull,
           focusedActorId: id,
           onNavigation: widget.onNavigation,
+          replace: true,
         );
       }
     });
@@ -124,8 +127,43 @@ class _DashboardBodyState extends State<DashboardBody> {
     );
   }
 
+  /// Browser back/forward and other platform pushes, from the enclosing
+  /// [Router]. Null when the body is mounted without one (the screenshot
+  /// harness and widget tests), where there is no browser history to follow.
+  /// Its `value` is the last platform push, not the current address (in-app
+  /// writes never update it), so it is read only inside the listener.
+  RouteInformationProvider? _routeProvider;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final provider = Router.maybeOf(context)?.routeInformationProvider;
+    if (provider != _routeProvider) {
+      _routeProvider?.removeListener(_onRouteChanged);
+      _routeProvider = provider;
+      _routeProvider?.addListener(_onRouteChanged);
+    }
+  }
+
+  void _onRouteChanged() {
+    final routeInfo = _routeProvider?.value;
+    if (routeInfo != null) {
+      // Multi-entry browser back arrives here as a route push, not popRoute,
+      // so the Navigator never sees it. Close any dialogs and the drawer, then
+      // show the address the browser moved to, so view and URL stay in step
+      // without rewriting the entry the browser just reached.
+      final page = ModalRoute.of(context);
+      if (page != null && !page.isCurrent) {
+        Navigator.of(context).popUntil((route) => route == page);
+      }
+      _scaffoldKey.currentState?.closeDrawer();
+      _applyRouteInformation(routeInfo);
+    }
+  }
+
   @override
   void dispose() {
+    _routeProvider?.removeListener(_onRouteChanged);
     _focusSub?.cancel();
     _actorSub?.cancel();
     super.dispose();
@@ -139,7 +177,37 @@ class _DashboardBodyState extends State<DashboardBody> {
       focusedObligationId: widget.store.focusedObligationId.valueOrNull,
       focusedActorId: widget.store.primary.valueOrNull,
       onNavigation: widget.onNavigation,
+      replace: false,
     );
+  }
+
+  void _applyRouteInformation(RouteInformation routeInformation) {
+    final uri = routeInformation.uri;
+    // A bare `/` is never in this session's history: the replayed focus write
+    // replaces it with the settled landing view's path before any push.
+    final targetView = parseDashboardView(uri) ?? DashboardView.overview;
+    final obligationId = parseFocusedObligationId(uri);
+    final actorId = parseFocusedActorId(uri);
+
+    if (obligationId != widget.store.focusedObligationId.valueOrNull) {
+      if (obligationId != null || targetView == DashboardView.work) {
+        widget.store.setFocusedObligationId(obligationId);
+      }
+    }
+    if (actorId != widget.store.primary.valueOrNull) {
+      if (actorId != null) {
+        widget.store.clickActor(actorId);
+      } else if (targetView == DashboardView.actors) {
+        widget.store.clearSelection();
+      }
+    }
+
+    if (_view != targetView) {
+      setState(() => _view = targetView);
+      if (widget.onNavigation != null) {
+        unawaited(widget.onNavigation!());
+      }
+    }
   }
 
   @override

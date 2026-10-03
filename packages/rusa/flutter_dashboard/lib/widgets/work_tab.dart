@@ -102,7 +102,12 @@ class _WorkTabState extends State<WorkTab> {
 
   void _checkFocusLink() {
     final focusedId = widget.store.focusedObligationId.valueOrNull;
-    if (focusedId == null) return;
+    if (focusedId == null) {
+      if (_selectedObligationId != null) {
+        setState(() => _selectedObligationId = null);
+      }
+      return;
+    }
     if (!_expandAncestors(focusedId) && !_fetchedTerminalRoots) {
       // The focused obligation may live under a quiet terminal root the
       // default load excluded (#241); widen once before giving up.
@@ -263,6 +268,8 @@ class _WorkTabState extends State<WorkTab> {
     _focusSub = widget.store.focusedObligationId.listen((focusedId) {
       if (focusedId != null && !_loading) {
         _expandAncestors(focusedId);
+      } else if (focusedId == null && mounted) {
+        setState(() => _selectedObligationId = null);
       }
     });
     _checkpointSub = widget.store.obligationRefreshes.listen((_) {
