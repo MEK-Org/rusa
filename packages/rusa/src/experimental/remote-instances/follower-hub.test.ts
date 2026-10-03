@@ -9,7 +9,7 @@ import type { Logger } from "../../observability/logger.js";
 import { FollowerEventQueue } from "./follower-event-queue.js";
 import { type FollowerEvent, FollowerHub } from "./follower-hub.js";
 import { FollowerUpdateTriggerStore } from "./follower-update-trigger-store.js";
-import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
+import { FOLLOWER_HTTP_BODY_LIMIT_BYTES, INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
 const hubs: FollowerHub[] = [];
 afterEach(async () => {
@@ -69,7 +69,10 @@ describe("leader follower gateway", () => {
     const h = await setup();
     const identity = await h.register("mac");
     const host = h.hub.createHost("mac", "actor-1");
-    const prompt = `${"\u0001".repeat(60_000)}synthetic tail ✓`;
+    // Two individually fitting events are the smallest batch that can cross the bound.
+    // Each control character takes six bytes in JSON; envelope overhead crosses it.
+    const promptCount = 2;
+    const prompt = `${"\u0001".repeat(Math.floor(FOLLOWER_HTTP_BODY_LIMIT_BYTES / 12))}synthetic tail ✓`;
     const received: string[] = [];
     let terminal = false;
     host.on("message", (message) => {
@@ -79,12 +82,24 @@ describe("leader follower gateway", () => {
       terminal = true;
     });
     const queue = new FollowerEventQueue();
-    for (let index = 0; index < 100; index++) {
-      queue.enqueue({
+    const events: FollowerEvent[] = [];
+    for (let index = 0; index < promptCount; index++) {
+      const event: FollowerEvent = {
         eventId: `prompt-${index}`,
         actorId: "actor-1",
         message: { type: "runPrompt", runId: `run-${index}`, provider: "claude", prompt },
-      });
+      };
+      events.push(event);
+      queue.enqueue(event);
+    }
+    const envelope = { ...identity, batchId: "00000000-0000-0000-0000-000000000000" };
+    const aggregateBytes = Buffer.byteLength(JSON.stringify({ ...envelope, events }));
+    expect(aggregateBytes).toBeGreaterThan(FOLLOWER_HTTP_BODY_LIMIT_BYTES);
+    expect(aggregateBytes - FOLLOWER_HTTP_BODY_LIMIT_BYTES).toBeLessThan(4096);
+    for (const event of events) {
+      expect(Buffer.byteLength(JSON.stringify({ ...envelope, events: [event] }))).toBeLessThan(
+        FOLLOWER_HTTP_BODY_LIMIT_BYTES
+      );
     }
     queue.enqueue({
       eventId: "terminal",
@@ -109,10 +124,10 @@ describe("leader follower gateway", () => {
     expect(queue.hasPending).toBe(true);
     await queue.flush(deliver, identity);
     expect(batchIds[0]).toBe(batchIds[1]);
-    console.info("synthetic follower HTTP request bytes", JSON.stringify(requestBytes));
-    expect(requestBytes.length).toBeGreaterThan(1);
-    expect(Math.max(...requestBytes)).toBeLessThanOrEqual(8 * 1024 * 1024);
-    expect(received).toEqual(Array(100).fill(prompt));
+    expect(requestBytes).toHaveLength(3);
+    expect(requestBytes[0]).toBe(requestBytes[1]);
+    expect(Math.max(...requestBytes)).toBeLessThanOrEqual(FOLLOWER_HTTP_BODY_LIMIT_BYTES);
+    expect(received).toEqual(Array(promptCount).fill(prompt));
     expect(terminal).toBe(true);
     expect(queue.hasPending).toBe(false);
   });
