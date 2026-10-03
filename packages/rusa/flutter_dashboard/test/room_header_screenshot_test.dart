@@ -58,6 +58,9 @@ void main() {
           ),
         );
         await settleImages(tester, portraitUrls(_ids));
+        // Let ActorAvatar's 200 ms decoded-frame fade finish so the capture
+        // shows settled portraits rather than the silhouette mid-transition.
+        await tester.pump(const Duration(milliseconds: 250));
         expect(find.byType(ChatRoomTab), findsOneWidget);
         for (final id in _ids) {
           expect(find.byKey(ValueKey('chat-room-avatar-$id')), findsOneWidget);
