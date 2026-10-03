@@ -673,6 +673,7 @@ export class CodexProvider implements CodingProvider {
         assistantTexts.length > 0 ? assistantTexts.join("\n") : rawOutput;
 
       return runSubprocess({
+        onSpawn: () => opts.onPromptLaunched?.(codexArgs[codexArgs.length - 1]),
         command: spawnCommand,
         args: spawnArgs,
         cwd: spawnCwd,

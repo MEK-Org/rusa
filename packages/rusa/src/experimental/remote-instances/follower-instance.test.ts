@@ -173,6 +173,36 @@ function abandonedRuns(h: Harness, id: string) {
 }
 
 describe("monolithic follower instance", () => {
+  it("#866 forwards actual follower launch text to leader lifecycle and rejects stale run receipts", async () => {
+    const h = setup({
+      providerFactory: (_bridge, _options, selected) => ({
+        name: "fixture",
+        providerName: selected?.provider ?? "instance-fixture",
+        async run(opts) {
+          opts.onPromptLaunched?.(`${opts.prompt}\nfixture adapter suffix`);
+          return { success: true, exitCode: 0, output: "fixture result" };
+        },
+      }),
+    });
+    const id = h.spawn("Fixture charter");
+    await waitUntil(() => h.promptEvents.length === 1);
+    const event = h.promptEvents[0];
+    expect(event).toMatchObject({
+      actorId: id,
+      runId: runStarts(h, id)[0],
+      provider: "instance-fixture",
+    });
+    expect(event?.prompt).toContain("fixture adapter suffix");
+    expect(event?.prompt).toContain("Fixture charter");
+    expect(JSON.stringify(h.meshEvents)).not.toContain("fixture adapter suffix");
+    h.remote.receive({
+      actorId: id,
+      message: { type: "runPrompt", runId: "stale-run", prompt: "stale", provider: "fixture" },
+    });
+    await delay(0);
+    expect(h.promptEvents).toHaveLength(1);
+  });
+
   it("serializes three computer-capable actors without holding unrelated actors", async () => {
     // Provider admission happens before the per-instance lock. Give all four
     // runs capacity here so the unrelated control proves the lock — rather

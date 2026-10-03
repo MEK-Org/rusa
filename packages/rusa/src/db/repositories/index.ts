@@ -25,6 +25,7 @@ import { PrincipalRepository } from "./principal-repository.js";
 import { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 import { RawInputRepository } from "./raw-input-repository.js";
 import { ReferenceCacheRepository } from "./reference-cache-repository.js";
+import { RunPromptRepository } from "./run-prompt-repository.js";
 import { SqliteActorRepository } from "./sqlite-actor-repository.js";
 import {
   type InboxListenerErrorHandler,
@@ -40,6 +41,7 @@ import {
  *  - maintenance — the distillation work queue
  */
 export class Repositories {
+  readonly runPrompts: RunPromptRepository;
   readonly actorRuns: ActorRunRepository;
   readonly actors: ActorRepository;
   readonly capabilityGrants: CapabilityGrantStore;
@@ -70,6 +72,7 @@ export class Repositories {
   readonly referenceCache: ReferenceCacheRepository;
 
   constructor(db: Database.Database) {
+    this.runPrompts = new RunPromptRepository(db);
     this.actorRuns = new ActorRunRepository(db);
     // Constructed before the actor repository, which writes an actor's principal
     // in the same transaction as the actor row.

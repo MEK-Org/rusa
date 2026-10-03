@@ -152,6 +152,18 @@ class DashboardApi {
     );
   }
 
+  /// Launch text is private and loaded only when a user opens its disclosure.
+  Future<Map<String, dynamic>?> fetchRunPrompt(String runId) async {
+    try {
+      return await _getJson(
+        _u('/api/mesh/runs/${Uri.encodeComponent(runId)}/prompt'),
+      );
+    } on DashboardApiException catch (error) {
+      if (error.status == 404) return null;
+      rethrow;
+    }
+  }
+
   /// `GET /api/mesh/events` — merged, newest-first, rowid-cursor paginated.
   Future<EventPage> fetchEvents({
     List<String>? actors,

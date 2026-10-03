@@ -7,10 +7,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { createActorRunModelConfig } from "../db/repositories/actor-run-model-config.js";
+import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
@@ -199,6 +202,7 @@ describe("human chat isolation (#590)", () => {
     };
     const deps: DashboardDataDeps = {
       actors,
+      runPrompts: new RunPromptRepository(db),
       principals,
       meshEvents,
       meshChat,
@@ -300,6 +304,53 @@ describe("human chat isolation (#590)", () => {
       moreInboxItemsCount?: number;
     }>;
   };
+
+  it("#866 scopes retained prompt text to its participants with two authenticated viewers", async () => {
+    const a = await login(alice);
+    const b = await login(bob);
+    record(a.id, ACTOR, "private fixture input");
+    const runs = new ActorRunRepository(db);
+    const prompts = new RunPromptRepository(db);
+    const runId = runs.start({
+      actorId: ACTOR,
+      modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
+    });
+    prompts.record(runId, "private fixture prompt", "claude", [a.id]);
+    const unknownRunId = runs.start({
+      actorId: ACTOR,
+      modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
+    });
+    prompts.recordForActor(ACTOR, unknownRunId, "unknown provenance fixture", "claude");
+    expect(
+      (
+        await fetch(`${origin}/api/mesh/runs/${unknownRunId}/prompt`, {
+          headers: { Cookie: a.cookie },
+        })
+      ).status
+    ).toBe(404);
+    const path = `/api/mesh/runs/${runId}/prompt`;
+    const own = await fetch(origin + path, { headers: { Cookie: a.cookie } });
+    expect(own.status).toBe(200);
+    expect(await own.json()).toMatchObject({
+      prompt: "private fixture prompt",
+      provider: "claude",
+    });
+    const other = await fetch(origin + path, { headers: { Cookie: b.cookie } });
+    expect(other.status).toBe(404);
+    expect(await other.text()).not.toContain("private fixture");
+    // New unrelated message traffic cannot broaden or narrow a completed run's snapshot.
+    record(b.id, ACTOR, "later private input");
+    expect((await fetch(origin + path, { headers: { Cookie: a.cookie } })).status).toBe(200);
+    const missing = await fetch(origin + "/api/mesh/runs/pre-feature/prompt", {
+      headers: { Cookie: a.cookie },
+    });
+    expect(missing.status).toBe(404);
+    const feed = await fetch(`${origin}/api/mesh/events?actors=${ACTOR}`, {
+      headers: { Cookie: a.cookie },
+    });
+    const events: EventPage = (await feed.json()) as EventPage;
+    expect(JSON.stringify(events)).not.toContain("private fixture prompt");
+  });
 
   /** Two humans each talk to the actor and the actor answers each of them. */
   async function seedBothConversations(a: { cookie: string; id: string }, b: typeof a) {

@@ -212,6 +212,7 @@ export type ActorEvent =
       selected: RawProviderModelConfig;
       runId?: string;
     }
+  | { type: "runPrompt"; runId: string; prompt: string; provider: string }
   | { type: "firstChunk" }
   | { type: "abandoned"; abandon: RunAbandon }
   | { type: "coalesced"; count: number; ageMs: number }
