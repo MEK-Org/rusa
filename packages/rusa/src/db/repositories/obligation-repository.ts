@@ -97,6 +97,7 @@ interface TrackedObligationRow {
   terminal_note: string | null;
   resolution_ref: string | null;
   snoozed_until: string | null;
+  checkpoint: string | null;
 }
 
 /** One captured UPDATE, as the TEMP history-capture trigger records it. */
@@ -110,6 +111,7 @@ interface ObligationDeltaRow {
   before_terminal_note: string | null;
   before_resolution_ref: string | null;
   before_snoozed_until: string | null;
+  before_checkpoint: string | null;
   after_owner_id: string;
   after_parent_id: string | null;
   after_priority: number | null;
@@ -118,6 +120,7 @@ interface ObligationDeltaRow {
   after_terminal_note: string | null;
   after_resolution_ref: string | null;
   after_snoozed_until: string | null;
+  after_checkpoint: string | null;
 }
 
 export interface CreateObligationInput {
@@ -567,7 +570,7 @@ export class ObligationRepository {
    *
    * An `AFTER UPDATE` trigger is told precisely which rows changed, by the one
    * component that knows. Cost becomes proportional to rows written rather than
-   * rows held, a checkpoint or artifact write captures nothing at all, and no
+   * rows held, an artifact write captures nothing at all, and no
    * mutator can add a tracked-column write that escapes the audit stream by
    * forgetting to announce itself. The `WHEN` clause uses `IS NOT` so a NULL
    * priority compares as a value rather than dropping the row.
@@ -589,6 +592,7 @@ export class ObligationRepository {
         before_terminal_note TEXT,
         before_resolution_ref TEXT,
         before_snoozed_until TEXT,
+        before_checkpoint TEXT,
         after_owner_id      TEXT NOT NULL,
         after_parent_id     TEXT,
         after_priority      REAL,
@@ -596,7 +600,8 @@ export class ObligationRepository {
         after_external_ref  TEXT,
         after_terminal_note TEXT,
         after_resolution_ref TEXT,
-        after_snoozed_until TEXT
+        after_snoozed_until TEXT,
+        after_checkpoint TEXT
       );
 
       CREATE TEMP TRIGGER IF NOT EXISTS obligation_history_capture
@@ -609,19 +614,20 @@ export class ObligationRepository {
         OR old.terminal_note IS NOT new.terminal_note
         OR old.resolution_ref IS NOT new.resolution_ref
         OR old.snoozed_until IS NOT new.snoozed_until
+        OR old.checkpoint IS NOT new.checkpoint
       BEGIN
         INSERT INTO obligation_history_delta (
           obligation_id,
           before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
-          before_terminal_note, before_resolution_ref, before_snoozed_until,
+          before_terminal_note, before_resolution_ref, before_snoozed_until, before_checkpoint,
           after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
-          after_terminal_note, after_resolution_ref, after_snoozed_until
+          after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint
         ) VALUES (
           new.id,
           old.owner_id, old.parent_id, old.priority, old.status, old.external_ref,
-          old.terminal_note, old.resolution_ref, old.snoozed_until,
+          old.terminal_note, old.resolution_ref, old.snoozed_until, old.checkpoint,
           new.owner_id, new.parent_id, new.priority, new.status, new.external_ref,
-          new.terminal_note, new.resolution_ref, new.snoozed_until
+          new.terminal_note, new.resolution_ref, new.snoozed_until, new.checkpoint
         );
       END;
     `);
@@ -1374,9 +1380,9 @@ export class ObligationRepository {
       .prepare(
         `SELECT obligation_id,
                 before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
-                before_terminal_note, before_resolution_ref, before_snoozed_until,
+                before_terminal_note, before_resolution_ref, before_snoozed_until, before_checkpoint,
                 after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
-                after_terminal_note, after_resolution_ref, after_snoozed_until
+                after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint
          FROM obligation_history_delta
          ORDER BY seq`
       )
@@ -1396,6 +1402,7 @@ export class ObligationRepository {
         terminal_note: delta.after_terminal_note,
         resolution_ref: delta.after_resolution_ref,
         snoozed_until: delta.after_snoozed_until,
+        checkpoint: delta.after_checkpoint,
       };
       const existing = net.get(delta.obligation_id);
       if (existing) {
@@ -1413,6 +1420,7 @@ export class ObligationRepository {
           terminal_note: delta.before_terminal_note,
           resolution_ref: delta.before_resolution_ref,
           snoozed_until: delta.before_snoozed_until,
+          checkpoint: delta.before_checkpoint,
         },
         after,
       });
@@ -1432,6 +1440,7 @@ export class ObligationRepository {
       const terminalNoteChanged = b.terminal_note !== a.terminal_note;
       const resolutionRefChanged = b.resolution_ref !== a.resolution_ref;
       const snoozeChanged = b.snoozed_until !== a.snoozed_until;
+      const checkpointChanged = b.checkpoint !== a.checkpoint;
 
       if (
         !ownerChanged &&
@@ -1441,7 +1450,8 @@ export class ObligationRepository {
         !externalRefChanged &&
         !terminalNoteChanged &&
         !resolutionRefChanged &&
-        !snoozeChanged
+        !snoozeChanged &&
+        !checkpointChanged
       ) {
         continue;
       }
@@ -1483,6 +1493,11 @@ export class ObligationRepository {
         afterState.snoozedUntil = a.snoozed_until;
       }
 
+      if (checkpointChanged) {
+        beforeState.checkpoint = b.checkpoint;
+        afterState.checkpoint = a.checkpoint;
+      }
+
       // Map the primary modified field to its semantic mutation kind.
       const kind: ObligationMutationKind = ownerChanged
         ? "reassign"
@@ -1494,7 +1509,9 @@ export class ObligationRepository {
               ? "status"
               : snoozeChanged && !externalRefChanged
                 ? "snooze"
-                : "external_ref";
+                : checkpointChanged && !externalRefChanged
+                  ? "checkpoint"
+                  : "external_ref";
 
       insert.run(
         id,
@@ -2636,6 +2653,93 @@ export class ObligationRepository {
     // Fail-closed for the whole call, like every other reader here: one row
     // that cannot be read makes the trail throw rather than silently shorten.
     return rows.map(parseHistoryRow);
+  }
+
+  /**
+   * A paged, newest-first detail trail. Child creation and artifacts already
+   * carry author/time in their source tables: project them without duplicate
+   * audit writes. A timestamp plus source-qualified key keeps pages stable
+   * when newer events arrive (including several mutations in one millisecond).
+   */
+  listHistoryPage(
+    id: string,
+    options: { before?: string; limit?: number } = {}
+  ): {
+    entries: Array<
+      Omit<ObligationHistoryEntry, "id" | "mutationKind" | "actingPrincipal"> & {
+        id: string;
+        actingPrincipal: string | null;
+        mutationKind: ObligationMutationKind | "artifact" | "child_added" | "created";
+        after: ObligationHistoryState & {
+          artifact?: { ref: string; label: string | null };
+          child?: { id: string; title: string | null; ownerId: string };
+        };
+      }
+    >;
+    nextBefore: string | null;
+  } {
+    const limit = Math.max(1, Math.min(options.limit ?? 10, 100));
+    const cursor = options.before ?? "";
+    const split = cursor.lastIndexOf("|");
+    const beforeTime = split < 0 ? "9999" : cursor.slice(0, split);
+    const beforeKey = split < 0 ? "" : cursor.slice(split + 1);
+    const rows = this.db
+      .prepare(`
+      SELECT * FROM (
+        SELECT 'history:' || printf('%016d', id) AS event_key, timestamp,
+          'history' AS source, id AS source_id, NULL AS principal, NULL AS title,
+          NULL AS owner_id, NULL AS ref, NULL AS label
+        FROM obligation_history WHERE obligation_id = @id
+        UNION ALL
+        SELECT 'artifact:' || id, attached_at, 'artifact', id, attached_by,
+          NULL, NULL, ref, label FROM obligation_artifacts WHERE obligation_id = @id
+        UNION ALL
+        SELECT 'child:' || id, created_at, 'child_added', id, creator_id,
+          title, owner_id, NULL, NULL FROM obligations WHERE parent_id = @id AND created_at IS NOT NULL
+        UNION ALL
+        SELECT 'created:' || id, created_at, 'created', id, creator_id,
+          title, owner_id, NULL, NULL FROM obligations WHERE id = @id AND created_at IS NOT NULL
+      ) WHERE timestamp < @beforeTime OR (timestamp = @beforeTime AND event_key < @beforeKey)
+      ORDER BY timestamp DESC, event_key DESC LIMIT @limit
+    `)
+      .all({ id, beforeTime, beforeKey, limit: limit + 1 }) as Array<{
+      event_key: string;
+      timestamp: string;
+      source: "history" | "artifact" | "child_added" | "created";
+      source_id: string | number;
+      principal: string | null;
+      title: string | null;
+      owner_id: string;
+      ref: string;
+      label: string | null;
+    }>;
+    const entries = rows.slice(0, limit).map((row) => {
+      if (row.source === "history") {
+        const stored = this.db
+          .prepare("SELECT * FROM obligation_history WHERE id = ?")
+          .get(row.source_id);
+        return { ...parseHistoryRow(stored), id: row.event_key };
+      }
+      return {
+        id: row.event_key,
+        obligationId: id,
+        mutationKind: row.source,
+        actingPrincipal: row.principal,
+        timestamp: row.timestamp,
+        before: {},
+        after:
+          row.source === "artifact"
+            ? { artifact: { ref: row.ref, label: row.label } }
+            : row.source === "child_added"
+              ? { child: { id: String(row.source_id), title: row.title, ownerId: row.owner_id } }
+              : {},
+      };
+    });
+    const last = entries.at(-1);
+    return {
+      entries,
+      nextBefore: rows.length > limit && last ? `${last.timestamp}|${last.id}` : null,
+    };
   }
 
   /**
