@@ -1,10 +1,13 @@
 import Database from "better-sqlite3";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ChatRoomRepository } from "../db/repositories/chat-room-repository.js";
+import { RoomEntryEpisodeRepository } from "../db/repositories/room-entry-episode-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { ChatRoomService } from "./chat-room.js";
+import { RoomEntryService } from "./room-entry.js";
 import { buildSupportedVoiceCatalog } from "./voice-catalog.js";
 import { googleVoiceConfig } from "./voice-config.js";
 
@@ -47,6 +50,33 @@ describe("ChatRoomService", () => {
     actors = new SqliteActorRepository(db);
     actors.upsert(actor("root"));
     clock = 0;
+  });
+
+  it("rolls roster deletion and invitation invalidation back together on failure", () => {
+    actors.upsert(actor("a", { voiceConfig: googleVoiceConfig("Kore") }));
+    const store = new RoomEntryEpisodeRepository(db);
+    const room = service((id) => entries.invalidateRecipient(id));
+    const entries = new RoomEntryService({
+      store,
+      inbox: new SqliteInboxRepository(db),
+      roster: () => room.participants().map((member) => member.actorId),
+    });
+    room.add("a", "root");
+    const entered = entries.enter({ principalId: "user-a", clientId: "tab-1", sessionKey: "s1" });
+    if (entered.status !== "entered") throw new Error("not entered");
+    const before = store.get(entered.episodeId);
+    const original = store.update.bind(store);
+    const failure = vi.spyOn(store, "update").mockImplementationOnce((id, patch) => {
+      original(id, patch);
+      throw new Error("injected invalidation failure");
+    });
+    expect(() => room.remove("a")).toThrow("injected invalidation failure");
+    expect(room.participants().map((member) => member.actorId)).toContain("a");
+    expect(store.get(entered.episodeId)).toEqual(before);
+    failure.mockRestore();
+    expect(room.remove("a")).toBe(true);
+    room.add("a", "root");
+    expect(entries.isEligibleRecipient(entered.episodeId, "a")).toBe(false);
   });
 
   it("starts as root alone", () => {

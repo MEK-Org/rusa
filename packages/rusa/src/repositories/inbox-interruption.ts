@@ -84,7 +84,7 @@ export function validateInboxInterruptionForWrite(payload: InboxPayload): void {
 }
 
 /** Why a payload is not a well-formed version-1 Room entry notice, or null. */
-function roomHumanEntryProblem(payload: InboxPayload): string | null {
+export function roomHumanEntryProblem(payload: InboxPayload): string | null {
   if (payload.version !== ROOM_HUMAN_ENTRY_VERSION) {
     return `unsupported version ${JSON.stringify(payload.version)}`;
   }

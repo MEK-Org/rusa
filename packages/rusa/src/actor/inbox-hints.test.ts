@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import {
   attachInboxHints,
@@ -350,12 +350,38 @@ describe("inbox hints", () => {
       ).toBe("departed");
     });
 
-    it("invites one concise update only while the human is present", () => {
+    it("rejects malformed notices before consulting live presence", () => {
+      const roomEntryPresence = vi.fn(() => "present" as const);
+      for (const malformed of [
+        { version: 99 },
+        { principalId: "" },
+        { priority: "normal" },
+        { interruption: "interrupt" },
+      ]) {
+        const entry = notice(malformed);
+        expect(projectRoomEntryPresence(entry, { roomEntryPresence })).toBe("departed");
+        expect(resolveInboxHint(entry, { roomEntryPresence })).not.toContain(
+          "you are a participant"
+        );
+      }
+      expect(roomEntryPresence).not.toHaveBeenCalled();
+    });
+
+    it("passes recipient and principal identity to the live invitation check", () => {
+      const roomEntryPresence = vi.fn(() => "departed" as const);
+      expect(projectRoomEntryPresence(notice(), { roomEntryPresence })).toBe("departed");
+      expect(roomEntryPresence).toHaveBeenCalledWith("ep-1", "root", "user-1");
+      expect(resolveInboxHint(notice(), { roomEntryPresence })).not.toContain(
+        "you are a participant"
+      );
+    });
+
+    it("restricts all phase B notices from ordinary reply and audio routes", () => {
       const present = resolveInboxHint(notice(), { roomEntryPresence: () => "present" });
       expect(present).toContain("user-1 entered the Chat Room at 2026-10-03T12:00:00.000Z");
       expect(present).toContain("notice, not a message");
-      expect(present).toContain("one concise, relevant update or unresolved question");
-      expect(present).toContain("otherwise say nothing");
+      expect(present).toContain("do not greet them or send an entry reply");
+      expect(present).toContain("ordinary reply or audio tools");
       expect(present).toContain("honest note; staying silent is fine");
       for (const presence of ["reconnecting", "departed"] as const) {
         const hint = resolveInboxHint(notice(), { roomEntryPresence: () => presence });

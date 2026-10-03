@@ -82,6 +82,58 @@ describe("RoomEntryService (#829)", () => {
     expect(recipients(entry.episodeId).every((r) => r.status === "delivered")).toBe(true);
   });
 
+  it("projects notice presence only for the matching principal and eligible recipient", () => {
+    const rooms = service();
+    const entered = rooms.enter(tab("tab-1"));
+    if (entered.status !== "entered") throw new Error("not entered");
+    expect(rooms.noticePresence(entered.episodeId, "actor-1", "user-a")).toBe("present");
+    expect(rooms.noticePresence(entered.episodeId, "actor-1", "other-user")).toBe("departed");
+    expect(rooms.noticePresence(entered.episodeId, "other-actor", "user-a")).toBe("departed");
+    rooms.invalidateRecipient("actor-1");
+    expect(notices("actor-1")).toHaveLength(1);
+    expect(rooms.noticePresence(entered.episodeId, "actor-1", "user-a")).toBe("departed");
+  });
+
+  it("prunes lapsed attachments during tab churn independently of notice retention", () => {
+    const rooms = service();
+    const stable = rooms.enter(tab("stable"));
+    if (stable.status !== "entered") throw new Error("not entered");
+    const attached = (rooms as unknown as { attached: Set<string> }).attached;
+    for (let i = 0; i < 20; i += 1) {
+      expect(
+        rooms.renew({
+          ...tab("stable"),
+          episodeId: stable.episodeId,
+          generation: stable.generation,
+        })
+      ).toMatchObject({ status: "renewed" });
+      rooms.enter(tab(`document-${i}`));
+      now += ROOM_ENTRY_LEASE_MS - 1;
+      rooms.renew({ ...tab("stable"), episodeId: stable.episodeId, generation: stable.generation });
+      now += 1;
+      rooms.collect();
+      expect(attached.size).toBe(1);
+    }
+    now += ROOM_ENTRY_LEASE_MS;
+    expect(rooms.collect()).toBe(0); // Unhandled notices retain the audit row.
+    expect(store.get(stable.episodeId)).not.toBeNull();
+    expect(attached.size).toBe(0);
+  });
+
+  it("releases expired sibling attachments on last explicit leave", () => {
+    const rooms = service();
+    const old = rooms.enter(tab("old"));
+    now += 1;
+    const live = rooms.enter(tab("live"));
+    if (old.status !== "entered" || live.status !== "entered") throw new Error("not entered");
+    now += ROOM_ENTRY_LEASE_MS - 1;
+    expect(
+      rooms.leave({ ...tab("live"), episodeId: live.episodeId, generation: live.generation })
+    ).toEqual({ status: "left", ended: true });
+    expect((rooms as unknown as { attached: Set<string> }).attached.size).toBe(0);
+    expect(store.get(live.episodeId)).not.toBeNull();
+  });
+
   it("shares one episode across tabs, reattaches and repeated enters without new notices", () => {
     const rooms = service();
     const first = rooms.enter(tab("tab-1"));

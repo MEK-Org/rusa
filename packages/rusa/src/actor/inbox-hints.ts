@@ -1,5 +1,8 @@
 import { isHumanOperator } from "../mcp/stamp.js";
-import { ROOM_HUMAN_ENTRY_PAYLOAD_TYPE } from "../repositories/inbox-interruption.js";
+import {
+  ROOM_HUMAN_ENTRY_PAYLOAD_TYPE,
+  roomHumanEntryProblem,
+} from "../repositories/inbox-interruption.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import type { RoomEntryPresence } from "../voice/room-entry.js";
 import type { ChatContextWindow } from "./inbox-chat-context.js";
@@ -20,7 +23,11 @@ export interface SelectedInboxEntry extends InboxEntry {
 /** Live state the hints may project; each source is optional. */
 export interface InboxHintContext {
   /** Presence of a Room entry episode; absent → Room entry notices project as departed. */
-  roomEntryPresence?: (episodeId: string) => RoomEntryPresence;
+  roomEntryPresence?: (
+    episodeId: string,
+    actorId: string,
+    principalId: string
+  ) => RoomEntryPresence;
 }
 
 /**
@@ -32,10 +39,11 @@ export function projectRoomEntryPresence(
   context: InboxHintContext = {}
 ): RoomEntryPresence | undefined {
   if (entry.payload.type !== ROOM_HUMAN_ENTRY_PAYLOAD_TYPE) return undefined;
-  const episodeId = entry.payload.episodeId;
-  if (typeof episodeId !== "string" || episodeId.length === 0) return "departed";
+  if (roomHumanEntryProblem(entry.payload)) return "departed";
+  const { episodeId, principalId } = entry.payload;
+  if (typeof episodeId !== "string" || typeof principalId !== "string") return "departed";
   try {
-    return context.roomEntryPresence?.(episodeId) ?? "departed";
+    return context.roomEntryPresence?.(episodeId, entry.actorId, principalId) ?? "departed";
   } catch {
     return "departed";
   }
@@ -46,13 +54,16 @@ function roomEntryHint(entry: InboxEntry, presence: RoomEntryPresence): string {
     typeof entry.payload.principalId === "string" ? entry.payload.principalId : "a human";
   const enteredAt =
     typeof entry.payload.enteredAt === "string" ? ` at ${entry.payload.enteredAt}` : "";
-  const lead = `The human ${principal} entered the Chat Room${enteredAt}, and you are a participant. This is a notice, not a message from them: it asks nothing and completes no obligation.`;
+  const lead = `A Room entry notice records that the human ${principal} entered the Chat Room${enteredAt}. This is a notice, not a message from them: it asks nothing and completes no obligation.`;
   const close =
     "When nothing useful remains, mark this entry handled with an honest note; staying silent is fine.";
-  if (presence === "present") {
-    return `${lead} They are in the Room now. If you have one concise, relevant update or unresolved question for them, you may offer it to them; otherwise say nothing. ${close}`;
-  }
-  return `${lead} They are ${presence === "reconnecting" ? "reconnecting, not confirmed listening" : "no longer in the Room"}, so do not greet them or send an entry reply. ${close}`;
+  const state =
+    presence === "present"
+      ? "in the Room now"
+      : presence === "reconnecting"
+        ? "reconnecting, not confirmed listening"
+        : "not confirmed present for this invitation";
+  return `${lead} They are ${state}. In phase B, do not greet them or send an entry reply: this notice grants no permission to use ordinary reply or audio tools, which may address a different conversation. Selected-entry routing comes in phase C. ${close}`;
 }
 
 function extractThreadId(threadName: string): string | undefined {
@@ -92,7 +103,12 @@ export function resolveInboxHint(
   const { source, payload } = entry;
 
   const roomPresence = projectRoomEntryPresence(entry, context);
-  if (roomPresence !== undefined) return roomEntryHint(entry, roomPresence);
+  if (roomPresence !== undefined) {
+    if (roomHumanEntryProblem(payload)) {
+      return "Unverified Room entry notice: its stored payload is malformed or unsupported. It establishes no participation or reply/audio authority; do not greet them or send an entry reply. Mark it handled with an honest note when nothing useful remains.";
+    }
+    return roomEntryHint(entry, roomPresence);
+  }
   const fromId = typeof payload.fromId === "string" ? payload.fromId : undefined;
 
   // Voice needs its own contract before the general human-message branch:

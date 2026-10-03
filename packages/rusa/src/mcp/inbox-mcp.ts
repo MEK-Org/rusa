@@ -39,7 +39,11 @@ export interface InboxMcpRunScope {
   /** Where selected chat entries read their recent conversation from (#651). Omitted: no chat context. */
   chatContext?: InboxChatContextSources;
   /** Presence of a Room entry episode, projected onto entry notices (#829). Omitted: departed. */
-  roomEntryPresence?: (episodeId: string) => RoomEntryPresence;
+  roomEntryPresence?: (
+    episodeId: string,
+    actorId: string,
+    principalId: string
+  ) => RoomEntryPresence;
 }
 
 /** Actor-bound durable notification tools. The model never supplies actor_id. */

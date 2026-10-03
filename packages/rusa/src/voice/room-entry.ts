@@ -182,6 +182,7 @@ export class RoomEntryService {
       }
       throw error;
     }
+    this.pruneAttachments();
     if (result.status === "entered") {
       const replacedPrefix = `${result.episodeId}\u0000${client.clientId}\u0000`;
       for (const key of this.attached) {
@@ -219,6 +220,7 @@ export class RoomEntryService {
       });
       return { status: "renewed", episodeId: row.id, generation: lease.generation };
     });
+    this.pruneAttachments();
     if (result.status === "renewed") {
       this.attached.add(attachmentKey(result.episodeId, client.clientId, result.generation));
     }
@@ -271,6 +273,7 @@ export class RoomEntryService {
       });
       return { status: "left", ended };
     });
+    this.pruneAttachments();
     if (result.status === "left") {
       this.attached.delete(attachmentKey(client.episodeId, client.clientId, client.generation));
     }
@@ -304,6 +307,7 @@ export class RoomEntryService {
         });
       }
     });
+    this.pruneAttachments();
   }
 
   /**
@@ -332,6 +336,14 @@ export class RoomEntryService {
     )
       ? "present"
       : "reconnecting";
+  }
+
+  /** Presence for a stored notice, requiring its principal and frozen recipient invitation. */
+  noticePresence(episodeId: string, actorId: string, principalId: string): RoomEntryPresence {
+    const loaded = this.loadOwned(episodeId, principalId);
+    const recipient = loaded?.document.recipients.find((held) => held.actorId === actorId);
+    if (recipient?.status !== "pending" && recipient?.status !== "delivered") return "departed";
+    return this.presence(episodeId);
   }
 
   /** Whether an actor still holds a valid invitation from this episode. */
@@ -429,8 +441,32 @@ export class RoomEntryService {
       }
     } finally {
       this.draining = false;
+      this.pruneAttachments();
     }
     return removed;
+  }
+
+  /** Drop process-local generations independently of durable notice/audit retention. */
+  private pruneAttachments(): void {
+    const now = this.now();
+    const liveByEpisode = new Map<string, Set<string>>();
+    for (const key of this.attached) {
+      const episodeId = key.split("\u0000", 1)[0];
+      let live = liveByEpisode.get(episodeId);
+      if (!live) {
+        const row = this.deps.store.get(episodeId);
+        const document = row && row.endedAt === null ? this.parse(row) : null;
+        live = new Set(
+          document
+            ? liveLeases(document, now).map((held) =>
+                attachmentKey(episodeId, held.clientId, held.generation)
+              )
+            : []
+        );
+        liveByEpisode.set(episodeId, live);
+      }
+      if (!live.has(key)) this.attached.delete(key);
+    }
   }
 
   /** Deliver one recipient's notice and stamp it; never throws. */

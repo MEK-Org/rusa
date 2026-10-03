@@ -535,12 +535,40 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   );
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+/** A reader limit, distinct from malformed JSON or a failed transport. */
+class RequestBodyTooLargeError extends Error {
+  constructor() {
+    super("Request body too large");
+  }
+}
+
+/** Read a request, optionally capping accumulated bytes before concatenation. */
+export function readBody(
+  req: IncomingMessage,
+  maxBytes = Number.POSITIVE_INFINITY
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
-    req.on("error", reject);
+    let bytes = 0;
+    let exceeded = false;
+    const onData = (chunk: Buffer) => {
+      if (exceeded) return; // Drain later transport chunks without retaining them.
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        exceeded = true;
+        chunks.length = 0;
+        reject(new RequestBodyTooLargeError());
+        return;
+      }
+      chunks.push(chunk);
+    };
+    req.on("data", onData);
+    req.once("end", () => {
+      req.off("data", onData);
+      req.off("error", reject);
+      if (!exceeded) resolve(Buffer.concat(chunks).toString("utf-8"));
+    });
+    req.once("error", reject);
   });
 }
 
@@ -579,8 +607,11 @@ async function handleRoomEntryRequest(
     sendJson(res, 503, { status: "unavailable", reason: "room entry unavailable" });
     return true;
   }
-  const raw = await readBody(req);
-  if (Buffer.byteLength(raw, "utf8") > MAX_ROOM_ENTRY_BODY_BYTES) {
+  let raw: string;
+  try {
+    raw = await readBody(req, MAX_ROOM_ENTRY_BODY_BYTES);
+  } catch (error) {
+    if (!(error instanceof RequestBodyTooLargeError)) throw error;
     sendJson(res, 413, { error: "Request body too large" });
     return true;
   }

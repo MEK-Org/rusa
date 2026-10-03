@@ -3088,7 +3088,8 @@ async function composeStart(
             assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(id, entryIds),
             isVoiceSessionActive: () => voiceService?.hasActiveSession(id) ?? false,
             chatContext: inboxChatContextSources(),
-            roomEntryPresence: (episodeId) => roomEntry.presence(episodeId),
+            roomEntryPresence: (episodeId, actorId, principalId) =>
+              roomEntry.noticePresence(episodeId, actorId, principalId),
           })
         );
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
@@ -3524,7 +3525,8 @@ async function composeStart(
       assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(rootId, entryIds),
       isVoiceSessionActive: () => voiceService?.hasActiveSession(rootId) ?? false,
       chatContext: inboxChatContextSources(),
-      roomEntryPresence: (episodeId) => roomEntry.presence(episodeId),
+      roomEntryPresence: (episodeId, actorId, principalId) =>
+        roomEntry.noticePresence(episodeId, actorId, principalId),
     })
   );
   const rootMeshChatUrl = mcpHttp.addServer(`${rootId}:${MESH_CHAT_MCP_NAME}`, () =>
