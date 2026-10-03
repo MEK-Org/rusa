@@ -8,6 +8,7 @@ import {
 import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { McpServerSpec } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
+import { EventTransferReceiver, type EventTransferStep } from "./follower-event-transfer.js";
 import {
   FollowerUpdateReconciler,
   type ReconciliationStatus,
@@ -21,7 +22,11 @@ import type {
   FollowerUpdateStatusEvent,
   LeaderCommand,
 } from "./protocol.js";
-import { INSTANCE_PROTOCOL_VERSION, OLDEST_FOLLOWER_PROTOCOL_VERSION } from "./protocol.js";
+import {
+  FOLLOWER_HTTP_BODY_LIMIT_BYTES,
+  INSTANCE_PROTOCOL_VERSION,
+  OLDEST_FOLLOWER_PROTOCOL_VERSION,
+} from "./protocol.js";
 import { FollowerDedupeTracker, RemoteInstance } from "./remote-instance.js";
 import { isSafeFollowerBind } from "./safe-bind.js";
 
@@ -55,6 +60,20 @@ export interface FollowerEvent {
 export interface FollowerHubOptions {
   logger?: Logger;
   triggerStore?: FollowerUpdateTriggerStore;
+  /** Replaces the default event-transfer receiver and its limits; for tests. */
+  eventTransfers?: EventTransferReceiver;
+}
+
+function isFollowerEvent(event: unknown): event is FollowerEvent {
+  const candidate = event as FollowerEvent | null;
+  return (
+    !!candidate &&
+    typeof candidate.eventId === "string" &&
+    !!candidate.eventId.trim() &&
+    typeof candidate.actorId === "string" &&
+    !!candidate.message &&
+    typeof candidate.message.type === "string"
+  );
 }
 
 async function readJson(req: IncomingMessage): Promise<unknown> {
@@ -62,7 +81,7 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 8 * 1024 * 1024) throw new Error("Request too large");
+    if (size > FOLLOWER_HTTP_BODY_LIMIT_BYTES) throw new Error("Request too large");
     chunks.push(chunk);
   }
   return JSON.parse(Buffer.concat(chunks).toString());
@@ -82,6 +101,7 @@ export class FollowerHub {
   private static readonly STALE_AFTER_MS = 45_000;
   private readonly log: Logger;
   private readonly dedupeTrackers = new Map<string, FollowerDedupeTracker>();
+  private readonly eventTransfers: EventTransferReceiver;
   /** Followers for which the current lapsed-contact interval has been reported. */
   private readonly staleFollowerIds = new Set<string>();
   /** Generations that a confirmed replacement made permanently stale. */
@@ -110,6 +130,9 @@ export class FollowerHub {
         });
       }
     }
+    for (const followerId of this.eventTransfers.sweep()) {
+      this.log.warn("follower_event_transfer_expired", { followerId });
+    }
     for (const [id, tracker] of this.dedupeTrackers) {
       if (!this.followers.has(id) && now - tracker.lastSeen > 3600_000) {
         this.dedupeTrackers.delete(id);
@@ -130,6 +153,7 @@ export class FollowerHub {
     if (token.length < 32) throw new Error("Follower token must be at least 32 characters");
     this.log = (opts?.logger ?? nullLogger).child({ component: "follower-gateway" });
     this.sweep.unref();
+    this.eventTransfers = opts?.eventTransfers ?? new EventTransferReceiver();
     this.triggerStore = opts?.triggerStore;
     if (this.triggerStore) {
       this.reconciler = new FollowerUpdateReconciler(this.triggerStore, this, {
@@ -330,6 +354,7 @@ export class FollowerHub {
   private drop(follower: RemoteInstance): void {
     this.followers.delete(follower.id);
     this.staleFollowerIds.delete(follower.id);
+    this.eventTransfers.discard(follower.id);
     follower.close();
     this.log.info("follower_disconnected", {
       followerId: follower.id,
@@ -506,6 +531,7 @@ export class FollowerHub {
             session: existing.session,
             protocolVersion: existing.protocolVersion,
             leaderToken: this.leaderToken,
+            eventTransfer: this.eventTransfers.capability,
           });
           return;
         }
@@ -549,6 +575,7 @@ export class FollowerHub {
         session: follower.session,
         protocolVersion,
         leaderToken: this.leaderToken,
+        eventTransfer: this.eventTransfers.capability,
       });
       return;
     }
@@ -602,40 +629,112 @@ export class FollowerHub {
         return;
       }
       for (const event of events) {
-        if (
-          !event ||
-          typeof event.eventId !== "string" ||
-          !event.eventId.trim() ||
-          typeof event.actorId !== "string" ||
-          !event.message ||
-          typeof event.message.type !== "string"
-        ) {
+        if (!isFollowerEvent(event)) {
           reply(res, 400, { error: "Invalid event shape or missing eventId" });
           return;
         }
-        if (follower.hasEvent(event.eventId)) continue;
-        follower.recordEvent(event.eventId);
-        follower.receive(event);
-        if (event.actorId === "$instance" && event.message?.type === "update_status") {
-          const status = follower.updateStatus;
-          if (status) {
-            for (const listener of this.onUpdateStatusListeners) {
-              try {
-                listener(follower.id, status);
-              } catch (err) {
-                this.log.warn("follower_update_status_listener_error", {
-                  followerId: follower.id,
-                  err,
-                });
-              }
-            }
-          }
+        if (!this.acceptEvent(follower, event)) {
+          reply(res, 409, {
+            status: "refused",
+            reason: "acceptance_failed",
+            eventId: event.eventId,
+          });
+          return;
         }
       }
       follower.recordBatch(batchId);
       reply(res, 200, {});
       return;
     }
+    if (path === "/events/transfer") {
+      const step = this.eventTransfers.accept(follower.id, follower.generation, body, (eventId) =>
+        follower.eventOutcome(eventId)
+      );
+      if (!("bytes" in step)) {
+        this.logTransferStep(follower.id, body, step);
+        reply(res, step.httpStatus, step.reply);
+        return;
+      }
+      let event: unknown;
+      try {
+        event = JSON.parse(step.bytes.toString("utf8"));
+      } catch {}
+      if (!isFollowerEvent(event) || event.eventId !== step.eventId) {
+        const refusal: EventTransferStep = {
+          httpStatus: 422,
+          reply: { status: "refused", reason: "invalid_event" },
+        };
+        this.logTransferStep(follower.id, body, refusal);
+        reply(res, refusal.httpStatus, refusal.reply);
+        return;
+      }
+      // The reassembled event takes the same acceptance path as an ordinary batch.
+      if (!this.acceptEvent(follower, event)) {
+        reply(res, 409, { status: "refused", reason: "acceptance_failed" });
+        return;
+      }
+      this.log.info("follower_event_transfer_completed", {
+        followerId: follower.id,
+        eventId: event.eventId,
+        eventType: event.message.type,
+        totalBytes: step.bytes.length,
+      });
+      reply(res, 200, { status: "complete" });
+      return;
+    }
     reply(res, 404, {});
+  }
+
+  private acceptEvent(follower: RemoteInstance, event: FollowerEvent): boolean {
+    const outcome = follower.eventOutcome(event.eventId);
+    if (outcome) return outcome === "accepted";
+    // Fence before invoking synchronous listeners: an earlier listener may
+    // have performed a side effect before a later listener throws.
+    follower.recordEvent(event.eventId, "failed");
+    try {
+      follower.receive(event);
+    } catch {
+      this.log.warn("follower_event_acceptance_failed", {
+        followerId: follower.id,
+        eventId: event.eventId,
+        eventType: event.message.type,
+      });
+      return false;
+    }
+    follower.recordEvent(event.eventId, "accepted");
+    if (event.actorId === "$instance" && event.message?.type === "update_status") {
+      const status = follower.updateStatus;
+      if (status) {
+        for (const listener of this.onUpdateStatusListeners) {
+          try {
+            listener(follower.id, status);
+          } catch (err) {
+            this.log.warn("follower_update_status_listener_error", {
+              followerId: follower.id,
+              err,
+            });
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  /** Content-free: identities, sizes and limits only, never fragment data. */
+  private logTransferStep(
+    followerId: string,
+    body: Record<string, unknown>,
+    step: Extract<EventTransferStep, { reply: unknown }>
+  ): void {
+    if (step.reply.status === "fragment" || step.reply.status === "complete") return;
+    this.log.warn("follower_event_transfer_not_accepted", {
+      followerId,
+      transferId: typeof body.transferId === "string" ? body.transferId.slice(0, 128) : undefined,
+      eventId: typeof body.eventId === "string" ? body.eventId.slice(0, 256) : undefined,
+      totalBytes: typeof body.totalBytes === "number" ? body.totalBytes : undefined,
+      index: typeof body.index === "number" ? body.index : undefined,
+      ...step.reply,
+      ...this.eventTransfers.usage,
+    });
   }
 }

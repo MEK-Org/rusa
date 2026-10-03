@@ -5,6 +5,60 @@ import type { ActorRunMode, RunNudge } from "../../actor/trigger-runner.js";
 import type { RawProviderModelConfig } from "../../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
 
+/** Existing follower gateway request-body bound, including the JSON envelope. */
+export const FOLLOWER_HTTP_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
+/** Ordinary `/events` batches carry at most this many events. */
+export const FOLLOWER_EVENT_BATCH_MAX_EVENTS = 100;
+
+/**
+ * Negotiated lossless transfer of one event too large for an ordinary batch
+ * (#876). The leader advertises it on `/register`; a follower sends fragments
+ * only to a leader that did. It is additive and does not change the protocol
+ * version: ordinary `/events` is unchanged, and an unadvertising leader leaves
+ * such an event parked on the follower.
+ */
+export interface EventTransferCapability {
+  version: 1;
+  /** Largest original serialized event the leader reassembles. */
+  maxEventBytes: number;
+  /** Largest raw fragment, before base64 and the request envelope. */
+  maxFragmentBytes: number;
+}
+export const EVENT_TRANSFER_CAPABILITY: EventTransferCapability = {
+  version: 1,
+  maxEventBytes: 64 * 1024 * 1024,
+  maxFragmentBytes: 1024 * 1024,
+};
+
+/** One fragment of an event transfer, posted to `/events/transfer`. */
+export interface EventTransferFragment {
+  transferId: string;
+  eventId: string;
+  /** Byte length of the original UTF-8 serialized event. */
+  totalBytes: number;
+  /** SHA-256 hex of the original serialized event. */
+  digest: string;
+  index: number;
+  offset: number;
+  /** Base64 of the raw fragment bytes. */
+  data: string;
+  /** SHA-256 hex of the raw fragment bytes. */
+  fragmentDigest: string;
+}
+
+/**
+ * The leader's answer to a fragment. `fragment` retains bytes but has not
+ * delivered the event; only `complete` does. `restart` asks for fragment zero of
+ * the same event; `busy` is retryable backpressure; `refused` will not change
+ * until capability, configuration or an operator does.
+ */
+export type EventTransferReply =
+  | { status: "fragment"; receivedBytes: number }
+  | { status: "complete" }
+  | { status: "restart"; reason: string }
+  | { status: "busy"; reason: string }
+  | { status: "refused"; reason: string; maxEventBytes?: number };
+
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
 //
 // Compatibility rule (#719): the leader deploys first and must keep followers on the
