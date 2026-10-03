@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import chalk, { Chalk } from "chalk";
 import { loadConfig, resolveHome } from "../config/index.js";
+import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 
 const DEFAULT_POLL_MS = 500;
 
@@ -165,7 +166,7 @@ function isActorReply(
   userPrincipalId?: string | null
 ): boolean {
   const peer = counterparty(event);
-  const isHuman = userPrincipalId && peer === userPrincipalId;
+  const isHuman = peer === HUMAN_OPERATOR || (userPrincipalId && peer === userPrincipalId);
   return (
     event.kind === "message_sent" &&
     event.actorId === actorId &&
@@ -197,7 +198,8 @@ class ActorChatClient {
     const peer = this.userPrincipalId;
     if (!peer)
       throw new Error("No durable user principal; configure dashboard auth or restart local setup");
-    const actorsParam = `${actorId},${peer}`;
+    // Historical alias reads remain until the copied-data PR3 cutover.
+    const actorsParam = `${actorId},${HUMAN_OPERATOR},${peer}`;
     const query = new URLSearchParams({
       actors: actorsParam,
       kinds: "message_sent",
@@ -235,7 +237,8 @@ function renderHistory(
 ): void {
   for (const event of [...events].reverse()) {
     if (!event.body) continue;
-    const isHuman = userPrincipalId && event.actorId === userPrincipalId;
+    const isHuman =
+      event.actorId === HUMAN_OPERATOR || (userPrincipalId && event.actorId === userPrincipalId);
     const label = isHuman ? theme.youLabel : theme.actorLabel;
     write(output, `${label} > ${event.body}\n\n`);
   }

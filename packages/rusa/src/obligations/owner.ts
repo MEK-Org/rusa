@@ -11,8 +11,8 @@ import type { Obligation } from "./obligation.js";
  * pressure only exists if every write boundary applies the same rule, so this
  * is the rule, in one place.
  *
- * Accepts a live actor or an active durable user principal. Unknown ids,
- * disabled users, retired actors and infrastructure ids cannot own work.
+ * Accepts a live actor or a durable user principal. Unknown ids, retired
+ * actors and infrastructure ids cannot own work.
  */
 export function resolveObligationOwner(
   actors: Pick<ActorRepository, "get">,
@@ -22,13 +22,13 @@ export function resolveObligationOwner(
   const ownerId = rawOwnerId.trim();
   if (principals) {
     const p = principals.get(ownerId);
-    if (p && p.kind === "user" && !p.disabledAt) return { ok: true, ownerId };
+    if (p && p.kind === "user") return { ok: true, ownerId };
   }
   const record = actors.get(ownerId);
   if (!record)
     return {
       ok: false,
-      error: `unknown obligation owner: ${ownerId}; find the durable user principal id in the dashboard /api/mesh/threads userPrincipalId, or name an active actor id`,
+      error: `unknown obligation owner: ${ownerId}; use the verified human message fromId, ask your parent for its durable principal mapping, or name an active actor id`,
     };
   if (record.status !== "active") {
     return { ok: false, error: `obligation owner is not active: ${ownerId}` };

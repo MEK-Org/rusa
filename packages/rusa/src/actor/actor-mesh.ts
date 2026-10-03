@@ -508,7 +508,7 @@ function isTrustedControlPrincipal(
   return (
     by === "root-llm" ||
     by === "e2e-controller" ||
-    (principals !== undefined && !!principals.getUser(by) && !principals.getUser(by)?.disabledAt)
+    (principals !== undefined && !!principals.getUser(by))
   );
 }
 

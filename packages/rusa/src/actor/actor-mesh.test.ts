@@ -425,16 +425,24 @@ function setup(
     responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
     reactToChatMessage?: ActorMeshOptions["reactToChatMessage"];
     secretsDir?: string;
+    principals?: PrincipalRepository;
   } = {}
 ) {
   const registry = opts.actors ?? new InMemoryActorRepository();
-  const principalDb = new Database(":memory:");
-  runMigrations(principalDb);
-  const principals = new PrincipalRepository(principalDb);
-  principals.ensureImplicitUser("2026-01-01T00:00:00Z");
-  onTestFinished(() => {
-    principalDb.close();
-  });
+  const human = {
+    id: "11111111-0000-4000-8000-000000000001",
+    kind: "user" as const,
+    email: "fixture@example.invalid",
+    createdAt: "2026-01-01T00:00:00Z",
+  };
+  // Scheduling/ancestry tests need principal lookup, not a migrated database.
+  const principals =
+    opts.principals ??
+    ({
+      get: (id: string) => (id === human.id ? human : undefined),
+      getUser: (id: string) => (id === human.id ? human : undefined),
+      listUsers: () => [human],
+    } as unknown as PrincipalRepository);
   const providers = new Map<string, CodingProvider>();
   const logs: string[] = [];
   let seq = 0;
@@ -10981,7 +10989,14 @@ describe("ActorMesh", () => {
 
     it("refuses unknown, legacy and disabled human senders before recording messages", () => {
       const recordChat = vi.fn(() => "chat-id");
-      const { mesh } = setup({ recordChat });
+      const db = new Database(":memory:");
+      runMigrations(db);
+      const principals = new PrincipalRepository(db);
+      principals.ensureImplicitUser("2026-01-01T00:00:00Z");
+      onTestFinished(() => {
+        db.close();
+      });
+      const { mesh } = setup({ recordChat, principals });
       const worker = mesh.spawn({ charter: "worker", parentId: "root" });
       const userId = testHumanId(mesh);
       for (const fromId of ["human:operator", "missing-user", "root"]) {
