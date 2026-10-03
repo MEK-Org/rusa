@@ -464,25 +464,7 @@ describe("SqliteActorRepository", () => {
     expect(secondRetiredAt).toBe(firstRetiredAt);
   });
 
-  it("derives humanUnlocked and lastChatSessionId from durable mesh_chat rows", () => {
-    repository.upsert(root);
-    expect(repository.get("root")).not.toHaveProperty("humanUnlocked");
-    expect(repository.get("root")).not.toHaveProperty("lastChatSessionId");
-
-    db.prepare(
-      "INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run("msg-1", "2026-09-03T13:05:00.000Z", HUMAN_OPERATOR, "root", "hello", "chat-1");
-    db.prepare(
-      "INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run("msg-2", "2026-09-03T13:10:00.000Z", HUMAN_OPERATOR, "root", "again", "chat-2");
-
-    expect(repository.get("root")).toMatchObject({
-      humanUnlocked: true,
-      lastChatSessionId: "chat-2",
-    });
-  });
-
-  it("lists mixed human/no-human actors without per-actor mesh_chat lookups", () => {
+  it("resolves the newest human chat from durable mesh_chat rows", () => {
     repository.upsert(root);
     repository.upsert({
       id: "worker",
@@ -498,37 +480,60 @@ describe("SqliteActorRepository", () => {
       status: "active",
       createdAt: "2026-09-03T13:02:00.000Z",
     });
+    expect(repository.lastHumanChat("root")).toBeUndefined();
+
     const insert = db.prepare(
       "INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id) VALUES (?, ?, ?, ?, ?, ?)"
     );
     insert.run("root-old", "2026-09-03T13:05:00.000Z", HUMAN_OPERATOR, "root", "old", "root-1");
     insert.run("root-new", "2026-09-03T13:10:00.000Z", HUMAN_OPERATOR, "root", "new", "root-2");
     insert.run("root-z", "2026-09-03T13:10:00.000Z", HUMAN_OPERATOR, "root", "tie", "root-3");
+    insert.run("root-actor", "2026-09-03T13:20:00.000Z", "worker", "root", "actor", "actor-1");
     insert.run("worker", "2026-09-03T13:15:00.000Z", HUMAN_OPERATOR, "worker", "hello", null);
+    insert.run("no-human", "2026-09-03T13:15:00.000Z", "worker", "no-human", "actor", "s");
 
-    const prepare = vi.spyOn(db, "prepare");
-    const byId = new Map(repository.list().map((record) => [record.id, record]));
-    expect(byId.get("root")).toMatchObject({ humanUnlocked: true, lastChatSessionId: "root-3" });
-    expect(byId.get("worker")).toMatchObject({ humanUnlocked: true });
-    expect(byId.get("worker")).not.toHaveProperty("lastChatSessionId");
-    expect(byId.get("no-human")).not.toHaveProperty("humanUnlocked");
-    expect(byId.get("no-human")).not.toHaveProperty("lastChatSessionId");
-    expect(
-      prepare.mock.calls.filter(
-        ([sql]) =>
-          typeof sql === "string" &&
-          sql.includes("WHERE recipient_id = ? AND sender_id = ? ORDER BY ts DESC, id DESC LIMIT 1")
-      )
-    ).toHaveLength(0);
-    expect(
-      prepare.mock.calls.filter(
-        ([sql]) =>
-          typeof sql === "string" && sql.includes("ORDER BY recipient_id, ts DESC, id DESC")
-      )
-    ).toHaveLength(1);
+    // Newest by (ts, id); a later actor-to-actor message does not displace it.
+    expect(repository.lastHumanChat("root")).toEqual({
+      sessionId: "root-3",
+      principalId: HUMAN_OPERATOR,
+    });
+    expect(repository.lastHumanChat("worker")).toEqual({ principalId: HUMAN_OPERATOR });
+    expect(repository.lastHumanChat("no-human")).toBeUndefined();
   });
 
-  it("derives humanUnlocked and lastChatSessionId from user principal mesh_chat rows", () => {
+  it("hydrates actor records without reading mesh_chat (#691)", () => {
+    repository.upsert(root);
+    for (let i = 0; i < 5; i++) {
+      repository.upsert({
+        id: `worker-${i}`,
+        charter: "Work",
+        parentId: "root",
+        status: "active",
+        createdAt: "2026-09-03T13:01:00.000Z",
+      });
+    }
+    const insert = db.prepare(
+      "INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id) VALUES (?, ?, ?, ?, ?, ?)"
+    );
+    insert.run("m-1", "2026-09-03T13:05:00.000Z", HUMAN_OPERATOR, "worker-1", "hello", "s-1");
+
+    const prepare = vi.spyOn(db, "prepare");
+    expect(repository.get("worker-1")).toMatchObject({ id: "worker-1", parentId: "root" });
+    expect(repository.children("root")).toHaveLength(5);
+    expect(repository.list()).toHaveLength(6);
+    repository.patch("worker-1", { title: "Renamed" });
+    const renamed = repository.get("worker-1");
+
+    // Before #691 every get()/children() row ran an unindexed mesh_chat scan.
+    const chatReads = prepare.mock.calls.filter(
+      ([sql]) => typeof sql === "string" && sql.includes("mesh_chat")
+    );
+    expect(chatReads).toHaveLength(0);
+    expect(renamed).toMatchObject({ title: "Renamed" });
+    expect(renamed).not.toHaveProperty("humanUnlocked");
+  });
+
+  it("resolves the newest human chat from user principal mesh_chat rows", () => {
     repository.upsert(root);
     const principalRepo = new PrincipalRepository(db);
     const userPrincipal = principalRepo.createUser({
@@ -551,15 +556,9 @@ describe("SqliteActorRepository", () => {
       "user-session-1"
     );
 
-    expect(repository.get("root")).toMatchObject({
-      humanUnlocked: true,
-      lastChatSessionId: "user-session-1",
-    });
-
-    const byId = new Map(repository.list().map((r) => [r.id, r]));
-    expect(byId.get("root")).toMatchObject({
-      humanUnlocked: true,
-      lastChatSessionId: "user-session-1",
+    expect(repository.lastHumanChat("root")).toEqual({
+      sessionId: "user-session-1",
+      principalId: userPrincipal.id,
     });
   });
 

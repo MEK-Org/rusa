@@ -107,8 +107,9 @@ this branch, not permanently.
 - `src/obligations/owner.ts` — `resolveObligationOwner` admits the single
   canonical operator id or a live actor; this is the one write boundary every
   owner passes through, and the natural place to accept a `PrincipalRef`.
-- `src/db/repositories/sqlite-actor-repository.ts` — derives `humanUnlocked` and
-  `lastChatSessionId` from chat rows whose sender is the operator literal.
+- `src/db/repositories/sqlite-actor-repository.ts` — `lastHumanChat` finds the
+  newest chat row whose sender is the operator literal or a user principal; the
+  reply tool reads it on demand, never during record hydration.
 - `src/voice/voice-service.ts` — announcements are gated on the recipient being
   the operator.
 - `src/commands/chat.ts` — its own local copy of the literal, for the CLI
