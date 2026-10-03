@@ -18,7 +18,7 @@ export interface EventTransferLimits {
   minFragmentBytes: number;
   /** Incomplete transfers across all followers; each follower holds at most one. */
   maxTransfers: number;
-  /** Declared original-event bytes reserved across all incomplete transfers. */
+  /** Declared original-event bytes reserved across incomplete transfers; excludes decode/parse copies. */
   maxReservedBytes: number;
   /** Discard staging after this long without newly accepted bytes. */
   idleMs: number;
@@ -203,10 +203,14 @@ export class EventTransferReceiver {
 
     if (fragment.index < staging.fragments.length) {
       // A retry after a lost acknowledgement. It neither extends a deadline nor
-      // replaces the bytes already accepted at that index; its recorded offset
-      // and digest identify it without decoding or re-encoding anything.
+      // replaces the bytes already accepted at that index. The claimed digest
+      // alone is not proof: require the retained bytes' canonical encoding too.
       const accepted = staging.fragments[fragment.index];
-      if (accepted.offset !== fragment.offset || accepted.digest !== fragment.fragmentDigest) {
+      if (
+        accepted.offset !== fragment.offset ||
+        accepted.digest !== fragment.fragmentDigest ||
+        staging.chunks[fragment.index].toString("base64") !== fragment.data
+      ) {
         return this.refuse(followerId, 409, "conflicting_fragment");
       }
       return {
@@ -242,6 +246,8 @@ export class EventTransferReceiver {
     }
 
     const original = Buffer.concat(staging.chunks, staging.totalBytes);
+    // Release chunk references before hashing/dispatching the concatenated bytes.
+    staging.chunks.length = 0;
     this.discard(followerId);
     if (sha256(original) !== staging.digest) {
       return { httpStatus: 409, reply: { status: "refused", reason: "digest_mismatch" } };

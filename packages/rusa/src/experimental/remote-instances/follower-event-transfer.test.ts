@@ -138,8 +138,17 @@ describe("event transfer receiver", () => {
   it("refuses conflicting fragments and declarations, and restarts on a gap", () => {
     const receiver = new EventTransferReceiver(small);
     const frags = fragmentsOf(log("a", "x".repeat(300)), "ta", 64);
-    receiver.accept("f1", "g1", frags[0], never);
+    // A duplicate's supplied digest is a claim, not proof of its incoming bytes.
     const tampered = Buffer.from("y".repeat(64));
+    for (const data of [tampered.toString("base64"), "!!"]) {
+      receiver.accept("f1", "g1", frags[0], never);
+      expect(receiver.accept("f1", "g1", { ...frags[0], data }, never)).toEqual({
+        httpStatus: 409,
+        reply: { status: "refused", reason: "conflicting_fragment" },
+      });
+      expect(receiver.usage).toEqual({ transfers: 0, reservedBytes: 0 });
+    }
+    receiver.accept("f1", "g1", frags[0], never);
     expect(
       receiver.accept(
         "f1",
@@ -580,6 +589,36 @@ describe("negotiated event transfer over the follower gateway", () => {
     expect(h.received).toEqual([event.message, ready().message]);
   });
 
+  it("converges after an unexpected progress acknowledgement without replaying an earlier index", async () => {
+    const h = await setup();
+    const base = h.sender(h.registration.eventTransfer as EventTransferCapability);
+    let changed = false;
+    const indices: number[] = [];
+    const transfer: FollowerEventTransferSender = {
+      capability: base.capability,
+      send: async (fragment) => {
+        indices.push(fragment.index);
+        const reply = await base.send(fragment);
+        // Corrupt one ACK after the real receiver has retained three fragments.
+        if (fragment.index === 2 && !changed && reply.status === "fragment") {
+          changed = true;
+          return { ...reply, receivedBytes: reply.receivedBytes + 1 };
+        }
+        return reply;
+      },
+    };
+    const event = log("big", "x".repeat(9 * MiB));
+    const queue = new FollowerEventQueue();
+    queue.enqueue(event);
+    queue.enqueue(ready());
+    const errors = await drain(queue, () => queue.flush(h.deliver, h.identity, transfer), 4);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ reason: "unexpected_progress" });
+    expect(indices).toEqual([0, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(queue.hasPending).toBe(false);
+    expect(h.received).toEqual([event.message, ready().message]);
+  });
+
   it("completes a final acknowledgement lost after staging expiry from committed dedupe", async () => {
     let now = 0;
     const h = await setup({
@@ -691,12 +730,15 @@ describe("negotiated event transfer over the follower gateway", () => {
     // Leader-incarnation fence: the old in-flight reply must not advance the new queue.
     queue.clear();
     expect(queue.isFlushing).toBe(false);
+    // B waits with a capability from the intermediate registration.
+    const intermediate = queue.flush(h.deliver, h.identity, transfer).catch((error) => error);
+    queue.clear();
     queue.enqueue(log("after-fence", "y".repeat(9 * MiB)));
     // The new registration advertised no transfer. Its flush waits for the old
     // request instead of joining a delivery that holds the old capability.
     const next = queue.flush(h.deliver, h.identity).catch((error) => error);
     release?.();
-    await Promise.all([first, joined]);
+    await Promise.all([first, joined, intermediate]);
     // The stale reply removed nothing, and the old flush sent nothing more.
     expect(await next).toMatchObject({ reason: "capability_missing", eventId: "after-fence" });
     expect(queue.hasPending).toBe(true);

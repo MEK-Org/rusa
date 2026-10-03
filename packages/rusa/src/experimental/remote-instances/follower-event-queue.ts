@@ -176,7 +176,9 @@ export class FollowerEventQueue {
     envelope: object = {},
     transfer?: FollowerEventTransferSender
   ): Promise<void> {
+    const epoch = this.epoch;
     while (this.inFlight) {
+      if (this.epoch !== epoch) return;
       const inFlight = this.inFlight;
       if (inFlight.epoch === this.epoch) return inFlight.delivery;
       // That delivery belongs to the registration `clear()` fenced. Wait for
@@ -185,6 +187,7 @@ export class FollowerEventQueue {
       await inFlight.delivery.catch(() => {});
       if (this.inFlight === inFlight) this.inFlight = undefined;
     }
+    if (this.epoch !== epoch) return;
 
     const inFlight = {
       delivery: this.deliverPending(deliver, envelope, transfer),
@@ -351,8 +354,8 @@ export class FollowerEventQueue {
     switch (reply.status) {
       case "fragment":
         if (reply.receivedBytes !== end) {
-          pending.index = 0;
-          pending.offset = 0;
+          // Retry this fragment: resetting to zero against live staging can
+          // loop on its cumulative ACK until expiry. Explicit restart resets.
           throw new FollowerEventTransferRetryError("unexpected_progress", 0);
         }
         pending.index++;

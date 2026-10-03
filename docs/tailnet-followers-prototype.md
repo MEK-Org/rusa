@@ -241,7 +241,11 @@ the session current at the attempt.
 
 The leader bounds staging: an original event of at most 64 MiB, one incomplete
 transfer per follower, eight and 128 MiB of declared bytes across all
-followers. Every fragment before the last carries at least 64 KiB, so a
+followers. This reservation bounds declared incomplete-event bytes, not process
+memory: request/base64 decoding, concatenation, UTF-8 strings and parsed objects
+can coexist with staged bytes. Chunks are released after concatenation, before
+dispatch; garbage collection and listener copies still affect peak memory.
+Every fragment before the last carries at least 64 KiB, so a
 transfer is at most about a thousand fragments, and the leader reads at most
 eight `/events/transfer` request bodies at once, answering `busy` to more
 before reading them. Staging expires five minutes after its last newly accepted fragment
@@ -258,7 +262,8 @@ it, and the follower logs `follower_event_parked` once with the event ID, type,
 size, limit and reason, never its content. Parked delivery is not retried until
 a registration brings a capability, or one different from the capability the
 leader refused under; nothing is truncated, dropped or reported as delivered.
-The log line is the only signal of a parked queue. Deploy an upgraded leader before relying on transfer
+The log line is the only signal of a parked queue; [#880](https://github.com/MEK-Org/rusa/issues/880)
+tracks content-free status/health visibility. Deploy an upgraded leader before relying on transfer
 from upgraded followers. A follower built before #876 is still accepted and
 keeps its old limit: an event that alone exceeds 8 MiB blocks its queue.
 

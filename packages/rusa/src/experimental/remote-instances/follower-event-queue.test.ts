@@ -50,6 +50,39 @@ describe("FollowerEventQueue", () => {
     expect(delivered).toEqual([["building"], ["restarting"]]);
   });
 
+  it("fences an ordinary flush waiting across two clears before the held request settles", async () => {
+    const queue = new FollowerEventQueue();
+    const sent: unknown[] = [];
+    let release: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const enqueue = (id: string) =>
+      queue.enqueue({
+        eventId: id,
+        actorId: "actor-1",
+        message: { type: "ready", pid: 123 },
+      });
+    const deliver = async (batch: { body: string }) => {
+      sent.push(JSON.parse(batch.body));
+      if (sent.length === 1) await held;
+    };
+    enqueue("old");
+    const first = queue.flush(deliver, { session: "A" });
+    queue.clear();
+    const intermediate = queue.flush(deliver, { session: "B" });
+    queue.clear();
+    enqueue("new");
+    const current = queue.flush(deliver, { session: "C" });
+    release?.();
+    await Promise.all([first, intermediate, current]);
+    expect(sent).toMatchObject([
+      { session: "A", events: [{ eventId: "old" }] },
+      { session: "C", events: [{ eventId: "new" }] },
+    ]);
+    expect(queue.hasPending).toBe(false);
+  });
+
   it("retries the bytes frozen at enqueue under the current envelope", async () => {
     const queue = new FollowerEventQueue();
     const event: FollowerEvent = {

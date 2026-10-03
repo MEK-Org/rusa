@@ -68,6 +68,9 @@ export class FollowerDedupeTracker {
     const recorded = this.processedEvents.get(eventId);
     if (recorded) {
       // Acceptance is final: a later failure for the same id cannot undo it.
+      // The sole failed -> accepted transition is FollowerHub.acceptEvent's
+      // pre-dispatch fence after synchronous receive returns successfully.
+      // Recorded failures otherwise stay terminal under that admission path.
       if (recorded !== "accepted") this.processedEvents.set(eventId, outcome);
       return;
     }
