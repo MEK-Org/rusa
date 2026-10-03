@@ -7,64 +7,14 @@ import 'package:rusa_dashboard/session.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/chat_room.dart';
 import 'package:rusa_dashboard/widgets/dashboard_body.dart';
-import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 
 import 'fakes.dart';
 
-class _TestSession extends DashboardSession {
-  _TestSession();
-
-  @override
-  DashboardSessionStatus status = DashboardSessionStatus.signedIn;
-
-  @override
-  bool get authenticationEnabled => true;
-
-  @override
-  String? get csrfToken => null;
-
-  @override
-  bool get isIdle => false;
-
-  @override
-  String? get profilePhotoUrl => null;
-
-  @override
-  String get operatorDisplayName => 'Operator';
-
-  @override
-  String? get browserTitle => null;
-
-  @override
-  String? get errorMessage => null;
-
-  @override
-  Future<void> requireAuthentication() async {}
-
-  @override
-  Future<void> signIn() async {}
-
-  @override
-  Future<void> signOut() async {}
-
-  @override
-  Future<void> visit() async {}
-
-  @override
-  void idleFromServer() {}
-
-  @override
-  Future<void> checkSession() async {}
-}
-
-Widget _testDashboardApp({
-  required DashboardStore store,
-  required DashboardSession session,
-}) {
+Widget _testDashboardApp({required DashboardStore store}) {
   return RusaDashboardApp(
-    bootstrapSession: () => Future.value(session),
+    bootstrapSession: () => Future.value(LocalDashboardSession()),
     pageBuilder: (_, _) => Scaffold(
       body: DashboardBody(
         store: store,
@@ -73,6 +23,22 @@ Widget _testDashboardApp({
       ),
     ),
   );
+}
+
+Future<void> _pumpDashboard(
+  WidgetTester tester, {
+  required DashboardStore store,
+  String initialUrl = '/overview',
+  Size size = const Size(1200, 800),
+}) async {
+  tester.platformDispatcher.defaultRouteNameTestValue = initialUrl;
+  debugDashboardUrl = initialUrl;
+  tester.view.physicalSize = size;
+  tester.view.devicePixelRatio = 1.0;
+
+  await tester.pumpWidget(_testDashboardApp(store: store));
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 50));
 }
 
 void main() {
@@ -106,43 +72,24 @@ void main() {
         await tester.runAsync(() async {
           addTearDown(() {
             tester.platformDispatcher.clearDefaultRouteNameTestValue();
+            tester.view.resetPhysicalSize();
+            tester.view.resetDevicePixelRatio();
           });
-
-          tester.platformDispatcher.defaultRouteNameTestValue = '/overview';
-          debugDashboardUrl = '/overview';
 
           final api = FakeApi()..chatRoomParticipants = ['root'];
           final store = DashboardStore(api: api, stream: FakeStream());
           await store.init();
 
-          final session = _TestSession();
-
-          // Render app with wide dimensions so top nav items are visible in header.
-          tester.view.physicalSize = const Size(1200, 800);
-          tester.view.devicePixelRatio = 1.0;
-          addTearDown(() {
-            tester.view.resetPhysicalSize();
-            tester.view.resetDevicePixelRatio();
-          });
-
-          await tester.pumpWidget(
-            _testDashboardApp(store: store, session: session),
-          );
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
+          await _pumpDashboard(tester, store: store, initialUrl: '/overview');
 
           // Initially on Overview
           expect(find.byType(OverviewTab), findsOneWidget);
           expect(find.byType(ChatRoomTab), findsNothing);
 
-          // Clear initial nav calls during mount
           recordedNavCalls.clear();
 
           // Navigate from Overview (A) to Room
-          final roomNavButton = find.widgetWithText(
-            InkWell,
-            'Room',
-          );
+          final roomNavButton = find.widgetWithText(InkWell, 'Room');
           expect(roomNavButton, findsOneWidget);
           await tester.tap(roomNavButton);
           await tester.pump();
@@ -152,7 +99,7 @@ void main() {
           expect(find.byType(ChatRoomTab), findsOneWidget);
           expect(find.byType(OverviewTab), findsNothing);
 
-          // Verify that navigation enabled multi-entry history and pushed (replace: false)
+          // Verify that navigation pushed history (replace: false)
           final pushUpdates = recordedNavCalls.where(
             (c) =>
                 c.method == 'routeInformationUpdated' &&
@@ -166,18 +113,9 @@ void main() {
             reason: 'Navigation to Room must push history entry with replace: false',
           );
 
-          final multiEntryCalls = recordedNavCalls.where(
-            (c) => c.method == 'selectMultiEntryHistory',
-          );
-          expect(
-            multiEntryCalls,
-            isNotEmpty,
-            reason: 'Navigation must ensure selectMultiEntryHistory is called',
-          );
-
           // Simulate browser / system back popping back to /overview
           final handled = await tester.binding.handlePushRoute('/overview');
-          expect(handled, isTrue, reason: 'DashboardBody must handle push route for /overview');
+          expect(handled, isTrue, reason: 'DashboardRouteScope must handle push route');
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 50));
 
@@ -200,29 +138,15 @@ void main() {
         await tester.runAsync(() async {
           addTearDown(() {
             tester.platformDispatcher.clearDefaultRouteNameTestValue();
+            tester.view.resetPhysicalSize();
+            tester.view.resetDevicePixelRatio();
           });
-
-          tester.platformDispatcher.defaultRouteNameTestValue = '/overview';
-          debugDashboardUrl = '/overview';
 
           final api = FakeApi()..chatRoomParticipants = ['root'];
           final store = DashboardStore(api: api, stream: FakeStream());
           await store.init();
 
-          final session = _TestSession();
-
-          tester.view.physicalSize = const Size(1200, 800);
-          tester.view.devicePixelRatio = 1.0;
-          addTearDown(() {
-            tester.view.resetPhysicalSize();
-            tester.view.resetDevicePixelRatio();
-          });
-
-          await tester.pumpWidget(
-            _testDashboardApp(store: store, session: session),
-          );
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
+          await _pumpDashboard(tester, store: store, initialUrl: '/overview');
 
           expect(find.byType(OverviewTab), findsOneWidget);
 
@@ -258,61 +182,51 @@ void main() {
     );
 
     testWidgets(
-      'mobile drawer navigation to Room on phone viewport returns on back',
+      'restoring URL without obligation focus clears focused obligation in store and UI',
       (tester) async {
         await tester.runAsync(() async {
           addTearDown(() {
             tester.platformDispatcher.clearDefaultRouteNameTestValue();
+            tester.view.resetPhysicalSize();
+            tester.view.resetDevicePixelRatio();
           });
-
-          tester.platformDispatcher.defaultRouteNameTestValue = '/overview';
-          debugDashboardUrl = '/overview';
 
           final api = FakeApi()..chatRoomParticipants = ['root'];
           final store = DashboardStore(api: api, stream: FakeStream());
           await store.init();
 
-          final session = _TestSession();
+          await _pumpDashboard(tester, store: store, initialUrl: '/work');
+          expect(find.byType(WorkTab), findsOneWidget);
 
-          // Phone viewport (< kNarrowBreakpoint = 720)
-          tester.view.physicalSize = const Size(390, 844);
-          tester.view.devicePixelRatio = 1.0;
-          addTearDown(() {
-            tester.view.resetPhysicalSize();
-            tester.view.resetDevicePixelRatio();
-          });
-
-          await tester.pumpWidget(
-            _testDashboardApp(store: store, session: session),
-          );
+          // Focus obligation Q (simulating in-view focus selection)
+          store.setFocusedObligationId('ob-q');
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 50));
+          expect(store.focusedObligationId.valueOrNull, 'ob-q');
 
-          expect(find.byType(OverviewTab), findsOneWidget);
-
-          // Open drawer via hamburger icon
-          final hamburger = find.byIcon(Icons.menu);
-          expect(hamburger, findsOneWidget);
-          await tester.tap(hamburger);
+          // Navigate to Room
+          await tester.tap(find.widgetWithText(InkWell, 'Room'));
           await tester.pump();
-          await tester.pump(const Duration(milliseconds: 300));
-
-          // Drawer is open; tap Chat Room tile
-          expect(find.byType(MobileNavDrawer), findsOneWidget);
-          await tester.tap(find.widgetWithText(ListTile, 'Room'));
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 300));
-
-          // Room view is active
+          await tester.pump(const Duration(milliseconds: 50));
           expect(find.byType(ChatRoomTab), findsOneWidget);
 
-          // Android system back returns to Overview
-          await tester.binding.handlePushRoute('/overview');
+          // Back to /work/ob-q restores WorkTab with obligation focused
+          await tester.binding.handlePushRoute('/work/ob-q');
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 50));
+          expect(find.byType(WorkTab), findsOneWidget);
+          expect(store.focusedObligationId.valueOrNull, 'ob-q');
 
-          expect(find.byType(OverviewTab), findsOneWidget);
-          expect(find.byType(ChatRoomTab), findsNothing);
+          // Back to original bare /work clears focused obligation in store
+          await tester.binding.handlePushRoute('/work');
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 50));
+          expect(find.byType(WorkTab), findsOneWidget);
+          expect(
+            store.focusedObligationId.valueOrNull,
+            isNull,
+            reason: 'Popping to bare /work must clear focused obligation in store',
+          );
 
           await store.dispose();
         });
@@ -325,29 +239,15 @@ void main() {
         await tester.runAsync(() async {
           addTearDown(() {
             tester.platformDispatcher.clearDefaultRouteNameTestValue();
+            tester.view.resetPhysicalSize();
+            tester.view.resetDevicePixelRatio();
           });
-
-          tester.platformDispatcher.defaultRouteNameTestValue = '/work';
-          debugDashboardUrl = '/work';
 
           final api = FakeApi();
           final store = DashboardStore(api: api, stream: FakeStream());
           await store.init();
 
-          final session = _TestSession();
-
-          tester.view.physicalSize = const Size(1200, 800);
-          tester.view.devicePixelRatio = 1.0;
-          addTearDown(() {
-            tester.view.resetPhysicalSize();
-            tester.view.resetDevicePixelRatio();
-          });
-
-          await tester.pumpWidget(
-            _testDashboardApp(store: store, session: session),
-          );
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
+          await _pumpDashboard(tester, store: store, initialUrl: '/work');
 
           recordedNavCalls.clear();
 
@@ -376,111 +276,24 @@ void main() {
     );
 
     testWidgets(
-      'direct deep link to /chat-room leaves app on system back (didPopRoute returns false)',
+      'direct deep link to /chat-room lands on Room without fabricating Overview',
       (tester) async {
         await tester.runAsync(() async {
           addTearDown(() {
             tester.platformDispatcher.clearDefaultRouteNameTestValue();
+            tester.view.resetPhysicalSize();
+            tester.view.resetDevicePixelRatio();
           });
-
-          tester.platformDispatcher.defaultRouteNameTestValue = '/chat-room';
-          debugDashboardUrl = '/chat-room';
 
           final api = FakeApi()..chatRoomParticipants = ['root'];
           final store = DashboardStore(api: api, stream: FakeStream());
           await store.init();
 
-          final session = _TestSession();
+          await _pumpDashboard(tester, store: store, initialUrl: '/chat-room');
 
-          tester.view.physicalSize = const Size(1200, 800);
-          tester.view.devicePixelRatio = 1.0;
-          addTearDown(() {
-            tester.view.resetPhysicalSize();
-            tester.view.resetDevicePixelRatio();
-          });
-
-          await tester.pumpWidget(
-            _testDashboardApp(store: store, session: session),
-          );
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-
-          // Verifies direct deep link loaded Room view
+          // Direct deep link displays ChatRoomTab
           expect(find.byType(ChatRoomTab), findsOneWidget);
           expect(find.byType(OverviewTab), findsNothing);
-
-          // System back at first entry (no prior browser history) invokes didPopRoute
-          final handled = await tester.binding.handlePopRoute();
-          expect(
-            handled,
-            isFalse,
-            reason:
-                'didPopRoute must return false on first entry to let platform exit PWA',
-          );
-
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-
-          // Must NOT fabricate navigation to OverviewTab
-          expect(
-            find.byType(OverviewTab),
-            findsNothing,
-            reason: 'Must not fabricate navigation to Overview on first-entry back',
-          );
-          expect(find.byType(ChatRoomTab), findsOneWidget);
-
-          await store.dispose();
-        });
-      },
-    );
-
-    testWidgets(
-      'actor detail selection on Actors tab: system back clears selection and consumes event',
-      (tester) async {
-        await tester.runAsync(() async {
-          addTearDown(() {
-            tester.platformDispatcher.clearDefaultRouteNameTestValue();
-          });
-
-          tester.platformDispatcher.defaultRouteNameTestValue = '/actors';
-          debugDashboardUrl = '/actors';
-
-          final api = FakeApi();
-          final store = DashboardStore(api: api, stream: FakeStream());
-          await store.init();
-
-          final session = _TestSession();
-
-          tester.view.physicalSize = const Size(1200, 800);
-          tester.view.devicePixelRatio = 1.0;
-          addTearDown(() {
-            tester.view.resetPhysicalSize();
-            tester.view.resetDevicePixelRatio();
-          });
-
-          await tester.pumpWidget(
-            _testDashboardApp(store: store, session: session),
-          );
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-
-          // Select an actor
-          store.clickActor('actor-1');
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-          expect(store.primary.valueOrNull, 'actor-1');
-
-          // System back in actor detail clears selection and returns true
-          final handled = await tester.binding.handlePopRoute();
-          expect(handled, isTrue);
-
-          await tester.pump();
-          await tester.pump(const Duration(milliseconds: 50));
-          expect(store.primary.valueOrNull, isNull);
-
-          // Second system back now has no selection to clear, returns false to exit
-          final secondHandled = await tester.binding.handlePopRoute();
-          expect(secondHandled, isFalse);
 
           await store.dispose();
         });

@@ -59,10 +59,9 @@ void main() {
       );
       await Future<void>.delayed(Duration.zero);
 
-      expect(calls, hasLength(2));
-      expect(calls[0].method, 'selectMultiEntryHistory');
-      expect(calls[1].method, 'routeInformationUpdated');
-      expect(calls[1].arguments, <String, Object?>{
+      expect(calls, hasLength(1));
+      expect(calls.single.method, 'routeInformationUpdated');
+      expect(calls.single.arguments, <String, Object?>{
         'uri': '/chat-room',
         'state': null,
         'replace': false,

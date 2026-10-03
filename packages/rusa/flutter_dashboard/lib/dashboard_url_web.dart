@@ -47,8 +47,5 @@ void writeDashboardViewToUrl(
   // API directly replaces the engine's serialized state and breaks teardown.
   // This is deliberately fire-and-forget: a view selection must not wait for
   // best-effort address-bar synchronization.
-  if (!replace) {
-    unawaited(SystemNavigator.selectMultiEntryHistory());
-  }
   unawaited(SystemNavigator.routeInformationUpdated(uri: url, replace: replace));
 }

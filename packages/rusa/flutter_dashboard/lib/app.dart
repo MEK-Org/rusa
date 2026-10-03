@@ -1,11 +1,14 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'dashboard_title.dart';
+import 'route_scope.dart';
 import 'session.dart';
 import 'theme.dart';
+
+export 'route_scope.dart';
 
 typedef DashboardPageBuilder =
     Widget Function(BuildContext context, DashboardSession session);
@@ -51,6 +54,7 @@ class _RusaDashboardAppState extends State<RusaDashboardApp>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    unawaited(SystemNavigator.selectMultiEntryHistory());
   }
 
   Future<DashboardSession> _bootstrapSession() async {
@@ -280,24 +284,4 @@ class _SignInPageState extends State<SignInPage> {
   );
 }
 
-/// Injects route updates from platform popstate/back navigation to descendant dashboard widgets.
-class DashboardRouteScope extends InheritedWidget {
-  const DashboardRouteScope({
-    super.key,
-    required this.routeNotifier,
-    required super.child,
-  });
-
-  final ValueListenable<RouteInformation?> routeNotifier;
-
-  static ValueListenable<RouteInformation?>? maybeOf(BuildContext context) {
-    return context
-        .dependOnInheritedWidgetOfExactType<DashboardRouteScope>()
-        ?.routeNotifier;
-  }
-
-  @override
-  bool updateShouldNotify(DashboardRouteScope oldWidget) =>
-      routeNotifier != oldWidget.routeNotifier;
-}
 

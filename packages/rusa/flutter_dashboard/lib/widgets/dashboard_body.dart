@@ -1,9 +1,8 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
-import '../app.dart';
+import '../route_scope.dart';
 import '../breakpoints.dart';
 import '../dashboard_url.dart';
 import '../dashboard_url_core.dart';
@@ -59,8 +58,7 @@ class DashboardBody extends StatefulWidget {
   State<DashboardBody> createState() => _DashboardBodyState();
 }
 
-class _DashboardBodyState extends State<DashboardBody>
-    with WidgetsBindingObserver {
+class _DashboardBodyState extends State<DashboardBody> {
   late DashboardView _view;
   StreamSubscription<String?>? _focusSub;
   StreamSubscription<String?>? _actorSub;
@@ -80,8 +78,6 @@ class _DashboardBodyState extends State<DashboardBody>
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    unawaited(SystemNavigator.selectMultiEntryHistory());
     _urlNamedView = dashboardViewFromUrl();
     _view = _urlNamedView ?? DashboardView.overview;
     final initialObligation = focusedObligationIdFromUrl();
@@ -156,7 +152,6 @@ class _DashboardBodyState extends State<DashboardBody>
   @override
   void dispose() {
     _routeNotifier?.removeListener(_onRouteChanged);
-    WidgetsBinding.instance.removeObserver(this);
     _focusSub?.cancel();
     _actorSub?.cancel();
     super.dispose();
@@ -181,9 +176,7 @@ class _DashboardBodyState extends State<DashboardBody>
     final actorId = parseFocusedActorId(uri);
 
     if (obligationId != widget.store.focusedObligationId.valueOrNull) {
-      if (obligationId != null) {
-        widget.store.setFocusedObligationId(obligationId);
-      }
+      widget.store.setFocusedObligationId(obligationId);
     }
     if (actorId != widget.store.primary.valueOrNull) {
       if (actorId != null) {
@@ -199,23 +192,6 @@ class _DashboardBodyState extends State<DashboardBody>
         unawaited(widget.onNavigation!());
       }
     }
-  }
-
-  @override
-  Future<bool> didPushRouteInformation(RouteInformation routeInformation) async {
-    _applyRouteInformation(routeInformation);
-    return true;
-  }
-
-  @override
-  Future<bool> didPopRoute() async {
-    final inActorDetail =
-        _view == DashboardView.actors && widget.store.primary.valueOrNull != null;
-    if (inActorDetail) {
-      widget.store.clearSelection();
-      return true;
-    }
-    return false;
   }
 
   @override
