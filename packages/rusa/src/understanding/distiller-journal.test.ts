@@ -686,7 +686,8 @@ describe("chat source coverage ", () => {
       NO_CLAIMS
     );
     expect(md).toContain("**chat was not in this run's read set** (0 spaces in membership)");
-    expect(md).toContain("ISSUE_NUM");
+    expect(md).toContain("Anything decided only in chat is invisible to this run");
+    expect(md).not.toContain("ISSUE_NUM");
     // The empty case must never read as a clean bill of health.
     expect(md).not.toContain("Chat coverage: complete");
   });

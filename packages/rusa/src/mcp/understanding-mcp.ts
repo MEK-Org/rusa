@@ -317,7 +317,7 @@ export function createUnderstandingWriteServer(
     {
       title: "Update a node's markdown body",
       description:
-        "Replace or append the markdown body of an existing node. Prefer folding a finding into the section that already owns the concept (a `replace` of the whole body) over appending a new dated section beside it — appended sections turn a node into a changelog . To correct part of a body rather than restate all of it, use `splice_node_contents` — re-emitting a large body by hand to change a few sentences risks mangling the rest. The write always lands; if the resulting body is past a ISSUE_NUM Part 2 split trigger the result carries `warnings` with the actual numbers, which is your cue to split the node.",
+        "Replace or append the markdown body of an existing node. Prefer folding a finding into the section that already owns the concept (a `replace` of the whole body) over appending a new dated section beside it — appended sections turn a node into a changelog . To correct part of a body rather than restate all of it, use `splice_node_contents` — re-emitting a large body by hand to change a few sentences risks mangling the rest. The write always lands; if the resulting body is past a split trigger the result carries `warnings` with the actual numbers, which is your cue to split the node.",
       inputSchema: {
         node_id: z.string(),
         action: z.enum(["replace", "append"]),

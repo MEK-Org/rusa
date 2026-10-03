@@ -783,7 +783,7 @@ function renderChatCoverage(summary: JournalLine | undefined): string[] {
   const spaces = Array.isArray(cov.spaces) ? cov.spaces : [];
   if (configured === 0 || (configured === undefined && spaces.length === 0)) {
     return [
-      `- Chat coverage: **chat was not in this run's read set** (${configured ?? 0} spaces in membership). Anything decided only in chat is invisible to this run — see ISSUE_NUM.${note}`,
+      `- Chat coverage: **chat was not in this run's read set** (${configured ?? 0} spaces in membership). Anything decided only in chat is invisible to this run.${note}`,
     ];
   }
   const scope =

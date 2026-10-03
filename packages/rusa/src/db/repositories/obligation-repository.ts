@@ -2328,7 +2328,7 @@ export class ObligationRepository {
       const retiringOwner = validateEntityId(retiringActorId);
       if (parentActorId === null) {
         throw new ObligationValidationError(
-          "retirement inheritance requires an actor parent; root/no-parent behavior is unresolved (ISSUE_NUM Q69)"
+          "retirement inheritance requires an actor parent; root/no-parent behavior is unresolved"
         );
       }
       const parentOwner = validateEntityId(parentActorId);
