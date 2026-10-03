@@ -2950,8 +2950,7 @@ describe("ActorMesh", () => {
       targetActorId: target,
     });
     expect(JSON.stringify(transferLog)).not.toContain("take over the review");
-    expect(registry.get(target)?.lastChatSessionId).toBeUndefined();
-    expect(registry.get(target)?.humanUnlocked).toBeUndefined();
+    expect(registry.lastHumanChat(target)).toBeUndefined();
 
     const handoff = inboxStore.entries.find(
       (entry) => entry.actorId === target && entry.payload.type === "voice.transfer"

@@ -921,7 +921,7 @@ describe("agent-execution MCP server", () => {
     holder = source.id;
 
     mesh.transferVoiceSession(source.id, target.id);
-    expect(actors.get(target.id)?.humanUnlocked).toBeUndefined();
+    expect(actors.lastHumanChat(target.id)).toBeUndefined();
 
     const client = await connect(createAgentExecMcpServer(mesh, target.id, root.id));
     const { tools } = await client.listTools();

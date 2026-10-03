@@ -1,4 +1,4 @@
-import type { ActorRecord } from "../actor/actor-record.js";
+import type { ActorRecord, HumanChat } from "../actor/actor-record.js";
 import type {
   ActorRecordPatch,
   ActorRepository,
@@ -8,6 +8,7 @@ import type {
 /** Lightweight repository adapter for isolated tests and embedders without SQLite. */
 export class InMemoryActorRepository implements ActorRepository {
   private readonly records = new Map<string, ActorRecord>();
+  private readonly humanChats = new Map<string, HumanChat>();
 
   upsert(record: ActorRecord): void {
     this.records.set(record.id, structuredClone(record));
@@ -28,6 +29,15 @@ export class InMemoryActorRepository implements ActorRepository {
 
   parentOf(id: string): string | null | undefined {
     return this.records.get(id)?.parentId;
+  }
+
+  lastHumanChat(id: string): HumanChat | undefined {
+    const chat = this.humanChats.get(id);
+    return chat ? { ...chat } : undefined;
+  }
+
+  noteHumanChat(id: string, chat: HumanChat): void {
+    this.humanChats.set(id, { ...chat });
   }
 
   patch(id: string, changes: ActorRecordPatch): void {

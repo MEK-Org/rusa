@@ -4139,11 +4139,7 @@ export class ActorMesh {
       this.log(`message to ${toId} from ${fromId} dropped — recipient not active`);
       return { delivered: false, status: rec?.status };
     }
-    this.actors.patch(toId, {
-      humanUnlocked: true,
-      lastChatSessionId: sessionId,
-      lastChatPrincipalId: fromId,
-    });
+    this.actors.noteHumanChat(toId, { sessionId, principalId: fromId });
     const target = this.runs.liveActor(toId);
     const messageId = this.recordMessageEmitted({
       fromId,

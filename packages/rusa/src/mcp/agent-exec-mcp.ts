@@ -247,9 +247,8 @@ export function createAgentExecMcpServer(
     return `github:${repo}/${kind === "github_pr" ? "pulls" : "issues"}/${number}`;
   };
 
-  const rec = mesh.actors.get(selfId);
   const voiceSessionId = mesh.activeVoiceSessionIdFor(selfId);
-  if (rec?.humanUnlocked || voiceSessionId) {
+  if (voiceSessionId || mesh.actors.lastHumanChat(selfId)) {
     server.registerTool(
       "reply",
       {
@@ -261,10 +260,10 @@ export function createAgentExecMcpServer(
       },
       async ({ message }) => {
         try {
-          const r = mesh.actors.get(selfId);
-          const sessionId = mesh.activeVoiceSessionIdFor(selfId) ?? r?.lastChatSessionId;
+          const chat = mesh.actors.lastHumanChat(selfId);
+          const sessionId = mesh.activeVoiceSessionIdFor(selfId) ?? chat?.sessionId;
           if (!sessionId) throw new Error("reply requires an active human conversation");
-          const toId = r?.lastChatPrincipalId ?? HUMAN_OPERATOR;
+          const toId = chat?.principalId ?? HUMAN_OPERATOR;
           mesh.recordMessageEmitted({
             fromId: selfId,
             toId,
