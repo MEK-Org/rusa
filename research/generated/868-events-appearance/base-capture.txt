@@ -1,0 +1,18 @@
+RUN  v4.0.18 <CHECKOUT>/packages/rusa
+
+stdout | src/actor/actor-mesh.test.ts > #868 evidence capture: handle_granted Events row > writes the served event page
+Skipped 0 dropped message_sent rows during legacy mesh_chat backfill.
+Skipped 0 "[yield/" message rows during legacy mesh_chat backfill.
+Skipped 0 "[run failed]" message rows during legacy mesh_chat backfill.
+Skipped 0 "[message redelivery capped]" message rows during legacy mesh_chat backfill.
+Skipped 0 "[capped]" message rows during legacy mesh_chat backfill.
+Skipped 0 "[scheduled message dropped]" message rows during legacy mesh_chat backfill.
+Removed 0 intermediate-vintage mechanical rows from mesh_chat.
+0014: no regressed mechanical notices to clean up.
+
+ ✓ src/actor/actor-mesh.test.ts (399 tests | 398 skipped) 139ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 398 skipped (399)
+   Start at  14:27:43
+   Duration  15.58s (transform 6.81s, setup 0ms, import 9.61s, tests 139ms, environment 5.04s)

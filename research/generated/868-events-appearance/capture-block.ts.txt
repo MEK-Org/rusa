@@ -1,0 +1,44 @@
+
+// #868 appearance evidence (evidence branch only, not part of the PR). Runs only
+// when RUSA_868_CAPTURE_OUT is set. It makes the same grant call that the
+// pre-#868 `introduce` tool made (`{ id, role }`), records events into a real
+// SQLite `mesh_events` table and writes the page the dashboard's
+// `GET /api/mesh/events?actors=<holder>` route serves (`listEventsByActors`).
+describe("#868 evidence capture: handle_granted Events row", () => {
+  it.runIf(Boolean(process.env.RUSA_868_CAPTURE_OUT))("writes the served event page", async () => {
+    const { default: Db } = await import("better-sqlite3");
+    const { runMigrations: migrate } = await import("../db/migrations/runner.js");
+    const { MeshEventRepository } = await import("../db/repositories/mesh-event-repository.js");
+    const fs = await import("node:fs");
+    const db = new Db(":memory:");
+    migrate(db);
+    const repo = new MeshEventRepository(db);
+    let n = 0;
+    const { mesh, registry } = setup({
+      events: (e) => {
+        repo.record({ ...e, ts: e.ts ?? `2026-10-03T14:00:0${n++}.000Z` });
+      },
+      idgen: (() => {
+        const ids = [
+          "aaaaaaaa-1111-4111-8111-111111111111",
+          "bbbbbbbb-2222-4222-8222-222222222222",
+        ];
+        let i = 0;
+        return () => ids[i++] ?? `extra-${i}`;
+      })(),
+    });
+    const holder = mesh.spawn({ charter: "implement the #814 patch", parentId: "root", title: "Patch coder" });
+    const target = mesh.spawn({ charter: "review code\nwith care", parentId: "root", title: "Release reviewer" });
+    mesh.grantHandle(holder, { id: target, role: "reviewer for your patch" });
+    const page = repo.listEventsByActors([holder], { limit: 50, humanViewerIds: [] });
+    const actors = [holder, target].map((id) => {
+      const r = registry.get(id);
+      return { id, parentId: r?.parentId ?? null, title: r?.title ?? null, charter: r?.charter };
+    });
+    fs.writeFileSync(
+      process.env.RUSA_868_CAPTURE_OUT as string,
+      `${JSON.stringify({ actors, page }, null, 2)}\n`
+    );
+    db.close();
+  });
+});

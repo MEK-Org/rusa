@@ -1,0 +1,41 @@
+{
+  "actors": [
+    {
+      "id": "aaaaaaaa-1111-4111-8111-111111111111",
+      "parentId": "root",
+      "title": "Patch coder",
+      "charter": "implement the #814 patch"
+    },
+    {
+      "id": "bbbbbbbb-2222-4222-8222-222222222222",
+      "parentId": "root",
+      "title": "Release reviewer",
+      "charter": "review code\nwith care"
+    }
+  ],
+  "page": {
+    "events": [
+      {
+        "id": "fcfc1024-0b15-45f3-bb55-73f9a0fe855e",
+        "ts": "2026-10-03T14:00:04.000Z",
+        "kind": "handle_granted",
+        "actorId": "aaaaaaaa-1111-4111-8111-111111111111",
+        "detail": null,
+        "body": null,
+        "payload": "{\"handleId\":\"bbbbbbbb-2222-4222-8222-222222222222\"}",
+        "success": null
+      },
+      {
+        "id": "328c42e1-312a-4adf-afdc-5b9c1ea6bc74",
+        "ts": "2026-10-03T14:00:01.000Z",
+        "kind": "actor_spawned",
+        "actorId": "aaaaaaaa-1111-4111-8111-111111111111",
+        "detail": "implement the #814 patch",
+        "body": "modelConfig=claude:claude-sonnet-4-6",
+        "payload": "{\"parentId\":\"root\"}",
+        "success": null
+      }
+    ],
+    "nextCursor": null
+  }
+}

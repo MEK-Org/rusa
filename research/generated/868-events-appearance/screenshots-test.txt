@@ -1,0 +1,45 @@
+Resolving dependencies...
+Downloading packages...
+  async 2.13.0 (2.13.1 available)
+  clock 1.1.2 (1.1.3 available)
+  code_assets 1.2.1 (2.1.0 available)
+  connectivity_plus 7.2.0 (7.3.1 available)
+  cupertino_icons 1.0.8 (2.0.0 available)
+  dbus 0.7.14 (0.8.0 available)
+  equatable 2.0.8 (3.0.0 available)
+! flutter_dropzone_platform_interface 2.2.0 from git https://github.com/AlabasterAxe/flutter_dropzone.git at 708386 in flutter_dropzone_platform_interface (overridden)
+! flutter_dropzone_web 4.2.0 from git https://github.com/AlabasterAxe/flutter_dropzone.git at 708386 in flutter_dropzone_web (overridden)
+  go_router 14.8.1 (18.0.2 available)
+  google_fonts 6.3.3 (9.0.0 available)
+  hooks 2.0.2 (2.2.0 available)
+  intl 0.20.2 (0.20.3 available)
+  jni 1.0.0 (1.1.0 available)
+  jni_flutter 1.0.1 (1.0.4 available)
+  matcher 0.12.19 (0.12.20 available)
+  material_color_utilities 0.13.0 (0.13.1 available)
+  meta 1.17.0 (1.19.0 available)
+  nm 0.5.0 (0.6.0 available)
+  objective_c 9.4.1 (9.6.2 available)
+  package_config 2.2.0 (3.0.0 available)
+  petitparser 7.0.2 (7.1.0 available)
+  platform 3.1.6 (3.2.0 available)
+  pub_semver 2.2.0 (2.2.1 available)
+  record_use 0.6.0 (1.1.1 available)
+  stack_trace 1.12.1 (1.12.2 available)
+  test_api 0.7.10 (0.7.14 available)
+  uuid 4.5.3 (4.6.0 available)
+  vector_math 2.2.0 (2.4.3 available)
+  vm_service 15.0.2 (15.3.0 available)
+  xml 6.6.1 (7.1.0 available)
+  yaml 3.1.3 (3.1.4 available)
+Got dependencies!
+30 packages have newer versions incompatible with dependency constraints.
+Try `flutter pub outdated` for more information.
+00:00 +0: loading <CHECKOUT>/packages/rusa/flutter_dashboard/test/handle_granted_event_screenshot_test.dart
+00:00 +0: (setUpAll)
+00:00 +0: renders the handle_granted Events row before, wide
+00:13 +1: renders the handle_granted Events row before, narrow
+00:19 +2: renders the handle_granted Events row after, wide
+00:23 +3: renders the handle_granted Events row after, narrow
+00:25 +4: (tearDownAll)
+00:26 +4: All tests passed!
