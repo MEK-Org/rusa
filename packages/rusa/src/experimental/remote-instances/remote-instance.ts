@@ -24,7 +24,7 @@ export const ACTIVE_UPDATE_PHASES = new Set<FollowerUpdateStatusPhase>([
 /** In-memory deduplication tracker preserving at-most-once delivery across follower reconnects. */
 export class FollowerDedupeTracker {
   private readonly processedBatches = new Set<string>();
-  private readonly processedEvents = new Set<string>();
+  private readonly processedEvents = new Map<string, "accepted" | "failed">();
   private readonly batchOrder: string[] = [];
   private readonly eventOrder: string[] = [];
   private static readonly MAX_TRACKED_BATCHES = 1000;
@@ -57,12 +57,24 @@ export class FollowerDedupeTracker {
     return this.processedEvents.has(eventId);
   }
 
-  recordEvent(eventId: string): void {
+  eventOutcome(eventId: string): "accepted" | "failed" | undefined {
+    return this.processedEvents.get(eventId);
+  }
+
+  recordEvent(eventId: string, outcome: "accepted" | "failed" = "accepted"): void {
     // Keep the follower's replay fence fresh for individual event processing
     // too, in case a batch is interrupted before it reaches recordBatch().
     this.touch();
-    if (this.processedEvents.has(eventId)) return;
-    this.processedEvents.add(eventId);
+    const recorded = this.processedEvents.get(eventId);
+    if (recorded) {
+      // Acceptance is final: a later failure for the same id cannot undo it.
+      // The sole failed -> accepted transition is FollowerHub.acceptEvent's
+      // pre-dispatch fence after synchronous receive returns successfully.
+      // Recorded failures otherwise stay terminal under that admission path.
+      if (recorded !== "accepted") this.processedEvents.set(eventId, outcome);
+      return;
+    }
+    this.processedEvents.set(eventId, outcome);
     this.eventOrder.push(eventId);
     if (this.eventOrder.length > FollowerDedupeTracker.MAX_TRACKED_EVENTS) {
       const oldest = this.eventOrder.shift();
@@ -118,8 +130,12 @@ export class RemoteInstance {
     return this.dedupeTracker.hasEvent(eventId);
   }
 
-  recordEvent(eventId: string): void {
-    this.dedupeTracker.recordEvent(eventId);
+  eventOutcome(eventId: string): "accepted" | "failed" | undefined {
+    return this.dedupeTracker.eventOutcome(eventId);
+  }
+
+  recordEvent(eventId: string, outcome: "accepted" | "failed" = "accepted"): void {
+    this.dedupeTracker.recordEvent(eventId, outcome);
   }
 
   /** Contact gates new actor placement and follower updates, not existing actor commands. */
