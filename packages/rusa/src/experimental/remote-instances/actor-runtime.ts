@@ -39,7 +39,7 @@ export function createActorRuntime(
   // `beforeRun` belongs to the same serialized Actor opportunity as its later
   // provider gate. Carry its mode to the leader's final admission boundary.
   let pendingRunMode: ActorRunMode = "ordinary";
-  let lastRuntimeState: "queued" | "running" | "winding_down" | "idle" = "idle";
+  let lastRuntimeState: "queued" | "running" | "idle" = "idle";
   /** The leader's number for the pool the Actor holds; `admit` echoes it (#725). */
   let modelConfigGeneration: number | undefined;
   /** The admission request in flight, which a reconnecting leader can resume. */
@@ -115,7 +115,7 @@ export function createActorRuntime(
           request: { ...resumed.request, resume: true },
         });
       }
-      send({ type: "state", state: lastRuntimeState, yielded: actor.isYielded });
+      send({ type: "state", state: lastRuntimeState });
       return;
     }
     let snapshot: RunSnapshot;
@@ -123,10 +123,6 @@ export function createActorRuntime(
     modelConfigGeneration = bootstrap.modelConfigGeneration;
     const bridge = {
       sendMessage: (to: string, body: string) => request({ op: "sendMessage", to, body }).result,
-      yieldRun: (status?: string, note?: string) => {
-        if (!actor) throw new Error("Actor is not initialized");
-        actor.declareYield(status, note);
-      },
     };
     const providerOptions = bootstrap.providerOptions ?? {};
     mcpServers.splice(0, mcpServers.length, ...(bootstrap.mcpServers ?? []));
@@ -347,13 +343,13 @@ export function createActorRuntime(
       onCoalesceAborted: (count, ageMs) => send({ type: "coalesced", count, ageMs }),
       onRuntimeStateChanged: (state) => {
         lastRuntimeState = state;
-        send({ type: "state", state, yielded: actor?.isYielded ?? false });
+        send({ type: "state", state });
       },
       log: (chunk) => send({ type: "log", chunk }),
     });
     send({ type: "ready", pid: process.pid });
     if (bootstrap.reconnect) {
-      send({ type: "state", state: "idle", yielded: false });
+      send({ type: "state", state: "idle" });
     }
   }
 
@@ -413,9 +409,6 @@ export function createActorRuntime(
         // A start the leader cancelled before this Actor could retain it (a
         // lease flap, for one) still owes the actor its scheduling opportunity.
         if (!stopping && actor && !actor.resumeCancelledRun()) actor.requestRun(message.nudge);
-        break;
-      case "yield":
-        actor?.declareYield(message.status, message.note);
         break;
       case "unkillable":
         actor?.markUnkillable();

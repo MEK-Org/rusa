@@ -3,7 +3,6 @@ import { deterministicExhaustionFallback } from "../providers/exhaustion-classif
 import { FakeProvider } from "../providers/fake-provider.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import * as sandboxModule from "../providers/sandbox.js";
-import { formatSigtermResult } from "../providers/termination-attribution.js";
 import type { CodingProvider, RunOptions, RunResult } from "../providers/types.js";
 import {
   Actor,
@@ -100,12 +99,10 @@ describe("Actor", () => {
   afterEach(() => vi.useRealTimers());
 
   it("runs the provider with the built prompt after debounce", async () => {
-    let actor!: Actor;
     const provider = new FakeProvider(() => {
-      actor.declareYield();
       return {};
     });
-    actor = makeActor({}, provider);
+    const actor = makeActor({}, provider);
     actor.requestRun();
     expect(provider.calls).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(10);
@@ -114,17 +111,15 @@ describe("Actor", () => {
   });
 
   it("reports the instantiated provider immediately before it runs", async () => {
-    let actor!: Actor;
     const provider = new FakeProvider(
       () => {
-        actor.declareYield();
         return {};
       },
       "codex",
       "gpt-5.6-terra"
     );
     const attempts: RawProviderModelConfig[] = [];
-    actor = makeActor(
+    const actor = makeActor(
       {
         modelConfig: [
           { provider: provider.providerName, model: "gpt-5.6-sol", effort: "medium" },
@@ -150,10 +145,9 @@ describe("Actor", () => {
   });
 
   it("keeps active attempt attribution on its launched model when a later model is staged", async () => {
-    let actor!: Actor;
     let runCount = 0;
     const attempts: RawProviderModelConfig[] = [];
-    actor = makeActor(
+    const actor = makeActor(
       {
         modelConfig: [{ provider: "codex", model: "gpt-5.6-sol", effort: "low" }],
         resolveProvider: (selected) =>
@@ -164,7 +158,6 @@ describe("Actor", () => {
                   { provider: "codex", model: "gpt-5.6-terra", effort: "high" },
                 ]);
               }
-              actor.declareYield();
               return {};
             },
             selected.provider,
@@ -212,15 +205,13 @@ describe("Actor", () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(states).toEqual(["queued", "running"]);
 
-    actor.declareYield();
-    expect(states).toEqual(["queued", "running", "winding_down"]);
     resolveProvider({ success: true, output: "done", exitCode: 0 });
     await flush();
-    expect(states).toEqual(["queued", "running", "winding_down"]);
+    expect(states).toEqual(["queued", "running"]);
 
     resolveRunEnd();
     await flush();
-    expect(states).toEqual(["queued", "running", "winding_down", "idle"]);
+    expect(states).toEqual(["queued", "running", "idle"]);
   });
 
   it("passes bwrap sandbox options to the provider when enabled", async () => {
@@ -236,13 +227,11 @@ describe("Actor", () => {
   });
 
   it("invokes prepareUnderstandingMount and passes host mount directory to sandbox options", async () => {
-    let actor!: Actor;
     const provider = new FakeProvider(() => {
-      actor.declareYield();
       return {};
     });
     const prepareMountMock = vi.fn().mockResolvedValue("/tmp/test-snapshot-mount");
-    actor = makeActor(
+    const actor = makeActor(
       {
         sandbox: true,
         prepareUnderstandingMount: prepareMountMock,
@@ -285,17 +274,14 @@ describe("Actor", () => {
   });
 
   it("resolves the live provider per-run, so an in-place swap takes effect on the next run", async () => {
-    let actor!: Actor;
     const provider1 = new FakeProvider(() => {
-      actor.declareYield();
       return {};
     });
     const provider2 = new FakeProvider(() => {
-      actor.declareYield();
       return {};
     });
     let live: FakeProvider = provider1;
-    actor = makeActor({ resolveProvider: () => live }, provider1);
+    const actor = makeActor({ resolveProvider: () => live }, provider1);
 
     actor.requestRun();
     await vi.advanceTimersByTimeAsync(10);
@@ -365,7 +351,6 @@ describe("Actor", () => {
     let resolveInvoke!: () => void;
     let invokeCalled = false;
     const provider = new FakeProvider(() => {
-      actor.declareYield("complete");
       return {
         success: true,
         output: "simulated output",
@@ -423,15 +408,13 @@ describe("Actor", () => {
   });
 
   it("routes the run through the gate and calls onRun", async () => {
-    let actor!: Actor;
     const provider = new FakeProvider(() => {
-      actor.declareYield();
       return {};
     });
     const seen: RunResult[] = [];
     let gated = 0;
     let gatedProvider: string | undefined;
-    actor = makeActor(
+    const actor = makeActor(
       {
         gate: async (fn, candidates) => {
           gated++;
@@ -453,9 +436,7 @@ describe("Actor", () => {
   });
 
   it("promotes a queued normal run when a responsive wake arrives", async () => {
-    let actor!: Actor;
     const provider = new FakeProvider(() => {
-      actor.declareYield();
       return {};
     });
     let promotions = 0;
@@ -485,7 +466,7 @@ describe("Actor", () => {
         },
       };
     };
-    actor = makeActor(
+    const actor = makeActor(
       {
         gate,
         onRunStart: (responsive) => startPriorities.push(responsive),
@@ -511,12 +492,10 @@ describe("Actor", () => {
     let releaseBlocker!: () => void;
     void limiter.run(() => new Promise<void>((resolve) => (releaseBlocker = resolve)));
     await flush();
-    let actor!: Actor;
     const provider = new FakeProvider(() => {
-      actor.declareYield();
       return {};
     });
-    actor = makeActor(
+    const actor = makeActor(
       {
         gate: (fn, candidates) => limiter.enqueue(() => fn(candidates[0])),
       },
@@ -545,12 +524,10 @@ describe("Actor", () => {
     const limiter = new ConcurrencyLimiter(1);
     limiter.enqueue(() => blocker);
 
-    let actor!: Actor;
     const provider = new FakeProvider(() => {
-      actor.declareYield();
       return {};
     });
-    actor = makeActor(
+    const actor = makeActor(
       {
         gate: (fn, candidates) => limiter.enqueue(() => fn(candidates[0])),
       },
@@ -619,16 +596,14 @@ describe("Actor", () => {
   });
 
   it("parks a requeue when halt arrives during its preflight, then resumes it once", async () => {
-    let actor!: Actor;
     let preflightCalls = 0;
     let releaseReplacementPreflight!: (allowed: boolean) => void;
     let firstGateReject!: (reason: unknown) => void;
     let gateCalls = 0;
     const provider = new FakeProvider(() => {
-      actor.declareYield();
       return {};
     });
-    actor = makeActor(
+    const actor = makeActor(
       {
         beforeRun: () => {
           preflightCalls++;
@@ -690,12 +665,10 @@ describe("Actor", () => {
     let releaseBlocker!: () => void;
     void limiter.run(() => new Promise<void>((resolve) => (releaseBlocker = resolve)));
     await flush();
-    let actor!: Actor;
     const provider = new FakeProvider(() => {
-      actor.declareYield();
       return {};
     });
-    actor = makeActor(
+    const actor = makeActor(
       {
         gate: (fn, candidates) => limiter.enqueue(() => fn(candidates[0])),
       },
@@ -724,15 +697,11 @@ describe("Actor", () => {
       // ordinary path too, they would all pass while the signal meant nothing.
       const abandoned: RunAbandon[] = [];
       let ended = 0;
-      let actor!: Actor;
-      // Yield inside the run, so this is ONE opportunity: an actor that ends a
-      // run without yielding earns a corrective run, which is a second queue and
-      // legitimately a second onRunEnd.
+      // Provider return settles the run, so this is ONE opportunity (#664).
       const provider = new FakeProvider(() => {
-        actor.declareYield();
         return {};
       });
-      actor = makeActor(
+      const actor = makeActor(
         {
           onRunEnd: () => {
             ended++;
@@ -757,12 +726,10 @@ describe("Actor", () => {
       await flush();
       const abandoned: RunAbandon[] = [];
       let ended = 0;
-      let actor!: Actor;
       const provider = new FakeProvider(() => {
-        actor.declareYield();
         return {};
       });
-      actor = makeActor(
+      const actor = makeActor(
         {
           gate: (fn, candidates) => limiter.enqueue(() => fn(candidates[0])),
           onRunEnd: () => {
@@ -1016,7 +983,6 @@ describe("Actor", () => {
   });
 
   it("recovers through a later configured pool entry in order with intact tuples", async () => {
-    let actor!: Actor;
     const primary = new FakeProvider(
       () => ({ success: false, output: "quota exhausted first", exitCode: 1 }),
       "claude",
@@ -1031,7 +997,6 @@ describe("Actor", () => {
     );
     const third = new FakeProvider(
       () => {
-        actor.declareYield();
         return { output: "recovered", model: "gemini-3.1-pro-bound" };
       },
       "agy",
@@ -1044,7 +1009,7 @@ describe("Actor", () => {
       next: RawProviderModelConfig;
       remainingAfter: number;
     }> = [];
-    actor = makeActor(
+    const actor = makeActor(
       {
         modelConfig: [
           { provider: "claude", model: "claude-opus", effort: "high" },
@@ -1084,7 +1049,6 @@ describe("Actor", () => {
   });
 
   it("reports each pool provider's actual model and effort before its attempt", async () => {
-    let actor!: Actor;
     const primary = new FakeProvider(
       () => ({ success: false, output: "quota exhausted", exitCode: 1 }),
       "primary-provider",
@@ -1093,7 +1057,6 @@ describe("Actor", () => {
     );
     const fallbackProvider = new FakeProvider(
       () => {
-        actor.declareYield();
         return { output: "fallback ok" };
       },
       "fallback-provider",
@@ -1104,7 +1067,7 @@ describe("Actor", () => {
       entry.provider === "fallback-provider" ? fallbackProvider : primary
     );
     const attempts: RawProviderModelConfig[] = [];
-    actor = makeActor(
+    const actor = makeActor(
       {
         modelConfig: [
           { provider: primary.providerName, model: "primary-model", effort: "high" },
@@ -1140,7 +1103,6 @@ describe("Actor", () => {
   });
 
   it("uses the recovery pool entry rather than a model-only fallback pin", async () => {
-    let actor!: Actor;
     const primary = new FakeProvider(
       () => ({ success: false, output: "quota exhausted", exitCode: 1 }),
       "primary-provider",
@@ -1148,7 +1110,6 @@ describe("Actor", () => {
     );
     const fallbackProvider = new FakeProvider(
       () => {
-        actor.declareYield();
         return { output: "fallback ok" };
       },
       "codex",
@@ -1159,7 +1120,7 @@ describe("Actor", () => {
       entry.provider === "codex" ? fallbackProvider : primary
     );
     const attempts: RawProviderModelConfig[] = [];
-    actor = makeActor(
+    const actor = makeActor(
       {
         modelConfig: [
           { provider: primary.providerName, model: "primary-model" },
@@ -1193,7 +1154,6 @@ describe("Actor", () => {
   });
 
   it("uses the next pool entry for a classified Claude session-limit exhaustion", async () => {
-    let actor!: Actor;
     const primary = new FakeProvider(
       () => ({
         success: false,
@@ -1203,11 +1163,10 @@ describe("Actor", () => {
       "claude-opus"
     );
     const fallbackProvider = new FakeProvider(() => {
-      actor.declareYield();
       return { output: "fallback ok" };
     }, "sonnet");
     const seen: RunResult[] = [];
-    actor = makeActor(
+    const actor = makeActor(
       {
         modelConfig: [
           { provider: "claude-opus", model: "opus" },
@@ -1231,7 +1190,6 @@ describe("Actor", () => {
   });
 
   it("does not retry a later pool candidate that the gate selected first", async () => {
-    let actor!: Actor;
     const candidates: RawProviderModelConfig[] = [
       { provider: "provider-a", model: "model-a" },
       { provider: "provider-b", model: "model-b" },
@@ -1248,7 +1206,6 @@ describe("Actor", () => {
     );
     const providerA = new FakeProvider(() => {
       calls.push("provider-a");
-      actor.declareYield();
       return { output: "recovered on a" };
     }, "provider-a");
     const providerC = new FakeProvider(() => {
@@ -1257,7 +1214,7 @@ describe("Actor", () => {
     }, "provider-c");
 
     const seen: RunResult[] = [];
-    actor = makeActor(
+    const actor = makeActor(
       {
         modelConfig: candidates,
         // Gate selects provider-b (index 1) first:
@@ -1292,20 +1249,18 @@ describe("Actor", () => {
   });
 
   it("skips a halted recovery candidate and tries the next configured pool entry", async () => {
-    let actor!: Actor;
     const primary = new FakeProvider(
       () => ({ success: false, output: "quota exhausted primary", exitCode: 1 }),
       "primary-model"
     );
     const haltedProvider = new FakeProvider(() => ({ output: "should not run" }), "halted-model");
     const nextProvider = new FakeProvider(() => {
-      actor.declareYield();
       return { output: "recovered after halt skip", exitCode: 0, success: true };
     }, "next-model");
     const diagnostics: PoolFallbackDiagnostic[] = [];
     const seen: RunResult[] = [];
 
-    actor = makeActor(
+    const actor = makeActor(
       {
         modelConfig: [
           { provider: "primary", model: "first" },
@@ -1357,20 +1312,18 @@ describe("Actor", () => {
   });
 
   it("skips a pacing-ineligible candidate and tries the next configured pool entry", async () => {
-    let actor!: Actor;
     const primary = new FakeProvider(
       () => ({ success: false, output: "quota exhausted primary", exitCode: 1 }),
       "primary-model"
     );
     const pacingProvider = new FakeProvider(() => ({ output: "should not run" }), "pacing-model");
     const nextProvider = new FakeProvider(() => {
-      actor.declareYield();
       return { output: "recovered after pacing skip", exitCode: 0, success: true };
     }, "next-model");
     const diagnostics: PoolFallbackDiagnostic[] = [];
     const seen: RunResult[] = [];
 
-    actor = makeActor(
+    const actor = makeActor(
       {
         modelConfig: [
           { provider: "primary", model: "first" },
@@ -1421,9 +1374,7 @@ describe("Actor", () => {
 
   it("retries an entry the gate passed over earlier only when the hook reports it eligible", async () => {
     let eligible = false;
-    let actor!: Actor;
     const providerA = new FakeProvider(() => {
-      actor.declareYield();
       return { success: true, output: "recovered on entry-a", exitCode: 0 };
     }, "model-a");
     const providerB = new FakeProvider(
@@ -1437,7 +1388,7 @@ describe("Actor", () => {
     ];
 
     const seen: RunResult[] = [];
-    actor = makeActor(
+    const actor = makeActor(
       {
         modelConfig: candidates,
         gate: (fn, poolCandidates) => {
@@ -1537,18 +1488,16 @@ describe("Actor", () => {
   });
 
   it("keeps existing fallback behaviour when recoveryEligibility hook is absent", async () => {
-    let actor!: Actor;
     const primary = new FakeProvider(
       () => ({ success: false, output: "quota exhausted on primary", exitCode: 1 }),
       "primary-model"
     );
     const fallbackProvider = new FakeProvider(() => {
-      actor.declareYield();
       return { success: true, output: "recovered without hook", exitCode: 0 };
     }, "fallback-model");
     const seen: RunResult[] = [];
 
-    actor = makeActor(
+    const actor = makeActor(
       {
         modelConfig: [
           { provider: "primary", model: "first" },
@@ -1847,7 +1796,7 @@ describe("Actor", () => {
     expect(provider.calls).toHaveLength(0); // threw before the provider was invoked
   });
 
-  it("settles cleanly without a corrective yield prompt when a run ends without yield (#664)", async () => {
+  it("settles cleanly on provider return with no corrective run (#664)", async () => {
     const provider = new FakeProvider();
     const actor = makeActor({}, provider);
     actor.requestRun();
@@ -1856,7 +1805,7 @@ describe("Actor", () => {
     expect(provider.calls).toHaveLength(1);
   });
 
-  it("does not queue responsive yield-elicitation runs when a run completes (#664)", async () => {
+  it("does not queue a responsive follow-up run when a run completes (#664)", async () => {
     const queuedEvents: { responsive: boolean; mode: string }[] = [];
     const provider = new FakeProvider();
     const actor = makeActor(
@@ -1872,7 +1821,7 @@ describe("Actor", () => {
     expect(queuedEvents).toEqual([{ responsive: false, mode: "ordinary" }]);
   });
 
-  it("does not notify parent of failure when a run ends without yield (#664)", async () => {
+  it("does not notify parent of failure when a run returns successfully (#664)", async () => {
     const toParent: string[] = [];
     const provider = new FakeProvider();
     const deps = {
@@ -1937,12 +1886,10 @@ describe("Actor", () => {
         releaseGate = resolve;
       });
       const order: string[] = [];
-      let actor!: Actor;
       const provider = new FakeProvider(() => {
-        actor.declareYield();
         return {};
       });
-      actor = makeActor(
+      const actor = makeActor(
         {
           onQueued: () => order.push("queued"),
           onRunStart: () => order.push("start"),
@@ -1983,9 +1930,7 @@ describe("Actor", () => {
 
     it("contains an onStart observer failure without aborting the run or preventing provider execution", async () => {
       const results: RunResult[] = [];
-      let actor!: Actor;
       const provider = new FakeProvider(() => {
-        actor.declareYield();
         return { success: true, exitCode: 0, output: "done" };
       });
       const errors: unknown[] = [];
@@ -2004,7 +1949,7 @@ describe("Actor", () => {
         ],
         (failure) => errors.push(failure.error)
       );
-      actor = makeActor({ lifecycle }, provider);
+      const actor = makeActor({ lifecycle }, provider);
 
       actor.requestRun();
       await vi.advanceTimersByTimeAsync(10);
@@ -2025,15 +1970,13 @@ describe("Actor", () => {
     // and every watchdog kill on record is the former wearing the latter's name.
     it("fires onFirstChunk once on the provider's first chunk, not per chunk", async () => {
       const order: string[] = [];
-      let actor!: Actor;
       const provider = new FakeProvider((opts) => {
         opts.onChunk?.("first");
         opts.onChunk?.("second");
         opts.onChunk?.("third");
-        actor.declareYield();
         return {};
       });
-      actor = makeActor(
+      const actor = makeActor(
         {
           onRunStart: () => order.push("start"),
           onFirstChunk: () => order.push("first-chunk"),
@@ -2055,12 +1998,10 @@ describe("Actor", () => {
     it("does not fire onFirstChunk when the provider emits nothing", async () => {
       let firstChunks = 0;
       let started = 0;
-      let actor!: Actor;
       const provider = new FakeProvider(() => {
-        actor.declareYield();
         return {}; // never calls onChunk — the zero-byte run
       });
-      actor = makeActor(
+      const actor = makeActor(
         {
           onRunStart: () => started++,
           onFirstChunk: () => firstChunks++,
@@ -2466,7 +2407,7 @@ describe("Actor", () => {
       });
     });
 
-    it("forces success=false for non-grace aborts even if provider returns success=true", async () => {
+    it("forces success=false for an interrupt even if provider returns success=true", async () => {
       let resolveRun!: (res: RunResult) => void;
       const provider = new FakeProvider(() => {
         return new Promise<RunResult>((resolve) => {
@@ -2580,217 +2521,6 @@ describe("Actor", () => {
     });
   });
 
-  describe("yield grace period & isYielded", () => {
-    it("reports isYielded accurately across run lifecycle", async () => {
-      let actor!: Actor;
-      const provider = new FakeProvider(() => {
-        expect(actor.isYielded).toBe(false);
-        actor.declareYield();
-        expect(actor.isYielded).toBe(true);
-        return { success: true };
-      });
-      actor = makeActor({}, provider);
-      actor.requestRun();
-      await vi.advanceTimersByTimeAsync(10);
-      await flush();
-      expect(actor.isYielded).toBe(true);
-    });
-
-    it("aborts run if process does not exit within yieldGraceMs and preserves yield status with graceKilled: true", async () => {
-      let actor!: Actor;
-      let abortedSignal: AbortSignal | undefined;
-      const onRunEnd = vi.fn();
-
-      const provider = new FakeProvider(async (opts: RunOptions) => {
-        abortedSignal = opts.signal;
-        actor.declareYield("complete");
-        // Simulate a rogue process that keeps living after yield
-        return new Promise<RunResult>((resolve) => {
-          opts.signal?.addEventListener("abort", () => {
-            resolve({
-              success: false,
-              exitCode: 143,
-              cancelled: true,
-              graceKilled: true,
-              output: "[Task killed by supervisor (yield grace period exceeded)]",
-            });
-          });
-        });
-      });
-
-      actor = makeActor({ yieldGraceMs: 5000, onRunEnd }, provider);
-      actor.requestRun();
-      await vi.advanceTimersByTimeAsync(10); // debounce
-
-      expect(actor.isRunning).toBe(true);
-      expect(actor.isYielded).toBe(true);
-      expect(abortedSignal?.aborted).toBe(false);
-
-      // Advance past 5000ms grace period
-      await vi.advanceTimersByTimeAsync(5000);
-      await flush();
-
-      expect(abortedSignal?.aborted).toBe(true);
-      expect(abortedSignal?.reason).toBe("yield-grace-exceeded");
-      expect(onRunEnd).toHaveBeenCalledWith(
-        expect.objectContaining({
-          success: true,
-          graceKilled: true,
-          yieldStatus: "complete",
-          exitCode: 143,
-          output: expect.stringContaining("yield grace period exceeded"),
-        })
-      );
-    });
-
-    it("preserves blocked yield status when grace-killed", async () => {
-      let actor!: Actor;
-      const onRunEnd = vi.fn();
-
-      const provider = new FakeProvider(async (opts: RunOptions) => {
-        actor.declareYield("blocked", "waiting for reviewer");
-        return new Promise<RunResult>((resolve) => {
-          opts.signal?.addEventListener("abort", () => {
-            resolve({
-              success: false,
-              exitCode: 143,
-              cancelled: true,
-              graceKilled: true,
-              output: "[Task killed by supervisor (yield grace period exceeded)]",
-            });
-          });
-        });
-      });
-
-      actor = makeActor({ yieldGraceMs: 3000, onRunEnd }, provider);
-      actor.requestRun();
-      await vi.advanceTimersByTimeAsync(10);
-
-      await vi.advanceTimersByTimeAsync(3000);
-      await flush();
-
-      expect(onRunEnd).toHaveBeenCalledWith(
-        expect.objectContaining({
-          success: true,
-          graceKilled: true,
-          yieldStatus: "blocked",
-          yieldNote: "waiting for reviewer",
-          exitCode: 143,
-        })
-      );
-    });
-
-    it("reports kill without prior yield as failed", async () => {
-      const onRunEnd = vi.fn();
-
-      const provider = new FakeProvider(() => ({
-        // Never calls declareYield
-        success: false,
-        exitCode: 143,
-        cancelled: true,
-        graceKilled: true,
-        output: "[Task killed by supervisor (yield grace period exceeded)]",
-      }));
-
-      const actor = makeActor({ onRunEnd }, provider);
-      actor.requestRun();
-      await vi.advanceTimersByTimeAsync(10);
-      await flush();
-
-      expect(onRunEnd).toHaveBeenCalledWith(
-        expect.objectContaining({
-          success: false,
-          graceKilled: true,
-          exitCode: 143,
-        })
-      );
-    });
-
-    // #257 arbiter: a supervisor grace-kill is a cleanup termination, not a
-    // capacity failure. Deleting the `graceKilled` short-circuit in
-    // `runWithPoolFallback` turns this RED — the chain classifies the killed run,
-    // relaunches on an already-aborted signal, and the run-end output becomes a
-    // both-tiers-exhausted summary with the real termination diagnostic gone.
-    it("does not spend the root pool on a supervisor grace-kill", async () => {
-      let actor!: Actor;
-      const onRunEnd = vi.fn();
-      const classify = vi.fn(async () => ({ exhausted: true }));
-
-      const primary = new FakeProvider(
-        async (opts: RunOptions) =>
-          new Promise<Partial<RunResult>>((resolve) => {
-            actor.declareYield("complete", "work pushed");
-            opts.signal?.addEventListener("abort", () => {
-              // Exactly what a real provider builds on a SIGTERM path.
-              resolve({ success: false, ...formatSigtermResult("agent transcript", opts.signal) });
-            });
-          }),
-        "primary-model"
-      );
-      const fallbackProvider = new FakeProvider(undefined, "fallback-model");
-
-      actor = makeActor(
-        {
-          yieldGraceMs: 5000,
-          modelConfig: [
-            { provider: "primary", model: "primary-model" },
-            { provider: "recovery", model: "fallback-model" },
-          ],
-          resolveProvider: (entry) => (entry.provider === "recovery" ? fallbackProvider : primary),
-          classifyExhaustion: classify,
-          onRunEnd,
-        },
-        primary
-      );
-      actor.requestRun();
-      await vi.advanceTimersByTimeAsync(10);
-      await vi.advanceTimersByTimeAsync(5000);
-      await flush();
-
-      expect(classify).not.toHaveBeenCalled();
-      expect(fallbackProvider.calls).toHaveLength(0);
-      expect(onRunEnd).toHaveBeenCalledWith(
-        expect.objectContaining({
-          success: true,
-          graceKilled: true,
-          yieldStatus: "complete",
-          yieldNote: "work pushed",
-          exitCode: 143,
-          // The raw termination diagnostic survives the run end.
-          output: expect.stringContaining(
-            "[Task killed by supervisor (yield grace period exceeded)]"
-          ),
-        })
-      );
-    });
-
-    it("still reports a post-yield failure that is not a cleanup termination", async () => {
-      let actor!: Actor;
-      const onRunEnd = vi.fn();
-
-      const provider = new FakeProvider(() => {
-        actor.declareYield("complete", "done");
-        // An unrelated error after the yield was accepted — no grace kill.
-        return { success: false, exitCode: 1, output: "post-yield MCP write failed" };
-      });
-
-      actor = makeActor({ onRunEnd }, provider);
-      actor.requestRun();
-      await vi.advanceTimersByTimeAsync(10);
-      await flush();
-
-      expect(onRunEnd).toHaveBeenCalledWith(
-        expect.objectContaining({
-          success: false,
-          exitCode: 1,
-          yieldStatus: "complete",
-          output: "post-yield MCP write failed",
-        })
-      );
-      expect(onRunEnd.mock.calls[0]?.[0]?.graceKilled).toBeUndefined();
-    });
-  });
-
   describe("sandbox mount teardown on all exit paths ", () => {
     let teardownSpy: ReturnType<typeof vi.spyOn>;
 
@@ -2803,13 +2533,11 @@ describe("Actor", () => {
     });
 
     it("tears down sandbox mounts on normal completion when sandbox is enabled", async () => {
-      let actor!: Actor;
       const provider = new FakeProvider(() => {
-        actor.declareYield("complete");
         return { success: true, exitCode: 0 };
       });
 
-      actor = makeActor({ cwd: "/tmp/test-actor-normal", sandbox: true }, provider);
+      const actor = makeActor({ cwd: "/tmp/test-actor-normal", sandbox: true }, provider);
       actor.requestRun();
       await vi.advanceTimersByTimeAsync(10);
       await flush();
@@ -2828,42 +2556,6 @@ describe("Actor", () => {
       await flush();
 
       expect(teardownSpy).toHaveBeenCalledWith("/tmp/test-actor-error");
-    });
-
-    it("tears down sandbox mounts on supervisor grace-kill exit path ", async () => {
-      let actor!: Actor;
-
-      const provider = new FakeProvider(async (opts: RunOptions) => {
-        actor.declareYield("complete");
-        // Simulate a process that hangs after yield until aborted by grace-kill
-        return new Promise<RunResult>((resolve) => {
-          opts.signal?.addEventListener("abort", () => {
-            resolve({
-              success: false,
-              exitCode: 143,
-              cancelled: true,
-              graceKilled: true,
-              output: "[Task killed by supervisor (yield grace period exceeded)]",
-            });
-          });
-        });
-      });
-
-      actor = makeActor(
-        { cwd: "/tmp/test-actor-grace-kill", sandbox: true, yieldGraceMs: 5000 },
-        provider
-      );
-      actor.requestRun();
-      await vi.advanceTimersByTimeAsync(10); // debounce
-
-      expect(actor.isRunning).toBe(true);
-      expect(teardownSpy).not.toHaveBeenCalled();
-
-      // Grace period expires -> supervisor terminates process
-      await vi.advanceTimersByTimeAsync(5000);
-      await flush();
-
-      expect(teardownSpy).toHaveBeenCalledWith("/tmp/test-actor-grace-kill");
     });
 
     it("tears down sandbox mounts on watchdog stall / ceiling timeout exit path", async () => {
@@ -2903,13 +2595,11 @@ describe("Actor", () => {
     });
 
     it("skips teardown when sandbox is disabled", async () => {
-      let actor!: Actor;
       const provider = new FakeProvider(() => {
-        actor.declareYield("complete");
         return { success: true };
       });
 
-      actor = makeActor({ cwd: "/tmp/test-actor-no-sandbox", sandbox: false }, provider);
+      const actor = makeActor({ cwd: "/tmp/test-actor-no-sandbox", sandbox: false }, provider);
       actor.requestRun();
       await vi.advanceTimersByTimeAsync(10);
       await flush();

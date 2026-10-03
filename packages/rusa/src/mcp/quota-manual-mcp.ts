@@ -63,14 +63,8 @@ const limitSchema = z.object({
  * envelope verbatim, so a stale, out-of-mode, or superseded-generation reading
  * is refused by the coordinator rather than filtered here.
  */
-export function createQuotaManualServer(
-  deps: QuotaManualMcpDeps,
-  options?: { isFenced?: () => boolean }
-): McpServer {
-  const server = createMcpServer(
-    { name: QUOTA_MANUAL_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced }
-  );
+export function createQuotaManualServer(deps: QuotaManualMcpDeps): McpServer {
+  const server = createMcpServer({ name: QUOTA_MANUAL_MCP_NAME, version: "0.1.0" });
 
   server.registerTool(
     "submit_manual_reading",

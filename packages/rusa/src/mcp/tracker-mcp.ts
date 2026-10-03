@@ -32,7 +32,6 @@ export interface TrackerMcpOptions {
    * bookkeeping: a throwing callback never fails the tool call.
    */
   onResourceCreated?: (resource: EventResource) => void;
-  isFenced?: () => boolean;
 }
 
 /**
@@ -46,10 +45,7 @@ export function createTrackerMcpServer(
   issueClient: IssueClient,
   options: TrackerMcpOptions = {}
 ): McpServer {
-  const server = createMcpServer(
-    { name: TRACKER_MCP_NAME, version: "0.1.0" },
-    { isFenced: options.isFenced }
-  );
+  const server = createMcpServer({ name: TRACKER_MCP_NAME, version: "0.1.0" });
 
   const actorHandle = options.actorHandle ?? generateHandle(selfId);
   const formatSignature = () =>

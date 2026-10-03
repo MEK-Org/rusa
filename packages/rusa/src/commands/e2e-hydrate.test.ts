@@ -100,13 +100,9 @@ describe("dashboard E2E hydration", () => {
     }
     expect(rootPosts.some((call) => call.path.endsWith("/messages"))).toBe(true);
     expect(rootPosts.some((call) => call.path.endsWith("/retire"))).toBe(true);
-    expect(
-      scripts.some((script) =>
-        script.toolCalls?.some(
-          (call: { arguments?: { status?: string } }) => call.arguments?.status === "blocked"
-        )
-      )
-    ).toBe(true);
+    // Runs settle on provider return (#664), so no fixture scripts a yield call.
+    expect(scripts.some((script) => script.output === "Waiting for reviewer")).toBe(true);
+    expect(scripts.some((script) => script.toolCalls !== undefined)).toBe(false);
     expect(scripts.some((script) => script.success === false)).toBe(true);
     expect(chatPosts).toEqual([{ text: "Can you help me with the dashboard?", dm: true }]);
     expect(trackerPosts).toEqual([

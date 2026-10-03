@@ -26,7 +26,6 @@ function createMockLiveActor(id: string): Actor {
   return {
     id,
     requestRun: () => {},
-    declareYield: () => {},
     markUnkillable: () => {},
     close: () => {},
     isRunning: false,

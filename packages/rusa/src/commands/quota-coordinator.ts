@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { loadConfig, resolveHome } from "../config/index.js";
 import type { RusaConfig } from "../config/types.js";
@@ -32,6 +33,20 @@ import {
   SchemaVersionRefusalError,
 } from "../quota/schema-guard.js";
 import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-store.js";
+import { readBuildSentinel } from "../update/build-sentinel.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+/**
+ * Read the build sentinel beside the modules this coordinator process actually
+ * loaded. The result is captured once at startup, so a later checkout or dist
+ * swap cannot make an already-running coordinator claim the new revision.
+ */
+export function coordinatorLoadedRevision(distDir = join(__dirname, "..")): string | null {
+  const revision = readBuildSentinel(distDir);
+  return revision && /^[0-9a-f]{40}$/.test(revision) ? revision : null;
+}
 
 export interface RunQuotaCoordinatorOptions {
   home?: string;
@@ -64,6 +79,11 @@ export interface RunQuotaCoordinatorOptions {
    * which an embedding caller observes emitted metrics.
    */
   logger?: Logger;
+  /**
+   * Test/embed seam for the revision captured at process startup. Production
+   * callers omit this and read the sentinel beside the running dist exactly once.
+   */
+  loadedRevision?: string | null;
 }
 
 /**
@@ -79,8 +99,9 @@ export function defaultQuotaBackupDir(databasePath: string): string {
   return join(dirname(databasePath), "backups");
 }
 
-export function defaultQuotaCoordinatorSocketPath(): string {
-  const runtimeDir = process.env.XDG_RUNTIME_DIR;
+export function defaultQuotaCoordinatorSocketPath(
+  runtimeDir: string | undefined = process.env.XDG_RUNTIME_DIR
+): string {
   if (runtimeDir && runtimeDir.trim().length > 0) {
     return join(runtimeDir.trim(), "rusa-quota", "coordinator.sock");
   }
@@ -246,6 +267,8 @@ export function coordinatorProviderLanes(config: RusaConfig): {
  */
 export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {}): Promise<void> {
   const log = opts.logger ?? createLogger({ context: { component: "quota-coordinator" } });
+  const loadedRevision =
+    opts.loadedRevision === undefined ? coordinatorLoadedRevision() : opts.loadedRevision;
   const mcHome = opts.home ?? resolveHome();
   const config = loadConfig(mcHome);
   // The coordinator's quota probes refresh the same login as the daemons do.
@@ -348,6 +371,7 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
       maxIntervalSeconds,
       staleAfterMs,
       manualHardStaleAfterMs,
+      loadedRevision,
       metrics,
       collectionStats: collection ? () => collection.getAllStats() : undefined,
     });

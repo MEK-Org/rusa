@@ -79,13 +79,8 @@ export async function runE2EHydrate(opts: {
   // The disposable instance's fake provider requires an explicit model since
   // #169; its external root runs model "fake-model" (#456).
   const fakeModel = "fake-model";
-  const yieldCall = (status: "complete" | "blocked", note: string) => ({
-    id: `yield-${status}-${note}`,
-    name: "mcp_mesh_yield_run",
-    arguments: { status, note },
-  });
-  const completedOutput = (output: string, note: string) =>
-    fakeProviderOutput({ output, toolCalls: [yieldCall("complete", note)] });
+  // A run settles when the provider returns (#664); fixtures need no tool call to finish.
+  const completedOutput = (output: string) => fakeProviderOutput({ output });
   const waitForIdle = async (actorId: string) => {
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
@@ -115,7 +110,7 @@ export async function runE2EHydrate(opts: {
 
   // 1. A completed/idle thread
   const idleActor = (await post(rootPort, "/actors", {
-    charter: `Be a helpful assistant.${completedOutput("Hello there!", "Initial task complete")}`,
+    charter: `Be a helpful assistant.${completedOutput("Hello there!")}`,
     provider: "fake",
     model: fakeModel,
     title: "Completed Task",
@@ -127,17 +122,9 @@ export async function runE2EHydrate(opts: {
   });
   await waitForIdle(idleActor.id);
 
-  // 2. A blocked thread
+  // 2. A thread whose run ended waiting on someone else
   const blockedActor = (await post(rootPort, "/actors", {
-    charter: `Waiting for PR review.${fakeProviderOutput({
-      toolCalls: [
-        {
-          id: "call-123",
-          name: "mcp_mesh_yield_run",
-          arguments: { status: "blocked", note: "Waiting for reviewer" },
-        },
-      ],
-    })}`,
+    charter: `Waiting for PR review.${completedOutput("Waiting for reviewer")}`,
     provider: "fake",
     model: fakeModel,
     title: "Blocked Task",
@@ -147,7 +134,7 @@ export async function runE2EHydrate(opts: {
 
   // 3. A retired thread
   const retiredActor = (await post(rootPort, "/actors", {
-    charter: `Old task.${completedOutput("done", "Old task complete")}`,
+    charter: `Old task.${completedOutput("done")}`,
     provider: "fake",
     model: fakeModel,
     title: "Retired Task",
@@ -173,10 +160,7 @@ export async function runE2EHydrate(opts: {
 
   // 5. Huge message bodies + emojis
   const emojiActor = (await post(rootPort, "/actors", {
-    charter: `Emoji task 🚀✨${completedOutput(
-      `Finished! 🎉\n${"A".repeat(5000)}`,
-      "Large emoji response complete"
-    )}`,
+    charter: `Emoji task 🚀✨${completedOutput(`Finished! 🎉\n${"A".repeat(5000)}`)}`,
     provider: "fake",
     model: fakeModel,
     title: "Emoji & Huge Message",
@@ -186,10 +170,7 @@ export async function runE2EHydrate(opts: {
 
   // 7. A long charter
   const longActor = (await post(rootPort, "/actors", {
-    charter: `Very long charter:\n${"B".repeat(10000)}${completedOutput(
-      "done",
-      "Long charter complete"
-    )}`,
+    charter: `Very long charter:\n${"B".repeat(10000)}${completedOutput("done")}`,
     provider: "fake",
     model: fakeModel,
     title: "Long Charter",
@@ -232,7 +213,7 @@ async function hydrateReferences(h: {
   rootPort: number;
   trackerPort: number;
   fakeModel: string;
-  completedOutput: (output: string, note: string) => string;
+  completedOutput: (output: string) => string;
   fakeProviderOutput: (output: unknown) => string;
   waitForIdle: (actorId: string) => Promise<void>;
 }): Promise<void> {
@@ -247,7 +228,7 @@ async function hydrateReferences(h: {
       title,
     })) as { id: string };
   const spawnIdle = async (title: string) => {
-    const actor = await spawn(title, `${title}.${h.completedOutput("On it.", `${title} ready`)}`);
+    const actor = await spawn(title, `${title}.${h.completedOutput("On it.")}`);
     await h.waitForIdle(actor.id);
     return actor;
   };

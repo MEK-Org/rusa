@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
-import { ActorMesh } from "../../actor/actor-mesh.js";
+import { ActorMesh, type ActorMeshOptions } from "../../actor/actor-mesh.js";
 import { InMemoryCapabilityGrantStore } from "../../actor/capability-grants.js";
 import { COMPUTER_USE_CAPABILITY } from "../../actor/computer-use-lock.js";
 import {
@@ -46,6 +46,9 @@ export function createHarness(options: {
   isHalted?: (provider?: string, model?: string) => boolean;
   /** Leader-side observer, called as each follower event is received, for race-window tests. */
   onEvent?: (actorId: string, event: ActorEvent) => void;
+  /** Obligation reads and experiment membership, for tests about strict head closure. */
+  obligations?: ActorMeshOptions["obligations"];
+  experimentEnrollments?: ActorMeshOptions["experimentEnrollments"];
 }) {
   const actors = new InMemoryActorRepository();
   const runtimes = new Map<string, ActorHandle>();
@@ -126,6 +129,8 @@ export function createHarness(options: {
     grantableCapabilities: new Set([COMPUTER_USE_CAPABILITY]),
     events: (event) => meshEvents.push(event),
     idgen: () => `instance-worker-${++sequence}`,
+    obligations: options.obligations,
+    experimentEnrollments: options.experimentEnrollments,
     ...(pacer
       ? {
           // Every declared candidate is a lane, and a halted one is skipped as

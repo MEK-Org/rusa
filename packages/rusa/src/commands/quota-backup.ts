@@ -27,7 +27,8 @@ export interface QuotaRestoreCommandOptions extends QuotaBackupCommandOptions {
   socketPath?: string;
 }
 
-function resolvePaths(
+/** The database, backup directory, and retention the backup commands act on. */
+export function resolveQuotaBackupPaths(
   opts: QuotaBackupCommandOptions,
   config: RusaConfig,
   mcHome: string
@@ -63,7 +64,7 @@ export function runQuotaBackup(opts: QuotaBackupCommandOptions = {}): void {
   const log = createLogger({ context: { component: "quota-backup" } });
   const mcHome = opts.home ?? resolveHome();
   const config = loadConfig(mcHome);
-  const { databasePath, backupDir, retain } = resolvePaths(opts, config, mcHome);
+  const { databasePath, backupDir, retain } = resolveQuotaBackupPaths(opts, config, mcHome);
 
   const result = backupQuotaDatabase({ databasePath, backupDir, retain });
   log.info("quota_backup_created", {
@@ -87,7 +88,7 @@ export async function runQuotaRestore(opts: QuotaRestoreCommandOptions = {}): Pr
   const log = createLogger({ context: { component: "quota-restore" } });
   const mcHome = opts.home ?? resolveHome();
   const config = loadConfig(mcHome);
-  const { databasePath, backupDir } = resolvePaths(opts, config, mcHome);
+  const { databasePath, backupDir } = resolveQuotaBackupPaths(opts, config, mcHome);
 
   const backupPath = opts.from?.trim() || listQuotaBackups(backupDir).at(-1);
   if (!backupPath) {
@@ -117,7 +118,7 @@ export function runQuotaBackupList(opts: QuotaBackupCommandOptions = {}): void {
   const log = createLogger({ context: { component: "quota-backup" } });
   const mcHome = opts.home ?? resolveHome();
   const config = loadConfig(mcHome);
-  const { backupDir, retain } = resolvePaths(opts, config, mcHome);
+  const { backupDir, retain } = resolveQuotaBackupPaths(opts, config, mcHome);
   const backups = listQuotaBackups(backupDir);
   log.info("quota_backup_list", { backupDir, retain, count: backups.length, backups });
 }

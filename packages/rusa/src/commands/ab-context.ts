@@ -121,7 +121,7 @@ import { type RunStartE2EHandles, runStart } from "./start.js";
  *
  * The holder supplies that one extra hop: it is an ordinary child of the real root
  * (`parentId: rootId`), adopted rather than spawned, and inert. It has no provider and
- * never runs — `requestRun()` is a deliberate no-op, so the yields and failure notices the
+ * never runs — `requestRun()` is a deliberate no-op, so the reports and failure notices the
  * arms address to their parent land in a thread that burns no quota answering them.
  *
  * It is deliberately NOT parentless. A `parentId: null` record used to be the trick (the
@@ -148,10 +148,10 @@ const RIG_HOLDER_CHARTER =
 
 /**
  * Inert {@link MeshActor} for {@link RIG_HOLDER_ID} — a registry record needs a live actor
- * to be addressable, and the arms address their parent on every yield.
+ * to be addressable, and the arms address their parent when they report.
  *
  * Every method is a no-op ON PURPOSE. `requestRun` is the load-bearing one: the mesh calls
- * it when a child yields or fails, and a real actor would answer on a real provider,
+ * it when a child reports or fails, and a real actor would answer on a real provider,
  * spending the window the arms are being measured against. `isRunning`/`isQueued` are
  * permanently false, which is honest — this thread has no runs.
  */
@@ -160,11 +160,8 @@ class RigHolderActor implements MeshActor {
   readonly isRunning = false;
   readonly isQueued = false;
   requestRun(): void {}
-  declareYield(): void {}
   markUnkillable(): void {}
-  preemptForResponsive():
-    | { preempted: false }
-    | { preempted: true; phase: "running" | "winding_down" | "queued" } {
+  preemptForResponsive(): { preempted: false } | { preempted: true; phase: "running" | "queued" } {
     return { preempted: false };
   }
   close(): void {}
@@ -296,7 +293,7 @@ const HARNESS_CHARTER =
   "message: implement the change, keep the WHOLE app coherent and runnable (don't drag " +
   "abandoned design forward, and don't drop an earlier decision that still applies), and " +
   "commit your work with git. When you have applied the current message, briefly summarize " +
-  "what you changed and why, then yield your turn. Re-derive current state from the files " +
+  "what you changed and why, then end your turn. Re-derive current state from the files " +
   "in your working directory each turn.";
 
 const POLL_MS = 2_000;
@@ -881,7 +878,7 @@ async function runProviderContextABBody(
       const startedAt = new Date().toISOString();
       // Sent AS the holder, not as root: the operator messages must come from the arms'
       // own parent, or the arms would hold a handle back to the live root and address
-      // their yields there — reintroducing exactly the coupling RIG_HOLDER_ID removes.
+      // their reports there — reintroducing exactly the coupling RIG_HOLDER_ID removes.
       mesh.sendMessage(id, step.message, RIG_HOLDER_ID);
       const result = await waitForActorIdle(idleDeps, {
         actorId: id,

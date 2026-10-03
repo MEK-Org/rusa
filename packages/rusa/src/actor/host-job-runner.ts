@@ -169,11 +169,14 @@ export function buildHostJobBwrapArgs(o: BuildHostJobBwrapArgsOptions): string[]
   // mcHome explicitly in case it's configured outside hostHome (a non-default
   // RUSA_HOME), so the mesh's own secrets root is never merely "usually"
   // hidden. Mounting a tmpfs inside an already-shadowed tree is a harmless
-  // no-op (still empty), so no ordering/overlap check is needed here.
+  // no-op (still empty), so no ordering/overlap check is needed here. Shadow
+  // the RESOLVED mcHome: when RUSA_HOME is a symlink under hostHome, the home
+  // tmpfs only hides the link, and its real target stays readable through the
+  // broad root bind unless the target itself is shadowed.
   const realHostHome = realpathIfExists(hostHome);
   const realMcHome = realpathIfExists(o.mcHome);
   args.push("--tmpfs", hostHome);
-  if (!overlaps(realHostHome, realMcHome)) args.push("--tmpfs", o.mcHome);
+  if (!overlaps(realHostHome, realMcHome)) args.push("--tmpfs", realMcHome);
   args.push("--tmpfs", "/tmp");
 
   // The job's own writable scratch dir, punched back through the shadow.

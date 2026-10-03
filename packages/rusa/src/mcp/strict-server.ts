@@ -1,6 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { toolError } from "./result.js";
 
 type ServerInfo = ConstructorParameters<typeof McpServer>[0];
 type ServerOptions = ConstructorParameters<typeof McpServer>[1];
@@ -74,17 +73,12 @@ function isRawShape(value: unknown): value is z.ZodRawShape {
  * left alone: it has chosen its own unknown-key policy and we do not override it.
  */
 
-export const DEFAULT_FENCED_ERROR_MESSAGE =
-  "Run is over: yield_run has already been called for this turn. Do not call any further tools; end your turn now.";
-
 export interface StrictServerOptions {
   capabilities?: ServerOptions extends { capabilities?: infer C } ? C : undefined;
-  isFenced?: () => boolean;
-  fencedErrorMessage?: string;
 }
 
 export function createMcpServer(info: ServerInfo, options?: StrictServerOptions): McpServer {
-  const { isFenced, fencedErrorMessage, ...serverOptions } = options ?? {};
+  const serverOptions = options ?? {};
   const server = new McpServer(
     info,
     Object.keys(serverOptions).length > 0 ? (serverOptions as ServerOptions) : undefined
@@ -106,13 +100,7 @@ export function createMcpServer(info: ServerInfo, options?: StrictServerOptions)
           ? z.strictObject(config.inputSchema)
           : config.inputSchema,
       },
-      // biome-ignore lint/suspicious/noExplicitAny: callback arguments are forwarded
-      async (args: any, extra: any) => {
-        if (isFenced?.()) {
-          return toolError(new Error(fencedErrorMessage ?? DEFAULT_FENCED_ERROR_MESSAGE));
-        }
-        return cb(args, extra);
-      }
+      cb
     )) as RegisterTool;
 
   return server;

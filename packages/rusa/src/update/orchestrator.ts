@@ -20,7 +20,7 @@
  */
 
 /** The ordered steps; a failure is reported against the granular step that threw. */
-export type UpdateStep = "pull" | "install" | "typecheck" | "build" | "drain";
+export type UpdateStep = "pull" | "install" | "typecheck" | "build" | "coordinator" | "drain";
 
 /** A git/build step that failed or — critically — HUNG past its hard timeout. */
 export class StepError extends Error {
@@ -56,6 +56,110 @@ export interface GitSeam {
 export interface BuildSeam {
   /** Build the checkout at `sha`. Throws {@link StepError} on failure/timeout. */
   build(sha: string): Promise<void>;
+  /**
+   * Restore the previously bootable dist after a post-build deployment failure.
+   * Production BuildRunner supplies this. Isolated legacy seams that cannot
+   * promote a dist leave it absent and fail closed if a post-build rollback is
+   * ever needed.
+   */
+  rollback?(): Promise<void>;
+}
+
+/** The installed pool coordinator unit that this checkout's build runs. */
+export interface CoordinatorTarget {
+  unit: string;
+  /** The coordinator's own home, read from its effective unit settings. */
+  home: string;
+  /** The socket that coordinator listens on, resolved from its own home. */
+  socketPath: string;
+}
+
+/**
+ * Whether this deployment built what the pool unit launches. Only `owner`
+ * refreshes; `not-owner` is a client of a coordinator another checkout owns;
+ * `unknown` is reported as such and never treated as either.
+ */
+export type CoordinatorOwnership =
+  | { ownership: "owner"; target: CoordinatorTarget }
+  | { ownership: "not-owner" | "unknown"; reason: string };
+
+/**
+ * Refresh the single pool coordinator when, and only when, this deployment
+ * owns its executable. Restarting a coordinator this update did not build
+ * would load an artifact nobody verified.
+ */
+export interface CoordinatorRestartSeam {
+  /** Who owns the launched executable. Total: undecidable ownership is `unknown`. */
+  resolve(): Promise<CoordinatorOwnership>;
+  /**
+   * The revision recorded by the artifact the owned unit would launch now —
+   * this checkout's live dist sentinel — or null when it records none.
+   */
+  artifactRevision(): string | null;
+  /** The revision the running coordinator reports loaded, or null when it cannot say. */
+  loadedRevision(target: CoordinatorTarget): Promise<string | null>;
+  /**
+   * The revision reported by the coordinator this instance dials, for the
+   * report when it does not own the unit. Never an input to ownership; null
+   * when it dials none or that coordinator cannot say.
+   */
+  dialedRevision(): Promise<string | null>;
+  /** The runbook's pre-restart database backup. Throws to refuse the restart. */
+  backup(target: CoordinatorTarget): Promise<void>;
+  /** Restart the unit and require its readyz to report `expectedRevision`. */
+  restart(target: CoordinatorTarget, expectedRevision: string): Promise<void>;
+}
+
+/** What the update did about the pool coordinator, for the result and the action log. */
+export type CoordinatorRefresh =
+  | {
+      outcome: "not-owner" | "unknown";
+      reason: string;
+      /** What the dialed coordinator reports loaded; a difference from this build is drift. */
+      loadedRevision: string | null;
+    }
+  | {
+      /**
+       * The owned coordinator's loaded artifact is not the one the build would
+       * retain, or either cannot be identified, so a failed refresh could not
+       * return to it. The update stopped before building or restarting.
+       */
+      outcome: "rollback-unavailable";
+      reason: string;
+      loadedRevision: string | null;
+      /** The live dist sentinel the build would retain as its rollback artifact. */
+      artifactRevision: string | null;
+    }
+  | {
+      /**
+       * `refreshed`: confirmed on the new build. `restored`: confirmed back on
+       * the artifact it had loaded before. `degraded`: confirmed on the
+       * retained artifact, which no longer matched what it had loaded before.
+       */
+      outcome: "refreshed" | "restored" | "degraded";
+      /** What the coordinator reported before this update restarted it (null: it could not say). */
+      previousLoadedRevision: string | null;
+      /** What readyz confirmed after the restart. */
+      loadedRevision: string;
+    };
+
+function describeCoordinator(refresh: CoordinatorRefresh): string {
+  if (refresh.outcome === "rollback-unavailable") {
+    const id = (sha: string | null) => (sha ? shortSha(sha) : "unknown");
+    return (
+      `not refreshed, rollback protection unavailable: ${refresh.reason}; ` +
+      `loaded ${id(refresh.loadedRevision)}, retained artifact ${id(refresh.artifactRevision)}`
+    );
+  }
+  if ("reason" in refresh) {
+    const why = refresh.outcome === "not-owner" ? "not owned" : "ownership unknown";
+    const loaded = refresh.loadedRevision
+      ? `loaded ${shortSha(refresh.loadedRevision)}`
+      : "loaded revision unknown";
+    return `not refreshed, ${why}: ${refresh.reason}; ${loaded}`;
+  }
+  const was = refresh.previousLoadedRevision ? shortSha(refresh.previousLoadedRevision) : "unknown";
+  return `${refresh.outcome} to ${shortSha(refresh.loadedRevision)} (previously loaded ${was})`;
 }
 
 /** The in-memory graceful-shutdown brake + a self-excluding, bounded drain. */
@@ -80,6 +184,8 @@ export interface NotifySeam {
 export interface UpdateDeps {
   git: GitSeam;
   build: BuildSeam;
+  /** Required in deployed startup wiring; optional for isolated legacy callers. */
+  coordinator?: CoordinatorRestartSeam;
   drain: DrainSeam;
   /** Best-effort failure notice (root also gets the result string). Optional. */
   notify?: NotifySeam;
@@ -121,6 +227,8 @@ export interface UpdateResult {
   newSha?: string;
   subject?: string;
   alreadyCurrent?: boolean;
+  /** The pool coordinator outcome, when the update reached that step. */
+  coordinator?: CoordinatorRefresh;
   /** True once we've engaged drain + called exit(0) (the restart path). */
   restarting: boolean;
   /**
@@ -197,6 +305,11 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
   let oldSha = "";
   let newSha = "";
   let movedToNew = false;
+  let builtNew = false;
+  let coordinatorTarget: CoordinatorTarget | undefined;
+  let coordinatorRestarted = false;
+  let previousLoadedRevision: string | null = null;
+  let coordinator: CoordinatorRefresh | undefined;
   let rollbackFailed = false;
 
   try {
@@ -234,6 +347,46 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
           `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
         );
       }
+      // The coordinator decision comes before anything destructive. The build's
+      // swap retires the live dist to dist.old and deletes the previous
+      // dist.old, so the live dist is the only artifact a failed refresh can
+      // return to. Unless it is verifiably the artifact the coordinator has
+      // loaded, stop here: nothing has been moved, built, or restarted.
+      if (deps.coordinator) {
+        step = "coordinator";
+        const resolved = await deps.coordinator.resolve();
+        if (resolved.ownership !== "owner") {
+          coordinator = {
+            outcome: resolved.ownership,
+            reason: resolved.reason,
+            loadedRevision: await deps.coordinator.dialedRevision(),
+          };
+          log(
+            `[update] pool coordinator ${describeCoordinator(coordinator)}` +
+              (coordinator.loadedRevision && coordinator.loadedRevision !== newSha
+                ? ` (drift from this build ${shortSha(newSha)}; not a rollback trigger)`
+                : "")
+          );
+        } else {
+          const retained = deps.coordinator.artifactRevision();
+          previousLoadedRevision = await deps.coordinator.loadedRevision(resolved.target);
+          if (!previousLoadedRevision || retained !== previousLoadedRevision) {
+            coordinator = {
+              outcome: "rollback-unavailable",
+              reason: !previousLoadedRevision
+                ? "the running coordinator does not report its loaded revision"
+                : retained
+                  ? "the live dist is not the artifact the coordinator has loaded"
+                  : "the live dist records no valid revision",
+              loadedRevision: previousLoadedRevision,
+              artifactRevision: retained,
+            };
+            throw new Error(`rollback protection unavailable: ${coordinator.reason}`);
+          }
+          coordinatorTarget = resolved.target;
+        }
+        step = "pull";
+      }
       log(`[update] resetting checkout to ${shortSha(newSha)}`);
       await deps.git.resetHard(newSha);
       movedToNew = true;
@@ -256,13 +409,51 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     step = "build";
     log(`[update] building ${shortSha(newSha)} (mesh stays live)…`);
     await deps.build.build(newSha);
+    builtNew = true;
     log(`[update] build green`);
+
+    // The coordinator is a distinct, pool-owned process. Its module cache does
+    // not change when this instance's checkout moves, so refresh it before the
+    // mesh drain. The seam verifies the coordinator reports the build revision
+    // it loaded; a successful systemctl invocation alone is not sufficient.
+    if (deps.coordinator && coordinatorTarget) {
+      step = "coordinator";
+      const target = coordinatorTarget;
+      const built = deps.coordinator.artifactRevision();
+      if (built !== newSha) {
+        throw new Error(
+          `the coordinator artifact records ${built ? shortSha(built) : "no valid revision"}, ` +
+            `not the built ${shortSha(newSha)}; refusing to restart onto it`
+        );
+      }
+      // The preflight's assurance holds only while the coordinator still runs
+      // the artifact now retained at dist.old.
+      const loadedNow = await deps.coordinator.loadedRevision(target);
+      if (loadedNow !== previousLoadedRevision) {
+        throw new Error(
+          `the coordinator's loaded revision changed during the build ` +
+            `(${loadedNow ? shortSha(loadedNow) : "unknown"}, was ${shortSha(previousLoadedRevision ?? "")}); ` +
+            `refusing to restart it`
+        );
+      }
+      await deps.coordinator.backup(target);
+      log(`[update] pre-restart quota backup taken; restarting ${target.unit}`);
+      coordinatorRestarted = true;
+      await deps.coordinator.restart(target, built);
+      coordinator = { outcome: "refreshed", previousLoadedRevision, loadedRevision: built };
+      log(`[update] pool coordinator ${describeCoordinator(coordinator)}`);
+    }
 
     // ── 3. GATE passed → quiesce + restart. Only now do we touch run-state. ─
     step = "drain";
     if (deps.notify) {
       try {
-        await deps.notify.notify(updateStatusText(newSha, subject));
+        // The coordinator outcome rides on the chat notice, so a deploy that
+        // left it unrefreshed (not owned, or ownership unknown) says so there.
+        await deps.notify.notify(
+          updateStatusText(newSha, subject) +
+            (coordinator ? ` [coordinator: ${describeCoordinator(coordinator)}]` : "")
+        );
       } catch (nErr) {
         log(`[update] notify failed: ${nErr instanceof Error ? nErr.message : String(nErr)}`);
       }
@@ -279,7 +470,9 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     const drainSummary = drain.quiesced ? "quiesced" : `timeout after ${drain.waitedMs}ms`;
     try {
       deps.recordAction?.(
-        `update committed: ${shortSha(oldSha)} → ${shortSha(newSha)} (${subject}) [drain: ${drainSummary}] — restarting`
+        `update committed: ${shortSha(oldSha)} → ${shortSha(newSha)} (${subject}) [drain: ${drainSummary}]` +
+          (coordinator ? ` [coordinator: ${describeCoordinator(coordinator)}]` : "") +
+          " — restarting"
       );
     } catch (recErr) {
       log(
@@ -307,6 +500,7 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
       newSha,
       subject,
       alreadyCurrent,
+      coordinator,
       restarting: true,
     };
   } catch (err) {
@@ -316,21 +510,69 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     const error = err instanceof Error ? err.message : String(err);
     log(`[update] FAILED at ${failedStep}${timedOut ? " (timeout)" : ""}: ${error}`);
 
-    // Fail-safe: roll the checkout back so a retry starts clean from old code.
+    // Fail-safe: restore the bootable dist before moving checkout HEAD back.
+    // A green build has already atomically promoted a matching dist/sentinel;
+    // resetting only git after a coordinator restart failure would leave the
+    // next systemd boot correctly refusing the mismatched pair.
     if (movedToNew && oldSha) {
       try {
+        if (builtNew) {
+          if (!deps.build.rollback) {
+            throw new Error("cannot restore previous dist: build seam has no post-build rollback");
+          }
+          await deps.build.rollback();
+          log(`[update] restored previous dist before checkout rollback`);
+        }
         await deps.git.resetHard(oldSha);
         log(`[update] rolled checkout back to ${shortSha(oldSha)}`);
+
+        // A restart command can fail after it has stopped or even started the
+        // unit. Once dist and checkout are restored, restart the coordinator onto
+        // the restored artifact so the pool does not keep a new in-memory
+        // coordinator beside an old deploy. The preflight established that this
+        // artifact is the one the coordinator had loaded; readyz must confirm
+        // the restored dist's own sentinel. Should that sentinel no longer
+        // match, the restart onto it is degraded recovery, never a restore, and
+        // is surfaced as rollback-unsafe. An artifact with no identity cannot be
+        // verified, so it is not restarted onto at all. Any failure is surfaced
+        // as rollback-unsafe; that includes a new build that already migrated
+        // the quota schema, whose recovery is the runbook's restore from the
+        // pre-restart backup.
+        if (coordinatorRestarted && coordinatorTarget && deps.coordinator) {
+          const restored = deps.coordinator.artifactRevision();
+          if (!restored) {
+            throw new Error(
+              "coordinator rollback not attempted: the restored dist records no valid revision"
+            );
+          }
+          try {
+            await deps.coordinator.restart(coordinatorTarget, restored);
+          } catch (restoreCoordinatorErr) {
+            throw new Error(
+              `coordinator rollback to ${shortSha(restored)} failed: ` +
+                `${restoreCoordinatorErr instanceof Error ? restoreCoordinatorErr.message : String(restoreCoordinatorErr)}`
+            );
+          }
+          const outcome = restored === previousLoadedRevision ? "restored" : "degraded";
+          coordinator = { outcome, previousLoadedRevision, loadedRevision: restored };
+          log(`[update] pool coordinator ${describeCoordinator(coordinator)}`);
+          if (outcome === "degraded") {
+            throw new Error(
+              `coordinator recovered onto retained ${shortSha(restored)}, not the previously ` +
+                `loaded ${previousLoadedRevision ? shortSha(previousLoadedRevision) : "unknown"}`
+            );
+          }
+        }
       } catch (rbErr) {
         const rbMsg = rbErr instanceof Error ? rbErr.message : String(rbErr);
         log(`[update] WARNING: rollback to ${shortSha(oldSha)} failed: ${rbMsg}`);
         rollbackFailed = true;
-        // The last silent-failure path: git is now at the new sha while the live
-        // dist+sentinel are still old → sentinel ≠ HEAD → the next restart REFUSES
-        // boot (the fragility window reopened). The process is still alive, so SHOUT
-        // — the same loud, chat-independent path as the boot-flap alert.
+        // The last silent-failure path: either the checkout/dist pair or the
+        // separately restarted coordinator may now disagree with the restored
+        // deployment. The process is still alive, so SHOUT — the same loud,
+        // chat-independent path as the boot-flap alert.
         const alert =
-          `⚠️ update rollback FAILED (${rbMsg}) — git HEAD≠dist/sentinel; ` +
+          `⚠️ update rollback FAILED (${rbMsg}) — deployment state may be split; ` +
           `system is restart-fragile, recover before any restart`;
         console.error(`[update] ${alert}`); // journal ERROR — always, chat-independent
         try {
@@ -347,15 +589,16 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
         }
       }
     }
-    const failureSummary = formatFailureOutcome({
-      failedStep,
-      timedOut,
-      error,
-      movedToNew,
-      rollbackFailed,
-      oldSha,
-      newSha,
-    });
+    const failureSummary =
+      formatFailureOutcome({
+        failedStep,
+        timedOut,
+        error,
+        movedToNew,
+        rollbackFailed,
+        oldSha,
+        newSha,
+      }) + (coordinator ? ` [coordinator: ${describeCoordinator(coordinator)}]` : "");
     try {
       deps.recordAction?.(failureSummary);
     } catch (recErr) {
@@ -377,6 +620,7 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
       error,
       timedOut,
       oldSha,
+      coordinator,
       restarting: false,
       rollbackFailed,
     };

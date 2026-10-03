@@ -143,21 +143,4 @@ describe("createMcpServer", () => {
     expect(res.isError).toBeFalsy();
     expect(dataOf(res)).toMatchObject({ a: "x", extra: 1 });
   });
-
-  it("rejects tool calls with a fencing error when isFenced returns true", async () => {
-    let fenced = false;
-    const server = createMcpServer({ name: "test", version: "0.1.0" }, { isFenced: () => fenced });
-    server.registerTool("action", { inputSchema: {} }, async () => toolOk({ done: true }));
-    const client = await connect(server);
-
-    const res1 = (await client.callTool({ name: "action", arguments: {} })) as CallToolResult;
-    expect(res1.isError).toBeFalsy();
-
-    fenced = true;
-    const res2 = (await client.callTool({ name: "action", arguments: {} })) as CallToolResult;
-    expect(res2.isError).toBe(true);
-    expect((res2.content[0] as { text: string }).text).toContain(
-      "Run is over: yield_run has already been called for this turn."
-    );
-  });
 });

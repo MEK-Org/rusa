@@ -412,6 +412,22 @@ export function formatAgyToolInvocation(step: AgyToolStep): string {
 }
 
 /**
+ * Guidance injected into the prompt for Antigravity-backed workers.
+ * Warns models not to background commands and end their turn with tasks pending,
+ * because headless `agy -p` print mode does not resume or exit cleanly once
+ * background tasks are left running.
+ */
+export const ANTIGRAVITY_COMMAND_DISCIPLINE = `## Antigravity command discipline
+When running commands, do not background long tasks and yield "awaiting completion".
+Keep commands in the foreground or poll them with \`manage_task\` to resolution
+before completing your turn; ending a turn with background tasks pending in headless
+mode prevents clean continuation.`;
+
+export function appendAntigravityCommandDiscipline(prompt: string): string {
+  return `${prompt.trim()}\n\n${ANTIGRAVITY_COMMAND_DISCIPLINE}\n`;
+}
+
+/**
  * Google Antigravity CLI provider.
  *
  * The binary is `agy` (installed at ~/.local/bin/agy); the provider name is
@@ -507,7 +523,7 @@ export class AntigravityProvider implements CodingProvider {
     const logFile = opts.session ? join(logDir, `.rusa-agy-${randomUUID()}.log`) : undefined;
 
     const args = buildAntigravityArgs({
-      prompt: opts.prompt,
+      prompt: appendAntigravityCommandDiscipline(opts.prompt),
       model: selection.model,
       effort: selection.effort,
       conversationId: opts.session?.id,
@@ -710,52 +726,20 @@ export class AntigravityProvider implements CodingProvider {
         }
       },
       cleanup,
-      buildKilledResult: ({
-        output,
-        exitCode,
-        cancelled,
-        interrupted,
-        interruptSource,
-        graceKilled,
-      }) => {
-        if (buffer) {
-          processLine(buffer);
-          buffer = "";
-        }
-        return withTokenUsage({
+      buildKilledResult: (sigtermResult) =>
+        withTokenUsage({
+          ...sigtermResult,
           success: false,
-          output: finalResultText ?? (emittedChunks.length > 0 ? emittedChunks.join("") : output),
-          exitCode,
-          cancelled,
-          interrupted,
-          interruptSource,
-          graceKilled,
+          output: finalResultText && !opts.signal?.aborted ? finalResultText : sigtermResult.output,
           sessionId: opts.session?.id,
-        });
-      },
-      buildSignalResult: ({
-        output,
-        exitCode,
-        cancelled,
-        interrupted,
-        interruptSource,
-        graceKilled,
-      }) => {
-        if (buffer) {
-          processLine(buffer);
-          buffer = "";
-        }
-        return withTokenUsage({
+        }),
+      buildSignalResult: (sigtermResult) =>
+        withTokenUsage({
+          ...sigtermResult,
           success: false,
-          output: finalResultText ?? (emittedChunks.length > 0 ? emittedChunks.join("") : output),
-          exitCode,
-          cancelled,
-          interrupted,
-          interruptSource,
-          graceKilled,
+          output: finalResultText && !opts.signal?.aborted ? finalResultText : sigtermResult.output,
           sessionId: captureSessionFromLog(),
-        });
-      },
+        }),
       buildExitResult: (output, exitCode) => {
         if (buffer) {
           processLine(buffer);

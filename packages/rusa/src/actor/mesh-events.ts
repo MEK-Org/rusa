@@ -9,6 +9,8 @@
  * one-line adapter.
  */
 
+import type { AbortReason } from "../providers/termination-attribution.js";
+
 // Across every kind the convention is kind-specific. Say which field is which on
 // every new kind; the notes here were backfilled after the names misled two
 // readers into opposite conclusions about who sent what .
@@ -128,15 +130,20 @@ export type MeshEventKind =
   // is the remembered actor; detail/body carry generation/count metadata only.
   | "portable_context_compacted"
   | "run_coalesced"
-  // Yield lifecycle: the actor received the one corrective yield-elicitation run
-  // (`run_continued`), declared it was done/blocked (`run_yielded`), or exhausted
-  // that corrective budget (`continuation_capped`).
+  // Historical yield lifecycle, read but no longer written since explicit yield
+  // was removed (#828): the actor received the one corrective yield-elicitation
+  // run (`run_continued`), declared it was done/blocked (`run_yielded`), or
+  // exhausted that corrective budget (`continuation_capped`).
   | "run_continued"
   | "run_yielded"
-  // A strict-obligation experiment participant attempted a clean yield without
+  // Historical: a strict-obligation participant attempted a clean yield without
   // closing the selected head obligation; payload identifies the obligation and
-  // actionable reason. The rejected yield itself is not recorded as yielded.
+  // actionable reason.
   | "run_yield_rejected"
+  // A strict-obligation participant returned successfully without closing a
+  // selected head obligation (#828); payload identifies the obligation and the
+  // shortfall. Its attention stays unhandled for the ordinary bounded retry.
+  | "run_return_rejected"
   | "continuation_capped"
   // Capability lifecycle (design ISSUE_NUM, phase 1a): the root granted/revoked an
   // extra MCP capability to an actor. `actorId` = the grantee actor, `payload` = { grantedBy },
@@ -258,12 +265,17 @@ export const RUN_TERMINAL_EVENT_KINDS = [
 export interface RunEndPayload {
   /** Durable actor_runs identity for this execution. */
   runId?: string;
-  /** True when the supervisor grace-killed the run after the yield grace period. */
+  /**
+   * Historical: set on runs recorded before explicit yield was removed (#828),
+   * when the supervisor grace-killed a run after its yield. Nothing writes it now.
+   */
   graceKilled?: boolean;
-  /** The declared yield status ('complete' | 'blocked') if the run yielded. */
+  /** Historical: the yield status ('complete' | 'blocked') a pre-#828 run declared. */
   yieldStatus?: string;
   /** What the provider reported this run ran on. Absent = not reported. */
   model?: string;
+  /** The typed reason for termination/abort (e.g. 'stall-watchdog', 'run-ceiling', 'interrupt:<by>', 'unknown'). */
+  abortReason?: AbortReason;
 }
 
 /**
@@ -275,17 +287,17 @@ export interface RunEndPayload {
  * literal, which is two chances to forget.
  *
  * `undefined` when there is nothing to say, so an ordinary run still records no payload
- * rather than an object of nulls.
+ * rather than an object of nulls. The historical keys are read, never written.
  */
-export function runEndPayload(result: RunEndPayload): string | undefined {
-  if (!result.runId && !result.graceKilled && !result.yieldStatus && !result.model)
-    return undefined;
-  return JSON.stringify({
-    runId: result.runId,
-    graceKilled: result.graceKilled,
-    yieldStatus: result.yieldStatus,
-    model: result.model,
-  } satisfies RunEndPayload);
+export function runEndPayload(
+  result: Pick<RunEndPayload, "runId" | "model" | "abortReason">
+): string | undefined {
+  if (!result.runId && !result.model && !result.abortReason) return undefined;
+  const payload: RunEndPayload = {};
+  if (result.runId) payload.runId = result.runId;
+  if (result.model) payload.model = result.model;
+  if (result.abortReason) payload.abortReason = result.abortReason;
+  return JSON.stringify(payload);
 }
 
 /**

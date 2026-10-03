@@ -67,7 +67,6 @@ function setup() {
     createActor: (ctx) => ({
       id: ctx.record.id,
       requestRun: () => {},
-      declareYield: () => {},
       markUnkillable: () => {},
       close: () => {},
       preemptForResponsive: () => ({ preempted: false }),

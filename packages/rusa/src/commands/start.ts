@@ -314,6 +314,7 @@ import {
 } from "../understanding/root-scope.js";
 import { renderUnderstandingSnapshot } from "../understanding/snapshot.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
+import { SystemdCoordinatorRestarter } from "../update/coordinator-restart.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { BuildRunner, GitRunner } from "../update/runner.js";
@@ -906,8 +907,8 @@ export function logRunEnd(logger: Logger, result: RunResult): void {
     capped: result.capped ?? false,
     cancelled: result.cancelled ?? false,
     interrupted: result.interrupted ?? false,
-    yieldStatus: result.yieldStatus,
     model: result.model,
+    abortReason: result.abortReason,
   };
   if (result.success) logger.info("run_end", fields);
   else if (result.capped) logger.warn("run_end", fields);
@@ -2137,6 +2138,11 @@ async function composeStart(
           { installMs: UPDATE_INSTALL_TIMEOUT_MS, buildMs: UPDATE_BUILD_TIMEOUT_MS },
           (m) => console.log(m)
         ),
+        coordinator: new SystemdCoordinatorRestarter({
+          cliPath: join(packageDir, "dist", "cli.js"),
+          dialedSocketPath: coordinatorSocketPath,
+          log: (m) => log.info("update_coordinator", { detail: m }),
+        }),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
         onCommitted: (newSha, branch) => {
           try {
@@ -2330,8 +2336,7 @@ async function composeStart(
           rootId,
           mesh.activeCapabilitiesFor(rootId),
           grantableServers,
-          mcpHttp,
-          { isFenced: (actorId) => mesh.isYielded(actorId) }
+          mcpHttp
         )
       );
       rootMcp.push(...rootGrantedMcp);
@@ -2343,8 +2348,7 @@ async function composeStart(
       actorId,
       mesh.activeCapabilitiesFor(actorId),
       grantableServers,
-      mcpHttp,
-      { isFenced: (actorId) => mesh.isYielded(actorId) }
+      mcpHttp
     );
     for (let index = workerMcp.length - 1; index >= 0; index -= 1) {
       const spec = workerMcp[index];
@@ -2682,9 +2686,8 @@ async function composeStart(
         obligationId
       );
       if (!focus) throw new Error(`run focus was not resolved for actor: ${id}`);
-      // Read after the selection commits: the same armed decision the
-      // clean-yield check enforces is what states the rule here, so the two
-      // can never disagree about this run.
+      // Read after the selection commits, so the notice states exactly the
+      // decision this selection armed.
       return {
         entries,
         focus,
@@ -2733,12 +2736,6 @@ async function composeStart(
     recordChat: (opts) => getRepositories().meshChat.record(opts),
     scheduledMessages: osScheduler,
     withTransaction: (fn) => getDb().transaction(fn)(),
-    recordRunYield: (actorId, status, note) => {
-      const runId = runAccounting.activeRunId(actorId);
-      if (!runId) return null;
-      getRepositories().actorRuns.recordYield(runId, status, note);
-      return runId;
-    },
     completedFocusEntryCounts: (actorId, excludeRunId) =>
       getRepositories().actorRuns.completedFocusEntryCounts(actorId, excludeRunId),
     capabilityGrants,
@@ -2764,15 +2761,15 @@ async function composeStart(
     obligations: {
       findLiveByExternalRef: (ref) => getRepositories().obligations.findLiveByExternalRef(ref),
       // Strict-obligation handling snapshots these unbounded edge reads at
-      // selection and compares them again on clean yield. Keep the production
-      // wiring on the same durable repository seam as the experiment registry.
+      // selection. Keep the production wiring on the same durable repository
+      // seam as the experiment registry.
       get: (id) => getRepositories().obligations.get(id),
       listDirectChildEdges: (parentId) =>
         getRepositories().obligations.listDirectChildEdges(parentId),
       listPrerequisiteEdges: (dependentId) =>
         getRepositories().obligations.listPrerequisiteEdges(dependentId),
-      // Yield-time snooze expiry is the mesh's own normalization, not the
-      // yielding actor's write, so it is attributed to the system principal.
+      // Snooze expiry during a closure check is the mesh's own normalization,
+      // not the actor's write, so it is attributed to the system principal.
       expireDueSnoozes: (ids) => getRepositories().obligations.expireDueSnoozes(ids, "system:mesh"),
       // Retirement's fail-closed preflight (#191): every non-terminal obligation
       // owned in the subtree is a blocker, so `scheduled` counts alongside
@@ -2940,10 +2937,11 @@ async function composeStart(
     isHalted: isProviderHalted,
     isShuttingDown: () => gracefulShutdown.isShuttingDown(),
     handleForId: (id) => (id === rootId ? rootHandle : generateHandle(id)),
-    onYield: (actorId, { notifyingParent }) => {
+    onRunReturned: (actorId, { notifyingParent }) => {
       // Consume-or-flush: surface a pending git-bridge deliverable to the parent
-      // only on a parent-triggered yield; on any other yield still clear it so a
-      // stale deliverable can't leak into a later, unrelated parent notification.
+      // only on a successful parent-triggered return; on any other finish still
+      // clear it so a stale deliverable can't leak into a later, unrelated parent
+      // notification.
       const deliverable = gitBridgeDeliverables.get(actorId);
       if (deliverable === undefined) return undefined;
       gitBridgeDeliverables.delete(actorId);
@@ -3050,7 +3048,6 @@ async function composeStart(
       }
 
       try {
-        const isFenced = () => mesh.isYielded(id);
         // A per-actor agent-execution endpoint, with this actor's identity baked in.
         // The management deps are wired on every endpoint; the endpoint mounts
         // the corresponding tools only for an actor holding the administrative
@@ -3060,12 +3057,12 @@ async function composeStart(
             onWrite: () => {
               mesh.markUnkillable(id);
             },
-            isFenced,
             modelClasses,
             validateModelClass: (input) =>
               validateModelConfigPool(config, input, { portable: true }),
             getFollowers: () => (followerHub ? followerHub.list() : []),
             chatRoom,
+            voices: () => supportedVoiceCatalog,
           })
         );
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
@@ -3073,14 +3070,13 @@ async function composeStart(
             select: inboxSelectFor(id),
             selected: () => mesh.selectedInboxEntries(id),
             onHandled: () => mesh.inboxHandled(id),
-            isFenced,
+            assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(id, entryIds),
             isVoiceSessionActive: () => voiceService?.hasActiveSession(id) ?? false,
             chatContext: inboxChatContextSources(),
           })
         );
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
           createObligationsMcpServer(getRepositories().obligations, id, {
-            isFenced,
             resolveOwner: (raw) =>
               resolveObligationOwner(actors, raw, getRepositories().principals),
             canManage: (callerId, obligation) =>
@@ -3089,18 +3085,15 @@ async function composeStart(
           })
         );
         const meshChatUrl = mcpHttp.addServer(`${id}:${MESH_CHAT_MCP_NAME}`, () =>
-          createMeshChatMcpServer(getRepositories().meshChat, id, { isFenced })
+          createMeshChatMcpServer(getRepositories().meshChat, id)
         );
         const pnpmInstallUrl = mcpHttp.addServer(`${id}:${PNPM_INSTALL_MCP_NAME}`, () =>
-          createPnpmInstallMcpServer({ actorRootFor: (actorId) => join(workersDir, actorId) }, id, {
-            isFenced,
-          })
+          createPnpmInstallMcpServer({ actorRootFor: (actorId) => join(workersDir, actorId) }, id)
         );
         const repoUrl = mcpHttp.addServer(`${id}:${REPO_MCP_NAME}`, () =>
           createRepoMcpServer(id, issueClient, {
             onWrite: () => webhookSilenceDetector?.recordOutboundWrite(),
             instanceId: rootHandle,
-            isFenced,
           })
         );
         const trackerUrl = mcpHttp.addServer(`${id}:${TRACKER_MCP_NAME}`, () =>
@@ -3112,7 +3105,6 @@ async function composeStart(
             onWrite: () => webhookSilenceDetector?.recordOutboundWrite(),
             instanceId: rootHandle,
             getRunSelection: () => activeRunSelections.get(id),
-            isFenced,
             // Mechanically add the creator as an exact-resource subscriber for
             // the created issue/PR: follow-up events route here additively
             // alongside any obligation-governed route. subscribedBy === actorId
@@ -3127,15 +3119,13 @@ async function composeStart(
           createUnderstandingReadServer(
             localWriteDeps,
             resolveUnderstandingRootNodeId(config),
-            understandingStrings.loadStrings,
-            { isFenced }
+            understandingStrings.loadStrings
           )
         );
         const quotaUrl = mcpHttp.addServer(`${id}:${QUOTA_MCP_NAME}`, () =>
           createQuotaMcpServer(
             { config, workersDir, coordinatorClient: quotaCoordinatorClient },
-            quotaService,
-            { isFenced }
+            quotaService
           )
         );
 
@@ -3147,14 +3137,13 @@ async function composeStart(
         ];
         if (chatClient) {
           const chatReadUrl = mcpHttp.addServer(`${id}:${CHAT_READ_MCP_NAME}`, () =>
-            createChatReadMcpServer(chatClient, { isFenced })
+            createChatReadMcpServer(chatClient)
           );
           perActorShared.push({ name: CHAT_READ_MCP_NAME, url: chatReadUrl });
         }
         if (slackClient) {
           const slackReadUrl = mcpHttp.addServer(`${id}:${SLACK_READ_MCP_NAME}`, () =>
             createSlackReadMcpServer(slackClient, {
-              isFenced,
               workDir: join(workersDir, id),
               fileToolsAvailable: () => actors.get(id)?.executionTarget === undefined,
             })
@@ -3177,15 +3166,7 @@ async function composeStart(
         // registered) is skipped safely. Parameterized capabilities (e.g. chat-write:spaces/AAAA)
         // are aggregated by their base name and passed to the factory.
         workerMcp.push(
-          ...mountGrantedServers(
-            id,
-            mesh.activeCapabilitiesFor(rec.id),
-            grantableServers,
-            mcpHttp,
-            {
-              isFenced: (actorId) => mesh.isYielded(actorId),
-            }
-          )
+          ...mountGrantedServers(id, mesh.activeCapabilitiesFor(rec.id), grantableServers, mcpHttp)
         );
 
         // Each worker gets its own private working directory and nothing else: its
@@ -3247,7 +3228,11 @@ async function composeStart(
           buildPrompt: () => {
             const r = actors.get(id);
             if (!r) return { prompt: "No active thread record." };
-            const handles = resolveHandleLabels(r.handles, (hid) => actors.get(hid)?.charter);
+            const handles = resolveHandleLabels(
+              r.handles,
+              (hid) => actors.get(hid)?.charter,
+              (hid) => actors.get(hid)?.title
+            );
             // Portable-context actors (design ISSUE_NUM) get their own recent run outputs
             // assembled into a stateless prefix; the per-run inject record rides on
             // this run's `run_start` event, not its own event kind.
@@ -3512,6 +3497,7 @@ async function composeStart(
       },
       getFollowers: () => (followerHub ? followerHub.list() : []),
       chatRoom,
+      voices: () => supportedVoiceCatalog,
     })
   );
   const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
@@ -3519,6 +3505,7 @@ async function composeStart(
       select: inboxSelectFor(rootId),
       selected: () => mesh.selectedInboxEntries(rootId),
       onHandled: () => mesh.inboxHandled(rootId),
+      assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(rootId, entryIds),
       isVoiceSessionActive: () => voiceService?.hasActiveSession(rootId) ?? false,
       chatContext: inboxChatContextSources(),
     })
@@ -4589,7 +4576,7 @@ async function composeStart(
 
   raiseQuotaWindowMissedAlarm = (missed) => {
     const scrape = missed.scrapeFailed
-      ? "quota scrape failed to parse, so it no longer shows"
+      ? "quota scrape failed, so it no longer shows"
       : "quota scrape no longer shows";
     const message =
       `Quota window missed: the latest ${missed.provider} ${scrape} ` +

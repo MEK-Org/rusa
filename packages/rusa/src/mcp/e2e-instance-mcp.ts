@@ -17,15 +17,8 @@ export interface E2EInstanceMcpDeps {
   manager: E2EInstanceController;
 }
 
-export function createE2EInstanceServer(
-  deps: E2EInstanceMcpDeps,
-  selfId: string,
-  options?: { isFenced?: () => boolean }
-): McpServer {
-  const server = createMcpServer(
-    { name: E2E_INSTANCE_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced }
-  );
+export function createE2EInstanceServer(deps: E2EInstanceMcpDeps, selfId: string): McpServer {
+  const server = createMcpServer({ name: E2E_INSTANCE_MCP_NAME, version: "0.1.0" });
 
   const up = async ({ worktree }: { worktree: string }) => {
     try {

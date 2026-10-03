@@ -23,6 +23,11 @@ import type { FollowerInfo } from "../experimental/remote-instances/follower-hub
 import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
 import type { ChatRoomService } from "../voice/chat-room.js";
+import {
+  resolveVoiceChoice,
+  type SupportedVoice,
+  voiceChoiceText,
+} from "../voice/voice-catalog.js";
 import type { VoiceConfigDocument } from "../voice/voice-config.js";
 import { MAX_VOICE_TRANSFER_NOTE_CHARS } from "../voice/voice-transfer-context.js";
 import { toolError, toolOk } from "./result.js";
@@ -123,7 +128,6 @@ export function createAgentExecMcpServer(
   options?: {
     onWrite?: () => void;
     rootControl?: RootControlService;
-    isFenced?: () => boolean;
     /**
      * Runtime model-class store. The model-class tools mount only when this and
      * `validateModelClass` are wired AND the endpoint's actor holds
@@ -139,12 +143,14 @@ export function createAgentExecMcpServer(
      * wired AND the endpoint's actor holds `room-admin`.
      */
     chatRoom?: Pick<ChatRoomService, "participants" | "add" | "remove">;
+    /**
+     * The dashboard picker's voice catalog (#817). When wired, every actor gets
+     * `get_voice`/`set_voice` for its own voice setting.
+     */
+    voices?: () => readonly SupportedVoice[];
   }
 ): McpServer {
-  const server = createMcpServer(
-    { name: AGENT_EXEC_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced ?? (() => mesh.isYielded(selfId)) }
-  );
+  const server = createMcpServer({ name: AGENT_EXEC_MCP_NAME, version: "0.1.0" });
 
   const eventResourceInputSchema = {
     source: z
@@ -514,36 +520,6 @@ export function createAgentExecMcpServer(
   );
 
   server.registerTool(
-    "yield_run",
-    {
-      title: "Yield your turn (done or blocked)",
-      description:
-        "Release your turn. Call this ONLY when you have no next step you could take yourself right now — either your current objective is complete, or you're blocked waiting on someone else (a review, a reply, an external event). Until you call it, the system keeps waking you to keep making progress, so do NOT yield while a next step is still in your own hands (e.g. you committed but haven't pushed/opened the PR yet — push and open it first). You'll wake again whenever you receive a message or a relevant event. Yielding automatically notifies your parent only when this run was triggered by your parent; externally-triggered clean runs stay silent unless you send_message by judgment. In particular: if you finish work your parent asked you to do during an externally-triggered run (an event or cron woke you, not your parent's message), send_message your parent with the result — the automatic parent notification won't fire for that run. Failed runs still mechanically notify the parent.",
-      inputSchema: {
-        status: z
-          .enum(["complete", "blocked"])
-          .describe(
-            "'complete' = your current objective is finished; 'blocked' = you can't proceed without someone else."
-          ),
-        note: z
-          .string()
-          .optional()
-          .describe(
-            "Recommended: a one-line summary of what you finished, or what you're blocked on and what would unblock you. For parent-triggered runs, your PARENT receives this; it is always recorded in the mesh log."
-          ),
-      },
-    },
-    async ({ status, note }) => {
-      try {
-        mesh.declareYield(selfId, status, note);
-        return toolOk("yielded");
-      } catch (err) {
-        return toolError(err);
-      }
-    }
-  );
-
-  server.registerTool(
     "introduce",
     {
       title: "Introduce one thread to another",
@@ -581,7 +557,7 @@ export function createAgentExecMcpServer(
       description:
         "List the child threads you've spawned, with their charter summary, status, handle, declared model pool, context portability, and " +
         "whether each one has a run in flight right now — your org chart for deciding what " +
-        "to follow up on, inspect, or retire. Supply `handle` to resolve a specific direct child. A child whose run_state is 'running', 'winding_down', or 'queued' is " +
+        "to follow up on, inspect, or retire. Supply `handle` to resolve a specific direct child. A child whose run_state is 'running' or 'queued' is " +
         "mid-work: retiring it would abandon that run, and the attempt will be refused.",
       inputSchema: {
         handle: z
@@ -641,7 +617,7 @@ export function createAgentExecMcpServer(
         "own descendants — completion is the parent's judgment. Refused while that subtree " +
         "has a run in flight: retiring mid-run abandons the provider call and destroys that " +
         "run's work. A queued run can be cancelled and retired by passing force: true. " +
-        "Check run_state in list_threads, or just wait for the thread's yield. " +
+        "Check run_state in list_threads, or wait for the thread's run to end. " +
         "Also refused while the subtree still owns a live obligation, has a scheduled " +
         "message pending in either direction, or holds a live event subscription; the " +
         "refusal names each one, and nothing is retired until you have reassigned or finished " +
@@ -1417,7 +1393,7 @@ export function createAgentExecMcpServer(
       {
         title: "Move an actor to a new parent (actor-admin)",
         description:
-          "Re-parent an actor to a new parent by thread id (e.g. promote a steward and move workers under it so they report to it). Requires the actor-admin capability; both the actor and its new parent must lie in your own subtree. Changes who receives the actor's completion/yield reports and who may retire it (ownership is the parent edge), and grants the new parent a handle so it can message the actor. The actor's own subtree moves with it. Rejected if it would create a cycle, target the root, or reference an unknown thread.",
+          "Re-parent an actor to a new parent by thread id (e.g. promote a steward and move workers under it so they report to it). Requires the actor-admin capability; both the actor and its new parent must lie in your own subtree. Changes who receives the actor's reports and failure notices and who may retire it (ownership is the parent edge), and grants the new parent a handle so it can message the actor. The actor's own subtree moves with it. Rejected if it would create a cycle, target the root, or reference an unknown thread.",
         inputSchema: {
           thread_id: z.string().describe("The actor to move."),
           new_parent_id: z.string().describe("The actor that becomes its new parent."),
@@ -1674,6 +1650,81 @@ export function createAgentExecMcpServer(
           const removed = chatRoom.remove(actor_id);
           if (removed) options?.onWrite?.();
           return toolOk({ actor_id, removed });
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
+  }
+
+  // ── Own voice (#817) ── An actor reads and changes only its own walkie
+  // voice: the endpoint's bound identity is the target, so these tools take no
+  // actor argument and need no capability. Choices resolve against the same
+  // catalog the dashboard picker offers.
+  if (options?.voices) {
+    const voices = options.voices;
+    const describeVoice = (catalog: readonly SupportedVoice[], voice: VoiceConfigDocument) => {
+      const key = JSON.stringify(voice);
+      const entry = catalog.find((v) => JSON.stringify(v.voiceConfig) === key);
+      const name = voice.provider === "google" ? voice.config.voiceName : voice.config.voiceId;
+      return {
+        // A stored voice no longer in the catalog still reads back, unlabelled.
+        choice: entry ? voiceChoiceText(catalog, entry) : null,
+        provider: voice.provider,
+        voice: name,
+      };
+    };
+
+    server.registerTool(
+      "get_voice",
+      {
+        title: "Read your walkie voice",
+        description:
+          "Read your own walkie-talkie voice and the voices you can choose. `voice` is null when you speak with the instance default. Each choice's `choice` text names exactly that voice when passed to set_voice.",
+        inputSchema: {},
+      },
+      async () => {
+        try {
+          const stored = mesh.actors.get(selfId)?.voiceConfig;
+          const catalog = voices();
+          return toolOk({
+            voice: stored ? describeVoice(catalog, stored) : null,
+            choices: catalog.map((v) => describeVoice(catalog, v.voiceConfig)),
+          });
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
+
+    server.registerTool(
+      "set_voice",
+      {
+        title: "Choose your walkie voice",
+        description:
+          "Choose your own walkie-talkie voice, used from your next spoken reply. Name a choice from get_voice: its `choice` text, its label, a Gemini voice name, or an ElevenLabs voice id. An ambiguous or unavailable choice is rejected with choice text for each candidate and changes nothing. Pass null to restore the instance default.",
+        inputSchema: {
+          voice: z
+            .string()
+            .trim()
+            .min(1)
+            .nullable()
+            .describe("The voice to use, or null for the instance default."),
+        },
+      },
+      async ({ voice }) => {
+        try {
+          if (!mesh.actors.get(selfId)) throw new Error(`unknown actor ${selfId}`);
+          const catalog = voices();
+          let voiceConfig: VoiceConfigDocument | undefined;
+          if (voice !== null) {
+            const resolved = resolveVoiceChoice(catalog, voice);
+            if (!resolved.ok) throw new Error(resolved.error);
+            voiceConfig = resolved.voice.voiceConfig;
+          }
+          mesh.actors.patch(selfId, { voiceConfig });
+          options?.onWrite?.();
+          return toolOk({ voice: voiceConfig ? describeVoice(catalog, voiceConfig) : null });
         } catch (err) {
           return toolError(err);
         }

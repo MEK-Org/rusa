@@ -1089,6 +1089,26 @@ export async function parseKimiQuota(
 }
 
 /**
+ * A provider run that was killed before it completed, so its output holds no
+ * panel to extract (#847). It fails the scrape the way a parser throw does, so
+ * history reports it `failed` and its cause survives in the scrape's
+ * `parse_error`. Every killed or signalled subprocess result is `cancelled`;
+ * an ordinary non-zero exit is not, and still goes to extraction.
+ */
+class QuotaCaptureError extends Error {
+  constructor(provider: string, command: string, result: RunResult) {
+    const flags = (["cancelled", "interrupted"] as const).filter((f) => result[f]);
+    const lastLine = result.output.trim().split("\n").pop()?.slice(-200) ?? "";
+    super(
+      `${provider} ${command} capture failed: exit ${result.exitCode}` +
+        (flags.length > 0 ? ` (${flags.join(", ")})` : "") +
+        (lastLine ? `; output ends: ${lastLine}` : "; no output")
+    );
+    this.name = "QuotaCaptureError";
+  }
+}
+
+/**
  * Whether a bad read may carry this previous window forward. Model-scoped
  * windows carry only for Claude, whose Fable window #763 asked to keep.
  */
@@ -1385,7 +1405,10 @@ export class QuotaService {
               status: "unknown",
               scrapedAt,
               raw: rawOutput,
-              message: `LLM quota parsing failed, preserving previous window assessment: ${error instanceof Error ? error.message : String(error)}`,
+              message:
+                error instanceof QuotaCaptureError
+                  ? `${error.message}; preserving previous window assessment`
+                  : `LLM quota parsing failed, preserving previous window assessment: ${error instanceof Error ? error.message : String(error)}`,
             },
             prevState,
             scrapedAt
@@ -1575,6 +1598,7 @@ export class QuotaService {
     // before the LLM parse, which is post-processing, not part of the scrape.
     const scrapedAt = this.scrapedAtNow();
     return this.parsePersistedScrape("claude", output, scrapedAt, async () => {
+      if (result.cancelled) throw new QuotaCaptureError("claude", "/usage", result);
       const apiKey = this.deps.config.geminiApiKey?.trim();
 
       if (!apiKey) {
@@ -1787,8 +1811,7 @@ export function createQuotaService(deps: QuotaMcpDeps): QuotaService {
  */
 export function createQuotaMcpServer(
   deps: QuotaMcpDeps,
-  service: QuotaService = createQuotaService(deps),
-  options?: { isFenced?: () => boolean }
+  service: QuotaService = createQuotaService(deps)
 ): McpServer {
   // §12 item 4 (#356): when a coordinator client is wired, get_quota reads
   // through GET /v1/quota and never reaches the local probe path. Both the
@@ -1796,10 +1819,7 @@ export function createQuotaMcpServer(
   // `status: "unsupported"` themselves, so there is one dispatch seam here.
   const coordinatorClient = deps.coordinatorClient ?? null;
 
-  const server = createMcpServer(
-    { name: QUOTA_MCP_NAME, version: "0.1.0" },
-    { isFenced: options?.isFenced }
-  );
+  const server = createMcpServer({ name: QUOTA_MCP_NAME, version: "0.1.0" });
 
   server.registerTool(
     "get_quota",

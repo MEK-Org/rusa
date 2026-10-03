@@ -18,13 +18,9 @@ export function createEmailSendMcpServer(
   options: {
     allowedRecipients: string[];
     onSend: (actorId: string, delivery: EmailDelivery) => void;
-    isFenced?: () => boolean;
   }
 ): McpServer {
-  const server = createMcpServer(
-    { name: EMAIL_SEND_MCP_NAME, version: "0.1.0" },
-    { isFenced: options.isFenced }
-  );
+  const server = createMcpServer({ name: EMAIL_SEND_MCP_NAME, version: "0.1.0" });
 
   const assertAllowed = (recipients: string[]) => {
     if (

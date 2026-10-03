@@ -57,11 +57,7 @@ import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "./u
  * grantee's `selfId` (baked into the server instance) when mounting a granted
  * capability on top of that actor's default tool set.
  */
-export type GrantableServerFactory = (
-  selfId: string,
-  params: string[],
-  options?: { isFenced?: () => boolean }
-) => McpServer;
+export type GrantableServerFactory = (selfId: string, params: string[]) => McpServer;
 
 /** Dependencies the grantable servers need, each scoped to that server boundary. */
 export interface GrantableServerDeps {
@@ -146,35 +142,24 @@ export function buildGrantableServers(
   deps: GrantableServerDeps
 ): Map<string, GrantableServerFactory> {
   const map = new Map<string, GrantableServerFactory>([
-    [
-      DISTILLER_MCP_NAME,
-      (_selfId, _params, options) => createDistillerServer(deps.distiller, options),
-    ],
+    [DISTILLER_MCP_NAME, () => createDistillerServer(deps.distiller)],
     [
       UNDERSTANDING_WRITE_MCP_NAME,
-      (_selfId, _params, options) =>
-        createUnderstandingWriteServer(deps.understanding, deps.rootNodeId, options),
+      () => createUnderstandingWriteServer(deps.understanding, deps.rootNodeId),
     ],
-    [
-      HOST_JOBS_MCP_NAME,
-      (selfId, _params, options) => createHostJobsServer(deps.hostJobs, selfId, options),
-    ],
-    [
-      E2E_INSTANCE_MCP_NAME,
-      (selfId, _params, options) => createE2EInstanceServer(deps.e2eInstance, selfId, options),
-    ],
+    [HOST_JOBS_MCP_NAME, (selfId) => createHostJobsServer(deps.hostJobs, selfId)],
+    [E2E_INSTANCE_MCP_NAME, (selfId) => createE2EInstanceServer(deps.e2eInstance, selfId)],
     [
       EMAIL_SEND_MCP_NAME,
-      (selfId, params, options) =>
+      (selfId, params) =>
         createEmailSendMcpServer(selfId, deps.gmailClient, {
           allowedRecipients: params,
           onSend: (actorId, delivery) => deps.onEmailSend(actorId, delivery.to, delivery.cc),
-          isFenced: options?.isFenced,
         }),
     ],
     [
       CALENDAR_READ_MCP_NAME,
-      (selfId, params, options) => {
+      (selfId, params) => {
         const allowedAccounts = params
           .filter((param) => param.startsWith("account:"))
           .map((param) => param.slice("account:".length))
@@ -184,39 +169,32 @@ export function buildGrantableServers(
           allowedCalendars,
           allowedAccounts,
           onRead: deps.onCalendarRead,
-          isFenced: options?.isFenced,
         });
       },
     ],
     [
       CALENDAR_WRITE_MCP_NAME,
-      (selfId, params, options) => {
+      (selfId, params) => {
         const allowedCalendars = params.filter((param) => !param.startsWith("account:"));
         return createCalendarWriteMcpServer(selfId, deps.calendarClients, {
           allowedCalendars,
           onWrite: deps.onCalendarWrite,
-          isFenced: options?.isFenced,
         });
       },
     ],
     [
       DRIVE_READ_MCP_NAME,
-      (selfId, params, options) => {
+      (selfId, params) => {
         return createDriveReadMcpServer(selfId, deps.driveClients, {
           allowedFolders: params,
           onRead: deps.onDriveRead,
-          isFenced: options?.isFenced,
         });
       },
     ],
-    [
-      QUOTA_MANUAL_MCP_NAME,
-      (_selfId, _params, options) =>
-        createQuotaManualServer(deps.quotaManual ?? { client: null }, options),
-    ],
+    [QUOTA_MANUAL_MCP_NAME, () => createQuotaManualServer(deps.quotaManual ?? { client: null })],
   ]);
   if (deps.chatClient) {
-    map.set(CHAT_WRITE_MCP_NAME, (selfId, params, options) => {
+    map.set(CHAT_WRITE_MCP_NAME, (selfId, params) => {
       // params are e.g. ["spaces/AAAA", "spaces/BBBB"] from "chat-write:spaces/AAAA" etc.
       // Or if they were granted "*", we can support that, though typically spaces are passed.
       const allowedSpaces = params.map((p) =>
@@ -228,7 +206,6 @@ export function buildGrantableServers(
         allowedSpaces,
         getRunSelection: () => deps.getRunSelectionForActor(selfId),
         onWrite: deps.onChatWrite,
-        isFenced: options?.isFenced,
         ...(workDir ? { workDir } : {}),
         selectedInboxEntries: deps.selectedInboxEntriesForActor
           ? () => deps.selectedInboxEntriesForActor?.(selfId) ?? []
@@ -238,11 +215,10 @@ export function buildGrantableServers(
     });
   }
   if (deps.slackClient) {
-    map.set(SLACK_WRITE_MCP_NAME, (selfId, params, options) => {
+    map.set(SLACK_WRITE_MCP_NAME, (selfId, params) => {
       if (!deps.slackClient) throw new Error("slackClient is required for slack-write capability");
       const workDir = deps.actorRootFor?.(selfId);
       return createSlackWriteMcpServer(deps.slackClient, params.includes("*") ? "all" : params, {
-        isFenced: options?.isFenced,
         ...(workDir ? { workDir } : {}),
         ...(deps.fileToolsAvailableForActor
           ? { fileToolsAvailable: () => deps.fileToolsAvailableForActor?.(selfId) ?? false }
@@ -276,8 +252,7 @@ export function mountGrantedServers(
   grantableServers: Map<string, GrantableServerFactory>,
   mcpHttp: {
     addServer: (name: string, factory: () => McpServer) => string;
-  },
-  options?: { isFenced?: (actorId: string) => boolean }
+  }
 ): McpServerSpec[] {
   const baseToParams = new Map<string, string[]>();
   for (const capability of activeCapabilities) {
@@ -295,11 +270,7 @@ export function mountGrantedServers(
   for (const [baseCapability, params] of baseToParams.entries()) {
     const factory = grantableServers.get(baseCapability);
     if (!factory) continue;
-    const isFenced = options?.isFenced;
-    const url = mcpHttp.addServer(`${actorId}:${baseCapability}`, () => {
-      const opts = isFenced ? { isFenced: () => isFenced(actorId) } : undefined;
-      return opts ? factory(actorId, params, opts) : factory(actorId, params);
-    });
+    const url = mcpHttp.addServer(`${actorId}:${baseCapability}`, () => factory(actorId, params));
     mounted.push({ name: baseCapability, url });
   }
   return mounted;

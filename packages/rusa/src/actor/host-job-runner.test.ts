@@ -1,7 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   buildHostJobBwrapArgs,
@@ -234,6 +235,42 @@ describe("buildHostJobBwrapArgs (pure argv)", () => {
     }, []);
     expect(tmpfsTargets).toContain(hostHome);
     expect(tmpfsTargets).not.toContain(nestedMcHome);
+  });
+
+  it("shadows the resolved target of a symlinked mcHome, not the link path", () => {
+    const realMcHome = join(dir, "real-mc");
+    mkdirSync(realMcHome, { recursive: true });
+    const linkedMcHome = join(hostHome, ".rusa-link");
+    symlinkSync(realMcHome, linkedMcHome);
+    const args = buildHostJobBwrapArgs({
+      hostHome,
+      mcHome: linkedMcHome,
+      scratchDir,
+      manifest: { readPaths: [] },
+    });
+    const tmpfsTargets = args.reduce<string[]>((acc, arg, i) => {
+      if (arg === "--tmpfs") acc.push(args[i + 1]);
+      return acc;
+    }, []);
+    expect(tmpfsTargets).toContain(realMcHome);
+    expect(tmpfsTargets).not.toContain(linkedMcHome);
+  });
+
+  it("still denies manifest paths through a symlinked mcHome or at its real target", () => {
+    const realMcHome = join(dir, "real-mc");
+    mkdirSync(join(realMcHome, "secrets"), { recursive: true });
+    const linkedMcHome = join(hostHome, ".rusa-link");
+    symlinkSync(realMcHome, linkedMcHome);
+    for (const readPath of [linkedMcHome, realMcHome, join(realMcHome, "secrets")]) {
+      expect(() =>
+        buildHostJobBwrapArgs({
+          hostHome,
+          mcHome: linkedMcHome,
+          scratchDir,
+          manifest: { readPaths: [readPath] },
+        })
+      ).toThrow(/denied/);
+    }
   });
 
   it("ensures parent dirs before every bind onto the shadowed tree (the ISSUE_NUM-class fix)", () => {
@@ -511,5 +548,90 @@ describe.skipIf(!BWRAP_CAPABLE)("buildHostJobBwrapArgs + real bwrap (ack item 3 
     );
     const written = execFileSync("cat", [join(scratchDir, "out.txt")], { encoding: "utf-8" });
     expect(written.trim()).toBe("scratch-write-ok");
+  });
+});
+
+/**
+ * A symlinked `RUSA_HOME` must hide its REAL target, not just the link. The
+ * decoy root lives under the package dir — outside `/tmp` and outside the
+ * fixture `$HOME` — so neither existing tmpfs can hide it by accident; only a
+ * shadow mounted on the resolved mcHome does. Scratch sits under mcHome, as
+ * `scratchDirFor` places it in production, and does not exist yet when the
+ * argv is built.
+ */
+describe.skipIf(!BWRAP_CAPABLE)("buildHostJobBwrapArgs + real bwrap: symlinked mcHome", () => {
+  const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+  let dir: string;
+  let outside: string;
+  let hostHome: string;
+  let allowedDir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "host-job-symlink-mchome-test-"));
+    outside = mkdtempSync(join(packageRoot, ".host-job-symlink-target-"));
+    expect(outside.startsWith("/tmp/")).toBe(false);
+    hostHome = join(dir, "home");
+    allowedDir = join(dir, "allowed");
+    mkdirSync(hostHome, { recursive: true });
+    mkdirSync(allowedDir, { recursive: true });
+    writeFileSync(join(allowedDir, "data.txt"), "ALLOWED_CONTENT");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  function seedState(realMcHome: string): void {
+    mkdirSync(join(realMcHome, "secrets"), { recursive: true });
+    writeFileSync(join(realMcHome, "wake-token"), "decoy-wake-token");
+    writeFileSync(join(realMcHome, "secrets", "decoy.key"), "decoy-secret");
+  }
+
+  function runJob(mcHome: string, realMcHome: string): { output: string; written: string } {
+    // Production order: host-jobs-mcp builds the argv before
+    // writeHostJobScript creates the scratch dir.
+    const scratchDir = join(mcHome, "host-jobs", "scratch", "job-test");
+    const args = buildHostJobBwrapArgs({
+      hostHome,
+      mcHome,
+      scratchDir,
+      manifest: { readPaths: [allowedDir] },
+    });
+    mkdirSync(scratchDir, { recursive: true });
+    const probe = [
+      `test -r "${join(realMcHome, "wake-token")}" && echo TOKEN_READABLE || echo TOKEN_DENIED`,
+      `test -r "${join(realMcHome, "secrets", "decoy.key")}" && echo SECRET_READABLE || echo SECRET_DENIED`,
+      `cat "${join(allowedDir, "data.txt")}"`,
+      'echo scratch-write-ok > "$HOME/out.txt"',
+    ].join("\n");
+    const output = execFileSync("bwrap", [...args, "--", "/bin/sh", "-c", probe], {
+      encoding: "utf-8",
+    });
+    const written = readFileSync(join(scratchDir, "out.txt"), "utf-8");
+    return { output, written };
+  }
+
+  function expectHidden({ output, written }: { output: string; written: string }): void {
+    expect(output).toContain("TOKEN_DENIED");
+    expect(output).toContain("SECRET_DENIED");
+    expect(output).not.toContain("TOKEN_READABLE");
+    expect(output).not.toContain("SECRET_READABLE");
+    expect(output).toContain("ALLOWED_CONTENT");
+    expect(written.trim()).toBe("scratch-write-ok");
+  }
+
+  it("hides the real target of a symlink under $HOME that points outside it", () => {
+    const realMcHome = join(outside, "state");
+    seedState(realMcHome);
+    const mcHome = join(hostHome, ".rusa-link");
+    symlinkSync(realMcHome, mcHome);
+    expectHidden(runJob(mcHome, realMcHome));
+  });
+
+  it("hides an ordinary mcHome directory outside both $HOME and /tmp", () => {
+    const mcHome = join(outside, "state");
+    seedState(mcHome);
+    expectHidden(runJob(mcHome, mcHome));
   });
 });

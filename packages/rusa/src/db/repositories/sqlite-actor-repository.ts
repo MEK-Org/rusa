@@ -525,7 +525,15 @@ export class SqliteActorRepository implements ActorRepository {
         "INSERT INTO actor_handles (actor_id, target_id, role) VALUES (?, ?, ?)"
       );
       for (const handle of record.handles ?? []) {
-        addHandle.run(record.id, handle.id, handle.role ?? null);
+        let storedRole: string | null = null;
+        if (handle.origin === "message") {
+          storedRole = handle.role ? `__origin:message:${handle.role}` : "__origin:message";
+        } else if (handle.role) {
+          storedRole = handle.role.startsWith("__origin:")
+            ? `__origin:explicit:${handle.role}`
+            : handle.role;
+        }
+        addHandle.run(record.id, handle.id, storedRole);
       }
     })();
 
@@ -625,10 +633,35 @@ export class SqliteActorRepository implements ActorRepository {
       ...(row.parent_id === null ? { isRoot: true } : {}),
       ...(handles.length
         ? {
-            handles: handles.map((handle) => ({
-              id: handle.target_id,
-              ...(handle.role ? { role: handle.role } : {}),
-            })),
+            handles: handles.map((handle) => {
+              const roleText = handle.role ?? undefined;
+              if (!roleText) {
+                return { id: handle.target_id };
+              }
+              if (roleText.startsWith("__origin:explicit:")) {
+                return {
+                  id: handle.target_id,
+                  role: roleText.slice("__origin:explicit:".length),
+                };
+              }
+              if (roleText === "__origin:message") {
+                return {
+                  id: handle.target_id,
+                  origin: "message" as const,
+                };
+              }
+              if (roleText.startsWith("__origin:message:")) {
+                return {
+                  id: handle.target_id,
+                  role: roleText.slice("__origin:message:".length),
+                  origin: "message" as const,
+                };
+              }
+              return {
+                id: handle.target_id,
+                role: roleText,
+              };
+            }),
           }
         : {}),
       ...(lastHumanMessage ? { humanUnlocked: true } : {}),

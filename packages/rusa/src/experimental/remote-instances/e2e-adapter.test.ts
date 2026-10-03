@@ -148,7 +148,7 @@ describe("instanceWorkerFactory", () => {
     // A deployed follower builds each admitted tuple from these provider
     // options, filling the tuple's unset fields from them. The second
     // candidate must not run at the first one's model or effort.
-    const bridge = { sendMessage: async () => "", yieldRun: () => {} };
+    const bridge = { sendMessage: async () => "" };
     for (const candidate of pool) {
       const provider = createProvider(bridge, bootstrap?.providerOptions ?? {}, candidate);
       expect({

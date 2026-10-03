@@ -2,6 +2,7 @@
  * Provider abstraction for CLI-based coding agents.
  */
 
+import type { AbortReason } from "./termination-attribution.js";
 import type { RunTokenUsage } from "./token-accounting.js";
 
 export type SandboxOptions = {
@@ -81,12 +82,8 @@ export interface RunResult {
   interrupted?: boolean;
   /** The typed source of the interrupt, if applicable (e.g. 'human:operator', 'responsive-notification'). */
   interruptSource?: string;
-  /** True when the run was grace-killed by the supervisor after exceeding the yield grace period. */
-  graceKilled?: boolean;
-  /** The declared yield status ('complete' | 'blocked') if the run yielded. */
-  yieldStatus?: string;
-  /** The actor-authored summary supplied with yield_run, if any. */
-  yieldNote?: string;
+  /** The typed reason for termination/abort (e.g. 'stall-watchdog', 'run-ceiling', 'interrupt:<by>', 'unknown'). */
+  abortReason?: AbortReason;
   /** True when the run failure is due to continuation-cap exhaustion. */
   capped?: boolean;
   /**

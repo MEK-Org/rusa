@@ -21,13 +21,9 @@ export function createDriveReadMcpServer(
   options: {
     allowedFolders: string[];
     onRead?: (actorId: string, observation: DriveReadObservation) => void;
-    isFenced?: () => boolean;
   }
 ): McpServer {
-  const server = createMcpServer(
-    { name: DRIVE_READ_MCP_NAME, version: "0.1.0" },
-    { isFenced: options.isFenced }
-  );
+  const server = createMcpServer({ name: DRIVE_READ_MCP_NAME, version: "0.1.0" });
 
   const checkFolderAccess = (folderId: string) => {
     if (!options.allowedFolders || options.allowedFolders.length === 0) return;

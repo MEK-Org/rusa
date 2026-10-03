@@ -47,7 +47,6 @@ import { runMigrations } from "../db/migrations/runner.js";
 import type { ChatRoomMember } from "../db/repositories/chat-room-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
-import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { FakeProvider } from "../providers/fake-provider.js";
@@ -61,8 +60,8 @@ import type { RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
 import { ChatRoomService } from "../voice/chat-room.js";
-import { buildSupportedVoiceCatalog } from "../voice/voice-catalog.js";
-import { googleVoiceConfig } from "../voice/voice-config.js";
+import { buildSupportedVoiceCatalog, parseVoiceDefinitions } from "../voice/voice-catalog.js";
+import { googleVoiceConfig, type VoiceConfigDocument } from "../voice/voice-config.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -794,81 +793,8 @@ describe("agent-execution MCP server", () => {
         "transfer_voice_session",
         "unenroll_actor_experiment",
         "unsubscribe_event_source",
-        "yield_run",
       ].sort()
     );
-  });
-
-  it("describes externally-triggered parent-delegated completion reporting", async () => {
-    const { mesh } = setup();
-    const client = await connect(createAgentExecMcpServer(mesh, "worker-1", "root"));
-    const { tools } = await client.listTools();
-    const yieldTool = tools.find((t) => t.name === "yield_run");
-    expect(yieldTool?.description).toMatch(/finish work your parent asked you to do/i);
-    expect(yieldTool?.description).toMatch(/automatic parent notification won't fire/i);
-  });
-
-  it("uses root enrollment to gate the opted-in worker while an unenrolled MCP control keeps yielding", async () => {
-    const db = new Database(":memory:");
-    runMigrations(db);
-    try {
-      const obligations = new ObligationRepository(db);
-      const { inboxStore, mesh } = setup({
-        obligations: {
-          findLiveByExternalRef: (ref) => obligations.findLiveByExternalRef(ref),
-          get: (id) => obligations.get(id),
-          listDirectChildEdges: (id) => obligations.listDirectChildEdges(id),
-          listPrerequisiteEdges: (id) => obligations.listPrerequisiteEdges(id),
-          expireDueSnoozes: (ids) => obligations.expireDueSnoozes(ids, "system:mesh"),
-        },
-      });
-      const root = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-      const optedIn = mesh.spawn({
-        charter: "opted in",
-        parentId: "root",
-        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-      });
-      const control = mesh.spawn({
-        charter: "control",
-        parentId: "root",
-        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-      });
-      const enrollment = (await root.callTool({
-        name: "enroll_actor_experiment",
-        arguments: { actor_id: optedIn, experiment: "strict_obligation_handling" },
-      })) as CallToolResult;
-      expect(enrollment.isError).toBeFalsy();
-
-      for (const [actorId, obligationId] of [
-        [optedIn, "strict-mcp-head"],
-        [control, "control-mcp-head"],
-      ]) {
-        obligations.create({ id: obligationId, title: obligationId, ownerId: actorId });
-        mesh.deliverReadyHeadAttention(actorId, { id: obligationId, intent: "handle it" }, null);
-        mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
-        const entry = inboxStore
-          .list(actorId, { status: "unhandled" })
-          .entries.find((candidate) => candidate.payload.type === "obligation.ready_head");
-        if (!entry) throw new Error("expected ready-head inbox entry");
-        mesh.selectInboxEntries(actorId, [entry.id]);
-      }
-
-      const optedInClient = await connect(createAgentExecMcpServer(mesh, optedIn, "root"));
-      const controlClient = await connect(createAgentExecMcpServer(mesh, control, "root"));
-      const rejected = (await optedInClient.callTool({
-        name: "yield_run",
-        arguments: { status: "complete" },
-      })) as CallToolResult;
-      expect(rejected.isError).toBe(true);
-      expect(String(dataOf(rejected))).toContain("selected head obligation strict-mcp-head");
-      const accepted = (await controlClient.callTool({
-        name: "yield_run",
-        arguments: { status: "complete" },
-      })) as CallToolResult;
-      expect(accepted.isError).toBeFalsy();
-    } finally {
-      db.close();
-    }
   });
 
   it("transfers only the caller's active voice session through a held target", async () => {
@@ -961,7 +887,6 @@ describe("agent-execution MCP server", () => {
       ({
         id,
         requestRun: () => {},
-        declareYield: () => {},
         markUnkillable: () => {},
         close: () => {},
         isRunning: false,
@@ -1063,44 +988,8 @@ describe("agent-execution MCP server", () => {
         "subscribe_event_source",
         "transfer_voice_session",
         "unsubscribe_event_source",
-        "yield_run",
       ].sort()
     );
-  });
-
-  it("yield_run records a run_yielded event for the caller", async () => {
-    const { mesh, events } = setup();
-    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-    const result = await client.callTool({
-      name: "yield_run",
-      arguments: { status: "complete", note: "done for now" },
-    });
-    expect(dataOf(result as CallToolResult)).toBe("yielded");
-    const yielded = events.find((e) => e.kind === "run_yielded");
-    expect(yielded).toMatchObject({ actorId: "root", detail: "complete" });
-  });
-
-  it("yield_run only records the yield when it is called outside an active run", async () => {
-    const { mesh, events } = setup();
-    const rootSrv = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-    const spawn = await rootSrv.callTool({
-      name: "spawn_thread",
-      arguments: {
-        charter: "do a thing",
-        model_config: { provider: "claude", model: "claude-sonnet-4-6" },
-      },
-    });
-    const { thread_id } = dataOf(spawn as CallToolResult) as { thread_id: string };
-    const childSrv = await connect(createAgentExecMcpServer(mesh, thread_id, "root"));
-    await childSrv.callTool({
-      name: "yield_run",
-      arguments: { status: "blocked", note: "waiting on review" },
-    });
-    const toParent = events.find((e) => e.kind === "message_sent");
-    expect(toParent).toBeUndefined();
-    const yielded = events.find((e) => e.kind === "run_yielded" && e.actorId === thread_id);
-    expect(yielded?.detail).toBe("blocked");
-    expect(yielded?.body).toBe("waiting on review");
   });
 
   it("spawn_thread creates a child parented to the caller and returns its id", async () => {
@@ -4962,5 +4851,140 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       expect(strangerClear.isError).toBe(true);
       expect(JSON.stringify(strangerClear.content)).toMatch(/Only the parent thread/i);
     });
+  });
+});
+
+describe("own voice tools (#817)", () => {
+  const christopher: VoiceConfigDocument = {
+    schemaVersion: 1,
+    provider: "elevenlabs",
+    config: { voiceId: "Puck" },
+  };
+  const configured = parseVoiceDefinitions([
+    { label: "Custom Puck", voiceConfig: googleVoiceConfig("puck") },
+    { label: "Christopher", voiceConfig: christopher },
+  ]);
+  const catalog = buildSupportedVoiceCatalog(configured, {
+    availableProviders: ["google", "elevenlabs"],
+  });
+
+  /** Two ungranted sibling workers, each with its own bound endpoint. */
+  async function twoWorkers() {
+    const fixture = setup({ seedRootGrants: false });
+    for (const id of ["worker-a", "worker-b"]) {
+      fixture.registry.upsert({
+        id,
+        charter: id,
+        parentId: "root",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    const endpoint = (id: string) =>
+      connect(
+        createAgentExecMcpServer(fixture.mesh, id, "root", undefined, { voices: () => catalog })
+      );
+    return { ...fixture, a: await endpoint("worker-a"), b: await endpoint("worker-b") };
+  }
+  const setVoice = (client: Client, voice: string | null, extra: Record<string, unknown> = {}) =>
+    client.callTool({
+      name: "set_voice",
+      arguments: { voice, ...extra },
+    }) as Promise<CallToolResult>;
+  const getVoice = (client: Client) =>
+    client.callTool({ name: "get_voice", arguments: {} }) as Promise<CallToolResult>;
+
+  it("offers the tools to an ungranted actor with no target-actor argument", async () => {
+    const { a } = await twoWorkers();
+    const { tools } = await a.listTools();
+    const setTool = tools.find((t) => t.name === "set_voice");
+    expect(tools.map((t) => t.name)).toContain("get_voice");
+    expect(Object.keys(setTool?.inputSchema.properties ?? {})).toEqual(["voice"]);
+  });
+
+  it("isolates two bound endpoints: each sets and clears only its own voice", async () => {
+    const { a, b, registry } = await twoWorkers();
+
+    const setA = await setVoice(a, "Christopher");
+    expect(setA.isError).toBeFalsy();
+    expect(dataOf(setA)).toEqual({
+      voice: { choice: "Christopher (ElevenLabs)", provider: "elevenlabs", voice: "Puck" },
+    });
+    expect((await setVoice(b, "kore")).isError).toBeFalsy();
+    expect(registry.get("worker-a")?.voiceConfig).toEqual(christopher);
+    expect(registry.get("worker-b")?.voiceConfig).toEqual(googleVoiceConfig("Kore"));
+
+    // The bound identity is the only target; a smuggled one is refused outright.
+    const smuggled = await setVoice(a, "Zephyr", { actor_id: "worker-b" });
+    expect(smuggled.isError).toBe(true);
+    expect(registry.get("worker-a")?.voiceConfig).toEqual(christopher);
+    expect(registry.get("worker-b")?.voiceConfig).toEqual(googleVoiceConfig("Kore"));
+
+    const readA = dataOf(await getVoice(a)) as { voice: unknown; choices: unknown[] };
+    expect(readA.voice).toEqual({
+      choice: "Christopher (ElevenLabs)",
+      provider: "elevenlabs",
+      voice: "Puck",
+    });
+    expect(readA.choices).toHaveLength(catalog.length);
+    expect(readA.choices).toContainEqual({
+      choice: "Custom Puck (Gemini)",
+      provider: "google",
+      voice: "Puck",
+    });
+
+    const cleared = await setVoice(a, null);
+    expect(cleared.isError).toBeFalsy();
+    expect(dataOf(cleared)).toEqual({ voice: null });
+    expect(registry.get("worker-a")?.voiceConfig).toBeUndefined();
+    expect(registry.get("worker-b")?.voiceConfig).toEqual(googleVoiceConfig("Kore"));
+    expect((dataOf(await getVoice(a)) as { voice: unknown }).voice).toBeNull();
+    expect((dataOf(await getVoice(b)) as { voice: unknown }).voice).toEqual({
+      choice: "Kore (Gemini)",
+      provider: "google",
+      voice: "Kore",
+    });
+  });
+
+  it("rejects a choice as a tool error without writing", async () => {
+    const { a, registry } = await twoWorkers();
+    await setVoice(a, "custom puck");
+    expect(registry.get("worker-a")?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
+
+    // Resolution itself is covered in voice-catalog.test.ts; here, the boundary.
+    const ambiguous = await setVoice(a, "Puck");
+    expect(ambiguous.isError).toBe(true);
+    expect(dataOf(ambiguous)).toMatch(
+      /ambiguous.*Custom Puck \(Gemini\).*Christopher \(ElevenLabs\)/
+    );
+    expect(registry.get("worker-a")?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
+  });
+
+  it("sets the voice named by each offered choice, including a shared label", async () => {
+    const { registry, mesh } = await twoWorkers();
+    const twins = buildSupportedVoiceCatalog(
+      parseVoiceDefinitions([
+        { label: "Alex", voiceConfig: { ...christopher } },
+        { label: "Alex", voiceConfig: { ...christopher, config: { voiceId: "alex-2" } } },
+      ]),
+      { availableProviders: ["google", "elevenlabs"] }
+    );
+    const client = await connect(
+      createAgentExecMcpServer(mesh, "worker-a", "root", undefined, { voices: () => twins })
+    );
+    const { choices } = dataOf(await getVoice(client)) as { choices: { choice: string }[] };
+    expect(choices.map((c) => c.choice)).toContain("Alex (ElevenLabs, alex-2)");
+    for (const [i, { choice }] of choices.entries()) {
+      expect((await setVoice(client, choice)).isError).toBeFalsy();
+      expect(registry.get("worker-a")?.voiceConfig).toEqual(twins[i].voiceConfig);
+    }
+  });
+
+  it("does not mount the tools when no catalog is wired", async () => {
+    const { mesh } = setup();
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const names = (await client.listTools()).tools.map((t) => t.name);
+    expect(names).not.toContain("set_voice");
+    expect(names).not.toContain("get_voice");
   });
 });

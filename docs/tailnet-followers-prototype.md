@@ -175,7 +175,7 @@ Example spawn via control API:
 
 ```sh
 curl -fsS http://127.0.0.1:8080/api/mesh/actors -H 'content-type: application/json' \
-  -d '{"target":"<follower-name>","provider":"codex","model":"gpt-5.6-sol","charter":"Perform the bounded task sent in your inbox, report to your parent, and yield."}'
+  -d '{"target":"<follower-name>","provider":"codex","model":"gpt-5.6-sol","charter":"Perform the bounded task sent in your inbox, report to your parent, and end your turn."}'
 ```
 
 Send work to the returned ID with `POST /api/mesh/actors/<id>/chat` or mesh `send_message`. Spawning alone
