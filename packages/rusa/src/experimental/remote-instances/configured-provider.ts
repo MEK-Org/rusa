@@ -1,13 +1,10 @@
 import type { RusaConfig } from "../../config/types.js";
-import type { ModelEntry } from "../../providers/model-catalog.js";
 import { resolveProvider } from "../../providers/registry.js";
 import type { ProviderFactory } from "./protocol.js";
 
 export interface ProviderSelection {
   providers: RusaConfig["providers"];
   name: string;
-  /** Complete normalized startup snapshot; omission means no known catalog. */
-  modelCatalogs?: Record<string, readonly ModelEntry[]>;
   model?: string;
   effort?: string;
 }

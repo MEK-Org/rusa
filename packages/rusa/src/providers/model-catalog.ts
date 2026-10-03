@@ -383,6 +383,8 @@ export function replaceProviderModelCatalogs(snapshot: unknown): void {
     );
   }
   // Omission is an old bootstrap with no known catalog, never permission to keep stale pins.
+  // Valid replacement is process-wide: co-residents require complete snapshots
+  // of the same authority. Mixed omitted/partial producers have no pin isolation.
   catalogs.clear();
   for (const [provider, entries] of Object.entries(parsed.data)) catalogs.set(provider, entries);
 }

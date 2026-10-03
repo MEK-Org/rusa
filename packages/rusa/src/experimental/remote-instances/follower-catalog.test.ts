@@ -228,36 +228,13 @@ it("a fresh follower launches the leader-admitted normalized Antigravity tuple",
   );
 }, 30_000);
 
-it.each([
-  {
-    catalog: undefined,
-    model: "gemini-fixture",
-    effort: "high",
-    reason: "catalog is empty or missing",
-  },
-  { catalog: [], model: "gemini-fixture", effort: "high", reason: "catalog is empty or missing" },
-  {
-    catalog: [{ identifier: "gemini-fixture-high", displayLabel: "Gemini Fixture (High)" }],
-    model: "gemini-unknown",
-    effort: "high",
-    reason: "model pin validation failed",
-  },
-  {
-    catalog: [{ identifier: "gemini-fixture-high", displayLabel: "Gemini Fixture (High)" }],
-    model: "gemini-fixture",
-    effort: "low",
-    reason: "reasoning effort validation failed",
-  },
-])("refuses a fresh follower selection: $reason ($model/$effort)", async ({
-  catalog,
-  model,
-  effort,
-  reason,
-}) => {
-  if (catalog) setProviderModelCatalog("agy", catalog);
-  const observed = await runFollower(leaderBootstrap({ provider: "antigravity", model, effort }));
+// Empty/model/effort permutations exercise the same refusal gate in model-catalog.test.ts.
+it("refuses a fresh follower explicit selection without a catalog", async () => {
+  const observed = await runFollower(
+    leaderBootstrap({ provider: "antigravity", model: "gemini-fixture", effort: "high" })
+  );
   expect(observed.argv).toBeUndefined();
-  expect(JSON.stringify(observed.events)).toContain(reason);
+  expect(JSON.stringify(observed.events)).toContain("catalog is empty or missing");
 }, 30_000);
 
 it("restores catalogs on actor reconnect and leaves old bootstrap defaults working", async () => {
@@ -305,16 +282,11 @@ it("reconnect replaces the catalog and passes the new admitted model/effort to t
   expect(observed.events.filter((e) => e.type === "error" || e.type === "fatal")).toEqual([]);
 }, 30_000);
 
-it.each([
-  "empty snapshot",
-  "removed provider",
-  "omitted field",
-])("reconnect %s clears a stale explicit selection", async (kind) => {
+// Empty/removed snapshots are covered at the replacement/selection boundary in-process.
+it("reconnect omission clears a stale explicit selection", async () => {
   const first = populatedBootstrap();
   const removed = JSON.parse(JSON.stringify(first)) as Bootstrap;
-  if (kind === "omitted field") delete removed.providerOptions?.modelCatalogs;
-  else if (removed.providerOptions)
-    removed.providerOptions.modelCatalogs = kind === "removed provider" ? { codex: [] } : {};
+  delete removed.providerOptions?.modelCatalogs;
   const observed = await runFollower(first, [removed]);
   expect(observed.launches).toHaveLength(1);
   expect(JSON.stringify(observed.events)).toContain("catalog is empty or missing");

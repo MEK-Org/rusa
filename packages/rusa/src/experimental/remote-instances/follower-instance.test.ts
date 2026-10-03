@@ -14,6 +14,7 @@ import {
 import { ProviderPacer } from "../../actor/provider-pacer.js";
 import { runMigrations } from "../../db/migrations/runner.js";
 import { ObligationRepository } from "../../db/repositories/obligation-repository.js";
+import { resolveAntigravitySelection } from "../../providers/antigravity.js";
 import {
   clearProviderModelCatalog,
   getProviderModelCatalog,
@@ -2527,7 +2528,7 @@ describe("monolithic follower instance", () => {
     expect(readyError).toEqual(h.failures[0]);
   });
 
-  it("preserves co-resident actor catalogs when another actor receives a malformed snapshot", () => {
+  it("preserves co-resident catalogs on malformed init but clears them on valid omission", () => {
     const events: { actorId: string; message: unknown }[] = [];
     const follower = new FollowerInstance(
       "/tmp/rusa-follower-twoactor",
@@ -2595,6 +2596,20 @@ describe("monolithic follower instance", () => {
       expect(getProviderModelCatalog("agy")).toEqual([
         { identifier: "gemini-fixture-high", displayLabel: "Fixture (High)", passable: true },
       ]);
+      // A legacy/default B bootstrap is valid but has no catalog authority. Its
+      // omission replaces the shared snapshot, so A's next explicit pin refuses.
+      follower.dispatch({
+        actorId: "actor-b",
+        message: {
+          type: "init",
+          bootstrap: { id: "actor-b", cwd: "/tmp/rusa-follower-twoactor" },
+        },
+      });
+      expect(follower.actorIds).toEqual(["actor-a", "actor-b"]);
+      expect(getProviderModelCatalog("agy")).toBeUndefined();
+      expect(() => resolveAntigravitySelection("gemini-fixture-high", "high")).toThrow(
+        "catalog is empty or missing"
+      );
     } finally {
       follower.close();
       clearProviderModelCatalog();

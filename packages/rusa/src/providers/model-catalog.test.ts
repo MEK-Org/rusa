@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { RusaConfig } from "../config/types.js";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
 import { buildAntigravityArgs, resolveAntigravitySelection } from "./antigravity.js";
 import {
@@ -24,6 +25,7 @@ import {
   setProviderModelCatalog,
   validateModelPin,
 } from "./model-catalog.js";
+import { validateProviderSelection } from "./provider-selection.js";
 
 vi.mock("../understanding/gemini-utils.js", () => ({
   getGeminiClient: vi.fn(),
@@ -1077,8 +1079,37 @@ it("normalized snapshots replace aliases, clear on omission, and own their entri
   });
   replaceProviderModelCatalogs({ antigravity: [] });
   expect(getProviderModelCatalog("agy")).toEqual([]);
-  replaceProviderModelCatalogs(undefined);
+  expect(() => resolveAntigravitySelection("gemini-fixture-high", "high")).toThrow(
+    "catalog is empty or missing"
+  );
+  for (const replacement of [{}, { codex: [] }, undefined]) {
+    replaceProviderModelCatalogs(snapshot);
+    replaceProviderModelCatalogs(replacement);
+    expect(getProviderModelCatalog("agy")).toBeUndefined();
+    expect(() => resolveAntigravitySelection("gemini-fixture-high", "high")).toThrow(
+      "catalog is empty or missing"
+    );
+  }
   expect(getAllProviderModelCatalogs().size).toBe(0);
+});
+
+it.each([
+  { model: "gemini-unknown", effort: "high", reason: "model pin validation failed" },
+  {
+    model: "gemini-fixture",
+    effort: "low",
+    reason: "reasoning effort validation failed",
+  },
+])("refuses explicit Antigravity selection in-process: $reason", ({ model, effort, reason }) => {
+  replaceProviderModelCatalogs({
+    agy: [{ identifier: "gemini-fixture", displayLabel: "Gemini Fixture", efforts: ["high"] }],
+  });
+  const config: RusaConfig = {
+    github: { account: "fixture" },
+    webhook: { port: 0, secret: "synthetic" },
+    providers: { antigravity: { cliCommand: "agy" } },
+  };
+  expect(() => validateProviderSelection(config, "antigravity", model, effort)).toThrow(reason);
 });
 
 it("validation occurs before clearing, preserving healthy shared catalog state on refusal", () => {
