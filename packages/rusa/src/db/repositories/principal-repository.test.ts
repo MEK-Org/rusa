@@ -3,12 +3,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
+import { IMPLICIT_USER_EMAIL } from "../../principals/implicit-user.js";
 import { runMigrations } from "../migrations/runner.js";
 import { PrincipalRepository } from "./principal-repository.js";
 
 const IDENTITY = { issuer: "https://securetoken.google.com/example", subject: "firebase-uid-1" };
 const OTHER_IDENTITY = { ...IDENTITY, subject: "firebase-uid-2" };
 const CREATED_AT = "2026-09-05T00:00:00.000Z";
+
+function required<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error("missing synthetic durable user");
+  return value;
+}
 
 function makeDb(): Database.Database {
   const db = new Database(":memory:");
@@ -30,6 +36,62 @@ describe("PrincipalRepository", () => {
   beforeEach(() => {
     db = makeDb();
     principals = new PrincipalRepository(db);
+  });
+
+  it("bootstraps exactly once and never replaces disabled attribution", () => {
+    const implicit = required(principals.ensureImplicitUser(CREATED_AT));
+    expect(implicit.email).toBe(IMPLICIT_USER_EMAIL);
+    expect(implicit.id).toMatch(/^[a-f0-9-]{36}$/);
+    expect(principals.ensureImplicitUser(CREATED_AT)).toBeUndefined();
+    principals.setDisabled(implicit.id, CREATED_AT);
+    expect(principals.ensureImplicitUser(CREATED_AT)).toBeUndefined();
+    expect(principals.listUsers()).toHaveLength(1);
+  });
+  it("claims the sole implicit row atomically, keeping root and identity", () => {
+    const implicit = required(principals.ensureImplicitUser(CREATED_AT));
+    principals.setRootActor(implicit.id, "root");
+    expect(
+      principals.claimUnboundUserByEmail(" Named@Example.COM ", IDENTITY, CREATED_AT)
+    ).toMatchObject({
+      id: implicit.id,
+      email: "named@example.com",
+      identity: IDENTITY,
+      rootActorId: "root",
+    });
+    expect(principals.claimUnboundUserByEmail("named@example.com", IDENTITY, CREATED_AT)?.id).toBe(
+      implicit.id
+    );
+    expect(
+      principals.claimUnboundUserByEmail("another@example.com", OTHER_IDENTITY, CREATED_AT)
+    ).toBeUndefined();
+    expect(principals.listUsers()).toHaveLength(1);
+  });
+  it("refuses disabled implicit claims and leaves multi-user implicit rows unclaimed", () => {
+    const implicit = required(principals.ensureImplicitUser(CREATED_AT));
+    principals.setDisabled(implicit.id, CREATED_AT);
+    expect(
+      principals.claimUnboundUserByEmail("named@example.com", IDENTITY, CREATED_AT)?.disabledAt
+    ).toBe(CREATED_AT);
+    expect(principals.getUser(implicit.id)?.email).toBe(IMPLICIT_USER_EMAIL);
+    principals.setDisabled(implicit.id, null);
+    principals.createUser({ email: "other@example.com", createdAt: CREATED_AT });
+    expect(
+      principals.claimUnboundUserByEmail("named@example.com", IDENTITY, CREATED_AT)
+    ).toBeUndefined();
+    expect(principals.getUser(implicit.id)?.identity).toBeUndefined();
+  });
+  it("rolls back email and binding together on write failure and rejects reserved admission", () => {
+    const implicit = required(principals.ensureImplicitUser(CREATED_AT));
+    db.exec(
+      "CREATE TRIGGER deny_claim BEFORE UPDATE ON users BEGIN SELECT RAISE(ABORT, 'claim denied'); END"
+    );
+    expect(() =>
+      principals.claimUnboundUserByEmail("named@example.com", IDENTITY, CREATED_AT)
+    ).toThrow("claim denied");
+    expect(principals.getUser(implicit.id)).toEqual(implicit);
+    expect(() =>
+      principals.claimUnboundUserByEmail(IMPLICIT_USER_EMAIL, IDENTITY, CREATED_AT)
+    ).toThrow("Reserved");
   });
 
   it("keeps an actor principal creation time synchronized with its actor row", () => {

@@ -446,7 +446,7 @@ export class ActorHandle implements MeshActor {
    * The follower's answer is asynchronous, so a run that finishes before the
    * command lands simply completes.
    */
-  interrupt(by = "human:operator"): {
+  interrupt(by: string): {
     interrupted: boolean;
     runStartTime?: Date;
     wasQueued?: boolean;

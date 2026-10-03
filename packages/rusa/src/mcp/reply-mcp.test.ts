@@ -2,12 +2,21 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
+import { describe, expect, it, onTestFinished } from "vitest";
 import type { Actor } from "../actor/actor.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
+import { runMigrations } from "../db/migrations/runner.js";
+import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
 import { HUMAN_OPERATOR } from "./stamp.js";
+
+function testHumanId(mesh: ActorMesh): string {
+  const user = mesh.principals?.listUsers()[0];
+  if (!user) throw new Error("missing synthetic durable user");
+  return user.id;
+}
 
 async function connect(server: McpServer): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -19,6 +28,13 @@ async function connect(server: McpServer): Promise<Client> {
 
 function setupTestMesh() {
   const registry = new InMemoryActorRepository();
+  const db = new Database(":memory:");
+  runMigrations(db);
+  const principals = new PrincipalRepository(db);
+  principals.ensureImplicitUser("2026-01-01T00:00:00Z");
+  onTestFinished(() => {
+    db.close();
+  });
   const recordedEvents: {
     kind: string;
     actorId?: string;
@@ -26,6 +42,7 @@ function setupTestMesh() {
     body?: string;
   }[] = [];
   const mesh = new ActorMesh({
+    principals,
     actors: registry,
     events: (e) => recordedEvents.push(e),
     grantableCapabilities: new Set(),
@@ -94,7 +111,9 @@ describe("Mesh Chat Security Invariant Tests", () => {
       expect(toolsBefore.map((t) => t.name)).not.toContain("reply");
 
       // Send message from human operator to actor-A
-      mesh.sendHumanMessage("actor-A", "operator ping", "session-XYZ");
+      mesh.sendHumanMessage("actor-A", "operator ping", "session-XYZ", {
+        fromId: testHumanId(mesh),
+      });
 
       // Now the server should have the reply tool
       const serverAfter = createAgentExecMcpServer(mesh, "actor-A", "root");
@@ -127,7 +146,7 @@ describe("Mesh Chat Security Invariant Tests", () => {
       });
       expect(recordedEvents[1]).toMatchObject({
         kind: "message_received",
-        actorId: HUMAN_OPERATOR,
+        actorId: testHumanId(mesh),
       });
 
       // Verify actor-B (who was never pinged) still does not have the reply tool

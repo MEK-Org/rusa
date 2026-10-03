@@ -65,6 +65,17 @@ import { buildSupportedVoiceCatalog, parseVoiceDefinitions } from "../voice/voic
 import { googleVoiceConfig, type VoiceConfigDocument } from "../voice/voice-config.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
 
+function required<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error("missing synthetic durable user");
+  return value;
+}
+
+function testHumanId(mesh: ActorMesh): string {
+  const user = mesh.principals?.listUsers()[0];
+  if (!user) throw new Error("missing synthetic durable user");
+  return user.id;
+}
+
 async function connect(server: McpServer): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -859,11 +870,15 @@ describe("agent-execution MCP server", () => {
     const actors = new SqliteActorRepository(db);
     const inboxStore = new SqliteInboxRepository(db);
     const chat = new MeshChatRepository(db);
+    const principals = new PrincipalRepository(db);
+    const firstHuman = required(principals.ensureImplicitUser("2026-01-01T00:00:00Z"));
     let holder = "";
     const mesh = new ActorMesh({
+      principals,
       actors,
       inboxStore,
       recordChat: (entry) => chat.record(entry),
+      listVoiceSessionChat: (sessionId) => chat.listForSession(sessionId, { limit: 100 }),
       voiceSessionTransfer: {
         activeSessionIdFor: (actorId) => {
           if (actorId !== holder) throw new Error("caller does not hold an active voice session");
@@ -921,6 +936,12 @@ describe("agent-execution MCP server", () => {
     actors.patch(source.id, { handles: [{ id: target.id }] });
     holder = source.id;
 
+    chat.record({
+      senderId: firstHuman.id,
+      recipientId: source.id,
+      body: "Hello",
+      sessionId: "transferred-session",
+    });
     mesh.transferVoiceSession(source.id, target.id);
     expect(actors.lastHumanChat(target.id)).toBeUndefined();
 
@@ -937,7 +958,7 @@ describe("agent-execution MCP server", () => {
       chat
         .listForSession("transferred-session", { limit: 10 })
         .find((entry) => entry.senderId === target.id)
-    ).toMatchObject({ recipientId: "human:operator", sessionId: "transferred-session" });
+    ).toMatchObject({ recipientId: firstHuman.id, sessionId: "transferred-session" });
   });
 
   it("replies to the human chat that arrived after the reply tool was registered (#691)", async () => {
@@ -945,9 +966,12 @@ describe("agent-execution MCP server", () => {
     runMigrations(db);
     const actors = new SqliteActorRepository(db);
     const chat = new MeshChatRepository(db);
+    const principals = new PrincipalRepository(db);
+    const firstHuman = required(principals.ensureImplicitUser("2026-01-01T00:00:00Z"));
     // Distinct, increasing timestamps so the newest-by-(ts, id) order is fixed.
     let tick = 0;
     const mesh = new ActorMesh({
+      principals,
       actors,
       inboxStore: new SqliteInboxRepository(db),
       recordChat: (entry) =>
@@ -993,7 +1017,7 @@ describe("agent-execution MCP server", () => {
     // The run's endpoint is built while the newest human message has no
     // session: that unlocks reply, but a send has no conversation to go to.
     chat.record({
-      senderId: "human:operator",
+      senderId: firstHuman.id,
       recipientId: "worker",
       body: "sessionless",
       sessionId: null,
@@ -1008,7 +1032,9 @@ describe("agent-execution MCP server", () => {
     expect(rejected.isError).toBe(true);
     expect(JSON.stringify(rejected.content)).toContain("requires an active human conversation");
 
-    mesh.sendHumanMessage("worker", "first", "session-a");
+    mesh.sendHumanMessage("worker", "first", "session-a", {
+      fromId: testHumanId(mesh),
+    });
 
     // A second human writes mid-run; the next reply must follow them.
     mesh.sendHumanMessage("worker", "second", "session-b", { fromId: user.id });

@@ -31,7 +31,7 @@ import {
 import type { VoiceConfigDocument } from "../voice/voice-config.js";
 import { MAX_VOICE_TRANSFER_NOTE_CHARS } from "../voice/voice-transfer-context.js";
 import { toolError, toolOk } from "./result.js";
-import { HUMAN_OPERATOR, isHumanOperator } from "./stamp.js";
+import { isHumanOperator } from "./stamp.js";
 import { createMcpServer } from "./strict-server.js";
 
 class ModelClassInUseError extends Error {
@@ -261,9 +261,17 @@ export function createAgentExecMcpServer(
       async ({ message }) => {
         try {
           const chat = mesh.actors.lastHumanChat(selfId);
-          const sessionId = mesh.activeVoiceSessionIdFor(selfId) ?? chat?.sessionId;
+          const voiceSession = mesh.activeVoiceSessionIdFor(selfId);
+          const sessionId = voiceSession ?? chat?.sessionId;
           if (!sessionId) throw new Error("reply requires an active human conversation");
-          const toId = chat?.principalId ?? HUMAN_OPERATOR;
+          const toId = voiceSession ? mesh.activeVoicePrincipalIdFor(selfId) : chat?.principalId;
+          if (
+            !toId ||
+            !mesh.principals?.getUser(toId) ||
+            mesh.principals.getUser(toId)?.disabledAt
+          ) {
+            throw new Error("reply requires a known durable human conversation principal");
+          }
           mesh.recordMessageEmitted({
             fromId: selfId,
             toId,

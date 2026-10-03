@@ -396,7 +396,7 @@ describe("obligations MCP", () => {
       })
     );
 
-    for (const ownerId of ["actor-nonexistent", "actor-retired", "system:mesh"]) {
+    for (const ownerId of ["actor-nonexistent", "actor-retired", "system:mesh", "human:operator"]) {
       const res = (await client.callTool({
         name: "create_obligation",
         arguments: { title: "typo", owner_id: ownerId, intent: "typo" },
@@ -405,10 +405,8 @@ describe("obligations MCP", () => {
     }
     expect(repository.list()).toHaveLength(0);
 
-    // A live actor and the canonical operator id are both legitimate: owning
-    // work to another actor is why `creator_id` exists, and owning it to the
-    // operator is the human-decision contract.
-    for (const ownerId of ["actor-a", "human:operator"]) {
+    // A live actor is routable without human principal storage.
+    for (const ownerId of ["actor-a"]) {
       const res = (await client.callTool({
         name: "create_obligation",
         arguments: { title: "fine", owner_id: ownerId, intent: "fine" },
@@ -417,7 +415,7 @@ describe("obligations MCP", () => {
     }
   });
 
-  it("creates human-owned work by durable id and legacy alias without actor attention", async () => {
+  it("creates human-owned work only by durable id without actor attention", async () => {
     const user = {
       kind: "user" as const,
       id: "fb394608-d6d6-4f2e-aebe-51a59bd01374",
@@ -442,7 +440,7 @@ describe("obligations MCP", () => {
       })
     );
 
-    for (const ownerId of [user.id, "human:operator"]) {
+    for (const ownerId of [user.id]) {
       const result = (await client.callTool({
         name: "create_obligation",
         arguments: { title: `owned through ${ownerId}`, owner_id: ownerId },
@@ -452,6 +450,13 @@ describe("obligations MCP", () => {
         user.id
       );
     }
+
+    const rejected = (await client.callTool({
+      name: "create_obligation",
+      arguments: { title: "legacy owner", owner_id: "human:operator" },
+    })) as CallToolResult;
+    expect(rejected.isError).toBe(true);
+    expect(JSON.stringify(rejected.content)).toContain("userPrincipalId");
 
     expect(
       db

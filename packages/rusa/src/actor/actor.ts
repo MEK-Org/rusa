@@ -528,7 +528,7 @@ export class Actor {
    * Sets the interrupted watermark to the run's start time so older inbox items
    * do not immediately re-schedule the actor.
    */
-  interrupt(by: string = "human:operator"): {
+  interrupt(by: string): {
     interrupted: boolean;
     runStartTime?: Date;
     wasQueued?: boolean;

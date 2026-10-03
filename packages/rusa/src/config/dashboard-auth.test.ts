@@ -88,3 +88,14 @@ describe("optional shared-human auth config", () => {
     ).toThrow("config.yaml: auth.firebase.appId must be a non-empty string when set");
   });
 });
+
+it("rejects reserved implicit admission email in either configuration form", () => {
+  for (const entry of [
+    { email: "LOCAL-OPERATOR@RUSA.INVALID" },
+    { allowedEmails: ["local-operator@rusa.invalid"] },
+  ]) {
+    expect(() => validateDashboardAuth({ ...entry, firebase: {} })).toThrow(
+      "reserved auth admission email"
+    );
+  }
+});
