@@ -197,8 +197,9 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
     expect(event).toMatchObject({ actorId: id, runId: runStarts(h, id)[0], provider: "claude" });
     expect(event?.prompt).toBe(argv[argv.indexOf("-p") + 1]);
     expect(event?.prompt).toContain("Synthetic charter");
-    expect(JSON.stringify(h.meshEvents.filter((entry) => entry.kind === "run_start")))
-      .not.toContain(JSON.stringify(event?.prompt));
+    expect(
+      JSON.stringify(h.meshEvents.filter((entry) => entry.kind === "run_start"))
+    ).not.toContain(JSON.stringify(event?.prompt));
     h.remote.receive({
       actorId: id,
       message: { type: "runPrompt", runId: "stale-run", prompt: "stale", provider: "fixture" },
