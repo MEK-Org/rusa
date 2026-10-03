@@ -45,7 +45,10 @@
   <button type="button" id="cancel" disabled>Cancel and discard clip</button>
   <p id="status" role="status">Idle</p>
   <div id="preview" aria-live="polite">No transcript</div>
-  <audio id="audio" controls></audio>
+  <p id="audio-description">Playback is for checking the captured synthetic clip. Recognition text
+    above is unverified; it is not an accurate caption of the recording.</p>
+  <!-- biome-ignore lint/a11y/useMediaCaption: User-recorded diagnostic audio has no verified captions; unverified recognition is displayed separately. -->
+  <audio id="audio" controls aria-describedby="audio-description"></audio>
   <p><a id="clip" hidden>Download this synthetic clip</a></p>
   <label>Listening check on latest completed clip
     <select id="integrity">
