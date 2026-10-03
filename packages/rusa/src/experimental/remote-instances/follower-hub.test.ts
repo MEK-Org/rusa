@@ -36,11 +36,11 @@ async function setup(options?: { logger?: Logger; triggerStore?: FollowerUpdateT
   const hub = new FollowerHub(token, options);
   hubs.push(hub);
   const origin = await hub.listen("127.0.0.1", 0);
-  const post = (path: string, body: object) =>
+  const post = (path: string, body: object | string) =>
     fetch(`${origin}${path}`, {
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-      body: JSON.stringify(body),
+      body: typeof body === "string" ? body : JSON.stringify(body),
     });
   const get = (path: string) =>
     fetch(`${origin}${path}`, {
@@ -109,10 +109,10 @@ describe("leader follower gateway", () => {
     const requestBytes: number[] = [];
     let loseAcknowledgement = true;
     const batchIds: string[] = [];
-    const deliver = async (batch: { batchId: string; events: FollowerEvent[] }) => {
+    const deliver = async (batch: { batchId: string; body: string }) => {
       batchIds.push(batch.batchId);
-      requestBytes.push(Buffer.byteLength(JSON.stringify({ ...identity, ...batch })));
-      const response = await h.post("/events", { ...identity, ...batch });
+      requestBytes.push(Buffer.byteLength(batch.body));
+      const response = await h.post("/events", batch.body);
       expect(response.status).toBe(200);
       await response.json();
       if (loseAcknowledgement) {

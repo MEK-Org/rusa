@@ -1,7 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
+import { request as httpRequest } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   FollowerEventAcceptanceFailedError,
+  type FollowerEventBatch,
   FollowerEventParkedError,
   FollowerEventQueue,
   FollowerEventTransferRetryError,
@@ -22,6 +24,7 @@ import {
   INSTANCE_PROTOCOL_VERSION,
   OLDEST_FOLLOWER_PROTOCOL_VERSION,
 } from "./protocol.js";
+import { FollowerDedupeTracker } from "./remote-instance.js";
 
 const MiB = 1024 * 1024;
 const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
@@ -60,6 +63,7 @@ describe("event transfer receiver", () => {
   const small: EventTransferLimits = {
     maxEventBytes: 4096,
     maxFragmentBytes: 64,
+    minFragmentBytes: 64,
     maxTransfers: 2,
     maxReservedBytes: 1000,
     idleMs: 5 * 60_000,
@@ -166,6 +170,55 @@ describe("event transfer receiver", () => {
     expect(receiver.usage).toEqual({ transfers: 0, reservedBytes: 0 });
   });
 
+  it("bounds fragment count by refusing an undersized fragment before the final one", () => {
+    const receiver = new EventTransferReceiver({
+      ...small,
+      maxFragmentBytes: 256,
+      minFragmentBytes: 32,
+    });
+    const event = log("a", "x".repeat(300));
+    const [whole] = fragmentsOf(event, "ta", 4096);
+    const tiny = fragmentsOf(event, "ta", 31);
+    expect(receiver.accept("f1", "g1", tiny[0], never)).toEqual({
+      httpStatus: 400,
+      reply: { status: "refused", reason: "invalid_fragment" },
+    });
+    expect(receiver.usage).toEqual({ transfers: 0, reservedBytes: 0 });
+
+    // Any size from the minimum to the maximum is accepted, and the final
+    // fragment may be as short as the remainder.
+    const bytes = Buffer.from(JSON.stringify(event), "utf8");
+    const cuts = [0, 32, 96, 160, bytes.length - 1, bytes.length];
+    const parts = cuts.slice(0, -1).map((offset, index) => {
+      const chunk = bytes.subarray(offset, cuts[index + 1]);
+      return {
+        ...whole,
+        index,
+        offset,
+        data: chunk.toString("base64"),
+        fragmentDigest: sha256(chunk),
+      };
+    });
+    let last: ReturnType<EventTransferReceiver["accept"]> | undefined;
+    for (const part of parts) {
+      last = receiver.accept("f1", "g1", part, never);
+      // A retry is recognised by the offset and digest recorded for its index.
+      if (part.index === 2) {
+        expect(receiver.accept("f1", "g1", parts[1], never)).toEqual({
+          httpStatus: 200,
+          reply: { status: "fragment", receivedBytes: 160 },
+        });
+      }
+    }
+    expect(last && "bytes" in last && JSON.parse(last.bytes.toString())).toEqual(event);
+
+    receiver.accept("f1", "g1", parts[0], never);
+    receiver.accept("f1", "g1", parts[1], never);
+    expect(receiver.accept("f1", "g1", { ...parts[1], offset: 31 }, never)).toMatchObject({
+      reply: { status: "refused", reason: "conflicting_fragment" },
+    });
+  });
+
   it("refuses declarations above the event maximum before staging anything", () => {
     const receiver = new EventTransferReceiver();
     const [first] = fragmentsOf(log("a", "x"), "ta", 64);
@@ -211,11 +264,11 @@ async function setup(options?: { receiver?: EventTransferReceiver; protocolVersi
   const hub = new FollowerHub(token, { eventTransfers: options?.receiver });
   hubs.push(hub);
   const origin = await hub.listen("127.0.0.1", 0);
-  const post = (path: string, body: object) =>
+  const post = (path: string, body: object | string) =>
     fetch(`${origin}${path}`, {
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-      body: JSON.stringify(body),
+      body: typeof body === "string" ? body : JSON.stringify(body),
     });
   const identity = { id: "mac", session: "" };
   const register = async (generation = "process-one") => {
@@ -239,10 +292,9 @@ async function setup(options?: { receiver?: EventTransferReceiver; protocolVersi
   const host = hub.createHost("mac", "actor-1");
   host.on("message", (message) => received.push(message));
   const requests: { path: string; bytes: number; status?: number }[] = [];
-  const deliver = async (batch: { batchId: string; events: FollowerEvent[] }) => {
-    const body = { ...identity, ...batch };
-    requests.push({ path: "/events", bytes: Buffer.byteLength(JSON.stringify(body)) });
-    const response = await post("/events", body);
+  const deliver = async (batch: FollowerEventBatch) => {
+    requests.push({ path: "/events", bytes: Buffer.byteLength(batch.body) });
+    const response = await post("/events", batch.body);
     requests[requests.length - 1].status = response.status;
     const reply = (await response.json()) as { reason?: string; eventId?: string };
     if (response.status === 409 && reply.reason === "acceptance_failed" && reply.eventId) {
@@ -260,7 +312,20 @@ async function setup(options?: { receiver?: EventTransferReceiver; protocolVersi
       return (await response.json()) as EventTransferReply;
     },
   });
-  return { hub, host, post, identity, register, registration, received, requests, deliver, sender };
+  return {
+    hub,
+    origin,
+    token,
+    host,
+    post,
+    identity,
+    register,
+    registration,
+    received,
+    requests,
+    deliver,
+    sender,
+  };
 }
 
 /** Flush until drained, retrying transport and transfer retries like the follower does. */
@@ -404,6 +469,14 @@ describe("negotiated event transfer over the follower gateway", () => {
     expect(response.status).toBe(400);
   });
 
+  it("keeps an accepted event accepted when a later failure names the same id", () => {
+    const tracker = new FollowerDedupeTracker();
+    tracker.recordEvent("e1", "failed");
+    tracker.recordEvent("e1", "accepted");
+    tracker.recordEvent("e1", "failed");
+    expect(tracker.eventOutcome("e1")).toBe("accepted");
+  });
+
   it("advertises the capability to current and previous protocol followers", async () => {
     for (const protocolVersion of [INSTANCE_PROTOCOL_VERSION, OLDEST_FOLLOWER_PROTOCOL_VERSION]) {
       const h = await setup({ protocolVersion });
@@ -423,7 +496,12 @@ describe("negotiated event transfer over the follower gateway", () => {
           requestId: 7,
           request: {
             op: "complete",
-            result: { success: false, exitCode: 143, output: `${"\u0001".repeat(3 * MiB)}✓ tail` },
+            result: {
+              success: false,
+              exitCode: 143,
+              // Six bytes per control character: the smallest escaped output over the limit.
+              output: `${"\u0001".repeat(Math.ceil(FOLLOWER_HTTP_BODY_LIMIT_BYTES / 6))}✓ tail`,
+            },
           },
         },
       } satisfies FollowerEvent,
@@ -587,7 +665,8 @@ describe("negotiated event transfer over the follower gateway", () => {
   });
 
   it("joins concurrent flushes and fences a queue cleared while a fragment is in flight", async () => {
-    const h = await setup();
+    const receiver = new EventTransferReceiver();
+    const h = await setup({ receiver });
     const base = h.sender(h.registration.eventTransfer as EventTransferCapability);
     let release: (() => void) | undefined;
     const held = new Promise<void>((resolve) => {
@@ -611,13 +690,24 @@ describe("negotiated event transfer over the follower gateway", () => {
     expect(sends).toBe(1);
     // Leader-incarnation fence: the old in-flight reply must not advance the new queue.
     queue.clear();
-    queue.enqueue(ready("after-fence"));
+    expect(queue.isFlushing).toBe(false);
+    queue.enqueue(log("after-fence", "y".repeat(9 * MiB)));
+    // The new registration advertised no transfer. Its flush waits for the old
+    // request instead of joining a delivery that holds the old capability.
+    const next = queue.flush(h.deliver, h.identity).catch((error) => error);
     release?.();
     await Promise.all([first, joined]);
-    // The new head was delivered on its own; the stale reply removed nothing.
-    expect(queue.hasPending).toBe(false);
+    // The stale reply removed nothing, and the old flush sent nothing more.
+    expect(await next).toMatchObject({ reason: "capability_missing", eventId: "after-fence" });
+    expect(queue.hasPending).toBe(true);
     expect(sends).toBe(1);
-    expect(h.received).toEqual([ready().message]);
+    expect(h.received).toEqual([]);
+    // A changed capability is used as negotiated, never the fenced one.
+    receiver.discard("mac"); // The fenced leader's staging went with it.
+    const renegotiated = h.sender({ ...base.capability, maxFragmentBytes: 2 * MiB });
+    expect(await drain(queue, () => queue.flush(h.deliver, h.identity, renegotiated))).toEqual([]);
+    expect(sends).toBe(1);
+    expect(h.received).toEqual([log("after-fence", "y".repeat(9 * MiB)).message]);
   });
 
   it("parks an oversized event visibly without network when the leader did not advertise transfer", async () => {
@@ -677,9 +767,16 @@ describe("negotiated event transfer over the follower gateway", () => {
     expect(h.received).toEqual([]);
     expect(refusedQueue.hasPending).toBe(true);
 
-    // A new registration's capability permits one fresh attempt.
-    const retry = await refusedQueue
+    // Re-registering with an unchanged leader advertises an equal capability.
+    const same = await refusedQueue
       .flush(h.deliver, h.identity, h.sender({ ...capability }))
+      .catch((e) => e);
+    expect(same).toMatchObject({ reason: "event_too_large", repeated: true });
+    expect(h.requests).toHaveLength(1);
+
+    // A different capability permits one fresh attempt.
+    const retry = await refusedQueue
+      .flush(h.deliver, h.identity, h.sender({ ...capability, maxEventBytes: 32 * MiB }))
       .catch((e) => e);
     expect(retry).toMatchObject({ reason: "event_too_large" });
     expect(h.requests).toHaveLength(2);
@@ -705,6 +802,43 @@ describe("negotiated event transfer over the follower gateway", () => {
     expect(await drain(queue, () => queue.flush(h.deliver, h.identity, transfer))).toEqual([]);
     expect(h.received).toHaveLength(1);
     expect(receiver.usage).toEqual({ transfers: 0, reservedBytes: 0 });
+  });
+
+  it("answers busy before reading a transfer body beyond the concurrent-read bound", async () => {
+    const limits = { ...EVENT_TRANSFER_LIMITS, maxTransfers: 2 };
+    const h = await setup({ receiver: new EventTransferReceiver(limits) });
+    const [fragment] = fragmentsOf(log("big", "x".repeat(100)), "t1", MiB);
+    const body = JSON.stringify({ ...h.identity, ...fragment });
+    // Two authenticated requests whose bodies have not finished arriving.
+    const held = [0, 1].map(() => {
+      const req = httpRequest(`${h.origin}/events/transfer`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${h.token}`, "content-type": "application/json" },
+      });
+      const status = new Promise<number>((resolve, reject) => {
+        req.on("response", (res) => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+        });
+        req.on("error", reject);
+      });
+      req.write(body.slice(0, 10));
+      return { req, status };
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const refused = await h.post("/events/transfer", body);
+    expect(refused.status).toBe(429);
+    expect(await refused.json()).toEqual({ status: "busy", reason: "capacity" });
+    // Ordinary batches are not subject to the transfer read bound.
+    expect(
+      (await h.post("/events", { ...h.identity, batchId: "ordinary", events: [ready()] })).status
+    ).toBe(200);
+    held[0].req.end(body.slice(10));
+    expect(await held[0].status).toBe(200);
+    // A finished read frees its place.
+    expect((await h.post("/events/transfer", body)).status).toBe(200);
+    held[1].req.destroy();
+    await held[1].status.catch(() => {});
   });
 
   it("refuses reassembled bytes that are not the declared event", async () => {

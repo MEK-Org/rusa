@@ -65,8 +65,10 @@ export class FollowerDedupeTracker {
     // Keep the follower's replay fence fresh for individual event processing
     // too, in case a batch is interrupted before it reaches recordBatch().
     this.touch();
-    if (this.processedEvents.has(eventId)) {
-      this.processedEvents.set(eventId, outcome);
+    const recorded = this.processedEvents.get(eventId);
+    if (recorded) {
+      // Acceptance is final: a later failure for the same id cannot undo it.
+      if (recorded !== "accepted") this.processedEvents.set(eventId, outcome);
       return;
     }
     this.processedEvents.set(eventId, outcome);

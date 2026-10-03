@@ -9,9 +9,28 @@ import {
   FOLLOWER_HTTP_BODY_LIMIT_BYTES,
 } from "./protocol.js";
 
-interface FollowerEventBatch {
+/**
+ * An event as it was when enqueued. Its serialized bytes and identity are
+ * frozen there, so every retry, batch and transfer carries the same content
+ * whatever the emitter later does with its object.
+ */
+interface QueuedEvent {
+  eventId: string;
+  eventType: string;
+  json: string;
+  bytes: number;
+}
+
+/** One ordinary `/events` request: `body` is the complete serialized request. */
+export interface FollowerEventBatch {
   batchId: string;
-  events: FollowerEvent[];
+  eventIds: string[];
+  body: string;
+}
+
+interface PendingBatch {
+  batchId: string;
+  events: QueuedEvent[];
 }
 
 /** Sends one fragment to a leader that advertised `capability` (#876). */
@@ -21,7 +40,7 @@ export interface FollowerEventTransferSender {
 }
 
 interface PendingTransfer {
-  event: FollowerEvent;
+  event: QueuedEvent;
   transferId: string;
   /** The original serialized event, frozen for every attempt and restart. */
   bytes: Buffer;
@@ -74,10 +93,25 @@ export class FollowerEventTransferRetryError extends Error {
 }
 
 const BUSY_RETRY_MS = 5_000;
+/** `,"events":[` and `]` added to the serialized envelope. */
+const EVENTS_FIELD_BYTES = 12;
+
+function batchBytes(events: QueuedEvent[]): number {
+  return events.reduce((sum, event) => sum + event.bytes, events.length - 1);
+}
 const ACCEPTANCE_FAILED = "acceptance_failed";
 
 function sha256(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+/** A re-registration with an unchanged leader advertises an equal capability. */
+function sameCapability(a: EventTransferCapability, b: EventTransferCapability): boolean {
+  return (
+    a.version === b.version &&
+    a.maxEventBytes === b.maxEventBytes &&
+    a.maxFragmentBytes === b.maxFragmentBytes
+  );
 }
 
 /**
@@ -90,36 +124,45 @@ function sha256(bytes: Buffer): string {
  * negotiated transfer, and stays the head until the leader reports it complete.
  */
 export class FollowerEventQueue {
-  private readonly events: FollowerEvent[] = [];
-  private readonly serializedBytes = new WeakMap<FollowerEvent, number>();
-  private pendingBatch: FollowerEventBatch | undefined;
+  private readonly events: QueuedEvent[] = [];
+  private pendingBatch: PendingBatch | undefined;
   private pendingTransfer: PendingTransfer | undefined;
-  private inFlight: Promise<void> | undefined;
+  private inFlight: { delivery: Promise<void>; epoch: number } | undefined;
+  /** Advanced by `clear()`; a delivery begun in an earlier epoch sends nothing further. */
+  private epoch = 0;
   private parkedKey: string | undefined;
-  /** A leader refusal holds until a new capability (a new registration) arrives. */
+  /** A leader refusal holds until a registration advertises a different capability. */
   private refused:
-    | { event: FollowerEvent; capability: EventTransferCapability; reason: string; limit?: number }
+    | { event: QueuedEvent; capability: EventTransferCapability; reason: string; limit?: number }
     | undefined;
   /**
    * The leader recorded a failed acceptance for this event. Resending cannot
    * change that within the leader's incarnation, so it stays the parked head
    * until the queue is cleared.
    */
-  private acceptanceFailed: FollowerEvent | undefined;
+  private acceptanceFailed: QueuedEvent | undefined;
 
   enqueue(event: FollowerEvent): void {
-    this.events.push(event);
+    const json = JSON.stringify(event);
+    this.events.push({
+      eventId: event.eventId,
+      eventType: event.message.type,
+      json,
+      bytes: Buffer.byteLength(json),
+    });
   }
 
   get hasPending(): boolean {
     return this.pendingBatch !== undefined || this.events.length > 0;
   }
 
+  /** False once `clear()` has fenced the delivery still in flight. */
   get isFlushing(): boolean {
-    return this.inFlight !== undefined;
+    return this.inFlight?.epoch === this.epoch;
   }
 
   clear(): void {
+    this.epoch++;
     this.pendingBatch = undefined;
     this.pendingTransfer = undefined;
     this.parkedKey = undefined;
@@ -133,24 +176,26 @@ export class FollowerEventQueue {
     envelope: object = {},
     transfer?: FollowerEventTransferSender
   ): Promise<void> {
-    if (this.inFlight) return this.inFlight;
+    while (this.inFlight) {
+      const inFlight = this.inFlight;
+      if (inFlight.epoch === this.epoch) return inFlight.delivery;
+      // That delivery belongs to the registration `clear()` fenced. Wait for
+      // its last request rather than join it: this queue is sent only with
+      // this call's envelope and capability.
+      await inFlight.delivery.catch(() => {});
+      if (this.inFlight === inFlight) this.inFlight = undefined;
+    }
 
-    const delivery = this.deliverPending(deliver, envelope, transfer);
-    this.inFlight = delivery;
+    const inFlight = {
+      delivery: this.deliverPending(deliver, envelope, transfer),
+      epoch: this.epoch,
+    };
+    this.inFlight = inFlight;
     try {
-      await delivery;
+      await inFlight.delivery;
     } finally {
-      if (this.inFlight === delivery) this.inFlight = undefined;
+      if (this.inFlight === inFlight) this.inFlight = undefined;
     }
-  }
-
-  private eventBytes(event: FollowerEvent): number {
-    let bytes = this.serializedBytes.get(event);
-    if (bytes === undefined) {
-      bytes = Buffer.byteLength(JSON.stringify(event));
-      this.serializedBytes.set(event, bytes);
-    }
-    return bytes;
   }
 
   private async deliverPending(
@@ -158,30 +203,51 @@ export class FollowerEventQueue {
     envelope: object,
     transfer: FollowerEventTransferSender | undefined
   ): Promise<void> {
-    while (this.pendingBatch || this.pendingTransfer || this.events.length) {
+    const epoch = this.epoch;
+    while (
+      this.epoch === epoch &&
+      (this.pendingBatch || this.pendingTransfer || this.events.length)
+    ) {
+      // The envelope is rebuilt for each attempt and may have changed with the
+      // session. Events already accepted from a re-formed batch are skipped
+      // by the leader's event dedupe.
+      const head = JSON.stringify({ ...envelope, batchId: this.pendingBatch?.batchId ?? "" });
+      const headBytes = Buffer.byteLength(head) + EVENTS_FIELD_BYTES;
+      if (
+        this.pendingBatch &&
+        headBytes + batchBytes(this.pendingBatch.events) > FOLLOWER_HTTP_BODY_LIMIT_BYTES
+      ) {
+        this.pendingBatch = undefined;
+      }
       if (!this.pendingBatch && !this.pendingTransfer) {
         if (this.acceptanceFailed && this.events[0] === this.acceptanceFailed) {
           return this.park(this.acceptanceFailed, ACCEPTANCE_FAILED);
         }
         const batchId = randomUUID();
-        let bytes = Buffer.byteLength(JSON.stringify({ ...envelope, batchId, events: [] }));
+        let bytes =
+          Buffer.byteLength(JSON.stringify({ ...envelope, batchId })) + EVENTS_FIELD_BYTES;
         let count = 0;
         for (const event of this.events.slice(0, FOLLOWER_EVENT_BATCH_MAX_EVENTS)) {
-          const eventBytes = this.eventBytes(event) + (count > 0 ? 1 : 0);
+          const eventBytes = event.bytes + (count > 0 ? 1 : 0);
           if (bytes + eventBytes > FOLLOWER_HTTP_BODY_LIMIT_BYTES) break;
           bytes += eventBytes;
           count++;
         }
         if (count > 0) this.pendingBatch = { batchId, events: this.events.slice(0, count) };
-        else this.pendingTransfer = this.startTransfer(this.events[0] as FollowerEvent, transfer);
+        else this.pendingTransfer = this.startTransfer(this.events[0] as QueuedEvent, transfer);
       }
       if (this.pendingTransfer) {
         await this.sendFragment(this.pendingTransfer, envelope, transfer);
         continue;
       }
-      const batch = this.pendingBatch as FollowerEventBatch;
+      const batch = this.pendingBatch as PendingBatch;
+      const prefix = JSON.stringify({ ...envelope, batchId: batch.batchId }).slice(0, -1);
       try {
-        await deliver(batch);
+        await deliver({
+          batchId: batch.batchId,
+          eventIds: batch.events.map((event) => event.eventId),
+          body: `${prefix},"events":[${batch.events.map((event) => event.json).join(",")}]}`,
+        });
       } catch (error) {
         if (!(error instanceof FollowerEventAcceptanceFailedError)) throw error;
         if (this.pendingBatch !== batch) continue;
@@ -203,36 +269,39 @@ export class FollowerEventQueue {
     }
   }
 
-  private park(event: FollowerEvent, reason: string, limit?: number): never {
+  private park(event: QueuedEvent, reason: string, limit?: number): never {
     const key = `${event.eventId}:${reason}`;
     const repeated = this.parkedKey === key;
     this.parkedKey = key;
     throw new FollowerEventParkedError(
       reason,
       event.eventId,
-      event.message.type,
-      this.eventBytes(event),
+      event.eventType,
+      event.bytes,
       limit,
       repeated
     );
   }
 
   private startTransfer(
-    event: FollowerEvent,
+    event: QueuedEvent,
     transfer: FollowerEventTransferSender | undefined
   ): PendingTransfer {
     if (!transfer) return this.park(event, "capability_missing", FOLLOWER_HTTP_BODY_LIMIT_BYTES);
-    if (this.refused?.event === event && this.refused.capability === transfer.capability) {
+    if (
+      this.refused?.event === event &&
+      sameCapability(this.refused.capability, transfer.capability)
+    ) {
       return this.park(event, this.refused.reason, this.refused.limit);
     }
     const maxEventBytes = Math.min(
       transfer.capability.maxEventBytes,
       EVENT_TRANSFER_CAPABILITY.maxEventBytes
     );
-    if (this.eventBytes(event) > maxEventBytes) {
+    if (event.bytes > maxEventBytes) {
       return this.park(event, "event_too_large", maxEventBytes);
     }
-    const bytes = Buffer.from(JSON.stringify(event), "utf8");
+    const bytes = Buffer.from(event.json, "utf8");
     return {
       event,
       transferId: randomUUID(),

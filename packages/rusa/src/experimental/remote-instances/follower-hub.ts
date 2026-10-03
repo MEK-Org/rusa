@@ -102,6 +102,7 @@ export class FollowerHub {
   private readonly log: Logger;
   private readonly dedupeTrackers = new Map<string, FollowerDedupeTracker>();
   private readonly eventTransfers: EventTransferReceiver;
+  private transferReads = 0;
   /** Followers for which the current lapsed-contact interval has been reported. */
   private readonly staleFollowerIds = new Set<string>();
   /** Generations that a confirmed replacement made permanently stale. */
@@ -440,7 +441,20 @@ export class FollowerHub {
       reply(res, 404, {});
       return;
     }
-    const body = (await readJson(req)) as Record<string, unknown>;
+    // Each transfer request buffers up to a whole body before the receiver
+    // can apply its own limits, so bound how many are read at once.
+    const transferRead = path === "/events/transfer";
+    if (transferRead && this.transferReads >= this.eventTransfers.maxTransfers) {
+      reply(res, 429, { status: "busy", reason: "capacity" });
+      return;
+    }
+    if (transferRead) this.transferReads++;
+    let body: Record<string, unknown>;
+    try {
+      body = (await readJson(req)) as Record<string, unknown>;
+    } finally {
+      if (transferRead) this.transferReads--;
+    }
     if (path.startsWith("/followers/") && path.endsWith("/update")) {
       const followerId = path.slice("/followers/".length, -"/update".length);
       try {

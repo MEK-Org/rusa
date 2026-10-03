@@ -10,6 +10,12 @@ import {
 export interface EventTransferLimits {
   maxEventBytes: number;
   maxFragmentBytes: number;
+  /**
+   * Smallest fragment accepted before the final one. It bounds the number of
+   * fragments, and so the per-fragment records, a transfer can make the
+   * leader keep.
+   */
+  minFragmentBytes: number;
   /** Incomplete transfers across all followers; each follower holds at most one. */
   maxTransfers: number;
   /** Declared original-event bytes reserved across all incomplete transfers. */
@@ -23,6 +29,7 @@ export interface EventTransferLimits {
 export const EVENT_TRANSFER_LIMITS: EventTransferLimits = {
   maxEventBytes: EVENT_TRANSFER_CAPABILITY.maxEventBytes,
   maxFragmentBytes: EVENT_TRANSFER_CAPABILITY.maxFragmentBytes,
+  minFragmentBytes: 64 * 1024,
   maxTransfers: 8,
   maxReservedBytes: 128 * 1024 * 1024,
   idleMs: 5 * 60_000,
@@ -36,7 +43,8 @@ interface Staging {
   totalBytes: number;
   digest: string;
   chunks: Buffer[];
-  fragmentDigests: string[];
+  /** Where each accepted fragment began and its digest, to recognise a retry. */
+  fragments: { offset: number; digest: string }[];
   receivedBytes: number;
   createdAt: number;
   progressAt: number;
@@ -109,6 +117,11 @@ export class EventTransferReceiver {
     };
   }
 
+  /** Also bounds the `/events/transfer` request bodies the hub reads at once. */
+  get maxTransfers(): number {
+    return this.limits.maxTransfers;
+  }
+
   get usage(): { transfers: number; reservedBytes: number } {
     return { transfers: this.staging.size, reservedBytes: this.reservedBytes };
   }
@@ -179,7 +192,7 @@ export class EventTransferReceiver {
         totalBytes: fragment.totalBytes,
         digest: fragment.digest,
         chunks: [],
-        fragmentDigests: [],
+        fragments: [],
         receivedBytes: 0,
         createdAt: now,
         progressAt: now,
@@ -188,17 +201,12 @@ export class EventTransferReceiver {
       this.reservedBytes += fragment.totalBytes;
     }
 
-    if (fragment.index < staging.fragmentDigests.length) {
+    if (fragment.index < staging.fragments.length) {
       // A retry after a lost acknowledgement. It neither extends a deadline nor
-      // replaces the bytes already accepted at that index.
-      const offset = staging.chunks
-        .slice(0, fragment.index)
-        .reduce((sum, chunk) => sum + chunk.length, 0);
-      if (
-        offset !== fragment.offset ||
-        staging.fragmentDigests[fragment.index] !== fragment.fragmentDigest ||
-        staging.chunks[fragment.index].toString("base64") !== fragment.data
-      ) {
+      // replaces the bytes already accepted at that index; its recorded offset
+      // and digest identify it without decoding or re-encoding anything.
+      const accepted = staging.fragments[fragment.index];
+      if (accepted.offset !== fragment.offset || accepted.digest !== fragment.fragmentDigest) {
         return this.refuse(followerId, 409, "conflicting_fragment");
       }
       return {
@@ -206,10 +214,7 @@ export class EventTransferReceiver {
         reply: { status: "fragment", receivedBytes: staging.receivedBytes },
       };
     }
-    if (
-      fragment.index !== staging.fragmentDigests.length ||
-      fragment.offset !== staging.receivedBytes
-    ) {
+    if (fragment.index !== staging.fragments.length || fragment.offset !== staging.receivedBytes) {
       this.discard(followerId);
       return { httpStatus: 409, reply: { status: "restart", reason: "non_contiguous" } };
     }
@@ -219,12 +224,14 @@ export class EventTransferReceiver {
       bytes.length > this.limits.maxFragmentBytes ||
       bytes.toString("base64") !== fragment.data ||
       staging.receivedBytes + bytes.length > staging.totalBytes ||
+      (staging.receivedBytes + bytes.length < staging.totalBytes &&
+        bytes.length < Math.min(this.limits.minFragmentBytes, this.limits.maxFragmentBytes)) ||
       sha256(bytes) !== fragment.fragmentDigest
     ) {
       return this.refuse(followerId, 400, "invalid_fragment");
     }
+    staging.fragments.push({ offset: staging.receivedBytes, digest: fragment.fragmentDigest });
     staging.chunks.push(bytes);
-    staging.fragmentDigests.push(fragment.fragmentDigest);
     staging.receivedBytes += bytes.length;
     staging.progressAt = this.now();
     if (staging.receivedBytes < staging.totalBytes) {

@@ -9,6 +9,7 @@ import { createLogger } from "../../observability/logger.js";
 import { GitRunner } from "../../update/runner.js";
 import {
   FollowerEventAcceptanceFailedError,
+  type FollowerEventBatch,
   FollowerEventParkedError,
   FollowerEventQueue,
   FollowerEventTransferRetryError,
@@ -108,11 +109,12 @@ class FollowerHttpError extends Error {
   }
 }
 
-function request(path: string, body: object): Promise<Response> {
+function request(path: string, body: object | string): Promise<Response> {
   return fetch(new URL(path, leader), {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify({ id: values.id, session, ...body }),
+    // A string is an already serialized request, sent byte for byte.
+    body: typeof body === "string" ? body : JSON.stringify({ id: values.id, session, ...body }),
     signal: AbortSignal.timeout(25_000),
   });
 }
@@ -152,8 +154,8 @@ function emit(actorId: string, message: FollowerEvent["message"], eventId?: stri
       void flush();
     }, 5);
 }
-async function postEvents(batch: object): Promise<void> {
-  const response = await request("/events", batch);
+async function postEvents(batch: FollowerEventBatch): Promise<void> {
+  const response = await request("/events", batch.body);
   if (response.ok) return;
   if (response.status === 409) {
     const refusal = (await response.json().catch(() => undefined)) as
@@ -194,7 +196,7 @@ async function flush(): Promise<void> {
           sendTimer = undefined;
           void flush();
         },
-        error instanceof FollowerEventTransferRetryError ? Math.max(error.retryAfterMs, 50) : 500
+        error instanceof FollowerEventTransferRetryError ? Math.max(error.retryAfterMs, 500) : 500
       );
     }
   }

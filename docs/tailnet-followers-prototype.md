@@ -235,9 +235,16 @@ event fence as `/events`. Only the final `complete` answer lets the follower
 drop the event; an intermediate answer means the leader holds bytes, not that
 the event was delivered.
 
+The follower serializes every event once, when it is queued; each retry of a
+batch or transfer sends those bytes and that event ID, under the envelope of
+the session current at the attempt.
+
 The leader bounds staging: an original event of at most 64 MiB, one incomplete
 transfer per follower, eight and 128 MiB of declared bytes across all
-followers. Staging expires five minutes after its last newly accepted fragment
+followers. Every fragment before the last carries at least 64 KiB, so a
+transfer is at most about a thousand fragments, and the leader reads at most
+eight `/events/transfer` request bodies at once, answering `busy` to more
+before reading them. Staging expires five minutes after its last newly accepted fragment
 (a repeated fragment does not extend it) and thirty minutes after it began, and
 is discarded when the follower's generation is replaced; the follower then
 restarts at fragment zero with the same event. Exhausted capacity is a
@@ -249,8 +256,9 @@ or facing a leader that did not advertise transfer — is *parked*: it stays at
 the head of the queue with its bytes intact, later events wait visibly behind
 it, and the follower logs `follower_event_parked` once with the event ID, type,
 size, limit and reason, never its content. Parked delivery is not retried until
-a new registration brings a capability; nothing is truncated, dropped or
-reported as delivered. Deploy an upgraded leader before relying on transfer
+a registration brings a capability, or one different from the capability the
+leader refused under; nothing is truncated, dropped or reported as delivered.
+The log line is the only signal of a parked queue. Deploy an upgraded leader before relying on transfer
 from upgraded followers. A follower built before #876 is still accepted and
 keeps its old limit: an event that alone exceeds 8 MiB blocks its queue.
 
