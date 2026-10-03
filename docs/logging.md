@@ -27,7 +27,22 @@ export function startThing(deps: { logger: Logger }) {
 
 The composition root — `rusa start` — builds the real one and hands it down.
 
-## Computer-use admission records
+## Provider and computer-use admission records
+
+The execution instance writes `provider_admission` on the existing provider gate:
+`phase: pending` means admission is unresolved, `admitted` means the provider
+gate invoked its start callback, and `ended` means its result settled. Pending
+is not evidence of a throttle cause: capacity, transport or other admission
+work can also be unresolved. Admitted precedes computer-use admission and
+execution; the execution lifecycle's `runStart` / `run_start` record establishes
+execution. The follower emits its own phases; leader selection does not prove
+follower receipt.
+
+Phase records include `actorId`, `responsive` and `elapsedMs` since gate entry.
+Ended includes `admitted` and `outcome`: `cancelled` for RunStartCancelledError,
+`failed` for other thrown/rejected gate results, or `resolved` for fulfillment.
+Resolved does not assert run success: the existing execution lifecycle owns
+that outcome. A pending cancellation ends without admitted or execution.
 
 The instance owning the computer-use lock writes `computer_use_wait` when a
 provider-admitted run waits behind a holder, and again when its blocker changes.
@@ -41,10 +56,10 @@ and secret scrubbing; the leader does not manufacture follower lock records.
 These records contain identifiers, flags and elapsed time, without prompts or
 tool arguments. They are transition breadcrumbs, not a durable current-state
 view: logging can be filtered or fail, and diagnostics cannot block admission.
-Acquisition precedes provider execution; `run_start` or `remote_run_start`
-confirms execution. A missing lock record does not establish provider pacing or
-follower receipt. Before an observed lock transition, the admission reason
-remains unknown from these records alone.
+Acquisition precedes provider execution; the execution lifecycle confirms
+execution. A missing lock record does not establish provider pacing or
+follower receipt. A pending provider phase marks unresolved admission, while
+its cause remains unknown from these records alone.
 
 ## Levels
 

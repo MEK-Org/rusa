@@ -1,6 +1,7 @@
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { createLogger } from "../observability/logger.js";
 import { ComputerUseLock } from "./computer-use-lock.js";
+import { RunStartCancelledError } from "./concurrency-limiter.js";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -507,5 +508,188 @@ describe("ComputerUseLock", () => {
     expect(start).toHaveBeenCalledOnce();
     expect(cancelledStart).not.toHaveBeenCalled();
     expect(attempted).toContain(throwOn);
+  });
+  it("distinguishes unresolved provider admission, admitted lock wait and execution", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+    onTestFinished(() => now.mockRestore());
+    const records: Record<string, unknown>[] = [];
+    const lock = new ComputerUseLock(
+      undefined,
+      createLogger({
+        format: "json",
+        destination: { write: (line: string) => records.push(JSON.parse(line)) },
+      })
+    );
+    const held = deferred<string>();
+    const holder = lock.gate("holder", true, () => held.promise);
+    const result = deferred<string>();
+    let admit!: (selected: string) => Promise<string>;
+    const execute = vi.fn(async () => "done");
+    const waiter = lock.gateAfterProvider<string, string>(
+      "waiter",
+      true,
+      (start) => {
+        admit = start;
+        return { result: result.promise, started: false, promote: () => {} };
+      },
+      execute,
+      () => true
+    );
+    expect(records.filter((r) => r.actorId === "waiter")).toEqual([
+      expect.objectContaining({ msg: "provider_admission", phase: "pending", elapsedMs: 0 }),
+    ]);
+    expect(execute).not.toHaveBeenCalled();
+    now.mockReturnValue(1200);
+    void admit("selected").then(result.resolve, result.reject);
+    expect(records.filter((r) => r.actorId === "waiter").map((r) => r.phase ?? r.msg)).toEqual([
+      "pending",
+      "admitted",
+      "computer_use_wait",
+    ]);
+    expect(records.find((r) => r.phase === "admitted")).toMatchObject({ elapsedMs: 200 });
+    expect(execute).not.toHaveBeenCalled();
+    now.mockReturnValue(1500);
+    held.resolve("holder");
+    await holder.result;
+    await expect(waiter instanceof Promise ? waiter : waiter.result).resolves.toBe("done");
+    expect(execute).toHaveBeenCalledOnce();
+    expect(records.filter((r) => r.msg === "provider_admission")).toEqual([
+      expect.objectContaining({ actorId: "waiter", phase: "pending", responsive: true }),
+      expect.objectContaining({ actorId: "waiter", phase: "admitted", elapsedMs: 200 }),
+      expect.objectContaining({
+        actorId: "waiter",
+        phase: "ended",
+        admitted: true,
+        outcome: "resolved",
+        elapsedMs: 500,
+      }),
+    ]);
+  });
+
+  it.each([
+    "cancelled",
+    "failed",
+    "thrown",
+  ])("ends %s admission without claiming execution", async (outcome) => {
+    const records: Record<string, unknown>[] = [];
+    const lock = new ComputerUseLock(
+      undefined,
+      createLogger({
+        format: "json",
+        destination: { write: (line: string) => records.push(JSON.parse(line)) },
+      })
+    );
+    const execute = vi.fn(async () => "done");
+    const reason =
+      outcome === "cancelled" ? new RunStartCancelledError() : new Error("synthetic failure");
+    if (outcome === "thrown") {
+      expect(() =>
+        lock.gateAfterProvider(
+          "actor",
+          false,
+          () => {
+            throw reason;
+          },
+          execute,
+          () => false
+        )
+      ).toThrow(reason);
+    } else {
+      const result = deferred<string>();
+      const handle = lock.gateAfterProvider(
+        "actor",
+        false,
+        () => ({
+          result: result.promise,
+          started: false,
+          promote: () => {},
+          cancel: () => {
+            result.reject(reason);
+            return true;
+          },
+        }),
+        execute,
+        () => false
+      );
+      if (handle instanceof Promise) throw new Error("expected handle");
+      if (outcome === "cancelled") expect(handle.cancel?.()).toBe(true);
+      else result.reject(reason);
+      await expect(handle.result).rejects.toBe(reason);
+    }
+    expect(execute).not.toHaveBeenCalled();
+    expect(records.map((r) => r.phase)).toEqual(["pending", "ended"]);
+    expect(records[1]).toMatchObject({
+      admitted: false,
+      outcome: outcome === "cancelled" ? "cancelled" : "failed",
+    });
+  });
+
+  it.each([
+    "pending",
+    "admitted",
+    "ended",
+  ])("preserves progress when provider %s logging throws", async (throwOn) => {
+    const attempted: string[] = [];
+    const lock = new ComputerUseLock(
+      undefined,
+      createLogger({
+        format: "json",
+        destination: {
+          write: (line: string) => {
+            const record = JSON.parse(line);
+            if (record.msg === "provider_admission") {
+              attempted.push(record.phase);
+              if (record.phase === throwOn) throw new Error("synthetic sink failure");
+            }
+          },
+        },
+      })
+    );
+    // Exercise the Promise path without computer-use and the handle path with it.
+    const direct = lock.gateAfterProvider(
+      "direct",
+      false,
+      (start) => start("selected"),
+      async () => "done",
+      () => false
+    );
+    await expect(direct instanceof Promise ? direct : direct.result).resolves.toBe("done");
+    const queued = deferred<string>();
+    const cancelled = lock.gateAfterProvider(
+      "cancelled",
+      false,
+      () => ({
+        result: queued.promise,
+        started: false,
+        promote: () => {},
+        cancel: () => {
+          queued.reject(new RunStartCancelledError());
+          return true;
+        },
+      }),
+      async () => "unexpected",
+      () => true
+    );
+    if (cancelled instanceof Promise) throw new Error("expected handle");
+    expect(cancelled.cancel?.()).toBe(true);
+    await expect(cancelled.result).rejects.toBeInstanceOf(RunStartCancelledError);
+    const next = lock.gateAfterProvider(
+      "next",
+      true,
+      (start) => start("selected"),
+      async () => "next",
+      () => true
+    );
+    await expect(next instanceof Promise ? next : next.result).resolves.toBe("next");
+    expect(attempted).toEqual([
+      "pending",
+      "admitted",
+      "ended",
+      "pending",
+      "ended",
+      "pending",
+      "admitted",
+      "ended",
+    ]);
   });
 });

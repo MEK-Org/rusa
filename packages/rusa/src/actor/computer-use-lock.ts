@@ -121,11 +121,46 @@ export class ComputerUseLock {
   ): Promise<T> | RunStartHandle<T> {
     let lockHandle: RunStartHandle<T> | undefined;
     let lockResponsive = responsive;
-    const providerHandle = providerGate((selected) => {
-      if (!shouldLock()) return start(selected);
-      lockHandle = this.gate(actorId, lockResponsive, () => start(selected), interrupt, reRequest);
-      return lockHandle.result;
-    });
+    const requestedAt = Date.now();
+    let admitted = false;
+    const reportPhase = (
+      phase: "pending" | "admitted" | "ended",
+      outcome?: "resolved" | "cancelled" | "failed"
+    ) =>
+      this.report("provider_admission", {
+        actorId,
+        responsive: lockResponsive,
+        phase,
+        elapsedMs: Math.max(0, Date.now() - requestedAt),
+        ...(phase === "ended" ? { admitted, outcome } : {}),
+      });
+    const reportEnded = (error: unknown) =>
+      reportPhase("ended", error instanceof RunStartCancelledError ? "cancelled" : "failed");
+    reportPhase("pending");
+    let providerHandle: Promise<T> | RunStartHandle<T>;
+    try {
+      providerHandle = providerGate((selected) => {
+        admitted = true;
+        reportPhase("admitted");
+        if (!shouldLock()) return start(selected);
+        lockHandle = this.gate(
+          actorId,
+          lockResponsive,
+          () => start(selected),
+          interrupt,
+          reRequest
+        );
+        return lockHandle.result;
+      });
+    } catch (error) {
+      reportEnded(error);
+      throw error;
+    }
+    // Observe settlement without replacing the result or changing cancellation.
+    // A resolved result can describe a failed run: execution lifecycle owns that
+    // outcome. Pending is an unresolved gate, not evidence of a throttle cause.
+    const result = isRunStartHandle(providerHandle) ? providerHandle.result : providerHandle;
+    void result.then(() => reportPhase("ended", "resolved"), reportEnded);
     if (!isRunStartHandle(providerHandle)) return providerHandle;
     return {
       result: providerHandle.result,
