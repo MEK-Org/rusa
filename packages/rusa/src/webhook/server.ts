@@ -37,6 +37,7 @@ import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import type { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { QuotaCoordinatorClientHealth } from "../quota/coordinator-client.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
@@ -137,6 +138,7 @@ export interface DashboardMeshRefs {
   inbox?: InboxRepository;
   /** Completed selection intervals used to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
+  runPrompts?: RunPromptRepository;
   /** Durable per-entry obligation associations for activity correlation. */
   inboxFocus?: InboxFocusRepository;
   emitter: MeshEventEmitter;
@@ -602,6 +604,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           obligations: options.mesh.obligations,
           inbox: options.mesh.inbox,
           actorRuns: options.mesh.actorRuns,
+          runPrompts: options.mesh.runPrompts,
           inboxFocus: options.mesh.inboxFocus,
           sseHub,
           mesh: options.mesh.mesh,

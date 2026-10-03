@@ -702,6 +702,7 @@ export class AntigravityProvider implements CodingProvider {
       : undefined;
 
     return runSubprocess({
+      onSpawn: () => opts.onPromptLaunched?.(args[args.indexOf("-p") + 1]),
       command: spawnCommand,
       args: spawnArgs,
       cwd: spawnCwd,
