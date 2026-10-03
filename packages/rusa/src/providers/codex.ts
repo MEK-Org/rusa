@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { parse, stringify } from "smol-toml";
 import type { ProviderConfig } from "../config/types.js";
 import {
@@ -37,6 +38,7 @@ import {
 } from "./sandbox.js";
 import { sanitizeArgvText } from "./spawn-arguments.js";
 import { runSubprocess } from "./subprocess-execution.js";
+import { formatSigtermResult, type TerminationAttribution } from "./termination-attribution.js";
 import {
   attributedTokenUsage,
   extractCodexTokenUsageFromStore,
@@ -47,6 +49,11 @@ import type { CodingProvider, McpServerSpec, RunOptions, RunResult } from "./typ
 export { CODEX_REASONING_EFFORTS, parseCodexModel } from "./reasoning-effort.js";
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+// Raw completion diagnostics retain the latest 64 KiB of decoded UTF-8 text.
+// Semantic output and parser input remain exact, independent of this budget.
+// The omission label and existing termination attribution are additional text.
+// An unfinished JSON line still needs full parser buffering, outside this cap.
+const RAW_DIAGNOSTIC_BYTES = 64 * 1024;
 /** Capability lifetime past a run's worst case (a resume attempt, then a fresh one). */
 const AUTH_LEASE_GRACE_MS = 5 * 60 * 1000;
 
@@ -487,12 +494,34 @@ export class CodexProvider implements CodingProvider {
       };
 
       // Issue #210: normalize the --json event stream for live output. The raw
-      // stdout/stderr still accumulates in `chunks` (the durable run record);
-      // only the curated reasoning/text/notices/errors reach onChunk. Every
+      // stdout/stderr diagnostics keep a bounded tail; only the curated
+      // reasoning/text/notices/errors reach onChunk. Every
       // event ticks liveness (`onChunk("")`) so the stall watchdog keeps
       // firing while tool results are suppressed.
       let lineBuffer = "";
       const assistantTexts: string[] = [];
+      const stdoutDecoder = new StringDecoder("utf8");
+      const stderrDecoder = new StringDecoder("utf8");
+      let diagnosticTail = "";
+      let diagnosticBytes = 0;
+      const captureDiagnostics = (text: string, chunks?: string[]) => {
+        diagnosticBytes += Buffer.byteLength(text);
+        // Slice before encoding so a single giant event never creates an
+        // additional giant diagnostic buffer. At most 64 Ki characters plus
+        // the previous bounded tail are encoded; discard a partial leading
+        // code point after enforcing the byte budget.
+        const tail = Buffer.from(diagnosticTail + text.slice(-RAW_DIAGNOSTIC_BYTES));
+        let start = Math.max(0, tail.length - RAW_DIAGNOSTIC_BYTES);
+        while (start < tail.length && ((tail[start] ?? 0) & 0xc0) === 0x80) start++;
+        diagnosticTail = tail.subarray(start).toString("utf8");
+        if (chunks) chunks.splice(0, chunks.length, diagnosticTail);
+      };
+      const diagnosticOutput = (label = false): string => {
+        const omitted = diagnosticBytes - Buffer.byteLength(diagnosticTail);
+        return label || omitted > 0
+          ? `[Codex raw diagnostics: ${omitted} UTF-8 bytes omitted; tail]\n${diagnosticTail}`
+          : diagnosticTail;
+      };
       const tick = () => opts.onChunk?.("");
       const itemText = (item: { content?: unknown; text?: unknown }): string => {
         if (typeof item.text === "string") return item.text;
@@ -666,11 +695,40 @@ export class CodexProvider implements CodingProvider {
             tick();
         }
       };
-      // The final assistant text becomes the run output; when the run produced
-      // none (failures), fall back to the raw stream so auth/quota strings in
-      // error events keep reaching the failure classifiers.
-      const effectiveOutput = (rawOutput: string): string =>
-        assistantTexts.length > 0 ? assistantTexts.join("\n") : rawOutput;
+      const processStdout = (text: string, chunks?: string[]) => {
+        opts.onStdout?.(text);
+        captureDiagnostics(text, chunks);
+        lineBuffer += text;
+        const lines = lineBuffer.split("\n");
+        lineBuffer = lines.pop() ?? "";
+        for (const line of lines) processLine(line);
+      };
+      let stdoutEnded = false;
+      const flushStdout = (chunks?: string[]) => {
+        if (stdoutEnded) return;
+        stdoutEnded = true;
+        processStdout(stdoutDecoder.end(), chunks);
+        if (lineBuffer) processLine(lineBuffer);
+        lineBuffer = "";
+      };
+      const flushStderr = () => {
+        const text = stderrDecoder.end();
+        if (text) {
+          opts.onStderr?.(text);
+          captureDiagnostics(text);
+        }
+      };
+      const buildInterruptedResult = (termination: TerminationAttribution): RunResult => {
+        flushStderr();
+        const output = [...assistantTexts, diagnosticOutput(true)].join("\n");
+        return buildResultWithSession({
+          ...termination,
+          success: false,
+          // Keep the shared termination fields and attribution text, with
+          // parsed output first and identifiable diagnostics separately below.
+          output: formatSigtermResult(output, opts.signal).output,
+        });
+      };
 
       return runSubprocess({
         command: spawnCommand,
@@ -682,40 +740,26 @@ export class CodexProvider implements CodingProvider {
         onStdout: opts.onStdout,
         onStderr: opts.onStderr,
         handleStdoutData: (data, chunks) => {
-          const text = data.toString();
-          opts.onStdout?.(text);
-          chunks.push(text);
-          lineBuffer += text;
-          const lines = lineBuffer.split("\n");
-          lineBuffer = lines.pop() ?? "";
-          for (const line of lines) {
-            processLine(line);
-          }
+          processStdout(stdoutDecoder.write(data), chunks);
         },
         handleStderrData: (data, chunks) => {
-          const text = data.toString();
+          const text = stderrDecoder.write(data);
           opts.onStderr?.(text);
           // The rendered transcript stays in the durable record but never
           // reaches the live-output callback (issue #210).
-          chunks.push(text);
+          captureDiagnostics(text, chunks);
         },
+        onStdoutEnd: flushStdout,
         // Temp cleanup is owned by run() below, not per-spawn.
-        buildKilledResult: (sigtermResult) =>
-          buildResultWithSession({
-            ...sigtermResult,
-            success: false,
-          }),
-        buildSignalResult: (sigtermResult) =>
-          buildResultWithSession({
-            ...sigtermResult,
-            success: false,
-          }),
-        buildExitResult: (output, exitCode) => {
-          if (lineBuffer) {
-            processLine(lineBuffer);
-            lineBuffer = "";
-          }
-          const outputText = effectiveOutput(output);
+        buildKilledResult: buildInterruptedResult,
+        buildSignalResult: buildInterruptedResult,
+        buildExitResult: (_output, exitCode) => {
+          flushStdout();
+          flushStderr();
+          // Normal output stays semantic; failures without assistant text keep
+          // the bounded raw tail so recent auth/quota diagnoses remain useful.
+          const outputText =
+            assistantTexts.length > 0 ? assistantTexts.join("\n") : diagnosticOutput();
           // Auth-fail alarm: if the run fails with an auth error, alert the operator.
           if (exitCode !== 0 && isCodexAuthFailure(outputText)) {
             console.error("\n=======================================================");
