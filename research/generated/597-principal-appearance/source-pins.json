@@ -1,0 +1,45 @@
+{
+  "before": {
+    "sha": "876012d75afaa95a131f6ecb8e1e5117745db609",
+    "files": {
+      "lib/widgets/events_tab.dart": "8daadf4322f4e2c131dc662fbea9445ae4ad7d56ff429ff8cbb2ad14049367c5",
+      "lib/widgets/avatar.dart": "afc326fa59f418e50bf3bdd8d4746c0ed8ebd30ba9fea01f04e430e0f75ce47f",
+      "lib/widgets/kind_chip.dart": "4fb10eaf1a8d65daf4a31960b6d53074265d960a0eb9a1147ec588a77f5ef874",
+      "lib/theme.dart": "89b014ecffee8ffb1a228ab085e3332a45c011471ac0bc8c7cce6be3536e073e",
+      "lib/models.dart": "e2f1603f5a8e2328415f51a8cf24ea4205bb76c5032545b9fda113403b321934",
+      "lib/store.dart": "298c3dad2aeadf17a6b0c7a5e689e4cfd637ab5fefb249ba45450aad0ce20ab6",
+      "lib/api.dart": "ba3d44a8fa30c4ef76069449b4e487e6a2fb87d78d23506d3f3fe270dc363a79",
+      "lib/principals.dart": "d25719a9ff43e8a797a428055c06f742b26c38c43e0f0d34981a99a272e11013",
+      "test/fakes.dart": "1f15661187c4b96af5f1be892f51e09322a050c52659d39ffbee41746f6b9a98"
+    },
+    "flutter_tree": "92062cdb6df8b2ab1cd7e0103031a87bf065d4aa"
+  },
+  "after": {
+    "sha": "f5ed13d8a4ccde1ba3c4bf628cee0816dc6ee0f6",
+    "built_sha": "f5ed13d8a4ccde1ba3c4bf628cee0816dc6ee0f6",
+    "files": {
+      "lib/widgets/events_tab.dart": "8daadf4322f4e2c131dc662fbea9445ae4ad7d56ff429ff8cbb2ad14049367c5",
+      "lib/widgets/avatar.dart": "afc326fa59f418e50bf3bdd8d4746c0ed8ebd30ba9fea01f04e430e0f75ce47f",
+      "lib/widgets/kind_chip.dart": "4fb10eaf1a8d65daf4a31960b6d53074265d960a0eb9a1147ec588a77f5ef874",
+      "lib/theme.dart": "89b014ecffee8ffb1a228ab085e3332a45c011471ac0bc8c7cce6be3536e073e",
+      "lib/models.dart": "e2f1603f5a8e2328415f51a8cf24ea4205bb76c5032545b9fda113403b321934",
+      "lib/store.dart": "298c3dad2aeadf17a6b0c7a5e689e4cfd637ab5fefb249ba45450aad0ce20ab6",
+      "lib/api.dart": "ba3d44a8fa30c4ef76069449b4e487e6a2fb87d78d23506d3f3fe270dc363a79",
+      "lib/principals.dart": "d25719a9ff43e8a797a428055c06f742b26c38c43e0f0d34981a99a272e11013",
+      "test/fakes.dart": "1f15661187c4b96af5f1be892f51e09322a050c52659d39ffbee41746f6b9a98"
+    },
+    "flutter_tree": "92062cdb6df8b2ab1cd7e0103031a87bf065d4aa"
+  },
+  "fixture_sha256": "dfa2fe8780ad09784104e22b3e2c4ba1e0725c2e76fc69a06065f5399a67ca11",
+  "input_contract": {
+    "before": {
+      "userPrincipalId": null,
+      "human_peer": "human:operator"
+    },
+    "after": {
+      "userPrincipalId": "00000000-0000-4000-8000-000000000597",
+      "human_peer": "00000000-0000-4000-8000-000000000597"
+    },
+    "synthetic_uuid": "Reserved stand-in for repository-minted durable UUID; no real user or production API data."
+  }
+}
