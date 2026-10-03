@@ -2492,6 +2492,41 @@ describe("monolithic follower instance", () => {
     expect(() => h.mesh.retire(id)).toThrow(/cannot retire/);
   });
 
+  it("rejects initial malformed-catalog readiness before its startup deadline", async () => {
+    const providerFactory = vi.fn<ProviderFactory>();
+    const h = setup({ providerFactory, startupTimeoutMs: 60_000 });
+    const dispatch = h.follower.dispatch.bind(h.follower);
+    h.follower.dispatch = (envelope) => {
+      if (envelope.message.type === "init") {
+        envelope.message.bootstrap.providerOptions = { modelCatalogs: { agy: null } };
+      }
+      dispatch(envelope);
+    };
+    const id = h.spawn("malformed catalog startup");
+    let readiness: "pending" | "resolved" | "rejected" = "pending";
+    let readyError: unknown;
+    void h.runtime(id).ready.then(
+      () => {
+        readiness = "resolved";
+      },
+      (error) => {
+        readiness = "rejected";
+        readyError = error;
+      }
+    );
+    // The real follower's fatal reaches the leader with no runtime exit. Inspect
+    // settlement now, while the 60s startup deadline cannot mask the defect.
+    await waitUntil(() => h.failures.length > 0);
+    expect(h.failures).toHaveLength(1);
+    expect(h.failures[0].message).toContain("Invalid model catalog snapshot");
+    expect(h.follower.actorIds).not.toContain(id);
+    expect(providerFactory).not.toHaveBeenCalled();
+    expect(runStarts(h, id)).toEqual([]);
+    expect(runResults(h, id)).toEqual([]);
+    expect(readiness).toBe("rejected");
+    expect(readyError).toEqual(h.failures[0]);
+  });
+
   it("preserves co-resident actor catalogs when another actor receives a malformed snapshot", () => {
     const events: { actorId: string; message: unknown }[] = [];
     const follower = new FollowerInstance(

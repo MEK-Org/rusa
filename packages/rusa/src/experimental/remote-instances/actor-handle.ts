@@ -218,6 +218,10 @@ export class ActorHandle implements MeshActor {
         resolveReady(message.pid);
         return;
       }
+      // Initial init refusal can emit fatal without a runtime exit. Settle this
+      // channel's startup before fail() clears the deadline; keep run accounting
+      // on the existing receive path (also used for reconnect/runtime failures).
+      if (message.type === "fatal") rejectReady(new Error(message.error));
       this.enqueueReceive(message);
     });
     channel.on("error", (error) => {
