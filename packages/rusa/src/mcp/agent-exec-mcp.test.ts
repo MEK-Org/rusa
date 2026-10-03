@@ -990,10 +990,25 @@ describe("agent-execution MCP server", () => {
       identity: { issuer: "https://accounts.google.com", subject: "second" },
     });
 
-    // The run's endpoint is built while the operator's message is the newest.
-    mesh.sendHumanMessage("worker", "first", "session-a");
+    // The run's endpoint is built while the newest human message has no
+    // session: that unlocks reply, but a send has no conversation to go to.
+    chat.record({
+      senderId: "human:operator",
+      recipientId: "worker",
+      body: "sessionless",
+      sessionId: null,
+      ts: new Date(Date.UTC(2026, 0, 1, 0, 0, ++tick)).toISOString(),
+    });
     const client = await connect(createAgentExecMcpServer(mesh, "worker", "root"));
     expect((await client.listTools()).tools.map((tool) => tool.name)).toContain("reply");
+    const rejected = (await client.callTool({
+      name: "reply",
+      arguments: { message: "Nowhere to send." },
+    })) as CallToolResult;
+    expect(rejected.isError).toBe(true);
+    expect(JSON.stringify(rejected.content)).toContain("requires an active human conversation");
+
+    mesh.sendHumanMessage("worker", "first", "session-a");
 
     // A second human writes mid-run; the next reply must follow them.
     mesh.sendHumanMessage("worker", "second", "session-b", { fromId: user.id });
