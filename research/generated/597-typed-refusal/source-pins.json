@@ -1,0 +1,16 @@
+{
+  "productHead": "c47e089c2b7ac1acd0963a0fc228fea742bb994a",
+  "flutterTree": "92062cdb6df8b2ab1cd7e0103031a87bf065d4aa",
+  "files": {
+    "packages/rusa/flutter_dashboard/lib/widgets/chat_tab.dart": "e5a950c1ff09ef6c30751afbc1e37476c7d79a722606babcc04f9f2d355e60b6",
+    "packages/rusa/flutter_dashboard/lib/store.dart": "298c3dad2aeadf17a6b0c7a5e689e4cfd637ab5fefb249ba45450aad0ce20ab6",
+    "packages/rusa/flutter_dashboard/lib/api.dart": "ba3d44a8fa30c4ef76069449b4e487e6a2fb87d78d23506d3f3fe270dc363a79",
+    "packages/rusa/flutter_dashboard/test/fakes.dart": "1f15661187c4b96af5f1be892f51e09322a050c52659d39ffbee41746f6b9a98",
+    "packages/rusa/src/actor/actor-mesh.ts": "75ccaf49296f2c7e505472502426ac4237afc34e8819c826f18853f31e821e5f",
+    "packages/rusa/src/voice/human-admission.ts": "ac300760913b523a3e0a73fdcb35f4e66065efa04d6a1d600b0efde3aa024c87",
+    "packages/rusa/src/voice/voice-api.ts": "f76ad9f18bc4cc1455eb4be2272dcd0f26a511a599c8076ff91308ef86c6816f",
+    "packages/rusa/src/dashboard/api.ts": "5b5aa71fba8eea609133ab3762c062144f016ba7207f6e4a8942b2d0e1b735f6",
+    "packages/rusa/src/dashboard/human-chat-isolation.test.ts": "24fbdcb944c016b3a07a995f232187b33612bcb7ea24a0570a9e53f8a8fbde10",
+    "packages/rusa/src/commands/start.ts": "804563c8aa834726b625b51fe17747113b154502c65893f78fb4b02140215e02"
+  }
+}
