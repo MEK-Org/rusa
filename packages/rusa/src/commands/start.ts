@@ -2933,6 +2933,11 @@ async function composeStart(
           throw new Error("voice session transfer is unavailable on this instance");
         return voiceService.activeSessionIdFor(actorId);
       },
+      activeSessionFor: (actorId) => {
+        if (!voiceService)
+          throw new Error("voice session transfer is unavailable on this instance");
+        return voiceService.activeSessionFor(actorId);
+      },
       transferActiveSession: (fromActorId, targetActorId) => {
         if (!voiceService)
           throw new Error("voice session transfer is unavailable on this instance");

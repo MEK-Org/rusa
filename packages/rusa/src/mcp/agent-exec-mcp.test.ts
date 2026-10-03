@@ -889,6 +889,10 @@ describe("agent-execution MCP server", () => {
           if (actorId !== holder) throw new Error("caller does not hold an active voice session");
           return "transferred-session";
         },
+        activeSessionFor: (actorId) => {
+          if (actorId !== holder) throw new Error("caller does not hold an active voice session");
+          return { sessionId: "transferred-session", principalId: firstHuman.id };
+        },
         transferActiveSession: (fromActorId, targetActorId) => {
           if (fromActorId !== holder)
             throw new Error("caller does not hold an active voice session");
@@ -964,6 +968,229 @@ describe("agent-execution MCP server", () => {
         .listForSession("transferred-session", { limit: 10 })
         .find((entry) => entry.senderId === target.id)
     ).toMatchObject({ recipientId: firstHuman.id, sessionId: "transferred-session" });
+  });
+
+  it("refuses reply when voice session is not bound to an active human principal (#597)", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const actors = new SqliteActorRepository(db);
+    const chat = new MeshChatRepository(db);
+    const principals = new PrincipalRepository(db);
+    const mesh = new ActorMesh({
+      principals,
+      actors,
+      inboxStore: new SqliteInboxRepository(db),
+      recordChat: (entry) => chat.record(entry),
+      listVoiceSessionChat: (sessionId) => chat.listForSession(sessionId, { limit: 100 }),
+      voiceSessionTransfer: {
+        activeSessionIdFor: () => "unbound-session",
+        activeSessionFor: () => ({ sessionId: "unbound-session", principalId: undefined }),
+        transferActiveSession: () => "unbound-session",
+        revertActiveSessionTransfer: () => {},
+        notifySessionTransferred: () => {},
+      },
+      createActor: () => ({}) as unknown as Actor,
+    });
+    const root: ActorRecord = {
+      id: "root",
+      charter: "root",
+      parentId: null,
+      isRoot: true,
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    mesh.adopt(root, {
+      id: "root",
+      requestRun: () => {},
+      markUnkillable: () => {},
+      close: () => {},
+      isRunning: false,
+      preemptForResponsive: () => ({ preempted: false as const }),
+    } as unknown as Actor);
+
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const reply = (await client.callTool({
+      name: "reply",
+      arguments: { message: "Test reply" },
+    })) as CallToolResult;
+    expect(reply.isError).toBe(true);
+    expect((reply.content[0] as { text: string }).text).toContain(
+      "voice session is not bound to an active human principal; reconnect the voice stream to continue"
+    );
+  });
+
+  it("refuses reply when voice session lease expired or was released (#597)", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const actors = new SqliteActorRepository(db);
+    const chat = new MeshChatRepository(db);
+    const principals = new PrincipalRepository(db);
+    const firstHuman = required(principals.ensureImplicitUser("2026-01-01T00:00:00Z"));
+    let leaseActive = true;
+    const mesh = new ActorMesh({
+      principals,
+      actors,
+      inboxStore: new SqliteInboxRepository(db),
+      recordChat: (entry) => chat.record(entry),
+      listVoiceSessionChat: (sessionId) => chat.listForSession(sessionId, { limit: 100 }),
+      voiceSessionTransfer: {
+        activeSessionIdFor: () => {
+          if (!leaseActive) throw new Error("caller does not hold an active voice session");
+          return "expired-session";
+        },
+        activeSessionFor: () => {
+          if (!leaseActive) throw new Error("caller does not hold an active voice session");
+          return { sessionId: "expired-session", principalId: firstHuman.id };
+        },
+        transferActiveSession: () => "expired-session",
+        revertActiveSessionTransfer: () => {},
+        notifySessionTransferred: () => {},
+      },
+      createActor: () => ({}) as unknown as Actor,
+    });
+    const root: ActorRecord = {
+      id: "root",
+      charter: "root",
+      parentId: null,
+      isRoot: true,
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    mesh.adopt(root, {
+      id: "root",
+      requestRun: () => {},
+      markUnkillable: () => {},
+      close: () => {},
+      isRunning: false,
+      preemptForResponsive: () => ({ preempted: false as const }),
+    } as unknown as Actor);
+
+    // Server is created while lease is active
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    // Lease expires or is released before tool invocation
+    leaseActive = false;
+
+    const reply = (await client.callTool({
+      name: "reply",
+      arguments: { message: "Test reply" },
+    })) as CallToolResult;
+    expect(reply.isError).toBe(true);
+    expect((reply.content[0] as { text: string }).text).toContain(
+      "voice session lease expired or was released; reconnect the voice stream to continue"
+    );
+  });
+
+  it("refuses reply when durable principal user is disabled (#597)", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const actors = new SqliteActorRepository(db);
+    const chat = new MeshChatRepository(db);
+    const principals = new PrincipalRepository(db);
+    const firstHuman = required(principals.ensureImplicitUser("2026-01-01T00:00:00Z"));
+    const mesh = new ActorMesh({
+      principals,
+      actors,
+      inboxStore: new SqliteInboxRepository(db),
+      recordChat: (entry) => chat.record(entry),
+      listVoiceSessionChat: (sessionId) => chat.listForSession(sessionId, { limit: 100 }),
+      voiceSessionTransfer: {
+        activeSessionIdFor: () => "session-1",
+        activeSessionFor: () => ({ sessionId: "session-1", principalId: firstHuman.id }),
+        transferActiveSession: () => "session-1",
+        revertActiveSessionTransfer: () => {},
+        notifySessionTransferred: () => {},
+      },
+      createActor: () => ({}) as unknown as Actor,
+    });
+    const root: ActorRecord = {
+      id: "root",
+      charter: "root",
+      parentId: null,
+      isRoot: true,
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    mesh.adopt(root, {
+      id: "root",
+      requestRun: () => {},
+      markUnkillable: () => {},
+      close: () => {},
+      isRunning: false,
+      preemptForResponsive: () => ({ preempted: false as const }),
+    } as unknown as Actor);
+
+    // Disable the user
+    principals.setDisabled(firstHuman.id, new Date().toISOString());
+
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const reply = (await client.callTool({
+      name: "reply",
+      arguments: { message: "Test reply" },
+    })) as CallToolResult;
+    expect(reply.isError).toBe(true);
+    expect((reply.content[0] as { text: string }).text).toContain(
+      "reply requires an active durable human conversation principal"
+    );
+  });
+
+  it("replies successfully with empty, truncated, or mixed chat history by reading principal directly from voice session lease (#597)", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const actors = new SqliteActorRepository(db);
+    const chat = new MeshChatRepository(db);
+    const principals = new PrincipalRepository(db);
+    const firstHuman = required(principals.ensureImplicitUser("2026-01-01T00:00:00Z"));
+    const mesh = new ActorMesh({
+      principals,
+      actors,
+      inboxStore: new SqliteInboxRepository(db),
+      recordChat: (entry) => chat.record(entry),
+      listVoiceSessionChat: (sessionId) => chat.listForSession(sessionId, { limit: 100 }),
+      voiceSessionTransfer: {
+        activeSessionIdFor: () => "history-free-session",
+        activeSessionFor: () => ({ sessionId: "history-free-session", principalId: firstHuman.id }),
+        transferActiveSession: () => "history-free-session",
+        revertActiveSessionTransfer: () => {},
+        notifySessionTransferred: () => {},
+      },
+      createActor: () => ({}) as unknown as Actor,
+    });
+    const root: ActorRecord = {
+      id: "root",
+      charter: "root",
+      parentId: null,
+      isRoot: true,
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    mesh.adopt(root, {
+      id: "root",
+      requestRun: () => {},
+      markUnkillable: () => {},
+      close: () => {},
+      isRunning: false,
+      preemptForResponsive: () => ({ preempted: false as const }),
+    } as unknown as Actor);
+
+    // Zero prior chat in history!
+    expect(chat.listForSession("history-free-session", { limit: 10 })).toHaveLength(0);
+
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const reply = (await client.callTool({
+      name: "reply",
+      arguments: { message: "Direct reply from session binding." },
+    })) as CallToolResult;
+    expect(reply.isError).not.toBe(true);
+
+    const emitted = chat.listForSession("history-free-session", { limit: 10 });
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      senderId: "root",
+      recipientId: firstHuman.id,
+      sessionId: "history-free-session",
+      body: "Direct reply from session binding.",
+    });
   });
 
   it("replies to the human chat that arrived after the reply tool was registered (#691)", async () => {

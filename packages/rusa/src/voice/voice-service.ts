@@ -165,6 +165,7 @@ export interface VoiceServiceOptions {
 
 interface VoiceSession {
   actorId: string;
+  principalId?: string;
   /** Number of open SSE connections carrying this stable session id. */
   connections: number;
   /** Null while a stream remains open; otherwise the reconnect deadline. */
@@ -236,17 +237,21 @@ export class VoiceService {
    * actor is a protocol error rather than an implicit transfer (transfers are
    * slice B). Any live connection holds authority indefinitely.
    */
-  openSession(sessionId: string, actorId: string): void {
-    const existing = this.validateSession(sessionId, actorId);
+  openSession(sessionId: string, actorId: string, principalId?: string): void {
+    const existing = this.validateSession(sessionId, actorId, principalId);
     if (existing) {
       if (existing.timer) clearTimeout(existing.timer);
       existing.timer = null;
       existing.expiresAt = null;
       existing.connections++;
+      if (principalId && !existing.principalId) {
+        existing.principalId = principalId;
+      }
       return;
     }
     this.sessions.set(sessionId, {
       actorId,
+      principalId,
       connections: 1,
       expiresAt: null,
       timer: null,
@@ -254,13 +259,22 @@ export class VoiceService {
   }
 
   /** Validate a pending stream without granting authority until it is attached. */
-  validateSession(sessionId: string, actorId: string): VoiceSession | undefined {
+  validateSession(
+    sessionId: string,
+    actorId: string,
+    principalId?: string
+  ): VoiceSession | undefined {
     if (!sessionId.trim()) throw new Error("sessionId is required");
     if (!actorId.trim()) throw new Error("actorId is required");
     this.expireSessions();
     const existing = this.sessions.get(sessionId);
-    if (existing && existing.actorId !== actorId) {
-      throw new Error("sessionId is already bound to a different actor");
+    if (existing) {
+      if (existing.actorId !== actorId) {
+        throw new Error("sessionId is already bound to a different actor");
+      }
+      if (existing.principalId !== principalId) {
+        throw new Error("sessionId is already bound to a different principal");
+      }
     }
     return existing;
   }
@@ -313,8 +327,8 @@ export class VoiceService {
     );
   }
 
-  /** The caller's sole active session UUID, or an error when transfer is ambiguous. */
-  activeSessionIdFor(actorId: string): string {
+  /** The caller's sole active session UUID and principal, or an error when transfer is ambiguous. */
+  activeSessionFor(actorId: string): { sessionId: string; principalId?: string } {
     this.expireSessions();
     const active = [...this.sessions.entries()].filter(
       ([, session]) =>
@@ -325,7 +339,21 @@ export class VoiceService {
     if (active.length > 1) {
       throw new Error("caller holds multiple active voice sessions; transfer is ambiguous");
     }
-    return active[0][0];
+    return { sessionId: active[0][0], principalId: active[0][1].principalId };
+  }
+
+  /** The caller's sole active session UUID, or an error when transfer is ambiguous. */
+  activeSessionIdFor(actorId: string): string {
+    return this.activeSessionFor(actorId).sessionId;
+  }
+
+  /** The caller's sole active session principal, or undefined when absent or unheld. */
+  activeSessionPrincipalIdFor(actorId: string): string | undefined {
+    try {
+      return this.activeSessionFor(actorId).principalId;
+    } catch {
+      return undefined;
+    }
   }
 
   /**

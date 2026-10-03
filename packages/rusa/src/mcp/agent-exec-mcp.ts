@@ -260,16 +260,34 @@ export function createAgentExecMcpServer(
       async ({ message }) => {
         try {
           const chat = mesh.actors.lastHumanChat(selfId);
-          const voiceSession = mesh.activeVoiceSessionIdFor(selfId);
-          const sessionId = voiceSession ?? chat?.sessionId;
+          const currentVoiceSession = mesh.activeVoiceSessionFor?.(selfId);
+          let sessionId: string | undefined;
+          let toId: string | undefined;
+
+          if (currentVoiceSession) {
+            sessionId = currentVoiceSession.sessionId;
+            toId = currentVoiceSession.principalId;
+            if (!toId) {
+              throw new Error(
+                "voice session is not bound to an active human principal; reconnect the voice stream to continue"
+              );
+            }
+          } else if (voiceSessionId) {
+            throw new Error(
+              "voice session lease expired or was released; reconnect the voice stream to continue"
+            );
+          } else {
+            sessionId = chat?.sessionId;
+            toId = chat?.principalId;
+          }
+
           if (!sessionId) throw new Error("reply requires an active human conversation");
-          const toId = voiceSession ? mesh.activeVoicePrincipalIdFor(selfId) : chat?.principalId;
-          if (
-            !toId ||
-            !mesh.principals?.getUser(toId) ||
-            mesh.principals.getUser(toId)?.disabledAt
-          ) {
+          if (!toId) {
             throw new Error("reply requires a known durable human conversation principal");
+          }
+          const user = mesh.principals?.getUser(toId);
+          if (!user || user.disabledAt) {
+            throw new Error("reply requires an active durable human conversation principal");
           }
           mesh.recordMessageEmitted({
             fromId: selfId,
