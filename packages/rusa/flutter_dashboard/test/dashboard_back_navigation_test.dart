@@ -217,6 +217,39 @@ void main() {
     );
 
     testWidgets(
+      'platform popRoute closes an open dialog without changing the view',
+      (tester) async {
+        await _withDashboard(
+          tester,
+          initialUrl: '/overview',
+          body: (_) async {
+            showDialog<void>(
+              context: tester.element(find.byType(DashboardBody)),
+              builder: (_) => const AlertDialog(content: Text('probe dialog')),
+            );
+            await _settle(tester);
+            expect(find.text('probe dialog'), findsOneWidget);
+
+            _navCalls.clear();
+            final handled = await tester.binding.handlePopRoute();
+            await _settle(tester);
+            // Let the dialog's exit transition finish.
+            await tester.pump(const Duration(milliseconds: 300));
+
+            expect(
+              handled,
+              isTrue,
+              reason: 'The Router must dispatch popRoute to its Navigator',
+            );
+            expect(find.text('probe dialog'), findsNothing);
+            expect(find.byType(OverviewTab), findsOneWidget);
+            expect(_urlWrites(), isEmpty);
+          },
+        );
+      },
+    );
+
+    testWidgets(
       'successive navigation Overview -> Work -> Room steps back through each location',
       (tester) async {
         await _withDashboard(
@@ -267,7 +300,11 @@ void main() {
               find.text('Select an obligation from the tree.'),
               findsNothing,
             );
-            expect(_urlWrites().last, ('/work/ob-q', true));
+            expect(
+              _urlWrites().last,
+              ('/work/ob-q', true),
+              reason: 'In-view focus updates rewrite the address in place',
+            );
 
             await _tapNav(tester, 'Room');
             expect(find.byType(ChatRoomTab), findsOneWidget);
@@ -303,32 +340,6 @@ void main() {
               reason:
                   'Clearing the focus re-states bare /work in place, never '
                   'pushing or writing a stale focused address',
-            );
-          },
-        );
-      },
-    );
-
-    testWidgets(
-      'focus updates within tab update URL in place with replace: true',
-      (tester) async {
-        await _withDashboard(
-          tester,
-          initialUrl: '/work',
-          api: FakeApi(),
-          body: (store) async {
-            _navCalls.clear();
-            store.setFocusedObligationId('ob-focused-1');
-            await _settle(tester);
-
-            final focusWrites = _urlWrites().where(
-              (w) => w.$1 == '/work/ob-focused-1',
-            );
-            expect(focusWrites, isNotEmpty);
-            expect(
-              focusWrites.last.$2,
-              isTrue,
-              reason: 'In-view focus updates must use replace: true',
             );
           },
         );

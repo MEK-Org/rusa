@@ -49,11 +49,6 @@ class _DashboardRouteInformationParser
   ) async {
     return routeInformation;
   }
-
-  @override
-  RouteInformation restoreRouteInformation(RouteInformation configuration) {
-    return configuration;
-  }
 }
 
 /// Hosts the dashboard under a [Router] without letting the Router write the
@@ -107,6 +102,10 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
       routerDelegate: _DashboardRouterDelegate(
         builder: (context) => _buildHost(),
       ),
+      // WidgetsApp only adds a default dispatcher for routerDelegate, not
+      // routerConfig. Without one, popRoute (single-entry history, a native
+      // back button) never reaches the Navigator, so open dialogs stay open.
+      backButtonDispatcher: RootBackButtonDispatcher(),
     );
   }
 

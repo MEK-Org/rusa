@@ -130,6 +130,8 @@ class _DashboardBodyState extends State<DashboardBody> {
   /// Browser back/forward and other platform pushes, from the enclosing
   /// [Router]. Null when the body is mounted without one (the screenshot
   /// harness and widget tests), where there is no browser history to follow.
+  /// Its `value` is the last platform push, not the current address (in-app
+  /// writes never update it), so it is read only inside the listener.
   RouteInformationProvider? _routeProvider;
 
   @override
