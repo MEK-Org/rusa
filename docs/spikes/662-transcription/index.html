@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#18202b">
+  <link rel="manifest" href="manifest.webmanifest">
+  <title>662 synthetic transcription spike</title>
+  <style>
+    body { max-width: 48rem; margin: auto; padding: 1rem; font: 1rem system-ui; background: #18202b; color: #fff; }
+    label { display: block; margin: .7rem 0; }
+    input, select, textarea, button { font: inherit; padding: .5rem; max-width: 100%; }
+    textarea { display: block; width: 95%; }
+    button { margin: .3rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #101620; padding: .7rem; }
+    #preview { min-height: 4rem; padding: 1rem; border: 1px solid #fff; }
+    a { color: #9dcaff; }
+  </style>
+</head>
+<body>
+  <h1>Synthetic transcription spike (#662)</h1>
+  <p>Read only the synthetic phrase. Browser recognition may send speech to its recognition service.
+    Local-required mode fails closed if unsupported. Nothing is sent to a rusa actor.
+    Clips and reports stay in page memory until you download them; reload clears them.</p>
+  <p><strong>Phrase:</strong> “The blue robot puts seven paper boats beside the green box.
+    Correction: make that eleven paper boats. End of synthetic sample.”</p>
+  <label>Device model / Android version / exact Chrome version (no device serial)
+    <input id="device" placeholder="UNTESTED until filled on target device">
+  </label>
+  <label>Network / offline test condition <input id="network" value="not recorded"></label>
+  <label>Capture mode
+    <select id="mode">
+      <option value="recorder">Recorder only (baseline)</option>
+      <option value="browser">Concurrent recorder + browser-default recognition (may be remote)</option>
+      <option value="local">Concurrent recorder + local-required recognition</option>
+    </select>
+  </label>
+  <label>Recognition language <input id="language" value="en-US"></label>
+  <button type="button" id="probe">Probe local support (no recording)</button>
+  <button type="button" id="install">Install local language pack</button>
+  <pre id="support"></pre>
+  <button type="button" id="start">Start synthetic trial</button>
+  <button type="button" id="mark" disabled>Mark speech onset, then speak</button>
+  <button type="button" id="stop" disabled>Stop and await final revisions</button>
+  <button type="button" id="cancel" disabled>Cancel and discard clip</button>
+  <p id="status" role="status">Idle</p>
+  <div id="preview" aria-live="polite">No transcript</div>
+  <audio id="audio" controls></audio>
+  <p><a id="clip" hidden>Download this synthetic clip</a></p>
+  <label>Listening check on latest completed clip
+    <select id="integrity">
+      <option>UNTESTED</option>
+      <option>Whole phrase audible, including ending</option>
+      <option>Missing words / gaps / silence (describe below)</option>
+    </select>
+  </label>
+  <label>Clip / lifecycle / processing-path observations
+    <textarea id="notes" rows="3" placeholder="UNTESTED; note evidence for processing path, not a guess"></textarea>
+  </label>
+  <label>Batch transcript of the SAME downloaded clip (optional; authorized isolated transcription only)
+    <textarea id="batch" rows="3" placeholder="UNTESTED — this harness never calls a rusa voice-memo route"></textarea>
+  </label>
+  <label>Batch provider / model / verification artifact (no credentials)
+    <input id="batchSource" placeholder="UNTESTED">
+  </label>
+  <button type="button" id="annotate">Save notes to latest completed trial</button>
+  <button type="button" id="export">Download JSON report</button>
+  <pre id="report"></pre>
+  <script type="module" src="spike.mjs"></script>
+</body>
+</html>
