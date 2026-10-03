@@ -47,6 +47,7 @@ import {
 import {
   type MeshProviderGate,
   type QueuedSelection,
+  type ResponsiveArrival,
   RunManager,
   VOICE_INBOX_PAYLOAD_TYPE,
 } from "../runtime/run-manager.js";
@@ -1084,11 +1085,10 @@ export class ActorMesh {
         ? {
             onResponsiveArrived: (
               actorId: string,
-              entries: readonly InboxEntry[],
-              baseline: "interrupt" | "queue",
+              arrivals: readonly ResponsiveArrival[],
               isRunning: boolean
             ) => {
-              this.shadowResponsiveInterruptions(actorId, entries, baseline, isRunning);
+              this.shadowResponsiveInterruptions(actorId, arrivals, isRunning);
             },
           }
         : {}),
@@ -1492,8 +1492,7 @@ export class ActorMesh {
    */
   private shadowResponsiveInterruptions(
     actorId: string,
-    incoming: readonly InboxEntry[],
-    baseline: "interrupt" | "queue",
+    incoming: readonly ResponsiveArrival[],
     wasRunning: boolean
   ): void {
     const classifier = this.responsiveInterruption;
@@ -1503,7 +1502,7 @@ export class ActorMesh {
     // selection, so a selection spares the full unhandled scan entirely.
     const pendingEntryIds =
       selectedEntryIds.length > 0 ? [] : this.unselectedInboxEntryIds(actorId, selectedEntryIds);
-    for (const entry of incoming) {
+    for (const { entry, baseline } of incoming) {
       // Explicit Run Now is an operator control, not a classifier candidate.
       // Direct interrupt() does not dispatch at all, preserving its hard path.
       if (entry.payload.type === "operator.run_now") continue;

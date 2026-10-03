@@ -609,6 +609,172 @@ describe("monolithic follower instance", () => {
     );
   });
 
+  describe("joining responsive work (#829)", () => {
+    function noDisplacement(h: Harness, id: string) {
+      expect(h.logs.some((log) => log.event === "remote_preempt_requested")).toBe(false);
+      expect(
+        h.events.some((event) => event.actorId === id && event.event.type === "preempted")
+      ).toBe(false);
+      expect(h.meshEvents.some((event) => event.kind === "run_preempted")).toBe(false);
+    }
+
+    it("lets an in-flight remote run finish and starts one responsive follow-up", async () => {
+      const h = setup({ delayMs: 500 });
+      const id = h.spawn("Finish this run");
+      await waitUntil(() => h.runtime(id).isRunning);
+      const [original] = runStarts(h, id);
+
+      h.dispatchJoining(id);
+
+      await waitUntil(() => runStarts(h, id).length === 2);
+      noDisplacement(h, id);
+      // The original run was not aborted: it ended exactly once, successfully,
+      // before the follow-up that sees the joining row started.
+      const results = runResults(h, id);
+      expect(results).toHaveLength(1);
+      expect(results[0]?.event.type === "result" && results[0].event.result.success).toBe(true);
+      const starts = h.events.filter(
+        (event) => event.actorId === id && event.event.type === "runStart"
+      );
+      expect(starts[0]?.event.type === "runStart" && starts[0].event.runId).toBe(original);
+      expect(starts[1]?.event).toEqual(expect.objectContaining({ responsive: true }));
+      expect(h.events.indexOf(results[0] as (typeof h.events)[number])).toBeLessThan(
+        h.events.indexOf(starts[1] as (typeof h.events)[number])
+      );
+      await waitUntil(() => runResults(h, id).length === 2);
+      expect(h.failures).toEqual([]);
+    });
+
+    it("promotes a queued remote admission held by the leader without a preempt", async () => {
+      const h = setup({ delayMs: 500 });
+      const first = h.spawn("Occupy the ordinary admission lane");
+      await waitUntil(() => h.runtime(first).isRunning);
+      const queued = h.spawn("Promote me by joining");
+      await waitUntil(() => h.runtime(queued).isQueued);
+      const queuedRun = queuedRuns(h, queued)[0];
+
+      h.dispatchJoining(queued);
+
+      await waitUntil(() => runStarts(h, queued).length === 1);
+      // The queued run itself absorbs the row at responsive priority: no
+      // second run, and the occupying run was not displaced either.
+      expect(runStarts(h, queued)).toEqual([queuedRun?.runId]);
+      expect(h.events).toContainEqual({
+        actorId: queued,
+        event: expect.objectContaining({ type: "runStart", responsive: true }),
+      });
+      expect(h.logs).toContainEqual(
+        expect.objectContaining({
+          event: "remote_admission_promoted",
+          fields: expect.objectContaining({ actorId: queued }),
+        })
+      );
+      expect(runResults(h, first)).toHaveLength(0);
+      noDisplacement(h, queued);
+    });
+
+    it("promotes a queued remote admission from the after-commit join seam", async () => {
+      const h = setup({ delayMs: 500 });
+      const first = h.spawn("Occupy the ordinary admission lane");
+      await waitUntil(() => h.runtime(first).isRunning);
+      const queued = h.spawn("Promote me from a subscriber copy");
+      await waitUntil(() => h.runtime(queued).isQueued);
+      const queuedRun = queuedRuns(h, queued)[0];
+
+      // No caller dispatch: the append's own after-commit wake joins, which
+      // never reaches preemptForResponsive, so only the wake can promote.
+      h.inboxStore.append([
+        {
+          actorId: queued,
+          source: "test:subscriber",
+          payload: { type: "test.event", priority: "responsive", deliveryRole: "subscriber" },
+        },
+      ]);
+
+      await waitUntil(() => runStarts(h, queued).length === 1);
+      expect(runStarts(h, queued)).toEqual([queuedRun?.runId]);
+      expect(h.events).toContainEqual({
+        actorId: queued,
+        event: expect.objectContaining({ type: "runStart", responsive: true }),
+      });
+      expect(runResults(h, first)).toHaveLength(0);
+      noDisplacement(h, queued);
+    });
+
+    it("admits responsive when the joining row lands before the admission request", async () => {
+      const h = setup({ delayMs: 500 });
+      const first = h.spawn("Occupy the ordinary admission lane");
+      await waitUntil(() => h.runtime(first).isRunning);
+      const held: Parameters<typeof h.remote.receive>[0][] = [];
+      const receive = h.remote.receive.bind(h.remote);
+      h.remote.receive = (event) => {
+        if (event.message.type === "request" && event.message.request.op === "admit") {
+          held.push(event);
+          return;
+        }
+        receive(event);
+      };
+      const queued = h.spawn("Join before you admit me");
+      await waitUntil(() => h.runtime(queued).isQueued && held.length === 1);
+
+      h.dispatchJoining(queued);
+      h.remote.receive = receive;
+      for (const event of held.splice(0)) receive(event);
+
+      await waitUntil(() => runStarts(h, queued).length === 1);
+      expect(h.events).toContainEqual({
+        actorId: queued,
+        event: expect.objectContaining({ type: "runStart", responsive: true }),
+      });
+      expect(h.logs).toContainEqual(
+        expect.objectContaining({
+          event: "remote_admission_promoted",
+          fields: expect.objectContaining({ actorId: queued }),
+        })
+      );
+      expect(runResults(h, first)).toHaveLength(0);
+      noDisplacement(h, queued);
+    });
+
+    it("keeps joining across a disconnect and its reconciliation replay", async () => {
+      const h = setup({ delayMs: 1500 });
+      const id = h.spawn("Keep running across the gap");
+      await waitUntil(() => h.runtime(id).isRunning);
+      const [original] = runStarts(h, id);
+
+      h.remote.close();
+      await h.runtime(id).exited;
+      h.dispatchJoining(id);
+      await waitUntil(() =>
+        h.logs.some(
+          (log) =>
+            log.event === "remote_wake_dropped" &&
+            log.fields?.actorId === id &&
+            log.fields?.priority === "responsive"
+        )
+      );
+      expect(h.logs.some((log) => log.event === "remote_preempt_deferred")).toBe(false);
+
+      const reconnect = h.reconnect();
+      h.runtime(id).attachHost(reconnect.createHost(id));
+      // Register-time and boot reconciliation re-read the same durable row.
+      h.mesh.dispatch(id);
+      h.mesh.reconcileInbox();
+      await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+
+      await waitUntil(() => runStarts(h, id).length === 2);
+      noDisplacement(h, id);
+      const results = runResults(h, id);
+      expect(results).toHaveLength(1);
+      expect(results[0]?.event.type === "result" && results[0].event.result.success).toBe(true);
+      expect(runStarts(h, id)[0]).toBe(original);
+      expect(
+        h.events.filter((event) => event.actorId === id && event.event.type === "runStart")[1]
+          ?.event
+      ).toEqual(expect.objectContaining({ responsive: true }));
+    });
+  });
+
   it("drops a pre-gate remote admission without retaining it and replays newer work (#787)", async () => {
     const h = setup({ delayMs: 500 });
     // Hold the follower's admission request after its queued state reaches the
