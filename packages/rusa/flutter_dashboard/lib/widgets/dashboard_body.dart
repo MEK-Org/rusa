@@ -215,7 +215,8 @@ class _DashboardBodyState extends State<DashboardBody> {
     return LayoutBuilder(
       builder: (context, constraints) {
         _resolveLandingView(constraints);
-        if (constraints.maxWidth >= kNarrowBreakpoint) {
+        if (constraints.maxWidth >= kNarrowBreakpoint &&
+            _view != DashboardView.chatRoom) {
           return _chrome();
         }
         // On a phone the header's leading slot carries the navigation: the
@@ -230,7 +231,9 @@ class _DashboardBodyState extends State<DashboardBody> {
             // A nested Scaffold of our own: the drawer has to hang off a
             // Scaffold, and this body is rendered directly — without main.dart's
             // — by the screenshot harness and the widget tests, so owning one
-            // keeps the drawer (and this file) VM-safe.
+            // keeps the drawer (and this file) VM-safe. Room uses this scaffold
+            // at every width: without its header, the left-edge drawer gesture
+            // is the navigation entry point on desktop as well as phones.
             return Scaffold(
               key: _scaffoldKey,
               backgroundColor: MeshColors.bgPrimary,
@@ -301,7 +304,7 @@ class _DashboardBodyState extends State<DashboardBody> {
       color: MeshColors.bgPrimary,
       child: Column(
         children: [
-          phoneHeader,
+          if (_view != DashboardView.chatRoom) phoneHeader,
           Expanded(
             child: _view == DashboardView.overview
                 ? OverviewTab(store: widget.store, onSelectView: _selectView)

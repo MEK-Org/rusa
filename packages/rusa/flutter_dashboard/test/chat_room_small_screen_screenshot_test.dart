@@ -4,7 +4,7 @@
 //   flutter test test/chat_room_small_screen_screenshot_test.dart
 //
 // It writes `flutter_dashboard/screenshots/chat_room_small_three_<state>.png`:
-// the real dashboard body, phone header included, on the Room with three
+// the real dashboard body, with the Room's header removed (#859), with three
 // actors, idle, recording and speaking. The viewport approximates a flip
 // phone's cover screen: a 1080x1272 px panel at an assumed device pixel ratio
 // of 2.625 is about 411x485 logical px.
