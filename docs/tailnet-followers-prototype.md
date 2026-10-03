@@ -212,6 +212,62 @@ at the cost of putting a bearer capability in a URL, where request logs, proxies
 and process listings can capture it. The gateway therefore never logs request
 paths, and the routing table is in memory only.
 
+### Event delivery
+
+The follower keeps each outbound event until the leader acknowledges it, and
+delivers in FIFO order. The gateway reads at most 8 MiB per request body,
+counting the whole UTF-8 JSON request: identity, session, batch ID and every
+serialized event with its escaping. An ordinary `POST /events` batch is the
+largest prefix of at most 100 events that fits; a retry after an uncertain
+acknowledgement resends the same batch ID and events, and the leader's batch
+and event fences ignore a repeat.
+
+An event too large for any batch on its own — a long log chunk, run result or
+request — is sent alone by negotiated transfer (#876). The leader advertises
+`eventTransfer` in its `/register` reply, and a follower uses
+`POST /events/transfer` only after seeing it; ordinary `/events` and the
+protocol version are unchanged. The follower serializes the event once and
+sends it in fragments of at most 1 MiB raw bytes, each with the event's
+original ID, total length and SHA-256, and its own index, offset and SHA-256.
+The leader stages fragments and, once the digest of the reassembled bytes
+matches, dispatches the original event through the same acceptance path and
+event fence as `/events`. Only the final `complete` answer lets the follower
+drop the event; an intermediate answer means the leader holds bytes, not that
+the event was delivered.
+
+The leader bounds staging: an original event of at most 64 MiB, one incomplete
+transfer per follower, eight and 128 MiB of declared bytes across all
+followers. Staging expires five minutes after its last newly accepted fragment
+(a repeated fragment does not extend it) and thirty minutes after it began, and
+is discarded when the follower's generation is replaced; the follower then
+restarts at fragment zero with the same event. Exhausted capacity is a
+retryable `busy` answer. A final acknowledgement lost even after staging
+expired is answered `complete` from the existing event fence.
+
+An event the follower cannot send — larger than 64 MiB, refused by the leader,
+or facing a leader that did not advertise transfer — is *parked*: it stays at
+the head of the queue with its bytes intact, later events wait visibly behind
+it, and the follower logs `follower_event_parked` once with the event ID, type,
+size, limit and reason, never its content. Parked delivery is not retried until
+a new registration brings a capability; nothing is truncated, dropped or
+reported as delivered. Deploy an upgraded leader before relying on transfer
+from upgraded followers. A follower built before #876 is still accepted and
+keeps its old limit: an event that alone exceeds 8 MiB blocks its queue.
+
+Acceptance means the leader's receiver returned without throwing; it says
+nothing about later durable processing. If the receiver throws, the leader
+records the event as failed in the same bounded per-follower event fence and
+answers HTTP 409 `acceptance_failed` — for `/events` with the failing event's
+ID, after any earlier events in that batch were accepted. Every retry of that
+event in the same leader incarnation gets the same answer, whatever its batch
+or transfer ID and across session renewal or staging expiry, and the receiver
+is not invoked again, because an earlier listener may already have acted. The
+follower drops only the accepted prefix, parks the failed event with its
+original bytes and stops resending it; later events wait behind it until an
+operator intervenes or a new leader incarnation fences the queue. A follower
+built before #876 retries the refused batch on its ordinary timer instead of
+parking.
+
 ## Reconnect and durability across leader restarts
 
 1. **Durable placement**: `executionTarget` is persisted on the `ActorRecord` in `mesh.db`'s

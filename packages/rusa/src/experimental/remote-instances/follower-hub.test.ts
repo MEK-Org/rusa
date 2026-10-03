@@ -6,9 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Logger } from "../../observability/logger.js";
-import { FollowerHub } from "./follower-hub.js";
+import { FollowerEventQueue } from "./follower-event-queue.js";
+import { type FollowerEvent, FollowerHub } from "./follower-hub.js";
 import { FollowerUpdateTriggerStore } from "./follower-update-trigger-store.js";
-import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
+import { FOLLOWER_HTTP_BODY_LIMIT_BYTES, INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
 const hubs: FollowerHub[] = [];
 afterEach(async () => {
@@ -64,6 +65,72 @@ async function setup(options?: { logger?: Logger; triggerStore?: FollowerUpdateT
 }
 
 describe("leader follower gateway", () => {
+  it("delivers complete escaped receipts and the following terminal event within the HTTP limit", async () => {
+    const h = await setup();
+    const identity = await h.register("mac");
+    const host = h.hub.createHost("mac", "actor-1");
+    // Two individually fitting events are the smallest batch that can cross the bound.
+    // Each control character takes six bytes in JSON; envelope overhead crosses it.
+    const eventCount = 2;
+    const chunk = `${"\u0001".repeat(Math.floor(FOLLOWER_HTTP_BODY_LIMIT_BYTES / 12))}synthetic tail ✓`;
+    const received: string[] = [];
+    let terminal = false;
+    host.on("message", (message) => {
+      if (message.type === "log") received.push(message.chunk);
+    });
+    host.on("exit", () => {
+      terminal = true;
+    });
+    const queue = new FollowerEventQueue();
+    const events: FollowerEvent[] = [];
+    for (let index = 0; index < eventCount; index++) {
+      const event: FollowerEvent = {
+        eventId: `log-${index}`,
+        actorId: "actor-1",
+        message: { type: "log", chunk },
+      };
+      events.push(event);
+      queue.enqueue(event);
+    }
+    const envelope = { ...identity, batchId: "00000000-0000-0000-0000-000000000000" };
+    const aggregateBytes = Buffer.byteLength(JSON.stringify({ ...envelope, events }));
+    expect(aggregateBytes).toBeGreaterThan(FOLLOWER_HTTP_BODY_LIMIT_BYTES);
+    expect(aggregateBytes - FOLLOWER_HTTP_BODY_LIMIT_BYTES).toBeLessThan(4096);
+    for (const event of events) {
+      expect(Buffer.byteLength(JSON.stringify({ ...envelope, events: [event] }))).toBeLessThan(
+        FOLLOWER_HTTP_BODY_LIMIT_BYTES
+      );
+    }
+    queue.enqueue({
+      eventId: "terminal",
+      actorId: "actor-1",
+      message: { type: "exit", code: 0, signal: null },
+    });
+    const requestBytes: number[] = [];
+    let loseAcknowledgement = true;
+    const batchIds: string[] = [];
+    const deliver = async (batch: { batchId: string; events: FollowerEvent[] }) => {
+      batchIds.push(batch.batchId);
+      requestBytes.push(Buffer.byteLength(JSON.stringify({ ...identity, ...batch })));
+      const response = await h.post("/events", { ...identity, ...batch });
+      expect(response.status).toBe(200);
+      await response.json();
+      if (loseAcknowledgement) {
+        loseAcknowledgement = false;
+        throw new Error("synthetic lost acknowledgement");
+      }
+    };
+    await expect(queue.flush(deliver, identity)).rejects.toThrow("synthetic lost acknowledgement");
+    expect(queue.hasPending).toBe(true);
+    await queue.flush(deliver, identity);
+    expect(batchIds[0]).toBe(batchIds[1]);
+    expect(requestBytes).toHaveLength(3);
+    expect(requestBytes[0]).toBe(requestBytes[1]);
+    expect(Math.max(...requestBytes)).toBeLessThanOrEqual(FOLLOWER_HTTP_BODY_LIMIT_BYTES);
+    expect(received).toEqual(Array(eventCount).fill(chunk));
+    expect(terminal).toBe(true);
+    expect(queue.hasPending).toBe(false);
+  });
   it("rolls a same-process registration forward without dropping its actor channel", async () => {
     const h = await setup();
     const registrations: string[] = [];
