@@ -67,7 +67,6 @@ import {
   viewingUserPrincipalId,
 } from "./human-chat-scope.js";
 import { selectPrioritizedInboxItem } from "./inbox-selection.js";
-import { canReadRunPrompt } from "./run-prompt-visibility.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
@@ -2097,16 +2096,15 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  // Launch text is fetched only on demand, with the same participant scope as events.
+  // Complete launch text is fetched on demand through the existing dashboard access path.
   const runPromptMatch = /^\/api\/mesh\/runs\/([^/]+)\/prompt$/.exec(pathname);
   if (runPromptMatch && req.method === "GET") {
     const retained = deps.runPrompts?.getById(decodeURIComponent(runPromptMatch[1]));
-    if (!retained || !canReadRunPrompt(retained.provenance, viewerScope())) {
-      sendJson(res, 404, { error: "prompt not retained or not accessible" });
+    if (!retained) {
+      sendJson(res, 404, { error: "prompt not retained" });
       return true;
     }
-    const { provenance: _provenance, ...response } = retained;
-    sendJson(res, 200, response);
+    sendJson(res, 200, retained);
     return true;
   }
 

@@ -3,11 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runMigrations } from "../migrations/runner.js";
 import { createActorRunModelConfig } from "./actor-run-model-config.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
-import {
-  RUN_PROMPT_MAX_BYTES,
-  RUN_PROMPT_RETENTION_MS,
-  RunPromptRepository,
-} from "./run-prompt-repository.js";
+import { RUN_PROMPT_RETENTION_MS, RunPromptRepository } from "./run-prompt-repository.js";
 
 describe("#866 retained launch prompts", () => {
   let db: Database.Database;
@@ -26,28 +22,34 @@ describe("#866 retained launch prompts", () => {
     });
   });
   afterEach(() => db.close());
-  it("retains the last launched fallback including provider and original byte count", () => {
-    prompts.record(runId, "first", "claude", null, now);
-    prompts.record(runId, "second ✓", "antigravity", null, now);
+  it("retains the last launch input including provider", () => {
+    prompts.record(runId, "first", "claude", now);
+    prompts.record(runId, "second ✓", "antigravity", now);
     expect(prompts.getById(runId, now)).toMatchObject({
       prompt: "second ✓",
-      promptBytes: 10,
       provider: "antigravity",
-      truncated: false,
     });
     expect(db.prepare("SELECT count(*) n FROM run_prompts").get()).toEqual({ n: 1 });
   });
-  it("caps the UTF-8 head on a code point boundary", () => {
-    const text = "a".repeat(RUN_PROMPT_MAX_BYTES - 1) + "😀tail";
-    prompts.record(runId, text, "claude", null, now);
-    const retained = prompts.getById(runId, now);
-    if (!retained) throw new Error("missing retained prompt");
-    expect(retained.prompt).toBe("a".repeat(RUN_PROMPT_MAX_BYTES - 1));
-    expect(retained.promptBytes).toBe(Buffer.byteLength(text));
-    expect(retained.truncated).toBe(true);
+  it("retains complete text beyond the former cap without reformatting", () => {
+    const text = "a".repeat(300_000) + "😀tail\n\n  indented\r\n";
+    prompts.record(runId, text, "claude", now);
+    expect(prompts.getById(runId, now)?.prompt).toBe(text);
+  });
+  it("never serves an older fallback when the new receipt fails", () => {
+    prompts.record(runId, "first", "claude", now);
+    db.exec(
+      "CREATE TRIGGER deny_prompt BEFORE INSERT ON run_prompts BEGIN SELECT RAISE(ABORT, 'receipt denied'); END"
+    );
+    expect(() => prompts.record(runId, "second", "kimi", now)).toThrow("receipt denied");
+    expect(prompts.getById(runId, now)).toBeNull();
+    expect(new RunPromptRepository(db).getById(runId, now)).toBeNull();
+    db.exec("DROP TRIGGER deny_prompt");
+    prompts.record(runId, "third", "codex", now);
+    expect(prompts.getById(runId, now)?.prompt).toBe("third");
   });
   it("expires reads immediately and prunes after 30 days with an injected clock", () => {
-    prompts.record(runId, "fixture", "claude", null, now);
+    prompts.record(runId, "fixture", "claude", now);
     expect(prompts.getById(runId, now + RUN_PROMPT_RETENTION_MS)).not.toBeNull();
     expect(prompts.getById(runId, now + RUN_PROMPT_RETENTION_MS + 1)).toBeNull();
     expect(prompts.prune(now + RUN_PROMPT_RETENTION_MS)).toBe(0);
@@ -55,12 +57,14 @@ describe("#866 retained launch prompts", () => {
     expect(new ActorRunRepository(db).getById(runId)).not.toBeNull();
   });
   it("cascades a deleted run without changing event rows", () => {
-    prompts.record(runId, "fixture", "claude", null, now);
+    prompts.record(runId, "fixture", "claude", now);
     db.prepare("DELETE FROM actor_runs WHERE id = ?").run(runId);
     expect(prompts.getById(runId, now)).toBeNull();
   });
-  it("retains unknown launch provenance as ineligible rather than inventing shared visibility", () => {
-    prompts.recordForActor("actor", runId, "fixture", "claude");
-    expect(prompts.getById(runId)?.provenance).toBeNull();
+  it("accepts production actor run receipts while rejecting mismatched run identity", () => {
+    prompts.recordForActor("other-actor", runId, "wrong", "claude");
+    expect(prompts.getById(runId)).toBeNull();
+    prompts.recordForActor("actor", runId, "complete fixture", "claude");
+    expect(prompts.getById(runId)?.prompt).toBe("complete fixture");
   });
 });

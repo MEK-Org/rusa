@@ -46,14 +46,12 @@ class EventsTab extends StatelessWidget {
               store.events,
               store.selection,
               store.actorStates,
-              store.dashboardConfig,
             ]),
             builder: (_, _) {
               final view = store.events.value;
               final multi = store.selection.value.length > 1;
               final handles = {
-                for (final a in store.actorStates.value.actors.values)
-                  a.thread.id: a.thread.handle,
+                for (final a in store.actorStates.value.actors.values) a.thread.id: a.thread.handle,
               };
               if (store.selection.value.isEmpty) {
                 return _empty('Select an actor to see its events.');
@@ -121,16 +119,6 @@ class EventsTab extends StatelessWidget {
         ? (row.yielded!.body ?? e.detail)
         : (isMessage ? (e.body ?? e.detail) : e.detail);
     final resolvedRunModel = e.resolvedRunModel;
-    String? runId;
-    if (e.kind == 'run_start' && e.payload != null) {
-      try {
-        final payload = jsonDecode(e.payload!) as Map<String, dynamic>;
-        if (payload['runId'] is String &&
-            (payload['runId'] as String).isNotEmpty) {
-          runId = payload['runId'] as String;
-        }
-      } catch (_) {}
-    }
 
     Widget? peerLabel;
     String? directionPeer;
@@ -141,30 +129,34 @@ class EventsTab extends StatelessWidget {
         if (e.kind == 'message_sent' && decoded.containsKey('to')) {
           directionPeer = decoded['to'] as String?;
           hasDirection = true;
-        } else if (e.kind == 'message_received' &&
-            decoded.containsKey('from')) {
+        } else if (e.kind == 'message_received' && decoded.containsKey('from')) {
           directionPeer = decoded['from'] as String?;
           hasDirection = true;
         }
       } catch (_) {}
     }
 
-    if ((e.kind == 'message_sent' || e.kind == 'message_received') &&
-        hasDirection) {
+    if ((e.kind == 'message_sent' || e.kind == 'message_received') && hasDirection) {
       final display = (directionPeer != null && directionPeer.isNotEmpty)
           ? (handles[directionPeer] ?? directionPeer)
           : 'unknown';
       final prep = e.kind == 'message_sent' ? 'to' : 'from';
       peerLabel = Text(
         '$prep $display',
-        style: kMonoStyle.copyWith(color: MeshColors.textMuted, fontSize: 11),
+        style: kMonoStyle.copyWith(
+          color: MeshColors.textMuted,
+          fontSize: 11,
+        ),
       );
     } else if (e.parentId != null) {
       peerLabel = Tooltip(
         message: 'Parent',
         child: Text(
           '→ ${handles[e.parentId] ?? e.parentId}',
-          style: kMonoStyle.copyWith(color: MeshColors.textMuted, fontSize: 11),
+          style: kMonoStyle.copyWith(
+            color: MeshColors.textMuted,
+            fontSize: 11,
+          ),
         ),
       );
     } else if (e.handleId != null) {
@@ -172,7 +164,10 @@ class EventsTab extends StatelessWidget {
         message: 'Handle',
         child: Text(
           '→ ${handles[e.handleId] ?? e.handleId}',
-          style: kMonoStyle.copyWith(color: MeshColors.textMuted, fontSize: 11),
+          style: kMonoStyle.copyWith(
+            color: MeshColors.textMuted,
+            fontSize: 11,
+          ),
         ),
       );
     }
@@ -230,7 +225,7 @@ class EventsTab extends StatelessWidget {
                 ],
                 if (runId != null)
                   RunPromptDisclosure(
-                    key: ValueKey('${store.userPrincipalId}:$runId'),
+                    key: ValueKey(runId),
                     runId: runId,
                     api: store.api,
                   ),

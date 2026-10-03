@@ -305,95 +305,35 @@ describe("human chat isolation (#590)", () => {
     }>;
   };
 
-  it("#866 scopes retained prompt text to its participants with two authenticated viewers", async () => {
+  it("#866 displays complete launch text through existing authenticated dashboard access", async () => {
     const a = await login(alice);
     const b = await login(bob);
-    record(a.id, ACTOR, "private fixture input");
     const runs = new ActorRunRepository(db);
     const prompts = new RunPromptRepository(db);
     const runId = runs.start({
       actorId: ACTOR,
       modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
     });
-    prompts.record(runId, "private fixture prompt", "claude", {
-      version: 1,
-      complete: true,
-      sources: [
-        { id: "fixture-scaffold", classification: "shared" },
-        {
-          id: "fixture-inherited-ledger-message",
-          classification: "human_chat",
-          participants: [
-            { id: a.id, kind: "user" },
-            { id: ACTOR, kind: "actor" },
-          ],
-        },
-      ],
-    });
+    const prompt = "# Synthetic charter\n\n  Preserve whitespace ✓\r\n" + "x".repeat(300_000);
+    prompts.recordForActor(ACTOR, runId, prompt, "claude");
     meshEvents.record({ kind: "run_start", actorId: ACTOR, payload: JSON.stringify({ runId }) });
+    const path = `/api/mesh/runs/${runId}/prompt`;
+    const anonymous = await fetch(origin + path);
+    expect(anonymous.status).toBe(401);
+    expect(await anonymous.text()).not.toContain("Synthetic charter");
     for (const cookie of [a.cookie, b.cookie]) {
-      const visible = await fetch(`${origin}/api/mesh/events?actors=${ACTOR}`, {
+      const response = await fetch(origin + path, { headers: { Cookie: cookie } });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ prompt, provider: "claude" });
+      const missing = await fetch(origin + "/api/mesh/runs/pre-feature/prompt", {
         headers: { Cookie: cookie },
       });
-      expect(JSON.stringify(await visible.json())).toContain(runId);
+      expect(missing.status).toBe(404);
     }
-    const sharedRunId = runs.start({
-      actorId: ACTOR,
-      modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
-    });
-    prompts.record(sharedRunId, "shared fixture", "claude", {
-      version: 1,
-      complete: true,
-      sources: [{ id: "positively-complete-synthetic-shared-inputs", classification: "shared" }],
-    });
-    for (const cookie of [a.cookie, b.cookie]) {
-      expect(
-        (
-          await fetch(`${origin}/api/mesh/runs/${sharedRunId}/prompt`, {
-            headers: { Cookie: cookie },
-          })
-        ).status
-      ).toBe(200);
-    }
-    const unknownRunId = runs.start({
-      actorId: ACTOR,
-      modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
-    });
-    prompts.recordForActor(ACTOR, unknownRunId, "unknown provenance fixture", "claude");
-    expect(
-      (
-        await fetch(`${origin}/api/mesh/runs/${unknownRunId}/prompt`, {
-          headers: { Cookie: a.cookie },
-        })
-      ).status
-    ).toBe(404);
-    const path = `/api/mesh/runs/${runId}/prompt`;
-    const own = await fetch(origin + path, { headers: { Cookie: a.cookie } });
-    expect(own.status).toBe(200);
-    expect(await own.json()).toMatchObject({
-      prompt: "private fixture prompt",
-      provider: "claude",
-    });
-    const other = await fetch(origin + path, { headers: { Cookie: b.cookie } });
-    expect(other.status).toBe(404);
-    expect(await other.text()).not.toContain("private fixture");
-    // New unrelated message traffic cannot broaden or narrow a completed run's snapshot.
-    record(b.id, ACTOR, "later private input");
-    expect((await fetch(origin + path, { headers: { Cookie: a.cookie } })).status).toBe(200);
-    const missing = await fetch(origin + "/api/mesh/runs/pre-feature/prompt", {
-      headers: { Cookie: a.cookie },
-    });
-    expect(missing.status).toBe(404);
     const feed = await fetch(`${origin}/api/mesh/events?actors=${ACTOR}`, {
       headers: { Cookie: a.cookie },
     });
-    const events: EventPage = (await feed.json()) as EventPage;
-    expect(JSON.stringify(events)).not.toContain("private fixture prompt");
-    // Synthetic source/history deletion and user reclassification cannot widen a preserved private requirement.
-    db.exec("DELETE FROM mesh_chat; DELETE FROM mesh_events;");
-    db.prepare("DELETE FROM users WHERE principal_id = ?").run(a.id);
-    db.prepare("UPDATE principals SET kind = 'actor' WHERE id = ?").run(a.id);
-    expect((await fetch(origin + path, { headers: { Cookie: b.cookie } })).status).toBe(404);
+    expect(JSON.stringify(await feed.json())).not.toContain("Synthetic charter");
   });
 
   /** Two humans each talk to the actor and the actor answers each of them. */
