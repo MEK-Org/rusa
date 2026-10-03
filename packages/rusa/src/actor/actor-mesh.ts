@@ -7,7 +7,7 @@ import {
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
-import { HUMAN_OPERATOR, isHumanOperator, MESH_SYSTEM } from "../mcp/stamp.js";
+import { isHumanOperator, MESH_SYSTEM } from "../mcp/stamp.js";
 import {
   isBlockingObligationStatus,
   isReadyForAttention,
@@ -511,10 +511,8 @@ function isTrustedControlPrincipal(
 ): boolean {
   return (
     by === "root-llm" ||
-    by === "human:operator" ||
-    by.startsWith("human:") ||
     by === "e2e-controller" ||
-    (principals !== undefined && principals.getUser(by) !== undefined)
+    (principals !== undefined && !!principals.getUser(by) && !principals.getUser(by)?.disabledAt)
   );
 }
 
@@ -2994,6 +2992,20 @@ export class ActorMesh {
     }
   }
 
+  /** Resolve the human side of the currently leased conversation, never a local fallback. */
+  activeVoicePrincipalIdFor(actorId: string): string | undefined {
+    const sessionId = this.activeVoiceSessionIdFor(actorId);
+    if (!sessionId) return undefined;
+    const humans = new Set<string>();
+    for (const chat of this.listVoiceSessionChat?.(sessionId) ?? []) {
+      for (const id of [chat.senderId, chat.recipientId]) {
+        const user = this.principals?.getUser(id);
+        if (user && !user.disabledAt) humans.add(id);
+      }
+    }
+    return humans.size === 1 ? [...humans][0] : undefined;
+  }
+
   /** Resolve an active live actor from the caller's own handle set. */
   private resolveHeldActiveActor(requesterId: string, targetHandleOrId: string): ActorRecord {
     const requested = targetHandleOrId.trim();
@@ -4195,10 +4207,13 @@ export class ActorMesh {
     toId: string,
     body: string,
     sessionId: string,
-    opts?: { voice?: boolean; fromId?: string }
+    opts: { voice?: boolean; fromId: string }
   ): MessageDeliveryResult {
     toId = this.resolveThreadId(toId);
-    const fromId = opts?.fromId ?? HUMAN_OPERATOR;
+    const fromId = opts.fromId;
+    if (!this.principals?.getUser(fromId) || this.principals.getUser(fromId)?.disabledAt) {
+      throw new Error("human message requires an active durable user principal");
+    }
     const rec = this.actors.get(toId);
     if (!rec || rec.status !== "active") {
       this.log(`message to ${toId} from ${fromId} dropped — recipient not active`);
@@ -4418,10 +4433,7 @@ export class ActorMesh {
    * interrupted run's start time, and only schedules a re-run if newer unhandled inbox
    * items have arrived after the interrupted run started.
    */
-  interrupt(
-    targetId: string,
-    by: string = "human:operator"
-  ): { interrupted: boolean; status?: string } {
+  interrupt(targetId: string, by: string): { interrupted: boolean; status?: string } {
     targetId = this.resolveThreadId(targetId);
     by = this.resolveThreadId(by);
     const target = this.runs.liveActor(targetId);

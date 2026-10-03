@@ -4,6 +4,7 @@ import {
   type PrincipalRepository,
 } from "../db/repositories/principal-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import { IMPLICIT_USER_EMAIL } from "../principals/implicit-user.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
 
 /** Safe response text for an admitted, verified account that cannot claim its
@@ -50,6 +51,7 @@ export class DashboardIdentityResolver {
       subject: token.sub,
     };
     const email = normalizeEmail(token.email);
+    if (email === IMPLICIT_USER_EMAIL) throw new Error("Reserved admission email");
     let user = repo.findUserByExternalIdentity(identity);
     if (!user) {
       try {

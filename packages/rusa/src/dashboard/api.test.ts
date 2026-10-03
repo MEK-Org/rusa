@@ -609,41 +609,13 @@ describe("handleMeshApiRequest", () => {
       expect(runNowMock).toHaveBeenCalledWith(UUID_A, other);
     });
 
-    it("uses the legacy local identity when no durable user is active", async () => {
+    it("refuses every mutation when all users are disabled", async () => {
       principals.setDisabled(LOCAL_USER, "2026-06-22T00:00:00.000Z");
-      obligations.create({ id: "task", ownerId: UUID_A, title: "local cancellation" });
-
-      const { res } = await call(
-        deps,
-        "POST",
-        "/api/mesh/obligations/task/status",
-        JSON.stringify({ status: "cancelled" })
-      );
-      await settled(res);
-
-      expect(res.statusCode).toBe(200);
-      expect(obligations.listHistory("task")).toEqual(
-        expect.arrayContaining([expect.objectContaining({ actingPrincipal: HUMAN_OPERATOR })])
-      );
+      await expectAllRejected(deps, "no durable user principal");
     });
-
-    it("cancels with the legacy local identity when no durable principal is available (#509)", async () => {
+    it("refuses every mutation when durable storage is unavailable", async () => {
       const { principals: _omitted, ...withoutPrincipals } = deps;
-      obligations.create({ id: "task", ownerId: UUID_A, title: "local cancellation" });
-
-      const { res } = await call(
-        withoutPrincipals,
-        "POST",
-        "/api/mesh/obligations/task/status",
-        JSON.stringify({ status: "cancelled", note: "local stop" })
-      );
-      await settled(res);
-
-      expect(res.statusCode).toBe(200);
-      expect(obligations.get("task")?.status).toBe("cancelled");
-      expect(obligations.listHistory("task")).toEqual(
-        expect.arrayContaining([expect.objectContaining({ actingPrincipal: HUMAN_OPERATOR })])
-      );
+      await expectAllRejected(withoutPrincipals, "no durable user principal");
     });
 
     it("rejects every mutation as ambiguous when several users are active, never guessing", async () => {
@@ -692,7 +664,7 @@ describe("handleMeshApiRequest", () => {
         deps,
         "POST",
         "/api/mesh/obligations",
-        JSON.stringify({ ownerId: HUMAN_OPERATOR, title: "decide" })
+        JSON.stringify({ ownerId: LOCAL_USER, title: "decide" })
       );
       await settled(created.res);
       expect(created.res.statusCode).toBe(201);
@@ -701,7 +673,7 @@ describe("handleMeshApiRequest", () => {
         deps,
         "POST",
         "/api/mesh/obligations/legacy/reassign",
-        JSON.stringify({ ownerId: HUMAN_OPERATOR })
+        JSON.stringify({ ownerId: LOCAL_USER })
       );
       await settled(reassigned.res);
       expect(reassigned.res.statusCode).toBe(200);
@@ -4456,7 +4428,7 @@ describe("handleMeshApiRequest", () => {
           "POST",
           "/api/mesh/obligations",
           JSON.stringify({
-            ownerId: HUMAN_OPERATOR,
+            ownerId: LOCAL_USER,
             title: "Decide",
             creatorId: "actor-impostor",
           })
@@ -4465,8 +4437,6 @@ describe("handleMeshApiRequest", () => {
         expect(res.statusCode).toBe(201);
         const created = JSON.parse(res.body).obligation;
         expect(created.creatorId).toBe(LOCAL_USER);
-        // The legacy owner alias resolves to the durable user too, so the
-        // request mints no new `human:operator` row (#460).
         expect(created.ownerId).toBe(LOCAL_USER);
       });
 
@@ -4664,9 +4634,9 @@ describe("handleMeshApiRequest", () => {
         });
       });
 
-      it("treats a row still owned by the legacy operator alias as the operator's", async () => {
+      it("refuses snoozing a row owned by an unknown legacy participant", async () => {
         obligations.create({ title: "legacy", id: "legacy", ownerId: HUMAN_OPERATOR });
-        expect((await snooze("legacy", { until: future() })).status).toBe(200);
+        expect((await snooze("legacy", { until: future() })).status).toBe(403);
       });
 
       it("refuses an obligation the human does not own", async () => {
@@ -4965,7 +4935,7 @@ describe("handleMeshApiRequest", () => {
           deps,
           "POST",
           "/api/mesh/obligations/task-owner/reassign",
-          JSON.stringify({ ownerId: "human:operator" })
+          JSON.stringify({ ownerId: LOCAL_USER })
         );
         await new Promise((resolve) => process.nextTick(resolve));
         expect(res.statusCode).toBe(200);
@@ -4993,7 +4963,7 @@ describe("handleMeshApiRequest", () => {
           deps,
           "POST",
           "/api/mesh/obligations/missing/reassign",
-          JSON.stringify({ ownerId: "human:operator" })
+          JSON.stringify({ ownerId: LOCAL_USER })
         );
         await new Promise((resolve) => process.nextTick(resolve));
         expect(missing.res.statusCode).toBe(404);

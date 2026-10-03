@@ -23,12 +23,18 @@ import {
 import { startTrackerServer } from "../e2e/tracker-server.js";
 import { setIssueClient } from "../gitops/issue-client.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import { resolveSoleActiveUser } from "../principals/operator-principal.js";
 import { assertBwrapAvailable } from "../providers/sandbox.js";
 import { ActorHandle } from "../remote-instances/actor-handle.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import { type RunStartE2EHandles, runStart } from "./start.js";
+
+function operatorPrincipalId(): string {
+  const resolved = resolveSoleActiveUser(getRepositories().principals);
+  if (!resolved.ok) throw new Error(resolved.error);
+  return resolved.user.id;
+}
 
 /** Local issue tracker REST surface (the agent-facing "GitHub"). */
 const TRACKER_PORT = 8084;
@@ -568,9 +574,8 @@ export function startRootControlServer(opts: {
           return;
         }
         if (url.pathname === "/obligations") {
-          // The external driver IS the operator, so the creator is the shared
-          // HUMAN_OPERATOR id — the same server-side binding the actor MCP does
-          // with its own actor id, never a value read off the request.
+          // Attribute this trusted driver action to the sole local durable user,
+          // never an identity read from the incoming request.
           const obligation = getRepositories().obligations.create({
             ownerId: String(body.ownerId ?? ""),
             parentId: body.parentId == null ? null : String(body.parentId),
@@ -578,7 +583,7 @@ export function startRootControlServer(opts: {
             title: String(body.title ?? ""),
             externalRef: body.externalRef == null ? null : String(body.externalRef),
             priority: typeof body.priority === "number" ? body.priority : null,
-            creatorId: HUMAN_OPERATOR,
+            creatorId: operatorPrincipalId(),
           });
           send(res, 200, { obligation });
           return;
@@ -590,7 +595,7 @@ export function startRootControlServer(opts: {
             body.status === "cancelled" ? "cancelled" : "done",
             typeof body.note === "string" ? body.note : null,
             typeof body.resolutionRef === "string" ? body.resolutionRef : null,
-            HUMAN_OPERATOR
+            operatorPrincipalId()
           );
           send(res, 200, { obligation });
           return;
@@ -600,7 +605,7 @@ export function startRootControlServer(opts: {
           const obligation = getRepositories().obligations.reassign(
             decodeURIComponent(reassignMatch[1]),
             String(body.ownerId ?? ""),
-            HUMAN_OPERATOR
+            operatorPrincipalId()
           );
           send(res, 200, { obligation });
           return;
@@ -610,7 +615,7 @@ export function startRootControlServer(opts: {
           const obligation = getRepositories().obligations.reparent(
             decodeURIComponent(reparentMatch[1]),
             body.parentId == null ? null : String(body.parentId),
-            HUMAN_OPERATOR
+            operatorPrincipalId()
           );
           send(res, 200, { obligation });
           return;

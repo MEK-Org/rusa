@@ -12,6 +12,7 @@ import { runMigrations } from "../db/migrations/runner.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import { IMPLICIT_USER_EMAIL } from "../principals/implicit-user.js";
 import { executeLegacyPrincipalMigration } from "../principals/legacy-migration.js";
 import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
@@ -345,6 +346,25 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
       writeHead: vi.fn(),
       end: vi.fn(),
     }) as unknown as ServerResponse;
+
+  it("rejects reserved login even when an auth constructor explicitly admits the marker", async () => {
+    const reservedAuth = new DashboardAuth(
+      { firebase: config.firebase, allowedEmails: [IMPLICIT_USER_EMAIL] },
+      firebase,
+      new DashboardIdentityResolver(() => principals, config.firebase.projectId),
+      () => now
+    );
+    token = claim({ email: IMPLICIT_USER_EMAIL });
+    cookies.set(
+      "reserved-cookie",
+      claim({ ...token, iss: "https://session.firebase.google.com/project" })
+    );
+    const req = authRequest(`${SESSION_COOKIE}=reserved-cookie`);
+    expect(await reservedAuth.authorize(req, authResponse())).toBe(false);
+    expect(getDashboardRequestPrincipal(req)).toBeUndefined();
+    expect(principals.listUsers()).toEqual([]);
+    await reservedAuth.close();
+  });
 
   it("binds a durable principal without changing operator authority or exposing the token", async () => {
     const cookie = await login();

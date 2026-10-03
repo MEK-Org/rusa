@@ -35,10 +35,7 @@ import {
 } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
-import {
-  resolveLegacyOperatorAlias,
-  resolveSoleActiveUser,
-} from "../principals/operator-principal.js";
+import { resolveSoleActiveUser } from "../principals/operator-principal.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import {
   type ResolvedReference,
@@ -753,9 +750,8 @@ function parseKinds(url: URL): string[] | undefined {
  * The durable principal a dashboard mutation is attributed to. An
  * authenticated session carries its verified identity. In auth-disabled local
  * mode the process boundary is the trust boundary. A sole active durable user
- * remains attributable after #460; when no active durable user exists, local
- * actions retain the legacy `human:operator` identity rather than becoming
- * unusable. Several active users are still refused rather than guessed at.
+ * remains attributable; startup bootstraps a durable user only for zero-user
+ * storage. Missing, disabled or ambiguous attribution is refused here.
  */
 export function resolveOperatorPrincipalId(
   req: IncomingMessage,
@@ -765,7 +761,6 @@ export function resolveOperatorPrincipalId(
   if (reqPrincipal) return { ok: true, principalId: reqPrincipal.id as RootControlPrincipal };
   const sole = resolveSoleActiveUser(deps?.principals);
   if (sole.ok) return { ok: true, principalId: sole.user.id as RootControlPrincipal };
-  if (sole.reason === "none") return { ok: true, principalId: HUMAN_OPERATOR };
   return { ok: false, error: sole.error };
 }
 
@@ -1549,13 +1544,7 @@ export async function handleMeshApiRequest(
           }
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
-          // A row still owned by the legacy operator alias belongs to whoever
-          // that alias resolves to now, the same reading every owner write uses.
-          const owner = resolveLegacyOperatorAlias(existing.ownerId, deps?.principals);
-          if (
-            existing.ownerId !== actingPrincipal &&
-            !(owner.ok && owner.ownerId === actingPrincipal)
-          ) {
+          if (existing.ownerId !== actingPrincipal) {
             sendJson(res, 403, {
               error: "only the obligation's current owner may snooze or unsnooze it",
             });

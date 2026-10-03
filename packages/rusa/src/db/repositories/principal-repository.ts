@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import { IMPLICIT_USER_EMAIL } from "../../principals/implicit-user.js";
 import type {
   ExternalIdentity,
   PrincipalRef,
@@ -185,6 +186,17 @@ export class PrincipalRepository {
     return created;
   }
 
+  /** Bootstrap exactly once, only when storage has no users (including disabled users). */
+  ensureImplicitUser(createdAt: string): UserPrincipal | undefined {
+    return this.db
+      .transaction(() => {
+        const users = this.listUsers();
+        if (users.length !== 0) return undefined;
+        return this.createUser({ email: IMPLICIT_USER_EMAIL, createdAt });
+      })
+      .immediate();
+  }
+
   /**
    * Bind a verified external identity to a user provisioned without one.
    *
@@ -236,39 +248,56 @@ export class PrincipalRepository {
     authenticatedAt: string
   ): UserPrincipal | undefined {
     const normalizedEmail = normalizeEmail(email);
-    return this.db.transaction(() => {
-      const user = this.findUserByEmail(normalizedEmail);
-      if (!user) return undefined;
-      // Let the resolver apply the same disabled-user refusal as an already
-      // bound identity. Nothing has been written, and this must not become an
-      // account-linking hint to an otherwise unauthorized caller.
-      if (user.disabledAt) return user;
-      if (user.identity) {
-        if (
-          user.identity.issuer === identity.issuer &&
-          user.identity.subject === identity.subject
-        ) {
-          return user;
+    if (normalizedEmail === IMPLICIT_USER_EMAIL) throw new Error("Reserved admission email");
+    return this.db
+      .transaction(() => {
+        let user = this.findUserByEmail(normalizedEmail);
+        if (!user) {
+          const users = this.listUsers();
+          const only = users.length === 1 ? users[0] : undefined;
+          if (only?.email === IMPLICIT_USER_EMAIL && !only.identity) user = only;
         }
-        throw new Error(
-          `PrincipalRepository: provisioned user '${user.id}' is already bound to another external identity`
-        );
-      }
+        if (!user) return undefined;
+        // Let the resolver apply the same disabled-user refusal as an already
+        // bound identity. Nothing has been written, and this must not become an
+        // account-linking hint to an otherwise unauthorized caller.
+        if (user.disabledAt) return user;
+        if (user.identity) {
+          if (
+            user.identity.issuer === identity.issuer &&
+            user.identity.subject === identity.subject
+          ) {
+            return user;
+          }
+          throw new Error(
+            `PrincipalRepository: provisioned user '${user.id}' is already bound to another external identity`
+          );
+        }
 
-      this.assertIdentityAvailable(identity);
-      const result = this.db
-        .prepare(
-          `UPDATE users
-           SET firebase_issuer = ?, firebase_subject = ?, last_authenticated_at = ?
+        this.assertIdentityAvailable(identity);
+        const result = this.db
+          .prepare(
+            `UPDATE users
+           SET firebase_issuer = ?, firebase_subject = ?, last_authenticated_at = ?, email = ?
            WHERE principal_id = ? AND email = ?
              AND firebase_issuer IS NULL AND firebase_subject IS NULL`
-        )
-        .run(identity.issuer, identity.subject, authenticatedAt, user.id, normalizedEmail);
-      if (result.changes !== 1) {
-        throw new Error(`PrincipalRepository: provisioned user '${user.id}' could not be claimed`);
-      }
-      return this.requireUser(user.id);
-    })();
+          )
+          .run(
+            identity.issuer,
+            identity.subject,
+            authenticatedAt,
+            normalizedEmail,
+            user.id,
+            user.email
+          );
+        if (result.changes !== 1) {
+          throw new Error(
+            `PrincipalRepository: provisioned user '${user.id}' could not be claimed`
+          );
+        }
+        return this.requireUser(user.id);
+      })
+      .immediate();
   }
 
   /** Update admission metadata. The principal id and root are untouched. */

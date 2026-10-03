@@ -1121,6 +1121,7 @@ async function composeStart(
   const database = initDb(mcHome);
   resources.acquire("database", () => closeDb());
   log.info("database_ready", { home: mcHome });
+  if (!config.auth) getRepositories().principals.ensureImplicitUser(new Date().toISOString());
 
   const modelClasses = getRepositories().modelClasses;
 

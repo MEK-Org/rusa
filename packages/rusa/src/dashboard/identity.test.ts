@@ -4,7 +4,13 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { nullLogger } from "../observability/logger.js";
+import { IMPLICIT_USER_EMAIL } from "../principals/implicit-user.js";
 import { DashboardIdentityClaimError, DashboardIdentityResolver } from "./identity.js";
+
+function required<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error("missing synthetic durable user");
+  return value;
+}
 
 let db: Database.Database;
 let repo: PrincipalRepository;
@@ -220,4 +226,23 @@ it("treats a Google id taken by a concurrent sign-in as the same logged conflict
     userId: other.id,
     holderId: owner.id,
   });
+});
+
+it("enriches local bootstrap in place and keeps the second human distinct", () => {
+  const local = required(repo.ensureImplicitUser("2026-01-01T00:00:00Z"));
+  expect(resolver.resolve(token()).id).toBe(local.id);
+  const other = resolver.resolve(
+    token({ sub: "second", uid: "second", email: "second@example.com" })
+  );
+  expect(other.id).not.toBe(local.id);
+  expect(repo.listUsers()).toHaveLength(2);
+});
+
+it("rejects reserved login and leaves disabled implicit attribution untouched", () => {
+  const local = required(repo.ensureImplicitUser("2026-01-01T00:00:00Z"));
+  expect(() => resolver.resolve(token({ email: IMPLICIT_USER_EMAIL }))).toThrow("Reserved");
+  repo.setDisabled(local.id, "2026-01-02T00:00:00Z");
+  expect(() => resolver.resolve(token())).toThrow("User disabled");
+  expect(repo.getUser(local.id)?.email).toBe(IMPLICIT_USER_EMAIL);
+  expect(repo.listUsers()).toHaveLength(1);
 });

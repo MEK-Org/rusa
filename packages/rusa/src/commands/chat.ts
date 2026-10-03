@@ -4,7 +4,6 @@ import type { Readable, Writable } from "node:stream";
 import chalk, { Chalk } from "chalk";
 import { loadConfig, resolveHome } from "../config/index.js";
 
-const HUMAN_OPERATOR = "human:operator";
 const DEFAULT_POLL_MS = 500;
 
 interface ThreadDto {
@@ -166,7 +165,7 @@ function isActorReply(
   userPrincipalId?: string | null
 ): boolean {
   const peer = counterparty(event);
-  const isHuman = peer === HUMAN_OPERATOR || (userPrincipalId && peer === userPrincipalId);
+  const isHuman = userPrincipalId && peer === userPrincipalId;
   return (
     event.kind === "message_sent" &&
     event.actorId === actorId &&
@@ -195,11 +194,10 @@ class ActorChatClient {
   }
 
   async conversation(actorId: string, limit: number): Promise<MeshEvent[]> {
-    const peer = this.userPrincipalId ?? HUMAN_OPERATOR;
-    const actorsParam =
-      peer !== HUMAN_OPERATOR
-        ? `${actorId},${HUMAN_OPERATOR},${peer}`
-        : `${actorId},${HUMAN_OPERATOR}`;
+    const peer = this.userPrincipalId;
+    if (!peer)
+      throw new Error("No durable user principal; configure dashboard auth or restart local setup");
+    const actorsParam = `${actorId},${peer}`;
     const query = new URLSearchParams({
       actors: actorsParam,
       kinds: "message_sent",
@@ -237,8 +235,7 @@ function renderHistory(
 ): void {
   for (const event of [...events].reverse()) {
     if (!event.body) continue;
-    const isHuman =
-      event.actorId === HUMAN_OPERATOR || (userPrincipalId && event.actorId === userPrincipalId);
+    const isHuman = userPrincipalId && event.actorId === userPrincipalId;
     const label = isHuman ? theme.youLabel : theme.actorLabel;
     write(output, `${label} > ${event.body}\n\n`);
   }

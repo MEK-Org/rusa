@@ -12,6 +12,7 @@ import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import type { MeshEventInput } from "../actor/mesh-events.js";
 import { type ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { LogFields, Logger } from "../observability/logger.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
@@ -116,9 +117,12 @@ export function createHarness(options: {
   const inboxDb = new Database(":memory:");
   runMigrations(inboxDb);
   const inboxStore = new SqliteInboxRepository(inboxDb);
+  const principals = new PrincipalRepository(inboxDb);
+  principals.ensureImplicitUser("2026-01-01T00:00:00Z");
   // No event seam: these follower tests never route or deliver events, and a
   // mesh without one simply refuses those paths rather than inventing a ladder.
   const mesh = new ActorMesh({
+    principals,
     actors,
     rootId: "root",
     inboxStore,

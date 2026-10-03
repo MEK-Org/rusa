@@ -52,6 +52,12 @@ function setup(
   return h;
 }
 
+function testHumanId(h: ReturnType<typeof createHarness>): string {
+  const user = h.mesh.principals?.listUsers()[0];
+  if (!user) throw new Error("missing synthetic durable user");
+  return user.id;
+}
+
 function grantComputerUse(h: ReturnType<typeof createHarness>, actorId: string): void {
   h.capabilityGrants.grant({
     actorId,
@@ -2102,7 +2108,7 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       const runId = queuedRunId(h, second);
       expect(runId).toBeTruthy();
 
-      expect(h.mesh.interrupt(second, "human:operator")).toEqual({ interrupted: true });
+      expect(h.mesh.interrupt(second, testHumanId(h))).toEqual({ interrupted: true });
       expect(h.runtime(second).isQueued).toBe(false);
       expect(h.runtime(second).getInterruptedWatermark()).not.toBeNull();
       expect(h.meshEvents).toContainEqual(
@@ -2129,7 +2135,7 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       await waitUntil(() => h.runtime(id).isRunning);
       const before = Date.now();
 
-      expect(h.mesh.interrupt(id, "human:operator")).toEqual({ interrupted: true });
+      expect(h.mesh.interrupt(id, testHumanId(h))).toEqual({ interrupted: true });
       expect(h.meshEvents).toContainEqual(
         expect.objectContaining({ kind: "root_control_action", actorId: id })
       );
@@ -2266,7 +2272,7 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
           // The queued report precedes the admission request on the same channel.
           if (event.type === "queued" && !interrupted) {
             expect(h.runtime(actorId).isQueued).toBe(true);
-            interrupted = h.mesh.interrupt(actorId, "human:operator");
+            interrupted = h.mesh.interrupt(actorId, testHumanId(h));
           }
         },
       });
@@ -2330,7 +2336,7 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
           typeof message.value === "object" &&
           "selected" in message.value
         ) {
-          interrupted = h.mesh.interrupt(id, "human:operator");
+          interrupted = h.mesh.interrupt(id, testHumanId(h));
         }
         return sent;
       }) as typeof runtime.channel.send;
@@ -2351,7 +2357,7 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
         onEvent: (actorId, event) => {
           // The follower reports running before its runStart, so this lands in between.
           if (event.type === "state" && event.state === "running" && !interrupted) {
-            interrupted = h.mesh.interrupt(actorId, "human:operator");
+            interrupted = h.mesh.interrupt(actorId, testHumanId(h));
           }
         },
       });
@@ -2397,7 +2403,7 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       }) as typeof runtime.channel.send;
 
       await waitUntil(() => started(h, id).length === 1);
-      expect(h.mesh.interrupt(id, "human:operator")).toEqual({ interrupted: true });
+      expect(h.mesh.interrupt(id, testHumanId(h))).toEqual({ interrupted: true });
       await waitUntil(() => started(h, id).length === 2);
       expect(h.runtime(id).getInterruptedWatermark()).toBeNull();
     });
@@ -2412,7 +2418,7 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
             const until = Date.now() + 5;
             while (Date.now() < until) {}
             h.dispatchNormal(actorId, "test:after-start");
-            interrupted = h.mesh.interrupt(actorId, "human:operator");
+            interrupted = h.mesh.interrupt(actorId, testHumanId(h));
           }
         },
       });

@@ -4,12 +4,13 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import Database from "better-sqlite3";
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { closeDb, getDb, initDb } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
@@ -98,6 +99,12 @@ import {
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
 const DEBOUNCE = 10;
+
+function testHumanId(mesh: ActorMesh): string {
+  const user = mesh.principals?.listUsers()[0];
+  if (!user) throw new Error("missing synthetic durable user");
+  return user.id;
+}
 
 /**
  * Test-only raw-row replacement. `patch` deliberately cannot alter model
@@ -417,6 +424,13 @@ function setup(
   } = {}
 ) {
   const registry = opts.actors ?? new InMemoryActorRepository();
+  const principalDb = new Database(":memory:");
+  runMigrations(principalDb);
+  const principals = new PrincipalRepository(principalDb);
+  principals.ensureImplicitUser("2026-01-01T00:00:00Z");
+  onTestFinished(() => {
+    principalDb.close();
+  });
   const providers = new Map<string, CodingProvider>();
   const logs: string[] = [];
   let seq = 0;
@@ -447,6 +461,7 @@ function setup(
   });
   const capabilityGrants = new InMemoryCapabilityGrantStore();
   mesh = new ActorMesh({
+    principals,
     supportedVoices: opts.supportedVoices,
     actors: registry,
     rootId: opts.rootId ?? "root",
@@ -2907,7 +2922,9 @@ describe("ActorMesh", () => {
 
     // A voice memo remains responsive even though normal work is held.
     expect(
-      mesh.sendHumanMessage(worker, "🎙️ [voice memo — reply for the ear]: status?", "voice-a")
+      mesh.sendHumanMessage(worker, "🎙️ [voice memo — reply for the ear]: status?", "voice-a", {
+        fromId: testHumanId(mesh),
+      })
     ).toEqual({
       delivered: true,
     });
@@ -3233,7 +3250,9 @@ describe("ActorMesh", () => {
     await tick();
     expect(firstSignal?.aborted).toBe(false);
 
-    mesh.sendHumanMessage(worker, "private operator body", "session-1");
+    mesh.sendHumanMessage(worker, "private operator body", "session-1", {
+      fromId: testHumanId(mesh),
+    });
     expect(firstSignal?.reason).toBe("interrupt:responsive-notification");
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3339,14 +3358,19 @@ describe("ActorMesh", () => {
 
     // Newest first, so the voice memo is the first row the scan reads and a
     // deployment with no observer has both its answers after one page.
-    mesh.sendHumanMessage(worker, "older operator body", "session-1");
+    mesh.sendHumanMessage(worker, "older operator body", "session-1", {
+      fromId: testHumanId(mesh),
+    });
     await tick();
 
     // Measure the voice memo's own dispatch: it is the newest row, so the scan
     // has both its answers after one page and stops. A collecting deployment
     // has to read the older row too, and pays a page for it.
     responsiveLists = 0;
-    mesh.sendHumanMessage(worker, "voice body", "session-1", { voice: true });
+    mesh.sendHumanMessage(worker, "voice body", "session-1", {
+      fromId: testHumanId(mesh),
+      voice: true,
+    });
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3612,9 +3636,13 @@ describe("ActorMesh", () => {
     await tick();
 
     // Repeated delivery pokes arrive while worker is running
-    mesh.sendHumanMessage(worker, "first operator body", "session-1");
+    mesh.sendHumanMessage(worker, "first operator body", "session-1", {
+      fromId: testHumanId(mesh),
+    });
     await tick();
-    mesh.sendHumanMessage(worker, "second operator body", "session-1");
+    mesh.sendHumanMessage(worker, "second operator body", "session-1", {
+      fromId: testHumanId(mesh),
+    });
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3670,7 +3698,9 @@ describe("ActorMesh", () => {
     const w3 = mesh.spawn({ charter: "worker 3", parentId: "root" });
 
     // 1. Idle state: w3 is idle when responsive message arrives
-    mesh.sendHumanMessage(w3, "hello idle w3", "session-3");
+    mesh.sendHumanMessage(w3, "hello idle w3", "session-3", {
+      fromId: testHumanId(mesh),
+    });
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3689,7 +3719,9 @@ describe("ActorMesh", () => {
     await tick();
 
     // Send responsive message to w2 while w2 is queued behind w1
-    mesh.sendHumanMessage(w2, "hello queued w2", "session-2");
+    mesh.sendHumanMessage(w2, "hello queued w2", "session-2", {
+      fromId: testHumanId(mesh),
+    });
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3698,7 +3730,9 @@ describe("ActorMesh", () => {
     expect(events.filter((e) => e.kind === "responsive_interruption_shadow")).toHaveLength(0);
 
     // 3. Running state: send responsive message to w1 while w1 is actively running
-    mesh.sendHumanMessage(w1, "hello running w1", "session-1");
+    mesh.sendHumanMessage(w1, "hello running w1", "session-1", {
+      fromId: testHumanId(mesh),
+    });
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3756,7 +3790,9 @@ describe("ActorMesh", () => {
 
     // Race 1: Responsive message arrives while worker is running.
     // Even if the run finishes shortly afterward, the arrival happened while running.
-    mesh.sendHumanMessage(worker, "arrival during run", "session-1");
+    mesh.sendHumanMessage(worker, "arrival during run", "session-1", {
+      fromId: testHumanId(mesh),
+    });
     // Release the run and allow any follow-up to finish immediately so worker becomes idle
     holdRun = false;
     resolveRun({ success: true, exitCode: 0, output: "done" });
@@ -3769,7 +3805,9 @@ describe("ActorMesh", () => {
 
     // Race 2: Run has completely ended; actor is now idle.
     // Subsequent responsive arrival must NOT trigger JEV.
-    mesh.sendHumanMessage(worker, "arrival after run ended", "session-1");
+    mesh.sendHumanMessage(worker, "arrival after run ended", "session-1", {
+      fromId: testHumanId(mesh),
+    });
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3810,7 +3848,9 @@ describe("ActorMesh", () => {
     await tick();
 
     // Deliver responsive message while running
-    mesh.sendHumanMessage(worker, "operator request", "session-1");
+    mesh.sendHumanMessage(worker, "operator request", "session-1", {
+      fromId: testHumanId(mesh),
+    });
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -4387,7 +4427,11 @@ describe("ActorMesh", () => {
     expect(mesh.sendMessage(child, "from your parent", "root")).toEqual({ delivered: true });
     expect(registry.get(child)?.handles ?? []).toEqual([]);
 
-    expect(mesh.sendHumanMessage(child, "from the operator", "session-1")).toEqual({
+    expect(
+      mesh.sendHumanMessage(child, "from the operator", "session-1", {
+        fromId: testHumanId(mesh),
+      })
+    ).toEqual({
       delivered: true,
     });
     expect(registry.get(child)?.handles ?? []).toEqual([]);
@@ -5014,7 +5058,9 @@ describe("ActorMesh", () => {
     expect(mesh.inFlight).toBe(1);
     expect(d.pending()).toBe(1);
 
-    mesh.sendHumanMessage(w2, "urgent", "human-session");
+    mesh.sendHumanMessage(w2, "urgent", "human-session", {
+      fromId: testHumanId(mesh),
+    });
     await vi.advanceTimersByTimeAsync(0);
 
     // w2 jumps out of the normal queue. Only w1 counts against maxConcurrent;
@@ -5864,7 +5910,7 @@ describe("ActorMesh", () => {
       grantableCapabilities: new Set(["understanding-write"]),
     });
 
-    expect(mesh.interrupt("root")).toEqual({ interrupted: false, status: "idle" });
+    expect(mesh.interrupt("root", "root-llm")).toEqual({ interrupted: false, status: "idle" });
 
     const markUnkillable = vi.spyOn(root, "markUnkillable");
     mesh.markUnkillable("root");
@@ -8025,7 +8071,9 @@ describe("ActorMesh", () => {
 
       // A responsive delivery preserves pool-b, while bypassing
       // pacing/concurrency entirely (blocker still holds the mesh's only slot).
-      mesh.sendHumanMessage(worker, "urgent", "human-session");
+      mesh.sendHumanMessage(worker, "urgent", "human-session", {
+        fromId: testHumanId(mesh),
+      });
       await vi.advanceTimersByTimeAsync(0);
 
       expect(poolARuns).toEqual([]);
@@ -10977,6 +11025,30 @@ describe("ActorMesh", () => {
       expect(onRunEndCalled).toBe(false);
     });
 
+    it("refuses unknown, legacy and disabled human senders before recording messages", () => {
+      const recordChat = vi.fn(() => "chat-id");
+      const { mesh } = setup({ recordChat });
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      const userId = testHumanId(mesh);
+      for (const fromId of ["human:operator", "missing-user", "root"]) {
+        expect(() => mesh.sendHumanMessage(worker, "private body", "session", { fromId })).toThrow(
+          "active durable user principal"
+        );
+      }
+      mesh.principals?.setDisabled(userId, "2026-01-02T00:00:00Z");
+      expect(() =>
+        mesh.sendHumanMessage(worker, "private body", "session", { fromId: userId })
+      ).toThrow("active durable user principal");
+      expect(recordChat).not.toHaveBeenCalled();
+      mesh.principals?.setDisabled(userId, null);
+      expect(mesh.sendHumanMessage(worker, "private body", "session", { fromId: userId })).toEqual({
+        delivered: true,
+      });
+      expect(recordChat).toHaveBeenCalledWith(
+        expect.objectContaining({ senderId: userId, recipientId: worker })
+      );
+    });
+
     it("sendMessage and sendHumanMessage targeting retired actor return delivered false", () => {
       const { mesh } = setup();
       const worker = mesh.spawn({ charter: "worker", parentId: "root" });
@@ -10988,7 +11060,9 @@ describe("ActorMesh", () => {
         expect(msgRes.status).toBe("retired");
       }
 
-      const humanRes = mesh.sendHumanMessage(worker, "hello from human", "session-1");
+      const humanRes = mesh.sendHumanMessage(worker, "hello from human", "session-1", {
+        fromId: testHumanId(mesh),
+      });
       expect(humanRes.delivered).toBe(false);
       if (!humanRes.delivered) {
         expect(humanRes.status).toBe("retired");
@@ -11005,7 +11079,7 @@ describe("ActorMesh", () => {
 
       expect(() => mesh.interrupt(child, peer)).toThrow(/may only interrupt its descendants/);
       expect(() => mesh.interrupt(child, parent)).not.toThrow();
-      expect(() => mesh.interrupt(child, "human:operator")).not.toThrow();
+      expect(() => mesh.interrupt(child, testHumanId(mesh))).not.toThrow();
     });
 
     it("scopes generated-root interrupt authority to its own subtree ", () => {
@@ -11051,7 +11125,7 @@ describe("ActorMesh", () => {
       expect(fake(worker).calls).toHaveLength(1);
 
       // Interrupt without any new inbox items
-      const res = mesh.interrupt(worker, "human:operator");
+      const res = mesh.interrupt(worker, testHumanId(mesh));
       expect(res.interrupted).toBe(true);
 
       // Provider finishes with interrupted result
@@ -11060,14 +11134,16 @@ describe("ActorMesh", () => {
         exitCode: 143,
         cancelled: true,
         interrupted: true,
-        output: "[Task interrupted by human:operator]",
+        output: `[Task interrupted by ${testHumanId(mesh)}]`,
       });
       await tick();
 
       // Since no new inbox items arrived since run start, worker does NOT run again
       expect(fake(worker).calls).toHaveLength(1);
       expect(mesh.activeRunState(worker)).toBeNull();
-      expect(events.some((e) => e.detail?.includes("interrupted by human:operator"))).toBe(true);
+      expect(events.some((e) => e.detail?.includes(`interrupted by ${testHumanId(mesh)}`))).toBe(
+        true
+      );
     });
 
     it("interrupt on running actor runs immediately if a new inbox item arrived after run start", async () => {
@@ -11113,7 +11189,7 @@ describe("ActorMesh", () => {
       ]);
 
       // Interrupt the first run
-      const res = mesh.interrupt(worker, "human:operator");
+      const res = mesh.interrupt(worker, testHumanId(mesh));
       expect(res.interrupted).toBe(true);
 
       resolveRun({
@@ -11121,7 +11197,7 @@ describe("ActorMesh", () => {
         exitCode: 143,
         cancelled: true,
         interrupted: true,
-        output: "[Task interrupted by human:operator]",
+        output: `[Task interrupted by ${testHumanId(mesh)}]`,
       });
       await tick();
 
@@ -12491,7 +12567,7 @@ describe("strict obligation handling (#382, #917)", () => {
     actorId: string
   ): Promise<Client> {
     const server = createObligationsMcpServer(repo, actorId, {
-      resolveOwner: (raw) => resolveObligationOwner(registry, raw),
+      resolveOwner: (raw) => resolveObligationOwner(registry, raw, mesh.principals),
       canManage: (callerId, obligation) =>
         canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
     });
@@ -12786,7 +12862,7 @@ describe("strict obligation handling (#382, #917)", () => {
     repo.create({ id: "to-human", title: "Human handoff", ownerId: source });
     selectHead(mesh, source, "to-human");
     repo.setCheckpoint("to-human", "Needs an operator decision.", source);
-    expect((await handoff("to-human", "human:operator")).isError).toBeFalsy();
+    expect((await handoff("to-human", testHumanId(mesh))).isError).toBeFalsy();
     expect(rejection(mesh, source)).toMatch(/not an active actor that can be woken/);
     mesh.abandonInboxRun(source);
 

@@ -10,6 +10,7 @@ import {
   type PrincipalRepository,
 } from "../db/repositories/principal-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import { IMPLICIT_USER_EMAIL } from "../principals/implicit-user.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
 import { DashboardCsrf } from "./csrf.js";
 import {
@@ -151,6 +152,7 @@ export class DashboardAuth {
   private admitted(token: DecodedIdToken): void {
     if (
       token.email_verified !== true ||
+      normalizeEmail(token.email ?? "") === IMPLICIT_USER_EMAIL ||
       !this.allowedEmails.has(normalizeEmail(token.email ?? "")) ||
       token.firebase?.sign_in_provider !== "google.com" ||
       !token.uid ||
