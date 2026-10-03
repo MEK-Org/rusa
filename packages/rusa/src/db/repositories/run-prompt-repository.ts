@@ -1,4 +1,8 @@
 import type Database from "better-sqlite3";
+import {
+  parseRunPromptProvenance,
+  type RunPromptProvenance,
+} from "../../dashboard/run-prompt-visibility.js";
 
 export const RUN_PROMPT_MAX_BYTES = 256 * 1024;
 export const RUN_PROMPT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -9,8 +13,8 @@ export interface RetainedRunPrompt {
   truncated: boolean;
   provider: string;
   createdAt: string;
-  /** Frozen, classified eligible viewers; null denotes unknown provenance; never returned by the HTTP API. */
-  eligibleViewerIds: string[] | null;
+  /** Frozen source identities, classification and requirements; null means unproven; never returned by the API. */
+  provenance: RunPromptProvenance | null;
 }
 
 /** Keep a UTF-8 head on a code point boundary, without inventing a replacement character. */
@@ -31,16 +35,16 @@ export class RunPromptRepository {
     runId: string,
     prompt: string,
     provider: string,
-    eligibleViewerIds: string[] | null,
+    provenance: RunPromptProvenance | null,
     nowMs = Date.now()
   ): void {
     const captured = capturePrompt(prompt);
     this.db
       .prepare(`
-      INSERT INTO run_prompts (run_id, prompt, prompt_bytes, provider, created_at, eligible_viewers)
+      INSERT INTO run_prompts (run_id, prompt, prompt_bytes, provider, created_at, provenance)
       VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(run_id) DO UPDATE SET prompt=excluded.prompt, prompt_bytes=excluded.prompt_bytes,
-        provider=excluded.provider, created_at=excluded.created_at, eligible_viewers=excluded.eligible_viewers
+        provider=excluded.provider, created_at=excluded.created_at, provenance=excluded.provenance
     `)
       .run(
         runId,
@@ -48,11 +52,11 @@ export class RunPromptRepository {
         captured.promptBytes,
         provider,
         new Date(nowMs).toISOString(),
-        eligibleViewerIds === null ? null : JSON.stringify(eligibleViewerIds)
+        provenance === null ? null : JSON.stringify(provenance)
       );
   }
 
-  /** Unknown provenance stays private until a launch-time audience contract is established. */
+  /** The existing production builders cannot prove complete provenance; retain it as unknown. */
   recordForActor(actorId: string, runId: string, prompt: string, provider: string): void {
     const run = this.db.prepare("SELECT actor_id FROM actor_runs WHERE id = ?").get(runId) as
       | { actor_id: string }
@@ -70,28 +74,24 @@ export class RunPromptRepository {
           prompt_bytes: number;
           provider: string;
           created_at: string;
-          eligible_viewers: string | null;
+          provenance: string | null;
         }
       | undefined;
     if (!row) return null;
-    let eligibleViewerIds: unknown;
+    let provenance: RunPromptProvenance | null;
     try {
-      eligibleViewerIds = row.eligible_viewers === null ? null : JSON.parse(row.eligible_viewers);
+      provenance =
+        row.provenance === null ? null : parseRunPromptProvenance(JSON.parse(row.provenance));
     } catch {
       return null;
     }
-    if (
-      eligibleViewerIds !== null &&
-      (!Array.isArray(eligibleViewerIds) || eligibleViewerIds.some((id) => typeof id !== "string"))
-    )
-      return null;
     return {
       prompt: row.prompt,
       promptBytes: row.prompt_bytes,
       truncated: Buffer.byteLength(row.prompt, "utf8") < row.prompt_bytes,
       provider: row.provider,
       createdAt: row.created_at,
-      eligibleViewerIds: eligibleViewerIds as string[] | null,
+      provenance,
     };
   }
 

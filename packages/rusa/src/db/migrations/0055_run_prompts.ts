@@ -11,7 +11,7 @@ export const runPrompts: Migration = {
         prompt_bytes INTEGER NOT NULL,
         provider TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        eligible_viewers TEXT
+        provenance TEXT
       );
       CREATE INDEX run_prompts_created_at ON run_prompts(created_at);
     `);
