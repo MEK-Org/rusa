@@ -2524,7 +2524,11 @@ async function composeStart(
   const roomEntry = new RoomEntryService({
     store: getRepositories().roomEntryEpisodes,
     inbox: getRepositories().inbox,
-    roster: () => chatRoom.participants().map((participant) => participant.actorId),
+    roster: () =>
+      chatRoom
+        .participants()
+        .filter((participant) => actors.get(participant.actorId)?.status === "active")
+        .map((participant) => participant.actorId),
     log: (message) => log.warn("room_entry", { message }),
   });
 

@@ -91,9 +91,12 @@ export function isValidRoomClientId(clientId: unknown): clientId is string {
 
 /** Decode a stored document, throwing when it is not a valid version-1 document. */
 export function parseRoomEntryDocument(json: string): RoomEntryDocument {
+  if (Buffer.byteLength(json, "utf8") > ROOM_ENTRY_LIMITS.maxDocumentBytes) {
+    throw new RoomEntryLimitError("room entry episode document exceeds its size bound");
+  }
   const value: unknown = JSON.parse(json);
-  const problem = documentProblem(value);
-  if (problem) throw new Error(`invalid room entry document: ${problem}`);
+  // Stored rows obey the same consumer bounds as newly written candidates.
+  serializeRoomEntryDocument(value as RoomEntryDocument);
   return value as RoomEntryDocument;
 }
 

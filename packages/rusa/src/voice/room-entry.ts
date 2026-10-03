@@ -112,6 +112,8 @@ export class RoomEntryService {
    */
   private readonly attached = new Set<string>();
   private draining = false;
+  /** Last attempted notice, including failures; the next pass starts after it. */
+  private lastDrainAttempt: string | null = null;
 
   constructor(private readonly deps: RoomEntryServiceDeps) {
     this.now = deps.now ?? Date.now;
@@ -144,7 +146,10 @@ export class RoomEntryService {
           const { row, document } = current;
           const next: RoomEntryDocument = {
             ...document,
-            leases: [...document.leases.filter((held) => held.clientId !== client.clientId), lease],
+            leases: [
+              ...liveLeases(document, now).filter((held) => held.clientId !== client.clientId),
+              lease,
+            ],
           };
           this.deps.store.update(row.id, {
             endedAt: null,
@@ -178,6 +183,10 @@ export class RoomEntryService {
       throw error;
     }
     if (result.status === "entered") {
+      const replacedPrefix = `${result.episodeId}\u0000${client.clientId}\u0000`;
+      for (const key of this.attached) {
+        if (key.startsWith(replacedPrefix)) this.attached.delete(key);
+      }
       this.attached.add(attachmentKey(result.episodeId, client.clientId, result.generation));
       if (result.created) this.drain();
     }
@@ -214,6 +223,27 @@ export class RoomEntryService {
       this.attached.add(attachmentKey(result.episodeId, client.clientId, result.generation));
     }
     return result;
+  }
+
+  /**
+   * Transport close loses live attachment, retaining only the reconnect lease.
+   * The future Room attachment uses this seam; an old generation cannot close
+   * its replacement. Only authenticated renewal makes it present again.
+   */
+  detach(client: {
+    principalId: string;
+    episodeId: string;
+    clientId: string;
+    generation: string;
+  }): void {
+    const loaded = this.loadOwned(client.episodeId, client.principalId);
+    if (
+      !loaded?.document.leases.some(
+        (held) => held.clientId === client.clientId && held.generation === client.generation
+      )
+    )
+      return;
+    this.attached.delete(attachmentKey(client.episodeId, client.clientId, client.generation));
   }
 
   /** Release one tab's lease; the last explicit leave ends the episode at once. */
@@ -334,18 +364,25 @@ export class RoomEntryService {
             .map((recipient) => recipient.actorId),
         }))
         .filter((queue) => queue.pending.length > 0);
-      let attempts = 0;
-      while (
-        attempts < ROOM_ENTRY_DRAIN_BATCH &&
-        queues.some((queue) => queue.pending.length > 0)
-      ) {
+      // Interleave episodes, then continue after the last attempted notice.
+      // Starting at the oldest episode/recipient on every pass lets a full
+      // batch of persistent failures starve everything that follows it.
+      const candidates: Array<{ row: RoomEntryEpisodeRow; actorId: string }> = [];
+      const maxPending = Math.max(0, ...queues.map((queue) => queue.pending.length));
+      for (let index = 0; index < maxPending; index += 1) {
         for (const queue of queues) {
-          const actorId = queue.pending.shift();
-          if (actorId === undefined) continue;
-          if (attempts >= ROOM_ENTRY_DRAIN_BATCH) break;
-          attempts += 1;
-          this.deliver(queue.row, actorId);
+          const actorId = queue.pending[index];
+          if (actorId !== undefined) candidates.push({ row: queue.row, actorId });
         }
+      }
+      const previous = candidates.findIndex(
+        ({ row, actorId }) => roomEntryNoticeId(row.id, actorId) === this.lastDrainAttempt
+      );
+      const count = Math.min(ROOM_ENTRY_DRAIN_BATCH, candidates.length);
+      for (let offset = 0; offset < count; offset += 1) {
+        const { row, actorId } = candidates[(previous + 1 + offset) % candidates.length];
+        this.lastDrainAttempt = roomEntryNoticeId(row.id, actorId);
+        this.deliver(row, actorId);
       }
     } finally {
       this.draining = false;
@@ -383,7 +420,12 @@ export class RoomEntryService {
           if (unhandled) return false;
           return this.deps.store.delete(row.id);
         });
-        if (deleted) removed += 1;
+        if (deleted) {
+          for (const key of this.attached) {
+            if (key.startsWith(`${candidate.id}\u0000`)) this.attached.delete(key);
+          }
+          removed += 1;
+        }
       }
     } finally {
       this.draining = false;

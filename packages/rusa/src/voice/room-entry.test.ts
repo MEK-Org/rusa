@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { RoomEntryEpisodeRepository } from "../db/repositories/room-entry-episode-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
@@ -68,6 +68,7 @@ describe("RoomEntryService (#829)", () => {
     for (const actorId of roster) {
       const [notice] = notices(actorId);
       expect(notice.id).toBe(roomEntryNoticeId(entry.episodeId, actorId));
+      expect(inbox.actorsWithUnhandled()).toContainEqual({ actorId, priority: "responsive" });
       expect(notice.payload).toEqual({
         type: "room.human_entry",
         version: 1,
@@ -108,6 +109,27 @@ describe("RoomEntryService (#829)", () => {
     expect(
       rooms.leave({ ...tab("tab-1"), episodeId: current.episodeId, generation: current.generation })
     ).toEqual({ status: "left", ended: true });
+  });
+
+  it("drops closed attachment presence while preserving its reconnect identity", () => {
+    const rooms = service();
+    const old = rooms.enter(tab("tab-1"));
+    const current = rooms.enter(tab("tab-1"));
+    if (old.status !== "entered" || current.status !== "entered") throw new Error("not entered");
+    rooms.detach({ ...tab("tab-1"), episodeId: old.episodeId, generation: old.generation });
+    expect(rooms.presence(current.episodeId)).toBe("present");
+    const client = {
+      ...tab("tab-1"),
+      episodeId: current.episodeId,
+      generation: current.generation,
+    };
+    rooms.detach({ ...client, principalId: "other-user" });
+    expect(rooms.presence(current.episodeId)).toBe("present");
+    rooms.detach(client);
+    expect(rooms.presence(current.episodeId)).toBe("reconnecting");
+    expect(rooms.renew(client)).toMatchObject({ status: "renewed" });
+    expect(rooms.presence(current.episodeId)).toBe("present");
+    for (const actorId of roster) expect(notices(actorId)).toHaveLength(1);
   });
 
   it("keeps the episode until the last explicit leave, then starts a new one", () => {
@@ -221,6 +243,22 @@ describe("RoomEntryService (#829)", () => {
       expect(leases.map((lease) => lease.clientId)).toEqual(entered.map((_, i) => `tab-${i}`));
     });
 
+    it("drops expired tab leases before enforcing the current-client bound", () => {
+      const rooms = service();
+      const entries = Array.from({ length: ROOM_ENTRY_LIMITS.maxLeases }, (_, i) =>
+        rooms.enter(tab(`tab-${i}`))
+      );
+      const first = entries[0];
+      if (first.status !== "entered") throw new Error("not entered");
+      now += ROOM_ENTRY_LEASE_MS - 1;
+      rooms.renew({ ...tab("tab-0"), episodeId: first.episodeId, generation: first.generation });
+      now += 1;
+      expect(rooms.enter(tab("new-tab"))).toMatchObject({ status: "entered", created: false });
+      expect(
+        parseRoomEntryDocument(store.get(first.episodeId)?.documentJson ?? "").leases
+      ).toHaveLength(2);
+    });
+
     it("refuses an oversized roster without creating an episode or any notice", () => {
       roster = Array.from({ length: ROOM_ENTRY_LIMITS.maxRecipients + 1 }, (_, i) => `actor-${i}`);
       expect(service().enter(tab("tab-1"))).toMatchObject({ status: "unavailable" });
@@ -260,6 +298,25 @@ describe("RoomEntryService (#829)", () => {
       rooms.drain();
       for (const actorId of roster) expect(notices(actorId)).toHaveLength(1);
       expect(recipients(entry.episodeId).every((r) => r.status === "delivered")).toBe(true);
+    });
+
+    it("recovers a failed progress stamp in the same process without a duplicate notice", () => {
+      const update = store.update.bind(store);
+      vi.spyOn(store, "update")
+        .mockImplementationOnce(() => {
+          throw new Error("stamp failed");
+        })
+        .mockImplementation(update);
+      const rooms = service();
+      const entry = rooms.enter(tab("tab-1"));
+      if (entry.status !== "entered") throw new Error("not entered");
+      expect(notices("root")).toHaveLength(1);
+      expect(recipients(entry.episodeId)).toContainEqual({ actorId: "root", status: "pending" });
+      now += 30_000;
+      rooms.drain();
+      expect(notices("root")).toHaveLength(1);
+      expect(recipients(entry.episodeId).every((r) => r.status === "delivered")).toBe(true);
+      expect(logs.some((line) => line.includes("stamp failed"))).toBe(true);
     });
 
     it("completes a notice appended before a crash without duplicating it", () => {
@@ -310,6 +367,59 @@ describe("RoomEntryService (#829)", () => {
       expect(notices("actor-2")).toEqual([]);
       expect(rooms.isEligibleRecipient(entry.episodeId, "actor-1")).toBe(false);
       expect(rooms.isEligibleRecipient(entry.episodeId, "root")).toBe(true);
+    });
+
+    it("advances past persistent failures to later recipients on the next pass", () => {
+      roster = Array.from({ length: 100 }, (_, i) => `actor-${i}`);
+      const rooms = service({
+        inbox: {
+          append: (inputs) => {
+            const index = Number(inputs[0].actorId.split("-")[1]);
+            if (index < ROOM_ENTRY_DRAIN_BATCH) throw new Error("persistent failure");
+            return inbox.append(inputs);
+          },
+          read: (actorId, id) => inbox.read(actorId, id),
+        },
+      });
+      const entry = rooms.enter(tab("tab-1"));
+      if (entry.status !== "entered") throw new Error("not entered");
+      expect(notices("actor-99")).toHaveLength(0);
+      rooms.drain();
+      expect(notices("actor-99")).toHaveLength(1);
+      expect(recipients(entry.episodeId).filter((r) => r.status === "pending")).toHaveLength(64);
+    });
+
+    it("advances past a failing full batch of episodes to a later episode", () => {
+      roster = ["root"];
+      for (let i = 0; i <= ROOM_ENTRY_DRAIN_BATCH; i += 1) {
+        store.insert({
+          id: `episode-${i}`,
+          principalId: `user-${i}`,
+          enteredAt: new Date(T0 + i).toISOString(),
+          endedAt: null,
+          documentJson: JSON.stringify({
+            version: 1,
+            leases: [],
+            recipients: [{ actorId: "root", status: "pending" }],
+          }),
+        });
+      }
+      const rooms = service({
+        inbox: {
+          append: (inputs) => {
+            if (inputs[0].payload.episodeId !== `episode-${ROOM_ENTRY_DRAIN_BATCH}`) {
+              throw new Error("persistent failure");
+            }
+            return inbox.append(inputs);
+          },
+          read: (actorId, id) => inbox.read(actorId, id),
+        },
+      });
+      rooms.drain();
+      expect(notices("root")).toHaveLength(0);
+      rooms.drain();
+      expect(notices("root")).toHaveLength(1);
+      expect(notices("root")[0].payload.episodeId).toBe(`episode-${ROOM_ENTRY_DRAIN_BATCH}`);
     });
 
     it("bounds one pass and shares it across episodes", () => {
