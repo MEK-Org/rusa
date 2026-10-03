@@ -2,9 +2,11 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
+import 'package:rusa_dashboard/widgets/avatar.dart';
 import 'package:rusa_dashboard/widgets/chat_room.dart';
 
 import 'fakes.dart';
@@ -52,7 +54,7 @@ void main() {
       find.byKey(const ValueKey('chat-room-avatar-actor-b')),
       findsNothing,
     );
-    expect(find.text('Voice: Puck'), findsOneWidget);
+    expect(find.textContaining('Voice'), findsNothing);
 
     final grid = tester.widget<GridView>(
       find.byKey(const ValueKey('chat-room-grid')),
@@ -74,17 +76,48 @@ void main() {
     );
   });
 
-  testWidgets('idle voice labels meet WCAG AA contrast on the tile', (
+  testWidgets('tiles show the avatar and name only, not the voice', (
     tester,
   ) async {
     api.chatRoomParticipants = ['root', 'actor-b'];
     await pumpRoom(tester);
 
-    // Both the selected tile and the unselected idle tile.
-    for (final text in ['Voice: Puck', 'Voice: Kore']) {
-      final label = tester.widget<Text>(find.text(text));
-      final ratio = contrastRatio(label.style!.color!, MeshColors.bgSecondary);
-      expect(ratio, greaterThanOrEqualTo(4.5), reason: text);
+    // Operator appearance feedback on #825: no voice line under the name.
+    for (final id in ['root', 'actor-b']) {
+      final tile = find.byKey(ValueKey('chat-room-avatar-$id'));
+      expect(
+        find.descendant(of: tile, matching: find.text('$id-handle')),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(of: tile, matching: find.textContaining('Voice')),
+        findsNothing,
+        reason: id,
+      );
+      // The name is the tile's last line: no empty slot is held under it, so
+      // the avatar grows into that height (#825 operator feedback).
+      expect(
+        find.descendant(of: tile, matching: find.byType(Text)),
+        findsOneWidget,
+        reason: id,
+      );
+      final container = tester.widget<AnimatedContainer>(
+        find.descendant(of: tile, matching: find.byType(AnimatedContainer)),
+      );
+      final border =
+          ((container.decoration! as BoxDecoration).border! as Border).bottom;
+      expect(
+        tester
+            .getRect(
+              find.descendant(of: tile, matching: find.text('$id-handle')),
+            )
+            .bottom,
+        moreOrLessEquals(
+          tester.getRect(tile).bottom - 12 - border.width,
+          epsilon: 0.01,
+        ),
+        reason: id,
+      );
     }
   });
 
@@ -167,8 +200,12 @@ void main() {
       await tester.pump();
       await tester.pump();
 
-      expect(find.text('Voice: Puck'), findsOneWidget);
-      expect(find.text('Voice: Achernar'), findsOneWidget);
+      // The voice is no longer drawn on the tile; the tile's accessibility
+      // label still names it.
+      final semantics = tester.ensureSemantics();
+      expect(find.bySemanticsLabel(RegExp('Voice: Puck')), findsOneWidget);
+      expect(find.bySemanticsLabel(RegExp('Voice: Achernar')), findsOneWidget);
+      semantics.dispose();
     },
   );
 
@@ -184,6 +221,13 @@ void main() {
 
   Rect tileRect(WidgetTester tester, String id) =>
       tester.getRect(find.byKey(ValueKey('chat-room-avatar-$id')));
+
+  Rect avatarRect(WidgetTester tester, String id) => tester.getRect(
+    find.descendant(
+      of: find.byKey(ValueKey('chat-room-avatar-$id')),
+      matching: find.byType(ActorAvatar),
+    ),
+  );
 
   group('#803 appearance', () {
     testWidgets('has no room header or idle prompt', (tester) async {
@@ -272,6 +316,7 @@ void main() {
 
         // A queued actor that is speaking shows the speaking border; it
         // returns to its state colour when playback ends.
+        final quietAvatar = avatarRect(tester, 'actor-b');
         await tester.tap(find.byKey(const ValueKey('chat-room-avatar-root')));
         await tester.pump();
         await tester.pump();
@@ -282,15 +327,31 @@ void main() {
         );
         await tester.pump();
         await tester.pump();
+        // Speaking is marked by the border and a corner badge over the
+        // avatar (#825 operator feedback); no line is added under the name,
+        // so the avatar does not shrink or move while the actor speaks.
+        expect(
+          find.descendant(
+            of: find.byKey(const ValueKey('chat-room-avatar-actor-b')),
+            matching: find.byKey(const ValueKey('chat-room-speaking-badge')),
+          ),
+          findsOneWidget,
+        );
         expect(find.text('Speaking'), findsOneWidget);
         expect(borderOf(tester, 'actor-b'), MeshColors.accent);
+        expect(avatarRect(tester, 'actor-b'), quietAvatar);
         expect(borderOf(tester, 'root'), MeshColors.border);
 
         walkie.player.finishCurrent();
         await tester.pump();
         await tester.pump();
+        expect(
+          find.byKey(const ValueKey('chat-room-speaking-badge')),
+          findsNothing,
+        );
         expect(find.text('Speaking'), findsNothing);
         expect(borderOf(tester, 'actor-b'), MeshColors.statusQueued);
+        expect(avatarRect(tester, 'actor-b'), quietAvatar);
 
         // init() started the store's polls; stop them before the pending
         // timer check.
@@ -317,13 +378,10 @@ void main() {
         ),
         findsOneWidget,
       );
-      expect(
-        find.descendant(
-          of: find.byKey(const ValueKey('chat-room-avatar-actor-b')),
-          matching: find.text('Tap to send'),
-        ),
-        findsOneWidget,
-      );
+      // The operator asked for neither a "Tap to send" line nor the voice
+      // under the name while recording.
+      expect(find.text('Tap to send'), findsNothing);
+      expect(find.textContaining('Voice'), findsNothing);
       expect(
         find.byKey(const ValueKey('chat-room-recording-badge')),
         findsOneWidget,
@@ -372,9 +430,17 @@ void main() {
         final idle = {
           for (final id in ['root', 'actor-b']) id: tileRect(tester, id),
         };
+        final idleAvatar = {
+          for (final id in idle.keys) id: avatarRect(tester, id),
+        };
         void expectStill(String phase) {
           for (final id in idle.keys) {
             expect(tileRect(tester, id), idle[id], reason: '$id while $phase');
+            expect(
+              avatarRect(tester, id),
+              idleAvatar[id],
+              reason: '$id avatar while $phase',
+            );
           }
         }
 
@@ -433,13 +499,105 @@ void main() {
       },
     );
   });
-}
+  group('#816 tap spinner', () {
+    Finder busy(String id) => find.byKey(ValueKey('chat-room-busy-$id'));
 
-/// WCAG 2.x contrast ratio between two opaque colours.
-double contrastRatio(Color a, Color b) {
-  final la = a.computeLuminance();
-  final lb = b.computeLuminance();
-  final hi = la > lb ? la : lb;
-  final lo = la > lb ? lb : la;
-  return (hi + 0.05) / (lo + 0.05);
+    testWidgets(
+      'spins on the tapped tile only while starting and sending, in place',
+      (tester) async {
+        api.chatRoomParticipants = ['root', 'actor-b'];
+        await pumpRoom(tester, size: const Size(420, 860));
+
+        const ids = ['root', 'actor-b'];
+        final idle = {for (final id in ids) id: tileRect(tester, id)};
+        final idleBorder = {for (final id in ids) id: borderOf(tester, id)};
+        void expectSpinner(String? on, String phase) {
+          for (final id in ids) {
+            expect(
+              busy(id),
+              id == on ? findsOneWidget : findsNothing,
+              reason: '$id spinner while $phase',
+            );
+            expect(tileRect(tester, id), idle[id], reason: '$id while $phase');
+            expect(
+              borderOf(tester, id),
+              idleBorder[id],
+              reason: '$id border while $phase',
+            );
+          }
+        }
+
+        expectSpinner(null, 'idle');
+
+        // Starting: the spinner is there on the first frame after the tap.
+        final mic = Completer<void>();
+        walkie.recorder.startCompleter = mic;
+        await tester.tap(find.byKey(const ValueKey('chat-room-avatar-root')));
+        await tester.pump();
+        expect(find.textContaining('Opening the mic'), findsOneWidget);
+        expectSpinner('root', 'starting');
+
+        mic.complete();
+        walkie.recorder.startCompleter = null;
+        await tester.pump();
+        await tester.pump();
+        expect(find.textContaining('Recording for'), findsOneWidget);
+        expectSpinner(null, 'recording');
+
+        final sending = Completer<void>();
+        api.memoGate = sending;
+        await tester.tap(find.byKey(const ValueKey('chat-room-avatar-root')));
+        await tester.pump();
+        expect(find.textContaining('Sending the memo'), findsOneWidget);
+        expectSpinner('root', 'sending');
+
+        sending.complete();
+        await tester.pump();
+        await tester.pump();
+        expect(find.text('Delivered to root-handle.'), findsOneWidget);
+        expectSpinner(null, 'delivered');
+        await tester.pump(const Duration(seconds: 10));
+      },
+    );
+
+    testWidgets('clears when starting is cancelled or sending fails', (
+      tester,
+    ) async {
+      api.chatRoomParticipants = ['root', 'actor-b'];
+      await pumpRoom(tester, size: const Size(1180, 820));
+
+      final mic = Completer<void>();
+      walkie.recorder.startCompleter = mic;
+      await tester.tap(find.byKey(const ValueKey('chat-room-avatar-actor-b')));
+      await tester.pump();
+      expect(busy('actor-b'), findsOneWidget);
+      expect(busy('root'), findsNothing);
+
+      await tester.tap(find.byKey(const ValueKey('chat-room-cancel')));
+      await tester.pump();
+      await tester.pump();
+      expect(busy('actor-b'), findsNothing);
+      mic.complete();
+      walkie.recorder.startCompleter = null;
+      await tester.pump();
+
+      await tester.tap(find.byKey(const ValueKey('chat-room-avatar-actor-b')));
+      await tester.pump();
+      await tester.pump();
+      final sending = Completer<void>();
+      api
+        ..memoGate = sending
+        ..memoError = DashboardApiException(Uri.parse('/memo'), 500, 'boom');
+      await tester.tap(find.byKey(const ValueKey('chat-room-avatar-actor-b')));
+      await tester.pump();
+      expect(busy('actor-b'), findsOneWidget);
+
+      sending.complete();
+      await tester.pump();
+      await tester.pump();
+      expect(find.textContaining('Send failed'), findsOneWidget);
+      expect(busy('actor-b'), findsNothing);
+      expect(busy('root'), findsNothing);
+    });
+  });
 }

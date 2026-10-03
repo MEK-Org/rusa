@@ -168,6 +168,13 @@ class _ChatRoomTabState extends State<ChatRoomTab> {
                   store: widget.store,
                   recordingRecipient: recordingRecipient,
                   speakingActorId: nowPlaying?.actorId,
+                  // A tap was accepted and the room is waiting on the mic or
+                  // the memo; the tapped tile spins until the phase moves on.
+                  busyActorId:
+                      record.phase == RecordPhase.starting ||
+                          record.phase == RecordPhase.sending
+                      ? recordingRecipient
+                      : null,
                   disabled:
                       available == false ||
                       record.phase == RecordPhase.starting ||
@@ -277,6 +284,7 @@ class _AvatarGrid extends StatelessWidget {
     required this.store,
     required this.recordingRecipient,
     required this.speakingActorId,
+    required this.busyActorId,
     required this.disabled,
     required this.onTap,
   });
@@ -285,6 +293,7 @@ class _AvatarGrid extends StatelessWidget {
   final DashboardStore store;
   final String? recordingRecipient;
   final String? speakingActorId;
+  final String? busyActorId;
   final bool disabled;
   final ValueChanged<String> onTap;
 
@@ -327,6 +336,7 @@ class _AvatarGrid extends StatelessWidget {
               store: store,
               recording: actor.id == recordingRecipient,
               speaking: actor.id == speakingActorId,
+              busy: actor.id == busyActorId,
               disabled: disabled,
               onTap: () => onTap(actor.id),
             );
@@ -344,6 +354,7 @@ class _RoomAvatarButton extends StatelessWidget {
     required this.store,
     required this.recording,
     required this.speaking,
+    required this.busy,
     required this.disabled,
     required this.onTap,
   });
@@ -353,6 +364,7 @@ class _RoomAvatarButton extends StatelessWidget {
   final DashboardStore store;
   final bool recording;
   final bool speaking;
+  final bool busy;
   final bool disabled;
   final VoidCallback onTap;
 
@@ -408,11 +420,30 @@ class _RoomAvatarButton extends StatelessWidget {
                                 constraints.maxWidth,
                                 constraints.maxHeight,
                               );
+                              // The spinner rings the avatar in the avatar's
+                              // own box, so it never moves or resizes the
+                              // tile, and leaves the state border alone (#816).
                               return AbsorbPointer(
-                                child: ActorAvatar(
-                                  id: actor.id,
-                                  size: size,
-                                  store: store,
+                                child: Stack(
+                                  alignment: Alignment.center,
+                                  children: [
+                                    ActorAvatar(
+                                      id: actor.id,
+                                      size: size,
+                                      store: store,
+                                    ),
+                                    if (busy)
+                                      SizedBox.square(
+                                        dimension: size,
+                                        child: CircularProgressIndicator(
+                                          key: ValueKey(
+                                            'chat-room-busy-${actor.id}',
+                                          ),
+                                          strokeWidth: 5,
+                                          color: MeshColors.textPrimary,
+                                        ),
+                                      ),
+                                  ],
                                 ),
                               );
                             },
@@ -430,30 +461,37 @@ class _RoomAvatarButton extends StatelessWidget {
                         fontWeight: FontWeight.w700,
                       ),
                     ),
-                    const SizedBox(height: 2),
-                    Text(
-                      speaking
-                          ? 'Speaking'
-                          : recording
-                          ? 'Tap to send'
-                          : _voiceLabel(actor),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: speaking
-                            ? MeshColors.accent
-                            : recording
-                            ? MeshColors.statusHalted
-                            : MeshColors.textSecondary,
-                        fontSize: 12,
-                      ),
-                    ),
+                    // The tile shows only the avatar and name (#825 operator
+                    // feedback), so the avatar takes the height a second line
+                    // would hold; badges overlay the corners instead.
                   ],
                 ),
                 // The border belongs to the actor's run state, so the capture
                 // this tile is recording is marked by a badge instead.
                 if (recording)
-                  const Positioned(top: 0, right: 0, child: _RecordingBadge()),
+                  const Positioned(
+                    top: 0,
+                    right: 0,
+                    child: _TileBadge(
+                      key: ValueKey('chat-room-recording-badge'),
+                      icon: Icons.mic,
+                      label: 'REC',
+                      background: MeshColors.statusHalted,
+                      foreground: MeshColors.textPrimary,
+                    ),
+                  ),
+                if (speaking)
+                  const Positioned(
+                    top: 0,
+                    left: 0,
+                    child: _TileBadge(
+                      key: ValueKey('chat-room-speaking-badge'),
+                      icon: Icons.volume_up,
+                      label: 'Speaking',
+                      background: MeshColors.accent,
+                      foreground: MeshColors.bgPrimary,
+                    ),
+                  ),
               ],
             ),
           ),
@@ -463,26 +501,38 @@ class _RoomAvatarButton extends StatelessWidget {
   }
 }
 
-class _RecordingBadge extends StatelessWidget {
-  const _RecordingBadge();
+/// A pill in a tile corner. It overlays the avatar, so showing or hiding it
+/// never moves or resizes the tile's contents.
+class _TileBadge extends StatelessWidget {
+  const _TileBadge({
+    super.key,
+    required this.icon,
+    required this.label,
+    required this.background,
+    required this.foreground,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color background;
+  final Color foreground;
 
   @override
   Widget build(BuildContext context) => Container(
-    key: const ValueKey('chat-room-recording-badge'),
     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
     decoration: BoxDecoration(
-      color: MeshColors.statusHalted,
+      color: background,
       borderRadius: BorderRadius.circular(999),
     ),
-    child: const Row(
+    child: Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Icon(Icons.mic, size: 14, color: MeshColors.textPrimary),
-        SizedBox(width: 4),
+        Icon(icon, size: 14, color: foreground),
+        const SizedBox(width: 4),
         Text(
-          'REC',
+          label,
           style: TextStyle(
-            color: MeshColors.textPrimary,
+            color: foreground,
             fontSize: 11,
             fontWeight: FontWeight.w800,
             letterSpacing: 0.8,

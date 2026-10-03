@@ -82,7 +82,25 @@ void main() {
       // speaking ring rather than a mid-transition blend.
       await tester.pump(const Duration(milliseconds: 250));
 
-      expect(find.text('Speaking'), findsOneWidget);
+      // Reply A is speaking: its tile carries the speaking border (#803) and
+      // a corner badge over the avatar, not a line under the name (#825).
+      final rootTile = tester.widget<AnimatedContainer>(
+        find.descendant(
+          of: find.byKey(const ValueKey('chat-room-avatar-root')),
+          matching: find.byType(AnimatedContainer),
+        ),
+      );
+      expect(
+        ((rootTile.decoration! as BoxDecoration).border! as Border).top.color,
+        MeshColors.accent,
+      );
+      expect(
+        find.descendant(
+          of: find.byKey(const ValueKey('chat-room-avatar-root')),
+          matching: find.byKey(const ValueKey('chat-room-speaking-badge')),
+        ),
+        findsOneWidget,
+      );
       // Reply B waits in the shared queue; the room no longer has a header to
       // count it in (#803).
       expect(find.text('CHAT ROOM'), findsNothing);
@@ -148,7 +166,8 @@ void main() {
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 250));
 
-      expect(find.text('Tap to send'), findsOneWidget);
+      expect(find.text('Tap to send'), findsNothing);
+      expect(find.textContaining('Voice'), findsNothing);
       expect(find.byKey(const ValueKey('chat-room-cancel')), findsOneWidget);
       expect(find.text('Cancel recording'), findsOneWidget);
       await captureBoundary(key, '$_outDir/chat_room_recording.png');
