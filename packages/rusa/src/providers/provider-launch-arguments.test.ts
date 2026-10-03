@@ -408,7 +408,7 @@ describe("#866 retained prompt equals the actual launched argv", () => {
         await provider.run({
           prompt: assembledActorContext(),
           cwd: cli.cwd,
-          onPromptLaunched: (prompt) => prompts.record(runId, prompt, adapter.name, []),
+          onPromptLaunched: (prompt) => prompts.record(runId, prompt, adapter.name, null),
         });
         const argv = cli.readArgv();
         if (!argv) throw new Error("missing launched argv");
