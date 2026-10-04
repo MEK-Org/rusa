@@ -1,470 +1,238 @@
-import { execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import type { ProviderConfig } from "../config/types.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodexProvider, listEffectiveCodexMcpServers } from "./codex.js";
 
 const dirs: string[] = [];
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-/**
- * Creates a hermetic fake Codex CLI script supporting --version, mcp list --json,
- * profile loading, project trust, configuration overrides, and exec event stream.
- */
-function createFakeCodexCli(binDir: string): string {
-  mkdirSync(binDir, { recursive: true });
-  const scriptPath = join(binDir, "fake-codex");
-  const scriptContent = `#!/usr/bin/env node
+// Fake inventory only. This models the configuration layers characterized by
+// separate native config-read receipts; it is not proof of native tool execution.
+function fixture() {
+  const root = mkdtempSync(join(tmpdir(), "rusa-886-inventory-"));
+  dirs.push(root);
+  const project = join(root, `project-${root.split("-").at(-1)}`);
+  const home = join(root, "home");
+  const codexHome = join(home, ".codex");
+  const bin = join(project, "bin");
+  for (const dir of [project, codexHome, bin, join(project, ".codex")])
+    mkdirSync(dir, { recursive: true });
+  const receipt = join(project, "invocations.jsonl");
+  const command = join(bin, "codex");
+  const parser = createRequire(import.meta.url).resolve("smol-toml");
+  writeFileSync(
+    command,
+    `#!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
-
+const { parse } = require(${JSON.stringify(parser)});
 const args = process.argv.slice(2);
-
-if (args.includes("--version")) {
-  console.log("codex-cli 0.160.0");
-  process.exit(0);
+if (process.env.FAKE_NO_JSON && args.includes("--json")) { console.error("unsupported --json"); process.exit(2); }
+if (process.env.FAKE_DISCOVERY_HANG && args.includes("mcp")) { setTimeout(() => {}, 60000); return; }
+const home = process.env.CODEX_HOME;
+function load(file) { return fs.existsSync(file) ? parse(fs.readFileSync(file, "utf8")) : {}; }
+function merge(a, b) { for (const [k, v] of Object.entries(b)) {
+  if (v && typeof v === "object" && !Array.isArray(v)) a[k] = merge(a[k] || {}, v);
+  else a[k] = v;
+} return a; }
+let config = load(path.join(home, "config.toml"));
+const profileAt = args.indexOf("--profile");
+if (profileAt >= 0) config = merge(config, load(path.join(home, args[profileAt + 1] + ".config.toml")));
+if (config.projects?.[process.cwd()]?.trust_level === "trusted") config = merge(config, load(path.join(process.cwd(), ".codex", "config.toml")));
+for (let i = 0; i < args.length; i++) if (["-c", "--config"].includes(args[i])) {
+  const override = args[++i];
+  const equal = override.indexOf("=");
+  const keys = override.slice(0, equal).split(".");
+  let current = config;
+  for (const key of keys.slice(0, -1)) current = current[key] ||= {};
+  current[keys.at(-1)] = parse("value=" + override.slice(equal + 1)).value;
 }
-
-if (process.env.SIMULATE_DISCOVERY_DELAY_MS) {
-  const ms = parseInt(process.env.SIMULATE_DISCOVERY_DELAY_MS, 10);
-  setTimeout(() => {}, ms);
-  return;
-}
-
-let profile = undefined;
-for (let i = 0; i < args.length; i++) {
-  if (args[i] === "--profile" && i + 1 < args.length) {
-    profile = args[i + 1];
-  }
-}
-
-const overrides = [];
-for (let i = 0; i < args.length; i++) {
-  if ((args[i] === "-c" || args[i] === "--config") && i + 1 < args.length) {
-    overrides.push(args[i + 1]);
-  }
-}
-
-const isMcpList = args.includes("mcp") && args.includes("list");
-const isExec = args.includes("exec");
-
-if (isMcpList) {
-  const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME || "/root", ".codex");
-  const baseConfigPath = path.join(codexHome, "config.toml");
-  let baseContent = "";
-  if (fs.existsSync(baseConfigPath)) {
-    baseContent = fs.readFileSync(baseConfigPath, "utf8");
-  }
-
-  let profileContent = "";
-  if (profile) {
-    const profilePath = path.join(codexHome, \`\${profile}.config.toml\`);
-    if (fs.existsSync(profilePath)) {
-      profileContent = fs.readFileSync(profilePath, "utf8");
-    }
-  }
-
-  function parseToml(content) {
-    const servers = new Map();
-    const projects = new Map();
-    let currentServer = null;
-    let currentProject = null;
-
-    const lines = content.split("\\n");
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-
-      const mcpMatch = trimmed.match(/^\\[mcp_servers\\.([a-zA-Z0-9_-]+)\\]$/);
-      if (mcpMatch) {
-        currentServer = mcpMatch[1];
-        currentProject = null;
-        if (!servers.has(currentServer)) servers.set(currentServer, {});
-        continue;
-      }
-
-      const projMatch = trimmed.match(/^\\[projects\\."([^"]+)"\\]$/);
-      if (projMatch) {
-        currentProject = projMatch[1];
-        currentServer = null;
-        if (!projects.has(currentProject)) projects.set(currentProject, {});
-        continue;
-      }
-
-      if (trimmed.startsWith("[")) {
-        currentServer = null;
-        currentProject = null;
-        continue;
-      }
-
-      if (currentServer) {
-        const kv = trimmed.match(/^([a-zA-Z0-9_-]+)\\s*=\\s*(.*)$/);
-        if (kv) {
-          const k = kv[1];
-          let v = kv[2].trim();
-          try { v = JSON.parse(v); } catch {}
-          servers.get(currentServer)[k] = v;
-        }
-      } else if (currentProject) {
-        const kv = trimmed.match(/^([a-zA-Z0-9_-]+)\\s*=\\s*(.*)$/);
-        if (kv) {
-          const k = kv[1];
-          let v = kv[2].trim();
-          try { v = JSON.parse(v); } catch {}
-          projects.get(currentProject)[k] = v;
-        }
-      }
-    }
-    return { servers, projects };
-  }
-
-  const baseParsed = parseToml(baseContent);
-  const profileParsed = parseToml(profileContent);
-
-  const mergedServers = new Map(baseParsed.servers);
-  for (const [name, cfg] of profileParsed.servers.entries()) {
-    mergedServers.set(name, { ...(mergedServers.get(name) || {}), ...cfg });
-  }
-
-  const cwd = process.cwd();
-  const projectTrust = baseParsed.projects.get(cwd);
-  if (projectTrust && projectTrust.trust_level === "trusted") {
-    const projectConfigPath = path.join(cwd, ".codex", "config.toml");
-    if (fs.existsSync(projectConfigPath)) {
-      const projectParsed = parseToml(fs.readFileSync(projectConfigPath, "utf8"));
-      for (const [name, cfg] of projectParsed.servers.entries()) {
-        mergedServers.set(name, { ...(mergedServers.get(name) || {}), ...cfg });
-      }
-    }
-  }
-
-  for (const override of overrides) {
-    const match = override.match(/^mcp_servers\\.([a-zA-Z0-9_-]+)\\.([a-zA-Z0-9_-]+)=(.*)$/);
-    if (match) {
-      const sName = match[1];
-      const sKey = match[2];
-      let sVal = match[3];
-      try { sVal = JSON.parse(sVal); } catch {}
-      if (!mergedServers.has(sName)) mergedServers.set(sName, {});
-      mergedServers.get(sName)[sKey] = sVal;
-    }
-  }
-
-  const result = [];
-  for (const [name, cfg] of mergedServers.entries()) {
-    if (cfg.invalid_key !== undefined) {
-      console.error(\`Invalid configuration for \${name}: invalid_key\`);
-      process.exit(1);
-    }
-    const isEnabled = cfg.enabled !== false;
-    let transport = undefined;
-    if (cfg.url) {
-      transport = { type: "sse", url: cfg.url };
-    } else if (cfg.command) {
-      transport = {
-        type: "stdio",
-        command: cfg.command,
-        args: Array.isArray(cfg.args) ? cfg.args : [],
-      };
-    } else if (isEnabled) {
-      console.error(\`Invalid configuration for \${name}: missing transport\`);
-      process.exit(1);
-    }
-    result.push({ name, enabled: isEnabled, transport });
-  }
-
-  console.log(JSON.stringify(result));
-  process.exit(0);
-}
-
-if (isExec) {
-  console.log(JSON.stringify({ type: "thread.started" }));
-  console.log(JSON.stringify({ type: "turn.started" }));
-  console.log(JSON.stringify({
-    type: "item.completed",
-    item: { type: "agent_message", text: "hermetic-codex-test-output" }
-  }));
+const servers = Object.entries(config.mcp_servers || {}).map(([name, c]) => {
+  if (!c.command && !c.url) { console.error("invalid transport"); process.exit(1); }
+  return { name, enabled: c.enabled !== false, transport: c.command ? { type: "stdio", command: c.command, args: c.args || [] } : { type: "streamable_http", url: c.url } };
+});
+const plugins = Object.entries(config.plugins || {}).filter(([, c]) => c.enabled !== false).map(([id]) => id);
+const inventory = { servers, plugins };
+if (process.env.FAKE_RECEIPT_PATH) fs.appendFileSync(process.env.FAKE_RECEIPT_PATH, JSON.stringify({ args, inventory }) + "\\n");
+if (args.includes("mcp")) { console.log(JSON.stringify(servers)); process.exit(0); }
+if (args.includes("resume") && process.env.FAKE_RESUME_FAIL) process.exit(1);
+if (args.includes("exec")) {
+  console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(inventory) } }));
   console.log(JSON.stringify({ type: "turn.completed" }));
   process.exit(0);
 }
-
-console.error("Unknown command or options");
-process.exit(1);
-`;
-  writeFileSync(scriptPath, scriptContent, { mode: 0o755 });
-  return scriptPath;
+console.error("unsupported command"); process.exit(2);
+`,
+    { mode: 0o755 }
+  );
+  vi.stubEnv("HOME", home);
+  vi.stubEnv("CODEX_HOME", codexHome);
+  vi.stubEnv("PATH", `${bin}:${process.env.PATH}`);
+  vi.stubEnv("FAKE_RECEIPT_PATH", receipt);
+  const configPath = join(codexHome, "config.toml");
+  writeFileSync(configPath, `[projects."${project}"]\ntrust_level="trusted"\n`);
+  const provider = new CodexProvider("codex", { cliCommand: command }, "fixture-model");
+  return { project, codexHome, configPath, command, provider, receipt };
 }
 
-let hasNativeCodex = false;
-try {
-  const version = execSync("codex --version", {
-    encoding: "utf-8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  hasNativeCodex = version.includes("codex");
-} catch {
-  hasNativeCodex = false;
+function inventory(output: string) {
+  return JSON.parse(output) as {
+    servers: Array<{ name: string; enabled: boolean; transport: unknown }>;
+    plugins: string[];
+  };
 }
 
-describe("CodexProvider computer-use configuration and precedence (#885)", () => {
-  it("discovers project direct MCP bindings and preserves transport and unrelated endpoints", async () => {
-    const root = mkdtempSync(join(tmpdir(), "rusa-codex-mcp-fixture-"));
-    dirs.push(root);
-
-    const codexHome = join(root, "codex-home");
-    const project = join(root, "project");
-    const projectCodex = join(project, ".codex");
-    mkdirSync(codexHome, { recursive: true });
-    mkdirSync(projectCodex, { recursive: true });
-
-    const fakeCodex = createFakeCodexCli(join(project, "bin"));
-
-    // User-level config has unrelated docs server and trusts the project
+describe("Codex computer-use fake inventories (#885)", () => {
+  it("selects a profile, then observes project and invocation override precedence with preserved transport", async () => {
+    const f = fixture();
     writeFileSync(
-      join(codexHome, "config.toml"),
-      `[mcp_servers.docs]\nurl="https://example.invalid/docs"\n\n[projects."${project}"]\ntrust_level="trusted"\n`
+      join(f.codexHome, "desktop.config.toml"),
+      '[mcp_servers.computer-use]\ncommand="fake-profile-never-launched"\nargs=["profile"]\nenabled=false\n'
     );
-
-    // Project-level config has direct computer-use binding (computer-use)
-    writeFileSync(
-      join(projectCodex, "config.toml"),
-      `[mcp_servers.computer-use]\ncommand="fake-desktop-never-launched"\nargs=["project"]\n`
-    );
-
-    const servers = await listEffectiveCodexMcpServers({
-      command: fakeCodex,
-      cwd: project,
-      env: {
-        ...process.env,
-        CODEX_HOME: codexHome,
-      },
-    });
-
-    const serverNames = servers.map((s) => s.name).sort();
-    expect(serverNames).toEqual(["computer-use", "docs"]);
-
-    const cu = servers.find((s) => s.name === "computer-use");
-    expect(cu).toBeDefined();
-    expect(cu?.enabled).toBe(true);
-    expect(cu?.transport).toMatchObject({
-      type: "stdio",
-      command: "fake-desktop-never-launched",
-      args: ["project"],
-    });
-
-    const docs = servers.find((s) => s.name === "docs");
-    expect(docs).toBeDefined();
-    expect(docs?.enabled).toBe(true);
-    expect(docs?.transport).toMatchObject({
-      type: "sse",
-      url: "https://example.invalid/docs",
-    });
-  });
-
-  it("proves project config overrides profile config for direct computer-use binding via --profile desktop", async () => {
-    const root = mkdtempSync(join(tmpdir(), "rusa-codex-profile-fixture-"));
-    dirs.push(root);
-
-    const codexHome = join(root, "codex-home");
-    const project = join(root, "project");
-    const projectCodex = join(project, ".codex");
-    mkdirSync(codexHome, { recursive: true });
-    mkdirSync(projectCodex, { recursive: true });
-
-    const fakeCodex = createFakeCodexCli(join(project, "bin"));
-
-    writeFileSync(
-      join(codexHome, "config.toml"),
-      `[projects."${project}"]\ntrust_level="trusted"\n`
-    );
-
-    // Profile desktop config has computer-use with profile arg
-    writeFileSync(
-      join(codexHome, "desktop.config.toml"),
-      `[mcp_servers.computer-use]\ncommand="fake-profile-never-launched"\nargs=["profile"]\n`
-    );
-
-    // Project config has computer-use with project arg
-    writeFileSync(
-      join(projectCodex, "config.toml"),
-      `[mcp_servers.computer-use]\ncommand="fake-desktop-never-launched"\nargs=["project"]\n`
-    );
-
-    // Pass --profile desktop through intended controls
-    const servers = await listEffectiveCodexMcpServers({
-      command: fakeCodex,
-      cwd: project,
-      env: {
-        ...process.env,
-        CODEX_HOME: codexHome,
-      },
-      profile: "desktop",
-    });
-
-    const cu = servers.find((s) => s.name === "computer-use");
-    expect(cu).toBeDefined();
-    // Project precedence: project settings win over profile settings
-    expect(cu?.transport).toMatchObject({
-      type: "stdio",
-      command: "fake-desktop-never-launched",
-      args: ["project"],
-    });
-  });
-
-  it("host-only direct binding stripped in sandbox merged config is NOT discovered and does NOT add bare disabled server entries", async () => {
-    const root = mkdtempSync(join(tmpdir(), "rusa-codex-sandbox-fixture-"));
-    dirs.push(root);
-
-    const project = join(root, "project");
-    mkdirSync(project, { recursive: true });
-    const fakeCodex = createFakeCodexCli(join(project, "bin"));
-
-    // Host home has direct computer-use server
-    const hostHome = join(root, "host-home");
-    const hostCodex = join(hostHome, ".codex");
-    mkdirSync(hostCodex, { recursive: true });
-    writeFileSync(
-      join(hostCodex, "config.toml"),
-      `[mcp_servers.computer-use]\ncommand="host-desktop-only"\nargs=["host"]\n`
-    );
-
-    const prevHome = process.env.HOME;
-    process.env.HOME = hostHome;
-
-    try {
-      const config: ProviderConfig = { cliCommand: fakeCodex };
-      const provider = new CodexProvider("codex", config, "gpt-5-codex");
-
-      const result = await provider.run({
-        prompt: "test sandbox regression",
-        cwd: project,
-        computerUse: false,
-        sandbox: {
-          worktreePath: project,
-          isE2eRoot: false,
-        },
+    const read = (configOverrides?: string[]) =>
+      listEffectiveCodexMcpServers({
+        command: f.command,
+        cwd: f.project,
+        profile: "desktop",
+        configOverrides,
       });
+    expect(await read()).toMatchObject([
+      {
+        name: "computer-use",
+        enabled: false,
+        transport: { command: "fake-profile-never-launched", args: ["profile"] },
+      },
+    ]);
+    writeFileSync(
+      join(f.project, ".codex", "config.toml"),
+      '[mcp_servers.computer-use]\ncommand="fake-project-never-launched"\nargs=["project"]\nenabled=true\n[mcp_servers.docs]\nurl="https://example.invalid/docs"\n'
+    );
+    const project = await read();
+    expect(project.find((s) => s.name === "computer-use")).toMatchObject({
+      enabled: true,
+      transport: { command: "fake-project-never-launched", args: ["project"] },
+    });
+    const denied = await read(["mcp_servers.computer-use.enabled=false"]);
+    expect(denied.find((s) => s.name === "computer-use")).toMatchObject({
+      enabled: false,
+      transport: { command: "fake-project-never-launched", args: ["project"] },
+    });
+    expect(denied.find((s) => s.name === "docs")).toEqual(project.find((s) => s.name === "docs"));
+  });
 
-      expect(result.success).toBe(true);
-      expect(result.exitCode).toBe(0);
-      expect(result.output).toContain("hermetic-codex-test-output");
-    } finally {
-      if (prevHome !== undefined) process.env.HOME = prevHome;
-      else delete process.env.HOME;
+  it("filters only known plugin and direct inventories for denied, allowed, revoked and allowed-after-denied invocations without modifying settings", async () => {
+    const f = fixture();
+    appendFileSync(
+      f.configPath,
+      '[plugins."unified-computer-use@openai-bundled"]\nenabled=true\n[plugins."computer-use@openai-bundled"]\nenabled=true\n[plugins."unrelated@fixture"]\nenabled=true\n[mcp_servers.computer-use]\ncommand="fake-desktop-never-launched"\n[mcp_servers.docs]\nurl="https://example.invalid/docs"\n'
+    );
+    const before = readFileSync(f.configPath, "utf8");
+    for (const computerUse of [false, true, false, true]) {
+      const result = await f.provider.run({ prompt: "synthetic", cwd: f.project, computerUse });
+      expect(result.success, result.output).toBe(true);
+      const observed = inventory(result.output);
+      expect(observed.plugins).toEqual(
+        computerUse
+          ? [
+              "unified-computer-use@openai-bundled",
+              "computer-use@openai-bundled",
+              "unrelated@fixture",
+            ]
+          : ["unrelated@fixture"]
+      );
+      expect(observed.servers.find((s) => s.name === "computer-use")).toMatchObject({
+        enabled: computerUse,
+        transport: { command: "fake-desktop-never-launched" },
+      });
+      expect(observed.servers.find((s) => s.name === "docs")).toMatchObject({ enabled: true });
+      expect(readFileSync(f.configPath, "utf8")).toBe(before);
     }
   });
 
-  it("fails closed without unfiltered fallback when configuration loading fails", async () => {
-    const root = mkdtempSync(join(tmpdir(), "rusa-codex-broken-fixture-"));
-    dirs.push(root);
-
-    const codexHome = join(root, "codex-home");
-    const project = join(root, "project");
-    mkdirSync(codexHome, { recursive: true });
-    mkdirSync(project, { recursive: true });
-
-    const fakeCodex = createFakeCodexCli(join(project, "bin"));
-
-    // Invalid transport in configuration (invalid_key triggers failure in fake-codex)
-    writeFileSync(
-      join(codexHome, "config.toml"),
-      `[mcp_servers.computer-use]\ninvalid_key="bad"\n`
+  it("discovers inside the sandbox merged configuration, excluding the stripped host-only binding", async () => {
+    const f = fixture();
+    appendFileSync(
+      f.configPath,
+      '[mcp_servers.computer-use]\ncommand="host-only-never-launched"\n'
     );
+    const result = await f.provider.run({
+      prompt: "synthetic",
+      cwd: f.project,
+      computerUse: false,
+      mcpServers: [{ name: "docs", url: "https://example.invalid/docs" }],
+      sandbox: { worktreePath: f.project },
+    });
+    expect(result.success, result.output).toBe(true);
+    expect(inventory(result.output).servers).toMatchObject([{ name: "docs", enabled: true }]);
+    const receipts = readFileSync(f.receipt, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(receipts).toHaveLength(2);
+    expect(receipts[0].inventory.servers.map((s: { name: string }) => s.name)).toEqual(["docs"]);
+    expect(receipts[1].args).not.toContain("mcp_servers.computer-use.enabled=false");
+  });
 
-    const config: ProviderConfig = { cliCommand: fakeCodex };
-    const provider = new CodexProvider("codex", config, "gpt-5-codex");
-
-    const prevCodexHome = process.env.CODEX_HOME;
-    process.env.CODEX_HOME = codexHome;
-    try {
-      const result = await provider.run({
-        prompt: "test broken config",
-        cwd: project,
+  for (const problem of ["unsupported-json", "invalid-transport"] as const) {
+    it(`fails closed before exec on ${problem}`, async () => {
+      const f = fixture();
+      if (problem === "unsupported-json") vi.stubEnv("FAKE_NO_JSON", "1");
+      else appendFileSync(f.configPath, "[mcp_servers.computer-use]\nenabled=false\n");
+      const result = await f.provider.run({
+        prompt: "synthetic",
+        cwd: f.project,
         computerUse: false,
       });
-
-      // Must fail closed with non-zero exit code; never execute unfiltered
       expect(result.success).toBe(false);
-      expect(result.exitCode).toBe(1);
       expect(result.output).toContain("Failed to determine effective MCP configuration");
-    } finally {
-      if (prevCodexHome !== undefined) process.env.CODEX_HOME = prevCodexHome;
-      else delete process.env.CODEX_HOME;
-    }
-  });
-
-  it("cancels cleanly when signal is aborted during configuration discovery", async () => {
-    const root = mkdtempSync(join(tmpdir(), "rusa-codex-cancel-fixture-"));
-    dirs.push(root);
-
-    const project = join(root, "project");
-    mkdirSync(project, { recursive: true });
-    const fakeCodex = createFakeCodexCli(join(project, "bin"));
-
-    const config: ProviderConfig = { cliCommand: fakeCodex };
-    const provider = new CodexProvider("codex", config, "gpt-5-codex");
-
-    const ac = new AbortController();
-    const prevDelay = process.env.SIMULATE_DISCOVERY_DELAY_MS;
-    process.env.SIMULATE_DISCOVERY_DELAY_MS = "10000";
-
-    try {
-      setTimeout(() => ac.abort(), 50);
-
-      const result = await provider.run({
-        prompt: "test cancellation",
-        cwd: project,
-        computerUse: false,
-        signal: ac.signal,
-      });
-
-      expect(result.success).toBe(false);
-      expect(result.cancelled).toBe(true);
-      expect(result.exitCode).toBe(1);
-      expect(result.output).toContain("Codex run cancelled during MCP configuration discovery");
-    } finally {
-      if (prevDelay !== undefined) process.env.SIMULATE_DISCOVERY_DELAY_MS = prevDelay;
-      else delete process.env.SIMULATE_DISCOVERY_DELAY_MS;
-    }
-  });
-
-  const itNative = hasNativeCodex ? it : it.skip;
-  itNative("isolated native CLI configuration-read receipts (workstation only)", async () => {
-    const root = mkdtempSync(join(tmpdir(), "rusa-native-codex-fixture-"));
-    dirs.push(root);
-
-    const codexHome = join(root, "codex-home");
-    const project = join(root, "project");
-    const projectCodex = join(project, ".codex");
-    mkdirSync(codexHome, { recursive: true });
-    mkdirSync(projectCodex, { recursive: true });
-
-    writeFileSync(
-      join(codexHome, "config.toml"),
-      `[projects."${project}"]\ntrust_level="trusted"\n`
-    );
-
-    writeFileSync(
-      join(projectCodex, "config.toml"),
-      `[mcp_servers.docs]\nurl="https://example.invalid/docs"\n`
-    );
-
-    const servers = await listEffectiveCodexMcpServers({
-      command: "codex",
-      cwd: project,
-      env: {
-        ...process.env,
-        CODEX_HOME: codexHome,
-      },
+      expect(() => readFileSync(f.receipt)).toThrow();
     });
+  }
 
-    console.log("Observed native Codex MCP discovery receipt:", JSON.stringify(servers));
-    expect(servers.length).toBeGreaterThanOrEqual(1);
-    const docs = servers.find((s) => s.name === "docs");
-    expect(docs).toBeDefined();
+  it("bounds a hung discovery by a shorter run timeout without launching exec", async () => {
+    const f = fixture();
+    vi.stubEnv("FAKE_DISCOVERY_HANG", "1");
+    const result = await f.provider.run({
+      prompt: "synthetic",
+      cwd: f.project,
+      computerUse: false,
+      timeoutMs: 25,
+    });
+    expect(result.success).toBe(false);
+    expect(result.cancelled).not.toBe(true);
+    expect(result.output).toContain("Failed to determine effective MCP configuration");
+    expect(() => readFileSync(f.receipt)).toThrow();
+  });
+
+  it("honors cancellation during configuration discovery without launching exec", async () => {
+    const f = fixture();
+    vi.stubEnv("FAKE_DISCOVERY_HANG", "1");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 50);
+    try {
+      const result = await f.provider.run({
+        prompt: "synthetic",
+        cwd: f.project,
+        computerUse: false,
+        signal: controller.signal,
+      });
+      expect(result.cancelled).toBe(true);
+      expect(result.success).toBe(false);
+      expect(() => readFileSync(f.receipt)).toThrow();
+    } finally {
+      clearTimeout(timer);
+    }
   });
 });

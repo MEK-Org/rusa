@@ -391,62 +391,25 @@ export interface ListEffectiveCodexMcpServersOptions {
  * Throws if the discovery command fails, is cancelled, or output cannot be parsed.
  */
 export async function listEffectiveCodexMcpServers(
-  commandOrOptions: string | ListEffectiveCodexMcpServersOptions,
-  cwd?: string,
-  env?: NodeJS.ProcessEnv,
-  timeoutMs = 60_000,
-  profile?: string
+  options: ListEffectiveCodexMcpServersOptions
 ): Promise<Array<{ name: string; enabled?: boolean; transport?: unknown }>> {
-  let command: string;
-  let args: string[];
-  let effectiveCwd: string;
-  let effectiveEnv: NodeJS.ProcessEnv | undefined;
-  let effectiveTimeoutMs: number;
-  let effectiveSignal: AbortSignal | undefined;
-
-  if (typeof commandOrOptions === "object") {
-    command = commandOrOptions.command;
-    effectiveCwd = commandOrOptions.cwd;
-    effectiveEnv = commandOrOptions.env;
-    effectiveTimeoutMs = commandOrOptions.timeoutMs ?? 60_000;
-    effectiveSignal = commandOrOptions.signal;
-
-    if (commandOrOptions.args) {
-      args = [...commandOrOptions.args];
-    } else {
-      args = [];
-      if (commandOrOptions.profile) {
-        args.push("--profile", commandOrOptions.profile);
-      }
-      args.push("mcp", "list", "--json");
-      if (commandOrOptions.configOverrides) {
-        for (const override of commandOrOptions.configOverrides) {
-          args.push("-c", override);
-        }
-      }
-    }
-  } else {
-    command = commandOrOptions;
-    effectiveCwd = cwd ?? process.cwd();
-    effectiveEnv = env;
-    effectiveTimeoutMs = timeoutMs;
-    args = [];
-    if (profile) {
-      args.push("--profile", profile);
-    }
-    args.push("mcp", "list", "--json");
-  }
-
+  const args = options.args ?? [
+    ...(options.profile ? ["--profile", options.profile] : []),
+    "mcp",
+    "list",
+    "--json",
+    ...(options.configOverrides ?? []).flatMap((override) => ["-c", override]),
+  ];
   return new Promise((resolve, reject) => {
     execFile(
-      command,
+      options.command,
       args,
       {
-        cwd: effectiveCwd,
-        env: effectiveEnv ?? process.env,
+        cwd: options.cwd,
+        env: options.env ?? process.env,
         encoding: "utf-8",
-        timeout: effectiveTimeoutMs,
-        signal: effectiveSignal,
+        timeout: options.timeoutMs ?? 5_000,
+        signal: options.signal,
         maxBuffer: 10 * 1024 * 1024,
       },
       (error, stdout) => {
@@ -940,7 +903,7 @@ export class CodexProvider implements CodingProvider {
       if (opts.computerUse !== true) {
         const computerUseOverrides: string[] = [...CODEX_DENIED_DESKTOP_PLUGIN_OVERRIDES];
         try {
-          const timeoutMs = Math.max(60_000, opts.timeoutMs ?? 60_000);
+          const discoveryTimeoutMs = Math.min(5_000, opts.timeoutMs ?? 5_000);
           const mcpListArgs = [
             "mcp",
             "list",
@@ -956,7 +919,7 @@ export class CodexProvider implements CodingProvider {
             args: discoveryArgs,
             cwd: spawnCwd,
             env: spawnEnv,
-            timeoutMs,
+            timeoutMs: discoveryTimeoutMs,
             signal: opts.signal,
           });
           for (const server of effectiveServers) {
@@ -965,10 +928,7 @@ export class CodexProvider implements CodingProvider {
             }
           }
         } catch (err) {
-          if (
-            opts.signal?.aborted ||
-            (typeof err === "object" && err !== null && "cancelled" in err)
-          ) {
+          if (opts.signal?.aborted) {
             return {
               success: false,
               cancelled: true,

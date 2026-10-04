@@ -1,13 +1,13 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Actor } from "../../actor/actor.js";
+import { InMemoryCapabilityGrantStore } from "../../actor/capability-grants.js";
 import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../../actor/computer-use-lock.js";
 import { ProviderPacer } from "../../actor/provider-pacer.js";
 import type { CodingProvider, RunOptions, RunResult } from "../../providers/types.js";
 import { createHarness, waitUntil } from "./harness.js";
-import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -15,272 +15,45 @@ afterEach(() => {
 });
 
 describe("computer-use scope enforcement and compatibility matrix (#885)", () => {
-  describe("pinned 2x2 compatibility matrix: producer × follower runtime", () => {
-    it("cell 1: old producer × old follower (wire missing, lock skipped, invocation omitted)", async () => {
-      const cwd = mkdtempSync(join(tmpdir(), "rusa-885-old-old-"));
-      dirs.push(cwd);
-
-      const invocations: Array<Record<string, unknown>> = [];
-      const parsedAdmissions: Array<boolean | undefined> = [];
-
-      const h = createHarness({
-        cwd,
-        legacyOmitInvocationAdmission: true,
-        providerFactory: () => ({
-          name: "fake-inventory",
-          providerName: "instance-fixture",
-          async run(opts: RunOptions): Promise<RunResult> {
-            invocations.push({
-              computerUse: opts.computerUse,
-              hasKey: "computerUse" in opts,
-            });
-            return { success: true, output: "old-old", exitCode: 0 };
-          },
-        }),
-      });
-
-      // Intercept wire dispatch to strip computerUse (simulating old producer)
-      const dispatch = h.follower.dispatch.bind(h.follower);
-      h.follower.dispatch = (envelope) => {
-        const m = envelope.message;
-        if (m.type === "reply" && m.value && typeof m.value === "object") {
-          const val = m.value as Record<string, unknown>;
-          parsedAdmissions.push(val.computerUse as boolean | undefined);
-          const stripped = { ...val };
-          delete stripped.computerUse;
-          dispatch({ ...envelope, message: { ...m, value: stripped } });
-          return;
-        }
-        dispatch(envelope);
-      };
-
-      try {
-        h.spawn("old-old actor");
-        await waitUntil(() => invocations.length === 1);
-
-        // Separate observations for parsing, scheduling, and invocation enforcement:
-        const observations = {
-          parsing: parsedAdmissions[0], // Stripped before follower received
-          scheduling: false, // Lock skipped since no admission
-          invocationEnforcement: invocations[0].computerUse, // Unpatched follower omits field
-        };
-
-        expect(observations.parsing).toBeUndefined();
-        expect(observations.scheduling).toBe(false);
-        expect(observations.invocationEnforcement).toBeUndefined();
-        expect(invocations[0].hasKey).toBe(false);
-      } finally {
-        await h.close();
-      }
+  it("a missing admission field denies on the repaired follower and skips the computer-use lock", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "rusa-885-missing-"));
+    dirs.push(cwd);
+    const invocations: RunOptions[] = [];
+    const lock = vi.spyOn(ComputerUseLock.prototype, "gate");
+    const h = createHarness({
+      cwd,
+      providerFactory: () => ({
+        name: "fake-inventory",
+        providerName: "instance-fixture",
+        async run(opts) {
+          invocations.push(opts);
+          return { success: true, output: "fake-only", exitCode: 0 };
+        },
+      }),
     });
-
-    it("cell 2: repaired producer × old follower (wire boolean, lock scheduled, invocation omitted)", async () => {
-      const cwd = mkdtempSync(join(tmpdir(), "rusa-885-repaired-old-"));
-      dirs.push(cwd);
-
-      const invocations: Array<Record<string, unknown>> = [];
-      const parsedAdmissions: Array<boolean | undefined> = [];
-
-      const h = createHarness({
-        cwd,
-        legacyOmitInvocationAdmission: true,
-        providerFactory: () => ({
-          name: "fake-inventory",
-          providerName: "instance-fixture",
-          async run(opts: RunOptions): Promise<RunResult> {
-            invocations.push({
-              computerUse: opts.computerUse,
-              hasKey: "computerUse" in opts,
-            });
-            return { success: true, output: "repaired-old", exitCode: 0 };
-          },
-        }),
-      });
-
-      // Observe wire reply from repaired producer
-      const dispatch = h.follower.dispatch.bind(h.follower);
-      h.follower.dispatch = (envelope) => {
-        const m = envelope.message;
-        if (
-          m.type === "reply" &&
-          m.value &&
-          typeof m.value === "object" &&
-          "computerUse" in m.value
-        ) {
-          parsedAdmissions.push((m.value as { computerUse?: boolean }).computerUse);
-        }
-        dispatch(envelope);
-      };
-
-      try {
-        const id = h.spawn("repaired-old actor");
-        h.capabilityGrants.grant({
-          actorId: id,
-          capability: COMPUTER_USE_CAPABILITY,
-          grantedBy: "root",
-          grantedAt: "2026-10-04T00:00:00Z",
-        });
-
-        await waitUntil(() => invocations.length === 1);
-
-        // Separate observations for parsing, scheduling, and invocation enforcement:
-        const observations = {
-          parsing: parsedAdmissions[0], // Repaired producer sends true
-          scheduling: true, // Follower parses wire boolean and schedules computerUseLock
-          invocationEnforcement: invocations[0].computerUse, // Legacy follower limitation: omitted from provider
-        };
-
-        expect(observations.parsing).toBe(true);
-        expect(observations.scheduling).toBe(true);
-        // Pinned legacy characterization: unmodified follower omitted field despite lock being scheduled
-        expect(observations.invocationEnforcement).toBeUndefined();
-        expect(invocations[0].hasKey).toBe(false);
-      } finally {
-        await h.close();
-      }
-    });
-
-    it("cell 3: old producer × repaired follower (wire missing, lock skipped, invocation denied)", async () => {
-      const cwd = mkdtempSync(join(tmpdir(), "rusa-885-old-repaired-"));
-      dirs.push(cwd);
-
-      const invocations: Array<Record<string, unknown>> = [];
-      const parsedAdmissions: Array<boolean | undefined> = [];
-
-      const h = createHarness({
-        cwd,
-        legacyOmitInvocationAdmission: false, // Repaired follower
-        providerFactory: () => ({
-          name: "fake-inventory",
-          providerName: "instance-fixture",
-          async run(opts: RunOptions): Promise<RunResult> {
-            invocations.push({
-              computerUse: opts.computerUse,
-              hasKey: "computerUse" in opts,
-            });
-            return { success: true, output: "old-repaired", exitCode: 0 };
-          },
-        }),
-      });
-
-      // Old producer strips computerUse from admission reply
-      const dispatch = h.follower.dispatch.bind(h.follower);
-      h.follower.dispatch = (envelope) => {
-        const m = envelope.message;
-        if (m.type === "reply" && m.value && typeof m.value === "object") {
-          const val = m.value as Record<string, unknown>;
-          parsedAdmissions.push(val.computerUse as boolean | undefined);
-          const stripped = { ...val };
-          delete stripped.computerUse;
-          dispatch({ ...envelope, message: { ...m, value: stripped } });
-          return;
-        }
-        dispatch(envelope);
-      };
-
-      try {
-        const id = h.spawn("old-repaired actor");
-        h.capabilityGrants.grant({
-          actorId: id,
-          capability: COMPUTER_USE_CAPABILITY,
-          grantedBy: "root",
-          grantedAt: "2026-10-04T00:00:00Z",
-        });
-
-        await waitUntil(() => invocations.length === 1);
-
-        // Separate observations for parsing, scheduling, and invocation enforcement:
-        const observations = {
-          parsing: undefined, // Missing from wire
-          scheduling: false, // Lock skipped
-          invocationEnforcement: invocations[0].computerUse, // Repaired follower defaults missing to false
-        };
-
-        expect(observations.parsing).toBeUndefined();
-        expect(observations.scheduling).toBe(false);
-        expect(observations.invocationEnforcement).toBe(false);
-        expect(invocations[0].hasKey).toBe(true);
-      } finally {
-        await h.close();
-      }
-    });
-
-    it("cell 4: repaired producer × repaired follower (wire boolean, lock scheduled, invocation enforced)", async () => {
-      expect(INSTANCE_PROTOCOL_VERSION).toBe(8);
-      const cwd = mkdtempSync(join(tmpdir(), "rusa-885-repaired-repaired-"));
-      dirs.push(cwd);
-
-      const invocations: Array<Record<string, unknown>> = [];
-      const parsedAdmissions: Array<boolean | undefined> = [];
-
-      const h = createHarness({
-        cwd,
-        legacyOmitInvocationAdmission: false, // Repaired follower
-        providerFactory: () => ({
-          name: "fake-inventory",
-          providerName: "instance-fixture",
-          async run(opts: RunOptions): Promise<RunResult> {
-            invocations.push({
-              computerUse: opts.computerUse,
-              hasKey: "computerUse" in opts,
-            });
-            return { success: true, output: "repaired-repaired", exitCode: 0 };
-          },
-        }),
-      });
-
-      const dispatch = h.follower.dispatch.bind(h.follower);
-      h.follower.dispatch = (envelope) => {
-        const m = envelope.message;
-        if (
-          m.type === "reply" &&
-          m.value &&
-          typeof m.value === "object" &&
-          "computerUse" in m.value
-        ) {
-          parsedAdmissions.push((m.value as { computerUse?: boolean }).computerUse);
-        }
-        dispatch(envelope);
-      };
-
-      try {
-        // Sub-case A: Denied (no grant)
-        h.spawn("repaired-repaired denied");
-        await waitUntil(() => invocations.length === 1);
-
-        const deniedObservations = {
-          parsing: parsedAdmissions[0],
-          scheduling: false,
-          invocationEnforcement: invocations[0].computerUse,
-        };
-        expect(deniedObservations.parsing).toBe(false);
-        expect(deniedObservations.scheduling).toBe(false);
-        expect(deniedObservations.invocationEnforcement).toBe(false);
-        expect(invocations[0].hasKey).toBe(true);
-
-        // Sub-case B: Allowed (grant present)
-        const idAllowed = h.spawn("repaired-repaired allowed");
-        h.capabilityGrants.grant({
-          actorId: idAllowed,
-          capability: COMPUTER_USE_CAPABILITY,
-          grantedBy: "root",
-          grantedAt: "2026-10-04T00:00:00Z",
-        });
-        await waitUntil(() => invocations.length === 2);
-
-        const allowedObservations = {
-          parsing: parsedAdmissions[1],
-          scheduling: true,
-          invocationEnforcement: invocations[1].computerUse,
-        };
-        expect(allowedObservations.parsing).toBe(true);
-        expect(allowedObservations.scheduling).toBe(true);
-        expect(allowedObservations.invocationEnforcement).toBe(true);
-        expect(invocations[1].hasKey).toBe(true);
-      } finally {
-        await h.close();
-      }
-    });
+    const dispatch = h.follower.dispatch.bind(h.follower);
+    h.follower.dispatch = (envelope) => {
+      const message = envelope.message;
+      if (
+        message.type === "reply" &&
+        message.value &&
+        typeof message.value === "object" &&
+        "computerUse" in message.value
+      ) {
+        const value = { ...message.value };
+        delete (value as { computerUse?: boolean }).computerUse;
+        dispatch({ ...envelope, message: { ...message, value } });
+      } else dispatch(envelope);
+    };
+    try {
+      h.spawn("synthetic missing admission");
+      await waitUntil(() => invocations.length === 1);
+      expect(invocations[0].computerUse).toBe(false);
+      expect(lock).not.toHaveBeenCalled();
+    } finally {
+      await h.close();
+      lock.mockRestore();
+    }
   });
 
   for (const scenario of ["denied", "allowed", "queued-revoke"] as const) {
@@ -399,7 +172,17 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
     dirs.push(cwd);
 
     const invocations: Array<Record<string, unknown>> = [];
-    let hasCapability = false;
+    const grants = new InMemoryCapabilityGrantStore();
+    const hasCapability = () => grants.activeFor("local-worker").includes(COMPUTER_USE_CAPABILITY);
+    const grant = () =>
+      grants.grant({
+        actorId: "local-worker",
+        capability: COMPUTER_USE_CAPABILITY,
+        grantedBy: "root",
+        grantedAt: "2026-10-04T00:00:00Z",
+      });
+    const revoke = () =>
+      grants.revoke("local-worker", COMPUTER_USE_CAPABILITY, "2026-10-04T00:01:00Z");
     const computerUseLock = new ComputerUseLock();
     let skew = 0;
     const holdMs = 3_600_000;
@@ -430,7 +213,7 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
         sessionId = id;
       },
       buildPrompt: () => ({ prompt: "local test" }),
-      isComputerUseAdmitted: () => hasCapability,
+      isComputerUseAdmitted: hasCapability,
       gate: (invoke, candidates, responsive) => {
         return computerUseLock.gateAfterProvider(
           "local-worker",
@@ -448,27 +231,27 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
             });
           },
           invoke,
-          () => hasCapability
+          hasCapability
         );
       },
     });
 
     try {
       // Run 1: denied (capability = false)
-      hasCapability = false;
+      revoke();
       actor.requestRun();
       await waitUntil(() => invocations.length === 1);
       expect(invocations[0].computerUse).toBe(false);
 
       // Run 2: allowed (capability = true)
-      hasCapability = true;
+      grant();
       actor.requestRun();
       await waitUntil(() => invocations.length === 2);
       expect(invocations[1].computerUse).toBe(true);
 
       // Run 3: queued-revoke
       // Capability is true when queued, pacer deferred to simulate queue hold
-      hasCapability = true;
+      grant();
       pacer.deferUntil(Date.now() + holdMs);
       actor.requestRun();
 
@@ -477,7 +260,7 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
       expect(invocations.length).toBe(2);
 
       // Revoke capability while queued in provider pacing
-      hasCapability = false;
+      revoke();
 
       // Release provider pacing by advancing time past holdMs
       skew = holdMs * 2;
