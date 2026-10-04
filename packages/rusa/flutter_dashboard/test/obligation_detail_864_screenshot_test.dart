@@ -201,12 +201,12 @@ void main() {
         intent:
             'An operator can download an actor’s run history as a CSV from the actor page, with one row per run: start, end, model, exit status and token totals. The export respects the current filters and streams, so a year of runs downloads without freezing the page.',
         status: 'done',
-        checkpoint:
-            'Pull request is green. Download button added to the actor page; export honours the status and date filters. Two reviews requested. Next: answer review questions, then merge.',
-        checkpointBy: 'coder',
-        checkpointAt: '2026-10-03T12:00:00.000Z',
         externalRef: 'github:example-org/example/issues/398',
       );
+      // Done clears standing in the same update; the prior text survives only
+      // in history.
+      const priorStanding =
+          'Pull request is green. Download button added to the actor page; export honours the status and date filters. Two reviews requested. Next: answer review questions, then merge.';
       final root = makeObligation(
         'dashboard',
         ownerId: 'steward',
@@ -238,9 +238,6 @@ void main() {
             'intent': ob.body,
             'status': 'done',
             'effectivePriority': 1.0,
-            'checkpoint': ob.checkpoint,
-            'checkpointAt': ob.checkpointAt,
-            'checkpointBy': 'coder',
             'externalRef': 'github:example-org/example/issues/398',
           },
           'ancestors': [
@@ -296,8 +293,8 @@ void main() {
               'mutationKind': 'status',
               'actingPrincipal': 'coder',
               'timestamp': '2026-10-03T13:00:00.000Z',
-              'before': {'status': 'ready'},
-              'after': {'status': 'done'},
+              'before': {'status': 'ready', 'checkpoint': priorStanding},
+              'after': {'status': 'done', 'checkpoint': null},
             },
             {
               'id': 3,
@@ -305,7 +302,7 @@ void main() {
               'actingPrincipal': 'coder',
               'timestamp': '2026-10-03T12:00:00.000Z',
               'before': {},
-              'after': {'checkpoint': ob.checkpoint},
+              'after': {'checkpoint': priorStanding},
             },
           ],
         });

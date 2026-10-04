@@ -9,11 +9,20 @@ the same transaction as the standing write. Existing rows remain intact.
 Pre-change binaries have a strict version-1 payload and state decoder. They
 reject version-2 rows, and changing only the version number cannot help because
 they also reject the checkpoint field. Once the upgraded writer records a
-checkpoint, rolling back to a pre-change binary can therefore break history
-reads. Retain a reader that understands both versions when planning recovery;
-do not remove audit rows to make an older binary accept the database. Root owns
-rollout and recovery decisions. This limitation is a payload-reader boundary,
-not a database-schema migration.
+checkpoint, rolling back to a pre-change binary breaks two readers:
+
+- the per-obligation history of any obligation with a version-2 row; and
+- the cross-obligation recent-activity reader (`listTerminalHistory`, behind
+  `/api/mesh/recent-activity`). A done or cancelled transition clears the
+  obligation's standing in the same update, so a terminal transition on any
+  obligation that had standing records a version-2 row. That reader selects
+  terminal rows across all obligations and fails on such a row.
+
+The recovery position is to keep a binary whose reader understands both
+versions. Audit rows are preserved: do not remove or rewrite them (including
+by editing their JSON payloads) to make an older binary accept the database.
+Root owns rollout and recovery decisions. This limitation is a payload-reader
+boundary, not a database-schema migration.
 
 The detail trail projects artifact attachment timestamps and creation times of
 **current children** from their existing records. A current-child entry is not

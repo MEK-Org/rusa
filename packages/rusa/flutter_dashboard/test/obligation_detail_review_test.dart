@@ -353,7 +353,21 @@ void main() {
 
         final titleRect = tester.getRect(title);
         final actionsRect = tester.getRect(actions);
-        // The done chip sits adjacent to the title (8px spacing), not floated to the right edge.
+        // The title hugs its text rather than expanding across the header, so
+        // the done chip follows the last glyph instead of the right edge.
+        final painter = TextPainter(
+          text: TextSpan(
+            text: ob.heading,
+            style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        addTearDown(painter.dispose);
+        // Allow for the selectable text's caret padding, nothing more.
+        expect(
+          titleRect.width,
+          inInclusiveRange(painter.width, painter.width + 16),
+        );
         expect(actionsRect.left, closeTo(titleRect.right + 8, 1));
         expect(actionsRect.center.dy, closeTo(titleRect.center.dy, 1.0));
 
