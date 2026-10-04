@@ -217,7 +217,7 @@ export class MeshChatRepository {
       AND sender_id != recipient_id)`;
     if (opts.routedActor) {
       sql += ` OR (recipient_id IN (${actorPlaceholders}) AND EXISTS (
-        SELECT 1 FROM mesh_events e WHERE e.kind = 'message_sent' AND json_valid(e.payload)
+        SELECT 1 FROM mesh_events e WHERE e.id = mesh_chat.id || ':sent' AND e.kind = 'message_sent' AND json_valid(e.payload)
         AND json_extract(e.payload, '$.messageId') = mesh_chat.id
         AND json_extract(e.payload, '$.originalActorId') IN (${actorPlaceholders})))`;
       params.push(...actorIds, ...actorIds);
