@@ -75,17 +75,22 @@ the gap before committing.`;
   }
   const command = ["git", ...meshGitIdentityArgs(identity), "commit"].map(shellQuote).join(" ");
   return `## Git identity
-Commits you make for mesh work are authored as the mesh: **${identity.name}
+Commits you make in your mesh workspace — the clones and worktrees the mesh
+owns — are authored as the mesh: **${identity.name}
 <${identity.email}>**, read from the mesh host's global Git config. Pass it on
 each Git command that creates commits (commit, merge, rebase, cherry-pick, revert,
 am); \`-c\` sets both author and committer for that one command:
 
     ${command} …
 
-Leave \`user.name\` and \`user.email\` in every Git config file — local,
-global, system — as you found them; they belong to whoever owns that machine or
-repository. Identity is the mesh's to supply, so don't add Git identity
-directives to a repository's agent instructions.`;
+The identity is whatever the host's global Git config holds, so on a machine
+whose global identity is a person's, that person is what the mesh presents. In
+a checkout that belongs to a person rather than to the mesh, leave the
+commit's identity to that repository's own configuration instead of imposing
+the mesh identity. Leave \`user.name\` and \`user.email\` in every Git config
+file — local, global, system — as you found them; they belong to whoever owns
+that machine or repository. Identity is the mesh's to supply, so don't add Git
+identity directives to a repository's agent instructions.`;
 }
 
 export const INBOX_DISCIPLINE = `## Work from your inbox

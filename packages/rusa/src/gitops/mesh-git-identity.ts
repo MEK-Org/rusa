@@ -22,6 +22,10 @@ function readGlobal(key: string, env: NodeJS.ProcessEnv): string | undefined {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
       env,
+      // Local file read with no lock; the timeout only bounds an exotic hung
+      // filesystem from stalling mesh startup. A timeout lands in the catch
+      // below and surfaces as "no identity", never as a wrong one.
+      timeout: 5_000,
     }).trim();
     return value || undefined;
   } catch {
