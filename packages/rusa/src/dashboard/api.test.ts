@@ -4597,6 +4597,25 @@ describe("handleMeshApiRequest", () => {
         expect(bare.listHistory("mine").some((h) => h.mutationKind === "snooze")).toBe(false);
       });
 
+      it("accepts the dashboard's microsecond UTC deadline and refuses a terminal row (#893)", async () => {
+        // Dart's DateTime.toUtc().toIso8601String() carries six fractional
+        // digits and a Z offset; the server stores it at millisecond precision.
+        obligations.create({ title: "mine", id: "mine", ownerId: LOCAL_USER });
+        const base = new Date(Date.now() + 2 * 3_600_000);
+        base.setUTCMilliseconds(123);
+        const dartForm = base.toISOString().replace(/Z$/, "456Z");
+        const set = await snooze("mine", { until: dartForm });
+        expect(set.status).toBe(200);
+        expect(set.data.obligation.snoozedUntil).toBe(base.toISOString());
+
+        obligations.create({ title: "finished", id: "finished", ownerId: LOCAL_USER });
+        obligations.setTerminalStatus("finished", "done", null, null, LOCAL_USER);
+        const refused = await snooze("finished", { until: future() });
+        expect(refused.status).toBe(400);
+        expect(refused.data.error).toContain("terminal obligations cannot be snoozed");
+        expect(obligations.get("finished")?.snoozedUntil).toBeNull();
+      });
+
       it("404s a missing obligation and 400s an invalid deadline", async () => {
         expect((await snooze("missing", { until: future() })).status).toBe(404);
         obligations.create({ title: "mine", id: "mine", ownerId: LOCAL_USER });

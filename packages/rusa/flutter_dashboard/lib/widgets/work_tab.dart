@@ -11,6 +11,7 @@ import 'avatar.dart';
 import 'header.dart';
 import 'obligation_card.dart';
 import 'obligation_dialogs.dart';
+import 'obligation_snooze.dart';
 import 'obligation_status.dart';
 import 'hierarchy_drag_drop.dart';
 import 'reference_preview.dart';
@@ -1773,6 +1774,18 @@ class _DetailViewState extends State<_DetailView> {
           onUpdated: onMutated,
         ),
       ),
+      if (canSnoozeObligation(store, o))
+        IconButton(
+          tooltip: o.isSnoozed ? 'Change snooze' : 'Snooze',
+          icon: const Icon(Icons.snooze),
+          color: kSnoozeColor,
+          onPressed: () => showSnoozeObligationDialog(
+            context,
+            store,
+            o,
+            onUpdated: onMutated,
+          ),
+        ),
       IconButton(
         tooltip: 'Reassign obligation',
         icon: const Icon(Icons.person_outline),

@@ -7,6 +7,7 @@ import '../theme.dart';
 import '../util.dart';
 import 'header.dart';
 import 'obligation_dialogs.dart';
+import 'obligation_snooze.dart';
 import 'obligation_status.dart';
 import 'reference_preview.dart';
 
@@ -114,6 +115,9 @@ class ObligationRow extends StatelessWidget {
                 case 'cancelled':
                   confirmAndSetObligationStatus(context, store, obligation, 'cancelled', onUpdated: onMutated);
                   break;
+                case 'snooze':
+                  showSnoozeObligationDialog(context, store, obligation, onUpdated: onMutated);
+                  break;
                 case 'reparent':
                   showReparentObligationDialog(context, store, obligation, onReparented: onMutated);
                   break;
@@ -156,6 +160,20 @@ class ObligationRow extends StatelessWidget {
                   ],
                 ),
               ),
+              if (canSnoozeObligation(store, obligation))
+                PopupMenuItem(
+                  value: 'snooze',
+                  child: Row(
+                    children: [
+                      const Icon(Icons.snooze, size: 16, color: kSnoozeColor),
+                      const SizedBox(width: 8),
+                      Text(
+                        obligation.isSnoozed ? 'Change Snooze...' : 'Snooze...',
+                        style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
+                      ),
+                    ],
+                  ),
+                ),
               const PopupMenuDivider(),
               const PopupMenuItem(
                 value: 'reparent',
