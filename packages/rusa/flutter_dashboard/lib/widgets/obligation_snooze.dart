@@ -178,11 +178,14 @@ Future<DateTime?> _pickCustomDeadline(
       ? current
       : now.add(const Duration(hours: 1));
   final today = DateTime(now.year, now.month, now.day);
+  // Five years out, or further when the current snooze already is: the server
+  // sets no upper bound.
+  final horizon = DateTime(today.year + 5, today.month, today.day);
   final date = await showDatePicker(
     context: context,
     initialDate: initial,
     firstDate: today,
-    lastDate: DateTime(today.year + 5, today.month, today.day),
+    lastDate: initial.isAfter(horizon) ? DateUtils.dateOnly(initial) : horizon,
     helpText: 'Snooze until',
   );
   if (date == null || !context.mounted) return null;

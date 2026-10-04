@@ -24,6 +24,9 @@ const String _suffix = String.fromEnvironment(
   defaultValue: 'after',
 );
 
+DateTime _minute(DateTime t) =>
+    DateTime.utc(t.year, t.month, t.day, t.hour, t.minute);
+
 void main() {
   setUpAll(() async {
     await loadFonts();
@@ -53,7 +56,13 @@ void main() {
           parentId: 'ob-release',
           ownerId: 'human:operator',
           title: 'Confirm changelog wording',
-          snoozedUntil: '2026-10-06T09:00:00.000Z',
+          // Relative to the live clock the views read, as the quota scenes
+          // in screenshots_test.dart are, so the snooze is always ahead.
+          snoozedUntil: _minute(
+            DateTime.now().toUtc().add(
+              const Duration(days: 1, hours: 20, minutes: 30),
+            ),
+          ).toIso8601String(),
         ),
       ];
     final store = DashboardStore(

@@ -406,6 +406,32 @@ void main() {
       expect(updates, 1);
     });
 
+    testWidgets('custom picker opens on a snooze beyond its usual horizon', (
+      tester,
+    ) async {
+      // Actors can snooze without an upper bound; the picker must still open
+      // on that date rather than asserting it is past lastDate.
+      final far = makeObligation(
+        'ob-1',
+        ownerId: 'human:operator',
+        intent: 'Mine',
+        snoozedUntil: '2036-06-15T09:00:00.000Z',
+      );
+      await open(tester, far);
+      await tester.tap(find.byKey(const ValueKey('snooze-option-custom')));
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      await tester.tap(find.text('OK'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('OK'));
+      await tester.pumpAndSettle();
+      final local = DateTime.parse(far.snoozedUntil!).toLocal();
+      expect(
+        api.snoozeCalls.single.until,
+        DateTime(local.year, local.month, local.day, local.hour, local.minute),
+      );
+    });
+
     testWidgets('a custom time no longer in the future writes nothing', (
       tester,
     ) async {
