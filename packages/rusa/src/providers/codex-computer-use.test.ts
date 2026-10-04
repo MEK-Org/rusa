@@ -1,14 +1,9 @@
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderConfig } from "../config/types.js";
-import {
-  CODEX_DENIED_DESKTOP_PLUGIN_OVERRIDES,
-  CodexProvider,
-  KNOWN_DIRECT_COMPUTER_USE_MCP_NAMES,
-  listEffectiveCodexMcpServers,
-} from "./codex.js";
+import { CodexProvider, listEffectiveCodexMcpServers } from "./codex.js";
 
 const dirs: string[] = [];
 afterEach(() => {

@@ -8,14 +8,11 @@ import type { ProviderConfig } from "../config/types.js";
 import {
   buildCodexArgs,
   buildCodexConfigOverrides,
-  CODEX_DENIED_DESKTOP_PLUGIN_OVERRIDES,
   CodexProvider,
   codexRolloutExists,
   codexRolloutResumable,
   extractCodexSessionModel,
   extractNewestCodexSessionId,
-  KNOWN_DIRECT_COMPUTER_USE_MCP_NAMES,
-  listEffectiveCodexMcpServers,
   overrideTomlModel,
   parseCodexModel,
   stripMcpServersFromToml,
@@ -1226,21 +1223,37 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       const config: ProviderConfig = { cliCommand: "codex" };
       const provider = new CodexProvider("codex", config, "gpt-5-codex");
 
-      execFileFn.mockImplementation((command: string, args: string[], options: unknown, cb?: Function) => {
-        const callback = (typeof options === "function" ? options : cb) as Function;
-        if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
-          callback(
-            null,
-            JSON.stringify([
-              { name: "computer-use", enabled: true, transport: { type: "stdio", command: "python3" } },
-              { name: "cua_repl", enabled: true, transport: { type: "stdio", command: "python3" } },
-              { name: "docs", enabled: true, transport: { type: "streamable_http", url: "https://example.invalid" } },
-            ])
-          );
-          return;
+      execFileFn.mockImplementation(
+        (command: string, args: string[], options: unknown, cb?: (...args: unknown[]) => void) => {
+          const callback = (typeof options === "function" ? options : cb) as (
+            ...args: unknown[]
+          ) => void;
+          if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
+            callback(
+              null,
+              JSON.stringify([
+                {
+                  name: "computer-use",
+                  enabled: true,
+                  transport: { type: "stdio", command: "python3" },
+                },
+                {
+                  name: "cua_repl",
+                  enabled: true,
+                  transport: { type: "stdio", command: "python3" },
+                },
+                {
+                  name: "docs",
+                  enabled: true,
+                  transport: { type: "streamable_http", url: "https://example.invalid" },
+                },
+              ])
+            );
+            return;
+          }
+          callback(new Error(`Unexpected execFile: ${command} ${args.join(" ")}`));
         }
-        callback(new Error(`Unexpected execFile: ${command} ${args.join(" ")}`));
-      });
+      );
 
       const mockChild = new EventEmitter() as EventEmitter & {
         stdout: EventEmitter;
@@ -1283,19 +1296,27 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       const config: ProviderConfig = { cliCommand: "codex" };
       const provider = new CodexProvider("codex", config, "gpt-5-codex");
 
-      execFileFn.mockImplementation((command: string, args: string[], options: unknown, cb?: Function) => {
-        const callback = (typeof options === "function" ? options : cb) as Function;
-        if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
-          callback(
-            null,
-            JSON.stringify([
-              { name: "docs", enabled: true, transport: { type: "streamable_http", url: "https://example.invalid" } },
-            ])
-          );
-          return;
+      execFileFn.mockImplementation(
+        (command: string, args: string[], options: unknown, cb?: (...args: unknown[]) => void) => {
+          const callback = (typeof options === "function" ? options : cb) as (
+            ...args: unknown[]
+          ) => void;
+          if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
+            callback(
+              null,
+              JSON.stringify([
+                {
+                  name: "docs",
+                  enabled: true,
+                  transport: { type: "streamable_http", url: "https://example.invalid" },
+                },
+              ])
+            );
+            return;
+          }
+          callback(new Error(`Unexpected execFile: ${command} ${args.join(" ")}`));
         }
-        callback(new Error(`Unexpected execFile: ${command} ${args.join(" ")}`));
-      });
+      );
 
       const mockChild = new EventEmitter() as EventEmitter & {
         stdout: EventEmitter;
@@ -1367,14 +1388,18 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       const config: ProviderConfig = { cliCommand: "codex" };
       const provider = new CodexProvider("codex", config, "gpt-5-codex");
 
-      execFileFn.mockImplementation((command: string, args: string[], options: unknown, cb?: Function) => {
-        const callback = (typeof options === "function" ? options : cb) as Function;
-        if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
-          callback(new Error("failed to load configuration"));
-          return;
+      execFileFn.mockImplementation(
+        (command: string, args: string[], options: unknown, cb?: (...args: unknown[]) => void) => {
+          const callback = (typeof options === "function" ? options : cb) as (
+            ...args: unknown[]
+          ) => void;
+          if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
+            callback(new Error("failed to load configuration"));
+            return;
+          }
+          callback(new Error(`Unexpected execFile: ${command} ${args.join(" ")}`));
         }
-        callback(new Error(`Unexpected execFile: ${command} ${args.join(" ")}`));
-      });
+      );
 
       const result = await provider.run({
         prompt: "test failed discovery",

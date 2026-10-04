@@ -1,4 +1,4 @@
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -372,9 +372,7 @@ export const CODEX_DENIED_DESKTOP_PLUGIN_OVERRIDES = [
 ];
 
 /** Known direct MCP server names that represent computer-use bindings (#885). */
-export const KNOWN_DIRECT_COMPUTER_USE_MCP_NAMES = new Set([
-  "computer-use",
-]);
+export const KNOWN_DIRECT_COMPUTER_USE_MCP_NAMES = new Set(["computer-use"]);
 
 /**
  * Discover configured MCP servers in the effective configuration using `codex mcp list --json`.
@@ -888,7 +886,12 @@ export class CodexProvider implements CodingProvider {
         const computerUseOverrides: string[] = [...CODEX_DENIED_DESKTOP_PLUGIN_OVERRIDES];
         try {
           const timeoutMs = Math.max(60_000, opts.timeoutMs ?? 60_000);
-          const effectiveServers = await listEffectiveCodexMcpServers(command, codexCwd, spawnEnv, timeoutMs);
+          const effectiveServers = await listEffectiveCodexMcpServers(
+            command,
+            codexCwd,
+            spawnEnv,
+            timeoutMs
+          );
           for (const server of effectiveServers) {
             if (KNOWN_DIRECT_COMPUTER_USE_MCP_NAMES.has(server.name) && server.transport) {
               computerUseOverrides.push(`mcp_servers.${server.name}.enabled=false`);

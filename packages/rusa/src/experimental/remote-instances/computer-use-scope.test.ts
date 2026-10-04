@@ -3,11 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { Actor } from "../../actor/actor.js";
-import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../../actor/computer-use-lock.js";
+import { COMPUTER_USE_CAPABILITY } from "../../actor/computer-use-lock.js";
 import { ProviderPacer } from "../../actor/provider-pacer.js";
 import type { CodingProvider, RunOptions, RunResult } from "../../providers/types.js";
-import { createActorRuntime } from "./actor-runtime.js";
-import { FollowerInstance } from "./follower-instance.js";
 import { createHarness, waitUntil } from "./harness.js";
 import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
@@ -83,7 +81,12 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
       const dispatch = h.follower.dispatch.bind(h.follower);
       h.follower.dispatch = (envelope) => {
         const m = envelope.message;
-        if (m.type === "reply" && m.value && typeof m.value === "object" && "computerUse" in m.value) {
+        if (
+          m.type === "reply" &&
+          m.value &&
+          typeof m.value === "object" &&
+          "computerUse" in m.value
+        ) {
           admissions.push((m.value as { computerUse: boolean }).computerUse);
         }
         dispatch(envelope);
@@ -143,7 +146,12 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
     const dispatch = h.follower.dispatch.bind(h.follower);
     h.follower.dispatch = (envelope) => {
       const m = envelope.message;
-      if (m.type === "reply" && m.value && typeof m.value === "object" && "computerUse" in m.value) {
+      if (
+        m.type === "reply" &&
+        m.value &&
+        typeof m.value === "object" &&
+        "computerUse" in m.value
+      ) {
         const strippedValue = { ...(m.value as Record<string, unknown>) };
         delete strippedValue.computerUse;
         dispatch({
