@@ -1344,3 +1344,83 @@ describe("linked model pacers (#588)", () => {
     expect(started.at(-1)).toEqual(["claude-fable-5-1", 30_000]);
   });
 });
+
+describe("pool selection by each candidate's governing pacer (#895)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const MINUTE = 60_000;
+  const clock = () => Date.now();
+  // Codex moderately throttled; Claude's provider lane cool, but Fable's own
+  // model-scoped lane (linked to it, #588) running hot.
+  const pool = () => {
+    const codex = new ProviderPacer(9 * MINUTE, clock);
+    const claude = new ProviderPacer(2 * MINUTE, clock);
+    const fable = new ProviderPacer(28 * MINUTE, clock, claude);
+    return {
+      codex,
+      fable,
+      codexCandidate: { config: "codex", lane: "codex", pacer: codex },
+      fableCandidate: { config: "claude-fable-5-1", lane: "claude", pacer: fable },
+    };
+  };
+  // Both provider-wide weekly readings trustworthy, Claude's with more headroom.
+  const weekly = (percentLeft: number) => ({
+    percentLeft,
+    observedAt: new Date(Date.now()).toISOString(),
+    resetAtIso: new Date(Date.now() + 4 * 24 * 60 * MINUTE).toISOString(),
+  });
+
+  it("responsive selection loses a candidate whose model lane is hotter, despite provider-wide headroom", () => {
+    const { codexCandidate, fableCandidate } = pool();
+    const codex = { ...codexCandidate, weeklyQuota: weekly(30) };
+    const fable = { ...fableCandidate, weeklyQuota: weekly(80) };
+    const now = Date.now();
+
+    expect(selectPoolLane([codex, fable], now, { responsive: true })?.config).toBe("codex");
+    expect(selectPoolLane([fable, codex], now, { responsive: true })?.config).toBe("codex");
+  });
+
+  it("responsive selection ranks by throttle period, not by the next normal slot", async () => {
+    const mesh = new ConcurrencyLimiter(4);
+    const { codex, codexCandidate, fableCandidate } = pool();
+    // Codex handled the previous message five minutes ago, so its next normal
+    // slot is four minutes out; Fable has been idle past its window.
+    await codex.submit(async () => "prior", { enqueueNormal: (fn) => mesh.enqueue(fn) }).result;
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    const now = Date.now();
+
+    expect(
+      selectPoolLane([codexCandidate, fableCandidate], now, { responsive: true })?.config
+    ).toBe("codex");
+  });
+
+  it("normal and responsive selection choose the same candidate for the same quotes", () => {
+    const { codexCandidate, fableCandidate } = pool();
+    const candidates = [
+      { ...fableCandidate, weeklyQuota: weekly(80) },
+      { ...codexCandidate, weeklyQuota: weekly(30) },
+    ];
+    const now = Date.now();
+    expect(codexCandidate.pacer.quote(now)).toBe(fableCandidate.pacer.quote(now));
+
+    expect(selectPoolLane(candidates, now)?.config).toBe("codex");
+    expect(selectPoolLane(candidates, now, { responsive: true })?.config).toBe("codex");
+  });
+
+  it("a responsive admission starts the candidate with the shorter governing throttle", async () => {
+    const mesh = new ConcurrencyLimiter(4);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const { codexCandidate, fableCandidate } = pool();
+    const handle = queue.enqueue(
+      async (config) => config,
+      [
+        { ...codexCandidate, weeklyQuota: weekly(30) },
+        { ...fableCandidate, weeklyQuota: weekly(80) },
+      ],
+      { responsive: true, threadId: "t", enqueueNormal: (fn) => mesh.enqueue(fn) }
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(handle.result).resolves.toBe("codex");
+  });
+});
