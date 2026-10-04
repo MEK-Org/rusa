@@ -13,6 +13,7 @@ import {
   codexRolloutResumable,
   extractCodexSessionModel,
   extractNewestCodexSessionId,
+  isCodexAuthFailure,
   overrideTomlModel,
   parseCodexModel,
   stripMcpServersFromToml,
@@ -565,7 +566,8 @@ trust_level = "trusted"
     // configured exit code (default 0). Returns every spawn's argv + the result.
     async function runWithSpawns(
       session: { id?: string } | undefined,
-      closeCodes: number[]
+      closeCodes: number[],
+      stderrBySpawn: string[][] = []
     ): Promise<{ argvs: string[][]; result: Awaited<ReturnType<CodexProvider["run"]>> }> {
       const provider = new CodexProvider("codex", { cliCommand: "codex" }, "gpt-5-codex");
       const argvs: string[][] = [];
@@ -579,7 +581,12 @@ trust_level = "trusted"
         };
         child.stdout = new EventEmitter();
         child.stderr = new EventEmitter();
-        setTimeout(() => child.emit("close", closeCodes[idx] ?? 0), 5);
+        setTimeout(() => {
+          for (const text of stderrBySpawn[idx] ?? []) {
+            child.stderr.emit("data", Buffer.from(text));
+          }
+          child.emit("close", closeCodes[idx] ?? 0);
+        }, 5);
         return child as unknown as ChildProcessWithoutNullStreams;
       });
       const result = await provider.run({
@@ -684,6 +691,25 @@ trust_level = "trusted"
       expect(codexArgsOf(argvs[1])).not.toContain("resume");
       // The fresh retry succeeded → overall success.
       expect(result.success).toBe(true);
+    });
+
+    it("keeps an evicted split auth diagnosis from retrying a failed resume", async () => {
+      seedRollout(ID);
+      const alarm = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const { argvs, result } = await runWithSpawns(
+          { id: ID },
+          [1, 0],
+          [["unau", "thorized\n", "x".repeat(3 * 64 * 1024)]]
+        );
+        expect(argvs).toHaveLength(1);
+        expect(result.success).toBe(false);
+        expect(isCodexAuthFailure(result.output)).toBe(true);
+        expect(Buffer.byteLength(result.output)).toBeLessThan(64 * 1024 + 256);
+        expect(alarm).toHaveBeenCalledWith(expect.stringContaining("AUTHENTICATION ALARM"));
+      } finally {
+        alarm.mockRestore();
+      }
     });
 
     it("hands shell children the throwaway CODEX_HOME on resume and on the fresh retry", async () => {

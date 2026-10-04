@@ -279,14 +279,8 @@ export function codexRolloutResumable(sessionsDir: string, sessionId: string): b
  * skip the resume→fresh fallback (a fresh run won't fix bad auth either).
  */
 export function isCodexAuthFailure(output: string): boolean {
-  const o = output.toLowerCase();
-  return (
-    o.includes("unauthorized") ||
-    o.includes("auth failed") ||
-    o.includes("authentication failed") ||
-    o.includes("token expired") ||
-    o.includes("login required") ||
-    o.includes("token invalid")
+  return /unauthorized|auth failed|authentication failed|token expired|login required|token invalid/i.test(
+    output
   );
 }
 
@@ -504,8 +498,16 @@ export class CodexProvider implements CodingProvider {
       const stderrDecoder = new StringDecoder("utf8");
       let diagnosticTail = "";
       let diagnosticBytes = 0;
+      let rawAuthFailure = false;
+      let authScanSuffix = "";
       const captureDiagnostics = (text: string, chunks?: string[]) => {
         diagnosticBytes += Buffer.byteLength(text);
+        // Preserve the existing auth decision even if its text is evicted. The
+        // longest recognized phrase is 21 characters; only chunk boundaries
+        // need overlap. Scan giant chunks without making a giant lowercase copy.
+        rawAuthFailure ||=
+          isCodexAuthFailure(text) || isCodexAuthFailure(authScanSuffix + text.slice(0, 20));
+        authScanSuffix = (authScanSuffix + text.slice(-20)).slice(-20);
         // Slice before encoding so a single giant event never creates an
         // additional giant diagnostic buffer. At most 64 Ki characters plus
         // the previous bounded tail are encoded; discard a partial leading
@@ -516,11 +518,17 @@ export class CodexProvider implements CodingProvider {
         diagnosticTail = tail.subarray(start).toString("utf8");
         if (chunks) chunks.splice(0, chunks.length, diagnosticTail);
       };
-      const diagnosticOutput = (label = false): string => {
+      const diagnosticOutput = (label = false, preserveAuth = false): string => {
         const omitted = diagnosticBytes - Buffer.byteLength(diagnosticTail);
-        return label || omitted > 0
-          ? `[Codex raw diagnostics: ${omitted} UTF-8 bytes omitted; tail]\n${diagnosticTail}`
-          : diagnosticTail;
+        const output =
+          label || omitted > 0
+            ? `[Codex raw diagnostics: ${omitted} UTF-8 bytes omitted; tail]\n${diagnosticTail}`
+            : diagnosticTail;
+        // Keep failure output classifiable without retaining evicted raw bytes.
+        // This fixed summary, like the omission label, is outside the raw budget.
+        return preserveAuth && omitted > 0 && rawAuthFailure && !isCodexAuthFailure(output)
+          ? `${output}\n[Codex authentication failed diagnostic observed before tail eviction]`
+          : output;
       };
       const tick = () => opts.onChunk?.("");
       const itemText = (item: { content?: unknown; text?: unknown }): string => {
@@ -720,7 +728,10 @@ export class CodexProvider implements CodingProvider {
       };
       const buildInterruptedResult = (termination: TerminationAttribution): RunResult => {
         flushStderr();
-        const output = [...assistantTexts, diagnosticOutput(true)].join("\n");
+        const output = [
+          ...assistantTexts,
+          diagnosticOutput(true, assistantTexts.length === 0),
+        ].join("\n");
         return buildResultWithSession({
           ...termination,
           success: false,
@@ -759,7 +770,9 @@ export class CodexProvider implements CodingProvider {
           // Normal output stays semantic; failures without assistant text keep
           // the bounded raw tail so recent auth/quota diagnoses remain useful.
           const outputText =
-            assistantTexts.length > 0 ? assistantTexts.join("\n") : diagnosticOutput();
+            assistantTexts.length > 0
+              ? assistantTexts.join("\n")
+              : diagnosticOutput(false, exitCode !== 0);
           // Auth-fail alarm: if the run fails with an auth error, alert the operator.
           if (exitCode !== 0 && isCodexAuthFailure(outputText)) {
             console.error("\n=======================================================");
