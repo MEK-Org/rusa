@@ -371,17 +371,15 @@ export const CODEX_DENIED_DESKTOP_PLUGIN_OVERRIDES = [
   "plugins.computer-use@openai-bundled.enabled=false",
 ];
 
-/** Known direct MCP server names that represent computer-use bindings (#885). */
+/** Specifically named configured direct binding covered by #885; not plugin-provided cua_repl. */
 export const KNOWN_DIRECT_COMPUTER_USE_MCP_NAMES = new Set(["computer-use"]);
 
 export interface ListEffectiveCodexMcpServersOptions {
   command: string;
-  args?: string[];
+  args: string[];
   cwd: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
-  profile?: string;
-  configOverrides?: string[];
   signal?: AbortSignal;
 }
 
@@ -393,17 +391,10 @@ export interface ListEffectiveCodexMcpServersOptions {
 export async function listEffectiveCodexMcpServers(
   options: ListEffectiveCodexMcpServersOptions
 ): Promise<Array<{ name: string; enabled?: boolean; transport?: unknown }>> {
-  const args = options.args ?? [
-    ...(options.profile ? ["--profile", options.profile] : []),
-    "mcp",
-    "list",
-    "--json",
-    ...(options.configOverrides ?? []).flatMap((override) => ["-c", override]),
-  ];
   return new Promise((resolve, reject) => {
     execFile(
       options.command,
-      args,
+      options.args,
       {
         cwd: options.cwd,
         env: options.env ?? process.env,
@@ -818,7 +809,6 @@ export class CodexProvider implements CodingProvider {
       const hasMcpServers = opts.mcpServers && opts.mcpServers.length > 0;
       if (opts.sandbox && (hasMcpServers || this.model || this.effort)) {
         mcpConfigSource = join("/tmp", `rusa-mcp-codex-${randomUUID()}.toml`);
-        tempPaths.push(mcpConfigSource);
         let baseConfig = "";
         const hostHome = process.env.HOME ?? "/root";
         const hostConfigPath = join(hostHome, ".codex", "config.toml");

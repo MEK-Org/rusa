@@ -178,7 +178,9 @@ export interface ActorOptions {
   onCoalesceAborted?: (count: number, ageMs: number) => void;
   /**
    * Returns whether computer-use capability is admitted for the upcoming/active run.
-   * Called immediately before provider invocation so that queued revokes take effect.
+   * Called before every provider attempt, including pool fallback. Local callers
+   * intersect the run's lock admission with the live grant: revokes deny, while
+   * grants after a skipped lock wait for the next run.
    */
   isComputerUseAdmitted?: () => boolean;
   /**

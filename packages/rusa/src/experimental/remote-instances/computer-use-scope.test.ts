@@ -4,7 +4,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Actor } from "../../actor/actor.js";
 import { InMemoryCapabilityGrantStore } from "../../actor/capability-grants.js";
-import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../../actor/computer-use-lock.js";
+import {
+  COMPUTER_USE_CAPABILITY,
+  ComputerUseLock,
+  createComputerUseAdmission,
+} from "../../actor/computer-use-lock.js";
 import { ProviderPacer } from "../../actor/provider-pacer.js";
 import type { CodingProvider, RunOptions, RunResult } from "../../providers/types.js";
 import { createHarness, waitUntil } from "./harness.js";
@@ -174,6 +178,7 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
     const invocations: Array<Record<string, unknown>> = [];
     const grants = new InMemoryCapabilityGrantStore();
     const hasCapability = () => grants.activeFor("local-worker").includes(COMPUTER_USE_CAPABILITY);
+    const admission = createComputerUseAdmission(hasCapability);
     const grant = () =>
       grants.grant({
         actorId: "local-worker",
@@ -213,7 +218,7 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
         sessionId = id;
       },
       buildPrompt: () => ({ prompt: "local test" }),
-      isComputerUseAdmitted: hasCapability,
+      isComputerUseAdmitted: admission.isAdmitted,
       gate: (invoke, candidates, responsive) => {
         return computerUseLock.gateAfterProvider(
           "local-worker",
@@ -231,7 +236,7 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
             });
           },
           invoke,
-          hasCapability
+          admission.shouldLock
         );
       },
     });
@@ -273,4 +278,84 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
       computerUseLock.close();
     }
   });
+
+  for (const [change, changeAt] of [
+    ["grant", "primary"],
+    ["grant", "fallback"],
+    ["revoke", "primary"],
+    ["revoke", "fallback"],
+  ] as const) {
+    it(`${change} at the ${changeAt} invocation respects the run's lock admission`, async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "rusa-885-late-grant-"));
+      dirs.push(cwd);
+      const grants = new InMemoryCapabilityGrantStore();
+      const hasCapability = () =>
+        grants.activeFor("local-worker").includes(COMPUTER_USE_CAPABILITY);
+      const grant = () =>
+        grants.grant({
+          actorId: "local-worker",
+          capability: COMPUTER_USE_CAPABILITY,
+          grantedBy: "root",
+          grantedAt: "2026-10-04T00:00:00Z",
+        });
+      if (change === "revoke") grant();
+      const admission = createComputerUseAdmission(hasCapability);
+      const lock = new ComputerUseLock();
+      const lockGate = vi.spyOn(lock, "gate");
+      const admissions: boolean[] = [];
+      const invocations: Array<boolean | undefined> = [];
+      const actor = new Actor({
+        id: "local-worker",
+        cwd,
+        modelConfig: [{ provider: "primary" }, { provider: "fallback" }],
+        mcpServers: [],
+        resolveProvider: ({ provider }) => ({
+          name: provider,
+          providerName: provider,
+          async run(opts) {
+            invocations.push(opts.computerUse);
+            return {
+              success: provider === "fallback",
+              output: "synthetic",
+              exitCode: provider === "fallback" ? 0 : 1,
+            };
+          },
+        }),
+        classifyExhaustion: async () => ({ exhausted: true }),
+        debounceMs: 10,
+        loadSessionId: () => undefined,
+        saveSessionId: () => {},
+        buildPrompt: () => ({ prompt: "synthetic late grant" }),
+        isComputerUseAdmitted: admission.isAdmitted,
+        onProviderAttempt: async (attempt) => {
+          if (attempt.providerName === changeAt) {
+            if (change === "grant") grant();
+            else grants.revoke("local-worker", COMPUTER_USE_CAPABILITY, "2026-10-04T00:01:00Z");
+          }
+        },
+        gate: (invoke, candidates, responsive) =>
+          lock.gateAfterProvider(
+            "local-worker",
+            responsive,
+            (start) => start(candidates[0]),
+            invoke,
+            () => {
+              const admitted = admission.shouldLock();
+              admissions.push(admitted);
+              return admitted;
+            }
+          ),
+      });
+      try {
+        actor.requestRun();
+        await waitUntil(() => invocations.length === 2 && !actor.isRunning);
+        expect(admissions).toEqual([change === "revoke"]);
+        expect(lockGate).toHaveBeenCalledTimes(change === "revoke" ? 1 : 0);
+        expect(hasCapability()).toBe(change === "grant");
+        expect(invocations).toEqual([change === "revoke" && changeAt === "fallback", false]);
+      } finally {
+        lock.close();
+      }
+    });
+  }
 });

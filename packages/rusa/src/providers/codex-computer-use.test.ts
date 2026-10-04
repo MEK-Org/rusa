@@ -105,8 +105,14 @@ describe("Codex computer-use fake inventories (#885)", () => {
       listEffectiveCodexMcpServers({
         command: f.command,
         cwd: f.project,
-        profile: "desktop",
-        configOverrides,
+        args: [
+          "--profile",
+          "desktop",
+          "mcp",
+          "list",
+          "--json",
+          ...(configOverrides ?? []).flatMap((c) => ["-c", c]),
+        ],
       });
     expect(await read()).toMatchObject([
       {
@@ -136,10 +142,10 @@ describe("Codex computer-use fake inventories (#885)", () => {
     const f = fixture();
     appendFileSync(
       f.configPath,
-      '[plugins."unified-computer-use@openai-bundled"]\nenabled=true\n[plugins."computer-use@openai-bundled"]\nenabled=true\n[plugins."unrelated@fixture"]\nenabled=true\n[mcp_servers.computer-use]\ncommand="fake-desktop-never-launched"\n[mcp_servers.docs]\nurl="https://example.invalid/docs"\n'
+      '[plugins."unified-computer-use@openai-bundled"]\nenabled=true\n[plugins."computer-use@openai-bundled"]\nenabled=true\n[plugins."unrelated@fixture"]\nenabled=true\n[mcp_servers.computer-use]\ncommand="fake-desktop-never-launched"\n[mcp_servers.docs]\nurl="https://example.invalid/docs"\n[mcp_servers.cua_repl]\ncommand="fake-plugin-server-never-launched"\n'
     );
     const before = readFileSync(f.configPath, "utf8");
-    for (const computerUse of [false, true, false, true]) {
+    for (const computerUse of [undefined, true, false, true]) {
       const result = await f.provider.run({ prompt: "synthetic", cwd: f.project, computerUse });
       expect(result.success, result.output).toBe(true);
       const observed = inventory(result.output);
@@ -153,10 +159,11 @@ describe("Codex computer-use fake inventories (#885)", () => {
           : ["unrelated@fixture"]
       );
       expect(observed.servers.find((s) => s.name === "computer-use")).toMatchObject({
-        enabled: computerUse,
+        enabled: computerUse === true,
         transport: { command: "fake-desktop-never-launched" },
       });
       expect(observed.servers.find((s) => s.name === "docs")).toMatchObject({ enabled: true });
+      expect(observed.servers.find((s) => s.name === "cua_repl")).toMatchObject({ enabled: true });
       expect(readFileSync(f.configPath, "utf8")).toBe(before);
     }
   });
