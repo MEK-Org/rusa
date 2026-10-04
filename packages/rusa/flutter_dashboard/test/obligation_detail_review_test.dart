@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 import 'fakes.dart';
 
@@ -18,17 +19,25 @@ Future<void> showDetail(
   FakeApi api, {
   FakeStream? stream,
   Size size = const Size(1600, 4000),
+  DashboardStore? store,
+  void Function(DashboardView)? onSelectView,
 }) async {
   await tester.binding.setSurfaceSize(size);
   addTearDown(() => tester.binding.setSurfaceSize(null));
-  final store = DashboardStore(api: api, stream: stream ?? FakeStream());
-  await store.init();
-  addTearDown(store.dispose);
-  store.setFocusedObligationId('detail');
+  final effectiveStore =
+      store ?? DashboardStore(api: api, stream: stream ?? FakeStream());
+  if (store == null) {
+    await effectiveStore.init();
+    addTearDown(effectiveStore.dispose);
+  }
+  effectiveStore.setFocusedObligationId('detail');
   await tester.pumpWidget(
     MaterialApp(
       home: Scaffold(
-        body: WorkTab(store: store, onSelectView: (_) {}),
+        body: WorkTab(
+          store: effectiveStore,
+          onSelectView: onSelectView ?? (_) {},
+        ),
       ),
     ),
   );
@@ -321,4 +330,98 @@ void main() {
       expect(tester.takeException(), isNull);
     });
   });
+
+  testWidgets(
+    'terminal done obligation places the status chip adjacent to the title without floating right',
+    (tester) async {
+      await tester.runAsync(() async {
+        final ob = makeObligation(
+          'detail',
+          ownerId: 'root',
+          title: 'Export run history as CSV',
+          status: 'done',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [ob];
+        await showDetail(tester, api, size: const Size(1600, 1000));
+
+        final title = find.byKey(const ValueKey('obligation-detail-title'));
+        final actions = find.byKey(const ValueKey('obligation-detail-actions'));
+        expect(title, findsOneWidget);
+        expect(actions, findsOneWidget);
+
+        final titleRect = tester.getRect(title);
+        final actionsRect = tester.getRect(actions);
+        // The done chip sits adjacent to the title (8px spacing), not floated to the right edge.
+        expect(actionsRect.left, closeTo(titleRect.right + 8, 1));
+        expect(actionsRect.center.dy, closeTo(titleRect.center.dy, 1.0));
+
+        // Done status chip is inside actions.
+        expect(
+          find.descendant(of: actions, matching: find.text('DONE')),
+          findsOneWidget,
+        );
+        // Terminal obligation does not render action buttons.
+        expect(find.byTooltip('Mark Done'), findsNothing);
+        expect(find.byTooltip('Cancel Obligation'), findsNothing);
+        expect(tester.takeException(), isNull);
+      });
+    },
+  );
+
+  testWidgets(
+    'people list entries are clickable to navigate to actor inbox and omit explicit inbox icon button',
+    (tester) async {
+      await tester.runAsync(() async {
+        final ob = makeObligation(
+          'detail',
+          ownerId: 'coder',
+          creatorId: 'steward',
+          title: 'Task with actor people',
+          status: 'ready',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('coder'), makeThread('steward')]
+          ..obligationsResult = [ob];
+
+        DashboardView? navigatedView;
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
+
+        await showDetail(
+          tester,
+          api,
+          store: store,
+          onSelectView: (v) => navigatedView = v,
+        );
+
+        // Explicit inbox icon button is removed.
+        expect(find.byIcon(Icons.inbox_outlined), findsNothing);
+
+        // Both owner and creator entries have tooltips and are clickable.
+        expect(find.byTooltip('View Owner Inbox →'), findsOneWidget);
+        expect(find.byTooltip('View Creator Inbox →'), findsOneWidget);
+
+        // Tap owner entry: navigates to coder's inbox.
+        await tester.tap(find.byTooltip('View Owner Inbox →'));
+        await tester.pumpAndSettle();
+
+        expect(store.primary.value, 'coder');
+        expect(store.detailPanelIndex.value, 4);
+        expect(navigatedView, DashboardView.actors);
+
+        // Tap creator entry: navigates to steward's inbox.
+        await tester.tap(find.byTooltip('View Creator Inbox →'));
+        await tester.pumpAndSettle();
+
+        expect(store.primary.value, 'steward');
+        expect(store.detailPanelIndex.value, 4);
+        expect(navigatedView, DashboardView.actors);
+
+        expect(tester.takeException(), isNull);
+      });
+    },
+  );
 }

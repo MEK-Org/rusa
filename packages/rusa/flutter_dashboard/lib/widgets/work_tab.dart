@@ -1640,49 +1640,14 @@ class _DetailViewState extends State<_DetailView> {
     ),
   );
 
-  Widget _ownerPanel(String ownerId) {
-    final isHuman = store.isHuman(ownerId);
-    final isSystem = ownerId.startsWith('system:');
-    final isActor = !isHuman && !isSystem;
-
-    return _identityPanel(
-      ownerId,
-      action: isActor
-          ? IconButton(
-              tooltip: 'View Owner Inbox →',
-              onPressed: () {
-                store.clickActor(ownerId);
-                store.setDetailPanelIndex(4); // Select Inbox tab
-                onSelectView(DashboardView.actors);
-              },
-              icon: const Icon(
-                Icons.inbox_outlined,
-                size: 16,
-                color: MeshColors.accent,
-              ),
-            )
-          : isHuman
-          ? IconButton(
-              tooltip: 'View Owner Queue →',
-              onPressed: () {
-                onSelectView(DashboardView.overview);
-              },
-              icon: const Icon(
-                Icons.list_alt,
-                size: 16,
-                color: MeshColors.accent,
-              ),
-            )
-          : null,
-    );
-  }
+  Widget _ownerPanel(String ownerId) => _identityPanel(ownerId, role: 'Owner');
 
   /// Who raised this obligation. Null is a real, honest state — a row that
   /// predates creator attribution — not something to paper over by falling
   /// back to the owner or guessing.
   Widget _creatorPanel(String? creatorId) => creatorId == null
       ? const Padding(
-          padding: EdgeInsets.symmetric(vertical: 8),
+          padding: EdgeInsets.symmetric(vertical: 4),
           child: Row(
             children: [
               Expanded(
@@ -1700,30 +1665,63 @@ class _DetailViewState extends State<_DetailView> {
         )
       : _identityPanel(creatorId, role: 'Creator');
 
-  Widget _identityPanel(String id, {Widget? action, String role = 'Owner'}) =>
-      Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        child: Row(
-          children: [
-            _personAvatar(id),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                store.actorDisplay(id),
-                style: const TextStyle(
-                  color: MeshColors.textPrimary,
-                  fontSize: 13,
-                ),
+  Widget _identityPanel(String id, {String role = 'Owner'}) {
+    final isHuman = store.isHuman(id);
+    final isSystem = id.startsWith('system:');
+    final isActor = !isHuman && !isSystem;
+
+    VoidCallback? onTap;
+    String? tooltip;
+    if (isActor) {
+      onTap = () {
+        store.clickActor(id);
+        store.setDetailPanelIndex(4); // Select Inbox tab
+        onSelectView(DashboardView.actors);
+      };
+      tooltip = 'View $role Inbox →';
+    } else if (isHuman) {
+      onTap = () {
+        onSelectView(DashboardView.overview);
+      };
+      tooltip = 'View $role Queue →';
+    }
+
+    final row = Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          _personAvatar(id),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              store.actorDisplay(id),
+              style: const TextStyle(
+                color: MeshColors.textPrimary,
+                fontSize: 13,
               ),
             ),
-            Text(
-              role,
-              style: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
-            ),
-            ?action,
-          ],
-        ),
-      );
+          ),
+          Text(
+            role,
+            style: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
+          ),
+        ],
+      ),
+    );
+
+    if (onTap == null) {
+      return row;
+    }
+
+    return Tooltip(
+      message: tooltip ?? '',
+      child: InkWell(
+        borderRadius: BorderRadius.circular(4),
+        onTap: onTap,
+        child: row,
+      ),
+    );
+  }
 
   Widget _personAvatar(String id) =>
       store.isHuman(id) || id.startsWith('system:')
@@ -2117,23 +2115,6 @@ class _DetailViewState extends State<_DetailView> {
       store: store,
       bordered: true,
     );
-    final titleAndStatus = Row(
-      children: [
-        Expanded(
-          child: SelectableText(
-            o.heading,
-            minLines: 1,
-            maxLines: 2,
-            style: titleStyle,
-          ),
-        ),
-        const SizedBox(width: 10),
-        status,
-      ],
-    );
-    if (o.isTerminal) {
-      return titleAndStatus;
-    }
     return Wrap(
       alignment: WrapAlignment.start,
       crossAxisAlignment: WrapCrossAlignment.center,
@@ -2156,7 +2137,10 @@ class _DetailViewState extends State<_DetailView> {
           crossAxisAlignment: WrapCrossAlignment.center,
           runSpacing: 4,
           spacing: 8,
-          children: [status, ...actions],
+          children: [
+            status,
+            if (!o.isTerminal) ...actions,
+          ],
         ),
       ],
     );
