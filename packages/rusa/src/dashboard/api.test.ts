@@ -2640,6 +2640,102 @@ describe("handleMeshApiRequest", () => {
     expect(closed?.eventReference).toBeUndefined();
   });
 
+  it("GET /api/mesh/inbox names the one obligation an entry is unambiguously tied to (#610)", async () => {
+    obligations.create({
+      id: "ob-pr",
+      title: "Land the PR",
+      ownerId: UUID_A,
+      externalRef: "github:MEK-Org/rusa/pulls/700",
+    });
+    obligations.create({
+      id: "ob-closed",
+      title: "Closed work",
+      ownerId: UUID_A,
+      externalRef: "github:MEK-Org/rusa/issues/701",
+    });
+    obligations.create({
+      id: "ob-other",
+      title: "Other work",
+      ownerId: UUID_A,
+      externalRef: "github:MEK-Org/rusa/issues/703",
+    });
+    obligations.setTerminalStatus("ob-closed", "done", null, null, UUID_A);
+    inbox.append([
+      {
+        id: "linked-event",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/pulls/700",
+        payload: { type: "pull_request_review.submitted", reviewId: 1 },
+      },
+      {
+        id: "terminal-link",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/issues/701",
+        payload: { type: "issue_comment.created", commentId: 2 },
+      },
+      {
+        id: "unlinked-event",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/issues/702",
+        payload: { type: "issue_comment.created", commentId: 3 },
+      },
+      {
+        id: "ready-head",
+        actorId: UUID_A,
+        source: "obligation:ob-pr",
+        payload: { type: "obligation.ready_head", obligationId: "ob-pr", intent: "Land the PR" },
+      },
+      {
+        id: "prereq-cancelled",
+        actorId: UUID_A,
+        source: "obligation:ob-pr",
+        payload: {
+          type: "obligation.prerequisite_cancelled",
+          obligationId: "ob-pr",
+          prerequisiteId: "ob-closed",
+        },
+      },
+      {
+        id: "conflict-event",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/pulls/700",
+        payload: {
+          type: "obligation.ready_head",
+          obligationId: "ob-other",
+          intent: "Other work",
+        },
+      },
+    ]);
+    // A prior run's selection associated the unlinked event with ob-pr.
+    deps = {
+      ...deps,
+      inboxFocus: {
+        listEntryObligationIds: (_actorId: string, entryId: string) =>
+          entryId === "unlinked-event" ? ["ob-pr"] : [],
+      } as unknown as DashboardDataDeps["inboxFocus"],
+    };
+
+    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const byId = new Map(
+      (JSON.parse(res.body).entries as Array<{ id: string; obligationId?: string }>).map((e) => [
+        e.id,
+        e,
+      ])
+    );
+    // The live obligation whose external ref is the event's source.
+    expect(byId.get("linked-event")?.obligationId).toBe("ob-pr");
+    // The obligation a ready-head signal names.
+    expect(byId.get("ready-head")?.obligationId).toBe("ob-pr");
+    // A closed obligation no longer governs its issue's events.
+    expect(byId.get("terminal-link")?.obligationId).toBeUndefined();
+    // Selection-only association does not make an entry an obligation card.
+    expect(byId.get("unlinked-event")?.obligationId).toBeUndefined();
+    // A cancelled-prerequisite notice keeps its own rendering.
+    expect(byId.get("prereq-cancelled")?.obligationId).toBeUndefined();
+    // When named and linked obligations disagree, it falls back to none (#610).
+    expect(byId.get("conflict-event")?.obligationId).toBeUndefined();
+  });
+
   it("GET /api/mesh/inbox resolves a Google Chat entry to its message card through the artifact resolver (#654)", async () => {
     // Shaped like `normalizeChatEvent`'s output: `source` is the containing
     // space (routing granularity), so the card must come from the message
