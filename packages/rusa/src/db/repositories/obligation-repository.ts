@@ -2275,35 +2275,53 @@ export class ObligationRepository {
 
       const previous = previousId === null ? null : queue[previousIndex];
       const next = nextId === null ? null : queue[nextIndex];
+
+      // Reject positions that would require ordinary work ahead of responsive work
+      // or responsive work after ordinary work, atomically without writes.
+      if (target.effectiveResponsive && previous !== null && !previous.effectiveResponsive) {
+        throw new ObligationValidationError("cannot place responsive work after ordinary work");
+      }
+      if (!target.effectiveResponsive && next !== null && next.effectiveResponsive) {
+        throw new ObligationValidationError("cannot place ordinary work ahead of responsive work");
+      }
+
+      // Resolve the requested position within the target's effective-responsiveness tier.
+      const tierPrevious =
+        previous !== null && previous.effectiveResponsive === target.effectiveResponsive
+          ? previous
+          : null;
+      const tierNext =
+        next !== null && next.effectiveResponsive === target.effectiveResponsive ? next : null;
+
       let priority: number;
       let repairSuffix = false;
-      if (previous === null && next === null) {
+      if (tierPrevious === null && tierNext === null) {
         priority = validatePriority(this.now());
-      } else if (previous === null) {
-        if (next === null) {
+      } else if (tierPrevious === null) {
+        if (tierNext === null) {
           throw new ObligationValidationError("priority move requires a queue neighbor");
         }
-        const half = next.effectivePriority / 2;
+        const half = tierNext.effectivePriority / 2;
         priority =
-          Number.isFinite(half) && half < next.effectivePriority
+          Number.isFinite(half) && half < tierNext.effectivePriority
             ? half
-            : priorityBefore(next.effectivePriority);
-      } else if (next === null) {
-        priority = priorityAfter(previous.effectivePriority);
+            : priorityBefore(tierNext.effectivePriority);
+      } else if (tierNext === null) {
+        priority = priorityAfter(tierPrevious.effectivePriority);
       } else {
-        const midpoint = strictMidpoint(previous.effectivePriority, next.effectivePriority);
+        const midpoint = strictMidpoint(tierPrevious.effectivePriority, tierNext.effectivePriority);
         if (midpoint !== null) {
           priority = midpoint;
         } else {
-          priority = priorityAfter(previous.effectivePriority);
+          priority = priorityAfter(tierPrevious.effectivePriority);
           repairSuffix = true;
         }
       }
       validatePriority(priority);
-      if (previous !== null && priority <= previous.effectivePriority) {
+      if (tierPrevious !== null && priority <= tierPrevious.effectivePriority) {
         throw new ObligationValidationError("no finite priority exists after the previous item");
       }
-      if (!repairSuffix && next !== null && priority >= next.effectivePriority) {
+      if (!repairSuffix && tierNext !== null && priority >= tierNext.effectivePriority) {
         throw new ObligationValidationError("no finite priority exists before the next item");
       }
       this.applyPriority(id, priority, scope);
@@ -2311,6 +2329,11 @@ export class ObligationRepository {
       if (repairSuffix) {
         let cursor = priority;
         for (const obligation of queue.slice(nextIndex)) {
+          // Calculate and repair only the target tier; collision repair cannot
+          // spill into or mutate other-tier priorities.
+          if (obligation.effectiveResponsive !== target.effectiveResponsive) {
+            break;
+          }
           if (obligation.effectivePriority > cursor) break;
           cursor = validatePriority(priorityAfter(cursor));
           // Numeric collision repair is not a semantic subtree reprioritization:

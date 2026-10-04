@@ -2294,6 +2294,205 @@ describe("ObligationRepository", () => {
     expect(c).toBeGreaterThan(b);
   });
 
+  describe("tier-aware priority reordering (#899)", () => {
+    it("reorders within the target's effective-responsiveness tier in a mixed queue (Seat 1 regression)", () => {
+      // Setup Seat 1's concrete queue:
+      // actor-c has [grandchild (responsive, p=100), z-head (p=10), z2 (p=20)]
+      repository.create({
+        title: "grandchild",
+        id: "grandchild",
+        ownerId: "actor-c",
+        priority: 100,
+      });
+      repository.markResponsive("grandchild", "system:mesh");
+      repository.create({
+        title: "z-head",
+        id: "z-head",
+        ownerId: "actor-c",
+        priority: 10,
+      });
+      repository.create({
+        title: "z2",
+        id: "z2",
+        ownerId: "actor-c",
+        priority: 20,
+      });
+
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "grandchild",
+        "z-head",
+        "z2",
+      ]);
+
+      // Move z2 between grandchild and z-head (to become the first ordinary item)
+      repository.movePriorityInternal("z2", "grandchild", "z-head", "system:mesh");
+
+      // z2 is the first ordinary item; its priority must be computed within the ordinary tier
+      // (before z-head's 10, so 10/2 = 5), not inflated after grandchild (101).
+      expect(repository.require("z2").effectivePriority).toBe(5);
+      // z-head priority must not be mutated or bumped by collision repair
+      expect(repository.require("z-head").effectivePriority).toBe(10);
+      // grandchild priority must remain unchanged
+      expect(repository.require("grandchild").effectivePriority).toBe(100);
+
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "grandchild",
+        "z2",
+        "z-head",
+      ]);
+    });
+
+    it("rejects impossible cross-tier moves atomically without modifying stored priorities", () => {
+      repository.create({
+        title: "grandchild",
+        id: "grandchild",
+        ownerId: "actor-c",
+        priority: 100,
+      });
+      repository.markResponsive("grandchild", "system:mesh");
+      repository.create({
+        title: "z-head",
+        id: "z-head",
+        ownerId: "actor-c",
+        priority: 10,
+      });
+      repository.create({
+        title: "z2",
+        id: "z2",
+        ownerId: "actor-c",
+        priority: 20,
+      });
+
+      // 1. Ordinary item cannot be placed ahead of responsive work
+      expect(() =>
+        repository.movePriorityInternal("z2", null, "grandchild", "system:mesh")
+      ).toThrow("cannot place ordinary work ahead of responsive work");
+      expect(repository.require("z2").effectivePriority).toBe(20);
+      expect(repository.require("grandchild").effectivePriority).toBe(100);
+      expect(repository.require("z-head").effectivePriority).toBe(10);
+
+      // 2. Responsive item cannot be placed after ordinary work
+      expect(() =>
+        repository.movePriorityInternal("grandchild", "z-head", "z2", "system:mesh")
+      ).toThrow("cannot place responsive work after ordinary work");
+      expect(repository.require("grandchild").effectivePriority).toBe(100);
+      expect(repository.require("z-head").effectivePriority).toBe(10);
+      expect(repository.require("z2").effectivePriority).toBe(20);
+
+      expect(() =>
+        repository.movePriorityInternal("grandchild", "z2", null, "system:mesh")
+      ).toThrow("cannot place responsive work after ordinary work");
+      expect(repository.require("grandchild").effectivePriority).toBe(100);
+    });
+
+    it("does not allow collision repair to spill into or mutate other-tier priorities", () => {
+      // Responsive tier collision repair must not mutate ordinary items
+      repository.create({
+        title: "r1",
+        id: "r1",
+        ownerId: "actor-c",
+        priority: 10,
+      });
+      repository.markResponsive("r1", "system:mesh");
+      repository.create({
+        title: "r2",
+        id: "r2",
+        ownerId: "actor-c",
+        priority: 10,
+      });
+      repository.markResponsive("r2", "system:mesh");
+      repository.create({
+        title: "r3",
+        id: "r3",
+        ownerId: "actor-c",
+        priority: 50,
+      });
+      repository.markResponsive("r3", "system:mesh");
+      repository.create({
+        title: "o1",
+        id: "o1",
+        ownerId: "actor-c",
+        priority: 5,
+      });
+
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "r1",
+        "r2",
+        "r3",
+        "o1",
+      ]);
+
+      // Move r3 between r1 (10) and r2 (11).
+      // Midpoint is null, so r3 gets priorityAfter(10)=11 and suffix repair bumps r2 to 12.
+      // Suffix repair must stop at the responsive boundary and NOT mutate o1.
+      repository.movePriorityInternal("r3", "r1", "r2", "system:mesh");
+      expect(repository.require("r1").effectivePriority).toBe(10);
+      expect(repository.require("r3").effectivePriority).toBe(11);
+      expect(repository.require("r2").effectivePriority).toBe(12);
+      expect(repository.require("o1").effectivePriority).toBe(5);
+
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "r1",
+        "r3",
+        "r2",
+        "o1",
+      ]);
+    });
+
+    it("supports valid moves across both tiers including tier boundaries", () => {
+      repository.create({
+        title: "r1",
+        id: "r1",
+        ownerId: "actor-c",
+        priority: 10,
+      });
+      repository.markResponsive("r1", "system:mesh");
+      repository.create({
+        title: "r2",
+        id: "r2",
+        ownerId: "actor-c",
+        priority: 20,
+      });
+      repository.markResponsive("r2", "system:mesh");
+      repository.create({
+        title: "o1",
+        id: "o1",
+        ownerId: "actor-c",
+        priority: 100,
+      });
+      repository.create({
+        title: "o2",
+        id: "o2",
+        ownerId: "actor-c",
+        priority: 200,
+      });
+
+      // Move r1 to the end of the responsive tier (between r2 and o1)
+      repository.movePriorityInternal("r1", "r2", "o1", "system:mesh");
+      expect(repository.require("r1").effectivePriority).toBe(21);
+      expect(repository.require("r2").effectivePriority).toBe(20);
+      expect(repository.require("o1").effectivePriority).toBe(100);
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "r2",
+        "r1",
+        "o1",
+        "o2",
+      ]);
+
+      // Move o2 to the beginning of the ordinary tier (between r1 and o1)
+      repository.movePriorityInternal("o2", "r1", "o1", "system:mesh");
+      expect(repository.require("o2").effectivePriority).toBe(50);
+      expect(repository.require("o1").effectivePriority).toBe(100);
+      expect(repository.require("r1").effectivePriority).toBe(21);
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "r2",
+        "r1",
+        "o2",
+        "o1",
+      ]);
+    });
+  });
+
   it("keeps a parent waiting until every direct child is terminal", () => {
     repository.create({
       title: "parent",
