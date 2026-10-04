@@ -349,9 +349,10 @@ const QUEUE_SQL: Record<ObligationQueue, string> = {
 /**
  * Owner-queue order: actionable ready work first, then the waiting group
  * (waiting rows and any snoozed non-terminal rows, including snoozed scheduled
- * rows), then unsnoozed scheduled and terminal rows; by effective priority then
- * id within each group. The ready head is this order's first row when that row
- * is actionable, so the two must not diverge.
+ * rows), then unsnoozed scheduled and terminal rows. Responsive ready work
+ * precedes other ready work; every group then orders by effective priority and
+ * id. The ready head is this order's first row when that row is actionable, so
+ * the two must not diverge.
  */
 const OWNER_QUEUE_ORDER_SQL = `
   CASE
@@ -359,6 +360,16 @@ const OWNER_QUEUE_ORDER_SQL = `
     WHEN ${WAITING_GROUP_SQL} THEN 1
     ELSE 2
   END,
+  CASE
+    WHEN ${ACTIONABLE_READY_SQL} AND effective_priority.effective_responsive = 1 THEN 0
+    ELSE 1
+  END,
+  effective_priority.effective_priority,
+  obligation.id`;
+
+/** Order shared by every actionable-ready head query. */
+const READY_HEAD_ORDER_SQL = `
+  CASE WHEN effective_priority.effective_responsive = 1 THEN 0 ELSE 1 END,
   effective_priority.effective_priority,
   obligation.id`;
 
@@ -973,7 +984,7 @@ export class ObligationRepository {
                     obligation.id,
                     ROW_NUMBER() OVER (
                       PARTITION BY obligation.owner_id
-                      ORDER BY effective_priority.effective_priority, obligation.id
+                      ORDER BY ${READY_HEAD_ORDER_SQL}
                     ) AS rank
              FROM obligations obligation
              JOIN effective_priority ON effective_priority.id = obligation.id
@@ -1031,9 +1042,9 @@ export class ObligationRepository {
    *
    * "Head" is the first row of the owner's queue when that row is actionable
    * ready work — ready and not snoozed (#722). It must stay byte-identical to
-   * `listOwned`'s ordering (actionable ready first, by effective priority, then
-   * id) or an actor would be told about a head its own queue does not show
-   * first. An owner whose only ready work is snoozed has no head.
+   * `listOwned`'s ordering (responsive actionable ready first, then effective
+   * priority and id) or an actor would be told about a head its own queue does
+   * not show first. An owner whose only ready work is snoozed has no head.
    *
    * Runs in a single CTE pass so callers do not need subsequent
    * `isEffectivelyResponsive` evaluations.
@@ -1062,7 +1073,7 @@ export class ObligationRepository {
                   effective_priority.effective_responsive,
                   ROW_NUMBER() OVER (
                     PARTITION BY obligation.owner_id
-                    ORDER BY effective_priority.effective_priority, obligation.id
+                    ORDER BY ${READY_HEAD_ORDER_SQL}
                   ) AS rank
            FROM obligations obligation
            JOIN effective_priority ON effective_priority.id = obligation.id
