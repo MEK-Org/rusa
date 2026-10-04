@@ -2107,6 +2107,41 @@ export class ObligationRepository {
     };
   }
 
+  /**
+   * Open obligations one creator filed for one owner, in the owner's queue
+   * order (#890): the questions an actor asked a human, shown when that human's
+   * message is selected. Done and cancelled rows are excluded.
+   */
+  listOpenOwnedCreatedByPage(
+    ownerId: EntityId,
+    creatorId: EntityId,
+    options: ObligationPageOptions
+  ): ObligationPage {
+    validateEntityId(ownerId);
+    validateEntityId(creatorId);
+    const { limit, offset } = validatePage(options);
+    const where = `WHERE obligation.owner_id = ? AND obligation.creator_id = ?
+         AND obligation.status NOT IN ('done', 'cancelled')`;
+    const rows = this.db
+      .prepare(
+        `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
+         ${where}
+         ORDER BY ${OWNER_QUEUE_ORDER_SQL}
+         LIMIT ? OFFSET ?`
+      )
+      .all(ownerId, creatorId, limit + 1, offset) as ObligationRow[];
+    const total = (
+      this.db
+        .prepare(`SELECT COUNT(*) AS count FROM obligations obligation ${where}`)
+        .get(ownerId, creatorId) as { count: number }
+    ).count;
+    return {
+      obligations: rows.slice(0, limit).map(toObligation),
+      total,
+      hasMore: rows.length > limit,
+    };
+  }
+
   list(options: ListObligationsOptions = {}): Obligation[] {
     const clauses: string[] = [];
     const params: string[] = [];
