@@ -143,6 +143,7 @@ export function createActorRuntime(
     // still rejects startup. Later runs resolve their own admitted tuple.
     resolveProvider(modelConfig[0]);
     if (stopping) return;
+    let currentRunComputerUse = false;
     actor = new Actor({
       ...bootstrap.actorOptions,
       id: bootstrap.id,
@@ -150,6 +151,7 @@ export function createActorRuntime(
       modelConfig,
       resolveProvider,
       mcpServers,
+      isComputerUseAdmitted: () => currentRunComputerUse,
       debounceMs: bootstrap.actorOptions?.debounceMs ?? 10,
       loadSessionId: () => sessionId,
       saveSessionId: (id) => {
@@ -159,6 +161,7 @@ export function createActorRuntime(
       buildPrompt: () => snapshot.promptBuild ?? { prompt: snapshot.prompt },
       prepareUnderstandingMount: () => request<string | undefined>({ op: "prepareMount" }).result,
       beforeRun: async ({ mode }) => {
+        currentRunComputerUse = false;
         pendingRunMode = mode;
         try {
           const reply = await request<{
@@ -232,6 +235,7 @@ export function createActorRuntime(
               if ("deferred" in admitted) throw new RunStartCancelledError();
               snapshot = admitted;
               computerUseAtAdmission = admitted.computerUse === true;
+              currentRunComputerUse = computerUseAtAdmission;
               if (stopping) throw new Error("Actor stopped before admission");
               // The leader's admission decision, not wake ordering, sets the run's priority.
               if (admitted.responsive && !responsive) actor?.promoteQueuedRun();
