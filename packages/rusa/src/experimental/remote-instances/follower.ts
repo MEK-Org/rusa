@@ -7,12 +7,24 @@ import { parseArgs } from "node:util";
 import { resolveRepoRoot } from "../../commands/service-instance.js";
 import { createLogger } from "../../observability/logger.js";
 import { GitRunner } from "../../update/runner.js";
-import { FollowerEventQueue } from "./follower-event-queue.js";
+import {
+  FollowerEventAcceptanceFailedError,
+  type FollowerEventBatch,
+  FollowerEventParkedError,
+  FollowerEventQueue,
+  FollowerEventTransferRetryError,
+  type FollowerEventTransferSender,
+} from "./follower-event-queue.js";
 import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { isFullCommitSha } from "./follower-update-validation.js";
 import { executeFollowerUpdate, FollowerBuildRunner } from "./follower-updater.js";
-import { type FollowerUpdateCommand, INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
+import {
+  type EventTransferCapability,
+  type EventTransferReply,
+  type FollowerUpdateCommand,
+  INSTANCE_PROTOCOL_VERSION,
+} from "./protocol.js";
 
 const { values } = parseArgs({
   options: {
@@ -81,6 +93,8 @@ const instance = new FollowerInstance(root, values.sandbox === "bwrap", (event) 
 const generation = randomUUID();
 let session = "";
 let leaderToken: string | undefined;
+/** Event transfer as advertised by the current registration; absent from older leaders. */
+let eventTransfer: FollowerEventTransferSender | undefined;
 let stopped = false;
 const eventQueue = new FollowerEventQueue();
 let sendTimer: ReturnType<typeof setTimeout> | undefined;
@@ -95,16 +109,41 @@ class FollowerHttpError extends Error {
   }
 }
 
-async function post<T>(path: string, body: object): Promise<T> {
-  const response = await fetch(new URL(path, leader), {
+function request(path: string, body: object | string): Promise<Response> {
+  return fetch(new URL(path, leader), {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify({ id: values.id, session, ...body }),
+    // A string is an already serialized request, sent byte for byte.
+    body: typeof body === "string" ? body : JSON.stringify({ id: values.id, session, ...body }),
     signal: AbortSignal.timeout(25_000),
   });
+}
+async function post<T>(path: string, body: object): Promise<T> {
+  const response = await request(path, body);
   if (!response.ok)
     throw new FollowerHttpError(`Leader ${path}: HTTP ${response.status}`, response.status);
   return (await response.json()) as T;
+}
+const TRANSFER_STATUSES = new Set(["fragment", "complete", "restart", "busy", "refused"]);
+function transferSender(capability: EventTransferCapability): FollowerEventTransferSender {
+  return {
+    capability,
+    send: async (fragment) => {
+      const response = await request("/events/transfer", fragment);
+      // A transfer answer is in the body whatever its HTTP status; anything
+      // else is a transport failure retried like an ordinary batch.
+      const reply = (await response.json().catch(() => undefined)) as
+        | EventTransferReply
+        | undefined;
+      if (response.status !== 410 && TRANSFER_STATUSES.has(reply?.status as string)) {
+        return reply as EventTransferReply;
+      }
+      throw new FollowerHttpError(
+        `Leader /events/transfer: HTTP ${response.status}`,
+        response.status
+      );
+    },
+  };
 }
 function emit(actorId: string, message: FollowerEvent["message"], eventId?: string): void {
   if (stopped) return;
@@ -115,20 +154,50 @@ function emit(actorId: string, message: FollowerEvent["message"], eventId?: stri
       void flush();
     }, 5);
 }
+async function postEvents(batch: FollowerEventBatch): Promise<void> {
+  const response = await request("/events", batch.body);
+  if (response.ok) return;
+  if (response.status === 409) {
+    const refusal = (await response.json().catch(() => undefined)) as
+      | { reason?: unknown; eventId?: unknown }
+      | undefined;
+    if (refusal?.reason === "acceptance_failed" && typeof refusal.eventId === "string") {
+      throw new FollowerEventAcceptanceFailedError(refusal.eventId);
+    }
+  }
+  throw new FollowerHttpError(`Leader /events: HTTP ${response.status}`, response.status);
+}
 async function flush(): Promise<void> {
   if (stopped) return;
   try {
-    await eventQueue.flush((batch) => post("/events", batch));
+    await eventQueue.flush(postEvents, { id: values.id, session }, eventTransfer);
   } catch (error) {
+    if (error instanceof FollowerEventParkedError) {
+      // Retrying cannot change the outcome; a new registration or capability
+      // does, and re-registration flushes. Later events wait behind this one.
+      if (!error.repeated)
+        log.warn("follower_event_parked", {
+          reason: error.reason,
+          eventId: error.eventId,
+          eventType: error.eventType,
+          eventBytes: error.eventBytes,
+          limitBytes: error.limitBytes,
+          eventTransfer: eventTransfer?.capability,
+        });
+      return;
+    }
     log.warn("follower_event_flush_failed", { err: error });
     if (error instanceof FollowerHttpError && error.status === 410) {
       session = "";
     }
     if (!stopped && eventQueue.hasPending && !sendTimer) {
-      sendTimer = setTimeout(() => {
-        sendTimer = undefined;
-        void flush();
-      }, 500);
+      sendTimer = setTimeout(
+        () => {
+          sendTimer = undefined;
+          void flush();
+        },
+        error instanceof FollowerEventTransferRetryError ? Math.max(error.retryAfterMs, 500) : 500
+      );
     }
   }
 }
@@ -172,6 +241,7 @@ async function run(): Promise<void> {
           session: string;
           protocolVersion: number;
           leaderToken?: string;
+          eventTransfer?: EventTransferCapability;
         }>("/register", {
           platform: process.platform,
           pid: process.pid,
@@ -191,6 +261,10 @@ async function run(): Promise<void> {
         }
         leaderToken = registration.leaderToken;
         session = registration.session;
+        eventTransfer =
+          registration.eventTransfer?.version === 1
+            ? transferSender(registration.eventTransfer)
+            : undefined;
         backoffMs = 500;
         log.info("follower_registered", {
           leader: leader.origin,

@@ -47,6 +47,7 @@ import { runMigrations } from "../db/migrations/runner.js";
 import type { ChatRoomMember } from "../db/repositories/chat-room-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
+import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { FakeProvider } from "../providers/fake-provider.js";
@@ -921,7 +922,7 @@ describe("agent-execution MCP server", () => {
     holder = source.id;
 
     mesh.transferVoiceSession(source.id, target.id);
-    expect(actors.get(target.id)?.humanUnlocked).toBeUndefined();
+    expect(actors.lastHumanChat(target.id)).toBeUndefined();
 
     const client = await connect(createAgentExecMcpServer(mesh, target.id, root.id));
     const { tools } = await client.listTools();
@@ -937,6 +938,92 @@ describe("agent-execution MCP server", () => {
         .listForSession("transferred-session", { limit: 10 })
         .find((entry) => entry.senderId === target.id)
     ).toMatchObject({ recipientId: "human:operator", sessionId: "transferred-session" });
+  });
+
+  it("replies to the human chat that arrived after the reply tool was registered (#691)", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const actors = new SqliteActorRepository(db);
+    const chat = new MeshChatRepository(db);
+    // Distinct, increasing timestamps so the newest-by-(ts, id) order is fixed.
+    let tick = 0;
+    const mesh = new ActorMesh({
+      actors,
+      inboxStore: new SqliteInboxRepository(db),
+      recordChat: (entry) =>
+        chat.record({ ...entry, ts: new Date(Date.UTC(2026, 0, 1, 0, 0, ++tick)).toISOString() }),
+      createActor: () => ({}) as unknown as Actor,
+    });
+    const liveActor = (id: string) =>
+      ({
+        id,
+        requestRun: () => {},
+        markUnkillable: () => {},
+        close: () => {},
+        isRunning: true,
+        preemptForResponsive: () => ({ preempted: false as const }),
+      }) as unknown as Actor;
+    mesh.adopt(
+      {
+        id: "root",
+        charter: "root",
+        parentId: null,
+        isRoot: true,
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+      liveActor("root")
+    );
+    mesh.adopt(
+      {
+        id: "worker",
+        charter: "worker",
+        parentId: "root",
+        status: "active",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      },
+      liveActor("worker")
+    );
+    const user = new PrincipalRepository(db).createUser({
+      email: "second@example.com",
+      createdAt: "2026-01-01T00:00:02.000Z",
+      identity: { issuer: "https://accounts.google.com", subject: "second" },
+    });
+
+    // The run's endpoint is built while the newest human message has no
+    // session: that unlocks reply, but a send has no conversation to go to.
+    chat.record({
+      senderId: "human:operator",
+      recipientId: "worker",
+      body: "sessionless",
+      sessionId: null,
+      ts: new Date(Date.UTC(2026, 0, 1, 0, 0, ++tick)).toISOString(),
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "worker", "root"));
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toContain("reply");
+    const rejected = (await client.callTool({
+      name: "reply",
+      arguments: { message: "Nowhere to send." },
+    })) as CallToolResult;
+    expect(rejected.isError).toBe(true);
+    expect(JSON.stringify(rejected.content)).toContain("requires an active human conversation");
+
+    mesh.sendHumanMessage("worker", "first", "session-a");
+
+    // A second human writes mid-run; the next reply must follow them.
+    mesh.sendHumanMessage("worker", "second", "session-b", { fromId: user.id });
+    const reply = (await client.callTool({
+      name: "reply",
+      arguments: { message: "On it." },
+    })) as CallToolResult;
+
+    expect(reply.isError).not.toBe(true);
+    const sent = (sessionId: string) =>
+      chat.listForSession(sessionId, { limit: 10 }).filter((entry) => entry.senderId === "worker");
+    expect(sent("session-b")).toEqual([
+      expect.objectContaining({ recipientId: user.id, body: "On it." }),
+    ]);
+    expect(sent("session-a")).toEqual([]);
   });
 
   it("describes live capability grants as effective on the next run", async () => {
@@ -1165,7 +1252,7 @@ describe("agent-execution MCP server", () => {
     expect(registry.list().map((r) => r.id)).toEqual(["root"]);
   });
 
-  it("introduce grants the holder a handle to the target (with optional role)", async () => {
+  it("introduce grants the holder a plain handle and takes no pairwise role (#814)", async () => {
     const { mesh, registry } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const a = dataOf(
@@ -1186,11 +1273,24 @@ describe("agent-execution MCP server", () => {
         },
       })) as CallToolResult
     ) as { thread_id: string };
-    await client.callTool({
+    // A reply-only handle minted by message delivery (#796) ...
+    mesh.sendMessage(a.thread_id, "hello", b.thread_id);
+    expect(registry.get(a.thread_id)?.handles).toEqual([{ id: b.thread_id, origin: "message" }]);
+
+    // ... is untouched by an introduction that tries to label the target ...
+    const labelled = (await client.callTool({
       name: "introduce",
       arguments: { holder_thread_id: a.thread_id, target_thread_id: b.thread_id, role: "reviewer" },
+    })) as CallToolResult;
+    expect(labelled.isError).toBe(true);
+    expect(registry.get(a.thread_id)?.handles).toEqual([{ id: b.thread_id, origin: "message" }]);
+
+    // ... and becomes an explicit grant on a plain introduction.
+    await client.callTool({
+      name: "introduce",
+      arguments: { holder_thread_id: a.thread_id, target_thread_id: b.thread_id },
     });
-    expect(registry.get(a.thread_id)?.handles).toEqual([{ id: b.thread_id, role: "reviewer" }]);
+    expect(registry.get(a.thread_id)?.handles).toEqual([{ id: b.thread_id }]);
   });
 
   it("list_threads returns the caller's direct reports", async () => {

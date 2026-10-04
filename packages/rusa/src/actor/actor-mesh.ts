@@ -47,6 +47,7 @@ import {
 import {
   type MeshProviderGate,
   type QueuedSelection,
+  type ResponsiveArrival,
   RunManager,
   VOICE_INBOX_PAYLOAD_TYPE,
 } from "../runtime/run-manager.js";
@@ -1084,11 +1085,10 @@ export class ActorMesh {
         ? {
             onResponsiveArrived: (
               actorId: string,
-              entries: readonly InboxEntry[],
-              baseline: "interrupt" | "queue",
+              arrivals: readonly ResponsiveArrival[],
               isRunning: boolean
             ) => {
-              this.shadowResponsiveInterruptions(actorId, entries, baseline, isRunning);
+              this.shadowResponsiveInterruptions(actorId, arrivals, isRunning);
             },
           }
         : {}),
@@ -1492,8 +1492,7 @@ export class ActorMesh {
    */
   private shadowResponsiveInterruptions(
     actorId: string,
-    incoming: readonly InboxEntry[],
-    baseline: "interrupt" | "queue",
+    incoming: readonly ResponsiveArrival[],
     wasRunning: boolean
   ): void {
     const classifier = this.responsiveInterruption;
@@ -1503,7 +1502,7 @@ export class ActorMesh {
     // selection, so a selection spares the full unhandled scan entirely.
     const pendingEntryIds =
       selectedEntryIds.length > 0 ? [] : this.unselectedInboxEntryIds(actorId, selectedEntryIds);
-    for (const entry of incoming) {
+    for (const { entry, baseline } of incoming) {
       // Explicit Run Now is an operator control, not a classifier candidate.
       // Direct interrupt() does not dispatch at all, preserving its hard path.
       if (entry.payload.type === "operator.run_now") continue;
@@ -3088,9 +3087,10 @@ export class ActorMesh {
     const rec = this.actors.get(toId);
     if (!rec) return;
     if (handle.id === toId) return; // don't hand an actor its own handle
+    // A pairwise role label is not stored: the holder sees the target's own
+    // title or charter (#814).
     const entry: ActorHandle = {
       id: handle.id,
-      ...(handle.role ? { role: handle.role } : {}),
       ...(handle.origin ? { origin: handle.origin } : {}),
     };
     const handles = (rec.handles ?? []).filter((h) => h.id !== handle.id);
@@ -3099,7 +3099,6 @@ export class ActorMesh {
     this.recordEvent({
       kind: "handle_granted",
       actorId: toId,
-      detail: entry.role,
       payload: JSON.stringify({
         handleId: handle.id,
         ...(entry.origin ? { origin: entry.origin } : {}),
@@ -4139,11 +4138,7 @@ export class ActorMesh {
       this.log(`message to ${toId} from ${fromId} dropped — recipient not active`);
       return { delivered: false, status: rec?.status };
     }
-    this.actors.patch(toId, {
-      humanUnlocked: true,
-      lastChatSessionId: sessionId,
-      lastChatPrincipalId: fromId,
-    });
+    this.actors.noteHumanChat(toId, { sessionId, principalId: fromId });
     const target = this.runs.liveActor(toId);
     const messageId = this.recordMessageEmitted({
       fromId,

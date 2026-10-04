@@ -7,6 +7,7 @@ import {
 } from "../actor/concurrency-limiter.js";
 import { isResponsiveNudge, type RunNudge } from "../actor/trigger-runner.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
+import { decodeInboxInterruption } from "../repositories/inbox-interruption.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 
 /**
@@ -85,6 +86,15 @@ export interface DurableDispatchWork {
    */
   unseenResponsive?: boolean;
   /**
+   * Whether any of that unabsorbed responsive work may replace the run in
+   * flight, read from each row's own durable interruption policy (#829). A
+   * row persisted as `join` is admitted at responsive priority and passes the
+   * voice hold, but only a genuinely interrupting unseen row can make a
+   * dispatch preempt — so ordinary traffic arriving behind a joining row, or a
+   * replay of it, cannot turn it into an interrupt.
+   */
+  unseenInterrupting?: boolean;
+  /**
    * The unabsorbed responsive rows themselves, collected only when a policy
    * hook asked to observe them. They are the same rows that set
    * `unseenResponsive`, read once, so an observer records the entries that
@@ -103,6 +113,16 @@ export interface DurableDispatchWork {
  */
 export interface RunManagerInternalPort {
   dispatchJoiningActiveRun(actorId: string): boolean;
+}
+
+/**
+ * One newly arrived responsive row and the interruption decision this
+ * dispatch applies to that row alone. A batch that preempts because one row
+ * interrupts does not relabel a joining row beside it as interrupting.
+ */
+export interface ResponsiveArrival {
+  entry: InboxEntry;
+  baseline: "interrupt" | "queue";
 }
 
 /**
@@ -146,8 +166,7 @@ export interface RunManagerOptions {
    */
   onResponsiveArrived?: (
     actorId: string,
-    entries: readonly InboxEntry[],
-    baseline: "interrupt" | "queue",
+    arrivals: readonly ResponsiveArrival[],
     isRunning: boolean
   ) => void;
   /** Internal construction-only port receiver. */
@@ -203,6 +222,12 @@ export class RunManager {
    * stranded set per retired actor.
    */
   private readonly observedResponsive = new Map<string, Set<string>>();
+  /**
+   * Entry ids whose stored interruption shape has already been reported as
+   * malformed, so an anomaly is visible once per row rather than once per
+   * dispatch. Bounded by {@link MAX_REPORTED_INTERRUPTION_DIAGNOSTICS}.
+   */
+  private readonly reportedInterruptionDiagnostics = new Set<string>();
   private readonly log: (msg: string) => void;
 
   constructor(opts: RunManagerOptions) {
@@ -287,6 +312,7 @@ export class RunManager {
    */
   private pendingResponsive(actorId: string): {
     unseenResponsive: boolean;
+    unseenInterrupting: boolean;
     unseenResponsiveEntries?: readonly InboxEntry[];
     voiceAt?: number;
   } {
@@ -296,6 +322,7 @@ export class RunManager {
     const collect = this.onResponsiveArrived !== undefined;
     let cursor: string | undefined;
     let unseenResponsive = false;
+    let unseenInterrupting = false;
     const unseenResponsiveEntries: InboxEntry[] = [];
     let voiceAt: number | undefined;
 
@@ -309,6 +336,7 @@ export class RunManager {
       for (const entry of page.entries) {
         if (entry.seenAt === null) {
           unseenResponsive = true;
+          if (this.interruptionPolicy(entry) === "interrupt") unseenInterrupting = true;
           if (collect) unseenResponsiveEntries.push(entry);
           if (voiceAt === undefined && entry.payload.type === VOICE_INBOX_PAYLOAD_TYPE) {
             const at = entry.deliveredAt.getTime();
@@ -318,7 +346,7 @@ export class RunManager {
           }
         }
       }
-      if (!collect && unseenResponsive && voiceAt !== undefined) {
+      if (!collect && unseenInterrupting && voiceAt !== undefined) {
         break;
       }
       cursor = page.nextCursor ?? undefined;
@@ -326,19 +354,40 @@ export class RunManager {
 
     return {
       unseenResponsive,
+      unseenInterrupting,
       ...(unseenResponsiveEntries.length > 0 ? { unseenResponsiveEntries } : {}),
       ...(voiceAt !== undefined ? { voiceAt } : {}),
     };
   }
 
   /**
+   * Decode one row's durable interruption policy, making a malformed stored
+   * shape visible once. The row is still scheduled, conservatively joining.
+   */
+  private interruptionPolicy(entry: InboxEntry): "interrupt" | "join" {
+    const decision = decodeInboxInterruption(entry.payload);
+    if (decision.diagnostic && !this.reportedInterruptionDiagnostics.has(entry.id)) {
+      if (this.reportedInterruptionDiagnostics.size >= MAX_REPORTED_INTERRUPTION_DIAGNOSTICS) {
+        this.reportedInterruptionDiagnostics.clear();
+      }
+      this.reportedInterruptionDiagnostics.add(entry.id);
+      this.log(
+        `inbox entry ${entry.id} for ${entry.actorId}: ${decision.diagnostic}; scheduling it without interrupting`
+      );
+    }
+    return decision.policy;
+  }
+
+  /**
    * Report each newly arrived responsive row to the policy hook exactly once,
-   * using the rows this dispatch already read.
+   * using the rows this dispatch already read. Each row carries its own
+   * baseline: it would interrupt only if this dispatch may preempt and the
+   * row's durable policy allows it.
    */
   private observeResponsiveArrival(
     actorId: string,
     work: DurableDispatchWork,
-    baseline: "interrupt" | "queue",
+    mayPreempt: boolean,
     isRunning: boolean
   ): void {
     const observe = this.onResponsiveArrived;
@@ -355,7 +404,18 @@ export class RunManager {
     for (const entry of arrived) observed.add(entry.id);
     if (observed.size > 0) this.observedResponsive.set(actorId, observed);
     else this.observedResponsive.delete(actorId);
-    if (arrived.length > 0) observe(actorId, arrived, baseline, isRunning);
+    if (arrived.length === 0) return;
+    observe(
+      actorId,
+      arrived.map((entry) => ({
+        entry,
+        baseline:
+          mayPreempt && decodeInboxInterruption(entry.payload).policy === "interrupt"
+            ? "interrupt"
+            : "queue",
+      })),
+      isRunning
+    );
   }
 
   private dispatchInternal(actorId: string, opts: { preempt: boolean }): boolean {
@@ -393,14 +453,12 @@ export class RunManager {
     }
     const wasRunning = target.isRunning;
     if (responsiveArrived) {
-      this.observeResponsiveArrival(
-        actorId,
-        work,
-        opts.preempt ? "interrupt" : "queue",
-        wasRunning
-      );
+      this.observeResponsiveArrival(actorId, work, opts.preempt, wasRunning);
     }
-    if (responsiveArrived && opts.preempt) {
+    // Arrival decides admission; only a row whose own durable policy permits
+    // it may replace the run in flight (#829). Joining rows reach that run's
+    // successor through the trigger runner's one responsive follow-up.
+    if (responsiveArrived && opts.preempt && work.unseenInterrupting !== false) {
       const preemption = target.preemptForResponsive();
       if (preemption.preempted) this.onPreempted(actorId, preemption.phase);
     }
@@ -474,6 +532,7 @@ export class RunManager {
     this.live.clear();
     this.selections.clear();
     this.observedResponsive.clear();
+    this.reportedInterruptionDiagnostics.clear();
   }
 
   // --------------------------------------------------------------- admission
@@ -515,6 +574,9 @@ export class RunManager {
     this.selections.delete(actorId);
   }
 }
+
+/** Malformed-row ids remembered before the reported set starts over. */
+const MAX_REPORTED_INTERRUPTION_DIAGNOSTICS = 1_000;
 
 /** The scheduling metadata a dispatch derives from durable state. */
 function dispatchNudge(work: DurableDispatchWork): RunNudge {

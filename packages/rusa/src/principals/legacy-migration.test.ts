@@ -763,14 +763,14 @@ describe("legacy-migration", () => {
         fromId: migration.principalId,
       });
 
-      // The updated actor record has lastChatPrincipalId set to the user principal
-      const updatedWorker = actorRepo.get(WORKER_ID);
-      expect(updatedWorker?.lastChatPrincipalId).toBe(migration.principalId);
+      // The worker's newest human chat names the user principal
+      const lastChat = actorRepo.lastHumanChat(WORKER_ID);
+      expect(lastChat?.principalId).toBe(migration.principalId);
 
       // Actor replies back in conversation
       mesh.recordMessageEmitted({
         fromId: WORKER_ID,
-        toId: updatedWorker?.lastChatPrincipalId ?? HUMAN_OPERATOR,
+        toId: lastChat?.principalId ?? HUMAN_OPERATOR,
         body: "Acknowledged ping",
         sessionId: "sess-123",
         isDrop: false,

@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { z } from "zod";
-import type { ActorRecord } from "../../actor/actor-record.js";
+import type { ActorRecord, HumanChat } from "../../actor/actor-record.js";
 import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 import {
   lookupModelClassPool,
@@ -554,34 +554,9 @@ export class SqliteActorRepository implements ActorRepository {
   }
 
   list(): ActorRecord[] {
-    const rows = this.db
-      .prepare("SELECT * FROM actors ORDER BY created_at, id")
-      .all() as ActorRow[];
-    const lastHumanMessageByRecipient = new Map<string, LastHumanMessage>();
-    // `/api/mesh/threads` lists every actor. Resolving the newest operator
-    // message in `fromRow` turned that request into one full mesh_chat scan per
-    // actor when no recipient index existed. One ordered pass has the same
-    // newest `(ts, id)` semantics and leaves the first row for each recipient
-    // in the map, without a schema migration or an N+1 query.
-    const newestHumanSql =
-      "SELECT recipient_id, session_id, sender_id FROM mesh_chat WHERE sender_id = ? OR sender_id IN (SELECT id FROM principals WHERE kind = 'user') ORDER BY recipient_id, ts DESC, id DESC";
-    const newestHumanRows = this.db.prepare(newestHumanSql).all(HUMAN_OPERATOR) as Array<{
-      recipient_id: string;
-      session_id: string | null;
-      sender_id: string | null;
-    }>;
-    for (const message of newestHumanRows) {
-      if (!lastHumanMessageByRecipient.has(message.recipient_id)) {
-        lastHumanMessageByRecipient.set(message.recipient_id, {
-          session_id: message.session_id,
-          sender_id: message.sender_id,
-        });
-      }
-    }
-    // `null` means this actor was resolved by the batch and has no matching
-    // human message. `undefined` remains reserved for callers such as `get()`
-    // and `children()`, which did not run the batch and must resolve one row.
-    return rows.map((row) => this.fromRow(row, lastHumanMessageByRecipient.get(row.id) ?? null));
+    return (
+      this.db.prepare("SELECT * FROM actors ORDER BY created_at, id").all() as ActorRow[]
+    ).map((row) => this.fromRow(row));
   }
 
   children(parentId: string): ActorRecord[] {
@@ -608,18 +583,30 @@ export class SqliteActorRepository implements ActorRepository {
     }
   }
 
-  private fromRow(row: ActorRow, listedLastHumanMessage?: LastHumanMessage | null): ActorRecord {
+  /**
+   * `mesh_chat` has no recipient index, so this is a full scan. It used to run
+   * inside every record read; it now runs only for the reply tool (#691).
+   */
+  lastHumanChat(id: string): HumanChat | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT session_id, sender_id FROM mesh_chat WHERE recipient_id = ? AND (sender_id = ? OR sender_id IN (SELECT id FROM principals WHERE kind = 'user')) ORDER BY ts DESC, id DESC LIMIT 1"
+      )
+      .get(id, HUMAN_OPERATOR) as LastHumanMessage | undefined;
+    if (!row) return undefined;
+    return {
+      ...(row.session_id ? { sessionId: row.session_id } : {}),
+      ...(row.sender_id ? { principalId: row.sender_id } : {}),
+    };
+  }
+
+  /** The `mesh_chat` row recorded for the message is the durable source. */
+  noteHumanChat(): void {}
+
+  private fromRow(row: ActorRow): ActorRecord {
     const handles = this.db
       .prepare("SELECT target_id, role FROM actor_handles WHERE actor_id = ? ORDER BY target_id")
       .all(row.id) as Array<{ target_id: string; role: string | null }>;
-    const singleHumanSql =
-      "SELECT session_id, sender_id FROM mesh_chat WHERE recipient_id = ? AND (sender_id = ? OR sender_id IN (SELECT id FROM principals WHERE kind = 'user')) ORDER BY ts DESC, id DESC LIMIT 1";
-    const lastHumanMessage =
-      listedLastHumanMessage === undefined
-        ? (this.db.prepare(singleHumanSql).get(row.id, HUMAN_OPERATOR) as
-            | LastHumanMessage
-            | undefined)
-        : listedLastHumanMessage;
     return {
       id: row.id,
       charter: row.charter,
@@ -664,9 +651,6 @@ export class SqliteActorRepository implements ActorRepository {
             }),
           }
         : {}),
-      ...(lastHumanMessage ? { humanUnlocked: true } : {}),
-      ...(lastHumanMessage?.session_id ? { lastChatSessionId: lastHumanMessage.session_id } : {}),
-      ...(lastHumanMessage?.sender_id ? { lastChatPrincipalId: lastHumanMessage.sender_id } : {}),
       ...this.desiredOverlay.get(row.id),
     };
   }
