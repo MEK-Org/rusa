@@ -1,0 +1,30 @@
+{
+  "README.md": {
+    "bytes": 1120,
+    "sha256": "be61b3885fa2a35054faa0f62ceb819644f346723dac823bf6c1f27d1bf86404"
+  },
+  "capture-harness.dart": {
+    "bytes": 4829,
+    "sha256": "293ea9f9c1a39d6b1a4e4eafbb14a7b17a4181da2d385a922f8aaeb306dd06d0"
+  },
+  "narrow-after.png": {
+    "bytes": 32442,
+    "sha256": "1ed0dad1b9fbfc7ce87d02cd4fe1aa338783da5a95477b436bc814b7bad93a3f"
+  },
+  "narrow-before.png": {
+    "bytes": 35108,
+    "sha256": "3a88c5adf25cb297dfe6ae56860d8027c7f31af63694baadce1a3ca639dd9c41"
+  },
+  "source-pins.json": {
+    "bytes": 918,
+    "sha256": "e3f4fcf55420d53198b435c36c47542cb56be0063a0c163579e10e19fbf16705"
+  },
+  "wide-after.png": {
+    "bytes": 44040,
+    "sha256": "5744a48f673af6beae00239dd43e58f6f75bc1a112fd76b8ea4e44c499cbde5c"
+  },
+  "wide-before.png": {
+    "bytes": 46841,
+    "sha256": "2d7e0ac0588dd890db355eb100727cd0894851d32b1d03364afbc2a625031931"
+  }
+}

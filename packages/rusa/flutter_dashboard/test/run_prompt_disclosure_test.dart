@@ -97,7 +97,7 @@ void main() {
     );
   });
 
-  testWidgets('404 renders unavailable, and server errors offer retry', (
+  testWidgets('404 renders unavailable, and server errors retry on re-expansion', (
     tester,
   ) async {
     var status = 404;
@@ -136,9 +136,11 @@ void main() {
     );
     await tester.tap(find.text('Run prompt'));
     await tester.pumpAndSettle();
-    expect(find.text('Could not load prompt. Retry'), findsOneWidget);
+    expect(find.text('Could not load prompt'), findsOneWidget);
     status = 404;
-    await tester.tap(find.text('Could not load prompt. Retry'));
+    await tester.tap(find.text('Run prompt'));
+    await tester.pump();
+    await tester.tap(find.text('Run prompt'));
     await tester.pumpAndSettle();
     expect(
       find.text('Prompt unavailable'),

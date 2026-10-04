@@ -146,9 +146,15 @@ describe("Actor", () => {
     await flush();
     expect(observed).toHaveLength(2);
     expect(observed[0]?.runId).toBe(observed[1]?.runId);
+    // A late successful-spawn observation belongs to this completed attempt.
+    primary.calls[0]?.onPromptLaunched?.("late original-attempt receipt");
+    await flush();
+    expect(observed).toHaveLength(3);
+    expect(observed[2]?.runId).toBe(observed[0]?.runId);
     expect(observed.map(({ provider, prompt }) => ({ provider, prompt }))).toEqual([
       { provider: "claude", prompt: "primary actual prompt" },
       { provider: "antigravity", prompt: "fallback actual prompt + suffix" },
+      { provider: "claude", prompt: "late original-attempt receipt" },
     ]);
     expect(actor.isRunning).toBe(false);
   });

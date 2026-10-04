@@ -56,12 +56,7 @@ class _RunPromptDisclosureState extends State<RunPromptDisclosure> {
               return const Text('Loading prompt…');
             }
             if (snapshot.data?.failed == true) {
-              return TextButton(
-                onPressed: () => setState(() {
-                  _prompt = _fetch();
-                }),
-                child: const Text('Could not load prompt. Retry'),
-              );
+              return const Text('Could not load prompt');
             }
             final data = snapshot.data?.data;
             if (data == null) {

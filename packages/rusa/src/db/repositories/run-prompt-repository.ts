@@ -4,7 +4,6 @@ export const RUN_PROMPT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface RetainedRunPrompt {
   prompt: string;
-  provider: string;
   createdAt: string;
 }
 
@@ -13,7 +12,7 @@ export class RunPromptRepository {
   constructor(private readonly db: Database.Database) {}
 
   /** Replace the previous attempt with the complete prompt supplied to this launch. */
-  record(runId: string, prompt: string, provider: string, nowMs = Date.now()): void {
+  record(runId: string, prompt: string, nowMs = Date.now()): void {
     // Suppress stale reads in this repository if DELETE fails. After a successful
     // DELETE, INSERT failure leaves no row even across restart. DELETE failure
     // cannot durably invalidate storage that refused the write.
@@ -21,31 +20,31 @@ export class RunPromptRepository {
     this.db.prepare("DELETE FROM run_prompts WHERE run_id = ?").run(runId);
     this.db
       .prepare(`
-      INSERT INTO run_prompts (run_id, prompt, provider, created_at)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO run_prompts (run_id, prompt, created_at)
+      VALUES (?, ?, ?)
     `)
-      .run(runId, prompt, provider, new Date(nowMs).toISOString());
+      .run(runId, prompt, new Date(nowMs).toISOString());
     this.failedWrites.delete(runId);
   }
 
-  recordForActor(actorId: string, runId: string, prompt: string, provider: string): void {
+  recordForActor(actorId: string, runId: string, prompt: string): void {
     const run = this.db.prepare("SELECT actor_id FROM actor_runs WHERE id = ?").get(runId) as
       | { actor_id: string }
       | undefined;
     if (!run || run.actor_id !== actorId) return;
-    this.record(runId, prompt, provider);
+    this.record(runId, prompt);
   }
 
   getById(runId: string, nowMs = Date.now()): RetainedRunPrompt | null {
     if (this.failedWrites.has(runId)) return null;
     const row = this.db
       .prepare(`
-      SELECT prompt, provider, created_at FROM run_prompts WHERE run_id = ? AND created_at >= ?
+      SELECT prompt, created_at FROM run_prompts WHERE run_id = ? AND created_at >= ?
     `)
       .get(runId, new Date(nowMs - RUN_PROMPT_RETENTION_MS).toISOString()) as
-      | { prompt: string; provider: string; created_at: string }
+      | { prompt: string; created_at: string }
       | undefined;
-    return row ? { prompt: row.prompt, provider: row.provider, createdAt: row.created_at } : null;
+    return row ? { prompt: row.prompt, createdAt: row.created_at } : null;
   }
 
   prune(nowMs = Date.now()): number {

@@ -1,0 +1,13 @@
+{
+  "baseHead": "73a9644c825f8f5b45246047dd44e447f566cb00",
+  "afterSources": {
+    "packages/rusa/flutter_dashboard/lib/models.dart": "d09c1215d41a054578ea8140dee926a92f2813567cfbe0d30de8badf0f27d736",
+    "packages/rusa/flutter_dashboard/lib/widgets/events_tab.dart": "070a05d551941c01f8831cbf70e50ddbc5c3cad0aa2ea0d43ea60a8f8d80f521",
+    "packages/rusa/flutter_dashboard/lib/widgets/run_prompt_disclosure.dart": "c307066f6a935d4fd8c188251e4e91eaa8242d6af0055ae51f8b0c7b1a259dc2"
+  },
+  "beforeSources": {
+    "packages/rusa/flutter_dashboard/lib/models.dart": "e2f1603f5a8e2328415f51a8cf24ea4205bb76c5032545b9fda113403b321934",
+    "packages/rusa/flutter_dashboard/lib/widgets/events_tab.dart": "51ee6a5d60ebf53805722b1d7bece7effaf3004f2ca777bf3e6220f868874c88",
+    "packages/rusa/flutter_dashboard/lib/widgets/run_prompt_disclosure.dart": "67440483594e58d11c3819149fcbdca72643b3f60dca34f3d6a6073c2aa366ea"
+  }
+}

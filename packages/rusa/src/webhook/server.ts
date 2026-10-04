@@ -355,7 +355,9 @@ export function createDashboardRequestHandler(
       if (
         req.method === "GET" &&
         /^\/api\/mesh\/runs\/[^/]+\/prompt$/.test(pathname) &&
-        (auth ? auth.config?.allowedEmails : localViewerIsAmbiguous(dataDeps?.principals))
+        (auth
+          ? !auth.config?.email || Boolean(auth.config.allowedEmails)
+          : localViewerIsAmbiguous(dataDeps?.principals))
       ) {
         res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify({ error: "prompt not retained" }));

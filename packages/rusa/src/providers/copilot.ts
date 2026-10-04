@@ -26,7 +26,8 @@ export class CopilotProvider implements CodingProvider {
     const command = this.config.cliCommand ?? "copilot";
 
     // The prompt is assembled text, made spawnable before it enters argv (#206).
-    const args = ["--allow-all-tools", "--prompt", sanitizeArgvText(opts.prompt)];
+    const launchPrompt = sanitizeArgvText(opts.prompt);
+    const args = ["--allow-all-tools", "--prompt", launchPrompt];
 
     if (this.model) {
       args.push("--model", this.model);
@@ -68,7 +69,7 @@ export class CopilotProvider implements CodingProvider {
     };
 
     return runSubprocess({
-      onSpawn: () => opts.onPromptLaunched?.(args[args.indexOf("--prompt") + 1]),
+      onSpawn: () => opts.onPromptLaunched?.(launchPrompt),
       command: spawnCommand,
       args: spawnArgs,
       cwd: spawnCwd,

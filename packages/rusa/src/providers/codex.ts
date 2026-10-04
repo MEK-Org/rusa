@@ -460,6 +460,7 @@ export class CodexProvider implements CodingProvider {
 
     // Spawn codex once with the given CLI args and resolve a RunResult. Does NOT
     // clean up temp files — run() does that once in `finally`, after any retry.
+    const launchPrompt = sanitizeArgvText(opts.prompt);
     const spawnCodex = (codexArgs: string[]): Promise<RunResult> => {
       const spawnArgs = bwrapResult
         ? buildActorBwrapCommand(bwrapResult, command, codexArgs)
@@ -673,7 +674,7 @@ export class CodexProvider implements CodingProvider {
         assistantTexts.length > 0 ? assistantTexts.join("\n") : rawOutput;
 
       return runSubprocess({
-        onSpawn: () => opts.onPromptLaunched?.(codexArgs[codexArgs.length - 1]),
+        onSpawn: () => opts.onPromptLaunched?.(launchPrompt),
         command: spawnCommand,
         args: spawnArgs,
         cwd: spawnCwd,
@@ -842,7 +843,7 @@ export class CodexProvider implements CodingProvider {
       if (resumeSessionId) {
         const resumeResult = await spawnCodex(
           buildCodexArgs({
-            prompt: opts.prompt,
+            prompt: launchPrompt,
             model: this.model,
             effort: this.effort,
             cwd: codexCwd,
@@ -864,7 +865,7 @@ export class CodexProvider implements CodingProvider {
 
       return await spawnCodex(
         buildCodexArgs({
-          prompt: opts.prompt,
+          prompt: launchPrompt,
           model: this.model,
           effort: this.effort,
           cwd: codexCwd,

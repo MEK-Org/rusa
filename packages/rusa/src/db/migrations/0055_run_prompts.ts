@@ -8,7 +8,6 @@ export const runPrompts: Migration = {
       CREATE TABLE run_prompts (
         run_id TEXT PRIMARY KEY REFERENCES actor_runs(id) ON DELETE CASCADE,
         prompt TEXT NOT NULL,
-        provider TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
       CREATE INDEX run_prompts_created_at ON run_prompts(created_at);

@@ -2567,7 +2567,7 @@ async function composeStart(
     });
     lifecycle.add({
       onPrompt: (event) => {
-        getRepositories().runPrompts.recordForActor(id, event.runId, event.prompt, event.provider);
+        getRepositories().runPrompts.recordForActor(id, event.runId, event.prompt);
       },
       onQueued: (event) => {
         mesh.recordEvent({

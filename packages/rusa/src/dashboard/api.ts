@@ -2104,7 +2104,7 @@ export async function handleMeshApiRequest(
       sendJson(res, 404, { error: "prompt not retained" });
       return true;
     }
-    sendJson(res, 200, retained);
+    sendJson(res, 200, { prompt: retained.prompt });
     return true;
   }
 

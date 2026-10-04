@@ -1,0 +1,5 @@
+# Run prompt failure control simplification
+
+Four synthetic native Flutter widget screenshots, inspected at original resolution, compare PR #874 base `73a9644c825f8f5b45246047dd44e447f566cb00` with the source hashes in source-pins.json. Wide 1180×820 and narrow 390×844, DPR 2. The real EventsTab/RunPromptDisclosure receives a synthetic fetch failure. Before shows the separate Retry action; after shows plain Could not load prompt. Collapse/re-expand still retries, as the focused widget test verifies. No live account or private prompt is used.
+
+The supplied capture harness imports the existing test fakes and screenshot_support.dart to load SDK fonts. Copy it to flutter_dashboard/test/private_run_prompt_review_capture_test.dart and run the mounted private SDK's Flutter test with RUSA_866_CAPTURE_SOURCE=before/after and RUSA_866_SCREENSHOTS set to a private output directory. Both captures exited 0 with 2/2 tests. Existing eight collapsed/expanded/unavailable frames remain applicable to those states; these four newly captured frames cover the changed failure state. Matt's appearance approval remains held.

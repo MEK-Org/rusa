@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import Database from "better-sqlite3";
 import type { DecodedIdToken } from "firebase-admin/auth";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { runMigrations } from "../db/migrations/runner.js";
@@ -317,7 +317,7 @@ describe("human chat isolation (#590)", () => {
       modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
     });
     const prompt = `# Synthetic charter\n\n  Preserve whitespace ✓\r\n${"x".repeat(300_000)}`;
-    prompts.recordForActor(ACTOR, runId, prompt, "claude");
+    prompts.recordForActor(ACTOR, runId, prompt);
     meshEvents.record({ kind: "run_start", actorId: ACTOR, payload: JSON.stringify({ runId }) });
     const path = `/api/mesh/runs/${runId}/prompt`;
     const anonymous = await fetch(origin + path);
@@ -368,18 +368,29 @@ describe("human chat isolation (#590)", () => {
     });
     const prompt = `# Synthetic charter\n\n  Preserve whitespace ✓\r\n${"x".repeat(300_000)}`;
     const prompts = new RunPromptRepository(db);
-    prompts.recordForActor(ACTOR, runId, prompt, "claude");
+    prompts.recordForActor(ACTOR, runId, prompt);
     const path = `/api/mesh/runs/${runId}/prompt`;
     expect((await fetch(origin + path)).status).toBe(401);
     const authenticated = await fetch(origin + path, { headers: { Cookie: a.cookie } });
     expect(authenticated.status).toBe(200);
-    expect(await authenticated.json()).toEqual(prompts.getById(runId));
+    expect(await authenticated.json()).toEqual({ prompt });
+    // Incomplete authenticated adapters refuse before touching retained prompt storage.
+    const config = Object.getOwnPropertyDescriptor(auth, "config");
+    const readPrompt = vi.spyOn(prompts, "getById");
+    Object.defineProperty(auth, "config", { value: undefined, configurable: true });
+    try {
+      expect((await fetch(origin + path, { headers: { Cookie: a.cookie } })).status).toBe(404);
+      expect(readPrompt).not.toHaveBeenCalled();
+    } finally {
+      if (config) Object.defineProperty(auth, "config", config);
+      readPrompt.mockRestore();
+    }
     // Replace only this isolated fixture's request handler; Alice is its sole durable user.
     server.removeAllListeners("request");
     server.on("request", createDashboardRequestHandler({ port: 0 }, deps));
     const local = await fetch(origin + path);
     expect(local.status).toBe(200);
-    expect(await local.json()).toEqual(prompts.getById(runId));
+    expect(await local.json()).toEqual({ prompt });
     // A second active user leaves auth-disabled mode unable to identify its viewer.
     principals.createUser({ email: "second@example.com", createdAt: new Date(now).toISOString() });
     const ambiguous = await fetch(origin + path);
