@@ -49,6 +49,7 @@ export function createHarness(options: {
   /** Obligation reads and experiment membership, for tests about strict head closure. */
   obligations?: ActorMeshOptions["obligations"];
   experimentEnrollments?: ActorMeshOptions["experimentEnrollments"];
+  legacyOmitInvocationAdmission?: boolean;
 }) {
   const actors = new InMemoryActorRepository();
   const runtimes = new Map<string, ActorHandle>();
@@ -58,7 +59,8 @@ export function createHarness(options: {
     options.cwd,
     false,
     (event) => queueMicrotask(() => remote.receive(structuredClone(event))),
-    options.providerFactory ?? createProvider
+    options.providerFactory ?? createProvider,
+    { legacyOmitInvocationAdmission: options.legacyOmitInvocationAdmission }
   );
   // Exercise the same instance commands without opening a port in unit tests.
   const wire = (instance: RemoteInstance) => {

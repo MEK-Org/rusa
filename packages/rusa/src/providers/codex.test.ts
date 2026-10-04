@@ -50,7 +50,11 @@ const { spawnFn, execSyncFn, execFileSyncFn, execFileFn } = vi.hoisted(() => {
         callback(null, "bwrap version", "");
         return;
       }
-      if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
+      if (
+        (command === "codex" || command === "bwrap") &&
+        args.includes("mcp") &&
+        args.includes("list")
+      ) {
         callback(null, "[]", "");
         return;
       }
@@ -1224,11 +1228,22 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       const provider = new CodexProvider("codex", config, "gpt-5-codex");
 
       execFileFn.mockImplementation(
-        (command: string, args: string[], options: unknown, cb?: (...args: unknown[]) => void) => {
+        (
+          command: string,
+          args: string[],
+          options: unknown,
+          cb?: (err: Error | null, stdout?: string, stderr?: string) => void
+        ) => {
           const callback = (typeof options === "function" ? options : cb) as (
-            ...args: unknown[]
+            err: Error | null,
+            stdout?: string,
+            stderr?: string
           ) => void;
-          if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
+          if (
+            (command === "codex" || command === "bwrap") &&
+            args.includes("mcp") &&
+            args.includes("list")
+          ) {
             callback(
               null,
               JSON.stringify([
@@ -1297,11 +1312,22 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       const provider = new CodexProvider("codex", config, "gpt-5-codex");
 
       execFileFn.mockImplementation(
-        (command: string, args: string[], options: unknown, cb?: (...args: unknown[]) => void) => {
+        (
+          command: string,
+          args: string[],
+          options: unknown,
+          cb?: (err: Error | null, stdout?: string, stderr?: string) => void
+        ) => {
           const callback = (typeof options === "function" ? options : cb) as (
-            ...args: unknown[]
+            err: Error | null,
+            stdout?: string,
+            stderr?: string
           ) => void;
-          if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
+          if (
+            (command === "codex" || command === "bwrap") &&
+            args.includes("mcp") &&
+            args.includes("list")
+          ) {
             callback(
               null,
               JSON.stringify([
@@ -1389,11 +1415,22 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       const provider = new CodexProvider("codex", config, "gpt-5-codex");
 
       execFileFn.mockImplementation(
-        (command: string, args: string[], options: unknown, cb?: (...args: unknown[]) => void) => {
+        (
+          command: string,
+          args: string[],
+          options: unknown,
+          cb?: (err: Error | null, stdout?: string, stderr?: string) => void
+        ) => {
           const callback = (typeof options === "function" ? options : cb) as (
-            ...args: unknown[]
+            err: Error | null,
+            stdout?: string,
+            stderr?: string
           ) => void;
-          if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
+          if (
+            (command === "codex" || command === "bwrap") &&
+            args.includes("mcp") &&
+            args.includes("list")
+          ) {
             callback(new Error("failed to load configuration"));
             return;
           }

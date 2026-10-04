@@ -18,7 +18,8 @@ export class FollowerInstance {
     private readonly home: string,
     private readonly sandbox: boolean,
     private readonly emit: (event: FollowerEvent) => void,
-    private readonly providerFactory: ProviderFactory = createProvider
+    private readonly providerFactory: ProviderFactory = createProvider,
+    private readonly options?: { legacyOmitInvocationAdmission?: boolean }
   ) {
     mkdirSync(home, { recursive: true });
   }
@@ -56,7 +57,8 @@ export class FollowerInstance {
             message: { type: "exit", code: 0, signal: null },
           });
         },
-        this.computerUseLock
+        this.computerUseLock,
+        this.options
       );
       this.actors.set(actorId, actor);
     }

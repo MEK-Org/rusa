@@ -374,25 +374,79 @@ export const CODEX_DENIED_DESKTOP_PLUGIN_OVERRIDES = [
 /** Known direct MCP server names that represent computer-use bindings (#885). */
 export const KNOWN_DIRECT_COMPUTER_USE_MCP_NAMES = new Set(["computer-use"]);
 
+export interface ListEffectiveCodexMcpServersOptions {
+  command: string;
+  args?: string[];
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+  profile?: string;
+  configOverrides?: string[];
+  signal?: AbortSignal;
+}
+
 /**
  * Discover configured MCP servers in the effective configuration using `codex mcp list --json`.
- * Throws if the discovery command fails or output cannot be parsed.
+ * Runs with the actual invocation's effective config/context (including bwrap/overrides/signal).
+ * Throws if the discovery command fails, is cancelled, or output cannot be parsed.
  */
 export async function listEffectiveCodexMcpServers(
-  command: string,
-  cwd: string,
+  commandOrOptions: string | ListEffectiveCodexMcpServersOptions,
+  cwd?: string,
   env?: NodeJS.ProcessEnv,
-  timeoutMs = 60_000
+  timeoutMs = 60_000,
+  profile?: string
 ): Promise<Array<{ name: string; enabled?: boolean; transport?: unknown }>> {
+  let command: string;
+  let args: string[];
+  let effectiveCwd: string;
+  let effectiveEnv: NodeJS.ProcessEnv | undefined;
+  let effectiveTimeoutMs: number;
+  let effectiveSignal: AbortSignal | undefined;
+
+  if (typeof commandOrOptions === "object") {
+    command = commandOrOptions.command;
+    effectiveCwd = commandOrOptions.cwd;
+    effectiveEnv = commandOrOptions.env;
+    effectiveTimeoutMs = commandOrOptions.timeoutMs ?? 60_000;
+    effectiveSignal = commandOrOptions.signal;
+
+    if (commandOrOptions.args) {
+      args = [...commandOrOptions.args];
+    } else {
+      args = [];
+      if (commandOrOptions.profile) {
+        args.push("--profile", commandOrOptions.profile);
+      }
+      args.push("mcp", "list", "--json");
+      if (commandOrOptions.configOverrides) {
+        for (const override of commandOrOptions.configOverrides) {
+          args.push("-c", override);
+        }
+      }
+    }
+  } else {
+    command = commandOrOptions;
+    effectiveCwd = cwd ?? process.cwd();
+    effectiveEnv = env;
+    effectiveTimeoutMs = timeoutMs;
+    args = [];
+    if (profile) {
+      args.push("--profile", profile);
+    }
+    args.push("mcp", "list", "--json");
+  }
+
   return new Promise((resolve, reject) => {
     execFile(
       command,
-      ["mcp", "list", "--json"],
+      args,
       {
-        cwd,
-        env: env ?? process.env,
+        cwd: effectiveCwd,
+        env: effectiveEnv ?? process.env,
         encoding: "utf-8",
-        timeout: timeoutMs,
+        timeout: effectiveTimeoutMs,
+        signal: effectiveSignal,
         maxBuffer: 10 * 1024 * 1024,
       },
       (error, stdout) => {
@@ -801,6 +855,7 @@ export class CodexProvider implements CodingProvider {
       const hasMcpServers = opts.mcpServers && opts.mcpServers.length > 0;
       if (opts.sandbox && (hasMcpServers || this.model || this.effort)) {
         mcpConfigSource = join("/tmp", `rusa-mcp-codex-${randomUUID()}.toml`);
+        tempPaths.push(mcpConfigSource);
         let baseConfig = "";
         const hostHome = process.env.HOME ?? "/root";
         const hostConfigPath = join(hostHome, ".codex", "config.toml");
@@ -886,18 +941,41 @@ export class CodexProvider implements CodingProvider {
         const computerUseOverrides: string[] = [...CODEX_DENIED_DESKTOP_PLUGIN_OVERRIDES];
         try {
           const timeoutMs = Math.max(60_000, opts.timeoutMs ?? 60_000);
-          const effectiveServers = await listEffectiveCodexMcpServers(
-            command,
-            codexCwd,
-            spawnEnv,
-            timeoutMs
-          );
+          const mcpListArgs = [
+            "mcp",
+            "list",
+            "--json",
+            ...configOverrides.flatMap((c) => ["-c", c]),
+          ];
+          const discoveryArgs = bwrapResult
+            ? buildActorBwrapCommand(bwrapResult, command, mcpListArgs)
+            : mcpListArgs;
+
+          const effectiveServers = await listEffectiveCodexMcpServers({
+            command: spawnCommand,
+            args: discoveryArgs,
+            cwd: spawnCwd,
+            env: spawnEnv,
+            timeoutMs,
+            signal: opts.signal,
+          });
           for (const server of effectiveServers) {
             if (KNOWN_DIRECT_COMPUTER_USE_MCP_NAMES.has(server.name) && server.transport) {
               computerUseOverrides.push(`mcp_servers.${server.name}.enabled=false`);
             }
           }
         } catch (err) {
+          if (
+            opts.signal?.aborted ||
+            (typeof err === "object" && err !== null && "cancelled" in err)
+          ) {
+            return {
+              success: false,
+              cancelled: true,
+              output: "Codex run cancelled during MCP configuration discovery",
+              exitCode: 1,
+            };
+          }
           return {
             success: false,
             output: `Failed to determine effective MCP configuration for computer-use denial: ${err instanceof Error ? err.message : String(err)}`,

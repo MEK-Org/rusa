@@ -28,7 +28,8 @@ export function createActorRuntime(
   createProvider: ProviderFactory,
   send: (message: ActorEvent) => void,
   onClosed: () => void,
-  computerUseLock?: ComputerUseLock
+  computerUseLock?: ComputerUseLock,
+  options?: { legacyOmitInvocationAdmission?: boolean }
 ) {
   let actor: Actor | undefined;
   let sequence = 0;
@@ -144,6 +145,7 @@ export function createActorRuntime(
     resolveProvider(modelConfig[0]);
     if (stopping) return;
     let currentRunComputerUse = false;
+    const omitAdmission = options?.legacyOmitInvocationAdmission === true;
     actor = new Actor({
       ...bootstrap.actorOptions,
       id: bootstrap.id,
@@ -151,7 +153,7 @@ export function createActorRuntime(
       modelConfig,
       resolveProvider,
       mcpServers,
-      isComputerUseAdmitted: () => currentRunComputerUse,
+      isComputerUseAdmitted: omitAdmission ? undefined : () => currentRunComputerUse,
       debounceMs: bootstrap.actorOptions?.debounceMs ?? 10,
       loadSessionId: () => sessionId,
       saveSessionId: (id) => {

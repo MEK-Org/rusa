@@ -759,7 +759,9 @@ export class Actor {
         mcpServers: this.opts.mcpServers,
         addDirs: this.opts.addDirs,
         sandbox,
-        computerUse: this.opts.isComputerUseAdmitted ? this.opts.isComputerUseAdmitted() : false,
+        ...(this.opts.isComputerUseAdmitted !== undefined
+          ? { computerUse: this.opts.isComputerUseAdmitted() }
+          : {}),
         // timeoutMs: provider OS-level timeout is the actor ceiling plus a grace
         // margin. The AbortController is the primary kill path; Node's spawn
         // timeout is only a backstop for the rare case our abort fails to land.
