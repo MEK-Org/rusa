@@ -1,0 +1,26 @@
+{
+  "packages/rusa/flutter_dashboard/lib/models.dart": {
+    "bytes": 81126,
+    "sha256": "91380c466b05d906e965d3959e689cbe170034ee9d4800e8a1d744832e63b864"
+  },
+  "packages/rusa/flutter_dashboard/lib/store.dart": {
+    "bytes": 72768,
+    "sha256": "d588a14e5c46200d91e894dc33607d675b782b08b0f40cf2830a6399c439f958"
+  },
+  "packages/rusa/flutter_dashboard/lib/widgets/chat_tab.dart": {
+    "bytes": 19706,
+    "sha256": "e5a950c1ff09ef6c30751afbc1e37476c7d79a722606babcc04f9f2d355e60b6"
+  },
+  "packages/rusa/flutter_dashboard/test/store_test.dart": {
+    "bytes": 76335,
+    "sha256": "b36c51d80da012f2045b0b279fe5ed0c5b9e5c82c386268fe75cf23a2f5f852b"
+  },
+  "packages/rusa/flutter_dashboard/test/fakes.dart": {
+    "bytes": 41541,
+    "sha256": "1f15661187c4b96af5f1be892f51e09322a050c52659d39ffbee41746f6b9a98"
+  },
+  "packages/rusa/flutter_dashboard/test/screenshot_support.dart": {
+    "bytes": 7003,
+    "sha256": "8c440eb26da1ca6052223ddd8dc7991bac22e175e73b4832ea4fa360c77edd72"
+  }
+}

@@ -331,6 +331,12 @@ export class VoiceService {
     }
   }
 
+  /** Whether an accepted session remains live anywhere, including after a holder transfer. */
+  acceptedSessionExists(sessionId: string): boolean {
+    this.expireSessions();
+    return this.sessions.has(sessionId);
+  }
+
   /** Whether this stable UUID currently authorizes voice memos for its actor and principal. */
   hasSession(sessionId: string, actorId: string, principalId?: string): boolean {
     const session = this.sessions.get(sessionId);

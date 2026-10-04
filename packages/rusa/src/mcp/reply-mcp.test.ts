@@ -3,7 +3,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
-import { describe, expect, it, onTestFinished } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import type { Actor } from "../actor/actor.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
 import { runMigrations } from "../db/migrations/runner.js";
@@ -73,7 +73,7 @@ function setupTestMesh() {
     createdAt: "2026-07-05T00:00:00Z",
   });
 
-  return { registry, mesh, inboxStore, recordedEvents };
+  return { registry, mesh, inboxStore, recordedEvents, chatStore };
 }
 
 describe("Mesh Chat Security Invariant Tests", () => {
@@ -107,14 +107,37 @@ describe("Mesh Chat Security Invariant Tests", () => {
   });
 
   describe("Negative Test #2: Reply Tool Scoped by Mount/Construction", () => {
-    it("hides the reply tool until the operator has pinged the actor, and scopes reply to the actor's thread", async () => {
-      const { mesh, inboxStore, recordedEvents } = setupTestMesh();
+    it("advertises reply consistently, refuses missing authority, and scopes accepted replies", async () => {
+      const { mesh, inboxStore, recordedEvents, chatStore } = setupTestMesh();
 
-      // Before human messages actor-A, its server has no reply tool
-      const serverBefore = createAgentExecMcpServer(mesh, "actor-A", "root");
+      // Stable tool advertisement does not confer any authority before accepted input.
+      const onWrite = vi.fn();
+      const emit = vi.spyOn(mesh, "recordMessageEmitted");
+      const wake = vi.spyOn(mesh, "dispatch");
+      const serverBefore = createAgentExecMcpServer(mesh, "actor-A", "root", undefined, {
+        onWrite,
+      });
       const clientBefore = await connect(serverBefore);
       const { tools: toolsBefore } = await clientBefore.listTools();
-      expect(toolsBefore.map((t) => t.name)).not.toContain("reply");
+      expect(toolsBefore.map((t) => t.name)).toContain("reply");
+      const before = recordedEvents.slice();
+      for (const input_ref of [undefined, "foreign-input"]) {
+        const refused = await clientBefore.callTool({
+          name: "reply",
+          arguments: {
+            message: "synthetic unauthorized reply",
+            ...(input_ref === undefined ? {} : { input_ref }),
+          },
+        });
+        expect(refused.isError).toBe(true);
+      }
+      expect(recordedEvents).toEqual(before);
+      expect(chatStore.listForActor("actor-A")).toEqual([]);
+      expect(emit).not.toHaveBeenCalled();
+      expect(wake).not.toHaveBeenCalled();
+      expect(onWrite).not.toHaveBeenCalled();
+      emit.mockRestore();
+      wake.mockRestore();
 
       const actor = mesh.actors.get("actor-A");
       if (!actor) throw new Error("missing synthetic actor");
@@ -175,11 +198,22 @@ describe("Mesh Chat Security Invariant Tests", () => {
         actorId: testHumanId(mesh),
       });
 
-      // Verify actor-B (who was never pinged) still does not have the reply tool
+      // Another actor advertises the same tool but cannot use actor-A's accepted input.
       const serverB = createAgentExecMcpServer(mesh, "actor-B", "root");
       const clientB = await connect(serverB);
       const { tools: toolsB } = await clientB.listTools();
-      expect(toolsB.map((t) => t.name)).not.toContain("reply");
+      expect(toolsB.map((t) => t.name)).toContain("reply");
+      const beforeForeign = recordedEvents.slice();
+      const denied = await clientB.callTool({
+        name: "reply",
+        arguments: {
+          message: "synthetic foreign input reply",
+          input_ref: input.id,
+        },
+      });
+      expect(denied.isError).toBe(true);
+      expect(recordedEvents).toEqual(beforeForeign);
+      expect(chatStore.listForActor("actor-B")).toEqual([]);
     });
 
     it("defaults reply(message) to a uniquely selected accepted human input", async () => {

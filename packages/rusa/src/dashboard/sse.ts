@@ -1,6 +1,9 @@
 import type { ServerResponse } from "node:http";
 import type { ActorRuntimeStateDelta, ActorRuntimeStateSnapshot } from "../actor/actor-mesh.js";
+import { sanitizeRoutedReplyEvent } from "../actor/routed-human-reply.js";
 import type { AvatarGenerationEvent } from "../avatar/avatars.js";
+import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
+import type { InboxRepository } from "../repositories/inbox-repository.js";
 import {
   eventAudience,
   type HumanChatPrincipalSource,
@@ -202,6 +205,7 @@ class SseClient {
 }
 
 export interface SseHubOptions {
+  routedReplies?: { inbox: InboxRepository | undefined; chatStore: MeshChatRepository };
   maxClients?: number;
   maxQueuePerClient?: number;
   maxChunksPerActor?: number;
@@ -254,7 +258,12 @@ export class SseHub {
     // write is isolated so one dead socket can't break the emit (which runs
     // synchronously inside an actor's log callback for live_output).
     this.unsubscribers.push(
-      this.emitter.onMeshEvent((event) => {
+      this.emitter.onMeshEvent((rawEvent) => {
+        const event = sanitizeRoutedReplyEvent(
+          rawEvent,
+          opts.routedReplies?.inbox,
+          opts.routedReplies?.chatStore
+        );
         const text = frame("mesh_event", event);
         // One audience decision per event, not one principal read per client.
         const admits = eventAudience(event, this.principals);

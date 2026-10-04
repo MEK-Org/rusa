@@ -223,7 +223,7 @@ describe("human chat isolation (#590)", () => {
       meshChat,
       inbox,
       obligations,
-      sseHub: new SseHub(emitter, { principals }),
+      sseHub: new SseHub(emitter, { principals, routedReplies: { inbox, chatStore: meshChat } }),
       mesh: mesh as unknown as ActorMesh,
       // The actor is queued, so its thread card projects its prioritized
       // inbox item.
@@ -420,6 +420,7 @@ describe("human chat isolation (#590)", () => {
     const home = mkdtempSync(join(tmpdir(), "voice-auth-fixture-"));
     const service = new VoiceService({
       home,
+      sessionLeaseMs: 1000,
       speech: {
         transcribe: async () => "",
         synthesize: async () => ({ pcm: Buffer.alloc(0), sampleRate: 24000 }),
@@ -481,10 +482,13 @@ describe("human chat isolation (#590)", () => {
     const a = await login(alice);
     const b = await login(bob);
     const home = mkdtempSync(join(tmpdir(), "typed-voice-auth-fixture-"));
+    let voiceNow = Date.now();
     const service = new VoiceService({
       home,
+      now: () => voiceNow,
+      sessionLeaseMs: 1000,
       speech: {
-        transcribe: async () => "",
+        transcribe: async () => "synthetic saved memo",
         synthesize: async () => ({ pcm: Buffer.alloc(0), sampleRate: 24000 }),
         streamSynthesize: async () => ({
           sampleRate: 24000,
@@ -499,6 +503,8 @@ describe("human chat isolation (#590)", () => {
       principals,
       inboxStore: inbox,
       recordChat: (entry) => meshChat.record(entry),
+      recordRoutedReply: (entry) =>
+        meshChat.recordRoutedReply(entry, meshEvents, (event) => emitter.emitMeshEvent(event)),
       voiceSessionTransfer: service,
       createActor: () => {
         throw new Error("synthetic fixture must not spawn providers");
@@ -507,6 +513,16 @@ describe("human chat isolation (#590)", () => {
     // Retain the actual durable admission/dispatch spine while observing wakes.
     const dispatch = vi.spyOn(mesh, "dispatch").mockImplementation(() => false);
     deps.mesh = mesh;
+    server.removeAllListeners("request");
+    server.on(
+      "request",
+      createDashboardRequestHandler(
+        { port: 0, auth: auth.config },
+        deps,
+        { actors: deps.actors, mesh, principals, sseHub: deps.sseHub, service },
+        auth
+      )
+    );
     const onWrite = vi.fn();
     let newestHumanInput: string | undefined;
     const unsubscribe = inbox.onItemsAppended((entries) => {
@@ -805,6 +821,7 @@ describe("human chat isolation (#590)", () => {
       const emittedObserver = vi.spyOn(mesh, "recordMessageEmitted");
       const snapshot = () => ({
         rows: (db.prepare("SELECT COUNT(*) AS n FROM mesh_chat").get() as { n: number }).n,
+        events: (db.prepare("SELECT COUNT(*) AS n FROM mesh_events").get() as { n: number }).n,
         writes: onWrite.mock.calls.length,
         wakes: dispatch.mock.calls.length,
         entries: (
@@ -873,7 +890,7 @@ describe("human chat isolation (#590)", () => {
             fromId: PEER,
             sessionId: lease,
             replyInput: { actorId: PEER, entryId: handoff.id },
-            replyBinding: { principalId: a.id, sessionId: lease, leaseBound: true },
+            replyBinding: handoff.payload.replyBinding,
           },
         },
       ]);
@@ -914,10 +931,193 @@ describe("human chat isolation (#590)", () => {
       await assertRefused(returned.id);
       principals.setDisabled(a.id, null);
 
-      // Ended voice lease fallback: typed input falls back to its original frozen text route.
-      // Handoffs currently drop the verified typed route; propagation awaits disposition.
+      // Losing local ownership is not proof that the accepted lease ended.
+      service.transferActiveSession(ACTOR, PEER, { sessionId: lease, principalId: a.id });
+      await assertRefused(sourceRef);
+      service.revertActiveSessionTransfer(lease, ACTOR, PEER);
+      const missingLiveness = vi
+        .spyOn(service, "acceptedSessionExists")
+        .mockReturnValue(undefined as unknown as boolean);
       service.closeSession(lease);
-      await assertRefused(returned.id); // conservative handoff refusal when its lease ended
+      await assertRefused(sourceRef);
+      missingLiveness.mockRestore();
+      Object.defineProperty(service, "acceptedSessionExists", {
+        value: undefined,
+        configurable: true,
+      });
+      await assertRefused(sourceRef); // A voice port without global liveness evidence fails closed.
+      delete (service as { acceptedSessionExists?: unknown }).acceptedSessionExists;
+      service.openSession(lease, ACTOR, a.id);
+      // Expiry, unlike a transfer, ends the lease and permits its original typed route.
+      service.disconnectSession(lease);
+      voiceNow += 2000;
+      expect(service.acceptedSessionExists(lease)).toBe(false);
+      // Ended voice lease fallback: typed input falls back to its original frozen text route.
+      // Verified typed handoffs retain the original admission route through transfer and return.
+      service.closeSession(lease);
+      await reply("synthetic ended returned typed reply", undefined, true, returned.id);
+      expect(
+        meshChat
+          .listForSession("synthetic-text-during-voice", { limit: 100 })
+          .find((entry) => entry.body === "synthetic ended returned typed reply")
+      ).toMatchObject({ senderId: ACTOR, recipientId: a.id });
+      // The routed reply is published after chat and authoritative proof commit, once.
+      const routedStreamController = new AbortController();
+      const routedStream = await fetch(`${origin}/api/mesh/stream?actors=${ACTOR}`, {
+        headers: { Cookie: a.cookie },
+        signal: routedStreamController.signal,
+      });
+      const routedReader = required(routedStream.body?.getReader());
+      const routedFrames = (async () => {
+        let text = "";
+        const decoder = new TextDecoder();
+        while (!text.includes("synthetic ended peer typed reply")) {
+          const frame = await routedReader.read();
+          if (frame.done) break;
+          text += decoder.decode(frame.value, { stream: true });
+        }
+        return text;
+      })();
+      await reply("synthetic ended peer typed reply", undefined, true, handoff.id, PEER);
+      const routedText = await routedFrames;
+      routedStreamController.abort();
+      const sentFrame = routedText
+        .split("\n")
+        .filter((line) => line.startsWith("data: "))
+        .map((line) => JSON.parse(line.slice(6)))
+        .find((event) => event.kind === "message_sent");
+      expect(JSON.parse(sentFrame.payload)).toMatchObject({ originalActorId: ACTOR });
+      expect(routedText).toContain(`"actorId":"${PEER}"`);
+      const routeHistory = await getJson<{
+        chat: { id: string; body: string; senderId: string; sessionId: string }[];
+      }>(`/api/mesh/chat?actors=${ACTOR},${a.id}`, a.cookie);
+      const routedRows = routeHistory.body.chat.filter(
+        (row) => row.body === "synthetic ended peer typed reply"
+      );
+      expect(routedRows).toHaveLength(1);
+      expect(routedRows[0]).toMatchObject({
+        senderId: PEER,
+        sessionId: "synthetic-text-during-voice",
+      });
+      const bobHistory = await getJson<{ chat: { body: string }[] }>(
+        `/api/mesh/chat?actors=${ACTOR},${b.id}`,
+        b.cookie
+      );
+      expect(
+        bobHistory.body.chat.some((row) => row.body === "synthetic ended peer typed reply")
+      ).toBe(false);
+      const routedID = required(routedRows[0]).id;
+      const rawProof = required(meshChat.routedReplyProof(routedID) ?? undefined);
+      const published = vi.fn();
+      const unobserve = emitter.onMeshEvent(published);
+      try {
+        const beforeRollback = snapshot();
+        const eventWrite = vi.spyOn(meshEvents, "record").mockImplementation(() => {
+          throw new Error("synthetic proof write failure");
+        });
+        const refusedWrite = await reply(
+          "synthetic must roll back",
+          undefined,
+          false,
+          handoff.id,
+          PEER
+        );
+        eventWrite.mockRestore();
+        expect(refusedWrite.isError).toBe(true);
+        const afterRollback = snapshot();
+        expect({ ...afterRollback, emits: beforeRollback.emits }).toEqual(beforeRollback);
+        expect(published).not.toHaveBeenCalled();
+      } finally {
+        unobserve();
+      }
+      // Metadata never broadens history without an independently verified actor-owned chain.
+      for (const invalid of [
+        {
+          ...JSON.parse(required(rawProof.payload ?? undefined)),
+          replyInput: { actorId: PEER, entryId: sourceRef },
+        },
+        {
+          ...JSON.parse(required(rawProof.payload ?? undefined)),
+          originalActorId: "foreign-actor",
+        },
+        { ...JSON.parse(required(rawProof.payload ?? undefined)), replyInput: null },
+        {},
+      ]) {
+        db.prepare("UPDATE mesh_events SET payload = ? WHERE id = ?").run(
+          JSON.stringify(invalid),
+          rawProof.id
+        );
+        const hidden = await getJson<{ chat: { id: string }[] }>(
+          `/api/mesh/chat?actors=${ACTOR},${a.id}`,
+          a.cookie
+        );
+        expect(hidden.body.chat.some((row) => row.id === routedID)).toBe(false);
+        const events = await getJson<{ events: { payload: string | null }[] }>(
+          `/api/mesh/events?since=2000-01-01&limit=500`,
+          a.cookie
+        );
+        expect(
+          events.body.events.some((event) =>
+            event.payload?.includes(`"originalActorId":"${ACTOR}"`)
+          )
+        ).toBe(false);
+      }
+      // Malformed proof grants no added history; live foreign proof is stripped too.
+      db.prepare("UPDATE mesh_events SET payload = ? WHERE id = ?").run("{malformed", rawProof.id);
+      const malformedHistory = await getJson<{ chat: { id: string }[] }>(
+        `/api/mesh/chat?actors=${ACTOR},${a.id}`,
+        a.cookie
+      );
+      expect(malformedHistory.status).toBe(200);
+      expect(malformedHistory.body.chat.some((row) => row.id === routedID)).toBe(false);
+      const forgedStreamController = new AbortController();
+      const forgedStream = await fetch(`${origin}/api/mesh/stream?actors=${ACTOR}`, {
+        headers: { Cookie: a.cookie },
+        signal: forgedStreamController.signal,
+      });
+      const forgedReader = required(forgedStream.body?.getReader());
+      const forgedFrames = (async () => {
+        let text = "";
+        const decoder = new TextDecoder();
+        while (!text.includes(rawProof.id)) {
+          const frame = await forgedReader.read();
+          if (frame.done) break;
+          text += decoder.decode(frame.value, { stream: true });
+        }
+        return text;
+      })();
+      const foreignProof = {
+        ...JSON.parse(required(rawProof.payload ?? undefined)),
+        replyInput: { actorId: PEER, entryId: sourceRef },
+      };
+      db.prepare("UPDATE mesh_events SET payload = ? WHERE id = ?").run(
+        JSON.stringify(foreignProof),
+        rawProof.id
+      );
+      emitter.emitMeshEvent(required(meshEvents.getById(rawProof.id) ?? undefined));
+      const forgedText = await forgedFrames;
+      forgedStreamController.abort();
+      const forgedFrame = forgedText
+        .split("\n")
+        .filter((line) => line.startsWith("data: "))
+        .map((line) => JSON.parse(line.slice(6)))
+        .find((event) => event.id === rawProof.id);
+      expect(JSON.parse(forgedFrame.payload).originalActorId).toBeUndefined();
+      expect(JSON.parse(forgedFrame.payload).replyInput).toBeUndefined();
+      db.prepare("UPDATE mesh_events SET payload = ? WHERE id = ?").run(
+        rawProof.payload,
+        rawProof.id
+      );
+      expect(
+        meshChat
+          .listForSession("synthetic-text-during-voice", { limit: 100 })
+          .find((entry) => entry.body === "synthetic ended peer typed reply")
+      ).toMatchObject({ senderId: PEER, recipientId: a.id });
+      expect(
+        meshChat
+          .listForSession(lease, { limit: 100 })
+          .some((entry) => entry.body === "synthetic ended peer typed reply")
+      ).toBe(false);
 
       // But typed input falls back to its original frozen text route:
       await reply("synthetic ended voice lease fallback", undefined, true, sourceRef);
@@ -926,6 +1126,70 @@ describe("human chat isolation (#590)", () => {
           .listForSession("synthetic-text-during-voice", { limit: 100 })
           .find((entry) => entry.body === "synthetic ended voice lease fallback")
       ).toMatchObject({ recipientId: a.id });
+      // Route evidence is stamped at authenticated admission, not inferred from payload type/prefix.
+      for (const kind of ["memo", "typed-prefix", "spoken"] as const) {
+        service.openSession(lease, ACTOR, a.id);
+        const memoCsrf = await csrf(a.cookie);
+        const accepted =
+          kind === "memo"
+            ? await fetch(`${origin}/api/mesh/actors/${ACTOR}/voice-memo?sessionId=${lease}`, {
+                method: "POST",
+                headers: {
+                  Cookie: `${a.cookie}; ${memoCsrf.cookie}`,
+                  Origin: origin,
+                  "X-Rusa-CSRF": memoCsrf.header,
+                  "Content-Type": "audio/webm",
+                },
+                body: Buffer.from("synthetic audio fixture"),
+              })
+            : await post(
+                `/api/mesh/actors/${ACTOR}/chat`,
+                {
+                  body: "🎙️ [voice memo synthetic typed prefix",
+                  sessionId: `synthetic-${kind}-text`,
+                  voice: kind === "spoken",
+                },
+                a.cookie
+              );
+        expect(accepted.status).toBe(200);
+        const ref = required(newestHumanInput);
+        const acceptedEntry = required(inbox.read(ACTOR, ref) ?? undefined);
+        expect(acceptedEntry.payload.type).toBe("human.voice");
+        service.closeSession(lease);
+        if (kind === "spoken") {
+          await assertRefused(ref); // Genuine live voice has no independently accepted text route.
+          continue;
+        }
+        await reply(`synthetic ended ${kind} reply`, undefined, true, ref);
+        expect(
+          meshChat
+            .listForSession(String(acceptedEntry.payload.sessionId), { limit: 100 })
+            .find((entry) => entry.body === `synthetic ended ${kind} reply`)
+        ).toMatchObject({ senderId: ACTOR, recipientId: a.id });
+        const acceptedBinding = acceptedEntry.payload.replyBinding as Record<string, unknown>;
+        const textRoute = acceptedBinding.textRoute as Record<string, unknown>;
+        for (const invalid of [
+          undefined,
+          { ...textRoute, actorId: PEER },
+          { ...textRoute, sessionId: "foreign-session" },
+          { ...textRoute, messageId: "foreign-message" },
+        ]) {
+          const [bad] = inbox.append([
+            {
+              actorId: ACTOR,
+              source: acceptedEntry.source,
+              payload: {
+                ...acceptedEntry.payload,
+                replyBinding: { ...acceptedBinding, textRoute: invalid },
+              },
+            },
+          ]);
+          await assertRefused(bad.id);
+        }
+        service.openSession("synthetic-bob-conflict", ACTOR, b.id);
+        await assertRefused(ref);
+        service.closeSession("synthetic-bob-conflict");
+      }
       service.openSession(lease, ACTOR, a.id);
 
       // Valid 100-record input resolves, but its next handoff must refuse before rebind.
@@ -944,7 +1208,7 @@ describe("human chat isolation (#590)", () => {
       }));
       inbox.append(depthChain);
       mesh.selectInboxEntries(ACTOR, [required(depthChain[0]).id]);
-      expect(mesh.resolveHumanReplyInput(ACTOR, required(depthChain[0]).id).binding).toEqual({
+      expect(mesh.resolveHumanReplyInput(ACTOR, required(depthChain[0]).id).binding).toMatchObject({
         principalId: a.id,
         sessionId: lease,
         leaseBound: true,
@@ -972,7 +1236,7 @@ describe("human chat isolation (#590)", () => {
               (entry.payload.replyInput as { entryId: string }).entryId === depthChain[1].id
           )
       );
-      expect(mesh.resolveHumanReplyInput(PEER, boundaryHandoff.id).binding).toEqual({
+      expect(mesh.resolveHumanReplyInput(PEER, boundaryHandoff.id).binding).toMatchObject({
         principalId: a.id,
         sessionId: lease,
         leaseBound: true,
@@ -1035,7 +1299,7 @@ describe("human chat isolation (#590)", () => {
       service.openSession("synthetic-new-alice", ACTOR, a.id);
       await assertRefused(returned.id);
       service.closeSession("synthetic-new-alice");
-      await assertRefused(returned.id);
+      await reply("synthetic ended replacement typed reply", undefined, true, returned.id);
       service.openSession("synthetic-unbound-lease", ACTOR);
       // Optional voice ports can return an unbound lease without rejecting in the all-lease check.
       const unboundAllLease = vi.spyOn(service, "heldByOtherPrincipal").mockReturnValue(false);

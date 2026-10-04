@@ -246,44 +246,33 @@ export function createAgentExecMcpServer(
     return `github:${repo}/${kind === "github_pr" ? "pulls" : "issues"}/${number}`;
   };
 
-  const voiceSessionId = mesh.activeVoiceSessionFor(selfId)?.sessionId;
-  if (voiceSessionId || mesh.actors.lastHumanChat(selfId)) {
-    server.registerTool(
-      "reply",
-      {
-        title: "Reply to the human operator",
-        description:
-          "Reply to the human operator in your conversation thread. Defaults to your single uniquely selected accepted human input; specify input_ref when multiple inputs are selected or when answering an earlier handled input.",
-        inputSchema: {
-          message: z.string().describe("The message to send back to the human operator."),
-          input_ref: z
-            .string()
-            .optional()
-            .describe(
-              "Your own accepted human input or verified voice-transfer inbox entry id, as returned by inbox list/select. Required when multiple human inputs are selected or when completing a delayed response to an earlier input."
-            ),
-        },
+  // Tool availability is stable; accepted-input authority is checked before every reply effect.
+  server.registerTool(
+    "reply",
+    {
+      title: "Reply to the human operator",
+      description:
+        "Reply to the human operator in your conversation thread. Defaults to your single uniquely selected accepted human input; specify input_ref when multiple inputs are selected or when answering an earlier handled input.",
+      inputSchema: {
+        message: z.string().describe("The message to send back to the human operator."),
+        input_ref: z
+          .string()
+          .optional()
+          .describe(
+            "Your own accepted human input or verified voice-transfer inbox entry id, as returned by inbox list/select. Required when multiple human inputs are selected or when completing a delayed response to an earlier input."
+          ),
       },
-      async ({ message, input_ref }) => {
-        try {
-          const { binding } = mesh.resolveHumanReplyInput(selfId, input_ref);
-          const { sessionId, principalId: toId } = binding;
-          mesh.recordMessageEmitted({
-            fromId: selfId,
-            toId,
-            body: message,
-            sessionId,
-            isDrop: false,
-          });
-          options?.onWrite?.();
-          return toolOk("sent");
-        } catch (err) {
-          return toolError(err);
-        }
+    },
+    async ({ message, input_ref }) => {
+      try {
+        mesh.replyToHuman(selfId, message, input_ref);
+        options?.onWrite?.();
+        return toolOk("sent");
+      } catch (err) {
+        return toolError(err);
       }
-    );
-  }
-
+    }
+  );
   server.registerTool(
     "spawn_thread",
     {

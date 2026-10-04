@@ -2869,6 +2869,10 @@ async function composeStart(
     },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),
+    recordRoutedReply: (reply) =>
+      getRepositories().meshChat.recordRoutedReply(reply, getRepositories().meshEvents, (event) =>
+        meshEmitter.emitMeshEvent(event)
+      ),
     scheduledMessages: osScheduler,
     withTransaction: (fn) => getDb().transaction(fn)(),
     completedFocusEntryCounts: (actorId, excludeRunId) =>
@@ -2928,6 +2932,7 @@ async function composeStart(
     // this host-owned port closes over it. ActorMesh keeps authorization and
     // durable handoff delivery; VoiceService keeps the one live-session map.
     voiceSessionTransfer: {
+      acceptedSessionExists: (sessionId) => voiceService?.acceptedSessionExists(sessionId),
       heldByOtherPrincipal: (actorId, principalId) =>
         voiceService?.heldByOtherPrincipal(actorId, principalId) ?? false,
       activeSessionFor: (actorId) => voiceService?.activeSessionFor(actorId),

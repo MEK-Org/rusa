@@ -116,6 +116,7 @@ import {
   shadowPrediction,
   shadowReactionTarget,
 } from "./responsive-interruption.js";
+import type { RoutedHumanReply } from "./routed-human-reply.js";
 import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
@@ -236,6 +237,8 @@ export interface RetireOptions {
 
 /** Host-owned live-session operations used by the actor transfer primitive. */
 export interface VoiceSessionTransferPort {
+  /** Read accepted-session liveness across holders; absence cannot authorize fallback. */
+  acceptedSessionExists?(sessionId: string): boolean | undefined;
   /** Read the caller's active session and bound human principal together. */
   activeSessionFor(actorId: string): { sessionId: string; principalId?: string } | undefined;
   /** Whether any live lease for this actor belongs to another human. */
@@ -717,6 +720,8 @@ export interface ActorMeshOptions {
    */
   retireCleanups?: RetireCleanup[];
   events?: MeshEventSink;
+  /** Strict atomic persistence and post-commit fan-out for proven routed human replies. */
+  recordRoutedReply?: (reply: RoutedHumanReply) => string;
   /** Durable record store for message content. */
   recordChat?: (opts: {
     id?: string;
@@ -930,6 +935,7 @@ export class ActorMesh {
   ) => void;
   private readonly retireCleanups: RetireCleanup[];
   private readonly events: MeshEventSink;
+  private readonly recordRoutedReply?: (reply: RoutedHumanReply) => string;
   private readonly recordChat?: (opts: {
     id?: string;
     senderId: string;
@@ -1135,6 +1141,7 @@ export class ActorMesh {
     ];
     this.events = opts.events ?? NOOP_MESH_EVENT_SINK;
     this.recordChat = opts.recordChat;
+    this.recordRoutedReply = opts.recordRoutedReply;
     this.voiceTransferLog = opts.voiceTransferLogger ?? nullLogger;
     this.scheduledMessages = opts.scheduledMessages;
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
@@ -1159,6 +1166,26 @@ export class ActorMesh {
    * this as a safe no-op (`INSERT OR IGNORE`) instead of duplicating the
    * message.
    */
+  replyToHuman(actorId: string, message: string, inputRef?: string): void {
+    const resolved = this.resolveHumanReplyInput(actorId, inputRef);
+    const { binding } = resolved;
+    const routedReply =
+      !binding.leaseBound && binding.textRoute && binding.textRoute.actorId !== actorId
+        ? {
+            originalActorId: binding.textRoute.actorId,
+            replyInput: { actorId, entryId: resolved.inputRef },
+          }
+        : undefined;
+    this.recordMessageEmitted({
+      fromId: actorId,
+      toId: binding.principalId,
+      body: message,
+      sessionId: binding.sessionId,
+      isDrop: false,
+      routedReply,
+    });
+  }
+
   recordMessageEmitted(opts: {
     id?: string;
     fromId: string;
@@ -1166,9 +1193,21 @@ export class ActorMesh {
     body: string;
     sessionId?: string;
     isDrop: boolean;
+    routedReply?: Pick<RoutedHumanReply, "originalActorId" | "replyInput">;
   }): string | undefined {
     const fromId = this.resolveThreadId(opts.fromId);
     const toId = this.resolveThreadId(opts.toId);
+    if (opts.routedReply) {
+      if (!this.recordRoutedReply || !opts.sessionId)
+        throw new Error("routed reply requires atomic durable proof storage");
+      return this.recordRoutedReply({
+        senderId: fromId,
+        recipientId: toId,
+        body: opts.body,
+        sessionId: opts.sessionId,
+        ...opts.routedReply,
+      });
+    }
     const msgId = this.writeChatRow({
       id: opts.id,
       fromId,
@@ -3083,7 +3122,7 @@ export class ActorMesh {
       }
     }
     const input = readAcceptedHumanInput(store, actorId, inputRef);
-    const { principalId, sessionId, leaseBound, textSessionId } = input.binding;
+    const { principalId, sessionId, leaseBound, textRoute } = input.binding;
     const user = this.principals?.getUser(principalId);
     if (!user || user.disabledAt) {
       throw new Error("reply requires an active durable human conversation principal");
@@ -3097,10 +3136,14 @@ export class ActorMesh {
     if (leaseBound) {
       if (lease && lease.sessionId === sessionId && lease.principalId === principalId) {
         resolvedSessionId = lease.sessionId;
-      } else if (!lease && textSessionId) {
+      } else if (
+        !lease &&
+        textRoute &&
+        this.voiceSessionTransfer?.acceptedSessionExists?.(sessionId) === false
+      ) {
         // Typed input with ended same-principal voice lease falls back ONLY to its original
         // independently verified frozen TEXT route with no conflicting active lease.
-        resolvedSessionId = textSessionId;
+        resolvedSessionId = textRoute.sessionId;
         resolvedLeaseBound = false;
       } else {
         throw new Error(
@@ -3110,11 +3153,13 @@ export class ActorMesh {
     }
     return {
       binding: {
+        ...(textRoute ? { textRoute } : {}),
         principalId,
         sessionId: resolvedSessionId,
         leaseBound: resolvedLeaseBound,
       },
       depth: input.depth,
+      inputRef,
     };
   }
 
@@ -4369,7 +4414,10 @@ export class ActorMesh {
             messageId,
             fromId,
             sessionId,
-            replyBinding,
+            replyBinding: {
+              ...replyBinding,
+              ...(opts.voice ? {} : { textRoute: { actorId: toId, sessionId, messageId } }),
+            },
           },
         },
       ]);

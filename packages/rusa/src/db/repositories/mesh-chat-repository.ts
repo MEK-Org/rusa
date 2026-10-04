@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import type { RoutedHumanReply } from "../../actor/routed-human-reply.js";
+import type { MeshEvent, MeshEventRepository } from "./mesh-event-repository.js";
 
 export interface MeshChat {
   id: string;
@@ -61,6 +63,63 @@ export class MeshChatRepository {
         opts.sessionId ?? null
       );
     return id;
+  }
+
+  /** Commit a newly proven routed reply and both audit rows before any fan-out. */
+  recordRoutedReply(
+    reply: RoutedHumanReply,
+    events: MeshEventRepository,
+    publish: (event: MeshEvent) => void
+  ): string {
+    const committed = this.db.transaction(() => {
+      const id = this.record(reply);
+      const sent = events.record({
+        id: `${id}:sent`,
+        kind: "message_sent",
+        actorId: reply.senderId,
+        detail: reply.sessionId,
+        payload: JSON.stringify({
+          messageId: id,
+          to: reply.recipientId,
+          originalActorId: reply.originalActorId,
+          replyInput: reply.replyInput,
+        }),
+      });
+      const received = events.record({
+        id: `${id}:received`,
+        kind: "message_received",
+        actorId: reply.recipientId,
+        detail: reply.sessionId,
+        payload: JSON.stringify({ messageId: id, from: reply.senderId }),
+      });
+      return { id, eventIds: [sent, received] };
+    })();
+    for (const id of committed.eventIds) {
+      const event = events.getById(id);
+      if (event) {
+        try {
+          publish(event);
+        } catch {
+          /* committed delivery survives a disconnected subscriber */
+        }
+      }
+    }
+    return committed.id;
+  }
+
+  /** Locate one durable sent proof. Duplicate or absent proofs confer no added visibility. */
+  routedReplyProof(
+    messageId: string
+  ): Pick<MeshEvent, "id" | "kind" | "actorId" | "payload"> | null {
+    const rows = this.db
+      .prepare(`SELECT id, kind, actor_id, payload FROM mesh_events
+      WHERE kind = 'message_sent' AND json_valid(payload)
+      AND json_extract(payload, '$.messageId') = ?
+      AND json_type(payload, '$.replyInput') = 'object' LIMIT 2`)
+      .all(messageId) as { id: string; kind: string; actor_id: string; payload: string }[];
+    return rows.length === 1
+      ? { id: rows[0].id, kind: rows[0].kind, actorId: rows[0].actor_id, payload: rows[0].payload }
+      : null;
   }
 
   /** Fetch a single message by id (PK lookup), or `null` if absent. */
@@ -142,19 +201,28 @@ export class MeshChatRepository {
    */
   listChatByActors(
     actorIds: string[],
-    opts: { limit: number; before?: number | null } = { limit: 50 }
+    opts: {
+      limit: number;
+      before?: number | null;
+      routedActor?: (chat: MeshChat) => string | null;
+    } = { limit: 50 }
   ): ChatPage {
     const { limit } = opts;
     if (actorIds.length === 0 || limit <= 0) return { chat: [], nextCursor: null };
 
     const actorPlaceholders = actorIds.map(() => "?").join(", ");
     const params: (string | number)[] = [...actorIds, ...actorIds];
-    let sql = `
-      SELECT rowid, * 
-      FROM mesh_chat
-      WHERE sender_id IN (${actorPlaceholders}) AND recipient_id IN (${actorPlaceholders})
-        AND sender_id != recipient_id
-    `;
+    let sql = `SELECT rowid, * FROM mesh_chat WHERE ((
+      sender_id IN (${actorPlaceholders}) AND recipient_id IN (${actorPlaceholders})
+      AND sender_id != recipient_id)`;
+    if (opts.routedActor) {
+      sql += ` OR (recipient_id IN (${actorPlaceholders}) AND EXISTS (
+        SELECT 1 FROM mesh_events e WHERE e.kind = 'message_sent' AND json_valid(e.payload)
+        AND json_extract(e.payload, '$.messageId') = mesh_chat.id
+        AND json_extract(e.payload, '$.originalActorId') IN (${actorPlaceholders})))`;
+      params.push(...actorIds, ...actorIds);
+    }
+    sql += ")";
 
     if (opts.before != null) {
       sql += ` AND rowid < ?`;
@@ -167,7 +235,18 @@ export class MeshChatRepository {
     const hasMore = rows.length > limit;
     const page = hasMore ? rows.slice(0, limit) : rows;
     const nextCursor = hasMore ? page[page.length - 1].rowid : null;
-    return { chat: page.map(toMeshChat), nextCursor };
+    return {
+      chat: page
+        .map(toMeshChat)
+        .filter(
+          (chat) =>
+            (actorIds.includes(chat.senderId) && actorIds.includes(chat.recipientId)) ||
+            (opts.routedActor &&
+              actorIds.includes(chat.recipientId) &&
+              actorIds.includes(opts.routedActor(chat) ?? ""))
+        ),
+      nextCursor,
+    };
   }
 }
 

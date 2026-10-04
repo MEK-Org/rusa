@@ -7,6 +7,7 @@ import type { HaltState } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { inboxEntryObligationRefs } from "../actor/inbox-focus.js";
 import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
+import { routedReplyActor, sanitizeRoutedReplyEvent } from "../actor/routed-human-reply.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
   type AvatarGenerationCoordinator,
@@ -2140,12 +2141,20 @@ export async function handleMeshApiRequest(
       sendJson(
         res,
         200,
-        meshEvents.listEventsSince(since, clampLimit(url), {
-          until: url.searchParams.get("until") ?? undefined,
-          kinds: parseKinds(url),
-          order: rawOrder === "desc" ? "desc" : "asc",
-          humanViewerIds,
-        })
+        (() => {
+          const page = meshEvents.listEventsSince(since, clampLimit(url), {
+            until: url.searchParams.get("until") ?? undefined,
+            kinds: parseKinds(url),
+            order: rawOrder === "desc" ? "desc" : "asc",
+            humanViewerIds,
+          });
+          return {
+            ...page,
+            events: page.events.map((event) =>
+              sanitizeRoutedReplyEvent(event, deps.inbox, deps.meshChat)
+            ),
+          };
+        })()
       );
       return true;
     }
@@ -2158,7 +2167,12 @@ export async function handleMeshApiRequest(
       conversation,
       humanViewerIds,
     });
-    sendJson(res, 200, page);
+    sendJson(res, 200, {
+      ...page,
+      events: page.events.map((event) =>
+        sanitizeRoutedReplyEvent(event, deps.inbox, deps.meshChat)
+      ),
+    });
     return true;
   }
 
@@ -2184,6 +2198,8 @@ export async function handleMeshApiRequest(
     const page = deps.meshChat.listChatByActors(resolved.actors, {
       limit: clampLimit(url),
       before: parsePositiveInt(url, "before") ?? null,
+      routedActor: (chat) =>
+        routedReplyActor(deps.inbox, chat, deps.meshChat.routedReplyProof(chat.id)),
     });
     sendJson(res, 200, page);
     return true;

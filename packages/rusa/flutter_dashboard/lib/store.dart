@@ -1495,7 +1495,7 @@ class DashboardStore {
     final actorId = e.actorId;
     if (actorId == null) return;
 
-    if (_selection.value.contains(actorId)) {
+    if (_selection.value.contains(actorId) || _selection.value.contains(e.routedOriginalActorId)) {
       final kf = _kindFilter.value;
       if (kf != null && e.kind != kf) return;
       if (_seenEventIds.add(e.id)) {
@@ -1528,8 +1528,9 @@ class DashboardStore {
           sessionId: null,
         );
 
+        final conversationActorId = e.routedOriginalActorId ?? senderId;
         if (sel.length == 2 && e.kind == 'message_sent') {
-          if (sel.contains(actorId) && sel.contains(recipientId)) {
+          if (sel.contains(conversationActorId) && sel.contains(recipientId)) {
             if (_seenConversationMessageIds.add(c.id)) {
               final cur = _conversation.value;
               _conversation.add(
@@ -1555,7 +1556,7 @@ class DashboardStore {
           final isHumanRecipient =
               recipientId == 'human:operator' ||
               (userPrincipalId != null && recipientId == userPrincipalId);
-          if ((actorId == selectedId && isHumanRecipient) ||
+          if ((conversationActorId == selectedId && isHumanRecipient) ||
               (isHumanSender && recipientId == selectedId)) {
             if (_seenOperatorChatMessageIds.add(c.id)) {
               final cur = _operatorChat.value;

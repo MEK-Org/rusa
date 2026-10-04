@@ -1727,6 +1727,31 @@ void main() {
     },
   );
 
+  test('operatorChat: validated routed reply appears once with peer sender and reloads', () async {
+    final api = FakeApi()..threadsResult = [makeThread('a'), makeThread('peer')];
+    final stream = FakeStream();
+    final store = await _booted(api, stream);
+    store.clickActor('a');
+    await pumpEventQueue();
+    stream.meshCtrl.add(makeEvent('routed-sent', 'message_sent', actor: 'peer',
+      body: 'Synthetic delayed completion',
+      payload: '{"messageId":"routed-chat","to":"human:operator","originalActorId":"a","replyInput":{"actorId":"peer","entryId":"accepted"}}'));
+    stream.meshCtrl.add(makeEvent('routed-received', 'message_received', actor: 'human:operator',
+      body: 'Synthetic delayed completion', payload: '{"messageId":"routed-chat","from":"peer"}'));
+    await pumpEventQueue();
+    expect(store.operatorChat.value.chat.map((e) => e.id), ['routed-chat']);
+    expect(store.operatorChat.value.chat.single.senderId, 'peer');
+    await store.dispose();
+    final reloadApi = FakeApi()..threadsResult = [makeThread('a'), makeThread('peer')]
+      ..chatPages = [ChatPage(chat: [makeChat('routed-chat', sender: 'peer', body: 'Synthetic delayed completion')], nextCursor: null)];
+    final reloaded = await _booted(reloadApi, FakeStream());
+    reloaded.clickActor('a');
+    await pumpEventQueue();
+    expect(reloaded.operatorChat.value.chat.map((e) => e.id), ['routed-chat']);
+    expect(reloaded.operatorChat.value.chat.single.senderId, 'peer');
+    await reloaded.dispose();
+  });
+
   test('operatorChat: live SSE prepend bounds the retained window (10 pages '
       'of 50) without disturbing selection/reset behavior', () async {
     final api = FakeApi()

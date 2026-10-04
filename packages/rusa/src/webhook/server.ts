@@ -626,6 +626,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   const sseHub = options.mesh
     ? new SseHub(options.mesh.emitter, {
         runtimeState: options.mesh.mesh,
+        routedReplies: { inbox: options.mesh.inbox, chatStore: options.mesh.meshChat },
         avatarGeneration,
         principals,
       })

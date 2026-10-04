@@ -4,7 +4,7 @@ export interface HumanReplyBinding {
   principalId: string;
   sessionId: string;
   leaseBound: boolean;
-  textSessionId?: string;
+  textRoute?: { actorId: string; sessionId: string; messageId: string };
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -26,7 +26,17 @@ function binding(entry: InboxEntry): HumanReplyBinding {
   if (typeof value.leaseBound !== "boolean") {
     throw new Error("human input lease binding is unprovable; ask for fresh input");
   }
+  const text = value.textRoute === undefined ? undefined : object(value.textRoute);
   return {
+    ...(text
+      ? {
+          textRoute: {
+            actorId: string(text.actorId),
+            sessionId: string(text.sessionId),
+            messageId: string(text.messageId),
+          },
+        }
+      : {}),
     principalId: string(value.principalId),
     sessionId: string(value.sessionId),
     leaseBound: value.leaseBound,
@@ -44,14 +54,15 @@ function direct(entry: InboxEntry): HumanReplyBinding {
   if (
     entry.source !== `mesh:${principalId}` ||
     value.principalId !== principalId ||
-    (!value.leaseBound && value.sessionId !== sessionId)
+    (!value.leaseBound && value.sessionId !== sessionId) ||
+    (value.textRoute &&
+      (value.textRoute.actorId !== entry.actorId ||
+        value.textRoute.sessionId !== sessionId ||
+        value.textRoute.messageId !== entry.payload.messageId))
   ) {
     throw new Error("human input has conflicting provenance; ask for fresh input");
   }
-  return {
-    ...value,
-    ...(entry.payload.type === "human.message" ? { textSessionId: sessionId } : {}),
-  };
+  return value;
 }
 
 /** Reads immutable delivery proof; selection and rendered/history text confer no authority. */
@@ -91,12 +102,16 @@ export function readAcceptedHumanInput(
   if (
     accepted.binding.principalId !== value.principalId ||
     accepted.binding.sessionId !== value.sessionId ||
-    accepted.binding.leaseBound !== value.leaseBound
+    accepted.binding.leaseBound !== value.leaseBound ||
+    accepted.binding.textRoute?.actorId !== value.textRoute?.actorId ||
+    accepted.binding.textRoute?.sessionId !== value.textRoute?.sessionId ||
+    accepted.binding.textRoute?.messageId !== value.textRoute?.messageId
   ) {
     throw new Error("voice handoff conflicts with its accepted source input");
   }
   return {
     binding: {
+      ...(value.textRoute ? { textRoute: value.textRoute } : {}),
       principalId: value.principalId,
       sessionId: value.sessionId,
       leaseBound: value.leaseBound,
