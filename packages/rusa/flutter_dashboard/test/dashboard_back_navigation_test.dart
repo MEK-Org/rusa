@@ -122,69 +122,89 @@ void main() {
   });
 
   group('browser/system back navigation', () {
+    testWidgets(
+      'an exceptionally short Room retains edge drawer and back exits (#859)',
+      (tester) async {
+        await _withDashboard(
+          tester,
+          initialUrl: '/overview',
+          size: const Size(411, 485),
+          body: (_) async {
+            expect(find.byType(MeshHeader), findsOneWidget);
+            await tester.tap(find.byIcon(Icons.menu));
+            await _settleDrawer(tester);
+            await tester.tap(find.byKey(const ValueKey('drawer-nav-chatRoom')));
+            await _settleDrawer(tester);
+            expect(find.byType(ChatRoomTab), findsOneWidget);
+            expect(
+              find.byType(MeshHeader),
+              findsNothing,
+              reason: 'the 411x485 cover screen uses the headerless Room',
+            );
+
+            await tester.dragFrom(const Offset(1, 200), const Offset(300, 0));
+            await _settleDrawer(tester);
+            expect(find.byType(MobileNavDrawer), findsOneWidget);
+            final scaffold = tester.state<ScaffoldState>(
+              find.byType(Scaffold).last,
+            );
+            expect(scaffold.isDrawerOpen, isTrue);
+
+            // Native back dismisses the gesture-opened drawer first.
+            expect(await tester.binding.handlePopRoute(), isTrue);
+            await _settleDrawer(tester);
+            expect(scaffold.isDrawerOpen, isFalse);
+            expect(find.byType(ChatRoomTab), findsOneWidget);
+
+            // Browser back restores the previous destination and its header;
+            // forward restores the short, headerless Room.
+            await _popTo(tester, '/overview');
+            expect(find.byType(OverviewTab), findsOneWidget);
+            expect(find.byType(MeshHeader), findsOneWidget);
+            await _popTo(tester, '/chat-room');
+            expect(find.byType(ChatRoomTab), findsOneWidget);
+            expect(find.byType(MeshHeader), findsNothing);
+
+            // The second exit actually reaches another destination.
+            await tester.dragFrom(const Offset(1, 200), const Offset(300, 0));
+            await _settleDrawer(tester);
+            await tester.tap(find.byKey(const ValueKey('drawer-nav-overview')));
+            await _settleDrawer(tester);
+            expect(find.byType(OverviewTab), findsOneWidget);
+            expect(find.byType(MeshHeader), findsOneWidget);
+          },
+        );
+      },
+    );
+
     for (final size in [const Size(390, 800), const Size(1200, 800)]) {
-      testWidgets(
-        'headerless Room retains edge drawer and back exits at ${size.width}px (#859)',
-        (tester) async {
-          await _withDashboard(
-            tester,
-            initialUrl: '/overview',
-            size: size,
-            body: (_) async {
-              expect(find.byType(MeshHeader), findsOneWidget);
-              if (size.width < 700) {
-                await tester.tap(find.byIcon(Icons.menu));
-                await _settleDrawer(tester);
-                await tester.tap(
-                  find.byKey(const ValueKey('drawer-nav-chatRoom')),
-                );
-                await _settleDrawer(tester);
-              } else {
-                await _tapNav(tester, 'Room');
-              }
-              expect(find.byType(ChatRoomTab), findsOneWidget);
-              expect(
-                find.byType(MeshHeader),
-                findsNothing,
-                reason: 'Room uses the full screen without a header',
-              );
-
-              await tester.dragFrom(const Offset(1, 200), const Offset(300, 0));
-              await _settleDrawer(tester);
-              expect(find.byType(MobileNavDrawer), findsOneWidget);
-              final scaffold = tester.state<ScaffoldState>(
-                find.byType(Scaffold).last,
-              );
-              expect(scaffold.isDrawerOpen, isTrue);
-
-              // Native back dismisses the gesture-opened drawer first.
-              expect(await tester.binding.handlePopRoute(), isTrue);
-              await _settleDrawer(tester);
-              expect(scaffold.isDrawerOpen, isFalse);
-              expect(find.byType(ChatRoomTab), findsOneWidget);
-
-              // Browser back restores the previous destination and its header;
-              // forward restores Room with no header again.
-              await _popTo(tester, '/overview');
-              expect(find.byType(OverviewTab), findsOneWidget);
-              expect(find.byType(MeshHeader), findsOneWidget);
-              await _popTo(tester, '/chat-room');
-              expect(find.byType(ChatRoomTab), findsOneWidget);
-              expect(find.byType(MeshHeader), findsNothing);
-
-              // The second exit actually reaches another destination.
-              await tester.dragFrom(const Offset(1, 200), const Offset(300, 0));
+      testWidgets('normal Room keeps its header at ${size.width}px (#859)', (
+        tester,
+      ) async {
+        await _withDashboard(
+          tester,
+          initialUrl: '/overview',
+          size: size,
+          body: (_) async {
+            if (size.width < 700) {
+              await tester.tap(find.byIcon(Icons.menu));
               await _settleDrawer(tester);
               await tester.tap(
-                find.byKey(const ValueKey('drawer-nav-overview')),
+                find.byKey(const ValueKey('drawer-nav-chatRoom')),
               );
               await _settleDrawer(tester);
-              expect(find.byType(OverviewTab), findsOneWidget);
-              expect(find.byType(MeshHeader), findsOneWidget);
-            },
-          );
-        },
-      );
+            } else {
+              await _tapNav(tester, 'Room');
+            }
+            expect(find.byType(ChatRoomTab), findsOneWidget);
+            expect(
+              find.byType(MeshHeader),
+              findsOneWidget,
+              reason: 'normal-height phones and desktops retain the header',
+            );
+          },
+        );
+      });
     }
 
     testWidgets(

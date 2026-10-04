@@ -11,6 +11,7 @@ import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/chat_room.dart';
 import 'package:rusa_dashboard/widgets/dashboard_body.dart';
+import 'package:rusa_dashboard/widgets/header.dart';
 
 import 'fakes.dart';
 import 'screenshot_support.dart';
@@ -62,6 +63,11 @@ void main() {
         // shows settled portraits rather than the silhouette mid-transition.
         await tester.pump(const Duration(milliseconds: 250));
         expect(find.byType(ChatRoomTab), findsOneWidget);
+        expect(
+          find.byType(MeshHeader),
+          entry.value.height <= 500 ? findsNothing : findsOneWidget,
+          reason: 'only the 411x485 cover capture is short enough to omit it',
+        );
         for (final id in _ids) {
           expect(find.byKey(ValueKey('chat-room-avatar-$id')), findsOneWidget);
         }
