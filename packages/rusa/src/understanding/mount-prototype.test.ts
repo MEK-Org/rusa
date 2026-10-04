@@ -262,6 +262,7 @@ describe("Issue #45: Integrated Understanding Read-Only Mount Prototype Validati
         threadId: "worker-123456",
         parentId: "root",
         understandingMountEnabled: true,
+        gitIdentity: null,
       });
       expect(enabledPrompt).toContain(notice);
 
@@ -269,6 +270,7 @@ describe("Issue #45: Integrated Understanding Read-Only Mount Prototype Validati
         threadId: "worker-123456",
         parentId: "root",
         understandingMountEnabled: false,
+        gitIdentity: null,
       });
       expect(disabledPrompt).not.toContain(notice);
 
