@@ -19,6 +19,104 @@ afterEach(() => {
 });
 
 describe("computer-use scope enforcement and compatibility matrix (#885)", () => {
+  it("default admission explicitly denies every local provider attempt", async () => {
+    const invocations: Array<boolean | undefined> = [];
+    const actor = new Actor({
+      id: "default-denied",
+      cwd: "/tmp",
+      modelConfig: [{ provider: "primary" }, { provider: "fallback" }],
+      mcpServers: [],
+      resolveProvider: ({ provider }) => ({
+        name: provider,
+        providerName: provider,
+        async run(opts) {
+          invocations.push(opts.computerUse);
+          return { success: provider === "fallback", output: "synthetic", exitCode: 1 };
+        },
+      }),
+      classifyExhaustion: async () => ({ exhausted: true }),
+      loadSessionId: () => undefined,
+      saveSessionId: () => {},
+      buildPrompt: () => ({ prompt: "synthetic" }),
+    });
+    try {
+      actor.requestRun();
+      await waitUntil(() => invocations.length === 2 && !actor.isBusy);
+      expect(invocations).toEqual([false, false]);
+    } finally {
+      actor.close();
+    }
+  });
+
+  it("a cancelled admitted lock waiter cannot authorize its next denied run", async () => {
+    const lock = new ComputerUseLock();
+    let releaseHolder!: () => void;
+    const held = lock.gate(
+      "holder",
+      true,
+      () =>
+        new Promise<void>((resolve) => {
+          releaseHolder = resolve;
+        })
+    );
+    let granted = true;
+    const admission = createComputerUseAdmission(() => granted);
+    const decisions: boolean[] = [];
+    const invocations: boolean[] = [];
+    const actor = new Actor({
+      id: "cancelled-worker",
+      cwd: "/tmp",
+      modelConfig: [{ provider: "synthetic" }],
+      mcpServers: [],
+      resolveProvider: () => ({
+        name: "synthetic",
+        providerName: "synthetic",
+        async run(opts) {
+          invocations.push(opts.computerUse === true);
+          return { success: true, output: "synthetic", exitCode: 0 };
+        },
+      }),
+      loadSessionId: () => undefined,
+      saveSessionId: () => {},
+      buildPrompt: () => ({ prompt: "synthetic" }),
+      isComputerUseAdmitted: admission.isAdmitted,
+      gate: (invoke, candidates, responsive) =>
+        lock.gateAfterProvider(
+          "cancelled-worker",
+          responsive,
+          (start) => ({
+            result: start(candidates[0]),
+            started: false,
+            promote: () => {},
+            cancel: () => false,
+          }),
+          invoke,
+          () => {
+            const decision = admission.shouldLock();
+            decisions.push(decision);
+            return decision;
+          }
+        ),
+    });
+    try {
+      actor.requestRun();
+      await waitUntil(() => decisions.length === 1 && actor.isQueued);
+      expect(actor.cancelQueuedRun({ retain: false })).toBe(true);
+      await waitUntil(() => !actor.isBusy);
+      expect(invocations).toEqual([]);
+      granted = false;
+      actor.requestRun();
+      await waitUntil(() => invocations.length === 1 && !actor.isBusy);
+      expect(decisions).toEqual([true, false]);
+      expect(invocations).toEqual([false]);
+    } finally {
+      actor.close();
+      releaseHolder();
+      await held.result;
+      lock.close();
+    }
+  });
+
   it("a missing admission field denies on the repaired follower and skips the computer-use lock", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "rusa-885-missing-"));
     dirs.push(cwd);
@@ -129,7 +227,7 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
     });
   }
 
-  it("repaired follower handles allowed-after-denied across sequential runs", async () => {
+  it("repaired follower re-admits sequential runs and does not perform in-run pool fallback", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "rusa-885-allowed-after-denied-"));
     dirs.push(cwd);
 
@@ -143,13 +241,20 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
           invocations.push({
             computerUse: opts.computerUse ?? "MISSING",
           });
-          return { success: true, output: "sequential", exitCode: 0 };
+          return {
+            success: opts.computerUse !== true,
+            output: "synthetic quota exhausted",
+            exitCode: 1,
+          };
         },
       }),
     });
 
     try {
-      const id = h.spawn("sequential actor");
+      const id = h.spawn("sequential actor", [
+        { provider: "primary", model: "synthetic" },
+        { provider: "fallback", model: "synthetic" },
+      ]);
       // Run 1: denied (no grant)
       await waitUntil(() => invocations.length === 1);
       expect(invocations[0].computerUse).toBe(false);
@@ -166,6 +271,12 @@ describe("computer-use scope enforcement and compatibility matrix (#885)", () =>
       h.runtime(id).requestRun();
       await waitUntil(() => invocations.length === 2);
       expect(invocations[1].computerUse).toBe(true);
+      await waitUntil(() => !h.runtime(id).isRunning && !h.runtime(id).isQueued);
+      expect(invocations).toHaveLength(2); // Failed worker attempt is reported, not retried.
+      h.capabilityGrants.revoke(id, COMPUTER_USE_CAPABILITY, "2026-10-04T00:03:00Z");
+      h.runtime(id).requestRun();
+      await waitUntil(() => invocations.length === 3);
+      expect(invocations[2].computerUse).toBe(false);
     } finally {
       await h.close();
     }

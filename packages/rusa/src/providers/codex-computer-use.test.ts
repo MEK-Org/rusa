@@ -10,7 +10,10 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { Actor } from "../actor/actor.js";
+import { waitUntil } from "../experimental/remote-instances/harness.js";
 import { CodexProvider, listEffectiveCodexMcpServers } from "./codex.js";
+import { classifyRunExhaustion } from "./exhaustion-classifier.js";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -205,6 +208,34 @@ describe("Codex computer-use fake inventories (#885)", () => {
       expect(result.success).toBe(false);
       expect(result.output).toContain("Failed to determine effective MCP configuration");
       expect(() => readFileSync(f.receipt)).toThrow();
+      const attempts: string[] = [];
+      const failures: string[] = [];
+      const actor = new Actor({
+        id: "discovery-failure",
+        cwd: f.project,
+        modelConfig: [{ provider: "codex" }, { provider: "fallback" }],
+        mcpServers: [],
+        resolveProvider: (entry) => {
+          attempts.push(entry.provider);
+          return f.provider;
+        },
+        classifyExhaustion: async (result) => {
+          failures.push(result.output);
+          return classifyRunExhaustion(result); // Actual deterministic path, no remote request.
+        },
+        loadSessionId: () => undefined,
+        saveSessionId: () => {},
+        buildPrompt: () => ({ prompt: "synthetic" }),
+      });
+      try {
+        actor.requestRun();
+        await waitUntil(() => failures.length === 1 && !actor.isBusy);
+        expect(attempts).toEqual(["codex"]);
+        expect(failures[0]).toContain("Failed to determine effective MCP configuration");
+        expect(() => readFileSync(f.receipt)).toThrow();
+      } finally {
+        actor.close();
+      }
     });
   }
 

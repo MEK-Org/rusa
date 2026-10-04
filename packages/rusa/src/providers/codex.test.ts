@@ -1073,7 +1073,15 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
     };
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
-    vi.mocked(spawn).mockReturnValue(child as unknown as ChildProcessWithoutNullStreams);
+    vi.mocked(spawn).mockImplementation(() => {
+      // Emit only after spawn returns and the provider installs its listeners.
+      queueMicrotask(() => {
+        if (opts.stdout) child.stdout.emit("data", Buffer.from(opts.stdout));
+        if (opts.stderr) child.stderr.emit("data", Buffer.from(opts.stderr));
+        child.emit("close", opts.exitCode ?? 0);
+      });
+      return child as unknown as ChildProcessWithoutNullStreams;
+    });
 
     const live: string[] = [];
     const runPromise = provider.run({
@@ -1081,11 +1089,6 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       cwd: "/tmp",
       onChunk: (c) => live.push(c),
     });
-    setTimeout(() => {
-      if (opts.stdout) child.stdout.emit("data", Buffer.from(opts.stdout));
-      if (opts.stderr) child.stderr.emit("data", Buffer.from(opts.stderr));
-      child.emit("close", opts.exitCode ?? 0);
-    }, 10);
     const result = await runPromise;
     return { result, live };
   }

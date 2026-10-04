@@ -371,9 +371,6 @@ export const CODEX_DENIED_DESKTOP_PLUGIN_OVERRIDES = [
   "plugins.computer-use@openai-bundled.enabled=false",
 ];
 
-/** Specifically named configured direct binding covered by #885; not plugin-provided cua_repl. */
-export const KNOWN_DIRECT_COMPUTER_USE_MCP_NAMES = new Set(["computer-use"]);
-
 export interface ListEffectiveCodexMcpServersOptions {
   command: string;
   args: string[];
@@ -913,7 +910,7 @@ export class CodexProvider implements CodingProvider {
             signal: opts.signal,
           });
           for (const server of effectiveServers) {
-            if (KNOWN_DIRECT_COMPUTER_USE_MCP_NAMES.has(server.name) && server.transport) {
+            if (server.name === "computer-use" && server.transport) {
               computerUseOverrides.push(`mcp_servers.${server.name}.enabled=false`);
             }
           }
