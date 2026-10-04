@@ -23,7 +23,7 @@ describe("WebhookSilenceDetector", () => {
       "Last inbound webhook event: 1970-01-01T00:00:00.000Z"
     );
     expect(notify.mock.calls[0][0]).toContain("Silent for 46 minute(s)");
-    expect(notify.mock.calls[0][0]).toContain("Recovery runbook: Rusa-Org/rusaISSUE_NUM.");
+    expect(notify.mock.calls[0][0]).not.toContain("ISSUE_NUM");
   });
 
   it("does not alert when silence has no outbound activity probe", async () => {

@@ -139,7 +139,6 @@ export class WebhookSilenceDetector {
       "⚠️ GitHub webhook delivery silence suspected.",
       `Last inbound webhook event: ${new Date(lastInboundAt).toISOString()}.`,
       `Silent for ${silentMinutes} minute(s) while the mesh has made outbound GitHub writes.`,
-      "Recovery runbook: Rusa-Org/rusaISSUE_NUM.",
     ].join(" ");
   }
 }

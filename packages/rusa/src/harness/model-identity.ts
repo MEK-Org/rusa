@@ -276,7 +276,7 @@ export function checkModelIdentity(arms: Record<string, ArmModelIdentity>): Mode
       message:
         `model identity NOT CAPTURED — no arm reported a model (${why}). ` +
         `"Both arms ran the same model" is UNVERIFIED, not verified: matching nulls are ` +
-        `absence of evidence. Do NOT read this as a pass — see ISSUE_NUM.`,
+        `absence of evidence. Do NOT read this as a pass.`,
     };
   }
 
@@ -291,7 +291,7 @@ export function checkModelIdentity(arms: Record<string, ArmModelIdentity>): Mode
       message:
         `model identity NOT CAPTURED on ${missing.join(", ")} (${why}) while ` +
         `${capturedArms.map((k) => `${k}=${models[k][0]}`).join(", ")} reported one. ` +
-        `A comparison needs both sides — this is unknown, not a pass. See ISSUE_NUM.`,
+        `A comparison needs both sides — this is unknown, not a pass.`,
     };
   }
 

@@ -134,12 +134,12 @@ export function nodeShapeWarnings(input: {
   const sections = countSections(input.next);
   if (input.next.length > NODE_LENGTH_TRIGGER) {
     warnings.push(
-      `Node body is now ${input.next.length} characters, past the ${NODE_LENGTH_TRIGGER}-character split trigger (ISSUE_NUM Part 2: one concept, one read). Split it into a hub plus children rather than growing it further.`
+      `Node body is now ${input.next.length} characters, past the ${NODE_LENGTH_TRIGGER}-character split trigger (one concept, one read). Split it into a hub plus children rather than growing it further.`
     );
   }
   if (sections > NODE_SECTION_TRIGGER) {
     warnings.push(
-      `Node body now opens ${sections} "## " sections, past the ${NODE_SECTION_TRIGGER}-section split trigger (ISSUE_NUM Part 2). Split it into a hub plus children rather than growing it further.`
+      `Node body now opens ${sections} "## " sections, past the ${NODE_SECTION_TRIGGER}-section split trigger. Split it into a hub plus children rather than growing it further.`
     );
   }
   if (
@@ -150,7 +150,7 @@ export function nodeShapeWarnings(input: {
       countSections(input.previous) > NODE_SECTION_TRIGGER)
   ) {
     warnings.push(
-      `This append opens a new "## " section on a node that was ALREADY over a split trigger (${input.previous.length} characters, ${countSections(input.previous)} sections). That is the changelog step ISSUE_NUM exists to stop: fold the finding into the section that already owns the concept, or split first and write the new section into the child.`
+      `This append opens a new "## " section on a node that was ALREADY over a split trigger (${input.previous.length} characters, ${countSections(input.previous)} sections). Avoid turning nodes into changelogs: fold the finding into the section that already owns the concept, or split first and write the new section into the child.`
     );
   }
   return warnings;
