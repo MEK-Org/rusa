@@ -18,6 +18,7 @@ import {
   parseCodexModel,
   stripMcpServersFromToml,
 } from "./codex.js";
+import { classifyRunExhaustion, deterministicExhaustionFallback } from "./exhaustion-classifier.js";
 import { SANDBOX_CODEX_SHELL_ENV_OVERRIDE } from "./sandbox.js";
 
 const { spawnFn, execSyncFn, execFileSyncFn } = vi.hoisted(() => {
@@ -1053,6 +1054,17 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
   }
 
   const line = (o: unknown) => `${JSON.stringify(o)}\n`;
+
+  it("preserves an evicted quota diagnosis for deterministic pool fallback", async () => {
+    const stdout = `quota exhausted\n${"x".repeat(3 * 64 * 1024)}`;
+    expect(deterministicExhaustionFallback(stdout)).toBe("quota");
+    const { result } = await runWithStream({ stdout, exitCode: 1 });
+    expect(result.success).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(deterministicExhaustionFallback(result.output)).toBe("quota");
+    expect(await classifyRunExhaustion(result)).toEqual({ exhausted: true });
+    expect(Buffer.byteLength(result.output)).toBeLessThan(64 * 1024 + 512);
+  });
 
   it("streams assistant text and uses it as the final output", async () => {
     const { result, live } = await runWithStream({

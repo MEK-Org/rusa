@@ -1,0 +1,59 @@
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import EventEmitter from "node:events";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { expect, it, vi } from "vitest";
+import { CodexProvider } from "./codex.js";
+import { classifyRunExhaustion } from "./exhaustion-classifier.js";
+
+const harness = vi.hoisted(() => ({
+  spawn: vi.fn(),
+}));
+vi.mock("node:child_process", async (original) => {
+  const actual = await original<typeof import("node:child_process")>();
+  return { ...actual, spawn: harness.spawn, default: { ...actual, spawn: harness.spawn } };
+});
+vi.mock("./sandbox.js", async (original) => ({
+  ...(await original<typeof import("./sandbox.js")>()),
+  codexRolloutStoreDir: (path: string) => join(path, "fixture-sessions"),
+  buildActorBwrapArgs: () => ({ args: [], commandPrefix: [], tempPaths: [] }),
+  buildActorBwrapCommand: (_wrapper: unknown, _command: string, args: string[]) => args,
+  teardownFlutterOverlay: () => {},
+}));
+import { CodexProvider as BaselineCodexProvider } from "./codex-baseline.fixture.js";
+import { routeRunFailure, type FailureSinkDeps } from "../actor/failure-sink.js";
+const receipt: Record<string, unknown> = {};
+it("captures actual matched synthetic interrupted/auth/quota failure notices", async () => {
+  const noise = " ".repeat(3 * 64 * 1024);
+  const cases = {
+    interrupted: { input: `${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Synthetic partial answer" } })}\n`, exit: null, signal: "SIGTERM" },
+    auth: { input: `unauthorized\n${noise}\nSynthetic terminal diagnostic`, exit: 1, signal: undefined },
+    quota: { input: `quota exhausted\n${noise}\nSynthetic terminal diagnostic`, exit: 1, signal: undefined },
+  };
+  for (const [sample, scenario] of Object.entries(cases)) {
+    const pair: Record<string, unknown> = {};
+    for (const [name, Provider] of [["before", BaselineCodexProvider], ["after", CodexProvider]] as const) {
+      const child = new EventEmitter() as EventEmitter & { stdout: EventEmitter; stderr: EventEmitter };
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      harness.spawn.mockReturnValue(child as unknown as ChildProcessWithoutNullStreams);
+      const pending = new Provider("codex", { cliCommand: "codex" }).run({ prompt: "Synthetic appearance fixture", cwd: "/tmp" });
+      child.stdout.emit("data", Buffer.from(scenario.input));
+      child.emit("close", scenario.exit, scenario.signal);
+      const result = await pending;
+      let note = "";
+      let forensics: unknown;
+      await routeRunFailure({
+        actors: { get: (() => ({ parentId: "fixture-parent" })) as FailureSinkDeps["actors"]["get"] },
+        rootId: "fixture-root", postToErrorChat: null, log() {}, classify: classifyRunExhaustion,
+        sendToParent(_to, body, _from, data) { note = body; forensics = data; },
+      }, "fixture-child", result, "codex/fixture-model", "fixture-run");
+      pair[name] = { note, forensics };
+      expect(note).toContain("[run failed]");
+      if (sample === "auth") expect(note.includes("raw auth-failure phrase matched")).toBe(name === "after");
+      if (sample === "quota") expect(note).toContain("quota exhausted:");
+    }
+    receipt[sample] = pair;
+  }
+  writeFileSync("flutter_dashboard/screenshots/884/notices.json", JSON.stringify(receipt, null, 2));
+});

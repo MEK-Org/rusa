@@ -21,6 +21,10 @@ import {
   writeCodexLeaseAuth,
 } from "./codex-auth-broker.js";
 import {
+  deterministicExhaustionFallback,
+  ExhaustionDiagnosticMatcher,
+} from "./exhaustion-classifier.js";
+import {
   formatLiveError,
   formatMcpInvocationNotice,
   formatRunCommandNotice,
@@ -498,10 +502,12 @@ export class CodexProvider implements CodingProvider {
       const stderrDecoder = new StringDecoder("utf8");
       let diagnosticTail = "";
       let diagnosticBytes = 0;
+      const exhaustionDiagnostics = new ExhaustionDiagnosticMatcher();
       let rawAuthFailure = false;
       let authScanSuffix = "";
       const captureDiagnostics = (text: string, chunks?: string[]) => {
         diagnosticBytes += Buffer.byteLength(text);
+        exhaustionDiagnostics.push(text);
         // Preserve the existing auth decision even if its text is evicted. The
         // longest recognized phrase is 21 characters; only chunk boundaries
         // need overlap. Scan giant chunks without making a giant lowercase copy.
@@ -518,17 +524,37 @@ export class CodexProvider implements CodingProvider {
         diagnosticTail = tail.subarray(start).toString("utf8");
         if (chunks) chunks.splice(0, chunks.length, diagnosticTail);
       };
-      const diagnosticOutput = (label = false, preserveAuth = false): string => {
+      const diagnosticOutput = (
+        label = false,
+        preserveExhaustion = false,
+        preserveAuth = false
+      ): string => {
         const omitted = diagnosticBytes - Buffer.byteLength(diagnosticTail);
-        const output =
+        let output =
           label || omitted > 0
             ? `[Codex raw diagnostics: ${omitted} UTF-8 bytes omitted; tail]\n${diagnosticTail}`
             : diagnosticTail;
-        // Keep failure output classifiable without retaining evicted raw bytes.
-        // This fixed summary, like the omission label, is outside the raw budget.
-        return preserveAuth && omitted > 0 && rawAuthFailure && !isCodexAuthFailure(output)
-          ? `${output}\n[Codex authentication failed diagnostic observed before tail eviction]`
-          : output;
+        // Failed raw fallbacks retain exhaustion facts, including interruption.
+        // Parsed semantic output keeps its authority; cancellation skips the
+        // auth retry guard, so only failed exits retain the auth decision.
+        // Summaries describe matches, not verified diagnoses.
+        // Labels and fixed rule witnesses are outside the raw byte budget.
+        if (omitted > 0) {
+          if (preserveAuth && rawAuthFailure && !isCodexAuthFailure(output)) {
+            // This phrase deliberately preserves isCodexAuthFailure's predicate.
+            output +=
+              "\n[Codex raw auth-failure phrase matched before tail eviction (authentication failed class)]";
+          }
+          if (
+            preserveExhaustion &&
+            exhaustionDiagnostics.classification() !== "unknown" &&
+            exhaustionDiagnostics.classification() !==
+              deterministicExhaustionFallback(diagnosticTail)
+          ) {
+            output += `\n${exhaustionDiagnostics.evidence()}`;
+          }
+        }
+        return output;
       };
       const tick = () => opts.onChunk?.("");
       const itemText = (item: { content?: unknown; text?: unknown }): string => {
@@ -772,7 +798,7 @@ export class CodexProvider implements CodingProvider {
           const outputText =
             assistantTexts.length > 0
               ? assistantTexts.join("\n")
-              : diagnosticOutput(false, exitCode !== 0);
+              : diagnosticOutput(false, exitCode !== 0, exitCode !== 0);
           // Auth-fail alarm: if the run fails with an auth error, alert the operator.
           if (exitCode !== 0 && isCodexAuthFailure(outputText)) {
             console.error("\n=======================================================");

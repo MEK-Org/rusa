@@ -90,82 +90,126 @@ export async function classifyRunExhaustion(
   }
 }
 
+// One rule source serves both the full-output fallback and bounded raw capture.
+const NETWORK_TERMS = [
+  "connection timed out",
+  "connection timeout",
+  "network changed",
+  "network change",
+  "getaddrinfo",
+  "eai_again",
+  "socket hang up",
+  "network is unreachable",
+  "etimedout",
+  "enetunreach",
+  "ehostunreach",
+  "enetdown",
+  "enotfound",
+  "econnrefused",
+  "econnreset",
+  "econnaborted",
+  "dns lookup",
+  "dns resolution",
+  "fetch failed",
+  "network error",
+  "networkerror",
+  "clientnetworkerror",
+  "socketerror",
+  "connecttimeouterror",
+  "headerstimeouterror",
+  "bodytimeouterror",
+  "sockettimeouterror",
+  "err_network_changed",
+  "err_connection_timed_out",
+  "err_connection_reset",
+  "err_connection_refused",
+  "err_name_not_resolved",
+  "err_internet_disconnected",
+  "err_address_unreachable",
+  "err_connection_aborted",
+  "err_connection_closed",
+  "err_timed_out",
+  "temporary failure in name resolution",
+  "tls handshake timeout",
+  "ssl handshake timeout",
+  "request timed out",
+  "request timeout",
+  "504 gateway timeout",
+  "gateway timeout",
+  "502 bad gateway",
+  "bad gateway",
+  "503 service unavailable",
+  "service unavailable",
+] as const;
+const QUOTA_RULES: readonly (readonly string[])[] = [
+  ["quota", "exhaust"],
+  ["quota", "limit"],
+  ["quota", "deplet"],
+  ["quota", "used up"],
+  ["usage limit"],
+  ["rate limit"],
+  ["429"],
+  ["5", "hour", "limit"],
+  ["five", "hour", "limit"],
+  ["session cap"],
+  ["session limit"],
+  ["hit your", "limit"],
+  ["capacity exhausted"],
+];
+
+const EXHAUSTION_TERMS = [...new Set([...NETWORK_TERMS, ...QUOTA_RULES.flat()])];
+const EXHAUSTION_OVERLAP = Math.max(...EXHAUSTION_TERMS.map((term) => term.length)) - 1;
+
+function matchingExhaustionRule(has: (term: string) => boolean): {
+  classification: ExhaustionFallbackResult;
+  terms: readonly string[];
+} {
+  // Preserve the existing network-over-quota precedence, including composite
+  // quota facts that may occur arbitrarily far apart in the complete stream.
+  const network = NETWORK_TERMS.find(has);
+  if (network) return { classification: "transient-network", terms: [network] };
+  const quota = QUOTA_RULES.find((terms) => terms.every(has));
+  return quota
+    ? { classification: "quota", terms: quota }
+    : { classification: "unknown", terms: [] };
+}
+
 export function deterministicExhaustionFallback(output: string): ExhaustionFallbackResult {
   const lower = output.toLowerCase();
+  return matchingExhaustionRule((term) => lower.includes(term)).classification;
+}
 
-  // Network transient error detection
-  if (
-    lower.includes("connection timed out") ||
-    lower.includes("connection timeout") ||
-    lower.includes("network changed") ||
-    lower.includes("network change") ||
-    lower.includes("getaddrinfo") ||
-    lower.includes("eai_again") ||
-    lower.includes("socket hang up") ||
-    lower.includes("network is unreachable") ||
-    lower.includes("etimedout") ||
-    lower.includes("enetunreach") ||
-    lower.includes("ehostunreach") ||
-    lower.includes("enetdown") ||
-    lower.includes("enotfound") ||
-    lower.includes("econnrefused") ||
-    lower.includes("econnreset") ||
-    lower.includes("econnaborted") ||
-    lower.includes("dns lookup") ||
-    lower.includes("dns resolution") ||
-    lower.includes("fetch failed") ||
-    lower.includes("network error") ||
-    lower.includes("networkerror") ||
-    lower.includes("clientnetworkerror") ||
-    lower.includes("socketerror") ||
-    lower.includes("connecttimeouterror") ||
-    lower.includes("headerstimeouterror") ||
-    lower.includes("bodytimeouterror") ||
-    lower.includes("sockettimeouterror") ||
-    lower.includes("err_network_changed") ||
-    lower.includes("err_connection_timed_out") ||
-    lower.includes("err_connection_reset") ||
-    lower.includes("err_connection_refused") ||
-    lower.includes("err_name_not_resolved") ||
-    lower.includes("err_internet_disconnected") ||
-    lower.includes("err_address_unreachable") ||
-    lower.includes("err_connection_aborted") ||
-    lower.includes("err_connection_closed") ||
-    lower.includes("err_timed_out") ||
-    lower.includes("temporary failure in name resolution") ||
-    lower.includes("tls handshake timeout") ||
-    lower.includes("ssl handshake timeout") ||
-    lower.includes("request timed out") ||
-    lower.includes("request timeout") ||
-    lower.includes("504 gateway timeout") ||
-    lower.includes("gateway timeout") ||
-    lower.includes("502 bad gateway") ||
-    lower.includes("bad gateway") ||
-    lower.includes("503 service unavailable") ||
-    lower.includes("service unavailable")
-  ) {
-    return "transient-network";
+/** Internal capture helper: literal facts plus the longest chunk-boundary overlap.
+ * It deliberately matches the same interleaved raw stdout/stderr as the existing
+ * fallback, including tool-output false positives. It is not provider diagnosis.
+ */
+export class ExhaustionDiagnosticMatcher {
+  private readonly observed = new Set<string>();
+  private suffix = "";
+
+  push(text: string): void {
+    // Lowercase only bounded windows, including for one giant diagnostic chunk.
+    for (let start = 0; start < text.length; start += 4096) {
+      const part = text.slice(start, start + 4096);
+      const lower = (this.suffix + part).toLowerCase();
+      for (const term of EXHAUSTION_TERMS) {
+        if (!this.observed.has(term) && lower.includes(term)) this.observed.add(term);
+      }
+      this.suffix = (this.suffix + part).slice(-EXHAUSTION_OVERLAP);
+    }
   }
 
-  // Quota error detection
-  if (
-    (lower.includes("quota") &&
-      (lower.includes("exhaust") ||
-        lower.includes("limit") ||
-        lower.includes("deplet") ||
-        lower.includes("used up"))) ||
-    lower.includes("usage limit") ||
-    lower.includes("rate limit") ||
-    lower.includes("429") ||
-    (lower.includes("5") && lower.includes("hour") && lower.includes("limit")) ||
-    (lower.includes("five") && lower.includes("hour") && lower.includes("limit")) ||
-    lower.includes("session cap") ||
-    lower.includes("session limit") ||
-    (lower.includes("hit your") && lower.includes("limit")) ||
-    lower.includes("capacity exhausted")
-  ) {
-    return "quota";
+  classification(): ExhaustionFallbackResult {
+    return matchingExhaustionRule((term) => this.observed.has(term)).classification;
   }
 
-  return "unknown";
+  /** Truthful matched terms also reproduce the existing deterministic decision.
+   * Call only when raw fallback eviction would otherwise change that decision.
+   * The vocabulary/summary coupling is pinned at the provider/classifier boundary.
+   * This does not promise equivalence for the already-bounded remote classifier.
+   */
+  evidence(): string {
+    const { terms } = matchingExhaustionRule((term) => this.observed.has(term));
+    return `[Codex raw diagnostic terms matched before tail eviction: ${terms.map((term) => JSON.stringify(term)).join(", ")}]`;
+  }
 }

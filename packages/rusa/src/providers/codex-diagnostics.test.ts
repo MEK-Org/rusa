@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodexProvider } from "./codex.js";
+import { classifyRunExhaustion, deterministicExhaustionFallback } from "./exhaustion-classifier.js";
 import type { SubprocessRunConfig } from "./subprocess-execution.js";
 import type { RunOptions } from "./types.js";
 
@@ -116,16 +117,35 @@ describe("Codex bounded raw diagnostics (#883)", () => {
     expect(run.raw.join("")).toBe(input);
   });
 
-  it("retains useful stderr diagnosis without parsed output and exact omitted bytes", async () => {
-    const run = start();
-    const input = `${"z".repeat(3 * BUDGET)}\nfixture quota refusal\n`;
-    run.child.stderr.emit("data", Buffer.from(input));
-    run.controller.abort("stall-watchdog");
-    const result = await run.result;
-    assertTail(result.output, input);
-    expect(result.output).toContain("fixture quota refusal");
-    expect(result).toMatchObject({ abortReason: "stall-watchdog", cancelled: true, exitCode: 143 });
-    expect(result.output).toContain("[Task killed by stall watchdog");
+  it.each([
+    "quota",
+    "transient-network",
+  ] as const)("retains evicted %s facts on interrupted raw fallback and exact omitted bytes", async (classification) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const run = start();
+      const marker =
+        classification === "quota" ? "quota exhausted" : "quota exhausted\nconnection timed out";
+      const input = `${marker}\n${"z".repeat(3 * BUDGET)}\nfixture quota refusal\n`;
+      expect(deterministicExhaustionFallback(input)).toBe(classification);
+      run.child.stderr.emit("data", Buffer.from(input));
+      run.controller.abort("stall-watchdog");
+      const result = await run.result;
+      assertTail(result.output, input);
+      expect(result.output).toContain("fixture quota refusal");
+      expect(deterministicExhaustionFallback(result.output)).toBe(classification);
+      expect(await classifyRunExhaustion(result)).toEqual({
+        exhausted: classification === "quota",
+      });
+      expect(result).toMatchObject({
+        abortReason: "stall-watchdog",
+        cancelled: true,
+        exitCode: 143,
+      });
+      expect(result.output).toContain("[Task killed by stall watchdog");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("preserves normal semantic output larger than the diagnostic budget and exact prompt", async () => {

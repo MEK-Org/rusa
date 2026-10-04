@@ -1,0 +1,114 @@
+{
+  "baseline": "a06afc8b8cea58fa789688eafa1ccd79c194fef0",
+  "amendedFrom": "758be6698bce5cf748dbfc72ae79a1b4b42f2d12",
+  "viewports": {
+    "wide": [1100, 800],
+    "narrow": [390, 844]
+  },
+  "pixelRatio": 2,
+  "sourceBlobs": {
+    "packages/rusa/src/providers/codex.ts": "58fa13fd6dcdb803fd83e893b9306fecdd75511c",
+    "packages/rusa/src/providers/exhaustion-classifier.ts": "7573aa3bf7e7be28df1809831070e7e6f5d90f62",
+    "packages/rusa/src/actor/failure-sink.ts": "91009187a50c898ede8d69d40fd2a6c0e6a86558",
+    "packages/rusa/flutter_dashboard/lib/widgets/inbox_tab.dart": "47b93e7a4ff50e2f39788805306197f17c795ef5"
+  },
+  "files": [
+    {
+      "name": "README.md",
+      "bytes": 2540,
+      "sha256": "5c9e4a6673e721c8aece6f1adebbbfe6caf643d38eeab5687d66cf160cd2a1e3"
+    },
+    {
+      "name": "appearance_test.dart.fixture",
+      "bytes": 2505,
+      "sha256": "0c5aff7b1f273789adf81add55451b9afe9cea2d4324c0a93cf1c56a8b86b5bb"
+    },
+    {
+      "name": "auth_narrow_after.png",
+      "bytes": 85593,
+      "sha256": "cd12f91f49edec3e9e6176ad8559b9c1d5b342717121d639a3af8549b1ba61c2",
+      "dimensions": [780, 1688]
+    },
+    {
+      "name": "auth_narrow_before.png",
+      "bytes": 69713,
+      "sha256": "d32a6d3403b44a218b592a25b080dca360ff2bfc24304e8eaf71fdab9bbf74f2",
+      "dimensions": [780, 1688]
+    },
+    {
+      "name": "auth_wide_after.png",
+      "bytes": 93482,
+      "sha256": "5b182f06300344fd4426fc1eda2d44b06036f6a80174868f555933db1b461a49",
+      "dimensions": [2200, 1600]
+    },
+    {
+      "name": "auth_wide_before.png",
+      "bytes": 79716,
+      "sha256": "f82a2a61b60dd3b142dd1a4647cfa1e9b0d23f92083e7764f13a3bb3367c37c3",
+      "dimensions": [2200, 1600]
+    },
+    {
+      "name": "generate-notices.ts.fixture",
+      "bytes": 3401,
+      "sha256": "f7b1224749ca28006489360cefc11015cc265d28f0a88d656072f3e01300ccb4"
+    },
+    {
+      "name": "interrupted_narrow_after.png",
+      "bytes": 116335,
+      "sha256": "667c08a474a4dfcfb7aaea200a6f051dd83fc75ac9f9e13021d49a49800bb796",
+      "dimensions": [780, 1688]
+    },
+    {
+      "name": "interrupted_narrow_before.png",
+      "bytes": 100586,
+      "sha256": "86267e2621b85fed0fa7ebae88f8b0e081368a98fae4acd3aee11399b2947438",
+      "dimensions": [780, 1688]
+    },
+    {
+      "name": "interrupted_wide_after.png",
+      "bytes": 125550,
+      "sha256": "b0e5c92c6cd90b75418d362f8b5570e8b35d29534b3662d5b2974a268217ac8b",
+      "dimensions": [2200, 1600]
+    },
+    {
+      "name": "interrupted_wide_before.png",
+      "bytes": 108581,
+      "sha256": "234d0f0fe55cfe6185983666684d286763faa328cccc822c786465b4a3734063",
+      "dimensions": [2200, 1600]
+    },
+    {
+      "name": "notices.json",
+      "bytes": 2405,
+      "sha256": "ec554bf0454c4fe60dd3cba8799b170f9cb2ab22b903796291293389240a0898"
+    },
+    {
+      "name": "quota_narrow_after.png",
+      "bytes": 100838,
+      "sha256": "fd96441ff28ed02f3ecd7f1cd0d3212ab802cce0e3aca941254c5937d345d403",
+      "dimensions": [780, 1688]
+    },
+    {
+      "name": "quota_narrow_before.png",
+      "bytes": 84980,
+      "sha256": "658cf726c2ecc1fa5d16befe5d2030190308cc119d57c8150ed0539e053f87dd",
+      "dimensions": [780, 1688]
+    },
+    {
+      "name": "quota_wide_after.png",
+      "bytes": 102297,
+      "sha256": "9a82af8d158875a66bf82bc4de6539eb5daa0a36b480c514575d87b3b68c373e",
+      "dimensions": [2200, 1600]
+    },
+    {
+      "name": "quota_wide_before.png",
+      "bytes": 88734,
+      "sha256": "ecdf5bfc5baa1a65dd07a7a04a7b26b6a659fea30468ca4f1e20961317f1b63a",
+      "dimensions": [2200, 1600]
+    },
+    {
+      "name": "regenerate.sh",
+      "bytes": 815,
+      "sha256": "1109e6bc688da451eec3d50c9ca965bb77dab57b7041661781474b65536e63bd"
+    }
+  ]
+}
