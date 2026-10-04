@@ -3875,6 +3875,42 @@ describe("handleMeshApiRequest", () => {
     });
 
     describe("GET /api/mesh/obligations/:id", () => {
+      it("returns root-first ancestors and an attributable paged history tail", async () => {
+        obligations.create({ id: "grandparent", title: "Root", ownerId: "actor-1" });
+        obligations.create({
+          id: "parent",
+          title: "Parent",
+          ownerId: "actor-1",
+          parentId: "grandparent",
+        });
+        obligations.create({
+          id: "detail",
+          title: "Detail",
+          ownerId: "actor-1",
+          parentId: "parent",
+        });
+        obligations.setCheckpoint("detail", "first", "actor-1");
+        obligations.setCheckpoint("detail", "second", "actor-2");
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/detail?history_limit=1");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+        expect(data.ancestors.map((a: { id: string }) => a.id)).toEqual(["grandparent", "parent"]);
+        expect(data.history).toHaveLength(1);
+        expect(data.history[0]).toMatchObject({
+          actingPrincipal: "actor-2",
+          after: { checkpoint: "second" },
+        });
+        obligations.setCheckpoint("detail", "newer", "actor-1");
+        const earlier = await call(
+          deps,
+          "GET",
+          `/api/mesh/obligations/detail?history_limit=1&history_before=${encodeURIComponent(data.historyNextBefore)}`
+        );
+        const page = JSON.parse(earlier.res.body);
+        expect(page.history[0].after.checkpoint).toBe("first");
+        expect(page.historyNextBefore).not.toBeNull(); // creation remains in the tail
+      });
+
       it("returns obligation with parent, children, and blockingChildren", async () => {
         obligations.create({
           title: "root-task",

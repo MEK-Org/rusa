@@ -2318,6 +2318,18 @@ export async function handleMeshApiRequest(
       offset: blocksOffset,
     });
     const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
+    const ancestors = [];
+    const seen = new Set([id]);
+    let ancestor = parent;
+    while (ancestor && !seen.has(ancestor.id)) {
+      seen.add(ancestor.id);
+      ancestors.unshift(ancestor);
+      ancestor = ancestor.parentId ? deps.obligations.get(ancestor.parentId) : null;
+    }
+    const history = deps.obligations.listHistoryPage(id, {
+      before: url.searchParams.get("history_before") ?? undefined,
+      limit: Math.min(parsePositiveInt(url, "history_limit") ?? 10, 100),
+    });
     // The obligation's own citations and the reference it claims resolve the
     // same way, through one scoped resolution: a `mesh:messages/<id>` naming
     // another human's conversation is projected without its content or ends
@@ -2345,6 +2357,9 @@ export async function handleMeshApiRequest(
     sendJson(res, 200, {
       obligation,
       parent,
+      ancestors,
+      history: history.entries,
+      historyNextBefore: history.nextBefore,
       children: children.obligations,
       blockingChildren: blockingChildren.obligations,
       completions: completions.completions,

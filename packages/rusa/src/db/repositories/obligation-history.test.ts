@@ -94,6 +94,138 @@ describe("Obligation mutation history", () => {
     );
   });
 
+  it("retains attributable checkpoint rewrites and clears in the existing history store", () => {
+    const ob = repository.create({ title: "History", ownerId: "actor-a" });
+    repository.setCheckpoint(ob.id, "first standing", "actor-a");
+    repository.setCheckpoint(ob.id, "second standing", "actor-b");
+    repository.setCheckpoint(ob.id, null, "actor-b");
+    const history = repository.listHistory(ob.id);
+    expect(history.map((h) => h.after)).toEqual([
+      { checkpoint: null },
+      { checkpoint: "second standing" },
+      { checkpoint: "first standing" },
+    ]);
+    expect(history.map((h) => h.before)).toEqual([
+      { checkpoint: "second standing" },
+      { checkpoint: "first standing" },
+      { checkpoint: null },
+    ]);
+    expect(history.map((h) => h.actingPrincipal)).toEqual(["actor-b", "actor-b", "actor-a"]);
+    const payloads = db
+      .prepare("SELECT payload FROM obligation_history WHERE obligation_id = ?")
+      .all(ob.id) as Array<{ payload: string }>;
+    expect(payloads.map((row) => JSON.parse(row.payload).schemaVersion)).toEqual([2, 2, 2]);
+    expect(history.every((h) => h.timestamp === new Date(now).toISOString())).toBe(true);
+  });
+
+  it("records an identical-text standing rewrite with its new actor and exact checkpoint time", () => {
+    const ob = repository.create({ title: "History", ownerId: "actor-a" });
+    repository.setCheckpoint(ob.id, "same text", "actor-a");
+    now += 1_000;
+    const updated = repository.setCheckpoint(ob.id, "same text", "actor-b");
+    const history = repository.listHistory(ob.id);
+    expect(history).toHaveLength(2);
+    expect(history[0]).toMatchObject({
+      actingPrincipal: "actor-b",
+      timestamp: updated.checkpointAt,
+      before: { checkpoint: "same text" },
+      after: { checkpoint: "same text" },
+    });
+  });
+
+  it("projects existing artifact and child timestamps without duplicate audit writes", () => {
+    const parent = repository.create({ title: "Parent", ownerId: "actor-a" });
+    now += 1_000;
+    const child = repository.create({
+      title: "Child",
+      ownerId: "actor-b",
+      parentId: parent.id,
+      creatorId: "actor-c",
+    });
+    now += 1_000;
+    repository.attachArtifact(parent.id, "github:example-org/example/pulls/1", {
+      attachedBy: "actor-b",
+      label: "Review",
+    });
+    repository.attachArtifact(parent.id, "github:example-org/example/pulls/1", {
+      attachedBy: "actor-c",
+    });
+    expect(repository.listHistory(parent.id).map((h) => h.mutationKind)).toEqual(["status"]);
+    const projected = repository.listHistoryPage(parent.id).entries;
+    expect(projected.map((h) => h.mutationKind)).toEqual([
+      "artifact",
+      "status",
+      "current_child_created",
+      "created",
+    ]);
+    expect(projected[0]).toMatchObject({
+      actingPrincipal: "actor-b",
+      after: { artifact: { ref: "github:example-org/example/pulls/1", label: "Review" } },
+    });
+    expect(projected[2]).toMatchObject({
+      actingPrincipal: "actor-c",
+      after: { child: { id: child.id, title: "Child", ownerId: "actor-b" } },
+    });
+    db.exec(
+      `CREATE TRIGGER reject_history BEFORE INSERT ON obligation_history BEGIN SELECT RAISE(ABORT, 'history failed'); END`
+    );
+    expect(() => repository.setCheckpoint(child.id, "not saved", "actor-b")).toThrow(
+      "history failed"
+    );
+    expect(repository.get(child.id)?.checkpoint).toBeNull();
+  });
+
+  it("labels child creation as current membership after A-to-B reparenting", () => {
+    const a = repository.create({ title: "A", ownerId: "actor-a" });
+    const b = repository.create({ title: "B", ownerId: "actor-a" });
+    now += 1_000;
+    const child = repository.create({
+      title: "Child",
+      ownerId: "actor-b",
+      parentId: a.id,
+      creatorId: "actor-c",
+    });
+    now += 1_000;
+    repository.reparent(child.id, b.id, "actor-a");
+    repository.reassign(child.id, "actor-a", "actor-a");
+    const inA = repository.listHistoryPage(a.id).entries;
+    const inB = repository.listHistoryPage(b.id).entries;
+    expect(inA.some((e) => e.after.child?.id === child.id)).toBe(false);
+    expect(inB.find((e) => e.after.child?.id === child.id)).toMatchObject({
+      mutationKind: "current_child_created",
+      timestamp: child.createdAt,
+      actingPrincipal: "actor-c",
+      after: { child: { title: "Child", ownerId: "actor-a" } },
+    });
+    expect(
+      repository.listHistory(child.id).find((e) => e.mutationKind === "reparent")
+    ).toMatchObject({
+      before: { parentId: a.id },
+      after: { parentId: b.id },
+    });
+  });
+
+  it("pages history with a stable exclusive id boundary across concurrent writes", () => {
+    const ob = repository.create({ title: "History", ownerId: "actor-a" });
+    for (let i = 0; i < 5; i++) repository.setCheckpoint(ob.id, `standing ${i}`, "actor-a");
+    const first = repository.listHistoryPage(ob.id, { limit: 2 });
+    repository.setCheckpoint(ob.id, "new head", "actor-b");
+    const second = repository.listHistoryPage(ob.id, {
+      limit: 2,
+      before: first.nextBefore ?? undefined,
+    });
+    const third = repository.listHistoryPage(ob.id, {
+      limit: 2,
+      before: second.nextBefore ?? undefined,
+    });
+    expect(
+      [...first.entries, ...second.entries, ...third.entries]
+        .filter((h) => h.mutationKind === "checkpoint")
+        .map((h) => h.after.checkpoint)
+    ).toEqual(["standing 4", "standing 3", "standing 2", "standing 1", "standing 0"]);
+    expect(third.nextBefore).toBeNull();
+  });
+
   describe("transactional atomicity and rollback", () => {
     it("rolls back history if the mutation transaction throws", () => {
       const ob = repository.create({

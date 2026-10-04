@@ -441,6 +441,7 @@ export const OBLIGATION_MUTATION_KINDS = [
   "status",
   "external_ref",
   "snooze",
+  "checkpoint",
 ] as const;
 
 export type ObligationMutationKind = (typeof OBLIGATION_MUTATION_KINDS)[number];
@@ -452,6 +453,7 @@ export type ObligationMutationKind = (typeof OBLIGATION_MUTATION_KINDS)[number];
  * are present in `before` and `after`. Absent fields were unchanged, not unset.
  */
 export interface ObligationHistoryState {
+  checkpoint?: string | null;
   ownerId?: string;
   parentId?: string | null;
   priority?: number | null;
@@ -479,7 +481,7 @@ export interface ObligationHistoryEntry {
 }
 
 /**
- * Version of the versioned JSON payload in `obligation_history.payload`.
+ * Original payload version. Detail history fields use version 2; readers accept both.
  * The schema carries no SQLite json_* validator; consuming code validates
  * and owns schema evolution at this boundary.
  */
@@ -529,6 +531,7 @@ const historyObligationIdSchema = z
  */
 export const obligationHistoryStateSchema = z
   .object({
+    checkpoint: z.string().nullable().optional(),
     ownerId: validatedBy(validateEntityId).optional(),
     parentId: historyObligationIdSchema.nullable().optional(),
     priority: z.number().nullable().optional(),
@@ -542,14 +545,22 @@ export const obligationHistoryStateSchema = z
 
 export const obligationHistoryPayloadSchema = z
   .object({
-    schemaVersion: z.literal(OBLIGATION_HISTORY_SCHEMA_VERSION),
+    schemaVersion: z.union([z.literal(1), z.literal(2)]),
     before: obligationHistoryStateSchema,
     after: obligationHistoryStateSchema,
   })
-  .strict();
+  .strict()
+  .superRefine((payload, ctx) => {
+    if (
+      payload.schemaVersion === 1 &&
+      [payload.before, payload.after].some((state) => state.checkpoint !== undefined)
+    ) {
+      ctx.addIssue({ code: "custom", message: "detail history fields require schemaVersion 2" });
+    }
+  });
 
 export interface ObligationHistoryPayload {
-  schemaVersion: typeof OBLIGATION_HISTORY_SCHEMA_VERSION;
+  schemaVersion: 1 | 2;
   before: ObligationHistoryState;
   after: ObligationHistoryState;
 }
@@ -559,7 +570,9 @@ export function buildHistoryPayload(
   after: ObligationHistoryState
 ): string {
   return JSON.stringify({
-    schemaVersion: OBLIGATION_HISTORY_SCHEMA_VERSION,
+    schemaVersion: [before, after].some((state) => state.checkpoint !== undefined)
+      ? 2
+      : OBLIGATION_HISTORY_SCHEMA_VERSION,
     before,
     after,
   });
