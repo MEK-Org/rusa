@@ -60,7 +60,7 @@ export function readAcceptedHumanInput(
   actorId: string,
   entryId: string,
   ancestors: readonly string[] = []
-): { binding: HumanReplyBinding } {
+): { binding: HumanReplyBinding; depth: number } {
   const entry = store.read(actorId, entryId);
   if (ancestors.includes(entryId) || ancestors.length >= 100) {
     throw new Error("voice handoff source reference is cyclic or too deep; ask for fresh input");
@@ -69,7 +69,7 @@ export function readAcceptedHumanInput(
     throw new Error("reply input_ref must name your own accepted human input entry");
   }
   if (entry.payload.type !== "voice.transfer") {
-    return { binding: direct(entry) };
+    return { binding: direct(entry), depth: 1 };
   }
   const origin = object(entry.payload.replyInput);
   const originActor = string(origin.actorId);
@@ -101,5 +101,6 @@ export function readAcceptedHumanInput(
       sessionId: value.sessionId,
       leaseBound: value.leaseBound,
     },
+    depth: accepted.depth + 1,
   };
 }

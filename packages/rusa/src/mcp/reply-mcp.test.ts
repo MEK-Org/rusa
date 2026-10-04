@@ -208,6 +208,13 @@ describe("Mesh Chat Security Invariant Tests", () => {
       const client = await connect(server);
       recordedEvents.length = 0;
 
+      const malformed = (await client.callTool({
+        name: "reply",
+        arguments: { message: "invalid explicit reference", input_ref: "" },
+      })) as CallToolResult;
+      expect(malformed.isError).toBe(true);
+      expect(recordedEvents).toHaveLength(0);
+
       // Calling reply without input_ref succeeds via the unique selected candidate
       const res = (await client.callTool({
         name: "reply",
@@ -292,8 +299,11 @@ describe("Mesh Chat Security Invariant Tests", () => {
       const [input] = inboxStore.list("actor-A").entries;
       if (!input) throw new Error("missing accepted human input");
 
-      // Mark the entry handled (bookkeeping during initial run)
+      // Finish the initial selected run; a fresh MCP session must use the handled reference.
+      mesh.selectInboxEntries("actor-A", [input.id]);
       inboxStore.markHandled("actor-A", [input.id]);
+      mesh.finishInboxRun("actor-A", { successful: true });
+      expect(mesh.selectedInboxEntries("actor-A")).toHaveLength(0);
       expect(inboxStore.read("actor-A", input.id)?.handledAt).not.toBeNull();
 
       // Later run / wake:

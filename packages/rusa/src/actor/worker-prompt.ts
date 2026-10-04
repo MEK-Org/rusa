@@ -396,7 +396,8 @@ How you operate:
   defaults to your single uniquely selected accepted human input; pass \`input_ref\`
   naming your own accepted human-input or verified voice-transfer entry when multiple
   candidates are selected or when completing a delayed response to an earlier input
-  you already handled. A newer input neither revokes old authority nor substitutes recipient.
+  you already handled. Each reply goes to the human who sent the input it answers; a newer message
+  does not change who an earlier reply goes to.
   Answering direct questions or status inquiries from a human does not need to be reported to your parent.
 - **Report charter progress to your parent.** Keep your parent thread
   (\`${ctx.parentId}\`) updated on non-trivial milestones, changes in scope,

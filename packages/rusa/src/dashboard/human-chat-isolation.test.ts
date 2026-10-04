@@ -732,17 +732,18 @@ describe("human chat isolation (#590)", () => {
             `/api/mesh/actors/${ACTOR}/chat`,
             {
               body: "synthetic frozen unheld alice",
-              sessionId: "synthetic-frozen-text",
+              sessionId: lease,
             },
             a.cookie
           )
         ).status
       ).toBe(200);
+      const frozenTextRef = required(newestHumanInput);
       service.openSession(lease, ACTOR, a.id);
       await reply("synthetic frozen text reply");
       expect(
         meshChat
-          .listForSession("synthetic-frozen-text", { limit: 100 })
+          .listForSession(lease, { limit: 100 })
           .find((entry) => entry.body === "synthetic frozen text reply")
       ).toMatchObject({ recipientId: a.id });
 
@@ -776,6 +777,17 @@ describe("human chat isolation (#590)", () => {
       } as Parameters<ActorMesh["adopt"]>[1]);
       mesh.grantHandle(ACTOR, { id: PEER });
       mesh.grantHandle(PEER, { id: ACTOR });
+      // A later same-ID lease cannot confer transfer authority on an unheld typed input.
+      mesh.selectInboxEntries(ACTOR, [frozenTextRef]);
+      const rebind = vi.spyOn(service, "transferActiveSession");
+      const peerBefore = inbox.list(PEER, { status: "all" }).entries;
+      const writesBeforeUnsupported = onWrite.mock.calls.length;
+      expect(() => mesh.transferVoiceSession(ACTOR, PEER)).toThrow("unambiguous");
+      expect(rebind).not.toHaveBeenCalled();
+      expect(service.activeSessionFor(ACTOR)).toEqual({ sessionId: lease, principalId: a.id });
+      expect(inbox.list(PEER, { status: "all" }).entries).toEqual(peerBefore);
+      expect(onWrite.mock.calls).toHaveLength(writesBeforeUnsupported);
+      rebind.mockRestore();
       mesh.selectInboxEntries(ACTOR, [sourceRef]);
       mesh.transferVoiceSession(ACTOR, PEER);
       const handoff = required(
@@ -903,9 +915,9 @@ describe("human chat isolation (#590)", () => {
       principals.setDisabled(a.id, null);
 
       // Ended voice lease fallback: typed input falls back to its original frozen text route.
-      // Voice-only inputs (like voice.transfer) refuse because voice gets no invented text route.
+      // Handoffs currently drop the verified typed route; propagation awaits disposition.
       service.closeSession(lease);
-      await assertRefused(returned.id); // voice-only transfer refused when voice lease ended
+      await assertRefused(returned.id); // conservative handoff refusal when its lease ended
 
       // But typed input falls back to its original frozen text route:
       await reply("synthetic ended voice lease fallback", undefined, true, sourceRef);
@@ -915,6 +927,59 @@ describe("human chat isolation (#590)", () => {
           .find((entry) => entry.body === "synthetic ended voice lease fallback")
       ).toMatchObject({ recipientId: a.id });
       service.openSession(lease, ACTOR, a.id);
+
+      // Valid 100-record input resolves, but its next handoff must refuse before rebind.
+      const depthChain = Array.from({ length: 99 }, (_, index) => ({
+        id: `synthetic-boundary-${index}`,
+        actorId: ACTOR,
+        source: `voice:transfer:${ACTOR}`,
+        payload: {
+          ...handoff.payload,
+          fromId: ACTOR,
+          replyInput: {
+            actorId: ACTOR,
+            entryId: index === 98 ? sourceRef : `synthetic-boundary-${index + 1}`,
+          },
+        },
+      }));
+      inbox.append(depthChain);
+      mesh.selectInboxEntries(ACTOR, [required(depthChain[0]).id]);
+      expect(mesh.resolveHumanReplyInput(ACTOR, required(depthChain[0]).id).binding).toEqual({
+        principalId: a.id,
+        sessionId: lease,
+        leaseBound: true,
+      });
+      const beforeDepth = snapshot();
+      const depthRebind = vi.spyOn(service, "transferActiveSession");
+      const depthControl = vi.spyOn(service, "notifySessionTransferred");
+      expect(() => mesh.transferVoiceSession(ACTOR, PEER)).toThrow("too deep");
+      expect(depthRebind).not.toHaveBeenCalled();
+      expect(depthControl).not.toHaveBeenCalled();
+      expect(snapshot()).toEqual(beforeDepth);
+      expect(service.activeSessionFor(ACTOR)).toEqual({ sessionId: lease, principalId: a.id });
+
+      // Adjacent valid 99-record source produces a resolvable 100-record target handoff.
+      mesh.selectInboxEntries(ACTOR, [required(depthChain[1]).id]);
+      mesh.transferVoiceSession(ACTOR, PEER);
+      expect(depthRebind).toHaveBeenCalledTimes(1);
+      expect(service.activeSessionFor(PEER)).toEqual({ sessionId: lease, principalId: a.id });
+      const boundaryHandoff = required(
+        inbox
+          .list(PEER)
+          .entries.find(
+            (entry) =>
+              entry.payload.type === "voice.transfer" &&
+              (entry.payload.replyInput as { entryId: string }).entryId === depthChain[1].id
+          )
+      );
+      expect(mesh.resolveHumanReplyInput(PEER, boundaryHandoff.id).binding).toEqual({
+        principalId: a.id,
+        sessionId: lease,
+        leaseBound: true,
+      });
+      service.revertActiveSessionTransfer(lease, ACTOR, PEER);
+      depthRebind.mockRestore();
+      depthControl.mockRestore();
 
       // The selected source must be unambiguous and current, before any rebind/write.
       mesh.selectInboxEntries(ACTOR, [returned.id]);
@@ -971,6 +1036,26 @@ describe("human chat isolation (#590)", () => {
       await assertRefused(returned.id);
       service.closeSession("synthetic-new-alice");
       await assertRefused(returned.id);
+      service.openSession("synthetic-unbound-lease", ACTOR);
+      // Optional voice ports can return an unbound lease without rejecting in the all-lease check.
+      const unboundAllLease = vi.spyOn(service, "heldByOtherPrincipal").mockReturnValue(false);
+      try {
+        await Promise.resolve();
+        const beforeUnbound = snapshot();
+        const unbound = await post(
+          `/api/mesh/actors/${ACTOR}/chat`,
+          {
+            body: "synthetic unbound lease must refuse",
+            sessionId: "synthetic-unbound-text",
+          },
+          a.cookie
+        );
+        expect(unbound.status).toBe(409);
+        expect(snapshot()).toEqual(beforeUnbound);
+      } finally {
+        service.closeSession("synthetic-unbound-lease");
+        unboundAllLease.mockRestore();
+      }
     } finally {
       unsubscribe();
       service.closeSession(lease);

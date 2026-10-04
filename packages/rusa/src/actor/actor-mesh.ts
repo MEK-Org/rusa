@@ -2934,9 +2934,10 @@ export class ActorMesh {
       this.listVoiceSessionChat?.(sessionId) ?? [],
       handoffNote
     );
-    // Prospective depth check: verify that handing off this input will not exceed the
-    // depth limit for the recipient before any lease rebind takes place.
-    readAcceptedHumanInput(inboxStore, fromActorId, input.entryId, ["prospective-transfer"]);
+    // The target adds one record to the already verified source chain.
+    if (input.depth >= 100) {
+      throw new Error("voice handoff source reference is too deep; ask for fresh input");
+    }
     transfer.transferActiveSession(fromActorId, target.id, {
       sessionId,
       principalId: lease.principalId,
@@ -3060,7 +3061,7 @@ export class ActorMesh {
     if (!store) {
       throw new Error("reply requires a durable inbox");
     }
-    if (!inputRef) {
+    if (inputRef === undefined) {
       const candidates = this.selectedInboxEntries(actorId)
         .map((id) => store.read(actorId, id))
         .filter(
@@ -3092,6 +3093,7 @@ export class ActorMesh {
       this.voiceSessionTransfer?.heldByOtherPrincipal(actorId, principalId) ?? false
     );
     let resolvedSessionId = sessionId;
+    let resolvedLeaseBound = leaseBound;
     if (leaseBound) {
       if (lease && lease.sessionId === sessionId && lease.principalId === principalId) {
         resolvedSessionId = lease.sessionId;
@@ -3099,6 +3101,7 @@ export class ActorMesh {
         // Typed input with ended same-principal voice lease falls back ONLY to its original
         // independently verified frozen TEXT route with no conflicting active lease.
         resolvedSessionId = textSessionId;
+        resolvedLeaseBound = false;
       } else {
         throw new Error(
           "accepted input's voice lease changed or ended; ask the human to send fresh input"
@@ -3109,8 +3112,9 @@ export class ActorMesh {
       binding: {
         principalId,
         sessionId: resolvedSessionId,
-        leaseBound: Boolean(lease && lease.sessionId === sessionId),
+        leaseBound: resolvedLeaseBound,
       },
+      depth: input.depth,
     };
   }
 
@@ -4326,7 +4330,7 @@ export class ActorMesh {
     const registry = this.voiceSessionTransfer;
     const binding = this.replyVoiceSessionFor(toId);
     assertHumanVoiceAdmission(registry?.heldByOtherPrincipal(toId, fromId) ?? false);
-    if (binding?.principalId && binding.principalId !== fromId) {
+    if (binding && binding.principalId !== fromId) {
       throw new HumanVoiceAdmissionError();
     }
     const replyBinding = {
