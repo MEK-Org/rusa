@@ -177,35 +177,43 @@ void main() {
       },
     );
 
-    for (final size in [const Size(390, 800), const Size(1200, 800)]) {
-      testWidgets('normal Room keeps its header at ${size.width}px (#859)', (
-        tester,
-      ) async {
+    testWidgets(
+      'conservative cover-screen geometry remains headerless (#859)',
+      (tester) async {
         await _withDashboard(
           tester,
-          initialUrl: '/overview',
-          size: size,
+          initialUrl: '/chat-room',
+          size: const Size(432, 509),
           body: (_) async {
-            if (size.width < 700) {
-              await tester.tap(find.byIcon(Icons.menu));
-              await _settleDrawer(tester);
-              await tester.tap(
-                find.byKey(const ValueKey('drawer-nav-chatRoom')),
-              );
-              await _settleDrawer(tester);
-            } else {
-              await _tapNav(tester, 'Room');
-            }
             expect(find.byType(ChatRoomTab), findsOneWidget);
             expect(
               find.byType(MeshHeader),
-              findsOneWidget,
-              reason: 'normal-height phones and desktops retain the header',
+              findsNothing,
+              reason: 'the conservative 2.5-DPR cover geometry is still short',
             );
           },
         );
-      });
-    }
+      },
+    );
+
+    testWidgets('wide short Room retains desktop chrome (#859)', (
+      tester,
+    ) async {
+      await _withDashboard(
+        tester,
+        initialUrl: '/chat-room',
+        size: const Size(844, 390),
+        body: (_) async {
+          expect(find.byType(ChatRoomTab), findsOneWidget);
+          expect(
+            find.byType(MeshHeader),
+            findsOneWidget,
+            reason: 'wide Room does not use the short mobile exception',
+          );
+          expect(find.byType(MobileNavDrawer), findsNothing);
+        },
+      );
+    });
 
     testWidgets(
       'startup preserves multi-entry mode without selecting single-entry history',
@@ -387,7 +395,7 @@ void main() {
             await tester.pump();
             await tester.pump(const Duration(milliseconds: 300));
             expect(find.byType(ChatRoomTab), findsOneWidget);
-            await tester.dragFrom(const Offset(1, 200), const Offset(300, 0));
+            await tester.tap(find.byTooltip('Navigation'));
             await tester.pump();
             await tester.pump(const Duration(milliseconds: 300));
             final scaffold = tester.state<ScaffoldState>(

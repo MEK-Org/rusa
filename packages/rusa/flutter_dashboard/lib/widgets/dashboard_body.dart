@@ -15,9 +15,10 @@ import 'mobile_nav_drawer.dart';
 import 'overview_tab.dart';
 import 'work_tab.dart';
 
-// The 411x485 cover-screen Room is the explicitly short layout; normal phone
-// and desktop heights keep their header.
-const _shortRoomMaxHeight = 500.0;
+// The 411x485 cover-screen Room is the explicitly short layout. 520 leaves
+// conservative room for the same physical cover panel at a 2.5 device-pixel
+// ratio (432x509 logical px); normal phone and desktop heights keep the header.
+const _shortRoomMaxHeight = 520.0;
 
 /// The header + responsive master-detail body. Lives in its own (VM-safe) file
 /// — importing no web-only code — so the screenshot harness can render the real
@@ -221,6 +222,7 @@ class _DashboardBodyState extends State<DashboardBody> {
         _resolveLandingView(constraints);
         final headerlessRoom =
             _view == DashboardView.chatRoom &&
+            constraints.maxWidth < kNarrowBreakpoint &&
             constraints.maxHeight <= _shortRoomMaxHeight;
         if (constraints.maxWidth >= kNarrowBreakpoint && !headerlessRoom) {
           return _chrome();
@@ -238,8 +240,8 @@ class _DashboardBodyState extends State<DashboardBody> {
             // Scaffold, and this body is rendered directly — without main.dart's
             // — by the screenshot harness and the widget tests, so owning one
             // keeps the drawer (and this file) VM-safe. An exceptionally short
-            // Room uses this scaffold at every width: without its header, the
-            // left-edge drawer gesture is its navigation entry point.
+            // narrow Room uses this scaffold: without its header, the left-edge
+            // drawer gesture is its navigation entry point.
             return Scaffold(
               key: _scaffoldKey,
               backgroundColor: MeshColors.bgPrimary,
