@@ -1,0 +1,53 @@
+import 'dart:convert';
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/theme.dart';
+import 'package:rusa_dashboard/widgets/inbox_tab.dart';
+import 'fakes.dart';
+import 'screenshot_support.dart';
+
+void main() {
+  setUpAll(loadFonts);
+  testWidgets('matched synthetic interrupted failure inbox text', (tester) async {
+    await tester.runAsync(() async {
+      final data = jsonDecode(File('screenshots/884/notices.json').readAsStringSync()) as Map<String,dynamic>;
+      for (final scenario in data.entries) {
+      for (final viewport in {'wide': const Size(1100, 800), 'narrow': const Size(390, 844)}.entries) {
+        await tester.binding.setSurfaceSize(viewport.value);
+        for (final version in ['before', 'after']) {
+          final sample = (scenario.value as Map<String,dynamic>)[version] as Map<String,dynamic>;
+          final payload = {
+            'type': 'mesh.mechanical_note', 'note': sample['note'],
+            ...sample['forensics'] as Map<String,dynamic>, 'fromId': 'fixture-child',
+          };
+          final api = FakeApi()
+            ..inboxResultsByStatus['unhandled'] = {'entries': [{
+              'id': 'fixture-notice', 'actorId': 'fixture-parent',
+              'source': 'mesh:mechanical:fixture-child',
+              'deliveredAt': '2026-10-03T12:00:00Z', 'handledAt': null,
+              'payload': payload,
+            }]}
+            ..inboxResultsByStatus['handled'] = {'entries': []};
+          final store = DashboardStore(api: api, stream: FakeStream());
+          await store.init();
+          final key = GlobalKey();
+          await tester.pumpWidget(RepaintBoundary(key: key, child: MaterialApp(
+            debugShowCheckedModeBanner: false, theme: buildMeshTheme(),
+            home: Scaffold(backgroundColor: MeshColors.bgPrimary,
+              body: InboxTab(actorId: 'fixture-parent', store: store)),
+          )));
+          for(var i=0; i<10; i++) { await tester.pump(const Duration(milliseconds: 50)); }
+          expect(find.textContaining(sample['note'] as String), findsOneWidget);
+          expect(tester.takeException(), isNull);
+          await captureBoundary(key, 'screenshots/884/${scenario.key}_${viewport.key}_$version.png');
+          await tester.pumpWidget(const SizedBox());
+          await store.dispose();
+        }
+      }
+      }
+      await tester.binding.setSurfaceSize(null);
+    });
+  });
+}

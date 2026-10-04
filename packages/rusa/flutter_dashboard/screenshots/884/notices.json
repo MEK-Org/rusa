@@ -1,0 +1,58 @@
+{
+  "interrupted": {
+    "before": {
+      "note": "[run failed] provider run codex/fixture-model failed.\n\n(exit 143, unknown)\n\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Synthetic partial answer\"}}\n\n[Task terminated by SIGTERM (source unattributed)]",
+      "forensics": {
+        "runId": "fixture-run",
+        "actorId": "fixture-child",
+        "exitCode": 143,
+        "abortReason": "unknown"
+      }
+    },
+    "after": {
+      "note": "[run failed] provider run codex/fixture-model failed.\n\n(exit 143, unknown)\n\nSynthetic partial answer\n[Codex raw diagnostics: 0 UTF-8 bytes omitted; tail]\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Synthetic partial answer\"}}\n\n[Task terminated by SIGTERM (source unattributed)]",
+      "forensics": {
+        "runId": "fixture-run",
+        "actorId": "fixture-child",
+        "exitCode": 143,
+        "abortReason": "unknown"
+      }
+    }
+  },
+  "auth": {
+    "before": {
+      "note": "[run failed] provider run codex/fixture-model failed.\n\n(exit 1)\n\nSynthetic terminal diagnostic",
+      "forensics": {
+        "runId": "fixture-run",
+        "actorId": "fixture-child",
+        "exitCode": 1
+      }
+    },
+    "after": {
+      "note": "[run failed] provider run codex/fixture-model failed.\n\n(exit 1)\n\nSynthetic terminal diagnostic\n[Codex raw auth-failure phrase matched before tail eviction (authentication failed class)]",
+      "forensics": {
+        "runId": "fixture-run",
+        "actorId": "fixture-child",
+        "exitCode": 1
+      }
+    }
+  },
+  "quota": {
+    "before": {
+      "note": "[run failed] quota exhausted: codex/fixture-model — clears on a timer. Parent judgment needed: wait, respawn on another provider/tier, or re-scope.\n\n(exit 1)\n\nSynthetic terminal diagnostic",
+      "forensics": {
+        "runId": "fixture-run",
+        "actorId": "fixture-child",
+        "exitCode": 1
+      }
+    },
+    "after": {
+      "note": "[run failed] quota exhausted: codex/fixture-model — clears on a timer. Parent judgment needed: wait, respawn on another provider/tier, or re-scope.\n\n(exit 1)\n\nSynthetic terminal diagnostic\n[Codex raw diagnostic terms matched before tail eviction: \"quota\", \"exhaust\"]",
+      "forensics": {
+        "runId": "fixture-run",
+        "actorId": "fixture-child",
+        "exitCode": 1
+      }
+    }
+  }
+}

@@ -13,9 +13,35 @@ vi.mock("../understanding/gemini-utils.js", () => ({
   extractGeminiText: async (response: { text?: string }) => response.text ?? "",
 }));
 
-import { classifyRunExhaustion, deterministicExhaustionFallback } from "./exhaustion-classifier.js";
+import {
+  classifyRunExhaustion,
+  deterministicExhaustionFallback,
+  ExhaustionDiagnosticMatcher,
+} from "./exhaustion-classifier.js";
 
 describe("exhaustion classifier", () => {
+  it("retains split literal and distant composite facts with network precedence", () => {
+    const matcher = new ExhaustionDiagnosticMatcher();
+    const pieces = [
+      "QuO",
+      "Ta",
+      "x".repeat(192 * 1024),
+      "exhaust",
+      "ed",
+      "connection ti",
+      "med out",
+    ];
+    let full = "";
+    for (const piece of pieces) {
+      full += piece;
+      matcher.push(piece);
+      expect(matcher.classification()).toBe(deterministicExhaustionFallback(full));
+      expect(deterministicExhaustionFallback(matcher.evidence())).toBe(matcher.classification());
+    }
+    expect(matcher.classification()).toBe("transient-network");
+    expect(matcher.evidence()).toContain('"connection timed out"');
+  });
+
   beforeEach(() => {
     gemini.generateContent.mockReset();
   });
