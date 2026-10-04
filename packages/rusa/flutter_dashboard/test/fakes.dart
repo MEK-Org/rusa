@@ -937,6 +937,35 @@ class FakeApi extends DashboardApi {
     return makeObligation(id, status: status);
   }
 
+  /// Each snooze write as the API was asked for it; null [until] clears.
+  final snoozeCalls = <({String id, DateTime? until})>[];
+  Object? snoozeError;
+  String? snoozeWarning;
+
+  @override
+  Future<ObligationSnoozeResult> setObligationSnooze(
+    String id,
+    DateTime? until,
+  ) async {
+    snoozeCalls.add((id: id, until: until));
+    if (snoozeError case final error?) throw error;
+    final index = obligationsResult.indexWhere((o) => o.id == id);
+    final old = index >= 0 ? obligationsResult[index] : makeObligation(id);
+    // Round-trips like the server: millisecond precision, UTC with `Z`.
+    final persisted = until == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(
+            until.millisecondsSinceEpoch,
+            isUtc: true,
+          ).toIso8601String();
+    final updated = ObligationDto.fromJson({
+      ...old.toJson(),
+      'snoozedUntil': persisted,
+    });
+    if (index >= 0) obligationsResult[index] = updated;
+    return ObligationSnoozeResult(obligation: updated, warning: snoozeWarning);
+  }
+
   final externalRefCalls = <({String id, String? ref})>[];
   Object? externalRefError;
 
