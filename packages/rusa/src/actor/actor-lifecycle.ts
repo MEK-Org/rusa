@@ -36,7 +36,6 @@ export interface ActorLifecycleStartEvent extends ActorLifecycleQueuedEvent {
 /** Internal observation only: never added to mesh_events or run logs. */
 export interface ActorLifecyclePromptEvent extends ActorLifecycleRunEvent {
   prompt: string;
-  provider: string;
 }
 
 export interface ActorLifecycleErrorEvent extends ActorLifecycleRunEvent {

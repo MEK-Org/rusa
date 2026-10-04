@@ -351,6 +351,7 @@ export function createDashboardRequestHandler(
         return;
       // #866: complete prompts are available in sole-email/local mode only.
       // Keep allowlist refusal at the established auth boundary, before storage reads.
+      // allowedEmails also fails closed for an unvalidated adapter object with both fields.
       // Auth-disabled mode with several active users cannot identify its viewer (#590).
       if (
         req.method === "GET" &&

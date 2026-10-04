@@ -1094,7 +1094,6 @@ export class ActorHandle implements MeshActor {
           actorId: this.id,
           runId: message.runId,
           prompt: message.prompt,
-          provider: message.provider,
         });
       case "firstChunk":
         hooks?.onFirstChunk?.();

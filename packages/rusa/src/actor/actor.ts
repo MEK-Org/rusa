@@ -755,7 +755,6 @@ export class Actor {
               actorId: this.id,
               runId,
               prompt,
-              provider: provider.providerName,
             });
         },
         cwd: this.opts.cwd,

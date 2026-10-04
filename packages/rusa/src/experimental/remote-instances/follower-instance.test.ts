@@ -194,7 +194,7 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
     await waitUntil(() => h.promptEvents.length === 1 && existsSync(dump));
     const event = h.promptEvents[0];
     const argv = JSON.parse(readFileSync(dump, "utf8")) as string[];
-    expect(event).toMatchObject({ actorId: id, runId: runStarts(h, id)[0], provider: "claude" });
+    expect(event).toMatchObject({ actorId: id, runId: runStarts(h, id)[0] });
     expect(event?.prompt).toBe(argv[argv.indexOf("-p") + 1]);
     expect(event?.prompt).toContain("Synthetic charter");
     expect(
@@ -202,7 +202,7 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
     ).not.toContain(JSON.stringify(event?.prompt));
     h.remote.receive({
       actorId: id,
-      message: { type: "runPrompt", runId: "stale-run", prompt: "stale", provider: "fixture" },
+      message: { type: "runPrompt", runId: "stale-run", prompt: "stale" },
     });
     await delay(0);
     expect(h.promptEvents).toHaveLength(1);
