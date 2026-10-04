@@ -8,18 +8,21 @@ import type { ProviderConfig } from "../config/types.js";
 import {
   buildCodexArgs,
   buildCodexConfigOverrides,
+  CODEX_DENIED_DESKTOP_PLUGIN_OVERRIDES,
   CodexProvider,
   codexRolloutExists,
   codexRolloutResumable,
   extractCodexSessionModel,
   extractNewestCodexSessionId,
+  KNOWN_DIRECT_COMPUTER_USE_MCP_NAMES,
+  listEffectiveCodexMcpServers,
   overrideTomlModel,
   parseCodexModel,
   stripMcpServersFromToml,
 } from "./codex.js";
 import { SANDBOX_CODEX_SHELL_ENV_OVERRIDE } from "./sandbox.js";
 
-const { spawnFn, execSyncFn, execFileSyncFn } = vi.hoisted(() => {
+const { spawnFn, execSyncFn, execFileSyncFn, execFileFn } = vi.hoisted(() => {
   const spawnFn = vi.fn();
   const execSyncFn = vi.fn((command: string) => {
     if (command === "pnpm store path") return "/tmp/pnpm-store/path";
@@ -31,19 +34,45 @@ const { spawnFn, execSyncFn, execFileSyncFn } = vi.hoisted(() => {
   });
   const execFileSyncFn = vi.fn((command: string, args: string[]) => {
     if (command === "bwrap" && args[0] === "--version") return "bwrap version";
+    if (command === "codex" && args[0] === "mcp" && args[1] === "list") return "[]";
     throw new Error(`Unexpected execFileSync: ${command} ${args.join(" ")}`);
   });
-  return { spawnFn, execSyncFn, execFileSyncFn };
+  const execFileFn = vi.fn(
+    (
+      command: string,
+      args: string[],
+      options: unknown,
+      cb?: (err: Error | null, stdout?: string, stderr?: string) => void
+    ) => {
+      const callback = (typeof options === "function" ? options : cb) as (
+        err: Error | null,
+        stdout?: string,
+        stderr?: string
+      ) => void;
+      if (command === "bwrap" && args[0] === "--version") {
+        callback(null, "bwrap version", "");
+        return;
+      }
+      if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
+        callback(null, "[]", "");
+        return;
+      }
+      callback(new Error(`Unexpected execFile: ${command} ${args?.join(" ")}`), "", "");
+    }
+  );
+  return { spawnFn, execSyncFn, execFileSyncFn, execFileFn };
 });
 
 vi.mock("node:child_process", () => ({
   spawn: spawnFn,
   execSync: execSyncFn,
   execFileSync: execFileSyncFn,
+  execFile: execFileFn,
   default: {
     spawn: spawnFn,
     execSync: execSyncFn,
     execFileSync: execFileSyncFn,
+    execFile: execFileFn,
   },
 }));
 
@@ -1019,9 +1048,11 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       cwd: "/tmp",
       onChunk: (c) => live.push(c),
     });
-    if (opts.stdout) child.stdout.emit("data", Buffer.from(opts.stdout));
-    if (opts.stderr) child.stderr.emit("data", Buffer.from(opts.stderr));
-    child.emit("close", opts.exitCode ?? 0);
+    setTimeout(() => {
+      if (opts.stdout) child.stdout.emit("data", Buffer.from(opts.stdout));
+      if (opts.stderr) child.stderr.emit("data", Buffer.from(opts.stderr));
+      child.emit("close", opts.exitCode ?? 0);
+    }, 10);
     const result = await runPromise;
     return { result, live };
   }
@@ -1188,5 +1219,173 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
 
     expect(live.join("")).not.toContain("cargo build");
     expect(result.output).toBe("built");
+  });
+
+  describe("computer-use scope enforcement (#885)", () => {
+    it("denies desktop plugins and discovers configured direct MCP servers when computerUse is false", async () => {
+      const config: ProviderConfig = { cliCommand: "codex" };
+      const provider = new CodexProvider("codex", config, "gpt-5-codex");
+
+      execFileFn.mockImplementation((command: string, args: string[], options: unknown, cb?: Function) => {
+        const callback = (typeof options === "function" ? options : cb) as Function;
+        if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
+          callback(
+            null,
+            JSON.stringify([
+              { name: "computer-use", enabled: true, transport: { type: "stdio", command: "python3" } },
+              { name: "cua_repl", enabled: true, transport: { type: "stdio", command: "python3" } },
+              { name: "docs", enabled: true, transport: { type: "streamable_http", url: "https://example.invalid" } },
+            ])
+          );
+          return;
+        }
+        callback(new Error(`Unexpected execFile: ${command} ${args.join(" ")}`));
+      });
+
+      const mockChild = new EventEmitter() as EventEmitter & {
+        stdout: EventEmitter;
+        stderr: EventEmitter;
+      };
+      mockChild.stdout = new EventEmitter();
+      mockChild.stderr = new EventEmitter();
+
+      vi.mocked(spawn).mockReturnValue(mockChild as ChildProcessWithoutNullStreams);
+
+      const runPromise = provider.run({
+        prompt: "test denied",
+        cwd: "/tmp/project",
+        computerUse: false,
+      });
+
+      setTimeout(() => {
+        mockChild.emit("close", 0);
+      }, 10);
+
+      const result = await runPromise;
+      expect(result.success).toBe(true);
+
+      const spawnCalls = vi.mocked(spawn).mock.calls;
+      expect(spawnCalls.length).toBe(1);
+      const args = spawnCalls[0][1] as string[];
+
+      // Checks plugin denials
+      expect(args).toContain("plugins.unified-computer-use@openai-bundled.enabled=false");
+      expect(args).toContain("plugins.computer-use@openai-bundled.enabled=false");
+      // Direct MCP server denials
+      expect(args).toContain("mcp_servers.computer-use.enabled=false");
+      // cua_repl is not a direct top-level server (it belongs to the plugin)
+      expect(args).not.toContain("mcp_servers.cua_repl.enabled=false");
+      // Unrelated docs endpoint is not overridden
+      expect(args).not.toContain("mcp_servers.docs.enabled=false");
+    });
+
+    it("does not pass absent direct MCP server overrides when not in effective config", async () => {
+      const config: ProviderConfig = { cliCommand: "codex" };
+      const provider = new CodexProvider("codex", config, "gpt-5-codex");
+
+      execFileFn.mockImplementation((command: string, args: string[], options: unknown, cb?: Function) => {
+        const callback = (typeof options === "function" ? options : cb) as Function;
+        if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
+          callback(
+            null,
+            JSON.stringify([
+              { name: "docs", enabled: true, transport: { type: "streamable_http", url: "https://example.invalid" } },
+            ])
+          );
+          return;
+        }
+        callback(new Error(`Unexpected execFile: ${command} ${args.join(" ")}`));
+      });
+
+      const mockChild = new EventEmitter() as EventEmitter & {
+        stdout: EventEmitter;
+        stderr: EventEmitter;
+      };
+      mockChild.stdout = new EventEmitter();
+      mockChild.stderr = new EventEmitter();
+
+      vi.mocked(spawn).mockReturnValue(mockChild as ChildProcessWithoutNullStreams);
+
+      const runPromise = provider.run({
+        prompt: "test absent direct",
+        cwd: "/tmp/project",
+        // missing computerUse field defaults to false
+      });
+
+      setTimeout(() => {
+        mockChild.emit("close", 0);
+      }, 10);
+
+      const result = await runPromise;
+      expect(result.success).toBe(true);
+
+      const spawnCalls = vi.mocked(spawn).mock.calls;
+      const args = spawnCalls[0][1] as string[];
+      // Plugins denied
+      expect(args).toContain("plugins.unified-computer-use@openai-bundled.enabled=false");
+      expect(args).toContain("plugins.computer-use@openai-bundled.enabled=false");
+      // Absent servers NEVER created
+      expect(args).not.toContain("mcp_servers.computer-use.enabled=false");
+      expect(args).not.toContain("mcp_servers.cua_repl.enabled=false");
+    });
+
+    it("inherits normal configuration when computerUse is true", async () => {
+      const config: ProviderConfig = { cliCommand: "codex" };
+      const provider = new CodexProvider("codex", config, "gpt-5-codex");
+
+      const mockChild = new EventEmitter() as EventEmitter & {
+        stdout: EventEmitter;
+        stderr: EventEmitter;
+      };
+      mockChild.stdout = new EventEmitter();
+      mockChild.stderr = new EventEmitter();
+
+      vi.mocked(spawn).mockReturnValue(mockChild as ChildProcessWithoutNullStreams);
+
+      const runPromise = provider.run({
+        prompt: "test allowed",
+        cwd: "/tmp/project",
+        computerUse: true,
+      });
+
+      setTimeout(() => {
+        mockChild.emit("close", 0);
+      }, 10);
+
+      const result = await runPromise;
+      expect(result.success).toBe(true);
+
+      const spawnCalls = vi.mocked(spawn).mock.calls;
+      const args = spawnCalls[0][1] as string[];
+      expect(args).not.toContain("plugins.unified-computer-use@openai-bundled.enabled=false");
+      expect(args).not.toContain("plugins.computer-use@openai-bundled.enabled=false");
+      expect(args).not.toContain("mcp_servers.computer-use.enabled=false");
+      expect(args).not.toContain("mcp_servers.cua_repl.enabled=false");
+    });
+
+    it("fails the invocation without spawning when effective MCP discovery throws", async () => {
+      const config: ProviderConfig = { cliCommand: "codex" };
+      const provider = new CodexProvider("codex", config, "gpt-5-codex");
+
+      execFileFn.mockImplementation((command: string, args: string[], options: unknown, cb?: Function) => {
+        const callback = (typeof options === "function" ? options : cb) as Function;
+        if (command === "codex" && args[0] === "mcp" && args[1] === "list") {
+          callback(new Error("failed to load configuration"));
+          return;
+        }
+        callback(new Error(`Unexpected execFile: ${command} ${args.join(" ")}`));
+      });
+
+      const result = await provider.run({
+        prompt: "test failed discovery",
+        cwd: "/tmp/project",
+        computerUse: false,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain("failed to load configuration");
+      expect(spawn).not.toHaveBeenCalled();
+    });
   });
 });

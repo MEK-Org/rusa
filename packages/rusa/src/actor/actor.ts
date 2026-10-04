@@ -177,6 +177,11 @@ export interface ActorOptions {
    */
   onCoalesceAborted?: (count: number, ageMs: number) => void;
   /**
+   * Returns whether computer-use capability is admitted for the upcoming/active run.
+   * Called immediately before provider invocation so that queued revokes take effect.
+   */
+  isComputerUseAdmitted?: () => boolean;
+  /**
    * Called immediately before each provider attempt with the instance that will
    * run. Unlike onRunStart, this includes fallbacks without changing run
    * lifecycle accounting. Its model and effort are the instantiated values, not
@@ -754,6 +759,7 @@ export class Actor {
         mcpServers: this.opts.mcpServers,
         addDirs: this.opts.addDirs,
         sandbox,
+        computerUse: this.opts.isComputerUseAdmitted ? this.opts.isComputerUseAdmitted() : false,
         // timeoutMs: provider OS-level timeout is the actor ceiling plus a grace
         // margin. The AbortController is the primary kill path; Node's spawn
         // timeout is only a backstop for the rare case our abort fails to land.

@@ -105,6 +105,7 @@ function writeArgvRecorder(script: string, dumpPath: string, rest: string[]): vo
     script,
     [
       "#!/bin/sh",
+      'if [ "$1" = "mcp" ] && [ "$2" = "list" ]; then echo "[]"; exit 0; fi',
       // Octal in the format string, since only the format is escape-processed —
       // an argument is written through %s exactly as it arrived.
       `for a in "$@"; do printf '%s\\036' "$a"; done > ${JSON.stringify(dumpPath)}`,

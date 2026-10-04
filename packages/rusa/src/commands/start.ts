@@ -3195,6 +3195,7 @@ async function composeStart(
           resolveProvider: (selected) =>
             resolveProvider(config, selected.provider, selected.model, selected.effort),
           mcpServers: workerMcp,
+          isComputerUseAdmitted: () => mesh.hasActiveCapability(id, COMPUTER_USE_CAPABILITY),
           addDirs: [],
           sandbox,
           prepareUnderstandingMount: understandingMountEnabled
@@ -3691,6 +3692,7 @@ async function composeStart(
     admitRun: ({ responsive }): boolean =>
       mesh.hasRunnableInbox(rootId) &&
       (responsive || !(voiceService?.hasActiveSession(rootId) ?? false)),
+    isComputerUseAdmitted: () => mesh.hasActiveCapability(rootId, COMPUTER_USE_CAPABILITY),
     gate: (fn, candidates, responsive) =>
       computerUseLock.gateAfterProvider(
         rootId,
