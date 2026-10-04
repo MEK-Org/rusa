@@ -1,9 +1,9 @@
-import type { ActorOptions, PromptBuild, RunAbandon } from "../../actor/actor.js";
-import type { ActorRuntimeState } from "../../actor/actor-mesh.js";
-import type { ActorRecord } from "../../actor/actor-record.js";
-import type { ActorRunMode, RunNudge } from "../../actor/trigger-runner.js";
-import type { RawProviderModelConfig } from "../../providers/model-config.js";
-import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
+import type { ActorOptions, PromptBuild, RunAbandon } from "../actor/actor.js";
+import type { ActorRuntimeState } from "../actor/actor-mesh.js";
+import type { ActorRecord } from "../actor/actor-record.js";
+import type { ActorRunMode, RunNudge } from "../actor/trigger-runner.js";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
+import type { CodingProvider, McpServerSpec, RunResult } from "../providers/types.js";
 
 /** Existing follower gateway request-body bound, including the JSON envelope. */
 export const FOLLOWER_HTTP_BODY_LIMIT_BYTES = 8 * 1024 * 1024;

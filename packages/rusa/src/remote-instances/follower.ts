@@ -4,9 +4,9 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { resolveRepoRoot } from "../../commands/service-instance.js";
-import { createLogger } from "../../observability/logger.js";
-import { GitRunner } from "../../update/runner.js";
+import { resolveRepoRoot } from "../commands/service-instance.js";
+import { createLogger } from "../observability/logger.js";
+import { GitRunner } from "../update/runner.js";
 import {
   FollowerEventAcceptanceFailedError,
   type FollowerEventBatch,

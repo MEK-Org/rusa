@@ -1,4 +1,4 @@
-# Tailnet follower prototype
+# Tailnet followers
 
 Start the leader and follower independently, then choose a registered follower
 when spawning an actor. One leader remains authoritative; a follower hosts
@@ -79,7 +79,7 @@ chmod 600 /absolute/path/to/follower-home/token
 ```
 
 You can use your normal SSH host alias instead. The enrollment secret grants
-access to this prototype gateway, so keep the token file private.
+access to this gateway, so keep the token file private.
 
 From the cloned repository, start the follower in the foreground:
 
@@ -147,7 +147,7 @@ Follower workspaces are retained for inspection.
 Automated instance and restart tests:
 
 ```sh
-pnpm exec vitest run src/experimental/remote-instances
+pnpm exec vitest run src/remote-instances
 ```
 
 Tests cover instance registration/versioning, safe bind enforcement (refusing 0.0.0.0
@@ -205,7 +205,7 @@ connection; the HTTP gateway is not intended for the public internet.
 `/mcp/<key>` is deliberately the one gateway path that does not check the
 enrollment bearer token: the 256-bit random path segment is itself the
 capability, and the gateway strips any inbound `authorization` header before
-proxying to the leader. That is the tradeoff this prototype accepts. It keeps
+proxying to the leader. That is the tradeoff this design accepts. It keeps
 the follower from ever holding the control secret — a compromised follower
 process can reach only the MCP endpoints currently assigned to its own actors —
 at the cost of putting a bearer capability in a URL, where request logs, proxies
@@ -366,7 +366,7 @@ whose stop command remains deliverable when contact returns. Any future expiry
 policy must be chosen from measured contact-gap data and documented as a separate
 operational decision.
 Provider process-tree cleanup after an abrupt crash still needs validation beyond
-this experiment. There is deliberately no per-actor Node crash isolation, matching the leader.
+the current automated tests. There is deliberately no per-actor Node crash isolation, matching the leader.
 Retirement interrupts/closes only that Actor; instance shutdown closes all actors.
 
 Local files stay on the follower. Media/file transfer, leader-local repository

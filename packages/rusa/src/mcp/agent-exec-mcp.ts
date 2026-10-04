@@ -19,9 +19,9 @@ import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import type { ModelClassRepository } from "../db/repositories/model-class-repository.js";
-import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
+import type { FollowerInfo } from "../remote-instances/follower-hub.js";
 import type { ChatRoomService } from "../voice/chat-room.js";
 import {
   resolveVoiceChoice,

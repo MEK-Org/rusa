@@ -1,18 +1,18 @@
 import { randomUUID } from "node:crypto";
-import type { ActorOptions } from "../../actor/actor.js";
-import type { ActorLifecycleAbandonmentReason } from "../../actor/actor-lifecycle.js";
-import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../actor/actor-mesh.js";
-import { COMPUTER_USE_CAPABILITY } from "../../actor/computer-use-lock.js";
-import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
+import type { ActorOptions } from "../actor/actor.js";
+import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
+import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../actor/actor-mesh.js";
+import { COMPUTER_USE_CAPABILITY } from "../actor/computer-use-lock.js";
+import type { RunStartHandle } from "../actor/concurrency-limiter.js";
 import {
   type ActorRunMode,
   isResponsiveNudge,
   mergeNudges,
   type RunNudge,
-} from "../../actor/trigger-runner.js";
-import { type Logger, nullLogger } from "../../observability/logger.js";
-import type { ProviderModelConfig, RawProviderModelConfig } from "../../providers/model-config.js";
-import type { RunResult } from "../../providers/types.js";
+} from "../actor/trigger-runner.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
+import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
+import type { RunResult } from "../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
 import {
   type ActorEvent,

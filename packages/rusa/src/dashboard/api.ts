@@ -196,11 +196,11 @@ export interface DashboardDataDeps {
   }) => FollowerUpdateStatus[];
 }
 
-import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
-import type { FollowerUpdateStatus } from "../experimental/remote-instances/protocol.js";
 import { githubInboxEventReference } from "../github/inbox-notification.js";
 import { gchatInboxMessageReference } from "../references/inbox-reference.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import type { FollowerInfo } from "../remote-instances/follower-hub.js";
+import type { FollowerUpdateStatus } from "../remote-instances/protocol.js";
 export type { FollowerInfo, FollowerUpdateStatus };
 
 /** Route prefix for the per-actor avatar endpoint . */

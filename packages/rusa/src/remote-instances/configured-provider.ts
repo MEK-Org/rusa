@@ -1,5 +1,5 @@
-import type { RusaConfig } from "../../config/types.js";
-import { resolveProvider } from "../../providers/registry.js";
+import type { RusaConfig } from "../config/types.js";
+import { resolveProvider } from "../providers/registry.js";
 import type { ProviderFactory } from "./protocol.js";
 
 export interface ProviderSelection {

@@ -4,16 +4,16 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import type { ActorFactoryContext, ActorMeshOptions } from "../../actor/actor-mesh.js";
-import { EXPERIMENT_ADMIN_CAPABILITY } from "../../actor/administrative-capabilities.js";
-import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../../actor/computer-use-lock.js";
+import type { ActorFactoryContext, ActorMeshOptions } from "../actor/actor-mesh.js";
+import { EXPERIMENT_ADMIN_CAPABILITY } from "../actor/administrative-capabilities.js";
+import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../actor/computer-use-lock.js";
 import {
   InMemoryExperimentEnrollmentStore,
   STRICT_OBLIGATION_HANDLING_EXPERIMENT,
-} from "../../actor/experiments.js";
-import { ProviderPacer } from "../../actor/provider-pacer.js";
-import { runMigrations } from "../../db/migrations/runner.js";
-import { ObligationRepository } from "../../db/repositories/obligation-repository.js";
+} from "../actor/experiments.js";
+import { ProviderPacer } from "../actor/provider-pacer.js";
+import { runMigrations } from "../db/migrations/runner.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { createHarness, waitUntil } from "./harness.js";
 import type { ActorEvent, LeaderCommand, ProviderFactory } from "./protocol.js";

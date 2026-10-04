@@ -1,20 +1,20 @@
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
-import { ActorMesh, type ActorMeshOptions } from "../../actor/actor-mesh.js";
-import { InMemoryCapabilityGrantStore } from "../../actor/capability-grants.js";
-import { COMPUTER_USE_CAPABILITY } from "../../actor/computer-use-lock.js";
+import { ActorMesh, type ActorMeshOptions } from "../actor/actor-mesh.js";
+import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
+import { COMPUTER_USE_CAPABILITY } from "../actor/computer-use-lock.js";
 import {
   InMemoryEventSourceOwnerStore,
   InMemoryEventSourceSubscriptionStore,
-} from "../../actor/event-subscriptions.js";
-import { ExternalRootDriver } from "../../actor/external-root-driver.js";
-import type { MeshEventInput } from "../../actor/mesh-events.js";
-import { type ProviderPacer, submitPoolGate } from "../../actor/provider-pacer.js";
-import { runMigrations } from "../../db/migrations/runner.js";
-import { SqliteInboxRepository } from "../../db/repositories/sqlite-inbox-repository.js";
-import type { LogFields, Logger } from "../../observability/logger.js";
-import type { ProviderModelConfig } from "../../providers/model-config.js";
-import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
+} from "../actor/event-subscriptions.js";
+import { ExternalRootDriver } from "../actor/external-root-driver.js";
+import type { MeshEventInput } from "../actor/mesh-events.js";
+import { type ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
+import { runMigrations } from "../db/migrations/runner.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
+import type { LogFields, Logger } from "../observability/logger.js";
+import type { ProviderModelConfig } from "../providers/model-config.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { ActorHandle } from "./actor-handle.js";
 import { createProvider } from "./fixture-provider.js";
 import { FollowerInstance } from "./follower-instance.js";
@@ -223,7 +223,7 @@ export function createHarness(options: {
     {
       id: "root",
       parentId: null,
-      charter: "Coordinate the prototype",
+      charter: "Coordinate the followers",
       status: "active",
       createdAt: new Date().toISOString(),
     },
