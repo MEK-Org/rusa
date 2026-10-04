@@ -19,6 +19,7 @@ class ActorTree extends StatelessWidget {
     required this.store,
     this.width = 360,
     this.touchTargets = false,
+    this.showBorder = true,
   });
 
   final DashboardStore store;
@@ -31,13 +32,19 @@ class ActorTree extends StatelessWidget {
   /// Enlarges row tap targets (taller rows) for comfortable touch on phones.
   final bool touchTargets;
 
+  /// Draws the sidebar's own right border. Off when a resizable divider
+  /// draws that edge instead.
+  final bool showBorder;
+
   @override
   Widget build(BuildContext context) {
     return Container(
       width: width,
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         color: MeshColors.bgSecondary,
-        border: Border(right: BorderSide(color: MeshColors.border)),
+        border: showBorder
+            ? const Border(right: BorderSide(color: MeshColors.border))
+            : null,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,

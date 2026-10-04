@@ -46,6 +46,12 @@ dependencies:
   # Renders the operator-supplied antler/tree SVG brand mark (issue #412) in
   # the dashboard header; Flutter's built-in Image has no SVG support.
   flutter_svg: ^2.2.0
+  # Resizable sidebars (#897). The fork glass goals uses; declared exactly as
+  # goals_widgets declares it, since pub needs one description per package.
+  multi_split_view:
+    git:
+      url: https://github.com/AlabasterAxe/multi_split_view
+      ref: master
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.

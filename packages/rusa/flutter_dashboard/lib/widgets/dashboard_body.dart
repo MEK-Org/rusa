@@ -13,6 +13,7 @@ import 'detail_panel.dart';
 import 'header.dart';
 import 'mobile_nav_drawer.dart';
 import 'overview_tab.dart';
+import 'resizable_sidebar.dart';
 import 'work_tab.dart';
 
 /// The header + responsive master-detail body. Lives in its own (VM-safe) file
@@ -501,14 +502,16 @@ class _ActorsBody extends StatelessWidget {
         if (constraints.maxWidth < kNarrowBreakpoint) {
           return _NarrowBody(store: store, onSelectView: onSelectView);
         }
-        return Row(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            ActorTree(store: store),
-            Expanded(
-              child: DetailPanel(store: store, onSelectView: onSelectView),
-            ),
-          ],
+        return ResizableSidebar(
+          defaultWidth: 360,
+          initialWidth: store.sidebarWidth('actors'),
+          onWidthChanged: (width) => store.setSidebarWidth('actors', width),
+          sidebar: ActorTree(
+            store: store,
+            width: double.infinity,
+            showBorder: false,
+          ),
+          detail: DetailPanel(store: store, onSelectView: onSelectView),
         );
       },
     );
