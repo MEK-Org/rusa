@@ -49,3 +49,93 @@ String? formatStartsIn(String iso, {DateTime? now}) {
   final restHours = hours % 24;
   return restHours == 0 ? 'in ~$days d' : 'in ~$days d $restHours h';
 }
+
+/// Project an external reference or URL string out to a browsable web URL,
+/// or null if the reference has no web representation.
+///
+/// Mirrored from the server-side reference projection:
+/// - github:OWNER/REPO -> https://github.com/OWNER/REPO
+/// - github:OWNER/REPO/issues/N -> https://github.com/OWNER/REPO/issues/N
+/// - github:OWNER/REPO/pulls/N -> https://github.com/OWNER/REPO/pull/N
+/// - github:OWNER/REPO/issues/N/comments/C -> https://github.com/OWNER/REPO/issues/N#issuecomment-C
+/// - github:OWNER/REPO/pulls/N/comments/C -> https://github.com/OWNER/REPO/pull/N#discussion_rC
+/// - github:OWNER/REPO/pulls/N/reviews/R -> https://github.com/OWNER/REPO/pull/N#pullrequestreview-R
+/// - github:OWNER/REPO/branches/B -> https://github.com/OWNER/REPO/tree/B
+/// - slack:channels/C -> https://app.slack.com/archives/C
+/// - slack:channels/C/messages/T -> https://app.slack.com/archives/C/p{T without dot}
+/// - Raw http:// or https:// URLs are returned verbatim.
+String? referenceUrl(String? rawRef) {
+  if (rawRef == null) return null;
+  final trimmed = rawRef.trim();
+  if (trimmed.isEmpty) return null;
+  if (trimmed.startsWith('https://') || trimmed.startsWith('http://')) {
+    return trimmed;
+  }
+  final separator = trimmed.indexOf(':');
+  if (separator <= 0) return null;
+  final scheme = trimmed.substring(0, separator).toLowerCase();
+  final path = trimmed.substring(separator + 1).trim();
+  if (path.isEmpty) return null;
+
+  if (scheme == 'slack') {
+    final segments = path.split('/').where((s) => s.isNotEmpty).toList();
+    if (segments.isNotEmpty &&
+        segments[0] == 'channels' &&
+        segments.length >= 2) {
+      final channel = segments[1];
+      if (segments.length >= 4 && segments[2] == 'messages') {
+        final ts = segments[3].replaceAll('.', '');
+        return 'https://app.slack.com/archives/${Uri.encodeComponent(channel)}/p$ts';
+      }
+      return 'https://app.slack.com/archives/${Uri.encodeComponent(channel)}';
+    }
+    return null;
+  }
+
+  if (scheme == 'github') {
+    if (path.contains('#')) {
+      final hashIndex = path.indexOf('#');
+      final repoPart = path.substring(0, hashIndex).trim();
+      final numPart = path.substring(hashIndex + 1).trim();
+      if (numPart.isNotEmpty && int.tryParse(numPart) != null) {
+        return 'https://github.com/$repoPart/issues/$numPart';
+      }
+      return 'https://github.com/$repoPart#$numPart';
+    }
+
+    final segments = path.split('/').where((s) => s.isNotEmpty).toList();
+    if (segments.isEmpty) return null;
+
+    if (segments.length >= 4 && segments[2] == 'branches') {
+      final owner = segments[0];
+      final repo = segments[1];
+      final branch = segments.sublist(3).join('/');
+      return 'https://github.com/$owner/$repo/tree/${Uri.encodeComponent(branch)}';
+    }
+
+    final isPullRequest = segments.length > 2 && segments[2] == 'pulls';
+    String anchor = '';
+    final commentIndex = segments.indexOf('comments');
+    final reviewIndex = segments.indexOf('reviews');
+
+    if (commentIndex >= 0 && commentIndex == segments.length - 2) {
+      anchor = isPullRequest
+          ? '#discussion_r${segments[commentIndex + 1]}'
+          : '#issuecomment-${segments[commentIndex + 1]}';
+      segments.removeRange(commentIndex, segments.length);
+    } else if (isPullRequest &&
+        reviewIndex >= 0 &&
+        reviewIndex == segments.length - 2) {
+      anchor = '#pullrequestreview-${segments[reviewIndex + 1]}';
+      segments.removeRange(reviewIndex, segments.length);
+    }
+
+    if (segments.length > 2 && segments[2] == 'pulls') {
+      segments[2] = 'pull';
+    }
+
+    return 'https://github.com/${segments.join('/')}$anchor';
+  }
+
+  return null;
+}

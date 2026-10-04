@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../actor_display.dart';
+import '../link_opener.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -21,6 +22,7 @@ class ObligationRow extends StatelessWidget {
     this.onMoveDown,
     this.onMutated,
     this.onSelectView,
+    this.openLink = openInNewTab,
     this.showOwner = false,
     this.showActions = true,
     this.showReorder = false,
@@ -36,6 +38,7 @@ class ObligationRow extends StatelessWidget {
   final VoidCallback? onMoveDown;
   final VoidCallback? onMutated;
   final void Function(DashboardView)? onSelectView;
+  final void Function(String url) openLink;
   final bool showOwner;
   final bool showActions;
   final bool showReorder;
@@ -58,7 +61,9 @@ class ObligationRow extends StatelessWidget {
     // rather than the status so a note that somehow outlives a transition is
     // visible rather than silently swallowed.
     final hasTerminalNote =
-        obligation.terminalNote != null && obligation.terminalNote!.trim().isNotEmpty;
+        obligation.terminalNote != null &&
+        obligation.terminalNote!.trim().isNotEmpty;
+    final externalUrl = referenceUrl(obligation.externalRef);
 
     // Kind, title, then status on one row — status follows the title as it
     // does in the actor and obligation detail headers.
@@ -76,7 +81,24 @@ class ObligationRow extends StatelessWidget {
             fontSize: 13.5,
           ),
         ),
-        ObligationStatusChip(obligation: obligation, store: store),
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ObligationStatusChip(obligation: obligation, store: store),
+            if (externalUrl != null) ...[
+              const SizedBox(width: 4),
+              IconButton(
+                icon: const Icon(Icons.open_in_new, size: 14),
+                color: MeshColors.accent,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+                tooltip: 'Open in new tab',
+                visualDensity: VisualDensity.compact,
+                onPressed: () => openLink(externalUrl),
+              ),
+            ],
+          ],
+        ),
       ],
     );
 
@@ -103,23 +125,44 @@ class ObligationRow extends StatelessWidget {
         if (showActions && !obligation.isTerminal) ...[
           if (showReorder) const SizedBox(width: 4),
           PopupMenuButton<String>(
-            icon: const Icon(Icons.more_vert, size: 18, color: MeshColors.textSecondary),
+            icon: const Icon(
+              Icons.more_vert,
+              size: 18,
+              color: MeshColors.textSecondary,
+            ),
             padding: EdgeInsets.zero,
             tooltip: 'Obligation Actions',
             color: MeshColors.bgTertiary,
             onSelected: (val) {
               switch (val) {
                 case 'done':
-                  confirmAndSetObligationStatus(context, store, obligation, 'done', onUpdated: onMutated);
+                  confirmAndSetObligationStatus(
+                    context,
+                    store,
+                    obligation,
+                    'done',
+                    onUpdated: onMutated,
+                  );
                   break;
                 case 'cancelled':
-                  confirmAndSetObligationStatus(context, store, obligation, 'cancelled', onUpdated: onMutated);
+                  confirmAndSetObligationStatus(
+                    context,
+                    store,
+                    obligation,
+                    'cancelled',
+                    onUpdated: onMutated,
+                  );
                   break;
                 case 'snooze':
                   showSnoozeObligationDialog(context, store, obligation, onUpdated: onMutated);
                   break;
                 case 'reparent':
-                  showReparentObligationDialog(context, store, obligation, onReparented: onMutated);
+                  showReparentObligationDialog(
+                    context,
+                    store,
+                    obligation,
+                    onReparented: onMutated,
+                  );
                   break;
                 case 'add_child':
                   showCreateObligationDialog(
@@ -146,7 +189,13 @@ class ObligationRow extends StatelessWidget {
                         color: ObligationStatusColors.done.chipForeground,
                       ),
                       const SizedBox(width: 8),
-                      const Text('Mark Done', style: TextStyle(color: MeshColors.textPrimary, fontSize: 13)),
+                      const Text(
+                        'Mark Done',
+                        style: TextStyle(
+                          color: MeshColors.textPrimary,
+                          fontSize: 13,
+                        ),
+                      ),
                     ],
                   ),
                 ),
@@ -154,9 +203,19 @@ class ObligationRow extends StatelessWidget {
                 value: 'cancelled',
                 child: Row(
                   children: [
-                    Icon(Icons.cancel_outlined, size: 16, color: Color(0xFFF87171)),
+                    Icon(
+                      Icons.cancel_outlined,
+                      size: 16,
+                      color: Color(0xFFF87171),
+                    ),
                     SizedBox(width: 8),
-                    Text('Cancel', style: TextStyle(color: MeshColors.textPrimary, fontSize: 13)),
+                    Text(
+                      'Cancel',
+                      style: TextStyle(
+                        color: MeshColors.textPrimary,
+                        fontSize: 13,
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -179,9 +238,19 @@ class ObligationRow extends StatelessWidget {
                 value: 'reparent',
                 child: Row(
                   children: [
-                    Icon(Icons.drive_file_move_outlined, size: 16, color: MeshColors.accent),
+                    Icon(
+                      Icons.drive_file_move_outlined,
+                      size: 16,
+                      color: MeshColors.accent,
+                    ),
                     SizedBox(width: 8),
-                    Text('Reparent...', style: TextStyle(color: MeshColors.textPrimary, fontSize: 13)),
+                    Text(
+                      'Reparent...',
+                      style: TextStyle(
+                        color: MeshColors.textPrimary,
+                        fontSize: 13,
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -191,7 +260,13 @@ class ObligationRow extends StatelessWidget {
                   children: [
                     Icon(Icons.add_task, size: 16, color: MeshColors.accent),
                     SizedBox(width: 8),
-                    Text('Add Child...', style: TextStyle(color: MeshColors.textPrimary, fontSize: 13)),
+                    Text(
+                      'Add Child...',
+                      style: TextStyle(
+                        color: MeshColors.textPrimary,
+                        fontSize: 13,
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -215,10 +290,7 @@ class ObligationRow extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Expanded(child: titleRow),
-                if (trailing != null) ...[
-                  const SizedBox(width: 8),
-                  trailing!,
-                ],
+                if (trailing != null) ...[const SizedBox(width: 8), trailing!],
                 const SizedBox(width: 8),
                 actionButtons,
               ],
@@ -230,14 +302,21 @@ class ObligationRow extends StatelessWidget {
                 body,
                 maxLines: 3,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12, height: 1.35),
+                style: const TextStyle(
+                  color: MeshColors.textSecondary,
+                  fontSize: 12,
+                  height: 1.35,
+                ),
               ),
             ],
             if (showOwner) ...[
               const SizedBox(height: 2),
               Text(
                 'Owner: ${store.ownerLabel(obligation.ownerId)}',
-                style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
+                style: const TextStyle(
+                  color: MeshColors.textMuted,
+                  fontSize: 11,
+                ),
               ),
             ],
             if (obligation.hasCheckpoint) ...[
@@ -250,32 +329,15 @@ class ObligationRow extends StatelessWidget {
                 maxLines: 4,
               ),
             ],
-            if (obligation.externalRef != null && obligation.externalRef!.trim().isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  const Text(
-                    'Reference: ',
-                    style: TextStyle(color: MeshColors.textSecondary, fontSize: 11.5),
-                  ),
-                  Expanded(
-                    child: Text(
-                      obligation.externalRef!,
-                      style: const TextStyle(
-                        color: MeshColors.accent,
-                        fontSize: 11.5,
-                        fontFamily: kMonoFontFamily,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ],
             if (obligation.isScheduled && obligation.nextReadyAt != null) ...[
               const SizedBox(height: 8),
               Row(
                 children: [
-                  const Icon(Icons.schedule, size: 13, color: MeshColors.textMuted),
+                  const Icon(
+                    Icons.schedule,
+                    size: 13,
+                    color: MeshColors.textMuted,
+                  ),
                   const SizedBox(width: 4),
                   Expanded(
                     child: Text(
@@ -296,7 +358,10 @@ class ObligationRow extends StatelessWidget {
               const SizedBox(height: 12),
               Container(
                 width: double.infinity,
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
                 decoration: BoxDecoration(
                   color: const Color(0xFF1E1B0F),
                   border: const Border(
@@ -331,7 +396,10 @@ class ObligationRow extends StatelessWidget {
               const SizedBox(height: 12),
               Container(
                 width: double.infinity,
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
                 decoration: BoxDecoration(
                   color: MeshColors.bgTertiary,
                   border: Border(
@@ -348,7 +416,9 @@ class ObligationRow extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      obligation.isDone ? 'Completed because:' : 'Cancelled because:',
+                      obligation.isDone
+                          ? 'Completed because:'
+                          : 'Cancelled because:',
                       style: const TextStyle(
                         color: MeshColors.textSecondary,
                         fontSize: 12,
@@ -358,7 +428,10 @@ class ObligationRow extends StatelessWidget {
                     const SizedBox(height: 6),
                     Text(
                       obligation.terminalNote!,
-                      style: const TextStyle(color: MeshColors.textPrimary, fontSize: 11.5),
+                      style: const TextStyle(
+                        color: MeshColors.textPrimary,
+                        fontSize: 11.5,
+                      ),
                     ),
                   ],
                 ),
@@ -368,7 +441,10 @@ class ObligationRow extends StatelessWidget {
               const SizedBox(height: 12),
               Container(
                 width: double.infinity,
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
                 decoration: BoxDecoration(
                   color: const Color(0xFF1E1313),
                   border: const Border(
@@ -493,7 +569,11 @@ class ObligationCheckpointPanel extends StatelessWidget {
         children: [
           Row(
             children: [
-              const Icon(Icons.flag_outlined, size: 13, color: MeshColors.accent),
+              const Icon(
+                Icons.flag_outlined,
+                size: 13,
+                color: MeshColors.accent,
+              ),
               const SizedBox(width: 4),
               const Text(
                 'Standing',
@@ -506,10 +586,18 @@ class ObligationCheckpointPanel extends StatelessWidget {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  checkpointStampLabel(obligation, lookupHandle, isViewer: isViewer, humanDisplayName: humanDisplayName),
+                  checkpointStampLabel(
+                    obligation,
+                    lookupHandle,
+                    isViewer: isViewer,
+                    humanDisplayName: humanDisplayName,
+                  ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
+                  style: const TextStyle(
+                    color: MeshColors.textMuted,
+                    fontSize: 11,
+                  ),
                 ),
               ),
             ],
@@ -518,7 +606,12 @@ class ObligationCheckpointPanel extends StatelessWidget {
           if (selectable)
             SelectableText(text, style: bodyStyle)
           else
-            Text(text, maxLines: maxLines, overflow: TextOverflow.ellipsis, style: bodyStyle),
+            Text(
+              text,
+              maxLines: maxLines,
+              overflow: TextOverflow.ellipsis,
+              style: bodyStyle,
+            ),
         ],
       ),
     );

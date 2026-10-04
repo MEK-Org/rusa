@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/util.dart';
 import 'package:rusa_dashboard/widgets/inbox_item_row.dart';
 import 'package:rusa_dashboard/widgets/inbox_tab.dart';
 import 'package:rusa_dashboard/widgets/obligation_card.dart';
@@ -76,6 +77,137 @@ void main() {
 
       expect(find.text('OBLIGATION'), findsNothing);
       expect(find.text('Ship the fix'), findsOneWidget);
+    });
+
+    testWidgets(
+      'renders external link icon button next to status and removes bottom reference URL (#898)',
+      (tester) async {
+        final store = DashboardStore(api: FakeApi(), stream: FakeStream());
+        final opened = <String>[];
+        var selectedView = false;
+
+        await tester.pumpWidget(
+          _host(
+            ObligationRow(
+              obligation: makeObligation(
+                'ob-898',
+                title: 'Link button on card',
+                intent: 'Open external reference from button',
+                externalRef: 'github:MEK-Org/rusa/issues/898',
+              ),
+              store: store,
+              openLink: opened.add,
+              onSelectView: (_) => selectedView = true,
+            ),
+          ),
+        );
+
+        // Icon button exists next to status chip
+        final iconFinder = find.byIcon(Icons.open_in_new);
+        expect(iconFinder, findsOneWidget);
+        expect(find.byTooltip('Open in new tab'), findsOneWidget);
+
+        final statusRect = tester.getRect(find.byType(ObligationStatusChip));
+        final iconRect = tester.getRect(iconFinder);
+        expect(iconRect.left, greaterThanOrEqualTo(statusRect.right));
+
+        // Bottom reference URL text is removed
+        expect(find.text('Reference: '), findsNothing);
+        expect(find.text('github:MEK-Org/rusa/issues/898'), findsNothing);
+
+        // Tapping icon button opens link without navigating the dashboard card
+        await tester.tap(iconFinder);
+        await tester.pump();
+        expect(opened, ['https://github.com/MEK-Org/rusa/issues/898']);
+        expect(selectedView, isFalse);
+        expect(store.focusedObligationId.value, isNull);
+
+        // Tapping card body focuses obligation
+        await tester.tap(find.text('Link button on card'));
+        await tester.pump();
+        expect(selectedView, isTrue);
+        expect(store.focusedObligationId.value, 'ob-898');
+      },
+    );
+
+    testWidgets('omits external link icon button when externalRef is absent', (
+      tester,
+    ) async {
+      final store = DashboardStore(api: FakeApi(), stream: FakeStream());
+      await tester.pumpWidget(
+        _host(
+          ObligationRow(
+            obligation: makeObligation('ob-no-ref', title: 'No external ref'),
+            store: store,
+          ),
+        ),
+      );
+
+      expect(find.byIcon(Icons.open_in_new), findsNothing);
+      expect(find.text('Reference: '), findsNothing);
+    });
+  });
+
+  group('referenceUrl', () {
+    test('converts GitHub references to canonical web URLs', () {
+      expect(
+        referenceUrl('github:MEK-Org/rusa/issues/898'),
+        'https://github.com/MEK-Org/rusa/issues/898',
+      );
+      expect(
+        referenceUrl('github:MEK-Org/rusa/pulls/871'),
+        'https://github.com/MEK-Org/rusa/pull/871',
+      );
+      expect(
+        referenceUrl('github:MEK-Org/rusa/issues/898/comments/12345'),
+        'https://github.com/MEK-Org/rusa/issues/898#issuecomment-12345',
+      );
+      expect(
+        referenceUrl('github:MEK-Org/rusa/pulls/871/comments/67890'),
+        'https://github.com/MEK-Org/rusa/pull/871#discussion_r67890',
+      );
+      expect(
+        referenceUrl('github:MEK-Org/rusa/pulls/871/reviews/5401'),
+        'https://github.com/MEK-Org/rusa/pull/871#pullrequestreview-5401',
+      );
+      expect(
+        referenceUrl('github:MEK-Org/rusa/branches/feature'),
+        'https://github.com/MEK-Org/rusa/tree/feature',
+      );
+      expect(
+        referenceUrl('github:MEK-Org/rusa'),
+        'https://github.com/MEK-Org/rusa',
+      );
+      expect(referenceUrl('github:MEK-Org'), 'https://github.com/MEK-Org');
+      expect(
+        referenceUrl('github:MEK-Org/rusa#345'),
+        'https://github.com/MEK-Org/rusa/issues/345',
+      );
+    });
+
+    test('converts Slack references to web URLs', () {
+      expect(
+        referenceUrl('slack:channels/C123'),
+        'https://app.slack.com/archives/C123',
+      );
+      expect(
+        referenceUrl('slack:channels/C123/messages/1720000000.000001'),
+        'https://app.slack.com/archives/C123/p1720000000000001',
+      );
+    });
+
+    test('passes through raw http/https URLs', () {
+      expect(
+        referenceUrl('https://github.com/MEK-Org/rusa/issues/898'),
+        'https://github.com/MEK-Org/rusa/issues/898',
+      );
+    });
+
+    test('returns null for unsupported schemes or empty strings', () {
+      expect(referenceUrl(null), isNull);
+      expect(referenceUrl(''), isNull);
+      expect(referenceUrl('   '), isNull);
+      expect(referenceUrl('mesh:messages/uuid'), isNull);
     });
   });
 
