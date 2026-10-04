@@ -21,10 +21,10 @@ Whitespace makes the terminal summary and added evidence readable; these are
 representative synthetic notices, not production observations. Other evicted
 network/composite terms use the same evidence format. Large non-whitespace tails
 can fill the existing last-800-character failure summary. No widget/layout/style,
-schema or wire change. Numeric omission labels can themselves affect the existing
-loose `5`/`hour`/`limit` rule; matched-fact preservation compares original raw
-facts with the raw tail, and does not promise whole formatted-output equivalence
-or remote-classifier equivalence. Matt's personal appearance approval remains required.
+schema or wire change. The deterministic fallback ignores the exact omitted-byte
+label line, so its count cannot satisfy the `429` or `5`/`hour`/`limit` rules.
+Matched-fact preservation compares original raw facts with the raw tail and does
+not promise remote-classifier equivalence. Matt's personal appearance approval remains required.
 
 Regenerate from the repository root with installed pnpm and a writable Flutter SDK:
 

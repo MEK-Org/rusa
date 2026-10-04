@@ -174,8 +174,17 @@ function matchingExhaustionRule(has: (term: string) => boolean): {
     : { classification: "unknown", terms: [] };
 }
 
+// Bounded raw capture labels its exact omitted-byte count. The count is our own
+// accounting, not provider text, so its digits must never satisfy the "429" or
+// "5"/"hour"/"limit" rules. Only this exact whole line is ignored.
+const OMITTED_DIAGNOSTIC_LABEL = /^\[Codex raw diagnostics: \d+ UTF-8 bytes omitted; tail\]$/gm;
+
+export function omittedDiagnosticLabel(omittedBytes: number): string {
+  return `[Codex raw diagnostics: ${omittedBytes} UTF-8 bytes omitted; tail]`;
+}
+
 export function deterministicExhaustionFallback(output: string): ExhaustionFallbackResult {
-  const lower = output.toLowerCase();
+  const lower = output.replace(OMITTED_DIAGNOSTIC_LABEL, "").toLowerCase();
   return matchingExhaustionRule((term) => lower.includes(term)).classification;
 }
 

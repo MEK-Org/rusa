@@ -23,6 +23,7 @@ import {
 import {
   deterministicExhaustionFallback,
   ExhaustionDiagnosticMatcher,
+  omittedDiagnosticLabel,
 } from "./exhaustion-classifier.js";
 import {
   formatLiveError,
@@ -524,15 +525,15 @@ export class CodexProvider implements CodingProvider {
         diagnosticTail = tail.subarray(start).toString("utf8");
         if (chunks) chunks.splice(0, chunks.length, diagnosticTail);
       };
-      const diagnosticOutput = (
+      const diagnosticOutput = ({
         label = false,
         preserveExhaustion = false,
-        preserveAuth = false
-      ): string => {
+        preserveAuth = false,
+      } = {}): string => {
         const omitted = diagnosticBytes - Buffer.byteLength(diagnosticTail);
         let output =
           label || omitted > 0
-            ? `[Codex raw diagnostics: ${omitted} UTF-8 bytes omitted; tail]\n${diagnosticTail}`
+            ? `${omittedDiagnosticLabel(omitted)}\n${diagnosticTail}`
             : diagnosticTail;
         // Failed raw fallbacks retain exhaustion facts, including interruption.
         // Parsed semantic output keeps its authority; cancellation skips the
@@ -756,7 +757,7 @@ export class CodexProvider implements CodingProvider {
         flushStderr();
         const output = [
           ...assistantTexts,
-          diagnosticOutput(true, assistantTexts.length === 0),
+          diagnosticOutput({ label: true, preserveExhaustion: assistantTexts.length === 0 }),
         ].join("\n");
         return buildResultWithSession({
           ...termination,
@@ -798,7 +799,10 @@ export class CodexProvider implements CodingProvider {
           const outputText =
             assistantTexts.length > 0
               ? assistantTexts.join("\n")
-              : diagnosticOutput(false, exitCode !== 0, exitCode !== 0);
+              : diagnosticOutput({
+                  preserveExhaustion: exitCode !== 0,
+                  preserveAuth: exitCode !== 0,
+                });
           // Auth-fail alarm: if the run fails with an auth error, alert the operator.
           if (exitCode !== 0 && isCodexAuthFailure(outputText)) {
             console.error("\n=======================================================");

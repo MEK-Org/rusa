@@ -1,22 +1,22 @@
 {
   "baseline": "a06afc8b8cea58fa789688eafa1ccd79c194fef0",
-  "amendedFrom": "758be6698bce5cf748dbfc72ae79a1b4b42f2d12",
+  "amendedFrom": "c437df485251f3fc45fb1995884dcb59a1a8772d",
   "viewports": {
     "wide": [1100, 800],
     "narrow": [390, 844]
   },
   "pixelRatio": 2,
   "sourceBlobs": {
-    "packages/rusa/src/providers/codex.ts": "58fa13fd6dcdb803fd83e893b9306fecdd75511c",
-    "packages/rusa/src/providers/exhaustion-classifier.ts": "7573aa3bf7e7be28df1809831070e7e6f5d90f62",
+    "packages/rusa/src/providers/codex.ts": "986a426e03b4f519021c51c642baf26ff28034a8",
+    "packages/rusa/src/providers/exhaustion-classifier.ts": "b6a06a13e05174d371ca13801908b59a01a77749",
     "packages/rusa/src/actor/failure-sink.ts": "91009187a50c898ede8d69d40fd2a6c0e6a86558",
     "packages/rusa/flutter_dashboard/lib/widgets/inbox_tab.dart": "47b93e7a4ff50e2f39788805306197f17c795ef5"
   },
   "files": [
     {
       "name": "README.md",
-      "bytes": 2540,
-      "sha256": "5c9e4a6673e721c8aece6f1adebbbfe6caf643d38eeab5687d66cf160cd2a1e3"
+      "bytes": 2548,
+      "sha256": "6f525362ddd3281165178a57fcf550fb24920992f2719bd92cca7197eb298052"
     },
     {
       "name": "appearance_test.dart.fixture",

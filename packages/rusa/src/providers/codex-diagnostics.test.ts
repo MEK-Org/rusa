@@ -148,6 +148,30 @@ describe("Codex bounded raw diagnostics (#883)", () => {
     }
   });
 
+  it.each([
+    { path: "exit", omitted: 196429, tail: "" },
+    { path: "interrupt", omitted: 150000, tail: "\nretry after an hour if the limit holds\n" },
+  ])("keeps the omitted-byte count out of deterministic classification ($path)", async ({
+    path,
+    omitted,
+    tail,
+  }) => {
+    // Neither stream contains "429" or "5"; only the count would add them.
+    const run = start();
+    const input = "y".repeat(omitted + BUDGET - tail.length) + tail;
+    expect(deterministicExhaustionFallback(input)).toBe("unknown");
+    run.child.stderr.emit("data", Buffer.from(input));
+    if (path === "exit") run.child.emit("close", 1);
+    else run.controller.abort("interrupt:fixture-operator");
+    const result = await run.result;
+    expect(result.output).toContain(
+      `[Codex raw diagnostics: ${omitted} UTF-8 bytes omitted; tail]`
+    );
+    assertTail(result.output, input);
+    expect(deterministicExhaustionFallback(result.output)).toBe("unknown");
+    expect(await classifyRunExhaustion(result)).toEqual({ exhausted: false });
+  });
+
   it("preserves normal semantic output larger than the diagnostic budget and exact prompt", async () => {
     const run = start();
     const text = "semantic 🦊\n".repeat(BUDGET / 4);
