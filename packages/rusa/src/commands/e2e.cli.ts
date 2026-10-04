@@ -77,7 +77,7 @@ program
         throw new Error("both Slack token paths must be supplied together");
       }
       if (opts.followerBind && (!opts.followerTokenFile || opts.resume)) {
-        throw new Error("Follower prototype requires --follower-token-file and a fresh instance");
+        throw new Error("Follower gateway requires --follower-token-file and a fresh instance");
       }
       await runActorMeshE2EUp({
         root: opts.root,

@@ -1,4 +1,4 @@
-import { type Logger, nullLogger } from "../../observability/logger.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import type { FollowerInfo } from "./follower-hub.js";
 import type {
   FollowerUpdateAttempt,

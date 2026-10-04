@@ -1,7 +1,7 @@
-import { Actor } from "../../actor/actor.js";
-import type { RunStartE2EHooks } from "../../commands/start.js";
-import type { RusaConfig } from "../../config/types.js";
-import type { Logger } from "../../observability/logger.js";
+import { Actor } from "../actor/actor.js";
+import type { RunStartE2EHooks } from "../commands/start.js";
+import type { RusaConfig } from "../config/types.js";
+import type { Logger } from "../observability/logger.js";
 import { ActorHandle } from "./actor-handle.js";
 import type { FollowerHub } from "./follower-hub.js";
 

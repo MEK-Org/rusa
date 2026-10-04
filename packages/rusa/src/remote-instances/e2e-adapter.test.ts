@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { ActorOptions } from "../../actor/actor.js";
-import type { ActorFactoryContext } from "../../actor/actor-mesh.js";
-import type { RusaConfig } from "../../config/types.js";
-import type { RunResult } from "../../providers/types.js";
+import type { ActorOptions } from "../actor/actor.js";
+import type { ActorFactoryContext } from "../actor/actor-mesh.js";
+import type { RusaConfig } from "../config/types.js";
+import type { RunResult } from "../providers/types.js";
 import type { ActorHandle } from "./actor-handle.js";
 import { createProvider } from "./configured-provider.js";
 import { instanceWorkerFactory } from "./e2e-adapter.js";

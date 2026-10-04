@@ -4,11 +4,11 @@ import { join } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
-import { isSafeFollowerBind } from "../experimental/remote-instances/safe-bind.js";
 import { resolveErrorSink } from "../observability/error-sink.js";
 import { validateModelConfigPool } from "../providers/model-config.js";
 import { providerCapabilityName } from "../providers/provider-selection.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
+import { isSafeFollowerBind } from "../remote-instances/safe-bind.js";
 import { parseVoiceDefinitions } from "../voice/voice-catalog.js";
 import { validateDashboardAuth } from "./dashboard-auth.js";
 import {

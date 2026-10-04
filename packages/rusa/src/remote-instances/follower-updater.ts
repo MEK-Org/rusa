@@ -1,8 +1,8 @@
 import type { spawn } from "node:child_process";
 import { existsSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { type GitSeam, StepError } from "../../update/orchestrator.js";
-import { runTimedStep } from "../../update/runner.js";
+import { type GitSeam, StepError } from "../update/orchestrator.js";
+import { runTimedStep } from "../update/runner.js";
 import { isFullCommitSha, isSafeFollowerBranch } from "./follower-update-validation.js";
 import type { FollowerUpdateStatusEvent, FollowerUpdateStep } from "./protocol.js";
 

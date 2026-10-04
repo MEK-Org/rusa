@@ -1,14 +1,14 @@
-import { Actor } from "../../actor/actor.js";
-import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
-import type { ComputerUseLock } from "../../actor/computer-use-lock.js";
+import { Actor } from "../actor/actor.js";
+import { createActorLifecycle } from "../actor/actor-lifecycle.js";
+import type { ComputerUseLock } from "../actor/computer-use-lock.js";
 import {
   RunStartCancelledError,
   type RunStartHandle,
   RunStartStaleProviderError,
-} from "../../actor/concurrency-limiter.js";
-import type { ActorRunMode } from "../../actor/trigger-runner.js";
-import type { ProviderModelConfig, RawProviderModelConfig } from "../../providers/model-config.js";
-import type { CodingProvider, McpServerSpec } from "../../providers/types.js";
+} from "../actor/concurrency-limiter.js";
+import type { ActorRunMode } from "../actor/trigger-runner.js";
+import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
+import type { CodingProvider, McpServerSpec } from "../providers/types.js";
 import {
   type ActorEvent,
   type Bootstrap,

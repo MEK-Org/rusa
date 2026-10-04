@@ -171,9 +171,6 @@ import type {
 } from "../db/repositories/obligation-repository.js";
 import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
-import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
-import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
-import { FollowerUpdateTriggerStore } from "../experimental/remote-instances/follower-update-trigger-store.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitops/issue-client.js";
 import { initEmptyBareRepo } from "../gitops/worktree.js";
@@ -284,6 +281,9 @@ import {
 import { type MissedQuotaWindow, MissedQuotaWindowDetector } from "../quota/missed-windows.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
+import { FollowerHub } from "../remote-instances/follower-hub.js";
+import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 import { constructActorFromInvocation } from "../runtime/actor-invocation.js";
 import {
@@ -685,7 +685,11 @@ export interface RunStartE2EHandles {
 export interface RunStartE2EHooks {
   /** Emulator boundary supplied only by the disposable e2e launcher. */
   dashboardAuth?: DashboardAuth;
-  /** Experimental execution seam; production always constructs a local Actor. */
+  /**
+   * Worker-construction override for e2e runs. Without it, production uses the
+   * follower gateway's factory when followers are configured (remote handles for
+   * placed actors, local Actors otherwise) and a local Actor when they are not.
+   */
   createWorkerActor?: (context: ActorFactoryContext, options: ActorOptions) => MeshActor;
   chatClient?: ChatClient;
   chatSource?: ChatSource;
@@ -2705,8 +2709,8 @@ async function composeStart(
     actors,
     principals: getRepositories().principals,
     rootId,
-    // Placement exists when an experimental remote-instance seam or follower gateway
-    // is wired. Unknown or disconnected targets fail closed.
+    // Placement exists when an e2e worker-construction override or the follower
+    // gateway is wired. Unknown or disconnected targets fail closed.
     supportsExecutionTarget: opts?.e2e?.createWorkerActor
       ? () => true
       : followerHub

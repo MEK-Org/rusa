@@ -5,8 +5,8 @@ import {
   request as proxyRequest,
   type ServerResponse,
 } from "node:http";
-import { type Logger, nullLogger } from "../../observability/logger.js";
-import type { McpServerSpec } from "../../providers/types.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
+import type { McpServerSpec } from "../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
 import { EventTransferReceiver, type EventTransferStep } from "./follower-event-transfer.js";
 import {
@@ -196,7 +196,7 @@ export class FollowerHub {
     this.reconciler?.arm();
   }
   async listen(host: string, port: number): Promise<string> {
-    // Never accidentally expose the prototype on every public interface.
+    // Never accidentally expose the follower gateway on every public interface.
     if (!isSafeFollowerBind(host)) {
       throw new Error("Bind the follower gateway to loopback or a Tailscale IPv4 address");
     }

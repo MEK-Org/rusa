@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Actor } from "../actor/actor.js";
-import { waitUntil } from "../experimental/remote-instances/harness.js";
+import { waitUntil } from "../remote-instances/harness.js";
 import { CodexProvider, listEffectiveCodexMcpServers } from "./codex.js";
 import { classifyRunExhaustion } from "./exhaustion-classifier.js";
 

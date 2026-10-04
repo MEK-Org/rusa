@@ -6,7 +6,7 @@ import { createServer, request as httpRequest, type ServerResponse } from "node:
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { beforeAll, expect, it } from "vitest";
-import type { Logger } from "../../observability/logger.js";
+import type { Logger } from "../observability/logger.js";
 import { FollowerHub } from "./follower-hub.js";
 import { waitUntil } from "./harness.js";
 import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";

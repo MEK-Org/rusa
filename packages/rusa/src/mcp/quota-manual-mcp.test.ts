@@ -8,8 +8,6 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
-import { INSTANCE_PROTOCOL_VERSION } from "../experimental/remote-instances/protocol.js";
 import {
   type ManualReadingRequest,
   type ManualReadingResult,
@@ -21,6 +19,8 @@ import {
 } from "../quota/coordinator-protocol.js";
 import { QuotaCoordinatorService } from "../quota/coordinator-service.js";
 import { SharedQuotaStore } from "../quota/shared-store.js";
+import { FollowerHub } from "../remote-instances/follower-hub.js";
+import { INSTANCE_PROTOCOL_VERSION } from "../remote-instances/protocol.js";
 import {
   buildGrantableServers,
   type GrantableServerDeps,

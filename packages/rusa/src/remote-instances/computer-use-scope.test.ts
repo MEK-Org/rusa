@@ -2,15 +2,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Actor } from "../../actor/actor.js";
-import { InMemoryCapabilityGrantStore } from "../../actor/capability-grants.js";
+import { Actor } from "../actor/actor.js";
+import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
 import {
   COMPUTER_USE_CAPABILITY,
   ComputerUseLock,
   createComputerUseAdmission,
-} from "../../actor/computer-use-lock.js";
-import { ProviderPacer } from "../../actor/provider-pacer.js";
-import type { CodingProvider, RunOptions, RunResult } from "../../providers/types.js";
+} from "../actor/computer-use-lock.js";
+import { ProviderPacer } from "../actor/provider-pacer.js";
+import type { CodingProvider, RunOptions, RunResult } from "../providers/types.js";
 import { createHarness, waitUntil } from "./harness.js";
 
 const dirs: string[] = [];
