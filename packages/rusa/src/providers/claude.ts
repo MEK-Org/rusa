@@ -140,8 +140,9 @@ export class ClaudeProvider implements CodingProvider {
       sessionArg = { id: sessionId, resume: Boolean(opts.session.id) };
     }
 
+    const launchPrompt = sanitizeArgvText(opts.prompt);
     const args = buildClaudeArgs({
-      prompt: opts.prompt,
+      prompt: launchPrompt,
       model: this.model,
       effort: this.effort,
       session: sessionArg,
@@ -281,6 +282,7 @@ export class ClaudeProvider implements CodingProvider {
     };
 
     return runSubprocess({
+      onSpawn: () => opts.onPromptLaunched?.(launchPrompt),
       command: spawnCommand,
       args: spawnArgs,
       cwd: spawnCwd,

@@ -2618,6 +2618,9 @@ async function composeStart(
       },
     });
     lifecycle.add({
+      onPrompt: (event) => {
+        getRepositories().runPrompts.recordForActor(id, event.runId, event.prompt);
+      },
       onQueued: (event) => {
         mesh.recordEvent({
           kind: "run_queued",
@@ -4130,6 +4133,7 @@ async function composeStart(
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,
           actorRuns: getRepositories().actorRuns,
+          runPrompts: getRepositories().runPrompts,
           inboxFocus: getRepositories().inboxFocus,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,
@@ -4588,6 +4592,11 @@ async function composeStart(
     handle.unref?.();
     resources.acquire(resource, () => clearInterval(handle));
   };
+  const pruneRunPrompts = () => {
+    getRepositories().runPrompts.prune();
+  };
+  pruneRunPrompts();
+  everyInterval("run prompt retention", pruneRunPrompts, 60 * 60 * 1000);
   // The interval handle says nothing about a probe already in flight, so keep
   // both a way to stop one (the signal) and a way to wait for it (the promise).
   // Acquired before the probe interval, so the interval stops first and no new

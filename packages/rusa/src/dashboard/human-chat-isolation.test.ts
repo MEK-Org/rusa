@@ -3,14 +3,17 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import Database from "better-sqlite3";
 import type { DecodedIdToken } from "firebase-admin/auth";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { createActorRunModelConfig } from "../db/repositories/actor-run-model-config.js";
+import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
@@ -89,8 +92,10 @@ describe("human chat isolation (#590)", () => {
   let auth: DashboardAuth;
   let server: ReturnType<typeof createServer>;
   let origin: string;
+  let deps: DashboardDataDeps;
   let alice: Person;
   let bob: Person;
+  let firebase: ConstructorParameters<typeof DashboardAuth>[1];
   /** Session cookie → the person it authenticates. */
   const cookies = new Map<string, Person>();
 
@@ -143,7 +148,7 @@ describe("human chat isolation (#590)", () => {
       ["alice-token", alice],
       ["bob-token", bob],
     ]);
-    const firebase = {
+    firebase = {
       verifyIdToken: async (value: string) => {
         const who = byIdToken.get(value);
         if (!who) throw new Error("unknown id token");
@@ -197,8 +202,9 @@ describe("human chat isolation (#590)", () => {
       },
       getSelection: () => undefined,
     };
-    const deps: DashboardDataDeps = {
+    deps = {
       actors,
+      runPrompts: new RunPromptRepository(db),
       principals,
       meshEvents,
       meshChat,
@@ -300,6 +306,100 @@ describe("human chat isolation (#590)", () => {
       moreInboxItemsCount?: number;
     }>;
   };
+
+  it("#866 withholds complete launch prompts from both allowedEmails viewers", async () => {
+    const a = await login(alice);
+    const b = await login(bob);
+    const runs = new ActorRunRepository(db);
+    const prompts = new RunPromptRepository(db);
+    const runId = runs.start({
+      actorId: ACTOR,
+      modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
+    });
+    const prompt = `# Synthetic charter\n\n  Preserve whitespace ✓\r\n${"x".repeat(300_000)}`;
+    prompts.recordForActor(ACTOR, runId, prompt);
+    meshEvents.record({ kind: "run_start", actorId: ACTOR, payload: JSON.stringify({ runId }) });
+    const path = `/api/mesh/runs/${runId}/prompt`;
+    const anonymous = await fetch(origin + path);
+    expect(anonymous.status).toBe(401);
+    expect(await anonymous.text()).not.toContain("Synthetic charter");
+    for (const cookie of [a.cookie, b.cookie]) {
+      const response = await fetch(origin + path, { headers: { Cookie: cookie } });
+      expect(response.status).toBe(404);
+      const unavailable = await response.text();
+      expect(unavailable).toBe(JSON.stringify({ error: "prompt not retained" }));
+      expect(unavailable).not.toContain(prompt);
+      expect(unavailable).not.toContain("provider");
+      expect(unavailable).not.toContain("createdAt");
+      const missing = await fetch(origin + "/api/mesh/runs/pre-feature/prompt", {
+        headers: { Cookie: cookie },
+      });
+      expect(missing.status).toBe(404);
+      expect(await missing.text()).toBe(unavailable);
+    }
+    expect(prompts.getById(runId)?.prompt).toBe(prompt);
+    const feed = await fetch(`${origin}/api/mesh/events?actors=${ACTOR}`, {
+      headers: { Cookie: a.cookie },
+    });
+    expect(JSON.stringify(await feed.json())).not.toContain("Synthetic charter");
+  });
+
+  it("#866 serves exact bytes through sole-email auth and the supported auth-disabled local path", async () => {
+    // Engineering boundary: #866 comment5972967230; no multi-human exception to #590.
+    // Rebuild this fixture as a real sole-email instance: authenticator and options agree.
+    await auth.close();
+    const soleEmail = { firebase: firebaseConfig, email: alice.email };
+    auth = new DashboardAuth(
+      soleEmail,
+      firebase,
+      new DashboardIdentityResolver(() => principals, PROJECT),
+      () => now
+    );
+    server.removeAllListeners("request");
+    server.on(
+      "request",
+      createDashboardRequestHandler({ port: 0, auth: soleEmail }, deps, null, auth)
+    );
+    const a = await login(alice);
+    expect((await post("/api/auth/session", { idToken: "bob-token" })).status).toBe(401);
+    const runId = new ActorRunRepository(db).start({
+      actorId: ACTOR,
+      modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
+    });
+    const prompt = `# Synthetic charter\n\n  Preserve whitespace ✓\r\n${"x".repeat(300_000)}`;
+    const prompts = new RunPromptRepository(db);
+    prompts.recordForActor(ACTOR, runId, prompt);
+    const path = `/api/mesh/runs/${runId}/prompt`;
+    expect((await fetch(origin + path)).status).toBe(401);
+    const authenticated = await fetch(origin + path, { headers: { Cookie: a.cookie } });
+    expect(authenticated.status).toBe(200);
+    expect(await authenticated.json()).toEqual({ prompt });
+    // Incomplete authenticated adapters refuse before touching retained prompt storage.
+    const config = Object.getOwnPropertyDescriptor(auth, "config");
+    const readPrompt = vi.spyOn(prompts, "getById");
+    Object.defineProperty(auth, "config", { value: undefined, configurable: true });
+    try {
+      expect((await fetch(origin + path, { headers: { Cookie: a.cookie } })).status).toBe(404);
+      expect(readPrompt).not.toHaveBeenCalled();
+    } finally {
+      if (config) Object.defineProperty(auth, "config", config);
+      readPrompt.mockRestore();
+    }
+    // Replace only this isolated fixture's request handler; Alice is its sole durable user.
+    server.removeAllListeners("request");
+    server.on("request", createDashboardRequestHandler({ port: 0 }, deps));
+    const local = await fetch(origin + path);
+    expect(local.status).toBe(200);
+    expect(await local.json()).toEqual({ prompt });
+    // A second active user leaves auth-disabled mode unable to identify its viewer.
+    principals.createUser({ email: "second@example.com", createdAt: new Date(now).toISOString() });
+    const ambiguous = await fetch(origin + path);
+    expect(ambiguous.status).toBe(404);
+    const unavailable = await ambiguous.text();
+    expect(unavailable).toBe(JSON.stringify({ error: "prompt not retained" }));
+    expect(unavailable).not.toContain("Synthetic charter");
+    expect(prompts.getById(runId)?.prompt).toBe(prompt);
+  });
 
   /** Two humans each talk to the actor and the actor answers each of them. */
   async function seedBothConversations(a: { cookie: string; id: string }, b: typeof a) {

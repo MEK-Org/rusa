@@ -43,6 +43,8 @@ export interface SessionSpec {
 export interface RunOptions {
   /** The prompt/task description to send to the agent */
   prompt: string;
+  /** Observes the exact post-adapter argv prompt after a subprocess launches. */
+  onPromptLaunched?: (prompt: string) => void;
   /** Working directory for the agent subprocess */
   cwd: string;
   /** Timeout in milliseconds (default: 10 minutes) */

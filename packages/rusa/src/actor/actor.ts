@@ -752,9 +752,18 @@ export class Actor {
     // boundary), then read by this closure when the gated invoke actually runs.
     let built: PromptBuild;
     const runProvider = async (provider: CodingProvider): Promise<RunResult> => {
+      const runId = this.currentRunId;
       await this.opts.onProviderAttempt?.(provider);
       return provider.run({
         prompt: built.prompt,
+        onPromptLaunched: (prompt) => {
+          if (runId)
+            void this.lifecycle.emit("onPrompt", {
+              actorId: this.id,
+              runId,
+              prompt,
+            });
+        },
         cwd: this.opts.cwd,
         // Continue this actor's own session (id undefined on first run → created).
         session: { id: sessionId },

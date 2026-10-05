@@ -1118,6 +1118,17 @@ class MeshEvent {
     return null;
   }
 
+  /// The immutable run id from this run-start receipt.
+  String? get runId {
+    if (kind != 'run_start' || payload == null) return null;
+    try {
+      final id = (jsonDecode(payload!) as Map<String, dynamic>)['runId'];
+      return id is String && id.isNotEmpty ? id : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// The concrete model that actually started this run. Older run_start rows
   /// predate launch metadata and deliberately return null rather than guessing
   /// from the actor's current configuration.

@@ -25,6 +25,7 @@ import {
   type ObligationRepository,
 } from "../db/repositories/obligation-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import type { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import {
   type Obligation,
@@ -85,6 +86,7 @@ export interface DashboardDataDeps {
   inbox?: InboxRepository;
   /** Completed selection intervals used only to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
+  runPrompts?: RunPromptRepository;
   /** Durable per-entry obligation associations for activity correlation. */
   inboxFocus?: InboxFocusRepository;
   sseHub: SseHub;
@@ -2125,6 +2127,18 @@ export async function handleMeshApiRequest(
       humanViewerIds,
     });
     sendJson(res, 200, page);
+    return true;
+  }
+
+  // Complete launch text is fetched on demand through the existing dashboard access path.
+  const runPromptMatch = /^\/api\/mesh\/runs\/([^/]+)\/prompt$/.exec(pathname);
+  if (runPromptMatch && req.method === "GET") {
+    const retained = deps.runPrompts?.getById(decodeURIComponent(runPromptMatch[1]));
+    if (!retained) {
+      sendJson(res, 404, { error: "prompt not retained" });
+      return true;
+    }
+    sendJson(res, 200, { prompt: retained.prompt });
     return true;
   }
 
