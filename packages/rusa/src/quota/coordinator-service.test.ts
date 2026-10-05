@@ -11,6 +11,7 @@ import {
   COORDINATOR_PROTOCOL_MAJOR,
   COORDINATOR_PROTOCOL_MINOR,
   calculateFreshness,
+  closedGoverningWindow,
   DEFAULT_HARD_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
@@ -817,6 +818,124 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(client.getLastPublishedStatus("claude")?.freshness).toMatchObject({ hardStale: false });
     expect(client.getLastAppliedInterval("claude")).toBe(recovered);
     expect(pacer.interval).toBe((recovered ?? 0) * 1000);
+  });
+
+  it("detects a closed provider-wide governing window only past its reset on a hard-stale whole lane (#794)", () => {
+    const resetMs = Date.parse("2040-01-01T00:00:00.000Z");
+    const observedAt = new Date(resetMs - 2 * 60 * 60_000).toISOString();
+    const bucket = {
+      key: "claude:weekly",
+      percentLeft: 50,
+      timeRemainingPct: 50,
+      error: 0,
+      derivative: 0,
+      requiredIntervalSeconds: 300,
+      resetAtIso: new Date(resetMs).toISOString(),
+      observedAt,
+    };
+    const stored: PersistedQuotaProviderStatus = {
+      provider: "claude",
+      intervalSeconds: 300,
+      uncappedIntervalSeconds: 300,
+      governingBucketKey: "claude:weekly",
+      capped: false,
+      expired: false,
+      exhaustedUntil: null,
+      updatedAt: observedAt,
+      buckets: [bucket],
+    };
+    const options = { maxIntervalSeconds: 3600, hardStaleAfterMs: 60 * 60_000 };
+    const at = (status: PersistedQuotaProviderStatus, nowMs: number) => {
+      const published = publishedThrottle(status, { ...options, nowMs });
+      return {
+        interval: published.intervalSeconds,
+        closed: closedGoverningWindow(published, nowMs),
+      };
+    };
+
+    // Hard-stale but the window is still open: retained interval, no close.
+    expect(at(stored, resetMs - 1)).toEqual({ interval: 300, closed: null });
+    // The reset passes with no newer reading: the ceiling is published as
+    // before, and the close is now detectable.
+    expect(at(stored, resetMs)).toEqual({ interval: 3600, closed: bucket });
+
+    // A reset that passed before the lane went hard-stale is not yet a close.
+    const recent = new Date(resetMs - 10 * 60_000).toISOString();
+    expect(
+      at({ ...stored, updatedAt: recent, buckets: [{ ...bucket, observedAt: recent }] }, resetMs)
+    ).toEqual({ interval: 300, closed: null });
+    // A newer scrape that omitted only the governing window is the partial
+    // case, and a governing window with no reset has nothing to close.
+    expect(at({ ...stored, updatedAt: recent }, resetMs + 60 * 60_000).closed).toBeNull();
+    expect(
+      at({ ...stored, buckets: [{ ...bucket, resetAtIso: null }] }, resetMs).closed
+    ).toBeNull();
+  });
+
+  it("reports the same closed window to a client whether the scrapes after it failed or went missing (#794)", async () => {
+    // The store only reasons over windows that have not reset yet, so the
+    // readings are recorded first and the coordinator's clock is then moved.
+    const nowMs = Date.now();
+    const resetMs = nowMs + 30 * 60_000;
+    const resetAtIso = new Date(resetMs).toISOString();
+    const windowMs = 7 * 24 * 60 * 60_000;
+    store.configureController({ maxIntervalSeconds: 3600 });
+    for (let offset = 5; offset >= 0; offset -= 1) {
+      const observedMs = nowMs - 3 * 60 * 60_000 - offset * 5 * 60_000;
+      const scrapedAt = new Date(observedMs).toISOString();
+      const percentLeft = ((resetMs - observedMs) / windowMs) * 100 - 2;
+      const state: ProviderQuotaSnapshot = {
+        provider: "claude",
+        status: "available",
+        scrapedAt,
+        limits: [{ kind: "weekly", label: "Weekly", percentLeft, resetAtIso }],
+      };
+      const id = store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "fixture" });
+      store.recordParsed(id, state, state);
+    }
+
+    let clockMs = resetMs - 60_000;
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+      now: () => clockMs,
+      maxIntervalSeconds: 3600,
+      hardStaleAfterMs: 60 * 60_000,
+    });
+    await service.start();
+    const client = new QuotaCoordinatorClient({
+      socketPath,
+      maxIntervalSeconds: 3600,
+      now: () => clockMs,
+    });
+    const read = async () => {
+      await client.getThrottle();
+      const status = client.getLastPublishedStatus("claude");
+      if (!status) throw new Error("no published status");
+      return status;
+    };
+
+    const open = await read();
+    expect(open.freshness.hardStale).toBe(true);
+    expect(closedGoverningWindow(open, clockMs)).toBeNull();
+
+    clockMs = resetMs + 60_000;
+    const missing = await read();
+    expect(missing.intervalSeconds).toBe(3600);
+    expect(closedGoverningWindow(missing, clockMs)).toMatchObject({
+      key: "claude:weekly",
+      resetAtIso,
+    });
+
+    // A failed probe leaves the stored reading, and so the close, as it was.
+    const failed = store.recordRaw({
+      provider: "claude",
+      scrapedAt: new Date(nowMs).toISOString(),
+      rawOutput: "fixture",
+    });
+    store.recordParseError(failed, new Error("unparseable"));
+    expect(await read()).toEqual(missing);
   });
 
   // Criterion 2: publishedThrottle equality and boundary pin.
