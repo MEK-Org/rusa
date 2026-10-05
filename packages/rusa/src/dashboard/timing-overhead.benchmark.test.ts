@@ -40,7 +40,7 @@ function p95(values: number[]): number {
   return sorted[Math.ceil(sorted.length * 0.95) - 1] ?? 0;
 }
 
-function measureBatch(timings: DashboardTimingRecorder | undefined): number {
+function measureBatch(timings?: DashboardTimingRecorder): number {
   const started = performance.now();
   for (let index = 0; index < BATCH_SIZE; index += 1) {
     const response = new BenchResponse();
