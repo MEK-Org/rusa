@@ -33,6 +33,7 @@ import {
   seedConfiguredActorGrants,
 } from "../actor/administrative-capabilities.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
+import { AvailabilityHolds } from "../actor/availability-holds.js";
 import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import {
@@ -1643,12 +1644,40 @@ async function composeStart(
   // Emergency brake: the single source of truth is the sentinel file. Halt by
   // hand (`touch ~/.rusa/HALT`), by chat (`/halt`), or pull the plug.
   const haltSwitch = new HaltSwitch(join(mcHome, "HALT"));
+  // Availability holds (#539) take a provider lane, or some of its models, out
+  // of selection without editing any pool. They are durable in mesh.db and
+  // compose with the brake: a candidate is blocked when either covers it.
+  // The callbacks run only once the mesh is up (holds change through MCP or
+  // chat, and the expiry timer is armed after `resumeAfterHalt` exists).
+  const availabilityHolds = new AvailabilityHolds({
+    repo: getRepositories().availabilityHolds,
+    onHeld: () => {
+      mesh.cancelHaltedQueuedRuns();
+    },
+    onReleased: () => {
+      const resumed = resumeAfterHalt();
+      console.warn(
+        `[mesh] ▶ availability hold lifted${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : ""}`
+      );
+    },
+  });
+  resources.acquire("availability hold expiry timer", () => availabilityHolds.stop());
   const rootProviderName = rootActor.provider;
-  const isProviderHalted = (providerName?: string, modelName?: string) =>
-    haltSwitch.isHalted(providerName ?? rootProviderName, modelName);
+  const isProviderHalted = (providerName?: string, modelName?: string) => {
+    const provider = providerName ?? rootProviderName;
+    return (
+      haltSwitch.isHalted(provider, modelName) || availabilityHolds.isHeld(provider, modelName)
+    );
+  };
   if (haltSwitch.hasActiveHalt()) {
     const why = haltSwitch.reason();
     console.warn(`[mesh] ⛔ HALT sentinel present${why ? ` (${why})` : ""} — runs are paused`);
+  }
+  for (const hold of availabilityHolds.list()) {
+    const scope = hold.model ? `${hold.provider}/${hold.model}` : hold.provider;
+    console.warn(
+      `[mesh] ⏸ availability hold on ${scope}${hold.expiry ? ` until ${hold.expiry}` : ""}`
+    );
   }
   // In-memory graceful-shutdown brake : the in-process `update` MCP tool
   // engages this (a direct call — no HTTP, no separate process) to quiesce the
@@ -3806,6 +3835,7 @@ async function composeStart(
     admissionQueue.refresh();
     return resumed;
   };
+  availabilityHolds.start();
   let haltExpiryTimer: ReturnType<typeof setTimeout> | null = null;
   resources.acquire("halt expiry timer", () => {
     if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
