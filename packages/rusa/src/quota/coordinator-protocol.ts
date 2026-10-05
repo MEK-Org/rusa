@@ -519,6 +519,37 @@ function wholeLaneReadingRetainsPacing(
   return governing.observedAt === stored.updatedAt;
 }
 
+/**
+ * The governing window of the lane's newest stored reading, when it carries a
+ * reset. A newer scrape that leaves only this bucket out is not a whole-lane
+ * missing reading, so it has none: that keeps the existing conservative
+ * partial-window election rule.
+ */
+function wholeLaneGoverningWindow(
+  stored: Omit<PersistedQuotaProviderStatus, "modelLanes">
+): PersistedQuotaBucketStatus | null {
+  if (!stored.governingBucketKey) return null;
+  const governing = stored.buckets.find((bucket) => bucket.key === stored.governingBucketKey);
+  if (!governing?.resetAtIso || governing.observedAt !== stored.updatedAt) return null;
+  return Number.isFinite(Date.parse(governing.resetAtIso)) ? governing : null;
+}
+
+/**
+ * The provider-wide governing window that has closed with no newer accepted
+ * reading (#794), or null: the whole lane is hard-stale and the governing
+ * window from its last reading has reset. Missing and failed scrapes look the
+ * same here, since neither replaces the stored reading. Detection only; it
+ * changes no published value.
+ */
+export function closedGoverningWindow(
+  status: Omit<PublishedThrottleProviderStatus, "modelLanes">,
+  nowMs: number
+): PersistedQuotaBucketStatus | null {
+  if (!status.freshness.hardStale) return null;
+  const governing = wholeLaneGoverningWindow(status);
+  return governing && Date.parse(governing.resetAtIso ?? "") <= nowMs ? governing : null;
+}
+
 /** The pacing a model-scoped lane set imposes on one concrete candidate model. */
 export interface ModelLanePacing {
   /** Longest interval among applicable lanes. */

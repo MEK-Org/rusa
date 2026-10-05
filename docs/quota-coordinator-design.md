@@ -1284,13 +1284,14 @@ sequenceDiagram
     Note over S: ... governing reset passes without a newer reading ...
     A->>S: GET /v1/throttle
     S-->>A: last interval, freshness.hardStale true (#794 retains throttle across reset)
-    Note over S: provider-wide retirement and alert are not implemented; #794 tracks them
+    A->>A: one system.quota_governing_window_closed alarm to root (#794)
 ```
 
 A whole provider lane whose readings stop or fail keeps its last reasoned interval
 through a hard-stale scrape, including across governing window reset (#794).
-The response remains truthfully hard-stale. Provider-wide alert after reset is tracked
-separately under #794. The service, not a client, is the only place that can distinguish
+The response remains truthfully hard-stale. Once that hard-stale lane's governing
+reset has passed, each instance raises one root alarm per close (#794); pacing is
+unchanged and the lane is not retired. The service, not a client, is the only place that can distinguish
 a failed scrape from a stable quota window, because a client sees an unchanging interval either way.
 
 ### 6.3 Service restart

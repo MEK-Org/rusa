@@ -1605,6 +1605,41 @@ describe("runStart webhook event routing (Phase 4)", () => {
         await close();
       }
     });
+
+    it("raises the window-close alarm for a provider already closed when the instance boots (#794)", async () => {
+      const updatedAt = new Date(Date.now() - 2 * 60 * 60_000).toISOString();
+      const status = throttleStatus("claude", { intervalSeconds: 3600, updatedAt });
+      const { close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => ({
+        claude: {
+          ...status,
+          buckets: status.buckets.map((bucket) => ({
+            ...bucket,
+            observedAt: updatedAt,
+            resetAtIso: new Date(Date.now() - 60_000).toISOString(),
+          })),
+          freshness: { ...status.freshness, stale: true, hardStale: true },
+        },
+      }));
+      try {
+        // The boot apply runs before the alarm is bound; the next one raises it.
+        await triggerQuotaThrottleTick();
+        await vi.waitFor(() =>
+          expect(
+            getRepositories()
+              .inbox.list("root")
+              .entries.filter(
+                (entry) =>
+                  (entry.payload as { type?: string }).type ===
+                  "system.quota_governing_window_closed"
+              )
+          ).toHaveLength(1)
+        );
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
   });
 
   it("keeps an in-progress coordinator history warmup from reading as authoritative empty history at readiness (#527)", async () => {

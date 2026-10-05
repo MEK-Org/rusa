@@ -272,6 +272,7 @@ import {
 } from "../quota/coordinator-client.js";
 import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
 import {
+  closedGoverningWindow,
   HISTORY_WINDOW_MS,
   isPublishedModelLane,
   type ModelLanePacing,
@@ -1813,6 +1814,39 @@ async function composeStart(
       }
     }
   };
+  // Providers whose governing window last applied as closed with no newer
+  // reading (#794). Each close is raised to root once, and a provider raises
+  // again only after a newer reading reopens it. Nothing is recorded before
+  // the alarm is bound, so a window already closed at boot still reaches root.
+  const closedGoverningWindowLanes = new Set<string>();
+  let raiseGoverningWindowClosedAlarm:
+    | ((closed: {
+        provider: string;
+        window: string;
+        resetAt: string | null;
+        lastReadingAt: string;
+      }) => void)
+    | null = null;
+  const noteGoverningWindowClosure = (
+    lane: string,
+    status: PublishedThrottleProviderStatus
+  ): void => {
+    const window = closedGoverningWindow(status, Date.now());
+    if (!window) {
+      closedGoverningWindowLanes.delete(lane);
+      return;
+    }
+    if (!raiseGoverningWindowClosedAlarm || closedGoverningWindowLanes.has(lane)) return;
+    closedGoverningWindowLanes.add(lane);
+    const closed = {
+      provider: lane,
+      window: window.key,
+      resetAt: window.resetAtIso,
+      lastReadingAt: status.updatedAt,
+    };
+    log.info("quota_governing_window_closed", closed);
+    raiseGoverningWindowClosedAlarm(closed);
+  };
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
     tick: QuotaThrottleTick,
@@ -1878,6 +1912,7 @@ async function composeStart(
     // Update the lanes before asking the shared admission list to re-scan them.
     applyThrottleStatusToPacer(pacer, status);
     applyModelLaneStatuses(providerName, status);
+    noteGoverningWindowClosure(providerName, status);
     const validModelLanes = Array.isArray(status.modelLanes)
       ? status.modelLanes.filter(isPublishedModelLane).map((lane) => ({
           models: [...lane.models],
@@ -4666,6 +4701,36 @@ async function composeStart(
           fallback: outcome,
           provider,
           model,
+        });
+      }
+    });
+  };
+
+  raiseGoverningWindowClosedAlarm = (closed) => {
+    const message =
+      `Quota window closed without a reading: ${closed.provider}'s governing window ` +
+      `"${closed.window}" reset at ${closed.resetAt}, and no quota reading has arrived since ` +
+      `${closed.lastReadingAt}. ${closed.provider} paces at the conservative ceiling until a ` +
+      "new reading arrives; check the scrapes to see why readings stopped.";
+    void deliverHostAlarm({
+      deliver: () =>
+        mesh.deliverExternalEvent({
+          sourceType: "timer",
+          rawResource: "system:events",
+          rawPayload: { type: "system.quota_governing_window_closed", ...closed, message },
+          priority: "responsive",
+          eventSummary: message,
+        }),
+      message,
+      sendToErrorChat,
+      log,
+      alarmName: "quota_governing_window_closed",
+    }).then((outcome) => {
+      if (outcome !== "delivered") {
+        log.warn("quota_governing_window_closed_not_delivered_to_mesh", {
+          fallback: outcome,
+          provider: closed.provider,
+          window: closed.window,
         });
       }
     });
