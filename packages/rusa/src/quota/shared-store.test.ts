@@ -81,7 +81,6 @@ describe("SharedQuotaStore schema v2 migration", () => {
       ).toEqual([
         "quota_manual_observation_receipts",
         "quota_observations",
-        "quota_parser_wording_pointers",
         "quota_parser_wording_revisions",
         "quota_provider_reading_modes",
         "quota_scrapes",
@@ -229,31 +228,6 @@ describe("SharedQuotaStore parser wording attribution (#536)", () => {
           source: "built_in",
         }))
       );
-    } finally {
-      store.close();
-    }
-  });
-
-  it("follows the provider's active pointer when one names a revision", () => {
-    const { store } = openStore();
-    try {
-      store.db
-        .prepare(
-          `INSERT INTO quota_parser_wording_revisions (id, provider, wording, source, created_at)
-           VALUES ('sha256:synthetic', 'kimi', 'Synthetic wording.\n', 'synthetic', '2030-01-01')`
-        )
-        .run();
-      store.db
-        .prepare(
-          `INSERT INTO quota_parser_wording_pointers (provider, active_revision_id, updated_at)
-           VALUES ('kimi', 'sha256:synthetic', '2030-01-01')`
-        )
-        .run();
-      expect(store.resolveParserWording("kimi")).toEqual({
-        revisionId: "sha256:synthetic",
-        text: "Synthetic wording.\n",
-      });
-      expect(store.resolveParserWording("agy").text).toBe(BUILT_IN_QUOTA_PARSER_WORDING.agy);
     } finally {
       store.close();
     }
@@ -591,7 +565,6 @@ describe("SharedQuotaStore canonical observations", () => {
       ).toEqual([
         "quota_manual_observation_receipts",
         "quota_observations",
-        "quota_parser_wording_pointers",
         "quota_parser_wording_revisions",
         "quota_provider_reading_modes",
         "quota_scrapes",
@@ -910,7 +883,6 @@ describe("SharedQuotaStore persisted controller", () => {
       ).toEqual([
         "quota_manual_observation_receipts",
         "quota_observations",
-        "quota_parser_wording_pointers",
         "quota_parser_wording_revisions",
         "quota_provider_reading_modes",
         "quota_scrapes",

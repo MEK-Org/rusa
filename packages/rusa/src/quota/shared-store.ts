@@ -588,12 +588,6 @@ export class SharedQuotaStore {
         source TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS quota_parser_wording_pointers (
-        provider TEXT PRIMARY KEY,
-        active_revision_id TEXT REFERENCES quota_parser_wording_revisions(id),
-        previous_revision_id TEXT REFERENCES quota_parser_wording_revisions(id),
-        updated_at TEXT NOT NULL
-      );
     `);
       this.ensureColumnsInTransaction();
       this.registerBuiltInParserWordingInTransaction();
@@ -698,28 +692,24 @@ export class SharedQuotaStore {
 
   /**
    * The parser wording a parse should use, captured before extraction (#536).
-   * Built-in revisions are seeded during database open, then this follows the
-   * provider's active pointer when one is set.
-   * Nothing writes that pointer yet, so today every parse resolves to the
-   * built-in wording; the supervised activation path is a later slice. Any
-   * failure reading or writing the control records degrades to the built-in
-   * wording unattributed — a broken control table must never stop parsing.
+   * This attribution-only slice uses the seeded built-in wording only. Pointer
+   * lookup and activation belong to the later activation slice, where their
+   * writer and rollback semantics can be reviewed together. If the immutable
+   * revision record cannot be read, parsing keeps its built-in wording and
+   * records no revision.
    */
   resolveParserWording(provider: QuotaLlmProvider): QuotaParserWording {
     try {
       const builtIn = BUILT_IN_QUOTA_PARSER_WORDING[provider];
       const builtInId = quotaParserWordingRevisionId(provider, builtIn);
-      const active = this.db
+      const registered = this.db
         .prepare(
-          `SELECT r.id, r.wording
-           FROM quota_parser_wording_pointers p
-           JOIN quota_parser_wording_revisions r ON r.id = p.active_revision_id
-           WHERE p.provider = ? AND r.provider = p.provider`
+          `SELECT id FROM quota_parser_wording_revisions
+           WHERE id = ? AND provider = ? AND wording = ? AND source = 'built_in'`
         )
-        .get(provider) as { id: string; wording: string } | undefined;
-      return active
-        ? { revisionId: active.id, text: active.wording }
-        : { revisionId: builtInId, text: builtIn };
+        .get(builtInId, provider, builtIn) as { id: string } | undefined;
+      if (!registered) throw new Error("built-in parser wording revision is unavailable");
+      return { revisionId: builtInId, text: builtIn };
     } catch (error) {
       (this.logger ?? quotaStoreLogger()).warn("parser_wording_records_unreadable", {
         provider,

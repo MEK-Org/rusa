@@ -2950,56 +2950,10 @@ describe("quota MCP server", () => {
         expect(latestRevision()).toBeNull();
       });
 
-      it("sends one captured active wording and retains its revision through a pointer change", async () => {
-        const initial = { id: "sha256:synthetic-initial", text: "Synthetic initial wording.\\n" };
-        const replacement = {
-          id: "sha256:synthetic-replacement",
-          text: "Synthetic replacement wording.\\n",
-        };
-        for (const wording of [initial, replacement]) {
-          store.db
-            .prepare(
-              `INSERT INTO quota_parser_wording_revisions (id, provider, wording, source, created_at)
-               VALUES (?, 'claude', ?, 'synthetic', '2030-01-01')`
-            )
-            .run(wording.id, wording.text);
-        }
-        store.db
-          .prepare(
-            `INSERT INTO quota_parser_wording_pointers (provider, active_revision_id, updated_at)
-             VALUES ('claude', ?, '2030-01-01')`
-          )
-          .run(initial.id);
-        mockGenerateContent.mockImplementationOnce((request) => {
-          expect(
-            (request as { config: { systemInstruction: string } }).config.systemInstruction
-          ).toContain(initial.text);
-          store.db
-            .prepare(
-              `UPDATE quota_parser_wording_pointers
-               SET active_revision_id = ?, updated_at = '2030-01-02'
-               WHERE provider = 'claude'`
-            )
-            .run(replacement.id);
-          return Promise.resolve({
-            text: () => JSON.stringify({ status: "unknown", windows: [] }),
-          });
-        });
-
-        await probeClaude();
-
-        expect(latestRevision()).toBe(initial.id);
-        expect(store.resolveParserWording("claude")).toEqual({
-          revisionId: replacement.id,
-          text: replacement.text,
-        });
-      });
-
       it("keeps parsing with the built-in wording when the control records are unreadable", async () => {
         const warn = vi.fn();
         store.close();
         store = new SharedQuotaStore(join(root, "shared.db"), { ...nullLogger, warn });
-        store.db.exec("DROP TABLE quota_parser_wording_pointers");
         store.db.exec("DROP TABLE quota_parser_wording_revisions");
         mockGenerateContent.mockResolvedValue({
           text: () => JSON.stringify({ status: "unknown", windows: [] }),
