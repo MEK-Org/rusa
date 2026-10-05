@@ -20,13 +20,12 @@ export function roomEntryNoticeId(episodeId: string, actorId: string): string {
 /** The identity an enter request carries after authentication. */
 export interface RoomEntryClient {
   principalId: string;
-  clientId?: string;
-  sessionKey?: string;
 }
 
 export type RoomEntryEnterResult =
   | { status: "entered"; notified: true; episodeId: string }
-  | { status: "entered"; notified: false; reason: "cooldown"; remainingMs: number };
+  | { status: "entered"; notified: false; reason: "cooldown"; remainingMs: number }
+  | { status: "unavailable"; reason: "notice delivery failed" };
 
 export interface RoomEntryServiceDeps {
   inbox: Pick<InboxRepository, "append">;
@@ -62,7 +61,6 @@ export class RoomEntryService {
       return { status: "entered", notified: false, reason: "cooldown", remainingMs };
     }
 
-    this.lastNotifiedAt.set(client.principalId, now);
     const episodeId = randomUUID();
     const enteredAt = new Date(now).toISOString();
     const participants = this.deps.roster();
@@ -87,14 +85,13 @@ export class RoomEntryService {
         this.deps.inbox.append(inputs);
       } catch (err) {
         this.deps.log?.(`failed to append room entry notices: ${String(err)}`);
+        return { status: "unavailable", reason: "notice delivery failed" };
       }
     }
 
+    // Only a delivered notice starts the retry cooldown. A failed append must
+    // leave the next entry attempt eligible to notify its recipients.
+    this.lastNotifiedAt.set(client.principalId, now);
     return { status: "entered", notified: true, episodeId };
-  }
-
-  /** Reset in-memory cooldown state. */
-  reset(): void {
-    this.lastNotifiedAt.clear();
   }
 }

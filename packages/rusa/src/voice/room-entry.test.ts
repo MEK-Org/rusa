@@ -40,7 +40,7 @@ describe("RoomEntryService", () => {
 
   it("sends noninterrupting inbox notices to all roster participants on first enter", () => {
     const service = createService();
-    const result = service.enter({ principalId: "human-matt", clientId: "tab-1" });
+    const result = service.enter({ principalId: "human-matt" });
 
     expect(result.status).toBe("entered");
     expect(result.notified).toBe(true);
@@ -64,40 +64,42 @@ describe("RoomEntryService", () => {
     }
   });
 
-  it("suppresses notifications during the 5-minute cooldown", () => {
+  it.each([
+    {
+      name: "suppresses the same principal during the cooldown",
+      advanceMs: 60_000,
+      principalId: "human-matt",
+      expected: {
+        status: "entered",
+        notified: false,
+        reason: "cooldown",
+        remainingMs: ROOM_ENTRY_COOLDOWN_MS - 60_000,
+      },
+      appendCount: 2,
+    },
+    {
+      name: "keeps another principal independent",
+      advanceMs: 10_000,
+      principalId: "human-alice",
+      expected: { status: "entered", notified: true },
+      appendCount: 4,
+    },
+    {
+      name: "allows the same principal after cooldown expiry",
+      advanceMs: ROOM_ENTRY_COOLDOWN_MS,
+      principalId: "human-matt",
+      expected: { status: "entered", notified: true },
+      appendCount: 4,
+    },
+  ])("$name", ({ advanceMs, principalId, expected, appendCount }) => {
     const service = createService();
     const first = service.enter({ principalId: "human-matt" });
     expect(first.notified).toBe(true);
     expect(appends).toHaveLength(2);
 
-    // 1 minute later
-    clock += 60_000;
-    const second = service.enter({ principalId: "human-matt" });
-    expect(second).toEqual({
-      status: "entered",
-      notified: false,
-      reason: "cooldown",
-      remainingMs: ROOM_ENTRY_COOLDOWN_MS - 60_000,
-    });
-    expect(appends).toHaveLength(2); // no new appends
-
-    // 4 minutes later (5 minutes total from first enter)
-    clock += 240_000;
-    const third = service.enter({ principalId: "human-matt" });
-    expect(third.notified).toBe(true);
-    expect(appends).toHaveLength(4);
-  });
-
-  it("maintains independent cooldowns for distinct principals", () => {
-    const service = createService();
-    const matt = service.enter({ principalId: "human-matt" });
-    expect(matt.notified).toBe(true);
-    expect(appends).toHaveLength(2);
-
-    clock += 10_000;
-    const alice = service.enter({ principalId: "human-alice" });
-    expect(alice.notified).toBe(true);
-    expect(appends).toHaveLength(4);
+    clock += advanceMs;
+    expect(service.enter({ principalId })).toMatchObject(expected);
+    expect(appends).toHaveLength(appendCount);
   });
 
   it("handles empty roster without creating appends", () => {
@@ -107,12 +109,14 @@ describe("RoomEntryService", () => {
     expect(appends).toHaveLength(0);
   });
 
-  it("logs append errors without throwing", () => {
+  it("returns unavailable after an append error and permits a retry before the cooldown", () => {
     const log = vi.fn();
+    let failAppend = true;
     const service = new RoomEntryService({
       inbox: {
         append: () => {
-          throw new Error("disk full");
+          if (failAppend) throw new Error("disk full");
+          return [];
         },
       },
       roster: () => ["actor-1"],
@@ -121,24 +125,16 @@ describe("RoomEntryService", () => {
     });
 
     const result = service.enter({ principalId: "human-matt" });
-    expect(result.status).toBe("entered");
-    expect(result.notified).toBe(true);
+    expect(result).toEqual({ status: "unavailable", reason: "notice delivery failed" });
     expect(log).toHaveBeenCalledWith(
       expect.stringContaining("failed to append room entry notices: Error: disk full")
     );
-  });
 
-  it("clears cooldown on reset", () => {
-    const service = createService();
-    service.enter({ principalId: "human-matt" });
-    expect(appends).toHaveLength(2);
-
-    clock += 30_000;
-    expect(service.enter({ principalId: "human-matt" }).notified).toBe(false);
-
-    service.reset();
-    expect(service.enter({ principalId: "human-matt" }).notified).toBe(true);
-    expect(appends).toHaveLength(4);
+    failAppend = false;
+    expect(service.enter({ principalId: "human-matt" })).toMatchObject({
+      status: "entered",
+      notified: true,
+    });
   });
 
   it("integrates with real SqliteInboxRepository and enforces noninterrupting payload validation", () => {
