@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
@@ -51,6 +52,13 @@ import {
   QuotaService,
 } from "./quota-mcp.js";
 
+const PRE_ATTRIBUTION_REQUEST_DIGESTS: Record<string, string> = {
+  claude: "28e377f8ca38a8bf4bf7832b00d9a5f2ee8bf8db28c8ac0dbb32a23281bcfd95",
+  codex: "f70c981d5da87df6e14185d675c45eb3344b7abeb7b20663c20cb7562728fb43",
+  agy: "500e5f4da8220d4c94735cbb6fcbc2ef701e07c0a23f9bda3a667b0685a9173e",
+  kimi: "1c5458f4ba8f50ab2aceff82ede61d49b57c05343f91fe29fdd1d1fc65d739df",
+};
+
 async function connect(server: McpServer): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -95,6 +103,40 @@ describe("quota MCP server", () => {
         }
       ).config.systemInstruction;
     }
+
+    // #536: wording attribution must not change a single byte of what the
+    // parser sends. These digests were taken from the pre-attribution parser
+    // at the same instant, timezone and catalog; a deliberate wording change
+    // updates them in the same commit.
+    it("sends byte-identical parser requests for every provider", async () => {
+      const previousTz = process.env.TZ;
+      process.env.TZ = "UTC";
+      try {
+        mockGenerateContent.mockResolvedValue({
+          text: () => JSON.stringify({ status: "unknown", windows: [] }),
+        });
+        const at = Date.parse("2026-10-05T04:30:00.000Z");
+        const models = [{ displayLabel: "Example Model", identifier: "example-model" }];
+        const parsers = {
+          claude: parseClaudeQuota,
+          codex: parseCodexQuota,
+          agy: parseAgyQuota,
+          kimi: parseKimiQuota,
+        };
+        const digests: Record<string, string> = {};
+        for (const [provider, parse] of Object.entries(parsers)) {
+          mockGenerateContent.mockClear();
+          await parse(`synthetic ${provider} capture`, "test-key", at, models);
+          digests[provider] = createHash("sha256")
+            .update(JSON.stringify(mockGenerateContent.mock.calls[0][0]))
+            .digest("hex");
+        }
+        expect(digests).toEqual(PRE_ATTRIBUTION_REQUEST_DIGESTS);
+      } finally {
+        if (previousTz === undefined) delete process.env.TZ;
+        else process.env.TZ = previousTz;
+      }
+    });
 
     it("parses Claude quota using LLM successfully", async () => {
       const output = "Claude output here";
