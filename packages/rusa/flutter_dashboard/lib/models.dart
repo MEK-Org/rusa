@@ -749,8 +749,10 @@ class HaltStatusDto {
   final List<String> providers;
   final List<String> models;
 
-  /// Requested expiry, ISO-8601. Always in the future when present — the
-  /// sentinel retires expired halts, so absence means indefinite.
+  /// Requested expiry, ISO-8601. It is in the future when the server builds
+  /// the snapshot — the sentinel retires expired halts; a client may present
+  /// that snapshot after its local clock has passed the expiry. Absence means
+  /// indefinite.
   final String? until;
 
   factory HaltStatusDto.fromJson(Map<String, dynamic> j) => HaltStatusDto(

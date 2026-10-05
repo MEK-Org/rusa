@@ -423,9 +423,11 @@ function operatorHandledNote(reason: string): string {
  * The smallest projection of the authoritative halt sentinel the header chip
  * needs to explain itself: whether the hold is global or names provider(s)
  * and/or model(s), and the requested expiry when one was set. The sentinel
- * layer already retires expired `until`s, so a returned `until` is always in
- * the future and its absence means indefinite. Reason text stays server-side:
- * the chip explains scope and effect, not the operator's note.
+ * layer already retires expired `until`s, so a returned `until` is in the
+ * future when this snapshot is built; an idle client may present it after its
+ * local clock passes that expiry. Its absence means indefinite. Reason text
+ * stays server-side: the chip explains scope and effect, not the operator's
+ * note.
  */
 function haltSnapshotJson(state: HaltState | null | undefined): {
   scope: "global" | "providers" | "models";

@@ -208,7 +208,6 @@ void main() {
     (tester) async {
       final handle = tester.ensureSemantics();
       final until = DateTime.utc(2026, 10, 4, 17, 52);
-      var now = until.subtract(const Duration(minutes: 1));
       final store = await _store(
         tester,
         HaltStatusDto(
@@ -218,25 +217,17 @@ void main() {
           until: until.toUtc().toIso8601String(),
         ),
       );
-      await tester.pumpWidget(_header(store, haltTooltipNow: () => now));
+      await tester.pumpWidget(_header(store));
       await tester.pump();
 
       const expectedSemantics =
-          'Reported halt scope: claude-opus-5-5 on claude.\n'
+          'Halted. Reported halt scope: claude-opus-5-5 on claude.\n'
           'While this reported halt is in force, actors run on an unheld '
           'candidate in their pool instead; an actor whose whole pool is held '
           'waits.\n'
           'A reported halt does not interrupt runs already in flight.\n'
           'Reported expiry: Sun Oct 4, 2026, 5:52 PM UTC.';
-      final semanticsStartsWith = RegExp(
-        '^${RegExp.escape(expectedSemantics)}',
-      );
-      expect(find.bySemanticsLabel(semanticsStartsWith), findsOneWidget);
-
-      // No rebuild follows this local transition. The label stays factual rather
-      // than retaining a stale future-tense "Expires" claim.
-      now = until.add(const Duration(minutes: 1));
-      expect(find.bySemanticsLabel(semanticsStartsWith), findsOneWidget);
+      expect(find.bySemanticsLabel(expectedSemantics), findsOneWidget);
       handle.dispose();
       await tester.runAsync(store.dispose);
     },

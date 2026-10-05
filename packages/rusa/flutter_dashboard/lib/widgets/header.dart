@@ -1097,6 +1097,9 @@ Color _legacyColorForRemaining(double remainingPercent) {
 const _scopedHaltEffect =
     'Actors run on an unheld candidate in their pool instead; an actor whose '
     'whole pool is held waits.';
+const _reportedScopedHaltEffect =
+    'While this reported halt is in force, actors run on an unheld candidate '
+    'in their pool instead; an actor whose whole pool is held waits.';
 
 /// Plain-text explanation of the active halt for the header chip's tooltip
 /// (#906): the authoritative scope, its scheduling effect, and the expiry.
@@ -1168,18 +1171,10 @@ String _haltDescription(
   switch (halt.scope) {
     case 'models':
       scope = '${halt.models.join(', ')} on $providers';
-      effect = reported
-          ? 'While this reported halt is in force, '
-                'actors run on an unheld candidate in their pool instead; an '
-                'actor whose whole pool is held waits.'
-          : _scopedHaltEffect;
+      effect = reported ? _reportedScopedHaltEffect : _scopedHaltEffect;
     case 'providers':
       scope = providers;
-      effect = reported
-          ? 'While this reported halt is in force, '
-                'actors run on an unheld candidate in their pool instead; an '
-                'actor whose whole pool is held waits.'
-          : _scopedHaltEffect;
+      effect = reported ? _reportedScopedHaltEffect : _scopedHaltEffect;
     default:
       scope = 'all providers';
       effect = reported
@@ -1225,7 +1220,10 @@ class _HaltedBadge extends StatelessWidget {
       ),
       excludeFromSemantics: true,
       child: Semantics(
-        label: haltSemanticsText(halt),
+        // Announce the status first, and use this explicit label instead of
+        // merging the visible child text at an implementation-defined suffix.
+        excludeSemantics: true,
+        label: 'Halted. ${haltSemanticsText(halt)}',
         child: Container(
           padding: EdgeInsets.symmetric(
             horizontal: compact ? 6 : 10,
