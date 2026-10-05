@@ -37,6 +37,7 @@ import { createLogger } from "../observability/logger.js";
 import { assertConcreteModelConfig } from "../providers/model-config.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { type DashboardDataDeps, handleMeshApiRequest, readBody } from "./api.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { SseHub } from "./sse.js";
