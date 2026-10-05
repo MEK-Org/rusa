@@ -8,7 +8,7 @@ import { meshGitIdentityArgs, resolveMeshGitIdentity } from "./mesh-git-identity
 
 const MESH = { name: "Mesh Bot", email: "mesh-bot@example.invalid" };
 const UNCARRIABLE =
-  "config.yaml gitIdentity contains <, >, a line break or a NUL byte, which a Git command cannot carry intact";
+  "config.yaml gitIdentity contains <, >, a line break or a NUL byte, which is not accepted for a mesh Git identity";
 
 describe("resolveMeshGitIdentity (#909)", () => {
   it("resolves a complete configured pair, trimmed", () => {
@@ -29,6 +29,7 @@ describe("resolveMeshGitIdentity (#909)", () => {
     [{ name: 7, email: "mesh-bot@example.invalid" }, "config.yaml gitIdentity lacks name"],
     [{ name: "Mesh <Bot>", email: "mesh-bot@example.invalid" }, UNCARRIABLE],
     [{ name: "Mesh\nBot", email: "mesh-bot@example.invalid" }, UNCARRIABLE],
+    [{ name: "Mesh\rBot", email: "mesh-bot@example.invalid" }, UNCARRIABLE],
     [{ name: "Mesh\u0000Bot", email: "mesh-bot@example.invalid" }, UNCARRIABLE],
   ])("reports a gap for %j", (configured, gap) => {
     expect(resolveMeshGitIdentity(configured)).toEqual({ identity: null, gap });

@@ -18,10 +18,10 @@ export type MeshGitIdentityResolution =
   | { identity: MeshGitIdentity; gap?: undefined }
   | { identity: null; gap: string };
 
-// A Git command can't carry these intact. Git stores an identity as one
-// `Name <email>` line and silently strips `<`, `>` and line breaks from it, so the
-// commit would not record the configured value. A NUL byte can't be passed in a
-// process argument at all, so `-c author.name=…` can't be run with it.
+// Git strips `<`, `>` and LF from an identity, so those values would not be
+// recorded as configured. A NUL byte cannot be passed in a process argument at
+// all. CR is also rejected to keep the displayed, line-oriented guidance intact;
+// this is deliberately not a general-purpose Git-ident validator.
 const UNCARRIABLE = /[<>\n\r\0]/;
 
 function field(value: unknown): string | undefined {
@@ -46,7 +46,7 @@ export function resolveMeshGitIdentity(configured: unknown): MeshGitIdentityReso
   if (UNCARRIABLE.test(name) || UNCARRIABLE.test(email)) {
     return {
       identity: null,
-      gap: "config.yaml gitIdentity contains <, >, a line break or a NUL byte, which a Git command cannot carry intact",
+      gap: "config.yaml gitIdentity contains <, >, a line break or a NUL byte, which is not accepted for a mesh Git identity",
     };
   }
   return { identity: { name, email } };
