@@ -2491,6 +2491,45 @@ describe("ObligationRepository", () => {
         "o1",
       ]);
     });
+
+    it("classifies a snoozed responsive row by queue order, not responsiveness alone", () => {
+      repository.setOsScheduler(new FakeObligationScheduler());
+      repository.create({ title: "r", id: "r", ownerId: "actor-c", priority: 10 });
+      repository.markResponsive("r", "system:mesh");
+      repository.create({ title: "o1", id: "o1", ownerId: "actor-c", priority: 20 });
+      repository.create({ title: "o2", id: "o2", ownerId: "actor-c", priority: 30 });
+      repository.create({ title: "s", id: "s", ownerId: "actor-c", priority: 40 });
+      repository.markResponsive("s", "system:mesh");
+      repository.setSnooze("s", "2100-01-01T00:00:00.000Z", "actor-c");
+
+      // The snoozed responsive row sorts after every actionable row.
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "r",
+        "o1",
+        "o2",
+        "s",
+      ]);
+
+      // Ordinary work may sit ahead of the snoozed responsive row.
+      repository.movePriorityInternal("o1", "o2", "s", "system:mesh");
+      expect(repository.require("o1").effectivePriority).toBe(35);
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "r",
+        "o2",
+        "o1",
+        "s",
+      ]);
+
+      // The snoozed responsive row may move after ordinary work.
+      repository.movePriorityInternal("s", "o1", null, "system:mesh");
+      expect(repository.require("s").effectivePriority).toBe(36);
+
+      // Actionable responsive work still cannot follow ordinary work.
+      expect(() => repository.movePriorityInternal("r", "o1", "s", "system:mesh")).toThrow(
+        "cannot place responsive work after ordinary work"
+      );
+      expect(repository.require("r").effectivePriority).toBe(10);
+    });
   });
 
   it("keeps a parent waiting until every direct child is terminal", () => {

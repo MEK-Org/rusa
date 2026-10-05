@@ -2276,22 +2276,25 @@ export class ObligationRepository {
       const previous = previousId === null ? null : queue[previousIndex];
       const next = nextId === null ? null : queue[nextIndex];
 
+      // Mirrors OWNER_QUEUE_ORDER_SQL: only actionable ready rows form the
+      // responsive-first tier; snoozed rows sort later by priority alone.
+      const inResponsiveTier = (o: Obligation) =>
+        o.status === "ready" && o.snoozedUntil === null && o.effectiveResponsive;
+      const targetTier = inResponsiveTier(target);
+
       // Reject positions that would require ordinary work ahead of responsive work
       // or responsive work after ordinary work, atomically without writes.
-      if (target.effectiveResponsive && previous !== null && !previous.effectiveResponsive) {
+      if (targetTier && previous !== null && !inResponsiveTier(previous)) {
         throw new ObligationValidationError("cannot place responsive work after ordinary work");
       }
-      if (!target.effectiveResponsive && next !== null && next.effectiveResponsive) {
+      if (!targetTier && next !== null && inResponsiveTier(next)) {
         throw new ObligationValidationError("cannot place ordinary work ahead of responsive work");
       }
 
       // Resolve the requested position within the target's effective-responsiveness tier.
       const tierPrevious =
-        previous !== null && previous.effectiveResponsive === target.effectiveResponsive
-          ? previous
-          : null;
-      const tierNext =
-        next !== null && next.effectiveResponsive === target.effectiveResponsive ? next : null;
+        previous !== null && inResponsiveTier(previous) === targetTier ? previous : null;
+      const tierNext = next !== null && inResponsiveTier(next) === targetTier ? next : null;
 
       let priority: number;
       let repairSuffix = false;
@@ -2331,7 +2334,7 @@ export class ObligationRepository {
         for (const obligation of queue.slice(nextIndex)) {
           // Calculate and repair only the target tier; collision repair cannot
           // spill into or mutate other-tier priorities.
-          if (obligation.effectiveResponsive !== target.effectiveResponsive) {
+          if (inResponsiveTier(obligation) !== targetTier) {
             break;
           }
           if (obligation.effectivePriority > cursor) break;
