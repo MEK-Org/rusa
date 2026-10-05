@@ -513,9 +513,7 @@ function wholeLaneReadingRetainsPacing(
 ): boolean {
   if (!stored.governingBucketKey) return false;
   const governing = stored.buckets.find((bucket) => bucket.key === stored.governingBucketKey);
-  if (!governing?.resetAtIso) return false;
-  const resetMs = Date.parse(governing.resetAtIso);
-  if (!Number.isFinite(resetMs)) return false;
+  if (!governing) return false;
   // A newer scrape that leaves only this bucket out is not a whole-lane missing
   // reading. Keep the existing conservative partial-window election rule.
   return governing.observedAt === stored.updatedAt;

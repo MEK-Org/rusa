@@ -412,7 +412,9 @@ carries no new information, so it does not send the lane back to the ceiling, no
 does window reset widen it to the ceiling merely because fresh readings are missing.
 The response remains truthfully `hardStale`; this is a pacing decision, not a
 freshness disguise. They are not retired as they are for a single missing model
-window. A newer provider scrape that omits only a governing window remains the
+window. No root alert fires when a whole provider reading stops; this change
+only keeps pacing, and provider-wide alerting is tracked separately under #794.
+A newer provider scrape that omits only a governing window remains the
 existing partial-window case and widens conservatively. A client that cannot
 reach the coordinator keeps its separate local hard-stale ceiling fallback.
 

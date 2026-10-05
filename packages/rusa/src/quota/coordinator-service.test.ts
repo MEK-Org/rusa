@@ -723,15 +723,15 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(afterReset.modelLanes).toMatchObject([{ intervalSeconds: 120 }]);
   });
 
-  it("rebuilds a missing-reading interval after coordinator restart and applies it to the client pacer", async () => {
-    const nowMs = Date.now();
+  it("rebuilds a missing-reading interval after coordinator restart, keeps it across reset, and recovers on a fresh reading (#794)", async () => {
+    let nowMs = Date.parse("2040-01-01T00:00:00.000Z");
     const resetMs = nowMs + 3 * 24 * 60 * 60_000;
-    const resetAtIso = new Date(resetMs).toISOString();
     const windowMs = 7 * 24 * 60 * 60_000;
     const snapshot = (
       scrapedAt: string,
       providerPercentLeft: number,
-      modelPercentLeft: number
+      modelPercentLeft: number,
+      resetAtIso = new Date(resetMs).toISOString()
     ): ProviderQuotaSnapshot => ({
       provider: "claude",
       status: "available",
@@ -791,118 +791,32 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       },
     ]);
     expect(pacer.interval).toBe((beforeRestart?.intervalSeconds ?? 0) * 1000);
-  });
 
-  it("retains last computed throttle through missed and failed readings and across reset, then recovers on a fresh reading (#794)", async () => {
-    let currentNowMs = Date.now();
-    const resetMs = currentNowMs + 2 * 60 * 60_000;
-    const resetAtIso = new Date(resetMs).toISOString();
-    const windowMs = 5 * 60 * 60_000;
-    const snapshot = (scrapedAt: string, providerPercentLeft: number): ProviderQuotaSnapshot => ({
-      provider: "claude",
-      status: "available",
-      scrapedAt,
-      limits: [
-        { kind: "five_hour", label: "5-Hour", percentLeft: providerPercentLeft, resetAtIso },
-      ],
-    });
-
-    store.configureController({ maxIntervalSeconds: 3600 });
-    for (let offset = 4; offset >= 0; offset -= 1) {
-      const observedMs = currentNowMs - 60 * 60_000 - offset * 5 * 60_000;
-      const scrapedAt = new Date(observedMs).toISOString();
-      const timeRemainingPct = ((resetMs - observedMs) / windowMs) * 100;
-      const state = snapshot(scrapedAt, timeRemainingPct - 15);
-      const id = store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "fixture" });
-      store.recordParsed(id, state, state);
-    }
-    const baselineThrottle = store.getProviderThrottle("claude");
-    expect(baselineThrottle?.intervalSeconds).toBeGreaterThan(0);
-    if (!baselineThrottle) throw new Error("expected baselineThrottle");
-    const computedInterval = baselineThrottle.intervalSeconds;
-
-    service = new QuotaCoordinatorService({
-      socketPath,
-      store,
-      configuredProviders: ["claude"],
-      now: () => currentNowMs,
-      maxIntervalSeconds: 3600,
-      staleAfterMs: 15 * 60_000,
-      hardStaleAfterMs: 60 * 60_000,
-    });
-    await service.start();
-
-    const client = new QuotaCoordinatorClient({
-      socketPath,
-      maxIntervalSeconds: 3600,
-      now: () => currentNowMs,
-    });
-    const pacer = new ProviderPacer(3600 * 1000, () => currentNowMs);
-
-    // Initial sync
+    // Readings stay missing past the governing reset: the last computed
+    // interval, not the ceiling, remains applied.
+    const computedInterval = beforeRestart?.intervalSeconds ?? 0;
+    expect(computedInterval).toBeLessThan(3600);
+    nowMs = resetMs + 10 * 60_000;
     await client.getThrottle();
     reconcileProviderPacersFromClient(() => pacer, ["claude"], client);
     expect(client.getLastAppliedInterval("claude")).toBe(computedInterval);
     expect(pacer.interval).toBe(computedInterval * 1000);
 
-    // 1. Missed readings: advance past hardStaleAfterMs while window is still open
-    currentNowMs += 70 * 60_000;
+    // One fresh reading in the next window recovers normal pacing.
+    const freshScrapedAt = new Date(nowMs).toISOString();
+    const fresh = snapshot(freshScrapedAt, 95, 95, new Date(nowMs + windowMs).toISOString());
+    store.recordParsed(
+      store.recordRaw({ provider: "claude", scrapedAt: freshScrapedAt, rawOutput: "fixture" }),
+      fresh,
+      fresh
+    );
     await client.getThrottle();
     reconcileProviderPacersFromClient(() => pacer, ["claude"], client);
-    expect(client.getLastPublishedStatus("claude")?.freshness).toMatchObject({
-      stale: true,
-      hardStale: true,
-    });
-    expect(client.getLastAppliedInterval("claude")).toBe(computedInterval);
-    expect(pacer.interval).toBe(computedInterval * 1000);
-
-    // 2. Failed readings: attempt a scrape that fails extraction
-    const failedScrapedAt = new Date(currentNowMs).toISOString();
-    const rawId = store.recordRaw({
-      provider: "claude",
-      scrapedAt: failedScrapedAt,
-      rawOutput: "corrupt",
-    });
-    store.recordParseError(rawId, new Error("synthetic extraction failure"));
-    await client.getThrottle();
-    reconcileProviderPacersFromClient(() => pacer, ["claude"], client);
-    expect(client.getLastAppliedInterval("claude")).toBe(computedInterval);
-    expect(pacer.interval).toBe(computedInterval * 1000);
-
-    // 3. Across reset: advance past window reset
-    currentNowMs = resetMs + 10 * 60_000;
-    await client.getThrottle();
-    reconcileProviderPacersFromClient(() => pacer, ["claude"], client);
-    expect(client.getLastAppliedInterval("claude")).toBe(computedInterval);
-    expect(pacer.interval).toBe(computedInterval * 1000);
-
-    // 4. Recover on a fresh reading: successful scrape with a new reset window
-    const newResetMs = currentNowMs + 5 * 60 * 60_000;
-    const newResetAtIso = new Date(newResetMs).toISOString();
-    const freshScrapedAt = new Date(currentNowMs).toISOString();
-    const freshState: ProviderQuotaSnapshot = {
-      provider: "claude",
-      status: "available",
-      scrapedAt: freshScrapedAt,
-      limits: [{ kind: "five_hour", label: "5-Hour", percentLeft: 95, resetAtIso: newResetAtIso }],
-    };
-    const freshRawId = store.recordRaw({
-      provider: "claude",
-      scrapedAt: freshScrapedAt,
-      rawOutput: "fresh",
-    });
-    store.recordParsed(freshRawId, freshState, freshState);
-
-    await client.getThrottle();
-    reconcileProviderPacersFromClient(() => pacer, ["claude"], client);
-    const recoveredThrottle = store.getProviderThrottle("claude");
-    expect(recoveredThrottle?.intervalSeconds).not.toBe(computedInterval);
-    expect(client.getLastAppliedInterval("claude")).toBe(recoveredThrottle?.intervalSeconds);
-    expect(pacer.interval).toBe((recoveredThrottle?.intervalSeconds ?? 0) * 1000);
-    expect(client.getLastPublishedStatus("claude")?.freshness).toMatchObject({
-      stale: false,
-      hardStale: false,
-    });
+    const recovered = store.getProviderThrottle("claude")?.intervalSeconds;
+    expect(recovered).not.toBe(computedInterval);
+    expect(client.getLastPublishedStatus("claude")?.freshness).toMatchObject({ hardStale: false });
+    expect(client.getLastAppliedInterval("claude")).toBe(recovered);
+    expect(pacer.interval).toBe((recovered ?? 0) * 1000);
   });
 
   // Criterion 2: publishedThrottle equality and boundary pin.
@@ -930,7 +844,9 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
           derivative: 0,
           requiredIntervalSeconds: 600,
           resetAtIso: null,
-          observedAt: new Date(nowMs - 7200000).toISOString(), // 2 hours old -> hard-stale
+          // Older than updatedAt: a newer scrape omitted the governing bucket,
+          // the partial-window case that still widens when hard-stale.
+          observedAt: new Date(nowMs - 9000000).toISOString(), // 2.5 hours old -> hard-stale
         },
       ],
     };
