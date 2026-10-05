@@ -155,6 +155,7 @@ import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
 import type { DashboardAuth } from "../dashboard/auth.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
+import { DashboardTimingRecorder } from "../dashboard/timing.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import {
   finishDeferredRootSessionImport,
@@ -182,6 +183,10 @@ import {
   createChatReadMcpServer,
   createChatWriteMcpServer,
 } from "../mcp/chat-mcp.js";
+import {
+  createDashboardTimingMcpServer,
+  DASHBOARD_TIMING_MCP_NAME,
+} from "../mcp/dashboard-timing-mcp.js";
 import type { DistillerMcpStore } from "../mcp/distiller-mcp.js";
 import {
   buildGrantableServers,
@@ -1604,6 +1609,12 @@ async function composeStart(
   // After persisting, broadcast the stored row to any live dashboard SSE clients
   // (best-effort — fan-out must never break the recording or the mesh).
   const meshEmitter = new MeshEventEmitter();
+  // Dashboard timings write only fixed, content-free metadata to mesh_events
+  // after each response has finished. The recorder prunes this one event kind
+  // at boot and in bounded batches; it never changes the SQLite schema.
+  const dashboardTimings = new DashboardTimingRecorder(getRepositories().meshEvents);
+  dashboardTimings.start();
+  resources.acquire("dashboard timing recorder", () => dashboardTimings.stop());
   // One child logger per actor run: `actorId` and `runId` ride every record the
   // run boundary writes, so a run reads back by field instead of by matching
   // prose across interleaved actors. The run's *output* never lands here — it is
@@ -3180,12 +3191,16 @@ async function composeStart(
             quotaService
           )
         );
+        const dashboardTimingUrl = mcpHttp.addServer(`${id}:${DASHBOARD_TIMING_MCP_NAME}`, () =>
+          createDashboardTimingMcpServer(dashboardTimings)
+        );
 
         const perActorShared: McpServerSpec[] = [
           { name: TRACKER_MCP_NAME, url: trackerUrl },
           { name: REPO_MCP_NAME, url: repoUrl },
           { name: UNDERSTANDING_READ_MCP_NAME, url: understandingUrl },
           { name: QUOTA_MCP_NAME, url: quotaUrl },
+          { name: DASHBOARD_TIMING_MCP_NAME, url: dashboardTimingUrl },
         ];
         if (chatClient) {
           const chatReadUrl = mcpHttp.addServer(`${id}:${CHAT_READ_MCP_NAME}`, () =>
@@ -3606,6 +3621,9 @@ async function composeStart(
       },
     })
   );
+  const rootDashboardTimingUrl = mcpHttp.addServer(`${rootId}:${DASHBOARD_TIMING_MCP_NAME}`, () =>
+    createDashboardTimingMcpServer(dashboardTimings)
+  );
 
   const cc = chatClient;
   let allowedSpaces: string[] = [];
@@ -3654,7 +3672,8 @@ async function composeStart(
     { name: INBOX_MCP_NAME, url: rootInboxUrl },
     { name: OBLIGATIONS_MCP_NAME, url: rootObligationsUrl },
     { name: MESH_CHAT_MCP_NAME, url: rootMeshChatUrl },
-    { name: PNPM_INSTALL_MCP_NAME, url: rootPnpmInstallUrl }
+    { name: PNPM_INSTALL_MCP_NAME, url: rootPnpmInstallUrl },
+    { name: DASHBOARD_TIMING_MCP_NAME, url: rootDashboardTimingUrl }
   );
   if (rootChatUrl) {
     rootMcp.push({ name: CHAT_WRITE_MCP_NAME, url: rootChatUrl });
@@ -4126,6 +4145,7 @@ async function composeStart(
           mesh,
           actors,
           meshEvents: getRepositories().meshEvents,
+          timings: dashboardTimings,
           meshChat: getRepositories().meshChat,
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,

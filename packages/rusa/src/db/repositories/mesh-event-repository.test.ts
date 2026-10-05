@@ -82,6 +82,67 @@ describe("MeshEventRepository", () => {
     expect(stored).toContain("truncated");
   });
 
+  describe("kind-scoped bounded diagnostic storage", () => {
+    it("reads only one event family since a timestamp without materializing bodies", () => {
+      repo.record({
+        id: "timing-old",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T09:59:59.000Z",
+        body: "must not be read",
+      });
+      repo.record({
+        id: "ordinary-event",
+        kind: "run_end",
+        ts: "2026-10-05T10:00:00.000Z",
+        body: "ordinary history",
+      });
+      repo.record({
+        id: "timing-first",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T10:00:00.000Z",
+        body: "must not be read",
+      });
+      repo.record({
+        id: "timing-second",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T10:00:00.000Z",
+        body: "must not be read",
+      });
+
+      const rows = repo.listByKindSince("dashboard_timing", "2026-10-05T10:00:00.000Z", 10);
+      expect(rows.map((row) => row.id)).toEqual(["timing-first", "timing-second"]);
+      expect(rows.map((row) => row.body)).toEqual([null, null]);
+    });
+
+    it("prunes only the requested event family by age and newest-record bound", () => {
+      repo.record({ id: "old-timing", kind: "dashboard_timing", ts: "2026-10-01T00:00:00.000Z" });
+      repo.record({
+        id: "current-timing-1",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T10:00:00.000Z",
+      });
+      repo.record({
+        id: "current-timing-2",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T10:01:00.000Z",
+      });
+      repo.record({
+        id: "current-timing-3",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T10:02:00.000Z",
+      });
+      repo.record({ id: "ordinary-history", kind: "run_end", ts: "2026-10-01T00:00:00.000Z" });
+
+      repo.pruneKind("dashboard_timing", "2026-10-05T00:00:00.000Z", 2);
+
+      expect(repo.list().map((row) => row.id)).toEqual([
+        "current-timing-2",
+        "current-timing-3",
+        "ordinary-history",
+      ]);
+    });
+  });
+
   describe("listEventsByActors", () => {
     it("conversation filter excludes self-sends and keeps only the A↔B pair ", () => {
       const a = "actor-a";
