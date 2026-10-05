@@ -231,11 +231,11 @@ export type MeshEventKind =
   // the calendar ID and issue number.
   | "calendar_write"
   // Startup moved a provider-scoped HALT sentinel into durable availability
-  // holds (#539) and archived the file as HALT.imported. `actorId` is absent
-  // (the mesh did it); `detail` summarizes the scope and expiry; `payload` =
-  // { reason, until, holds: [{ provider, model, expiry }] }. The id is derived
-  // from the file, so a restart after a crash before the file was archived
-  // records it once.
+  // holds (#539) and archived the file as HALT.imported-<digest>. `actorId`
+  // is absent (the mesh did it); `detail` summarizes the scope and expiry;
+  // `payload` = { reason, until, holds: [{ provider, model, expiry }] }. The id
+  // is derived from the file, so a restart after a crash before the file was
+  // archived records it once.
   | "availability_hold_imported";
 
 /**

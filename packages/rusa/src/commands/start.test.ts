@@ -4025,9 +4025,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
       join(homeDir, "HALT"),
       `${JSON.stringify({ reason: "chat /halt from Operator", providers: ["codex"], until })}\n`
     );
+    const startDashboardServerSpy = vi
+      .spyOn(webhookServer, "startDashboardServer")
+      .mockResolvedValue({ close: vi.fn(async () => {}) });
+    onTestFinished(() => startDashboardServerSpy.mockRestore());
     const readyPromise = new Promise<void>((resolve) => {
       runStart({
         e2e: {
+          dashboard: true,
           chatClient,
           chatSource,
           onReady: (handles) => {
@@ -4054,7 +4059,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     // Startup imported the scoped file as a hold and archived it.
     expect(existsSync(join(homeDir, "HALT"))).toBe(false);
-    expect(existsSync(join(homeDir, "HALT.imported"))).toBe(true);
+    expect(readdirSync(homeDir).filter((name) => name.startsWith("HALT.imported-"))).toHaveLength(
+      1
+    );
     expect(held("codex")).toBe(true);
     expect(held("claude")).toBe(false);
     const imported = getRepositories().meshEvents.listByKinds(["availability_hold_imported"], {
@@ -4127,6 +4134,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(halt.isHalted()).toBe(false);
     expect(held("antigravity")).toBe(true);
     expect(held("claude")).toBe(true);
+    // The header's HALTED indicator follows the holds, not just the brake.
+    const dashboardHalted = () => startDashboardServerSpy.mock.calls[0]?.[0].mesh?.isHalted?.();
+    expect(dashboardHalted()).toBe(true);
     expect(
       getRepositories()
         .availabilityHolds.list()
@@ -4144,6 +4154,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       "Resume command rejected: model-scoped resume requires a provider"
     );
     expect(lastReply()).toContain("/resume provider:");
+
+    await message("/resume provider:antigravity,claude", "messages/resume-rest");
+    expect(dashboardHalted()).toBe(false);
   });
 
   it("wires model-admin availability holds into the configured actor's endpoint and run admission (#539)", async () => {

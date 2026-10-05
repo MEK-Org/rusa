@@ -1654,7 +1654,8 @@ async function composeStart(
   // hand (`touch ~/.rusa/HALT`), by chat (`/halt`), or pull the plug.
   const haltSwitch = new HaltSwitch(join(mcHome, "HALT"));
   // A provider-scoped sentinel from before #539 becomes durable holds once and
-  // is archived as HALT.imported; the file for the global brake is left alone.
+  // is archived as HALT.imported-<digest>; the file for the global brake is
+  // left alone.
   const importedHolds = importScopedHaltFile({
     file: join(mcHome, "HALT"),
     repo: getRepositories().availabilityHolds,

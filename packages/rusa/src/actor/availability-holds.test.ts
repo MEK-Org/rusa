@@ -1,4 +1,12 @@
-import { existsSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -194,6 +202,7 @@ describe("importScopedHaltFile", () => {
     writeFileSync(file, typeof state === "string" ? state : `${JSON.stringify(state)}\n`);
     utimesSync(file, mtime, mtime);
   };
+  const archives = () => readdirSync(dir).filter((name) => name.startsWith("HALT.imported-"));
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "halt-import-"));
@@ -227,7 +236,7 @@ describe("importScopedHaltFile", () => {
     expect(imported).toEqual([expected("claude"), expected("codex")]);
     expect(repo.list()).toEqual([expected("claude"), expected("codex")]);
     expect(existsSync(file)).toBe(false);
-    expect(existsSync(`${file}.imported`)).toBe(true);
+    expect(archives()).toHaveLength(1);
     const recorded = events.list().filter((event) => event.kind === "availability_hold_imported");
     expect(recorded).toHaveLength(1);
     expect(recorded[0]?.detail).toBe(
@@ -260,6 +269,17 @@ describe("importScopedHaltFile", () => {
       events.list().filter((event) => event.kind === "availability_hold_imported")
     ).toHaveLength(1);
     expect(existsSync(file)).toBe(false);
+    expect(archives()).toHaveLength(1);
+  });
+
+  it("keeps an earlier archive when a later hand-written sentinel is imported", () => {
+    writeHalt({ reason: "first", providers: ["kimi"] });
+    importFile();
+    writeHalt({ reason: "second", providers: ["codex"] });
+    importFile();
+
+    const kept = archives().map((name) => JSON.parse(readFileSync(join(dir, name), "utf8")).reason);
+    expect(kept.sort()).toEqual(["first", "second"]);
   });
 
   it("leaves a missing sentinel, the global brake, an expired one and a models-only one alone", () => {
