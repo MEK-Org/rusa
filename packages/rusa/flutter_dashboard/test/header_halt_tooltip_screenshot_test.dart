@@ -5,7 +5,8 @@
 // It writes `screenshots/906_*_after.png`. The `before` images come from the
 // same file run against staging with the `// after-only` lines removed and
 // `--dart-define=SHOT_SUFFIX=before`: the same hover/long-press on the chip,
-// which had no tooltip there.
+// which had no tooltip there. The passed-expiry phone scene has no `before`:
+// staging showed no tooltip for any halt, as `global_longpress_phone_before`.
 import 'dart:io';
 
 import 'package:flutter/gestures.dart';
@@ -84,6 +85,10 @@ void main() {
       .add(const Duration(minutes: 40))
       .toUtc()
       .toIso8601String();
+  final passed = DateTime.now()
+      .subtract(const Duration(minutes: 20))
+      .toUtc()
+      .toIso8601String();
 
   testWidgets('normal header (no halt)', (tester) async {
     await scene(
@@ -141,6 +146,27 @@ void main() {
         await tester.pump();
       },
     );
+  });
+
+  testWidgets('phone: long-press on a provider-scoped halt past its expiry', (
+    tester,
+  ) async {
+    await scene(
+      tester,
+      name: 'provider_passed_longpress_phone',
+      size: const Size(390, 320),
+      halted: true,
+      halt: HaltStatusDto( // after-only
+        scope: 'providers', // after-only
+        providers: const ['codex', 'gemini'], // after-only
+        until: passed, // after-only
+      ), // after-only
+      reveal: () async {
+        await tester.longPress(chip);
+        await tester.pump();
+      },
+    );
+    expect(find.textContaining('Expiry passed'), findsOneWidget);
   });
 
   testWidgets('phone: long-press on a global halt', (tester) async {
