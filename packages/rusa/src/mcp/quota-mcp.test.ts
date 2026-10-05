@@ -29,6 +29,7 @@ vi.mock("@google/genai", () => ({
 
 import type { RusaConfig } from "../config/types.js";
 import { buildQuotaSnapshot } from "../dashboard/quota-api.js";
+import { nullLogger } from "../observability/logger.js";
 import { KimiAuthRequiredError } from "../providers/kimi-usage-scrape.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import { buildActorBwrapArgs } from "../providers/sandbox.js";
@@ -40,6 +41,10 @@ import {
   COORDINATOR_PROTOCOL_MINOR,
 } from "../quota/coordinator-protocol.js";
 import { MissedQuotaWindowDetector } from "../quota/missed-windows.js";
+import {
+  BUILT_IN_QUOTA_PARSER_WORDING,
+  quotaParserWordingRevisionId,
+} from "../quota/parser-wording.js";
 import { SharedQuotaStore } from "../quota/shared-store.js";
 import {
   createQuotaMcpServer,
@@ -2856,6 +2861,104 @@ describe("quota MCP server", () => {
           "parsed",
           ...cases.map((c) => (c.parseError ? "failed" : "parsed")),
         ]);
+      });
+    });
+
+    describe("parser wording attribution (#536)", () => {
+      let root: string;
+      let store: SharedQuotaStore;
+      beforeEach(() => {
+        mockGenerateContent.mockReset();
+        root = mkdtempSync(join(tmpdir(), "rusa-536-"));
+        store = new SharedQuotaStore(join(root, "shared.db"));
+      });
+      afterEach(() => {
+        store.close();
+        rmSync(root, { recursive: true, force: true });
+      });
+
+      function probeClaude(): Promise<unknown> {
+        return new QuotaService({
+          config: { ...mockConfig, geminiApiKey: "test-gemini-key" } as RusaConfig,
+          workersDir: root,
+          resolveProvider: mockResolveProvider,
+          scrapeStore: store,
+          ttlMs: 0,
+        }).getQuotaProbeOutcome("claude");
+      }
+
+      function latestRevision(): string | null {
+        return (
+          store.db
+            .prepare(
+              `SELECT parser_wording_revision_id AS revision FROM quota_scrapes
+               ORDER BY rowid DESC LIMIT 1`
+            )
+            .get() as { revision: string | null }
+        ).revision;
+      }
+
+      const builtInId = quotaParserWordingRevisionId(
+        "claude",
+        BUILT_IN_QUOTA_PARSER_WORDING.claude
+      );
+
+      it("sends the built-in wording and records its revision on a parsed scrape", async () => {
+        mockGenerateContent.mockResolvedValue({
+          text: () => JSON.stringify({ status: "unknown", windows: [] }),
+        });
+
+        await probeClaude();
+
+        const request = mockGenerateContent.mock.calls[0][0] as {
+          config: { systemInstruction: string };
+        };
+        expect(request.config.systemInstruction).toContain(BUILT_IN_QUOTA_PARSER_WORDING.claude);
+        expect(latestRevision()).toBe(builtInId);
+      });
+
+      it("records the revision on a failed parse too", async () => {
+        mockGenerateContent.mockRejectedValue(new Error("synthetic extractor outage"));
+
+        await probeClaude();
+
+        const row = store.db
+          .prepare(
+            `SELECT parse_error, parser_wording_revision_id AS revision FROM quota_scrapes
+             ORDER BY rowid DESC LIMIT 1`
+          )
+          .get() as { parse_error: string | null; revision: string | null };
+        expect(row.revision).toBe(builtInId);
+      });
+
+      it("keeps parsing with the built-in wording when the control records are unreadable", async () => {
+        const warn = vi.fn();
+        store.close();
+        store = new SharedQuotaStore(join(root, "shared.db"), { ...nullLogger, warn });
+        store.db.exec("DROP TABLE quota_parser_wording_pointers");
+        store.db.exec("DROP TABLE quota_parser_wording_revisions");
+        mockGenerateContent.mockResolvedValue({
+          text: () => JSON.stringify({ status: "unknown", windows: [] }),
+        });
+
+        await probeClaude();
+
+        expect(warn).toHaveBeenCalledWith("parser_wording_records_unreadable", {
+          provider: "claude",
+          error: expect.stringContaining("quota_parser_wording"),
+        });
+        const request = mockGenerateContent.mock.calls[0][0] as {
+          config: { systemInstruction: string };
+        };
+        expect(request.config.systemInstruction).toContain(BUILT_IN_QUOTA_PARSER_WORDING.claude);
+        const row = store.db
+          .prepare(
+            `SELECT parsed_state, parser_wording_revision_id AS revision FROM quota_scrapes
+             ORDER BY rowid DESC LIMIT 1`
+          )
+          .get() as { parsed_state: string | null; revision: string | null };
+        expect(row.parsed_state).not.toBeNull();
+        expect(row.revision).toBeNull();
       });
     });
 

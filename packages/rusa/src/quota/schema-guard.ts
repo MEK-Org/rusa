@@ -5,6 +5,12 @@ import type Database from "better-sqlite3";
  * reading-mode fence and manual-observation idempotency receipts. Version 3
  * adds `quota_observations.model_scope` to the observation and controller
  * identity (#588), so a model-scoped window keeps its own PID history.
+ *
+ * Purely additive changes do not bump it. The #536 parser-wording revision
+ * tables and the nullable `quota_scrapes.parser_wording_revision_id` column are
+ * ignored by a pre-change binary, which refuses any newer version outright, so
+ * leaving the version alone is what lets that binary keep reading and writing
+ * an upgraded database.
  */
 export const QUOTA_SCHEMA_VERSION = 3;
 
