@@ -1234,6 +1234,7 @@ export function createAgentExecMcpServer(
         .describe("Provider lane, e.g. 'kimi' or 'codex' (case-insensitive; 'agy' = antigravity)."),
       models: z
         .array(z.string().min(1))
+        .min(1)
         .optional()
         .describe(
           "Model slugs on that provider. Omit to cover the whole provider; each listed model is its own hold."

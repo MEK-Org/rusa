@@ -3999,7 +3999,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(chatClient.sent.at(-1)?.text ?? "").toContain("Resumed");
   });
 
-  it("handles scoped/timed halt commands as coexisting durable holds (#539)", async () => {
+  it("imports a scoped HALT file at startup, then handles scoped/timed halt commands as coexisting durable holds (#539)", async () => {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
     const config = {
@@ -4019,6 +4019,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       geminiApiKey: "fake-gemini-key",
     };
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+    const until = new Date(Date.now() + 60_000).toISOString();
+    // A provider-scoped HALT file from before #539.
+    writeFileSync(
+      join(homeDir, "HALT"),
+      `${JSON.stringify({ reason: "chat /halt from Operator", providers: ["codex"], until })}\n`
+    );
     const readyPromise = new Promise<void>((resolve) => {
       runStart({
         e2e: {
@@ -4044,8 +4050,19 @@ describe("runStart webhook event routing (Phase 4)", () => {
         isDirectMessage: true,
       });
     const lastReply = () => chatClient.sent.at(-1)?.text ?? "";
-    const until = new Date(Date.now() + 60_000).toISOString();
     const halt = new HaltSwitch(join(homeDir, "HALT"));
+
+    // Startup imported the scoped file as a hold and archived it.
+    expect(existsSync(join(homeDir, "HALT"))).toBe(false);
+    expect(existsSync(join(homeDir, "HALT.imported"))).toBe(true);
+    expect(held("codex")).toBe(true);
+    expect(held("claude")).toBe(false);
+    const imported = getRepositories().meshEvents.listByKinds(["availability_hold_imported"], {
+      bodyKinds: [],
+    });
+    expect(imported.map((event) => event.detail)).toEqual([
+      `HALT file imported as hold on codex until ${until}`,
+    ]);
 
     await message(`/halt provider:claude,codex until:${until}`, "messages/halt-1");
     expect(lastReply()).toContain(`Halted providers claude, codex until ${until}`);
@@ -4113,29 +4130,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       "Resume command rejected: model-scoped resume requires a provider"
     );
     expect(lastReply()).toContain("/resume provider:");
-  });
-
-  it("imports a scoped HALT file from before #539 as holds at startup, once", async () => {
-    const until = new Date(Date.now() + 60 * 60_000).toISOString();
-    writeFileSync(
-      join(homeDir, "HALT"),
-      `${JSON.stringify({ reason: "chat /halt from Operator", providers: ["codex"], until })}\n`
-    );
-    const { chatClient, message } = await startClaudeChatHaltService();
-
-    expect(existsSync(join(homeDir, "HALT"))).toBe(false);
-    expect(held("codex")).toBe(true);
-    expect(held("claude")).toBe(false);
-    const imported = getRepositories().meshEvents.listByKinds(["availability_hold_imported"], {
-      bodyKinds: [],
-    });
-    expect(imported).toHaveLength(1);
-    expect(imported[0]?.detail).toBe(`HALT file imported as hold on codex until ${until}`);
-
-    await message("/halt", "messages/halt-after-import");
-    expect(chatClient.sent.at(-1)?.text ?? "").toContain(
-      `• codex (all models), until ${until} — chat /halt from Operator`
-    );
   });
 
   it("wires model-admin availability holds into the configured actor's endpoint and run admission (#539)", async () => {

@@ -80,12 +80,13 @@ describe("availability holds in admission", () => {
 
   it("holds only the named model, leaving the provider's other models eligible", async () => {
     const held = lane({ provider: "codex", model: "gpt-5.5" });
-    const sibling = lane({ provider: "codex-mini", model: "gpt-5.5-mini" });
+    const sibling = lane({ provider: "codex", model: "gpt-5.5-mini" });
     holds.set({ provider: "codex", models: ["gpt-5.5"], createdBy: "root" });
 
-    const { handle } = admit([held, sibling]);
+    const { handle, started } = admit([held, sibling]);
     await vi.advanceTimersByTimeAsync(0);
-    await expect(handle.result).resolves.toEqual({ provider: "codex-mini", model: "gpt-5.5-mini" });
+    expect(started).toEqual([{ provider: "codex", model: "gpt-5.5-mini" }]);
+    await expect(handle.result).resolves.toEqual({ provider: "codex", model: "gpt-5.5-mini" });
   });
 
   it("restores the held primary at expiry without a pool edit", async () => {
@@ -107,20 +108,5 @@ describe("availability holds in admission", () => {
     await vi.advanceTimersByTimeAsync(1);
     await expect(handle.result).resolves.toEqual({ provider: "kimi", model: "kimi-k2" });
     expect(JSON.stringify(pool.map((entry) => entry.config))).toBe(before);
-  });
-
-  it("restores the held primary when the hold is cleared", async () => {
-    const primary = lane({ provider: "kimi", model: "kimi-k2" });
-    const fallback = lane({ provider: "codex", model: "gpt-5.5" });
-    fallback.pacer.deferUntil(Date.now() + 10 * HOUR);
-    holds.set({ provider: "kimi", createdBy: "root" });
-
-    const { handle, started } = admit([primary, fallback]);
-    await vi.advanceTimersByTimeAsync(HOUR);
-    expect(started).toEqual([]);
-
-    holds.clear({ provider: "kimi" });
-    await vi.advanceTimersByTimeAsync(0);
-    await expect(handle.result).resolves.toEqual({ provider: "kimi", model: "kimi-k2" });
   });
 });

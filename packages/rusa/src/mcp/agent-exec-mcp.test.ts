@@ -3311,7 +3311,7 @@ describe("availability hold tools (#539)", () => {
     ]);
   });
 
-  it("refuses an unmeetable scope or a past expiry and stores nothing", async () => {
+  it("refuses an unmeetable or empty scope or a past expiry and stores nothing", async () => {
     const { mesh } = setup();
     const { repo, options } = holdDeps();
     const root = await connect(createAgentExecMcpServer(mesh, "root", "root", undefined, options));
@@ -3321,6 +3321,9 @@ describe("availability hold tools (#539)", () => {
     expect(dataOf(unknown)).toMatch(/not configured/);
     const typo = await call(root, "set_availability_hold", { provider: "kimi", models: ["typo"] });
     expect(typo.isError).toBe(true);
+    // An empty list is not the omitted list: it must not widen to the provider.
+    const empty = await call(root, "set_availability_hold", { provider: "kimi", models: [] });
+    expect(empty.isError).toBe(true);
     const past = await call(root, "set_availability_hold", {
       provider: "kimi",
       expiry: "2026-10-05T11:59:59Z",

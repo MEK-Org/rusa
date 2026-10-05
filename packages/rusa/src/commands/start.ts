@@ -1653,8 +1653,8 @@ async function composeStart(
   // Emergency brake: the single source of truth is the sentinel file. Halt by
   // hand (`touch ~/.rusa/HALT`), by chat (`/halt`), or pull the plug.
   const haltSwitch = new HaltSwitch(join(mcHome, "HALT"));
-  // A provider-scoped sentinel from before #539 becomes durable holds once,
-  // leaving the file for the global brake alone.
+  // A provider-scoped sentinel from before #539 becomes durable holds once and
+  // is archived as HALT.imported; the file for the global brake is left alone.
   const importedHolds = importScopedHaltFile({
     file: join(mcHome, "HALT"),
     repo: getRepositories().availabilityHolds,
