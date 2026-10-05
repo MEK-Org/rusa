@@ -15,6 +15,7 @@ Widget _header(
   DashboardStore store, {
   double width = 1100,
   bool phone = false,
+  DateTime Function()? haltTooltipNow,
 }) => MaterialApp(
   home: Scaffold(
     body: SizedBox(
@@ -24,6 +25,7 @@ Widget _header(
         selected: DashboardView.actors,
         onSelect: (_) {},
         onMenuTap: phone ? () {} : null,
+        haltTooltipNow: haltTooltipNow,
       ),
     ),
   ),
@@ -109,12 +111,7 @@ void main() {
         ),
         now: now,
       );
-      expect(
-        text,
-        endsWith(
-          'Expiry passed today 11:30 AM; the badge clears on the next refresh.',
-        ),
-      );
+      expect(text, endsWith('Expiry passed today 11:30 AM.'));
       expect(text, isNot(contains('Expires')));
     });
 
@@ -227,19 +224,21 @@ void main() {
     'tooltip evaluates dynamically on hover so a passed expiry is recognized '
     'without a widget rebuild',
     (tester) async {
-      final until = DateTime.now().add(const Duration(milliseconds: 500));
+      // Keep the actual expiry a day away: the store's expiry timer cannot
+      // refresh this test. The controllable presentation clock alone crosses
+      // the expiry after the header has built.
+      final until = DateTime.now().add(const Duration(days: 1));
+      var now = until.subtract(const Duration(minutes: 1));
       final store = await _store(
         tester,
         HaltStatusDto(scope: 'global', until: until.toUtc().toIso8601String()),
       );
-      await tester.pumpWidget(_header(store));
+      await tester.pumpWidget(_header(store, haltTooltipNow: () => now));
       await tester.pump();
 
-      // Advance real time past until so DateTime.now() exceeds until.
-      await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 600)),
-      );
-      await tester.pump();
+      // Do not pump/rebuild after this transition. Replacing the lazy Builder
+      // with build-time text makes this assertion fail.
+      now = until.add(const Duration(minutes: 1));
 
       final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
       await mouse.addPointer(location: Offset.zero);

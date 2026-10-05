@@ -162,6 +162,7 @@ class MeshHeader extends StatelessWidget {
     this.onLogout,
     this.profilePhotoUrl,
     this.profileDisplayName,
+    this.haltTooltipNow,
   });
 
   final DashboardStore store;
@@ -169,6 +170,10 @@ class MeshHeader extends StatelessWidget {
   final VoidCallback? onLogout;
   final String? profilePhotoUrl;
   final String? profileDisplayName;
+
+  /// Test clock for the lazily built halt tooltip. Production callers leave
+  /// this null, so each presentation reads the wall clock.
+  final DateTime Function()? haltTooltipNow;
 
   /// Which top-level view is active (drives the nav highlight).
   final DashboardView selected;
@@ -308,6 +313,7 @@ class MeshHeader extends StatelessWidget {
                                         return _HaltedBadge(
                                           halt: statusSnap.data,
                                           compact: compact,
+                                          now: haltTooltipNow,
                                         );
                                       },
                                     ),
@@ -1135,9 +1141,7 @@ String haltTooltipText(HaltStatusDto? halt, {DateTime? now}) {
   } else if (until.isAfter(local)) {
     expiry = 'Expires ${_haltExpiryFormat(until, local)}.';
   } else {
-    expiry =
-        'Expiry passed ${_haltExpiryFormat(until, local)}; '
-        'the badge clears on the next refresh.';
+    expiry = 'Expiry passed ${_haltExpiryFormat(until, local)}.';
   }
   return 'Halt scope: $scope.\n$effect\n$inFlight\n$expiry';
 }
@@ -1158,10 +1162,11 @@ String _haltExpiryFormat(DateTime until, DateTime now) {
 /// solely while an active halt exists. The tooltip names the authoritative
 /// scope and expiry from the same snapshot that raised the badge (#906).
 class _HaltedBadge extends StatelessWidget {
-  const _HaltedBadge({this.halt, this.compact = false});
+  const _HaltedBadge({this.halt, this.compact = false, this.now});
 
   final HaltStatusDto? halt;
   final bool compact;
+  final DateTime Function()? now;
 
   @override
   Widget build(BuildContext context) {
@@ -1170,11 +1175,13 @@ class _HaltedBadge extends StatelessWidget {
       richMessage: WidgetSpan(
         // Evaluated when the tooltip opens, so a passed expiry reads as passed
         // on an idle page; the overlay's DefaultTextStyle supplies the style.
-        child: Builder(builder: (context) => Text(haltTooltipText(halt))),
+        child: Builder(
+          builder: (context) => Text(haltTooltipText(halt, now: now?.call())),
+        ),
       ),
       excludeFromSemantics: true,
       child: Semantics(
-        label: haltTooltipText(halt),
+        label: haltTooltipText(halt, now: now?.call()),
         child: Container(
           padding: EdgeInsets.symmetric(
             horizontal: compact ? 6 : 10,
