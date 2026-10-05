@@ -2778,9 +2778,8 @@ async function composeStart(
     // here rather than at routing time hangs boot.
     obligations: {
       findLiveByExternalRef: (ref) => getRepositories().obligations.findLiveByExternalRef(ref),
-      // Strict-obligation handling snapshots these unbounded edge reads at
-      // selection. Keep the production wiring on the same durable repository
-      // seam as the experiment registry.
+      // Strict head closure (#917) snapshots these unbounded edge reads at
+      // every head selection, so they read the same durable repository.
       get: (id) => getRepositories().obligations.get(id),
       listDirectChildEdges: (parentId) =>
         getRepositories().obligations.listDirectChildEdges(parentId),

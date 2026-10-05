@@ -38,7 +38,6 @@ import {
 import {
   type ExperimentEnrollmentStore,
   InMemoryExperimentEnrollmentStore,
-  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
 } from "../actor/experiments.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
@@ -72,6 +71,9 @@ async function connect(server: McpServer): Promise<Client> {
   await client.connect(clientTransport);
   return client;
 }
+
+/** A fixture rollout: the production experiment registry is empty between rollouts. */
+const FIXTURE_EXPERIMENT = "fixture_rollout";
 
 function dataOf(result: CallToolResult): unknown {
   const first = result.content[0];
@@ -207,6 +209,9 @@ function setup(
     inboxStore,
     completedFocusEntryCounts: opts.completedFocusEntryCounts,
     experimentEnrollments: opts.experimentEnrollments,
+    // The production registry is empty between rollouts; the tools are
+    // exercised against a fixture rollout instead.
+    experimentRegistry: { [FIXTURE_EXPERIMENT]: { intent: "Exercise the rollout seam." } },
     isVoiceSessionActive: opts.isVoiceSessionActive,
     voiceSessionTransfer: opts.voiceSessionTransfer,
     listVoiceSessionChat: opts.listVoiceSessionChat,
@@ -624,7 +629,7 @@ describe("administrative capability gating of management tools (#549)", () => {
       });
       experiments.enroll({
         actorId,
-        experiment: STRICT_OBLIGATION_HANDLING_EXPERIMENT,
+        experiment: FIXTURE_EXPERIMENT,
         enrolledBy: "test",
         enrolledAt: "2026-01-01T00:00:00Z",
       });
@@ -4556,31 +4561,31 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
     })) as CallToolResult;
     const threadId = (dataOf(spawned) as { thread_id: string }).thread_id;
     // Enrollment is strictly post-spawn: the actor exists first, unenrolled.
-    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(false);
+    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(false);
 
     const enrolled = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(enrolled.isError).toBeFalsy();
     expect(changeOf(enrolled)).toMatchObject({
       actor_id: threadId,
-      experiment: "strict_obligation_handling",
+      experiment: FIXTURE_EXPERIMENT,
       enrolled: true,
       changed: true,
     });
-    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(true);
+    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(true);
 
     const listed = (await root.callTool({
       name: "list_actor_experiments",
       arguments: { actor_id: threadId },
     })) as CallToolResult;
     expect(dataOf(listed)).toMatchObject({
-      experiments: [{ name: "strict_obligation_handling" }],
+      experiments: [{ name: FIXTURE_EXPERIMENT }],
       enrollments: [
         {
           actor_id: threadId,
-          experiment: "strict_obligation_handling",
+          experiment: FIXTURE_EXPERIMENT,
           enrolled_by: "root",
         },
       ],
@@ -4588,11 +4593,11 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     const unenrolled = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(unenrolled.isError).toBeFalsy();
     expect(changeOf(unenrolled)).toMatchObject({ enrolled: false, changed: true });
-    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(false);
+    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(false);
     const afterList = (await root.callTool({
       name: "list_actor_experiments",
       arguments: {},
@@ -4611,11 +4616,11 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     const first = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     const second = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(second.isError).toBeFalsy();
     expect(changeOf(first)).toMatchObject({ enrolled: true, changed: true });
@@ -4623,11 +4628,11 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     });
     const repeatOff = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(repeatOff.isError).toBeFalsy();
     expect(changeOf(repeatOff)).toMatchObject({ enrolled: false, changed: false });
@@ -4651,7 +4656,7 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     const unknownActor = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: "no-such-thread", experiment: "strict_obligation_handling" },
+      arguments: { actor_id: "no-such-thread", experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(unknownActor.isError).toBe(true);
     expect(mesh.listExperimentEnrollments()).toEqual([]);
@@ -4667,24 +4672,24 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
     });
     await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     });
     mesh.retire(threadId);
 
-    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(true);
+    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(true);
     const reEnroll = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(reEnroll.isError).toBe(true);
     expect(String(dataOf(reEnroll))).toContain("retired");
 
     const withdraw = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(withdraw.isError).toBeFalsy();
-    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(false);
+    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(false);
   });
 
   it("is not a grantable capability, so no grant can hand it to a worker", async () => {
@@ -4715,13 +4720,13 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     const enrolled = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: "root", experiment: "strict_obligation_handling" },
+      arguments: { actor_id: "root", experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(enrolled.isError).toBeFalsy();
     // The response names the thread the row was written under, not the
     // legacy address the caller typed, so it correlates with the readback.
     expect(changeOf(enrolled)).toMatchObject({ actor_id: configuredRootId, changed: true });
-    expect(mesh.isEnrolledInExperiment(configuredRootId, "strict_obligation_handling")).toBe(true);
+    expect(mesh.isEnrolledInExperiment(configuredRootId, FIXTURE_EXPERIMENT)).toBe(true);
 
     const listed = (await root.callTool({
       name: "list_actor_experiments",
@@ -4731,18 +4736,18 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       enrollments: [
         {
           actor_id: configuredRootId,
-          experiment: "strict_obligation_handling",
+          experiment: FIXTURE_EXPERIMENT,
         },
       ],
     });
 
     const unenrolled = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: "root", experiment: "strict_obligation_handling" },
+      arguments: { actor_id: "root", experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(unenrolled.isError).toBeFalsy();
     expect(changeOf(unenrolled)).toMatchObject({ actor_id: configuredRootId, changed: true });
-    expect(mesh.isEnrolledInExperiment(configuredRootId, "strict_obligation_handling")).toBe(false);
+    expect(mesh.isEnrolledInExperiment(configuredRootId, FIXTURE_EXPERIMENT)).toBe(false);
   });
 
   it("deletes a stale row for an experiment no longer in the registry via the tool", async () => {
@@ -4754,18 +4759,19 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       parentId: "root",
       modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
-    // A row left behind by an experiment since deleted from `EXPERIMENTS`:
-    // nothing at the mesh or tool layer can write this name any more.
+    // A row left behind by an experiment since deleted from `EXPERIMENTS` —
+    // strict obligation handling, now every actor's behavior (#917): nothing at
+    // the mesh or tool layer can write this name any more.
     experimentEnrollments.enroll({
       actorId: threadId,
-      experiment: "retired_experiment",
+      experiment: "strict_obligation_handling",
       enrolledBy: "root",
       enrolledAt: "2026-01-01T00:00:00Z",
     });
 
     const unenrollStale = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "retired_experiment" },
+      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     expect(unenrollStale.isError).toBeFalsy();
     expect(changeOf(unenrollStale)).toMatchObject({ enrolled: false, changed: true });
@@ -4774,7 +4780,7 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
     // Enrolling under that name is still refused — cleanup is one-way.
     const reEnroll = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "retired_experiment" },
+      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     expect(reEnroll.isError).toBe(true);
   });

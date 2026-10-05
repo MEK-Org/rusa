@@ -46,9 +46,8 @@ export function createHarness(options: {
   isHalted?: (provider?: string, model?: string) => boolean;
   /** Leader-side observer, called as each follower event is received, for race-window tests. */
   onEvent?: (actorId: string, event: ActorEvent) => void;
-  /** Obligation reads and experiment membership, for tests about strict head closure. */
+  /** Obligation reads, for tests about strict head closure. */
   obligations?: ActorMeshOptions["obligations"];
-  experimentEnrollments?: ActorMeshOptions["experimentEnrollments"];
 }) {
   const actors = new InMemoryActorRepository();
   const runtimes = new Map<string, ActorHandle>();
@@ -130,7 +129,6 @@ export function createHarness(options: {
     events: (event) => meshEvents.push(event),
     idgen: () => `instance-worker-${++sequence}`,
     obligations: options.obligations,
-    experimentEnrollments: options.experimentEnrollments,
     ...(pacer
       ? {
           // Every declared candidate is a lane, and a halted one is skipped as
