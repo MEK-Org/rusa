@@ -31,6 +31,32 @@ export type EntityId = string;
  */
 export type ObligationExternalRef = Reference;
 
+/** The event predicates v1 can use to finish an obligation. */
+export type CompletionMatcherKind = "pr_merged" | "deployed";
+
+/** Versioned, application-validated data stored in a matcher's `spec_json`. */
+export interface CompletionMatcherSpec {
+  schemaVersion: 1;
+}
+
+/** The one opt-in matcher currently attached to an obligation, if any. */
+export interface CompletionMatcher {
+  kind: CompletionMatcherKind;
+  /** A canonical PR reference for `pr_merged`, or a 40-hex commit for `deployed`. */
+  target: string;
+  spec: CompletionMatcherSpec;
+  setBy: EntityId;
+  setAt: string;
+  satisfiedAt: string | null;
+  satisfiedRef: string | null;
+  closedUnmergedAt: string | null;
+}
+
+/** Model-facing shape accepted by the create/set matcher boundary. */
+export type CompletionMatcherInput =
+  | { kind: "pr_merged"; pr: string }
+  | { kind: "deployed"; commit: string };
+
 export interface Obligation {
   id: string;
   parentId: string | null;
@@ -48,6 +74,8 @@ export interface Obligation {
   /** The fuller statement of what should become true. The body, not the heading. */
   intent: string | null;
   externalRef: ObligationExternalRef | null;
+  /** An explicit event→done predicate. It never changes `externalRef`. */
+  completionMatcher: CompletionMatcher | null;
   status: ObligationStatus;
   /** Explicit override; null means inherit from the nearest prioritized ancestor. */
   priority: number | null;

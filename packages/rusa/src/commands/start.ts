@@ -219,7 +219,9 @@ import {
   UNDERSTANDING_READ_MCP_NAME,
 } from "../mcp/understanding-mcp.js";
 import type { UpdateToolDeps } from "../mcp/update-mcp.js";
+import { CompletionMatcherEvaluator } from "../obligations/completion-matcher-evaluator.js";
 import {
+  type CompletionMatcherInput,
   type EntityId,
   isTerminalObligationStatus,
   type Obligation,
@@ -347,6 +349,7 @@ import {
 } from "../webhook/directed-delivery.js";
 import {
   createDashboardRequestHandler,
+  deployedSha,
   startDashboardServer,
   startWebhookServer,
 } from "../webhook/server.js";
@@ -1617,6 +1620,50 @@ async function composeStart(
     }
   })();
   const addDirs: string[] = repoRoot ? [repoRoot] : [];
+  const excludedGitHubRepos = new Set(
+    (config.github.orgs ?? [])
+      .flatMap((entry) => entry.excludedRepos ?? [])
+      .map((repo) => repo.toLowerCase())
+  );
+  const completionMatcherGit = repoRoot ? new GitRunner(repoRoot) : null;
+  const completionMatcherRepository = config.github.repos?.[0] ?? null;
+  const completionMatcherEvaluator = new CompletionMatcherEvaluator({
+    obligations: getRepositories().obligations,
+    issueClient,
+    deployedSha: () => deployedSha,
+    isAncestor: (ancestor, descendant) =>
+      completionMatcherGit
+        ? completionMatcherGit.isAncestor(ancestor, descendant)
+        : Promise.reject(new Error("local checkout unavailable")),
+    repository: completionMatcherRepository,
+    instanceName: rootHandle,
+    onClosedUnmerged: (obligation, matcher) => {
+      // A stable id makes retries (including boot reconciliation after a crash)
+      // deliver at most one owner notice for one matcher installation.
+      inboxStore.append([
+        {
+          id: `completion-matcher-unmerged:${obligation.id}:${matcher.setAt}`,
+          actorId: obligation.ownerId,
+          source: matcher.target,
+          payload: {
+            type: "completion_matcher_closed_unmerged",
+            obligationId: obligation.id,
+            matcher: { kind: matcher.kind, target: matcher.target },
+          },
+        },
+      ]);
+    },
+    log: (message) => console.warn(message),
+  });
+  const validateCompletionMatcher = async (matcher: CompletionMatcherInput): Promise<void> => {
+    if (matcher.kind !== "pr_merged") return;
+    const target = asGitHubIssue(parseReference(matcher.pr));
+    if (target && excludedGitHubRepos.has(`${target.owner}/${target.repo}`.toLowerCase())) {
+      throw new Error(
+        `completion matcher refuses configured excluded repository: ${target.owner}/${target.repo}`
+      );
+    }
+  };
   // Append-only observability log: every message, wake, spawn, and retire lands
   // in `mesh_events` so a run can be replayed as a timeline by `rusa report`.
   // After persisting, broadcast the stored row to any live dashboard SSE clients
@@ -3163,6 +3210,9 @@ async function composeStart(
             canManage: (callerId, obligation) =>
               canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
             recordEvent: (event) => mesh.recordEvent(event),
+            validateCompletionMatcher,
+            evaluateCompletionMatcher: (obligationId) =>
+              completionMatcherEvaluator.evaluate(obligationId),
           })
         );
         const meshChatUrl = mcpHttp.addServer(`${id}:${MESH_CHAT_MCP_NAME}`, () =>
@@ -3610,6 +3660,9 @@ async function composeStart(
       canManage: () => true,
       resolveOwner: (raw) => resolveObligationOwner(actors, raw, getRepositories().principals),
       recordEvent: (event) => mesh.recordEvent(event),
+      validateCompletionMatcher,
+      evaluateCompletionMatcher: (obligationId) =>
+        completionMatcherEvaluator.evaluate(obligationId),
     })
   );
   const rootPnpmInstallUrl = mcpHttp.addServer(`${rootId}:${PNPM_INSTALL_MCP_NAME}`, () =>
@@ -3936,6 +3989,15 @@ async function composeStart(
   mesh.reconcileInbox();
   getRepositories().obligations.reconcileScheduledObligations();
   try {
+    await completionMatcherEvaluator.reconcileAtBoot();
+  } catch (err) {
+    // One matcher read/checkout problem must not prevent the mesh from
+    // starting; an unchecked matcher is retried by the next boot or live event.
+    console.warn(
+      `[completion-matcher] boot reconciliation failed: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  try {
     mesh.reconcileReadyHeads(getRepositories().obligations);
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
@@ -3974,12 +4036,6 @@ async function composeStart(
   const dashboardPort = config.dashboard?.port ?? 8080;
   const dashboardBindHost = config.dashboard?.bindHost ?? "127.0.0.1";
   const botLogin = config.github.account?.toLowerCase();
-  const excludedGitHubRepos = new Set(
-    (config.github.orgs ?? [])
-      .flatMap((entry) => entry.excludedRepos ?? [])
-      .map((repo) => repo.toLowerCase())
-  );
-
   const onEvent = async (
     event: string,
     payload: Record<string, unknown>,
@@ -3998,6 +4054,21 @@ async function composeStart(
         `[github] configured excluded repository event dropped: ${event} on ${repoFullName}`
       );
       return;
+    }
+    // Completion matching deliberately runs before every authorship, bot, and
+    // subscription delivery filter. A staging merge made by the bot must close
+    // its explicitly-matched obligation even when no actor subscribed to the
+    // repository and even when no routable owner exists for this webhook.
+    if (event === "pull_request" && action === "closed" && repoFullName) {
+      const pull = payload.pull_request as { number?: number; merged?: boolean } | undefined;
+      const number = pull?.number ?? (payload.number as number | undefined);
+      if (typeof number === "number") {
+        await completionMatcherEvaluator.handlePullRequestClosed({
+          repo: repoFullName,
+          number,
+          merged: pull?.merged === true,
+        });
+      }
     }
     // Directive-only: this walks a parent fallback chain and must never feed authorship.
     // See authorStampBodyForWebhookPayload.

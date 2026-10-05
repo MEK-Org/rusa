@@ -10,6 +10,9 @@ import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js"
 import {
   assertObligationStatus,
   buildHistoryPayload,
+  type CompletionMatcher,
+  type CompletionMatcherInput,
+  type CompletionMatcherKind,
   type EntityId,
   isBlockingObligationStatus,
   isDeadlineDue,
@@ -36,6 +39,7 @@ import {
 } from "../../obligations/obligation.js";
 import { createLogger, type Logger } from "../../observability/logger.js";
 import type { PrincipalKind } from "../../principals/principal-ref.js";
+import { asGitHubIssue } from "../../references/reference.js";
 
 let _obligationLogger: Logger | undefined;
 function obligationLogger(): Logger {
@@ -75,6 +79,14 @@ interface ObligationRow {
   next_ready_at: string | null;
   snoozed_until: string | null;
   has_completion_history: 0 | 1;
+  matcher_kind: CompletionMatcherKind | null;
+  matcher_target: string | null;
+  matcher_spec_json: string | null;
+  matcher_set_by: string | null;
+  matcher_set_at: string | null;
+  matcher_satisfied_at: string | null;
+  matcher_satisfied_ref: string | null;
+  matcher_closed_unmerged_at: string | null;
 }
 
 interface ObligationArtifactRow {
@@ -156,6 +168,8 @@ export interface CreateObligationInput {
     | { policy: "cron"; cronExpr: string }
     | { policy: "completion_interval"; intervalSeconds: number }
     | null;
+  /** Optional opt-in event→done predicate, persisted with the new row. */
+  completionMatcher?: CompletionMatcherInput | null;
   /**
    * Obligations this one must wait on. Accepted in the same transaction as
    * creation (#212) so a blocked obligation can never exist as `ready`, even
@@ -395,9 +409,18 @@ const PROJECTED_OBLIGATION = `
            SELECT 1
            FROM obligation_completions
            WHERE obligation_id = obligation.id
-         ) AS has_completion_history
+         ) AS has_completion_history,
+         matcher.kind AS matcher_kind,
+         matcher.target AS matcher_target,
+         matcher.spec_json AS matcher_spec_json,
+         matcher.set_by AS matcher_set_by,
+         matcher.set_at AS matcher_set_at,
+         matcher.satisfied_at AS matcher_satisfied_at,
+         matcher.satisfied_ref AS matcher_satisfied_ref,
+         matcher.closed_unmerged_at AS matcher_closed_unmerged_at
   FROM obligations obligation
   JOIN effective_priority ON effective_priority.id = obligation.id
+  LEFT JOIN obligation_completion_matchers matcher ON matcher.obligation_id = obligation.id
 `;
 
 /**
@@ -488,6 +511,7 @@ function toObligation(row: ObligationRow): Obligation {
     ownerId: validateEntityId(row.owner_id),
     intent: row.intent,
     externalRef: row.external_ref === null ? null : parseExternalRef(row.external_ref),
+    completionMatcher: toCompletionMatcher(row),
     status: row.status,
     priority: row.priority,
     effectivePriority: validatePriority(row.effective_priority),
@@ -511,6 +535,79 @@ function toObligation(row: ObligationRow): Obligation {
     snoozedUntil: row.snoozed_until,
     hasCompletionHistory: row.has_completion_history === 1,
   };
+}
+
+function parseCompletionMatcherSpec(raw: string): { schemaVersion: 1 } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new ObligationValidationError("completion matcher spec_json is not valid JSON");
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    (parsed as { schemaVersion?: unknown }).schemaVersion !== 1 ||
+    Object.keys(parsed).some((key) => key !== "schemaVersion")
+  ) {
+    throw new ObligationValidationError("completion matcher spec_json has an unsupported shape");
+  }
+  return { schemaVersion: 1 };
+}
+
+function toCompletionMatcher(row: ObligationRow): CompletionMatcher | null {
+  if (row.matcher_kind === null) return null;
+  if (
+    row.matcher_target === null ||
+    row.matcher_spec_json === null ||
+    row.matcher_set_by === null ||
+    row.matcher_set_at === null
+  ) {
+    throw new ObligationValidationError("completion matcher row is incomplete");
+  }
+  if (row.matcher_kind !== "pr_merged" && row.matcher_kind !== "deployed") {
+    throw new ObligationValidationError("completion matcher has an unsupported kind");
+  }
+  return {
+    kind: row.matcher_kind,
+    target: row.matcher_target,
+    spec: parseCompletionMatcherSpec(row.matcher_spec_json),
+    setBy: validateEntityId(row.matcher_set_by),
+    setAt: row.matcher_set_at,
+    satisfiedAt: row.matcher_satisfied_at,
+    satisfiedRef: row.matcher_satisfied_ref,
+    closedUnmergedAt: row.matcher_closed_unmerged_at,
+  };
+}
+
+function normalizeCompletionMatcherInput(matcher: CompletionMatcherInput): {
+  kind: CompletionMatcherKind;
+  target: string;
+  specJson: string;
+} {
+  if (matcher.kind === "pr_merged") {
+    const reference = parseObligationReference(matcher.pr);
+    const pull = asGitHubIssue(reference);
+    if (pull?.collection !== "pulls") {
+      throw new ObligationValidationError(
+        "pr_merged matcher must name a GitHub pull request, e.g. github:MEK-Org/rusa/pulls/190"
+      );
+    }
+    return {
+      kind: matcher.kind,
+      target: reference.key,
+      specJson: JSON.stringify({ schemaVersion: 1 }),
+    };
+  }
+  if (matcher.kind === "deployed") {
+    const commit = matcher.commit.trim().toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(commit)) {
+      throw new ObligationValidationError("deployed matcher commit must be a 40-hex SHA");
+    }
+    return { kind: matcher.kind, target: commit, specJson: JSON.stringify({ schemaVersion: 1 }) };
+  }
+  throw new ObligationValidationError("completion matcher has an unsupported kind");
 }
 
 function toArtifact(row: ObligationArtifactRow): ObligationArtifact {
@@ -1603,6 +1700,15 @@ export class ObligationRepository {
       ) {
         throw new ObligationValidationError("recurrence interval must be a positive integer");
       }
+      if (recurrence !== null && recurrence !== undefined && input.completionMatcher != null) {
+        throw new ObligationValidationError(
+          "recurring or scheduled obligations cannot carry a completion matcher"
+        );
+      }
+      const completionMatcher =
+        input.completionMatcher == null
+          ? null
+          : normalizeCompletionMatcherInput(input.completionMatcher);
 
       // PROVISIONAL ISSUE_NUM Q72: human IDs are opaque nonempty handles; no registry exists yet.
       const externalRef =
@@ -1701,6 +1807,22 @@ export class ObligationRepository {
           );
         if (input.recurrence?.policy === "cron") {
           this.markScheduleDirty(id);
+        }
+        if (completionMatcher !== null) {
+          this.db
+            .prepare(
+              `INSERT INTO obligation_completion_matchers
+                (obligation_id, kind, target, spec_json, set_by, set_at)
+               VALUES (?, ?, ?, ?, ?, ?)`
+            )
+            .run(
+              id,
+              completionMatcher.kind,
+              completionMatcher.target,
+              completionMatcher.specJson,
+              actingPrincipal,
+              stampedAt
+            );
         }
       } catch (error) {
         if (
@@ -2079,6 +2201,103 @@ export class ObligationRepository {
         )
         .all(...params) as ObligationRow[]
     ).map(toObligation);
+  }
+
+  /** Every non-terminal row carrying a completion matcher, optionally of one kind. */
+  listLiveCompletionMatchers(kind?: CompletionMatcherKind): Obligation[] {
+    const kindClause = kind === undefined ? "" : " AND matcher.kind = ?";
+    const params = kind === undefined ? [] : [kind];
+    return (
+      this.db
+        .prepare(
+          `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
+           WHERE obligation.status IN ('ready', 'waiting')
+             AND matcher.obligation_id IS NOT NULL${kindClause}
+           ORDER BY obligation.id`
+        )
+        .all(...params) as ObligationRow[]
+    ).map(toObligation);
+  }
+
+  /**
+   * Persist a matching observation and complete immediately when no live child
+   * remains. A child-bearing node keeps the observation until `tryRelease`
+   * reaches it, preserving the normal live-child invariant.
+   */
+  satisfyCompletionMatcher(
+    id: string,
+    expected: Pick<CompletionMatcher, "kind" | "target" | "setAt">,
+    satisfaction: { resolutionRef: string; note: string }
+  ): { obligation: Obligation; satisfied: boolean } {
+    return this.mutate("system:mesh", () => {
+      const obligation = this.require(id);
+      const matcher = obligation.completionMatcher;
+      if (
+        isTerminalObligationStatus(obligation.status) ||
+        matcher === null ||
+        matcher.kind !== expected.kind ||
+        matcher.target !== expected.target ||
+        matcher.setAt !== expected.setAt
+      ) {
+        return { obligation, satisfied: false };
+      }
+
+      if (matcher.satisfiedAt === null) {
+        const resolutionRef = parseObligationReference(satisfaction.resolutionRef).key;
+        this.db
+          .prepare(
+            `UPDATE obligation_completion_matchers
+             SET satisfied_at = ?, satisfied_ref = ?
+             WHERE obligation_id = ? AND satisfied_at IS NULL`
+          )
+          .run(this.stamp(), resolutionRef, id);
+      }
+
+      const liveChild = this.listChildren(id).find((child) =>
+        isBlockingObligationStatus(child.status)
+      );
+      if (liveChild) return { obligation: this.require(id), satisfied: true };
+      return {
+        obligation: this.setTerminalStatusInMutation(
+          id,
+          "done",
+          satisfaction.note,
+          satisfaction.resolutionRef,
+          "system:mesh"
+        ),
+        satisfied: true,
+      };
+    });
+  }
+
+  /** Record a closed-without-merge observation without changing obligation status. */
+  recordCompletionMatcherClosedUnmerged(
+    id: string,
+    expected: Pick<CompletionMatcher, "kind" | "target" | "setAt">
+  ): Obligation | null {
+    return this.mutate("system:mesh", () => {
+      const obligation = this.require(id);
+      const matcher = obligation.completionMatcher;
+      if (
+        isTerminalObligationStatus(obligation.status) ||
+        matcher === null ||
+        matcher.kind !== expected.kind ||
+        matcher.target !== expected.target ||
+        matcher.setAt !== expected.setAt
+      ) {
+        return null;
+      }
+      if (matcher.closedUnmergedAt === null) {
+        this.db
+          .prepare(
+            `UPDATE obligation_completion_matchers
+             SET closed_unmerged_at = ?
+             WHERE obligation_id = ? AND closed_unmerged_at IS NULL`
+          )
+          .run(this.stamp(), id);
+      }
+      return this.require(id);
+    });
   }
 
   /** Bounded owner-queue read for externally serialized projections. */
@@ -2529,6 +2748,60 @@ export class ObligationRepository {
   }
 
   /**
+   * Set, replace, or clear this obligation's one opt-in completion predicate.
+   *
+   * Replacement deliberately clears satisfaction and unmerged-close evidence:
+   * those observations belong to the old predicate and must never survive a
+   * retarget. The evaluation service performs the immediate/boot/event checks
+   * after this write; persisting the matcher itself is intentionally local and
+   * does not make a network request inside the repository transaction.
+   */
+  setCompletionMatcher(
+    id: string,
+    matcher: CompletionMatcherInput | null,
+    principal: EntityId
+  ): Obligation {
+    return this.mutate(principal, () => {
+      const obligation = this.require(id);
+      if (isTerminalObligationStatus(obligation.status)) {
+        throw new ObligationValidationError(
+          "terminal obligations cannot carry a completion matcher"
+        );
+      }
+      if (obligation.recurrencePolicy !== null || obligation.status === "scheduled") {
+        throw new ObligationValidationError(
+          "recurring or scheduled obligations cannot carry a completion matcher"
+        );
+      }
+      if (matcher === null) {
+        this.db
+          .prepare("DELETE FROM obligation_completion_matchers WHERE obligation_id = ?")
+          .run(id);
+      } else {
+        const normalized = normalizeCompletionMatcherInput(matcher);
+        const setBy = validateEntityId(principal);
+        this.db
+          .prepare(
+            `INSERT INTO obligation_completion_matchers
+              (obligation_id, kind, target, spec_json, set_by, set_at, satisfied_at, satisfied_ref, closed_unmerged_at)
+             VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+             ON CONFLICT(obligation_id) DO UPDATE SET
+               kind = excluded.kind,
+               target = excluded.target,
+               spec_json = excluded.spec_json,
+               set_by = excluded.set_by,
+               set_at = excluded.set_at,
+               satisfied_at = NULL,
+               satisfied_ref = NULL,
+               closed_unmerged_at = NULL`
+          )
+          .run(id, normalized.kind, normalized.target, normalized.specJson, setBy, this.stamp());
+      }
+      return this.require(id);
+    });
+  }
+
+  /**
    * Rewrite where this obligation stands, in the writing entity's words (#302).
    *
    * Replace semantics, deliberately: the previous value is gone, because the
@@ -2865,148 +3138,159 @@ export class ObligationRepository {
     resolutionRef: string | null | undefined,
     principal: EntityId
   ): Obligation {
-    return this.mutate(principal, () => {
-      const obligation = this.require(id);
-      if (isTerminalObligationStatus(obligation.status)) {
-        throw new ObligationValidationError("terminal obligations cannot be reopened or changed");
-      }
-      if (obligation.status === "scheduled" && status === "done") {
-        throw new ObligationValidationError(
-          "scheduled obligations cannot be completed until they are ready"
-        );
-      }
-      const liveChild = this.listChildren(id).find((child) =>
-        isBlockingObligationStatus(child.status)
-      );
-      if (liveChild) {
-        throw new ObligationValidationError(
-          `cannot ${status === "cancelled" ? "cancel" : "complete"} obligation with live children`
-        );
-      }
+    return this.mutate(principal, () =>
+      this.setTerminalStatusInMutation(id, status, note, resolutionRef, principal)
+    );
+  }
 
-      const completedAt = this.stamp();
-      const resolution = resolutionRef == null ? null : parseObligationReference(resolutionRef).key;
-      if (resolution !== null) {
-        // Same transaction as the transition: evidence that arrives only if a
-        // second call succeeds is evidence that goes missing on a crash.
-        this.db
-          .prepare(
-            `INSERT INTO obligation_artifacts (id, obligation_id, ref, label, attached_by, attached_at)
+  /** The terminal transition body, for matcher satisfaction after children clear. */
+  private setTerminalStatusInMutation(
+    id: string,
+    status: "done" | "cancelled",
+    note: string | null | undefined,
+    resolutionRef: string | null | undefined,
+    _principal: EntityId
+  ): Obligation {
+    const obligation = this.require(id);
+    if (isTerminalObligationStatus(obligation.status)) {
+      throw new ObligationValidationError("terminal obligations cannot be reopened or changed");
+    }
+    if (obligation.status === "scheduled" && status === "done") {
+      throw new ObligationValidationError(
+        "scheduled obligations cannot be completed until they are ready"
+      );
+    }
+    const liveChild = this.listChildren(id).find((child) =>
+      isBlockingObligationStatus(child.status)
+    );
+    if (liveChild) {
+      throw new ObligationValidationError(
+        `cannot ${status === "cancelled" ? "cancel" : "complete"} obligation with live children`
+      );
+    }
+
+    const completedAt = this.stamp();
+    const resolution = resolutionRef == null ? null : parseObligationReference(resolutionRef).key;
+    if (resolution !== null) {
+      // Same transaction as the transition: evidence that arrives only if a
+      // second call succeeds is evidence that goes missing on a crash.
+      this.db
+        .prepare(
+          `INSERT INTO obligation_artifacts (id, obligation_id, ref, label, attached_by, attached_at)
            VALUES (?, ?, ?, NULL, NULL, ?)
            ON CONFLICT(obligation_id, ref) DO NOTHING`
-          )
-          .run(randomUUID(), id, resolution, completedAt);
+        )
+        .run(randomUUID(), id, resolution, completedAt);
+    }
+
+    if (status === "done" && obligation.recurrencePolicy !== null) {
+      const seqRow = this.db
+        .prepare(
+          `SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM obligation_completions WHERE obligation_id = ?`
+        )
+        .get(id) as { seq: number };
+      const seq = seqRow.seq;
+      const completionId = randomUUID();
+
+      let nextReadyAt: string | null = null;
+      if (
+        obligation.recurrencePolicy === "completion_interval" &&
+        obligation.recurrenceIntervalSeconds != null
+      ) {
+        nextReadyAt = new Date(
+          new Date(completedAt).getTime() + obligation.recurrenceIntervalSeconds * 1000
+        ).toISOString();
+      } else if (obligation.recurrencePolicy === "cron" && obligation.recurrenceCron != null) {
+        nextReadyAt = nextCronOccurrence(
+          obligation.recurrenceCron,
+          new Date(completedAt)
+        ).toISOString();
       }
 
-      if (status === "done" && obligation.recurrencePolicy !== null) {
-        const seqRow = this.db
-          .prepare(
-            `SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM obligation_completions WHERE obligation_id = ?`
-          )
-          .get(id) as { seq: number };
-        const seq = seqRow.seq;
-        const completionId = randomUUID();
-
-        let nextReadyAt: string | null = null;
-        if (
-          obligation.recurrencePolicy === "completion_interval" &&
-          obligation.recurrenceIntervalSeconds != null
-        ) {
-          nextReadyAt = new Date(
-            new Date(completedAt).getTime() + obligation.recurrenceIntervalSeconds * 1000
-          ).toISOString();
-        } else if (obligation.recurrencePolicy === "cron" && obligation.recurrenceCron != null) {
-          nextReadyAt = nextCronOccurrence(
-            obligation.recurrenceCron,
-            new Date(completedAt)
-          ).toISOString();
-        }
-
-        this.db
-          .prepare(
-            `INSERT INTO obligation_completions (id, obligation_id, sequence, completed_at, note, resolution_ref, next_ready_at)
+      this.db
+        .prepare(
+          `INSERT INTO obligation_completions (id, obligation_id, sequence, completed_at, note, resolution_ref, next_ready_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
-          )
-          .run(
-            completionId,
-            id,
-            seq,
-            completedAt,
-            normalizeTerminalNote(note),
-            resolution,
-            nextReadyAt
-          );
+        )
+        .run(
+          completionId,
+          id,
+          seq,
+          completedAt,
+          normalizeTerminalNote(note),
+          resolution,
+          nextReadyAt
+        );
 
-        this.db
-          .prepare(
-            `UPDATE obligations
+      this.db
+        .prepare(
+          `UPDATE obligations
          SET status = 'scheduled', next_ready_at = ?, updated_at = ?,
              checkpoint = NULL, checkpoint_at = NULL, checkpoint_by = NULL
          WHERE id = ?`
-          )
-          .run(nextReadyAt, completedAt, id);
+        )
+        .run(nextReadyAt, completedAt, id);
 
-        if (obligation.recurrencePolicy === "completion_interval" && nextReadyAt) {
-          this.markScheduleDirty(id);
-        }
-      } else {
-        // Reached for `cancelled` (any recurrence) or `done` with no
-        // recurrence — both permanently stop recurrence, so the recurrence
-        // columns are cleared alongside the status in the same statement
-        // rather than left to describe a cycle that will never resume.
-        this.db
-          .prepare(
-            `UPDATE obligations
+      if (obligation.recurrencePolicy === "completion_interval" && nextReadyAt) {
+        this.markScheduleDirty(id);
+      }
+    } else {
+      // Reached for `cancelled` (any recurrence) or `done` with no
+      // recurrence — both permanently stop recurrence, so the recurrence
+      // columns are cleared alongside the status in the same statement
+      // rather than left to describe a cycle that will never resume.
+      this.db
+        .prepare(
+          `UPDATE obligations
            SET status = ?, terminal_note = ?, resolution_ref = ?, updated_at = ?,
                next_ready_at = NULL, recurrence_policy = NULL, recurrence_cron = NULL,
                recurrence_interval_seconds = NULL, snoozed_until = NULL,
                checkpoint = NULL, checkpoint_at = NULL, checkpoint_by = NULL
            WHERE id = ?`
-          )
-          .run(status, normalizeTerminalNote(note), resolution, completedAt, id);
+        )
+        .run(status, normalizeTerminalNote(note), resolution, completedAt, id);
 
-        // A never-recurring, never-snoozed obligation has no cron entry and
-        // can never reach `scheduled`, so it never owned an OS activation —
-        // only recurring obligations (cron, still-armed while ready/waiting,
-        // or completion_interval, owning a pending `at` job while scheduled)
-        // and snoozed ones (owning the `at` for the deadline, #722) need the
-        // post-commit reconciliation to tear anything down.
-        if (obligation.recurrencePolicy !== null || obligation.snoozedUntil !== null) {
-          this.markScheduleDirty(id);
-        }
+      // A never-recurring, never-snoozed obligation has no cron entry and
+      // can never reach `scheduled`, so it never owned an OS activation —
+      // only recurring obligations (cron, still-armed while ready/waiting,
+      // or completion_interval, owning a pending `at` job while scheduled)
+      // and snoozed ones (owning the `at` for the deadline, #722) need the
+      // post-commit reconciliation to tear anything down.
+      if (obligation.recurrencePolicy !== null || obligation.snoozedUntil !== null) {
+        this.markScheduleDirty(id);
+      }
 
-        if (status === "done") {
-          this.reevaluateDependents(id);
-        } else {
-          // Cancelling never satisfies a dependent (#212) — it forfeits the
-          // wait forever, so each dependent's owner needs durable attention
-          // to remove or replace this edge rather than a silent release.
-          // Matches {@link listPrerequisiteCancellationAttention}'s live-dependent
-          // filter: a dependent that already reached done/cancelled on its own
-          // has nothing left to repair, so it should not receive a prompt just
-          // because the now-dangling edge still names it.
-          const dependents = this.db
-            .prepare(
-              `SELECT op.dependent_id AS dependent_id, dependent.owner_id AS dependent_owner_id
+      if (status === "done") {
+        this.reevaluateDependents(id);
+      } else {
+        // Cancelling never satisfies a dependent (#212) — it forfeits the
+        // wait forever, so each dependent's owner needs durable attention
+        // to remove or replace this edge rather than a silent release.
+        // Matches {@link listPrerequisiteCancellationAttention}'s live-dependent
+        // filter: a dependent that already reached done/cancelled on its own
+        // has nothing left to repair, so it should not receive a prompt just
+        // because the now-dangling edge still names it.
+        const dependents = this.db
+          .prepare(
+            `SELECT op.dependent_id AS dependent_id, dependent.owner_id AS dependent_owner_id
              FROM obligation_prerequisites op
              JOIN obligations dependent ON dependent.id = op.dependent_id
              WHERE op.prerequisite_id = ?
                AND dependent.status IN ('ready', 'waiting', 'scheduled')`
-            )
-            .all(id) as Array<{ dependent_id: string; dependent_owner_id: string }>;
-          for (const dependent of dependents) {
-            this.pendingCancellationAttention.push({
-              dependentId: dependent.dependent_id,
-              dependentOwnerId: dependent.dependent_owner_id,
-              prerequisiteId: id,
-            });
-          }
+          )
+          .all(id) as Array<{ dependent_id: string; dependent_owner_id: string }>;
+        for (const dependent of dependents) {
+          this.pendingCancellationAttention.push({
+            dependentId: dependent.dependent_id,
+            dependentOwnerId: dependent.dependent_owner_id,
+            prerequisiteId: id,
+          });
         }
       }
+    }
 
-      if (obligation.parentId !== null) this.tryRelease(obligation.parentId);
-      return this.require(id);
-    });
+    if (obligation.parentId !== null) this.tryRelease(obligation.parentId);
+    return this.require(id);
   }
 
   /**
@@ -3528,6 +3812,15 @@ export class ObligationRepository {
       )
       .get(id) as { count: number };
     if (liveChildren.count !== 0) return;
+    const matcher = obligation.completionMatcher;
+    if (matcher !== null && matcher.satisfiedAt !== null && matcher.satisfiedRef !== null) {
+      const note =
+        matcher.kind === "pr_merged"
+          ? `Completion matcher satisfied: ${matcher.target} merged`
+          : `Completion matcher satisfied: deployed revision ${matcher.satisfiedRef} contains ${matcher.target}`;
+      this.setTerminalStatusInMutation(id, "done", note, matcher.satisfiedRef, "system:mesh");
+      return;
+    }
     if (!this.prerequisitesSatisfied(id)) return;
     this.db
       .prepare(

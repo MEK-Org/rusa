@@ -5226,7 +5226,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(requestRunCalls).toEqual([{ actorId: "root", reason: "{}" }]);
     });
 
-    it("delivers a bot-sender event NOT on the list — a merged PR must notify (github_branch deploy flows depend on merge-adjacent events)", async () => {
+    it("satisfies a bot-sender merged-PR matcher before routing, with no subscriber", async () => {
       let emitGitHubEvent:
         | ((event: string, payload: Record<string, unknown>) => Promise<void>)
         | undefined;
@@ -5252,11 +5252,20 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!mesh || !emitGitHubEvent) {
         throw new Error("Mesh or emitGitHubEvent not ready");
       }
-      mesh.subscribeEventSource("github:dummy-org", "root", "root");
+      getRepositories().obligations.create({
+        id: "bot-merged-matcher",
+        title: "bot merge gate",
+        ownerId: "human:operator",
+      });
+      getRepositories().obligations.setCompletionMatcher(
+        "bot-merged-matcher",
+        { kind: "pr_merged", pr: "github:dummy-org/dummy-repo/pulls/456" },
+        "human:operator"
+      );
 
-      // pull_request/closed (a merge) is deliberately NOT suppressed: humans
-      // merge PRs, and staging-deploy flows subscribe to merge-adjacent
-      // events. Unknown/unlisted event types deliver by default.
+      // No event subscription is installed. The matcher hook must still see a
+      // bot-made merge before normal ownership/subscription delivery decides
+      // that nobody should receive this webhook.
       await emitGitHubEvent("pull_request", {
         action: "closed",
         repository: { full_name: "dummy-org/dummy-repo" },
@@ -5264,7 +5273,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
         sender: { login: "mock-bot" },
       });
 
-      expect(requestRunCalls).toEqual([{ actorId: "root", reason: "{}" }]);
+      expect(getRepositories().obligations.require("bot-merged-matcher")).toMatchObject({
+        status: "done",
+        resolutionRef: "github:dummy-org/dummy-repo/pulls/456",
+      });
+      expect(requestRunCalls).toEqual([]);
     });
   });
 

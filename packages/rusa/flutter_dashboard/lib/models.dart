@@ -1931,6 +1931,7 @@ class ObligationDto {
     this.updatedAt,
     this.intent,
     this.externalRef,
+    this.completionMatcher,
     required this.status,
     this.priority,
     required this.effectivePriority,
@@ -1969,6 +1970,9 @@ class ObligationDto {
   final String? updatedAt;
   final String? intent;
   final String? externalRef;
+
+  /// Read-only event predicate, set through the obligations MCP server.
+  final CompletionMatcherDto? completionMatcher;
   final String
   status; // "ready" | "waiting" | "done" | "cancelled" | "scheduled"
   final double? priority;
@@ -2107,6 +2111,11 @@ class ObligationDto {
       updatedAt: j['updatedAt'] as String?,
       intent: j['intent'] as String?,
       externalRef: extRef,
+      completionMatcher: j['completionMatcher'] is Map
+          ? CompletionMatcherDto.fromJson(
+              (j['completionMatcher'] as Map).cast<String, dynamic>(),
+            )
+          : null,
       status: j['status'] as String? ?? 'ready',
       priority: (j['priority'] as num?)?.toDouble(),
       effectivePriority: (j['effectivePriority'] as num?)?.toDouble() ?? 0.0,
@@ -2137,6 +2146,8 @@ class ObligationDto {
     if (updatedAt != null) 'updatedAt': updatedAt,
     if (intent != null) 'intent': intent,
     if (externalRef != null) 'externalRef': externalRef,
+    if (completionMatcher != null)
+      'completionMatcher': completionMatcher!.toJson(),
     'status': status,
     if (priority != null) 'priority': priority,
     'effectivePriority': effectivePriority,
@@ -2153,6 +2164,48 @@ class ObligationDto {
     if (checkpointAt != null) 'checkpointAt': checkpointAt,
     if (checkpointBy != null) 'checkpointBy': checkpointBy,
     if (hasCompletionHistory) 'hasCompletionHistory': hasCompletionHistory,
+  };
+}
+
+/// The immutable dashboard projection of an obligation completion matcher.
+class CompletionMatcherDto {
+  const CompletionMatcherDto({
+    required this.kind,
+    required this.target,
+    required this.setBy,
+    required this.setAt,
+    this.satisfiedAt,
+    this.satisfiedRef,
+    this.closedUnmergedAt,
+  });
+
+  final String kind;
+  final String target;
+  final String setBy;
+  final String setAt;
+  final String? satisfiedAt;
+  final String? satisfiedRef;
+  final String? closedUnmergedAt;
+
+  factory CompletionMatcherDto.fromJson(Map<String, dynamic> j) =>
+      CompletionMatcherDto(
+        kind: j['kind'] as String? ?? '',
+        target: j['target'] as String? ?? '',
+        setBy: j['setBy'] as String? ?? '',
+        setAt: j['setAt'] as String? ?? '',
+        satisfiedAt: j['satisfiedAt'] as String?,
+        satisfiedRef: j['satisfiedRef'] as String?,
+        closedUnmergedAt: j['closedUnmergedAt'] as String?,
+      );
+
+  Map<String, dynamic> toJson() => {
+    'kind': kind,
+    'target': target,
+    'setBy': setBy,
+    'setAt': setAt,
+    if (satisfiedAt != null) 'satisfiedAt': satisfiedAt,
+    if (satisfiedRef != null) 'satisfiedRef': satisfiedRef,
+    if (closedUnmergedAt != null) 'closedUnmergedAt': closedUnmergedAt,
   };
 }
 

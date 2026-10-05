@@ -29,6 +29,7 @@ import { obligationHistory } from "../migrations/0045_obligation_history.js";
 import { obligationResponsive } from "../migrations/0049_obligation_responsive.js";
 import { dropObligationReadyHeads } from "../migrations/0050_drop_obligation_ready_heads.js";
 import { obligationSnooze } from "../migrations/0052_obligation_snooze.js";
+import { obligationCompletionMatchers } from "../migrations/0056_obligation_completion_matchers.js";
 import {
   MAX_OBLIGATION_PAGE_LIMIT,
   type ObligationQueue,
@@ -92,12 +93,75 @@ describe("ObligationRepository", () => {
     obligationResponsive.up(db);
     obligationSnooze.up(db);
     dropObligationReadyHeads.up(db);
+    obligationCompletionMatchers.up(db);
     now = 1_000;
     repository = new ObligationRepository(
       db,
       (id) => ["actor-a", "actor-b", "actor-c"].includes(id),
       () => now++
     );
+  });
+
+  it("sets, replaces, and clears one completion matcher without leaving stale observations", () => {
+    repository.create({ id: "matcher", title: "matcher", ownerId: "actor-a" });
+
+    const first = repository.setCompletionMatcher(
+      "matcher",
+      { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      "actor-a"
+    );
+    expect(first.completionMatcher).toMatchObject({
+      kind: "pr_merged",
+      target: "github:MEK-Org/rusa/pulls/190",
+      spec: { schemaVersion: 1 },
+      satisfiedAt: null,
+      closedUnmergedAt: null,
+    });
+
+    const replaced = repository.setCompletionMatcher(
+      "matcher",
+      { kind: "deployed", commit: "a".repeat(40) },
+      "actor-b"
+    );
+    expect(replaced.completionMatcher).toMatchObject({
+      kind: "deployed",
+      target: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      setBy: "actor-b",
+      satisfiedAt: null,
+      satisfiedRef: null,
+      closedUnmergedAt: null,
+    });
+
+    expect(
+      repository.setCompletionMatcher("matcher", null, "actor-a").completionMatcher
+    ).toBeNull();
+  });
+
+  it("holds matcher satisfaction behind live children, then finishes when the final child clears", () => {
+    repository.create({ id: "parent", title: "parent", ownerId: "actor-a" });
+    repository.create({ id: "child", title: "child", parentId: "parent", ownerId: "actor-a" });
+    const parent = repository.setCompletionMatcher(
+      "parent",
+      { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      "actor-a"
+    );
+    const matcher = parent.completionMatcher;
+    if (matcher === null) throw new Error("completion matcher was not persisted");
+
+    const observed = repository.satisfyCompletionMatcher("parent", matcher, {
+      note: "Completion matcher satisfied: PR #190 merged",
+      resolutionRef: "github:MEK-Org/rusa/pulls/190",
+    });
+    expect(observed.obligation).toMatchObject({ status: "waiting" });
+    expect(observed.obligation.completionMatcher).toMatchObject({
+      satisfiedRef: "github:MEK-Org/rusa/pulls/190",
+    });
+
+    repository.setTerminalStatus("child", "done", "child finished", null, "actor-a");
+    expect(repository.require("parent")).toMatchObject({
+      status: "done",
+      resolutionRef: "github:MEK-Org/rusa/pulls/190",
+    });
   });
 
   it("stamps createdAt/updatedAt on create and advances updatedAt on mutation", async () => {
@@ -5475,6 +5539,8 @@ describe("multi-instance crontab reconciliation (#304)", () => {
     obligationHistory.up(d);
     obligationResponsive.up(d);
     obligationSnooze.up(d);
+    dropObligationReadyHeads.up(d);
+    obligationCompletionMatchers.up(d);
     return d;
   };
 
