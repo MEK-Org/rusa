@@ -162,31 +162,36 @@ interface DecisionBase {
 }
 
 /**
- * Why a decision produced no interrupt. These stay distinct on purpose: the
- * feature exists to measure, and "we never asked", "the client broke", "it ran
- * long" and "it answered but not confidently" are different data.
+ * Why a decision fell back to the baseline interrupt or conditionally suppressed to queue.
+ * These stay distinct on purpose: the feature exists to measure, and
+ * "we never asked", "the client broke", "it ran long" and "it answered but
+ * not confidently" are different data.
  */
-export type ResponsiveInterruptionQueueReason =
+export type ResponsiveInterruptionFallbackReason =
   | "unavailable"
   | "client_error"
   | "input_unavailable"
   | "timeout"
   | "no_candidates"
-  | "invalid_probability"
-  | "below_threshold";
+  | "invalid_probability";
+
+export type ResponsiveInterruptionReason = ResponsiveInterruptionFallbackReason | "below_threshold";
+
+export type ResponsiveInterruptionQueueReason = ResponsiveInterruptionReason;
 
 export type ResponsiveInterruptionDecision =
   | (DecisionBase & {
-      outcome: ResponsiveInterruptionVerdict;
-      interruptProbability: number;
-      matchedCandidateIds: readonly string[];
+      outcome: "interrupt";
+      reason?: ResponsiveInterruptionFallbackReason;
+      interruptProbability?: number;
+      matchedCandidateIds?: readonly string[];
     })
   | (DecisionBase & {
       outcome: "queue";
-      reason: ResponsiveInterruptionQueueReason;
+      reason: "below_threshold";
       /** The original Noul probability survives a below-threshold outcome. */
-      interruptProbability?: number;
-      matchedCandidateIds?: readonly string[];
+      interruptProbability: number;
+      matchedCandidateIds: readonly string[];
     });
 
 /**
@@ -244,17 +249,13 @@ export class ShadowResponsiveInterruptionClassifier {
         pendingEntryIds: [...input.pendingEntryIds],
       },
     };
-    const queue = (
-      reason: ResponsiveInterruptionQueueReason,
-      learned?: {
-        interruptProbability: number;
-        matchedCandidateIds: readonly string[];
-      }
-    ): ResponsiveInterruptionDecision => ({ ...base, outcome: "queue", reason, ...learned });
+    const fallback = (
+      reason: ResponsiveInterruptionFallbackReason
+    ): ResponsiveInterruptionDecision => ({ ...base, outcome: "interrupt", reason });
 
-    if (!this.client) return queue("unavailable");
+    if (!this.client) return fallback("unavailable");
     // Nothing to weigh the arrival against decides nothing; skip the round trip.
-    if (candidateEntryIds.length === 0) return queue("no_candidates");
+    if (candidateEntryIds.length === 0) return fallback("no_candidates");
 
     let response: JevDecisionResponse;
     try {
@@ -267,11 +268,13 @@ export class ShadowResponsiveInterruptionClassifier {
     } catch (err) {
       // The error text is the other route by which operational content could
       // reach the audit, so only the fact of failure is recorded.
-      if (err === DEADLINE_EXCEEDED) return queue("timeout");
-      return queue(err instanceof JevInputUnavailableError ? "input_unavailable" : "client_error");
+      if (err === DEADLINE_EXCEEDED) return fallback("timeout");
+      return fallback(
+        err instanceof JevInputUnavailableError ? "input_unavailable" : "client_error"
+      );
     }
 
-    if (!isProbability(response?.interruptProbability)) return queue("invalid_probability");
+    if (!isProbability(response?.interruptProbability)) return fallback("invalid_probability");
     // Anything the client names that it was not offered is dropped, so a
     // defective or future client cannot write free text into the audit
     // through the one field that survives redaction.
@@ -284,7 +287,7 @@ export class ShadowResponsiveInterruptionClassifier {
     // Noul is P(yes), so apply the threshold directly. There is no winning
     // label or second confidence score to gate first.
     if (response.interruptProbability < this.threshold) {
-      return queue("below_threshold", learned);
+      return { ...base, outcome: "queue", reason: "below_threshold", ...learned };
     }
     return { ...base, outcome: "interrupt", ...learned };
   }
