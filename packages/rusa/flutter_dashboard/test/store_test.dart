@@ -1188,6 +1188,31 @@ void main() {
   );
 
   test(
+    'haltStatus: a server still reporting a passed until is not re-polled in a '
+    'tight loop (client clock ahead of server)',
+    () async {
+      final until = DateTime.now().subtract(const Duration(seconds: 5));
+      final api = FakeApi()
+        ..halted = true
+        ..halt = HaltStatusDto(
+          scope: 'global',
+          until: until.toUtc().toIso8601String(),
+        )
+        ..threadsResult = [makeThread('a', parent: 'root')];
+      final store = await _booted(api, FakeStream());
+
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      await pumpEventQueue();
+
+      // Boot fetch plus the one expiry sync; the server's unchanged answer
+      // must not re-arm a zero-delay timer.
+      expect(api.threadsCallCount, 2);
+      expect(store.halted.value, true);
+      await store.dispose();
+    },
+  );
+
+  test(
     'schedulerWarning: seeded from the threads payload and exposed as a stream',
     () async {
       final api = FakeApi()

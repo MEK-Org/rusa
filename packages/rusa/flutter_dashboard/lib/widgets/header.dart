@@ -1168,15 +1168,9 @@ class _HaltedBadge extends StatelessWidget {
     return Tooltip(
       ignorePointer: true,
       richMessage: WidgetSpan(
-        child: Builder(
-          builder: (context) => Text(
-            haltTooltipText(halt),
-            style: TooltipTheme.of(context).textStyle ??
-                Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: Colors.white,
-                    ),
-          ),
-        ),
+        // Evaluated when the tooltip opens, so a passed expiry reads as passed
+        // on an idle page; the overlay's DefaultTextStyle supplies the style.
+        child: Builder(builder: (context) => Text(haltTooltipText(halt))),
       ),
       excludeFromSemantics: true,
       child: Semantics(

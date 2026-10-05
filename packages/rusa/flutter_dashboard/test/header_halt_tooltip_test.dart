@@ -152,6 +152,33 @@ void main() {
     await tester.runAsync(store.dispose);
   });
 
+  testWidgets('the tooltip text keeps the tooltip theme style', (tester) async {
+    final store = await _store(tester, const HaltStatusDto(scope: 'global'));
+    await tester.pumpWidget(_header(store));
+    await tester.pump();
+
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.addPointer(location: Offset.zero);
+    addTearDown(mouse.removePointer);
+    await mouse.moveTo(tester.getCenter(find.text('Halted')));
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+
+    // The lazily built text must read like a plain tooltip message, not a
+    // hard-coded colour that vanishes on the theme's tooltip background.
+    final text = find.textContaining('Halt scope: all providers.');
+    final themed = DefaultTextStyle.of(tester.element(text)).style;
+    final rendered = tester
+        .widget<RichText>(
+          find.descendant(of: text, matching: find.byType(RichText)),
+        )
+        .text
+        .style!;
+    expect(rendered.color, themed.color);
+    expect(rendered.fontSize, themed.fontSize);
+    await tester.runAsync(store.dispose);
+  });
+
   testWidgets('phone long-press on the compact chip shows the scope tooltip', (
     tester,
   ) async {
@@ -203,10 +230,7 @@ void main() {
       final until = DateTime.now().add(const Duration(milliseconds: 500));
       final store = await _store(
         tester,
-        HaltStatusDto(
-          scope: 'global',
-          until: until.toUtc().toIso8601String(),
-        ),
+        HaltStatusDto(scope: 'global', until: until.toUtc().toIso8601String()),
       );
       await tester.pumpWidget(_header(store));
       await tester.pump();

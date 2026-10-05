@@ -432,6 +432,7 @@ class DashboardStore {
   Timer? _queuePacingPoll;
   Timer? _runtimeRetry;
   Timer? _haltExpiryTimer;
+  String? _haltExpirySyncedUntil;
   _RuntimePhase _runtimePhase = _RuntimePhase.uninitialized;
   RuntimeCursor? _runtimeCursor;
   final List<ActorRuntimeStateDelta> _runtimeBuffer = [];
@@ -1861,7 +1862,9 @@ class DashboardStore {
     _haltExpiryTimer?.cancel();
     _haltExpiryTimer = null;
     final untilStr = halt?.until;
-    if (untilStr == null) return;
+    // One sync per expiry: a server whose clock trails ours still reports
+    // this until after it fires, and re-arming at zero delay would loop.
+    if (untilStr == null || untilStr == _haltExpirySyncedUntil) return;
     final until = DateTime.tryParse(untilStr)?.toUtc();
     if (until == null) return;
     final now = DateTime.now().toUtc();
@@ -1869,6 +1872,7 @@ class DashboardStore {
     final duration = delay.isNegative ? Duration.zero : delay;
     _haltExpiryTimer = Timer(duration, () {
       _haltExpiryTimer = null;
+      _haltExpirySyncedUntil = untilStr;
       unawaited(_requestRuntimeSync());
     });
   }
