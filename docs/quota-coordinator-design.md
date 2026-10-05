@@ -1104,11 +1104,11 @@ launch. Nothing fails closed, because there is no closed to fail to.
   behaviour on a failed scrape — "keep the last persisted reasoned interval"
   (`start.ts:1362`) — and `freshness.stale` says so, so the dashboard can show it.
 - `hardStale` at `now - observedAt > hardStaleAfterMs` (default 3600 s): a
-  whole lane with a still-valid governing window keeps its last reasoned
-  interval and reports its hard-stale freshness. A newer scrape that omitted
-  only the governing bucket, a lane with no governing reset, or a passed reset
-  widens to `maxIntervalSeconds`. **The fallback degradation is always toward
-  slower, never faster.**
+  whole lane with an accepted governing reading keeps its last reasoned
+  interval (including across governing window reset, per #794 operator policy correction)
+  and reports its hard-stale freshness. A newer scrape that omitted only the governing bucket
+  or a lane with no governing bucket widens to `maxIntervalSeconds`. **The
+  fallback degradation is always toward slower, never faster.**
 
 **The hard-stale widening is a named transformation, not a client courtesy**,
 because two criteria depend on knowing exactly where it happens. Define:
@@ -1116,10 +1116,10 @@ because two criteria depend on knowing exactly where it happens. Define:
 ```
 publishedThrottle(p).intervalSeconds
     = stored(p).intervalSeconds                            when not hardStale
-    = stored(p).intervalSeconds                            when hardStale,
+    = stored(p).intervalSeconds                            when hardStale and
                                                           the governing bucket is
                                                           from the newest stored
-                                                          scrape, and its reset is future
+                                                          scrape
     = max(stored(p).intervalSeconds, maxIntervalSeconds)   when hardStale
                                                           otherwise
 
@@ -1280,20 +1280,18 @@ sequenceDiagram
     Note over A: A applies it unchanged, exactly as today
     Note over S: ... failures continue past hardStaleAfterMs ...
     A->>S: GET /v1/throttle
-    S-->>A: last interval, freshness.hardStale true, while governing reset is future
+    S-->>A: last interval, freshness.hardStale true
     Note over S: ... governing reset passes without a newer reading ...
     A->>S: GET /v1/throttle
-    S-->>A: intervalSeconds = maxIntervalSeconds, freshness.hardStale true
+    S-->>A: last interval, freshness.hardStale true (#794 retains throttle across reset)
     Note over S: provider-wide retirement and alert are not implemented; #794 tracks them
 ```
 
-A whole provider lane whose governing reset is still future keeps its last
-reasoned interval through a hard-stale failed scrape; after that reset, the
-fallback widens to `maxIntervalSeconds`. The fallback degradation is monotone
-toward slower. Provider-wide retirement and an alert after the reset are not
-implemented yet; #794 tracks that work. The service, not a client, is the only
-place that can distinguish a failed scrape from a stable quota window, because a
-client sees an unchanging interval either way.
+A whole provider lane whose readings stop or fail keeps its last reasoned interval
+through a hard-stale scrape, including across governing window reset (#794).
+The response remains truthfully hard-stale. Provider-wide alert after reset is tracked
+separately under #794. The service, not a client, is the only place that can distinguish
+a failed scrape from a stable quota window, because a client sees an unchanging interval either way.
 
 ### 6.3 Service restart
 

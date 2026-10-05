@@ -650,7 +650,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(res91m.json.error.code).toBe("stale_observation");
   });
 
-  it("retains provider and model intervals through a hard-stale missing scrape until their governing windows reset", () => {
+  it("retains provider and model intervals through a hard-stale missing scrape, including across governing window reset (#794)", () => {
     const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
     const observedAt = new Date(nowMs - 2 * 60 * 60_000).toISOString();
     const resetAtIso = new Date(nowMs + 60 * 60_000).toISOString();
@@ -719,8 +719,8 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       maxIntervalSeconds: 3600,
       hardStaleAfterMs: 60 * 60_000,
     });
-    expect(afterReset.intervalSeconds).toBe(3600);
-    expect(afterReset.modelLanes).toMatchObject([{ intervalSeconds: 3600 }]);
+    expect(afterReset.intervalSeconds).toBe(300);
+    expect(afterReset.modelLanes).toMatchObject([{ intervalSeconds: 120 }]);
   });
 
   it("rebuilds a missing-reading interval after coordinator restart and applies it to the client pacer", async () => {
@@ -791,6 +791,118 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       },
     ]);
     expect(pacer.interval).toBe((beforeRestart?.intervalSeconds ?? 0) * 1000);
+  });
+
+  it("retains last computed throttle through missed and failed readings and across reset, then recovers on a fresh reading (#794)", async () => {
+    let currentNowMs = Date.now();
+    const resetMs = currentNowMs + 2 * 60 * 60_000;
+    const resetAtIso = new Date(resetMs).toISOString();
+    const windowMs = 5 * 60 * 60_000;
+    const snapshot = (scrapedAt: string, providerPercentLeft: number): ProviderQuotaSnapshot => ({
+      provider: "claude",
+      status: "available",
+      scrapedAt,
+      limits: [
+        { kind: "five_hour", label: "5-Hour", percentLeft: providerPercentLeft, resetAtIso },
+      ],
+    });
+
+    store.configureController({ maxIntervalSeconds: 3600 });
+    for (let offset = 4; offset >= 0; offset -= 1) {
+      const observedMs = currentNowMs - 60 * 60_000 - offset * 5 * 60_000;
+      const scrapedAt = new Date(observedMs).toISOString();
+      const timeRemainingPct = ((resetMs - observedMs) / windowMs) * 100;
+      const state = snapshot(scrapedAt, timeRemainingPct - 15);
+      const id = store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "fixture" });
+      store.recordParsed(id, state, state);
+    }
+    const baselineThrottle = store.getProviderThrottle("claude");
+    expect(baselineThrottle?.intervalSeconds).toBeGreaterThan(0);
+    if (!baselineThrottle) throw new Error("expected baselineThrottle");
+    const computedInterval = baselineThrottle.intervalSeconds;
+
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+      now: () => currentNowMs,
+      maxIntervalSeconds: 3600,
+      staleAfterMs: 15 * 60_000,
+      hardStaleAfterMs: 60 * 60_000,
+    });
+    await service.start();
+
+    const client = new QuotaCoordinatorClient({
+      socketPath,
+      maxIntervalSeconds: 3600,
+      now: () => currentNowMs,
+    });
+    const pacer = new ProviderPacer(3600 * 1000, () => currentNowMs);
+
+    // Initial sync
+    await client.getThrottle();
+    reconcileProviderPacersFromClient(() => pacer, ["claude"], client);
+    expect(client.getLastAppliedInterval("claude")).toBe(computedInterval);
+    expect(pacer.interval).toBe(computedInterval * 1000);
+
+    // 1. Missed readings: advance past hardStaleAfterMs while window is still open
+    currentNowMs += 70 * 60_000;
+    await client.getThrottle();
+    reconcileProviderPacersFromClient(() => pacer, ["claude"], client);
+    expect(client.getLastPublishedStatus("claude")?.freshness).toMatchObject({
+      stale: true,
+      hardStale: true,
+    });
+    expect(client.getLastAppliedInterval("claude")).toBe(computedInterval);
+    expect(pacer.interval).toBe(computedInterval * 1000);
+
+    // 2. Failed readings: attempt a scrape that fails extraction
+    const failedScrapedAt = new Date(currentNowMs).toISOString();
+    const rawId = store.recordRaw({
+      provider: "claude",
+      scrapedAt: failedScrapedAt,
+      rawOutput: "corrupt",
+    });
+    store.recordParseError(rawId, new Error("synthetic extraction failure"));
+    await client.getThrottle();
+    reconcileProviderPacersFromClient(() => pacer, ["claude"], client);
+    expect(client.getLastAppliedInterval("claude")).toBe(computedInterval);
+    expect(pacer.interval).toBe(computedInterval * 1000);
+
+    // 3. Across reset: advance past window reset
+    currentNowMs = resetMs + 10 * 60_000;
+    await client.getThrottle();
+    reconcileProviderPacersFromClient(() => pacer, ["claude"], client);
+    expect(client.getLastAppliedInterval("claude")).toBe(computedInterval);
+    expect(pacer.interval).toBe(computedInterval * 1000);
+
+    // 4. Recover on a fresh reading: successful scrape with a new reset window
+    const newResetMs = currentNowMs + 5 * 60 * 60_000;
+    const newResetAtIso = new Date(newResetMs).toISOString();
+    const freshScrapedAt = new Date(currentNowMs).toISOString();
+    const freshState: ProviderQuotaSnapshot = {
+      provider: "claude",
+      status: "available",
+      scrapedAt: freshScrapedAt,
+      limits: [{ kind: "five_hour", label: "5-Hour", percentLeft: 95, resetAtIso: newResetAtIso }],
+    };
+    const freshRawId = store.recordRaw({
+      provider: "claude",
+      scrapedAt: freshScrapedAt,
+      rawOutput: "fresh",
+    });
+    store.recordParsed(freshRawId, freshState, freshState);
+
+    await client.getThrottle();
+    reconcileProviderPacersFromClient(() => pacer, ["claude"], client);
+    const recoveredThrottle = store.getProviderThrottle("claude");
+    expect(recoveredThrottle?.intervalSeconds).not.toBe(computedInterval);
+    expect(client.getLastAppliedInterval("claude")).toBe(recoveredThrottle?.intervalSeconds);
+    expect(pacer.interval).toBe((recoveredThrottle?.intervalSeconds ?? 0) * 1000);
+    expect(client.getLastPublishedStatus("claude")?.freshness).toMatchObject({
+      stale: false,
+      hardStale: false,
+    });
   });
 
   // Criterion 2: publishedThrottle equality and boundary pin.
