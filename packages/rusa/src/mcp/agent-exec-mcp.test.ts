@@ -24,6 +24,7 @@ import {
   ROOM_ADMIN_CAPABILITY,
   seedConfiguredActorGrants,
 } from "../actor/administrative-capabilities.js";
+import { AvailabilityHolds } from "../actor/availability-holds.js";
 import {
   InMemoryCapabilityGrantStore,
   PARENT_GRANTABLE_CAPABILITIES,
@@ -44,6 +45,7 @@ import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-sc
 import type { RootControlService } from "../actor/root-control.js";
 import type { RusaConfig } from "../config/types.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { AvailabilityHoldRepository } from "../db/repositories/availability-hold-repository.js";
 import type { ChatRoomMember } from "../db/repositories/chat-room-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
@@ -289,7 +291,13 @@ const MANAGEMENT_TOOLS: Record<string, readonly string[]> = {
     "remove_room_participant",
   ],
 };
-const ALL_MANAGEMENT_TOOLS = Object.values(MANAGEMENT_TOOLS).flat();
+/** Root-only: no grant, `model-admin` included, unlocks these for another actor (#539). */
+const ROOT_HOLD_TOOLS = [
+  "list_availability_holds",
+  "set_availability_hold",
+  "clear_availability_hold",
+] as const;
+const ALL_MANAGEMENT_TOOLS = [...Object.values(MANAGEMENT_TOOLS).flat(), ...ROOT_HOLD_TOOLS];
 
 describe("administrative capability gating of management tools (#549)", () => {
   const config = {
@@ -304,6 +312,7 @@ describe("administrative capability gating of management tools (#549)", () => {
       modelClasses,
       validateModelClass: (input: ModelConfigInput) =>
         validateModelConfigPool(config, input, { portable: true }),
+      availabilityHolds: new AvailabilityHolds({ repo: new AvailabilityHoldRepository(db) }),
       chatRoom: {
         participants: () => [],
         add: () => {
@@ -3220,6 +3229,145 @@ describe("agent-execution MCP server", () => {
         "caller is not the current effective owner"
       );
     });
+  });
+});
+
+describe("availability hold tools (#539)", () => {
+  const NOW = Date.parse("2026-10-05T12:00:00.000Z");
+
+  function holdDeps() {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const repo = new AvailabilityHoldRepository(db);
+    const availabilityHolds = new AvailabilityHolds({ repo, now: () => NOW });
+    // Production normalizes before checking the configured providers.
+    const validateHoldScope = (provider: string, models: readonly string[]) => {
+      if (!["kimi", "codex"].includes(provider.toLowerCase())) {
+        throw new Error(`provider ${provider} is not configured; no hold was placed`);
+      }
+      if (models.includes("typo")) throw new Error("catalog does not list typo");
+    };
+    return { repo, availabilityHolds, options: { availabilityHolds, validateHoldScope } };
+  }
+
+  const call = async (client: Client, name: string, args: Record<string, unknown>) =>
+    (await client.callTool({ name, arguments: args })) as CallToolResult;
+
+  it("sets, lists and clears provider-wide and model-scoped holds for the configured actor", async () => {
+    const { mesh, events } = setup();
+    const { repo, availabilityHolds, options } = holdDeps();
+    const root = await connect(createAgentExecMcpServer(mesh, "root", "root", undefined, options));
+
+    const wide = await call(root, "set_availability_hold", {
+      provider: "Kimi",
+      expiry: "2026-10-05T18:52:00Z",
+      reason: "capacity",
+    });
+    expect(wide.isError).toBeFalsy();
+    expect(dataOf(wide)).toEqual([
+      {
+        provider: "kimi",
+        model: null,
+        expiry: "2026-10-05T18:52:00.000Z",
+        reason: "capacity",
+        created_by: "root",
+        created_at: new Date(NOW).toISOString(),
+      },
+    ]);
+    const scoped = await call(root, "set_availability_hold", {
+      provider: "codex",
+      models: ["gpt-5.5", "gpt-5.5-mini"],
+    });
+    expect(scoped.isError).toBeFalsy();
+    expect(availabilityHolds.isHeld("codex", "gpt-5.5")).toBe(true);
+    expect(availabilityHolds.isHeld("codex", "gpt-5.6")).toBe(false);
+
+    const listed = await call(root, "list_availability_holds", {});
+    expect(
+      (dataOf(listed) as Array<{ provider: string; model: string | null }>).map(
+        ({ provider, model }) => `${provider}/${model ?? "*"}`
+      )
+    ).toEqual(["codex/gpt-5.5", "codex/gpt-5.5-mini", "kimi/*"]);
+
+    const cleared = await call(root, "clear_availability_hold", {
+      provider: "codex",
+      models: ["gpt-5.5"],
+    });
+    expect((dataOf(cleared) as Array<{ model: string }>).map((hold) => hold.model)).toEqual([
+      "gpt-5.5",
+    ]);
+    expect(availabilityHolds.isHeld("codex", "gpt-5.5")).toBe(false);
+    expect(availabilityHolds.isHeld("codex", "gpt-5.5-mini")).toBe(true);
+    expect(repo.list()).toHaveLength(2);
+
+    const details = events
+      .filter((event) => event.kind === "root_control_action")
+      .map((event) => event.detail);
+    expect(details).toEqual([
+      "model-admin set_availability_hold",
+      "model-admin set_availability_hold",
+      "model-admin clear_availability_hold",
+    ]);
+  });
+
+  it("refuses an unmeetable or empty scope or a past expiry and stores nothing", async () => {
+    const { mesh } = setup();
+    const { repo, options } = holdDeps();
+    const root = await connect(createAgentExecMcpServer(mesh, "root", "root", undefined, options));
+
+    const unknown = await call(root, "set_availability_hold", { provider: "mystery" });
+    expect(unknown.isError).toBe(true);
+    expect(dataOf(unknown)).toMatch(/not configured/);
+    const typo = await call(root, "set_availability_hold", { provider: "kimi", models: ["typo"] });
+    expect(typo.isError).toBe(true);
+    // An empty list is not the omitted list: it must not widen to the provider.
+    const empty = await call(root, "set_availability_hold", { provider: "kimi", models: [] });
+    expect(empty.isError).toBe(true);
+    const past = await call(root, "set_availability_hold", {
+      provider: "kimi",
+      expiry: "2026-10-05T11:59:59Z",
+    });
+    expect(past.isError).toBe(true);
+    expect(dataOf(past)).toMatch(/must be in the future/);
+    expect(repo.list()).toEqual([]);
+  });
+
+  it("refuses a non-root actor even when it holds model-admin", async () => {
+    const { mesh, registry, capabilityGrants } = setup();
+    registry.upsert({
+      id: "0b2c3d4e-steward",
+      charter: "steward",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    capabilityGrants.grant({
+      actorId: "0b2c3d4e-steward",
+      capability: MODEL_ADMIN_CAPABILITY,
+      grantedBy: "test",
+      grantedAt: "2026-01-01T00:00:00Z",
+    });
+    const { repo, options } = holdDeps();
+    const steward = await connect(
+      createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root", undefined, options)
+    );
+    const names = (await steward.listTools()).tools.map((tool) => tool.name);
+    expect(mesh.hasActiveCapability("0b2c3d4e-steward", MODEL_ADMIN_CAPABILITY)).toBe(true);
+    for (const tool of ROOT_HOLD_TOOLS) expect(names).not.toContain(tool);
+    const refused = await call(steward, "set_availability_hold", { provider: "kimi" });
+    expect(refused.isError).toBe(true);
+    expect(repo.list()).toEqual([]);
+  });
+
+  it("denies root's open session once model-admin is revoked", async () => {
+    const { mesh, capabilityGrants } = setup();
+    const { repo, options } = holdDeps();
+    const root = await connect(createAgentExecMcpServer(mesh, "root", "root", undefined, options));
+    capabilityGrants.revoke("root", MODEL_ADMIN_CAPABILITY, "2026-01-01T00:00:01Z");
+    const denied = await call(root, "set_availability_hold", { provider: "kimi" });
+    expect(denied.isError).toBe(true);
+    expect(dataOf(denied)).toMatch(/model-admin/);
+    expect(repo.list()).toEqual([]);
   });
 });
 

@@ -229,7 +229,14 @@ export type MeshEventKind =
   // A granted calendar-write tool successfully wrote to Google Calendar.
   // `actorId` is the writer; detail is the operation; payload identifies only
   // the calendar ID and issue number.
-  | "calendar_write";
+  | "calendar_write"
+  // Startup moved a provider-scoped HALT sentinel into durable availability
+  // holds (#539) and archived the file as HALT.imported-<digest>. `actorId`
+  // is absent (the mesh did it); `detail` summarizes the scope and expiry;
+  // `payload` = { reason, until, holds: [{ provider, model, expiry }] }. The id
+  // is derived from the file, so a restart after a crash before the file was
+  // archived records it once.
+  | "availability_hold_imported";
 
 /**
  * The kinds that close a queued run opportunity. `run_queued` opens one; exactly
