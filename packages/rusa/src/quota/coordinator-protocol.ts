@@ -536,10 +536,11 @@ function wholeLaneGoverningWindow(
 
 /**
  * The provider-wide governing window that has closed with no newer accepted
- * reading (#794), or null. The first applied status at or after that reset is
- * closed even if the retained reading is still fresh; hard staleness controls
- * only the existing throttle fallback. Missing and failed scrapes look the
- * same here, since neither replaces the stored reading. Detection only; it
+ * reading (#794), or null. Alerts on the first applied status where the governing
+ * window has reset, its retained accepted reading predates that reset, and that
+ * reading has passed the soft-stale threshold (probe TTL plus three ticks from
+ * observation, per #794 timing ruling 5992971926). Missing and failed scrapes look
+ * the same here, since neither replaces the stored reading. Detection only; it
  * changes no published value.
  */
 export function closedGoverningWindow(
@@ -552,8 +553,16 @@ export function closedGoverningWindow(
   const observedMs = Date.parse(governing.observedAt);
   // A reading accepted after its advertised reset supersedes the old window,
   // even if that provider still reports the old reset. The alert is only for
-  // the retained pre-reset reading that has no successor.
-  return Number.isFinite(observedMs) && observedMs < resetMs && resetMs <= nowMs ? governing : null;
+  // the retained pre-reset reading that has no successor and has passed the
+  // soft-stale horizon (reuse published freshness semantics).
+  const staleThresholdMs =
+    status.freshness.staleAfterMs ?? freshnessThresholds(status.freshness.mode).staleAfterMs;
+  const isStale =
+    status.freshness.stale ||
+    (Number.isFinite(observedMs) && nowMs - observedMs > staleThresholdMs);
+  return Number.isFinite(observedMs) && observedMs < resetMs && resetMs <= nowMs && isStale
+    ? governing
+    : null;
 }
 
 /** The pacing a model-scoped lane set imposes on one concrete candidate model. */

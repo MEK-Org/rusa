@@ -859,13 +859,33 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     // before, and the close is now detectable.
     expect(at(stored, resetMs)).toEqual({ interval: 3600, closed: bucket });
 
-    // A reading immediately before reset is still fresh after reset, but the
-    // first observed status at the boundary closes its governing window. Its
-    // published throttle remains the normal fresh interval.
+    // A reading immediately before reset is healthy and fresh at reset: it stays
+    // quiet without alerting (#794 timing amendment).
     const recent = new Date(resetMs - 10 * 60_000).toISOString();
+    const recentStatus = {
+      ...stored,
+      updatedAt: recent,
+      buckets: [{ ...bucket, observedAt: recent }],
+    };
+    expect(at(recentStatus, resetMs)).toEqual({ interval: 300, closed: null });
+
+    // As time passes past the soft-stale threshold (45m default for scrape) without a newer reading,
+    // the window-close is detected. Its published throttle remains the retained interval (300).
+    const softStaleMs = resetMs + 36 * 60_000; // age = 46m > 45m staleAfterMs
+    expect(at(recentStatus, softStaleMs)).toEqual({
+      interval: 300,
+      closed: { ...bucket, observedAt: recent },
+    });
+
+    // An already soft-stale reading at reset alerts on the first applied closed status.
+    const alreadyStale = new Date(resetMs - 50 * 60_000).toISOString();
     expect(
-      at({ ...stored, updatedAt: recent, buckets: [{ ...bucket, observedAt: recent }] }, resetMs)
-    ).toEqual({ interval: 300, closed: { ...bucket, observedAt: recent } });
+      at(
+        { ...stored, updatedAt: alreadyStale, buckets: [{ ...bucket, observedAt: alreadyStale }] },
+        resetMs
+      )
+    ).toEqual({ interval: 300, closed: { ...bucket, observedAt: alreadyStale } });
+
     // A newer scrape that omitted only the governing window is the partial
     // case, and a governing window with no reset has nothing to close.
     expect(at({ ...stored, updatedAt: recent }, resetMs + 60 * 60_000).closed).toBeNull();

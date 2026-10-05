@@ -1290,9 +1290,11 @@ sequenceDiagram
 A whole provider lane whose readings stop or fail keeps its last reasoned interval
 through a hard-stale scrape, including across governing window reset (#794).
 The response remains truthfully hard-stale. The first status an instance applies
-at or after the reset raises one root alarm per close (#794), even if the retained
-reading is still fresh; the alarm leaves the already-published interval unchanged
-and the lane is not retired. The service, not a client, is the only place that can distinguish
+after reset where the reading predates the reset and has passed the soft-stale
+threshold (probe TTL plus three ticks from observation) raises one root alarm per
+distinct closed window (#794); a healthy fresh reading at reset stays quiet. The
+alarm leaves the already-published interval unchanged and the lane is not retired.
+The service, not a client, is the only place that can distinguish
 a failed scrape from a stable quota window, because a client sees an unchanging interval either way.
 
 ### 6.3 Service restart

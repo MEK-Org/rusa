@@ -1814,11 +1814,12 @@ async function composeStart(
       }
     }
   };
-  // Providers whose governing window last applied as closed with no newer
-  // reading (#794). Each close is raised to root once, and a provider raises
-  // again only after a newer reading reopens it. Nothing is recorded before
-  // the alarm is bound, so a window already closed at boot still reaches root.
-  const closedGoverningWindowLanes = new Set<string>();
+  // Deduplicate governing window closure alerts by distinct window transition
+  // (${lane}:${window.key}:${window.resetAtIso}) (#794). Each distinct closed
+  // window alerts once, even across successive distinct closes without an
+  // intermediate open apply. Nothing is recorded before the alarm is bound,
+  // so a window already closed at boot still reaches root.
+  const closedGoverningWindows = new Set<string>();
   let raiseGoverningWindowClosedAlarm:
     | ((closed: {
         provider: string;
@@ -1832,12 +1833,10 @@ async function composeStart(
     status: PublishedThrottleProviderStatus
   ): void => {
     const window = closedGoverningWindow(status, Date.now());
-    if (!window) {
-      closedGoverningWindowLanes.delete(lane);
-      return;
-    }
-    if (!raiseGoverningWindowClosedAlarm || closedGoverningWindowLanes.has(lane)) return;
-    closedGoverningWindowLanes.add(lane);
+    if (!window) return;
+    const dedupKey = `${lane}:${window.key}:${window.resetAtIso ?? ""}`;
+    if (!raiseGoverningWindowClosedAlarm || closedGoverningWindows.has(dedupKey)) return;
+    closedGoverningWindows.add(dedupKey);
     const closed = {
       provider: lane,
       window: window.key,
@@ -4709,8 +4708,8 @@ async function composeStart(
   raiseGoverningWindowClosedAlarm = (closed) => {
     const message =
       `Quota window closed without a reading: ${closed.provider}'s governing window ` +
-      `"${closed.window}" reset at ${closed.resetAt}, and no quota reading has arrived since ` +
-      `${closed.lastReadingAt}. Check the scrapes to see why readings stopped.`;
+      `"${closed.window}" reset at ${closed.resetAt}, and no newer accepted quota reading has arrived since ` +
+      `${closed.lastReadingAt}. Check the scrapes to inspect collection.`;
     void deliverHostAlarm({
       deliver: () =>
         mesh.deliverExternalEvent({

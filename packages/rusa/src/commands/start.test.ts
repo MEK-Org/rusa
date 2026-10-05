@@ -1537,27 +1537,43 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     it("raises one root alarm per provider-wide governing window closing with no newer reading (#794)", async () => {
       // A whole-lane reading as the coordinator publishes it: its governing
-      // window comes from that same reading. Closing is independent of its
-      // hard-stale status; only the existing published throttle differs.
+      // window comes from that same reading.
       const reading = (
         resetMs: number,
         intervalSeconds: number,
-        hardStale: boolean,
-        observedMs = hardStale ? Date.now() - 2 * 60 * 60_000 : resetMs - 60_000
+        freshnessState: { stale: boolean; hardStale: boolean },
+        observedMs = resetMs - 60_000,
+        windowKey = "claude:weekly"
       ) => {
         const updatedAt = new Date(observedMs).toISOString();
         const status = throttleStatus("claude", { intervalSeconds, updatedAt });
         return {
           ...status,
-          buckets: status.buckets.map((bucket) => ({
-            ...bucket,
-            observedAt: updatedAt,
-            resetAtIso: new Date(resetMs).toISOString(),
-          })),
-          freshness: { ...status.freshness, stale: hardStale, hardStale },
+          governingBucketKey: windowKey,
+          buckets: [
+            {
+              key: windowKey,
+              percentLeft: 50,
+              timeRemainingPct: 50,
+              error: 0,
+              derivative: 0,
+              requiredIntervalSeconds: intervalSeconds,
+              observedAt: updatedAt,
+              resetAtIso: new Date(resetMs).toISOString(),
+            },
+          ],
+          freshness: {
+            ...status.freshness,
+            stale: freshnessState.stale,
+            hardStale: freshnessState.hardStale,
+            staleAfterMs: 45 * 60_000,
+            hardStaleAfterMs: 60 * 60_000,
+          },
         };
       };
-      let published = reading(Date.now() + 60 * 60_000, 300, false, Date.now());
+
+      const now = Date.now();
+      let published = reading(now + 60 * 60_000, 300, { stale: false, hardStale: false }, now);
       const { close, triggerQuotaThrottleTick, getThrottle } = await bootWithCoordinator(() => ({
         claude: published,
       }));
@@ -1569,49 +1585,94 @@ describe("runStart webhook event routing (Phase 4)", () => {
               (entry.payload as { type?: string }).type === "system.quota_governing_window_closed"
           );
       try {
-        // The reading is fresh and its window is still open: no alarm and its
-        // ordinary throttle is applied.
+        // 1. Window still open and reading is fresh: ordinary throttle applied, no alarm.
         await triggerQuotaThrottleTick();
         expect(getThrottle("claude")?.intervalSeconds).toBe(300);
         expect(closedAlarms()).toEqual([]);
 
-        // A fresh reading immediately before its reset closes on the first
-        // observed status at/after reset. The alert must not change pacing.
-        const resetMs = Date.now() - 60_000;
-        published = reading(resetMs, 300, false);
+        // 2. Healthy reset/recovery without an alert:
+        // A fresh reading at reset (reset has passed, but reading is still fresh < staleAfterMs).
+        // It stays quiet per the soft-stale timing amendment (#794).
+        const window1ResetMs = now - 60_000;
+        published = reading(
+          window1ResetMs,
+          300,
+          { stale: false, hardStale: false },
+          window1ResetMs - 10 * 60_000
+        );
+        await triggerQuotaThrottleTick();
+        expect(getThrottle("claude")?.intervalSeconds).toBe(300);
+        expect(closedAlarms()).toEqual([]);
+
+        // 3. Soft-stale crossing after reset:
+        // That same window reaches the soft-stale threshold without a newer reading.
+        // The first applied status after crossing soft-stale raises one responsive alarm.
+        published = reading(
+          window1ResetMs,
+          300,
+          { stale: true, hardStale: false },
+          window1ResetMs - 50 * 60_000
+        );
         await triggerQuotaThrottleTick();
         await vi.waitFor(() => expect(closedAlarms()).toHaveLength(1));
-        expect(closedAlarms()[0]).toMatchObject({
+        const alarm1 = closedAlarms()[0];
+        expect(alarm1).toMatchObject({
           actorId: "root",
           source: "system:events",
           payload: expect.objectContaining({
             provider: "claude",
             window: "claude:weekly",
-            resetAt: new Date(resetMs).toISOString(),
+            resetAt: new Date(window1ResetMs).toISOString(),
             priority: "responsive",
-            message: expect.stringContaining("Check the scrapes"),
+            message: expect.stringContaining("Check the scrapes to inspect collection"),
           }),
         });
-        expect((closedAlarms()[0].payload as unknown as { message: string }).message).not.toContain(
-          "conservative ceiling"
-        );
+        const alarm1Msg = (alarm1.payload as unknown as { message: string }).message;
+        expect(alarm1Msg).toContain("no newer accepted quota reading has arrived since");
+        expect(alarm1Msg).not.toContain("conservative ceiling");
+        // Pin unchanged published/applied throttle value around the alert:
         expect(getThrottle("claude")?.intervalSeconds).toBe(300);
 
-        // Still closed on the next apply: raised once, not per tick.
+        // 4. Repeated applies of the same closed window are deduplicated:
         await triggerQuotaThrottleTick();
         await new Promise((resolve) => setTimeout(resolve, 50));
         expect(closedAlarms()).toHaveLength(1);
         expect(getThrottle("claude")?.intervalSeconds).toBe(300);
 
-        // A newer reading reopens the lane, so its own later close raises again.
-        published = reading(Date.now() + 60 * 60_000, 300, false);
-        await triggerQuotaThrottleTick();
-        expect(getThrottle("claude")?.intervalSeconds).toBe(300);
-        // The same close when hard-stale retains the existing ceiling. Pin
-        // that outcome before and after the alert, too.
-        published = reading(Date.now() - 1_000, 3600, true);
+        // 5. Successive distinct closes without an intermediate open apply:
+        // A distinct governing window (different resetAtIso) closes and is applied directly
+        // without an intermediate open apply. The compound dedup key (${lane}:${window.key}:${window.resetAtIso})
+        // ensures this second distinct transition raises its own alarm.
+        const window2ResetMs = now - 30_000;
+        published = reading(
+          window2ResetMs,
+          3600,
+          { stale: true, hardStale: true },
+          window2ResetMs - 2 * 60 * 60_000,
+          "claude:session"
+        );
         await triggerQuotaThrottleTick();
         await vi.waitFor(() => expect(closedAlarms()).toHaveLength(2));
+        const alarm2 = closedAlarms().find(
+          (entry) => (entry.payload as { window?: string }).window === "claude:session"
+        );
+        expect(alarm2).toMatchObject({
+          actorId: "root",
+          source: "system:events",
+          payload: expect.objectContaining({
+            provider: "claude",
+            window: "claude:session",
+            resetAt: new Date(window2ResetMs).toISOString(),
+            priority: "responsive",
+          }),
+        });
+        // Pin hard-stale throttle value:
+        expect(getThrottle("claude")?.intervalSeconds).toBe(3600);
+
+        // Repeated apply of window 2 is also deduplicated:
+        await triggerQuotaThrottleTick();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(closedAlarms()).toHaveLength(2);
         expect(getThrottle("claude")?.intervalSeconds).toBe(3600);
       } finally {
         await shutdownFn?.();
