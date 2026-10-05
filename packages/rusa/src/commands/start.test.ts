@@ -2835,79 +2835,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       return worker as Actor;
     };
 
-    it("records not_connected diagnostic when attempt starts but no client connects during the run", async () => {
-      const workerId = "diag-not-connected-worker";
-      const mesh = await bootWithWorker(workerId);
-      const actor = actorFor(mesh, workerId);
-
-      // Provider attempt starts, but no client connects to loopback MCP servers
-      (
-        actor as unknown as {
-          opts: {
-            onProviderAttempt?: (attempt: {
-              providerName: string;
-              model?: string;
-              effort?: string;
-            }) => void;
-          };
-        }
-      ).opts.onProviderAttempt?.({
-        providerName: "antigravity",
-        model: "Gemini 3.7 Flash (High)",
-        effort: "high",
-      });
-
-      const runId = await startLifecycleRun(actor, {
-        provider: "antigravity",
-        model: "Gemini 3.7 Flash (High)",
-        effort: "high",
-      });
-      await endLifecycleRun(actor, runId, {
-        success: true,
-        exitCode: 0,
-        output: "done",
-      });
-
-      const [diag] = getRepositories().meshEvents.listEventsByActors([workerId], {
-        limit: 10,
-        kinds: ["run_mcp_diagnostic"],
-      }).events;
-      expect(diag).toBeDefined();
-      expect(diag?.detail).toBe("not_connected");
-      const payload = JSON.parse(diag?.payload ?? "{}");
-      expect(payload.classification).toBe("not_connected");
-      expect(payload.totalCalls).toBe(0);
-      expect(payload.servers.mesh?.initialized).toBe(false);
-    });
-
-    it("records unknown diagnostic when run finishes without an active attempt window (e.g. restart mid-run)", async () => {
-      const workerId = "diag-unknown-worker";
-      const mesh = await bootWithWorker(workerId);
-      const actor = actorFor(mesh, workerId);
-
-      // Direct start without onProviderAttempt (e.g. unstarted window)
-      const runId = await startLifecycleRun(actor, {
-        provider: "antigravity",
-        model: "Gemini 3.7 Flash (High)",
-        effort: "high",
-      });
-      await endLifecycleRun(actor, runId, {
-        success: true,
-        exitCode: 0,
-        output: "done",
-      });
-
-      const [diag] = getRepositories().meshEvents.listEventsByActors([workerId], {
-        limit: 10,
-        kinds: ["run_mcp_diagnostic"],
-      }).events;
-      expect(diag).toBeDefined();
-      expect(diag?.detail).toBe("unknown");
-      const payload = JSON.parse(diag?.payload ?? "{}");
-      expect(payload.classification).toBe("unknown");
-      expect(payload.totalCalls).toBe(0);
-    });
-
+    // The tally itself is proven in http-server.test.ts; this proves the
+    // wiring: the window opens on the provider attempt, the event lands at run end.
     it("records used diagnostic when client calls an MCP tool during the run", async () => {
       const workerId = "diag-used-worker";
       const mesh = await bootWithWorker(workerId);
@@ -2962,8 +2891,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       const payload = JSON.parse(diag?.payload ?? "{}");
       expect(payload.classification).toBe("used");
       expect(payload.totalCalls).toBe(1);
-      expect(payload.servers.mesh?.toolCalls).toBe(1);
-      expect(payload.servers.mesh?.firstTool).toBe("list_followers");
+      expect(payload.servers.mesh).toEqual({ initialized: true, toolsListed: true, toolCalls: 1 });
 
       await client.close();
     });

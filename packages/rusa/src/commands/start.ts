@@ -3086,21 +3086,18 @@ async function composeStart(
         // The management deps are wired on every endpoint; the endpoint mounts
         // the corresponding tools only for an actor holding the administrative
         // capability (#549), so an ungranted worker sees none of them.
-        const meshUrl = mcpHttp.addServer(
-          id,
-          () =>
-            createAgentExecMcpServer(mesh, id, rootId, osScheduler, {
-              onWrite: () => {
-                mesh.markUnkillable(id);
-              },
-              modelClasses,
-              validateModelClass: (input) =>
-                validateModelConfigPool(config, input, { portable: true }),
-              getFollowers: () => (followerHub ? followerHub.list() : []),
-              chatRoom,
-              voices: () => supportedVoiceCatalog,
-            }),
-          { actorId: id }
+        const meshUrl = mcpHttp.addServer(id, () =>
+          createAgentExecMcpServer(mesh, id, rootId, osScheduler, {
+            onWrite: () => {
+              mesh.markUnkillable(id);
+            },
+            modelClasses,
+            validateModelClass: (input) =>
+              validateModelConfigPool(config, input, { portable: true }),
+            getFollowers: () => (followerHub ? followerHub.list() : []),
+            chatRoom,
+            voices: () => supportedVoiceCatalog,
+          })
         );
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
           createInboxMcpServer(inboxStore, id, {
@@ -3533,21 +3530,18 @@ async function composeStart(
   // ── Root actor ──
   const rootAgentDir = join(mcHome, "root-agent");
   mkdirSync(rootAgentDir, { recursive: true });
-  const rootMeshUrl = mcpHttp.addServer(
-    rootId,
-    () =>
-      createAgentExecMcpServer(mesh, rootId, rootId, osScheduler, {
-        rootControl,
-        modelClasses,
-        validateModelClass: (input) => validateModelConfigPool(config, input, { portable: true }),
-        onWrite: () => {
-          mesh.markUnkillable(rootId);
-        },
-        getFollowers: () => (followerHub ? followerHub.list() : []),
-        chatRoom,
-        voices: () => supportedVoiceCatalog,
-      }),
-    { actorId: rootId }
+  const rootMeshUrl = mcpHttp.addServer(rootId, () =>
+    createAgentExecMcpServer(mesh, rootId, rootId, osScheduler, {
+      rootControl,
+      modelClasses,
+      validateModelClass: (input) => validateModelConfigPool(config, input, { portable: true }),
+      onWrite: () => {
+        mesh.markUnkillable(rootId);
+      },
+      getFollowers: () => (followerHub ? followerHub.list() : []),
+      chatRoom,
+      voices: () => supportedVoiceCatalog,
+    })
   );
   const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
     createInboxMcpServer(inboxStore, rootId, {

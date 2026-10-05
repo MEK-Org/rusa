@@ -3,8 +3,8 @@ import type { Socket } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { type CallToolResult, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeScheduledMessagePayload } from "../actor/os-scheduler.js";
 import { FakeChatClient } from "../chat/fake.js";
 import type { IssueClient } from "../gitops/issue-client.js";
@@ -1026,19 +1026,8 @@ describe("McpHttpServer", () => {
   });
 
   describe("classifyMcpRun", () => {
-    it("classifies as not_connected when no mounts initialized", () => {
-      expect(
-        classifyMcpRun(
-          {
-            mesh: { initialized: false, toolsListed: false, toolCalls: 0 },
-            inbox: { initialized: false, toolsListed: false, toolCalls: 0 },
-          },
-          ["mesh", "inbox"]
-        )
-      ).toBe("not_connected");
-    });
-
-    it("classifies as not_connected when mesh server specifically is not initialized", () => {
+    // Edge cases the live-mount tests below do not reach directly.
+    it("is not_connected when the mesh mount never initialized, even if another mount did", () => {
       expect(
         classifyMcpRun(
           {
@@ -1050,19 +1039,7 @@ describe("McpHttpServer", () => {
       ).toBe("not_connected");
     });
 
-    it("classifies as listing_incomplete when initialized but tools/list did not complete", () => {
-      expect(
-        classifyMcpRun(
-          {
-            mesh: { initialized: true, toolsListed: false, toolCalls: 0 },
-            inbox: { initialized: false, toolsListed: false, toolCalls: 0 },
-          },
-          ["mesh", "inbox"]
-        )
-      ).toBe("listing_incomplete");
-    });
-
-    it("classifies as listing_incomplete when only a subset of expected servers completed listing", () => {
+    it("is listing_incomplete when only some expected mounts completed a listing", () => {
       expect(
         classifyMcpRun(
           {
@@ -1073,226 +1050,168 @@ describe("McpHttpServer", () => {
         )
       ).toBe("listing_incomplete");
     });
-
-    it("classifies as discovered_unused when all expected servers initialized and listed, with 0 tool calls", () => {
-      expect(
-        classifyMcpRun(
-          {
-            mesh: { initialized: true, toolsListed: true, toolCalls: 0 },
-            inbox: { initialized: true, toolsListed: true, toolCalls: 0 },
-          },
-          ["mesh", "inbox"]
-        )
-      ).toBe("discovered_unused");
-    });
-
-    it("classifies as used when at least one tool call was made across mounts", () => {
-      expect(
-        classifyMcpRun(
-          {
-            mesh: { initialized: true, toolsListed: true, toolCalls: 0 },
-            inbox: { initialized: true, toolsListed: true, toolCalls: 1, firstTool: "inbox.list" },
-          },
-          ["mesh", "inbox"]
-        )
-      ).toBe("used");
-    });
   });
 
-  describe("McpHttpServer per-run tally and diagnostics", () => {
+  describe("per-run MCP tally (#292)", () => {
     const actorId = "test-actor-42";
+    const pingServer = () => {
+      const s = createMcpServer({ name: "mesh", version: "0.1.0" });
+      s.tool("ping", {}, async () => toolOk("pong"));
+      return s;
+    };
+    const connect = async (url: string) => {
+      const client = new Client({ name: "test-client", version: "1.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+      return client;
+    };
 
-    it("returns unknown when no run window was active for the actor", () => {
-      const diag = http.finishRunWindow("unknown-actor");
-      expect(diag.classification).toBe("unknown");
-      expect(diag.servers).toEqual({});
-      expect(diag.totalCalls).toBe(0);
-    });
-
-    it("records initialize, completed tools/list, and first tools/call on live mounts", async () => {
-      const toolClient = new Client({ name: "test-client", version: "1.0.0" });
-      const inboxToolClient = new Client({ name: "inbox-client", version: "1.0.0" });
-
-      const meshUrl = http.addServer(
-        actorId,
-        () => {
-          const s = createMcpServer({ name: "mesh", version: "0.1.0" });
-          s.tool("ping", {}, async () => toolOk("pong"));
-          return s;
-        },
-        { actorId }
-      );
-
-      const inboxUrl = http.addServer(
-        `${actorId}:inbox`,
-        () => {
-          const s = createMcpServer({ name: "inbox", version: "0.1.0" });
-          s.tool("list", {}, async () => toolOk("items"));
-          return s;
-        },
-        { actorId }
-      );
-
+    it("tallies initialize, completed listing and calls per mount, recording no tool names", async () => {
+      const meshUrl = http.addServer(actorId, pingServer);
+      const inboxUrl = http.addServer(`${actorId}:inbox`, () => {
+        const s = createMcpServer({ name: "inbox", version: "0.1.0" });
+        s.tool("list", {}, async () => toolOk("items"));
+        return s;
+      });
       http.startRunWindow(actorId, ["mesh", "inbox"]);
 
-      // Connect to mesh server, list tools, and call ping
-      const meshTransport = new StreamableHTTPClientTransport(new URL(meshUrl));
-      await toolClient.connect(meshTransport);
-      await toolClient.listTools();
-      await toolClient.callTool({ name: "ping", arguments: {} });
-
-      // Connect to inbox server and list tools without calling any
-      const inboxTransport = new StreamableHTTPClientTransport(new URL(inboxUrl));
-      await inboxToolClient.connect(inboxTransport);
-      await inboxToolClient.listTools();
+      const mesh = await connect(meshUrl);
+      await mesh.listTools();
+      await mesh.callTool({ name: "ping", arguments: {} });
+      // A caller-supplied name is counted as a call but never stored.
+      await mesh.callTool({ name: "/home/private/token-xyz", arguments: {} }).catch(() => {});
+      const inbox = await connect(inboxUrl);
+      await inbox.listTools();
 
       const diag = http.finishRunWindow(actorId);
-
-      expect(diag.classification).toBe("used");
-      expect(diag.totalCalls).toBe(1);
-      expect(diag.servers.mesh).toEqual({
-        initialized: true,
-        toolsListed: true,
-        toolCalls: 1,
-        firstTool: "ping",
+      expect(diag).toEqual({
+        classification: "used",
+        totalCalls: 2,
+        servers: {
+          mesh: { initialized: true, toolsListed: true, toolCalls: 2 },
+          inbox: { initialized: true, toolsListed: true, toolCalls: 0 },
+        },
       });
-      expect(diag.servers.inbox).toEqual({
-        initialized: true,
-        toolsListed: true,
-        toolCalls: 0,
-      });
+      expect(JSON.stringify(diag)).not.toMatch(/ping|token-xyz|private/);
 
-      await toolClient.close();
-      await inboxToolClient.close();
+      await mesh.close();
+      await inbox.close();
     });
 
-    it("records discovered_unused when client initializes and lists tools on all expected mounts but makes 0 calls", async () => {
-      const client = new Client({ name: "test-client", version: "1.0.0" });
-      const meshUrl = http.addServer(
-        actorId,
-        () => {
-          const s = createMcpServer({ name: "mesh", version: "0.1.0" });
-          s.tool("ping", {}, async () => toolOk("pong"));
-          return s;
-        },
-        { actorId }
-      );
+    it("is not_connected with no traffic and listing_incomplete after initialize alone", async () => {
+      const meshUrl = http.addServer(actorId, pingServer);
+      http.startRunWindow(actorId, ["mesh"]);
+      expect(http.finishRunWindow(actorId).classification).toBe("not_connected");
 
       http.startRunWindow(actorId, ["mesh"]);
-
-      const transport = new StreamableHTTPClientTransport(new URL(meshUrl));
-      await client.connect(transport);
-      await client.listTools();
-
-      const diag = http.finishRunWindow(actorId);
-      expect(diag.classification).toBe("discovered_unused");
-      expect(diag.totalCalls).toBe(0);
-      expect(diag.servers.mesh?.initialized).toBe(true);
-      expect(diag.servers.mesh?.toolsListed).toBe(true);
-
+      const client = await connect(meshUrl);
+      expect(http.finishRunWindow(actorId)).toMatchObject({
+        classification: "listing_incomplete",
+        servers: { mesh: { initialized: true, toolsListed: false } },
+      });
       await client.close();
     });
 
-    it("records listing_incomplete when client initializes but does not request tool list", async () => {
-      const client = new Client({ name: "test-client", version: "1.0.0" });
-      const meshUrl = http.addServer(
-        actorId,
-        () => {
-          return createMcpServer({ name: "mesh", version: "0.1.0" });
-        },
-        { actorId }
-      );
-
-      http.startRunWindow(actorId, ["mesh"]);
-
-      const transport = new StreamableHTTPClientTransport(new URL(meshUrl));
-      await client.connect(transport);
-      // Connected/initialized, but do not call listTools()
-
-      const diag = http.finishRunWindow(actorId);
-      expect(diag.classification).toBe("listing_incomplete");
-      expect(diag.totalCalls).toBe(0);
-      expect(diag.servers.mesh?.initialized).toBe(true);
-      expect(diag.servers.mesh?.toolsListed).toBe(false);
-
-      await client.close();
-    });
-
-    it("records not_connected when no client connects during the run window", () => {
-      http.addServer(actorId, () => createMcpServer({ name: "mesh", version: "0.1.0" }), {
-        actorId,
-      });
-      http.startRunWindow(actorId, ["mesh"]);
-
-      const diag = http.finishRunWindow(actorId);
-      expect(diag.classification).toBe("not_connected");
-      expect(diag.totalCalls).toBe(0);
-      expect(diag.servers.mesh?.initialized).toBe(false);
-      expect(diag.servers.mesh?.toolsListed).toBe(false);
-    });
-
-    it("resets tally cleanly across provider attempts / retries and ignores pre-window traffic", async () => {
-      const client = new Client({ name: "test-client", version: "1.0.0" });
-      const meshUrl = http.addServer(
-        actorId,
-        () => {
-          const s = createMcpServer({ name: "mesh", version: "0.1.0" });
-          s.tool("ping", {}, async () => toolOk("pong"));
-          return s;
-        },
-        { actorId }
-      );
-
-      // Pre-run discovery / pre-window request: client connects before startRunWindow is called
-      const transport = new StreamableHTTPClientTransport(new URL(meshUrl));
-      await client.connect(transport);
+    it("ignores pre-window traffic and starts each attempt from zero", async () => {
+      const meshUrl = http.addServer(actorId, pingServer);
+      const client = await connect(meshUrl);
       await client.listTools();
 
-      // Attempt 1 starts: window opened with reset counts
       http.startRunWindow(actorId, ["mesh"]);
-      const attempt1Diag = http.getRunDiagnostic(actorId);
-      expect(attempt1Diag.servers.mesh?.initialized).toBe(false);
-      expect(attempt1Diag.servers.mesh?.toolsListed).toBe(false);
-
-      // Attempt 1 makes a call
       await client.callTool({ name: "ping", arguments: {} });
-      expect(http.getRunDiagnostic(actorId).totalCalls).toBe(1);
+      expect(http.finishRunWindow(actorId)).toMatchObject({
+        classification: "used",
+        servers: { mesh: { initialized: false, toolsListed: false, toolCalls: 1 } },
+      });
 
-      // Attempt 1 fails, Attempt 2 starts (pool fallback / retry)
+      // A retry is a fresh provider process: a new window, a new session.
       http.startRunWindow(actorId, ["mesh"]);
-      const attempt2Diag = http.getRunDiagnostic(actorId);
-      expect(attempt2Diag.totalCalls).toBe(0);
-      expect(attempt2Diag.servers.mesh?.toolCalls).toBe(0);
-
-      // Attempt 2 spawns fresh provider process which connects, lists tools, and exits without calling tools
-      const client2 = new Client({ name: "test-client-attempt2", version: "1.0.0" });
-      const transport2 = new StreamableHTTPClientTransport(new URL(meshUrl));
-      await client2.connect(transport2);
-      await client2.listTools();
-      const finalDiag = http.finishRunWindow(actorId);
-      expect(finalDiag.classification).toBe("discovered_unused");
-      expect(finalDiag.totalCalls).toBe(0);
+      const retry = await connect(meshUrl);
+      await retry.listTools();
+      expect(http.finishRunWindow(actorId)).toMatchObject({
+        classification: "discovered_unused",
+        totalCalls: 0,
+      });
 
       await client.close();
-      await client2.close();
+      await retry.close();
     });
 
-    it("cleans up active run window on clearRunWindow without leaks", () => {
-      http.startRunWindow(actorId, ["mesh", "inbox"]);
-      expect(http.getRunDiagnostic(actorId).classification).toBe("not_connected");
+    it("never attributes one actor's traffic to another actor's open window", async () => {
+      const otherUrl = http.addServer("actor-a", pingServer);
+      const otherTrackerUrl = http.addServer("actor-a:tracker", pingServer);
+      http.addServer("actor-b", pingServer);
+      http.addServer("actor-b:tracker", pingServer);
+      http.startRunWindow("actor-b", ["mesh", "tracker"]);
+
+      for (const url of [otherUrl, otherTrackerUrl]) {
+        const client = await connect(url);
+        await client.listTools();
+        await client.callTool({ name: "ping", arguments: {} });
+        await client.close();
+      }
+
+      expect(http.finishRunWindow("actor-b")).toMatchObject({
+        classification: "not_connected",
+        totalCalls: 0,
+        servers: {
+          mesh: { initialized: false, toolsListed: false, toolCalls: 0 },
+          tracker: { initialized: false, toolsListed: false, toolCalls: 0 },
+        },
+      });
+      expect(http.finishRunWindow("actor-a").classification).toBe("unknown");
+    });
+
+    it("counts a listing only when its result is written within the same attempt", async () => {
+      let entered = false;
+      let release = () => {};
+      let fail = false;
+      const meshUrl = http.addServer(actorId, () => {
+        const s = pingServer();
+        s.server.setRequestHandler(ListToolsRequestSchema, async () => {
+          entered = true;
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          if (fail) throw new Error("listing failed");
+          return { tools: [] };
+        });
+        return s;
+      });
+      http.startRunWindow(actorId, ["mesh"]);
+      const client = await connect(meshUrl);
+
+      // Attempt 1's listing completes only after attempt 2 replaced it.
+      const late = client.listTools();
+      await vi.waitFor(() => expect(entered).toBe(true));
+      http.startRunWindow(actorId, ["mesh"]);
+      release();
+      await late;
+      expect(http.finishRunWindow(actorId).servers.mesh?.toolsListed).toBe(false);
+
+      // An error result is not a completed listing.
+      http.startRunWindow(actorId, ["mesh"]);
+      entered = false;
+      fail = true;
+      const failed = client.listTools().then(
+        () => "listed",
+        () => "rejected"
+      );
+      await vi.waitFor(() => expect(entered).toBe(true));
+      release();
+      await expect(failed).resolves.toBe("rejected");
+      expect(http.finishRunWindow(actorId).servers.mesh?.toolsListed).toBe(false);
+
+      await client.close();
+    });
+
+    it("drops an attempt's window on clearRunWindow", () => {
+      http.startRunWindow(actorId, ["mesh"]);
       http.clearRunWindow(actorId);
-      expect(http.getRunDiagnostic(actorId).classification).toBe("unknown");
-    });
-
-    it("sanitizes diagnostic payload to capability labels and counts only", () => {
-      http.startRunWindow(actorId, ["mesh", "inbox", "tracker"]);
-      const diag = http.finishRunWindow(actorId);
-
-      const jsonStr = JSON.stringify(diag);
-      // Must not contain actor UUID or internal paths
-      expect(jsonStr).not.toContain(actorId);
-      expect(Object.keys(diag.servers)).toEqual(["mesh", "inbox", "tracker"]);
-      expect(diag.servers.mesh).toEqual({ initialized: false, toolsListed: false, toolCalls: 0 });
+      expect(http.finishRunWindow(actorId)).toEqual({
+        classification: "unknown",
+        servers: {},
+        totalCalls: 0,
+      });
     });
   });
 });
