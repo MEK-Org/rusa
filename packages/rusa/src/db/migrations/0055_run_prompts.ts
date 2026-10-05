@@ -1,6 +1,11 @@
 import type { Migration } from "./types.js";
 
-/** Retained launch text stays out of the run ledger and event stream (#866). */
+/**
+ * Retained launch text stays out of the run ledger and event stream (#866).
+ * It is not part of the run entity: fetching a run never loads it, callers
+ * ask for it separately, and they must expect it to be gone once the 30-day
+ * retention prunes it.
+ */
 export const runPrompts: Migration = {
   id: "0055_run_prompts",
   up: (db) => {
