@@ -41,7 +41,7 @@ describe("Git identity guidance (#909)", () => {
     const text = gitIdentityGuidance(resolveMeshGitIdentity(MESH));
     expect(text).toContain("**Mesh Bot\n<mesh-bot@example.invalid>**");
     expect(text).toContain(
-      "git -c 'author.name=Mesh Bot' -c author.email=mesh-bot@example.invalid -c 'committer.name=Mesh Bot' -c committer.email=mesh-bot@example.invalid commit"
+      "git -c 'user.name=Mesh Bot' -c user.email=mesh-bot@example.invalid -c 'author.name=Mesh Bot' -c author.email=mesh-bot@example.invalid -c 'committer.name=Mesh Bot' -c committer.email=mesh-bot@example.invalid commit"
     );
     expect(text).toContain(
       "env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_COMMITTER_NAME -u\nGIT_COMMITTER_EMAIL git …"

@@ -18,10 +18,10 @@ export type MeshGitIdentityResolution =
   | { identity: MeshGitIdentity; gap?: undefined }
   | { identity: null; gap: string };
 
-// Git strips `<`, `>` and LF from an identity, so those values would not be
-// recorded as configured. A NUL byte cannot be passed in a process argument at
-// all. CR is also rejected to keep the displayed, line-oriented guidance intact;
-// this is deliberately not a general-purpose Git-ident validator.
+// Bounded transport, prompt and delimiter safety: Git uses `<` and `>` as ident
+// envelope delimiters, LF/CR breaks the line-oriented prompt guidance and commit
+// header, and NUL cannot be passed in a process argument. This provides a
+// minimal safe seam, deliberately avoiding a general-purpose Git-ident validator.
 const UNCARRIABLE = /[<>\n\r\0]/;
 
 function field(value: unknown): string | undefined {
@@ -53,12 +53,15 @@ export function resolveMeshGitIdentity(configured: unknown): MeshGitIdentityReso
 }
 
 /**
- * `git` options that set author and committer for one command only. Git reads
- * `author.*` and `committer.*` before `user.*`, so those are what is set; a
- * person's role-specific keys would otherwise win over `-c user.*`.
+ * `git` options that set identity for one command only. Supplying command-line
+ * `user.*` alongside `author.*` and `committer.*` ensures the configured identity
+ * wins across Git versions without a version probe: on Git 2.22+, `author.*` and
+ * `committer.*` take precedence over an operator's role-specific keys, while on
+ * older Git where role keys are not recognized, command-line `user.*` overrides
+ * any ambient configuration.
  */
 export function meshGitIdentityArgs(identity: MeshGitIdentity): string[] {
-  return ["author", "committer"].flatMap((role) => [
+  return ["user", "author", "committer"].flatMap((role) => [
     "-c",
     `${role}.name=${identity.name}`,
     "-c",
