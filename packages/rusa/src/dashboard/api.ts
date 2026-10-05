@@ -59,7 +59,7 @@ import {
   type VoiceConfigDocument,
   voiceConfigSchema,
 } from "../voice/voice-config.js";
-import { dashboardSessionKey, getDashboardRequestPrincipal } from "./auth.js";
+import { getDashboardRequestPrincipal } from "./auth.js";
 import {
   type HumanChatScope,
   humanChatViewer,
@@ -577,14 +577,12 @@ export function readBody(
   });
 }
 
-/** Largest Room entry request body; the real ones are a few hundred bytes. */
-const MAX_ROOM_ENTRY_BODY_BYTES = 4 * 1024;
-
 /**
  * Room entry (#829): `POST /api/mesh/chat-room/entry` announces one human
- * entering the Room. Identity is the verified request principal and its
- * session, never the body. Without a verified durable principal — auth-disabled local
- * mode — entry is `disabled` and nothing is recorded.
+ * entering the Room. Identity is the verified request principal; the endpoint
+ * has no caller-supplied entry identity or session state. Without a verified
+ * durable principal — auth-disabled local mode — entry is `disabled` and
+ * nothing is recorded.
  */
 async function handleRoomEntryRequest(
   req: IncomingMessage,
@@ -594,8 +592,7 @@ async function handleRoomEntryRequest(
 ): Promise<boolean> {
   if (pathname !== "/api/mesh/chat-room/entry") return false;
   const principal = getDashboardRequestPrincipal(req);
-  const sessionKey = dashboardSessionKey(req);
-  if (!principal || !sessionKey) {
+  if (!principal) {
     sendJson(res, 200, { status: "disabled" });
     return true;
   }
@@ -603,25 +600,8 @@ async function handleRoomEntryRequest(
     sendJson(res, 503, { status: "unavailable", reason: "room entry unavailable" });
     return true;
   }
-  let raw: string;
-  try {
-    raw = await readBody(req, MAX_ROOM_ENTRY_BODY_BYTES);
-  } catch (error) {
-    if (!(error instanceof RequestBodyTooLargeError)) throw error;
-    sendJson(res, 413, { error: "Request body too large" });
-    return true;
-  }
-  let body: Record<string, unknown>;
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
-    body = parsed as Record<string, unknown>;
-  } catch {
-    sendJson(res, 400, { error: "Expected a JSON object body" });
-    return true;
-  }
-  const clientId = typeof body.clientId === "string" ? body.clientId : "";
-  sendJson(res, 200, deps.roomEntry.enter({ principalId: principal.id, clientId, sessionKey }));
+  const result = deps.roomEntry.enter({ principalId: principal.id });
+  sendJson(res, result.status === "unavailable" ? 503 : 200, result);
   return true;
 }
 

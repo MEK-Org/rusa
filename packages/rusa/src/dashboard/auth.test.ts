@@ -18,7 +18,6 @@ import type { DashboardDataDeps } from "./api.js";
 import {
   createDashboardAuth,
   DashboardAuth,
-  dashboardSessionKey,
   getDashboardRequestPrincipal,
   SESSION_COOKIE,
   SESSION_MS,
@@ -749,41 +748,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect(res.headers.get("set-cookie")).toContain("Max-Age=0");
   });
 
-  it("reports the ended session on logout and on a rejected cookie, never on an outage (#829)", async () => {
-    const ended = vi.fn();
-    const unsubscribe = auth.onSessionEnded(ended);
-    const loggedOut = await login();
-    const key = dashboardSessionKey({ headers: { cookie: loggedOut } } as IncomingMessage);
-    expect(key).toMatch(/^[0-9a-f]{64}$/);
-    expect(key).not.toContain(loggedOut.split("=")[1]);
-    await post("/api/auth/logout", loggedOut);
-    expect(ended).toHaveBeenCalledExactlyOnceWith(key);
-
-    ended.mockClear();
-    const cookie = await login();
-    // Even local verification fails transiently: unavailable, not an ended session.
-    now += 60_000;
-    firebase.verifySessionCookie.mockRejectedValueOnce(outage()).mockRejectedValueOnce(outage());
-    expect((await post("/api/mesh/actors/actor/interrupt", cookie)).status).toBe(503);
-    expect(ended).not.toHaveBeenCalled();
-    revoked = true;
-    now += 60_000;
-    expect((await post("/api/mesh/actors/actor/interrupt", cookie)).status).toBe(401);
-    expect(ended).toHaveBeenCalledExactlyOnceWith(
-      dashboardSessionKey({ headers: { cookie } } as IncomingMessage)
-    );
-
-    // A throwing listener cannot change the answer, and unsubscribing stops delivery.
-    ended.mockClear();
-    auth.onSessionEnded(() => {
-      throw new Error("listener failure");
-    });
-    unsubscribe();
-    expect((await post("/api/mesh/actors/actor/interrupt", cookie)).status).toBe(401);
-    expect(ended).not.toHaveBeenCalled();
-  });
-
-  it("binds Room entry routes to the verified principal and session, never the body (#829)", async () => {
+  it("binds Room entry routes to the verified principal without a caller-supplied identity (#829)", async () => {
     const send = async (path: string, cookie: string, body: string) => {
       const bootstrap = await fetch(`${origin}/api/auth/csrf`, {
         headers: { "X-Rusa-CSRF-Bootstrap": "1", Cookie: cookie },
@@ -804,23 +769,21 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     const cookie = await login();
     const user = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });
     if (!user) throw new Error("Expected durable user");
-    const sessionKey = dashboardSessionKey({ headers: { cookie } } as IncomingMessage);
-
-    const forged = { clientId: "tab", principalId: "forged", sessionKey: "forged" };
-    const entered = await send("/api/mesh/chat-room/entry", cookie, JSON.stringify(forged));
+    const entered = await send("/api/mesh/chat-room/entry", cookie, "not a JSON payload");
     expect(entered.status).toBe(200);
     expect(await entered.json()).toMatchObject({ status: "entered", episodeId: "ep" });
-    expect(roomEntry.enter).toHaveBeenCalledExactlyOnceWith({
-      principalId: user.id,
-      clientId: "tab",
-      sessionKey,
-    });
+    expect(roomEntry.enter).toHaveBeenCalledExactlyOnceWith({ principalId: user.id });
 
-    expect((await send("/api/mesh/chat-room/entry", cookie, "[]")).status).toBe(400);
-    expect((await send("/api/mesh/chat-room/entry", cookie, "{")).status).toBe(400);
-    const oversized = JSON.stringify({ clientId: "tab", padding: "x".repeat(8 * 1024) });
-    expect((await send("/api/mesh/chat-room/entry", cookie, oversized)).status).toBe(413);
-    expect(roomEntry.enter).toHaveBeenCalledOnce();
+    roomEntry.enter.mockReturnValueOnce({
+      status: "unavailable",
+      reason: "notice delivery failed",
+    });
+    const unavailable = await send("/api/mesh/chat-room/entry", cookie, "");
+    expect(unavailable.status).toBe(503);
+    expect(await unavailable.json()).toEqual({
+      status: "unavailable",
+      reason: "notice delivery failed",
+    });
   });
 
   it.each([
@@ -870,8 +833,6 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
       return res;
     };
     const req = { headers: { cookie } } as IncomingMessage;
-    const ended = vi.fn();
-    auth.onSessionEnded(ended);
     const first = response();
     auth.guardStream(req, first);
     // A transport failure during the periodic check leaves the stream open.
@@ -879,14 +840,11 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     now += 60_000;
     await vi.advanceTimersByTimeAsync(60_000);
     expect(first.end).not.toHaveBeenCalled();
-    expect(ended).not.toHaveBeenCalled();
     unreachable = false;
     revoked = true;
     now += 60_000;
     await vi.advanceTimersByTimeAsync(60_000);
     expect(first.end).toHaveBeenCalledWith(expect.stringContaining("auth_required"));
-    // Revocation noticed by a live stream also ends the session's Room entry leases (#829).
-    expect(ended).toHaveBeenCalledExactlyOnceWith(dashboardSessionKey(req));
     revoked = false;
     const user = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });
     if (!user) throw new Error("Expected durable user");

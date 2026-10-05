@@ -62,17 +62,6 @@ function sessionCookie(req: IncomingMessage): string | undefined {
   return matches.length === 1 ? matches[0].slice(SESSION_COOKIE.length + 1) : undefined;
 }
 
-/**
- * A stable, non-secret key for the session cookie a request carries: the same
- * digest the revocation cache uses. Lets state bound to one dashboard session
- * (Room entry leases, #829) be invalidated when that session ends without ever
- * storing the cookie itself.
- */
-export function dashboardSessionKey(req: IncomingMessage): string | undefined {
-  const cookie = sessionCookie(req);
-  return cookie ? sessionKeyOf(cookie) : undefined;
-}
-
 function sessionKeyOf(cookie: string): string {
   return createHash("sha256").update(cookie).digest("hex");
 }
@@ -132,7 +121,6 @@ export class DashboardAuth {
     { cookie: string; timer: ReturnType<typeof setInterval> }
   >();
   private readonly allowedEmails: ReadonlySet<string>;
-  private readonly sessionEndedListeners = new Set<(sessionKey: string) => void>();
 
   constructor(
     readonly config: DashboardAuthConfig,
@@ -223,34 +211,8 @@ export class DashboardAuth {
       // 401 is the browser's signal to sign in again, so an unreachable Firebase
       // must not send one.
       if (isTransient(error)) json(res, 503, { error: "Authentication unavailable" });
-      else {
-        const cookie = sessionCookie(req);
-        if (cookie) this.sessionEnded(cookie);
-        json(res, 401, { error: "Authentication required" });
-      }
+      else json(res, 401, { error: "Authentication required" });
       return false;
-    }
-  }
-
-  /**
-   * Observe sessions that ended: an explicit logout, or a cookie that failed
-   * verification for a reason other than Firebase being unreachable (revoked,
-   * expired, no longer admitted). The listener receives the session's
-   * {@link dashboardSessionKey}. Returns an unsubscribe function.
-   */
-  onSessionEnded(listener: (sessionKey: string) => void): () => void {
-    this.sessionEndedListeners.add(listener);
-    return () => this.sessionEndedListeners.delete(listener);
-  }
-
-  private sessionEnded(cookie: string): void {
-    const key = sessionKeyOf(cookie);
-    for (const listener of this.sessionEndedListeners) {
-      try {
-        listener(key);
-      } catch {
-        // A listener's failure must never change the authentication answer.
-      }
     }
   }
 
@@ -293,7 +255,6 @@ export class DashboardAuth {
       for (const [res, stream] of this.streams) {
         if (stream.cookie === cookie) this.endStream(res, "auth_required");
       }
-      if (cookie) this.sessionEnded(cookie);
       setCookie(res, "", 0);
       this.csrf.issue(req, res, "", SESSION_MS / 1000);
       json(res, 200, { ok: true });
@@ -353,9 +314,7 @@ export class DashboardAuth {
       checking = true;
       try {
         await this.verify(cookie, true);
-      } catch (error) {
-        // An outage is not an ended session; the stream still closes, as before.
-        if (!isTransient(error)) this.sessionEnded(cookie);
+      } catch {
         this.endStream(res, "auth_required");
       } finally {
         checking = false;
