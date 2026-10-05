@@ -7,6 +7,7 @@ import {
   HALT_SYNTAX_HELP,
   HaltSwitch,
   parseHaltCommand,
+  parseResumeCommand,
 } from "./halt-switch.js";
 
 describe("HaltSwitch", () => {
@@ -143,6 +144,31 @@ describe("parseHaltCommand", () => {
     expect(() => parseHaltCommand("/halt model:claude-sonnet-4-6")).toThrow(/requires a provider/);
     expect(() => parseHaltCommand("/halt providers:claude")).toThrow(/unknown halt option/);
     expect(() => parseHaltCommand("/halt models:claude-sonnet-4-6")).toThrow(/unknown halt option/);
+  });
+});
+
+describe("parseResumeCommand", () => {
+  it("parses bare, provider-scoped and model-scoped resumes", () => {
+    expect(parseResumeCommand("/resume")).toEqual({});
+    expect(parseResumeCommand("/continue")).toEqual({});
+    expect(parseResumeCommand("/resume provider:Codex,agy")).toEqual({
+      providers: ["codex", "antigravity"],
+    });
+    expect(parseResumeCommand("/resume provider:claude model:claude-sonnet-5")).toEqual({
+      providers: ["claude"],
+      models: ["claude-sonnet-5"],
+    });
+    expect(parseResumeCommand("please resume")).toBeNull();
+  });
+
+  it("rejects until, a provider-less model and malformed atoms", () => {
+    expect(() => parseResumeCommand("/resume until:2026-07-27T03:00:00Z")).toThrow(
+      /unknown resume option "until"/
+    );
+    expect(() => parseResumeCommand("/resume model:claude-sonnet-5")).toThrow(
+      /model-scoped resume requires a provider/
+    );
+    expect(() => parseResumeCommand("/resume provider:")).toThrow(/invalid resume option/);
   });
 });
 
