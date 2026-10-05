@@ -272,6 +272,7 @@ import {
 } from "../quota/coordinator-client.js";
 import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
 import {
+  closedGoverningWindow,
   HISTORY_WINDOW_MS,
   isPublishedModelLane,
   type ModelLanePacing,
@@ -1813,6 +1814,38 @@ async function composeStart(
       }
     }
   };
+  // Deduplicate governing window closure alerts by distinct window transition
+  // (${lane}:${window.key}:${window.resetAtIso}) (#794). Each distinct closed
+  // window alerts once, even across successive distinct closes without an
+  // intermediate open apply. Nothing is recorded before the alarm is bound,
+  // so a window already closed at boot still reaches root.
+  const closedGoverningWindows = new Set<string>();
+  let raiseGoverningWindowClosedAlarm:
+    | ((closed: {
+        provider: string;
+        window: string;
+        resetAt: string | null;
+        lastReadingAt: string;
+      }) => void)
+    | null = null;
+  const noteGoverningWindowClosure = (
+    lane: string,
+    status: PublishedThrottleProviderStatus
+  ): void => {
+    const window = closedGoverningWindow(status, Date.now());
+    if (!window) return;
+    const dedupKey = `${lane}:${window.key}:${window.resetAtIso ?? ""}`;
+    if (!raiseGoverningWindowClosedAlarm || closedGoverningWindows.has(dedupKey)) return;
+    closedGoverningWindows.add(dedupKey);
+    const closed = {
+      provider: lane,
+      window: window.key,
+      resetAt: window.resetAtIso,
+      lastReadingAt: status.updatedAt,
+    };
+    log.info("quota_governing_window_closed", closed);
+    raiseGoverningWindowClosedAlarm(closed);
+  };
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
     tick: QuotaThrottleTick,
@@ -1878,6 +1911,7 @@ async function composeStart(
     // Update the lanes before asking the shared admission list to re-scan them.
     applyThrottleStatusToPacer(pacer, status);
     applyModelLaneStatuses(providerName, status);
+    noteGoverningWindowClosure(providerName, status);
     const validModelLanes = Array.isArray(status.modelLanes)
       ? status.modelLanes.filter(isPublishedModelLane).map((lane) => ({
           models: [...lane.models],
@@ -4666,6 +4700,35 @@ async function composeStart(
           fallback: outcome,
           provider,
           model,
+        });
+      }
+    });
+  };
+
+  raiseGoverningWindowClosedAlarm = (closed) => {
+    const message =
+      `Quota window closed without a reading: ${closed.provider}'s governing window ` +
+      `"${closed.window}" reset at ${closed.resetAt}, and no newer accepted quota reading has arrived since ` +
+      `${closed.lastReadingAt}. Check the scrapes to inspect collection.`;
+    void deliverHostAlarm({
+      deliver: () =>
+        mesh.deliverExternalEvent({
+          sourceType: "timer",
+          rawResource: "system:events",
+          rawPayload: { type: "system.quota_governing_window_closed", ...closed, message },
+          priority: "responsive",
+          eventSummary: message,
+        }),
+      message,
+      sendToErrorChat,
+      log,
+      alarmName: "quota_governing_window_closed",
+    }).then((outcome) => {
+      if (outcome !== "delivered") {
+        log.warn("quota_governing_window_closed_not_delivered_to_mesh", {
+          fallback: outcome,
+          provider: closed.provider,
+          window: closed.window,
         });
       }
     });

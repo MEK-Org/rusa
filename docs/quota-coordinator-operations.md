@@ -412,8 +412,18 @@ carries no new information, so it does not send the lane back to the ceiling, no
 does window reset widen it to the ceiling merely because fresh readings are missing.
 The response remains truthfully `hardStale`; this is a pacing decision, not a
 freshness disguise. They are not retired as they are for a single missing model
-window. No root alert fires when a whole provider reading stops; this change
-only keeps pacing, and provider-wide alerting is tracked separately under #794.
+window. On the first applied coordinator status where the governing window has
+reset, its retained accepted reading predates that reset, and that reading has
+passed the soft-stale threshold (probe TTL plus three ticks from observation,
+per #794 timing amendment), each `rusa start` process raises one responsive
+`system.quota_governing_window_closed` alarm to root on `system:events` (#794),
+naming the provider, window, reset and last reading and asking root to check the
+scrapes. A healthy fresh reading at reset stays quiet; an already stale reading
+alerts at the first applied closed status. Deduplication is keyed per distinct
+window (`${lane}:${window.key}:${window.resetAtIso}`), so successive distinct
+window closures alert even without an intermediate open apply. A process that
+restarts raises a still-closed window once more. The alarm only detects and
+reports the close; it leaves published and applied pacing unchanged.
 A newer provider scrape that omits only a governing window remains the
 existing partial-window case and widens conservatively. A client that cannot
 reach the coordinator keeps its separate local hard-stale ceiling fallback.

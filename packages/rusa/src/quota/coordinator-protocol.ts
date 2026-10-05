@@ -519,6 +519,52 @@ function wholeLaneReadingRetainsPacing(
   return governing.observedAt === stored.updatedAt;
 }
 
+/**
+ * The governing window of the lane's newest stored reading, when it carries a
+ * reset. A newer scrape that leaves only this bucket out is not a whole-lane
+ * missing reading, so it has none: that keeps the existing conservative
+ * partial-window election rule.
+ */
+function wholeLaneGoverningWindow(
+  stored: Omit<PersistedQuotaProviderStatus, "modelLanes">
+): PersistedQuotaBucketStatus | null {
+  if (!stored.governingBucketKey) return null;
+  const governing = stored.buckets.find((bucket) => bucket.key === stored.governingBucketKey);
+  if (!governing?.resetAtIso || governing.observedAt !== stored.updatedAt) return null;
+  return Number.isFinite(Date.parse(governing.resetAtIso)) ? governing : null;
+}
+
+/**
+ * The provider-wide governing window that has closed with no newer accepted
+ * reading (#794), or null. Alerts on the first applied status where the governing
+ * window has reset, its retained accepted reading predates that reset, and that
+ * reading has passed the soft-stale threshold (probe TTL plus three ticks from
+ * observation, per #794 timing ruling 5992971926). Missing and failed scrapes look
+ * the same here, since neither replaces the stored reading. Detection only; it
+ * changes no published value.
+ */
+export function closedGoverningWindow(
+  status: Omit<PublishedThrottleProviderStatus, "modelLanes">,
+  nowMs: number
+): PersistedQuotaBucketStatus | null {
+  const governing = wholeLaneGoverningWindow(status);
+  if (!governing) return null;
+  const resetMs = Date.parse(governing.resetAtIso ?? "");
+  const observedMs = Date.parse(governing.observedAt);
+  // A reading accepted after its advertised reset supersedes the old window,
+  // even if that provider still reports the old reset. The alert is only for
+  // the retained pre-reset reading that has no successor and has passed the
+  // soft-stale horizon (reuse published freshness semantics).
+  const staleThresholdMs =
+    status.freshness.staleAfterMs ?? freshnessThresholds(status.freshness.mode).staleAfterMs;
+  const isStale =
+    status.freshness.stale ||
+    (Number.isFinite(observedMs) && nowMs - observedMs > staleThresholdMs);
+  return Number.isFinite(observedMs) && observedMs < resetMs && resetMs <= nowMs && isStale
+    ? governing
+    : null;
+}
+
 /** The pacing a model-scoped lane set imposes on one concrete candidate model. */
 export interface ModelLanePacing {
   /** Longest interval among applicable lanes. */
