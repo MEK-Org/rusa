@@ -195,4 +195,38 @@ void main() {
     handle.dispose();
     await tester.runAsync(store.dispose);
   });
+
+  testWidgets(
+    'tooltip evaluates dynamically on hover so a passed expiry is recognized '
+    'without a widget rebuild',
+    (tester) async {
+      final until = DateTime.now().add(const Duration(milliseconds: 500));
+      final store = await _store(
+        tester,
+        HaltStatusDto(
+          scope: 'global',
+          until: until.toUtc().toIso8601String(),
+        ),
+      );
+      await tester.pumpWidget(_header(store));
+      await tester.pump();
+
+      // Advance real time past until so DateTime.now() exceeds until.
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 600)),
+      );
+      await tester.pump();
+
+      final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      await mouse.addPointer(location: Offset.zero);
+      addTearDown(mouse.removePointer);
+      await mouse.moveTo(tester.getCenter(find.text('Halted')));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1));
+
+      expect(find.textContaining('Expiry passed'), findsOneWidget);
+      expect(find.textContaining('Expires today'), findsNothing);
+      await tester.runAsync(store.dispose);
+    },
+  );
 }

@@ -1165,12 +1165,22 @@ class _HaltedBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final tooltip = haltTooltipText(halt);
     return Tooltip(
-      message: tooltip,
+      ignorePointer: true,
+      richMessage: WidgetSpan(
+        child: Builder(
+          builder: (context) => Text(
+            haltTooltipText(halt),
+            style: TooltipTheme.of(context).textStyle ??
+                Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: Colors.white,
+                    ),
+          ),
+        ),
+      ),
       excludeFromSemantics: true,
       child: Semantics(
-        label: tooltip,
+        label: haltTooltipText(halt),
         child: Container(
           padding: EdgeInsets.symmetric(
             horizontal: compact ? 6 : 10,

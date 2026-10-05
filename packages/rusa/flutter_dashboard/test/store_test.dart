@@ -1156,6 +1156,38 @@ void main() {
   );
 
   test(
+    'haltStatus: an active halt with until schedules a sync when expiry arrives',
+    () async {
+      final until = DateTime.now().add(const Duration(milliseconds: 100));
+      final api = FakeApi()
+        ..halted = true
+        ..halt = HaltStatusDto(
+          scope: 'global',
+          until: until.toUtc().toIso8601String(),
+        )
+        ..threadsResult = [makeThread('a', parent: 'root')];
+      final store = await _booted(api, FakeStream());
+      expect(store.halted.value, true);
+      expect(store.haltStatus.value?.until, isNotNull);
+      expect(api.threadsCallCount, 1);
+
+      // Transition the fake server state: when until elapses, the server reports no halt.
+      api
+        ..halted = false
+        ..halt = null;
+
+      // Wait past until for the scheduled one-shot timer to fire.
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      await pumpEventQueue();
+
+      expect(api.threadsCallCount, 2);
+      expect(store.halted.value, false);
+      expect(store.haltStatus.value, isNull);
+      await store.dispose();
+    },
+  );
+
+  test(
     'schedulerWarning: seeded from the threads payload and exposed as a stream',
     () async {
       final api = FakeApi()
