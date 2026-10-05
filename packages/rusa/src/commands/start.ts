@@ -1661,9 +1661,9 @@ async function composeStart(
     recordEvent: meshEvents,
   });
   if (importedHolds.length > 0) {
-    console.warn(
-      `[mesh] ⏸ imported scoped HALT file as ${importedHolds.length} availability hold(s); file removed`
-    );
+    log.info("availability_hold_imported_from_file", {
+      count: importedHolds.length,
+    });
   }
   // Availability holds (#539) take a provider lane, or some of its models, out
   // of selection without editing any pool. They are durable in mesh.db and
@@ -1677,9 +1677,9 @@ async function composeStart(
     },
     onReleased: () => {
       const resumed = resumeAfterHalt();
-      console.warn(
-        `[mesh] ▶ availability hold lifted${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : ""}`
-      );
+      log.info("availability_hold_lifted", {
+        replayedRuns: resumed.length,
+      });
     },
   });
   resources.acquire("availability hold expiry timer", () => availabilityHolds.stop());
@@ -1718,10 +1718,11 @@ async function composeStart(
     console.warn(`[mesh] ⛔ HALT sentinel present${why ? ` (${why})` : ""} — runs are paused`);
   }
   for (const hold of availabilityHolds.list()) {
-    const scope = hold.model ? `${hold.provider}/${hold.model}` : hold.provider;
-    console.warn(
-      `[mesh] ⏸ availability hold on ${scope}${hold.expiry ? ` until ${hold.expiry}` : ""}`
-    );
+    log.warn("availability_hold_active", {
+      provider: hold.provider,
+      model: hold.model ?? null,
+      expiry: hold.expiry ?? null,
+    });
   }
   // In-memory graceful-shutdown brake : the in-process `update` MCP tool
   // engages this (a direct call — no HTTP, no separate process) to quiesce the
@@ -4488,7 +4489,7 @@ async function composeStart(
           return;
         }
         const cancelled = mesh.cancelHaltedQueuedRuns();
-        console.warn(`[mesh] ⏸ availability hold set via chat by ${who}`);
+        log.warn("availability_hold_set_via_chat", { who, providers, models });
         const parts = [`provider${providers.length === 1 ? "" : "s"} ${providers.join(", ")}`];
         if (models.length) {
           parts.push(`model${models.length === 1 ? "" : "s"} ${models.join(", ")}`);
@@ -4547,7 +4548,7 @@ async function composeStart(
           if (haltSwitch.hasActiveHalt()) {
             lines.push("The global halt is still in place; bare /resume releases it.");
           }
-          console.warn(`[mesh] ▶ availability holds cleared via chat by ${who} (${named})`);
+          log.info("availability_holds_cleared_via_chat", { who, scope: named });
           void cc.send(msg.spaceName, lines.join("\n")).catch(() => {});
           return;
         }
