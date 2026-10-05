@@ -36,6 +36,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildWorkerPrompt } from "../actor/worker-prompt.js";
 import type { ProviderConfig } from "../config/types.js";
+import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
 import { AntigravityProvider } from "./antigravity.js";
 import { buildClaudeArgs, ClaudeProvider } from "./claude.js";
 import { CodexProvider } from "./codex.js";
@@ -69,7 +70,7 @@ function assembledActorContext(): string {
     parentId: "00000000-0000-4000-8000-00000000beef",
     handles: [],
     understandingMountEnabled: false,
-    gitIdentity: null,
+    gitIdentity: resolveMeshGitIdentity(undefined),
   });
 }
 

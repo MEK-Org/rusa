@@ -13,6 +13,7 @@ import { ObligationRepository } from "../db/repositories/obligation-repository.j
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
+import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
 import { createObligationsMcpServer } from "../mcp/obligations-mcp.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
@@ -537,7 +538,7 @@ function setup(
                 (hid) => registry.get(hid)?.charter,
                 (hid) => registry.get(hid)?.title
               ),
-              gitIdentity: null,
+              gitIdentity: resolveMeshGitIdentity(undefined),
             }),
           };
         },

@@ -1282,13 +1282,13 @@ async function composeStart(
 
   log.info("github_identity_resolved", { account: config.github.account });
 
-  // Read once from the mesh host's global Git config and handed to every actor
-  // prompt, which tells actors to apply it per command (#894).
-  const meshGitIdentity = resolveMeshGitIdentity();
-  if (meshGitIdentity) {
-    log.info("mesh_git_identity_resolved", { name: meshGitIdentity.name });
+  // Resolved once from config.yaml's explicit gitIdentity and handed to every
+  // actor prompt, which applies it per command or reports the gap (#894, #909).
+  const meshGitIdentity = resolveMeshGitIdentity(config.gitIdentity);
+  if (meshGitIdentity.identity) {
+    log.info("mesh_git_identity_resolved", { name: meshGitIdentity.identity.name });
   } else {
-    log.warn("mesh_git_identity_missing", {});
+    log.warn("mesh_git_identity_missing", { gap: meshGitIdentity.gap });
   }
 
   // The root's configured identity : the display handle every

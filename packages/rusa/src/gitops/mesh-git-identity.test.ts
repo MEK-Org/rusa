@@ -3,17 +3,74 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { gitIdentityGuidance } from "../actor/worker-prompt.js";
 import { meshGitIdentityArgs, resolveMeshGitIdentity } from "./mesh-git-identity.js";
+
+const MESH = { name: "Mesh Bot", email: "mesh-bot@example.invalid" };
+
+describe("resolveMeshGitIdentity (#909)", () => {
+  it("resolves a complete configured pair, trimmed", () => {
+    expect(
+      resolveMeshGitIdentity({ name: " Mesh Bot ", email: " mesh-bot@example.invalid " })
+    ).toEqual({ identity: MESH });
+  });
+
+  it.each([
+    [undefined, "config.yaml has no gitIdentity"],
+    [null, "config.yaml has no gitIdentity"],
+    ["Mesh Bot", "config.yaml gitIdentity is not a mapping of name and email"],
+    [[MESH], "config.yaml gitIdentity is not a mapping of name and email"],
+    [{}, "config.yaml gitIdentity lacks name and email"],
+    [{ name: "  ", email: "" }, "config.yaml gitIdentity lacks name and email"],
+    [{ name: "Mesh Bot" }, "config.yaml gitIdentity lacks email"],
+    [{ email: "mesh-bot@example.invalid" }, "config.yaml gitIdentity lacks name"],
+    [{ name: 7, email: "mesh-bot@example.invalid" }, "config.yaml gitIdentity lacks name"],
+    [
+      { name: "Mesh <Bot>", email: "mesh-bot@example.invalid" },
+      "config.yaml gitIdentity contains <, > or a line break, which Git cannot record",
+    ],
+    [
+      { name: "Mesh\nBot", email: "mesh-bot@example.invalid" },
+      "config.yaml gitIdentity contains <, > or a line break, which Git cannot record",
+    ],
+    [
+      { name: "Mesh Bot", email: "mesh-bot" },
+      "config.yaml gitIdentity.email is not an email address",
+    ],
+  ])("reports a gap for %j", (configured, gap) => {
+    expect(resolveMeshGitIdentity(configured)).toEqual({ identity: null, gap });
+  });
+});
+
+describe("Git identity guidance (#909)", () => {
+  it("names the configured identity and its command-scoped use", () => {
+    const text = gitIdentityGuidance(resolveMeshGitIdentity(MESH));
+    expect(text).toContain("**Mesh Bot\n<mesh-bot@example.invalid>**");
+    expect(text).toContain(
+      "git -c 'user.name=Mesh Bot' -c user.email=mesh-bot@example.invalid commit"
+    );
+    expect(text).toContain("`gitIdentity` in rusa's config.yaml");
+    expect(text).not.toContain("global Git config");
+  });
+
+  it("states the concrete gap and holds commits without stopping other work", () => {
+    const text = gitIdentityGuidance(resolveMeshGitIdentity({ name: "Mesh Bot" }));
+    expect(text).toContain("The mesh has no Git identity: config.yaml gitIdentity lacks email.");
+    expect(text).toContain("don't create\ncommits in your mesh workspace");
+    expect(text).toContain("carry on with\nwork that doesn't need one");
+    expect(text).not.toContain("git -c");
+  });
+});
 
 // Synthetic identities only: a disposable HOME and global config file stand in
 // for the machine's owner, so no real account's Git config is read or written.
-describe("mesh Git identity (#894)", () => {
+describe("mesh Git identity in a disposable repository (#894, #909)", () => {
   let root: string;
   let env: NodeJS.ProcessEnv;
   let globalConfig: string;
 
-  const git = (cwd: string, args: string[], extraEnv: NodeJS.ProcessEnv = {}) =>
-    execFileSync("git", args, { cwd, env: { ...env, ...extraEnv }, encoding: "utf-8" }).trim();
+  const git = (cwd: string, args: string[]) =>
+    execFileSync("git", args, { cwd, env, encoding: "utf-8" }).trim();
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "mesh-git-identity-"));
@@ -30,23 +87,7 @@ describe("mesh Git identity (#894)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("reads the identity from global config without writing it", () => {
-    writeFileSync(globalConfig, "[user]\n\tname = Mesh Bot\n\temail = mesh-bot@example.invalid\n");
-    const before = readFileSync(globalConfig, "utf-8");
-
-    expect(resolveMeshGitIdentity(env)).toEqual({
-      name: "Mesh Bot",
-      email: "mesh-bot@example.invalid",
-    });
-    expect(readFileSync(globalConfig, "utf-8")).toBe(before);
-  });
-
-  it("reports no identity when global config lacks a name or email", () => {
-    writeFileSync(globalConfig, "[user]\n\tname = Mesh Bot\n");
-    expect(resolveMeshGitIdentity(env)).toBeNull();
-  });
-
-  it("commits as the mesh for one command and leaves a person's local and global identity unchanged", () => {
+  it("commits as the configured identity and leaves a person's local and global identity unchanged", () => {
     // The machine's owner: a global identity plus a different repo-local one.
     writeFileSync(
       globalConfig,
@@ -57,17 +98,18 @@ describe("mesh Git identity (#894)", () => {
     git(repo, ["config", "user.name", "Human Local"]);
     git(repo, ["config", "user.email", "human-local@example.invalid"]);
     const localConfig = join(repo, ".git", "config");
-    const globalBefore = readFileSync(globalConfig, "utf-8");
-    const localBefore = readFileSync(localConfig, "utf-8");
+    const globalBefore = readFileSync(globalConfig);
+    const localBefore = readFileSync(localConfig);
 
-    const mesh = { name: "Mesh Bot", email: "mesh-bot@example.invalid" };
-    git(repo, [...meshGitIdentityArgs(mesh), "commit", "-q", "--allow-empty", "-m", "mesh"]);
+    const { identity } = resolveMeshGitIdentity(MESH);
+    if (!identity) throw new Error("expected a resolved identity");
+    git(repo, [...meshGitIdentityArgs(identity), "commit", "-q", "--allow-empty", "-m", "mesh"]);
 
     expect(git(repo, ["log", "-1", "--format=%an <%ae>|%cn <%ce>"])).toBe(
       "Mesh Bot <mesh-bot@example.invalid>|Mesh Bot <mesh-bot@example.invalid>"
     );
-    expect(readFileSync(globalConfig, "utf-8")).toBe(globalBefore);
-    expect(readFileSync(localConfig, "utf-8")).toBe(localBefore);
+    expect(readFileSync(globalConfig).equals(globalBefore)).toBe(true);
+    expect(readFileSync(localConfig).equals(localBefore)).toBe(true);
 
     // A person's own commit in the same repository still uses their identity.
     git(repo, ["commit", "-q", "--allow-empty", "-m", "human"]);
