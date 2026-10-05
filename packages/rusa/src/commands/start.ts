@@ -4718,7 +4718,10 @@ async function composeStart(
           // Read-only exposures: the emergency-brake state and a snapshot of
           // which actors are executing a run right now — for the header HALTED
           // indicator and per-thread run-state dots. No new mesh behavior.
-          isHalted: () => haltSwitch.hasActiveHalt(),
+          // A scoped `/halt` lit the indicator when it was the HALT file, so
+          // an active availability hold still does (#539).
+          isHalted: () =>
+            haltSwitch.hasActiveHalt() || availabilityHolds.list().length > 0,
           haltSnapshot: () => haltSwitch.state(),
           // Surfaces the boot-time `at`/`atrm`/`atd`/`atq` AND `crontab`/crond/
           // cron.allow-cron.deny preflights so a missing one-shot facility or an
