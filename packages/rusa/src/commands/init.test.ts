@@ -17,7 +17,7 @@ const promptMocks = vi.hoisted(() => {
 
   return {
     state,
-    input: vi.fn(async () => {
+    input: vi.fn(async (_prompt: { message: string; default?: string }) => {
       const value = state.inputs.shift();
       if (value === undefined) throw new Error("Missing mocked input response");
       return value;
@@ -35,19 +35,9 @@ const promptMocks = vi.hoisted(() => {
   };
 });
 
+// Any Git config read or write is an unexpected command: init keeps the mesh's
+// Git identity in rusa's config.yaml only (#909).
 function defaultExecSyncBehavior(command: string): string {
-  if (command === "git config --global user.name") {
-    throw new Error("git user.name not configured");
-  }
-  if (command === "git config --global user.email") {
-    throw new Error("git user.email not configured");
-  }
-  if (command.startsWith("git config --global user.name ")) {
-    return "";
-  }
-  if (command.startsWith("git config --global user.email ")) {
-    return "";
-  }
   if (command.includes("Metadata-Flavor: Google")) {
     throw new Error("Not running on GCE");
   }
@@ -317,5 +307,80 @@ describe("runInit", () => {
       firebaseServiceAccountKeyPath: "/path/to/firebase-key.json",
     });
     expect(config.glassGoals).toBeUndefined();
+  });
+
+  it("stores the mesh Git identity in config.yaml without touching Git config", async () => {
+    await runInit();
+
+    const config = parseYaml(readFileSync(join(mcHome, "config.yaml"), "utf-8")) as RusaConfig;
+    expect(config.gitIdentity).toEqual({ name: "Test User", email: "test@example.com" });
+    const commands = execSyncMock.mock.calls.map(([command]) => command);
+    expect(commands.filter((command) => command.startsWith("git "))).toEqual([]);
+  });
+
+  it("leaves gitIdentity unset when both answers are blank", async () => {
+    promptMocks.state.inputs = [
+      mcHome,
+      "test-gemini-key",
+      "test-user",
+      "",
+      "",
+      "9742",
+      "",
+      "8080",
+      "",
+    ];
+
+    await runInit();
+
+    const config = parseYaml(readFileSync(join(mcHome, "config.yaml"), "utf-8")) as RusaConfig;
+    expect(config.gitIdentity).toBeUndefined();
+  });
+
+  it("offers the configured identity, never a Git config one, when re-running init", async () => {
+    const existingConfig: RusaConfig = {
+      github: { account: "existing-user" },
+      providers: {},
+      geminiApiKey: "existing-gemini-key",
+      gitIdentity: { name: "Mesh Bot", email: "mesh-bot@example.invalid" },
+      webhook: { port: 9742, secret: "existing-secret" },
+      dashboard: { port: 8080 },
+    };
+    writeFileSync(join(mcHome, "config.yaml"), stringifyYaml(existingConfig), "utf-8");
+    promptMocks.state.inputs = [
+      mcHome,
+      "existing-user",
+      "Mesh Bot",
+      "mesh-bot@example.invalid",
+      "9742",
+      "",
+      "8080",
+      "",
+    ];
+    promptMocks.state.confirms = [true, false];
+
+    await runInit();
+
+    const defaults = promptMocks.input.mock.calls.map(([prompt]) => prompt.default);
+    expect(defaults[2]).toBe("Mesh Bot");
+    expect(defaults[3]).toBe("mesh-bot@example.invalid");
+    const config = parseYaml(readFileSync(join(mcHome, "config.yaml"), "utf-8")) as RusaConfig;
+    expect(config.gitIdentity).toEqual(existingConfig.gitIdentity);
+  });
+
+  it("keeps an existing gitIdentity through non-interactive defaults", async () => {
+    const existingConfig: RusaConfig = {
+      github: { account: "existing-user" },
+      providers: { claude: { cliCommand: "claude" } },
+      geminiApiKey: "existing-gemini-key",
+      gitIdentity: { name: "Mesh Bot", email: "mesh-bot@example.invalid" },
+      webhook: { port: 9742, secret: "existing-secret" },
+    };
+    writeFileSync(join(mcHome, "config.yaml"), stringifyYaml(existingConfig), "utf-8");
+
+    await runInit({ nonInteractive: true, defaults: true, home: mcHome });
+
+    const config = parseYaml(readFileSync(join(mcHome, "config.yaml"), "utf-8")) as RusaConfig;
+    expect(config.gitIdentity).toEqual(existingConfig.gitIdentity);
   });
 });

@@ -88,6 +88,8 @@ describe("quickstart seeding through the real git bridge", () => {
     expect(worktree.error).toBeUndefined();
     expect(worktree.success).toBe(true);
     expect(git(worktree.path, "rev-parse", "HEAD")).toBe(head);
+    // No invented identity lands in the repository's config (#909).
+    expect(() => git(worktree.path, "config", "--local", "--get-regexp", "^user\\.")).toThrow();
   });
 
   it("keeps the mc/* receive restriction on the seeded repo", async () => {

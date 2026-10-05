@@ -491,9 +491,8 @@ export function addWorktree(opts: {
       }
     }
 
-    // Configure worktree git settings
-    git(worktreePath, "config", "user.email", "rusa@localhost");
-    git(worktreePath, "config", "user.name", "Meta Coder");
+    // No identity is written here: mesh commits name theirs per command from
+    // config.yaml's gitIdentity, and an invented one would misattribute (#909).
 
     // Set safe directory (for modern git versions)
     try {
