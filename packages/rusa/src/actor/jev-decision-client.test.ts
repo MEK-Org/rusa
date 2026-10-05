@@ -18,6 +18,7 @@ import {
   JevInputUnavailableError,
   RESPONSIVE_INTERRUPTION_QUESTION,
   ShadowResponsiveInterruptionClassifier,
+  shadowPrediction,
 } from "./responsive-interruption.js";
 
 function readJevQueryAuditLog(path: string): JevQueryAuditRecord[] {
@@ -574,7 +575,7 @@ describe("stalled response body (#813)", () => {
       });
 
       expect(server.requests()).toBe(1);
-      expect(decision).toMatchObject({ outcome: "queue", reason: "timeout" });
+      expect(decision).toMatchObject({ outcome: "interrupt", reason: "timeout" });
       expect(unhandled).toEqual([]);
     } finally {
       server.close();
@@ -600,4 +601,32 @@ describe("stalled response body (#813)", () => {
       server.close();
     }
   }, 15_000);
+
+  describe("interruption baseline with HttpJevDecisionClient (#533)", () => {
+    it("preserves baseline interrupt when incoming text is unavailable", async () => {
+      const fetch = vi.fn<Fetch>();
+      const resolve = vi.fn(async (_actorId: string, id: string) => ({
+        id,
+        source: "obligation:o",
+        type: "scheduled.wake",
+        text: id === "incoming" ? null : "text",
+        sender: null,
+        timestamp: null,
+      }));
+      const client = new HttpJevDecisionClient("synthetic-key", resolve, { fetch });
+      const classifier = new ShadowResponsiveInterruptionClassifier({
+        threshold: 0.5,
+        client,
+      });
+      const decision = await classifier.evaluate({
+        actorId: "worker",
+        incomingEntryId: "incoming",
+        selectedEntryIds: ["candidate"],
+        pendingEntryIds: [],
+      });
+      expect(decision).toMatchObject({ outcome: "interrupt", reason: "input_unavailable" });
+      expect(shadowPrediction(decision)).toBe(null);
+      expect(fetch).not.toHaveBeenCalled();
+    });
+  });
 });
