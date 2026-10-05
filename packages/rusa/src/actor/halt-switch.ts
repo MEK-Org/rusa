@@ -156,11 +156,11 @@ export const HALT_SYNTAX_HELP =
 
 /** The `/resume` forms, quoted back when one fails to parse. */
 export const RESUME_SYNTAX_HELP =
-  "Valid syntax: `/resume` (release the global halt and every hold)," +
+  "Valid syntax: `/resume` (release the global halt; holds stay in force)," +
   " `/resume provider:<p>[,<p2>]` (every hold on those providers)," +
   " `/resume provider:<p> model:<m>[,<m2>]` (only those model holds).";
 
-/** A parsed `/resume`: no scope releases everything. */
+/** A parsed `/resume`: no scope releases only the global halt. */
 export interface ResumeCommand {
   providers?: string[];
   models?: string[];

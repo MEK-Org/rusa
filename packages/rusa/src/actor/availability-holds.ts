@@ -163,7 +163,9 @@ export interface ImportScopedHaltFileOptions {
 
 /**
  * Move a provider-scoped HALT sentinel into durable holds, then archive it as
- * `HALT.imported`, so the holds govern that scope (#539). Left in place, the
+ * `HALT.imported-<digest>`, so the holds govern that scope (#539). The digest
+ * names each archive by content and mtime, so a later hand-written sentinel
+ * never overwrites an earlier archive and a replayed import reuses its name. Left in place, the
  * file would keep holding after a scoped `/resume` cleared the hold, and the
  * next restart would import it again. Returns the stored holds; empty when
  * there was nothing to import.
@@ -214,6 +216,6 @@ export function importScopedHaltFile(options: ImportScopedHaltFileOptions): Avai
       })),
     }),
   });
-  renameSync(file, `${file}.imported`);
+  renameSync(file, `${file}.imported-${digest.slice(0, 12)}`);
   return holds;
 }
