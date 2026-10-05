@@ -101,6 +101,23 @@ void main() {
       expect(text, endsWith('Expires Tue Oct 6, 9:05 AM.'));
     });
 
+    test('a passed expiry is not worded as pending', () {
+      final text = haltTooltipText(
+        HaltStatusDto(
+          scope: 'global',
+          until: DateTime(2026, 10, 4, 11, 30).toUtc().toIso8601String(),
+        ),
+        now: now,
+      );
+      expect(
+        text,
+        endsWith(
+          'Expiry passed today 11:30 AM; the badge clears on the next refresh.',
+        ),
+      );
+      expect(text, isNot(contains('Expires')));
+    });
+
     test('an older server without the field claims no scope', () {
       expect(
         haltTooltipText(null, now: now),

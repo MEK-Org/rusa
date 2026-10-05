@@ -1094,8 +1094,9 @@ const _scopedHaltEffect =
 
 /// Plain-text explanation of the active halt for the header chip's tooltip
 /// (#906): the authoritative scope, its scheduling effect, and the expiry.
-/// The sentinel retires expired halts before they reach the dashboard, so a
-/// present `until` is always in the future and its absence means indefinite.
+/// The server retires an expired sentinel, but an idle mesh may not refresh
+/// the snapshot at `until`, so a past expiry is worded as passed rather than
+/// pending; a missing `until` means indefinite.
 ///
 /// The effect lines mirror `HaltSwitch` and `ActorMesh.prepareRun`: a global
 /// halt skips every new run; a scoped halt only skips a run when every
@@ -1124,10 +1125,20 @@ String haltTooltipText(HaltStatusDto? halt, {DateTime? now}) {
       scope = 'all providers';
       effect = 'No new runs start.';
   }
-  final until = halt.until == null ? null : DateTime.tryParse(halt.until!);
-  final expiry = until == null
-      ? 'No expiry — holds until resumed.'
-      : 'Expires ${_haltExpiryFormat(until.toLocal(), (now ?? DateTime.now()).toLocal())}.';
+  final until = halt.until == null
+      ? null
+      : DateTime.tryParse(halt.until!)?.toLocal();
+  final local = (now ?? DateTime.now()).toLocal();
+  final String expiry;
+  if (until == null) {
+    expiry = 'No expiry — holds until resumed.';
+  } else if (until.isAfter(local)) {
+    expiry = 'Expires ${_haltExpiryFormat(until, local)}.';
+  } else {
+    expiry =
+        'Expiry passed ${_haltExpiryFormat(until, local)}; '
+        'the badge clears on the next refresh.';
+  }
   return 'Halt scope: $scope.\n$effect\n$inFlight\n$expiry';
 }
 
