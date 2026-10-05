@@ -104,6 +104,9 @@ export type MeshEventKind =
   | "run_first_chunk"
   // A run produced a result. `payload` = {@link RunEndPayload}.
   | "run_end"
+  // In-process per-run MCP server diagnostic tally for an execution attempt.
+  // `actorId` = the actor, `detail` = the McpRunClassification, `payload` = JSON of RunMcpDiagnostic.
+  | "run_mcp_diagnostic"
   // The other way a queued run opportunity ends: it was abandoned before it
   // produced a result, so there is nothing to report. `actorId` = the actor,
   // `detail` = why (a coalesce-abort, a cancelled queued start, or an

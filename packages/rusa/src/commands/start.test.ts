@@ -2786,6 +2786,189 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
   });
 
+  describe("run_mcp_diagnostic event at run end (#292)", () => {
+    const bootWithWorker = async (workerId: string): Promise<ActorMesh> => {
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+          rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+        }),
+        "utf8"
+      );
+      writeFileSync(
+        join(homeDir, "threads.json"),
+        JSON.stringify({
+          threads: [
+            legacyRootThread,
+            {
+              id: workerId,
+              charter: "worker charter",
+              parentId: "root",
+              status: "active",
+              createdAt: "2026-09-06T00:00:00.000Z",
+            },
+          ],
+        }),
+        "utf8"
+      );
+      let mesh: ActorMesh | undefined;
+      await new Promise<void>((resolve) => {
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      if (!mesh) throw new Error("mesh not ready");
+      return mesh;
+    };
+
+    const actorFor = (mesh: ActorMesh, workerId: string): Actor => {
+      const worker = mesh.get(workerId);
+      if (!worker) throw new Error("worker not rehydrated");
+      return worker as Actor;
+    };
+
+    it("records not_connected diagnostic when attempt starts but no client connects during the run", async () => {
+      const workerId = "diag-not-connected-worker";
+      const mesh = await bootWithWorker(workerId);
+      const actor = actorFor(mesh, workerId);
+
+      // Provider attempt starts, but no client connects to loopback MCP servers
+      (
+        actor as unknown as {
+          opts: {
+            onProviderAttempt?: (attempt: {
+              providerName: string;
+              model?: string;
+              effort?: string;
+            }) => void;
+          };
+        }
+      ).opts.onProviderAttempt?.({
+        providerName: "antigravity",
+        model: "Gemini 3.7 Flash (High)",
+        effort: "high",
+      });
+
+      const runId = await startLifecycleRun(actor, {
+        provider: "antigravity",
+        model: "Gemini 3.7 Flash (High)",
+        effort: "high",
+      });
+      await endLifecycleRun(actor, runId, {
+        success: true,
+        exitCode: 0,
+        output: "done",
+      });
+
+      const [diag] = getRepositories().meshEvents.listEventsByActors([workerId], {
+        limit: 10,
+        kinds: ["run_mcp_diagnostic"],
+      }).events;
+      expect(diag).toBeDefined();
+      expect(diag?.detail).toBe("not_connected");
+      const payload = JSON.parse(diag?.payload ?? "{}");
+      expect(payload.classification).toBe("not_connected");
+      expect(payload.totalCalls).toBe(0);
+      expect(payload.servers.mesh?.initialized).toBe(false);
+    });
+
+    it("records unknown diagnostic when run finishes without an active attempt window (e.g. restart mid-run)", async () => {
+      const workerId = "diag-unknown-worker";
+      const mesh = await bootWithWorker(workerId);
+      const actor = actorFor(mesh, workerId);
+
+      // Direct start without onProviderAttempt (e.g. unstarted window)
+      const runId = await startLifecycleRun(actor, {
+        provider: "antigravity",
+        model: "Gemini 3.7 Flash (High)",
+        effort: "high",
+      });
+      await endLifecycleRun(actor, runId, {
+        success: true,
+        exitCode: 0,
+        output: "done",
+      });
+
+      const [diag] = getRepositories().meshEvents.listEventsByActors([workerId], {
+        limit: 10,
+        kinds: ["run_mcp_diagnostic"],
+      }).events;
+      expect(diag).toBeDefined();
+      expect(diag?.detail).toBe("unknown");
+      const payload = JSON.parse(diag?.payload ?? "{}");
+      expect(payload.classification).toBe("unknown");
+      expect(payload.totalCalls).toBe(0);
+    });
+
+    it("records used diagnostic when client calls an MCP tool during the run", async () => {
+      const workerId = "diag-used-worker";
+      const mesh = await bootWithWorker(workerId);
+      const actor = actorFor(mesh, workerId);
+
+      const actorOpts = (
+        actor as unknown as { opts: { mcpServers: Array<{ name: string; url: string }> } }
+      ).opts;
+      const meshSpec = actorOpts.mcpServers.find((s) => s.name === "mesh");
+      if (!meshSpec) throw new Error("mesh spec not found");
+
+      // Provider attempt starts
+      (
+        actor as unknown as {
+          opts: {
+            onProviderAttempt?: (attempt: {
+              providerName: string;
+              model?: string;
+              effort?: string;
+            }) => void;
+          };
+        }
+      ).opts.onProviderAttempt?.({
+        providerName: "antigravity",
+        model: "Gemini 3.7 Flash (High)",
+        effort: "high",
+      });
+
+      const client = new Client({ name: "test-client", version: "1.0.0" });
+      const transport = new StreamableHTTPClientTransport(new URL(meshSpec.url));
+      await client.connect(transport);
+      await client.listTools();
+      await client.callTool({ name: "list_followers", arguments: {} });
+
+      const runId = await startLifecycleRun(actor, {
+        provider: "antigravity",
+        model: "Gemini 3.7 Flash (High)",
+        effort: "high",
+      });
+      await endLifecycleRun(actor, runId, {
+        success: true,
+        exitCode: 0,
+        output: "called tool",
+      });
+
+      const [diag] = getRepositories().meshEvents.listEventsByActors([workerId], {
+        limit: 10,
+        kinds: ["run_mcp_diagnostic"],
+      }).events;
+      expect(diag).toBeDefined();
+      expect(diag?.detail).toBe("used");
+      const payload = JSON.parse(diag?.payload ?? "{}");
+      expect(payload.classification).toBe("used");
+      expect(payload.totalCalls).toBe(1);
+      expect(payload.servers.mesh?.toolCalls).toBe(1);
+      expect(payload.servers.mesh?.firstTool).toBe("list_followers");
+
+      await client.close();
+    });
+  });
+
   it("mounts a live calendar-read grant for root on the next run", async () => {
     let mesh: ActorMesh | undefined;
     let root: Actor | undefined;

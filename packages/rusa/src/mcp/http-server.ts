@@ -69,6 +69,73 @@ export interface HostJobExitHandler {
   }) => void;
 }
 
+export type McpRunClassification =
+  | "not_connected"
+  | "listing_incomplete"
+  | "discovered_unused"
+  | "used"
+  | "unknown";
+
+export interface McpServerMountTally {
+  initialized: boolean;
+  toolsListed: boolean;
+  toolCalls: number;
+  firstTool?: string;
+}
+
+export interface RunMcpDiagnostic {
+  classification: McpRunClassification;
+  servers: Record<string, McpServerMountTally>;
+  totalCalls: number;
+}
+
+/**
+ * Classify a run's in-process MCP diagnostic from its per-mount tally and expected servers.
+ */
+export function classifyMcpRun(
+  mounts: Record<string, McpServerMountTally>,
+  expectedServers: readonly string[]
+): McpRunClassification {
+  let totalCalls = 0;
+  for (const tally of Object.values(mounts)) {
+    totalCalls += tally.toolCalls;
+  }
+  if (totalCalls > 0) {
+    return "used";
+  }
+
+  const anyInitialized = Object.values(mounts).some((m) => m.initialized);
+  const meshMount = mounts.mesh;
+  const meshInitialized = meshMount?.initialized === true;
+
+  if (!anyInitialized) {
+    return "not_connected";
+  }
+  if (expectedServers.includes("mesh") && !meshInitialized) {
+    return "not_connected";
+  }
+
+  const serversToCheck = expectedServers.length > 0 ? expectedServers : Object.keys(mounts);
+  if (serversToCheck.length === 0) {
+    return anyInitialized ? "discovered_unused" : "not_connected";
+  }
+
+  let allCompletedListing = true;
+  for (const server of serversToCheck) {
+    const tally = mounts[server];
+    if (!tally || !tally.initialized || !tally.toolsListed) {
+      allCompletedListing = false;
+      break;
+    }
+  }
+
+  if (allCompletedListing) {
+    return "discovered_unused";
+  }
+
+  return "listing_incomplete";
+}
+
 /** Length-checked, timing-safe string compare (avoids leaking the token via timing). */
 function safeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
@@ -212,6 +279,18 @@ export class McpHttpServer {
   private readonly serverLabels = new Map<string, string>();
   /** Per server-name: session id -> monotonic creation time for close diagnostics. */
   private readonly sessionStartedAt = new Map<string, Map<string, number>>();
+  /** Per mounted server: the actor ID bound to it, if known. */
+  private readonly serverActors = new Map<string, string>();
+  /** Active run tallies keyed by actor ID. */
+  private readonly activeRunTallies = new Map<
+    string,
+    {
+      actorId: string;
+      expectedServers: readonly string[];
+      mounts: Map<string, McpServerMountTally>;
+      startedAt: number;
+    }
+  >();
   private readonly log: Logger;
   /** Cron-driven wake endpoint backend; null until {@link setWakeHandler} wires it. */
   private wake: WakeHandler | null;
@@ -315,7 +394,11 @@ export class McpHttpServer {
    * per-actor endpoint (e.g. the agent-execution server for one actor, with its
    * id baked in). Returns the loopback URL to hand the actor's provider.
    */
-  addServer(name: string, factory: () => McpServer, opts?: { logLabel?: string }): string {
+  addServer(
+    name: string,
+    factory: () => McpServer,
+    opts?: { logLabel?: string; actorId?: string }
+  ): string {
     this.factories[name] = factory;
     if (!this.sessions.has(name)) this.sessions.set(name, new Map());
     if (!this.sessionStartedAt.has(name)) this.sessionStartedAt.set(name, new Map());
@@ -323,6 +406,11 @@ export class McpHttpServer {
       name,
       opts?.logLabel?.slice(0, MAX_MCP_LOG_METADATA_LENGTH) ?? derivedServerLabel(name)
     );
+    if (opts?.actorId) {
+      this.serverActors.set(name, opts.actorId);
+    } else if (name.includes(":")) {
+      this.serverActors.set(name, name.slice(0, name.lastIndexOf(":")));
+    }
     return this.urlFor(name);
   }
 
@@ -341,11 +429,178 @@ export class McpHttpServer {
     }
     this.sessionStartedAt.delete(name);
     this.serverLabels.delete(name);
+    this.serverActors.delete(name);
     delete this.factories[name];
     const token = this.nameToToken.get(name);
     if (token) {
       this.tokenToName.delete(token);
       this.nameToToken.delete(name);
+    }
+  }
+
+  /**
+   * Start a run tally window for an actor, recording in-process initialize,
+   * tools/list, and tools/call events across its mounted MCP servers.
+   * Clears any previous attempt tally for this actor.
+   */
+  startRunWindow(actorId: string, expectedServers?: readonly string[]): void {
+    const servers = expectedServers
+      ? [...expectedServers]
+      : this.getMountedServerLabelsForActor(actorId);
+    const mounts = new Map<string, McpServerMountTally>();
+    for (const server of servers) {
+      mounts.set(server, { initialized: false, toolsListed: false, toolCalls: 0 });
+    }
+    this.activeRunTallies.set(actorId, {
+      actorId,
+      expectedServers: servers,
+      mounts,
+      startedAt: performance.now(),
+    });
+  }
+
+  /**
+   * Finish the active run tally window for an actor and compute its classification.
+   * Disposes of the active window state so no memory leaks across runs.
+   */
+  finishRunWindow(actorId: string): RunMcpDiagnostic {
+    const tally = this.activeRunTallies.get(actorId);
+    if (!tally) {
+      return {
+        classification: "unknown",
+        servers: {},
+        totalCalls: 0,
+      };
+    }
+    this.activeRunTallies.delete(actorId);
+    const servers: Record<string, McpServerMountTally> = {};
+    let totalCalls = 0;
+    for (const [label, mount] of tally.mounts.entries()) {
+      servers[label] = { ...mount };
+      totalCalls += mount.toolCalls;
+    }
+    const classification = classifyMcpRun(servers, tally.expectedServers);
+    return {
+      classification,
+      servers,
+      totalCalls,
+    };
+  }
+
+  /**
+   * Clear the active run window for an actor without computing diagnostics (e.g. on teardown/retire).
+   */
+  clearRunWindow(actorId: string): void {
+    this.activeRunTallies.delete(actorId);
+  }
+
+  /**
+   * Read the current diagnostic snapshot for an actor without closing its window.
+   */
+  getRunDiagnostic(actorId: string): RunMcpDiagnostic {
+    const tally = this.activeRunTallies.get(actorId);
+    if (!tally) {
+      return {
+        classification: "unknown",
+        servers: {},
+        totalCalls: 0,
+      };
+    }
+    const servers: Record<string, McpServerMountTally> = {};
+    let totalCalls = 0;
+    for (const [label, mount] of tally.mounts.entries()) {
+      servers[label] = { ...mount };
+      totalCalls += mount.toolCalls;
+    }
+    const classification = classifyMcpRun(servers, tally.expectedServers);
+    return {
+      classification,
+      servers,
+      totalCalls,
+    };
+  }
+
+  private getMountedServerLabelsForActor(actorId: string): string[] {
+    const labels = new Set<string>();
+    for (const [name, actor] of this.serverActors.entries()) {
+      if (actor === actorId) {
+        labels.add(this.serverLabels.get(name) ?? derivedServerLabel(name));
+      }
+    }
+    for (const name of Object.keys(this.factories)) {
+      if (name === actorId || name.startsWith(`${actorId}:`)) {
+        labels.add(this.serverLabels.get(name) ?? derivedServerLabel(name));
+      }
+    }
+    return Array.from(labels);
+  }
+
+  private resolveActorForServer(name: string, serverLabel: string): string | undefined {
+    const mapped = this.serverActors.get(name);
+    if (mapped && this.activeRunTallies.has(mapped)) {
+      return mapped;
+    }
+    if (name.includes(":")) {
+      const derived = name.slice(0, name.lastIndexOf(":"));
+      if (this.activeRunTallies.has(derived)) {
+        return derived;
+      }
+    }
+    if (this.activeRunTallies.has(name)) {
+      return name;
+    }
+    for (const [activeId, tally] of this.activeRunTallies.entries()) {
+      if (tally.expectedServers.includes(serverLabel)) {
+        return activeId;
+      }
+    }
+    if (mapped) return mapped;
+    if (name.includes(":")) return name.slice(0, name.lastIndexOf(":"));
+    return undefined;
+  }
+
+  private recordMountInitialize(name: string): void {
+    const serverLabel = this.serverLabel(name) ?? derivedServerLabel(name);
+    const actorId = this.resolveActorForServer(name, serverLabel);
+    if (!actorId) return;
+    const tally = this.activeRunTallies.get(actorId);
+    if (!tally) return;
+    let mount = tally.mounts.get(serverLabel);
+    if (!mount) {
+      mount = { initialized: false, toolsListed: false, toolCalls: 0 };
+      tally.mounts.set(serverLabel, mount);
+    }
+    mount.initialized = true;
+  }
+
+  private recordMountToolsListed(name: string): void {
+    const serverLabel = this.serverLabel(name) ?? derivedServerLabel(name);
+    const actorId = this.resolveActorForServer(name, serverLabel);
+    if (!actorId) return;
+    const tally = this.activeRunTallies.get(actorId);
+    if (!tally) return;
+    let mount = tally.mounts.get(serverLabel);
+    if (!mount) {
+      mount = { initialized: false, toolsListed: false, toolCalls: 0 };
+      tally.mounts.set(serverLabel, mount);
+    }
+    mount.toolsListed = true;
+  }
+
+  private recordMountToolCall(name: string, toolName?: string): void {
+    const serverLabel = this.serverLabel(name) ?? derivedServerLabel(name);
+    const actorId = this.resolveActorForServer(name, serverLabel);
+    if (!actorId) return;
+    const tally = this.activeRunTallies.get(actorId);
+    if (!tally) return;
+    let mount = tally.mounts.get(serverLabel);
+    if (!mount) {
+      mount = { initialized: false, toolsListed: false, toolCalls: 0 };
+      tally.mounts.set(serverLabel, mount);
+    }
+    mount.toolCalls += 1;
+    if (!mount.firstTool && toolName) {
+      mount.firstTool = toolName;
     }
   }
 
@@ -449,6 +704,12 @@ export class McpHttpServer {
         const body = await readJsonBody(req);
         metadata = requestMetadata(body);
         this.log.info("mcp_request_body_read", requestFields());
+        if (isInitializeRequest(body) || metadata.rpcMethod === "initialize") {
+          this.recordMountInitialize(name);
+        }
+        if (metadata.rpcMethod === "tools/call") {
+          this.recordMountToolCall(name, metadata.toolName);
+        }
         const existing = sessionId ? transports.get(sessionId) : undefined;
         let transport: StreamableHTTPServerTransport;
         if (existing) {
@@ -501,6 +762,9 @@ export class McpHttpServer {
         this.log.info("mcp_transport_dispatch", requestFields());
         await transport.handleRequest(req, res, body);
         this.log.info("mcp_transport_returned", requestFields());
+        if (metadata.rpcMethod === "tools/list" && res.statusCode < 400) {
+          this.recordMountToolsListed(name);
+        }
         return;
       }
 
@@ -743,6 +1007,8 @@ export class McpHttpServer {
   }
 
   async close(): Promise<void> {
+    this.activeRunTallies.clear();
+    this.serverActors.clear();
     for (const transports of this.sessions.values()) {
       for (const transport of transports.values()) {
         try {
