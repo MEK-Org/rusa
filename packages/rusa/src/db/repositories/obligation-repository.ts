@@ -358,9 +358,10 @@ const QUEUE_SQL: Record<ObligationQueue, string> = {
 /**
  * Owner-queue order: actionable ready work first, then the waiting group
  * (waiting rows and any snoozed non-terminal rows, including snoozed scheduled
- * rows), then unsnoozed scheduled and terminal rows; by effective priority then
- * id within each group. The ready head is this order's first row when that row
- * is actionable, so the two must not diverge.
+ * rows), then unsnoozed scheduled and terminal rows. Responsive ready work
+ * precedes other ready work; every group then orders by effective priority and
+ * id. The ready head is this order's first row when that row is actionable, so
+ * the two must not diverge.
  */
 const OWNER_QUEUE_ORDER_SQL = `
   CASE
@@ -368,6 +369,16 @@ const OWNER_QUEUE_ORDER_SQL = `
     WHEN ${WAITING_GROUP_SQL} THEN 1
     ELSE 2
   END,
+  CASE
+    WHEN ${ACTIONABLE_READY_SQL} AND effective_priority.effective_responsive = 1 THEN 0
+    ELSE 1
+  END,
+  effective_priority.effective_priority,
+  obligation.id`;
+
+/** Order shared by every actionable-ready head query. */
+const READY_HEAD_ORDER_SQL = `
+  CASE WHEN effective_priority.effective_responsive = 1 THEN 0 ELSE 1 END,
   effective_priority.effective_priority,
   obligation.id`;
 
@@ -991,7 +1002,7 @@ export class ObligationRepository {
                     obligation.id,
                     ROW_NUMBER() OVER (
                       PARTITION BY obligation.owner_id
-                      ORDER BY effective_priority.effective_priority, obligation.id
+                      ORDER BY ${READY_HEAD_ORDER_SQL}
                     ) AS rank
              FROM obligations obligation
              JOIN effective_priority ON effective_priority.id = obligation.id
@@ -1049,9 +1060,9 @@ export class ObligationRepository {
    *
    * "Head" is the first row of the owner's queue when that row is actionable
    * ready work — ready and not snoozed (#722). It must stay byte-identical to
-   * `listOwned`'s ordering (actionable ready first, by effective priority, then
-   * id) or an actor would be told about a head its own queue does not show
-   * first. An owner whose only ready work is snoozed has no head.
+   * `listOwned`'s ordering (responsive actionable ready first, then effective
+   * priority and id) or an actor would be told about a head its own queue does
+   * not show first. An owner whose only ready work is snoozed has no head.
    *
    * Runs in a single CTE pass so callers do not need subsequent
    * `isEffectivelyResponsive` evaluations.
@@ -1080,7 +1091,7 @@ export class ObligationRepository {
                   effective_priority.effective_responsive,
                   ROW_NUMBER() OVER (
                     PARTITION BY obligation.owner_id
-                    ORDER BY effective_priority.effective_priority, obligation.id
+                    ORDER BY ${READY_HEAD_ORDER_SQL}
                   ) AS rank
            FROM obligations obligation
            JOIN effective_priority ON effective_priority.id = obligation.id
@@ -2300,35 +2311,56 @@ export class ObligationRepository {
 
       const previous = previousId === null ? null : queue[previousIndex];
       const next = nextId === null ? null : queue[nextIndex];
+
+      // Mirrors OWNER_QUEUE_ORDER_SQL: only actionable ready rows form the
+      // responsive-first tier; snoozed rows sort later by priority alone.
+      const inResponsiveTier = (o: Obligation) =>
+        o.status === "ready" && o.snoozedUntil === null && o.effectiveResponsive;
+      const targetTier = inResponsiveTier(target);
+
+      // Reject positions that would require ordinary work ahead of responsive work
+      // or responsive work after ordinary work, atomically without writes.
+      if (targetTier && previous !== null && !inResponsiveTier(previous)) {
+        throw new ObligationValidationError("cannot place responsive work after ordinary work");
+      }
+      if (!targetTier && next !== null && inResponsiveTier(next)) {
+        throw new ObligationValidationError("cannot place ordinary work ahead of responsive work");
+      }
+
+      // Resolve the requested position within the target's effective-responsiveness tier.
+      const tierPrevious =
+        previous !== null && inResponsiveTier(previous) === targetTier ? previous : null;
+      const tierNext = next !== null && inResponsiveTier(next) === targetTier ? next : null;
+
       let priority: number;
       let repairSuffix = false;
-      if (previous === null && next === null) {
+      if (tierPrevious === null && tierNext === null) {
         priority = validatePriority(this.now());
-      } else if (previous === null) {
-        if (next === null) {
+      } else if (tierPrevious === null) {
+        if (tierNext === null) {
           throw new ObligationValidationError("priority move requires a queue neighbor");
         }
-        const half = next.effectivePriority / 2;
+        const half = tierNext.effectivePriority / 2;
         priority =
-          Number.isFinite(half) && half < next.effectivePriority
+          Number.isFinite(half) && half < tierNext.effectivePriority
             ? half
-            : priorityBefore(next.effectivePriority);
-      } else if (next === null) {
-        priority = priorityAfter(previous.effectivePriority);
+            : priorityBefore(tierNext.effectivePriority);
+      } else if (tierNext === null) {
+        priority = priorityAfter(tierPrevious.effectivePriority);
       } else {
-        const midpoint = strictMidpoint(previous.effectivePriority, next.effectivePriority);
+        const midpoint = strictMidpoint(tierPrevious.effectivePriority, tierNext.effectivePriority);
         if (midpoint !== null) {
           priority = midpoint;
         } else {
-          priority = priorityAfter(previous.effectivePriority);
+          priority = priorityAfter(tierPrevious.effectivePriority);
           repairSuffix = true;
         }
       }
       validatePriority(priority);
-      if (previous !== null && priority <= previous.effectivePriority) {
+      if (tierPrevious !== null && priority <= tierPrevious.effectivePriority) {
         throw new ObligationValidationError("no finite priority exists after the previous item");
       }
-      if (!repairSuffix && next !== null && priority >= next.effectivePriority) {
+      if (!repairSuffix && tierNext !== null && priority >= tierNext.effectivePriority) {
         throw new ObligationValidationError("no finite priority exists before the next item");
       }
       this.applyPriority(id, priority, scope);
@@ -2336,6 +2368,11 @@ export class ObligationRepository {
       if (repairSuffix) {
         let cursor = priority;
         for (const obligation of queue.slice(nextIndex)) {
+          // Calculate and repair only the target tier; collision repair cannot
+          // spill into or mutate other-tier priorities.
+          if (inResponsiveTier(obligation) !== targetTier) {
+            break;
+          }
           if (obligation.effectivePriority > cursor) break;
           cursor = validatePriority(priorityAfter(cursor));
           // Numeric collision repair is not a semantic subtree reprioritization:
