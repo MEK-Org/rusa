@@ -72,6 +72,7 @@ import {
   HALT_SYNTAX_HELP,
   type HaltCommand,
   HaltSwitch,
+  normalizeProvider,
   parseHaltCommand,
 } from "../actor/halt-switch.js";
 import { generateHandle, resolveRootHandle } from "../actor/handle-generator.js";
@@ -2065,6 +2066,29 @@ async function composeStart(
     },
   });
   resources.acquire("availability hold expiry timer", () => availabilityHolds.stop());
+  // The same scope rule as chat `/halt` (#630): a hold no run can meet, on an
+  // unconfigured provider or a model its catalog does not list, is refused
+  // whole rather than acknowledged.
+  const validateHoldScope = (provider: string, models: readonly string[]) => {
+    const name = normalizeProvider(provider);
+    if (config.providers[name] === undefined) {
+      throw new Error(`provider ${name} is not configured; no hold was placed`);
+    }
+    if (models.length === 0) return;
+    const catalogued = acceptableModelPins(name) ?? [];
+    const uncatalogued = findUncataloguedHaltModels(models, catalogued);
+    if (uncatalogued.length === 0) return;
+    const named = uncatalogued
+      .map(({ model, nearest }) =>
+        nearest.length ? `${model} (closest: ${nearest.join(", ")})` : model
+      )
+      .join(", ");
+    const why =
+      catalogued.length === 0
+        ? ` No model catalog is recorded for ${name}; omit models to hold the whole provider.`
+        : "";
+    throw new Error(`the ${name} model catalog does not list ${named}.${why} No hold was placed.`);
+  };
   // The configured actor's own pool head, not the `rootActor` file tuple.
   const rootProviderName = (rootBootModelConfig.modelConfig[0] as ProviderModelConfig).provider;
   const isProviderHalted = (providerName?: string, modelName?: string) => {
@@ -3544,6 +3568,8 @@ async function composeStart(
             modelClasses,
             validateModelClass: (input) =>
               validateModelConfigPool(config, input, { portable: true }),
+            availabilityHolds,
+            validateHoldScope,
             getFollowers: () => (followerHub ? followerHub.list() : []),
             chatRoom,
             voices: () => supportedVoiceCatalog,
@@ -4013,6 +4039,8 @@ async function composeStart(
       rootControl,
       modelClasses,
       validateModelClass: (input) => validateModelConfigPool(config, input, { portable: true }),
+      availabilityHolds,
+      validateHoldScope,
       onWrite: () => {
         mesh.markUnkillable(rootId);
       },
