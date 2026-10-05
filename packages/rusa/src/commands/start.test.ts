@@ -2787,6 +2787,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
   });
 
   describe("run_mcp_diagnostic event at run end (#292)", () => {
+    let rootHandle: Actor | undefined;
     const bootWithWorker = async (workerId: string): Promise<ActorMesh> => {
       writeFileSync(
         join(homeDir, "config.yaml"),
@@ -2819,6 +2820,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           e2e: {
             onReady: (handles) => {
               mesh = handles.mesh;
+              rootHandle = handles.root as Actor;
               shutdownFn = handles.shutdown;
               resolve();
             },
@@ -2893,6 +2895,45 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(payload.totalCalls).toBe(1);
       expect(payload.servers.mesh).toEqual({ initialized: true, toolsListed: true, toolCalls: 1 });
 
+      await client.close();
+    });
+
+    it("tallies root's bare-named host services in root's own window", async () => {
+      await bootWithWorker("diag-root-worker");
+      const root = rootHandle;
+      if (!root) throw new Error("root not ready");
+      const rootOpts = (
+        root as unknown as {
+          opts: {
+            mcpServers: Array<{ name: string; url: string }>;
+            onProviderAttempt?: (attempt: { providerName: string; model?: string }) => void;
+          };
+        }
+      ).opts;
+      const quotaSpec = rootOpts.mcpServers.find((s) => s.name === "quota");
+      if (!quotaSpec) throw new Error("root quota spec not found");
+      rootOpts.onProviderAttempt?.({ providerName: "antigravity", model: "Gemini 3.7 Flash" });
+
+      const client = new Client({ name: "test-client", version: "1.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(quotaSpec.url)));
+      await client.listTools();
+      await client.callTool({ name: "get_quota", arguments: {} }).catch(() => {});
+
+      const runId = await startLifecycleRun(root, {
+        provider: "antigravity",
+        model: "Gemini 3.7 Flash",
+        effort: "high",
+      });
+      await endLifecycleRun(root, runId, { success: true, exitCode: 0, output: "quota only" });
+
+      const [diag] = getRepositories().meshEvents.listEventsByActors([root.id], {
+        limit: 10,
+        kinds: ["run_mcp_diagnostic"],
+      }).events;
+      expect(diag?.detail).toBe("used");
+      const payload = JSON.parse(diag?.payload ?? "{}");
+      expect(payload.totalCalls).toBe(1);
+      expect(payload.servers.quota).toEqual({ initialized: true, toolsListed: true, toolCalls: 1 });
       await client.close();
     });
   });

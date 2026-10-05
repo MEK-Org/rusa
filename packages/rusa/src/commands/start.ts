@@ -3632,6 +3632,9 @@ async function composeStart(
         )
       : undefined;
 
+  // Only root is handed the host services' bare-named URLs; workers get their
+  // own `<id>:<service>` copies. Bind them to root so its run tally counts them.
+  mcpHttp.bindHostServices(rootId);
   rootMcp.push(
     ...sharedMcp,
     { name: TRACKER_MCP_NAME, url: rootTrackerUrl },

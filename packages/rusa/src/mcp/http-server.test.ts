@@ -1,4 +1,4 @@
-import { Agent, type IncomingMessage, request, type ServerResponse } from "node:http";
+import { Agent, type IncomingMessage, request, type Server, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -1201,6 +1201,155 @@ describe("McpHttpServer", () => {
       await expect(failed).resolves.toBe("rejected");
       expect(http.finishRunWindow(actorId).servers.mesh?.toolsListed).toBe(false);
 
+      await client.close();
+    });
+
+    it("tallies host services for their bound owner, never for an actor sharing the name", async () => {
+      const hostUrl = (name: string) => http.urls().find((u) => u.name === name)?.url ?? "";
+      http.bindHostServices(actorId);
+      http.startRunWindow(actorId, ["tracker", "chat"]);
+      // An actor whose id equals a host service's name does not own it.
+      http.startRunWindow("tracker", ["tracker"]);
+
+      const tracker = await connect(hostUrl("tracker"));
+      await tracker.listTools();
+      const chatClient = await connect(hostUrl("chat"));
+      await chatClient.listTools();
+      expect(http.finishRunWindow(actorId)).toMatchObject({
+        classification: "discovered_unused",
+        servers: {
+          tracker: { initialized: true, toolsListed: true, toolCalls: 0 },
+          chat: { initialized: true, toolsListed: true, toolCalls: 0 },
+        },
+      });
+      expect(http.finishRunWindow("tracker").classification).toBe("not_connected");
+
+      http.startRunWindow(actorId, ["tracker", "chat"]);
+      await tracker.callTool({ name: "no_such_tool", arguments: {} }).catch(() => {});
+      expect(http.finishRunWindow(actorId)).toMatchObject({
+        classification: "used",
+        totalCalls: 1,
+      });
+
+      await tracker.close();
+      await chatClient.close();
+    });
+
+    it("credits a request to the attempt open at arrival, even when its body lands later", async () => {
+      const meshUrl = http.addServer(actorId, pingServer);
+      http.startRunWindow(actorId, ["mesh"]);
+      const body = JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "slow-client", version: "1.0.0" },
+        },
+      });
+      const req = request(meshUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          "content-length": Buffer.byteLength(body),
+        },
+      });
+      const done = new Promise<void>((resolve, reject) => {
+        req.once("response", (res) => {
+          res.resume();
+          res.once("end", resolve);
+        });
+        req.once("error", reject);
+      });
+      req.write(body.slice(0, 10));
+      await waitForRecord(requestLogs, (r) => r.event === "mcp_request_arrived", "arrival");
+
+      // The next attempt opens while the first attempt's request body is still streaming.
+      http.startRunWindow(actorId, ["mesh"]);
+      req.end(body.slice(10));
+      await done;
+      expect(http.finishRunWindow(actorId).servers.mesh?.initialized).toBe(false);
+    });
+
+    it("counts a listing only when the response carrying its result finishes", async () => {
+      let hold = false;
+      let entered = false;
+      let release = () => {};
+      const meshUrl = http.addServer(actorId, () => {
+        const s = pingServer();
+        s.server.setRequestHandler(ListToolsRequestSchema, async () => {
+          if (hold) {
+            entered = true;
+            await new Promise<void>((resolve) => {
+              release = resolve;
+            });
+          }
+          return { tools: [] };
+        });
+        return s;
+      });
+      // Requests marked here have their response write fail, as a socket that
+      // dies after the transport accepted the result would.
+      (http as unknown as { server: Server }).server.on("request", (req, res) => {
+        if (req.headers["x-test-fail-write"] === undefined) return;
+        res.write = () => {
+          res.destroy();
+          return false;
+        };
+      });
+      const transport = new StreamableHTTPClientTransport(new URL(meshUrl));
+      const client = new Client({ name: "test-client", version: "1.0.0" });
+      await client.connect(transport);
+      const rawList = (id: number, extra: Record<string, string> = {}) => {
+        const req = request(meshUrl, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+            "mcp-session-id": transport.sessionId ?? "",
+            ...extra,
+          },
+        });
+        req.once("error", () => {});
+        req.once("response", (res) => {
+          res.once("error", () => {});
+          res.resume();
+        });
+        req.end(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/list", params: {} }));
+        return req;
+      };
+
+      // The client disconnects before the result: the transport's send throws.
+      http.startRunWindow(actorId, ["mesh"]);
+      hold = true;
+      const gone = rawList(98);
+      await vi.waitFor(() => expect(entered).toBe(true));
+      gone.destroy();
+      await waitForRecord(requestLogs, (r) => r.event === "mcp_http_response_closed", "close");
+      release();
+      // A later round trip on the same session: the late result has been sent by now.
+      await client.callTool({ name: "ping", arguments: {} });
+      expect(http.finishRunWindow(actorId).servers.mesh).toEqual({
+        initialized: false,
+        toolsListed: false,
+        toolCalls: 1,
+      });
+
+      // The transport accepts the result, then the response write fails.
+      http.startRunWindow(actorId, ["mesh"]);
+      hold = false;
+      requestLogs.length = 0;
+      rawList(99, { "x-test-fail-write": "1" });
+      await waitForRecord(requestLogs, (r) => r.event === "mcp_http_response_closed", "close");
+      await client.callTool({ name: "ping", arguments: {} });
+      expect(http.finishRunWindow(actorId).servers.mesh?.toolsListed).toBe(false);
+
+      // The same listing on a healthy response counts.
+      http.startRunWindow(actorId, ["mesh"]);
+      await client.listTools();
+      expect(http.finishRunWindow(actorId).servers.mesh?.toolsListed).toBe(true);
       await client.close();
     });
 

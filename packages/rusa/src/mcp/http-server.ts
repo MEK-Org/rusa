@@ -83,7 +83,7 @@ export type McpRunClassification =
 export interface McpServerMountTally {
   /** An `initialize` request arrived. */
   initialized: boolean;
-  /** A `tools/list` result was written to its response stream. */
+  /** A `tools/list` result was accepted and the HTTP response carrying it finished. */
   toolsListed: boolean;
   /** `tools/call` requests that arrived. */
   toolCalls: number;
@@ -266,6 +266,10 @@ export class McpHttpServer {
   private readonly sessionStartedAt = new Map<string, Map<string, number>>();
   /** Open run-attempt windows keyed by actor id. */
   private readonly runWindows = new Map<string, RunWindow>();
+  /** Host services declared at construction; their names carry no actor id. */
+  private readonly hostServices: ReadonlySet<string>;
+  /** The one actor that mounts the host services; unset until {@link bindHostServices}. */
+  private hostServiceOwner: string | undefined;
   /** Per transport: `tools/list` request ids awaiting their result, and what to mark. */
   private readonly pendingToolsLists = new WeakMap<
     StreamableHTTPServerTransport,
@@ -286,6 +290,7 @@ export class McpHttpServer {
     this.log = (opts.logger ?? nullLogger).child({ component: "mcp-http" });
     this.wake = opts.wake ?? null;
     this.hostJobExit = opts.hostJobExit ?? null;
+    this.hostServices = new Set(Object.keys(this.factories));
     for (const name of Object.keys(this.factories)) {
       this.sessions.set(name, new Map());
       this.sessionStartedAt.set(name, new Map());
@@ -442,12 +447,27 @@ export class McpHttpServer {
   }
 
   /**
-   * The open window of the actor that owns mount `name`. Every mount is
-   * actor-named (`<actor>` or `<actor>:<capability>`), so ownership comes from
-   * the name alone; traffic on a mount whose owner has no open window is not
-   * tallied, never attributed to another actor.
+   * Record which actor mounts the host services declared at construction. Their
+   * names (`understanding`, `quota`, ...) carry no actor id, and only that
+   * actor is handed their URLs, so its window tallies their traffic.
+   */
+  bindHostServices(ownerId: string): void {
+    this.hostServiceOwner = ownerId;
+  }
+
+  /**
+   * The open window of the actor that owns mount `name`. A host service belongs
+   * to its bound owner; every other mount is actor-named (`<actor>` or
+   * `<actor>:<capability>`), so ownership comes from the name alone. Traffic on
+   * a mount whose owner has no open window is not tallied, never attributed to
+   * another actor.
    */
   private runWindowFor(name: string): RunWindow | undefined {
+    if (this.hostServices.has(name)) {
+      return this.hostServiceOwner === undefined
+        ? undefined
+        : this.runWindows.get(this.hostServiceOwner);
+    }
     const separator = name.lastIndexOf(":");
     return this.runWindows.get(separator >= 0 ? name.slice(0, separator) : name);
   }
@@ -463,9 +483,10 @@ export class McpHttpServer {
   }
 
   /**
-   * Count a `tools/list` only once its JSON-RPC result has been written to the
-   * response stream. `handleRequest` can return before the server answers; an
-   * error response, or a stream closed before the answer, never counts.
+   * Report a pending `tools/list` whose JSON-RPC result the transport accepted.
+   * That alone does not prove delivery: the SDK's `send` ignores a failed SSE
+   * write, so the caller also waits for the HTTP response to finish. An error
+   * response, or a `send` that throws, never reports.
    */
   private observeToolsListResults(transport: StreamableHTTPServerTransport): void {
     const pending = new Map<string | number, () => void>();
@@ -473,10 +494,10 @@ export class McpHttpServer {
     const send = transport.send.bind(transport);
     transport.send = async (message: JSONRPCMessage, options) => {
       const id = "id" in message && !("method" in message) ? message.id : undefined;
-      const onListed = id === undefined ? undefined : pending.get(id);
+      const onResult = id === undefined ? undefined : pending.get(id);
       if (id !== undefined) pending.delete(id);
       await send(message, options);
-      if (onListed && "result" in message) onListed();
+      if (onResult && "result" in message) onResult();
     };
   }
 
@@ -575,14 +596,15 @@ export class McpHttpServer {
       httpMethod: boundedMetadata(req.method),
     });
 
+    // The window is read once, at arrival, before the body is read: a request
+    // that outlives its attempt must not mark the attempt that replaced it.
+    const runWindow = this.runWindowFor(name);
+
     try {
       if (req.method === "POST") {
         const body = await readJsonBody(req);
         metadata = requestMetadata(body);
         this.log.info("mcp_request_body_read", requestFields());
-        // The window is read once, at arrival: a request that outlives its
-        // attempt must not mark the attempt that replaced it.
-        const runWindow = this.runWindowFor(name);
         if (runWindow && metadata.rpcMethod === "initialize") {
           this.mountTally(runWindow, name).initialized = true;
         }
@@ -645,10 +667,24 @@ export class McpHttpServer {
           metadata.rpcMethod === "tools/list" &&
           (typeof listId === "string" || typeof listId === "number")
         ) {
-          this.pendingToolsLists.get(transport)?.set(listId, () => {
-            if (this.runWindowFor(name) === runWindow) {
+          // A listing counts once its result was accepted AND Node finished
+          // this HTTP response, which carries it — local evidence the answer
+          // left this host, not a client receipt. A response closed first never
+          // counts, nor does one finishing after a newer attempt opened.
+          let resultAccepted = false;
+          let finished = false;
+          const markListed = () => {
+            if (resultAccepted && finished && this.runWindowFor(name) === runWindow) {
               this.mountTally(runWindow, name).toolsListed = true;
             }
+          };
+          this.pendingToolsLists.get(transport)?.set(listId, () => {
+            resultAccepted = true;
+            markListed();
+          });
+          res.once("finish", () => {
+            finished = true;
+            markListed();
           });
         }
         this.log.info("mcp_transport_dispatch", requestFields());
