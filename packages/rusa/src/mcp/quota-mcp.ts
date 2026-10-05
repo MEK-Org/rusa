@@ -167,6 +167,12 @@ export interface ProviderQuotaSnapshot {
    */
   limits?: QuotaLimit[];
   /**
+   * Optional balance from a Codex `/status` `Credits:` row. Its absence means
+   * the rendered panel did not report a balance; it never means zero. This is
+   * observation-only until #924's pacing design is approved.
+   */
+  remainingCredits?: number;
+  /**
    * ISO-8601 instant the underlying provider was actually scraped (ISSUE_NUM, ask
    * 5) — stamped once, at probe time, by whichever `probe*Quota` produced this
    * state. Rides unchanged through the TTL cache (a cache hit returns the
@@ -597,6 +603,20 @@ function resolvePercentLeft(w: LlmQuotaWindow): number | string {
   return hasUsed ? 100 - value : value;
 }
 
+/**
+ * Read an optional Codex `Credits:` balance exactly as a non-negative printed
+ * number. Codex groups whole credits (for example `3,336`); accepting a plain
+ * decimal keeps this observation layer tolerant of a future fractional display
+ * without treating an absent field as zero.
+ */
+function parsePrintedCreditBalance(text: unknown): number | undefined {
+  if (typeof text !== "string") return undefined;
+  const trimmed = text.trim();
+  if (!/^(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?$/.test(trimmed)) return undefined;
+  const value = Number(trimmed.replaceAll(",", ""));
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
 async function parseQuotaWithLlm(
   output: string,
   apiKey: string,
@@ -629,6 +649,18 @@ async function parseQuotaWithLlm(
       description:
         "Per-window breakdown, e.g. session + weekly (claude/kimi) or 5h + Weekly (codex/kimi).",
       items: LLM_WINDOW_ITEM_SCHEMA,
+    };
+  }
+
+  if (provider === "codex") {
+    properties.remainingCredits = {
+      type: Type.STRING,
+      description:
+        "Optional remaining credit balance. Emit only when the rendered `/status` panel has a " +
+        "literal `Credits:` row. Copy its printed non-negative number as text, preserving digit " +
+        "grouping (for example `3,336` or `0`). Omit this field when that row is absent; absent " +
+        "means unknown, never zero. Do not infer credits from URLs, rate-limit prose, plan names, " +
+        "or generic mentions of credits.",
     };
   }
 
@@ -791,7 +823,7 @@ async function parseQuotaWithLlm(
     if (!parsed || typeof parsed !== "object") {
       throw new Error("Quota parse failed: response is not an object");
     }
-    const parsedObj = parsed as { windows?: unknown; status?: unknown };
+    const parsedObj = parsed as { windows?: unknown; status?: unknown; remainingCredits?: unknown };
     if (!Array.isArray(parsedObj.windows)) {
       throw new Error("Quota parse failed: response omitted the required windows array");
     }
@@ -801,6 +833,16 @@ async function parseQuotaWithLlm(
       )
     ) {
       throw new Error(`Quota parse failed: invalid status '${String(parsedObj.status)}'`);
+    }
+
+    const hasRemainingCredits = Object.hasOwn(parsedObj, "remainingCredits");
+    const remainingCredits = hasRemainingCredits
+      ? parsePrintedCreditBalance(parsedObj.remainingCredits)
+      : undefined;
+    if (hasRemainingCredits && remainingCredits === undefined) {
+      throw new Error(
+        `Quota parse failed: invalid remainingCredits ${JSON.stringify(parsedObj.remainingCredits)}`
+      );
     }
 
     const limits: QuotaLimit[] = [];
@@ -933,6 +975,7 @@ async function parseQuotaWithLlm(
     return {
       status,
       limits,
+      ...(remainingCredits !== undefined ? { remainingCredits } : {}),
     };
   };
 
@@ -1679,6 +1722,9 @@ export class QuotaService {
         status: parsed.status ?? "unknown",
         message: parsed.message,
         limits: parsed.limits,
+        ...(parsed.remainingCredits !== undefined
+          ? { remainingCredits: parsed.remainingCredits }
+          : {}),
         ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
         raw,
         scrapedAt,
