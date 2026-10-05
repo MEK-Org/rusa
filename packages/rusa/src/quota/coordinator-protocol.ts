@@ -547,7 +547,13 @@ export function closedGoverningWindow(
   nowMs: number
 ): PersistedQuotaBucketStatus | null {
   const governing = wholeLaneGoverningWindow(status);
-  return governing && Date.parse(governing.resetAtIso ?? "") <= nowMs ? governing : null;
+  if (!governing) return null;
+  const resetMs = Date.parse(governing.resetAtIso ?? "");
+  const observedMs = Date.parse(governing.observedAt);
+  // A reading accepted after its advertised reset supersedes the old window,
+  // even if that provider still reports the old reset. The alert is only for
+  // the retained pre-reset reading that has no successor.
+  return Number.isFinite(observedMs) && observedMs < resetMs && resetMs <= nowMs ? governing : null;
 }
 
 /** The pacing a model-scoped lane set imposes on one concrete candidate model. */

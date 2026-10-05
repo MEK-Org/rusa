@@ -4710,8 +4710,7 @@ async function composeStart(
     const message =
       `Quota window closed without a reading: ${closed.provider}'s governing window ` +
       `"${closed.window}" reset at ${closed.resetAt}, and no quota reading has arrived since ` +
-      `${closed.lastReadingAt}. ${closed.provider} paces at the conservative ceiling until a ` +
-      "new reading arrives; check the scrapes to see why readings stopped.";
+      `${closed.lastReadingAt}. Check the scrapes to see why readings stopped.`;
     void deliverHostAlarm({
       deliver: () =>
         mesh.deliverExternalEvent({

@@ -872,6 +872,17 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(
       at({ ...stored, buckets: [{ ...bucket, resetAtIso: null }] }, resetMs).closed
     ).toBeNull();
+
+    // A newer accepted reading can still carry a provider's old reset value.
+    // It supersedes the pre-reset reading, so it is not the missing-reading
+    // transition that this alert reports.
+    const postReset = new Date(resetMs + 1_000).toISOString();
+    expect(
+      at(
+        { ...stored, updatedAt: postReset, buckets: [{ ...bucket, observedAt: postReset }] },
+        resetMs + 1_000
+      ).closed
+    ).toBeNull();
   });
 
   it("reports the same closed window to a client whether the scrapes after it failed or went missing (#794)", async () => {

@@ -1539,8 +1539,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // A whole-lane reading as the coordinator publishes it: its governing
       // window comes from that same reading. Closing is independent of its
       // hard-stale status; only the existing published throttle differs.
-      const reading = (resetMs: number, intervalSeconds: number, hardStale: boolean) => {
-        const updatedAt = new Date(Date.now() - (hardStale ? 2 * 60 * 60_000 : 0)).toISOString();
+      const reading = (
+        resetMs: number,
+        intervalSeconds: number,
+        hardStale: boolean,
+        observedMs = hardStale ? Date.now() - 2 * 60 * 60_000 : resetMs - 60_000
+      ) => {
+        const updatedAt = new Date(observedMs).toISOString();
         const status = throttleStatus("claude", { intervalSeconds, updatedAt });
         return {
           ...status,
@@ -1552,7 +1557,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           freshness: { ...status.freshness, stale: hardStale, hardStale },
         };
       };
-      let published = reading(Date.now() + 60 * 60_000, 300, false);
+      let published = reading(Date.now() + 60 * 60_000, 300, false, Date.now());
       const { close, triggerQuotaThrottleTick, getThrottle } = await bootWithCoordinator(() => ({
         claude: published,
       }));
@@ -1584,9 +1589,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
             window: "claude:weekly",
             resetAt: new Date(resetMs).toISOString(),
             priority: "responsive",
-            message: expect.stringContaining("check the scrapes"),
+            message: expect.stringContaining("Check the scrapes"),
           }),
         });
+        expect((closedAlarms()[0].payload as unknown as { message: string }).message).not.toContain(
+          "conservative ceiling"
+        );
         expect(getThrottle("claude")?.intervalSeconds).toBe(300);
 
         // Still closed on the next apply: raised once, not per tick.
