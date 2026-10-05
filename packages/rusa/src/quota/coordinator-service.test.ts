@@ -959,7 +959,9 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
 
     clockMs = resetMs + 60_000;
     const missing = await read();
-    expect(missing.intervalSeconds).toBe(3600);
+    // The close leaves #916 keep-last pacing alone: the interval stays below the ceiling.
+    expect(open.intervalSeconds).toBeLessThan(3600);
+    expect(missing.intervalSeconds).toBe(open.intervalSeconds);
     expect(closedGoverningWindow(missing, clockMs)).toMatchObject({
       key: "claude:weekly",
       resetAtIso,
