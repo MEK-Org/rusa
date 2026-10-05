@@ -313,4 +313,27 @@ describe("inbox hints", () => {
       expect(hinted[1].hint).toBeUndefined();
     });
   });
+
+  describe("Room entry notices", () => {
+    it("hints that an entry notice asks nothing, completes no obligation, and prohibits greetings", () => {
+      const hint = resolveInboxHint(
+        makeEntry({
+          source: "room:entry",
+          payload: {
+            type: "room.human_entry",
+            version: 1,
+            priority: "responsive",
+            interruption: "join",
+            episodeId: "ep-1",
+            principalId: "human-matt",
+            enteredAt: "2026-10-05T18:00:00.000Z",
+          },
+        })
+      );
+      expect(hint).toContain("human-matt entered the Chat Room at 2026-10-05T18:00:00.000Z");
+      expect(hint).toContain("it asks nothing and completes no obligation");
+      expect(hint).toContain("do not greet them or send an entry reply");
+      expect(hint).toContain("staying silent is fine");
+    });
+  });
 });

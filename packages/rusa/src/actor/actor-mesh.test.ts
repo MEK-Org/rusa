@@ -46,6 +46,7 @@ import {
   EventManager,
   HierarchicalEventSourceResolver,
 } from "../runtime/event-manager.js";
+import { RoomEntryService } from "../voice/room-entry.js";
 import { isSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { Actor } from "./actor.js";
@@ -9870,6 +9871,30 @@ describe("ActorMesh", () => {
         expect(t.admissions.get(participant)).toEqual([false, true]);
         await vi.advanceTimersByTimeAsync(10_000);
         expect(t.runs.get(participant)).toBe(2);
+      });
+
+      it("reaches running participants from a real entry through the append seam alone", async () => {
+        const t = setupTwoRunningActors();
+        const first = t.mesh.spawn({ charter: "first", parentId: "root" });
+        const second = t.mesh.spawn({ charter: "second", parentId: "root" });
+        await t.startRun(first);
+        await t.startRun(second);
+        const rooms = new RoomEntryService({
+          inbox: t.inboxStore,
+          roster: () => [first, second],
+        });
+
+        // Two tabs: one notification due to cooldown, one notice per participant, no explicit dispatch.
+        rooms.enter({ principalId: "human-1", clientId: "tab-1" });
+        rooms.enter({ principalId: "human-1", clientId: "tab-2" });
+        await vi.advanceTimersByTimeAsync(0);
+
+        for (const actorId of [first, second]) {
+          expect(t.signals.get(actorId)?.aborted).toBe(false);
+          expect(t.runs.get(actorId)).toBe(1);
+          expect(t.unhandledResponsive(actorId)).toHaveLength(1);
+        }
+        expect(t.preemptions()).toEqual([]);
       });
 
       it("promotes a queued run without preempting or adding a follow-up", async () => {

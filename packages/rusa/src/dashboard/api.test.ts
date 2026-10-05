@@ -31,8 +31,7 @@ import {
 import { assertConcreteModelConfig } from "../providers/model-config.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
-import type { InboxEntry } from "../repositories/inbox-repository.js";
-import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
+import { type DashboardDataDeps, handleMeshApiRequest, readBody } from "./api.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { SseHub } from "./sse.js";
 
@@ -4946,5 +4945,34 @@ describe("handleMeshApiRequest", () => {
         expect(obligations.get("task-owner")?.ownerId).toBe("actor-1");
       });
     });
+  });
+});
+
+describe("bounded dashboard request reader", () => {
+  it("rejects a chunk crossing the cap before concatenation and discards subsequent chunks", async () => {
+    const req = new MockReq();
+    const concat = vi.spyOn(Buffer, "concat");
+    try {
+      const result = readBody(req as unknown as IncomingMessage, 4096);
+      const rejected = expect(result).rejects.toThrow("Request body too large");
+      req.emit("data", Buffer.alloc(3000));
+      req.emit("data", Buffer.alloc(2000));
+      await rejected; // Reject at the crossing chunk, before end arrives.
+      // Later chunks must not be concatenated even if the sender continues.
+      req.emit("data", Buffer.alloc(8000));
+      req.emit("end");
+      expect(concat).not.toHaveBeenCalled();
+    } finally {
+      concat.mockRestore();
+    }
+  });
+
+  it("accepts a multibyte body at the exact byte limit", async () => {
+    const req = new MockReq();
+    const result = readBody(req as unknown as IncomingMessage, 4);
+    req.emit("data", Buffer.from("é"));
+    req.emit("data", Buffer.from("é"));
+    req.emit("end");
+    expect(await result).toBe("éé");
   });
 });
