@@ -173,6 +173,7 @@ import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitops/issue-client.js";
+import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
 import { initEmptyBareRepo } from "../gitops/worktree.js";
 import { AGENT_EXEC_MCP_NAME, createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
 import {
@@ -1280,6 +1281,15 @@ async function composeStart(
   }
 
   log.info("github_identity_resolved", { account: config.github.account });
+
+  // Read once from the mesh host's global Git config and handed to every actor
+  // prompt, which tells actors to apply it per command (#894).
+  const meshGitIdentity = resolveMeshGitIdentity();
+  if (meshGitIdentity) {
+    log.info("mesh_git_identity_resolved", { name: meshGitIdentity.name });
+  } else {
+    log.warn("mesh_git_identity_missing", {});
+  }
 
   // The root's configured identity : the display handle every
   // root-identity surface (signing byline, dashboard, avatar, commitment
@@ -3261,6 +3271,7 @@ async function composeStart(
                   parentId: r.parentId ?? rootId,
                   handles,
                   understandingMountEnabled,
+                  gitIdentity: meshGitIdentity,
                 },
                 injection?.priorContext
               ),
@@ -3662,7 +3673,12 @@ async function composeStart(
         portableContextStore
       );
       return {
-        prompt: buildRootPrompt(rootActor.charter, injection?.priorContext, rootHandle),
+        prompt: buildRootPrompt(
+          rootActor.charter,
+          injection?.priorContext,
+          rootHandle,
+          meshGitIdentity
+        ),
         injectRecord: injection?.injectRecord,
       };
     },

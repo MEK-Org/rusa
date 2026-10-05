@@ -1,3 +1,4 @@
+import { type MeshGitIdentity, meshGitIdentityArgs } from "../gitops/mesh-git-identity.js";
 import type { ActorHandle } from "./actor-record.js";
 import { generateHandle } from "./handle-generator.js";
 
@@ -52,6 +53,44 @@ say the origin is unknown. Never synthesize a plausible-sounding origin.`;
 /** Tell actors their handle without asking them to add a visible byline. */
 export function trackerWritingGuidance(handle: string): string {
   return `Your actor handle is **${handle}**. Do not sign your own name.`;
+}
+
+function shellQuote(arg: string): string {
+  return /^[\w@%+=:,./-]+$/.test(arg) ? arg : `'${arg.replaceAll("'", `'\\''`)}'`;
+}
+
+/**
+ * The mesh's Git identity for mesh-owned commits (#894). It lives here, in the
+ * mesh-supplied prompt, rather than in any repository's agent instructions,
+ * which also reach people's own coding sessions. Command-scoped `-c` keeps every
+ * Git config file untouched, including on a machine where a person's global
+ * identity is set.
+ */
+export function gitIdentityGuidance(identity: MeshGitIdentity | null): string {
+  if (!identity) {
+    return `## Git identity
+The mesh has no Git identity configured: its host's global Git config lacks
+\`user.name\` or \`user.email\`. Do not set one or borrow anyone's identity; report
+the gap before committing.`;
+  }
+  const command = ["git", ...meshGitIdentityArgs(identity), "commit"].map(shellQuote).join(" ");
+  return `## Git identity
+Commits you make in your mesh workspace — the clones and worktrees the mesh
+owns — are authored as the mesh: **${identity.name}
+<${identity.email}>**, read from the mesh host's global Git config. Pass it on
+each Git command that creates commits (commit, merge, rebase, cherry-pick, revert,
+am); \`-c\` sets both author and committer for that one command:
+
+    ${command} …
+
+The identity is whatever the host's global Git config holds, so on a machine
+whose global identity is a person's, that person is what the mesh presents. In
+a checkout that belongs to a person rather than to the mesh, leave the
+commit's identity to that repository's own configuration instead of imposing
+the mesh identity. Leave \`user.name\` and \`user.email\` in every Git config
+file — local, global, system — as you found them; they belong to whoever owns
+that machine or repository. Identity is the mesh's to supply, so don't add Git
+identity directives to a repository's agent instructions.`;
 }
 
 export const INBOX_DISCIPLINE = `## Work from your inbox
@@ -249,6 +288,8 @@ export interface WorkerPromptContext {
   handles?: ResolvedHandle[];
   /** Whether the Integrated Understanding read-only filesystem mount is enabled. */
   understandingMountEnabled?: boolean;
+  /** The mesh's Git identity for mesh-owned commits; null when unconfigured. */
+  gitIdentity: MeshGitIdentity | null;
 }
 
 /** A short, one-line label for an actor, derived from its charter. */
@@ -378,6 +419,8 @@ ${DELEGATION_DISCIPLINE}
 ${GROUNDING_DISCIPLINE}
 
 ${trackerWritingGuidance(generateHandle(ctx.threadId))}
+
+${gitIdentityGuidance(ctx.gitIdentity)}
 
 ${INBOX_DISCIPLINE}
 

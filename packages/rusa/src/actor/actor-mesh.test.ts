@@ -537,6 +537,7 @@ function setup(
                 (hid) => registry.get(hid)?.charter,
                 (hid) => registry.get(hid)?.title
               ),
+              gitIdentity: null,
             }),
           };
         },
