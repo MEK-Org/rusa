@@ -21,7 +21,7 @@ export type MeshGitIdentityResolution =
 // A Git command can't carry these intact. Git stores an identity as one
 // `Name <email>` line and silently strips `<`, `>` and line breaks from it, so the
 // commit would not record the configured value. A NUL byte can't be passed in a
-// process argument at all, so `-c user.name=…` can't be run with it.
+// process argument at all, so `-c author.name=…` can't be run with it.
 const UNCARRIABLE = /[<>\n\r\0]/;
 
 function field(value: unknown): string | undefined {
@@ -52,7 +52,16 @@ export function resolveMeshGitIdentity(configured: unknown): MeshGitIdentityReso
   return { identity: { name, email } };
 }
 
-/** `git` options that set author and committer for one command only. */
+/**
+ * `git` options that set author and committer for one command only. Git reads
+ * `author.*` and `committer.*` before `user.*`, so those are what is set; a
+ * person's role-specific keys would otherwise win over `-c user.*`.
+ */
 export function meshGitIdentityArgs(identity: MeshGitIdentity): string[] {
-  return ["-c", `user.name=${identity.name}`, "-c", `user.email=${identity.email}`];
+  return ["author", "committer"].flatMap((role) => [
+    "-c",
+    `${role}.name=${identity.name}`,
+    "-c",
+    `${role}.email=${identity.email}`,
+  ]);
 }

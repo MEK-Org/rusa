@@ -40,7 +40,7 @@ describe("Git identity guidance (#909)", () => {
     const text = gitIdentityGuidance(resolveMeshGitIdentity(MESH));
     expect(text).toContain("**Mesh Bot\n<mesh-bot@example.invalid>**");
     expect(text).toContain(
-      "git -c 'user.name=Mesh Bot' -c user.email=mesh-bot@example.invalid commit"
+      "git -c 'author.name=Mesh Bot' -c author.email=mesh-bot@example.invalid -c 'committer.name=Mesh Bot' -c committer.email=mesh-bot@example.invalid commit"
     );
     expect(text).toContain("`gitIdentity` in rusa's config.yaml");
     expect(text).not.toContain("global Git config");
@@ -80,11 +80,16 @@ describe("mesh Git identity in a disposable repository (#894, #909)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("commits as the configured identity and leaves a person's local and global identity unchanged", () => {
-    // The machine's owner: a global identity plus a different repo-local one.
+  it("commits and replays as the configured identity over a person's Git config, leaving it unchanged", () => {
+    // The machine's owner: a global identity, including the role-specific keys
+    // Git reads before user.*, plus a different repo-local one.
     writeFileSync(
       globalConfig,
-      "[user]\n\tname = Human Global\n\temail = human-global@example.invalid\n"
+      [
+        "[user]\n\tname = Human Global\n\temail = human-global@example.invalid\n",
+        "[author]\n\tname = Human Author\n\temail = human-author@example.invalid\n",
+        "[committer]\n\tname = Human Committer\n\temail = human-committer@example.invalid\n",
+      ].join("")
     );
     const repo = join(root, "repo");
     git(root, ["init", "-q", repo]);
@@ -93,65 +98,26 @@ describe("mesh Git identity in a disposable repository (#894, #909)", () => {
     const localConfig = join(repo, ".git", "config");
     const globalBefore = readFileSync(globalConfig);
     const localBefore = readFileSync(localConfig);
+    const head = () => git(repo, ["log", "-1", "--format=%an <%ae>|%cn <%ce>"]);
 
-    const { identity } = resolveMeshGitIdentity(MESH);
-    if (!identity) throw new Error("expected a resolved identity");
-    git(repo, [...meshGitIdentityArgs(identity), "commit", "-q", "--allow-empty", "-m", "mesh"]);
-
-    expect(git(repo, ["log", "-1", "--format=%an <%ae>|%cn <%ce>"])).toBe(
-      "Mesh Bot <mesh-bot@example.invalid>|Mesh Bot <mesh-bot@example.invalid>"
-    );
-    expect(readFileSync(globalConfig).equals(globalBefore)).toBe(true);
-    expect(readFileSync(localConfig).equals(localBefore)).toBe(true);
-
-    // A person's own commit in the same repository still uses their identity.
-    git(repo, ["commit", "-q", "--allow-empty", "-m", "human"]);
-    expect(git(repo, ["log", "-1", "--format=%an <%ae>|%cn <%ce>"])).toBe(
-      "Human Local <human-local@example.invalid>|Human Local <human-local@example.invalid>"
-    );
-  });
-
-  it("keeps a replayed commit's author, and yields to inherited identity variables unless they are cleared", () => {
-    const repo = join(root, "repo");
-    git(root, ["init", "-q", repo]);
     const { identity } = resolveMeshGitIdentity(MESH);
     if (!identity) throw new Error("expected a resolved identity");
     const mesh = meshGitIdentityArgs(identity);
-    const head = () => git(repo, ["log", "-1", "--format=%an <%ae>|%cn <%ce>"]);
-    const person = ["-c", "user.name=Someone", "-c", "user.email=someone@example.invalid"];
+    git(repo, [...mesh, "commit", "-q", "--allow-empty", "-m", "mesh"]);
+    expect(head()).toBe("Mesh Bot <mesh-bot@example.invalid>|Mesh Bot <mesh-bot@example.invalid>");
 
-    git(repo, [...person, "commit", "-q", "--allow-empty", "-m", "base"]);
+    // A person's own commit in the same repository still uses their configuration.
     git(repo, ["checkout", "-q", "-b", "side"]);
-    git(repo, [...person, "commit", "-q", "--allow-empty", "-m", "theirs"]);
+    git(repo, ["commit", "-q", "--allow-empty", "-m", "human"]);
+    const human = "Human Author <human-author@example.invalid>";
+    expect(head()).toBe(`${human}|Human Committer <human-committer@example.invalid>`);
+
+    // A replay keeps that author and records the mesh as committer.
     git(repo, ["checkout", "-q", "-"]);
     git(repo, [...mesh, "cherry-pick", "--allow-empty", "side"]);
-    expect(head()).toBe("Someone <someone@example.invalid>|Mesh Bot <mesh-bot@example.invalid>");
+    expect(head()).toBe(`${human}|Mesh Bot <mesh-bot@example.invalid>`);
 
-    const inherited = {
-      GIT_AUTHOR_NAME: "Inherited",
-      GIT_AUTHOR_EMAIL: "inherited@example.invalid",
-      GIT_COMMITTER_NAME: "Inherited",
-      GIT_COMMITTER_EMAIL: "inherited@example.invalid",
-    };
-    const withInherited = { ...env, ...inherited };
-    execFileSync("git", [...mesh, "commit", "-q", "--allow-empty", "-m", "inherited"], {
-      cwd: repo,
-      env: withInherited,
-    });
-    expect(head()).toBe(
-      "Inherited <inherited@example.invalid>|Inherited <inherited@example.invalid>"
-    );
-
-    // What the guidance prescribes: clear them for the command with `env -u`.
-    const unset = Object.keys(inherited).flatMap((key) => ["-u", key]);
-    execFileSync(
-      "env",
-      [...unset, "git", ...mesh, "commit", "-q", "--allow-empty", "-m", "cleared"],
-      {
-        cwd: repo,
-        env: withInherited,
-      }
-    );
-    expect(head()).toBe("Mesh Bot <mesh-bot@example.invalid>|Mesh Bot <mesh-bot@example.invalid>");
+    expect(readFileSync(globalConfig).equals(globalBefore)).toBe(true);
+    expect(readFileSync(localConfig).equals(localBefore)).toBe(true);
   });
 });
