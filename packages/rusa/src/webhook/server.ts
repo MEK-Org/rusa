@@ -194,6 +194,7 @@ export interface DashboardMeshRefs {
   geminiApiKey?: DashboardDataDeps["geminiApiKey"];
   supportedVoices?: DashboardDataDeps["supportedVoices"];
   chatRoom?: DashboardDataDeps["chatRoom"];
+  roomEntry?: DashboardDataDeps["roomEntry"];
   referenceCache?: DashboardDataDeps["referenceCache"];
   chatClient?: DashboardDataDeps["chatClient"];
   slackClient?: DashboardDataDeps["slackClient"];
@@ -698,6 +699,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           avatarGeneration,
           supportedVoices: options.mesh.supportedVoices,
           chatRoom: options.mesh.chatRoom,
+          roomEntry: options.mesh.roomEntry,
           referenceCache: options.mesh.referenceCache,
           chatClient: options.mesh.chatClient,
           slackClient: options.mesh.slackClient,
