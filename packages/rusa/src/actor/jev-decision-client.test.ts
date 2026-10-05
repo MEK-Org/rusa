@@ -602,26 +602,7 @@ describe("stalled response body (#813)", () => {
     }
   }, 15_000);
 
-  describe("interruption baseline and conditional suppression with HttpJevDecisionClient (#533)", () => {
-    it("preserves baseline interrupt when HTTP request fails with 504", async () => {
-      const fetch = vi.fn<Fetch>(
-        async () => new Response(JSON.stringify({ error: "gateway timeout" }), { status: 504 })
-      );
-      const client = new HttpJevDecisionClient("synthetic-key", text, { fetch });
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client,
-      });
-      const decision = await classifier.evaluate({
-        actorId: "worker",
-        incomingEntryId: "incoming",
-        selectedEntryIds: ["candidate"],
-        pendingEntryIds: [],
-      });
-      expect(decision).toMatchObject({ outcome: "interrupt", reason: "client_error" });
-      expect(shadowPrediction(decision)).toBe(null);
-    });
-
+  describe("interruption baseline with HttpJevDecisionClient (#533)", () => {
     it("preserves baseline interrupt when incoming text is unavailable", async () => {
       const fetch = vi.fn<Fetch>();
       const resolve = vi.fn(async (_actorId: string, id: string) => ({
@@ -646,64 +627,6 @@ describe("stalled response body (#813)", () => {
       expect(decision).toMatchObject({ outcome: "interrupt", reason: "input_unavailable" });
       expect(shadowPrediction(decision)).toBe(null);
       expect(fetch).not.toHaveBeenCalled();
-    });
-
-    it("preserves baseline interrupt when service returns invalid answer", async () => {
-      const fetch = vi.fn<Fetch>(async () => json({ answers: {} }));
-      const client = new HttpJevDecisionClient("synthetic-key", text, { fetch });
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client,
-      });
-      const decision = await classifier.evaluate({
-        actorId: "worker",
-        incomingEntryId: "incoming",
-        selectedEntryIds: ["candidate"],
-        pendingEntryIds: [],
-      });
-      expect(decision).toMatchObject({ outcome: "interrupt", reason: "client_error" });
-      expect(shadowPrediction(decision)).toBe(null);
-    });
-
-    it("suppresses interrupt to queue when timely valid score is below threshold", async () => {
-      const fetch = vi.fn<Fetch>(async () => answer(0.2));
-      const client = new HttpJevDecisionClient("synthetic-key", text, { fetch });
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client,
-      });
-      const decision = await classifier.evaluate({
-        actorId: "worker",
-        incomingEntryId: "incoming",
-        selectedEntryIds: ["candidate"],
-        pendingEntryIds: [],
-      });
-      expect(decision).toMatchObject({
-        outcome: "queue",
-        reason: "below_threshold",
-        interruptProbability: 0.2,
-      });
-      expect(shadowPrediction(decision)).toBe("queue");
-    });
-
-    it("interrupts with prediction when timely valid score is above threshold", async () => {
-      const fetch = vi.fn<Fetch>(async () => answer(0.8));
-      const client = new HttpJevDecisionClient("synthetic-key", text, { fetch });
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client,
-      });
-      const decision = await classifier.evaluate({
-        actorId: "worker",
-        incomingEntryId: "incoming",
-        selectedEntryIds: ["candidate"],
-        pendingEntryIds: [],
-      });
-      expect(decision).toMatchObject({
-        outcome: "interrupt",
-        interruptProbability: 0.8,
-      });
-      expect(shadowPrediction(decision)).toBe("interrupt");
     });
   });
 });

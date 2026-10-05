@@ -162,10 +162,9 @@ interface DecisionBase {
 }
 
 /**
- * Why a decision fell back to the baseline interrupt or conditionally suppressed to queue.
- * These stay distinct on purpose: the feature exists to measure, and
- * "we never asked", "the client broke", "it ran long" and "it answered but
- * not confidently" are different data.
+ * Why a decision kept the baseline interrupt without a usable score. These
+ * stay distinct on purpose: the feature exists to measure, and "we never
+ * asked", "the client broke" and "it ran long" are different data.
  */
 export type ResponsiveInterruptionFallbackReason =
   | "unavailable"
@@ -175,19 +174,23 @@ export type ResponsiveInterruptionFallbackReason =
   | "no_candidates"
   | "invalid_probability";
 
-export type ResponsiveInterruptionReason = ResponsiveInterruptionFallbackReason | "below_threshold";
-
-export type ResponsiveInterruptionQueueReason = ResponsiveInterruptionReason;
-
 export type ResponsiveInterruptionDecision =
   | (DecisionBase & {
       outcome: "interrupt";
-      reason?: ResponsiveInterruptionFallbackReason;
-      interruptProbability?: number;
-      matchedCandidateIds?: readonly string[];
+      /** No usable score arrived, so the baseline interrupt stands. */
+      reason: ResponsiveInterruptionFallbackReason;
+      interruptProbability?: never;
+      matchedCandidateIds?: never;
+    })
+  | (DecisionBase & {
+      outcome: "interrupt";
+      reason?: never;
+      interruptProbability: number;
+      matchedCandidateIds: readonly string[];
     })
   | (DecisionBase & {
       outcome: "queue";
+      /** A timely valid score fell under the threshold: "it answered but not confidently". */
       reason: "below_threshold";
       /** The original Noul probability survives a below-threshold outcome. */
       interruptProbability: number;
