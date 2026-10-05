@@ -209,7 +209,7 @@ describe("SharedQuotaStore parser wording attribution (#536)", () => {
     }
   });
 
-  it("registers each provider's built-in wording once, keyed by its content hash", () => {
+  it("seeds each provider's built-in wording during database open, keyed by content hash", () => {
     const { store } = openStore();
     try {
       const first = store.resolveParserWording("codex");
@@ -221,14 +221,14 @@ describe("SharedQuotaStore parser wording attribution (#536)", () => {
         store.db
           .prepare("SELECT id, provider, wording, source FROM quota_parser_wording_revisions")
           .all()
-      ).toEqual([
-        {
-          id: expectedId,
-          provider: "codex",
-          wording: BUILT_IN_QUOTA_PARSER_WORDING.codex,
+      ).toEqual(
+        (["claude", "codex", "agy", "kimi"] as const).map((provider) => ({
+          id: quotaParserWordingRevisionId(provider, BUILT_IN_QUOTA_PARSER_WORDING[provider]),
+          provider,
+          wording: BUILT_IN_QUOTA_PARSER_WORDING[provider],
           source: "built_in",
-        },
-      ]);
+        }))
+      );
     } finally {
       store.close();
     }

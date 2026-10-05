@@ -596,6 +596,7 @@ export class SharedQuotaStore {
       );
     `);
       this.ensureColumnsInTransaction();
+      this.registerBuiltInParserWordingInTransaction();
       if (currentVersion < QUOTA_SCHEMA_VERSION) {
         this.db.pragma(`user_version = ${QUOTA_SCHEMA_VERSION}`);
       }
@@ -678,9 +679,27 @@ export class SharedQuotaStore {
   }
 
   /**
+   * Built-in wording is immutable for the life of this binary. Seed all four
+   * rows while opening the database, rather than taking a write lock on every
+   * parse merely to repeat an `INSERT OR IGNORE`.
+   */
+  private registerBuiltInParserWordingInTransaction(): void {
+    const registeredAt = new Date().toISOString();
+    const insert = this.db.prepare(
+      `INSERT OR IGNORE INTO quota_parser_wording_revisions
+        (id, provider, wording, source, created_at)
+       VALUES (?, ?, ?, 'built_in', ?)`
+    );
+    for (const provider of Object.keys(BUILT_IN_QUOTA_PARSER_WORDING) as QuotaLlmProvider[]) {
+      const wording = BUILT_IN_QUOTA_PARSER_WORDING[provider];
+      insert.run(quotaParserWordingRevisionId(provider, wording), provider, wording, registeredAt);
+    }
+  }
+
+  /**
    * The parser wording a parse should use, captured before extraction (#536).
-   * Registers the built-in wording as an immutable revision (a no-op once it
-   * exists), then follows the provider's active pointer when one is set.
+   * Built-in revisions are seeded during database open, then this follows the
+   * provider's active pointer when one is set.
    * Nothing writes that pointer yet, so today every parse resolves to the
    * built-in wording; the supervised activation path is a later slice. Any
    * failure reading or writing the control records degrades to the built-in
@@ -690,13 +709,6 @@ export class SharedQuotaStore {
     try {
       const builtIn = BUILT_IN_QUOTA_PARSER_WORDING[provider];
       const builtInId = quotaParserWordingRevisionId(provider, builtIn);
-      this.db
-        .prepare(
-          `INSERT OR IGNORE INTO quota_parser_wording_revisions
-            (id, provider, wording, source, created_at)
-           VALUES (?, ?, ?, 'built_in', ?)`
-        )
-        .run(builtInId, provider, builtIn, new Date().toISOString());
       const active = this.db
         .prepare(
           `SELECT r.id, r.wording

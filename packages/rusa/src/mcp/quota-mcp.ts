@@ -615,7 +615,8 @@ async function parseQuotaWithLlm(
   provider: QuotaLlmProvider,
   generatedAtMs = Date.now(),
   configuredModels: readonly ModelEntry[] = [],
-  providerWording: string = BUILT_IN_QUOTA_PARSER_WORDING[provider]
+  providerWording: string = BUILT_IN_QUOTA_PARSER_WORDING[provider],
+  onRequest?: () => void
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   const client = getGeminiClient(apiKey);
   const isAgy = provider === "agy";
@@ -706,6 +707,10 @@ async function parseQuotaWithLlm(
     modelName: string,
     seen: ExtractionAttemptObservation
   ): Promise<Partial<ProviderQuotaSnapshot>> => {
+    // The caller uses this to distinguish an LLM attempt from a no-key or
+    // capture-failure fallback. Mark it immediately before the request: a
+    // transport failure still attempted this wording and belongs to it.
+    onRequest?.();
     const response = await client.models.generateContent({
       model: modelName,
       contents: `Parse the following CLI/TUI output of a quota check for the provider '${provider}':\n\n${output}`,
@@ -940,7 +945,8 @@ export async function parseClaudeQuota(
   apiKey?: string,
   generatedAtMs = Date.now(),
   configuredModels: readonly ModelEntry[] = [],
-  providerWording: string = BUILT_IN_QUOTA_PARSER_WORDING.claude
+  providerWording: string = BUILT_IN_QUOTA_PARSER_WORDING.claude,
+  onRequest?: () => void
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   // Ratified: parse TUI output with an LLM, not regex — TUIs drift. No-key = fail-closed unknown, never a regex guess.
   if (apiKey) {
@@ -950,7 +956,8 @@ export async function parseClaudeQuota(
       "claude",
       generatedAtMs,
       configuredModels,
-      providerWording
+      providerWording,
+      onRequest
     );
   }
   return {
@@ -1013,7 +1020,8 @@ export async function parseCodexQuota(
   apiKey?: string,
   generatedAtMs = Date.now(),
   configuredModels: readonly ModelEntry[] = [],
-  providerWording: string = BUILT_IN_QUOTA_PARSER_WORDING.codex
+  providerWording: string = BUILT_IN_QUOTA_PARSER_WORDING.codex,
+  onRequest?: () => void
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   // Ratified: parse TUI output with an LLM, not regex — TUIs drift. No-key = fail-closed unknown, never a regex guess.
   if (apiKey) {
@@ -1023,7 +1031,8 @@ export async function parseCodexQuota(
       "codex",
       generatedAtMs,
       configuredModels,
-      providerWording
+      providerWording,
+      onRequest
     );
   }
   return {
@@ -1037,7 +1046,8 @@ export async function parseAgyQuota(
   apiKey?: string,
   generatedAtMs = Date.now(),
   configuredModels: readonly ModelEntry[] = [],
-  providerWording: string = BUILT_IN_QUOTA_PARSER_WORDING.agy
+  providerWording: string = BUILT_IN_QUOTA_PARSER_WORDING.agy,
+  onRequest?: () => void
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   // Ratified: parse TUI output with an LLM, not regex — TUIs drift. No-key = fail-closed unknown, never a regex guess.
   if (apiKey) {
@@ -1047,7 +1057,8 @@ export async function parseAgyQuota(
       "agy",
       generatedAtMs,
       configuredModels,
-      providerWording
+      providerWording,
+      onRequest
     );
   }
   return {
@@ -1061,7 +1072,8 @@ export async function parseKimiQuota(
   apiKey: string,
   generatedAtMs = Date.now(),
   configuredModels: readonly ModelEntry[] = [],
-  providerWording: string = BUILT_IN_QUOTA_PARSER_WORDING.kimi
+  providerWording: string = BUILT_IN_QUOTA_PARSER_WORDING.kimi,
+  onRequest?: () => void
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   // Ratified: parse new TUI output with an LLM, not regex — TUIs drift.
   return parseQuotaWithLlm(
@@ -1070,7 +1082,8 @@ export async function parseKimiQuota(
     "kimi",
     generatedAtMs,
     configuredModels,
-    providerWording
+    providerWording,
+    onRequest
   );
 }
 
@@ -1355,7 +1368,10 @@ export class QuotaService {
     provider: "claude" | "codex" | "agy" | "kimi",
     rawOutput: string,
     scrapedAt: string,
-    parse: (providerWording: string) => Promise<ProviderQuotaSnapshot> | ProviderQuotaSnapshot
+    parse: (
+      providerWording: string,
+      onParserRequest: () => void
+    ) => Promise<ProviderQuotaSnapshot> | ProviderQuotaSnapshot
   ): Promise<ProviderQuotaSnapshot> {
     const prevState = this.cache.get(provider)?.state;
     const id = this.deps.scrapeStore?.recordRaw({
@@ -1368,14 +1384,30 @@ export class QuotaService {
     const wording =
       this.deps.scrapeStore?.resolveParserWording?.(provider) ??
       builtInQuotaParserWording(provider);
+    let parserRequestAttempted = false;
     try {
-      const rawState = await parse(wording.text);
+      const rawState = await parse(wording.text, () => {
+        parserRequestAttempted = true;
+      });
       const inferredState = inferQuotaState(rawState, prevState, scrapedAt);
-      if (id) this.deps.scrapeStore?.recordParsed(id, rawState, inferredState, wording.revisionId);
+      if (id) {
+        this.deps.scrapeStore?.recordParsed(
+          id,
+          rawState,
+          inferredState,
+          parserRequestAttempted ? wording.revisionId : null
+        );
+      }
       if (rawState.status === "unknown") this.failedReads.add(inferredState);
       return inferredState;
     } catch (error) {
-      if (id) this.deps.scrapeStore?.recordParseError(id, error, wording.revisionId);
+      if (id) {
+        this.deps.scrapeStore?.recordParseError(
+          id,
+          error,
+          parserRequestAttempted ? wording.revisionId : null
+        );
+      }
       if (prevState?.limits && prevState.limits.length > 0) {
         const hasUnexpired = prevState.limits.some(
           (l) =>
@@ -1588,35 +1620,41 @@ export class QuotaService {
     // Stamp scrapedAt as soon as the scrape itself completes (ISSUE_NUM, ask 5) —
     // before the LLM parse, which is post-processing, not part of the scrape.
     const scrapedAt = this.scrapedAtNow();
-    return this.parsePersistedScrape("claude", output, scrapedAt, async (providerWording) => {
-      if (result.cancelled) throw new QuotaCaptureError("claude", "/usage", result);
-      const apiKey = this.deps.config.geminiApiKey?.trim();
+    return this.parsePersistedScrape(
+      "claude",
+      output,
+      scrapedAt,
+      async (providerWording, onRequest) => {
+        if (result.cancelled) throw new QuotaCaptureError("claude", "/usage", result);
+        const apiKey = this.deps.config.geminiApiKey?.trim();
 
-      if (!apiKey) {
+        if (!apiKey) {
+          return {
+            provider: "claude",
+            status: "unknown",
+            message: "no geminiApiKey configured for LLM quota parsing",
+            scrapedAt,
+          };
+        }
+        const parsed = await parseClaudeQuota(
+          output,
+          apiKey,
+          Date.parse(scrapedAt),
+          this.configuredModelsFor("claude"),
+          providerWording,
+          onRequest
+        );
         return {
           provider: "claude",
-          status: "unknown",
-          message: "no geminiApiKey configured for LLM quota parsing",
+          status: parsed.status || "unknown",
+          message: parsed.message,
+          limits: parsed.limits,
+          ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
+          raw: output,
           scrapedAt,
         };
       }
-      const parsed = await parseClaudeQuota(
-        output,
-        apiKey,
-        Date.parse(scrapedAt),
-        this.configuredModelsFor("claude"),
-        providerWording
-      );
-      return {
-        provider: "claude",
-        status: parsed.status || "unknown",
-        message: parsed.message,
-        limits: parsed.limits,
-        ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
-        raw: output,
-        scrapedAt,
-      };
-    });
+    );
   }
 
   /**
@@ -1650,33 +1688,39 @@ export class QuotaService {
     // Stamp scrapedAt as soon as the scrape itself completes (ISSUE_NUM, ask 5) —
     // before the LLM parse, which is post-processing, not part of the scrape.
     const scrapedAt = this.scrapedAtNow();
-    return this.parsePersistedScrape("codex", raw, scrapedAt, async (providerWording) => {
-      const apiKey = this.deps.config.geminiApiKey?.trim();
-      if (!apiKey) {
+    return this.parsePersistedScrape(
+      "codex",
+      raw,
+      scrapedAt,
+      async (providerWording, onRequest) => {
+        const apiKey = this.deps.config.geminiApiKey?.trim();
+        if (!apiKey) {
+          return {
+            provider: "codex",
+            status: "unknown",
+            message: "no geminiApiKey configured for LLM quota parsing",
+            scrapedAt,
+          };
+        }
+        const parsed = await parseCodexQuota(
+          raw,
+          apiKey,
+          Date.parse(scrapedAt),
+          this.configuredModelsFor("codex"),
+          providerWording,
+          onRequest
+        );
         return {
           provider: "codex",
-          status: "unknown",
-          message: "no geminiApiKey configured for LLM quota parsing",
+          status: parsed.status ?? "unknown",
+          message: parsed.message,
+          limits: parsed.limits,
+          ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
+          raw,
           scrapedAt,
         };
       }
-      const parsed = await parseCodexQuota(
-        raw,
-        apiKey,
-        Date.parse(scrapedAt),
-        this.configuredModelsFor("codex"),
-        providerWording
-      );
-      return {
-        provider: "codex",
-        status: parsed.status ?? "unknown",
-        message: parsed.message,
-        limits: parsed.limits,
-        ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
-        raw,
-        scrapedAt,
-      };
-    });
+    );
   }
 
   /**
@@ -1702,7 +1746,7 @@ export class QuotaService {
     // Stamp scrapedAt as soon as the scrape itself completes (ISSUE_NUM, ask 5) —
     // before the LLM parse, which is post-processing, not part of the scrape.
     const scrapedAt = this.scrapedAtNow();
-    return this.parsePersistedScrape("agy", raw, scrapedAt, async (providerWording) => {
+    return this.parsePersistedScrape("agy", raw, scrapedAt, async (providerWording, onRequest) => {
       const apiKey = this.deps.config.geminiApiKey?.trim();
       if (apiKey) {
         const parsed = await parseAgyQuota(
@@ -1710,7 +1754,8 @@ export class QuotaService {
           apiKey,
           Date.parse(scrapedAt),
           this.configuredModelsFor("agy"),
-          providerWording
+          providerWording,
+          onRequest
         );
         return {
           provider: "agy",
@@ -1772,13 +1817,14 @@ export class QuotaService {
     }
 
     const scrapedAt = this.scrapedAtNow();
-    return this.parsePersistedScrape("kimi", raw, scrapedAt, async (providerWording) => {
+    return this.parsePersistedScrape("kimi", raw, scrapedAt, async (providerWording, onRequest) => {
       const parsed = await parseKimiQuota(
         raw,
         apiKey,
         Date.parse(scrapedAt),
         this.configuredModelsFor("kimi"),
-        providerWording
+        providerWording,
+        onRequest
       );
       return {
         provider: "kimi",

@@ -2684,13 +2684,21 @@ describe("quota MCP server", () => {
         return service;
       }
 
-      function latestScrape(): { parse_error: string | null; parsed_state: string | null } {
+      function latestScrape(): {
+        parse_error: string | null;
+        parsed_state: string | null;
+        revision: string | null;
+      } {
         return store.db
           .prepare(
-            `SELECT parse_error, parsed_state FROM quota_scrapes
+            `SELECT parse_error, parsed_state, parser_wording_revision_id AS revision FROM quota_scrapes
              WHERE provider = 'claude' ORDER BY scraped_at DESC, rowid DESC LIMIT 1`
           )
-          .get() as { parse_error: string | null; parsed_state: string | null };
+          .get() as {
+          parse_error: string | null;
+          parsed_state: string | null;
+          revision: string | null;
+        };
       }
 
       it("records a timed-out capture of a local silent process as a failed scrape with its cause", async () => {
@@ -2724,6 +2732,9 @@ describe("quota MCP server", () => {
         expect(row.parse_error).toContain("claude /usage capture failed");
         expect(row.parse_error).toContain("exit 143");
         expect(row.parse_error).toContain("cancelled");
+        // A cancelled capture never called the parser, so it must not claim a
+        // wording revision as its provenance.
+        expect(row.revision).toBeNull();
         expect(store.listScrapeOutcomesSince("claude", baselineAt)).toEqual([
           { observedAt: baselineAt, outcome: "parsed" },
           { observedAt: probeAt, outcome: "failed" },
@@ -2877,9 +2888,9 @@ describe("quota MCP server", () => {
         rmSync(root, { recursive: true, force: true });
       });
 
-      function probeClaude(): Promise<unknown> {
+      function probeClaude(geminiApiKey: string | null = "test-gemini-key"): Promise<unknown> {
         return new QuotaService({
-          config: { ...mockConfig, geminiApiKey: "test-gemini-key" } as RusaConfig,
+          config: { ...mockConfig, geminiApiKey: geminiApiKey ?? undefined } as RusaConfig,
           workersDir: root,
           resolveProvider: mockResolveProvider,
           scrapeStore: store,
@@ -2917,7 +2928,7 @@ describe("quota MCP server", () => {
         expect(latestRevision()).toBe(builtInId);
       });
 
-      it("records the revision on a failed parse too", async () => {
+      it("records the revision after an attempted extraction returns unknown", async () => {
         mockGenerateContent.mockRejectedValue(new Error("synthetic extractor outage"));
 
         await probeClaude();
@@ -2928,7 +2939,60 @@ describe("quota MCP server", () => {
              ORDER BY rowid DESC LIMIT 1`
           )
           .get() as { parse_error: string | null; revision: string | null };
+        expect(row.parse_error).toBeNull();
         expect(row.revision).toBe(builtInId);
+      });
+
+      it("leaves the revision null when no parser request is sent", async () => {
+        await probeClaude(null);
+
+        expect(mockGenerateContent).not.toHaveBeenCalled();
+        expect(latestRevision()).toBeNull();
+      });
+
+      it("sends one captured active wording and retains its revision through a pointer change", async () => {
+        const initial = { id: "sha256:synthetic-initial", text: "Synthetic initial wording.\\n" };
+        const replacement = {
+          id: "sha256:synthetic-replacement",
+          text: "Synthetic replacement wording.\\n",
+        };
+        for (const wording of [initial, replacement]) {
+          store.db
+            .prepare(
+              `INSERT INTO quota_parser_wording_revisions (id, provider, wording, source, created_at)
+               VALUES (?, 'claude', ?, 'synthetic', '2030-01-01')`
+            )
+            .run(wording.id, wording.text);
+        }
+        store.db
+          .prepare(
+            `INSERT INTO quota_parser_wording_pointers (provider, active_revision_id, updated_at)
+             VALUES ('claude', ?, '2030-01-01')`
+          )
+          .run(initial.id);
+        mockGenerateContent.mockImplementationOnce((request) => {
+          expect(
+            (request as { config: { systemInstruction: string } }).config.systemInstruction
+          ).toContain(initial.text);
+          store.db
+            .prepare(
+              `UPDATE quota_parser_wording_pointers
+               SET active_revision_id = ?, updated_at = '2030-01-02'
+               WHERE provider = 'claude'`
+            )
+            .run(replacement.id);
+          return Promise.resolve({
+            text: () => JSON.stringify({ status: "unknown", windows: [] }),
+          });
+        });
+
+        await probeClaude();
+
+        expect(latestRevision()).toBe(initial.id);
+        expect(store.resolveParserWording("claude")).toEqual({
+          revisionId: replacement.id,
+          text: replacement.text,
+        });
       });
 
       it("keeps parsing with the built-in wording when the control records are unreadable", async () => {
