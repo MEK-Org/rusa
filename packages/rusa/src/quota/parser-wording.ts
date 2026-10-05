@@ -75,14 +75,13 @@ export function quotaParserWordingRevisionId(provider: QuotaLlmProvider, wording
     .digest("hex")}`;
 }
 
-/** The wording one parse uses, captured before extraction begins. */
+/** The immutable revision to attribute to an attempted built-in parse. */
 export interface QuotaParserWording {
-  /** Null when the wording is the built-in text and no revision record could be read or written. */
+  /** Null when the built-in revision record could not be read or written. */
   revisionId: string | null;
-  text: string;
 }
 
-/** The in-code wording with no revision record: the fallback whenever control records fail. */
-export function builtInQuotaParserWording(provider: QuotaLlmProvider): QuotaParserWording {
-  return { revisionId: null, text: BUILT_IN_QUOTA_PARSER_WORDING[provider] };
+/** The in-code wording has no revision record when its control records fail. */
+export function unattributedBuiltInParserWording(): QuotaParserWording {
+  return { revisionId: null };
 }

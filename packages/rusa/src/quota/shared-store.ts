@@ -23,9 +23,9 @@ import type { PublishedScrapeOutcome } from "./coordinator-protocol.js";
 import { parseParsedState, serializeParsedState } from "./parsed-state.js";
 import {
   BUILT_IN_QUOTA_PARSER_WORDING,
-  builtInQuotaParserWording,
   type QuotaParserWording,
   quotaParserWordingRevisionId,
+  unattributedBuiltInParserWording,
 } from "./parser-wording.js";
 import { QUOTA_OBSERVATION_SLOT_MS, quotaCycleChanged } from "./quota-cycle.js";
 import {
@@ -718,13 +718,13 @@ export class SharedQuotaStore {
         )
         .get(builtInId, provider, builtIn) as { id: string } | undefined;
       if (!registered) throw new Error("built-in parser wording revision is unavailable");
-      return { revisionId: builtInId, text: builtIn };
+      return { revisionId: builtInId };
     } catch (error) {
       (this.logger ?? quotaStoreLogger()).warn("parser_wording_records_unreadable", {
         provider,
         error: error instanceof Error ? error.message : String(error),
       });
-      return builtInQuotaParserWording(provider);
+      return unattributedBuiltInParserWording();
     }
   }
 

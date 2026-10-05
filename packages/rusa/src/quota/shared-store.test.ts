@@ -215,7 +215,7 @@ describe("SharedQuotaStore parser wording attribution (#536)", () => {
       const first = store.resolveParserWording("codex");
       const again = store.resolveParserWording("codex");
       const expectedId = quotaParserWordingRevisionId("codex", BUILT_IN_QUOTA_PARSER_WORDING.codex);
-      expect(first).toEqual({ revisionId: expectedId, text: BUILT_IN_QUOTA_PARSER_WORDING.codex });
+      expect(first).toEqual({ revisionId: expectedId });
       expect(again).toEqual(first);
       expect(store.db.prepare("SELECT * FROM quota_parser_wording_revisions").all()).toEqual(
         (["claude", "codex", "agy", "kimi"] as const).map((provider) => ({
@@ -247,7 +247,6 @@ describe("SharedQuotaStore parser wording attribution (#536)", () => {
       });
       expect(store.resolveParserWording("claude")).toEqual({
         revisionId: null,
-        text: BUILT_IN_QUOTA_PARSER_WORDING.claude,
       });
       const scrape = store.recordRaw({
         provider: "claude",
