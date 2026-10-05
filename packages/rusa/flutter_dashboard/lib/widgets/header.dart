@@ -1122,7 +1122,14 @@ String haltTooltipText(HaltStatusDto? halt, {DateTime? now}) {
   } else {
     expiry = 'Expiry passed ${_haltExpiryFormat(until, local)}.';
   }
-  return _haltDescription(halt, expiry);
+  // A stale snapshot can still carry a halt after its locally observed
+  // expiry. Describe its effects as reported and conditional in that case,
+  // rather than implying that they remain in force.
+  return _haltDescription(
+    halt,
+    expiry,
+    reported: until != null && !until.isAfter(local),
+  );
 }
 
 /// The accessible label uses a clock-stable expiry fact. A screen reader may

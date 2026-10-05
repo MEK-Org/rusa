@@ -111,6 +111,14 @@ void main() {
         ),
         now: now,
       );
+      expect(
+        text,
+        startsWith(
+          'Reported halt scope: all providers.\n'
+          'While this reported halt is in force, no new runs start.\n'
+          'A reported halt does not interrupt runs already in flight.',
+        ),
+      );
       expect(text, endsWith('Expiry passed today 11:30 AM.'));
       expect(text, isNot(contains('Expires')));
     });
