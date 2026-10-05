@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { brotliCompress, gzip, constants as zlibConstants } from "node:zlib";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
+import type { HaltState } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { inboxEntryObligationRefs } from "../actor/inbox-focus.js";
 import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
@@ -103,6 +104,15 @@ export interface DashboardDataDeps {
    * when absent (e.g. a UI-only server) the response reports `halted: false`.
    */
   isHalted?: () => boolean;
+  /**
+   * Read-only structured view of the active halt — global versus the held
+   * provider(s)/model(s), plus the requested expiry — from the same
+   * authoritative sentinel as `isHalted`. Surfaced as the top-level `halt`
+   * field on `/api/mesh/threads` so the header chip can explain its scope;
+   * `null` (or absent, for a UI-only server) means no active halt, never an
+   * expired one: the sentinel layer already retires `until` past its time.
+   */
+  haltSnapshot?: () => HaltState | null;
   /**
    * Read-only snapshot of both host-scheduler preflights: crontab/crond and
    * `at`/`atrm`/`atd`/`atq`. Surfaced as the top-level `schedulerWarning`
@@ -407,6 +417,29 @@ function operatorHandledNote(reason: string): string {
   return reason
     ? `Cleared from the dashboard by the operator: ${reason}`
     : "Cleared from the dashboard by the operator; no reason given.";
+}
+
+/**
+ * The smallest projection of the authoritative halt sentinel the header chip
+ * needs to explain itself: whether the hold is global or names provider(s)
+ * and/or model(s), and the requested expiry when one was set. The sentinel
+ * layer already retires expired `until`s, so a returned `until` is always in
+ * the future and its absence means indefinite. Reason text stays server-side:
+ * the chip explains scope and effect, not the operator's note.
+ */
+function haltSnapshotJson(state: HaltState | null | undefined): {
+  scope: "global" | "providers" | "models";
+  providers?: string[];
+  models?: string[];
+  until?: string;
+} | null {
+  if (!state) return null;
+  return {
+    scope: state.models?.length ? "models" : state.providers?.length ? "providers" : "global",
+    ...(state.providers?.length ? { providers: state.providers } : {}),
+    ...(state.models?.length ? { models: state.models } : {}),
+    ...(state.until ? { until: state.until } : {}),
+  };
 }
 
 /**
@@ -2080,6 +2113,7 @@ export async function handleMeshApiRequest(
     const userPrincipalId = viewingUserPrincipalId(req, deps.principals);
     sendJson(res, 200, {
       halted: deps.isHalted?.() ?? false,
+      halt: haltSnapshotJson(deps.haltSnapshot?.()),
       schedulerWarning: schedulerHealth && !schedulerHealth.ok ? schedulerHealth.issues : null,
       runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
       threads,
