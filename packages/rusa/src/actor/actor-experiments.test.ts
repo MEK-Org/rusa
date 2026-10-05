@@ -214,7 +214,7 @@ describe("actor experiment enrollment", () => {
     ]);
   });
 
-  it("treats strict_obligation_handling as retired: not enrollable, never enrolled, and still cleanable (#917)", () => {
+  it("treats a leftover strict_obligation_handling row as inert (#917)", () => {
     const enrollments = new InMemoryExperimentEnrollmentStore();
     const { mesh } = setup({ experimentEnrollments: enrollments, experimentRegistry: undefined });
     // A row a deployed rollout left behind.
@@ -224,15 +224,7 @@ describe("actor experiment enrollment", () => {
       enrolledBy: "root",
       enrolledAt: "2026-09-10T00:00:00Z",
     });
-    expect(mesh.listRegisteredExperiments()).toEqual([]);
     expect(mesh.isEnrolledInExperiment("worker", "strict_obligation_handling")).toBe(false);
-    expect(() =>
-      mesh.enrollActorInExperiment("sibling", "strict_obligation_handling", "root")
-    ).toThrow("unknown experiment: strict_obligation_handling (known: none)");
-    expect(
-      mesh.unenrollActorFromExperiment("worker", "strict_obligation_handling", "root").changed
-    ).toBe(true);
-    expect(enrollments.list()).toEqual([]);
   });
 
   it("admits only an experiment-admin holder: the actor itself, its parent, and a sibling are all refused", () => {

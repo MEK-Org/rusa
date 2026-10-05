@@ -12239,20 +12239,6 @@ describe("strict obligation handling (#382, #917)", () => {
     ]);
   });
 
-  it("holds root to strict closure with no enrollment and no exemption (#917)", () => {
-    const { mesh } = strictMesh();
-    repo.create({ id: "root-head", title: "Root head", ownerId: "root" });
-
-    selectHead(mesh, "root", "root-head");
-
-    expect(mesh.runDisciplineNotice("root")).toContain("root-head");
-    expect(rejection(mesh, "root")).toMatch(
-      /selected head obligation root-head \("Root head"\) was not finished or decomposed/
-    );
-    repo.setTerminalStatus("root-head", "done", null, null, "root");
-    expect(rejection(mesh, "root")).toBe("");
-  });
-
   it("arms strict handling from the focused obligation status at selection", () => {
     const { mesh } = strictMesh();
 
@@ -12847,6 +12833,7 @@ describe("strict obligation handling (#382, #917)", () => {
     // same closure as any worker — no enrollment, no exemption (#917).
     repo.create({ id: "from-root", title: "Delegated by root", ownerId: "root" });
     selectHead(mesh, rootId, "from-root");
+    expect(mesh.runDisciplineNotice(rootId)).toContain("from-root");
     expect(rejection(mesh, rootId)).toMatch(/selected head obligation from-root/);
     repo.setCheckpoint("from-root", "Standing recorded; worker should take it.", rootId);
     repo.reassign("from-root", source, "root");
