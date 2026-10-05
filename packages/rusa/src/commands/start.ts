@@ -33,7 +33,11 @@ import {
   seedConfiguredActorGrants,
 } from "../actor/administrative-capabilities.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
-import { AvailabilityHolds } from "../actor/availability-holds.js";
+import {
+  AvailabilityHolds,
+  describeHold,
+  importScopedHaltFile,
+} from "../actor/availability-holds.js";
 import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import {
@@ -73,6 +77,9 @@ import {
   HaltSwitch,
   normalizeProvider,
   parseHaltCommand,
+  parseResumeCommand,
+  RESUME_SYNTAX_HELP,
+  type ResumeCommand,
 } from "../actor/halt-switch.js";
 import {
   DEFAULT_ROOT_CHARTER,
@@ -166,6 +173,7 @@ import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
 import { importLegacyPortableContextState } from "../db/legacy-portable-context-import.js";
+import type { AvailabilityHold } from "../db/repositories/availability-hold-repository.js";
 import type {
   ObligationStatusChange,
   PrerequisiteAttention,
@@ -1645,6 +1653,18 @@ async function composeStart(
   // Emergency brake: the single source of truth is the sentinel file. Halt by
   // hand (`touch ~/.rusa/HALT`), by chat (`/halt`), or pull the plug.
   const haltSwitch = new HaltSwitch(join(mcHome, "HALT"));
+  // A provider-scoped sentinel from before #539 becomes durable holds once,
+  // leaving the file for the global brake alone.
+  const importedHolds = importScopedHaltFile({
+    file: join(mcHome, "HALT"),
+    repo: getRepositories().availabilityHolds,
+    recordEvent: meshEvents,
+  });
+  if (importedHolds.length > 0) {
+    console.warn(
+      `[mesh] ⏸ imported scoped HALT file as ${importedHolds.length} availability hold(s); file removed`
+    );
+  }
   // Availability holds (#539) take a provider lane, or some of its models, out
   // of selection without editing any pool. They are durable in mesh.db and
   // compose with the brake: a candidate is blocked when either covers it.
@@ -4290,6 +4310,14 @@ async function composeStart(
     // triggers is the space's wake mode (#692): `all` or `mentions` as its owner
     // set it, else every message in a DM/two-person space and mentions elsewhere.
     // The mode is read per message, so a change governs the next arrival.
+    const holdLines = (holds: readonly AvailabilityHold[]) =>
+      holds.map((hold) => `• ${describeHold(hold)}`).join("\n");
+    const activeHoldsNote = () => {
+      const holds = availabilityHolds.list();
+      return holds.length
+        ? `\nAvailability holds in force:\n${holdLines(holds)}`
+        : "\nNo availability holds are in force.";
+    };
     const onChat = async (msg: ChatMessage): Promise<void> => {
       if (config.chat?.excludedSpaces?.includes(msg.spaceName)) {
         return;
@@ -4300,8 +4328,9 @@ async function composeStart(
       if (!trigger) return;
       // Mechanical emergency brake — matched here at the ingestion edge, with NO
       // LLM in the loop, so it works even when every actor is wedged (the exact
-      // situation you'd want it in). It toggles the same HALT sentinel file you
-      // can touch by hand; the reply is a direct send, not a root run.
+      // situation you'd want it in). Bare `/halt` toggles the same HALT sentinel
+      // file you can touch by hand, scoped forms set durable availability holds
+      // (#539); the reply is a direct send, not a root run.
       const cmd = msg.text?.trim() ?? "";
       let haltCommand: HaltCommand | null;
       try {
@@ -4336,12 +4365,11 @@ async function composeStart(
           return;
         }
         // A `model:` scope the provider's catalog does not list is a hold no
-        // run can ever meet, and taking the single halt sentinel for it is
-        // #630: the corrected halt is then refused until the inert one is
-        // resumed. Refuse instead, and offer back what to retype. This sits
-        // above `haltSwitch.halt` deliberately — below it, the sentinel, the
-        // queued-run flush, and the expiry timer would all have happened for a
-        // command being declined.
+        // run can ever meet, and acknowledging it is #630: the operator
+        // believes a model is held when nothing is. Refuse instead, and offer
+        // back what to retype. This sits above the hold write deliberately —
+        // below it, the hold, the queued-run flush, and the expiry timer would
+        // all have happened for a command being declined.
         //
         // The catalog, not the live pools: Rusa restores provider catalogs from
         // durable `model_scrapes` at startup, so an idle provider still knows
@@ -4405,49 +4433,143 @@ async function composeStart(
             .catch(() => {});
           return;
         }
-        if (!haltSwitch.halt(`chat /halt from ${who}`, haltCommand)) {
+        const until = haltCommand.until ? ` until ${haltCommand.until}` : "";
+        if (providers.length === 0) {
+          // Bare `/halt` is the global emergency brake, still the HALT file.
+          // Its reply names the holds too, so the operator sees everything
+          // that is keeping work from starting.
+          if (!haltSwitch.halt(`chat /halt from ${who}`, haltCommand)) {
+            const current = haltSwitch.state()?.until;
+            void cc
+              .send(
+                msg.spaceName,
+                `⛔ The global halt is already in place${current ? ` until ${current}` : ""}. Send /resume to release it.${activeHoldsNote()}`
+              )
+              .catch(() => {});
+            return;
+          }
+          const cancelled = mesh.cancelHaltedQueuedRuns();
+          scheduleHaltExpiry(haltCommand.until);
+          console.warn(`[mesh] ⛔ HALT engaged via chat by ${who}`);
+          const flushed = cancelled.length ? ` Cleared ${cancelled.length} queued run(s).` : "";
           void cc
             .send(
               msg.spaceName,
-              "⛔ Cannot halt while a current halt is already in place. Send /resume, then issue a new halt with every provider you wish to halt."
+              `⛔ Halted all actor runs${until}.${flushed} Send /resume to continue.${activeHoldsNote()}`
+            )
+            .catch(() => {});
+          return;
+        }
+        // A scoped `/halt` is a durable availability hold (#539). Holds on
+        // different scopes coexist, and the same scope again replaces its
+        // expiry and reason, so no `/resume` is needed before re-scoping.
+        try {
+          for (const provider of providers) {
+            availabilityHolds.set(
+              {
+                provider,
+                ...(models.length ? { models } : {}),
+                ...(haltCommand.until ? { expiry: haltCommand.until } : {}),
+                reason: `chat /halt from ${who}`,
+                createdBy: `chat:${msg.senderName}`,
+              },
+              { silent: true }
+            );
+          }
+        } catch (err) {
+          void cc
+            .send(
+              msg.spaceName,
+              `⛔ Halt command rejected: ${err instanceof Error ? err.message : String(err)}.`
             )
             .catch(() => {});
           return;
         }
         const cancelled = mesh.cancelHaltedQueuedRuns();
-        scheduleHaltExpiry(haltCommand.until);
-        console.warn(`[mesh] ⛔ HALT engaged via chat by ${who}`);
-        const parts: string[] = [];
-        if (haltCommand.providers?.length) {
-          parts.push(
-            `provider${haltCommand.providers.length === 1 ? "" : "s"} ${haltCommand.providers.join(", ")}`
-          );
+        console.warn(`[mesh] ⏸ availability hold set via chat by ${who}`);
+        const parts = [`provider${providers.length === 1 ? "" : "s"} ${providers.join(", ")}`];
+        if (models.length) {
+          parts.push(`model${models.length === 1 ? "" : "s"} ${models.join(", ")}`);
         }
-        if (haltCommand.models?.length) {
-          parts.push(
-            `model${haltCommand.models.length === 1 ? "" : "s"} ${haltCommand.models.join(", ")}`
-          );
-        }
-        const scope = parts.length ? parts.join(" and ") : "all actor runs";
-        const expiry = haltCommand.until ? ` until ${haltCommand.until}` : "";
         const flushed = cancelled.length ? ` Cleared ${cancelled.length} queued run(s).` : "";
-        void cc
-          .send(msg.spaceName, `⛔ Halted ${scope}${expiry}.${flushed} Send /resume to continue.`)
-          .catch(() => {});
-        return;
-      }
-      if (/^\/(?:resume|continue)$/i.test(cmd)) {
-        haltSwitch.resume();
-        if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
-        haltExpiryTimer = null;
-        const resumed = resumeAfterHalt();
-        console.warn(`[mesh] ▶ HALT cleared via chat by ${who}`);
+        const global = haltSwitch.hasActiveHalt() ? " The global halt is also in place." : "";
         void cc
           .send(
             msg.spaceName,
-            `▶ Resumed${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : " — actors will run on the next trigger"}.`
+            `⛔ Halted ${parts.join(" and ")}${until}.${flushed} Send /resume provider:${providers.join(",")} to release it.${global}`
           )
           .catch(() => {});
+        return;
+      }
+      let resumeCommand: ResumeCommand | null;
+      try {
+        resumeCommand = parseResumeCommand(cmd);
+      } catch (err) {
+        void cc
+          .send(
+            msg.spaceName,
+            `▶ Resume command rejected: ${err instanceof Error ? err.message : String(err)}.` +
+              ` ${RESUME_SYNTAX_HELP}`
+          )
+          .catch(() => {});
+        return;
+      }
+      if (resumeCommand) {
+        const scopedProviders = resumeCommand.providers ?? [];
+        if (scopedProviders.length > 0) {
+          // A scoped `/resume` releases only matching holds; the global
+          // brake is not a provider's to release.
+          const released = scopedProviders.flatMap((provider) =>
+            availabilityHolds.clear(
+              {
+                provider,
+                ...(resumeCommand.models?.length ? { models: resumeCommand.models } : {}),
+              },
+              { silent: true }
+            )
+          );
+          const resumed = released.length ? resumeAfterHalt() : [];
+          const active = released.filter((hold) => availabilityHolds.isActive(hold));
+          const remaining = availabilityHolds
+            .list()
+            .filter((hold) => scopedProviders.includes(hold.provider));
+          const named = `provider:${scopedProviders.join(",")}${resumeCommand.models?.length ? ` model:${resumeCommand.models.join(",")}` : ""}`;
+          const lines = [
+            active.length
+              ? `▶ Released availability holds${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : ""}:\n${holdLines(active)}`
+              : `▶ No availability hold in force matched ${named}; nothing was released.`,
+          ];
+          const expired = released.length - active.length;
+          if (expired > 0) lines.push(`Also removed ${expired} expired hold record(s).`);
+          if (remaining.length) lines.push(`Still held:\n${holdLines(remaining)}`);
+          if (haltSwitch.hasActiveHalt()) {
+            lines.push("The global halt is still in place; bare /resume releases it.");
+          }
+          console.warn(`[mesh] ▶ availability holds cleared via chat by ${who} (${named})`);
+          void cc.send(msg.spaceName, lines.join("\n")).catch(() => {});
+          return;
+        }
+        // Bare `/resume` releases everything: the global brake and every
+        // hold. Each released hold is named, so an indefinite hold never
+        // disappears silently behind an emergency-brake release.
+        const wasHalted = haltSwitch.hasActiveHalt();
+        haltSwitch.resume();
+        if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
+        haltExpiryTimer = null;
+        const released = availabilityHolds.clearAll({ silent: true });
+        const resumed = resumeAfterHalt();
+        const active = released.filter((hold) => availabilityHolds.isActive(hold));
+        const expired = released.length - active.length;
+        const lines = [
+          `▶ Resumed${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : " — actors will run on the next trigger"}.`,
+          wasHalted ? "Global halt released." : "No global halt was in place.",
+          active.length
+            ? `Released availability holds:\n${holdLines(active)}`
+            : "No availability holds were in force.",
+        ];
+        if (expired > 0) lines.push(`Also removed ${expired} expired hold record(s).`);
+        console.warn(`[mesh] ▶ HALT and availability holds cleared via chat by ${who}`);
+        void cc.send(msg.spaceName, lines.join("\n")).catch(() => {});
         return;
       }
       await mesh.deliverExternalEvent({

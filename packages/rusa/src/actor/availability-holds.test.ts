@@ -1,3 +1,6 @@
+import { existsSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
@@ -5,7 +8,13 @@ import {
   type AvailabilityHold,
   AvailabilityHoldRepository,
 } from "../db/repositories/availability-hold-repository.js";
-import { AvailabilityHolds } from "./availability-holds.js";
+import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
+import {
+  AvailabilityHolds,
+  describeHold,
+  HALT_FILE_IMPORT_CREATOR,
+  importScopedHaltFile,
+} from "./availability-holds.js";
 
 const START = Date.parse("2026-10-05T12:00:00.000Z");
 const HOUR = 60 * 60 * 1000;
@@ -164,5 +173,143 @@ describe("AvailabilityHolds", () => {
     expect(holds.isHeld("kimi", "kimi-k2")).toBe(true);
     vi.advanceTimersByTime(far - Date.now());
     expect(released).toHaveLength(1);
+  });
+});
+
+describe("AvailabilityHolds silent changes", () => {
+  it("skips the callbacks for a caller that cancels and replays runs itself", () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const calls: string[] = [];
+    const holds = new AvailabilityHolds({
+      repo: new AvailabilityHoldRepository(db),
+      onHeld: () => calls.push("held"),
+      onReleased: () => calls.push("released"),
+    });
+    holds.set({ provider: "kimi", createdBy: "root" }, { silent: true });
+    holds.set({ provider: "codex", createdBy: "root" }, { silent: true });
+    expect(holds.clear({ provider: "kimi" }, { silent: true })).toHaveLength(1);
+    expect(holds.clearAll({ silent: true })).toHaveLength(1);
+    expect(calls).toEqual([]);
+    holds.stop();
+  });
+});
+
+describe("describeHold", () => {
+  it("names provider, model scope, expiry and reason", () => {
+    const base = { reason: "", createdBy: "root", createdAt: "2026-10-05T12:00:00.000Z" };
+    expect(describeHold({ ...base, provider: "kimi" })).toBe("kimi (all models), until cleared");
+    expect(
+      describeHold({
+        ...base,
+        provider: "codex",
+        model: "gpt-5.5",
+        expiry: "2026-10-05T13:00:00.000Z",
+        reason: "capacity",
+      })
+    ).toBe("codex model gpt-5.5, until 2026-10-05T13:00:00.000Z — capacity");
+  });
+});
+
+describe("importScopedHaltFile", () => {
+  let dir: string;
+  let file: string;
+  let db: Database.Database;
+  let repo: AvailabilityHoldRepository;
+  let events: MeshEventRepository;
+  const now = () => START;
+  const mtime = new Date("2026-10-05T11:00:00.000Z");
+  const importFile = () =>
+    importScopedHaltFile({ file, repo, recordEvent: (event) => events.record(event), now });
+  const writeHalt = (state: unknown) => {
+    writeFileSync(file, typeof state === "string" ? state : `${JSON.stringify(state)}\n`);
+    utimesSync(file, mtime, mtime);
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "halt-import-"));
+    file = join(dir, "HALT");
+    db = new Database(":memory:");
+    runMigrations(db);
+    repo = new AvailabilityHoldRepository(db);
+    events = new MeshEventRepository(db);
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("moves a provider-scoped sentinel into holds, records one event and removes the file", () => {
+    const until = new Date(START + HOUR).toISOString();
+    writeHalt({
+      reason: "chat /halt from Operator",
+      providers: ["claude", "codex"],
+      models: ["m1"],
+      until,
+    });
+
+    const imported = importFile();
+
+    const expected = (provider: string) => ({
+      provider,
+      model: "m1",
+      expiry: until,
+      reason: "chat /halt from Operator",
+      createdBy: HALT_FILE_IMPORT_CREATOR,
+      createdAt: mtime.toISOString(),
+    });
+    expect(imported).toEqual([expected("claude"), expected("codex")]);
+    expect(repo.list()).toEqual([expected("claude"), expected("codex")]);
+    expect(existsSync(file)).toBe(false);
+    const recorded = events.list().filter((event) => event.kind === "availability_hold_imported");
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]?.detail).toBe(
+      `HALT file imported as hold on claude/m1, codex/m1 until ${until}`
+    );
+    expect(JSON.parse(recorded[0]?.payload ?? "{}")).toEqual({
+      reason: "chat /halt from Operator",
+      until,
+      holds: [
+        { provider: "claude", model: "m1", expiry: until },
+        { provider: "codex", model: "m1", expiry: until },
+      ],
+    });
+  });
+
+  it("replays to the same holds and a single event after a crash before the file was removed", () => {
+    writeHalt({ providers: ["kimi"] });
+    // The crash: holds and event are stored, the file is still there.
+    importScopedHaltFile({ file, repo, recordEvent: (event) => events.record(event), now });
+    writeHalt({ providers: ["kimi"] });
+    const first = repo.list();
+
+    importFile();
+
+    expect(repo.list()).toEqual(first);
+    expect(first).toEqual([
+      expect.objectContaining({ provider: "kimi", createdAt: mtime.toISOString() }),
+    ]);
+    expect(
+      events.list().filter((event) => event.kind === "availability_hold_imported")
+    ).toHaveLength(1);
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it("leaves the global brake, an expired sentinel and a models-only sentinel alone", () => {
+    for (const state of [
+      "",
+      "plain reason",
+      { reason: "global" },
+      { providers: ["kimi"], until: new Date(START - HOUR).toISOString() },
+      { models: ["m1"] },
+    ]) {
+      writeHalt(state);
+      expect(importFile()).toEqual([]);
+      expect(existsSync(file)).toBe(true);
+    }
+    expect(repo.list()).toEqual([]);
+    expect(events.list()).toEqual([]);
+  });
+
+  it("does nothing without a sentinel", () => {
+    expect(importFile()).toEqual([]);
+    expect(repo.list()).toEqual([]);
   });
 });
