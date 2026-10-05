@@ -90,10 +90,16 @@ ${shared}`;
 Commits you make in your mesh workspace — the clones and worktrees the mesh
 owns — are authored as the mesh: **${identity.name}
 <${identity.email}>**, the \`gitIdentity\` in rusa's config.yaml. Pass it on
-each Git command that creates commits (commit, merge, rebase, cherry-pick, revert,
-am); \`-c\` sets both author and committer for that one command:
+each Git command that creates commits (commit, merge, revert, and the replays
+rebase, cherry-pick and am), for that one command only:
 
     ${command} …
+
+On a new commit, \`-c\` sets both author and committer. A replay keeps each
+commit's original author and records the mesh as committer. Git lets
+\`GIT_AUTHOR_NAME\`, \`GIT_AUTHOR_EMAIL\`, \`GIT_COMMITTER_NAME\` and
+\`GIT_COMMITTER_EMAIL\` in the environment override \`-c\`, so if any of them is
+set, clear it for that command with \`env -u\`.
 
 In a checkout that belongs to a person rather than to the mesh, leave the
 commit's identity to that repository's own configuration instead of imposing

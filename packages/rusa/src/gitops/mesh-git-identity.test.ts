@@ -7,6 +7,8 @@ import { gitIdentityGuidance } from "../actor/worker-prompt.js";
 import { meshGitIdentityArgs, resolveMeshGitIdentity } from "./mesh-git-identity.js";
 
 const MESH = { name: "Mesh Bot", email: "mesh-bot@example.invalid" };
+const UNCARRIABLE =
+  "config.yaml gitIdentity contains <, >, a line break or a NUL byte, which a Git command cannot carry intact";
 
 describe("resolveMeshGitIdentity (#909)", () => {
   it("resolves a complete configured pair, trimmed", () => {
@@ -25,18 +27,9 @@ describe("resolveMeshGitIdentity (#909)", () => {
     [{ name: "Mesh Bot" }, "config.yaml gitIdentity lacks email"],
     [{ email: "mesh-bot@example.invalid" }, "config.yaml gitIdentity lacks name"],
     [{ name: 7, email: "mesh-bot@example.invalid" }, "config.yaml gitIdentity lacks name"],
-    [
-      { name: "Mesh <Bot>", email: "mesh-bot@example.invalid" },
-      "config.yaml gitIdentity contains <, > or a line break, which Git cannot record",
-    ],
-    [
-      { name: "Mesh\nBot", email: "mesh-bot@example.invalid" },
-      "config.yaml gitIdentity contains <, > or a line break, which Git cannot record",
-    ],
-    [
-      { name: "Mesh Bot", email: "mesh-bot" },
-      "config.yaml gitIdentity.email is not an email address",
-    ],
+    [{ name: "Mesh <Bot>", email: "mesh-bot@example.invalid" }, UNCARRIABLE],
+    [{ name: "Mesh\nBot", email: "mesh-bot@example.invalid" }, UNCARRIABLE],
+    [{ name: "Mesh\u0000Bot", email: "mesh-bot@example.invalid" }, UNCARRIABLE],
   ])("reports a gap for %j", (configured, gap) => {
     expect(resolveMeshGitIdentity(configured)).toEqual({ identity: null, gap });
   });
@@ -116,5 +109,49 @@ describe("mesh Git identity in a disposable repository (#894, #909)", () => {
     expect(git(repo, ["log", "-1", "--format=%an <%ae>|%cn <%ce>"])).toBe(
       "Human Local <human-local@example.invalid>|Human Local <human-local@example.invalid>"
     );
+  });
+
+  it("keeps a replayed commit's author, and yields to inherited identity variables unless they are cleared", () => {
+    const repo = join(root, "repo");
+    git(root, ["init", "-q", repo]);
+    const { identity } = resolveMeshGitIdentity(MESH);
+    if (!identity) throw new Error("expected a resolved identity");
+    const mesh = meshGitIdentityArgs(identity);
+    const head = () => git(repo, ["log", "-1", "--format=%an <%ae>|%cn <%ce>"]);
+    const person = ["-c", "user.name=Someone", "-c", "user.email=someone@example.invalid"];
+
+    git(repo, [...person, "commit", "-q", "--allow-empty", "-m", "base"]);
+    git(repo, ["checkout", "-q", "-b", "side"]);
+    git(repo, [...person, "commit", "-q", "--allow-empty", "-m", "theirs"]);
+    git(repo, ["checkout", "-q", "-"]);
+    git(repo, [...mesh, "cherry-pick", "--allow-empty", "side"]);
+    expect(head()).toBe("Someone <someone@example.invalid>|Mesh Bot <mesh-bot@example.invalid>");
+
+    const inherited = {
+      GIT_AUTHOR_NAME: "Inherited",
+      GIT_AUTHOR_EMAIL: "inherited@example.invalid",
+      GIT_COMMITTER_NAME: "Inherited",
+      GIT_COMMITTER_EMAIL: "inherited@example.invalid",
+    };
+    const withInherited = { ...env, ...inherited };
+    execFileSync("git", [...mesh, "commit", "-q", "--allow-empty", "-m", "inherited"], {
+      cwd: repo,
+      env: withInherited,
+    });
+    expect(head()).toBe(
+      "Inherited <inherited@example.invalid>|Inherited <inherited@example.invalid>"
+    );
+
+    // What the guidance prescribes: clear them for the command with `env -u`.
+    const unset = Object.keys(inherited).flatMap((key) => ["-u", key]);
+    execFileSync(
+      "env",
+      [...unset, "git", ...mesh, "commit", "-q", "--allow-empty", "-m", "cleared"],
+      {
+        cwd: repo,
+        env: withInherited,
+      }
+    );
+    expect(head()).toBe("Mesh Bot <mesh-bot@example.invalid>|Mesh Bot <mesh-bot@example.invalid>");
   });
 });

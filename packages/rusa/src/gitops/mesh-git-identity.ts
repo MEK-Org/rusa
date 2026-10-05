@@ -18,9 +18,11 @@ export type MeshGitIdentityResolution =
   | { identity: MeshGitIdentity; gap?: undefined }
   | { identity: null; gap: string };
 
-// Git stores identities as `Name <email>` on one line, so these characters
-// cannot be recorded faithfully.
-const UNRECORDABLE = /[<>\n\r]/;
+// A Git command can't carry these intact. Git stores an identity as one
+// `Name <email>` line and silently strips `<`, `>` and line breaks from it, so the
+// commit would not record the configured value. A NUL byte can't be passed in a
+// process argument at all, so `-c user.name=…` can't be run with it.
+const UNCARRIABLE = /[<>\n\r\0]/;
 
 function field(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -41,14 +43,11 @@ export function resolveMeshGitIdentity(configured: unknown): MeshGitIdentityReso
   if (!name || !email) {
     return { identity: null, gap: `config.yaml gitIdentity lacks ${missing.join(" and ")}` };
   }
-  if (UNRECORDABLE.test(name) || UNRECORDABLE.test(email)) {
+  if (UNCARRIABLE.test(name) || UNCARRIABLE.test(email)) {
     return {
       identity: null,
-      gap: "config.yaml gitIdentity contains <, > or a line break, which Git cannot record",
+      gap: "config.yaml gitIdentity contains <, >, a line break or a NUL byte, which a Git command cannot carry intact",
     };
-  }
-  if (!/^[^@\s]+@[^@\s]+$/.test(email)) {
-    return { identity: null, gap: "config.yaml gitIdentity.email is not an email address" };
   }
   return { identity: { name, email } };
 }
