@@ -106,7 +106,7 @@ Git identity variables override those \`-c\` arguments. If any of
 \`GIT_COMMITTER_EMAIL\` is set, clear all four for that one mesh Git command:
 \`env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_COMMITTER_NAME -u
 GIT_COMMITTER_EMAIL git …\`. Do not clear them globally; that keeps a replay's
-original author intact.
+identity variables available for a person's non-mesh Git commands.
 
 In a checkout that belongs to a person rather than to the mesh, leave the
 commit's identity to that repository's own configuration instead of imposing

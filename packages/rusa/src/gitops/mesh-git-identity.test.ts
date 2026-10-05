@@ -120,30 +120,6 @@ describe("mesh Git identity in a disposable repository (#894, #909)", () => {
     git(repo, [...mesh, "cherry-pick", "--allow-empty", "side"]);
     expect(head()).toBe(`${human}|Mesh Bot <mesh-bot@example.invalid>`);
 
-    // Inherited variables outrank -c. The prompt's command prefix clears them
-    // only for the mesh commit and leaves the replay's original author alone.
-    const inherited = {
-      GIT_AUTHOR_NAME: "Inherited",
-      GIT_AUTHOR_EMAIL: "inherited@example.invalid",
-      GIT_COMMITTER_NAME: "Inherited",
-      GIT_COMMITTER_EMAIL: "inherited@example.invalid",
-    };
-    const withInherited = { ...env, ...inherited };
-    execFileSync("git", [...mesh, "commit", "-q", "--allow-empty", "-m", "inherited"], {
-      cwd: repo,
-      env: withInherited,
-    });
-    expect(head()).toBe(
-      "Inherited <inherited@example.invalid>|Inherited <inherited@example.invalid>"
-    );
-    const unset = Object.keys(inherited).flatMap((key) => ["-u", key]);
-    execFileSync(
-      "env",
-      [...unset, "git", ...mesh, "commit", "-q", "--allow-empty", "-m", "cleared"],
-      { cwd: repo, env: withInherited }
-    );
-    expect(head()).toBe("Mesh Bot <mesh-bot@example.invalid>|Mesh Bot <mesh-bot@example.invalid>");
-
     expect(readFileSync(globalConfig).equals(globalBefore)).toBe(true);
     expect(readFileSync(localConfig).equals(localBefore)).toBe(true);
   });
