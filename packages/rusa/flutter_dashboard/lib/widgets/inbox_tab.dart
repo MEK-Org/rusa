@@ -65,9 +65,10 @@ class _InboxTabState extends State<InboxTab> {
 
     final readyObligations = (results[2] as ObligationPage).obligations;
     final waitingObligations = (results[3] as ObligationPage).obligations;
-    final scheduledObligations = (results[4] as ObligationPage).obligations
-        .toList()
-      ..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
+    final scheduledObligations =
+        (results[4] as ObligationPage).obligations.toList()..sort(
+          (a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''),
+        );
 
     // Fetch blockers for waiting obligations
     final blockers = await Future.wait(
@@ -344,6 +345,7 @@ class _InboxTabState extends State<InboxTab> {
       store: widget.store,
       blockers: blockers,
       onSelectView: widget.onSelectView,
+      openLink: widget.openLink,
       onMutated: _refresh,
       showKindChip: false,
       showReorder: isReadyList && items.length > 1,

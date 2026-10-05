@@ -1909,6 +1909,7 @@ class _DetailViewState extends State<_DetailView> {
                   store: store,
                   showOwner: true,
                   showKindChip: false,
+                  openLink: openLink,
                   showActions:
                       false, // In the original, the work_tab children row didn't have actions menu.
                   contentPadding: const EdgeInsets.symmetric(
@@ -2036,6 +2037,7 @@ class _DetailViewState extends State<_DetailView> {
               showActions: false,
               showKindChip: false,
               onSelectView: onSelectView,
+              openLink: openLink,
               contentPadding: const EdgeInsets.symmetric(
                 horizontal: 16,
                 vertical: 12,

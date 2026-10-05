@@ -39,9 +39,7 @@ void main() {
         await tester.pump();
 
         final wideQueue = tester.getRect(find.text('My Queue'));
-        final wideQuota = tester.getRect(
-          find.textContaining('Quota Pacing'),
-        );
+        final wideQuota = tester.getRect(find.textContaining('Quota Pacing'));
         expect(wideQueue.left, lessThan(wideQuota.left));
         expect(wideQueue.bottom, greaterThan(wideQuota.top));
         expect(wideQuota.bottom, greaterThan(wideQueue.top));
@@ -51,9 +49,7 @@ void main() {
         await tester.pump();
 
         final narrowQueue = tester.getRect(find.text('My Queue'));
-        final narrowQuota = tester.getRect(
-          find.textContaining('Quota Pacing'),
-        );
+        final narrowQuota = tester.getRect(find.textContaining('Quota Pacing'));
         expect(narrowQueue.left, closeTo(narrowQuota.left, 1));
         expect(narrowQueue.top, lessThan(narrowQuota.top));
         expect(find.text('New Obligation'), findsNothing);
@@ -227,7 +223,7 @@ void main() {
           status: 'ready',
           priority: 50.0,
           effectivePriority: 50.0,
-          externalRef: 'github_pr:dummy-org/dummy-repoISSUE_NUM',
+          externalRef: 'github:dummy-org/dummy-repo/pulls/101',
         );
         final waitingOb = makeObligation(
           'ob-waiting',
@@ -272,9 +268,10 @@ void main() {
 
         // Check ready items
         expect(find.text('Approve PR review'), findsOneWidget);
+        expect(find.byIcon(Icons.open_in_new), findsOneWidget);
         expect(
-          find.text('github_pr:dummy-org/dummy-repoISSUE_NUM'),
-          findsOneWidget,
+          find.text('github:dummy-org/dummy-repo/pulls/101'),
+          findsNothing,
         );
 
         // Check waiting items and blocker
