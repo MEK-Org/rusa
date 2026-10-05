@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
@@ -4051,6 +4052,73 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     await message("/resume", "messages/resume");
     expect(halt.isHalted()).toBe(false);
+  });
+
+  it("wires model-admin availability holds into the configured actor's endpoint and run admission (#539)", async () => {
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: { provider: "claude", model: "claude-sonnet-5" },
+      }),
+      "utf8"
+    );
+    let mesh: ActorMesh | undefined;
+    let root: Actor | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            root = handles.root as Actor;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh || !root) throw new Error("mesh or root not ready");
+    const rootOptions = (
+      root as unknown as { opts: { mcpServers: Array<{ name: string; url: string }> } }
+    ).opts;
+    const meshUrl = rootOptions.mcpServers.find((server) => server.name === "mesh")?.url;
+    if (!meshUrl) throw new Error("root mesh server missing");
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const client = new Client({ name: "test", version: "0.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(meshUrl)));
+      try {
+        return (await client.callTool({ name, arguments: args })) as CallToolResult;
+      } finally {
+        await client.close();
+      }
+    };
+    const workerId = mesh.spawn({
+      charter: "codex worker",
+      parentId: "root",
+      modelConfig: { provider: "codex", model: "gpt-5.5" },
+    });
+
+    const unconfigured = await call("set_availability_hold", { provider: "kimi" });
+    expect(unconfigured.isError).toBe(true);
+    expect(JSON.stringify(unconfigured.content)).toContain("not configured");
+    expect(getRepositories().availabilityHolds.list()).toEqual([]);
+
+    expect((await call("set_availability_hold", { provider: "codex" })).isError).toBeFalsy();
+    expect(getRepositories().availabilityHolds.list()).toEqual([
+      expect.objectContaining({ provider: "codex", createdBy: "root" }),
+    ]);
+    // Every pool entry held: the worker's run is not admitted, and its pool is untouched.
+    expect(mesh.prepareRun(workerId)).toBe(false);
+    expect(getRepositories().actors.get(workerId)?.modelConfig).toEqual([
+      expect.objectContaining({ provider: "codex", model: "gpt-5.5" }),
+    ]);
+
+    expect((await call("clear_availability_hold", { provider: "codex" })).isError).toBeFalsy();
+    expect(mesh.prepareRun(workerId)).toBe(true);
   });
 
   async function startClaudeChatHaltService() {
