@@ -680,9 +680,10 @@ export class SharedQuotaStore {
    * Built-in wording is immutable for the life of this binary. Seed all four
    * rows while opening the database, rather than taking a write lock on every
    * parse merely to repeat an `INSERT OR IGNORE`. This runs after the schema
-   * transaction and outside it: a revision table that cannot take the seeds is
-   * a broken control record, which degrades parsing to unattributed built-in
-   * wording rather than refusing the store (#536).
+   * transaction and outside it: a revision table that cannot take the seeds, or
+   * already holds an expected id with other content, is a broken control
+   * record, which degrades parsing to unattributed built-in wording rather than
+   * refusing the store (#536).
    */
   private registerBuiltInParserWording(): void {
     try {
@@ -690,11 +691,19 @@ export class SharedQuotaStore {
         `INSERT OR IGNORE INTO quota_parser_wording_revisions (id, provider, wording)
          VALUES (?, ?, ?)`
       );
+      const read = this.db.prepare(
+        "SELECT provider, wording FROM quota_parser_wording_revisions WHERE id = ?"
+      );
       this.db
         .transaction(() => {
           for (const provider of Object.keys(BUILT_IN_QUOTA_PARSER_WORDING) as QuotaLlmProvider[]) {
             const wording = BUILT_IN_QUOTA_PARSER_WORDING[provider];
-            insert.run(quotaParserWordingRevisionId(provider, wording), provider, wording);
+            const id = quotaParserWordingRevisionId(provider, wording);
+            insert.run(id, provider, wording);
+            const row = read.get(id) as { provider: string; wording: string } | undefined;
+            if (row?.provider !== provider || row.wording !== wording) {
+              throw new Error(`revision ${id} does not hold the built-in ${provider} wording`);
+            }
           }
         })
         .immediate();

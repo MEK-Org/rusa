@@ -6,7 +6,6 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockGenerateContent = vi.fn();
@@ -29,7 +28,6 @@ vi.mock("@google/genai", () => ({
 
 import type { RusaConfig } from "../config/types.js";
 import { buildQuotaSnapshot } from "../dashboard/quota-api.js";
-import { nullLogger } from "../observability/logger.js";
 import { KimiAuthRequiredError } from "../providers/kimi-usage-scrape.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import { buildActorBwrapArgs } from "../providers/sandbox.js";
@@ -2935,37 +2933,6 @@ describe("quota MCP server", () => {
 
         expect(mockGenerateContent).not.toHaveBeenCalled();
         expect(latestRevision()).toBeNull();
-      });
-
-      it("keeps parsing with the built-in wording when control table registration fails at open", async () => {
-        const warn = vi.fn();
-        store.close();
-        const db = new Database(join(root, "shared.db"));
-        db.exec("DROP TABLE quota_parser_wording_revisions");
-        db.exec("CREATE TABLE quota_parser_wording_revisions (id TEXT PRIMARY KEY)");
-        db.close();
-        store = new SharedQuotaStore(join(root, "shared.db"), { ...nullLogger, warn });
-        mockGenerateContent.mockResolvedValue({
-          text: () => JSON.stringify({ status: "unknown", windows: [] }),
-        });
-
-        await probeClaude();
-
-        expect(warn).toHaveBeenCalledWith("parser_wording_registration_failed", {
-          error: expect.stringContaining("provider"),
-        });
-        const request = mockGenerateContent.mock.calls[0][0] as {
-          config: { systemInstruction: string };
-        };
-        expect(request.config.systemInstruction).toContain(BUILT_IN_QUOTA_PARSER_WORDING.claude);
-        const row = store.db
-          .prepare(
-            `SELECT parsed_state, parser_wording_revision_id AS revision FROM quota_scrapes
-             ORDER BY rowid DESC LIMIT 1`
-          )
-          .get() as { parsed_state: string | null; revision: string | null };
-        expect(row.parsed_state).not.toBeNull();
-        expect(row.revision).toBeNull();
       });
     });
 

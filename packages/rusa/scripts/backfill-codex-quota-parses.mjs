@@ -19,7 +19,11 @@ function usage() {
     "    --report /absolute/path/to/report.md [--concurrency 3] [--attempts 3] [--apply]",
     "",
     "Without --apply, parses and reports the proposed changes without writing the database.",
-    "With --apply, creates an online SQLite backup before atomically replacing parsed_state.",
+    "With --apply, creates an online SQLite backup before atomically replacing parsed_state",
+    "and setting parser_wording_revision_id to the built-in Codex wording revision, or to",
+    "null when that revision is not registered in the database.",
+    "--apply requires a database already opened by a coordinator from this release, which",
+    "adds the parser_wording_revision_id column: deploy first, then backfill.",
     "Raw scrape text and quota_observations are never modified.",
   ].join("\n");
 }
@@ -172,6 +176,25 @@ function validateState(state, rowHash) {
   }
 }
 
+/**
+ * Attribute re-parsed rows only to a revision the coordinator registered;
+ * otherwise record null, as the store does when registration fails (#536).
+ */
+function registeredCodexRevisionId(db) {
+  const wording = BUILT_IN_QUOTA_PARSER_WORDING.codex;
+  const id = quotaParserWordingRevisionId("codex", wording);
+  const registry = db
+    .prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quota_parser_wording_revisions'"
+    )
+    .get();
+  if (!registry) return null;
+  const row = db
+    .prepare("SELECT provider, wording FROM quota_parser_wording_revisions WHERE id = ?")
+    .get(id);
+  return row?.provider === "codex" && row.wording === wording ? id : null;
+}
+
 function renderReport(summary) {
   return (
     "# Codex quota parse backfill\n\n" +
@@ -185,7 +208,8 @@ function renderReport(summary) {
     (summary.backup
       ? `Backup: \`${summary.backup}\`\n\n`
       : "Backup: not created for dry run.\n\n") +
-    "Only `quota_scrapes.parsed_state` and its `parse_error` were updated. Raw scrape evidence and `quota_observations` were left unchanged.\n"
+    `Parser wording revision written: ${summary.applied ? `\`${summary.revisionId ?? "null (not registered)"}\`` : "none for dry run"}\n\n` +
+    "Only `quota_scrapes.parsed_state`, its `parse_error` and its `parser_wording_revision_id` were updated. Raw scrape evidence and `quota_observations` were left unchanged.\n"
   );
 }
 
@@ -205,6 +229,14 @@ async function main() {
   let rows;
   let seed;
   try {
+    if (args.apply) {
+      const columns = db.prepare("PRAGMA table_info(quota_scrapes)").all();
+      if (!columns.some((column) => column.name === "parser_wording_revision_id")) {
+        throw new Error(
+          "quota_scrapes has no parser_wording_revision_id column; start a coordinator from this release against the database before --apply"
+        );
+      }
+    }
     rows = db
       .prepare(
         `SELECT id, scraped_at AS scrapedAt, raw_output AS rawOutput, parsed_state AS parsedState
@@ -259,26 +291,24 @@ async function main() {
   }
 
   let backup;
+  let revisionId = null;
   if (args.apply) {
     backup = await backupDatabase(args.database, args.backupDir);
     process.stdout.write(`[codex-backfill] verified backup ${backup}\n`);
     const writable = new Database(args.database, { fileMustExist: true });
     writable.pragma("busy_timeout = 30000");
     try {
-      const codexRevisionId = quotaParserWordingRevisionId(
-        "codex",
-        BUILT_IN_QUOTA_PARSER_WORDING.codex
-      );
       const update = writable.prepare(
         `UPDATE quota_scrapes
          SET parsed_state = ?, parse_error = NULL, parser_wording_revision_id = ?
          WHERE id = ? AND provider = 'codex' AND scraped_at = ?`
       );
       const apply = writable.transaction(() => {
+        revisionId = registeredCodexRevisionId(writable);
         for (const replacement of replacements) {
           const result = update.run(
             replacement.serialized,
-            codexRevisionId,
+            revisionId,
             replacement.id,
             replacement.scrapedAt
           );
@@ -303,6 +333,7 @@ async function main() {
     newProviderWindows,
     statuses,
     backup,
+    revisionId,
   };
   await mkdir(dirname(args.report), { recursive: true });
   await writeFile(args.report, renderReport(summary));
