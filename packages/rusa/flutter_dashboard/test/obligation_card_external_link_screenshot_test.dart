@@ -18,12 +18,12 @@ void main() {
     await loadFonts();
   });
 
-  const ids = ['root', 'shimmering-armadillo'];
+  const ids = ['root', 'example-worker'];
 
   Future<DashboardStore> createStore() async {
     final activeEntry = InboxEntryDto.fromJson({
       'id': 'entry-active',
-      'actorId': 'shimmering-armadillo',
+      'actorId': 'example-worker',
       'source': 'github:MEK-Org/rusa/pulls/871',
       'deliveredAt': '2026-10-04T12:00:00.000Z',
       'payload': {
@@ -50,9 +50,9 @@ void main() {
       ..threadsResult = [
         makeThread('root', runState: RunState.idle),
         makeThread(
-          'shimmering-armadillo',
+          'example-worker',
           parent: 'root',
-          title: 'Shimmering Armadillo',
+          title: 'Example Worker',
           runState: RunState.running,
           selectedInboxItem: activeEntry,
         ),
@@ -70,7 +70,7 @@ void main() {
         ),
         makeObligation(
           'ob-871',
-          ownerId: 'shimmering-armadillo',
+          ownerId: 'example-worker',
           title: 'Remove room header on short screens',
           intent: 'Omit Room header on <=520px height narrow screens.',
           externalRef: 'github:MEK-Org/rusa/pulls/871',
