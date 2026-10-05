@@ -13,7 +13,13 @@ import 'detail_panel.dart';
 import 'header.dart';
 import 'mobile_nav_drawer.dart';
 import 'overview_tab.dart';
+import 'resizable_sidebar.dart';
 import 'work_tab.dart';
+
+// The 411x485 cover-screen Room is the explicitly short layout. 520 leaves
+// conservative room for the same physical cover panel at a 2.5 device-pixel
+// ratio (432x509 logical px); normal phone and desktop heights keep the header.
+const _shortRoomMaxHeight = 520.0;
 
 /// The header + responsive master-detail body. Lives in its own (VM-safe) file
 /// — importing no web-only code — so the screenshot harness can render the real
@@ -215,7 +221,11 @@ class _DashboardBodyState extends State<DashboardBody> {
     return LayoutBuilder(
       builder: (context, constraints) {
         _resolveLandingView(constraints);
-        if (constraints.maxWidth >= kNarrowBreakpoint) {
+        final headerlessRoom =
+            _view == DashboardView.chatRoom &&
+            constraints.maxWidth < kNarrowBreakpoint &&
+            constraints.maxHeight <= _shortRoomMaxHeight;
+        if (constraints.maxWidth >= kNarrowBreakpoint && !headerlessRoom) {
           return _chrome();
         }
         // On a phone the header's leading slot carries the navigation: the
@@ -230,7 +240,9 @@ class _DashboardBodyState extends State<DashboardBody> {
             // A nested Scaffold of our own: the drawer has to hang off a
             // Scaffold, and this body is rendered directly — without main.dart's
             // — by the screenshot harness and the widget tests, so owning one
-            // keeps the drawer (and this file) VM-safe.
+            // keeps the drawer (and this file) VM-safe. An exceptionally short
+            // narrow Room uses this scaffold: without its header, the left-edge
+            // drawer gesture is its navigation entry point.
             return Scaffold(
               key: _scaffoldKey,
               backgroundColor: MeshColors.bgPrimary,
@@ -249,6 +261,7 @@ class _DashboardBodyState extends State<DashboardBody> {
                 onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),
                 onBack: inActorDetail ? widget.store.clearSelection : null,
                 detailActorId: inActorDetail ? snap.data : null,
+                hideRoomHeader: headerlessRoom,
               ),
             );
           },
@@ -264,6 +277,7 @@ class _DashboardBodyState extends State<DashboardBody> {
     VoidCallback? onMenuTap,
     VoidCallback? onBack,
     String? detailActorId,
+    bool hideRoomHeader = false,
   }) {
     Widget header(ThreadDto? detail) {
       return MeshHeader(
@@ -301,7 +315,7 @@ class _DashboardBodyState extends State<DashboardBody> {
       color: MeshColors.bgPrimary,
       child: Column(
         children: [
-          phoneHeader,
+          if (!hideRoomHeader) phoneHeader,
           Expanded(
             child: _view == DashboardView.overview
                 ? OverviewTab(store: widget.store, onSelectView: _selectView)
@@ -501,14 +515,16 @@ class _ActorsBody extends StatelessWidget {
         if (constraints.maxWidth < kNarrowBreakpoint) {
           return _NarrowBody(store: store, onSelectView: onSelectView);
         }
-        return Row(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            ActorTree(store: store),
-            Expanded(
-              child: DetailPanel(store: store, onSelectView: onSelectView),
-            ),
-          ],
+        return ResizableSidebar(
+          defaultWidth: 360,
+          initialWidth: store.sidebarWidth('actors'),
+          onWidthChanged: (width) => store.setSidebarWidth('actors', width),
+          sidebar: ActorTree(
+            store: store,
+            width: double.infinity,
+            showBorder: false,
+          ),
+          detail: DetailPanel(store: store, onSelectView: onSelectView),
         );
       },
     );

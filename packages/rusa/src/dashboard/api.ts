@@ -198,11 +198,11 @@ export interface DashboardDataDeps {
   }) => FollowerUpdateStatus[];
 }
 
-import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
-import type { FollowerUpdateStatus } from "../experimental/remote-instances/protocol.js";
 import { githubInboxEventReference } from "../github/inbox-notification.js";
 import { gchatInboxMessageReference } from "../references/inbox-reference.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import type { FollowerInfo } from "../remote-instances/follower-hub.js";
+import type { FollowerUpdateStatus } from "../remote-instances/protocol.js";
 export type { FollowerInfo, FollowerUpdateStatus };
 
 /** Route prefix for the per-actor avatar endpoint . */
@@ -275,6 +275,11 @@ type ResolvedInboxEntry = InboxEntry & {
    * issue or PR it was routed by), when the event names one.
    */
   eventReference?: ResolvedReference;
+  /**
+   * The one obligation this entry is unambiguously tied to, so the dashboard
+   * can show that obligation's card in place of the raw item (#610).
+   */
+  obligationId?: string;
 };
 type ResolvedInboxPage = Omit<InboxPage, "entries"> & { entries: ResolvedInboxEntry[] };
 
@@ -632,7 +637,36 @@ async function resolveInboxPage(
       return entry;
     })
   );
-  return { ...page, entries: entries.filter((entry) => entry !== null) };
+  return {
+    ...page,
+    entries: entries
+      .filter((entry) => entry !== null)
+      .map((entry) => {
+        const obligationId = inboxEntryObligation(entry, deps);
+        return obligationId ? { ...entry, obligationId } : entry;
+      }),
+  };
+}
+
+/**
+ * The obligation an inbox entry stands for (#610): the one a ready signal
+ * names, or the live obligation whose external ref is the entry's GitHub
+ * source, which the store keeps unique among live obligations. Uses the same
+ * per-entry refs inbox selection resolves, with two exclusions: selection-time
+ * associations record what a run chose rather than what the entry is, and a
+ * cancelled-prerequisite notice says something the obligation card would not.
+ * Null when nothing ties it, or when the two disagree.
+ */
+function inboxEntryObligation(entry: InboxEntry, deps: DashboardDataDeps): string | null {
+  const refs = inboxEntryObligationRefs({ listEntryObligationIds: () => [] }, entry.actorId, entry);
+  const named =
+    entry.payload.type === "obligation.prerequisite_cancelled" ? null : refs.payloadObligationId;
+  const linked =
+    refs.githubWorkRef && deps.obligations
+      ? (deps.obligations.findLiveObligationByExternalRef(refs.githubWorkRef)?.id ?? null)
+      : null;
+  if (named && linked && named !== linked) return null;
+  return named ?? linked;
 }
 
 /**
@@ -2298,6 +2332,18 @@ export async function handleMeshApiRequest(
       offset: blocksOffset,
     });
     const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
+    const ancestors = [];
+    const seen = new Set([id]);
+    let ancestor = parent;
+    while (ancestor && !seen.has(ancestor.id)) {
+      seen.add(ancestor.id);
+      ancestors.unshift(ancestor);
+      ancestor = ancestor.parentId ? deps.obligations.get(ancestor.parentId) : null;
+    }
+    const history = deps.obligations.listHistoryPage(id, {
+      before: url.searchParams.get("history_before") ?? undefined,
+      limit: Math.min(parsePositiveInt(url, "history_limit") ?? 10, 100),
+    });
     // The obligation's own citations and the reference it claims resolve the
     // same way, through one scoped resolution: a `mesh:messages/<id>` naming
     // another human's conversation is projected without its content or ends
@@ -2325,6 +2371,9 @@ export async function handleMeshApiRequest(
     sendJson(res, 200, {
       obligation,
       parent,
+      ancestors,
+      history: history.entries,
+      historyNextBefore: history.nextBefore,
       children: children.obligations,
       blockingChildren: blockingChildren.obligations,
       completions: completions.completions,

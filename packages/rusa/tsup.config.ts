@@ -5,7 +5,7 @@ import { defineConfig } from "tsup";
 // atomic swap on a green build. Unset (CI/dev) → the normal `dist`.
 const outDir = process.env.RUSA_DIST_DIR ?? "dist";
 
-// The experimental follower and maintenance tools are deliberately absent:
+// The follower and maintenance tools are deliberately absent:
 // `build:follower` (tsup.follower.config.ts) and `build:maintenance`
 // (tsup.maintenance.config.ts) are their authoritative builds, and nothing in
 // the leader runtime execs those entrypoints, so the shipped distribution has no

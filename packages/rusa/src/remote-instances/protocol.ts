@@ -1,0 +1,260 @@
+import type { ActorOptions, PromptBuild, RunAbandon } from "../actor/actor.js";
+import type { ActorRuntimeState } from "../actor/actor-mesh.js";
+import type { ActorRecord } from "../actor/actor-record.js";
+import type { ActorRunMode, RunNudge } from "../actor/trigger-runner.js";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
+import type { CodingProvider, McpServerSpec, RunResult } from "../providers/types.js";
+
+/** Existing follower gateway request-body bound, including the JSON envelope. */
+export const FOLLOWER_HTTP_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
+/** Ordinary `/events` batches carry at most this many events. */
+export const FOLLOWER_EVENT_BATCH_MAX_EVENTS = 100;
+
+/**
+ * Negotiated lossless transfer of one event too large for an ordinary batch
+ * (#876). The leader advertises it on `/register`; a follower sends fragments
+ * only to a leader that did. It is additive and does not change the protocol
+ * version: ordinary `/events` is unchanged, and an unadvertising leader leaves
+ * such an event parked on the follower.
+ */
+export interface EventTransferCapability {
+  version: 1;
+  /** Largest original serialized event the leader reassembles. */
+  maxEventBytes: number;
+  /** Largest raw fragment, before base64 and the request envelope. */
+  maxFragmentBytes: number;
+}
+export const EVENT_TRANSFER_CAPABILITY: EventTransferCapability = {
+  version: 1,
+  maxEventBytes: 64 * 1024 * 1024,
+  maxFragmentBytes: 1024 * 1024,
+};
+
+/** One fragment of an event transfer, posted to `/events/transfer`. */
+export interface EventTransferFragment {
+  transferId: string;
+  eventId: string;
+  /** Byte length of the original UTF-8 serialized event. */
+  totalBytes: number;
+  /** SHA-256 hex of the original serialized event. */
+  digest: string;
+  index: number;
+  offset: number;
+  /** Base64 of the raw fragment bytes. */
+  data: string;
+  /** SHA-256 hex of the raw fragment bytes. */
+  fragmentDigest: string;
+}
+
+/**
+ * The leader's answer to a fragment. `fragment` retains bytes but has not
+ * delivered the event; only `complete` does. `restart` asks for fragment zero of
+ * the same event; `busy` is retryable backpressure; `refused` will not change
+ * until capability, configuration or an operator does.
+ */
+export type EventTransferReply =
+  | { status: "fragment"; receivedBytes: number }
+  | { status: "complete" }
+  | { status: "restart"; reason: string }
+  | { status: "busy"; reason: string }
+  | { status: "refused"; reason: string; maxEventBytes?: number };
+
+// Commands/events multiplexed by actor ID over the authenticated instance connection.
+//
+// Compatibility rule (#719): the leader deploys first and must keep followers on the
+// previous protocol fully working until the reconciler updates them. So every bump
+// to N keeps N−1 working (the leader adapts to any v(N−1) shape it changed, and never
+// sends a v(N−1) follower a command it cannot parse) and drops N−2. When you bump
+// this, delete the adapters that only served the version now falling out of range.
+//
+// #725 added optional fields without a bump: the leader numbers each pool it sends
+// (`init`, `modelConfig`) and the follower echoes that number on `admit`. A follower
+// built before #725 (v7 or v8) omits it, and the leader falls back to its own view
+// of the queued report. Pre- and post-#725 v8 followers share a version, so the
+// fallback lives until v8 leaves the window, not at the next bump. It is tagged
+// `pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8`.
+export const INSTANCE_PROTOCOL_VERSION = 8;
+/** Oldest follower protocol the leader still admits; see the rule above. */
+export const OLDEST_FOLLOWER_PROTOCOL_VERSION = INSTANCE_PROTOCOL_VERSION - 1;
+export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
+export const COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR =
+  "Coordinator reconnected without the queued admission";
+/** The leader replaced a queued actor's pool; re-run the same admission against it. */
+export const COORDINATOR_MODEL_CONFIG_CHANGED_ERROR = "Coordinator model configuration changed";
+/** An operator interrupt or a provider halt cancelled the queued admission before it started. */
+export const COORDINATOR_ADMISSION_CANCELLED_ERROR = "Coordinator cancelled the queued admission";
+export interface Bootstrap {
+  id: string;
+  cwd: string;
+  sessionId?: string;
+  /** The actor's declared candidate pool. */
+  modelConfig?: RawProviderModelConfig[];
+  /** The leader's generation for `modelConfig`, echoed on `admit` (#725). */
+  modelConfigGeneration?: number;
+  providerOptions?: Record<string, unknown>;
+  mcpServers?: McpServerSpec[];
+  actorOptions?: Pick<ActorOptions, "sandbox" | "addDirs" | "timeoutMs" | "debounceMs">;
+  /** True when reconnecting to an existing actor runtime (avoids duplicate host error). */
+  reconnect?: boolean;
+  /**
+   * True when the leader kept an unstarted admission for this actor across the
+   * transport loss. The follower answers by re-announcing that one pending
+   * request; every other pending call is still rejected on reconnect.
+   */
+  resumeAdmission?: boolean;
+}
+
+export interface RunSnapshot {
+  record: ActorRecord;
+  prompt: string;
+  promptBuild?: PromptBuild;
+  mcpServers?: McpServerSpec[];
+  /** Capability state read by the leader at this run's provider admission. */
+  computerUse?: boolean;
+  /** The candidate the leader's pacing gate reserved for this run. */
+  selected?: RawProviderModelConfig;
+  /**
+   * True when the leader admitted this run at responsive priority. A promotion
+   * decided on the leader is only reliably visible to the follower here; the
+   * responsive wake behind it can lose the race with this reply on the wire.
+   */
+  responsive?: boolean;
+}
+
+export interface ProviderBridge {
+  sendMessage(to: string, body: string): Promise<unknown>;
+}
+
+export type ProviderFactory = (
+  bridge: ProviderBridge,
+  options: Record<string, unknown>,
+  /** The leader-admitted tuple that this adapter must execute. */
+  selected?: RawProviderModelConfig
+) => CodingProvider;
+
+export type Request =
+  | { op: "beforeRun"; mode: ActorRunMode }
+  | { op: "prepareMount" }
+  | { op: "complete"; result: RunResult }
+  | {
+      op: "admit";
+      candidates: RawProviderModelConfig[];
+      responsive: boolean;
+      /** The final admission check must distinguish ordinary work from session work. */
+      mode: ActorRunMode;
+      /**
+       * True when this is the follower re-announcing an admission the leader
+       * retained, under the request id the leader's gate still answers on.
+       */
+      resume?: boolean;
+      /**
+       * The pool generation `candidates` were quoted under, as last numbered by
+       * the leader. Absent from a follower built before #725.
+       */
+      modelConfigGeneration?: number;
+    }
+  | { op: "sendMessage"; to: string; body: string }
+  /**
+   * The provider tuple the follower actually instantiated, after its own config
+   * filled anything the admitted tuple omitted. A request rather than an event:
+   * the follower waits for the reply before invoking the provider.
+   */
+  | { op: "providerAttempt"; attempt: RawProviderModelConfig };
+
+export type LeaderCommand =
+  | { type: "init"; bootstrap: Bootstrap }
+  /** Replace the follower Actor's next-run pool without resetting its runtime. */
+  | {
+      type: "modelConfig";
+      modelConfig: RawProviderModelConfig[];
+      /** The leader's number for this pool, echoed on `admit`; absent before #725. */
+      generation?: number;
+    }
+  | { type: "wake"; nudge?: RunNudge }
+  /** Ask the follower to replace its current opportunity with responsive work. */
+  | { type: "preempt"; requestId: number }
+  /** Operator interrupt of the run the follower is executing. */
+  | { type: "interrupt"; by: string }
+  /**
+   * The leader is cancelling this actor's unstarted admission. Sent before the
+   * admission's error reply, so the follower's Actor keeps the opportunity for
+   * `resumeCancelled` when retain is true, or drops it when retain is false.
+   */
+  | { type: "cancelQueued"; retain?: boolean }
+  /** Replay a cancelled queued opportunity; `nudge` covers a follower that kept none. */
+  | { type: "resumeCancelled"; nudge: RunNudge }
+  | { type: "unkillable" }
+  | { type: "stop" }
+  | { type: "reply"; requestId: number; value?: unknown; error?: string };
+
+export type ActorEvent =
+  | { type: "ready"; pid: number }
+  /** The follower's observed outcome of a leader preemption request. */
+  | {
+      type: "preempted";
+      requestId: number;
+      preempted: boolean;
+      phase?: "running" | "queued" | "winding_down";
+    }
+  | { type: "request"; requestId: number; request: Request }
+  | { type: "release"; requestId: number }
+  /** Wire state; "winding_down" is retained for v7/v8 follower compatibility until OLDEST_FOLLOWER_PROTOCOL_VERSION > 8. */
+  | { type: "state"; state: ActorRuntimeState | "winding_down"; yielded?: boolean }
+  | { type: "session"; sessionId: string }
+  | { type: "queued"; responsive: boolean; mode: ActorRunMode; runId?: string }
+  | { type: "error"; error: string }
+  | { type: "result"; result: RunResult }
+  | {
+      type: "runStart";
+      responsive: boolean;
+      injectRecord?: PromptBuild["injectRecord"];
+      /** The candidate this run actually launched on, for leader-side accounting. */
+      selected: RawProviderModelConfig;
+      runId?: string;
+    }
+  | { type: "runPrompt"; runId: string; prompt: string }
+  | { type: "firstChunk" }
+  | { type: "abandoned"; abandon: RunAbandon }
+  | { type: "coalesced"; count: number; ageMs: number }
+  | { type: "log"; chunk: string }
+  | { type: "fatal"; error: string };
+
+export type FollowerUpdateStatusPhase =
+  | "pending"
+  | "fetching"
+  | "building"
+  | "draining"
+  | "restarting"
+  | "failed"
+  | "already_current";
+
+export type FollowerUpdateStep = "pull" | "install" | "build" | "drain";
+
+export interface FollowerUpdateStatus {
+  updateId: string;
+  status: FollowerUpdateStatusPhase;
+  step?: FollowerUpdateStep;
+  error?: string;
+  oldSha?: string;
+  newSha?: string;
+  rollbackFailed?: boolean;
+  timestamp: string;
+}
+
+export interface FollowerUpdateCommand {
+  type: "update";
+  updateId: string;
+  targetSha?: string;
+  branch?: string;
+}
+
+export interface FollowerUpdateStatusEvent {
+  type: "update_status";
+  updateId: string;
+  status: FollowerUpdateStatusPhase;
+  step?: FollowerUpdateStep;
+  error?: string;
+  oldSha?: string;
+  newSha?: string;
+  rollbackFailed?: boolean;
+}

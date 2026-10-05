@@ -36,6 +36,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildWorkerPrompt } from "../actor/worker-prompt.js";
 import type { ProviderConfig } from "../config/types.js";
+import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
 import { AntigravityProvider } from "./antigravity.js";
 import { buildClaudeArgs, ClaudeProvider } from "./claude.js";
 import { CodexProvider } from "./codex.js";
@@ -69,6 +70,7 @@ function assembledActorContext(): string {
     parentId: "00000000-0000-4000-8000-00000000beef",
     handles: [],
     understandingMountEnabled: false,
+    gitIdentity: resolveMeshGitIdentity(undefined),
   });
 }
 
@@ -105,6 +107,7 @@ function writeArgvRecorder(script: string, dumpPath: string, rest: string[]): vo
     script,
     [
       "#!/bin/sh",
+      'if [ "$1" = "mcp" ] && [ "$2" = "list" ]; then echo "[]"; exit 0; fi',
       // Octal in the format string, since only the format is escape-processed —
       // an argument is written through %s exactly as it arrived.
       `for a in "$@"; do printf '%s\\036' "$a"; done > ${JSON.stringify(dumpPath)}`,

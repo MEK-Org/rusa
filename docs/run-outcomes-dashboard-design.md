@@ -17,7 +17,7 @@ This design starts from `staging` commit `fc2fefff63181434f701ce043cb980a94303ba
   and clears run-scoped focus at lifecycle boundaries.
 - `packages/rusa/src/db/repositories/actor-run-repository.ts` stores run focus
   and terminal rows. `src/actor/actor.ts`, `src/actor/actor-mesh.ts`, and
-  `src/experimental/remote-instances/actor-handle.ts` provide the existing
+  `src/remote-instances/actor-handle.ts` provide the existing
   local and remote terminal boundaries. A follower's `result` message is the
   observed remote CLI result; a lost follower channel is a separate leader-side
   transport observation, not evidence that the provider CLI died.

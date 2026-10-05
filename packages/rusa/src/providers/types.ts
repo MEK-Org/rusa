@@ -74,6 +74,12 @@ export interface RunOptions {
    * multi-repo grants are handled by per-actor worktree binding (a later increment).
    */
   addDirs?: string[];
+  /**
+   * Whether the actor has an admitted computer-use grant for this invocation.
+   * If omitted or false, desktop tool sources (bundled plugins and configured MCP computer-use bindings)
+   * must be denied.
+   */
+  computerUse?: boolean;
 }
 
 export interface RunResult {

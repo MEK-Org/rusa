@@ -205,8 +205,20 @@ describe("ObligationRepository", () => {
         );
       });
 
-      it("announces a responsive obligation that becomes ready behind the head", () => {
+      it("promotes a responsive obligation ahead of a non-responsive ready head", () => {
         repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
+        const heads: Array<{
+          id: string | null;
+          previousHeadId: string | null;
+          responsive: boolean;
+        }> = [];
+        repository.setReadyHeadListener(({ head, previousHeadId }) =>
+          heads.push({
+            id: head?.id ?? null,
+            previousHeadId,
+            responsive: head?.effectiveResponsive ?? false,
+          })
+        );
         repository.create({
           title: "hotfix",
           id: "hotfix",
@@ -215,8 +227,9 @@ describe("ObligationRepository", () => {
           responsive: true,
         });
 
-        expect(announced).toEqual([{ id: "hotfix", actingPrincipal: "system:mesh" }]);
-        expect(repository.listResponsiveReadyAttention().map((o) => o.id)).toEqual(["hotfix"]);
+        expect(heads).toEqual([{ id: "hotfix", previousHeadId: "head", responsive: true }]);
+        expect(announced).toEqual([]);
+        expect(repository.listResponsiveReadyAttention()).toEqual([]);
       });
 
       it("leaves the head announcement to the ready-head change", () => {
@@ -257,6 +270,18 @@ describe("ObligationRepository", () => {
 
       it("announces a responsive obligation that re-readies behind the head on prerequisite completion", () => {
         repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
+        const heads: Array<{
+          id: string | null;
+          previousHeadId: string | null;
+          responsive: boolean;
+        }> = [];
+        repository.setReadyHeadListener(({ head, previousHeadId }) =>
+          heads.push({
+            id: head?.id ?? null,
+            previousHeadId,
+            responsive: head?.effectiveResponsive ?? false,
+          })
+        );
         repository.create({
           title: "gate",
           id: "gate",
@@ -271,13 +296,17 @@ describe("ObligationRepository", () => {
           blockedBy: ["gate"],
           responsive: true,
         });
-        // The gate now blocks responsive work, so it is urgent itself (#674).
-        expect(announced).toEqual([{ id: "gate", actingPrincipal: "system:mesh" }]);
+        // The gate now blocks responsive work, so it is urgent itself (#674)
+        // and promotes ahead of the ordinary head.
+        expect(heads).toEqual([{ id: "gate", previousHeadId: "head", responsive: true }]);
+        expect(announced).toEqual([]);
+        heads.length = 0;
         announced.length = 0;
 
         repository.setTerminalStatus("gate", "done", null, null, "system:mesh");
         expect(repository.require("gate").status).toBe("done");
-        expect(announced).toEqual([{ id: "hotfix", actingPrincipal: "system:mesh" }]);
+        expect(heads).toEqual([{ id: "hotfix", previousHeadId: "gate", responsive: true }]);
+        expect(announced).toEqual([]);
       });
 
       it("does not announce non-responsive readiness (regression)", () => {
@@ -305,10 +334,17 @@ describe("ObligationRepository", () => {
 
         repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
         repository.create({
+          title: "responsive head",
+          id: "responsive-head",
+          ownerId: "actor-a",
+          priority: 2,
+          responsive: true,
+        });
+        repository.create({
           title: "hotfix",
           id: "hotfix",
           ownerId: "actor-a",
-          priority: 2,
+          priority: 3,
           responsive: true,
         });
         expect(announced).toEqual([]);
@@ -334,12 +370,27 @@ describe("ObligationRepository", () => {
         // it, not this listener.
         expect(announced).toEqual([]);
 
-        // Behind actor-b's existing head neither a status nor a head changes —
-        // the reassignment itself must announce (assigned ready responsive
-        // work always creates inbox attention, #531).
+        const heads: Array<{
+          id: string | null;
+          previousHeadId: string | null;
+          responsive: boolean;
+        }> = [];
+        repository.setReadyHeadListener(({ head, previousHeadId }) =>
+          heads.push({
+            id: head?.id ?? null,
+            previousHeadId,
+            responsive: head?.effectiveResponsive ?? false,
+          })
+        );
+
+        // Reassignment promotes responsive work ahead of actor-b's ordinary
+        // head, so the established ready-head path produces the one wake.
         repository.reassign("hotfix", "actor-b", "system:mesh");
-        expect(announced).toEqual([{ id: "hotfix", actingPrincipal: "system:mesh" }]);
-        expect(repository.listResponsiveReadyAttention().map((o) => o.id)).toEqual(["hotfix"]);
+        // Removing actor-a's prior head and promoting actor-b's new one are
+        // separate owner transitions in the same committed reassignment.
+        expect(heads).toContainEqual({ id: "hotfix", previousHeadId: "b-head", responsive: true });
+        expect(announced).toEqual([]);
+        expect(repository.listResponsiveReadyAttention()).toEqual([]);
       });
 
       it("announces ready responsive obligations inherited during actor retirement behind the inheriting owner's head", () => {
@@ -370,19 +421,15 @@ describe("ObligationRepository", () => {
 
         repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b", "system:mesh");
 
-        // actor-b's existing head is b-head (priority 1). Both r-resp-1 and r-resp-2
-        // are transferred behind b-head and must be announced immediately.
-        // r-plain is not responsive, so it must not be announced.
-        expect(announced).toEqual([
-          { id: "r-resp-1", actingPrincipal: "system:mesh" },
-          { id: "r-resp-2", actingPrincipal: "system:mesh" },
-        ]);
+        // r-resp-1 becomes actor-b's responsive head; r-resp-2 remains behind
+        // it and retains the dedicated behind-head delivery path.
+        expect(announced).toEqual([{ id: "r-resp-2", actingPrincipal: "system:mesh" }]);
         expect(
           repository
             .listResponsiveReadyAttention()
             .map((o) => o.id)
             .sort()
-        ).toEqual(["r-resp-1", "r-resp-2"].sort());
+        ).toEqual(["r-resp-2"]);
       });
 
       it("announces inherited responsive head via ready-head change and behind-head obligations via responsiveReadyListener", () => {
@@ -421,6 +468,18 @@ describe("ObligationRepository", () => {
       });
 
       it("announces ready subtree members that turn responsive through reparenting, including descendants", () => {
+        const heads: Array<{
+          id: string | null;
+          previousHeadId: string | null;
+          responsive: boolean;
+        }> = [];
+        repository.setReadyHeadListener(({ head, previousHeadId }) =>
+          heads.push({
+            id: head?.id ?? null,
+            previousHeadId,
+            responsive: head?.effectiveResponsive ?? false,
+          })
+        );
         repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
         repository.create({
           title: "responsive root",
@@ -437,18 +496,16 @@ describe("ObligationRepository", () => {
           parentId: "moving",
           priority: 7,
         });
-        // r-root became ready behind the head and was announced at creation.
-        expect(announced).toEqual([{ id: "r-root", actingPrincipal: "system:mesh" }]);
+        // r-root became the responsive head at creation.
+        expect(announced).toEqual([]);
+        heads.length = 0;
 
         // Filing the child demoted 'moving' to waiting. Reparenting the
-        // subtree under r-root flips both members' resolved responsiveness;
-        // the ready child behind the unchanged head must announce immediately,
-        // not wait for a boot sweep.
+        // Filing the subtree makes r-root wait; its ready descendant is then
+        // the responsive head rather than a behind-head notification.
         repository.reparent("moving", "r-root", "system:mesh");
-        expect(announced).toEqual([
-          { id: "r-root", actingPrincipal: "system:mesh" },
-          { id: "moving-child", actingPrincipal: "system:mesh" },
-        ]);
+        expect(heads).toEqual([{ id: "moving-child", previousHeadId: "r-root", responsive: true }]);
+        expect(announced).toEqual([]);
       });
 
       it("announces ready subtree members when existing work is marked responsive", () => {
@@ -461,14 +518,87 @@ describe("ObligationRepository", () => {
           parentId: "hotfix",
           priority: 3,
         });
+        const heads: Array<{
+          id: string | null;
+          previousHeadId: string | null;
+          responsive: boolean;
+        }> = [];
+        repository.setReadyHeadListener(({ head, previousHeadId }) =>
+          heads.push({
+            id: head?.id ?? null,
+            previousHeadId,
+            responsive: head?.effectiveResponsive ?? false,
+          })
+        );
 
         repository.markResponsive("hotfix", "system:mesh");
 
         expect(repository.require("hotfix").effectiveResponsive).toBe(true);
         expect(repository.require("child").effectiveResponsive).toBe(true);
-        // The child makes its parent wait; the ready child behind the
-        // unchanged head gets the immediate responsive announcement.
-        expect(announced).toEqual([{ id: "child", actingPrincipal: "system:mesh" }]);
+        // The child makes its parent wait and becomes the responsive head.
+        expect(heads).toEqual([{ id: "child", previousHeadId: "head", responsive: true }]);
+        expect(announced).toEqual([]);
+      });
+
+      it("preempts a different owner's non-head ready descendant when a waiting ancestor is marked responsive (#896)", () => {
+        const headChanges: Array<{
+          id: string | null;
+          previousHeadId: string | null;
+          responsive: boolean;
+        }> = [];
+        repository.setReadyHeadListener(({ head, previousHeadId }) =>
+          headChanges.push({
+            id: head?.id ?? null,
+            previousHeadId,
+            responsive: head?.effectiveResponsive ?? false,
+          })
+        );
+        repository.create({ title: "owner-z head", id: "z-head", ownerId: "actor-c", priority: 1 });
+        repository.create({ title: "ancestor", id: "ancestor", ownerId: "actor-a", priority: 10 });
+        repository.create({
+          title: "waiting child",
+          id: "child",
+          ownerId: "actor-b",
+          parentId: "ancestor",
+          priority: 20,
+        });
+        repository.create({
+          title: "ready grandchild",
+          id: "grandchild",
+          ownerId: "actor-c",
+          parentId: "child",
+          priority: 30,
+        });
+
+        expect(repository.require("ancestor").status).toBe("waiting");
+        expect(repository.require("child").status).toBe("waiting");
+        expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+          "z-head",
+          "grandchild",
+        ]);
+        announced = [];
+        headChanges.length = 0;
+
+        repository.markResponsive("ancestor", "actor-a");
+
+        expect(repository.require("grandchild")).toMatchObject({ effectiveResponsive: true });
+        // The promoted descendant takes the existing ready-head path, which
+        // produces one responsive wake rather than competing head and
+        // behind-head announcements.
+        expect(headChanges).toEqual([
+          { id: "grandchild", previousHeadId: "z-head", responsive: true },
+        ]);
+        expect(announced).toEqual([]);
+        expect(repository.readyHeadRecords()).toContainEqual({
+          ownerId: "actor-c",
+          headId: "grandchild",
+          responsive: true,
+        });
+        expect(repository.listResponsiveReadyAttention()).toEqual([]);
+        expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+          "grandchild",
+          "z-head",
+        ]);
       });
 
       it("reannounces an unchanged ready head when it is marked responsive", () => {
@@ -533,7 +663,8 @@ describe("ObligationRepository", () => {
         );
 
         expect(repository.require("hotfix")).toMatchObject({ status: "ready", readyCount: 2 });
-        expect(announced).toEqual([{ id: "hotfix", actingPrincipal: "system:mesh" }]);
+        expect(repository.readyHeads().get("actor-a")).toBe("hotfix");
+        expect(announced).toEqual([]);
       });
 
       it("retries a failed delivery with the original acting principal, not a later mutation's", () => {
@@ -546,10 +677,17 @@ describe("ObligationRepository", () => {
 
         repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
         repository.create({
+          title: "responsive head",
+          id: "responsive-head",
+          ownerId: "actor-a",
+          priority: 2,
+          responsive: true,
+        });
+        repository.create({
           title: "hotfix",
           id: "hotfix",
           ownerId: "actor-a",
-          priority: 2,
+          priority: 3,
           responsive: true,
           creatorId: "actor-b",
         });
@@ -680,8 +818,13 @@ describe("ObligationRepository", () => {
       });
 
       expect(effective("blocker", "blocker-child", "head")).toEqual([true, true, false]);
-      expect(announced).toEqual(["blocker-child"]);
-      expect(repository.listResponsiveReadyAttention().map((o) => o.id)).toEqual(["blocker-child"]);
+      expect(headChanges).toContainEqual({
+        ownerId: "actor-b",
+        headId: "blocker-child",
+        responsive: true,
+      });
+      expect(announced).toEqual([]);
+      expect(repository.listResponsiveReadyAttention()).toEqual([]);
     });
 
     it("announces an already-ready blocker when an edge or the dependent changes", () => {
@@ -701,15 +844,21 @@ describe("ObligationRepository", () => {
         blockedBy: ["marked"],
       });
       expect(announced).toEqual([]);
+      headChanges.length = 0;
 
       repository.addPrerequisite("urgent", "edge-later", "actor-a");
       expect(repository.require("urgent").status).toBe("waiting");
       expect(effective("edge-later", "marked")).toEqual([true, false]);
-      expect(announced).toEqual(["edge-later"]);
+      expect(headChanges).toContainEqual({
+        ownerId: "actor-b",
+        headId: "edge-later",
+        responsive: true,
+      });
+      expect(announced).toEqual([]);
 
       repository.markResponsive("plain-dependent", "system:mesh");
       expect(effective("marked")).toEqual([true]);
-      expect(announced).toEqual(["edge-later", "marked"]);
+      expect(announced).toEqual(["marked"]);
     });
 
     it("carries the prerequisite-edge author to responsive delivery", () => {
@@ -720,6 +869,12 @@ describe("ObligationRepository", () => {
       repository.create({ title: "owner head", id: "owner-head", ownerId: "actor-b", priority: 1 });
       repository.create({ title: "blocker", id: "blocker", ownerId: "actor-b", priority: 2 });
       repository.create({
+        title: "second blocker",
+        id: "second-blocker",
+        ownerId: "actor-b",
+        priority: 3,
+      });
+      repository.create({
         title: "responsive dependent",
         id: "responsive-dependent",
         ownerId: "actor-a",
@@ -727,10 +882,13 @@ describe("ObligationRepository", () => {
       });
 
       repository.addPrerequisite("responsive-dependent", "blocker", "actor-a");
+      causes.length = 0;
+      repository.addPrerequisite("responsive-dependent", "second-blocker", "actor-a");
 
-      // `start.ts` turns this peer-authored cause into the existing preemptive
-      // responsive inbox path; ActorMesh covers that peer/self distinction.
-      expect(causes).toEqual([{ id: "blocker", actingPrincipal: "actor-a" }]);
+      // The first blocker is promoted to ready head. The second remains behind
+      // it, so `start.ts` preserves the prerequisite-edge author's identity on
+      // the existing preemptive responsive inbox path.
+      expect(causes).toEqual([{ id: "second-blocker", actingPrincipal: "actor-a" }]);
     });
 
     it("keeps a shared blocker responsive until its last responsive dependent stops waiting", () => {
@@ -809,7 +967,7 @@ describe("ObligationRepository", () => {
         responsive: true,
       });
       const attentionBefore = repository.listResponsiveReadyAttention().map((o) => o.id);
-      expect(attentionBefore).toEqual(["blocker"]);
+      expect(attentionBefore).toEqual([]);
 
       const reloaded = new ObligationRepository(
         db,
@@ -823,8 +981,8 @@ describe("ObligationRepository", () => {
       expect(reloaded.listResponsiveReadyAttention().map((o) => o.id)).toEqual(attentionBefore);
       expect(reloaded.readyHeadRecords()).toContainEqual({
         ownerId: "actor-b",
-        headId: "head",
-        responsive: false,
+        headId: "blocker",
+        responsive: true,
       });
     });
 
@@ -2136,6 +2294,244 @@ describe("ObligationRepository", () => {
     expect(c).toBeGreaterThan(b);
   });
 
+  describe("tier-aware priority reordering (#899)", () => {
+    it("reorders within the target's effective-responsiveness tier in a mixed queue (Seat 1 regression)", () => {
+      // Setup Seat 1's concrete queue:
+      // actor-c has [grandchild (responsive, p=100), z-head (p=10), z2 (p=20)]
+      repository.create({
+        title: "grandchild",
+        id: "grandchild",
+        ownerId: "actor-c",
+        priority: 100,
+      });
+      repository.markResponsive("grandchild", "system:mesh");
+      repository.create({
+        title: "z-head",
+        id: "z-head",
+        ownerId: "actor-c",
+        priority: 10,
+      });
+      repository.create({
+        title: "z2",
+        id: "z2",
+        ownerId: "actor-c",
+        priority: 20,
+      });
+
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "grandchild",
+        "z-head",
+        "z2",
+      ]);
+
+      // Move z2 between grandchild and z-head (to become the first ordinary item)
+      repository.movePriorityInternal("z2", "grandchild", "z-head", "system:mesh");
+
+      // z2 is the first ordinary item; its priority must be computed within the ordinary tier
+      // (before z-head's 10, so 10/2 = 5), not inflated after grandchild (101).
+      expect(repository.require("z2").effectivePriority).toBe(5);
+      // z-head priority must not be mutated or bumped by collision repair
+      expect(repository.require("z-head").effectivePriority).toBe(10);
+      // grandchild priority must remain unchanged
+      expect(repository.require("grandchild").effectivePriority).toBe(100);
+
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "grandchild",
+        "z2",
+        "z-head",
+      ]);
+    });
+
+    it("rejects impossible cross-tier moves atomically without modifying stored priorities", () => {
+      repository.create({
+        title: "grandchild",
+        id: "grandchild",
+        ownerId: "actor-c",
+        priority: 100,
+      });
+      repository.markResponsive("grandchild", "system:mesh");
+      repository.create({
+        title: "z-head",
+        id: "z-head",
+        ownerId: "actor-c",
+        priority: 10,
+      });
+      repository.create({
+        title: "z2",
+        id: "z2",
+        ownerId: "actor-c",
+        priority: 20,
+      });
+
+      // 1. Ordinary item cannot be placed ahead of responsive work
+      expect(() =>
+        repository.movePriorityInternal("z2", null, "grandchild", "system:mesh")
+      ).toThrow("cannot place ordinary work ahead of responsive work");
+      expect(repository.require("z2").effectivePriority).toBe(20);
+      expect(repository.require("grandchild").effectivePriority).toBe(100);
+      expect(repository.require("z-head").effectivePriority).toBe(10);
+
+      // 2. Responsive item cannot be placed after ordinary work
+      expect(() =>
+        repository.movePriorityInternal("grandchild", "z-head", "z2", "system:mesh")
+      ).toThrow("cannot place responsive work after ordinary work");
+      expect(repository.require("grandchild").effectivePriority).toBe(100);
+      expect(repository.require("z-head").effectivePriority).toBe(10);
+      expect(repository.require("z2").effectivePriority).toBe(20);
+
+      expect(() =>
+        repository.movePriorityInternal("grandchild", "z2", null, "system:mesh")
+      ).toThrow("cannot place responsive work after ordinary work");
+      expect(repository.require("grandchild").effectivePriority).toBe(100);
+    });
+
+    it("does not allow collision repair to spill into or mutate other-tier priorities", () => {
+      // Responsive tier collision repair must not mutate ordinary items
+      repository.create({
+        title: "r1",
+        id: "r1",
+        ownerId: "actor-c",
+        priority: 10,
+      });
+      repository.markResponsive("r1", "system:mesh");
+      repository.create({
+        title: "r2",
+        id: "r2",
+        ownerId: "actor-c",
+        priority: 10,
+      });
+      repository.markResponsive("r2", "system:mesh");
+      repository.create({
+        title: "r3",
+        id: "r3",
+        ownerId: "actor-c",
+        priority: 50,
+      });
+      repository.markResponsive("r3", "system:mesh");
+      repository.create({
+        title: "o1",
+        id: "o1",
+        ownerId: "actor-c",
+        priority: 5,
+      });
+
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "r1",
+        "r2",
+        "r3",
+        "o1",
+      ]);
+
+      // Move r3 between r1 (10) and r2 (11).
+      // Midpoint is null, so r3 gets priorityAfter(10)=11 and suffix repair bumps r2 to 12.
+      // Suffix repair must stop at the responsive boundary and NOT mutate o1.
+      repository.movePriorityInternal("r3", "r1", "r2", "system:mesh");
+      expect(repository.require("r1").effectivePriority).toBe(10);
+      expect(repository.require("r3").effectivePriority).toBe(11);
+      expect(repository.require("r2").effectivePriority).toBe(12);
+      expect(repository.require("o1").effectivePriority).toBe(5);
+
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "r1",
+        "r3",
+        "r2",
+        "o1",
+      ]);
+    });
+
+    it("supports valid moves across both tiers including tier boundaries", () => {
+      repository.create({
+        title: "r1",
+        id: "r1",
+        ownerId: "actor-c",
+        priority: 10,
+      });
+      repository.markResponsive("r1", "system:mesh");
+      repository.create({
+        title: "r2",
+        id: "r2",
+        ownerId: "actor-c",
+        priority: 20,
+      });
+      repository.markResponsive("r2", "system:mesh");
+      repository.create({
+        title: "o1",
+        id: "o1",
+        ownerId: "actor-c",
+        priority: 100,
+      });
+      repository.create({
+        title: "o2",
+        id: "o2",
+        ownerId: "actor-c",
+        priority: 200,
+      });
+
+      // Move r1 to the end of the responsive tier (between r2 and o1)
+      repository.movePriorityInternal("r1", "r2", "o1", "system:mesh");
+      expect(repository.require("r1").effectivePriority).toBe(21);
+      expect(repository.require("r2").effectivePriority).toBe(20);
+      expect(repository.require("o1").effectivePriority).toBe(100);
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "r2",
+        "r1",
+        "o1",
+        "o2",
+      ]);
+
+      // Move o2 to the beginning of the ordinary tier (between r1 and o1)
+      repository.movePriorityInternal("o2", "r1", "o1", "system:mesh");
+      expect(repository.require("o2").effectivePriority).toBe(50);
+      expect(repository.require("o1").effectivePriority).toBe(100);
+      expect(repository.require("r1").effectivePriority).toBe(21);
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "r2",
+        "r1",
+        "o2",
+        "o1",
+      ]);
+    });
+
+    it("classifies a snoozed responsive row by queue order, not responsiveness alone", () => {
+      repository.setOsScheduler(new FakeObligationScheduler());
+      repository.create({ title: "r", id: "r", ownerId: "actor-c", priority: 10 });
+      repository.markResponsive("r", "system:mesh");
+      repository.create({ title: "o1", id: "o1", ownerId: "actor-c", priority: 20 });
+      repository.create({ title: "o2", id: "o2", ownerId: "actor-c", priority: 30 });
+      repository.create({ title: "s", id: "s", ownerId: "actor-c", priority: 40 });
+      repository.markResponsive("s", "system:mesh");
+      repository.setSnooze("s", "2100-01-01T00:00:00.000Z", "actor-c");
+
+      // The snoozed responsive row sorts after every actionable row.
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "r",
+        "o1",
+        "o2",
+        "s",
+      ]);
+
+      // Ordinary work may sit ahead of the snoozed responsive row.
+      repository.movePriorityInternal("o1", "o2", "s", "system:mesh");
+      expect(repository.require("o1").effectivePriority).toBe(35);
+      expect(repository.listOwned("actor-c", { status: "ready" }).map((o) => o.id)).toEqual([
+        "r",
+        "o2",
+        "o1",
+        "s",
+      ]);
+
+      // The snoozed responsive row may move after ordinary work.
+      repository.movePriorityInternal("s", "o1", null, "system:mesh");
+      expect(repository.require("s").effectivePriority).toBe(36);
+
+      // Actionable responsive work still cannot follow ordinary work.
+      expect(() => repository.movePriorityInternal("r", "o1", "s", "system:mesh")).toThrow(
+        "cannot place responsive work after ordinary work"
+      );
+      expect(repository.require("r").effectivePriority).toBe(10);
+    });
+  });
+
   it("keeps a parent waiting until every direct child is terminal", () => {
     repository.create({
       title: "parent",
@@ -2803,7 +3199,9 @@ describe("ObligationRepository", () => {
 
     expect(() =>
       repository.inheritRetiringActorObligationsInternal("actor-a", null, "system:mesh")
-    ).toThrow("root/no-parent behavior is unresolved (ISSUE_NUM Q69)");
+    ).toThrow(
+      /^retirement inheritance requires an actor parent; root\/no-parent behavior is unresolved$/
+    );
     expect(() =>
       repository.inheritRetiringActorObligationsInternal("actor-a", "unknown", "system:mesh")
     ).toThrow("actor owner does not exist: unknown");
@@ -3792,12 +4190,14 @@ describe("ObligationRepository", () => {
         snooze("hot", iso(T0 + HOUR));
         const before = repository.require("hot").readyCount;
         responsive = [];
+        heads = [];
 
         const cleared = snooze("hot", null);
 
         expect(cleared.readyCount).toBe(before + 1);
-        expect(responsive).toEqual(["hot"]);
-        expect(repository.listResponsiveReadyAttention().map((o) => o.id)).toEqual(["hot"]);
+        expect(heads).toEqual([{ ownerId: "actor-a", headId: "hot" }]);
+        expect(responsive).toEqual([]);
+        expect(repository.listResponsiveReadyAttention()).toEqual([]);
       });
 
       it("expiry of a snoozed head re-announces it as the head", () => {

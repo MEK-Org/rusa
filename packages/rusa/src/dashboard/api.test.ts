@@ -2640,6 +2640,102 @@ describe("handleMeshApiRequest", () => {
     expect(closed?.eventReference).toBeUndefined();
   });
 
+  it("GET /api/mesh/inbox names the one obligation an entry is unambiguously tied to (#610)", async () => {
+    obligations.create({
+      id: "ob-pr",
+      title: "Land the PR",
+      ownerId: UUID_A,
+      externalRef: "github:MEK-Org/rusa/pulls/700",
+    });
+    obligations.create({
+      id: "ob-closed",
+      title: "Closed work",
+      ownerId: UUID_A,
+      externalRef: "github:MEK-Org/rusa/issues/701",
+    });
+    obligations.create({
+      id: "ob-other",
+      title: "Other work",
+      ownerId: UUID_A,
+      externalRef: "github:MEK-Org/rusa/issues/703",
+    });
+    obligations.setTerminalStatus("ob-closed", "done", null, null, UUID_A);
+    inbox.append([
+      {
+        id: "linked-event",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/pulls/700",
+        payload: { type: "pull_request_review.submitted", reviewId: 1 },
+      },
+      {
+        id: "terminal-link",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/issues/701",
+        payload: { type: "issue_comment.created", commentId: 2 },
+      },
+      {
+        id: "unlinked-event",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/issues/702",
+        payload: { type: "issue_comment.created", commentId: 3 },
+      },
+      {
+        id: "ready-head",
+        actorId: UUID_A,
+        source: "obligation:ob-pr",
+        payload: { type: "obligation.ready_head", obligationId: "ob-pr", intent: "Land the PR" },
+      },
+      {
+        id: "prereq-cancelled",
+        actorId: UUID_A,
+        source: "obligation:ob-pr",
+        payload: {
+          type: "obligation.prerequisite_cancelled",
+          obligationId: "ob-pr",
+          prerequisiteId: "ob-closed",
+        },
+      },
+      {
+        id: "conflict-event",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/pulls/700",
+        payload: {
+          type: "obligation.ready_head",
+          obligationId: "ob-other",
+          intent: "Other work",
+        },
+      },
+    ]);
+    // A prior run's selection associated the unlinked event with ob-pr.
+    deps = {
+      ...deps,
+      inboxFocus: {
+        listEntryObligationIds: (_actorId: string, entryId: string) =>
+          entryId === "unlinked-event" ? ["ob-pr"] : [],
+      } as unknown as DashboardDataDeps["inboxFocus"],
+    };
+
+    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const byId = new Map(
+      (JSON.parse(res.body).entries as Array<{ id: string; obligationId?: string }>).map((e) => [
+        e.id,
+        e,
+      ])
+    );
+    // The live obligation whose external ref is the event's source.
+    expect(byId.get("linked-event")?.obligationId).toBe("ob-pr");
+    // The obligation a ready-head signal names.
+    expect(byId.get("ready-head")?.obligationId).toBe("ob-pr");
+    // A closed obligation no longer governs its issue's events.
+    expect(byId.get("terminal-link")?.obligationId).toBeUndefined();
+    // Selection-only association does not make an entry an obligation card.
+    expect(byId.get("unlinked-event")?.obligationId).toBeUndefined();
+    // A cancelled-prerequisite notice keeps its own rendering.
+    expect(byId.get("prereq-cancelled")?.obligationId).toBeUndefined();
+    // When named and linked obligations disagree, it falls back to none (#610).
+    expect(byId.get("conflict-event")?.obligationId).toBeUndefined();
+  });
+
   it("GET /api/mesh/inbox resolves a Google Chat entry to its message card through the artifact resolver (#654)", async () => {
     // Shaped like `normalizeChatEvent`'s output: `source` is the containing
     // space (routing granularity), so the card must come from the message
@@ -3779,6 +3875,42 @@ describe("handleMeshApiRequest", () => {
     });
 
     describe("GET /api/mesh/obligations/:id", () => {
+      it("returns root-first ancestors and an attributable paged history tail", async () => {
+        obligations.create({ id: "grandparent", title: "Root", ownerId: "actor-1" });
+        obligations.create({
+          id: "parent",
+          title: "Parent",
+          ownerId: "actor-1",
+          parentId: "grandparent",
+        });
+        obligations.create({
+          id: "detail",
+          title: "Detail",
+          ownerId: "actor-1",
+          parentId: "parent",
+        });
+        obligations.setCheckpoint("detail", "first", "actor-1");
+        obligations.setCheckpoint("detail", "second", "actor-2");
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/detail?history_limit=1");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+        expect(data.ancestors.map((a: { id: string }) => a.id)).toEqual(["grandparent", "parent"]);
+        expect(data.history).toHaveLength(1);
+        expect(data.history[0]).toMatchObject({
+          actingPrincipal: "actor-2",
+          after: { checkpoint: "second" },
+        });
+        obligations.setCheckpoint("detail", "newer", "actor-1");
+        const earlier = await call(
+          deps,
+          "GET",
+          `/api/mesh/obligations/detail?history_limit=1&history_before=${encodeURIComponent(data.historyNextBefore)}`
+        );
+        const page = JSON.parse(earlier.res.body);
+        expect(page.history[0].after.checkpoint).toBe("first");
+        expect(page.historyNextBefore).not.toBeNull(); // creation remains in the tail
+      });
+
       it("returns obligation with parent, children, and blockingChildren", async () => {
         obligations.create({
           title: "root-task",
@@ -4499,6 +4631,25 @@ describe("handleMeshApiRequest", () => {
         expect(JSON.parse(res.body).error).toContain("no host activation scheduler");
         expect(bare.get("mine")?.snoozedUntil).toBeNull();
         expect(bare.listHistory("mine").some((h) => h.mutationKind === "snooze")).toBe(false);
+      });
+
+      it("accepts the dashboard's microsecond UTC deadline and refuses a terminal row (#893)", async () => {
+        // Dart's DateTime.toUtc().toIso8601String() carries six fractional
+        // digits and a Z offset; the server stores it at millisecond precision.
+        obligations.create({ title: "mine", id: "mine", ownerId: LOCAL_USER });
+        const base = new Date(Date.now() + 2 * 3_600_000);
+        base.setUTCMilliseconds(123);
+        const dartForm = base.toISOString().replace(/Z$/, "456Z");
+        const set = await snooze("mine", { until: dartForm });
+        expect(set.status).toBe(200);
+        expect(set.data.obligation.snoozedUntil).toBe(base.toISOString());
+
+        obligations.create({ title: "finished", id: "finished", ownerId: LOCAL_USER });
+        obligations.setTerminalStatus("finished", "done", null, null, LOCAL_USER);
+        const refused = await snooze("finished", { until: future() });
+        expect(refused.status).toBe(400);
+        expect(refused.data.error).toContain("terminal obligations cannot be snoozed");
+        expect(obligations.get("finished")?.snoozedUntil).toBeNull();
       });
 
       it("404s a missing obligation and 400s an invalid deadline", async () => {

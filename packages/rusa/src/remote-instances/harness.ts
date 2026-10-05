@@ -1,0 +1,317 @@
+import { setTimeout as delay } from "node:timers/promises";
+import Database from "better-sqlite3";
+import type { ActorLifecyclePromptEvent } from "../actor/actor-lifecycle.js";
+import { ActorMesh, type ActorMeshOptions } from "../actor/actor-mesh.js";
+import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
+import { COMPUTER_USE_CAPABILITY } from "../actor/computer-use-lock.js";
+import {
+  InMemoryEventSourceOwnerStore,
+  InMemoryEventSourceSubscriptionStore,
+} from "../actor/event-subscriptions.js";
+import { ExternalRootDriver } from "../actor/external-root-driver.js";
+import type { MeshEventInput } from "../actor/mesh-events.js";
+import { type ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
+import { runMigrations } from "../db/migrations/runner.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
+import type { LogFields, Logger } from "../observability/logger.js";
+import type { ProviderModelConfig } from "../providers/model-config.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import { ActorHandle } from "./actor-handle.js";
+import { createProvider } from "./fixture-provider.js";
+import { FollowerInstance } from "./follower-instance.js";
+import type { ActorEvent, ProviderFactory } from "./protocol.js";
+import { RemoteInstance } from "./remote-instance.js";
+
+export async function waitUntil(check: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for instance actor");
+    await delay(10);
+  }
+}
+
+/** All coordinator state is ephemeral here. No production DB, config, or service access. */
+export function createHarness(options: {
+  cwd: string;
+  delayMs?: number;
+  providerFactory?: ProviderFactory;
+  maxConcurrent?: number;
+  /**
+   * Leader-side provider pacing. Supplied only by tests about a run that waits
+   * to be admitted; without it the mesh keeps its unpaced default gate.
+   */
+  pacer?: ProviderPacer;
+  startupTimeoutMs?: number;
+  stateStaleTimeoutMs?: number;
+  /** Provider halt state, for tests about halted-queue cancellation and replay. */
+  isHalted?: (provider?: string, model?: string) => boolean;
+  /** Leader-side observer, called as each follower event is received, for race-window tests. */
+  onEvent?: (actorId: string, event: ActorEvent) => void;
+  /** Obligation reads and experiment membership, for tests about strict head closure. */
+  obligations?: ActorMeshOptions["obligations"];
+  experimentEnrollments?: ActorMeshOptions["experimentEnrollments"];
+}) {
+  const promptEvents: ActorLifecyclePromptEvent[] = [];
+  const actors = new InMemoryActorRepository();
+  const runtimes = new Map<string, ActorHandle>();
+  let remote = new RemoteInstance("test-follower", process.platform, process.pid);
+  const remotes = [remote];
+  const follower = new FollowerInstance(
+    options.cwd,
+    false,
+    (event) => queueMicrotask(() => remote.receive(structuredClone(event))),
+    options.providerFactory ?? createProvider
+  );
+  // Exercise the same instance commands without opening a port in unit tests.
+  const wire = (instance: RemoteInstance) => {
+    instance.flush = () => {
+      for (const command of instance.commands.splice(0))
+        if ("actorId" in command) {
+          queueMicrotask(() => follower.dispatch(structuredClone(command)));
+        } else {
+          // This in-process fixture shares the leader checkout. Running an update
+          // here could reset the test source tree, so surface an explicit failed
+          // status instead of silently discarding the command.
+          queueMicrotask(() =>
+            instance.receive({
+              actorId: "$instance",
+              message: {
+                type: "update_status",
+                updateId: command.updateId,
+                status: "failed",
+                error: "Follower updates require an isolated follower process",
+              },
+            })
+          );
+        }
+    };
+  };
+  wire(remote);
+  const messages: Array<{ fromId: string; toId: string; body: string }> = [];
+  const events: Array<{ actorId: string; event: ActorEvent }> = [];
+  const meshEvents: MeshEventInput[] = [];
+  // The leader's request/outcome distinction is only visible in its structured logs.
+  const logs: Array<{ event: string; fields?: LogFields }> = [];
+  const logger: Logger = {
+    debug: () => {},
+    info: (event, fields) => {
+      logs.push({ event, fields });
+    },
+    warn: (event, fields) => {
+      logs.push({ event, fields });
+    },
+    error: (event, fields) => {
+      logs.push({ event, fields });
+    },
+    child: () => logger,
+  };
+  const failures: Error[] = [];
+  let sequence = 0;
+  const eventSourceOwners = new InMemoryEventSourceOwnerStore();
+  const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
+  const capabilityGrants = new InMemoryCapabilityGrantStore();
+  const pacer = options.pacer;
+  // Dispatch reads work and priority back out of durable inbox state, so these
+  // tests need a real store rather than a stub: the production SQLite one over
+  // an in-memory database, which is exactly what a follower leader runs.
+  const inboxDb = new Database(":memory:");
+  runMigrations(inboxDb);
+  const inboxStore = new SqliteInboxRepository(inboxDb);
+  // No event seam: these follower tests never route or deliver events, and a
+  // mesh without one simply refuses those paths rather than inventing a ladder.
+  const mesh = new ActorMesh({
+    actors,
+    rootId: "root",
+    inboxStore,
+    eventSourceOwners,
+    eventSourceSubscriptions,
+    maxConcurrent: options.maxConcurrent ?? 1,
+    isHalted: options.isHalted,
+    capabilityGrants,
+    grantableCapabilities: new Set([COMPUTER_USE_CAPABILITY]),
+    events: (event) => meshEvents.push(event),
+    idgen: () => `instance-worker-${++sequence}`,
+    obligations: options.obligations,
+    experimentEnrollments: options.experimentEnrollments,
+    ...(pacer
+      ? {
+          // Every declared candidate is a lane, and a halted one is skipped as
+          // in the production pool gate, so a pool admits a healthy candidate.
+          providerGate: (fn, candidates, request) =>
+            submitPoolGate(
+              fn,
+              candidates.map((config) => ({ config, lane: "instance-fixture", pacer })),
+              {
+                responsive: request.responsive,
+                threadId: request.threadId,
+                enqueueNormal: request.enqueueNormal,
+                isHalted: (config) => options.isHalted?.(config.provider, config.model) ?? false,
+              }
+            ),
+        }
+      : {}),
+    recordChat: (message) => {
+      messages.push({ fromId: message.senderId, toId: message.recipientId, body: message.body });
+      return `message-${messages.length}`;
+    },
+    onModelSet: (actorId, newModelConfig) => {
+      const liveActor = mesh.get(actorId);
+      if (liveActor && typeof liveActor.setModelConfig === "function") {
+        liveActor.setModelConfig(newModelConfig);
+      }
+    },
+    createActor: (context) => {
+      let cursor = 0;
+      let admittedCursor = 0;
+      context.lifecycle.add({
+        onPrompt: (event) => {
+          promptEvents.push(event);
+        },
+        onEnd: (event) => {
+          if (event.terminal.kind === "abandoned") {
+            mesh.recordEvent({
+              kind: "run_abandoned",
+              actorId: context.record.id,
+              detail: event.terminal.reason,
+              payload: JSON.stringify({
+                started: event.terminal.started,
+                runId: event.runId,
+              }),
+            });
+          }
+        },
+      });
+      const runtime = new ActorHandle({
+        host: remote.createHost(context.record.id),
+        context,
+        startupTimeoutMs: options.startupTimeoutMs,
+        stateStaleTimeoutMs: options.stateStaleTimeoutMs,
+        bootstrap: {
+          id: context.record.id,
+          cwd: options.cwd,
+          modelConfig: context.record.modelConfig ? [...context.record.modelConfig] : undefined,
+          providerOptions: { delayMs: options.delayMs },
+          sessionId: context.record.sessionId,
+        },
+        snapshot: () => {
+          const record = context.getRecord();
+          if (!record) throw new Error("Actor record is missing");
+          admittedCursor = messages.length;
+          return {
+            record,
+            prompt: JSON.stringify({
+              charter: record.charter,
+              parentId: record.parentId,
+              messages: messages
+                .slice(cursor, admittedCursor)
+                .filter((message) => message.toId === record.id)
+                .map((message) => message.body),
+            }),
+          };
+        },
+        saveSession: (sessionId) => actors.patch(context.record.id, { sessionId }),
+        onEvent: (event) => {
+          events.push({ actorId: context.record.id, event });
+          options.onEvent?.(context.record.id, event);
+          if (event.type === "result" && event.result.success) cursor = admittedCursor;
+        },
+        onFailure: (error) => {
+          failures.push(error);
+        },
+        logger,
+      });
+      runtimes.set(context.record.id, runtime);
+      return runtime;
+    },
+  });
+  mesh.adopt(
+    {
+      id: "root",
+      parentId: null,
+      charter: "Coordinate the followers",
+      status: "active",
+      createdAt: new Date().toISOString(),
+    },
+    new ExternalRootDriver("root")
+  );
+
+  /** Durable responsive work, as any real producer would leave it, then dispatch. */
+  const dispatchResponsive = (actorId: string, source = "test:responsive") => {
+    inboxStore.append([
+      { actorId, source, payload: { type: "test.responsive", priority: "responsive" } },
+    ]);
+    return mesh.dispatch(actorId);
+  };
+
+  /**
+   * Responsive work persisted as joining: admitted at responsive priority, but
+   * never allowed to replace a run in flight (#829).
+   */
+  const dispatchJoining = (actorId: string, source = "test:joining") => {
+    inboxStore.append([
+      {
+        actorId,
+        source,
+        payload: { type: "test.joining", priority: "responsive", interruption: "join" },
+      },
+    ]);
+    return mesh.dispatch(actorId);
+  };
+
+  /** The same, at ordinary priority. */
+  const dispatchNormal = (actorId: string, source = "test:normal") => {
+    inboxStore.append([{ actorId, source, payload: { type: "test.normal" } }]);
+    return mesh.dispatch(actorId);
+  };
+
+  return {
+    mesh,
+    inboxStore,
+    dispatchResponsive,
+    dispatchJoining,
+    dispatchNormal,
+    actors,
+    runtimes,
+    messages,
+    promptEvents,
+    events,
+    meshEvents,
+    logs,
+    failures,
+    capabilityGrants,
+    follower,
+    home: options.cwd,
+    get remote() {
+      return remote;
+    },
+    reconnect() {
+      remote = new RemoteInstance("test-follower", process.platform, process.pid);
+      remotes.push(remote);
+      wire(remote);
+      return remote;
+    },
+    runtime: (id: string) => {
+      const runtime = runtimes.get(id);
+      if (!runtime) throw new Error(`No runtime for ${id}`);
+      return runtime;
+    },
+    spawn: (
+      charter: string,
+      modelConfig: ProviderModelConfig | ProviderModelConfig[] = {
+        provider: "instance-fixture",
+        model: "scripted",
+      }
+    ) => {
+      const id = mesh.spawn({ charter, parentId: "root", modelConfig });
+      mesh.sendMessage(id, "Begin your charter", "root");
+      return id;
+    },
+    async close() {
+      mesh.shutdownAll();
+      for (const r of remotes) r.close();
+      await Promise.all([...runtimes.values()].map((runtime) => runtime.exited));
+      follower.close();
+      inboxDb.close();
+    },
+  };
+}

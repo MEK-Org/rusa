@@ -19,7 +19,7 @@ import {
 } from "./codex.js";
 import { SANDBOX_CODEX_SHELL_ENV_OVERRIDE } from "./sandbox.js";
 
-const { spawnFn, execSyncFn, execFileSyncFn } = vi.hoisted(() => {
+const { spawnFn, execSyncFn, execFileSyncFn, execFileFn } = vi.hoisted(() => {
   const spawnFn = vi.fn();
   const execSyncFn = vi.fn((command: string) => {
     if (command === "pnpm store path") return "/tmp/pnpm-store/path";
@@ -31,19 +31,49 @@ const { spawnFn, execSyncFn, execFileSyncFn } = vi.hoisted(() => {
   });
   const execFileSyncFn = vi.fn((command: string, args: string[]) => {
     if (command === "bwrap" && args[0] === "--version") return "bwrap version";
+    if (command === "codex" && args[0] === "mcp" && args[1] === "list") return "[]";
     throw new Error(`Unexpected execFileSync: ${command} ${args.join(" ")}`);
   });
-  return { spawnFn, execSyncFn, execFileSyncFn };
+  const execFileFn = vi.fn(
+    (
+      command: string,
+      args: string[],
+      options: unknown,
+      cb?: (err: Error | null, stdout?: string, stderr?: string) => void
+    ) => {
+      const callback = (typeof options === "function" ? options : cb) as (
+        err: Error | null,
+        stdout?: string,
+        stderr?: string
+      ) => void;
+      if (command === "bwrap" && args[0] === "--version") {
+        callback(null, "bwrap version", "");
+        return;
+      }
+      if (
+        (command === "codex" || command === "bwrap") &&
+        args.includes("mcp") &&
+        args.includes("list")
+      ) {
+        callback(null, "[]", "");
+        return;
+      }
+      callback(new Error(`Unexpected execFile: ${command} ${args?.join(" ")}`), "", "");
+    }
+  );
+  return { spawnFn, execSyncFn, execFileSyncFn, execFileFn };
 });
 
 vi.mock("node:child_process", () => ({
   spawn: spawnFn,
   execSync: execSyncFn,
   execFileSync: execFileSyncFn,
+  execFile: execFileFn,
   default: {
     spawn: spawnFn,
     execSync: execSyncFn,
     execFileSync: execFileSyncFn,
+    execFile: execFileFn,
   },
 }));
 
@@ -686,6 +716,38 @@ trust_level = "trusted"
       expect(result.success).toBe(true);
     });
 
+    it("reuses filtered plugin/direct overrides and the sandbox context for resume-to-fresh fallback", async () => {
+      seedRollout(ID);
+      execFileFn.mockImplementationOnce((_command, _args, _options, cb) => {
+        cb?.(
+          null,
+          JSON.stringify([
+            { name: "computer-use", transport: { type: "stdio", command: "fake-desktop" } },
+          ]),
+          ""
+        );
+      });
+      const { argvs, result } = await runWithSpawns({ id: ID }, [1, 0]);
+      expect(result.success).toBe(true);
+      expect(argvs).toHaveLength(2);
+      const discovery = execFileFn.mock.calls.find(([, args]) => args.includes("mcp"));
+      expect(discovery?.[0]).toBe("bwrap");
+      const options = discovery?.[2] as { timeout: number };
+      expect(options.timeout).toBe(5_000);
+      for (const argv of argvs) {
+        expect(codexArgsOf(argv)).toEqual(
+          expect.arrayContaining([
+            "plugins.unified-computer-use@openai-bundled.enabled=false",
+            "plugins.computer-use@openai-bundled.enabled=false",
+            "mcp_servers.computer-use.enabled=false",
+          ])
+        );
+        expect(argv.slice(0, argv.indexOf("--"))).toEqual(
+          discovery?.[1].slice(0, discovery[1].indexOf("--"))
+        );
+      }
+    });
+
     it("hands shell children the throwaway CODEX_HOME on resume and on the fresh retry", async () => {
       seedRollout(ID);
       const { argvs } = await runWithSpawns({ id: ID }, [1, 0]);
@@ -1011,7 +1073,15 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
     };
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
-    vi.mocked(spawn).mockReturnValue(child as unknown as ChildProcessWithoutNullStreams);
+    vi.mocked(spawn).mockImplementation(() => {
+      // Emit only after spawn returns and the provider installs its listeners.
+      queueMicrotask(() => {
+        if (opts.stdout) child.stdout.emit("data", Buffer.from(opts.stdout));
+        if (opts.stderr) child.stderr.emit("data", Buffer.from(opts.stderr));
+        child.emit("close", opts.exitCode ?? 0);
+      });
+      return child as unknown as ChildProcessWithoutNullStreams;
+    });
 
     const live: string[] = [];
     const runPromise = provider.run({
@@ -1019,9 +1089,6 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       cwd: "/tmp",
       onChunk: (c) => live.push(c),
     });
-    if (opts.stdout) child.stdout.emit("data", Buffer.from(opts.stdout));
-    if (opts.stderr) child.stderr.emit("data", Buffer.from(opts.stderr));
-    child.emit("close", opts.exitCode ?? 0);
     const result = await runPromise;
     return { result, live };
   }

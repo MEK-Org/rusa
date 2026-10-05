@@ -163,8 +163,8 @@ void main() {
       await tester.pump();
 
       // Opened, the same standing carries its author and time.
-      expect(find.text('Standing'), findsOneWidget);
-      expect(find.textContaining('root-handle · '), findsOneWidget);
+      expect(find.text('HISTORY'), findsOneWidget);
+      expect(find.textContaining('root-handle current standing · '), findsOneWidget);
 
       await store.dispose();
     });
@@ -323,7 +323,7 @@ void main() {
 
         // Standing is visible in both the sidebar tree node and the detail view
         expect(find.text(oldStanding), findsNWidgets(2));
-        expect(find.text('Standing'), findsOneWidget);
+        expect(find.text('HISTORY'), findsOneWidget);
 
         // Page the completion history so earlier completions are loaded
         expect(find.textContaining('Cycle 2'), findsOneWidget);
@@ -429,7 +429,7 @@ void main() {
 
         // Both the tree node and the open detail view reflect the new standing
         expect(find.text(newStanding), findsNWidgets(2));
-        expect(find.text('Standing'), findsOneWidget);
+        expect(find.text('HISTORY'), findsOneWidget);
 
         // Completion paging state is preserved by stable identity and descending
         // sequence order: newly arrived Cycle 3, previously loaded Cycle 2, and

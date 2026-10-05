@@ -162,7 +162,7 @@ export interface ActorRuntimeStateSnapshot {
 
 export interface SpawnRequest {
   /**
-   * Experimental execution placement, not persisted on the record. A target is
+   * Execution placement, not persisted on the record. A target is
    * only admitted when the runtime declares placement support through
    * {@link ActorMeshOptions.supportsExecutionTarget}; otherwise the spawn is
    * rejected rather than quietly running the actor in this process.
@@ -586,7 +586,7 @@ export interface ActorMeshOptions {
    */
   validateSpawn?: (req: SpawnRequest) => ProviderModelConfig[];
   /**
-   * Experimental placement gate, consulted for every spawn that names an
+   * Placement gate, consulted for every spawn that names an
    * `executionTarget`. Fail-closed by omission: a runtime that cannot place
    * actors elsewhere leaves this unset, and an explicit target is then refused
    * instead of degrading into a silent local run on the leader.

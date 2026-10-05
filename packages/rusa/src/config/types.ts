@@ -411,6 +411,16 @@ export type DashboardAuthConfig = {
     }
 );
 
+/**
+ * The Git identity mesh-owned commits are made under (#909). Both fields are
+ * required together; an absent, blank or partial pair is reported to actors as
+ * a configuration gap rather than replaced by any other identity.
+ */
+export interface GitIdentityConfig {
+  name?: string;
+  email?: string;
+}
+
 export interface RusaConfig {
   /** Optional Google authentication with shared human operator access. */
   auth?: DashboardAuthConfig;
@@ -463,6 +473,8 @@ export interface RusaConfig {
   mesh?: MeshConfig;
   /** Worker isolation mode. Defaults to "bwrap". */
   sandbox?: SandboxMode;
+  /** Git identity for mesh-owned commits; unset means actors report the gap. */
+  gitIdentity?: GitIdentityConfig;
   /** If true, serve local git bare repositories via a local Git HTTP server and redirect sandbox clones to them. */
   gitBridge?: boolean;
   /** Port the local Git HTTP server binds to (default: 8085). */

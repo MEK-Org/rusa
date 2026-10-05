@@ -504,12 +504,16 @@ class DashboardApi {
 
   Future<ObligationDetailSnapshot> fetchObligationDetail(
     String id, {
+    String? historyBefore,
+    int? historyLimit,
     int? childrenOffset,
     int? blockingOffset,
     int? completionsOffset,
     int? limit,
   }) async {
     final q = <String, String>{
+      'history_before': ?historyBefore,
+      if (historyLimit != null) 'history_limit': '$historyLimit',
       if (childrenOffset != null) 'children_offset': '$childrenOffset',
       if (blockingOffset != null) 'blocking_offset': '$blockingOffset',
       if (completionsOffset != null) 'completions_offset': '$completionsOffset',
@@ -634,6 +638,35 @@ class DashboardApi {
     return ObligationDto.fromJson(json['obligation'] as Map<String, dynamic>);
   }
 
+  /// `POST /api/mesh/obligations/:id/snooze` — set, replace or clear (null
+  /// [until]) the snooze on an obligation the viewer owns (#722). The deadline
+  /// is sent as UTC with its `Z` offset; the server refuses one not in the
+  /// future, and only the current owner may write it.
+  Future<ObligationSnoozeResult> setObligationSnooze(
+    String id,
+    DateTime? until,
+  ) async {
+    final uri = _u('/api/mesh/obligations/$id/snooze');
+    final res = await _client.post(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({'until': until?.toUtc().toIso8601String()}),
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+    final json = jsonDecode(res.body) as Map<String, dynamic>;
+    return ObligationSnoozeResult(
+      obligation: ObligationDto.fromJson(
+        json['obligation'] as Map<String, dynamic>,
+      ),
+      warning: json['warning'] as String?,
+    );
+  }
+
   Future<ObligationDto> reorderObligation(
     String id, {
     String? previousId,
@@ -703,6 +736,14 @@ class DashboardApi {
   }
 
   void close() => _client.close();
+}
+
+/// A committed snooze write: the persisted obligation, plus the server's
+/// warning when the write committed but its wake timer did not arm.
+class ObligationSnoozeResult {
+  const ObligationSnoozeResult({required this.obligation, this.warning});
+  final ObligationDto obligation;
+  final String? warning;
 }
 
 class DashboardApiException implements Exception {

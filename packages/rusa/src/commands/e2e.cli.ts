@@ -77,7 +77,7 @@ program
         throw new Error("both Slack token paths must be supplied together");
       }
       if (opts.followerBind && (!opts.followerTokenFile || opts.resume)) {
-        throw new Error("Follower prototype requires --follower-token-file and a fresh instance");
+        throw new Error("Follower gateway requires --follower-token-file and a fresh instance");
       }
       await runActorMeshE2EUp({
         root: opts.root,
@@ -108,7 +108,7 @@ program
 program
   .command("ab-context")
   .description(
-    "Side-by-side provider-agnostic-context A/B (design ISSUE_NUM): run the evolving todo-app " +
+    "Side-by-side provider-agnostic-context A/B: run the evolving todo-app " +
       "scenario on a native vs a portable-context worker; emit metrics + a blind-judging package"
   )
   .option("--root <path>", "Reuse a specific instance root instead of a fresh tempdir")

@@ -97,6 +97,9 @@ interface TrackedObligationRow {
   terminal_note: string | null;
   resolution_ref: string | null;
   snoozed_until: string | null;
+  checkpoint: string | null;
+  checkpoint_at: string | null;
+  checkpoint_by: string | null;
 }
 
 /** One captured UPDATE, as the TEMP history-capture trigger records it. */
@@ -110,6 +113,9 @@ interface ObligationDeltaRow {
   before_terminal_note: string | null;
   before_resolution_ref: string | null;
   before_snoozed_until: string | null;
+  before_checkpoint: string | null;
+  before_checkpoint_at: string | null;
+  before_checkpoint_by: string | null;
   after_owner_id: string;
   after_parent_id: string | null;
   after_priority: number | null;
@@ -118,6 +124,9 @@ interface ObligationDeltaRow {
   after_terminal_note: string | null;
   after_resolution_ref: string | null;
   after_snoozed_until: string | null;
+  after_checkpoint: string | null;
+  after_checkpoint_at: string | null;
+  after_checkpoint_by: string | null;
 }
 
 export interface CreateObligationInput {
@@ -349,9 +358,10 @@ const QUEUE_SQL: Record<ObligationQueue, string> = {
 /**
  * Owner-queue order: actionable ready work first, then the waiting group
  * (waiting rows and any snoozed non-terminal rows, including snoozed scheduled
- * rows), then unsnoozed scheduled and terminal rows; by effective priority then
- * id within each group. The ready head is this order's first row when that row
- * is actionable, so the two must not diverge.
+ * rows), then unsnoozed scheduled and terminal rows. Responsive ready work
+ * precedes other ready work; every group then orders by effective priority and
+ * id. The ready head is this order's first row when that row is actionable, so
+ * the two must not diverge.
  */
 const OWNER_QUEUE_ORDER_SQL = `
   CASE
@@ -359,6 +369,16 @@ const OWNER_QUEUE_ORDER_SQL = `
     WHEN ${WAITING_GROUP_SQL} THEN 1
     ELSE 2
   END,
+  CASE
+    WHEN ${ACTIONABLE_READY_SQL} AND effective_priority.effective_responsive = 1 THEN 0
+    ELSE 1
+  END,
+  effective_priority.effective_priority,
+  obligation.id`;
+
+/** Order shared by every actionable-ready head query. */
+const READY_HEAD_ORDER_SQL = `
+  CASE WHEN effective_priority.effective_responsive = 1 THEN 0 ELSE 1 END,
   effective_priority.effective_priority,
   obligation.id`;
 
@@ -567,7 +587,7 @@ export class ObligationRepository {
    *
    * An `AFTER UPDATE` trigger is told precisely which rows changed, by the one
    * component that knows. Cost becomes proportional to rows written rather than
-   * rows held, a checkpoint or artifact write captures nothing at all, and no
+   * rows held, an artifact write captures nothing at all, and no
    * mutator can add a tracked-column write that escapes the audit stream by
    * forgetting to announce itself. The `WHEN` clause uses `IS NOT` so a NULL
    * priority compares as a value rather than dropping the row.
@@ -589,6 +609,9 @@ export class ObligationRepository {
         before_terminal_note TEXT,
         before_resolution_ref TEXT,
         before_snoozed_until TEXT,
+        before_checkpoint TEXT,
+        before_checkpoint_at TEXT,
+        before_checkpoint_by TEXT,
         after_owner_id      TEXT NOT NULL,
         after_parent_id     TEXT,
         after_priority      REAL,
@@ -596,7 +619,10 @@ export class ObligationRepository {
         after_external_ref  TEXT,
         after_terminal_note TEXT,
         after_resolution_ref TEXT,
-        after_snoozed_until TEXT
+        after_snoozed_until TEXT,
+        after_checkpoint TEXT,
+        after_checkpoint_at TEXT,
+        after_checkpoint_by TEXT
       );
 
       CREATE TEMP TRIGGER IF NOT EXISTS obligation_history_capture
@@ -609,19 +635,22 @@ export class ObligationRepository {
         OR old.terminal_note IS NOT new.terminal_note
         OR old.resolution_ref IS NOT new.resolution_ref
         OR old.snoozed_until IS NOT new.snoozed_until
+        OR old.checkpoint IS NOT new.checkpoint
+        OR old.checkpoint_at IS NOT new.checkpoint_at
+        OR old.checkpoint_by IS NOT new.checkpoint_by
       BEGIN
         INSERT INTO obligation_history_delta (
           obligation_id,
           before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
-          before_terminal_note, before_resolution_ref, before_snoozed_until,
+          before_terminal_note, before_resolution_ref, before_snoozed_until, before_checkpoint, before_checkpoint_at, before_checkpoint_by,
           after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
-          after_terminal_note, after_resolution_ref, after_snoozed_until
+          after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint, after_checkpoint_at, after_checkpoint_by
         ) VALUES (
           new.id,
           old.owner_id, old.parent_id, old.priority, old.status, old.external_ref,
-          old.terminal_note, old.resolution_ref, old.snoozed_until,
+          old.terminal_note, old.resolution_ref, old.snoozed_until, old.checkpoint, old.checkpoint_at, old.checkpoint_by,
           new.owner_id, new.parent_id, new.priority, new.status, new.external_ref,
-          new.terminal_note, new.resolution_ref, new.snoozed_until
+          new.terminal_note, new.resolution_ref, new.snoozed_until, new.checkpoint, new.checkpoint_at, new.checkpoint_by
         );
       END;
     `);
@@ -973,7 +1002,7 @@ export class ObligationRepository {
                     obligation.id,
                     ROW_NUMBER() OVER (
                       PARTITION BY obligation.owner_id
-                      ORDER BY effective_priority.effective_priority, obligation.id
+                      ORDER BY ${READY_HEAD_ORDER_SQL}
                     ) AS rank
              FROM obligations obligation
              JOIN effective_priority ON effective_priority.id = obligation.id
@@ -1031,9 +1060,9 @@ export class ObligationRepository {
    *
    * "Head" is the first row of the owner's queue when that row is actionable
    * ready work — ready and not snoozed (#722). It must stay byte-identical to
-   * `listOwned`'s ordering (actionable ready first, by effective priority, then
-   * id) or an actor would be told about a head its own queue does not show
-   * first. An owner whose only ready work is snoozed has no head.
+   * `listOwned`'s ordering (responsive actionable ready first, then effective
+   * priority and id) or an actor would be told about a head its own queue does
+   * not show first. An owner whose only ready work is snoozed has no head.
    *
    * Runs in a single CTE pass so callers do not need subsequent
    * `isEffectivelyResponsive` evaluations.
@@ -1062,7 +1091,7 @@ export class ObligationRepository {
                   effective_priority.effective_responsive,
                   ROW_NUMBER() OVER (
                     PARTITION BY obligation.owner_id
-                    ORDER BY effective_priority.effective_priority, obligation.id
+                    ORDER BY ${READY_HEAD_ORDER_SQL}
                   ) AS rank
            FROM obligations obligation
            JOIN effective_priority ON effective_priority.id = obligation.id
@@ -1374,9 +1403,9 @@ export class ObligationRepository {
       .prepare(
         `SELECT obligation_id,
                 before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
-                before_terminal_note, before_resolution_ref, before_snoozed_until,
+                before_terminal_note, before_resolution_ref, before_snoozed_until, before_checkpoint, before_checkpoint_at, before_checkpoint_by,
                 after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
-                after_terminal_note, after_resolution_ref, after_snoozed_until
+                after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint, after_checkpoint_at, after_checkpoint_by
          FROM obligation_history_delta
          ORDER BY seq`
       )
@@ -1396,6 +1425,9 @@ export class ObligationRepository {
         terminal_note: delta.after_terminal_note,
         resolution_ref: delta.after_resolution_ref,
         snoozed_until: delta.after_snoozed_until,
+        checkpoint: delta.after_checkpoint,
+        checkpoint_at: delta.after_checkpoint_at,
+        checkpoint_by: delta.after_checkpoint_by,
       };
       const existing = net.get(delta.obligation_id);
       if (existing) {
@@ -1413,6 +1445,9 @@ export class ObligationRepository {
           terminal_note: delta.before_terminal_note,
           resolution_ref: delta.before_resolution_ref,
           snoozed_until: delta.before_snoozed_until,
+          checkpoint: delta.before_checkpoint,
+          checkpoint_at: delta.before_checkpoint_at,
+          checkpoint_by: delta.before_checkpoint_by,
         },
         after,
       });
@@ -1432,6 +1467,10 @@ export class ObligationRepository {
       const terminalNoteChanged = b.terminal_note !== a.terminal_note;
       const resolutionRefChanged = b.resolution_ref !== a.resolution_ref;
       const snoozeChanged = b.snoozed_until !== a.snoozed_until;
+      const checkpointChanged =
+        b.checkpoint !== a.checkpoint ||
+        b.checkpoint_at !== a.checkpoint_at ||
+        b.checkpoint_by !== a.checkpoint_by;
 
       if (
         !ownerChanged &&
@@ -1441,7 +1480,8 @@ export class ObligationRepository {
         !externalRefChanged &&
         !terminalNoteChanged &&
         !resolutionRefChanged &&
-        !snoozeChanged
+        !snoozeChanged &&
+        !checkpointChanged
       ) {
         continue;
       }
@@ -1483,6 +1523,11 @@ export class ObligationRepository {
         afterState.snoozedUntil = a.snoozed_until;
       }
 
+      if (checkpointChanged) {
+        beforeState.checkpoint = b.checkpoint;
+        afterState.checkpoint = a.checkpoint;
+      }
+
       // Map the primary modified field to its semantic mutation kind.
       const kind: ObligationMutationKind = ownerChanged
         ? "reassign"
@@ -1494,13 +1539,15 @@ export class ObligationRepository {
               ? "status"
               : snoozeChanged && !externalRefChanged
                 ? "snooze"
-                : "external_ref";
+                : checkpointChanged && !externalRefChanged
+                  ? "checkpoint"
+                  : "external_ref";
 
       insert.run(
         id,
         kind,
         actingPrincipal,
-        this.stamp(),
+        kind === "checkpoint" && a.checkpoint_at !== null ? a.checkpoint_at : this.stamp(),
         buildHistoryPayload(beforeState, afterState)
       );
     }
@@ -2264,35 +2311,56 @@ export class ObligationRepository {
 
       const previous = previousId === null ? null : queue[previousIndex];
       const next = nextId === null ? null : queue[nextIndex];
+
+      // Mirrors OWNER_QUEUE_ORDER_SQL: only actionable ready rows form the
+      // responsive-first tier; snoozed rows sort later by priority alone.
+      const inResponsiveTier = (o: Obligation) =>
+        o.status === "ready" && o.snoozedUntil === null && o.effectiveResponsive;
+      const targetTier = inResponsiveTier(target);
+
+      // Reject positions that would require ordinary work ahead of responsive work
+      // or responsive work after ordinary work, atomically without writes.
+      if (targetTier && previous !== null && !inResponsiveTier(previous)) {
+        throw new ObligationValidationError("cannot place responsive work after ordinary work");
+      }
+      if (!targetTier && next !== null && inResponsiveTier(next)) {
+        throw new ObligationValidationError("cannot place ordinary work ahead of responsive work");
+      }
+
+      // Resolve the requested position within the target's effective-responsiveness tier.
+      const tierPrevious =
+        previous !== null && inResponsiveTier(previous) === targetTier ? previous : null;
+      const tierNext = next !== null && inResponsiveTier(next) === targetTier ? next : null;
+
       let priority: number;
       let repairSuffix = false;
-      if (previous === null && next === null) {
+      if (tierPrevious === null && tierNext === null) {
         priority = validatePriority(this.now());
-      } else if (previous === null) {
-        if (next === null) {
+      } else if (tierPrevious === null) {
+        if (tierNext === null) {
           throw new ObligationValidationError("priority move requires a queue neighbor");
         }
-        const half = next.effectivePriority / 2;
+        const half = tierNext.effectivePriority / 2;
         priority =
-          Number.isFinite(half) && half < next.effectivePriority
+          Number.isFinite(half) && half < tierNext.effectivePriority
             ? half
-            : priorityBefore(next.effectivePriority);
-      } else if (next === null) {
-        priority = priorityAfter(previous.effectivePriority);
+            : priorityBefore(tierNext.effectivePriority);
+      } else if (tierNext === null) {
+        priority = priorityAfter(tierPrevious.effectivePriority);
       } else {
-        const midpoint = strictMidpoint(previous.effectivePriority, next.effectivePriority);
+        const midpoint = strictMidpoint(tierPrevious.effectivePriority, tierNext.effectivePriority);
         if (midpoint !== null) {
           priority = midpoint;
         } else {
-          priority = priorityAfter(previous.effectivePriority);
+          priority = priorityAfter(tierPrevious.effectivePriority);
           repairSuffix = true;
         }
       }
       validatePriority(priority);
-      if (previous !== null && priority <= previous.effectivePriority) {
+      if (tierPrevious !== null && priority <= tierPrevious.effectivePriority) {
         throw new ObligationValidationError("no finite priority exists after the previous item");
       }
-      if (!repairSuffix && next !== null && priority >= next.effectivePriority) {
+      if (!repairSuffix && tierNext !== null && priority >= tierNext.effectivePriority) {
         throw new ObligationValidationError("no finite priority exists before the next item");
       }
       this.applyPriority(id, priority, scope);
@@ -2300,6 +2368,11 @@ export class ObligationRepository {
       if (repairSuffix) {
         let cursor = priority;
         for (const obligation of queue.slice(nextIndex)) {
+          // Calculate and repair only the target tier; collision repair cannot
+          // spill into or mutate other-tier priorities.
+          if (inResponsiveTier(obligation) !== targetTier) {
+            break;
+          }
           if (obligation.effectivePriority > cursor) break;
           cursor = validatePriority(priorityAfter(cursor));
           // Numeric collision repair is not a semantic subtree reprioritization:
@@ -2328,7 +2401,7 @@ export class ObligationRepository {
       const retiringOwner = validateEntityId(retiringActorId);
       if (parentActorId === null) {
         throw new ObligationValidationError(
-          "retirement inheritance requires an actor parent; root/no-parent behavior is unresolved (ISSUE_NUM Q69)"
+          "retirement inheritance requires an actor parent; root/no-parent behavior is unresolved"
         );
       }
       const parentOwner = validateEntityId(parentActorId);
@@ -2636,6 +2709,106 @@ export class ObligationRepository {
     // Fail-closed for the whole call, like every other reader here: one row
     // that cannot be read makes the trail throw rather than silently shorten.
     return rows.map(parseHistoryRow);
+  }
+
+  /**
+   * A paged, newest-first detail trail. Artifacts and creation of current
+   * children project their source timestamps without duplicate audit writes.
+   * Current child membership/title/owner is not historical addition to this parent.
+   * A timestamp plus source-qualified key keeps pages stable
+   * when newer events arrive (including several mutations in one millisecond).
+   */
+  listHistoryPage(
+    id: string,
+    options: { before?: string; limit?: number } = {}
+  ): {
+    entries: Array<
+      Omit<ObligationHistoryEntry, "id" | "mutationKind" | "actingPrincipal"> & {
+        id: string;
+        actingPrincipal: string | null;
+        mutationKind: ObligationMutationKind | "artifact" | "current_child_created" | "created";
+        after: ObligationHistoryState & {
+          artifact?: { ref: string; label: string | null };
+          child?: { id: string; title: string | null; ownerId: string };
+        };
+      }
+    >;
+    nextBefore: string | null;
+  } {
+    const limit = Math.max(1, Math.min(options.limit ?? 10, 100));
+    const cursor = options.before ?? "";
+    const split = cursor.lastIndexOf("|");
+    const beforeTime = split < 0 ? "9999" : cursor.slice(0, split);
+    const beforeKey = split < 0 ? "" : cursor.slice(split + 1);
+    const rows = this.db
+      .prepare(`
+      SELECT * FROM (
+        SELECT 'history:' || printf('%016d', id) AS event_key, timestamp,
+          'history' AS source, id AS source_id, NULL AS principal, NULL AS title,
+          NULL AS owner_id, NULL AS ref, NULL AS label,
+          obligation_id, mutation_kind, acting_principal, payload
+        FROM obligation_history WHERE obligation_id = @id
+        UNION ALL
+        SELECT 'artifact:' || id, attached_at, 'artifact', id, attached_by,
+          NULL, NULL, ref, label, NULL, NULL, NULL, NULL FROM obligation_artifacts WHERE obligation_id = @id
+        UNION ALL
+        SELECT 'child:' || id, created_at, 'current_child_created', id, creator_id,
+          title, owner_id, NULL, NULL, NULL, NULL, NULL, NULL FROM obligations WHERE parent_id = @id AND created_at IS NOT NULL
+        UNION ALL
+        SELECT 'created:' || id, created_at, 'created', id, creator_id,
+          title, owner_id, NULL, NULL, NULL, NULL, NULL, NULL FROM obligations WHERE id = @id AND created_at IS NOT NULL
+      ) WHERE timestamp < @beforeTime OR (timestamp = @beforeTime AND event_key < @beforeKey)
+      ORDER BY timestamp DESC, event_key DESC LIMIT @limit
+    `)
+      .all({ id, beforeTime, beforeKey, limit: limit + 1 }) as Array<{
+      event_key: string;
+      timestamp: string;
+      source: "history" | "artifact" | "current_child_created" | "created";
+      source_id: string | number;
+      principal: string | null;
+      title: string | null;
+      owner_id: string;
+      ref: string;
+      label: string | null;
+      obligation_id: string;
+      mutation_kind: ObligationMutationKind;
+      acting_principal: string;
+      payload: string;
+    }>;
+    const entries = rows.slice(0, limit).map((row) => {
+      if (row.source === "history") {
+        return {
+          ...parseHistoryRow({
+            id: row.source_id,
+            obligation_id: row.obligation_id,
+            mutation_kind: row.mutation_kind,
+            acting_principal: row.acting_principal,
+            timestamp: row.timestamp,
+            payload: row.payload,
+          }),
+          id: row.event_key,
+        };
+      }
+      return {
+        id: row.event_key,
+        obligationId: id,
+        mutationKind: row.source,
+        actingPrincipal: row.principal,
+        timestamp: row.timestamp,
+        before: {},
+        after:
+          row.source === "artifact"
+            ? { artifact: { ref: row.ref, label: row.label } }
+            : row.source === "current_child_created"
+              ? { child: { id: String(row.source_id), title: row.title, ownerId: row.owner_id } }
+              : {},
+      };
+    });
+    const last = entries.at(-1);
+    return {
+      entries,
+      nextBefore: rows.length > limit && last ? `${last.timestamp}|${last.id}` : null,
+    };
   }
 
   /**

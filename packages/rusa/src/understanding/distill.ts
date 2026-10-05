@@ -310,7 +310,7 @@ Before proposing any operations you **must**:
 
 The prime objective is a clear, stable hierarchy. Ensure:
 1. Maintain a single conceptual root node named "${CONCEPTUAL_ROOT_TITLE}".
-2. Integrate and fold findings into existing sections in place. Do NOT append dated sections to existing nodes (which turns nodes into changelogs, ISSUE_NUM).
+2. Integrate and fold findings into existing sections in place. Do NOT append dated sections to existing nodes (which turns nodes into changelogs).
 3. Create child nodes only when a section becomes substantial enough to stand alone as a meaty document.
 4. When splitting a section into a child node, remove or condense that section in the parent and place the detailed material in the child.
 5. Every created child node is placed into the hierarchy immediately by providing \`parent_id\` at \`create_node\` time or by a \`create_relationship\` right after.

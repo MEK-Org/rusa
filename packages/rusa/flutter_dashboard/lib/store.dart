@@ -911,6 +911,23 @@ class DashboardStore {
     _treePreferencesCache.saveWorkExpanded(_workExpanded);
   }
 
+  // ── Sidebar widths (#897) ──────────────────────────────────────────────
+  //
+  // The width the user dragged each resizable sidebar to, kept so it survives
+  // a view switch (which rebuilds the view from scratch). In memory only: a
+  // reload starts from the defaults again.
+
+  final Map<String, double> _sidebarWidths = {};
+
+  /// The width the user last left the sidebar named [id] at this session, or
+  /// null if it is still at its default.
+  double? sidebarWidth(String id) => _sidebarWidths[id];
+
+  /// Records [width] as the sidebar named [id]'s width for this session.
+  void setSidebarWidth(String id, double width) {
+    _sidebarWidths[id] = width;
+  }
+
   /// Reorders a child actor among its siblings under the same parent.
   /// [draggedId] is moved relative to [targetId] (before it if [before] is true, else after).
   /// Reordering is strictly scoped to siblings with the exact same [parentId] (v1 constraint).

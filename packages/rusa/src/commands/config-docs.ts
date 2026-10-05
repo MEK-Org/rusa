@@ -130,6 +130,9 @@ Top-level fields:
   jevApiKeyFile            Optional basename of a credential file directly under RUSA_HOME/secrets. Opts into shadow-only JEV responsive-interruption predictions; invalid or unavailable credentials keep the existing scheduler and post no prediction reaction.
   elevenlabsApiKey         Optional. Enables ElevenLabs walkie-talkie transcription and actor speech.
   deployBranch             Optional. Branch the root self-update tool deploys from. Defaults to master.
+  gitIdentity              Optional complete name/email pair for mesh-owned commits. Sets command-scoped
+                           user.*, author.* and committer.* overrides so the configured identity wins
+                           without touching Git config files.
   webhook                  Required. Local webhook listener settings.
   rootActor                Required. Explicit provider/model pin the root actor runs on; identity defaults to
                            root-actor.

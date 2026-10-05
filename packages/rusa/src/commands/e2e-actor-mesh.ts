@@ -21,13 +21,13 @@ import {
   resumeE2EInstance,
 } from "../e2e/provision.js";
 import { startTrackerServer } from "../e2e/tracker-server.js";
-import { ActorHandle } from "../experimental/remote-instances/actor-handle.js";
-import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
-import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
 import { setIssueClient } from "../gitops/issue-client.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { assertBwrapAvailable } from "../providers/sandbox.js";
+import { ActorHandle } from "../remote-instances/actor-handle.js";
+import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
+import { FollowerHub } from "../remote-instances/follower-hub.js";
 import { type RunStartE2EHandles, runStart } from "./start.js";
 
 /** Local issue tracker REST surface (the agent-facing "GitHub"). */
