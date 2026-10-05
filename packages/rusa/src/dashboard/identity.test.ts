@@ -150,3 +150,38 @@ it.each([
   expect(() => resolver.resolve(token(extra))).toThrow();
   expect(db.prepare("SELECT COUNT(*) AS n FROM users").get()).toEqual({ n: 0 });
 });
+
+it("records the Google account id from the verified sign-in token, never moving one another user holds", () => {
+  const warn = vi.fn();
+  const logged = new DashboardIdentityResolver(() => repo, "project", { ...nullLogger, warn });
+  // Synthetic Google account ids; never a real person's.
+  const google = (id: string) =>
+    token({
+      firebase: { identities: { "google.com": [id] }, sign_in_provider: "google.com" },
+    } as Partial<DecodedIdToken>);
+  const at = new Date().toISOString();
+
+  const owner = logged.resolve(google("100000000000000000001"));
+  logged.recordAuthentication(owner, at, google("100000000000000000001"));
+  expect(repo.getUser(owner.id)?.googleAccountId).toBe("100000000000000000001");
+  expect(repo.findUserByGoogleAccountId("100000000000000000001")?.id).toBe(owner.id);
+
+  // A token without a Google identity leaves the recorded id alone.
+  logged.recordAuthentication(owner, at, token());
+  expect(repo.getUser(owner.id)?.googleAccountId).toBe("100000000000000000001");
+
+  // Another user presenting the same Google id is logged by id and not rebound.
+  const other = repo.createUser({
+    email: "other@example.com",
+    identity: { issuer: ISSUER, subject: "other" },
+    createdAt: at,
+  });
+  logged.recordAuthentication(other, at, google("100000000000000000001"));
+  expect(repo.getUser(other.id)?.googleAccountId).toBeUndefined();
+  expect(repo.getUser(owner.id)?.googleAccountId).toBe("100000000000000000001");
+  expect(warn).toHaveBeenCalledWith("dashboard_google_account_conflict", {
+    userId: other.id,
+    holderId: owner.id,
+  });
+  expect(repo.getUser(other.id)?.lastAuthenticatedAt).toBe(at);
+});

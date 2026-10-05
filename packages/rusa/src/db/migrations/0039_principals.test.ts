@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { SqliteActorRepository } from "../repositories/sqlite-actor-repository.js";
 import { principals } from "./0039_principals.js";
+import { userGoogleAccountId } from "./0058_user_google_account_id.js";
 import { runMigrations } from "./runner.js";
 
 const ROOT_CREATED_AT = "2026-09-03T13:00:00.000Z";
@@ -14,14 +15,17 @@ type PrincipalRow = { id: string; kind: string; created_at: string };
  * A database migrated to the head *before* this migration, so the backfill can
  * be exercised against actors it did not create. Recording the id up front is
  * how the shared runner is told to stop short of it, rather than replaying the
- * chain by hand and diverging from what a real upgrade does.
+ * chain by hand and diverging from what a real upgrade does. Later migrations
+ * that alter `users` are held back the same way and replayed after it.
  */
 function databaseWithoutPrincipals(): Database.Database {
   const db = new Database(":memory:");
   db.exec(
     `CREATE TABLE _migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')));`
   );
-  db.prepare("INSERT INTO _migrations (id) VALUES (?)").run(principals.id);
+  const skip = db.prepare("INSERT INTO _migrations (id) VALUES (?)");
+  skip.run(principals.id);
+  skip.run(userGoogleAccountId.id);
   runMigrations(db);
   db.pragma("foreign_keys = ON");
   return db;
@@ -39,6 +43,7 @@ function migratedWithActors(): Database.Database {
   const db = databaseWithoutPrincipals();
   seedActors(db);
   principals.up(db);
+  userGoogleAccountId.up(db);
   return db;
 }
 
@@ -88,6 +93,8 @@ describe("0039_principals (schema, application bypassed)", () => {
       "root_actor_id",
       "disabled_at",
       "last_authenticated_at",
+      // Appended by 0058_user_google_account_id, which this harness replays after 0039.
+      "google_account_id",
     ]);
 
     const principalColumns = (

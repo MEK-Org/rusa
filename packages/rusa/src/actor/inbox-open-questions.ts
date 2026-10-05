@@ -1,6 +1,6 @@
 import type { ObligationPage } from "../db/repositories/obligation-repository.js";
 import type { ObligationArtifact } from "../obligations/obligation.js";
-import type { PrincipalRef } from "../principals/principal-ref.js";
+import type { PrincipalRef, UserPrincipal } from "../principals/principal-ref.js";
 import { inboxEntryReference } from "../references/inbox-reference.js";
 import { parseReference } from "../references/reference.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
@@ -41,21 +41,36 @@ export interface InboxOpenQuestionSources {
 
 const MESH_HUMAN_PAYLOAD_TYPES = new Set(["human.message", VOICE_INBOX_PAYLOAD_TYPE]);
 
+/** What the sender seam reads: principals by id, and users by Google account id. */
+export interface InboxSenderPrincipals {
+  get: (id: string) => PrincipalRef | undefined;
+  findUserByGoogleAccountId: (googleAccountId: string) => UserPrincipal | undefined;
+}
+
 /**
  * The user principal who sent an inbox entry, or undefined when the sender is
- * not a known user. Only identities the mesh already trusts resolve: a
- * dashboard or voice message carries the authenticated principal as `fromId`
- * on a `mesh:<fromId>` source, and that id must name a user row. Nothing is
- * guessed from display names, and the legacy `human:operator` alias (which has
- * no principal row) stays unmatched rather than falling back to any user.
- * Google Chat senders do not resolve yet: their link to a user is the
- * sign-in-verified Google account id, which is gated on a real-identity check.
+ * not a known user. Only identities the mesh already trusts resolve, and
+ * nothing is guessed from display names:
+ * - a dashboard or voice message carries the authenticated principal as
+ *   `fromId` on a `mesh:<fromId>` source, and that id must name a user row;
+ * - a Google Chat message names its sender `users/{id}`, and that id must equal
+ *   the Google account id a user's verified dashboard sign-in recorded.
+ * The legacy `human:operator` alias (which has no principal row), a disabled
+ * user, and any other source stay unmatched rather than falling back to a user.
  */
 export function resolveInboxSenderPrincipal(
   entry: Pick<InboxEntry, "source" | "payload">,
-  principals: { get: (id: string) => PrincipalRef | undefined }
+  principals: InboxSenderPrincipals
 ): string | undefined {
   const { source, payload } = entry;
+  if (payload.type === "gchat.message") {
+    const sender = payload.senderName;
+    if (typeof sender !== "string" || !source.startsWith("gchat:")) return undefined;
+    const match = /^users\/([^/]+)$/.exec(sender);
+    if (match === null) return undefined;
+    const user = principals.findUserByGoogleAccountId(match[1] as string);
+    return user === undefined || user.disabledAt !== undefined ? undefined : user.id;
+  }
   if (!MESH_HUMAN_PAYLOAD_TYPES.has(String(payload.type))) return undefined;
   const fromId = payload.fromId;
   if (typeof fromId !== "string" || source !== `mesh:${fromId}`) return undefined;

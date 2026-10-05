@@ -278,7 +278,7 @@ export class DashboardAuth {
       }
       const principal = this.identities.resolve(token);
       const cookie = await this.firebase.createSessionCookie(idToken, { expiresIn: SESSION_MS });
-      this.identities.recordAuthentication(principal, new Date(this.now()).toISOString());
+      this.identities.recordAuthentication(principal, new Date(this.now()).toISOString(), token);
       setCookie(res, cookie, SESSION_MS / 1000);
       this.csrf.issue(req, res, cookie, SESSION_MS / 1000);
       json(res, 200, { authenticated: true });

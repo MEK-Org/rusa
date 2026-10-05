@@ -26,6 +26,29 @@ function humanMessage(id: string, fromId: string, messageId = `msg-${id}`): Inbo
   };
 }
 
+// Synthetic Google account ids; never a real person's.
+const ALICE_GOOGLE_ID = "100000000000000000001";
+const BOB_GOOGLE_ID = "100000000000000000002";
+
+function chatMessage(id: string, senderName: unknown, message = "M"): InboxEntry {
+  return {
+    id,
+    actorId: "asker",
+    source: "gchat:spaces/S",
+    payload: {
+      type: "gchat.message",
+      messageName: `spaces/S/messages/${message}`,
+      spaceName: "spaces/S",
+      senderName,
+      priority: "responsive",
+    },
+    deliveredAt: new Date(AT),
+    seenAt: null,
+    handledAt: null,
+    handledNote: null,
+  };
+}
+
 describe("attachOpenQuestions", () => {
   let db: Database.Database;
   let repos: Repositories;
@@ -127,6 +150,53 @@ describe("attachOpenQuestions", () => {
 
     const result = attachOpenQuestions(
       [legacyOperator, unknownUser, actorSent, spoofedSource, gchat],
+      "asker",
+      sources
+    );
+
+    for (const entry of result) {
+      expect(entry).not.toHaveProperty("openQuestions");
+      expect(entry).not.toHaveProperty("openQuestionsError");
+    }
+  });
+
+  it("resolves a Google Chat sender through the Google account id recorded at sign-in", () => {
+    ask("q", alice);
+    ask("bobs", bob);
+    repos.principals.setGoogleAccountId(alice, ALICE_GOOGLE_ID);
+
+    const [entry] = attachOpenQuestions(
+      [chatMessage("c1", `users/${ALICE_GOOGLE_ID}`, "M1")],
+      "asker",
+      sources
+    );
+
+    expect(entry.openQuestions).toEqual({
+      principalId: alice,
+      resolutionRef: "gchat:spaces/S/messages/M1",
+      reminder: expect.stringContaining('resolution_ref "gchat:spaces/S/messages/M1"'),
+      questions: [{ id: "q", title: "Question q" }],
+      total: 1,
+      truncated: false,
+    });
+  });
+
+  it("leaves Chat senders unmatched without a recorded, enabled Google account id", () => {
+    ask("q", alice);
+    ask("bobs", bob);
+    repos.principals.setGoogleAccountId(bob, BOB_GOOGLE_ID);
+    repos.principals.setDisabled(bob, AT);
+
+    const result = attachOpenQuestions(
+      [
+        // Alice has open questions but has not signed in since the column appeared.
+        chatMessage("unrecorded", `users/${ALICE_GOOGLE_ID}`),
+        chatMessage("disabled", `users/${BOB_GOOGLE_ID}`),
+        chatMessage("bare-id", BOB_GOOGLE_ID),
+        chatMessage("nested", `users/${BOB_GOOGLE_ID}/extra`),
+        chatMessage("missing", undefined),
+        { ...chatMessage("not-chat", `users/${BOB_GOOGLE_ID}`), source: `mesh:${bob}` },
+      ],
       "asker",
       sources
     );
