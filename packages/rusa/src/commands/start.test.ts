@@ -1639,41 +1639,54 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect(closedAlarms()).toHaveLength(1);
         expect(getThrottle("claude")?.intervalSeconds).toBe(300);
 
-        // 5. Successive distinct closes without an intermediate open apply:
-        // A distinct governing window (different resetAtIso) closes and is applied directly
-        // without an intermediate open apply. The compound dedup key (${lane}:${window.key}:${window.resetAtIso})
-        // ensures this second distinct transition raises its own alarm.
+        // 5. A new reset for the same governing key arrives fresh, so it does
+        // not alert. When that same accepted reading later becomes stale, the
+        // second reset closes without an intermediate open apply. Keeping the
+        // key at claude:weekly proves resetAtIso is part of the dedup key.
         const window2ResetMs = now - 30_000;
         published = reading(
           window2ResetMs,
-          3600,
+          300,
+          { stale: false, hardStale: false },
+          window2ResetMs - 10 * 60_000,
+          "claude:weekly"
+        );
+        await triggerQuotaThrottleTick();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(closedAlarms()).toHaveLength(1);
+
+        published = reading(
+          window2ResetMs,
+          300,
           { stale: true, hardStale: true },
-          window2ResetMs - 2 * 60 * 60_000,
-          "claude:session"
+          window2ResetMs - 10 * 60_000,
+          "claude:weekly"
         );
         await triggerQuotaThrottleTick();
         await vi.waitFor(() => expect(closedAlarms()).toHaveLength(2));
         const alarm2 = closedAlarms().find(
-          (entry) => (entry.payload as { window?: string }).window === "claude:session"
+          (entry) =>
+            (entry.payload as { window?: string; resetAt?: string }).resetAt ===
+            new Date(window2ResetMs).toISOString()
         );
         expect(alarm2).toMatchObject({
           actorId: "root",
           source: "system:events",
           payload: expect.objectContaining({
             provider: "claude",
-            window: "claude:session",
+            window: "claude:weekly",
             resetAt: new Date(window2ResetMs).toISOString(),
             priority: "responsive",
           }),
         });
-        // Pin hard-stale throttle value:
-        expect(getThrottle("claude")?.intervalSeconds).toBe(3600);
+        // The alert observes the published throttle; it does not select one.
+        expect(getThrottle("claude")?.intervalSeconds).toBe(published.intervalSeconds);
 
         // Repeated apply of window 2 is also deduplicated:
         await triggerQuotaThrottleTick();
         await new Promise((resolve) => setTimeout(resolve, 50));
         expect(closedAlarms()).toHaveLength(2);
-        expect(getThrottle("claude")?.intervalSeconds).toBe(3600);
+        expect(getThrottle("claude")?.intervalSeconds).toBe(published.intervalSeconds);
       } finally {
         await shutdownFn?.();
         shutdownFn = undefined;

@@ -855,9 +855,13 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
 
     // Hard-stale but the window is still open: retained interval, no close.
     expect(at(stored, resetMs - 1)).toEqual({ interval: 300, closed: null });
-    // The reset passes with no newer reading: the ceiling is published as
-    // before, and the close is now detectable.
-    expect(at(stored, resetMs)).toEqual({ interval: 3600, closed: bucket });
+    // The reset passes with no newer reading: whatever throttle publication
+    // selects for this input is applied unchanged, and the close is detectable.
+    const publishedAtReset = publishedThrottle(stored, { ...options, nowMs: resetMs });
+    expect(at(stored, resetMs)).toEqual({
+      interval: publishedAtReset.intervalSeconds,
+      closed: bucket,
+    });
 
     // A reading immediately before reset is healthy and fresh at reset: it stays
     // quiet without alerting (#794 timing amendment).
