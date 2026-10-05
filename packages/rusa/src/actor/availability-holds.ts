@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, statSync } from "node:fs";
 import type {
   AvailabilityHold,
   AvailabilityHoldRepository,
@@ -167,8 +167,10 @@ export interface ImportScopedHaltFileOptions {
 }
 
 /**
- * Move a provider-scoped HALT sentinel into durable holds, then remove it, so
- * holds have one source of truth (#539). Returns the stored holds; empty when
+ * Move a provider-scoped HALT sentinel into durable holds, then archive it as
+ * `HALT.imported`, so the holds govern that scope (#539). Left in place, the
+ * file would keep holding after a scoped `/resume` cleared the hold, and the
+ * next restart would import it again. Returns the stored holds; empty when
  * there was nothing to import.
  *
  * Only an active sentinel that names providers is imported. A bare or
@@ -176,7 +178,7 @@ export interface ImportScopedHaltFileOptions {
  * holds nothing; a models-only one (only writable by hand) has no provider to
  * key a hold on and keeps working as the file brake.
  *
- * A crash between storing the holds and removing the file is safe to replay.
+ * A crash between storing the holds and archiving the file is safe to replay.
  * The holds' `createdAt` is the file's mtime, so setting the same scopes again
  * rewrites identical rows, and the event id is derived from the file's bytes
  * and mtime, so the second `record` is ignored.
@@ -217,6 +219,6 @@ export function importScopedHaltFile(options: ImportScopedHaltFileOptions): Avai
       })),
     }),
   });
-  rmSync(file, { force: true });
+  renameSync(file, `${file}.imported`);
   return holds;
 }

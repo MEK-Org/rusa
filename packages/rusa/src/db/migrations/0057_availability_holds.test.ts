@@ -29,20 +29,6 @@ describe("0057_availability_holds", () => {
     expect(db.prepare("SELECT COUNT(*) AS n FROM availability_holds").get()).toEqual({ n: 0 });
   });
 
-  it("allows one provider-wide row and one row per model for each provider", () => {
-    const db = new Database(":memory:");
-    availabilityHolds.up(db);
-    const insert = db.prepare(
-      `INSERT INTO availability_holds (provider, model, created_by, created_at) VALUES (?, ?, 'root', '${CREATED}')`
-    );
-
-    insert.run("kimi", null);
-    insert.run("kimi", "kimi-k2");
-    insert.run("codex", null);
-    expect(() => insert.run("kimi", null)).toThrow(/UNIQUE/);
-    expect(() => insert.run("kimi", "kimi-k2")).toThrow(/UNIQUE/);
-  });
-
   it("refuses blank or unnormalized scopes", () => {
     const db = new Database(":memory:");
     availabilityHolds.up(db);

@@ -70,83 +70,54 @@ describe("AvailabilityHolds", () => {
     expect(held).toEqual([]);
   });
 
-  it("releases an expiring hold at its expiry without deleting it", () => {
-    const expiry = new Date(START + HOUR).toISOString();
-    holds.set({ provider: "kimi", expiry, createdBy: "root" });
-
-    vi.advanceTimersByTime(HOUR - 1);
-    expect(released).toEqual([]);
-    expect(holds.isHeld("kimi", "kimi-k2")).toBe(true);
-
-    vi.advanceTimersByTime(1);
-    expect(released.map((batch) => batch.map((hold) => hold.provider))).toEqual([["kimi"]]);
-    expect(holds.isHeld("kimi", "kimi-k2")).toBe(false);
-    expect(holds.list()).toEqual([]);
-    expect(repo.list()).toHaveLength(1);
-  });
-
-  it("wakes once per distinct expiry, earliest first", () => {
-    holds.set({
-      provider: "kimi",
-      expiry: new Date(START + 2 * HOUR).toISOString(),
-      createdBy: "root",
-    });
+  it("wakes at each distinct expiry, following a replaced one, and keeps the expired rows", () => {
     holds.set({
       provider: "codex",
       expiry: new Date(START + HOUR).toISOString(),
       createdBy: "root",
     });
+    holds.set({
+      provider: "kimi",
+      expiry: new Date(START + HOUR / 2).toISOString(),
+      createdBy: "root",
+    });
+    // Setting the same scope again replaces its expiry; the earlier wake must not fire.
+    holds.set({
+      provider: "kimi",
+      expiry: new Date(START + 2 * HOUR).toISOString(),
+      createdBy: "root",
+    });
     holds.set({ provider: "claude", createdBy: "root" });
+    const releasedProviders = () => released.map((batch) => batch.map((hold) => hold.provider));
 
+    vi.advanceTimersByTime(HOUR - 1);
+    expect(released).toEqual([]);
+    expect(holds.isHeld("kimi", "kimi-k2")).toBe(true);
+    vi.advanceTimersByTime(1);
+    expect(releasedProviders()).toEqual([["codex"]]);
+    expect(holds.isHeld("codex", "gpt-5.5")).toBe(false);
     vi.advanceTimersByTime(HOUR);
-    expect(released.map((batch) => batch.map((hold) => hold.provider))).toEqual([["codex"]]);
-    vi.advanceTimersByTime(HOUR);
-    expect(released.map((batch) => batch.map((hold) => hold.provider))).toEqual([
-      ["codex"],
-      ["kimi"],
-    ]);
+    expect(releasedProviders()).toEqual([["codex"], ["kimi"]]);
     vi.advanceTimersByTime(100 * HOUR);
     expect(released).toHaveLength(2);
     expect(holds.isHeld("claude", "opus")).toBe(true);
+    expect(holds.list()).toHaveLength(1);
+    expect(repo.list()).toHaveLength(3);
   });
 
-  it("follows a replaced expiry instead of the original one", () => {
+  it("reports cleared holds to onReleased, skips it when nothing matched, and cancels their wake", () => {
     holds.set({
       provider: "kimi",
+      models: ["kimi-k2"],
       expiry: new Date(START + HOUR).toISOString(),
       createdBy: "root",
     });
-    holds.set({
-      provider: "kimi",
-      expiry: new Date(START + 3 * HOUR).toISOString(),
-      createdBy: "root",
-    });
-
-    vi.advanceTimersByTime(HOUR);
-    expect(released).toEqual([]);
-    expect(holds.isHeld("kimi", "kimi-k2")).toBe(true);
-    vi.advanceTimersByTime(2 * HOUR);
-    expect(released).toHaveLength(1);
-  });
-
-  it("reports cleared holds to onReleased and skips the callback when nothing matched", () => {
-    holds.set({ provider: "kimi", models: ["kimi-k2"], createdBy: "root" });
 
     expect(holds.clear({ provider: "codex" })).toEqual([]);
     expect(released).toEqual([]);
     expect(holds.clear({ provider: "kimi", models: ["kimi-k2"] })).toHaveLength(1);
     expect(released).toHaveLength(1);
     expect(holds.isHeld("kimi", "kimi-k2")).toBe(false);
-  });
-
-  it("cancels a pending expiry wake when the hold is cleared first", () => {
-    holds.set({
-      provider: "kimi",
-      expiry: new Date(START + HOUR).toISOString(),
-      createdBy: "root",
-    });
-    holds.clearAll();
-
     vi.advanceTimersByTime(2 * HOUR);
     expect(released).toHaveLength(1);
   });
@@ -236,7 +207,7 @@ describe("importScopedHaltFile", () => {
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-  it("moves a provider-scoped sentinel into holds, records one event and removes the file", () => {
+  it("moves a provider-scoped sentinel into holds, records one event and archives the file", () => {
     const until = new Date(START + HOUR).toISOString();
     writeHalt({
       reason: "chat /halt from Operator",
@@ -258,6 +229,7 @@ describe("importScopedHaltFile", () => {
     expect(imported).toEqual([expected("claude"), expected("codex")]);
     expect(repo.list()).toEqual([expected("claude"), expected("codex")]);
     expect(existsSync(file)).toBe(false);
+    expect(existsSync(`${file}.imported`)).toBe(true);
     const recorded = events.list().filter((event) => event.kind === "availability_hold_imported");
     expect(recorded).toHaveLength(1);
     expect(recorded[0]?.detail).toBe(
@@ -273,7 +245,7 @@ describe("importScopedHaltFile", () => {
     });
   });
 
-  it("replays to the same holds and a single event after a crash before the file was removed", () => {
+  it("replays to the same holds and a single event after a crash before the file was archived", () => {
     writeHalt({ providers: ["kimi"] });
     // The crash: holds and event are stored, the file is still there.
     importScopedHaltFile({ file, repo, recordEvent: (event) => events.record(event), now });
@@ -292,7 +264,8 @@ describe("importScopedHaltFile", () => {
     expect(existsSync(file)).toBe(false);
   });
 
-  it("leaves the global brake, an expired sentinel and a models-only sentinel alone", () => {
+  it("leaves a missing sentinel, the global brake, an expired one and a models-only one alone", () => {
+    expect(importFile()).toEqual([]);
     for (const state of [
       "",
       "plain reason",
@@ -306,10 +279,5 @@ describe("importScopedHaltFile", () => {
     }
     expect(repo.list()).toEqual([]);
     expect(events.list()).toEqual([]);
-  });
-
-  it("does nothing without a sentinel", () => {
-    expect(importFile()).toEqual([]);
-    expect(repo.list()).toEqual([]);
   });
 });
