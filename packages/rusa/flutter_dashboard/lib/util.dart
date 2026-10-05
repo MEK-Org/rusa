@@ -93,24 +93,18 @@ String? referenceUrl(String? rawRef) {
   }
 
   if (scheme == 'github') {
-    if (path.contains('#')) {
-      final hashIndex = path.indexOf('#');
-      final repoPart = path.substring(0, hashIndex).trim();
-      final numPart = path.substring(hashIndex + 1).trim();
-      if (numPart.isNotEmpty && int.tryParse(numPart) != null) {
-        return 'https://github.com/$repoPart/issues/$numPart';
-      }
-      return 'https://github.com/$repoPart#$numPart';
-    }
-
     final segments = path.split('/').where((s) => s.isNotEmpty).toList();
     if (segments.isEmpty) return null;
 
-    if (segments.length >= 4 && segments[2] == 'branches') {
+    if (segments.length == 4 && segments[2] == 'branches') {
       final owner = segments[0];
       final repo = segments[1];
-      final branch = segments.sublist(3).join('/');
-      return 'https://github.com/$owner/$repo/tree/${Uri.encodeComponent(branch)}';
+      try {
+        final decodedBranch = Uri.decodeComponent(segments[3]);
+        return 'https://github.com/$owner/$repo/tree/${Uri.encodeComponent(decodedBranch)}';
+      } catch (_) {
+        return null;
+      }
     }
 
     final isPullRequest = segments.length > 2 && segments[2] == 'pulls';

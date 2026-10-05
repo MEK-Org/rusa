@@ -175,14 +175,14 @@ void main() {
         'https://github.com/MEK-Org/rusa/tree/feature',
       );
       expect(
+        referenceUrl('github:MEK-Org/rusa/branches/mc%2F0940705a%2Ffix'),
+        'https://github.com/MEK-Org/rusa/tree/mc%2F0940705a%2Ffix',
+      );
+      expect(
         referenceUrl('github:MEK-Org/rusa'),
         'https://github.com/MEK-Org/rusa',
       );
       expect(referenceUrl('github:MEK-Org'), 'https://github.com/MEK-Org');
-      expect(
-        referenceUrl('github:MEK-Org/rusa#345'),
-        'https://github.com/MEK-Org/rusa/issues/345',
-      );
     });
 
     test('converts Slack references to web URLs', () {
