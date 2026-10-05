@@ -650,7 +650,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(res91m.json.error.code).toBe("stale_observation");
   });
 
-  it("retains provider and model intervals through a hard-stale missing scrape until their governing windows reset", () => {
+  it("retains provider and model intervals through a hard-stale missing scrape, including across governing window reset (#794)", () => {
     const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
     const observedAt = new Date(nowMs - 2 * 60 * 60_000).toISOString();
     const resetAtIso = new Date(nowMs + 60 * 60_000).toISOString();
@@ -719,19 +719,19 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       maxIntervalSeconds: 3600,
       hardStaleAfterMs: 60 * 60_000,
     });
-    expect(afterReset.intervalSeconds).toBe(3600);
-    expect(afterReset.modelLanes).toMatchObject([{ intervalSeconds: 3600 }]);
+    expect(afterReset.intervalSeconds).toBe(300);
+    expect(afterReset.modelLanes).toMatchObject([{ intervalSeconds: 120 }]);
   });
 
-  it("rebuilds a missing-reading interval after coordinator restart and applies it to the client pacer", async () => {
-    const nowMs = Date.now();
+  it("rebuilds a missing-reading interval after coordinator restart, keeps it across reset, and recovers on a fresh reading (#794)", async () => {
+    let nowMs = Date.parse("2040-01-01T00:00:00.000Z");
     const resetMs = nowMs + 3 * 24 * 60 * 60_000;
-    const resetAtIso = new Date(resetMs).toISOString();
     const windowMs = 7 * 24 * 60 * 60_000;
     const snapshot = (
       scrapedAt: string,
       providerPercentLeft: number,
-      modelPercentLeft: number
+      modelPercentLeft: number,
+      resetAtIso = new Date(resetMs).toISOString()
     ): ProviderQuotaSnapshot => ({
       provider: "claude",
       status: "available",
@@ -791,6 +791,32 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       },
     ]);
     expect(pacer.interval).toBe((beforeRestart?.intervalSeconds ?? 0) * 1000);
+
+    // Readings stay missing past the governing reset: the last computed
+    // interval, not the ceiling, remains applied.
+    const computedInterval = beforeRestart?.intervalSeconds ?? 0;
+    expect(computedInterval).toBeLessThan(3600);
+    nowMs = resetMs + 10 * 60_000;
+    await client.getThrottle();
+    reconcileProviderPacersFromClient(() => pacer, ["claude"], client);
+    expect(client.getLastAppliedInterval("claude")).toBe(computedInterval);
+    expect(pacer.interval).toBe(computedInterval * 1000);
+
+    // One fresh reading in the next window recovers normal pacing.
+    const freshScrapedAt = new Date(nowMs).toISOString();
+    const fresh = snapshot(freshScrapedAt, 95, 95, new Date(nowMs + windowMs).toISOString());
+    store.recordParsed(
+      store.recordRaw({ provider: "claude", scrapedAt: freshScrapedAt, rawOutput: "fixture" }),
+      fresh,
+      fresh
+    );
+    await client.getThrottle();
+    reconcileProviderPacersFromClient(() => pacer, ["claude"], client);
+    const recovered = store.getProviderThrottle("claude")?.intervalSeconds;
+    expect(recovered).not.toBe(computedInterval);
+    expect(client.getLastPublishedStatus("claude")?.freshness).toMatchObject({ hardStale: false });
+    expect(client.getLastAppliedInterval("claude")).toBe(recovered);
+    expect(pacer.interval).toBe((recovered ?? 0) * 1000);
   });
 
   // Criterion 2: publishedThrottle equality and boundary pin.
@@ -818,7 +844,9 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
           derivative: 0,
           requiredIntervalSeconds: 600,
           resetAtIso: null,
-          observedAt: new Date(nowMs - 7200000).toISOString(), // 2 hours old -> hard-stale
+          // Older than updatedAt: a newer scrape omitted the governing bucket,
+          // the partial-window case that still widens when hard-stale.
+          observedAt: new Date(nowMs - 9000000).toISOString(), // 2.5 hours old -> hard-stale
         },
       ],
     };

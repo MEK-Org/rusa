@@ -406,17 +406,17 @@ lanes the same way.
 
 When the coordinator can still answer but a whole provider reading is missing
 or failed, including when the coordinator stops collecting, the provider lane
-and model lanes from that last reading keep their computed intervals while
-their governing window has not reset. A failed probe carries no new
-information, so it does not send the lane back to the ceiling. This reverses
-the earlier #730 rule that such lanes age together and widen to the ceiling. The response remains
-truthfully `hardStale`; this is a pacing decision, not a freshness disguise.
-Once the window resets with still no reading, those lanes widen to the ceiling.
-They are not retired, and root is not alerted, as they are for a single missing
-model window. That retire-and-alert step is not implemented yet. A
-newer provider scrape that omits only a governing window remains the existing
-partial-window case and widens conservatively. A client that cannot reach the
-coordinator keeps its separate local hard-stale ceiling fallback.
+and model lanes from that last reading keep their computed intervals, including
+across governing window reset (#794 operator policy correction). A failed probe
+carries no new information, so it does not send the lane back to the ceiling, nor
+does window reset widen it to the ceiling merely because fresh readings are missing.
+The response remains truthfully `hardStale`; this is a pacing decision, not a
+freshness disguise. They are not retired as they are for a single missing model
+window. No root alert fires when a whole provider reading stops; this change
+only keeps pacing, and provider-wide alerting is tracked separately under #794.
+A newer provider scrape that omits only a governing window remains the
+existing partial-window case and widens conservatively. A client that cannot
+reach the coordinator keeps its separate local hard-stale ceiling fallback.
 
 ### Dashboard estimates for missing readings (#759)
 
