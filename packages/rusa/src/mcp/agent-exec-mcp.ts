@@ -121,9 +121,11 @@ export function createAgentExecMcpServer(
   mesh: ActorMesh,
   selfId: string,
   /**
-   * The configured actor's id. Used ONLY to route the configured actor's own
-   * spawn/send through `rootControl` for attribution; it grants no authority
-   * (#549) — every management tool below is gated by an active capability.
+   * The configured actor's id. Used to route the configured actor's own
+   * spawn/send through `rootControl` for attribution, and to confine the
+   * availability hold tools to that actor (#539). It grants no authority on
+   * its own (#549): every management tool below is gated by an active
+   * capability.
    */
   rootId: string,
   wakeScheduler?: ActorWakeScheduler,
@@ -140,7 +142,8 @@ export function createAgentExecMcpServer(
     validateModelClass?: (input: ConcreteModelConfigInput) => ProviderModelConfig[];
     /**
      * Durable provider/model availability holds (#539). The hold tools mount
-     * only when this is wired AND the endpoint's actor holds `model-admin`.
+     * only when this is wired AND the endpoint is the configured actor AND it
+     * holds `model-admin`; no grant opens them to any other actor.
      */
     availabilityHolds?: Pick<AvailabilityHolds, "list" | "set" | "clear">;
     /**
@@ -1213,9 +1216,11 @@ export function createAgentExecMcpServer(
 
   // ── Availability holds (#539) ── Readiness, not applicability: a hold takes
   // a provider lane, or some of its models, out of selection without editing
-  // any pool, so it is model policy held by `model-admin` like the class
-  // registry, and host-global for the same reason (a lane has no subtree).
-  if (holds(MODEL_ADMIN_CAPABILITY) && options?.availabilityHolds) {
+  // any pool, so it is host-global model policy like the class registry. The
+  // operator ruled these tools root-only: they mount for the configured actor
+  // alone, which must also hold `model-admin`, so no grant to any other actor
+  // (model-admin included) can open them.
+  if (selfId === rootId && holds(MODEL_ADMIN_CAPABILITY) && options?.availabilityHolds) {
     const availabilityHolds = options.availabilityHolds;
     const validateHoldScope = options.validateHoldScope;
     const assertModelAdmin = () => assertCapability(MODEL_ADMIN_CAPABILITY);
@@ -1244,9 +1249,9 @@ export function createAgentExecMcpServer(
     server.registerTool(
       "list_availability_holds",
       {
-        title: "List active availability holds (model-admin)",
+        title: "List active availability holds (root only)",
         description:
-          "List the provider/model availability holds active right now. A row with model null holds the whole provider; expiry null means it lasts until cleared. Expired holds are not listed. Requires the model-admin capability.",
+          "List the provider/model availability holds active right now. A row with model null holds the whole provider; expiry null means it lasts until cleared. Expired holds are not listed. Only the configured actor, holding model-admin, has this tool.",
         inputSchema: {},
       },
       async () => {
@@ -1263,9 +1268,9 @@ export function createAgentExecMcpServer(
     server.registerTool(
       "set_availability_hold",
       {
-        title: "Hold a provider or model out of selection (model-admin)",
+        title: "Hold a provider or model out of selection (root only)",
         description:
-          "Take a provider lane, or listed models on it, out of model selection without editing any model pool. Selection skips held entries before quota pacing and never falls back to one: an actor whose only unheld entry is paced waits for it. Setting the same scope again replaces its expiry and reason. Queued starts already reserved on a newly held entry are cancelled and replay when the hold is cleared or expires. Holds persist in mesh.db across restarts. Requires the model-admin capability.",
+          "Take a provider lane, or listed models on it, out of model selection without editing any model pool. Selection skips held entries before quota pacing and never falls back to one: an actor whose only unheld entry is paced waits for it. Setting the same scope again replaces its expiry and reason. Queued starts already reserved on a newly held entry are cancelled and replay when the hold is cleared or expires. Holds persist in mesh.db across restarts. Only the configured actor, holding model-admin, has this tool.",
         inputSchema: {
           ...scopeInput,
           expiry: z
@@ -1305,9 +1310,9 @@ export function createAgentExecMcpServer(
     server.registerTool(
       "clear_availability_hold",
       {
-        title: "Clear availability holds (model-admin)",
+        title: "Clear availability holds (root only)",
         description:
-          "Clear holds on a provider. Without models, every hold on the provider is cleared, provider-wide and model-scoped alike; with models, only those model holds are cleared and a provider-wide hold stays. Cleared entries become eligible again from their unchanged pools, and queued starts a hold cancelled replay. Returns the cleared holds (empty when nothing matched). Requires the model-admin capability.",
+          "Clear holds on a provider. Without models, every hold on the provider is cleared, provider-wide and model-scoped alike; with models, only those model holds are cleared and a provider-wide hold stays. Cleared entries become eligible again from their unchanged pools, and queued starts a hold cancelled replay. Returns the cleared holds (empty when nothing matched). Only the configured actor, holding model-admin, has this tool.",
         inputSchema: scopeInput,
       },
       async ({ provider, models }) => {

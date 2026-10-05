@@ -4111,19 +4111,33 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await message("/resume provider:codex", "messages/resume-codex-again");
     expect(lastReply()).toContain("No availability hold in force matched provider:codex");
 
-    // Bare /resume releases everything and names every hold it released, so
-    // the indefinite antigravity hold does not vanish silently.
+    // Bare /resume releases only the global brake (operator decision, #918
+    // comment 6000743198). Every hold stays in force and is listed, so the
+    // indefinite antigravity hold is neither cleared nor hidden.
     await message("/resume", "messages/resume");
     const resumed = lastReply();
     expect(resumed).toContain("Resumed");
     expect(resumed).toContain("Global halt released.");
     expect(resumed).toContain(
-      "• antigravity (all models), until cleared — chat /halt from Operator"
+      "Availability holds still in force:\n• antigravity (all models), until cleared — chat /halt from Operator"
     );
     expect(resumed).toContain(`• claude (all models), until ${until}`);
+    expect(resumed).toContain("/resume provider:");
     expect(resumed).not.toContain("codex");
     expect(halt.isHalted()).toBe(false);
-    expect(getRepositories().availabilityHolds.list()).toEqual([]);
+    expect(held("antigravity")).toBe(true);
+    expect(held("claude")).toBe(true);
+    expect(
+      getRepositories()
+        .availabilityHolds.list()
+        .map((hold) => hold.provider)
+    ).toEqual(["antigravity", "claude"]);
+
+    // With no brake in place, bare /resume says so and still releases no hold.
+    await message("/resume", "messages/resume-no-brake");
+    expect(lastReply()).toContain("No global halt was in place.");
+    expect(lastReply()).toContain("Availability holds still in force:");
+    expect(held("antigravity")).toBe(true);
 
     await message("/resume model:x", "messages/resume-bad");
     expect(lastReply()).toContain(
@@ -4277,7 +4291,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(idleAck).toContain("Halted");
     expect(idleAck).not.toContain("rejected");
     expect(held("claude", "claude-opus-5")).toBe(true);
-    await message("/resume", "messages/resume-idle");
+    await message("/resume provider:claude", "messages/resume-idle");
     expect(halt.isHalted()).toBe(false);
 
     // A transposed suffix: no run can ever be launched on this name, so a hold
@@ -4300,7 +4314,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(correctAck).not.toContain("rejected");
     expect(held("claude", "claude-sonnet-5")).toBe(true);
 
-    await message("/resume", "messages/resume-correct");
+    await message("/resume provider:claude", "messages/resume-correct");
     expect(halt.isHalted()).toBe(false);
 
     // A comma list is refused whole. Holding the half that matched would leave
@@ -4334,7 +4348,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await message("/halt provider:claude model:claude-sonnet-5", "messages/halt-after-mixed");
     expect(chatClient.sent.at(-1)?.text ?? "").toContain("Halted");
     expect(held("claude", "claude-sonnet-5")).toBe(true);
-    await message("/resume", "messages/resume-after-mixed");
+    await message("/resume provider:claude", "messages/resume-after-mixed");
     expect(halt.isHalted()).toBe(false);
 
     clearProviderModelCatalog();

@@ -127,14 +127,6 @@ describe("AvailabilityHoldRepository", () => {
     expect(holds.clear({ provider: "kimi" })).toEqual([]);
   });
 
-  it("clears every hold at once", () => {
-    holds.set({ provider: "kimi", createdBy: "root", createdAt: CREATED });
-    holds.set({ provider: "codex", models: ["gpt-5.5"], createdBy: "root", createdAt: CREATED });
-
-    expect(holds.clearAll()).toHaveLength(2);
-    expect(holds.list()).toEqual([]);
-  });
-
   it("survives reopening the database", () => {
     const dir = mkdtempSync(join(tmpdir(), "availability-holds-"));
     const file = join(dir, "mesh.db");

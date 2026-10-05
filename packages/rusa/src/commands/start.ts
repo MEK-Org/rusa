@@ -4552,26 +4552,23 @@ async function composeStart(
           void cc.send(msg.spaceName, lines.join("\n")).catch(() => {});
           return;
         }
-        // Bare `/resume` releases everything: the global brake and every
-        // hold. Each released hold is named, so an indefinite hold never
-        // disappears silently behind an emergency-brake release.
+        // Bare `/resume` releases only the global brake (operator decision,
+        // #918). Every hold stays in force and is listed, so an indefinite
+        // hold is never hidden behind an emergency-brake release.
         const wasHalted = haltSwitch.hasActiveHalt();
         haltSwitch.resume();
         if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
         haltExpiryTimer = null;
-        const released = availabilityHolds.clearAll({ silent: true });
         const resumed = resumeAfterHalt();
-        const active = released.filter((hold) => availabilityHolds.isActive(hold));
-        const expired = released.length - active.length;
+        const remaining = availabilityHolds.list();
         const lines = [
           `▶ Resumed${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : " — actors will run on the next trigger"}.`,
           wasHalted ? "Global halt released." : "No global halt was in place.",
-          active.length
-            ? `Released availability holds:\n${holdLines(active)}`
-            : "No availability holds were in force.",
+          remaining.length
+            ? `Availability holds still in force:\n${holdLines(remaining)}\nSend /resume provider:<name> to release one.`
+            : "No availability holds are in force.",
         ];
-        if (expired > 0) lines.push(`Also removed ${expired} expired hold record(s).`);
-        console.warn(`[mesh] ▶ HALT and availability holds cleared via chat by ${who}`);
+        console.warn(`[mesh] ▶ HALT cleared via chat by ${who}`);
         void cc.send(msg.spaceName, lines.join("\n")).catch(() => {});
         return;
       }

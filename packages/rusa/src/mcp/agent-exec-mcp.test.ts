@@ -277,14 +277,7 @@ const MANAGEMENT_TOOLS: Record<string, readonly string[]> = {
     "unenroll_actor_experiment",
     "list_actor_experiments",
   ],
-  [MODEL_ADMIN_CAPABILITY]: [
-    "list_model_classes",
-    "set_model_class",
-    "delete_model_class",
-    "list_availability_holds",
-    "set_availability_hold",
-    "clear_availability_hold",
-  ],
+  [MODEL_ADMIN_CAPABILITY]: ["list_model_classes", "set_model_class", "delete_model_class"],
   [ACTOR_ADMIN_CAPABILITY]: [
     "revive_thread",
     "set_thread_title",
@@ -298,7 +291,13 @@ const MANAGEMENT_TOOLS: Record<string, readonly string[]> = {
     "remove_room_participant",
   ],
 };
-const ALL_MANAGEMENT_TOOLS = Object.values(MANAGEMENT_TOOLS).flat();
+/** Root-only: no grant, `model-admin` included, unlocks these for another actor (#539). */
+const ROOT_HOLD_TOOLS = [
+  "list_availability_holds",
+  "set_availability_hold",
+  "clear_availability_hold",
+] as const;
+const ALL_MANAGEMENT_TOOLS = [...Object.values(MANAGEMENT_TOOLS).flat(), ...ROOT_HOLD_TOOLS];
 
 describe("administrative capability gating of management tools (#549)", () => {
   const config = {
@@ -3333,8 +3332,8 @@ describe("availability hold tools (#539)", () => {
     expect(repo.list()).toEqual([]);
   });
 
-  it("hides the tools from a child and denies an open session once model-admin is revoked", async () => {
-    const { mesh, registry, capabilityGrants } = setup({ seedRootGrants: false });
+  it("refuses a non-root actor even when it holds model-admin", async () => {
+    const { mesh, registry, capabilityGrants } = setup();
     registry.upsert({
       id: "0b2c3d4e-steward",
       charter: "steward",
@@ -3342,24 +3341,30 @@ describe("availability hold tools (#539)", () => {
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
-    const { repo, options } = holdDeps();
-    const child = await connect(
-      createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root", undefined, options)
-    );
-    const names = (await child.listTools()).tools.map((tool) => tool.name);
-    expect(names).not.toContain("set_availability_hold");
-
     capabilityGrants.grant({
       actorId: "0b2c3d4e-steward",
       capability: MODEL_ADMIN_CAPABILITY,
       grantedBy: "test",
       grantedAt: "2026-01-01T00:00:00Z",
     });
+    const { repo, options } = holdDeps();
     const steward = await connect(
       createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root", undefined, options)
     );
-    capabilityGrants.revoke("0b2c3d4e-steward", MODEL_ADMIN_CAPABILITY, "2026-01-01T00:00:01Z");
-    const denied = await call(steward, "set_availability_hold", { provider: "kimi" });
+    const names = (await steward.listTools()).tools.map((tool) => tool.name);
+    expect(mesh.hasActiveCapability("0b2c3d4e-steward", MODEL_ADMIN_CAPABILITY)).toBe(true);
+    for (const tool of ROOT_HOLD_TOOLS) expect(names).not.toContain(tool);
+    const refused = await call(steward, "set_availability_hold", { provider: "kimi" });
+    expect(refused.isError).toBe(true);
+    expect(repo.list()).toEqual([]);
+  });
+
+  it("denies root's open session once model-admin is revoked", async () => {
+    const { mesh, capabilityGrants } = setup();
+    const { repo, options } = holdDeps();
+    const root = await connect(createAgentExecMcpServer(mesh, "root", "root", undefined, options));
+    capabilityGrants.revoke("root", MODEL_ADMIN_CAPABILITY, "2026-01-01T00:00:01Z");
+    const denied = await call(root, "set_availability_hold", { provider: "kimi" });
     expect(denied.isError).toBe(true);
     expect(dataOf(denied)).toMatch(/model-admin/);
     expect(repo.list()).toEqual([]);

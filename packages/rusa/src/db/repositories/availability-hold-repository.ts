@@ -117,15 +117,6 @@ export class AvailabilityHoldRepository {
     })();
   }
 
-  /** Delete every stored hold. Returns the deleted rows. */
-  clearAll(): AvailabilityHold[] {
-    return this.db.transaction(() => {
-      const rows = this.selectAll();
-      this.db.prepare("DELETE FROM availability_holds").run();
-      return rows.map(toHold);
-    })();
-  }
-
   /**
    * Stored holds ordered by provider, then provider-wide before model rows.
    * Pass `now` to see only holds still active at that instant.
