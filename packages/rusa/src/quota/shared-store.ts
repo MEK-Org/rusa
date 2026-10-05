@@ -45,6 +45,11 @@ export { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION, SchemaVersionRefusalErr
 // Maintenance scripts consume this bundled shared-store artifact, so expose
 // the one persistence decoder/writer rather than duplicating JSON handling.
 export { parseParsedState, serializeParsedState } from "./parsed-state.js";
+export {
+  BUILT_IN_QUOTA_PARSER_WORDING,
+  type QuotaParserWording,
+  quotaParserWordingRevisionId,
+} from "./parser-wording.js";
 
 const SLOT_MS = QUOTA_OBSERVATION_SLOT_MS;
 export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -403,6 +408,7 @@ export class SharedQuotaStore {
    * current behaviour and only the coordinator process opts in.
    */
   private metrics: QuotaMetrics = nullQuotaMetrics;
+  private registeredParserWording = false;
 
   constructor(
     readonly databasePath: string,
@@ -692,7 +698,9 @@ export class SharedQuotaStore {
           }
         })
         .immediate();
+      this.registeredParserWording = true;
     } catch (error) {
+      this.registeredParserWording = false;
       (this.logger ?? quotaStoreLogger()).warn("parser_wording_registration_failed", {
         error: error instanceof Error ? error.message : String(error),
       });
@@ -703,29 +711,17 @@ export class SharedQuotaStore {
    * The parser wording a parse should use, captured before extraction (#536).
    * This attribution-only slice uses the seeded built-in wording only. Pointer
    * lookup and activation belong to the later activation slice, where their
-   * writer and rollback semantics can be reviewed together. If the immutable
-   * revision record cannot be read, parsing keeps its built-in wording and
-   * records no revision.
+   * writer and rollback semantics can be reviewed together. Registration is
+   * verified once when opening the store: if the revision record could not be
+   * registered, parsing keeps its built-in wording and records no revision.
    */
   resolveParserWording(provider: QuotaLlmProvider): QuotaParserWording {
-    try {
-      const builtIn = BUILT_IN_QUOTA_PARSER_WORDING[provider];
-      const builtInId = quotaParserWordingRevisionId(provider, builtIn);
-      const registered = this.db
-        .prepare(
-          `SELECT id FROM quota_parser_wording_revisions
-           WHERE id = ? AND provider = ? AND wording = ?`
-        )
-        .get(builtInId, provider, builtIn) as { id: string } | undefined;
-      if (!registered) throw new Error("built-in parser wording revision is unavailable");
-      return { revisionId: builtInId };
-    } catch (error) {
-      (this.logger ?? quotaStoreLogger()).warn("parser_wording_records_unreadable", {
-        provider,
-        error: error instanceof Error ? error.message : String(error),
-      });
+    if (!this.registeredParserWording) {
       return unattributedBuiltInParserWording();
     }
+    return {
+      revisionId: quotaParserWordingRevisionId(provider, BUILT_IN_QUOTA_PARSER_WORDING[provider]),
+    };
   }
 
   /**

@@ -3,7 +3,11 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { inferQuotaState, parseCodexQuota } from "../build/maintenance/mcp/quota-mcp.js";
-import { serializeParsedState } from "../build/maintenance/quota/shared-store.js";
+import {
+  BUILT_IN_QUOTA_PARSER_WORDING,
+  quotaParserWordingRevisionId,
+  serializeParsedState,
+} from "../build/maintenance/quota/shared-store.js";
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -261,14 +265,23 @@ async function main() {
     const writable = new Database(args.database, { fileMustExist: true });
     writable.pragma("busy_timeout = 30000");
     try {
+      const codexRevisionId = quotaParserWordingRevisionId(
+        "codex",
+        BUILT_IN_QUOTA_PARSER_WORDING.codex
+      );
       const update = writable.prepare(
         `UPDATE quota_scrapes
-         SET parsed_state = ?, parse_error = NULL
+         SET parsed_state = ?, parse_error = NULL, parser_wording_revision_id = ?
          WHERE id = ? AND provider = 'codex' AND scraped_at = ?`
       );
       const apply = writable.transaction(() => {
         for (const replacement of replacements) {
-          const result = update.run(replacement.serialized, replacement.id, replacement.scrapedAt);
+          const result = update.run(
+            replacement.serialized,
+            codexRevisionId,
+            replacement.id,
+            replacement.scrapedAt
+          );
           if (result.changes !== 1) {
             throw new Error(`row ${shortHash(replacement.id)} changed during the backfill`);
           }

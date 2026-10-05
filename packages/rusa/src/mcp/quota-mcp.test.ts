@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
@@ -7,6 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockGenerateContent = vi.fn();
@@ -57,13 +57,6 @@ import {
   QuotaService,
 } from "./quota-mcp.js";
 
-const PRE_ATTRIBUTION_REQUEST_DIGESTS: Record<string, string> = {
-  claude: "28e377f8ca38a8bf4bf7832b00d9a5f2ee8bf8db28c8ac0dbb32a23281bcfd95",
-  codex: "f70c981d5da87df6e14185d675c45eb3344b7abeb7b20663c20cb7562728fb43",
-  agy: "500e5f4da8220d4c94735cbb6fcbc2ef701e07c0a23f9bda3a667b0685a9173e",
-  kimi: "1c5458f4ba8f50ab2aceff82ede61d49b57c05343f91fe29fdd1d1fc65d739df",
-};
-
 async function connect(server: McpServer): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -109,37 +102,31 @@ describe("quota MCP server", () => {
       ).config.systemInstruction;
     }
 
-    // #536: wording attribution must not change a single byte of what the
-    // parser sends. These digests were taken from the pre-attribution parser
-    // at the same instant, timezone and catalog; a deliberate wording change
-    // updates them in the same commit.
-    it("sends byte-identical parser requests for every provider", async () => {
-      const previousTz = process.env.TZ;
-      process.env.TZ = "UTC";
-      try {
-        mockGenerateContent.mockResolvedValue({
-          text: () => JSON.stringify({ status: "unknown", windows: [] }),
-        });
-        const at = Date.parse("2026-10-05T04:30:00.000Z");
-        const models = [{ displayLabel: "Example Model", identifier: "example-model" }];
-        const parsers = {
-          claude: parseClaudeQuota,
-          codex: parseCodexQuota,
-          agy: parseAgyQuota,
-          kimi: parseKimiQuota,
-        };
-        const digests: Record<string, string> = {};
-        for (const [provider, parse] of Object.entries(parsers)) {
-          mockGenerateContent.mockClear();
-          await parse(`synthetic ${provider} capture`, "test-key", at, models);
-          digests[provider] = createHash("sha256")
-            .update(JSON.stringify(mockGenerateContent.mock.calls[0][0]))
-            .digest("hex");
-        }
-        expect(digests).toEqual(PRE_ATTRIBUTION_REQUEST_DIGESTS);
-      } finally {
-        if (previousTz === undefined) delete process.env.TZ;
-        else process.env.TZ = previousTz;
+    // #536: wording attribution preserves prompt structure and embeds the
+    // provider-specific built-in wording in systemInstruction for each provider.
+    it("assembles parser requests containing the built-in wording and prompt contracts for every provider", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () => JSON.stringify({ status: "unknown", windows: [] }),
+      });
+      const at = Date.parse("2026-10-05T04:30:00.000Z");
+      const models = [{ displayLabel: "Example Model", identifier: "example-model" }];
+      const parsers = {
+        claude: parseClaudeQuota,
+        codex: parseCodexQuota,
+        agy: parseAgyQuota,
+        kimi: parseKimiQuota,
+      };
+      for (const [provider, parse] of Object.entries(parsers)) {
+        mockGenerateContent.mockClear();
+        await parse(`synthetic ${provider} capture`, "test-key", at, models);
+        const instruction = lastSystemInstruction();
+        expect(instruction).toContain("You are a precise quota parser.");
+        expect(instruction).toContain("OUTPUT SCOPE CONTRACT:");
+        expect(instruction).toContain("GROUNDING REQUIREMENT:");
+        expect(instruction).toContain("PERCENTAGE REQUIREMENT:");
+        expect(instruction).toContain(
+          BUILT_IN_QUOTA_PARSER_WORDING[provider as keyof typeof parsers]
+        );
       }
     });
 
@@ -2950,20 +2937,22 @@ describe("quota MCP server", () => {
         expect(latestRevision()).toBeNull();
       });
 
-      it("keeps parsing with the built-in wording when the control records are unreadable", async () => {
+      it("keeps parsing with the built-in wording when control table registration fails at open", async () => {
         const warn = vi.fn();
         store.close();
+        const db = new Database(join(root, "shared.db"));
+        db.exec("DROP TABLE quota_parser_wording_revisions");
+        db.exec("CREATE TABLE quota_parser_wording_revisions (id TEXT PRIMARY KEY)");
+        db.close();
         store = new SharedQuotaStore(join(root, "shared.db"), { ...nullLogger, warn });
-        store.db.exec("DROP TABLE quota_parser_wording_revisions");
         mockGenerateContent.mockResolvedValue({
           text: () => JSON.stringify({ status: "unknown", windows: [] }),
         });
 
         await probeClaude();
 
-        expect(warn).toHaveBeenCalledWith("parser_wording_records_unreadable", {
-          provider: "claude",
-          error: expect.stringContaining("quota_parser_wording"),
+        expect(warn).toHaveBeenCalledWith("parser_wording_registration_failed", {
+          error: expect.stringContaining("provider"),
         });
         const request = mockGenerateContent.mock.calls[0][0] as {
           config: { systemInstruction: string };

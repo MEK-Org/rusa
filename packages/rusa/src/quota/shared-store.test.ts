@@ -307,6 +307,47 @@ describe("SharedQuotaStore parser wording attribution (#536)", () => {
       store.close();
     }
   });
+
+  it("attributes re-parsed rows to the built-in wording revision on backfill", () => {
+    const { store } = openStore();
+    try {
+      const id = store.recordRaw({
+        provider: "codex",
+        scrapedAt: "2030-01-01T00:00:00.000Z",
+        rawOutput: "synthetic",
+      });
+      expect(
+        store.db
+          .prepare("SELECT parser_wording_revision_id AS rev FROM quota_scrapes WHERE id = ?")
+          .get(id)
+      ).toEqual({ rev: null });
+
+      const codexRevisionId = quotaParserWordingRevisionId(
+        "codex",
+        BUILT_IN_QUOTA_PARSER_WORDING.codex
+      );
+      store.db
+        .prepare(
+          `UPDATE quota_scrapes
+           SET parsed_state = ?, parse_error = NULL, parser_wording_revision_id = ?
+           WHERE id = ? AND provider = 'codex' AND scraped_at = ?`
+        )
+        .run(serializeParsedState(snapshot(75)), codexRevisionId, id, "2030-01-01T00:00:00.000Z");
+
+      expect(
+        store.db
+          .prepare(
+            "SELECT parsed_state, parser_wording_revision_id AS rev FROM quota_scrapes WHERE id = ?"
+          )
+          .get(id)
+      ).toEqual({
+        parsed_state: serializeParsedState(snapshot(75)),
+        rev: codexRevisionId,
+      });
+    } finally {
+      store.close();
+    }
+  });
 });
 
 describe("SharedQuotaStore canonical observations", () => {
