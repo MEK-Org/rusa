@@ -100,7 +100,7 @@ export interface DashboardDataDeps {
    * Chat Room entry notifier (#829). Only a verified durable principal can
    * enter; auth-disabled local mode answers `disabled`.
    */
-  roomEntry?: Pick<RoomEntryService, "enter" | "renew" | "leave">;
+  roomEntry?: Pick<RoomEntryService, "enter">;
   /** Root-authorized commands exposed to trusted dashboard operators. */
   rootControl?: RootControlService;
   /**
@@ -581,10 +581,9 @@ export function readBody(
 const MAX_ROOM_ENTRY_BODY_BYTES = 4 * 1024;
 
 /**
- * Room entry lifecycle (#829): `POST /api/mesh/chat-room/entry` enters (or
- * reattaches) one tab, `.../entry/renew` proves it live, `.../entry/leave`
- * releases it. Identity is the verified request principal and its session,
- * never the body. Without a verified durable principal — auth-disabled local
+ * Room entry (#829): `POST /api/mesh/chat-room/entry` announces one human
+ * entering the Room. Identity is the verified request principal and its
+ * session, never the body. Without a verified durable principal — auth-disabled local
  * mode — entry is `disabled` and nothing is recorded.
  */
 async function handleRoomEntryRequest(
@@ -593,15 +592,7 @@ async function handleRoomEntryRequest(
   pathname: string,
   deps: DashboardDataDeps | null
 ): Promise<boolean> {
-  const action =
-    pathname === "/api/mesh/chat-room/entry"
-      ? "enter"
-      : pathname === "/api/mesh/chat-room/entry/renew"
-        ? "renew"
-        : pathname === "/api/mesh/chat-room/entry/leave"
-          ? "leave"
-          : null;
-  if (!action) return false;
+  if (pathname !== "/api/mesh/chat-room/entry") return false;
   const principal = getDashboardRequestPrincipal(req);
   const sessionKey = dashboardSessionKey(req);
   if (!principal || !sessionKey) {
@@ -630,28 +621,7 @@ async function handleRoomEntryRequest(
     return true;
   }
   const clientId = typeof body.clientId === "string" ? body.clientId : "";
-  const client = { principalId: principal.id, clientId, sessionKey };
-  if (action === "enter") {
-    sendJson(res, 200, deps.roomEntry.enter(client));
-    return true;
-  }
-  const episodeId = typeof body.episodeId === "string" ? body.episodeId : "";
-  const generation = typeof body.generation === "string" ? body.generation : "";
-  if (!clientId || !episodeId || !generation) {
-    sendJson(res, 400, { error: "clientId, episodeId and generation are required" });
-    return true;
-  }
-  sendJson(
-    res,
-    200,
-    action === "renew"
-      ? deps.roomEntry.renew
-        ? deps.roomEntry.renew({ ...client, episodeId, generation })
-        : { status: "ok" }
-      : deps.roomEntry.leave
-        ? deps.roomEntry.leave({ principalId: principal.id, clientId, episodeId, generation })
-        : { status: "ok" }
-  );
+  sendJson(res, 200, deps.roomEntry.enter({ principalId: principal.id, clientId, sessionKey }));
   return true;
 }
 

@@ -93,14 +93,6 @@ export class RoomEntryService {
     return { status: "entered", notified: true, episodeId };
   }
 
-  renew?(_client: RoomEntryClient): { status: "ok" } {
-    return { status: "ok" };
-  }
-
-  leave?(_client: RoomEntryClient): { status: "ok" } {
-    return { status: "ok" };
-  }
-
   /** Reset in-memory cooldown state. */
   reset(): void {
     this.lastNotifiedAt.clear();

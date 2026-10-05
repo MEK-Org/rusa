@@ -98,9 +98,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
   let origin: string;
   const interrupt = vi.fn(() => ({ interrupted: true, status: "interrupted" }));
   const roomEntry = {
-    enter: vi.fn(() => ({ status: "entered", episodeId: "ep", generation: "g", created: true })),
-    renew: vi.fn(() => ({ status: "renewed" })),
-    leave: vi.fn(() => ({ status: "left", ended: true })),
+    enter: vi.fn(() => ({ status: "entered", notified: true, episodeId: "ep" })),
   };
   beforeEach(async () => {
     now = Date.now();
@@ -818,29 +816,8 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
       sessionKey,
     });
 
-    const lease = { ...forged, episodeId: "ep", generation: "g" };
-    await send("/api/mesh/chat-room/entry/renew", cookie, JSON.stringify(lease));
-    expect(roomEntry.renew).toHaveBeenCalledExactlyOnceWith({
-      principalId: user.id,
-      clientId: "tab",
-      sessionKey,
-      episodeId: "ep",
-      generation: "g",
-    });
-    await send("/api/mesh/chat-room/entry/leave", cookie, JSON.stringify(lease));
-    expect(roomEntry.leave).toHaveBeenCalledExactlyOnceWith({
-      principalId: user.id,
-      clientId: "tab",
-      episodeId: "ep",
-      generation: "g",
-    });
-
     expect((await send("/api/mesh/chat-room/entry", cookie, "[]")).status).toBe(400);
     expect((await send("/api/mesh/chat-room/entry", cookie, "{")).status).toBe(400);
-    expect(
-      (await send("/api/mesh/chat-room/entry/renew", cookie, JSON.stringify({ clientId: "tab" })))
-        .status
-    ).toBe(400);
     const oversized = JSON.stringify({ clientId: "tab", padding: "x".repeat(8 * 1024) });
     expect((await send("/api/mesh/chat-room/entry", cookie, oversized)).status).toBe(413);
     expect(roomEntry.enter).toHaveBeenCalledOnce();
