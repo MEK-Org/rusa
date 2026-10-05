@@ -6,6 +6,7 @@ import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js"
 import type { ActorRepository } from "../../repositories/actor-repository.js";
 import type { InboxRepository } from "../../repositories/inbox-repository.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
+import { AvailabilityHoldRepository } from "./availability-hold-repository.js";
 import { DbCapabilityGrantStore } from "./capability-grant-repository.js";
 import { ChatRoomRepository } from "./chat-room-repository.js";
 import { DbEventSourceOwnerStore } from "./event-source-owner-repository.js";
@@ -42,6 +43,7 @@ import {
 export class Repositories {
   readonly actorRuns: ActorRunRepository;
   readonly actors: ActorRepository;
+  readonly availabilityHolds: AvailabilityHoldRepository;
   readonly capabilityGrants: CapabilityGrantStore;
   readonly chatRoom: ChatRoomRepository;
   readonly eventSourceOwners: DbEventSourceOwnerStore;
@@ -78,6 +80,7 @@ export class Repositories {
     // actor's pool from the live class row on every read.
     this.modelClasses = new ModelClassRepository(db);
     this.actors = new SqliteActorRepository(db, this.principals, this.modelClasses);
+    this.availabilityHolds = new AvailabilityHoldRepository(db);
     this.capabilityGrants = new DbCapabilityGrantStore(db);
     this.chatRoom = new ChatRoomRepository(db);
     this.eventSourceOwners = new DbEventSourceOwnerStore(db);
@@ -133,6 +136,12 @@ export type {
   PortableLedgerSourceKind,
 } from "./actor-run-repository.js";
 export { ActorRunRepository } from "./actor-run-repository.js";
+export type {
+  AvailabilityHold,
+  AvailabilityHoldScope,
+  SetAvailabilityHold,
+} from "./availability-hold-repository.js";
+export { AvailabilityHoldRepository } from "./availability-hold-repository.js";
 export type { ChatRoomMember } from "./chat-room-repository.js";
 export { ChatRoomRepository } from "./chat-room-repository.js";
 export { DbEventSourceOwnerStore } from "./event-source-owner-repository.js";
