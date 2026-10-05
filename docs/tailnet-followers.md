@@ -1,0 +1,377 @@
+# Tailnet followers
+
+Start the leader and follower independently, then choose a registered follower
+when spawning an actor. One leader remains authoritative; a follower hosts
+multiple actors and stays connected when individual actors are retired.
+
+Both leader and follower host ordinary `Actor` objects inside their single Node
+process. Only provider CLI invocations are subprocesses. On the leader,
+`FollowerHub` maintains registered `RemoteInstance` objects, each of which owns
+its actor channels and command queue. `ActorHandle` is only the compatibility
+adapter for the existing mesh interface; it never spawns or kills a process.
+
+```text
+Leader Node process                       Follower Node process
+  ActorMesh / authoritative state           FollowerInstance
+  RemoteInstance ── instance connection ──▶   Actor A → provider CLI subprocess
+    actor-addressed handles                 Actor B → provider CLI subprocess
+```
+
+The earlier local-process demo, per-actor Node entrypoint, and `--worker-runtime`
+mode have been removed. Protocol version 3 requires rebuilding both ends;
+old followers are rejected at enrollment. Follower instances can be updated
+via the mesh control plane without actor coordination (see Follower updates below).
+
+The follower gateway can be hosted either persistently in `rusa start` (for staging
+and production) via `config.yaml`, or in a disposable E2E instance via `rusa am-up`.
+The gateway binds only to a specified Tailscale IPv4 address (`100.64.0.0/10`) or
+loopback (`127.0.0.1` for local testing); public interfaces and wildcard `0.0.0.0`
+are strictly refused.
+
+## Persistent leader configuration (`rusa start`)
+
+In `config.yaml`, configure the `followers:` block:
+
+```yaml
+followers:
+  bind: 100.x.y.z        # Tailscale IPv4 (100.64.0.0/10) or 127.0.0.1. Refuses 0.0.0.0.
+  port: 8290
+  tokenFile: /absolute/private/path/enrollment-token
+```
+
+Generate the enrollment token if needed:
+```sh
+node scripts/follower-token.mjs /absolute/private/path/enrollment-token
+```
+
+When `rusa start` runs with this configuration, it starts `FollowerHub`, binds to
+the configured address and port, and enables remote placement for `POST /api/mesh/actors`
+and `spawn_thread`.
+
+
+## Mac setup
+
+Requires Node 20.19+ and pnpm. Clone the repository with its submodules:
+
+```sh
+git clone --recurse-submodules https://github.com/MEK-Org/rusa.git rusa-follower
+cd rusa-follower
+pnpm install --frozen-lockfile
+pnpm --filter rusa run build:follower
+```
+
+For an existing clone, pull and run `git submodule update --init --recursive`
+before installing. Leader and follower must be built from the same commit —
+enrollment rejects a mismatched instance protocol version rather than
+negotiating one, so upgrade both ends together. The follower build does not
+build Flutter or start any leader services.
+
+Create a separate follower home, then copy the enrollment secret from the leader
+using your existing SSH access. All addresses, names and absolute paths below
+are placeholders: substitute your own values locally, and do not commit private
+infrastructure details or enrollment secrets to the repository.
+
+```sh
+mkdir -p /absolute/path/to/follower-home
+scp '<ssh-user>@<leader-tailnet-host>:/absolute/private/path/enrollment-token' \
+  /absolute/path/to/follower-home/token
+chmod 600 /absolute/path/to/follower-home/token
+```
+
+You can use your normal SSH host alias instead. The enrollment secret grants
+access to this gateway, so keep the token file private.
+
+From the cloned repository, start the follower in the foreground:
+
+```sh
+node packages/rusa/build/follower/follower.js \
+  --leader 'http://<leader-tailscale-ip>:8290' \
+  --id '<follower-name>' \
+  --home /absolute/path/to/follower-home \
+  --token-file /absolute/path/to/follower-home/token \
+  --sandbox none
+```
+
+Leave this terminal running. The follower writes its diagnostics through the
+application logger, so a `follower_registered` record naming the leader origin
+and the follower pid means enrollment succeeded; it does not yet mean an actor
+was spawned. No inbound Mac listener, Tailscale Serve configuration, or Mac
+Remote Login is needed. Outbound access from the Mac to the leader's TCP port
+8290 must be allowed by the tailnet policy.
+
+On macOS, `--sandbox none` runs provider CLIs with the local user's permissions.
+Workers are placed under the dedicated follower home's `workers/` directory;
+this directory convention is not an OS security boundary. The first transport
+check uses the scripted provider and requires no model credentials. Real runs
+require the chosen provider CLI installed and authenticated on the Mac.
+
+## Leader setup
+
+From `packages/rusa`, build into a separate directory and create a new secret:
+
+```sh
+RUSA_DIST_DIR=build/tailnet-leader pnpm exec tsup
+RUSA_DIST_DIR=build/tailnet-leader node scripts/copy-assets.mjs
+node scripts/follower-token.mjs /absolute/private/path/enrollment-token
+node build/tailnet-leader/commands/e2e.cli.js am-up \
+  --root /absolute/path/to/a/new/disposable/leader \
+  --root-driver external --port-offset 200 \
+  --follower-bind '<leader-tailscale-ip>' --follower-port 8290 \
+  --follower-token-file /absolute/private/path/enrollment-token
+```
+
+Substitute the leader's own Tailscale IPv4 address. If managing this process
+through a service manager, choose a distinct test-only unit name and state
+directory. Stop only that test unit; do not stop another mesh's instance.
+
+## Spawn and test
+
+The leader's control API remains loopback-only. On the leader:
+
+```sh
+# Staging/production dashboard API (port 8080 by default):
+curl -fsS http://127.0.0.1:8080/api/mesh/followers
+
+# Or E2E harness (port offset 200 -> port 8286):
+curl -fsS http://127.0.0.1:8286/followers
+node scripts/follower-smoke.mjs --target '<follower-name>' --port 8286
+```
+
+The smoke test uses the real Actor, provider registry, MCP HTTP transport and
+durable mesh messaging with a scripted provider. It verifies two runs in the
+same actor/session, two replies to the parent's inbox, and that retiring one
+actor leaves the follower and its sibling alive. It retires its test actors.
+It also checks that both actors execute in the registered follower's single PID.
+Follower workspaces are retained for inspection.
+
+Automated instance and restart tests:
+
+```sh
+pnpm exec vitest run src/remote-instances
+```
+
+Tests cover instance registration/versioning, safe bind enforcement (refusing 0.0.0.0
+and public IPs), shared PID, actor-local sessions, fresh admission-time prompts,
+active retirement, initialization failure, disconnect, automatic reconnect with backoff,
+actor re-attachment by ID across synthetic leader restart, and MCP capability routing/revocation —
+both mid-life, when a grant leaves the snapshot, and at actor exit.
+
+### Placement API and model-facing tools
+
+Remote placement is fully model-facing and API-accessible:
+
+1. **Model-facing MCP tools**:
+   - `list_followers`: Returns the list of currently connected follower nodes and their platform/actor details.
+   - `spawn_thread`: Accepts an optional `target: "<follower-name>"` parameter.
+2. **Dashboard REST API**:
+   - `GET /api/mesh/followers`: Returns `{ followers: [...] }`.
+   - `POST /api/mesh/actors`: Accepts optional `target: "<follower-name>"`.
+   - `GET /api/mesh/threads`: Thread DTO includes `executionTarget: "<follower-name>" | null`.
+3. **Fail-closed placement**:
+   - If `target` specifies an unknown or disconnected follower, the request immediately fails with a 400 error (or tool error).
+   - Remote placement never silently falls back to local execution.
+
+Example spawn via control API:
+
+```sh
+curl -fsS http://127.0.0.1:8080/api/mesh/actors -H 'content-type: application/json' \
+  -d '{"target":"<follower-name>","provider":"codex","model":"gpt-5.6-sol","charter":"Perform the bounded task sent in your inbox, report to your parent, and end your turn."}'
+```
+
+Send work to the returned ID with `POST /api/mesh/actors/<id>/chat` or mesh `send_message`. Spawning alone
+does not start a run. Omitting `target` keeps execution on the leader.
+
+## What crosses the connection
+
+The follower authenticates with a secret, registers a process-lifetime generation
+and receives a renewable registration session, then long-polls the leader for
+actor commands. It forwards actor events over HTTP. A reconnect from the same
+generation rolls the session and reattaches its hosts; a different authenticated
+generation fences the old session and is the confirmed replacement boundary.
+Each actor runs the original `Actor` class inside the follower process, using
+locally installed provider adapters and credentials. The follower assigns each
+actor a local workspace without changing process-wide cwd or per-actor environment.
+Provider factories are local code, never module paths supplied over the network.
+
+The leader keeps records, inboxes, prompt assembly, admission, accounting and
+MCP servers. Per-actor unguessable gateway URLs forward only assigned leader
+MCP endpoints, preserving streaming and session headers. The URL set is
+reconciled against the actor's capabilities on every refresh, so a grant the
+leader withdraws stops resolving while the actor is still running, not only
+when it exits; exit revokes whatever is left. Control enrollment secrets are
+not included in actor tool URLs. Tailscale provides the encrypted network
+connection; the HTTP gateway is not intended for the public internet.
+
+`/mcp/<key>` is deliberately the one gateway path that does not check the
+enrollment bearer token: the 256-bit random path segment is itself the
+capability, and the gateway strips any inbound `authorization` header before
+proxying to the leader. That is the tradeoff this design accepts. It keeps
+the follower from ever holding the control secret — a compromised follower
+process can reach only the MCP endpoints currently assigned to its own actors —
+at the cost of putting a bearer capability in a URL, where request logs, proxies
+and process listings can capture it. The gateway therefore never logs request
+paths, and the routing table is in memory only.
+
+### Event delivery
+
+The follower keeps each outbound event until the leader acknowledges it, and
+delivers in FIFO order. The gateway reads at most 8 MiB per request body,
+counting the whole UTF-8 JSON request: identity, session, batch ID and every
+serialized event with its escaping. An ordinary `POST /events` batch is the
+largest prefix of at most 100 events that fits; a retry after an uncertain
+acknowledgement resends the same batch ID and events, and the leader's batch
+and event fences ignore a repeat.
+
+An event too large for any batch on its own — a long log chunk, run result or
+request — is sent alone by negotiated transfer (#876). The leader advertises
+`eventTransfer` in its `/register` reply, and a follower uses
+`POST /events/transfer` only after seeing it; ordinary `/events` and the
+protocol version are unchanged. The follower serializes the event once and
+sends it in fragments of at most 1 MiB raw bytes, each with the event's
+original ID, total length and SHA-256, and its own index, offset and SHA-256.
+The leader stages fragments and, once the digest of the reassembled bytes
+matches, dispatches the original event through the same acceptance path and
+event fence as `/events`. Only the final `complete` answer lets the follower
+drop the event; an intermediate answer means the leader holds bytes, not that
+the event was delivered.
+
+The follower serializes every event once, when it is queued; each retry of a
+batch or transfer sends those bytes and that event ID, under the envelope of
+the session current at the attempt.
+
+The leader bounds staging: an original event of at most 64 MiB, one incomplete
+transfer per follower, eight and 128 MiB of declared bytes across all
+followers. This reservation bounds declared incomplete-event bytes, not process
+memory: request/base64 decoding, concatenation, UTF-8 strings and parsed objects
+can coexist with staged bytes. Chunks are released after concatenation, before
+dispatch; garbage collection and listener copies still affect peak memory.
+Every fragment before the last carries at least 64 KiB, so a
+transfer is at most about a thousand fragments, and the leader reads at most
+eight `/events/transfer` request bodies at once, answering `busy` to more
+before reading them. Staging expires five minutes after its last newly accepted fragment
+(a repeated fragment does not extend it) and thirty minutes after it began, and
+is discarded when the follower's generation is replaced; the follower then
+restarts at fragment zero with the same event. Exhausted capacity is a
+retryable `busy` answer. A final acknowledgement lost even after staging
+expired is answered `complete` from the existing event fence.
+
+An event the follower cannot send — larger than 64 MiB, refused by the leader,
+or facing a leader that did not advertise transfer — is *parked*: it stays at
+the head of the queue with its bytes intact, later events wait visibly behind
+it, and the follower logs `follower_event_parked` once with the event ID, type,
+size, limit and reason, never its content. Parked delivery is not retried until
+a registration brings a capability, or one different from the capability the
+leader refused under; nothing is truncated, dropped or reported as delivered.
+The log line is the only signal of a parked queue; [#880](https://github.com/MEK-Org/rusa/issues/880)
+tracks content-free status/health visibility. Deploy an upgraded leader before relying on transfer
+from upgraded followers. A follower built before #876 is still accepted and
+keeps its old limit: an event that alone exceeds 8 MiB blocks its queue.
+
+Acceptance means the leader's receiver returned without throwing; it says
+nothing about later durable processing. If the receiver throws, the leader
+records the event as failed in the same bounded per-follower event fence and
+answers HTTP 409 `acceptance_failed` — for `/events` with the failing event's
+ID, after any earlier events in that batch were accepted. Every retry of that
+event in the same leader incarnation gets the same answer, whatever its batch
+or transfer ID and across session renewal or staging expiry, and the receiver
+is not invoked again, because an earlier listener may already have acted. The
+follower drops only the accepted prefix, parks the failed event with its
+original bytes and stops resending it; later events wait behind it until an
+operator intervenes or a new leader incarnation fences the queue. A follower
+built before #876 retries the refused batch on its ordinary timer instead of
+parking.
+
+## Reconnect and durability across leader restarts
+
+1. **Durable placement**: `executionTarget` is persisted on the `ActorRecord` in `mesh.db`'s
+   application-owned `context_config` JSON document. The reader accepts the previous strict
+   v1 document and this build writes strict v2 documents; this is not a SQL migration and does
+   not add a database JSON validator.
+2. **Client-side backoff reconnect**: If the leader restarts or transient network interruptions occur, the follower does not exit; it initiates an exponential backoff reconnect loop calling `/register`. The same running process retains its generation, so the leader rolls the session without closing its actor channels or retained admission ticket.
+3. **Re-attachment and capability re-issuance**: When the leader restarts and the follower re-enrolls, the leader re-attaches placed actors by ID and re-issues fresh bearer capability URLs. Unhandled inbox items trigger recovery wakes. A newly registered process generation fences and replaces any older channels for that enrollment identity.
+
+Before enabling placement, take the normal `mesh.db` backup for the deploy. Once a v2 document
+has been written, do not roll the database back to a pre-v2 binary: that binary strictly rejects
+the newer document. Roll forward with a fix, or restore the pre-rollout database snapshot as a
+coordinated service rollback. There is no SQL migration to reverse.
+
+## Follower updates and lifecycle management
+
+Followers support an explicit, authenticated mesh-level update mechanism that does
+not require actor coordination or interrupt running actors prematurely.
+
+### Compatibility and version fencing
+
+Follower nodes report their active git `commitSha`, process generation, and
+`protocolVersion` upon enrollment via `POST /register`.
+- Enrollment admits a follower whose `protocolVersion` is the leader's `INSTANCE_PROTOCOL_VERSION` (N, currently 8) or the previous one (N−1). An N−1 follower is fully admitted and runs normally until the update reconciler moves it to the leader's build; the registration reply echoes the follower's own version, which is the protocol that session speaks. Anything else fails closed with HTTP 409. Every refusal of an authenticated, parseable register request logs `follower_register_rejected` with the follower id, `protocolVersion`, `commitSha` and reason; a 401 or unparseable body carries no trustworthy identity, so only the follower's own registration-failure log records it.
+- Release order is leader first, then followers. Each protocol bump therefore keeps N−1 working (the leader handles any changed v(N−1) shape and does not send a v(N−1) follower a command it cannot parse) and drops N−2. The rule sits next to the constant in `protocol.ts`.
+- Update commands can specify an explicit full SHA-1/SHA-256 `targetSha`. The follower rejects an invalid branch or a target outside the fetched branch before checkout. Enrollment is the sole protocol-compatibility fence; a command cannot override it.
+
+### Build and deploy trigger semantics
+
+Follower updates can be triggered via three paths:
+1. **FollowerHub Gateway API** (authenticated via enrollment bearer token):
+   - `POST /followers/:id/update` - triggers update for a single follower with optional `{ targetSha, branch }`.
+   - `GET /followers/:id/update` - queries the last known update status of a follower.
+   - `POST /followers/update-all` - triggers updates across all currently connected followers.
+   - `GET /followers/reconciliation` - queries the active automatic update trigger and reconciliation state.
+2. **Dashboard REST API** (loopback control API):
+   - `POST /api/mesh/followers/:id/update`
+   - `GET /api/mesh/followers/:id/update`
+   - `POST /api/mesh/followers/update-all`
+3. **Automatic leader-update trigger & reconciliation**:
+   - When the leader self-updates via the `update` tool, `executeUpdate` persists an active `FollowerUpdateTrigger` to `<mcHome>/data/follower-update-trigger.json` *after* the update is committed and drained, immediately before the restart exit. A failed or timed-out leader update never writes a trigger — and neither does one that fails after a green build, since that path rolls the checkout back to the old SHA and no trigger may name a revision the leader reverted.
+   - The document is schema-versioned. A trigger file that is unparseable or of an unrecognised shape is reported through the application logger as invalid — distinctly from "no active trigger" — and never prevents the leader from starting.
+   - **The replacement leader must survive its own boot before it moves anyone else.** Reconciliation is armed only once startup completes and the mesh is live, not when the follower gateway binds its socket. A leader that comes up far enough to open a port and then dies therefore dispatches nothing. This is the automated form of the operator-verification step that previously guarded the same risk: the leader demonstrating it can run the revision is what authorises propagating it. Followers that connect before arming are reconciled at arming, not dropped.
+   - As enrolled followers reconnect and register via `POST /register`, the reconciler evaluates their reported `commitSha`:
+     - If `follower.commitSha === trigger.targetSha`: recorded as `success`.
+     - If the follower lags `targetSha`, an update is dispatched via `updateFollower`. The `pending` attempt is recorded before dispatch so the single-flight gate is durable across leader crashes from the moment the command is enqueued; a dispatch that throws is overwritten as a failure rather than leaving a `pending` state the follower could never leave.
+     - **Fail-stop loop prevention**: If a follower previously reported a failure (`status: "failed"`) for the given `targetSha`, automatic reconciliation skips that follower to avoid endless build/restart loops. A newer target supersedes that suppression.
+   - **Automatic rollout is single-flight.** Once armed, the reconciler dispatches at most one automatic follower update at a time. Its durable `pending` attempt remains the gate across leader replacement; a replacement waits rather than guessing whether the former leader's follower is still draining or restarting. A failure, an `already_current` report, or a replacement registration on `targetSha` is terminal for that follower and releases the next eligible connected follower. This applies only to automatic reconciliation: the authenticated single-follower and update-all API paths remain operator-directed.
+   - **An active trigger is not retired by the followers that happen to be connected.** The leader keeps no durable enrollment roster, so "every follower we can see is current" cannot establish that every enrolled follower is; completing on it would strand a follower that was offline during the leader update, which is the case the durable document exists to serve. The trigger instead stays active until the next leader update supersedes it, so a follower that reconnects hours later is still caught up. `GET /followers/reconciliation` reports whether a trigger is outstanding, whether all *connected* followers are current, and the per-follower attempt state.
+
+### Follower-side update execution and safe rollback boundary
+
+When a follower receives a `FollowerUpdateCommand`, it executes `executeFollowerUpdate` in the background:
+- **Phased reporting**: Status transitions from `pending` through `fetching`, `building`, `draining`, and `restarting`; terminal non-restart outcomes are `already_current` or `failed`.
+- **Observable status reporting**: Follower status updates are dispatched back to the leader as `$instance` event records (`FollowerUpdateStatusEvent`) over the existing multiplexed event batch channel (`POST /events`), updating the leader's in-memory `FollowerInfo` without interrupting or conflicting with actor-addressed messages.
+- **Staging build isolation**: Followers build into a staging directory (`build/follower.new`) using `RUSA_FOLLOWER_DIST_DIR=build/follower.new`.
+- **Safe rollback boundary**: Active actors continue executing during pull and build. The follower then closes admission and waits up to its configured drain timeout for them to finish before restart; only a timeout permits interruption. If any later step fails after a green artifact promotion (including drain or a returning restart hook), the follower restores both the previous artifact and `git reset --hard <oldSha>`. A rollback failure is surfaced in the final failed status.
+- **Cutover recovery**: Only after a green build succeeds is `build/follower.new` promoted to `build/follower`. If promotion fails after the old directory moved aside, the implementation restores that old directory before reporting failure.
+
+## Provider and computer-use support
+
+- **Codex computer use**: Downstream of the 2026-09-06 live follower validation test on macOS against an E2E leader, where Codex's native computer-use MCP (screen/accessibility state, mouse, keyboard) drove Notes.app end-to-end without macOS permission prompts. Rusa does not provide a custom desktop automation harness or macOS sandboxing; execution relies on the provider's native host capabilities.
+- **Claude computer use**: Strictly excluded and out of scope for #301 per the 2026-09-06 operator scope ruling. Headless Claude Code sessions lack a computer-use tool in this environment; no PTY harness or desktop automation tooling is provided or attempted.
+- **Actor scheduling**: Grant the `computer-use` capability to each actor that may control a desktop. The grant or revocation takes effect at that actor's next provider admission, including a run already waiting in provider pacing. Each execution process holds an in-memory computer-use lock: one capable run may hold it at a time, while ordinary capable work waits with its inbox work intact. A responsive capable wake requests interruption of a normal holder and begins only after that holder stops; a responsive holder finishes, and later responsive requests remain FIFO behind it. The lock coordinates only runs in its own process: it deliberately does not use PID files or coordinate across follower replacement processes. It is acquired after provider admission, so an admitted capable run retains that provider admission while it waits for the lock. On shutdown, queued runs are cancelled and the active holder is interrupted. No configuration setting is required.
+
+## Limits
+
+Leader run accounting is exactly-once for admitted runs. A transport lapse is not
+a run outcome: an in-flight remote run remains pending and may report its late
+result after a same-generation reconnect. It ends only on that reported result,
+explicit cancellation, or a confirmed replacement process generation. Provider
+effects remain outside exactly-once guarantees.
+
+The gateway records authenticated last contact from the follower's long-poll and
+event requests and emits one `follower_contact_stale` warning when fresh contact
+first lapses. It refuses new actor placement and follower updates for that
+generation, but leaves existing actor channels and their queued commands intact
+for the next poll. Reattachment is not freshness-gated. It does not expire
+channels or fail runs on a 45-second timer. To recover, restore the
+follower's leader connectivity and let its same generation re-register and poll;
+to end a stranded run, use the normal actor cancellation or retirement control,
+whose stop command remains deliverable when contact returns. Any future expiry
+policy must be chosen from measured contact-gap data and documented as a separate
+operational decision.
+Provider process-tree cleanup after an abrupt crash still needs validation beyond
+the current automated tests. There is deliberately no per-actor Node crash isolation, matching the leader.
+Retirement interrupts/closes only that Actor; instance shutdown closes all actors.
+
+Local files stay on the follower. Media/file transfer, leader-local repository
+URL rewrites, host-job tools, Understanding mounts, provider/model changes and
+interrupt/preemption are not portable yet. Start with local file tasks and the
+ordinary inbox/mesh tools. Desktop capture/control and macOS permissions remain
+separate work. The leader may send provider configuration, but provider secrets
+and account authentication should be provisioned locally on the follower.

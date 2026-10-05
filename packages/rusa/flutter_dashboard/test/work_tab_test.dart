@@ -11,7 +11,6 @@ import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/hierarchy_drag_drop.dart';
 import 'package:rusa_dashboard/widgets/obligation_card.dart';
 import 'package:rusa_dashboard/widgets/obligation_status.dart';
-import 'package:rusa_dashboard/widgets/reference_preview.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 
 
@@ -135,7 +134,7 @@ void main() {
       await tester.pump();
       await tester.pump();
 
-      expect(find.text('CREATOR'), findsOneWidget);
+      expect(find.text('Creator'), findsOneWidget);
       expect(find.text('creator-1-handle'), findsOneWidget);
       // Owner and creator differ here — the raw creator id should not leak
       // into the primary line, only the resolved handle should.
@@ -174,7 +173,7 @@ void main() {
       await tester.pump();
       await tester.pump();
 
-      expect(find.text('CREATOR'), findsOneWidget);
+      expect(find.text('Creator'), findsOneWidget);
       expect(find.text('Operator'), findsOneWidget);
       expect(find.text('human:operator'), findsNothing);
 
@@ -215,11 +214,11 @@ void main() {
         await tester.pump();
         await tester.pump();
 
-        expect(find.text('OWNER'), findsOneWidget);
+        expect(find.text('Owner'), findsOneWidget);
         expect(find.text('Operator'), findsOneWidget);
         expect(find.text('Unknown actor'), findsNothing);
         expect(find.text(durableUser), findsNothing);
-        expect(find.text('View Owner Queue →'), findsOneWidget);
+        expect(find.byTooltip('View Owner Queue →'), findsOneWidget);
 
         await store.dispose();
       });
@@ -260,7 +259,7 @@ void main() {
         await tester.pump();
         await tester.pump();
 
-        expect(find.text('CREATOR'), findsOneWidget);
+        expect(find.text('Creator'), findsOneWidget);
         expect(find.text('Operator'), findsOneWidget);
         expect(find.text('Unknown actor'), findsNothing);
         expect(find.text(durableUser), findsNothing);
@@ -366,7 +365,7 @@ void main() {
         await tester.pump();
         await tester.pump();
 
-        expect(find.text('CREATOR'), findsOneWidget);
+        expect(find.text('Creator'), findsOneWidget);
         expect(find.text('Unknown actor'), findsOneWidget);
         expect(find.text('retired-actor-999'), findsNothing);
 
@@ -403,7 +402,7 @@ void main() {
       await tester.pump();
       await tester.pump();
 
-      expect(find.text('CREATOR'), findsOneWidget);
+      expect(find.text('Creator'), findsOneWidget);
       expect(
         find.text('Unknown — predates creator attribution'),
         findsOneWidget,
@@ -1050,7 +1049,7 @@ void main() {
 
         // Child detail view is shown
         expect(find.text('Child obligation heading'), findsWidgets);
-        expect(find.text('PARENT'), findsOneWidget);
+        expect(find.text('PARENT'), findsNothing); // ancestors are breadcrumbs
         expect(find.text('Parent obligation heading'), findsWidgets);
 
         // Scroll to and tap the parent row in the PARENT section
@@ -1115,10 +1114,10 @@ void main() {
         // In narrow layout, child detail view is displayed with the back bar
         expect(find.text('Back to List'), findsOneWidget);
         expect(find.text('Child obligation heading'), findsWidgets);
-        expect(find.text('PARENT'), findsOneWidget);
+        expect(find.text('PARENT'), findsNothing); // ancestors are breadcrumbs
         expect(find.text('Parent obligation heading'), findsWidgets);
 
-        // Tap the parent row in the PARENT section
+        // Tap the ancestor breadcrumb
         await tester.tap(find.text('Parent obligation heading').last);
         for (int i = 0; i < 10; i++) {
           await tester.pump(const Duration(milliseconds: 10));
@@ -1187,9 +1186,12 @@ void main() {
         await tester.pump();
 
         expect(find.text('EXTERNAL LINK'), findsOneWidget);
-        expect(find.byType(ReferencePreview), findsOneWidget);
-        expect(find.text('GITHUB'), findsOneWidget);
+        expect(find.byTooltip('View reference context'), findsOneWidget);
         expect(find.text('Make external link a reference card'), findsOneWidget);
+        await tester.tap(find.byTooltip('View reference context'));
+        await tester.pumpAndSettle();
+        expect(find.text('GITHUB'), findsOneWidget);
+        expect(find.text('Make external link a reference card'), findsNWidgets(2));
         expect(find.text('root-handle'), findsOneWidget);
         expect(
           find.text('Reference card in obligation view preview snippet'),
@@ -1201,6 +1203,8 @@ void main() {
         await tester.tap(find.byTooltip('Open in new tab'));
         expect(openedLinks, ['https://github.com/MEK-Org/rusa/issues/345']);
 
+        await tester.tap(find.text('Close'));
+        await tester.pumpAndSettle();
         // Tap edit button to open edit dialog
         expect(find.byTooltip('Change or unlink'), findsOneWidget);
         await tester.tap(find.byTooltip('Change or unlink'));
@@ -1253,8 +1257,10 @@ void main() {
         }
 
         expect(find.text('EXTERNAL LINK'), findsOneWidget);
-        expect(find.byType(ReferencePreview), findsOneWidget);
+        expect(find.byTooltip('View reference context'), findsOneWidget);
         expect(find.text('Done obligation with reference card'), findsOneWidget);
+        await tester.tap(find.byTooltip('View reference context'));
+        await tester.pumpAndSettle();
         expect(find.byTooltip('Open in new tab'), findsOneWidget);
         expect(find.byTooltip('Change or unlink'), findsNothing);
 
@@ -1294,10 +1300,12 @@ void main() {
         await tester.pump();
 
         expect(find.text('EXTERNAL LINK'), findsOneWidget);
-        expect(find.byType(ReferencePreview), findsOneWidget);
+        expect(find.byTooltip('View reference context'), findsOneWidget);
+        await tester.tap(find.byTooltip('View reference context'));
+        await tester.pumpAndSettle();
         expect(find.text('GITHUB'), findsOneWidget);
-        expect(find.text('GitHub reference'), findsOneWidget);
-        expect(find.text('Not resolvable yet.'), findsOneWidget);
+        expect(find.text('GitHub reference'), findsNWidgets(2));
+        expect(find.descendant(of: find.byType(AlertDialog), matching: find.text('Not resolvable yet.')), findsOneWidget);
         expect(find.byTooltip('Change or unlink'), findsOneWidget);
 
         await store.dispose();
@@ -1335,7 +1343,7 @@ void main() {
         await tester.pump();
 
         expect(find.text('EXTERNAL LINK'), findsOneWidget);
-        expect(find.byType(ReferencePreview), findsNothing);
+        expect(find.byTooltip('View reference context'), findsNothing);
         expect(
           find.text('Not linked to an issue, PR or repository.'),
           findsOneWidget,

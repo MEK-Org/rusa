@@ -321,6 +321,8 @@ describe("graph-store write ops", () => {
         appended,
       });
       expect(warnings.some((w) => w.includes("ALREADY over a split trigger"))).toBe(true);
+      expect(warnings.some((w) => w.includes("Avoid turning nodes into changelogs"))).toBe(true);
+      expect(warnings.every((w) => !w.includes("ISSUE_NUM"))).toBe(true);
     });
 
     it("does not call out an append that folds into an existing section", () => {

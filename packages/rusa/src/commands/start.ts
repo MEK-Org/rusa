@@ -35,7 +35,11 @@ import {
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
 import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
-import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../actor/computer-use-lock.js";
+import {
+  COMPUTER_USE_CAPABILITY,
+  ComputerUseLock,
+  createComputerUseAdmission,
+} from "../actor/computer-use-lock.js";
 import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { assertSpawnContextSupported } from "../actor/context-selection.js";
 import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.js";
@@ -167,9 +171,6 @@ import type {
 } from "../db/repositories/obligation-repository.js";
 import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
-import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
-import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
-import { FollowerUpdateTriggerStore } from "../experimental/remote-instances/follower-update-trigger-store.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitops/issue-client.js";
 import { initEmptyBareRepo } from "../gitops/worktree.js";
@@ -280,6 +281,9 @@ import {
 import { type MissedQuotaWindow, MissedQuotaWindowDetector } from "../quota/missed-windows.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
+import { FollowerHub } from "../remote-instances/follower-hub.js";
+import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 import { constructActorFromInvocation } from "../runtime/actor-invocation.js";
 import {
@@ -681,7 +685,11 @@ export interface RunStartE2EHandles {
 export interface RunStartE2EHooks {
   /** Emulator boundary supplied only by the disposable e2e launcher. */
   dashboardAuth?: DashboardAuth;
-  /** Experimental execution seam; production always constructs a local Actor. */
+  /**
+   * Worker-construction override for e2e runs. Without it, production uses the
+   * follower gateway's factory when followers are configured (remote handles for
+   * placed actors, local Actors otherwise) and a local Actor when they are not.
+   */
   createWorkerActor?: (context: ActorFactoryContext, options: ActorOptions) => MeshActor;
   chatClient?: ChatClient;
   chatSource?: ChatSource;
@@ -2701,8 +2709,8 @@ async function composeStart(
     actors,
     principals: getRepositories().principals,
     rootId,
-    // Placement exists when an experimental remote-instance seam or follower gateway
-    // is wired. Unknown or disconnected targets fail closed.
+    // Placement exists when an e2e worker-construction override or the follower
+    // gateway is wired. Unknown or disconnected targets fail closed.
     supportsExecutionTarget: opts?.e2e?.createWorkerActor
       ? () => true
       : followerHub
@@ -3188,6 +3196,9 @@ async function composeStart(
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
         let localActor: Actor | undefined;
+        const computerUseAdmission = createComputerUseAdmission(() =>
+          mesh.hasActiveCapability(id, COMPUTER_USE_CAPABILITY)
+        );
         const actorOptions: ActorOptions = {
           id,
           cwd,
@@ -3195,6 +3206,7 @@ async function composeStart(
           resolveProvider: (selected) =>
             resolveProvider(config, selected.provider, selected.model, selected.effort),
           mcpServers: workerMcp,
+          isComputerUseAdmitted: computerUseAdmission.isAdmitted,
           addDirs: [],
           sandbox,
           prepareUnderstandingMount: understandingMountEnabled
@@ -3269,7 +3281,7 @@ async function composeStart(
                 responsive,
                 (start) => ctx.gate(start, candidates, responsive),
                 fn,
-                () => mesh.hasActiveCapability(id, COMPUTER_USE_CAPABILITY),
+                computerUseAdmission.shouldLock,
                 () => localActor?.preemptForResponsive(),
                 () => localActor?.requestRun()
               );
@@ -3614,6 +3626,9 @@ async function composeStart(
   const rootLifecycle = mesh.lifecycleFor(rootId);
   addRunLifecycleListeners(rootLifecycle, rootId, rootBootModelConfig.modelConfig[0]);
   let root: MeshActor;
+  const rootComputerUseAdmission = createComputerUseAdmission(() =>
+    mesh.hasActiveCapability(rootId, COMPUTER_USE_CAPABILITY)
+  );
   const rootActorOptions: ActorOptions = {
     id: rootId,
     cwd: rootAgentDir,
@@ -3691,13 +3706,14 @@ async function composeStart(
     admitRun: ({ responsive }): boolean =>
       mesh.hasRunnableInbox(rootId) &&
       (responsive || !(voiceService?.hasActiveSession(rootId) ?? false)),
+    isComputerUseAdmitted: rootComputerUseAdmission.isAdmitted,
     gate: (fn, candidates, responsive) =>
       computerUseLock.gateAfterProvider(
         rootId,
         responsive,
         (start) => mesh.gateRun(start, candidates, responsive, rootId),
         fn,
-        () => mesh.hasActiveCapability(rootId, COMPUTER_USE_CAPABILITY),
+        rootComputerUseAdmission.shouldLock,
         () => root.preemptForResponsive?.(),
         () => root.requestRun?.()
       ),

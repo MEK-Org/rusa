@@ -3,6 +3,18 @@ import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limit
 /** Capability required for a run to reserve exclusive computer control on its instance. */
 export const COMPUTER_USE_CAPABILITY = "computer-use";
 
+/** Bind each serialized actor run to its lock decision; live revokes still deny attempts. */
+export function createComputerUseAdmission(hasCapability: () => boolean) {
+  let admitted = false;
+  return {
+    shouldLock: () => {
+      admitted = hasCapability();
+      return admitted;
+    },
+    isAdmitted: () => admitted && hasCapability(),
+  };
+}
+
 type Start<T> = () => Promise<T> | RunStartHandle<T>;
 
 interface LockEntry<T> {

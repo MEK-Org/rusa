@@ -40,10 +40,6 @@ import { handleQuotaApiRequest, type QuotaHistoryDto } from "../dashboard/quota-
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { buildE2EConfig } from "../e2e/provision.js";
-import { ActorHandle } from "../experimental/remote-instances/actor-handle.js";
-import { FollowerInstance } from "../experimental/remote-instances/follower-instance.js";
-import { INSTANCE_PROTOCOL_VERSION } from "../experimental/remote-instances/protocol.js";
-import { RemoteInstance } from "../experimental/remote-instances/remote-instance.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { McpHttpServer } from "../mcp/http-server.js";
@@ -54,6 +50,10 @@ import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/m
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { HISTORY_WINDOW_MS } from "../quota/coordinator-protocol.js";
+import { ActorHandle } from "../remote-instances/actor-handle.js";
+import { FollowerInstance } from "../remote-instances/follower-instance.js";
+import { INSTANCE_PROTOCOL_VERSION } from "../remote-instances/protocol.js";
+import { RemoteInstance } from "../remote-instances/remote-instance.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { SlackSocketSource } from "../slack/socket-source.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";

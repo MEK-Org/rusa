@@ -102,11 +102,7 @@ InboxEntryDto makeInboxEntry(
   actorId: actorId,
   source: source,
   deliveredAt: deliveredAt,
-  payload: {
-    'type': type,
-    'priority': ?priority,
-    'content': ?content,
-  },
+  payload: {'type': type, 'priority': ?priority, 'content': ?content},
   reference: reference,
 );
 
@@ -733,17 +729,24 @@ class FakeApi extends DashboardApi {
     );
   }
 
+  ObligationDetailSnapshot Function(String id, String? historyBefore)?
+  obligationDetailByHistory;
   int obligationDetailCallCount = 0;
 
   @override
   Future<ObligationDetailSnapshot> fetchObligationDetail(
     String id, {
+    String? historyBefore,
+    int? historyLimit,
     int? childrenOffset,
     int? blockingOffset,
     int? completionsOffset,
     int? limit,
   }) async {
     obligationDetailCallCount++;
+    if (obligationDetailByHistory != null) {
+      return obligationDetailByHistory!(id, historyBefore);
+    }
     final byOffset = obligationDetailByOffset;
     if (byOffset != null) {
       return byOffset(id, completionsOffset);
@@ -935,6 +938,35 @@ class FakeApi extends DashboardApi {
       return updated;
     }
     return makeObligation(id, status: status);
+  }
+
+  /// Each snooze write as the API was asked for it; null [until] clears.
+  final snoozeCalls = <({String id, DateTime? until})>[];
+  Object? snoozeError;
+  String? snoozeWarning;
+
+  @override
+  Future<ObligationSnoozeResult> setObligationSnooze(
+    String id,
+    DateTime? until,
+  ) async {
+    snoozeCalls.add((id: id, until: until));
+    if (snoozeError case final error?) throw error;
+    final index = obligationsResult.indexWhere((o) => o.id == id);
+    final old = index >= 0 ? obligationsResult[index] : makeObligation(id);
+    // Round-trips like the server: millisecond precision, UTC with `Z`.
+    final persisted = until == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(
+            until.millisecondsSinceEpoch,
+            isUtc: true,
+          ).toIso8601String();
+    final updated = ObligationDto.fromJson({
+      ...old.toJson(),
+      'snoozedUntil': persisted,
+    });
+    if (index >= 0) obligationsResult[index] = updated;
+    return ObligationSnoozeResult(obligation: updated, warning: snoozeWarning);
   }
 
   final externalRefCalls = <({String id, String? ref})>[];
@@ -1222,10 +1254,7 @@ class FakeObligationsCache implements ObligationsCache {
   }
 
   @override
-  void invalidate({
-    required String scope,
-    required String principalId,
-  }) {
+  void invalidate({required String scope, required String principalId}) {
     _entries.remove('$scope.$principalId');
     if (stored?.scope == scope && stored?.principalId == principalId) {
       stored = null;
@@ -1291,7 +1320,9 @@ class FakeVoiceRecorder implements VoiceRecorder {
     final c = startCompleter;
     if (c != null) await c.future;
     if (generation != _generation) {
-      throw StateError('mic acquisition superseded by a newer recording session');
+      throw StateError(
+        'mic acquisition superseded by a newer recording session',
+      );
     }
   }
 

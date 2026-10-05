@@ -7,6 +7,8 @@ import 'package:rusa_dashboard/session.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/chat_room.dart';
 import 'package:rusa_dashboard/widgets/dashboard_body.dart';
+import 'package:rusa_dashboard/widgets/header.dart';
+import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 
@@ -79,6 +81,11 @@ Future<void> _settle(WidgetTester tester) async {
   await tester.pump(const Duration(milliseconds: 50));
 }
 
+Future<void> _settleDrawer(WidgetTester tester) async {
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 400));
+}
+
 Future<void> _tapNav(WidgetTester tester, String label) async {
   await tester.tap(find.widgetWithText(InkWell, label));
   await _settle(tester);
@@ -115,6 +122,99 @@ void main() {
   });
 
   group('browser/system back navigation', () {
+    testWidgets(
+      'an exceptionally short Room retains edge drawer and back exits (#859)',
+      (tester) async {
+        await _withDashboard(
+          tester,
+          initialUrl: '/overview',
+          size: const Size(411, 485),
+          body: (_) async {
+            expect(find.byType(MeshHeader), findsOneWidget);
+            await tester.tap(find.byIcon(Icons.menu));
+            await _settleDrawer(tester);
+            await tester.tap(find.byKey(const ValueKey('drawer-nav-chatRoom')));
+            await _settleDrawer(tester);
+            expect(find.byType(ChatRoomTab), findsOneWidget);
+            expect(
+              find.byType(MeshHeader),
+              findsNothing,
+              reason: 'the 411x485 cover screen uses the headerless Room',
+            );
+
+            await tester.dragFrom(const Offset(1, 200), const Offset(300, 0));
+            await _settleDrawer(tester);
+            expect(find.byType(MobileNavDrawer), findsOneWidget);
+            final scaffold = tester.state<ScaffoldState>(
+              find.byType(Scaffold).last,
+            );
+            expect(scaffold.isDrawerOpen, isTrue);
+
+            // Native back dismisses the gesture-opened drawer first.
+            expect(await tester.binding.handlePopRoute(), isTrue);
+            await _settleDrawer(tester);
+            expect(scaffold.isDrawerOpen, isFalse);
+            expect(find.byType(ChatRoomTab), findsOneWidget);
+
+            // Browser back restores the previous destination and its header;
+            // forward restores the short, headerless Room.
+            await _popTo(tester, '/overview');
+            expect(find.byType(OverviewTab), findsOneWidget);
+            expect(find.byType(MeshHeader), findsOneWidget);
+            await _popTo(tester, '/chat-room');
+            expect(find.byType(ChatRoomTab), findsOneWidget);
+            expect(find.byType(MeshHeader), findsNothing);
+
+            // The second exit actually reaches another destination.
+            await tester.dragFrom(const Offset(1, 200), const Offset(300, 0));
+            await _settleDrawer(tester);
+            await tester.tap(find.byKey(const ValueKey('drawer-nav-overview')));
+            await _settleDrawer(tester);
+            expect(find.byType(OverviewTab), findsOneWidget);
+            expect(find.byType(MeshHeader), findsOneWidget);
+          },
+        );
+      },
+    );
+
+    testWidgets(
+      'conservative cover-screen geometry remains headerless (#859)',
+      (tester) async {
+        await _withDashboard(
+          tester,
+          initialUrl: '/chat-room',
+          size: const Size(432, 509),
+          body: (_) async {
+            expect(find.byType(ChatRoomTab), findsOneWidget);
+            expect(
+              find.byType(MeshHeader),
+              findsNothing,
+              reason: 'the conservative 2.5-DPR cover geometry is still short',
+            );
+          },
+        );
+      },
+    );
+
+    testWidgets('wide short Room retains desktop chrome (#859)', (
+      tester,
+    ) async {
+      await _withDashboard(
+        tester,
+        initialUrl: '/chat-room',
+        size: const Size(844, 390),
+        body: (_) async {
+          expect(find.byType(ChatRoomTab), findsOneWidget);
+          expect(
+            find.byType(MeshHeader),
+            findsOneWidget,
+            reason: 'wide Room does not use the short mobile exception',
+          );
+          expect(find.byType(MobileNavDrawer), findsNothing);
+        },
+      );
+    });
+
     testWidgets(
       'startup preserves multi-entry mode without selecting single-entry history',
       (tester) async {

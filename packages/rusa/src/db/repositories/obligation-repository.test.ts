@@ -2803,7 +2803,9 @@ describe("ObligationRepository", () => {
 
     expect(() =>
       repository.inheritRetiringActorObligationsInternal("actor-a", null, "system:mesh")
-    ).toThrow("root/no-parent behavior is unresolved (ISSUE_NUM Q69)");
+    ).toThrow(
+      /^retirement inheritance requires an actor parent; root\/no-parent behavior is unresolved$/
+    );
     expect(() =>
       repository.inheritRetiringActorObligationsInternal("actor-a", "unknown", "system:mesh")
     ).toThrow("actor owner does not exist: unknown");

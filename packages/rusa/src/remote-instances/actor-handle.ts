@@ -1,0 +1,1321 @@
+import { randomUUID } from "node:crypto";
+import type { ActorOptions } from "../actor/actor.js";
+import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
+import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../actor/actor-mesh.js";
+import { COMPUTER_USE_CAPABILITY } from "../actor/computer-use-lock.js";
+import type { RunStartHandle } from "../actor/concurrency-limiter.js";
+import {
+  type ActorRunMode,
+  isResponsiveNudge,
+  mergeNudges,
+  type RunNudge,
+} from "../actor/trigger-runner.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
+import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
+import type { RunResult } from "../providers/types.js";
+import type { ActorChannel } from "./actor-channel.js";
+import {
+  type ActorEvent,
+  type Bootstrap,
+  COORDINATOR_ADMISSION_CANCELLED_ERROR,
+  COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
+  COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR,
+  type LeaderCommand,
+  type RunSnapshot,
+} from "./protocol.js";
+
+export interface ActorHandleOptions {
+  host: ActorChannel;
+  bootstrap: Bootstrap;
+  context: ActorFactoryContext;
+  // Read only after central scheduler admission, so queued runs get fresh work.
+  snapshot: () => RunSnapshot;
+  saveSession: (sessionId: string) => void;
+  onEvent?: (event: ActorEvent) => void;
+  /**
+   * Connection/startup failure notice. Purely informational — terminal run
+   * accounting is the handle's own job, so a listener here must not synthesize
+   * a run end of its own.
+   */
+  onFailure: (error: Error) => void;
+  actorOptions?: ActorOptions;
+  target?: string;
+  logger?: Logger;
+  startupTimeoutMs?: number;
+  stateStaleTimeoutMs?: number;
+}
+
+function sameModelConfigPool(
+  current: readonly RawProviderModelConfig[] | undefined,
+  next: readonly RawProviderModelConfig[]
+): boolean {
+  return Boolean(
+    current &&
+      current.length === next.length &&
+      current.every(
+        (entry, index) =>
+          entry.provider === next[index]?.provider &&
+          entry.model === next[index]?.model &&
+          entry.effort === next[index]?.effort
+      )
+  );
+}
+
+/** MeshActor compatibility handle; connection/lifetime belongs to RemoteInstance. */
+export class ActorHandle implements MeshActor {
+  readonly id: string;
+  channel: ActorChannel;
+  ready!: Promise<number>;
+  exited!: Promise<void>;
+  private readonly log: Logger;
+  private runStartTime?: number;
+  /** When the leader received the open run's `runStart`. */
+  private runStartedAt?: Date;
+  /**
+   * When the leader handed the open admission, and with it the prompt snapshot,
+   * to the follower: the watermark a running interrupt sets. Nothing delivered
+   * after it reached that run's prompt.
+   */
+  private admittedAt?: Date;
+  /**
+   * Inbox items delivered at or before this time do not justify another run.
+   * The leader answers the follower's beforeRun, so it owns the watermark.
+   */
+  private interruptedWatermark: Date | null = null;
+  /** The run that watermark interrupted; its own late `runStart` must not clear it. */
+  private interruptedRunId: string | undefined;
+  /** A queued start was cancelled; {@link resumeCancelledRun} replays it. */
+  private cancelledQueuedRun = false;
+  private cancelledQueuedNudge: RunNudge | undefined;
+  /** {@link resumeCancelledRun} was asked for and the follower has not been sent it yet. */
+  private resumeCancelledPending = false;
+  /**
+   * Cancellation asked for between the follower's queued report and its
+   * admission request; that request is refused as cancelled when it arrives.
+   */
+  private pendingQueuedCancel = false;
+  private pendingQueuedCancelRetain?: boolean;
+  /**
+   * The pool changed between the follower's queued report and its admission
+   * request, which was quoted under the old pool; refuse it as stale on arrival.
+   * Only a request that does not name its pool relies on this.
+   * pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8,
+   * with quotedGeneration.
+   */
+  private pendingQueuedRequote = false;
+  /**
+   * The pool the leader had sent before it processed the follower's queued
+   * report, or before the latest re-quote it asked for. A pin that crosses that
+   * report on the wire is stamped here as already quoted, so for a follower
+   * built before #725, which does not name its pool on `admit`, that one run can
+   * start on the pre-pin pool.
+   * pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8,
+   * with the branch of rescheduleQueuedRun that reads it.
+   */
+  private quotedGeneration = 0;
+  private state: ActorRuntimeState = "idle";
+  private closed = false;
+  private terminated = false;
+  private gates = new Map<
+    number,
+    {
+      handle: RunStartHandle<void>;
+      release: () => void;
+      /** Priority the leader actually admitted, which a promotion can raise after the request. */
+      admission: { responsive: boolean };
+      /** Pool revision this reservation quoted; used if it survives a flap. */
+      modelConfigGeneration: number;
+      /** The pool changed after this reservation quoted; retry it under the new pool. */
+      modelConfigStale: boolean;
+      /** An operator interrupt or provider halt cancelled this reservation. */
+      cancelled: boolean;
+    }
+  >();
+  private startupTimer?: ReturnType<typeof setTimeout>;
+  private stateStaleTimer?: ReturnType<typeof setTimeout>;
+  /** True between the leader admitting a run and that same run's terminal accounting. */
+  private runOpen = false;
+  /** Identity minted by the leader-side execution coordinator before admission. */
+  private queuedRunId: string | undefined;
+  private startedRunId: string | undefined;
+  private queuedMode: ActorRunMode | undefined;
+  private receiveChain: Promise<void> | undefined;
+  /** Responsive displacement asked for while the follower's state was unknown. */
+  private pendingPreempt = false;
+  /** True from reattach until the follower reports which run, if any, survived the gap. */
+  private stateStale = false;
+  /**
+   * The stale-state deadline released held wakes before any report arrived.
+   * The leader's booked state still says nothing about the follower, so the
+   * first report that does arrive keeps its reattach meaning.
+   */
+  private stateUnconfirmed = false;
+  /**
+   * Resolves with that first report. The mesh preempts before it nudges, and a
+   * wake that overtook the deferred preempt would have its dirty bit cancelled
+   * by it, so wakes wait here until the preempt decision has been sent.
+   */
+  private stateSettled: Promise<void> = Promise.resolve();
+  private settleState: (() => void) | undefined;
+  /** Promotion requested between the follower's queued report and its admission request. */
+  private pendingQueuedPromotion = false;
+  /** Incremented for each next-run pool replacement so stale gates can re-quote. */
+  private modelConfigGeneration = 0;
+  /** Last pool sent to this follower; kept apart from the caller-owned bootstrap object. */
+  private modelConfig: RawProviderModelConfig[] | undefined;
+  private preemptSequence = 0;
+  /** The one unanswered preempt; later responsive items coalesce behind its answer. */
+  private outstandingPreempt: number | undefined;
+  /**
+   * One admission the leader reserved and the follower never started, kept
+   * across a transport loss. The ticket is this run's place in provider pacing
+   * and concurrency; a replacement admission re-enters both at the tail.
+   */
+  private retainedAdmission: { requestId: number; runId: string } | undefined;
+  /** A ticket dropped during a transport gap still owes its work a wake (#613). */
+  private redispatchOwed = false;
+
+  constructor(private readonly opts: ActorHandleOptions) {
+    this.id = opts.bootstrap.id;
+    this.modelConfig = opts.bootstrap.modelConfig ? [...opts.bootstrap.modelConfig] : undefined;
+    this.channel = opts.host;
+    this.log = (opts.logger ?? nullLogger).child({
+      component: "remote-instance",
+      actorId: this.id,
+      target: opts.target ?? opts.host.nodeId,
+    });
+    this.bindChannel(opts.host);
+    this.send({
+      type: "init",
+      bootstrap: { ...opts.bootstrap, modelConfigGeneration: this.modelConfigGeneration },
+    });
+  }
+
+  private bindChannel(channel: ActorChannel, awaitStartup = true): void {
+    let resolveReady!: (pid: number) => void;
+    let rejectReady!: (error: Error) => void;
+    this.ready = new Promise((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    // Factories are synchronous; boot failure can arrive before the caller awaits ready.
+    void this.ready.catch(() => {});
+    clearTimeout(this.startupTimer);
+    if (awaitStartup) {
+      const startupTimeout = this.opts.startupTimeoutMs ?? 10_000;
+      this.startupTimer = setTimeout(() => {
+        const error = new Error("Remote actor startup timed out");
+        rejectReady(error);
+        this.fail(error);
+      }, startupTimeout);
+    }
+    channel.on("message", (raw) => {
+      const message = raw as ActorEvent;
+      if (message.type === "ready") {
+        clearTimeout(this.startupTimer);
+        resolveReady(message.pid);
+        return;
+      }
+      this.enqueueReceive(message);
+    });
+    channel.on("error", (error) => {
+      rejectReady(error);
+      this.fail(error);
+    });
+    this.exited = new Promise((resolve) =>
+      channel.once("exit", (code, signal) => {
+        clearTimeout(this.startupTimer);
+        const error = new Error(`Remote actor exited (${signal ?? code})`);
+        rejectReady(error);
+        this.settleState?.();
+        if (!this.closed) this.fail(error);
+        this.releaseGates();
+        this.state = "idle";
+        this.opts.context.onRuntimeStateChanged("idle");
+        resolve();
+      })
+    );
+  }
+
+  attachHost(newChannel: ActorChannel): void {
+    if (this.terminated) {
+      this.log.warn("remote_attach_after_close", {
+        actorId: this.id,
+        target: this.opts.target ?? newChannel.nodeId,
+      });
+      return;
+    }
+    this.channel.removeAllListeners();
+    this.channel = newChannel;
+    this.closed = false;
+    // The follower kept its Actor across the gap; its first state report says
+    // whether a run admitted before the loss is still in flight.
+    this.stateStale = true;
+    this.stateUnconfirmed = false;
+    this.settleState?.();
+    this.stateSettled = new Promise((resolve) => {
+      this.settleState = resolve;
+    });
+    clearTimeout(this.stateStaleTimer);
+    const staleTimeout = this.opts.stateStaleTimeoutMs ?? 10_000;
+    this.stateStaleTimer = setTimeout(() => {
+      if (!this.stateStale || this.closed) return;
+      this.log.warn("remote_state_stale_timeout", {
+        actorId: this.id,
+        target: this.opts.target ?? this.channel.nodeId,
+      });
+      // Only wake delivery waits on this deadline. A missing report is not
+      // proof the follower gave up a retained ticket: its resume claim, its
+      // first report, or a fresh admission still decides that (#602/#604).
+      this.stateStale = false;
+      this.stateUnconfirmed = true;
+      if (this.pendingPreempt) {
+        this.pendingPreempt = false;
+        this.applyPreempt();
+      }
+      this.settleState?.();
+    }, staleTimeout);
+    // A reconnect is transport recovery, not a fresh actor boot. Its delayed
+    // state/ready report must not cancel a leader-retained admission after 10s.
+    this.bindChannel(newChannel, false);
+    const freshSnapshot = this.opts.snapshot();
+    const sessionId = freshSnapshot.record.sessionId ?? this.opts.bootstrap.sessionId;
+    if (this.retainedAdmission) {
+      this.log.info("remote_admission_retained", {
+        actorId: this.id,
+        target: this.opts.target ?? newChannel.nodeId,
+        requestId: this.retainedAdmission.requestId,
+      });
+    }
+    this.send({
+      type: "init",
+      bootstrap: {
+        ...this.opts.bootstrap,
+        ...(sessionId ? { sessionId } : {}),
+        modelConfig: freshSnapshot.record.modelConfig ?? this.modelConfig,
+        modelConfigGeneration: this.modelConfigGeneration,
+        mcpServers: freshSnapshot.mcpServers,
+        reconnect: true,
+        // Invite the follower to re-announce the admission this handle kept.
+        ...(this.retainedAdmission ? { resumeAdmission: true } : {}),
+      },
+    });
+    // An unhalt during the gap asked for a replay this channel can now carry.
+    if (this.resumeCancelledPending) this.deliverResumeCancelled();
+    // A ticket dropped during the gap: this channel can carry its work's wake.
+    if (this.redispatchOwed) this.redispatchDroppedWork();
+  }
+
+  get isRunning(): boolean {
+    return this.state === "running";
+  }
+  get isQueued(): boolean {
+    return this.state === "queued";
+  }
+
+  requestRun(nudge?: RunNudge): void {
+    // A responsive wake raises the admission the leader holds for a queued
+    // run, as a local Actor promotes its pending start, without asking the
+    // follower to displace anything. Only preemptForResponsive does that, and
+    // only for durable work whose own policy allows it (#829).
+    if (nudge && isResponsiveNudge(nudge)) this.promoteQueuedRun();
+    void this.ready
+      .then(() => this.stateSettled)
+      .then(() => {
+        if (this.closed || !this.send({ type: "wake", nudge })) this.reportDroppedWake(nudge);
+      })
+      .catch(() => this.reportDroppedWake(nudge));
+  }
+
+  /**
+   * Cancel an admission the leader reserved and the follower has not started,
+   * giving back its place in provider pacing and concurrency. The follower's
+   * Actor books the run `start-cancelled` and keeps the opportunity, as a local
+   * queued-start cancellation does, until {@link resumeCancelledRun}.
+   */
+  cancelQueuedRun(opts?: { retain?: boolean }): boolean {
+    if (this.terminated) return false;
+    const retain = opts?.retain ?? true;
+    if (this.resumeCancelledPending) {
+      if (retain) {
+        this.resumeCancelledPending = false;
+        this.cancelledQueuedRun = true;
+      } else {
+        this.resumeCancelledPending = false;
+        this.cancelledQueuedRun = false;
+        this.cancelledQueuedNudge = undefined;
+      }
+      return true;
+    }
+    const unstarted = [...this.gates.values()].filter((gate) => !gate.handle.started);
+    let responsive: boolean;
+    if (unstarted.length > 0) {
+      let cancelled = false;
+      for (const gate of unstarted) {
+        // Only a gate this call cancelled answers as cancelled; one that had
+        // already settled keeps its real rejection.
+        if (!gate.handle.cancel?.()) continue;
+        gate.cancelled = true;
+        cancelled = true;
+      }
+      if (!cancelled) return false;
+      // The gate's rejection replies on a later microtask, so this command lands
+      // first and the follower settles its start as cancelled, not failed.
+      this.send({ type: "cancelQueued", retain });
+      responsive = unstarted.some((gate) => gate.admission.responsive);
+    } else if (this.state === "queued" && !this.runOpen && !this.closed && this.gates.size === 0) {
+      // The follower reported queued and its admission request has not taken
+      // a gate yet. It follows the report on the same channel, so refuse it
+      // on arrival (see rejectCancelledAdmission) as a local queued start would be.
+      this.pendingQueuedCancel = true;
+      this.pendingQueuedCancelRetain = retain;
+      responsive = this.pendingQueuedPromotion;
+    } else {
+      return false;
+    }
+    if (retain) {
+      this.cancelledQueuedNudge = mergeNudges(this.cancelledQueuedNudge ?? null, {
+        ...(responsive ? { priority: "responsive" } : {}),
+        mode: this.queuedMode ?? "ordinary",
+      });
+      this.cancelledQueuedRun = true;
+    } else {
+      this.cancelledQueuedNudge = undefined;
+      this.cancelledQueuedRun = false;
+    }
+    this.opts.context.onQueuedRunCancelled?.();
+    return true;
+  }
+
+  /**
+   * Replay the scheduling opportunity retained by {@link cancelQueuedRun}. The
+   * request stays pending until a connected follower is sent it, so an unhalt
+   * during a transport gap replays after reattach.
+   */
+  resumeCancelledRun(): boolean {
+    if (!this.cancelledQueuedRun) return false;
+    this.cancelledQueuedRun = false;
+    if (this.pendingQueuedCancel) {
+      // The cancellation has not reached the follower: its admission request
+      // is still in flight. Withdraw the refusal so that request proceeds as
+      // the replay; a resume command now would leave it parked on arrival.
+      this.pendingQueuedCancel = false;
+      this.cancelledQueuedNudge = undefined;
+      return true;
+    }
+    this.resumeCancelledPending = true;
+    this.deliverResumeCancelled();
+    return true;
+  }
+
+  /** Send a pending replay in wake order; a closed channel leaves it for attachHost. */
+  private deliverResumeCancelled(): void {
+    void this.ready
+      .then(() => this.stateSettled)
+      .then(() => {
+        if (!this.resumeCancelledPending || this.closed) return;
+        const nudge = this.cancelledQueuedNudge ?? {};
+        if (!this.send({ type: "resumeCancelled", nudge })) return;
+        this.resumeCancelledPending = false;
+        this.cancelledQueuedNudge = undefined;
+      })
+      .catch(() => {});
+  }
+
+  /**
+   * Refuse an admission request whose queued start was cancelled before it
+   * arrived. The follower's pending start is already registered, so
+   * `cancelQueued` settles it and retains the opportunity, as for a gate.
+   */
+  private rejectCancelledAdmission(requestId: number): boolean {
+    if (!this.pendingQueuedCancel) return false;
+    this.pendingQueuedCancel = false;
+    const retain = this.pendingQueuedCancelRetain ?? true;
+    this.pendingQueuedCancelRetain = undefined;
+    // The resumed start asks again under the pool the follower holds by then.
+    this.pendingQueuedRequote = false;
+    this.pendingQueuedPromotion = false;
+    this.send({ type: "cancelQueued", retain });
+    this.send({ type: "reply", requestId, error: COORDINATOR_ADMISSION_CANCELLED_ERROR });
+    return true;
+  }
+
+  /**
+   * Operator interrupt. A queued start is cancelled here, where its admission
+   * lives; a started run is aborted by the follower, which owns the provider.
+   * The follower's answer is asynchronous, so a run that finishes before the
+   * command lands simply completes.
+   */
+  interrupt(by = "human:operator"): {
+    interrupted: boolean;
+    runStartTime?: Date;
+    wasQueued?: boolean;
+  } {
+    const now = new Date();
+    const admitted = [...this.gates.values()].some((gate) => gate.handle.started);
+    if (this.isRunning || admitted) {
+      if (this.closed || !this.send({ type: "interrupt", by })) return { interrupted: false };
+      // The follower's prompt is the admission reply's snapshot, built just
+      // after admittedAt, so that instant bounds what the run saw. runStartedAt
+      // is the later receipt of `runStart` and would hide work delivered between.
+      const runStartTime = this.admittedAt ?? this.runStartedAt ?? now;
+      this.interruptedWatermark = runStartTime;
+      this.interruptedRunId = this.startedRunId ?? this.queuedRunId;
+      return { interrupted: true, runStartTime, wasQueued: false };
+    }
+    if (!this.cancelQueuedRun()) return { interrupted: false };
+    this.interruptedWatermark = now;
+    if (this.state === "queued") {
+      this.state = "idle";
+      this.opts.context.onRuntimeStateChanged("idle");
+    }
+    return { interrupted: true, runStartTime: now, wasQueued: true };
+  }
+
+  getInterruptedWatermark(): Date | null {
+    return this.interruptedWatermark;
+  }
+
+  clearInterruptWatermark(): void {
+    this.interruptedWatermark = null;
+  }
+
+  markUnkillable(): void {
+    this.send({ type: "unkillable" });
+  }
+  /**
+   * A follower confirms effective preemption asynchronously. Returning false
+   * here keeps ActorMesh from writing `run_preempted` before that confirmation.
+   * Queued admissions are a leader-owned resource, so they can be promoted
+   * directly without asking the follower to guess at a promise-backed gate.
+   */
+  preemptForResponsive(): { preempted: false } {
+    if (this.closed || !this.channel.connected || this.stateStale) {
+      // A run admitted before a transport loss may still be executing on the
+      // follower (#381). Decide against the state it reports after reattaching
+      // rather than against the idle the leader booked at disconnect.
+      this.pendingPreempt = true;
+      this.log.info("remote_preempt_deferred", {
+        actorId: this.id,
+        target: this.opts.target ?? this.channel.nodeId,
+      });
+      return { preempted: false };
+    }
+    this.applyPreempt();
+    return { preempted: false };
+  }
+
+  /**
+   * Adopt the next-run pool, as a local Actor does. A queued reservation keeps
+   * its quote until the mesh decides what the change means for it: a
+   * {@link rescheduleQueuedRun} re-quote, or a {@link cancelQueuedRun} when the
+   * new pool cannot run.
+   */
+  setModelConfig(modelConfig: ProviderModelConfig[]): void {
+    if (sameModelConfigPool(this.modelConfig, modelConfig)) return;
+    this.modelConfig = [...modelConfig];
+    this.modelConfigGeneration++;
+    this.send({
+      type: "modelConfig",
+      modelConfig: [...modelConfig],
+      generation: this.modelConfigGeneration,
+    });
+  }
+
+  /**
+   * Retry a reservation quoted under an older pool through the current one.
+   * The `modelConfig` command already precedes the stale reply on the channel,
+   * so the follower's Actor re-asks for the same opportunity under that pool.
+   */
+  rescheduleQueuedRun(): boolean {
+    if (this.terminated) return false;
+    if (this.closed || !this.channel.connected) {
+      // attachHost's init carries the current pool, and claimRetainedAdmission
+      // re-quotes a ticket quoted under an older one.
+      const retained = this.retainedAdmission && this.gates.get(this.retainedAdmission.requestId);
+      return (
+        retained !== undefined && retained.modelConfigGeneration !== this.modelConfigGeneration
+      );
+    }
+    let rescheduled = false;
+    let cancelledGate = false;
+    for (const gate of this.gates.values()) {
+      if (gate.handle.started || gate.modelConfigGeneration === this.modelConfigGeneration) {
+        continue;
+      }
+      // Repeated updates before the stale reply unwinds share that one retry.
+      if (gate.modelConfigStale) {
+        rescheduled = true;
+        continue;
+      }
+      gate.modelConfigStale = true;
+      if (gate.handle.cancel?.()) rescheduled = cancelledGate = true;
+    }
+    // pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8.
+    // An echoed generation refuses the stale request by itself; the mesh
+    // re-dispatches nothing for a queued actor, so returning false here changes
+    // no outcome.
+    if (
+      !rescheduled &&
+      this.state === "queued" &&
+      !this.runOpen &&
+      this.gates.size === 0 &&
+      !this.pendingQueuedCancel &&
+      this.quotedGeneration !== this.modelConfigGeneration
+    ) {
+      this.pendingQueuedRequote = true;
+      rescheduled = true;
+    }
+    // The stale reply follows the `modelConfig` command, so the re-ask is quoted
+    // under the current pool. pre-echo adapter (#725): remove once
+    // OLDEST_FOLLOWER_PROTOCOL_VERSION > 8, with quotedGeneration.
+    if (rescheduled) this.quotedGeneration = this.modelConfigGeneration;
+    // As Actor.rescheduleQueuedRun: the old quote's recorded selection is gone.
+    // Only a gate records one; the request-in-flight branch has none to clear.
+    if (cancelledGate) this.opts.context.onQueuedRunCancelled?.();
+    return rescheduled;
+  }
+
+  /** Refuse an admission request quoted under a pool replaced before it arrived. */
+  private rejectStaleAdmission(requestId: number, quotedGeneration: number | undefined): boolean {
+    // A follower names the pool it quoted; one built before #725 leaves the
+    // leader to infer it (pre-echo adapter (#725): remove once
+    // OLDEST_FOLLOWER_PROTOCOL_VERSION > 8).
+    const stale =
+      quotedGeneration === undefined
+        ? this.pendingQueuedRequote
+        : quotedGeneration !== this.modelConfigGeneration;
+    this.pendingQueuedRequote = false;
+    if (!stale) return false;
+    this.send({ type: "reply", requestId, error: COORDINATOR_MODEL_CONFIG_CHANGED_ERROR });
+    return true;
+  }
+
+  close(): void {
+    if (this.terminated) return;
+    this.terminated = true;
+    this.closed = true;
+    clearTimeout(this.startupTimer);
+    clearTimeout(this.stateStaleTimer);
+    this.stateStaleTimer = undefined;
+    this.pendingPreempt = false;
+    this.pendingQueuedPromotion = false;
+    this.pendingQueuedCancel = false;
+    this.pendingQueuedRequote = false;
+    this.resumeCancelledPending = false;
+    this.outstandingPreempt = undefined;
+    void this.cancelRetainedAdmission();
+    // Keep running slots occupied until the remote actor releases them or exits.
+    for (const gate of this.gates.values()) gate.handle.cancel?.();
+    this.send({ type: "stop" });
+  }
+
+  /** A transport loss is recoverable: keep only what attachHost can still act on. */
+  private disconnect(): void {
+    if (this.closed) return;
+    this.closed = true;
+    clearTimeout(this.startupTimer);
+    clearTimeout(this.stateStaleTimer);
+    this.stateStaleTimer = undefined;
+    // An unanswered preempt is re-decided against the follower's reattach state.
+    this.pendingPreempt ||= this.outstandingPreempt !== undefined;
+    this.outstandingPreempt = undefined;
+    // Keep running slots occupied until the remote actor releases them or exits.
+    for (const [requestId, gate] of this.gates) {
+      // A ticket the follower never started still holds this run's place in
+      // pacing and concurrency, and a transport loss is not a run outcome. Keep
+      // it for the reattach handshake to claim instead of making the run queue
+      // again as fresh work (#602).
+      if (!gate.handle.started && this.queuedRunId) {
+        if (!this.retainedAdmission) {
+          this.retainedAdmission = { requestId, runId: this.queuedRunId };
+          continue;
+        }
+        this.log.warn("remote_admission_multiple_unstarted", {
+          actorId: this.id,
+          retainedRequestId: this.retainedAdmission.requestId,
+          droppedRequestId: requestId,
+        });
+      }
+      gate.handle.cancel?.();
+    }
+    // A promotion asked for before the admission request arrived has nothing
+    // left to apply to once that request is gone; a retained ticket keeps it
+    // live, and the deferred preempt re-promotes it after reattach.
+    if (!this.retainedAdmission) this.pendingQueuedPromotion = false;
+    // The follower re-derives its queued run on reattach; that is a fresh request.
+    this.pendingQueuedCancel = false;
+    this.pendingQueuedRequote = false;
+  }
+
+  private releaseGates(): void {
+    for (const [requestId, gate] of this.gates) {
+      // A retained admission outlives the transport that carried it: only a
+      // claim, a fresh admission, or the leader giving up resolves it.
+      if (requestId === this.retainedAdmission?.requestId) continue;
+      gate.handle.cancel?.();
+      gate.release();
+      this.gates.delete(requestId);
+    }
+  }
+
+  /** The follower reclaimed its ticket; the retained gate still owes the reply. */
+  private claimRetainedAdmission(requestId: number): boolean {
+    if (this.retainedAdmission?.requestId !== requestId) return false;
+    const gate = this.gates.get(requestId);
+    if (!gate) return false;
+    if (gate.modelConfigGeneration !== this.modelConfigGeneration) {
+      // The follower has the replacement pool from attachHost's init, while
+      // this ticket was quoted under the old one. Reject it as stale so the
+      // follower's Actor retries the same queued opportunity under that pool.
+      this.retainedAdmission = undefined;
+      gate.modelConfigStale = true;
+      gate.handle.cancel?.();
+      return true;
+    }
+    this.retainedAdmission = undefined;
+    this.log.info("remote_admission_resumed", {
+      actorId: this.id,
+      target: this.opts.target ?? this.channel.nodeId,
+      requestId,
+    });
+    return true;
+  }
+
+  /**
+   * Give up a retained admission. The run it was holding never started, so the
+   * leader books it here: the follower that would have reported that run's
+   * outcome is either gone or has already moved on to other work.
+   */
+  private cancelRetainedAdmission(): void | Promise<void> {
+    const retained = this.retainedAdmission;
+    if (!retained) return;
+    this.retainedAdmission = undefined;
+    const gate = this.gates.get(retained.requestId);
+    if (gate) {
+      this.gates.delete(retained.requestId);
+      gate.handle.cancel?.();
+      gate.release();
+    }
+    this.log.info("remote_admission_dropped", {
+      actorId: this.id,
+      target: this.opts.target ?? this.channel.nodeId,
+      requestId: retained.requestId,
+    });
+    // Only the run the ticket was reserved for; a later run owns its own end.
+    // Under standard follower runtime initialize(), the first post-reattach state
+    // report is sent synchronously and drops an unclaimed ticket while queuedRunId
+    // still equals retained.runId. The direct onEnd emit below defensively handles
+    // out-of-order protocol arrivals (e.g. an unannounced queued run or out-of-band
+    // fresh admission) where queuedRunId advanced before this cancellation ran.
+    if (this.queuedRunId === retained.runId) {
+      return this.endQueuedRun("start-cancelled", false);
+    }
+    return this.opts.context.lifecycle.emit("onEnd", {
+      actorId: this.id,
+      runId: retained.runId,
+      terminal: { kind: "abandoned", reason: "start-cancelled", started: false },
+    });
+  }
+
+  /**
+   * Give up a retained ticket the follower did not reclaim. Its run is booked
+   * as never started, but the durable work it was admitted for is still
+   * unhandled and no delivery is coming to wake it, so ask the mesh to
+   * reconcile this actor's inbox, which re-derives existence and priority
+   * there (#613). Each drop needs a fresh transport loss to have retained the
+   * ticket, so this cannot cycle.
+   */
+  private async dropRetainedAdmission(): Promise<void> {
+    if (!this.retainedAdmission) return;
+    await this.cancelRetainedAdmission();
+    // The disconnected channel's ready is rejected, so a wake now would be
+    // dropped; attachHost delivers it on the channel that replaces this one.
+    if (this.closed) {
+      this.redispatchOwed = true;
+      return;
+    }
+    this.redispatchDroppedWork();
+  }
+
+  private redispatchDroppedWork(): void {
+    this.redispatchOwed = false;
+    try {
+      this.opts.context.mesh.reconcileActorInbox(this.id);
+    } catch (error) {
+      // A missed nudge over durable state; boot reconciliation still lists it.
+      this.log.warn("remote_redispatch_failed", {
+        actorId: this.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private enqueueReceive(message: ActorEvent): void {
+    const run = () => {
+      try {
+        const res = this.receive(message);
+        if (res && typeof (res as Promise<void>).then === "function") {
+          return (res as Promise<void>).catch((error) => this.fail(error));
+        }
+      } catch (error) {
+        this.fail(error instanceof Error ? error : new Error(String(error)));
+      }
+    };
+    if (!this.receiveChain) {
+      const res = run();
+      if (res) {
+        this.receiveChain = res.finally(() => {
+          if (this.receiveChain === res) {
+            this.receiveChain = undefined;
+          }
+        });
+      }
+    } else {
+      this.receiveChain = this.receiveChain.then(run);
+    }
+  }
+
+  private fail(error: Error): void {
+    if (this.closed) return;
+    // Termination stays strictly reserved for a genuine actor close() (e.g. thread retirement).
+    // A connection error, startup timeout, or transport loss disconnects the handle so attachHost
+    // can still recover and rebind on reconnect.
+    this.disconnect();
+    // A retained admission still owns its run: the claim that resumes it, or the
+    // cancellation that drops it, decides that run's outcome instead.
+    const retained = this.retainedAdmission !== undefined;
+    this.opts.onFailure(error);
+    // A connection or startup failure is not itself a run outcome. Only a run
+    // the leader actually admitted is terminated here, so an idle disconnect or
+    // a boot timeout books nothing.
+    const terminate = () => {
+      if (this.runOpen) {
+        void this.endRun({ success: false, output: error.message, exitCode: -1 });
+      } else if (this.queuedRunId && !retained) {
+        void this.endQueuedRun("start-cancelled", false);
+      }
+    };
+    if (this.receiveChain) {
+      this.receiveChain = this.receiveChain.then(terminate).catch(() => {});
+    } else {
+      terminate();
+    }
+  }
+
+  /**
+   * Close out the admitted run exactly once.
+   *
+   * Leader accounting opens a durable run on `runStart` and closes it against
+   * that run id; closing one that was never opened throws, and closing one twice
+   * double-counts. Failures arrive on their own schedule — before admission,
+   * while idle, or racing a completion already in flight — so the open-run flag,
+   * not the trigger, decides whether anything ends. The flag is cleared before
+   * awaiting so a disconnect landing mid-completion finds nothing left to end.
+   */
+  private endRun(result: RunResult): void | Promise<void> {
+    const runId = this.startedRunId;
+    if (!this.runOpen || !runId) return;
+    this.runOpen = false;
+    this.startedRunId = undefined;
+    this.queuedRunId = undefined;
+    const elapsedMs =
+      this.runStartTime !== undefined
+        ? Math.round(performance.now() - this.runStartTime)
+        : undefined;
+    this.runStartTime = undefined;
+    this.runStartedAt = undefined;
+    this.admittedAt = undefined;
+    this.log.info("remote_run_end", {
+      actorId: this.id,
+      target: this.opts.target ?? this.channel.nodeId,
+      success: result.success,
+      exitCode: result.exitCode,
+      elapsedMs,
+    });
+    return this.opts.context.lifecycle.emit("onEnd", {
+      actorId: this.id,
+      runId,
+      terminal: { kind: "result", result },
+    });
+  }
+
+  private endQueuedRun(
+    reason: ActorLifecycleAbandonmentReason,
+    started: boolean
+  ): void | Promise<void> {
+    const runId = started ? this.startedRunId : this.queuedRunId;
+    if (!runId) return;
+    this.runOpen = false;
+    this.admittedAt = undefined;
+    this.startedRunId = undefined;
+    this.queuedRunId = undefined;
+    return this.opts.context.lifecycle.emit("onEnd", {
+      actorId: this.id,
+      runId,
+      terminal: { kind: "abandoned", reason, started },
+    });
+  }
+
+  /**
+   * The wake itself is not durable state: the inbox entry behind it is, and
+   * the follower's re-register re-derives its priority from there.
+   */
+  private reportDroppedWake(nudge?: RunNudge): void {
+    this.log.warn("remote_wake_dropped", {
+      actorId: this.id,
+      target: this.opts.target ?? this.channel.nodeId,
+      priority: nudge?.priority ?? "normal",
+    });
+  }
+
+  /** Displace whatever the follower's latest state report says is in the way. */
+  private applyPreempt(): void {
+    if (this.stateUnconfirmed) {
+      // Nothing reported since reattach: promote a ticket the leader holds, or
+      // let the follower's own Actor decide whether a run is in the way.
+      if (!this.promoteQueuedAdmissions()) this.sendPreempt();
+    } else if (this.isQueued) {
+      if (!this.promoteQueuedAdmissions()) this.pendingQueuedPromotion = true;
+    } else if (this.isRunning) {
+      this.sendPreempt();
+    }
+  }
+
+  /**
+   * Raise a queued run to responsive admission without displacing anything.
+   * An unstarted ticket the leader holds — including one retained across a
+   * transport gap — is promoted in place. With no ticket yet, a follower that
+   * reported queued (or has not reported since reattaching) has its next
+   * admission request admitted responsive; a non-queued report clears that.
+   */
+  private promoteQueuedRun(): void {
+    if (this.terminated || this.promoteQueuedAdmissions()) return;
+    if (this.isQueued || this.stateStale || this.stateUnconfirmed) {
+      this.pendingQueuedPromotion = true;
+    }
+  }
+
+  /**
+   * Promote the leader's real admission handle, not the follower's async gate
+   * wrapper. True when the leader holds an unstarted ticket, whether this call
+   * promoted it or it was already responsive.
+   */
+  private promoteQueuedAdmissions(): boolean {
+    let held = false;
+    let promoted = false;
+    for (const gate of this.gates.values()) {
+      if (gate.handle.started) continue;
+      held = true;
+      if (gate.admission.responsive) continue;
+      gate.admission.responsive = true;
+      gate.handle.promote();
+      promoted = true;
+    }
+    if (promoted) this.logAdmissionPromoted();
+    return held;
+  }
+
+  private logAdmissionPromoted(): void {
+    this.log.info("remote_admission_promoted", {
+      actorId: this.id,
+      target: this.opts.target ?? this.channel.nodeId,
+    });
+  }
+
+  /** Ask once; the follower's answer to the open request covers every item behind it. */
+  private sendPreempt(): void {
+    if (this.outstandingPreempt !== undefined) return;
+    const requestId = ++this.preemptSequence;
+    if (!this.send({ type: "preempt", requestId })) {
+      this.pendingPreempt = true;
+      return;
+    }
+    this.outstandingPreempt = requestId;
+    this.log.info("remote_preempt_requested", {
+      actorId: this.id,
+      target: this.opts.target ?? this.channel.nodeId,
+      requestId,
+      phase: this.state,
+    });
+  }
+
+  private send(message: LeaderCommand): boolean {
+    if (!this.channel.connected) return false;
+    return this.channel.send(message, (error) => {
+      if (error) this.fail(error);
+    });
+  }
+
+  private receive(message: ActorEvent): void | Promise<void> {
+    const ctx = this.opts.context;
+    const hooks = this.opts.actorOptions;
+    this.opts.onEvent?.(message);
+    switch (message.type) {
+      case "fatal":
+        this.fail(new Error(message.error));
+        break;
+      case "state": {
+        clearTimeout(this.stateStaleTimer);
+        this.stateStaleTimer = undefined;
+        const reattachReport = this.stateStale || this.stateUnconfirmed;
+        // A fresh queued report, including the follower's re-derived run after
+        // a reattach, is taken as quoted under the pool the leader had sent
+        // before processing it. A pin that crossed the report on the wire
+        // breaks that; only the generation an `admit` echoes catches it.
+        // pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8,
+        // with quotedGeneration.
+        if (message.state === "queued" && (this.state !== "queued" || reattachReport)) {
+          this.quotedGeneration = this.modelConfigGeneration;
+        }
+        // Legacy wire reader: older v7/v8 followers can still report "winding_down"
+        // while their provider is alive; normalize it to "running" so activeRunState
+        // and isRunning treat the live run as running until those versions leave
+        // the supported window.
+        const wireState: ActorRuntimeState =
+          message.state === "winding_down" ? "running" : message.state;
+        this.state = wireState;
+        this.stateStale = false;
+        this.stateUnconfirmed = false;
+        if (wireState !== "queued") {
+          this.pendingQueuedPromotion = false;
+          this.pendingQueuedCancel = false;
+        }
+        if (this.pendingPreempt) {
+          this.pendingPreempt = false;
+          this.applyPreempt();
+        }
+        // Any wake held since reattach is now ordered behind the preempt decision.
+        this.settleState?.();
+        ctx.onRuntimeStateChanged(wireState);
+        // The first report after a reattach is the deadline for claiming a
+        // retained ticket: whatever the follower holds now, it is not the run
+        // that ticket was reserved for.
+        if (reattachReport) return this.dropRetainedAdmission();
+        break;
+      }
+      case "preempted":
+        // Only the open request is answerable; an answer from before a reattach
+        // describes a request this generation already re-decided.
+        if (message.requestId !== this.outstandingPreempt) break;
+        this.outstandingPreempt = undefined;
+        if (message.preempted && message.phase) {
+          ctx.mesh.recordEvent({
+            kind: "run_preempted",
+            actorId: this.id,
+            detail: message.phase,
+            payload: JSON.stringify({ reason: "responsive_notification" }),
+          });
+          this.log.info("remote_preempt_effective", {
+            actorId: this.id,
+            target: this.opts.target ?? this.channel.nodeId,
+            requestId: message.requestId,
+            phase: message.phase,
+          });
+        } else {
+          this.log.info("remote_preempt_not_effective", {
+            actorId: this.id,
+            target: this.opts.target ?? this.channel.nodeId,
+            requestId: message.requestId,
+          });
+        }
+        break;
+      case "session":
+        this.opts.saveSession(message.sessionId);
+        break;
+      case "queued":
+        this.queuedRunId = message.runId ?? randomUUID();
+        this.queuedMode = message.mode;
+        return ctx.lifecycle.emit("onQueued", {
+          actorId: this.id,
+          runId: this.queuedRunId,
+          responsive: message.responsive,
+          mode: message.mode,
+        });
+      case "result":
+        return this.endRun(message.result);
+      case "error": {
+        const runId = this.startedRunId ?? this.queuedRunId;
+        if (runId) {
+          return ctx.lifecycle.emit("onError", {
+            actorId: this.id,
+            runId,
+            error: new Error(message.error),
+          });
+        }
+        break;
+      }
+      case "runStart":
+        // Older followers do not send `providerAttempt`, but their run-start
+        // tuple is still the leader-admitted attempt. Keep that attribution;
+        // current followers refine it with the tuple they instantiated.
+        this.opts.actorOptions?.onProviderAttempt?.({
+          providerName: message.selected.provider,
+          model: message.selected.model,
+          effort: message.selected.effort,
+        });
+        // Mark open only once the leader's own run-start accounting has taken:
+        // a throw here leaves no run to close.
+        this.runStartTime = performance.now();
+        this.runStartedAt = new Date();
+        this.queuedRunId = message.runId ?? this.queuedRunId ?? randomUUID();
+        // A later run has moved past the interrupt, as locally. The interrupted
+        // run's own start can arrive after the interrupt and is not one.
+        if (
+          this.interruptedWatermark &&
+          this.runStartedAt > this.interruptedWatermark &&
+          this.queuedRunId !== this.interruptedRunId
+        ) {
+          this.interruptedWatermark = null;
+          this.interruptedRunId = undefined;
+        }
+        this.startedRunId = this.queuedRunId;
+        // Mark the terminal claim before awaiting observers. The first
+        // lifecycle listener starts synchronously, so accounting is open; a
+        // follower disconnect in an observer's await gap must still close it.
+        this.runOpen = true;
+        this.log.info("remote_run_start", {
+          actorId: this.id,
+          target: this.opts.target ?? this.channel.nodeId,
+          responsive: message.responsive,
+          selected: message.selected,
+        });
+        return ctx.lifecycle.emit("onStart", {
+          actorId: this.id,
+          runId: this.startedRunId,
+          responsive: message.responsive,
+          mode: this.queuedMode ?? "ordinary",
+          injectRecord: message.injectRecord,
+          selected: message.selected,
+        });
+      case "firstChunk":
+        hooks?.onFirstChunk?.();
+        break;
+      case "abandoned":
+        // An abandoned run is already terminal on the leader side; it has no
+        // run end left to record.
+        return this.endQueuedRun(message.abandon.reason, message.abandon.started);
+      case "coalesced":
+        hooks?.onCoalesceAborted?.(message.count, message.ageMs);
+        break;
+      case "log":
+        hooks?.log?.(message.chunk);
+        break;
+      case "release":
+        this.gates.get(message.requestId)?.release();
+        this.gates.delete(message.requestId);
+        break;
+      case "request": {
+        const { requestId, request } = message;
+        try {
+          if (this.closed) throw new Error("Actor is closed");
+          switch (request.op) {
+            case "beforeRun": {
+              const beforeRunResult = hooks?.beforeRun?.(request) ?? ctx.beforeRun(request);
+              if (
+                beforeRunResult &&
+                typeof (beforeRunResult as Promise<boolean>).then === "function"
+              ) {
+                return (beforeRunResult as Promise<boolean>).then((allowed) => {
+                  this.send({
+                    type: "reply",
+                    requestId,
+                    value: {
+                      allowed,
+                      sessionId: hooks?.loadSessionId() ?? ctx.getRecord()?.sessionId,
+                    },
+                  });
+                });
+              }
+              this.send({
+                type: "reply",
+                requestId,
+                value: {
+                  allowed: beforeRunResult,
+                  sessionId: hooks?.loadSessionId() ?? ctx.getRecord()?.sessionId,
+                },
+              });
+              break;
+            }
+            case "prepareMount":
+              return (async () => {
+                this.send({
+                  type: "reply",
+                  requestId,
+                  value: await hooks?.prepareUnderstandingMount?.(),
+                });
+              })();
+            case "complete": {
+              this.opts.onEvent?.({ type: "result", result: request.result });
+              const endResult = this.endRun(request.result);
+              if (endResult && typeof (endResult as Promise<void>).then === "function") {
+                return (endResult as Promise<void>).then(() => {
+                  this.send({ type: "reply", requestId });
+                });
+              }
+              this.send({ type: "reply", requestId });
+              break;
+            }
+            case "providerAttempt":
+              // An attempt that arrives after the run closed must not restore
+              // the selection terminal cleanup removed.
+              if (this.runOpen)
+                void this.opts.actorOptions?.onProviderAttempt?.({
+                  providerName: request.attempt.provider,
+                  model: request.attempt.model,
+                  effort: request.attempt.effort,
+                });
+              this.send({ type: "reply", requestId });
+              break;
+            case "sendMessage":
+              // Bind sender identity here; the remote actor cannot choose a different actor.
+              this.send({
+                type: "reply",
+                requestId,
+                value: ctx.mesh.sendMessage(request.to, request.body, this.id),
+              });
+              break;
+            case "admit": {
+              if (request.resume) {
+                // A follower re-announcing its pending admission is claiming the
+                // ticket this handle kept for it. The reply still comes from the
+                // retained gate, when pacing and concurrency release it.
+                if (!this.claimRetainedAdmission(requestId)) {
+                  // Nothing left to claim: that run was already booked as
+                  // abandoned here, so the follower must not run under its id.
+                  this.send({
+                    type: "reply",
+                    requestId,
+                    error: COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR,
+                  });
+                }
+                break;
+              }
+              return (async () => {
+                // Any other admission says the retained run is not coming back.
+                await this.cancelRetainedAdmission();
+                if (this.rejectCancelledAdmission(requestId)) return;
+                // A responsive item that landed between the follower's queued
+                // report and this request is admitted at the priority it asked
+                // for, not the one the follower knew about when it asked.
+                const admission = { responsive: request.responsive || this.pendingQueuedPromotion };
+                if (this.pendingQueuedPromotion) {
+                  this.pendingQueuedPromotion = false;
+                  if (!request.responsive) this.logAdmissionPromoted();
+                }
+                // A remote actor's provider gate lives here, not inside the
+                // follower. Recheck host authority immediately before reserving
+                // capacity so ordinary work queued before voice opens cannot
+                // cross the boundary after it changes.
+                if (
+                  !(await (ctx.admitRun?.({
+                    responsive: admission.responsive,
+                    mode: request.mode,
+                  }) ?? true))
+                ) {
+                  this.send({ type: "reply", requestId, value: { deferred: true } });
+                  return;
+                }
+                // Cancelled while the host-authority preflight was pending.
+                if (this.rejectCancelledAdmission(requestId)) return;
+                // Quoted under a replaced pool, including one pinned during that
+                // preflight: refuse it before its candidates are reserved.
+                if (this.rejectStaleAdmission(requestId, request.modelConfigGeneration)) return;
+                let release!: () => void;
+                const finished = new Promise<void>((resolve) => {
+                  release = resolve;
+                });
+                const candidates = request.candidates as RawProviderModelConfig[];
+                const modelConfigGeneration = this.modelConfigGeneration;
+                const handle = ctx.gate(
+                  async (selected) => {
+                    // Provider pacing can delay this callback after the first
+                    // preflight above. Recheck the live host authority at the
+                    // actual admission boundary before exposing a snapshot to
+                    // the follower, so no ordinary provider launch can cross a
+                    // newly opened voice session.
+                    if (
+                      !(await (ctx.admitRun?.({
+                        responsive: admission.responsive,
+                        mode: request.mode,
+                      }) ?? true))
+                    ) {
+                      this.send({ type: "reply", requestId, value: { deferred: true } });
+                      return;
+                    }
+                    if (this.closed) throw new Error("Actor closed before admission");
+                    const gate = this.gates.get(requestId);
+                    if (
+                      gate?.modelConfigStale ||
+                      modelConfigGeneration !== this.modelConfigGeneration
+                    ) {
+                      this.send({
+                        type: "reply",
+                        requestId,
+                        error: COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
+                      });
+                      return;
+                    }
+                    this.admittedAt = new Date();
+                    // Selection is decided here and carried to the follower, so the
+                    // remote run uses the candidate the leader actually reserved.
+                    this.send({
+                      type: "reply",
+                      requestId,
+                      value: {
+                        ...this.opts.snapshot(),
+                        // A follower can wait in provider pacing after its
+                        // beforeRun request. Read the durable grant at the
+                        // selected-provider boundary instead of carrying that
+                        // earlier snapshot into the instance lock.
+                        computerUse: ctx.mesh.hasActiveCapability(this.id, COMPUTER_USE_CAPABILITY),
+                        selected,
+                        responsive: admission.responsive,
+                      },
+                    });
+                    await finished;
+                  },
+                  candidates,
+                  admission.responsive
+                );
+                this.gates.set(requestId, {
+                  handle,
+                  release,
+                  admission,
+                  modelConfigGeneration,
+                  modelConfigStale: false,
+                  cancelled: false,
+                });
+                void handle.result.catch((error: Error) => {
+                  const gate = this.gates.get(requestId);
+                  this.gates.delete(requestId);
+                  if (gate?.modelConfigStale) {
+                    this.send({
+                      type: "reply",
+                      requestId,
+                      error: COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
+                    });
+                    return;
+                  }
+                  this.send({
+                    type: "reply",
+                    requestId,
+                    error: gate?.cancelled ? COORDINATOR_ADMISSION_CANCELLED_ERROR : error.message,
+                  });
+                  // A retained ticket that loses its place (the leader gave up, or
+                  // pacing released it into a dead channel) ends the run it held:
+                  // nothing else is left to report that run's outcome.
+                  if (this.retainedAdmission?.requestId === requestId) {
+                    void this.dropRetainedAdmission();
+                  }
+                });
+              })();
+            }
+          }
+        } catch (error) {
+          this.send({ type: "reply", requestId, error: String(error) });
+        }
+      }
+    }
+  }
+}

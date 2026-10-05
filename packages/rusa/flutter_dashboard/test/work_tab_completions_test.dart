@@ -53,7 +53,7 @@ void main() {
         await tester.pump();
         await tester.pump();
 
-        expect(find.text('COMPLETION HISTORY'), findsOneWidget);
+        expect(find.text('HISTORY'), findsOneWidget);
         expect(find.textContaining('Cycle 1'), findsOneWidget);
         await store.dispose();
       });
