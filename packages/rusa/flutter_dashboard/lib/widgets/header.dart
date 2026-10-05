@@ -1109,6 +1109,37 @@ const _scopedHaltEffect =
 /// candidate in the actor's pool is held, so actors with an unheld candidate
 /// keep running there. In-flight runs always finish.
 String haltTooltipText(HaltStatusDto? halt, {DateTime? now}) {
+  final untilString = halt?.until;
+  final until = untilString == null
+      ? null
+      : DateTime.tryParse(untilString)?.toLocal();
+  final local = (now ?? DateTime.now()).toLocal();
+  final String expiry;
+  if (until == null) {
+    expiry = 'No expiry — holds until resumed.';
+  } else if (until.isAfter(local)) {
+    expiry = 'Expires ${_haltExpiryFormat(until, local)}.';
+  } else {
+    expiry = 'Expiry passed ${_haltExpiryFormat(until, local)}.';
+  }
+  return _haltDescription(halt, expiry);
+}
+
+/// The accessible label uses a clock-stable expiry fact. A screen reader may
+/// reach the badge after local time passes `until` but before a new snapshot
+/// rebuilds it, so it must not retain a stale future-tense expiry claim.
+String haltSemanticsText(HaltStatusDto? halt) {
+  final untilString = halt?.until;
+  final until = untilString == null
+      ? null
+      : DateTime.tryParse(untilString)?.toLocal();
+  final expiry = until == null
+      ? 'No expiry — holds until resumed.'
+      : 'Reported expiry: ${DateFormat('EEE MMM d, y, h:mm a').format(until)}.';
+  return _haltDescription(halt, expiry);
+}
+
+String _haltDescription(HaltStatusDto? halt, String expiry) {
   const inFlight = 'Runs already in flight finish.';
   if (halt == null) {
     // Older server without the structured halt field: the chip is right,
@@ -1130,18 +1161,6 @@ String haltTooltipText(HaltStatusDto? halt, {DateTime? now}) {
     default:
       scope = 'all providers';
       effect = 'No new runs start.';
-  }
-  final until = halt.until == null
-      ? null
-      : DateTime.tryParse(halt.until!)?.toLocal();
-  final local = (now ?? DateTime.now()).toLocal();
-  final String expiry;
-  if (until == null) {
-    expiry = 'No expiry — holds until resumed.';
-  } else if (until.isAfter(local)) {
-    expiry = 'Expires ${_haltExpiryFormat(until, local)}.';
-  } else {
-    expiry = 'Expiry passed ${_haltExpiryFormat(until, local)}.';
   }
   return 'Halt scope: $scope.\n$effect\n$inFlight\n$expiry';
 }
@@ -1181,7 +1200,7 @@ class _HaltedBadge extends StatelessWidget {
       ),
       excludeFromSemantics: true,
       child: Semantics(
-        label: haltTooltipText(halt, now: now?.call()),
+        label: haltSemanticsText(halt),
         child: Container(
           padding: EdgeInsets.symmetric(
             horizontal: compact ? 6 : 10,

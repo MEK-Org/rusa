@@ -195,27 +195,38 @@ void main() {
     await tester.runAsync(store.dispose);
   });
 
-  testWidgets('the chip announces its scope to assistive technology', (
+  testWidgets('the chip announces its scope and stable expiry to assistive technology', (
     tester,
   ) async {
     final handle = tester.ensureSemantics();
+    final until = DateTime.now().add(const Duration(days: 1));
+    var now = until.subtract(const Duration(minutes: 1));
     final store = await _store(
       tester,
-      const HaltStatusDto(
+      HaltStatusDto(
         scope: 'models',
         providers: ['claude'],
         models: ['claude-opus-5-5'],
+        until: until.toUtc().toIso8601String(),
       ),
     );
-    await tester.pumpWidget(_header(store));
+    await tester.pumpWidget(_header(store, haltTooltipNow: () => now));
     await tester.pump();
 
     expect(
       find.bySemanticsLabel(
-        RegExp(r'^Halt scope: claude-opus-5-5 on claude\.'),
+        RegExp(
+          r'^Halt scope: claude-opus-5-5 on claude\.[\s\S]*'
+          r'Reported expiry: ',
+        ),
       ),
       findsOneWidget,
     );
+
+    // No rebuild follows this local transition. The label stays factual rather
+    // than retaining a stale future-tense "Expires" claim.
+    now = until.add(const Duration(minutes: 1));
+    expect(find.bySemanticsLabel(RegExp('Reported expiry:')), findsOneWidget);
     handle.dispose();
     await tester.runAsync(store.dispose);
   });
@@ -224,9 +235,8 @@ void main() {
     'tooltip evaluates dynamically on hover so a passed expiry is recognized '
     'without a widget rebuild',
     (tester) async {
-      // Keep the actual expiry a day away: the store's expiry timer cannot
-      // refresh this test. The controllable presentation clock alone crosses
-      // the expiry after the header has built.
+      // The controllable presentation clock alone crosses the expiry after the
+      // header has built.
       final until = DateTime.now().add(const Duration(days: 1));
       var now = until.subtract(const Duration(minutes: 1));
       final store = await _store(

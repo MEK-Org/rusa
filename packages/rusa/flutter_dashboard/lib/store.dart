@@ -431,8 +431,6 @@ class DashboardStore {
   Timer? _quotaPoll;
   Timer? _queuePacingPoll;
   Timer? _runtimeRetry;
-  Timer? _haltExpiryTimer;
-  String? _haltExpirySyncedUntil;
   _RuntimePhase _runtimePhase = _RuntimePhase.uninitialized;
   RuntimeCursor? _runtimeCursor;
   final List<ActorRuntimeStateDelta> _runtimeBuffer = [];
@@ -1764,7 +1762,6 @@ class DashboardStore {
       _runtimeRetryDelay = _kRuntimeRetryInitial;
       _halted.add(snap.halted);
       _haltStatus.add(snap.halt);
-      _scheduleHaltExpirySync(snap.halt);
       _schedulerWarning.add(snap.schedulerWarning);
       _supportedVoices.add(snap.supportedVoices);
       _updateActorStatesFromThreads(snap.threads);
@@ -1858,25 +1855,6 @@ class DashboardStore {
     });
   }
 
-  void _scheduleHaltExpirySync(HaltStatusDto? halt) {
-    _haltExpiryTimer?.cancel();
-    _haltExpiryTimer = null;
-    final untilStr = halt?.until;
-    // One sync per expiry: a server whose clock trails ours still reports
-    // this until after it fires, and re-arming at zero delay would loop.
-    if (untilStr == null || untilStr == _haltExpirySyncedUntil) return;
-    final until = DateTime.tryParse(untilStr)?.toUtc();
-    if (until == null) return;
-    final now = DateTime.now().toUtc();
-    final delay = until.difference(now);
-    final duration = delay.isNegative ? Duration.zero : delay;
-    _haltExpiryTimer = Timer(duration, () {
-      _haltExpiryTimer = null;
-      _haltExpirySyncedUntil = untilStr;
-      unawaited(_requestRuntimeSync());
-    });
-  }
-
   void _onLiveOutput(LiveOutputChunk chunk) {
     // Only the selected actors' output is shown (the server already filters, but
     // guard in case a stale frame arrives across a reconnect).
@@ -1962,7 +1940,6 @@ class DashboardStore {
     _quotaPoll?.cancel();
     _queuePacingPoll?.cancel();
     _runtimeRetry?.cancel();
-    _haltExpiryTimer?.cancel();
     for (final s in _subs) {
       await s.cancel();
     }
