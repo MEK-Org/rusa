@@ -92,11 +92,6 @@ export class AvailabilityHolds {
     return this.released(this.options.repo.clear(scope), options);
   }
 
-  /** Clear every hold. Returns the cleared holds, expired ones included. */
-  clearAll(options: HoldChangeOptions = {}): AvailabilityHold[] {
-    return this.released(this.options.repo.clearAll(), options);
-  }
-
   /** True iff `hold` is still in force (it has no expiry, or it is in the future). */
   isActive(hold: AvailabilityHold): boolean {
     return hold.expiry === undefined || Date.parse(hold.expiry) > this.now();

@@ -158,9 +158,7 @@ describe("AvailabilityHolds silent changes", () => {
       onReleased: () => calls.push("released"),
     });
     holds.set({ provider: "kimi", createdBy: "root" }, { silent: true });
-    holds.set({ provider: "codex", createdBy: "root" }, { silent: true });
     expect(holds.clear({ provider: "kimi" }, { silent: true })).toHaveLength(1);
-    expect(holds.clearAll({ silent: true })).toHaveLength(1);
     expect(calls).toEqual([]);
     holds.stop();
   });
