@@ -1132,15 +1132,22 @@ String haltSemanticsText(HaltStatusDto? halt) {
   final untilString = halt?.until;
   final until = untilString == null
       ? null
-      : DateTime.tryParse(untilString)?.toLocal();
+      : DateTime.tryParse(untilString)?.toUtc();
   final expiry = until == null
       ? 'No expiry — holds until resumed.'
-      : 'Reported expiry: ${DateFormat('EEE MMM d, y, h:mm a').format(until)}.';
-  return _haltDescription(halt, expiry);
+      : 'Reported expiry: '
+            "${DateFormat('EEE MMM d, y, h:mm a').format(until)} UTC.";
+  return _haltDescription(halt, expiry, reported: true);
 }
 
-String _haltDescription(HaltStatusDto? halt, String expiry) {
-  const inFlight = 'Runs already in flight finish.';
+String _haltDescription(
+  HaltStatusDto? halt,
+  String expiry, {
+  bool reported = false,
+}) {
+  final inFlight = reported
+      ? 'A reported halt does not interrupt runs already in flight.'
+      : 'Runs already in flight finish.';
   if (halt == null) {
     // Older server without the structured halt field: the chip is right,
     // the scope is unknown.
@@ -1154,15 +1161,26 @@ String _haltDescription(HaltStatusDto? halt, String expiry) {
   switch (halt.scope) {
     case 'models':
       scope = '${halt.models.join(', ')} on $providers';
-      effect = _scopedHaltEffect;
+      effect = reported
+          ? 'While this reported halt is in force, '
+                'actors run on an unheld candidate in their pool instead; an '
+                'actor whose whole pool is held waits.'
+          : _scopedHaltEffect;
     case 'providers':
       scope = providers;
-      effect = _scopedHaltEffect;
+      effect = reported
+          ? 'While this reported halt is in force, '
+                'actors run on an unheld candidate in their pool instead; an '
+                'actor whose whole pool is held waits.'
+          : _scopedHaltEffect;
     default:
       scope = 'all providers';
-      effect = 'No new runs start.';
+      effect = reported
+          ? 'While this reported halt is in force, no new runs start.'
+          : 'No new runs start.';
   }
-  return 'Halt scope: $scope.\n$effect\n$inFlight\n$expiry';
+  final label = reported ? 'Reported halt scope' : 'Halt scope';
+  return '$label: $scope.\n$effect\n$inFlight\n$expiry';
 }
 
 /// Same-day expiries read as a time; later ones carry the weekday and date.
