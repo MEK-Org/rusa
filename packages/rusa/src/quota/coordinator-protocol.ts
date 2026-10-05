@@ -536,8 +536,9 @@ function wholeLaneGoverningWindow(
 
 /**
  * The provider-wide governing window that has closed with no newer accepted
- * reading (#794), or null: the whole lane is hard-stale and the governing
- * window from its last reading has reset. Missing and failed scrapes look the
+ * reading (#794), or null. The first applied status at or after that reset is
+ * closed even if the retained reading is still fresh; hard staleness controls
+ * only the existing throttle fallback. Missing and failed scrapes look the
  * same here, since neither replaces the stored reading. Detection only; it
  * changes no published value.
  */
@@ -545,7 +546,6 @@ export function closedGoverningWindow(
   status: Omit<PublishedThrottleProviderStatus, "modelLanes">,
   nowMs: number
 ): PersistedQuotaBucketStatus | null {
-  if (!status.freshness.hardStale) return null;
   const governing = wholeLaneGoverningWindow(status);
   return governing && Date.parse(governing.resetAtIso ?? "") <= nowMs ? governing : null;
 }

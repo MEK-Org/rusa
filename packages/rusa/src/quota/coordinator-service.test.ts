@@ -820,7 +820,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(pacer.interval).toBe((recovered ?? 0) * 1000);
   });
 
-  it("detects a closed provider-wide governing window only past its reset on a hard-stale whole lane (#794)", () => {
+  it("detects a provider-wide governing-window close at reset without requiring hard staleness (#794)", () => {
     const resetMs = Date.parse("2040-01-01T00:00:00.000Z");
     const observedAt = new Date(resetMs - 2 * 60 * 60_000).toISOString();
     const bucket = {
@@ -859,11 +859,13 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     // before, and the close is now detectable.
     expect(at(stored, resetMs)).toEqual({ interval: 3600, closed: bucket });
 
-    // A reset that passed before the lane went hard-stale is not yet a close.
+    // A reading immediately before reset is still fresh after reset, but the
+    // first observed status at the boundary closes its governing window. Its
+    // published throttle remains the normal fresh interval.
     const recent = new Date(resetMs - 10 * 60_000).toISOString();
     expect(
       at({ ...stored, updatedAt: recent, buckets: [{ ...bucket, observedAt: recent }] }, resetMs)
-    ).toEqual({ interval: 300, closed: null });
+    ).toEqual({ interval: 300, closed: { ...bucket, observedAt: recent } });
     // A newer scrape that omitted only the governing window is the partial
     // case, and a governing window with no reset has nothing to close.
     expect(at({ ...stored, updatedAt: recent }, resetMs + 60 * 60_000).closed).toBeNull();
