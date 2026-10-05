@@ -68,9 +68,9 @@ function shellQuote(arg: string): string {
  * which also reach people's own coding sessions. Command-scoped `-c` keeps every
  * Git config file untouched, including on a machine where a person's global
  * identity is set. This is guidance: rusa does not intercept actors' Git commands.
- * It assumes no `GIT_AUTHOR_*` or `GIT_COMMITTER_*` variable reaches the actor,
- * since those override `-c`. rusa sets none; only an operator's service `.env`
- * could supply one.
+ * Git identity variables override `-c`. rusa sets none, but an actor can inherit
+ * them from an interactive shell or a service environment, so the prompt says how
+ * to clear them only for a mesh Git command.
  */
 export function gitIdentityGuidance(resolution: MeshGitIdentityResolution): string {
   const shared = `Leave the identity keys (\`user.*\`, \`author.*\`, \`committer.*\`) in
@@ -100,6 +100,13 @@ rebase, cherry-pick and am), for that one command only:
 
 A new commit records the mesh as both author and committer. A replay keeps each
 commit's original author and records the mesh as committer.
+
+Git identity variables override those \`-c\` arguments. If any of
+\`GIT_AUTHOR_NAME\`, \`GIT_AUTHOR_EMAIL\`, \`GIT_COMMITTER_NAME\` or
+\`GIT_COMMITTER_EMAIL\` is set, clear all four for that one mesh Git command:
+\`env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_COMMITTER_NAME -u
+GIT_COMMITTER_EMAIL git …\`. Do not clear them globally; that keeps a replay's
+original author intact.
 
 In a checkout that belongs to a person rather than to the mesh, leave the
 commit's identity to that repository's own configuration instead of imposing
