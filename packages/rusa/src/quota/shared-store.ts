@@ -584,18 +584,16 @@ export class SharedQuotaStore {
       CREATE TABLE IF NOT EXISTS quota_parser_wording_revisions (
         id TEXT PRIMARY KEY,
         provider TEXT NOT NULL,
-        wording TEXT NOT NULL,
-        source TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        wording TEXT NOT NULL
       );
     `);
       this.ensureColumnsInTransaction();
-      this.registerBuiltInParserWordingInTransaction();
       if (currentVersion < QUOTA_SCHEMA_VERSION) {
         this.db.pragma(`user_version = ${QUOTA_SCHEMA_VERSION}`);
       }
     });
     migrate.immediate();
+    this.registerBuiltInParserWording();
   }
 
   /**
@@ -675,18 +673,29 @@ export class SharedQuotaStore {
   /**
    * Built-in wording is immutable for the life of this binary. Seed all four
    * rows while opening the database, rather than taking a write lock on every
-   * parse merely to repeat an `INSERT OR IGNORE`.
+   * parse merely to repeat an `INSERT OR IGNORE`. This runs after the schema
+   * transaction and outside it: a revision table that cannot take the seeds is
+   * a broken control record, which degrades parsing to unattributed built-in
+   * wording rather than refusing the store (#536).
    */
-  private registerBuiltInParserWordingInTransaction(): void {
-    const registeredAt = new Date().toISOString();
-    const insert = this.db.prepare(
-      `INSERT OR IGNORE INTO quota_parser_wording_revisions
-        (id, provider, wording, source, created_at)
-       VALUES (?, ?, ?, 'built_in', ?)`
-    );
-    for (const provider of Object.keys(BUILT_IN_QUOTA_PARSER_WORDING) as QuotaLlmProvider[]) {
-      const wording = BUILT_IN_QUOTA_PARSER_WORDING[provider];
-      insert.run(quotaParserWordingRevisionId(provider, wording), provider, wording, registeredAt);
+  private registerBuiltInParserWording(): void {
+    try {
+      const insert = this.db.prepare(
+        `INSERT OR IGNORE INTO quota_parser_wording_revisions (id, provider, wording)
+         VALUES (?, ?, ?)`
+      );
+      this.db
+        .transaction(() => {
+          for (const provider of Object.keys(BUILT_IN_QUOTA_PARSER_WORDING) as QuotaLlmProvider[]) {
+            const wording = BUILT_IN_QUOTA_PARSER_WORDING[provider];
+            insert.run(quotaParserWordingRevisionId(provider, wording), provider, wording);
+          }
+        })
+        .immediate();
+    } catch (error) {
+      (this.logger ?? quotaStoreLogger()).warn("parser_wording_registration_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -705,7 +714,7 @@ export class SharedQuotaStore {
       const registered = this.db
         .prepare(
           `SELECT id FROM quota_parser_wording_revisions
-           WHERE id = ? AND provider = ? AND wording = ? AND source = 'built_in'`
+           WHERE id = ? AND provider = ? AND wording = ?`
         )
         .get(builtInId, provider, builtIn) as { id: string } | undefined;
       if (!registered) throw new Error("built-in parser wording revision is unavailable");

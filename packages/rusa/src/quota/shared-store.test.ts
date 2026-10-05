@@ -11,6 +11,7 @@ import {
   type QuotaService,
   type QuotaWindowKind,
 } from "../mcp/quota-mcp.js";
+import { nullLogger } from "../observability/logger.js";
 import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import { QuotaCollectionLoop } from "./coordinator-collection.js";
 import { QuotaCoordinatorService } from "./coordinator-service.js";
@@ -216,18 +217,45 @@ describe("SharedQuotaStore parser wording attribution (#536)", () => {
       const expectedId = quotaParserWordingRevisionId("codex", BUILT_IN_QUOTA_PARSER_WORDING.codex);
       expect(first).toEqual({ revisionId: expectedId, text: BUILT_IN_QUOTA_PARSER_WORDING.codex });
       expect(again).toEqual(first);
-      expect(
-        store.db
-          .prepare("SELECT id, provider, wording, source FROM quota_parser_wording_revisions")
-          .all()
-      ).toEqual(
+      expect(store.db.prepare("SELECT * FROM quota_parser_wording_revisions").all()).toEqual(
         (["claude", "codex", "agy", "kimi"] as const).map((provider) => ({
           id: quotaParserWordingRevisionId(provider, BUILT_IN_QUOTA_PARSER_WORDING[provider]),
           provider,
           wording: BUILT_IN_QUOTA_PARSER_WORDING[provider],
-          source: "built_in",
         }))
       );
+    } finally {
+      store.close();
+    }
+  });
+
+  it("still opens and degrades to unattributed parsing when the revision table rejects the seeds", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-quota-wording-broken-"));
+    roots.push(root);
+    const path = join(root, "quota.db");
+    // A control table that exists but cannot take the seed rows: the schema's
+    // `CREATE TABLE IF NOT EXISTS` leaves it alone and registration fails.
+    const broken = new Database(path);
+    broken.exec("CREATE TABLE quota_parser_wording_revisions (id TEXT PRIMARY KEY)");
+    broken.close();
+    const warn = vi.fn();
+
+    const store = new SharedQuotaStore(path, { ...nullLogger, warn });
+    try {
+      expect(warn).toHaveBeenCalledWith("parser_wording_registration_failed", {
+        error: expect.stringContaining("provider"),
+      });
+      expect(store.resolveParserWording("claude")).toEqual({
+        revisionId: null,
+        text: BUILT_IN_QUOTA_PARSER_WORDING.claude,
+      });
+      const scrape = store.recordRaw({
+        provider: "claude",
+        scrapedAt: "2030-01-01T00:00:00.000Z",
+        rawOutput: "synthetic",
+      });
+      store.recordParsed(scrape, snapshot(50), snapshot(50), null);
+      expect(store.getLatestSnapshot("claude")?.limits?.[0]?.percentLeft).toBe(50);
     } finally {
       store.close();
     }
