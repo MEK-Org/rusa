@@ -70,6 +70,7 @@ import {
 import { selectPrioritizedInboxItem } from "./inbox-selection.js";
 import type { SseHub } from "./sse.js";
 import type { DashboardTimingRecorder } from "./timing.js";
+import { measureDashboardPhase, startDashboardPhase } from "./timing-phases.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {
@@ -539,7 +540,9 @@ function compress(encoding: Encoding, payload: Buffer): Promise<Buffer> {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const endSerialization = startDashboardPhase("serialization");
   const payload = Buffer.from(JSON.stringify(body), "utf-8");
+  endSerialization();
   // `Vary` regardless of what this particular response did: the header
   // describes the endpoint's behaviour, and omitting it on the uncompressed
   // branch is how an intermediary caches a br body for a client that can't read it.
@@ -559,13 +562,16 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 
   // Off the event loop: zlib's async form runs on the threadpool, so a 2 MB
   // body costs this request latency and not every concurrent one.
+  const endCompression = startDashboardPhase("compression");
   compress(encoding, payload).then(
     (compressed) => {
+      endCompression();
       if (res.writableEnded) return;
       res.writeHead(status, { ...headers, "Content-Encoding": encoding });
       res.end(compressed);
     },
     () => {
+      endCompression();
       // Compression is an optimisation; failing it must not fail the response.
       if (res.writableEnded) return;
       res.writeHead(status, headers);
@@ -627,11 +633,12 @@ async function resolveInboxPage(
   // Same cache/resolver an obligation's cited artifacts use, so an external
   // inbox entry gets the identical rich preview and "open in new tab" link
   // rather than a second rendering path.
+  const { referenceCache } = deps;
   const resolve = (ref: string) =>
-    deps.referenceCache
-      ? deps.referenceCache
-          .get(ref, deps, budget)
-          .catch(() => resolveReferenceSync(ref, { meshChat: deps.meshChat }))
+    referenceCache
+      ? measureDashboardPhase("enrichment", () => referenceCache.get(ref, deps, budget)).catch(
+          () => resolveReferenceSync(ref, { meshChat: deps.meshChat })
+        )
       : resolveReferenceSync(ref, { meshChat: deps.meshChat });
   const entries: Array<ResolvedInboxEntry | null> = await Promise.all(
     page.entries.map(async (entry): Promise<ResolvedInboxEntry | null> => {
@@ -2392,15 +2399,20 @@ export async function handleMeshApiRequest(
     // stored, so the scope applies to the cached and uncached paths alike.
     // Citations and the external reference start together and share one
     // deadline, so two cold references wait one window, not two (#933).
-    const referenceBudget = deps.referenceCache?.startBudget();
+    const { referenceCache } = deps;
+    const referenceBudget = referenceCache?.startBudget();
     const resolveCited = async (ref: string): Promise<ResolvedReferenceWithEntity> =>
       scopeMeshMessageReference(
-        deps.referenceCache
-          ? await deps.referenceCache.get(ref, deps, referenceBudget).catch(() => ({
-              ...resolveReferenceSync(ref, { meshChat: deps.meshChat }),
-              unavailable: "could not load context",
-              cacheState: "unavailable" as const,
-            }))
+        referenceCache
+          ? await measureDashboardPhase("enrichment", () =>
+              referenceCache.get(ref, deps, referenceBudget)
+            ).catch(
+              () => ({
+                ...resolveReferenceSync(ref, { meshChat: deps.meshChat }),
+                unavailable: "could not load context",
+                cacheState: "unavailable" as const,
+              })
+            )
           : resolveReferenceSync(ref, { meshChat: deps.meshChat }),
         viewerScope()
       );

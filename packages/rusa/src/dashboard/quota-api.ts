@@ -8,6 +8,7 @@ import {
 } from "../quota/coordinator-protocol.js";
 import { estimateLane, type LaneReading, quotaLaneKey } from "../quota/lane-estimate.js";
 import { isProviderScopedWindow } from "../quota/window-scope.js";
+import { startDashboardPhase } from "./timing-phases.js";
 
 /**
  * Server-side cached per-provider quota endpoint for the dashboard header (ISSUE_NUM,
@@ -701,11 +702,15 @@ const SNAPSHOT_PATH = "/api/quota";
 const HISTORY_PATH = "/api/quota/history";
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  // Encode before writing headers: header write ends the route phase.
+  const endSerialization = startDashboardPhase("serialization");
+  const encoded = JSON.stringify(body);
+  endSerialization();
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
   });
-  res.end(JSON.stringify(body));
+  res.end(encoded);
 }
 
 /**

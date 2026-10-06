@@ -29,6 +29,7 @@ describe("dashboard timing MCP", () => {
         measurement: { numerator: 0, denominator: 0, state: "no-referenced-request" as const },
       },
       pairedRequestDurations: [],
+      serverPhases: [],
       groups: [],
     }));
     const client = await connect(createDashboardTimingMcpServer({ summary }));

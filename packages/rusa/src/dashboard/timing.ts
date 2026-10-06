@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { MeshEvent, MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
+import {
+  DASHBOARD_SERVER_PHASES,
+  type DashboardServerPhase,
+  type DashboardServerPhaseDurations,
+} from "./timing-phases.js";
 
 /** Stored in the existing append-only log; no migration or dashboard UI change. */
 export const DASHBOARD_TIMING_EVENT_KIND = "dashboard_timing";
@@ -50,6 +55,15 @@ const CLIENT_LABELS = [
 
 export type DashboardTimingLabel = (typeof SERVER_LABELS)[number] | (typeof CLIENT_LABELS)[number];
 
+/**
+ * Fixed sub-operations of one server label whose paths differ materially:
+ * the quota snapshot reads cached state, while history may await a
+ * coordinator read-through. Never derived from query values or identifiers.
+ */
+const SERVER_OPERATIONS = ["quota_snapshot", "quota_history"] as const;
+
+export type DashboardTimingOperation = (typeof SERVER_OPERATIONS)[number];
+
 export interface DashboardTimingPayload {
   v: 1;
   source: TimingSource;
@@ -64,6 +78,14 @@ export interface DashboardTimingPayload {
    * measurements.
    */
   requestTimings?: Array<{ requestId: string; requestMs: number }>;
+  /** Server-only fixed sub-operation; absent on records that predate it. */
+  operation?: DashboardTimingOperation;
+  /**
+   * Server-only measured phases (#935). Each is the union of that phase's own
+   * intervals; phases overlap and are not additive. Unreached or unmeasured
+   * phases are absent, and records that predate phases have none.
+   */
+  phases?: DashboardServerPhaseDurations;
   durationMs: number | null;
   status: number | null;
   bytes: number | null;
@@ -114,6 +136,23 @@ function hasLabel(value: unknown, labels: readonly string[]): value is Dashboard
 
 export function isDashboardTimingLabel(value: unknown): value is DashboardTimingLabel {
   return hasLabel(value, SERVER_LABELS) || hasLabel(value, CLIENT_LABELS);
+}
+
+/** Fixed path templates only: request URLs and query strings never become telemetry. */
+export function dashboardTimingOperationForRoute(
+  pathname: string
+): DashboardTimingOperation | null {
+  if (pathname === "/api/quota") return "quota_snapshot";
+  if (pathname === "/api/quota/history") return "quota_history";
+  return null;
+}
+
+function isPhaseDurations(value: unknown): value is DashboardServerPhaseDurations {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.entries(value).every(
+    ([phase, ms]) =>
+      DASHBOARD_SERVER_PHASES.includes(phase as DashboardServerPhase) && isIntegerMilliseconds(ms)
+  );
 }
 
 /** Fixed path templates only: request URLs and query strings never become telemetry. */
@@ -225,6 +264,8 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
     const requestId = value.requestId;
     const requestIds = value.requestIds;
     const requestTimings = value.requestTimings;
+    const operation = value.operation;
+    const phases = value.phases;
     if (
       value.v !== 1 ||
       (value.source !== "server" && value.source !== "client") ||
@@ -256,6 +297,11 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
       (outcome !== null && outcome !== "success" && outcome !== "failure") ||
       (value.source === "server" && outcome !== null) ||
       (value.source === "server" && requestTimings !== undefined) ||
+      (operation !== undefined &&
+        (value.source !== "server" ||
+          value.label !== "mesh_quota" ||
+          !SERVER_OPERATIONS.includes(operation as DashboardTimingOperation))) ||
+      (phases !== undefined && (value.source !== "server" || !isPhaseDurations(phases))) ||
       (value.source === "client" && status !== null)
     ) {
       return null;
@@ -274,6 +320,8 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
             })),
           }
         : {}),
+      ...(operation ? { operation: operation as DashboardTimingOperation } : {}),
+      ...(phases ? { phases: { ...(phases as DashboardServerPhaseDurations) } } : {}),
       durationMs,
       status,
       bytes,
@@ -329,16 +377,20 @@ export class DashboardTimingRecorder {
 
   recordServer(input: {
     label: DashboardTimingLabel;
+    operation?: DashboardTimingOperation;
     requestId?: string;
     durationMs: number | null;
     status: number | null;
     bytes: number | null;
+    phases?: DashboardServerPhaseDurations;
   }): void {
     this.enqueue({
       v: 1,
       source: "server",
       label: input.label,
+      ...(input.operation ? { operation: input.operation } : {}),
       ...(input.requestId ? { requestId: input.requestId } : {}),
+      ...(input.phases && Object.keys(input.phases).length > 0 ? { phases: input.phases } : {}),
       durationMs: input.durationMs == null ? null : Math.round(input.durationMs),
       status: input.status,
       bytes: input.bytes,
@@ -492,16 +544,46 @@ export interface DashboardTimingSummary {
   };
   /** Exact, unambiguous pairs grouped by fixed interaction and server endpoint. */
   pairedRequestDurations: DashboardPairedRequestDurationGroup[];
+  /**
+   * Server records grouped by fixed label and operation, with request-wide
+   * duration and each measured phase over the same records. Phases overlap
+   * (enrichment runs inside route) and are never summed or subtracted.
+   */
+  serverPhases: DashboardServerPhaseGroup[];
   groups: DashboardTimingGroup[];
 }
 
 export interface DashboardPairedRequestDurationGroup {
   interaction: (typeof CLIENT_LABELS)[number];
   serverLabel: (typeof SERVER_LABELS)[number];
+  /** Present when the paired server records carry a fixed operation. */
+  serverOperation?: DashboardTimingOperation;
   sampleCount: number;
   clientRequestMs: DashboardTimingDistribution;
   serverDurationMs: DashboardTimingDistribution;
+  /**
+   * Phases of the server records in exactly these pairs. Absent phases are
+   * omitted, and the field itself is absent when no pair measured any phase.
+   */
+  serverPhaseMs?: DashboardPhaseDistributions;
 }
+
+export interface DashboardServerPhaseGroup {
+  label: (typeof SERVER_LABELS)[number];
+  operation?: DashboardTimingOperation;
+  sampleCount: number;
+  durationMs: DashboardTimingDistribution;
+  phases: DashboardPhaseDistributions;
+}
+
+/** A phase distribution with how many of the cohort's records measured it. */
+export interface DashboardPhaseDistribution extends DashboardTimingDistribution {
+  coverage: DashboardRequestCoverage;
+}
+
+export type DashboardPhaseDistributions = Partial<
+  Record<DashboardServerPhase, DashboardPhaseDistribution>
+>;
 
 export interface DashboardRequestCoverage {
   numerator: number;
@@ -558,6 +640,58 @@ function coverage(numerator: number, denominator: number): DashboardRequestCover
             ? "full"
             : "partial",
   };
+}
+
+/**
+ * Distributions of each measured phase over one cohort of server records.
+ * A phase no record measured is omitted rather than reported as zero.
+ */
+function phaseDistributions(
+  cohort: Array<DashboardServerPhaseDurations | undefined>
+): DashboardPhaseDistributions {
+  const result: DashboardPhaseDistributions = {};
+  for (const phase of DASHBOARD_SERVER_PHASES) {
+    const values = cohort.flatMap((phases) =>
+      phases?.[phase] === undefined ? [] : [phases[phase]]
+    );
+    if (values.length === 0) continue;
+    result[phase] = { ...distribution(values), coverage: coverage(values.length, cohort.length) };
+  }
+  return result;
+}
+
+function pairedPhases(cohort: Array<DashboardServerPhaseDurations | undefined>): {
+  serverPhaseMs?: DashboardPhaseDistributions;
+} {
+  const serverPhaseMs = phaseDistributions(cohort);
+  return Object.keys(serverPhaseMs).length > 0 ? { serverPhaseMs } : {};
+}
+
+function serverPhaseGroups(
+  rows: Array<{ payload: DashboardTimingPayload }>
+): DashboardServerPhaseGroup[] {
+  const groups = new Map<string, DashboardTimingPayload[]>();
+  for (const { payload } of rows) {
+    if (payload.source !== "server") continue;
+    const key = `${payload.label}:${payload.operation ?? ""}`;
+    const group = groups.get(key) ?? [];
+    group.push(payload);
+    groups.set(key, group);
+  }
+  return [...groups.values()]
+    .map((payloads) => ({
+      label: payloads[0].label as (typeof SERVER_LABELS)[number],
+      ...(payloads[0].operation ? { operation: payloads[0].operation } : {}),
+      sampleCount: payloads.length,
+      durationMs: distribution(
+        payloads.flatMap((payload) => (payload.durationMs === null ? [] : [payload.durationMs]))
+      ),
+      phases: phaseDistributions(payloads.map((payload) => payload.phases)),
+    }))
+    .sort(
+      (a, b) =>
+        a.label.localeCompare(b.label) || (a.operation ?? "").localeCompare(b.operation ?? "")
+    );
 }
 
 function summarize(
@@ -637,13 +771,15 @@ function summarize(
         requestMs: clientMeasurements[0].requestMs,
         serverDurationMs: server.durationMs,
         serverLabel: server.label as (typeof SERVER_LABELS)[number],
+        serverOperation: server.operation,
+        serverPhases: server.phases,
       },
     ];
   });
   const pairedRequestIds = pairedRows.length;
   const pairedGroups = new Map<string, typeof pairedRows>();
   for (const pair of pairedRows) {
-    const key = `${pair.interaction}:${pair.serverLabel}`;
+    const key = `${pair.interaction}:${pair.serverLabel}:${pair.serverOperation ?? ""}`;
     const group = pairedGroups.get(key) ?? [];
     group.push(pair);
     pairedGroups.set(key, group);
@@ -665,14 +801,19 @@ function summarize(
       .map((pairs) => ({
         interaction: pairs[0].interaction,
         serverLabel: pairs[0].serverLabel,
+        ...(pairs[0].serverOperation ? { serverOperation: pairs[0].serverOperation } : {}),
         sampleCount: pairs.length,
         clientRequestMs: distribution(pairs.map((pair) => pair.requestMs)),
         serverDurationMs: distribution(pairs.map((pair) => pair.serverDurationMs)),
+        ...pairedPhases(pairs.map((pair) => pair.serverPhases)),
       }))
       .sort(
         (a, b) =>
-          a.interaction.localeCompare(b.interaction) || a.serverLabel.localeCompare(b.serverLabel)
+          a.interaction.localeCompare(b.interaction) ||
+          a.serverLabel.localeCompare(b.serverLabel) ||
+          (a.serverOperation ?? "").localeCompare(b.serverOperation ?? "")
       ),
+    serverPhases: serverPhaseGroups(rows),
     groups: [...groups.values()]
       .map((group) => {
         const p95Ms = percentile(group.durations, 95);

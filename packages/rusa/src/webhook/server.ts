@@ -27,6 +27,11 @@ import type { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { handleQuotaApiRequest, type QuotaApiDeps } from "../dashboard/quota-api.js";
 import { SseHub } from "../dashboard/sse.js";
 import { handleDashboardTimingTelemetry } from "../dashboard/timing-http.js";
+import {
+  beginDashboardRoutePhase,
+  measureDashboardPhase,
+  runDashboardRequestScope,
+} from "../dashboard/timing-phases.js";
 import { beginDashboardRequestTiming } from "../dashboard/timing-server.js";
 import {
   handleUnderstandingOpsRequest,
@@ -315,7 +320,7 @@ export function createDashboardRequestHandler(
     throw new Error("Dashboard auth configuration requires an initialized authentication boundary");
   const { serveUi = true } = options;
   const log = (options.logger ?? nullLogger).child({ component: "dashboard" });
-  return async (req: IncomingMessage, res: ServerResponse) => {
+  const handle = async (req: IncomingMessage, res: ServerResponse) => {
     try {
       const requestUrl = new URL(req.url || "/", "http://localhost");
       const { pathname } = requestUrl;
@@ -354,9 +359,10 @@ export function createDashboardRequestHandler(
         auth &&
         pathname.startsWith("/api/") &&
         !publicBrandingIcon &&
-        !(await auth.authorize(req, res))
+        !(await measureDashboardPhase("auth", () => auth.authorize(req, res)))
       )
         return;
+      beginDashboardRoutePhase();
       // #866: complete prompts are available in sole-email/local mode only.
       // Keep allowlist refusal at the established auth boundary, before storage reads.
       // allowedEmails also fails closed for an unvalidated adapter object with both fields.
@@ -510,6 +516,9 @@ export function createDashboardRequestHandler(
       }
     }
   };
+  // Each request gets its own scope so awaited handler work can find its phase clock.
+  return (req: IncomingMessage, res: ServerResponse) =>
+    runDashboardRequestScope(() => handle(req, res));
 }
 
 /**
