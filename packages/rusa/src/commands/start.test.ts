@@ -8470,6 +8470,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "dashboard-timing",
         "pnpm-hardlinks",
         "update",
       ]);
@@ -8478,6 +8479,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "repo",
         "understanding",
         "quota",
+        "dashboard-timing",
         "mesh",
         "inbox",
         "obligations",
@@ -8487,6 +8489,20 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // Every worker endpoint is the worker's own; none is shared with root.
       const rootUrls = new Set(rootServers.map((server) => server.url));
       expect(workerServers.filter((server) => rootUrls.has(server.url))).toEqual([]);
+    });
+
+    it("unmounts a retired worker's dashboard timing endpoint", async () => {
+      withWorker("timing-retire-worker");
+      const { mesh } = await boot();
+      const dashboardTimingUrl = mcpServersOf(workerOf(mesh, "timing-retire-worker")).find(
+        (server) => server.name === "dashboard-timing"
+      )?.url;
+      expect(dashboardTimingUrl).toBeDefined();
+
+      mesh.retire("timing-retire-worker");
+      await vi.waitFor(async () => {
+        expect((await fetch(dashboardTimingUrl as string)).status).toBe(404);
+      });
     });
 
     it("adds chat read to both sets and chat write to the root only when chat is configured", async () => {
@@ -8508,6 +8524,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "dashboard-timing",
         "chat-write",
         "pnpm-hardlinks",
         "update",
@@ -8517,6 +8534,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "repo",
         "understanding",
         "quota",
+        "dashboard-timing",
         "chat-read",
         "mesh",
         "inbox",

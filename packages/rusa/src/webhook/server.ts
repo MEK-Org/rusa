@@ -26,6 +26,8 @@ import { handleIuReportsApiRequest, type IuReportsApiDeps } from "../dashboard/i
 import type { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { handleQuotaApiRequest, type QuotaApiDeps } from "../dashboard/quota-api.js";
 import { SseHub } from "../dashboard/sse.js";
+import { handleDashboardTimingTelemetry } from "../dashboard/timing-http.js";
+import { beginDashboardRequestTiming } from "../dashboard/timing-server.js";
 import {
   handleUnderstandingOpsRequest,
   handleUnderstandingStringsRequest,
@@ -135,6 +137,8 @@ export interface DashboardMeshRefs {
   actors: ActorRepository;
   principals?: PrincipalRepository;
   meshEvents: MeshEventRepository;
+  /** Optional content-free timing recorder, owned by the live start wiring. */
+  timings?: DashboardDataDeps["timings"];
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
   obligations?: ObligationRepository;
@@ -313,6 +317,8 @@ export function createDashboardRequestHandler(
     try {
       const requestUrl = new URL(req.url || "/", "http://localhost");
       const { pathname } = requestUrl;
+      const timings = dataDeps?.timings;
+      beginDashboardRequestTiming(res, pathname, req.method, timings);
 
       // Minimal liveness endpoint — always available, even without a live mesh.
       if (req.method === "GET" && pathname === "/api/health") {
@@ -367,6 +373,10 @@ export function createDashboardRequestHandler(
       if (auth && (pathname === "/api/mesh/stream" || pathname === "/api/mesh/voice/stream")) {
         auth.guardStream(req, res);
       }
+
+      // This route is deliberately outside the recorder's own route map: it
+      // accepts client summaries but never generates recursive telemetry.
+      if (await handleDashboardTimingTelemetry(req, res, pathname, timings)) return;
 
       if (req.method === "GET" && pathname === "/api/dashboard/config") {
         res.writeHead(200, {
@@ -625,6 +635,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           principals,
           logger: options.logger,
           meshEvents: options.mesh.meshEvents,
+          timings: options.mesh.timings,
           meshChat: options.mesh.meshChat,
           obligations: options.mesh.obligations,
           inbox: options.mesh.inbox,
