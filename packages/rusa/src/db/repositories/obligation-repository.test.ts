@@ -29,6 +29,7 @@ import { obligationHistory } from "../migrations/0045_obligation_history.js";
 import { obligationResponsive } from "../migrations/0049_obligation_responsive.js";
 import { dropObligationReadyHeads } from "../migrations/0050_drop_obligation_ready_heads.js";
 import { obligationSnooze } from "../migrations/0052_obligation_snooze.js";
+import { obligationCompletionMatchers } from "../migrations/0059_obligation_completion_matchers.js";
 import {
   MAX_OBLIGATION_PAGE_LIMIT,
   type ObligationQueue,
@@ -92,12 +93,200 @@ describe("ObligationRepository", () => {
     obligationResponsive.up(db);
     obligationSnooze.up(db);
     dropObligationReadyHeads.up(db);
+    obligationCompletionMatchers.up(db);
     now = 1_000;
     repository = new ObligationRepository(
       db,
       (id) => ["actor-a", "actor-b", "actor-c"].includes(id),
       () => now++
     );
+  });
+
+  it("sets, replaces, and clears one completion matcher without leaving stale observations", () => {
+    repository.create({ id: "matcher", title: "matcher", ownerId: "actor-a" });
+
+    const first = repository.setCompletionMatcher(
+      "matcher",
+      { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      "actor-a"
+    );
+    expect(first.completionMatcher).toMatchObject({
+      kind: "pr_merged",
+      // Canonical lowercase, so the webhook lookup is an exact indexed match.
+      target: "github:mek-org/rusa/pulls/190",
+      spec: { schemaVersion: 1 },
+      satisfiedAt: null,
+      closedUnmergedAt: null,
+    });
+    const firstMatcher = first.completionMatcher;
+    if (firstMatcher === null) throw new Error("completion matcher was not persisted");
+    // A real prior observation, so replacement has something stale to discard.
+    expect(
+      repository.recordCompletionMatcherClosedUnmerged("matcher", firstMatcher)?.completionMatcher
+    ).toMatchObject({ closedUnmergedAt: expect.any(String) });
+
+    const replaced = repository.setCompletionMatcher(
+      "matcher",
+      { kind: "deployed", commit: "a".repeat(40) },
+      "actor-b"
+    );
+    expect(replaced.completionMatcher).toMatchObject({
+      kind: "deployed",
+      target: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      setBy: "actor-b",
+      satisfiedAt: null,
+      satisfiedRef: null,
+      closedUnmergedAt: null,
+    });
+
+    // Replacing with an equal predicate is still a new installation.
+    const second = repository.setCompletionMatcher(
+      "matcher",
+      { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      "actor-a"
+    );
+    const secondMatcher = second.completionMatcher;
+    if (secondMatcher === null) throw new Error("completion matcher was not persisted");
+    repository.recordCompletionMatcherClosedUnmerged("matcher", secondMatcher);
+    now += 1_000;
+    expect(
+      repository.setCompletionMatcher(
+        "matcher",
+        { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+        "actor-a"
+      ).completionMatcher
+    ).toMatchObject({ closedUnmergedAt: null, satisfiedAt: null });
+
+    expect(
+      repository.setCompletionMatcher("matcher", null, "actor-a").completionMatcher
+    ).toBeNull();
+  });
+
+  it("refuses recurrence on an obligation that already carries a completion matcher", () => {
+    repository.create({ id: "matched", title: "matched", ownerId: "actor-a" });
+    repository.setCompletionMatcher(
+      "matched",
+      { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      "actor-a"
+    );
+
+    expect(() =>
+      repository.setRecurrence(
+        "matched",
+        { policy: "completion_interval", intervalSeconds: 60 },
+        "actor-a"
+      )
+    ).toThrow(/completion matcher cannot be recurring/);
+    expect(repository.require("matched").recurrencePolicy).toBeNull();
+  });
+
+  it("holds matcher satisfaction behind live children, then finishes when the final child clears", () => {
+    repository.create({ id: "parent", title: "parent", ownerId: "actor-a" });
+    repository.create({ id: "child", title: "child", parentId: "parent", ownerId: "actor-a" });
+    const deployedRef = `github:MEK-Org/rusa/commits/${"b".repeat(40)}`;
+    // A manually attached artifact on the same deployed revision must keep its
+    // label and not conflict with or drop the matcher's observation note.
+    repository.attachArtifact("parent", deployedRef, { label: "prior manual evidence" });
+
+    const parent = repository.setCompletionMatcher(
+      "parent",
+      { kind: "deployed", commit: "a".repeat(40) },
+      "actor-a"
+    );
+    const matcher = parent.completionMatcher;
+    if (matcher === null) throw new Error("completion matcher was not persisted");
+    const observedNote1 = `Completion matcher satisfied: instance observer-1 running bbbbbbb contains aaaaaaa`;
+
+    const observed1 = repository.satisfyCompletionMatcher("parent", matcher, {
+      note: observedNote1,
+      resolutionRef: deployedRef,
+    });
+    expect(observed1.obligation).toMatchObject({ status: "waiting" });
+    expect(observed1.obligation.completionMatcher).toMatchObject({ satisfiedRef: deployedRef });
+
+    // Retarget to another commit contained in the same deployed revision.
+    // The prior satisfaction observation is discarded and the new one is recorded.
+    const retargeted = repository.setCompletionMatcher(
+      "parent",
+      { kind: "deployed", commit: "c".repeat(40) },
+      "actor-a"
+    );
+    const matcher2 = retargeted.completionMatcher;
+    if (matcher2 === null) throw new Error("retargeted completion matcher was not persisted");
+    expect(matcher2.satisfiedAt).toBeNull();
+    expect(matcher2.satisfiedRef).toBeNull();
+
+    const observedNote2 = `Completion matcher satisfied: instance observer-2 running bbbbbbb contains ccccccc`;
+    const observed2 = repository.satisfyCompletionMatcher("parent", matcher2, {
+      note: observedNote2,
+      resolutionRef: deployedRef,
+    });
+    expect(observed2.obligation).toMatchObject({ status: "waiting" });
+    expect(observed2.obligation.completionMatcher).toMatchObject({ satisfiedRef: deployedRef });
+
+    repository.setTerminalStatus("child", "done", "child finished", null, "actor-a");
+    expect(repository.require("parent")).toMatchObject({
+      status: "done",
+      resolutionRef: deployedRef,
+      // Distinguishes target C / observer-2 rather than the earlier target A observation.
+      terminalNote: observedNote2,
+    });
+    // The manually attached artifact preserves its original label.
+    expect(repository.listArtifacts("parent")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          ref: deployedRef,
+          label: "prior manual evidence",
+        }),
+      ])
+    );
+    // The child's transition is the caller's; the parent's completion is the mesh's.
+    expect(repository.listHistory("child")[0]).toMatchObject({
+      actingPrincipal: "actor-a",
+      after: { status: "done" },
+    });
+    expect(repository.listHistory("parent")[0]).toMatchObject({
+      actingPrincipal: "system:mesh",
+      after: { status: "done" },
+    });
+  });
+
+  it("refuses a blank satisfaction note at the write and leaves the matcher unsatisfied", () => {
+    repository.create({ id: "blank", title: "blank", ownerId: "actor-a" });
+    const matcher = repository.setCompletionMatcher(
+      "blank",
+      { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      "actor-a"
+    ).completionMatcher;
+    if (matcher === null) throw new Error("completion matcher was not persisted");
+
+    expect(() =>
+      repository.satisfyCompletionMatcher("blank", matcher, {
+        note: "   ",
+        resolutionRef: "github:MEK-Org/rusa/pulls/190",
+      })
+    ).toThrow(/satisfaction note must not be blank/);
+    expect(repository.require("blank")).toMatchObject({
+      status: "ready",
+      completionMatcher: { satisfiedAt: null, satisfiedRef: null, spec: { schemaVersion: 1 } },
+    });
+  });
+
+  it("rejects a satisfied matcher row that has no satisfiedNote", () => {
+    repository.create({ id: "noted", title: "noted", ownerId: "actor-a" });
+    repository.setCompletionMatcher(
+      "noted",
+      { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      "actor-a"
+    );
+    db.prepare(
+      `UPDATE obligation_completion_matchers
+       SET satisfied_at = '2026-10-06T00:00:00.000Z',
+           satisfied_ref = 'github:MEK-Org/rusa/pulls/190'
+       WHERE obligation_id = 'noted'`
+    ).run();
+
+    expect(() => repository.require("noted")).toThrow(/satisfied matcher has no satisfiedNote/);
   });
 
   it("stamps createdAt/updatedAt on create and advances updatedAt on mutation", async () => {
@@ -5475,6 +5664,8 @@ describe("multi-instance crontab reconciliation (#304)", () => {
     obligationHistory.up(d);
     obligationResponsive.up(d);
     obligationSnooze.up(d);
+    dropObligationReadyHeads.up(d);
+    obligationCompletionMatchers.up(d);
     return d;
   };
 

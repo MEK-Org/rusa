@@ -2788,6 +2788,66 @@ export class ActorMesh {
     }
   }
 
+  /**
+   * Durable owner attention for a completion matcher whose PR closed without
+   * merging (#190). One notice per matcher installation: the key carries the
+   * matcher's `set_at`, so replays and boot reconciliation are silent no-ops
+   * while a replaced matcher that closes unmerged again is announced again.
+   * Human owners see the recorded state on the dashboard instead.
+   */
+  deliverCompletionMatcherClosedUnmergedAttention(
+    ownerId: string,
+    obligationId: string,
+    matcherSetAt: string
+  ): boolean {
+    if (!this.inboxStore) return false;
+    if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) return false;
+    const actorId = this.resolveThreadId(ownerId);
+    const record = this.actors.get(actorId);
+    if (!record || record.status !== "active") return false;
+    const entries = this.inboxStore.append([
+      {
+        id: deduplicatedInboxEntryId(
+          `obligation-matcher-closed-unmerged:${obligationId}:${matcherSetAt}`,
+          actorId
+        ),
+        actorId,
+        source: `obligation:${obligationId}`,
+        payload: {
+          type: "obligation.completion_matcher_closed_unmerged",
+          obligationId,
+        } as unknown as InboxPayload,
+      },
+    ]);
+    if (entries.length === 0) return false;
+    this.dispatch(actorId);
+    return true;
+  }
+
+  /** Boot recovery for {@link deliverCompletionMatcherClosedUnmergedAttention}. */
+  reconcileCompletionMatcherClosedUnmergedAttention(obligations: {
+    listCompletionMatcherClosedUnmergedAttention(): Iterable<{
+      obligationId: string;
+      ownerId: string;
+      matcherSetAt: string;
+    }>;
+  }): void {
+    if (!this.inboxStore) return;
+    try {
+      for (const attention of obligations.listCompletionMatcherClosedUnmergedAttention()) {
+        this.deliverCompletionMatcherClosedUnmergedAttention(
+          attention.ownerId,
+          attention.obligationId,
+          attention.matcherSetAt
+        );
+      }
+    } catch (err) {
+      this.log(
+        `completion-matcher attention reconciliation failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
   inboxHandled(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     if (this.inboxStore && this.inboxStore.countUnhandled(actorId) > 0) {

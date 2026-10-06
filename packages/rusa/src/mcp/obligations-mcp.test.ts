@@ -18,6 +18,7 @@ import { obligationHistory } from "../db/migrations/0045_obligation_history.js";
 import { obligationResponsive } from "../db/migrations/0049_obligation_responsive.js";
 import { dropObligationReadyHeads } from "../db/migrations/0050_drop_obligation_ready_heads.js";
 import { obligationSnooze } from "../db/migrations/0052_obligation_snooze.js";
+import { obligationCompletionMatchers } from "../db/migrations/0059_obligation_completion_matchers.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { OBLIGATION_CHECKPOINT_MAX } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
@@ -57,10 +58,11 @@ describe("obligations MCP", () => {
     obligationResponsive.up(db);
     obligationSnooze.up(db);
     dropObligationReadyHeads.up(db);
+    obligationCompletionMatchers.up(db);
     repository = new ObligationRepository(db);
   });
 
-  it("exposes all 15 obligation tools", async () => {
+  it("exposes all 16 obligation tools", async () => {
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual([
@@ -75,6 +77,7 @@ describe("obligations MCP", () => {
       "reorder_obligation",
       "reparent_obligation",
       "set_checkpoint",
+      "set_completion_matcher",
       "set_external_ref",
       "set_obligation_recurrence",
       "set_obligation_status",
@@ -578,6 +581,57 @@ describe("obligations MCP", () => {
     })) as CallToolResult;
     expect(res.isError).toBeFalsy();
     expect(repository.require("rec-owned").recurrencePolicy).toBe("cron");
+  });
+
+  it("sets and clears an owner-managed completion matcher", async () => {
+    repository.create({ title: "matched", id: "matched", ownerId: "actor-a" });
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+
+    const set = (await client.callTool({
+      name: "set_completion_matcher",
+      arguments: {
+        id: "matched",
+        matcher: { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      },
+    })) as CallToolResult;
+    expect(set.isError).toBeFalsy();
+    expect(repository.require("matched").completionMatcher).toMatchObject({
+      kind: "pr_merged",
+      target: "github:mek-org/rusa/pulls/190",
+    });
+
+    const cleared = (await client.callTool({
+      name: "set_completion_matcher",
+      arguments: { id: "matched", matcher: null },
+    })) as CallToolResult;
+    expect(cleared.isError).toBeFalsy();
+    expect(repository.require("matched").completionMatcher).toBeNull();
+  });
+
+  it("reports a committed matcher as unchecked when its evaluation throws", async () => {
+    repository.create({ title: "matched", id: "matched", ownerId: "actor-a" });
+    const client = await connect(
+      createObligationsMcpServer(repository, "actor-a", {
+        evaluateCompletionMatcher: async () => {
+          throw new Error("SQLITE_BUSY");
+        },
+      })
+    );
+
+    const set = (await client.callTool({
+      name: "set_completion_matcher",
+      arguments: {
+        id: "matched",
+        matcher: { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      },
+    })) as CallToolResult;
+
+    // The write committed, so the tool must not read as a failed write.
+    expect(set.isError).toBeFalsy();
+    expect(dataOf(set)).toMatchObject({
+      evaluation: "unchecked",
+    });
+    expect(repository.require("matched").completionMatcher).not.toBeNull();
   });
 
   it("rejects set_obligation_recurrence for a non-owner, and honors the owner-ancestor policy", async () => {

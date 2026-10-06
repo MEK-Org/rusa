@@ -830,6 +830,7 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
     checkpoint,
     checkpointAt: checkpoint == null ? null : "2026-09-07T12:00:00.000Z",
     checkpointBy: checkpoint == null ? null : "actor-a",
+    completionMatcher: null,
     hasCompletionHistory: false,
   });
 

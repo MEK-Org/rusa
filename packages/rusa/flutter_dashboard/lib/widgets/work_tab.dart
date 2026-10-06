@@ -1224,6 +1224,11 @@ class _DetailViewState extends State<_DetailView> {
       const Divider(height: 32, color: MeshColors.border),
       _SectionHeader('EXTERNAL LINK'),
       _externalRefPanel(context, data),
+      if (data.obligation.completionMatcher != null) ...[
+        const Divider(height: 32, color: MeshColors.border),
+        _SectionHeader('COMPLETION MATCHER'),
+        _completionMatcherPanel(data.obligation.completionMatcher!),
+      ],
       if (data.artifacts.isNotEmpty) ...[
         const Divider(height: 32, color: MeshColors.border),
         _SectionHeader('ARTIFACTS'),
@@ -1864,6 +1869,46 @@ class _DetailViewState extends State<_DetailView> {
     return _referenceLine(reference, action: edit);
   }
 
+  Widget _completionMatcherPanel(CompletionMatcherDto matcher) {
+    final label = matcher.kind == 'pr_merged'
+        ? 'Complete when this pull request merges'
+        : 'Complete when this instance deploys a descendant build';
+    final state = matcher.satisfiedAt != null
+        ? 'Satisfied ${formatTs(matcher.satisfiedAt!)}'
+        // Recorded once and not cleared by a reopen, so it is stated as a past
+        // observation; a later merge of the reopened PR still satisfies it.
+        : matcher.closedUnmergedAt != null
+        ? 'PR was closed without merging at ${formatTs(matcher.closedUnmergedAt!)}'
+        : 'Pending';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(color: MeshColors.textPrimary, fontSize: 12.5),
+        ),
+        const SizedBox(height: 6),
+        SelectableText(
+          matcher.target,
+          style: const TextStyle(color: MeshColors.accent, fontSize: 12),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          '$state · set by ${store.actorDisplay(matcher.setBy)}',
+          style: const TextStyle(color: MeshColors.textMuted, fontSize: 11.5),
+        ),
+        // A merged PR's resolution is its own target, already shown above.
+        if (matcher.kind == 'deployed' && matcher.satisfiedRef != null) ...[
+          const SizedBox(height: 4),
+          SelectableText(
+            'Resolution: ${matcher.satisfiedRef}',
+            style: const TextStyle(color: MeshColors.textMuted, fontSize: 11.5),
+          ),
+        ],
+      ],
+    );
+  }
+
   Widget _childrenPanel(BuildContext context, ObligationDetailSnapshot data) {
     final all = data.children;
     // Only `done` is hidden: that is what #396 asks for, and a cancelled child
@@ -2181,10 +2226,7 @@ class _DetailViewState extends State<_DetailView> {
           crossAxisAlignment: WrapCrossAlignment.center,
           runSpacing: 4,
           spacing: 8,
-          children: [
-            status,
-            if (!o.isTerminal) ...actions,
-          ],
+          children: [status, if (!o.isTerminal) ...actions],
         ),
       ],
     );
