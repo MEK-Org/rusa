@@ -1,13 +1,19 @@
 // @vitest-environment node
 import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
-import { describe, expect, it } from "vitest";
-import type { MeshEvent, MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
-import { DashboardTimingRecorder } from "./timing.js";
+import Database from "better-sqlite3";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { runMigrations } from "../db/migrations/runner.js";
+import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
+import {
+  DASHBOARD_TIMING_EVENT_KIND,
+  DASHBOARD_TIMING_MAX_RECORDS,
+  DashboardTimingRecorder,
+} from "./timing.js";
 import { beginDashboardRequestTiming } from "./timing-server.js";
 
-const BATCH_SIZE = 64;
-const SAMPLES = 40;
+const BATCH_SIZE = 32;
+const SAMPLES = 20;
 const BODY = JSON.stringify({ actors: 1000, status: "ok" });
 
 class BenchResponse extends EventEmitter {
@@ -29,54 +35,83 @@ class BenchResponse extends EventEmitter {
   }
 }
 
-const noOpStore = {
-  record: (_opts: Parameters<MeshEventRepository["record"]>[0]) => "timing-row",
-  listByKindSince: (_kind: string, _sinceISO: string, _limit: number): MeshEvent[] => [],
-  pruneKind: (_kind: string, _olderThanISO: string, _maxRecords: number) => undefined,
-};
-
 function p95(values: number[]): number {
   const sorted = [...values].sort((left, right) => left - right);
   return sorted[Math.ceil(sorted.length * 0.95) - 1] ?? 0;
 }
 
-function measureBatch(timings?: DashboardTimingRecorder): number {
-  const started = performance.now();
-  for (let index = 0; index < BATCH_SIZE; index += 1) {
-    const response = new BenchResponse();
-    if (timings) {
-      beginDashboardRequestTiming(
-        response as unknown as ServerResponse,
-        "/api/mesh/threads",
-        timings
-      );
-    }
-    response.end(BODY);
-  }
-  const millisecondsPerResponse = (performance.now() - started) / BATCH_SIZE;
-  // Persisting is deliberately out of the measured response path.
-  timings?.flush();
-  return millisecondsPerResponse;
-}
+const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 describe.skipIf(process.env.RUSA_BENCH_DASHBOARD_TIMING !== "1")(
   "dashboard timing response-path overhead",
   () => {
-    it("reports paired p95 per-response overhead without a database flush", () => {
+    let db: Database.Database;
+    let events: MeshEventRepository;
+    let recorder: DashboardTimingRecorder;
+
+    beforeEach(() => {
+      db = new Database(":memory:");
+      runMigrations(db);
+      events = new MeshEventRepository(db);
+      // Exercise the existing store at its durable count boundary rather than
+      // an empty or mocked writer. The timestamp is current so boot pruning
+      // retains this representative timing population.
+      const timestamp = new Date().toISOString();
+      for (let index = 0; index < DASHBOARD_TIMING_MAX_RECORDS; index += 1) {
+        events.record({
+          kind: DASHBOARD_TIMING_EVENT_KIND,
+          detail: "server:mesh_threads",
+          payload: JSON.stringify({
+            v: 1,
+            source: "server",
+            label: "mesh_threads",
+            durationMs: 1,
+            status: 200,
+            bytes: 2,
+            outcome: null,
+          }),
+          ts: timestamp,
+        });
+      }
+      recorder = new DashboardTimingRecorder(events);
+      recorder.start();
+    });
+
+    afterEach(() => db.close());
+
+    async function measureBatch(timings?: DashboardTimingRecorder): Promise<number> {
+      const started = performance.now();
+      for (let index = 0; index < BATCH_SIZE; index += 1) {
+        const response = new BenchResponse();
+        if (timings) {
+          beginDashboardRequestTiming(
+            response as unknown as ServerResponse,
+            "/api/mesh/threads",
+            "GET",
+            timings
+          );
+        }
+        response.end(BODY);
+        // The recorder's setImmediate flush is queued by `finish`; awaiting a
+        // following turn includes that real SQLite overlap in the receipt.
+        await nextTurn();
+      }
+      return (performance.now() - started) / BATCH_SIZE;
+    }
+
+    it("reports paired p95 per-response overhead with real SQLite flush overlap", async () => {
       const baseline: number[] = [];
       const instrumented: number[] = [];
-      const recorder = new DashboardTimingRecorder(noOpStore);
 
-      // Warm both paths once, then alternate each batch to reduce warmup bias.
-      measureBatch();
-      measureBatch(recorder);
+      await measureBatch();
+      await measureBatch(recorder);
       for (let sample = 0; sample < SAMPLES; sample += 1) {
         if (sample % 2 === 0) {
-          baseline.push(measureBatch());
-          instrumented.push(measureBatch(recorder));
+          baseline.push(await measureBatch());
+          instrumented.push(await measureBatch(recorder));
         } else {
-          instrumented.push(measureBatch(recorder));
-          baseline.push(measureBatch());
+          instrumented.push(await measureBatch(recorder));
+          baseline.push(await measureBatch());
         }
       }
 
@@ -84,13 +119,14 @@ describe.skipIf(process.env.RUSA_BENCH_DASHBOARD_TIMING !== "1")(
       const instrumentedP95Ms = p95(instrumented);
       console.log(
         JSON.stringify({
-          metric: "dashboard_timing_response_path",
+          metric: "dashboard_timing_post_response_sqlite_overlap",
           samples: SAMPLES,
           batchSize: BATCH_SIZE,
+          retainedTimingRows: DASHBOARD_TIMING_MAX_RECORDS,
           baselineP95Ms,
           instrumentedP95Ms,
           p95DeltaMs: instrumentedP95Ms - baselineP95Ms,
-          note: "Includes UUID/header/response wrapper/enqueue; excludes post-response SQLite flush.",
+          note: "Includes UUID/header/response wrapper/enqueue and next-turn SQLite flush against retained timing rows; it is not an end-to-end dashboard-load latency claim.",
         })
       );
       expect(baseline).toHaveLength(SAMPLES);

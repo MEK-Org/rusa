@@ -40,11 +40,12 @@ function trackResponseBytes(res: ServerResponse): () => number {
 export function beginDashboardRequestTiming(
   res: ServerResponse,
   pathname: string,
+  method: string | undefined,
   timings: DashboardTimingRecorder | undefined
 ): void {
   const requestId = pathname.startsWith("/api/") ? createDashboardRequestId() : undefined;
   if (requestId) res.setHeader("X-Rusa-Request-Id", requestId);
-  const label = timings ? dashboardTimingLabelForRoute(pathname) : null;
+  const label = timings ? dashboardTimingLabelForRoute(pathname, method ?? "GET") : null;
   if (!timings || !label) return;
   const started = performance.now();
   const responseBytes = trackResponseBytes(res);

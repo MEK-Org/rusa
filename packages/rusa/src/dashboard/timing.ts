@@ -8,11 +8,14 @@ export const DASHBOARD_TIMING_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const DASHBOARD_TIMING_MAX_QUEUE = 512;
 export const DASHBOARD_TIMING_MAX_CLIENT_IDS = 32;
 export const DASHBOARD_TIMING_MAX_CLIENT_BODY_BYTES = 8 * 1024;
+/** Retention maintenance is intentionally not on every post-response batch. */
+export const DASHBOARD_TIMING_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+/** Bound a hot dashboard's count overshoot without a delete on every flush. */
+export const DASHBOARD_TIMING_PRUNE_BATCH_RECORDS = 512;
 
 type TimingSource = "server" | "client";
 
 const SERVER_LABELS = [
-  "api_health",
   "dashboard_config",
   "mesh_threads",
   "mesh_actor_charter",
@@ -20,6 +23,7 @@ const SERVER_LABELS = [
   "mesh_actor_activity",
   "mesh_actor_chat",
   "mesh_actor_inbox",
+  "mesh_actor_list",
   "mesh_actor_mutation",
   "mesh_obligations",
   "mesh_obligation_detail",
@@ -57,8 +61,8 @@ export interface DashboardTimingPayload {
   durationMs: number | null;
   status: number | null;
   bytes: number | null;
-  storeMs: number | null;
-  serializationMs: number | null;
+  /** Client-declared interaction result; server observations leave this null. */
+  outcome: "success" | "failure" | null;
 }
 
 export interface DashboardClientTimingInput {
@@ -102,9 +106,13 @@ export function isDashboardTimingLabel(value: unknown): value is DashboardTiming
 }
 
 /** Fixed path templates only: request URLs and query strings never become telemetry. */
-export function dashboardTimingLabelForRoute(pathname: string): DashboardTimingLabel | null {
+export function dashboardTimingLabelForRoute(
+  pathname: string,
+  method: string
+): DashboardTimingLabel | null {
+  const isRead = method === "GET" || method === "HEAD" || method === "OPTIONS";
   if (pathname === "/api/dashboard/timing") return null;
-  if (pathname === "/api/health") return "api_health";
+  if (pathname === "/api/health") return null;
   if (pathname === "/api/dashboard/config") return "dashboard_config";
   if (pathname === "/api/mesh/threads") return "mesh_threads";
   if (pathname === "/api/mesh/threads/charter") return "mesh_actor_charter";
@@ -114,7 +122,8 @@ export function dashboardTimingLabelForRoute(pathname: string): DashboardTimingL
   if (pathname === "/api/mesh/events") return "mesh_events";
   if (pathname === "/api/quota" || pathname === "/api/quota/history") return "mesh_quota";
   if (pathname === "/api/mesh/stream") return "mesh_stream_open";
-  if (pathname === "/api/mesh/obligations") return "mesh_obligations";
+  if (pathname === "/api/mesh/obligations")
+    return isRead ? "mesh_obligations" : "mesh_obligation_mutation";
   if (pathname === "/api/mesh/obligations/forest") return "mesh_obligation_forest";
   if (/^\/api\/mesh\/obligations\/[^/]+\/tree$/.test(pathname)) return "mesh_obligation_tree";
   if (/^\/api\/mesh\/obligations\/[^/]+$/.test(pathname)) return "mesh_obligation_detail";
@@ -128,6 +137,7 @@ export function dashboardTimingLabelForRoute(pathname: string): DashboardTimingL
   if (/^\/api\/mesh\/actors\/[^/]+\/chat$/.test(pathname)) return "mesh_actor_chat";
   if (/^\/api\/mesh\/actors\/[^/]+\/inbox$/.test(pathname)) return "mesh_actor_inbox";
   if (/^\/api\/mesh\/actors\/[^/]+$/.test(pathname)) return "mesh_actor_detail";
+  if (pathname === "/api/mesh/actors") return isRead ? "mesh_actor_list" : "mesh_actor_mutation";
   if (/^\/api\/mesh\/actors\b/.test(pathname)) return "mesh_actor_mutation";
   return pathname.startsWith("/api/") ? "api_other" : null;
 }
@@ -164,8 +174,7 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
     const durationMs = value.durationMs;
     const status = value.status;
     const bytes = value.bytes;
-    const storeMs = value.storeMs;
-    const serializationMs = value.serializationMs;
+    const outcome = value.outcome;
     const requestId = value.requestId;
     const requestIds = value.requestIds;
     if (
@@ -180,8 +189,9 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
       (durationMs !== null && !isFiniteMilliseconds(durationMs)) ||
       (status !== null && !isHttpStatus(status)) ||
       (bytes !== null && !isByteCount(bytes)) ||
-      (storeMs !== null && !isFiniteMilliseconds(storeMs)) ||
-      (serializationMs !== null && !isFiniteMilliseconds(serializationMs))
+      (outcome !== null && outcome !== "success" && outcome !== "failure") ||
+      (value.source === "server" && outcome !== null) ||
+      (value.source === "client" && status !== null)
     ) {
       return null;
     }
@@ -194,8 +204,7 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
       durationMs,
       status,
       bytes,
-      storeMs,
-      serializationMs,
+      outcome,
     };
   } catch {
     return null;
@@ -218,6 +227,8 @@ export class DashboardTimingRecorder {
   private flushHandle: ReturnType<typeof setImmediate> | undefined;
   private stopped = false;
   private dropped = 0;
+  private lastPrunedAt: number | undefined;
+  private recordedSincePrune = 0;
 
   constructor(
     private readonly events: TimingEventStore,
@@ -249,8 +260,6 @@ export class DashboardTimingRecorder {
     durationMs: number | null;
     status: number | null;
     bytes: number | null;
-    storeMs?: number | null;
-    serializationMs?: number | null;
   }): void {
     this.enqueue({
       v: 1,
@@ -260,8 +269,7 @@ export class DashboardTimingRecorder {
       durationMs: input.durationMs == null ? null : Math.round(input.durationMs),
       status: input.status,
       bytes: input.bytes,
-      storeMs: input.storeMs ?? null,
-      serializationMs: input.serializationMs ?? null,
+      outcome: null,
     });
   }
 
@@ -272,10 +280,9 @@ export class DashboardTimingRecorder {
       label: input.interaction,
       requestIds: input.requestIds,
       durationMs: input.durationMs,
-      status: input.outcome === "success" ? 200 : input.outcome === "failure" ? 500 : null,
+      status: null,
       bytes: null,
-      storeMs: null,
-      serializationMs: null,
+      outcome: input.outcome ?? null,
     });
   }
 
@@ -295,9 +302,13 @@ export class DashboardTimingRecorder {
           ts: entry.ts,
         });
       }
-      // Keep the durable bound strict after every bounded flush; this work is
-      // still after the response and never touches any non-timing event family.
-      if (batch.length > 0) this.prune();
+      // Retention does not belong on every post-response batch. The periodic
+      // maintenance still preserves the age/count bound without making a
+      // busy dashboard pay a delete query after each flush.
+      if (batch.length > 0) {
+        this.recordedSincePrune += batch.length;
+        this.maybePrune();
+      }
     } catch {
       // Telemetry cannot take down the service after its response has already
       // completed. The aggregate exposes this conservative loss count.
@@ -308,15 +319,28 @@ export class DashboardTimingRecorder {
 
   summary(opts: { since: Date; label?: DashboardTimingLabel }): DashboardTimingSummary {
     const since = opts.since.toISOString();
-    const rows = this.events
+    const allRows = this.events
       .listByKindSince(DASHBOARD_TIMING_EVENT_KIND, since, DASHBOARD_TIMING_MAX_RECORDS)
       .flatMap((event) => {
         const payload = parsePayload(event);
-        return payload && (opts.label === undefined || payload.label === opts.label)
-          ? [{ event, payload }]
-          : [];
+        return payload ? [{ event, payload }] : [];
       });
-    return summarize(rows, since, this.dropped);
+    const rows =
+      opts.label === undefined
+        ? allRows
+        : allRows.filter(({ payload }) => payload.label === opts.label);
+    // A filtered client interaction is compared against the whole server
+    // population; otherwise filtering `initial_load` erases every server ID
+    // and turns coverage into a meaningless zero. This is coverage only, not
+    // a joined latency or client-phase analysis.
+    const correlationRows =
+      opts.label !== undefined &&
+      CLIENT_LABELS.includes(opts.label as (typeof CLIENT_LABELS)[number])
+        ? allRows.filter(
+            ({ payload }) => payload.source === "server" || payload.label === opts.label
+          )
+        : rows;
+    return summarize(rows, correlationRows, since, this.dropped);
   }
 
   private enqueue(payload: DashboardTimingPayload): void {
@@ -349,6 +373,19 @@ export class DashboardTimingRecorder {
       new Date(this.now().getTime() - DASHBOARD_TIMING_RETENTION_MS).toISOString(),
       DASHBOARD_TIMING_MAX_RECORDS
     );
+    this.lastPrunedAt = this.now().getTime();
+    this.recordedSincePrune = 0;
+  }
+
+  private maybePrune(): void {
+    const now = this.now().getTime();
+    if (
+      this.lastPrunedAt === undefined ||
+      now - this.lastPrunedAt >= DASHBOARD_TIMING_PRUNE_INTERVAL_MS ||
+      this.recordedSincePrune >= DASHBOARD_TIMING_PRUNE_BATCH_RECORDS
+    ) {
+      this.prune();
+    }
   }
 }
 
@@ -361,8 +398,7 @@ export interface DashboardTimingGroup {
   p99Ms: number | null;
   maxMs: number | null;
   statusBuckets: Record<string, number>;
-  store: { count: number; totalMs: number };
-  serialization: { count: number; totalMs: number };
+  outcomeBuckets: Record<"success" | "failure", number>;
   flagged: boolean;
 }
 
@@ -400,6 +436,7 @@ function thresholdFor(source: TimingSource, label: DashboardTimingLabel): number
 
 function summarize(
   rows: Array<{ event: MeshEvent; payload: DashboardTimingPayload }>,
+  correlationRows: Array<{ event: MeshEvent; payload: DashboardTimingPayload }>,
   since: string,
   droppedSinceStart: number
 ): DashboardTimingSummary {
@@ -409,8 +446,7 @@ function summarize(
       payload: DashboardTimingPayload;
       durations: number[];
       statuses: Map<string, number>;
-      store: number[];
-      serialization: number[];
+      outcomes: Map<"success" | "failure", number>;
       count: number;
     }
   >();
@@ -420,10 +456,9 @@ function summarize(
     const key = `${payload.source}:${payload.label}`;
     const group = groups.get(key) ?? {
       payload,
-      durations: [],
+      durations: [] as number[],
       statuses: new Map<string, number>(),
-      store: [],
-      serialization: [],
+      outcomes: new Map<"success" | "failure", number>(),
       count: 0,
     };
     group.count += 1;
@@ -433,12 +468,14 @@ function summarize(
         `${Math.floor(payload.status / 100)}xx`,
         (group.statuses.get(`${Math.floor(payload.status / 100)}xx`) ?? 0) + 1
       );
-    if (payload.storeMs !== null) group.store.push(payload.storeMs);
-    if (payload.serializationMs !== null) group.serialization.push(payload.serializationMs);
+    if (payload.outcome !== null)
+      group.outcomes.set(payload.outcome, (group.outcomes.get(payload.outcome) ?? 0) + 1);
+    groups.set(key, group);
+  }
+  for (const { payload } of correlationRows) {
     if (payload.source === "server" && payload.requestId) serverRequestIds.add(payload.requestId);
     if (payload.source === "client")
       for (const id of payload.requestIds ?? []) clientRequestIds.add(id);
-    groups.set(key, group);
   }
   const matchedRequestIds = [...clientRequestIds].filter((id) => serverRequestIds.has(id)).length;
   return {
@@ -462,13 +499,9 @@ function summarize(
           p99Ms: percentile(group.durations, 99),
           maxMs: group.durations.length ? Math.max(...group.durations) : null,
           statusBuckets: Object.fromEntries(group.statuses),
-          store: {
-            count: group.store.length,
-            totalMs: group.store.reduce((sum, value) => sum + value, 0),
-          },
-          serialization: {
-            count: group.serialization.length,
-            totalMs: group.serialization.reduce((sum, value) => sum + value, 0),
+          outcomeBuckets: {
+            success: group.outcomes.get("success") ?? 0,
+            failure: group.outcomes.get("failure") ?? 0,
           },
           flagged:
             group.count >= 20 &&

@@ -2434,6 +2434,7 @@ async function composeStart(
     void mcpHttp.removeServer(`${actorId}:${QUOTA_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${CHAT_READ_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${SLACK_READ_MCP_NAME}`);
+    void mcpHttp.removeServer(`${actorId}:${DASHBOARD_TIMING_MCP_NAME}`);
     // Tear down EVERY granted-capability endpoint this actor could have mounted
     //  — iterate the full grantable set, not the current grants, so an
     // endpoint can't leak past retire even after a revoke cleared the grant.

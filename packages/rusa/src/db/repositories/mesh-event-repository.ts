@@ -306,7 +306,7 @@ export class MeshEventRepository {
       SELECT e.rowid AS rowid, e.*, c.body AS chat_body
       FROM mesh_events e
       LEFT JOIN mesh_chat c ON json_extract(e.payload, '$.messageId') = c.id
-      WHERE e.ts >= ?
+      WHERE e.ts >= ? AND e.kind != 'dashboard_timing'
     `;
     if (opts.until != null) {
       sql += ` AND e.ts < ?`;

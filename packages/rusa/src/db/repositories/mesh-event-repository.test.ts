@@ -472,6 +472,20 @@ describe("MeshEventRepository", () => {
       expect(page.events.map((e) => e.detail)).toEqual(["early", "late"]);
     });
 
+    it("excludes dashboard timing diagnostics from the distiller replay window", () => {
+      repo.record({ kind: "run_start", actorId: "a", detail: "substantive", ts: stamp(1) });
+      repo.record({
+        kind: "dashboard_timing",
+        actorId: null,
+        detail: "server:mesh_threads",
+        payload: "{}",
+        ts: stamp(2),
+      });
+
+      const page = repo.listEventsWindow({ since: stamp(0), limit: 50 });
+      expect(page.events.map((event) => event.detail)).toEqual(["substantive"]);
+    });
+
     it("pages with a cursor that resumes exactly after the last served event", () => {
       for (let i = 0; i < 5; i++)
         repo.record({ kind: "run_start", actorId: "a", detail: String(i), ts: stamp(i) });

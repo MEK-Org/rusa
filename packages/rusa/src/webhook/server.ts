@@ -306,7 +306,7 @@ export function createDashboardRequestHandler(
       const requestUrl = new URL(req.url || "/", "http://localhost");
       const { pathname } = requestUrl;
       const timings = dataDeps?.timings;
-      beginDashboardRequestTiming(res, pathname, timings);
+      beginDashboardRequestTiming(res, pathname, req.method, timings);
 
       // Minimal liveness endpoint — always available, even without a live mesh.
       if (req.method === "GET" && pathname === "/api/health") {
