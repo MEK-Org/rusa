@@ -35,9 +35,9 @@ class BenchResponse extends EventEmitter {
   }
 }
 
-function p95(values: number[]): number {
+function percentile(values: number[], fraction: number): number {
   const sorted = [...values].sort((left, right) => left - right);
-  return sorted[Math.ceil(sorted.length * 0.95) - 1] ?? 0;
+  return sorted[Math.ceil(sorted.length * fraction) - 1] ?? 0;
 }
 
 const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -79,9 +79,10 @@ describe.skipIf(process.env.RUSA_BENCH_DASHBOARD_TIMING !== "1")(
 
     afterEach(() => db.close());
 
-    async function measureBatch(timings?: DashboardTimingRecorder): Promise<number> {
-      const started = performance.now();
+    async function measureBatch(timings?: DashboardTimingRecorder): Promise<number[]> {
+      const intervals: number[] = [];
       for (let index = 0; index < BATCH_SIZE; index += 1) {
+        const started = performance.now();
         const response = new BenchResponse();
         if (timings) {
           beginDashboardRequestTiming(
@@ -93,13 +94,14 @@ describe.skipIf(process.env.RUSA_BENCH_DASHBOARD_TIMING !== "1")(
         }
         response.end(BODY);
         // The recorder's setImmediate flush is queued by `finish`; awaiting a
-        // following turn includes that real SQLite overlap in the receipt.
+        // following turn includes that real SQLite overlap in each interval.
         await nextTurn();
+        intervals.push(performance.now() - started);
       }
-      return (performance.now() - started) / BATCH_SIZE;
+      return intervals;
     }
 
-    it("reports paired p95 per-response overhead with real SQLite flush overlap", async () => {
+    it("reports p95 of individual response intervals with real SQLite flush overlap", async () => {
       const baseline: number[] = [];
       const instrumented: number[] = [];
 
@@ -107,30 +109,31 @@ describe.skipIf(process.env.RUSA_BENCH_DASHBOARD_TIMING !== "1")(
       await measureBatch(recorder);
       for (let sample = 0; sample < SAMPLES; sample += 1) {
         if (sample % 2 === 0) {
-          baseline.push(await measureBatch());
-          instrumented.push(await measureBatch(recorder));
+          baseline.push(...(await measureBatch()));
+          instrumented.push(...(await measureBatch(recorder)));
         } else {
-          instrumented.push(await measureBatch(recorder));
-          baseline.push(await measureBatch());
+          instrumented.push(...(await measureBatch(recorder)));
+          baseline.push(...(await measureBatch()));
         }
       }
 
-      const baselineP95Ms = p95(baseline);
-      const instrumentedP95Ms = p95(instrumented);
+      const baselineP95Ms = percentile(baseline, 0.95);
+      const instrumentedP95Ms = percentile(instrumented, 0.95);
       console.log(
         JSON.stringify({
           metric: "dashboard_timing_post_response_sqlite_overlap",
-          samples: SAMPLES,
-          batchSize: BATCH_SIZE,
+          responsesPerArm: SAMPLES * BATCH_SIZE,
           retainedTimingRows: DASHBOARD_TIMING_MAX_RECORDS,
           baselineP95Ms,
           instrumentedP95Ms,
           p95DeltaMs: instrumentedP95Ms - baselineP95Ms,
+          baselineMaxMs: percentile(baseline, 1),
+          instrumentedMaxMs: percentile(instrumented, 1),
           note: "Includes UUID/header/response wrapper/enqueue and next-turn SQLite flush against retained timing rows; it is not an end-to-end dashboard-load latency claim.",
         })
       );
-      expect(baseline).toHaveLength(SAMPLES);
-      expect(instrumented).toHaveLength(SAMPLES);
+      expect(baseline).toHaveLength(SAMPLES * BATCH_SIZE);
+      expect(instrumented).toHaveLength(SAMPLES * BATCH_SIZE);
     });
   }
 );

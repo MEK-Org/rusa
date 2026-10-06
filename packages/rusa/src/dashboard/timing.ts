@@ -134,7 +134,9 @@ export function dashboardTimingLabelForRoute(
   ) {
     return "mesh_obligation_mutation";
   }
-  if (/^\/api\/mesh\/actors\/[^/]+\/chat$/.test(pathname)) return "mesh_actor_chat";
+  if (/^\/api\/mesh\/actors\/[^/]+\/chat$/.test(pathname)) {
+    return isRead ? "mesh_actor_chat" : "mesh_actor_mutation";
+  }
   if (/^\/api\/mesh\/actors\/[^/]+\/inbox$/.test(pathname)) return "mesh_actor_inbox";
   if (/^\/api\/mesh\/actors\/[^/]+$/.test(pathname)) return "mesh_actor_detail";
   if (pathname === "/api/mesh/actors") return isRead ? "mesh_actor_list" : "mesh_actor_mutation";
@@ -302,9 +304,9 @@ export class DashboardTimingRecorder {
           ts: entry.ts,
         });
       }
-      // Retention does not belong on every post-response batch. The periodic
-      // maintenance still preserves the age/count bound without making a
-      // busy dashboard pay a delete query after each flush.
+      // Retention does not belong on every post-response batch: at the 20k-row
+      // bound, pruning each flush added ~21 ms to per-response p95 in the
+      // overhead benchmark. Periodic maintenance keeps the age/count bound.
       if (batch.length > 0) {
         this.recordedSincePrune += batch.length;
         this.maybePrune();

@@ -93,14 +93,26 @@ describe("dashboard timing server wrapper", () => {
       recorder
     );
     mutation.end("created");
+    const chatSend = new TestResponse();
+    beginDashboardRequestTiming(
+      chatSend as unknown as ServerResponse,
+      "/api/mesh/actors/actor-1/chat",
+      "POST",
+      recorder
+    );
+    chatSend.end("sent");
 
-    expect(recordServer).toHaveBeenCalledTimes(2);
+    expect(recordServer).toHaveBeenCalledTimes(3);
     expect(recordServer).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({ label: "mesh_actor_list" })
     );
     expect(recordServer).toHaveBeenNthCalledWith(
       2,
+      expect.objectContaining({ label: "mesh_actor_mutation" })
+    );
+    expect(recordServer).toHaveBeenNthCalledWith(
+      3,
       expect.objectContaining({ label: "mesh_actor_mutation" })
     );
   });

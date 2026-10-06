@@ -247,18 +247,23 @@ export class MeshEventRepository {
 
   /**
    * Read one bounded, content-free event family without materialising unrelated
-   * transcript bodies. Callers own the meaning of `kind`; this repository only
+   * transcript bodies. A capped read keeps the newest `limit` rows, returned
+   * oldest-first. Callers own the meaning of `kind`; this repository only
    * supplies the append-only storage primitive.
    */
   listByKindSince(kind: string, sinceISO: string, limit: number): MeshEvent[] {
     if (limit <= 0) return [];
     const rows = this.db
       .prepare(
-        `SELECT id, ts, kind, actor_id, detail, NULL AS body, payload, success
-         FROM mesh_events
-         WHERE kind = ? AND ts >= ?
-         ORDER BY ts ASC, rowid ASC
-         LIMIT ?`
+        `SELECT id, ts, kind, actor_id, detail, body, payload, success
+         FROM (
+           SELECT rowid AS seq, id, ts, kind, actor_id, detail, NULL AS body, payload, success
+           FROM mesh_events
+           WHERE kind = ? AND ts >= ?
+           ORDER BY ts DESC, rowid DESC
+           LIMIT ?
+         )
+         ORDER BY ts ASC, seq ASC`
       )
       .all(kind, sinceISO, limit) as MeshEventRow[];
     return rows.map(toMeshEvent);

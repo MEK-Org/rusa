@@ -109,9 +109,18 @@ describe("MeshEventRepository", () => {
         body: "must not be read",
       });
 
+      repo.record({
+        id: "timing-newest",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T10:00:01.000Z",
+      });
+
       const rows = repo.listByKindSince("dashboard_timing", "2026-10-05T10:00:00.000Z", 10);
-      expect(rows.map((row) => row.id)).toEqual(["timing-first", "timing-second"]);
-      expect(rows.map((row) => row.body)).toEqual([null, null]);
+      expect(rows.map((row) => row.id)).toEqual(["timing-first", "timing-second", "timing-newest"]);
+      expect(rows.map((row) => row.body)).toEqual([null, null, null]);
+      // A cap between prunes keeps the newest observations, still oldest-first.
+      const capped = repo.listByKindSince("dashboard_timing", "2026-10-05T10:00:00.000Z", 2);
+      expect(capped.map((row) => row.id)).toEqual(["timing-second", "timing-newest"]);
     });
 
     it("prunes only the requested event family by age and newest-record bound", () => {
