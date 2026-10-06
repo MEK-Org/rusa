@@ -358,7 +358,6 @@ describe("0056_actor_execution_config", () => {
       { id: "root", role: "parent" },
     ]);
     reopened.close();
-
   });
 
   it("fails the read of rows a pre-change binary writes afterwards (the rollback limit)", () => {

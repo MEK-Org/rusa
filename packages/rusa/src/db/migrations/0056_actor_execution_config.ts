@@ -95,10 +95,7 @@ function extractLegacyV2Context(
 
 function isLegacyContext(context: Record<string, unknown>): boolean {
   const keys = Object.keys(context);
-  if (
-    context.schemaVersion !== 2 ||
-    (context.type !== "native" && context.type !== "portable")
-  ) {
+  if (context.schemaVersion !== 2 || (context.type !== "native" && context.type !== "portable")) {
     return false;
   }
   if (context.type === "native") {
@@ -110,10 +107,7 @@ function isLegacyContext(context: Record<string, unknown>): boolean {
   return (
     keys.every(
       (key) =>
-        key === "schemaVersion" ||
-        key === "type" ||
-        key === "mode" ||
-        key === "compactionModel"
+        key === "schemaVersion" || key === "type" || key === "mode" || key === "compactionModel"
     ) &&
     (context.mode === "tail" || context.mode === "ledger") &&
     (context.compactionModel === undefined || typeof context.compactionModel === "string")

@@ -14470,7 +14470,6 @@ describe("accountRun token accounting (#443)", () => {
       expect(registry.get("child")?.parentId).toBe("root");
       expect(registry.get("root")?.title).toBe("Root again");
     });
-
   });
 });
 
