@@ -16,7 +16,7 @@ function setup(options?: Partial<ActorMeshOptions>) {
     id: "root",
     charter: "root",
     parentId: null,
-    isRoot: true,
+    sandboxed: false,
     status: "active",
     createdAt: "2026-01-01T00:00:00Z",
   });

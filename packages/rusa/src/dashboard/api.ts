@@ -2192,7 +2192,7 @@ export async function handleMeshApiRequest(
 
         return {
           id: r.id,
-          handle: r.isRoot === true ? rootHandle : generateHandle(r.id),
+          handle: r.parentId === null ? rootHandle : generateHandle(r.id),
           parentId: r.parentId,
           status: r.status,
           executionTarget: r.executionTarget ?? null,

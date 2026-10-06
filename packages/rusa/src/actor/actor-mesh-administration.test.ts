@@ -23,8 +23,8 @@ const FIXTURE_EXPERIMENT = "fixture_rollout";
 /**
  * Authority over other actors is grant-derived (#549). These characterizations
  * pin the boundary: an opaque-id actor holding a grant may administer its
- * subtree; a parentless actor, an `isRoot: true` record, or the literal `root`
- * address without a grant may not; revocation withdraws authority immediately.
+ * subtree; a parentless actor or the literal `root` address without a grant
+ * may not; revocation withdraws authority immediately.
  */
 
 // The generic `secret` base is grantable (#542); the parent-grantable path
@@ -46,6 +46,7 @@ function record(
     id,
     charter: id,
     parentId,
+    sandboxed: parentId !== null,
     status: "active",
     createdAt: "2026-01-01T00:00:00Z",
     ...extra,
@@ -77,9 +78,9 @@ function setup() {
     }),
   });
   // The configured actor: parentless and flagged, exactly as the wiring adopts it.
-  actors.upsert(record("configured", null, { isRoot: true }));
+  actors.upsert(record("configured", null));
   // A second parentless, flagged actor with its own subtree and no grants.
-  actors.upsert(record("other-parentless", null, { isRoot: true }));
+  actors.upsert(record("other-parentless", null));
   actors.upsert(record("other-child", "other-parentless"));
   // An opaque-id steward under the configured actor, with a child of its own.
   actors.upsert(record("0b2c3d4e-steward", "configured"));
@@ -116,7 +117,7 @@ describe("capability administration is grant-derived", () => {
     ).toThrow(/own subtree/);
   });
 
-  it("refuses an ungranted parentless isRoot record and the literal root address", () => {
+  it("refuses an ungranted parentless record and the literal root address", () => {
     const { mesh } = setup();
     expect(() =>
       mesh.grantCapability("other-child", "understanding-write", "other-parentless")
@@ -223,7 +224,7 @@ describe("experiment administration is grant-derived", () => {
     ).toEqual({ actorId: "steward-child", changed: true });
   });
 
-  it("refuses an ungranted parentless isRoot record", () => {
+  it("refuses an ungranted parentless record", () => {
     const { mesh } = setup();
     expect(() =>
       mesh.enrollActorInExperiment("other-child", FIXTURE_EXPERIMENT, "other-parentless")

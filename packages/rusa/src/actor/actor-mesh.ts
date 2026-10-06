@@ -1316,12 +1316,32 @@ export class ActorMesh {
    * changing stable creation metadata.
    */
   adopt(record: ActorRecord, actor: MeshActor): void {
+    this.assertSingleTopLevel(record);
     const existing = this.actors.get(record.id);
     this.actors.upsert(existing ? { ...existing, ...record } : record);
     this.runs.register(record.id, actor);
     if (actor.lifecycle) this.lifecycles.set(record.id, actor.lifecycle);
     else this.lifecycleFor(record.id);
     this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
+  }
+
+  /**
+   * The running daemon still boots exactly one top-level actor. The repository
+   * can store several parentless actors now (#550), but that is not authority
+   * to create them: until forest boot lands, adoption refuses a second one,
+   * retired or not, as the dropped unique index did. {@link spawn} cannot make
+   * one at all, since it always resolves a parent.
+   */
+  private assertSingleTopLevel(record: ActorRecord): void {
+    if (record.parentId !== null) return;
+    const other = this.actors
+      .list()
+      .find((existing) => existing.parentId === null && existing.id !== record.id);
+    if (other) {
+      throw new Error(
+        `Cannot add ${record.id} as a second top-level actor: ${other.id} is already top-level`
+      );
+    }
   }
 
   /**
@@ -3061,6 +3081,8 @@ export class ActorMesh {
       // instead of creating a fresh one (loadSessionId reads record.sessionId).
       sessionId: req.conversationId,
       title: req.title,
+      // The worker builder sandboxes every child it runs (#550).
+      sandboxed: true,
       executionTarget: req.executionTarget,
       // Every actor gets its own walkie-talkie voice at birth so a transfer or
       // multi-actor chat is audible as different speakers; the operator can
@@ -3193,9 +3215,8 @@ export class ActorMesh {
 
   /**
    * Whether `actorId` currently holds `capability` as an active grant (#549).
-   * This is the only source of administrative authority: a parentless record,
-   * the `isRoot` flag, and the literal `root` address confer nothing on their
-   * own. Fail-closed — an unknown or unaddressed actor holds nothing.
+   * This is the only source of administrative authority: a parentless record
+   * and the literal `root` address confer nothing on their own. Fail-closed — an unknown or unaddressed actor holds nothing.
    */
   hasActiveCapability(actorId: string | undefined, capability: string): boolean {
     if (!actorId) return false;
@@ -5179,9 +5200,6 @@ export class ActorMesh {
     const record = this.actors.get(id);
     if (!record) {
       throw new Error(`Cannot reparent unknown thread: ${id}`);
-    }
-    if (record.isRoot === true) {
-      throw new Error(`Cannot reparent the root (${id})`);
     }
     if (record.parentId == null) {
       throw new Error(`Cannot give the top-level thread ${id} a parent`);

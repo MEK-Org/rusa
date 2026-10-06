@@ -44,7 +44,7 @@ describe("list_subscriptions performance and event loop safety (#687)", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      isRoot: true,
+      sandboxed: false,
       status: "active",
       createdAt: new Date().toISOString(),
     });
@@ -55,6 +55,7 @@ describe("list_subscriptions performance and event loop safety (#687)", () => {
         id: s,
         charter: s,
         parentId: "root",
+        sandboxed: true,
         status: "active",
         createdAt: new Date().toISOString(),
       });
@@ -68,6 +69,7 @@ describe("list_subscriptions performance and event loop safety (#687)", () => {
         id: w,
         charter: w,
         parentId: stewards[i % stewards.length],
+        sandboxed: true,
         status: i < 30 ? "retired" : "active",
         createdAt: new Date().toISOString(),
       });
@@ -192,7 +194,7 @@ describe("list_subscriptions performance and event loop safety (#687)", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      isRoot: true,
+      sandboxed: false,
       status: "active",
       createdAt: new Date().toISOString(),
     });
@@ -201,6 +203,7 @@ describe("list_subscriptions performance and event loop safety (#687)", () => {
       id: "steward-1",
       charter: "steward-1",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: new Date().toISOString(),
     });
@@ -209,6 +212,7 @@ describe("list_subscriptions performance and event loop safety (#687)", () => {
       id: "steward-2",
       charter: "steward-2",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: new Date().toISOString(),
     });
@@ -217,6 +221,7 @@ describe("list_subscriptions performance and event loop safety (#687)", () => {
       id: "worker-s1",
       charter: "worker-s1",
       parentId: "steward-1",
+      sandboxed: true,
       status: "active",
       createdAt: new Date().toISOString(),
     });
@@ -225,6 +230,7 @@ describe("list_subscriptions performance and event loop safety (#687)", () => {
       id: "worker-s2",
       charter: "worker-s2",
       parentId: "steward-2",
+      sandboxed: true,
       status: "active",
       createdAt: new Date().toISOString(),
     });

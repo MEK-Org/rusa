@@ -75,6 +75,7 @@ describe("pnpm hardlinks MCP", () => {
       id: "worker-1",
       charter: "test",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-06-30T00:00:00.000Z",
     });

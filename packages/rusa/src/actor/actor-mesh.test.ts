@@ -54,6 +54,7 @@ import type {
   ActorFactoryContext,
   ActorMeshOptions,
   LiveObligationSummary,
+  MeshActor,
   MeshObligationPort,
   RetireCleanup,
   SpawnRequest,
@@ -591,7 +592,7 @@ function setup(
       id: rootId,
       charter: "root",
       parentId: null,
-      isRoot: true,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     },
@@ -774,7 +775,7 @@ describe("ActorMesh", () => {
         id: externalId,
         charter: "external root",
         parentId: "root",
-        isRoot: false,
+        sandboxed: true,
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       },
@@ -960,6 +961,7 @@ describe("ActorMesh", () => {
       id: "t1",
       charter: "resumed work",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -984,6 +986,7 @@ describe("ActorMesh", () => {
       id: "t1",
       charter: "bad worker",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -991,6 +994,7 @@ describe("ActorMesh", () => {
       id: "t2",
       charter: "good worker",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1039,6 +1043,7 @@ describe("ActorMesh", () => {
       id: "dead",
       charter: "done",
       parentId: "root",
+      sandboxed: true,
       status: "retired",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1054,6 +1059,7 @@ describe("ActorMesh", () => {
       id: "t1",
       charter: "work",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1069,6 +1075,7 @@ describe("ActorMesh", () => {
       id: "t1",
       charter: "the elder",
       parentId: "root",
+      sandboxed: true,
       sessionId: "agy-conv-xyz",
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
@@ -1102,6 +1109,7 @@ describe("ActorMesh", () => {
       id: "t1",
       charter: "resumed work",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1126,6 +1134,7 @@ describe("ActorMesh", () => {
         id,
         charter: "resumed work",
         parentId: "root",
+        sandboxed: true,
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       });
@@ -5341,7 +5350,7 @@ describe("ActorMesh", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      isRoot: true,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5349,6 +5358,7 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5373,7 +5383,7 @@ describe("ActorMesh", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      isRoot: true,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5381,6 +5391,7 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5411,6 +5422,7 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5431,6 +5443,7 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5460,6 +5473,7 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5482,6 +5496,7 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5504,6 +5519,7 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5524,6 +5540,7 @@ describe("ActorMesh", () => {
       id: "worker-thread",
       charter: "doc-toolkit steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5797,6 +5814,7 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5813,14 +5831,15 @@ describe("ActorMesh", () => {
       id: "ab-rig-holder",
       charter: "rig holder",
       parentId: null,
-      isRoot: false,
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
     registry.upsert({
       id: "legacy-parentless",
-      charter: "legacy record without explicit isRoot",
+      charter: "legacy parentless record",
       parentId: null,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5828,17 +5847,18 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
 
-    // Root (with isRoot: true) has grant and revoke authority
+    // Root has grant and revoke authority
     expect(() => mesh.grantCapability("iu-thread", "understanding-write", "root")).not.toThrow();
     await expect(
       mesh.revokeCapability("iu-thread", "understanding-write", "root")
     ).resolves.not.toThrow();
 
-    // ab-rig-holder (parentId: null, isRoot: false) is refused grant & revoke authority
+    // A sandboxed parentless record (ab-rig-holder shape) is refused grant & revoke authority
     expect(() => mesh.grantCapability("iu-thread", "understanding-write", "ab-rig-holder")).toThrow(
       /only a capability-admin holder may grant/
     );
@@ -5846,7 +5866,8 @@ describe("ActorMesh", () => {
       mesh.revokeCapability("iu-thread", "understanding-write", "ab-rig-holder")
     ).rejects.toThrow(/only a capability-admin holder may revoke/);
 
-    // Legacy parentless record without explicit isRoot (defaults falsy) is also refused
+    // So is a parentless record that runs unsandboxed, as root does: neither
+    // topology nor sandboxed confers authority
     expect(() =>
       mesh.grantCapability("iu-thread", "understanding-write", "legacy-parentless")
     ).toThrow(/only a capability-admin holder may grant/);
@@ -5860,7 +5881,7 @@ describe("ActorMesh", () => {
       id: "account-b-root",
       charter: "another account root",
       parentId: null,
-      isRoot: true,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5868,6 +5889,7 @@ describe("ActorMesh", () => {
       id: "account-b-child",
       charter: "another account child",
       parentId: "account-b-root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5875,7 +5897,7 @@ describe("ActorMesh", () => {
     expect(() => mesh.grantCapability("account-b-child", "understanding-write", "root")).toThrow(
       /own subtree/
     );
-    // Being parentless/isRoot confers nothing: the other tree's root is refused
+    // Being parentless confers nothing: the other tree's root is refused
     // until it holds capability-admin itself (a row, not a topology inference).
     expect(() =>
       mesh.grantCapability("account-b-child", "understanding-write", "account-b-root")
@@ -8109,7 +8131,9 @@ describe("ActorMesh", () => {
     const a = mesh.spawn({ charter: "a", parentId: "root" });
     const b = mesh.spawn({ charter: "b", parentId: a }); // b is a's child
 
-    expect(() => mesh.reparentThread("root", a)).toThrow(/reparent the root/);
+    expect(() => mesh.reparentThread("root", a)).toThrow(
+      /Cannot give the top-level thread root a parent/
+    );
     expect(() => mesh.reparentThread(a, a)).toThrow(/to itself/);
     expect(() => mesh.reparentThread(a, "non-existent")).toThrow(/unknown parent/);
     expect(() => mesh.reparentThread("non-existent", a)).toThrow(/unknown thread/);
@@ -11059,7 +11083,7 @@ describe("ActorMesh", () => {
       const { mesh, registry } = setup({ rootId: generatedRootId });
       const ownChild = mesh.spawn({ charter: "own child", parentId: "root" });
       const otherRoot = mesh.spawn({ charter: "another account root", parentId: "root" });
-      registry.patch(otherRoot, { parentId: null, isRoot: true });
+      registry.patch(otherRoot, { parentId: null });
       const otherChild = mesh.spawn({ charter: "other child", parentId: otherRoot });
 
       expect(() => mesh.interrupt(ownChild, "root")).not.toThrow();
@@ -14361,6 +14385,104 @@ describe("accountRun token accounting (#443)", () => {
       expect(sqliteInbox.countUnhandled(queuedWorker)).toBe(0);
 
       db.close();
+    });
+  });
+
+  describe("single top-level actor guard (#550)", () => {
+    const dummyActor = (id: string): MeshActor => ({
+      id,
+      requestRun: () => {},
+      markUnkillable: () => {},
+      close: () => {},
+      preemptForResponsive: () => ({ preempted: false }),
+      isRunning: false,
+    });
+
+    it("refuses to adopt a second parentless actor, leaving the repository unchanged", () => {
+      const { mesh, registry } = setup();
+      const before = registry.list();
+
+      expect(() =>
+        mesh.adopt(
+          {
+            id: "second",
+            charter: "second",
+            parentId: null,
+            sandboxed: false,
+            status: "active",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+          dummyActor("second")
+        )
+      ).toThrow("Cannot add second as a second top-level actor: root is already top-level");
+
+      expect(registry.list()).toEqual(before);
+      expect(mesh.isLiveActor("second")).toBe(false);
+    });
+
+    it("counts a retired parentless actor as the top-level one", () => {
+      const { mesh, registry } = setup();
+      registry.patch("root", { status: "retired" });
+      expect(registry.get("root")?.status).toBe("retired");
+
+      expect(() =>
+        mesh.adopt(
+          {
+            id: "second",
+            charter: "second",
+            parentId: null,
+            sandboxed: false,
+            status: "active",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+          dummyActor("second")
+        )
+      ).toThrow(/second top-level actor: root/);
+    });
+
+    it("re-adopts the top-level actor itself and adopts actors with a parent", () => {
+      const { mesh, registry } = setup();
+      mesh.adopt(
+        {
+          id: "root",
+          charter: "root",
+          parentId: null,
+          sandboxed: false,
+          status: "active",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          title: "Root again",
+        },
+        dummyActor("root")
+      );
+      mesh.adopt(
+        {
+          id: "child",
+          charter: "child",
+          parentId: "root",
+          sandboxed: true,
+          status: "active",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+        dummyActor("child")
+      );
+
+      expect(registry.list().filter((a) => a.parentId === null)).toHaveLength(1);
+      expect(registry.get("child")?.parentId).toBe("root");
+      expect(registry.get("root")?.title).toBe("Root again");
+    });
+
+    it("is the mesh's rule, not the repository's", () => {
+      const { registry } = setup();
+      registry.upsert({
+        id: "second",
+        charter: "second",
+        parentId: null,
+        sandboxed: false,
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+
+      expect(registry.list().filter((a) => a.parentId === null)).toHaveLength(2);
     });
   });
 });

@@ -261,7 +261,7 @@ function setup(
       id: rootId,
       charter: "root",
       parentId: null,
-      isRoot: true,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     },
@@ -335,7 +335,7 @@ describe("administrative capability gating of management tools (#549)", () => {
     return tools.map((t) => t.name);
   }
 
-  it("shows no management tool on an ungranted parentless (isRoot) endpoint", async () => {
+  it("shows no management tool on an ungranted parentless endpoint", async () => {
     const { mesh } = setup({ seedRootGrants: false });
     const client = await connect(
       createAgentExecMcpServer(mesh, "root", "root", undefined, modelClassDeps())
@@ -352,6 +352,7 @@ describe("administrative capability gating of management tools (#549)", () => {
       id: "0b2c3d4e-steward",
       charter: "steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -386,6 +387,7 @@ describe("administrative capability gating of management tools (#549)", () => {
         id,
         charter: id,
         parentId,
+        sandboxed: parentId !== null,
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       });
@@ -427,6 +429,7 @@ describe("administrative capability gating of management tools (#549)", () => {
       id: "0b2c3d4e-steward",
       charter: "steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -463,6 +466,7 @@ describe("administrative capability gating of management tools (#549)", () => {
       id: "worker-a",
       charter: "worker",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -544,6 +548,7 @@ describe("administrative capability gating of management tools (#549)", () => {
         id,
         charter: id,
         parentId,
+        sandboxed: parentId !== null,
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       });
@@ -614,6 +619,7 @@ describe("administrative capability gating of management tools (#549)", () => {
         id,
         charter: id,
         parentId,
+        sandboxed: parentId !== null,
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       });
@@ -749,6 +755,7 @@ describe("administrative capability gating of management tools (#549)", () => {
       id: "0b2c3d4e-steward",
       charter: "steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1791,6 +1798,7 @@ describe("agent-execution MCP server", () => {
       id: "stranger",
       charter: "not mine",
       parentId: "someone-else",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1908,6 +1916,7 @@ describe("agent-execution MCP server", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1932,6 +1941,7 @@ describe("agent-execution MCP server", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1950,6 +1960,7 @@ describe("agent-execution MCP server", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1973,6 +1984,7 @@ describe("agent-execution MCP server", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -3700,6 +3712,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       id: "73e0b00f",
       charter: "nightly",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -4946,6 +4959,7 @@ describe("own voice tools (#817)", () => {
         id,
         charter: id,
         parentId: "root",
+        sandboxed: true,
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       });

@@ -185,11 +185,13 @@ function durableRecord(
     ...(context ? { context } : {}),
     ...(legacy.title ? { title: legacy.title } : {}),
     ...(legacy.sessionId ? { sessionId: legacy.sessionId } : {}),
+    // The same rule migration 0056 backfills with: the sole root ran
+    // unsandboxed and every descendant sandboxed (#550).
+    sandboxed: legacy.parentId !== null,
     status: legacy.status,
     createdAt: toCanonicalTimestamp(legacy.createdAt),
   };
   if (record.parentId === null) {
-    record.isRoot = true;
     if (rootSessionId && record.context?.type !== "portable") record.sessionId = rootSessionId;
   }
   if (record.sessionId && !record.context) record.context = { type: "native" };

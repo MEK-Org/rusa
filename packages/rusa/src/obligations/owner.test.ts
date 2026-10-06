@@ -9,7 +9,14 @@ const USER_B = "22222222-0000-4000-8000-000000000002";
 const actors = {
   get: (id: string): ActorRecord | undefined =>
     id === ACTOR
-      ? { id, charter: "c", parentId: null, status: "active", createdAt: "2026-01-01T00:00:00Z" }
+      ? {
+          id,
+          charter: "c",
+          parentId: null,
+          sandboxed: false,
+          status: "active",
+          createdAt: "2026-01-01T00:00:00Z",
+        }
       : undefined,
 };
 const users: UserPrincipal[] = [USER_A, USER_B].map((id) => ({

@@ -8,6 +8,7 @@ function record(id: string, overrides: Partial<ActorRecord> = {}): ActorRecord {
     id,
     charter: `charter ${id}`,
     parentId: "root",
+    sandboxed: true,
     status: "active",
     createdAt: "2026-01-01T00:00:00.000Z",
     ...overrides,
@@ -17,7 +18,7 @@ function record(id: string, overrides: Partial<ActorRecord> = {}): ActorRecord {
 describe("resolveRootActorId", () => {
   it("returns the single parentless actor", () => {
     const actors = new InMemoryActorRepository();
-    actors.upsert(record("generated-root", { parentId: null, isRoot: true }));
+    actors.upsert(record("generated-root", { parentId: null, sandboxed: false }));
     actors.upsert(record("worker", { parentId: "generated-root" }));
 
     expect(resolveRootActorId(actors, () => "new-id")).toBe("generated-root");
@@ -31,8 +32,8 @@ describe("resolveRootActorId", () => {
 
   it("rejects ambiguous root topology", () => {
     const actors = new InMemoryActorRepository();
-    actors.upsert(record("root-a", { parentId: null, isRoot: true }));
-    actors.upsert(record("root-b", { parentId: null, isRoot: true }));
+    actors.upsert(record("root-a", { parentId: null, sandboxed: false }));
+    actors.upsert(record("root-b", { parentId: null, sandboxed: false }));
 
     expect(() => resolveRootActorId(actors)).toThrow(/multiple root records found: root-a, root-b/);
   });

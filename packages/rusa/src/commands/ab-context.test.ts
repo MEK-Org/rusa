@@ -34,7 +34,7 @@ function setup() {
       id: ROOT_ID,
       charter: "root",
       parentId: null,
-      isRoot: true,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     },
@@ -100,7 +100,7 @@ describe("A/B arm parenting ", () => {
     adoptRigHolder(mesh, ROOT_ID);
     const rec = registry.get(RIG_HOLDER_ID);
     expect(rec?.parentId).toBe(ROOT_ID);
-    expect(rec?.isRoot).toBe(false);
+    expect(rec?.sandboxed).toBe(true);
     expect(rec?.status).toBe("active");
     expect(rec?.modelConfig).toBeUndefined();
   });

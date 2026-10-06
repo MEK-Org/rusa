@@ -113,6 +113,7 @@ function record(id: string, overrides: Partial<ActorRecord> = {}): ActorRecord {
     id,
     charter: `charter for ${id}`,
     parentId: "root",
+    sandboxed: true,
     status: "active",
     createdAt: "2026-01-01T00:00:00.000Z",
     ...overrides,

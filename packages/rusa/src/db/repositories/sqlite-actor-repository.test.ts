@@ -19,7 +19,7 @@ const root: ActorRecord = {
   sessionId: "session-1",
   context: { type: "native" },
   title: "Root",
-  isRoot: true,
+  sandboxed: false,
   status: "active",
   createdAt: "2026-09-03T13:00:00.000Z",
 };
@@ -52,6 +52,7 @@ describe("SqliteActorRepository", () => {
       id: "worker",
       charter: "Implement a slice",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       context: { type: "portable", mode: "ledger", compactionModel: "gemini-test" },
       handles: [{ id: "root", role: "parent" }],
@@ -136,6 +137,7 @@ describe("SqliteActorRepository", () => {
       id: "worker",
       charter: "Implement a slice",
       parentId: "root",
+      sandboxed: true,
       modelClass: "fast",
       status: "active",
       createdAt: "2026-09-03T13:01:00.000Z",
@@ -162,6 +164,7 @@ describe("SqliteActorRepository", () => {
       id: "worker",
       charter: "Implement a slice",
       parentId: "root",
+      sandboxed: true,
       modelClass: "fast",
       status: "active",
       createdAt: "2026-09-03T13:01:00.000Z",
@@ -188,6 +191,7 @@ describe("SqliteActorRepository", () => {
       id: "broken",
       charter: "Broken class binding",
       parentId: "root",
+      sandboxed: true,
       modelClass: "broken-class",
       status: "active",
       createdAt: "2026-09-03T13:01:00.000Z",
@@ -196,6 +200,7 @@ describe("SqliteActorRepository", () => {
       id: "missing",
       charter: "Missing class binding",
       parentId: "root",
+      sandboxed: true,
       modelClass: "missing-class",
       status: "active",
       createdAt: "2026-09-03T13:02:00.000Z",
@@ -356,6 +361,8 @@ describe("SqliteActorRepository", () => {
       '{"schemaVersion":1,"type":"native","mode":"tail"}',
       '{"schemaVersion":1,"type":"native","executionTarget":"mac-mini"}',
       '{"schemaVersion":2,"type":"native","unknown":true}',
+      // v2 carried the placement until 0056 moved it to execution_config.
+      '{"schemaVersion":2,"type":"native","executionTarget":"mac-mini"}',
     ]) {
       db.prepare("UPDATE actors SET context_config = ? WHERE id = 'root'").run(invalid);
       expect(() => repository.get("root")).toThrow(/invalid context_config for actor 'root'/);
@@ -368,6 +375,7 @@ describe("SqliteActorRepository", () => {
       id: "worker",
       charter: "Work",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-09-03T13:01:00.000Z",
     });
@@ -385,6 +393,7 @@ describe("SqliteActorRepository", () => {
         id: peerId,
         charter: `Charter for ${peerId}`,
         parentId: "root",
+        sandboxed: true,
         status: "active",
         createdAt: "2026-09-03T13:00:00.000Z",
       });
@@ -393,6 +402,7 @@ describe("SqliteActorRepository", () => {
       id: "worker-handles",
       charter: "Test handle origins",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       handles: [
         { id: "peer-1", origin: "message" },
@@ -446,6 +456,7 @@ describe("SqliteActorRepository", () => {
       id: "titled-peer",
       charter: "Review release candidates\nand more",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       title: "Release reviewer",
       createdAt: "2026-09-03T13:00:00.000Z",
@@ -454,6 +465,7 @@ describe("SqliteActorRepository", () => {
       id: "untitled-peer",
       charter: "Triage incoming issues",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-09-03T13:00:00.000Z",
     });
@@ -461,6 +473,7 @@ describe("SqliteActorRepository", () => {
       id: "holder",
       charter: "Hold handles",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-09-03T13:01:00.000Z",
     });
@@ -510,6 +523,7 @@ describe("SqliteActorRepository", () => {
       id: "worker",
       charter: "Work",
       parentId: "root",
+      sandboxed: true,
       status: "retired",
       createdAt: "2026-09-03T13:01:00.000Z",
     });
@@ -536,6 +550,7 @@ describe("SqliteActorRepository", () => {
         id: `worker-${i}`,
         charter: "Work",
         parentId: "root",
+        sandboxed: true,
         status: "active",
         createdAt: "2026-09-03T13:01:00.000Z",
       });
@@ -574,6 +589,7 @@ describe("SqliteActorRepository", () => {
         id: "worker",
         charter: "Persist",
         parentId: "root",
+        sandboxed: true,
         status: "active",
         handles: [{ id: "root", role: "parent" }],
         createdAt: "2026-09-03T13:01:00.000Z",
@@ -582,10 +598,13 @@ describe("SqliteActorRepository", () => {
 
       const reopened = new Database(file);
       reopened.pragma("foreign_keys = ON");
-      expect(new SqliteActorRepository(reopened).get("worker")).toMatchObject({
+      const reread = new SqliteActorRepository(reopened);
+      expect(reread.get("worker")).toMatchObject({
         id: "worker",
+        sandboxed: true,
         handles: [{ id: "root", role: "parent" }],
       });
+      expect(reread.get("root")).toEqual(root);
       reopened.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -595,26 +614,118 @@ describe("SqliteActorRepository", () => {
   it("enforces relational ownership invariants", () => {
     expect(() => repository.upsert({ ...root, parentId: "missing" })).toThrow();
     repository.upsert(root);
-    expect(() => repository.upsert({ ...root, id: "second-root" })).toThrow();
-    expect(() =>
-      repository.upsert({ ...root, id: "root-with-parent", parentId: "root" })
-    ).toThrow();
     expect(() =>
       db.prepare("INSERT INTO actor_handles (actor_id, target_id) VALUES ('missing', 'root')").run()
     ).toThrow();
   });
 
-  it("refuses a parentless, non-root record", () => {
-    expect(() =>
-      repository.upsert({
-        id: "driver",
-        charter: "A/B driver stub",
-        parentId: null,
-        isRoot: false,
-        status: "active",
-        createdAt: "2026-09-03T13:00:00.000Z",
-      })
-    ).toThrow();
+  it("stores several parentless actors, each with its own sandboxed value (#550)", () => {
+    repository.upsert(root);
+    const driver: ActorRecord = {
+      id: "driver",
+      charter: "A/B driver stub",
+      parentId: null,
+      sandboxed: true,
+      status: "active",
+      createdAt: "2026-09-03T13:05:00.000Z",
+    };
+    repository.upsert(driver);
+
+    expect(repository.list().filter((record) => record.parentId === null)).toEqual([root, driver]);
+    expect(repository.get("driver")).toEqual(driver);
+    expect(repository.get("root")).not.toHaveProperty("isRoot");
+  });
+
+  it("keeps sandboxed across a parent change (#550)", () => {
+    repository.upsert(root);
+    repository.upsert({
+      id: "lead",
+      charter: "Lead",
+      parentId: "root",
+      sandboxed: true,
+      status: "active",
+      createdAt: "2026-09-03T13:01:00.000Z",
+    });
+    repository.upsert({
+      id: "worker",
+      charter: "Implement",
+      parentId: "lead",
+      sandboxed: false,
+      status: "active",
+      createdAt: "2026-09-03T13:02:00.000Z",
+    });
+
+    repository.patch("worker", { parentId: "root" });
+    repository.patch("lead", { parentId: null });
+
+    expect(repository.get("worker")).toMatchObject({
+      parentId: "root",
+      sandboxed: false,
+    });
+    expect(repository.get("lead")).toMatchObject({
+      parentId: null,
+      sandboxed: true,
+    });
+  });
+
+  it("refuses a write that leaves sandboxed out or does not state it as a boolean (#550)", () => {
+    const { sandboxed: _omitted, ...withoutSandboxed } = root;
+    for (const sandboxed of [undefined, null, "true", 1, ""]) {
+      expect(() =>
+        repository.upsert({ ...withoutSandboxed, sandboxed } as unknown as ActorRecord)
+      ).toThrow(/invalid execution_config for actor 'root'/);
+    }
+    expect(repository.get("root")).toBeUndefined();
+  });
+
+  it("stores how an actor runs in its own versioned execution_config (#550)", () => {
+    repository.upsert({
+      ...root,
+      context: { type: "native" },
+      sessionId: "session-root",
+      executionTarget: "follower-a",
+    });
+    const row = db
+      .prepare("SELECT context_config, execution_config FROM actors WHERE id = 'root'")
+      .get() as { context_config: string; execution_config: string };
+    expect(JSON.parse(row.execution_config)).toEqual({
+      schemaVersion: 1,
+      sandboxed: false,
+      executionTarget: "follower-a",
+    });
+    // context_config keeps only the context selection and the session.
+    expect(JSON.parse(row.context_config)).toEqual({
+      schemaVersion: 1,
+      type: "native",
+      sessionId: "session-root",
+    });
+
+    // Clearing the placement returns the actor to the leader.
+    repository.patch("root", { executionTarget: undefined });
+    expect(repository.get("root")?.executionTarget).toBeUndefined();
+    expect(
+      JSON.parse(
+        (
+          db.prepare("SELECT execution_config FROM actors WHERE id = 'root'").get() as {
+            execution_config: string;
+          }
+        ).execution_config
+      )
+    ).toEqual({ schemaVersion: 1, sandboxed: false });
+  });
+
+  it.each([
+    ["missing", null, /missing execution_config for actor 'root'/],
+    ["unversioned", '{"sandboxed":true}', /invalid execution_config for actor 'root'/],
+    ["future", '{"schemaVersion":2,"sandboxed":true}', /invalid execution_config for actor 'root'/],
+    ["non-boolean", '{"schemaVersion":1,"sandboxed":"yes"}', /invalid execution_config/],
+    ["unknown field", '{"schemaVersion":1,"sandboxed":true,"kind":"external"}', /invalid/],
+    ["not JSON", "{", /invalid execution_config for actor 'root'/],
+  ])("refuses to read a %s execution_config rather than guess how the actor runs (#550)", (_label, stored, error) => {
+    repository.upsert(root);
+    db.prepare("UPDATE actors SET execution_config = ? WHERE id = 'root'").run(stored);
+
+    expect(() => repository.get("root")).toThrow(error);
   });
 
   it("keeps a staged desired modelConfig pool in process memory, not the durable document", () => {
@@ -694,6 +805,7 @@ describe("SqliteActorRepository", () => {
       id: "worker",
       charter: "Implement a slice",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-09-03T13:01:00.000Z",
     };
@@ -733,6 +845,7 @@ describe("SqliteActorRepository", () => {
       id: "worker",
       charter: "Implement a slice",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       context: { type: "portable", mode: "ledger" },
       modelConfig: [
@@ -752,6 +865,7 @@ describe("SqliteActorRepository", () => {
       id: "worker-remote",
       charter: "Run remotely on macOS",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       executionTarget: "mac-mini-follower",
       modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
@@ -761,15 +875,15 @@ describe("SqliteActorRepository", () => {
     repository.upsert(remoteWorker);
 
     const stored = db
-      .prepare("SELECT context_config FROM actors WHERE id = 'worker-remote'")
-      .get() as {
-      context_config: string;
-    };
-    expect(JSON.parse(stored.context_config)).toEqual({
-      schemaVersion: 2,
-      type: "native",
+      .prepare("SELECT context_config, execution_config FROM actors WHERE id = 'worker-remote'")
+      .get() as { context_config: string | null; execution_config: string };
+    expect(JSON.parse(stored.execution_config)).toEqual({
+      schemaVersion: 1,
+      sandboxed: true,
       executionTarget: "mac-mini-follower",
     });
+    // Placement alone no longer writes a context document.
+    expect(stored.context_config).toBeNull();
 
     expect(repository.get("worker-remote")?.executionTarget).toBe("mac-mini-follower");
 
@@ -778,7 +892,7 @@ describe("SqliteActorRepository", () => {
     expect(reopened.get("worker-remote")?.executionTarget).toBe("mac-mini-follower");
   });
 
-  it("reads the strict v1 context document while emitting the v2 placement shape", () => {
+  it("keeps the v1 context document as it is when an actor is placed", () => {
     repository.upsert(root);
     db.prepare("UPDATE actors SET context_config = ? WHERE id = 'root'").run(
       JSON.stringify({ schemaVersion: 1, type: "native", sessionId: "legacy-session" })
@@ -794,34 +908,13 @@ describe("SqliteActorRepository", () => {
       context_config: string;
     };
     expect(JSON.parse(stored.context_config)).toEqual({
-      schemaVersion: 2,
-      type: "native",
-      sessionId: "legacy-session",
-      executionTarget: "mac-mini-follower",
-    });
-  });
-
-  it("emits v1 for unplaced actors to keep rollback blast radius strictly bounded", () => {
-    repository.upsert(root);
-    const unplacedWorker: ActorRecord = {
-      id: "worker-local",
-      charter: "local test charter",
-      parentId: "root",
-      status: "active",
-      sessionId: "local-session-123",
-      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
-      createdAt: "2026-09-07T12:00:00.000Z",
-    };
-    repository.upsert(unplacedWorker);
-    const stored = db
-      .prepare("SELECT context_config FROM actors WHERE id = 'worker-local'")
-      .get() as {
-      context_config: string;
-    };
-    expect(JSON.parse(stored.context_config)).toEqual({
       schemaVersion: 1,
       type: "native",
-      sessionId: "local-session-123",
+      sessionId: "legacy-session",
+    });
+    expect(repository.get("root")).toMatchObject({
+      sessionId: "legacy-session",
+      executionTarget: "mac-mini-follower",
     });
   });
 
@@ -844,6 +937,7 @@ describe("SqliteActorRepository", () => {
         id: "worker",
         charter: "Implement a slice",
         parentId: "missing",
+        sandboxed: true,
         status: "active",
         createdAt: "2026-09-03T13:01:00.000Z",
       })
@@ -869,6 +963,7 @@ describe("SqliteActorRepository", () => {
       id: "worker",
       charter: "Implement a slice",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-09-03T13:01:00.000Z",
     };
@@ -891,6 +986,7 @@ describe("SqliteActorRepository", () => {
       id: "worker-voice",
       charter: "Speak",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       voiceConfig: {
         schemaVersion: 1,
@@ -904,6 +1000,7 @@ describe("SqliteActorRepository", () => {
       id: "worker-quiet",
       charter: "Fallback",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-09-09T12:01:00.000Z",
     };
@@ -950,6 +1047,7 @@ describe("SqliteActorRepository", () => {
         id: "worker",
         charter: "Persist",
         parentId: "root",
+        sandboxed: true,
         status: "active",
         voiceConfig: {
           schemaVersion: 1,
@@ -982,7 +1080,7 @@ describe("SqliteActorRepository", () => {
     repository.upsert({
       ...root,
       id: "eleven-worker",
-      isRoot: false,
+      sandboxed: true,
       parentId: "root",
       voiceConfig,
     });
@@ -997,6 +1095,7 @@ describe("SqliteActorRepository", () => {
       id: "worker",
       charter: "Speak",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       voiceConfig: { schemaVersion: 1, provider: "google", config: { voiceName: "Puck" } },
       createdAt: "2026-09-09T12:00:00.000Z",
@@ -1058,6 +1157,7 @@ describe("SqliteActorRepository", () => {
       id: "worker",
       charter: "Worker",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-09-09T12:00:00.000Z",
     };
@@ -1072,6 +1172,7 @@ describe("SqliteActorRepository", () => {
       id: "steward",
       charter: "Steward",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-09-09T12:00:00.000Z",
     };

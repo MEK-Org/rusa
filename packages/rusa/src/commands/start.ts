@@ -3354,14 +3354,10 @@ async function composeStart(
         const cwd = join(workersDir, id);
         mkdirSync(cwd, { recursive: true });
 
-        // Sandbox every worker that has a bwrap layout — agy AND claude .
-        // Workers run untrusted code, so isolating them from the privileged plane is
-        // mandatory: a fresh tmpfs /tmp stops one actor reading another's MCP-config
-        // endpoint token from shared /tmp (identity harvest), and the read-only `/`
-        // bind stops tampering with ~/.rusa runtime state, including mesh.db.
-        // Root is NOT built here and stays unsandboxed — it is the trusted plane.
-        // The Actor derives the sandbox (rooted at cwd, git+gh); each provider mounts
-        // its own auth dir rw (see providerWritableStateDirs).
+        // Workers request managed sandboxed execution by default (#465, #550).
+        // The deployment mapping is:
+        //   ActorOptions.sandbox = (sandboxed && config.sandbox !== "container-boundary")
+        // The flag selects inner sandboxing; container-boundary mode relies on its deployment boundary.
         const sandbox = config.sandbox !== "container-boundary";
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
@@ -3811,6 +3807,11 @@ async function composeStart(
   const rootComputerUseAdmission = createComputerUseAdmission(() =>
     mesh.hasActiveCapability(rootId, COMPUTER_USE_CAPABILITY)
   );
+  // The configured root actor runs unsandboxed by default (#465, #550). The e2e
+  // harness has always sandboxed its root independently of deployment mode; retain
+  // that harness-only exception, including container-boundary mode. Its record
+  // states the same requested builder intent, not an isolation/authorization claim.
+  const rootSandboxed = Boolean(opts?.e2e);
   const rootActorOptions: ActorOptions = {
     id: rootId,
     cwd: rootAgentDir,
@@ -3825,7 +3826,7 @@ async function composeStart(
       resolveProvider(config, selected.provider, selected.model, selected.effort),
     mcpServers: rootMcp,
     addDirs,
-    sandbox: Boolean(opts?.e2e),
+    sandbox: rootSandboxed,
     isE2eRoot: Boolean(opts?.e2e),
     loadSessionId: () =>
       actors.get(rootId)?.context?.type === "portable"
@@ -3935,7 +3936,7 @@ async function composeStart(
     id: rootId,
     charter: rootActor.charter ?? DEFAULT_ROOT_CHARTER,
     parentId: null,
-    isRoot: true,
+    sandboxed: rootSandboxed,
     // Persisted pool preserved verbatim (validated, same order), or the
     // configured tuple seeding a record that had none. Adoption merges onto
     // the existing row, which is what keeps a persisted pool's `modelClass`.

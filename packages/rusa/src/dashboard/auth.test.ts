@@ -123,7 +123,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
             list: () => [
               {
                 id: "actor",
-                isRoot: true,
+                sandboxed: false,
                 parentId: null,
                 status: "active",
                 charter: "Shared root",

@@ -38,7 +38,7 @@ function setup(
     id: rootId,
     charter: "root",
     parentId: null,
-    isRoot: true,
+    sandboxed: false,
     status: "active",
     createdAt: "2026-09-10T00:00:00Z",
   });
@@ -46,6 +46,7 @@ function setup(
     id: "parent",
     charter: "parent",
     parentId: rootId,
+    sandboxed: true,
     status: "active",
     createdAt: "2026-09-10T00:00:00Z",
   });
@@ -53,6 +54,7 @@ function setup(
     id: "worker",
     charter: "worker",
     parentId: "parent",
+    sandboxed: true,
     status: opts.workerStatus ?? "active",
     createdAt: "2026-09-10T00:00:00Z",
   });
@@ -60,6 +62,7 @@ function setup(
     id: "sibling",
     charter: "sibling",
     parentId: "parent",
+    sandboxed: true,
     status: "active",
     createdAt: "2026-09-10T00:00:00Z",
   });
@@ -254,7 +257,7 @@ describe("actor experiment enrollment", () => {
       id: "account-b-root",
       charter: "another account root",
       parentId: null,
-      isRoot: true,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-09-10T00:00:00Z",
     });
@@ -262,6 +265,7 @@ describe("actor experiment enrollment", () => {
       id: "account-b-child",
       charter: "another account child",
       parentId: "account-b-root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-09-10T00:00:00Z",
     });
@@ -270,7 +274,7 @@ describe("actor experiment enrollment", () => {
     );
     expect(enrollments.list()).toEqual([]);
     // The other tree's root is refused until it holds the grant itself (#549):
-    // parentless/isRoot is topology, not authority.
+    // being parentless is topology, not authority.
     expect(() =>
       mesh.enrollActorInExperiment("account-b-child", EXPERIMENT, "account-b-root")
     ).toThrow(/experiment-admin/);
@@ -336,7 +340,7 @@ describe("actor experiment enrollment", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      isRoot: true,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-09-10T00:00:00Z",
     });

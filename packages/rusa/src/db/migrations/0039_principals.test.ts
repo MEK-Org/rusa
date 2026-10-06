@@ -134,7 +134,7 @@ describe("0039_principals (schema, application bypassed)", () => {
       id: "root",
       charter: "test actor",
       parentId: null,
-      isRoot: true,
+      sandboxed: false,
       status: "active",
       createdAt: ROOT_CREATED_AT,
     };
@@ -142,6 +142,7 @@ describe("0039_principals (schema, application bypassed)", () => {
       id: "worker",
       charter: "test actor",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: WORKER_CREATED_AT,
     };

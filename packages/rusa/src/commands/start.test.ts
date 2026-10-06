@@ -38,6 +38,7 @@ import type { RusaConfig } from "../config/types.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { handleQuotaApiRequest, type QuotaHistoryDto } from "../dashboard/quota-api.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { buildE2EConfig } from "../e2e/provision.js";
 import type { IssueClient } from "../gitops/issue-client.js";
@@ -2286,7 +2287,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
               id: "root",
               charter: "root",
               parentId: null,
-              isRoot: true,
+              sandboxed: false,
               status: "active",
               createdAt: "2026-01-01T00:00:00.000Z",
             },
@@ -7198,6 +7199,87 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(t2Record?.status).toBe("active");
   });
 
+  it.each([
+    { mode: "default", configSandbox: undefined },
+    { mode: "container-boundary", configSandbox: "container-boundary" as const },
+  ])("stores sandboxed and verifies parity with builder options in $mode mode (#550)", async ({
+    configSandbox,
+  }) => {
+    if (configSandbox) {
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+          rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+          geminiApiKey: "fake-gemini-key",
+          sandbox: configSandbox,
+        }),
+        "utf8"
+      );
+    }
+    // A database a pre-#550 binary left: root and a worker, no execution_config.
+    rmSync(join(homeDir, "threads.json"));
+    mkdirSync(join(homeDir, "data"), { recursive: true });
+    const legacy = new Database(join(homeDir, "data", "mesh.db"));
+    runMigrations(legacy, { throughId: "0055_run_prompts" });
+    const insert = legacy.prepare(
+      "INSERT INTO actors (id, charter, parent_id, model_config, created_at) VALUES (?, ?, ?, ?, ?)"
+    );
+    const pool = JSON.stringify({
+      schemaVersion: 2,
+      entries: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
+    });
+    insert.run("root", "root", null, pool, "2026-01-01T00:00:00.000Z");
+    insert.run("lead", "lead tasks", "root", pool, "2026-01-01T00:01:00.000Z");
+    legacy.close();
+
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("Mesh not ready");
+    const booted = mesh;
+
+    const spawned = booted.spawn({
+      charter: "new tasks",
+      parentId: "root",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+    });
+
+    // Worker deployment mapping from root architecture disposition (#550 comment 5989255045):
+    // ActorOptions.sandbox = (sandboxed && config.sandbox !== "container-boundary")
+    const expectedWorkerSandbox = (sandboxed: boolean) =>
+      sandboxed && configSandbox !== "container-boundary";
+
+    for (const id of ["lead", spawned]) {
+      const live = booted.get(id) as unknown as { opts: { sandbox?: boolean } } | undefined;
+      if (!live) throw new Error(`${id} is not live`);
+      const stored = booted.actors.get(id)?.sandboxed;
+      if (stored === undefined) throw new Error(`${id} has no sandboxed`);
+      expect(live.opts.sandbox, `${id} sandbox parity`).toBe(expectedWorkerSandbox(stored));
+    }
+
+    // The configured root retains the existing e2e harness exception: it is
+    // sandboxed in both modes. Worker deployment mapping above remains unchanged.
+    expect((booted.get("root") as unknown as { opts: { sandbox?: boolean } }).opts.sandbox).toBe(
+      true
+    );
+    expect(booted.actors.get("root")?.sandboxed).toBe(true);
+    // Backfilled worker retained its backfilled sandboxed value:
+    expect(booted.actors.get("lead")?.sandboxed).toBe(true);
+    // Newly created worker explicitly wrote sandboxed:
+    expect(booted.actors.get(spawned)?.sandboxed).toBe(true);
+  });
+
   it("rehydrates a persisted remote worker after its follower enrolls late", async () => {
     const port = await new Promise<number>((resolve, reject) => {
       const probe = createServer();
@@ -7235,7 +7317,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      isRoot: true,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-09-07T00:00:00.000Z",
     });
@@ -7243,6 +7325,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       id: "placed-worker",
       charter: "wait for the Mac follower",
       parentId: "root",
+      sandboxed: true,
       modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash (High)" }],
       executionTarget: "mac-mini",
       status: "active",
@@ -7397,6 +7480,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       id: "retired-worker",
       charter: "finished prior to reconnect",
       parentId: "root",
+      sandboxed: true,
       executionTarget: "mac-mini",
       status: "retired",
       createdAt: "2026-09-07T00:02:00.000Z",

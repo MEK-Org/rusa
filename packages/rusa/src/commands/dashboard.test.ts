@@ -33,7 +33,7 @@ const mockDbModule = vi.hoisted(() => ({
   initDb: vi.fn(() => ({})),
   getRepositories: vi.fn(() => ({
     actors: {
-      list: vi.fn((): { id: string; parentId: string | null; isRoot: boolean }[] => []),
+      list: vi.fn((): { id: string; parentId: string | null }[] => []),
     },
     meshEvents: {},
     meshChat: {},
@@ -101,12 +101,12 @@ describe("runDashboard", () => {
     expect(mockLegacyImport.importLegacyActorState).not.toHaveBeenCalled();
   });
 
-  it("picks the root by isRoot, matching ActorMesh, not by a parentless shape", async () => {
+  it("names the sole parentless actor as root", async () => {
     mockDbModule.getRepositories.mockReturnValue({
       actors: {
         list: vi.fn(() => [
-          { id: "legacy-parentless", parentId: null, isRoot: false },
-          { id: "the-real-root", parentId: null, isRoot: true },
+          { id: "the-real-root", parentId: null },
+          { id: "worker", parentId: "the-real-root" },
         ]),
       },
       meshEvents: {},
@@ -122,6 +122,31 @@ describe("runDashboard", () => {
       expect.objectContaining({
         mesh: expect.objectContaining({
           rootIdentity: expect.objectContaining({ id: "the-real-root" }),
+        }),
+      })
+    );
+  });
+
+  it("names no root when the repository holds several parentless actors (#550)", async () => {
+    mockDbModule.getRepositories.mockReturnValue({
+      actors: {
+        list: vi.fn(() => [
+          { id: "parentless-a", parentId: null },
+          { id: "parentless-b", parentId: null },
+        ]),
+      },
+      meshEvents: {},
+      meshChat: {},
+      obligations: {},
+      referenceCache: mockReferenceCacheRepo,
+    });
+
+    await runDashboard();
+
+    expect(mockWebhookServerModule.startDashboardServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mesh: expect.objectContaining({
+          rootIdentity: expect.objectContaining({ id: undefined }),
         }),
       })
     );

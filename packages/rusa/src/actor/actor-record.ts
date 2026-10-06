@@ -76,11 +76,24 @@ export interface ActorRecord {
   sessionId?: string;
   context?: ContextConfig;
   title?: string;
-  /** Compatibility view of root topology; repositories derive this from parentId. */
-  isRoot?: boolean;
+  /**
+   * Requested managed sandboxing (#465, #550), stored in the versioned
+   * `actors.execution_config` document with [executionTarget]. It is
+   * independent of where the actor sits in the tree, and it is neither an
+   * authorization grant nor proof of effective isolation. In running systems
+   * the deployment mapping is:
+   *   ActorOptions.sandbox = (sandboxed && config.sandbox !== "container-boundary")
+   *
+   * Every write must state it: there is no default, so a missing value fails
+   * the write instead of being guessed. A parent change keeps it.
+   */
+  sandboxed: boolean;
   status: ActorStatus;
   createdAt: string;
-  /** Registered follower ID where this actor is placed remotely; unset for leader-local execution. */
+  /**
+   * Registered follower ID where this actor is placed remotely, stored in
+   * `execution_config`; unset means the actor runs on the leader.
+   */
   executionTarget?: string;
   /** Per-actor walkie-talkie voice; absent follows the instance-wide default. */
   voiceConfig?: VoiceConfigDocument;

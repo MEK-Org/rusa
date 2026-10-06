@@ -117,7 +117,14 @@ async function settled(res: MockRes): Promise<void> {
 }
 
 function rec(id: string, parentId: string | null, status: "active" | "retired"): ActorRecord {
-  return { id, charter: `charter ${id}`, parentId, status, createdAt: "2026-06-21T00:00:00.000Z" };
+  return {
+    id,
+    charter: `charter ${id}`,
+    parentId,
+    sandboxed: parentId !== null,
+    status,
+    createdAt: "2026-06-21T00:00:00.000Z",
+  };
 }
 
 const googleVoiceConfig = (voiceName: string) => ({
@@ -1449,6 +1456,7 @@ describe("handleMeshApiRequest", () => {
           id,
           charter: `charter ${id} `.repeat(40),
           parentId: "root",
+          sandboxed: true,
           status: "active",
           createdAt: "2026-06-21T00:00:00.000Z",
         });
@@ -1757,14 +1765,14 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads shows the default root handle when no identity is configured", async () => {
-    actors.upsert({ ...rec("root", null, "active"), isRoot: true });
+    actors.upsert(rec("root", null, "active"));
     const { res } = await call(deps, "GET", "/api/mesh/threads");
     const { threads } = JSON.parse(res.body);
     expect(threads.find((t: { id: string }) => t.id === "root").handle).toBe("root-actor");
   });
 
   it("GET /api/mesh/threads shows the configured root handle, leaving worker handles alone ", async () => {
-    actors.upsert({ ...rec("root", null, "active"), isRoot: true });
+    actors.upsert(rec("root", null, "active"));
     actors.upsert(rec(UUID_A, "root", "active"));
     const configuredDeps: DashboardDataDeps = {
       ...deps,
@@ -1779,8 +1787,8 @@ describe("handleMeshApiRequest", () => {
     );
   });
 
-  it("GET /api/mesh/threads identifies a generated-id root from isRoot", async () => {
-    actors.upsert({ ...rec(UUID_A, null, "active"), isRoot: true });
+  it("GET /api/mesh/threads identifies a generated-id root by its null parent", async () => {
+    actors.upsert(rec(UUID_A, null, "active"));
     const configuredDeps: DashboardDataDeps = {
       ...deps,
       rootIdentity: { id: UUID_A, handle: "ember-familiar" },
@@ -1796,6 +1804,7 @@ describe("handleMeshApiRequest", () => {
       id: "root",
       charter: "root charter\nline 2",
       parentId: null,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1804,6 +1813,7 @@ describe("handleMeshApiRequest", () => {
       charter: "child charter\nline 2",
       title: "Custom Title",
       parentId: "root",
+      sandboxed: true,
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1826,6 +1836,7 @@ describe("handleMeshApiRequest", () => {
       id: UUID_A,
       charter: long,
       parentId: null,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1847,6 +1858,7 @@ describe("handleMeshApiRequest", () => {
       id: UUID_A,
       charter: "short charter\nline 2",
       parentId: null,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1867,6 +1879,7 @@ describe("handleMeshApiRequest", () => {
       id: UUID_A,
       charter: "\u{1F9ED}".repeat(400),
       parentId: null,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1888,6 +1901,7 @@ describe("handleMeshApiRequest", () => {
       id: UUID_A,
       charter: long,
       parentId: null,
+      sandboxed: false,
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });

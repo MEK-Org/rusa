@@ -96,6 +96,7 @@ function rec(id: string, status: "active" | "retired"): ActorRecord {
     id,
     charter: `charter ${id}`,
     parentId: null,
+    sandboxed: false,
     status,
     createdAt: "2026-07-17T00:00:00.000Z",
   };

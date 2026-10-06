@@ -995,8 +995,8 @@ export function createAgentExecMcpServer(
   // depth, like the grant-gated `update` tool): each group is registered ONLY
   // when the endpoint's actor holds the named administrative capability as an
   // active grant at session start, AND each handler re-checks the grant live so
-  // a revocation fails closed on an already-open session. Topology (`isRoot`,
-  // a null parent, the configured root id) plays no part: a capable opaque-id
+  // a revocation fails closed on an already-open session. Topology (a null
+  // parent, the configured root id) plays no part: a capable opaque-id
   // actor gets exactly the same tools, and an ungranted parentless actor gets
   // none. Every tool below that touches actors is further confined to the
   // caller's own subtree (self included): a write naming a target actor is
