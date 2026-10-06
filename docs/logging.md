@@ -290,6 +290,18 @@ leave a failure-alert or log-rotation companion pointing at a script that is no
 longer present. Treat a checkout move as an installed-unit review, not only as
 an application update.
 
+Which checkout the units name depends on the instance's deployment mode:
+
+- **Package mode** (the default) takes the CLI path from the `rusa` entry that
+  runs the install, as invoked rather than resolved through links, and takes
+  the notifier and rotator from the `scripts/` directory two levels above it. A
+  `rusa` on `PATH` that still reaches the old checkout writes the old paths
+  back.
+- **Self mode** installs only the production instance and always uses the
+  fixed deploy worktree under `<RUSA_HOME>/workspaces/<repo-key>/worktrees/deploy`.
+  `--repo-path` only seeds that worktree when it does not exist yet, so moving
+  some other checkout does not change self-mode units.
+
 Before retiring the old checkout, identify every affected instance and inspect
 the effective generated units and any installed drop-ins without changing their
 state:
@@ -304,10 +316,13 @@ systemctl --user show --property=OnFailure <instance>.service
 
 Read each displayed `ExecStart=` before the move. In particular, check the
 main service executable, the alert's `notify-failure.mjs`, and the rotation
-service's `rotate-log.mjs`; confirm that each referenced path still exists
-after the proposed move. Check that the main unit's `OnFailure=` value names
-the alert companion being reviewed. If this host has the shared quota
-coordinator, inspect its service and alert companion in the same way:
+service's `rotate-log.mjs`. A self-mode main unit also has an `ExecStartPre=`
+boot gate that runs `scripts/verify-build.mjs` with the checkout root as its
+argument; check both the script path and that argument. Confirm that each
+referenced path still exists after the proposed move. Check that the main
+unit's `OnFailure=` value names the alert companion being reviewed. If this
+host has the shared quota coordinator, inspect its service and alert companion
+in the same way:
 
 ```bash
 systemctl --user cat rusa-quota-coordinator.service \
@@ -317,16 +332,27 @@ systemctl --user show --property=OnFailure rusa-quota-coordinator.service
 
 Use the actual unit names from the installed files; an instance-specific name
 can differ by environment. Do not trigger a failure or stop a running service
-to test notification delivery. Keep the existing unit-file backup and rollback
-procedure in place until the review and reapplication have been verified.
+to test notification delivery.
 
-After the checkout is in its intended location, review the current
-`install-service` generator and reapply the instance configuration with the
-same environment and deployment-mode options used for that instance, adding
-`--no-restart` when the current process must stay up. For example:
+The installer overwrites unit files in place and keeps no copy. Before
+reapplying, copy every file that `systemctl --user cat` listed (each is named
+in a `# /path` comment line), including any `<unit>.d/` drop-in directories,
+to a dated backup directory. To roll back, restore those files and run
+`systemctl --user daemon-reload`.
+
+Reapplying rewrites only the base unit files. A drop-in that sets
+`ExecStart=`, `ExecStartPre=` or `OnFailure=` survives, keeps its old path, and
+still overrides the regenerated unit. Edit or remove such a drop-in by hand.
+
+After the checkout is in its intended location, reapply the instance
+configuration with the same environment and deployment-mode options used for
+that instance, adding `--no-restart` when the current process must stay up. In
+package mode, run the CLI from its new location so the units take their paths
+from it:
 
 ```bash
-rusa install-service --environment <environment> --no-restart
+node <new-checkout>/packages/rusa/dist/cli.js install-service \
+  --environment <environment> --no-restart
 ```
 
 `--no-restart` is a non-disruptive reapply, not a dry run. It rewrites the
@@ -337,15 +363,28 @@ serve configuration. It does not restart the already-running instance, so the
 new main-service policy takes effect on its next restart or self-update. The
 rotation timer may start immediately when enabled.
 
+`install-service` does not rewrite the coordinator. If the coordinator's units
+still name the old checkout, regenerate them with `install-quota-coordinator`
+as described in [the coordinator runbook, §1](quota-coordinator-operations.md#1-units).
+Run it from the new location with the coordinator's existing deployment mode,
+adding `--no-restart` to leave the running coordinator up. It adopts the home
+the installed unit already uses, so the database identity is kept. Reapplying
+an instance can add its client ordering after the coordinator already exists.
+
 Repeat the `systemctl --user cat` and `show` checks after reapplying. Verify
-that all affected `ExecStart=` paths now resolve inside the intended checkout,
-the notifier and rotator scripts exist, and `OnFailure=` names the companion
-that was regenerated. When a coordinator is installed, also verify its
-generator-owned service and alert units; reapplying an instance can add its
-client ordering after the coordinator already exists, but it does not rewrite
-the coordinator itself. If a path or target is wrong, use the preserved backup
-and the established rollback procedure rather than removing the old checkout
-or forcing a service failure.
+that the CLI, `notify-failure.mjs`, `rotate-log.mjs` and, in self mode,
+`verify-build.mjs` and its checkout argument all come from the intended
+package or checkout, and that the scripts exist. The Node interpreter and data
+arguments such as the rotated log path normally sit outside the checkout;
+confirm only that they still exist. Check that `OnFailure=` names the companion
+that was regenerated. If a path or target is wrong, restore the backup rather
+than removing the old checkout or forcing a service failure.
+
+Keep the old checkout until each affected service has restarted onto the new
+paths, whether by a planned restart or a self-update, and
+`systemctl --user status` shows the running command line from the new
+location. Until then the running process still loads files from the old
+checkout. Retire the old checkout only after that check passes.
 
 ## Reading actor output
 
