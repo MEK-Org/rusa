@@ -1,0 +1,125 @@
+// Synthetic, reproducible appearance receipt for #926.
+//
+// This file is copied into test/ only while regenerate.sh runs. It deliberately
+// speaks the detail-snapshot JSON wire shape so it also compiles against the
+// pre-change dashboard: the older decoder ignores completionMatcher, while the
+// #926 decoder renders the read-only panel.
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:rusa_dashboard/models.dart';
+import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/theme.dart';
+import 'package:rusa_dashboard/widgets/work_tab.dart';
+
+import 'fakes.dart';
+import 'screenshot_support.dart';
+
+void main() {
+  setUpAll(loadFonts);
+
+  for (final entry in {
+    'wide': const Size(1400, 900),
+    'narrow': const Size(390, 844),
+  }.entries) {
+    testWidgets('completion matcher ${entry.key}', (tester) async {
+      await tester.runAsync(() async {
+        const phase = String.fromEnvironment('MATCHER_PHASE');
+        final ids = ['delivery-coder', 'delivery-steward'];
+        HttpOverrides.global = FakeImageHttpOverrides(await portraits(ids));
+        addTearDown(() => HttpOverrides.global = null);
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.binding.setSurfaceSize(entry.value);
+
+        final obligation = makeObligation(
+          'matcher-demo',
+          ownerId: 'delivery-coder',
+          creatorId: 'delivery-steward',
+          title: 'Ship deployment evidence',
+          intent:
+              'Complete this delivery record only after its tracked pull request has merged.',
+          checkpoint:
+              'Implementation is green; the completion is waiting for the merge event.',
+          checkpointBy: 'delivery-coder',
+          checkpointAt: '2026-10-06T04:00:00.000Z',
+          externalRef: 'github:MEK-Org/rusa/pulls/190',
+        );
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('delivery-coder'),
+            makeThread('delivery-steward'),
+          ]
+          ..obligationsResult = [obligation]
+          ..obligationDetails['matcher-demo'] =
+              ObligationDetailSnapshot.fromJson({
+                'obligation': {
+                  'id': 'matcher-demo',
+                  'ownerId': 'delivery-coder',
+                  'creatorId': 'delivery-steward',
+                  'title': obligation.heading,
+                  'intent': obligation.body,
+                  'status': 'ready',
+                  'effectivePriority': 1.0,
+                  'checkpoint': obligation.checkpoint,
+                  'checkpointAt': obligation.checkpointAt,
+                  'checkpointBy': obligation.checkpointBy,
+                  'externalRef': 'github:MEK-Org/rusa/pulls/190',
+                  'completionMatcher': {
+                    'kind': 'pr_merged',
+                    'target': 'github:MEK-Org/rusa/pulls/190',
+                    'setBy': 'delivery-steward',
+                    'setAt': '2026-10-06T03:30:00.000Z',
+                    'satisfiedAt': '2026-10-06T04:15:00.000Z',
+                    'satisfiedRef': 'github:MEK-Org/rusa/pulls/190',
+                  },
+                },
+                'ancestors': const [],
+                'children': const [],
+                'blockedBy': const [],
+                'blockedByTotal': 0,
+                'blocks': const [],
+                'blocksTotal': 0,
+                'externalReference': {
+                  'ref': 'github:MEK-Org/rusa/pulls/190',
+                  'scheme': 'github',
+                  'title': 'Pull request #190',
+                  'url': 'https://github.com/MEK-Org/rusa/pull/190',
+                },
+                'artifacts': const [],
+                'history': const [],
+              });
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
+        store.setFocusedObligationId('matcher-demo');
+        final key = GlobalKey();
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: buildMeshTheme(),
+            home: RepaintBoundary(
+              key: key,
+              child: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await settleImages(tester, portraitUrls(ids));
+        if (phase == 'after') {
+          await tester.ensureVisible(find.text('COMPLETION MATCHER'));
+          await tester.pump();
+          expect(find.text('Complete when this pull request merges'), findsOneWidget);
+          expect(find.textContaining('Satisfied'), findsOneWidget);
+        } else {
+          expect(find.text('COMPLETION MATCHER'), findsNothing);
+        }
+        await captureBoundary(
+          key,
+          'screenshots/926/completion_matcher_${entry.key}_${phase}.png',
+        );
+        expect(tester.takeException(), isNull);
+      });
+    });
+  }
+}
