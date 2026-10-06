@@ -5,6 +5,35 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:rusa_dashboard/api.dart';
+import 'package:rusa_dashboard/dashboard_timing.dart';
+
+class _BodyGatedClient extends http.BaseClient {
+  final body = StreamController<List<int>>();
+  final timingRequest = Completer<http.BaseRequest>();
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    if (request.url.path == '/api/dashboard/timing') {
+      timingRequest.complete(request);
+      return http.StreamedResponse(
+        Stream<List<int>>.value(utf8.encode('{"accepted":true}')),
+        202,
+      );
+    }
+    return http.StreamedResponse(
+      body.stream,
+      200,
+      headers: const {
+        'X-Rusa-Request-Id': '123e4567-e89b-42d3-a456-426614174000',
+      },
+    );
+  }
+
+  @override
+  void close() {
+    unawaited(body.close());
+  }
+}
 
 void main() {
   const requestId = '123e4567-e89b-42d3-a456-426614174000';
@@ -115,6 +144,50 @@ void main() {
       expect(envelope['outcome'], 'failure');
       expect(envelope['requestIds'], isEmpty);
       expect(envelope.containsKey('requestTimings'), isFalse);
+    },
+  );
+
+  test(
+    'request timing ends after the response body, before later interaction work',
+    () async {
+      final client = _BodyGatedClient();
+      final api = DashboardApi(
+        base: Uri.parse('https://dashboard.example/'),
+        client: client,
+      );
+      addTearDown(api.close);
+
+      final interaction = api.trackInteraction(
+        DashboardInteraction.initialLoad,
+        () async {
+          // This nested API scope must not replace the named outer interaction.
+          await api.fetchCharter('private-actor-id');
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+        },
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(client.timingRequest.isCompleted, isFalse);
+
+      client.body.add(utf8.encode(jsonEncode({'charter': 'private charter'})));
+      await client.body.close();
+      await Future<void>.delayed(Duration.zero);
+      // The body is complete, but the interaction's later work still keeps
+      // the receipt from being emitted.
+      expect(client.timingRequest.isCompleted, isFalse);
+
+      await interaction;
+      final request = await client.timingRequest.future;
+      expect(request, isA<http.Request>());
+      final body =
+          jsonDecode((request as http.Request).body) as Map<String, dynamic>;
+      final timing =
+          (body['requestTimings'] as List<dynamic>).single
+              as Map<String, dynamic>;
+      expect(body['interaction'], 'initial_load');
+      expect(
+        body['durationMs'] as int,
+        greaterThan(timing['requestMs'] as int),
+      );
     },
   );
 }

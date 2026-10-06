@@ -3,6 +3,7 @@ import 'package:flutter_svg/flutter_svg.dart';
 import 'package:flutter/material.dart';
 
 import '../breakpoints.dart';
+import '../dashboard_timing.dart';
 import '../link_opener.dart';
 import '../models.dart';
 import '../store.dart';
@@ -61,7 +62,10 @@ class _WorkTabState extends State<WorkTab> {
   /// [forceIncludeTerminal] widens a single load beyond the current "Show
   /// Done" setting — used when a focus link names an obligation the default
   /// (terminal-excluding) load didn't fetch at all.
-  Future<void> _loadRoots({bool forceIncludeTerminal = false}) async {
+  Future<void> _loadRoots({
+    bool forceIncludeTerminal = false,
+    bool trackNavigation = false,
+  }) async {
     final includeTerminal = forceIncludeTerminal || _showDone;
     final generation = ++_loadGeneration;
     try {
@@ -70,9 +74,15 @@ class _WorkTabState extends State<WorkTab> {
         _isBackgroundRefreshing = _rootTrees.isNotEmpty;
         _error = null;
       });
-      final forest = await widget.store.api.fetchObligationForest(
+      Future<ObligationForest> load() => widget.store.api.fetchObligationForest(
         includeTerminalRoots: includeTerminal,
       );
+      final forest = trackNavigation
+          ? await widget.store.api.trackInteraction(
+              DashboardInteraction.primaryNavigation,
+              load,
+            )
+          : await load();
       if (!mounted || generation != _loadGeneration) return;
       setState(() {
         _rootTrees = forest.trees;
@@ -267,7 +277,7 @@ class _WorkTabState extends State<WorkTab> {
       _loading = true;
       _isBackgroundRefreshing = false;
     }
-    _loadRoots();
+    _loadRoots(trackNavigation: true);
     _focusSub = widget.store.focusedObligationId.listen((focusedId) {
       if (focusedId != null && !_loading) {
         _expandAncestors(focusedId);
@@ -840,7 +850,7 @@ class _DetailViewState extends State<_DetailView> {
   @override
   void initState() {
     super.initState();
-    _fetch();
+    _fetch(trackDetail: true);
     _checkpointSub = widget.store.obligationRefreshes.listen(_onRefresh);
   }
 
@@ -865,7 +875,7 @@ class _DetailViewState extends State<_DetailView> {
       _pendingAttempts = 0;
       _pendingSeen = const {};
       _pendingGaveUp = const {};
-      _fetch();
+      _fetch(trackDetail: true);
     }
   }
 
@@ -952,9 +962,13 @@ class _DetailViewState extends State<_DetailView> {
         )
       : reference;
 
-  void _fetch() {
+  void _fetch({bool trackDetail = false}) {
     final gen = _beginFetch();
-    final future = store.api.fetchObligationDetail(widget.obligationId);
+    Future<ObligationDetailSnapshot> load() =>
+        store.api.fetchObligationDetail(widget.obligationId);
+    final future = trackDetail
+        ? store.api.trackInteraction(DashboardInteraction.obligationDetail, load)
+        : load();
     _future = future;
     future
         .then((data) {

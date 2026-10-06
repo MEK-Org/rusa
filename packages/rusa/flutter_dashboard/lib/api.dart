@@ -501,7 +501,7 @@ class DashboardApi {
     bool? rootsOnly,
     int? limit,
     int? offset,
-  }) => trackInteraction(DashboardInteraction.primaryNavigation, () async {
+  }) async {
     final q = <String, String>{
       'ownerId': ?ownerId,
       'status': ?status,
@@ -513,7 +513,7 @@ class DashboardApi {
     return ObligationPage.fromJson(
       await _getJson(_u('/api/mesh/obligations', q)),
     );
-  });
+  }
 
   Future<ObligationDetailSnapshot> fetchObligationDetail(
     String id, {
@@ -523,7 +523,7 @@ class DashboardApi {
     int? blockingOffset,
     int? completionsOffset,
     int? limit,
-  }) => trackInteraction(DashboardInteraction.obligationDetail, () async {
+  }) async {
     final q = <String, String>{
       'history_before': ?historyBefore,
       if (historyLimit != null) 'history_limit': '$historyLimit',
@@ -535,14 +535,12 @@ class DashboardApi {
     return ObligationDetailSnapshot.fromJson(
       await _getJson(_u('/api/mesh/obligations/$id', q)),
     );
-  });
+  }
 
-  Future<ObligationTreeDto> fetchObligationTree(String id) => trackInteraction(
-    DashboardInteraction.obligationDetail,
-    () async => ObligationTreeDto.fromJson(
-      await _getJson(_u('/api/mesh/obligations/$id/tree')),
-    ),
-  );
+  Future<ObligationTreeDto> fetchObligationTree(String id) async =>
+      ObligationTreeDto.fromJson(
+        await _getJson(_u('/api/mesh/obligations/$id/tree')),
+      );
 
   /// One root page's full trees in a single request — see #241. Replaces the
   /// former `fetchObligations(rootsOnly: true)` + one `fetchObligationTree`
@@ -555,7 +553,7 @@ class DashboardApi {
     int? limit,
     int? offset,
     bool includeTerminalRoots = false,
-  }) => trackInteraction(DashboardInteraction.primaryNavigation, () async {
+  }) async {
     final q = <String, String>{
       if (limit != null) 'limit': '$limit',
       if (offset != null) 'offset': '$offset',
@@ -564,7 +562,7 @@ class DashboardApi {
     return ObligationForest.fromJson(
       await _getJson(_u('/api/mesh/obligations/forest', q)),
     );
-  });
+  }
 
   // ── Obligations write routes ──
 

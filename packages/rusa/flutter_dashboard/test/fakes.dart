@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:rusa_dashboard/actor_hierarchy_cache.dart';
 import 'package:rusa_dashboard/api.dart';
+import 'package:rusa_dashboard/dashboard_timing.dart';
 import 'package:rusa_dashboard/avatar_platform.dart';
 import 'package:rusa_dashboard/mesh_stream.dart';
 import 'package:rusa_dashboard/models.dart';
@@ -215,6 +216,8 @@ class FakeApi extends DashboardApi {
   int threadsCallCount = 0;
   final threadSnapshotGates = <Completer<ThreadsSnapshot>>[];
   Object? threadsError;
+  final timingInteractions =
+      <({DashboardInteraction interaction, String outcome})>[];
   List<EventPage> eventPages = [];
   List<ChatPage> chatPages = [];
   int chatCall = 0;
@@ -240,6 +243,21 @@ class FakeApi extends DashboardApi {
   /// When set, the NEXT fetchEvents awaits this instead of returning a canned
   /// page — lets a test inject a live SSE frame mid-fetch (the seam window).
   Completer<EventPage>? eventsGate;
+
+  @override
+  Future<T> trackInteraction<T>(
+    DashboardInteraction interaction,
+    Future<T> Function() action,
+  ) async {
+    try {
+      final result = await action();
+      timingInteractions.add((interaction: interaction, outcome: 'success'));
+      return result;
+    } catch (_) {
+      timingInteractions.add((interaction: interaction, outcome: 'failure'));
+      rethrow;
+    }
+  }
 
   @override
   Future<ThreadsSnapshot> fetchThreads() async {

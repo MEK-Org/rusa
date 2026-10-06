@@ -34,8 +34,19 @@ class _TimingContext {
   final Stopwatch stopwatch;
   final Set<String> requestIds = <String>{};
   final Map<String, int> requestTimings = <String, int>{};
+  bool _closed = false;
+
+  /// A Zone can outlive the interaction that installed it. Closing makes a
+  /// detached timer or stream harmless instead of letting it amend a receipt
+  /// that has already been sent.
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    stopwatch.stop();
+  }
 
   bool addRequestId(String? value) {
+    if (_closed) return false;
     if (value == null || !_uuidPattern.hasMatch(value)) return false;
     if (requestIds.contains(value)) return true;
     if (requestIds.length >= _maxRequestIds) return false;
@@ -44,7 +55,7 @@ class _TimingContext {
   }
 
   void addRequestTiming(String requestId, int requestMs) {
-    if (requestIds.contains(requestId)) {
+    if (!_closed && requestIds.contains(requestId)) {
       requestTimings.putIfAbsent(
         requestId,
         () => requestMs.clamp(0, _maxDurationMs),
@@ -130,15 +141,19 @@ class DashboardTimingReporter {
     DashboardInteraction interaction,
     Future<T> Function() action,
   ) {
+    // Interaction scopes are deliberately not nestable. A nested scope would
+    // otherwise replace its parent Zone and make one user action's request
+    // set depend on call order. Call sites own one named interaction boundary.
+    if (Zone.current[_timingContextKey] is _TimingContext) return action();
     final context = _TimingContext(interaction);
     return runZoned(() async {
       try {
         final result = await action();
-        context.stopwatch.stop();
+        context.close();
         unawaited(_post(context, 'success'));
         return result;
       } catch (_) {
-        context.stopwatch.stop();
+        context.close();
         unawaited(_post(context, 'failure'));
         rethrow;
       }

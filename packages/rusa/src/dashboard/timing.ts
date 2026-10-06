@@ -480,23 +480,22 @@ export interface DashboardTimingSummary {
   since: string;
   sampleCount: number;
   droppedSinceStart: number;
-  clientServerCoverage: {
-    clientRequestIds: number;
-    serverRequestIds: number;
-    matchedRequestIds: number;
-  };
   /** Coverage is counted against the exact, de-duplicated IDs a client row references. */
   requestCoverage: {
     correlation: DashboardRequestCoverage;
     measurement: DashboardRequestCoverage;
   };
-  /** Both distributions use the exact same unambiguous ID-paired cohort. */
-  pairedRequestDurations: {
-    sampleCount: number;
-    clientRequestMs: DashboardTimingDistribution;
-    serverDurationMs: DashboardTimingDistribution;
-  };
+  /** Exact, unambiguous pairs grouped by fixed interaction and server endpoint. */
+  pairedRequestDurations: DashboardPairedRequestDurationGroup[];
   groups: DashboardTimingGroup[];
+}
+
+export interface DashboardPairedRequestDurationGroup {
+  interaction: (typeof CLIENT_LABELS)[number];
+  serverLabel: (typeof SERVER_LABELS)[number];
+  sampleCount: number;
+  clientRequestMs: DashboardTimingDistribution;
+  serverDurationMs: DashboardTimingDistribution;
 }
 
 export interface DashboardRequestCoverage {
@@ -572,10 +571,12 @@ function summarize(
       count: number;
     }
   >();
-  const serverRequestIds = new Set<string>();
   const clientRequestIds = new Set<string>();
   const serverRowsByRequestId = new Map<string, DashboardTimingPayload[]>();
-  const clientMeasurementsByRequestId = new Map<string, number[]>();
+  const clientMeasurementsByRequestId = new Map<
+    string,
+    Array<{ interaction: (typeof CLIENT_LABELS)[number]; requestMs: number }>
+  >();
   for (const { payload } of rows) {
     const key = `${payload.source}:${payload.label}`;
     const group = groups.get(key) ?? {
@@ -598,7 +599,6 @@ function summarize(
   }
   for (const { payload } of correlationRows) {
     if (payload.source === "server" && payload.requestId) {
-      serverRequestIds.add(payload.requestId);
       const serverRows = serverRowsByRequestId.get(payload.requestId) ?? [];
       serverRows.push(payload);
       serverRowsByRequestId.set(payload.requestId, serverRows);
@@ -607,7 +607,10 @@ function summarize(
       for (const id of payload.requestIds ?? []) clientRequestIds.add(id);
       for (const timing of payload.requestTimings ?? []) {
         const values = clientMeasurementsByRequestId.get(timing.requestId) ?? [];
-        values.push(timing.requestMs);
+        values.push({
+          interaction: payload.label as (typeof CLIENT_LABELS)[number],
+          requestMs: timing.requestMs,
+        });
         clientMeasurementsByRequestId.set(timing.requestId, values);
       }
     }
@@ -621,27 +624,43 @@ function summarize(
     const server = serverRowsByRequestId.get(id)?.[0];
     const clientMeasurements = clientMeasurementsByRequestId.get(id);
     if (!server || server.durationMs === null || clientMeasurements?.length !== 1) return [];
-    return [{ requestMs: clientMeasurements[0], serverDurationMs: server.durationMs }];
+    return [
+      {
+        interaction: clientMeasurements[0].interaction,
+        requestMs: clientMeasurements[0].requestMs,
+        serverDurationMs: server.durationMs,
+        serverLabel: server.label as (typeof SERVER_LABELS)[number],
+      },
+    ];
   });
   const pairedRequestIds = pairedRows.length;
+  const pairedGroups = new Map<string, typeof pairedRows>();
+  for (const pair of pairedRows) {
+    const key = `${pair.interaction}:${pair.serverLabel}`;
+    const group = pairedGroups.get(key) ?? [];
+    group.push(pair);
+    pairedGroups.set(key, group);
+  }
   return {
     since,
     sampleCount: rows.length,
     droppedSinceStart,
-    clientServerCoverage: {
-      clientRequestIds: clientRequestIds.size,
-      serverRequestIds: serverRequestIds.size,
-      matchedRequestIds: correlatedRequestIds.length,
-    },
     requestCoverage: {
       correlation: coverage(correlatedRequestIds.length, clientRequestIds.size),
       measurement: coverage(pairedRequestIds, clientRequestIds.size),
     },
-    pairedRequestDurations: {
-      sampleCount: pairedRequestIds,
-      clientRequestMs: distribution(pairedRows.map((pair) => pair.requestMs)),
-      serverDurationMs: distribution(pairedRows.map((pair) => pair.serverDurationMs)),
-    },
+    pairedRequestDurations: [...pairedGroups.values()]
+      .map((pairs) => ({
+        interaction: pairs[0].interaction,
+        serverLabel: pairs[0].serverLabel,
+        sampleCount: pairs.length,
+        clientRequestMs: distribution(pairs.map((pair) => pair.requestMs)),
+        serverDurationMs: distribution(pairs.map((pair) => pair.serverDurationMs)),
+      }))
+      .sort(
+        (a, b) =>
+          a.interaction.localeCompare(b.interaction) || a.serverLabel.localeCompare(b.serverLabel)
+      ),
     groups: [...groups.values()]
       .map((group) => {
         const p95Ms = percentile(group.durations, 95);

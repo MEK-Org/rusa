@@ -112,20 +112,19 @@ describe("dashboard timing recorder", () => {
       since: new Date("2026-10-05T11:00:00.000Z"),
       label: "initial_load",
     });
-    expect(summary.clientServerCoverage).toEqual({
-      clientRequestIds: 1,
-      serverRequestIds: 20,
-      matchedRequestIds: 1,
-    });
     expect(summary.requestCoverage).toEqual({
       correlation: { numerator: 1, denominator: 1, state: "full" },
       measurement: { numerator: 1, denominator: 1, state: "full" },
     });
-    expect(summary.pairedRequestDurations).toEqual({
-      sampleCount: 1,
-      clientRequestMs: { p50Ms: 2100, p95Ms: 2100, p99Ms: 2100, maxMs: 2100 },
-      serverDurationMs: { p50Ms: 600, p95Ms: 600, p99Ms: 600, maxMs: 600 },
-    });
+    expect(summary.pairedRequestDurations).toEqual([
+      {
+        interaction: "initial_load",
+        serverLabel: "mesh_threads",
+        sampleCount: 1,
+        clientRequestMs: { p50Ms: 2100, p95Ms: 2100, p99Ms: 2100, maxMs: 2100 },
+        serverDurationMs: { p50Ms: 600, p95Ms: 600, p99Ms: 600, maxMs: 600 },
+      },
+    ]);
     expect(summary.groups).toEqual([
       expect.objectContaining({
         source: "client",
@@ -185,14 +184,60 @@ describe("dashboard timing recorder", () => {
       correlation: { numerator: 3, denominator: 5, state: "partial" },
       measurement: { numerator: 2, denominator: 5, state: "partial" },
     });
-    expect(summary.pairedRequestDurations).toEqual({
-      sampleCount: 2,
-      clientRequestMs: { p50Ms: 80, p95Ms: 100, p99Ms: 100, maxMs: 100 },
-      serverDurationMs: { p50Ms: 40, p95Ms: 70, p99Ms: 70, maxMs: 70 },
-    });
+    expect(summary.pairedRequestDurations).toEqual([
+      {
+        interaction: "initial_load",
+        serverLabel: "mesh_threads",
+        sampleCount: 2,
+        clientRequestMs: { p50Ms: 80, p95Ms: 100, p99Ms: 100, maxMs: 100 },
+        serverDurationMs: { p50Ms: 40, p95Ms: 70, p99Ms: 70, maxMs: 70 },
+      },
+    ]);
     expect(JSON.stringify(summary)).not.toContain(paired);
     expect(JSON.stringify(summary)).not.toContain(legacy);
     expect(JSON.stringify(summary)).not.toContain(duplicate);
+  });
+
+  it("groups exact pairs by fixed interaction and server endpoint", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    const threadId = randomUUID();
+    const eventId = randomUUID();
+    recorder.recordServer({
+      label: "mesh_threads",
+      requestId: threadId,
+      durationMs: 40,
+      status: 200,
+      bytes: 1,
+    });
+    recorder.recordServer({
+      label: "mesh_events",
+      requestId: eventId,
+      durationMs: 60,
+      status: 200,
+      bytes: 1,
+    });
+    recorder.recordClient({
+      interaction: "initial_load",
+      durationMs: 100,
+      requestIds: [threadId],
+      requestTimings: [{ requestId: threadId, requestMs: 80 }],
+      outcome: "success",
+    });
+    recorder.recordClient({
+      interaction: "actor_detail",
+      durationMs: 120,
+      requestIds: [eventId],
+      requestTimings: [{ requestId: eventId, requestMs: 90 }],
+      outcome: "success",
+    });
+    while (timingRows().length < 4) recorder.flush();
+
+    expect(
+      recorder.summary({ since: new Date("2026-10-05T11:00:00.000Z") }).pairedRequestDurations
+    ).toEqual([
+      expect.objectContaining({ interaction: "actor_detail", serverLabel: "mesh_events" }),
+      expect.objectContaining({ interaction: "initial_load", serverLabel: "mesh_threads" }),
+    ]);
   });
 
   it("reports missing and no-referenced-request coverage separately", () => {

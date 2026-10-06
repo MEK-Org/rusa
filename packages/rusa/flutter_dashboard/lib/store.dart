@@ -435,6 +435,7 @@ class DashboardStore {
   RuntimeCursor? _runtimeCursor;
   final List<ActorRuntimeStateDelta> _runtimeBuffer = [];
   Future<void>? _runtimeSyncTask;
+  int _authoritativeThreadSnapshots = 0;
   bool _runtimeSyncAgain = false;
   Duration _runtimeRetryDelay = _kRuntimeRetryInitial;
 
@@ -573,10 +574,22 @@ class DashboardStore {
     _subs.add(_stream.avatarUpdates.listen(_onAvatarUpdate));
     _subs.add(_actorStates.listen(_syncRunSelections));
     _stream.connect(const []); // mesh_event flows for all actors regardless
-    await _api.trackInteraction(
-      DashboardInteraction.initialLoad,
-      refreshThreads,
-    );
+    try {
+      await _api.trackInteraction(DashboardInteraction.initialLoad, () async {
+        final snapshotsBefore = _authoritativeThreadSnapshots;
+        await refreshThreads();
+        // `_requestRuntimeSync` deliberately catches and retries a transient
+        // failure for the dashboard. The initial interaction is not usable
+        // until that first authoritative thread snapshot has actually landed.
+        if (_authoritativeThreadSnapshots == snapshotsBefore) {
+          throw StateError('initial thread snapshot unavailable');
+        }
+      });
+    } catch (_) {
+      // `_runRuntimeSync` already exposed the original failure and scheduled
+      // its existing retry. Keep the UI's resilient startup behaviour while
+      // the timing receipt truthfully reports this first attempt as a failure.
+    }
     unawaited(refreshDashboardConfig());
     unawaited(refreshRecentActivity());
     unawaited(refreshQuota());
@@ -1792,6 +1805,7 @@ class DashboardStore {
       _actorsStale.add(false);
       _persistActorHierarchy(snap.threads);
       _runtimeCursor = snap.runtimeCursor;
+      _authoritativeThreadSnapshots += 1;
       _error.add(null);
       if (!_drainRuntimeBuffer()) _runtimeSyncAgain = true;
     }
