@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
+import 'dashboard_timing.dart';
 import 'models.dart';
 import 'session_client.dart';
 
@@ -10,11 +11,14 @@ import 'session_client.dart';
 /// behind `tailscale serve` (relative paths, no hard-coded host).
 class DashboardApi {
   DashboardApi({http.Client? client, Uri? base, SessionRequestState? session})
-    : _client = SessionClient(client, session),
-      _base = base ?? Uri.base;
+    : _base = base ?? Uri.base {
+    _client = DashboardTimingClient(SessionClient(client, session));
+    _timings = DashboardTimingReporter(client: _client, base: _base);
+  }
 
-  final http.Client _client;
+  late final http.Client _client;
   final Uri _base;
+  late final DashboardTimingReporter _timings;
 
   /// The origin every request is resolved against. Exposed so the store can
   /// scope persisted state to the server it actually came from.
@@ -23,6 +27,13 @@ class DashboardApi {
   Uri _u(String path, [Map<String, String>? query]) => _base
       .resolve(path)
       .replace(queryParameters: query?.isEmpty ?? true ? null : query);
+
+  /// Measures one named, content-free client interaction without exposing its
+  /// route or resource identifiers to the telemetry payload.
+  Future<T> trackInteraction<T>(
+    DashboardInteraction interaction,
+    Future<T> Function() action,
+  ) => _timings.measure(interaction, action);
 
   Future<Map<String, dynamic>> _getJson(Uri uri) async {
     final res = await _client.get(uri, headers: {'Accept': 'application/json'});
@@ -66,12 +77,13 @@ class DashboardApi {
   /// The thread list carries only a clipped preview, since it is the same field
   /// for every actor on every poll. The whole text is fetched here, for the one
   /// actor whose detail panel is open.
-  Future<String> fetchCharter(String threadId) async {
-    final json = await _getJson(
-      _u('/api/mesh/threads/charter', {'id': threadId}),
-    );
-    return json['charter'] as String? ?? '';
-  }
+  Future<String> fetchCharter(String threadId) =>
+      trackInteraction(DashboardInteraction.actorDetail, () async {
+        final json = await _getJson(
+          _u('/api/mesh/threads/charter', {'id': threadId}),
+        );
+        return json['charter'] as String? ?? '';
+      });
 
   Future<List<String>> fetchRootControlProviders() async {
     final json = await _getJson(_u('/api/mesh/control/options'));
@@ -255,7 +267,7 @@ class DashboardApi {
     String actorId,
     String body, {
     String? sessionId,
-  }) async {
+  }) => trackInteraction(DashboardInteraction.dashboardMutation, () async {
     final uri = _u('/api/mesh/actors/$actorId/chat');
     final payload = {'body': body, 'sessionId': ?sessionId};
     final res = await _client.post(
@@ -269,28 +281,29 @@ class DashboardApi {
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);
     }
-  }
+  });
 
   /// `POST /api/mesh/actors/:actorId/interrupt` — interrupt a running actor .
   ///
   /// Sends no `by`: the server binds the acting principal from the request
   /// (authenticated identity, or the sole durable user in local mode), so a
   /// client-supplied attribution could only be a guess or the legacy alias.
-  Future<void> interruptActor(String actorId) async {
-    final uri = _u('/api/mesh/actors/$actorId/interrupt');
-    final payload = <String, dynamic>{};
-    final res = await _client.post(
-      uri,
-      headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: jsonEncode(payload),
-    );
-    if (res.statusCode != 200) {
-      throw DashboardApiException(uri, res.statusCode, res.body);
-    }
-  }
+  Future<void> interruptActor(String actorId) =>
+      trackInteraction(DashboardInteraction.actorInterrupt, () async {
+        final uri = _u('/api/mesh/actors/$actorId/interrupt');
+        final payload = <String, dynamic>{};
+        final res = await _client.post(
+          uri,
+          headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode(payload),
+        );
+        if (res.statusCode != 200) {
+          throw DashboardApiException(uri, res.statusCode, res.body);
+        }
+      });
 
   /// `POST /api/mesh/admission-queue/reorder` — move an unclaimed queued
   /// actor before [beforeThreadId], or to the end when it is null (#570).
@@ -488,7 +501,7 @@ class DashboardApi {
     bool? rootsOnly,
     int? limit,
     int? offset,
-  }) async {
+  }) => trackInteraction(DashboardInteraction.primaryNavigation, () async {
     final q = <String, String>{
       'ownerId': ?ownerId,
       'status': ?status,
@@ -500,7 +513,7 @@ class DashboardApi {
     return ObligationPage.fromJson(
       await _getJson(_u('/api/mesh/obligations', q)),
     );
-  }
+  });
 
   Future<ObligationDetailSnapshot> fetchObligationDetail(
     String id, {
@@ -510,7 +523,7 @@ class DashboardApi {
     int? blockingOffset,
     int? completionsOffset,
     int? limit,
-  }) async {
+  }) => trackInteraction(DashboardInteraction.obligationDetail, () async {
     final q = <String, String>{
       'history_before': ?historyBefore,
       if (historyLimit != null) 'history_limit': '$historyLimit',
@@ -522,13 +535,14 @@ class DashboardApi {
     return ObligationDetailSnapshot.fromJson(
       await _getJson(_u('/api/mesh/obligations/$id', q)),
     );
-  }
+  });
 
-  Future<ObligationTreeDto> fetchObligationTree(String id) async {
-    return ObligationTreeDto.fromJson(
+  Future<ObligationTreeDto> fetchObligationTree(String id) => trackInteraction(
+    DashboardInteraction.obligationDetail,
+    () async => ObligationTreeDto.fromJson(
       await _getJson(_u('/api/mesh/obligations/$id/tree')),
-    );
-  }
+    ),
+  );
 
   /// One root page's full trees in a single request — see #241. Replaces the
   /// former `fetchObligations(rootsOnly: true)` + one `fetchObligationTree`
@@ -541,7 +555,7 @@ class DashboardApi {
     int? limit,
     int? offset,
     bool includeTerminalRoots = false,
-  }) async {
+  }) => trackInteraction(DashboardInteraction.primaryNavigation, () async {
     final q = <String, String>{
       if (limit != null) 'limit': '$limit',
       if (offset != null) 'offset': '$offset',
@@ -550,7 +564,7 @@ class DashboardApi {
     return ObligationForest.fromJson(
       await _getJson(_u('/api/mesh/obligations/forest', q)),
     );
-  }
+  });
 
   // ── Obligations write routes ──
 
@@ -561,7 +575,7 @@ class DashboardApi {
     String? intent,
     String? externalRef,
     double? priority,
-  }) async {
+  }) => trackInteraction(DashboardInteraction.dashboardMutation, () async {
     final uri = _u('/api/mesh/obligations');
     final payload = {
       'ownerId': ownerId,
@@ -584,14 +598,14 @@ class DashboardApi {
     }
     final json = jsonDecode(res.body) as Map<String, dynamic>;
     return ObligationDto.fromJson(json['obligation'] as Map<String, dynamic>);
-  }
+  });
 
   Future<ObligationDto> setObligationStatus(
     String id,
     String status, {
     String? note,
     String? resolutionRef,
-  }) async {
+  }) => trackInteraction(DashboardInteraction.obligationStatus, () async {
     final uri = _u('/api/mesh/obligations/$id/status');
     final trimmed = note?.trim();
     final res = await _client.post(
@@ -614,11 +628,14 @@ class DashboardApi {
     }
     final json = jsonDecode(res.body) as Map<String, dynamic>;
     return ObligationDto.fromJson(json['obligation'] as Map<String, dynamic>);
-  }
+  });
 
   /// `POST /api/mesh/obligations/:id/external-ref` — link, relink or unlink the
   /// issue/PR/repo this obligation *is*. A null or blank [ref] unlinks.
-  Future<ObligationDto> setObligationExternalRef(String id, String? ref) async {
+  Future<ObligationDto> setObligationExternalRef(
+    String id,
+    String? ref,
+  ) => trackInteraction(DashboardInteraction.dashboardMutation, () async {
     final uri = _u('/api/mesh/obligations/$id/external-ref');
     final trimmed = ref?.trim();
     final res = await _client.post(
@@ -636,7 +653,7 @@ class DashboardApi {
     }
     final json = jsonDecode(res.body) as Map<String, dynamic>;
     return ObligationDto.fromJson(json['obligation'] as Map<String, dynamic>);
-  }
+  });
 
   /// `POST /api/mesh/obligations/:id/snooze` — set, replace or clear (null
   /// [until]) the snooze on an obligation the viewer owns (#722). The deadline
@@ -645,7 +662,7 @@ class DashboardApi {
   Future<ObligationSnoozeResult> setObligationSnooze(
     String id,
     DateTime? until,
-  ) async {
+  ) => trackInteraction(DashboardInteraction.obligationSnooze, () async {
     final uri = _u('/api/mesh/obligations/$id/snooze');
     final res = await _client.post(
       uri,
@@ -665,14 +682,14 @@ class DashboardApi {
       ),
       warning: json['warning'] as String?,
     );
-  }
+  });
 
   Future<ObligationDto> reorderObligation(
     String id, {
     String? previousId,
     String? nextId,
     String scope = 'subtree',
-  }) async {
+  }) => trackInteraction(DashboardInteraction.dashboardMutation, () async {
     final uri = _u('/api/mesh/obligations/$id/reorder');
     final payload = {
       'previousId': ?previousId,
@@ -692,33 +709,33 @@ class DashboardApi {
     }
     final json = jsonDecode(res.body) as Map<String, dynamic>;
     return ObligationDto.fromJson(json['obligation'] as Map<String, dynamic>);
-  }
+  });
 
-  Future<ObligationDto> reparentObligation(
-    String id, {
-    String? parentId,
-  }) async {
-    final uri = _u('/api/mesh/obligations/$id/reparent');
-    final payload = {'parentId': ?parentId};
-    final res = await _client.post(
-      uri,
-      headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: jsonEncode(payload),
-    );
-    if (res.statusCode != 200) {
-      throw DashboardApiException(uri, res.statusCode, res.body);
-    }
-    final json = jsonDecode(res.body) as Map<String, dynamic>;
-    return ObligationDto.fromJson(json['obligation'] as Map<String, dynamic>);
-  }
+  Future<ObligationDto> reparentObligation(String id, {String? parentId}) =>
+      trackInteraction(DashboardInteraction.dashboardMutation, () async {
+        final uri = _u('/api/mesh/obligations/$id/reparent');
+        final payload = {'parentId': ?parentId};
+        final res = await _client.post(
+          uri,
+          headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode(payload),
+        );
+        if (res.statusCode != 200) {
+          throw DashboardApiException(uri, res.statusCode, res.body);
+        }
+        final json = jsonDecode(res.body) as Map<String, dynamic>;
+        return ObligationDto.fromJson(
+          json['obligation'] as Map<String, dynamic>,
+        );
+      });
 
   Future<ObligationDto> reassignObligation(
     String id, {
     required String ownerId,
-  }) async {
+  }) => trackInteraction(DashboardInteraction.dashboardMutation, () async {
     final uri = _u('/api/mesh/obligations/$id/reassign');
     final res = await _client.post(
       uri,
@@ -733,7 +750,7 @@ class DashboardApi {
     }
     final json = jsonDecode(res.body) as Map<String, dynamic>;
     return ObligationDto.fromJson(json['obligation'] as Map<String, dynamic>);
-  }
+  });
 
   void close() => _client.close();
 }

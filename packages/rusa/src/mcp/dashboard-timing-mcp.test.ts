@@ -20,6 +20,15 @@ describe("dashboard timing MCP", () => {
       sampleCount: 1,
       droppedSinceStart: 0,
       clientServerCoverage: { clientRequestIds: 0, serverRequestIds: 1, matchedRequestIds: 0 },
+      requestCoverage: {
+        correlation: { numerator: 0, denominator: 0, state: "no-referenced-request" as const },
+        measurement: { numerator: 0, denominator: 0, state: "no-referenced-request" as const },
+      },
+      pairedRequestDurations: {
+        sampleCount: 0,
+        clientRequestMs: { p50Ms: null, p95Ms: null, p99Ms: null, maxMs: null },
+        serverDurationMs: { p50Ms: null, p95Ms: null, p99Ms: null, maxMs: null },
+      },
       groups: [],
     }));
     const client = await connect(createDashboardTimingMcpServer({ summary }));

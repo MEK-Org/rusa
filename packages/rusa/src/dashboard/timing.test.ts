@@ -34,12 +34,14 @@ describe("dashboard timing recorder", () => {
         interaction: "initial_load",
         durationMs: 123,
         requestIds: [id],
+        requestTimings: [{ requestId: id, requestMs: 45 }],
         outcome: "success",
       })
     ).toEqual({
       interaction: "initial_load",
       durationMs: 123,
       requestIds: [id],
+      requestTimings: [{ requestId: id, requestMs: 45 }],
       outcome: "success",
     });
     expect(
@@ -52,6 +54,33 @@ describe("dashboard timing recorder", () => {
     ).toBeNull();
     expect(
       parseDashboardClientTiming({ interaction: "free-text", durationMs: 1, requestIds: [] })
+    ).toBeNull();
+    expect(
+      parseDashboardClientTiming({
+        interaction: "initial_load",
+        durationMs: 1,
+        requestIds: [id],
+        requestTimings: [{ requestId: randomUUID(), requestMs: 1 }],
+      })
+    ).toBeNull();
+    expect(
+      parseDashboardClientTiming({
+        interaction: "initial_load",
+        durationMs: 1,
+        requestIds: [id],
+        requestTimings: [
+          { requestId: id, requestMs: 1 },
+          { requestId: id, requestMs: 2 },
+        ],
+      })
+    ).toBeNull();
+    expect(
+      parseDashboardClientTiming({
+        interaction: "initial_load",
+        durationMs: 1,
+        requestIds: [id],
+        requestTimings: [{ requestId: id, requestMs: 1.5 }],
+      })
     ).toBeNull();
   });
 
@@ -74,6 +103,7 @@ describe("dashboard timing recorder", () => {
       interaction: "initial_load",
       durationMs: 2200,
       requestIds: [requestId],
+      requestTimings: [{ requestId, requestMs: 2100 }],
       outcome: "success",
     });
     while (timingRows().length < 21) recorder.flush();
@@ -87,6 +117,15 @@ describe("dashboard timing recorder", () => {
       serverRequestIds: 20,
       matchedRequestIds: 1,
     });
+    expect(summary.requestCoverage).toEqual({
+      correlation: { numerator: 1, denominator: 1, state: "full" },
+      measurement: { numerator: 1, denominator: 1, state: "full" },
+    });
+    expect(summary.pairedRequestDurations).toEqual({
+      sampleCount: 1,
+      clientRequestMs: { p50Ms: 2100, p95Ms: 2100, p99Ms: 2100, maxMs: 2100 },
+      serverDurationMs: { p50Ms: 600, p95Ms: 600, p99Ms: 600, maxMs: 600 },
+    });
     expect(summary.groups).toEqual([
       expect.objectContaining({
         source: "client",
@@ -98,6 +137,98 @@ describe("dashboard timing recorder", () => {
       }),
     ]);
     expect(JSON.stringify(summary)).not.toContain(requestId);
+  });
+
+  it("keeps legacy, missing, duplicate and parallel request IDs honest in paired coverage", () => {
+    const recorder = new DashboardTimingRecorder(
+      events,
+      () => new Date("2026-10-05T12:00:00.000Z")
+    );
+    const paired = randomUUID();
+    const legacy = randomUUID();
+    const missing = randomUUID();
+    const duplicate = randomUUID();
+    const parallel = randomUUID();
+    for (const [requestId, durationMs] of [
+      [paired, 40],
+      [legacy, 50],
+      [duplicate, 60],
+      [duplicate, 61],
+      [parallel, 70],
+    ] as const) {
+      recorder.recordServer({
+        label: "mesh_threads",
+        requestId,
+        durationMs,
+        status: 200,
+        bytes: 1,
+      });
+    }
+    recorder.recordClient({
+      interaction: "initial_load",
+      durationMs: 250,
+      requestIds: [paired, legacy, missing, duplicate, parallel],
+      requestTimings: [
+        { requestId: paired, requestMs: 80 },
+        { requestId: duplicate, requestMs: 90 },
+        { requestId: parallel, requestMs: 100 },
+      ],
+      outcome: "success",
+    });
+    while (timingRows().length < 6) recorder.flush();
+
+    const summary = recorder.summary({
+      since: new Date("2026-10-05T11:00:00.000Z"),
+      label: "initial_load",
+    });
+    expect(summary.requestCoverage).toEqual({
+      correlation: { numerator: 3, denominator: 5, state: "partial" },
+      measurement: { numerator: 2, denominator: 5, state: "partial" },
+    });
+    expect(summary.pairedRequestDurations).toEqual({
+      sampleCount: 2,
+      clientRequestMs: { p50Ms: 80, p95Ms: 100, p99Ms: 100, maxMs: 100 },
+      serverDurationMs: { p50Ms: 40, p95Ms: 70, p99Ms: 70, maxMs: 70 },
+    });
+    expect(JSON.stringify(summary)).not.toContain(paired);
+    expect(JSON.stringify(summary)).not.toContain(legacy);
+    expect(JSON.stringify(summary)).not.toContain(duplicate);
+  });
+
+  it("reports missing and no-referenced-request coverage separately", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    recorder.recordClient({
+      interaction: "actor_detail",
+      durationMs: 20,
+      requestIds: [randomUUID()],
+      outcome: "failure",
+    });
+    recorder.recordClient({
+      interaction: "obligation_detail",
+      durationMs: 20,
+      requestIds: [],
+      outcome: "failure",
+    });
+    while (timingRows().length < 2) recorder.flush();
+
+    expect(
+      recorder.summary({
+        since: new Date(Date.now() - 60_000),
+        label: "actor_detail",
+      }).requestCoverage
+    ).toEqual({
+      correlation: { numerator: 0, denominator: 1, state: "missing" },
+      measurement: { numerator: 0, denominator: 1, state: "missing" },
+    });
+    expect(
+      recorder.summary({
+        since: new Date(Date.now() - 60_000),
+        label: "obligation_detail",
+      }).requestCoverage
+    ).toEqual({
+      correlation: { numerator: 0, denominator: 0, state: "no-referenced-request" },
+      measurement: { numerator: 0, denominator: 0, state: "no-referenced-request" },
+    });
   });
 
   it("drops excess post-response observations instead of growing its queue", () => {

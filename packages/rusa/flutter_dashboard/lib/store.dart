@@ -6,6 +6,7 @@ import 'package:rxdart/rxdart.dart';
 import 'actor_display.dart';
 import 'actor_hierarchy_cache.dart';
 import 'api.dart';
+import 'dashboard_timing.dart';
 import 'avatar_platform.dart';
 import 'mesh_stream.dart';
 import 'models.dart';
@@ -572,7 +573,10 @@ class DashboardStore {
     _subs.add(_stream.avatarUpdates.listen(_onAvatarUpdate));
     _subs.add(_actorStates.listen(_syncRunSelections));
     _stream.connect(const []); // mesh_event flows for all actors regardless
-    await refreshThreads();
+    await _api.trackInteraction(
+      DashboardInteraction.initialLoad,
+      refreshThreads,
+    );
     unawaited(refreshDashboardConfig());
     unawaited(refreshRecentActivity());
     unawaited(refreshQuota());

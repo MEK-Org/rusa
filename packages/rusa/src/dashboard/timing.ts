@@ -58,6 +58,12 @@ export interface DashboardTimingPayload {
   requestId?: string;
   /** The bounded set of server request UUIDs included in one client interaction. */
   requestIds?: string[];
+  /**
+   * Client-observed dispatch-through-body-consumption durations. These are
+   * optional so existing v1 client records remain readable without invented
+   * measurements.
+   */
+  requestTimings?: Array<{ requestId: string; requestMs: number }>;
   durationMs: number | null;
   status: number | null;
   bytes: number | null;
@@ -69,6 +75,7 @@ export interface DashboardClientTimingInput {
   interaction: (typeof CLIENT_LABELS)[number];
   durationMs: number;
   requestIds: string[];
+  requestTimings?: Array<{ requestId: string; requestMs: number }>;
   outcome?: "success" | "failure";
 }
 
@@ -80,6 +87,10 @@ interface TimingEventStore {
 
 function isFiniteMilliseconds(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 86_400_000;
+}
+
+function isIntegerMilliseconds(value: unknown): value is number {
+  return isFiniteMilliseconds(value) && Number.isInteger(value);
 }
 
 function isHttpStatus(value: unknown): value is number {
@@ -149,7 +160,7 @@ export function parseDashboardClientTiming(input: unknown): DashboardClientTimin
   const value = input as Record<string, unknown>;
   if (
     !Object.keys(value).every((key) =>
-      ["interaction", "durationMs", "requestIds", "outcome"].includes(key)
+      ["interaction", "durationMs", "requestIds", "requestTimings", "outcome"].includes(key)
     )
   ) {
     return null;
@@ -161,10 +172,44 @@ export function parseDashboardClientTiming(input: unknown): DashboardClientTimin
   if (!value.requestIds.every(isUuid)) return null;
   if (value.outcome !== undefined && value.outcome !== "success" && value.outcome !== "failure")
     return null;
+  const requestIds = [...new Set(value.requestIds)];
+  let requestTimings: Array<{ requestId: string; requestMs: number }> | undefined;
+  if (value.requestTimings !== undefined) {
+    if (
+      !Array.isArray(value.requestTimings) ||
+      value.requestTimings.length > DASHBOARD_TIMING_MAX_CLIENT_IDS
+    ) {
+      return null;
+    }
+    const seen = new Set<string>();
+    requestTimings = [];
+    for (const timing of value.requestTimings) {
+      if (
+        !timing ||
+        typeof timing !== "object" ||
+        Array.isArray(timing) ||
+        !Object.keys(timing).every((key) => ["requestId", "requestMs"].includes(key))
+      ) {
+        return null;
+      }
+      const entry = timing as Record<string, unknown>;
+      if (
+        !isUuid(entry.requestId) ||
+        !requestIds.includes(entry.requestId) ||
+        !isIntegerMilliseconds(entry.requestMs) ||
+        seen.has(entry.requestId)
+      ) {
+        return null;
+      }
+      seen.add(entry.requestId);
+      requestTimings.push({ requestId: entry.requestId, requestMs: entry.requestMs });
+    }
+  }
   return {
     interaction: value.interaction as DashboardClientTimingInput["interaction"],
     durationMs: Math.round(value.durationMs),
-    requestIds: [...new Set(value.requestIds)],
+    requestIds,
+    ...(requestTimings ? { requestTimings } : {}),
     ...(value.outcome ? { outcome: value.outcome } : {}),
   };
 }
@@ -179,6 +224,7 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
     const outcome = value.outcome;
     const requestId = value.requestId;
     const requestIds = value.requestIds;
+    const requestTimings = value.requestTimings;
     if (
       value.v !== 1 ||
       (value.source !== "server" && value.source !== "client") ||
@@ -188,11 +234,28 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
         (!Array.isArray(requestIds) ||
           requestIds.length > DASHBOARD_TIMING_MAX_CLIENT_IDS ||
           !requestIds.every(isUuid))) ||
+      (requestTimings !== undefined &&
+        (!Array.isArray(requestTimings) ||
+          requestTimings.length > DASHBOARD_TIMING_MAX_CLIENT_IDS ||
+          requestTimings.some(
+            (timing) =>
+              !timing ||
+              typeof timing !== "object" ||
+              Array.isArray(timing) ||
+              !isUuid((timing as Record<string, unknown>).requestId) ||
+              !isIntegerMilliseconds((timing as Record<string, unknown>).requestMs)
+          ) ||
+          new Set(requestTimings.map((timing) => (timing as { requestId: string }).requestId))
+            .size !== requestTimings.length ||
+          requestTimings.some(
+            (timing) => !requestIds?.includes((timing as { requestId: string }).requestId)
+          ))) ||
       (durationMs !== null && !isFiniteMilliseconds(durationMs)) ||
       (status !== null && !isHttpStatus(status)) ||
       (bytes !== null && !isByteCount(bytes)) ||
       (outcome !== null && outcome !== "success" && outcome !== "failure") ||
       (value.source === "server" && outcome !== null) ||
+      (value.source === "server" && requestTimings !== undefined) ||
       (value.source === "client" && status !== null)
     ) {
       return null;
@@ -203,6 +266,14 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
       label: value.label,
       ...(requestId ? { requestId } : {}),
       ...(requestIds ? { requestIds } : {}),
+      ...(requestTimings
+        ? {
+            requestTimings: requestTimings.map((timing) => ({
+              requestId: (timing as { requestId: string }).requestId,
+              requestMs: (timing as { requestMs: number }).requestMs,
+            })),
+          }
+        : {}),
       durationMs,
       status,
       bytes,
@@ -281,6 +352,7 @@ export class DashboardTimingRecorder {
       source: "client",
       label: input.interaction,
       requestIds: input.requestIds,
+      ...(input.requestTimings ? { requestTimings: input.requestTimings } : {}),
       durationMs: input.durationMs,
       status: null,
       bytes: null,
@@ -413,7 +485,31 @@ export interface DashboardTimingSummary {
     serverRequestIds: number;
     matchedRequestIds: number;
   };
+  /** Coverage is counted against the exact, de-duplicated IDs a client row references. */
+  requestCoverage: {
+    correlation: DashboardRequestCoverage;
+    measurement: DashboardRequestCoverage;
+  };
+  /** Both distributions use the exact same unambiguous ID-paired cohort. */
+  pairedRequestDurations: {
+    sampleCount: number;
+    clientRequestMs: DashboardTimingDistribution;
+    serverDurationMs: DashboardTimingDistribution;
+  };
   groups: DashboardTimingGroup[];
+}
+
+export interface DashboardRequestCoverage {
+  numerator: number;
+  denominator: number;
+  state: "full" | "partial" | "missing" | "no-referenced-request";
+}
+
+export interface DashboardTimingDistribution {
+  p50Ms: number | null;
+  p95Ms: number | null;
+  p99Ms: number | null;
+  maxMs: number | null;
 }
 
 function percentile(values: number[], p: number): number | null {
@@ -436,6 +532,30 @@ function thresholdFor(source: TimingSource, label: DashboardTimingLabel): number
   return 500;
 }
 
+function distribution(values: number[]): DashboardTimingDistribution {
+  return {
+    p50Ms: percentile(values, 50),
+    p95Ms: percentile(values, 95),
+    p99Ms: percentile(values, 99),
+    maxMs: values.length ? Math.max(...values) : null,
+  };
+}
+
+function coverage(numerator: number, denominator: number): DashboardRequestCoverage {
+  return {
+    numerator,
+    denominator,
+    state:
+      denominator === 0
+        ? "no-referenced-request"
+        : numerator === 0
+          ? "missing"
+          : numerator === denominator
+            ? "full"
+            : "partial",
+  };
+}
+
 function summarize(
   rows: Array<{ event: MeshEvent; payload: DashboardTimingPayload }>,
   correlationRows: Array<{ event: MeshEvent; payload: DashboardTimingPayload }>,
@@ -454,6 +574,8 @@ function summarize(
   >();
   const serverRequestIds = new Set<string>();
   const clientRequestIds = new Set<string>();
+  const serverRowsByRequestId = new Map<string, DashboardTimingPayload[]>();
+  const clientMeasurementsByRequestId = new Map<string, number[]>();
   for (const { payload } of rows) {
     const key = `${payload.source}:${payload.label}`;
     const group = groups.get(key) ?? {
@@ -475,11 +597,33 @@ function summarize(
     groups.set(key, group);
   }
   for (const { payload } of correlationRows) {
-    if (payload.source === "server" && payload.requestId) serverRequestIds.add(payload.requestId);
-    if (payload.source === "client")
+    if (payload.source === "server" && payload.requestId) {
+      serverRequestIds.add(payload.requestId);
+      const serverRows = serverRowsByRequestId.get(payload.requestId) ?? [];
+      serverRows.push(payload);
+      serverRowsByRequestId.set(payload.requestId, serverRows);
+    }
+    if (payload.source === "client") {
       for (const id of payload.requestIds ?? []) clientRequestIds.add(id);
+      for (const timing of payload.requestTimings ?? []) {
+        const values = clientMeasurementsByRequestId.get(timing.requestId) ?? [];
+        values.push(timing.requestMs);
+        clientMeasurementsByRequestId.set(timing.requestId, values);
+      }
+    }
   }
-  const matchedRequestIds = [...clientRequestIds].filter((id) => serverRequestIds.has(id)).length;
+  // Only one server record and one client request measurement make an exact
+  // pair. Duplicates are deliberately excluded instead of multiplying samples.
+  const correlatedRequestIds = [...clientRequestIds].filter(
+    (id) => serverRowsByRequestId.get(id)?.length === 1
+  );
+  const pairedRows = correlatedRequestIds.flatMap((id) => {
+    const server = serverRowsByRequestId.get(id)?.[0];
+    const clientMeasurements = clientMeasurementsByRequestId.get(id);
+    if (!server || server.durationMs === null || clientMeasurements?.length !== 1) return [];
+    return [{ requestMs: clientMeasurements[0], serverDurationMs: server.durationMs }];
+  });
+  const pairedRequestIds = pairedRows.length;
   return {
     since,
     sampleCount: rows.length,
@@ -487,7 +631,16 @@ function summarize(
     clientServerCoverage: {
       clientRequestIds: clientRequestIds.size,
       serverRequestIds: serverRequestIds.size,
-      matchedRequestIds,
+      matchedRequestIds: correlatedRequestIds.length,
+    },
+    requestCoverage: {
+      correlation: coverage(correlatedRequestIds.length, clientRequestIds.size),
+      measurement: coverage(pairedRequestIds, clientRequestIds.size),
+    },
+    pairedRequestDurations: {
+      sampleCount: pairedRequestIds,
+      clientRequestMs: distribution(pairedRows.map((pair) => pair.requestMs)),
+      serverDurationMs: distribution(pairedRows.map((pair) => pair.serverDurationMs)),
     },
     groups: [...groups.values()]
       .map((group) => {
