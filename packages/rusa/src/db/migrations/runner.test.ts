@@ -111,7 +111,7 @@ describe("Database Migration System", () => {
       "0053_chat_room_participants",
       "0055_run_prompts",
       "0058_user_google_account_id",
-      "0056_obligation_completion_matchers",
+      "0059_obligation_completion_matchers",
     ]);
 
     const tableNames = (

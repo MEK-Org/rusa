@@ -18,7 +18,7 @@ import { obligationHistory } from "../db/migrations/0045_obligation_history.js";
 import { obligationResponsive } from "../db/migrations/0049_obligation_responsive.js";
 import { dropObligationReadyHeads } from "../db/migrations/0050_drop_obligation_ready_heads.js";
 import { obligationSnooze } from "../db/migrations/0052_obligation_snooze.js";
-import { obligationCompletionMatchers } from "../db/migrations/0056_obligation_completion_matchers.js";
+import { obligationCompletionMatchers } from "../db/migrations/0059_obligation_completion_matchers.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { OBLIGATION_CHECKPOINT_MAX } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";

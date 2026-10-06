@@ -1653,7 +1653,7 @@ async function composeStart(
         },
       ]);
     },
-    log: (message) => console.warn(message),
+    log: (message) => log.warn("completion_matcher_warning", { message }),
   });
   const validateCompletionMatcher = async (matcher: CompletionMatcherInput): Promise<void> => {
     if (matcher.kind !== "pr_merged") return;
@@ -3993,9 +3993,9 @@ async function composeStart(
   } catch (err) {
     // One matcher read/checkout problem must not prevent the mesh from
     // starting; an unchecked matcher is retried by the next boot or live event.
-    console.warn(
-      `[completion-matcher] boot reconciliation failed: ${err instanceof Error ? err.message : String(err)}`
-    );
+    log.warn("completion_matcher_boot_reconcile_failed", {
+      err: err instanceof Error ? err.message : String(err),
+    });
   }
   try {
     mesh.reconcileReadyHeads(getRepositories().obligations);

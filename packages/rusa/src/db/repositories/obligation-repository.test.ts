@@ -29,7 +29,7 @@ import { obligationHistory } from "../migrations/0045_obligation_history.js";
 import { obligationResponsive } from "../migrations/0049_obligation_responsive.js";
 import { dropObligationReadyHeads } from "../migrations/0050_drop_obligation_ready_heads.js";
 import { obligationSnooze } from "../migrations/0052_obligation_snooze.js";
-import { obligationCompletionMatchers } from "../migrations/0056_obligation_completion_matchers.js";
+import { obligationCompletionMatchers } from "../migrations/0059_obligation_completion_matchers.js";
 import {
   MAX_OBLIGATION_PAGE_LIMIT,
   type ObligationQueue,

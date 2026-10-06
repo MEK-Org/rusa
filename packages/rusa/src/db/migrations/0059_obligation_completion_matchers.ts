@@ -12,7 +12,7 @@ import type { Migration } from "./types.js";
  * functions or a table rebuild.
  */
 export const obligationCompletionMatchers: Migration = {
-  id: "0056_obligation_completion_matchers",
+  id: "0059_obligation_completion_matchers",
   up: (db: Database) => {
     db.exec(`
       CREATE TABLE obligation_completion_matchers (
