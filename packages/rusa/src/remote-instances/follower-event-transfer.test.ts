@@ -919,23 +919,23 @@ describe("parked queue diagnostic (#880)", () => {
   const at = (ms: number) => new Date(ms).toISOString();
   const bytesOf = (event: FollowerEvent) => Buffer.byteLength(JSON.stringify(event));
 
-  /** Report a parked head on `/poll` as the follower does, then read the hub's status listing. */
-  async function report(h: Awaited<ReturnType<typeof setup>>, parkedEvent: unknown) {
-    // The first poll is held open; a duplicate is answered 409 after the report is recorded.
-    void h.post("/poll", { ...h.identity, parkedEvent }).catch(() => {});
+  /** Hold a poll open, as the follower does, without reporting anything. */
+  async function hold(h: Awaited<ReturnType<typeof setup>>) {
+    void h.post("/poll", h.identity).catch(() => {});
+    await vi.waitFor(async () => expect((await h.post("/poll", h.identity)).status).toBe(409));
+  }
+  /**
+   * Report on a duplicate `/poll`, which the hub answers 409 only after
+   * recording the report, then read the hub's status listing once.
+   */
+  async function listed(h: Awaited<ReturnType<typeof setup>>, parkedEvent: unknown) {
+    expect((await h.post("/poll", { ...h.identity, parkedEvent })).status).toBe(409);
     const response = await fetch(`${h.origin}/followers`, {
       headers: { authorization: `Bearer ${h.token}` },
     });
     expect(response.status).toBe(200);
-    return response;
-  }
-  async function listed(h: Awaited<ReturnType<typeof setup>>, parkedEvent: unknown) {
-    let followers: Array<Record<string, unknown>> = [];
-    await vi.waitFor(async () => {
-      followers = (await (await report(h, parkedEvent)).json()) as typeof followers;
-      expect(followers).toHaveLength(1);
-      expect(followers[0]).toHaveProperty("parkedEvent");
-    });
+    const followers = (await response.json()) as Array<Record<string, unknown>>;
+    expect(followers).toHaveLength(1);
     return followers[0];
   }
 
@@ -948,6 +948,7 @@ describe("parked queue diagnostic (#880)", () => {
     ).json()) as Array<Record<string, unknown>>;
     expect(unreported[0]).not.toHaveProperty("parkedEvent");
     expect(queue.parkedHead).toBeUndefined();
+    await hold(h);
     expect((await listed(h, queue.parkedHead ?? null)).parkedEvent).toBeNull();
 
     const big = log("big", "x".repeat(9 * MiB));
@@ -993,6 +994,26 @@ describe("parked queue diagnostic (#880)", () => {
     expect(fenced.parkedHead).toMatchObject({ eventId: "fenced" });
     fenced.clear();
     expect(fenced.parkedHead).toBeUndefined();
+  });
+
+  it("keeps since for a fragment that can never be sent", async () => {
+    let now = Date.parse("2026-10-06T12:00:00.000Z");
+    const parkedAt = now;
+    const h = await setup();
+    const queue = new FollowerEventQueue(() => now);
+    queue.enqueue(log("unsendable", "small"));
+    // An envelope at the body limit leaves no room for any fragment.
+    const envelope = { ...h.identity, pad: "x".repeat(FOLLOWER_HTTP_BODY_LIMIT_BYTES) };
+    const transfer = h.sender(h.registration.eventTransfer as EventTransferCapability);
+    await queue.flush(h.deliver, envelope, transfer).catch(() => {});
+    now += 60_000;
+    await queue.flush(h.deliver, envelope, transfer).catch(() => {});
+    expect(queue.parkedHead).toMatchObject({
+      reason: "fragment_too_large",
+      eventId: "unsendable",
+      since: at(parkedAt),
+    });
+    expect(h.requests).toEqual([]);
   });
 
   it("reports an oversize leader refusal until a different capability is retried", async () => {
@@ -1051,6 +1072,7 @@ describe("parked queue diagnostic (#880)", () => {
     expect(queue.parkedHead).toEqual(parked);
     expect(h.requests).toHaveLength(1);
     expect(h.received).toHaveLength(2);
+    await hold(h);
     const status = await listed(h, queue.parkedHead);
     expect(status.parkedEvent).toEqual(parked);
     expect(JSON.stringify(status)).not.toContain("synthetic failing content");
@@ -1065,6 +1087,7 @@ describe("parked queue diagnostic (#880)", () => {
       bytes: 42,
       since: "2026-10-06T12:00:00.000Z",
     };
+    await hold(h);
     expect(
       (await listed(h, { ...valid, chunk: "private content", token: "secret" })).parkedEvent
     ).toEqual(valid);
@@ -1078,12 +1101,9 @@ describe("parked queue diagnostic (#880)", () => {
       { ...valid, since: "not a time" },
       "parked",
     ]) {
-      await vi.waitFor(async () => {
-        const followers = (await (await report(h, invalid)).json()) as Array<
-          Record<string, unknown>
-        >;
-        expect(followers[0]).not.toHaveProperty("parkedEvent");
-      });
+      // A valid report first, so each malformed one has something to drop.
+      expect((await listed(h, valid)).parkedEvent).toEqual(valid);
+      expect(await listed(h, invalid)).not.toHaveProperty("parkedEvent");
     }
   });
 });

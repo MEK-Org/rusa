@@ -142,7 +142,11 @@ export class FollowerEventQueue {
    * until the queue is cleared.
    */
   private acceptanceFailed: QueuedEvent | undefined;
-  /** The head as last parked; cleared when it is sent again or the queue is cleared. */
+  /**
+   * The head as last parked. It clears only when a request is sent or on
+   * `clear()`, so a head that keeps parking before reaching the wire keeps
+   * its `since`.
+   */
   private parked: FollowerParkedEvent | undefined;
 
   constructor(private readonly now: () => number = Date.now) {}
@@ -249,8 +253,6 @@ export class FollowerEventQueue {
         }
         if (count > 0) this.pendingBatch = { batchId, events: this.events.slice(0, count) };
         else this.pendingTransfer = this.startTransfer(this.events[0] as QueuedEvent, transfer);
-        // Parking throws above, so reaching here means the head is being sent again.
-        this.parked = undefined;
       }
       if (this.pendingTransfer) {
         await this.sendFragment(this.pendingTransfer, envelope, transfer);
@@ -258,6 +260,7 @@ export class FollowerEventQueue {
       }
       const batch = this.pendingBatch as PendingBatch;
       const prefix = JSON.stringify({ ...envelope, batchId: batch.batchId }).slice(0, -1);
+      this.parked = undefined;
       try {
         await deliver({
           batchId: batch.batchId,
@@ -370,6 +373,7 @@ export class FollowerEventQueue {
       this.pendingTransfer = undefined;
       return this.park(pending.event, "fragment_too_large", FOLLOWER_HTTP_BODY_LIMIT_BYTES);
     }
+    this.parked = undefined;
     const reply = await transfer.send(fragment);
     // A leader-incarnation fence cleared the queue while this request was in flight.
     if (this.pendingTransfer !== pending) return;

@@ -266,10 +266,12 @@ Follower status also shows it ([#880](https://github.com/MEK-Org/rusa/issues/880
 each follower `/poll` reports its parked head, so a change shows within one
 poll hold (20 seconds), and `GET /followers` (and
 `/api/mesh/followers`) lists it as `parkedEvent: { reason, eventId, eventType,
-bytes, since }` — `null` when nothing is parked, absent for a follower that
-does not report one. It names the event, never its content; `since` holds
-while the head stays parked for the same reason, and the field clears when
-the head is sent again or the queue is fenced. Deploy an upgraded leader before relying on transfer
+bytes, since }` — `null` when nothing is parked, absent until a new follower
+process first polls, or for a follower that does not report one. It names the
+event, never its content; `since` holds while the head stays parked for the
+same reason, and the field clears when a request for it is sent or the queue
+is fenced. A follower that stops polling keeps its last report until it is
+dropped, so read the field with `lastSeen`. Deploy an upgraded leader before relying on transfer
 from upgraded followers. A follower built before #876 is still accepted and
 keeps its old limit: an event that alone exceeds 8 MiB blocks its queue.
 
