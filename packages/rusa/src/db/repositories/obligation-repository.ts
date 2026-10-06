@@ -230,6 +230,10 @@ export interface ChildObligationPageOptions extends ObligationPageOptions {
 
 export interface OwnedObligationPageOptions extends ObligationPageOptions {
   status?: ObligationStatus;
+  /** Only rows this entity created: the questions an actor filed for a human (#890). */
+  creatorId?: EntityId;
+  /** Exclude done and cancelled rows. */
+  openOnly?: boolean;
 }
 
 /**
@@ -2082,12 +2086,21 @@ export class ObligationRepository {
     validateEntityId(ownerId);
     const { limit, offset } = validatePage(options);
     const params: Array<string | number> = [ownerId];
-    const statusClause = options.status === undefined ? "" : " AND obligation.status = ?";
-    if (options.status !== undefined) params.push(options.status);
+    let filter = "";
+    if (options.status !== undefined) {
+      filter += " AND obligation.status = ?";
+      params.push(options.status);
+    }
+    if (options.creatorId !== undefined) {
+      validateEntityId(options.creatorId);
+      filter += " AND obligation.creator_id = ?";
+      params.push(options.creatorId);
+    }
+    if (options.openOnly) filter += " AND obligation.status NOT IN ('done', 'cancelled')";
     const rows = this.db
       .prepare(
         `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
-         WHERE obligation.owner_id = ?${statusClause}
+         WHERE obligation.owner_id = ?${filter}
          ORDER BY ${OWNER_QUEUE_ORDER_SQL}
          LIMIT ? OFFSET ?`
       )
@@ -2096,44 +2109,9 @@ export class ObligationRepository {
       this.db
         .prepare(
           `SELECT COUNT(*) AS count FROM obligations obligation
-           WHERE obligation.owner_id = ?${statusClause}`
+           WHERE obligation.owner_id = ?${filter}`
         )
         .get(...params) as { count: number }
-    ).count;
-    return {
-      obligations: rows.slice(0, limit).map(toObligation),
-      total,
-      hasMore: rows.length > limit,
-    };
-  }
-
-  /**
-   * Open obligations one creator filed for one owner, in the owner's queue
-   * order (#890): the questions an actor asked a human, shown when that human's
-   * message is selected. Done and cancelled rows are excluded.
-   */
-  listOpenOwnedCreatedByPage(
-    ownerId: EntityId,
-    creatorId: EntityId,
-    options: ObligationPageOptions
-  ): ObligationPage {
-    validateEntityId(ownerId);
-    validateEntityId(creatorId);
-    const { limit, offset } = validatePage(options);
-    const where = `WHERE obligation.owner_id = ? AND obligation.creator_id = ?
-         AND obligation.status NOT IN ('done', 'cancelled')`;
-    const rows = this.db
-      .prepare(
-        `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
-         ${where}
-         ORDER BY ${OWNER_QUEUE_ORDER_SQL}
-         LIMIT ? OFFSET ?`
-      )
-      .all(ownerId, creatorId, limit + 1, offset) as ObligationRow[];
-    const total = (
-      this.db
-        .prepare(`SELECT COUNT(*) AS count FROM obligations obligation ${where}`)
-        .get(ownerId, creatorId) as { count: number }
     ).count;
     return {
       obligations: rows.slice(0, limit).map(toObligation),

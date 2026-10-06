@@ -185,3 +185,39 @@ it("records the Google account id from the verified sign-in token, never moving 
   });
   expect(repo.getUser(other.id)?.lastAuthenticatedAt).toBe(at);
 });
+
+it("treats a Google id taken by a concurrent sign-in as the same logged conflict", () => {
+  const warn = vi.fn();
+  const logged = new DashboardIdentityResolver(() => repo, "project", { ...nullLogger, warn });
+  const at = new Date().toISOString();
+  // Synthetic Google account id; never a real person's.
+  const googleId = "100000000000000000002";
+  const owner = repo.createUser({
+    email: "owner@example.com",
+    identity: { issuer: ISSUER, subject: "owner" },
+    createdAt: at,
+  });
+  repo.setGoogleAccountId(owner.id, googleId);
+  const other = repo.createUser({
+    email: "other@example.com",
+    identity: { issuer: ISSUER, subject: "other" },
+    createdAt: at,
+  });
+  // The other sign-in read the id as free just before the owner's write landed.
+  vi.spyOn(repo, "findUserByGoogleAccountId").mockReturnValueOnce(undefined);
+
+  logged.recordAuthentication(
+    other,
+    at,
+    token({
+      firebase: { identities: { "google.com": [googleId] }, sign_in_provider: "google.com" },
+    } as Partial<DecodedIdToken>)
+  );
+  expect(repo.getUser(other.id)?.googleAccountId).toBeUndefined();
+  expect(repo.getUser(owner.id)?.googleAccountId).toBe(googleId);
+  expect(repo.getUser(other.id)?.lastAuthenticatedAt).toBe(at);
+  expect(warn).toHaveBeenCalledWith("dashboard_google_account_conflict", {
+    userId: other.id,
+    holderId: owner.id,
+  });
+});

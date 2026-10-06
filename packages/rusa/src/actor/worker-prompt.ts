@@ -170,8 +170,9 @@ recovery attempt.`;
  *
  * Since #890 the whole block is a default that a charter may turn off. An actor
  * whose charter opts out keeps its tools and ready-head delivery; only the
- * practice guidance yields. Filing a human question also requires that the human
- * has a principal, so a question for someone without one stays conversational.
+ * practice guidance yields. Filing a human question also requires an owner
+ * `create_obligation` accepts for that person, so a question for someone the
+ * actor cannot name stays conversational.
  */
 export const OBLIGATION_DISCIPLINE = `## Obligations are why work exists
 
@@ -210,10 +211,11 @@ to hold a single task should have been that task under its parent. Work you will
 finish in this run needs no obligation at all.
 
 **A question for a human is an obligation too.** When you need a decision only a
-person can make and that person has a principal, create the obligation and own
-it to them (\`human:operator\`) instead of only asking in chat. When they have
-no principal, ask in conversation only: do not invent an owner for the question
-or create a principal to hold it. A question asked in a message is gone at the next
+person can make and you can name that person as an owner \`create_obligation\`
+accepts (\`human:operator\` for your operator, or their own principal id),
+create the obligation and own it to them instead of only asking in chat. When
+you can't name them, ask in conversation only: do not invent an owner for the
+question, borrow another person's, or create a principal to hold it. A question asked in a message is gone at the next
 compaction; one in the tree is a standing call-list they can work through. **One
 obligation per question** — four questions in one node cannot be answered,
 reordered, or finished separately, which is the whole point of having them.

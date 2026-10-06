@@ -71,7 +71,7 @@ describe("attachOpenQuestions", () => {
     sources = {
       resolveSenderPrincipal: (entry) => resolveInboxSenderPrincipal(entry, repos.principals),
       listOpenQuestions: (ownerId, creatorId, limit) =>
-        repos.obligations.listOpenOwnedCreatedByPage(ownerId, creatorId, { limit }),
+        repos.obligations.listOwnedPage(ownerId, { creatorId, openOnly: true, limit }),
       listArtifacts: (obligationId) => repos.obligations.listArtifacts(obligationId),
     };
   });

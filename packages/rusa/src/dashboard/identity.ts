@@ -90,15 +90,22 @@ export class DashboardIdentityResolver {
     repo.recordAuthentication(user.id, at);
     const googleAccountId = token === undefined ? undefined : googleAccountIdOf(token);
     if (googleAccountId === undefined || googleAccountId === user.googleAccountId) return;
-    const holder = repo.findUserByGoogleAccountId(googleAccountId);
-    if (holder !== undefined && holder.id !== user.id) {
-      this.logger.warn("dashboard_google_account_conflict", {
-        userId: user.id,
-        holderId: holder.id,
-      });
-      return;
+    let holder = repo.findUserByGoogleAccountId(googleAccountId);
+    if (holder === undefined || holder.id === user.id) {
+      try {
+        repo.setGoogleAccountId(user.id, googleAccountId);
+        return;
+      } catch (error) {
+        // A concurrent sign-in can take the id between that read and this
+        // write; the unique index refuses this one, which is the same conflict.
+        holder = repo.findUserByGoogleAccountId(googleAccountId);
+        if (holder === undefined || holder.id === user.id) throw error;
+      }
     }
-    repo.setGoogleAccountId(user.id, googleAccountId);
+    this.logger.warn("dashboard_google_account_conflict", {
+      userId: user.id,
+      holderId: holder.id,
+    });
   }
 
   /** A verified identity whose email another row already holds fails closed.

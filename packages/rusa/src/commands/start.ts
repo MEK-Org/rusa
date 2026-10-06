@@ -1562,7 +1562,7 @@ async function composeStart(
     return {
       resolveSenderPrincipal: (entry) => resolveInboxSenderPrincipal(entry, principals),
       listOpenQuestions: (ownerId, creatorId, limit) =>
-        obligations.listOpenOwnedCreatedByPage(ownerId, creatorId, { limit }),
+        obligations.listOwnedPage(ownerId, { creatorId, openOnly: true, limit }),
       listArtifacts: (obligationId) => obligations.listArtifacts(obligationId),
     };
   };
