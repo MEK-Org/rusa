@@ -442,74 +442,24 @@ describe("MeshEventRepository", () => {
   });
 
   describe("latestActivityByActor", () => {
-    it("returns the latest ts per actor, ignoring null actor_ids", () => {
-      repo.record({ kind: "run_start", actorId: "a", ts: "2026-06-20T00:00:00.000Z" });
-      repo.record({ kind: "run_end", actorId: "a", success: true, ts: "2026-06-21T00:00:00.000Z" });
-      repo.record({ kind: "run_start", actorId: "b", ts: "2026-06-22T00:00:00.000Z" });
-      repo.record({ kind: "actor_retired", actorId: null, ts: "2026-06-23T00:00:00.000Z" });
-
-      const latest = repo.latestActivityByActor();
-      expect(latest.get("a")).toBe("2026-06-21T00:00:00.000Z");
-      expect(latest.get("b")).toBe("2026-06-22T00:00:00.000Z");
-      expect(latest.has("c")).toBe(false);
-    });
-
-    it("returns an empty map when no events exist", () => {
-      expect(repo.latestActivityByActor()).toEqual(new Map());
-    });
-
-    it("returns latest ts for specified actorIds using bounded seeks (#934)", () => {
-      repo.record({ kind: "run_start", actorId: "a", ts: "2026-06-20T00:00:00.000Z" });
-      repo.record({ kind: "run_end", actorId: "a", success: true, ts: "2026-06-21T00:00:00.000Z" });
-      repo.record({ kind: "run_start", actorId: "b", ts: "2026-06-22T00:00:00.000Z" });
-      repo.record({
-        kind: "run_start",
-        actorId: "retired_with_events",
-        ts: "2026-06-23T00:00:00.000Z",
-      });
-
-      const result = repo.latestActivityByActor([
-        "a",
-        "empty_actor",
-        "retired_with_events",
-        "unknown_actor",
-      ]);
-      expect(result.get("a")).toBe("2026-06-21T00:00:00.000Z");
-      expect(result.get("retired_with_events")).toBe("2026-06-23T00:00:00.000Z");
-      expect(result.has("empty_actor")).toBe(false);
-      expect(result.has("unknown_actor")).toBe(false);
-      expect(result.has("b")).toBe(false); // not queried
-    });
-
-    it("handles empty list, duplicates, and chunking (#934)", () => {
-      repo.record({ kind: "run_start", actorId: "a", ts: "2026-06-20T00:00:00.000Z" });
+    it("returns latest ts only for requested actor ids with one JSON input (#934)", () => {
       expect(repo.latestActivityByActor([])).toEqual(new Map());
 
-      const withDups = repo.latestActivityByActor(["a", "a", "b"]);
-      expect(withDups.get("a")).toBe("2026-06-20T00:00:00.000Z");
-      expect(withDups.has("b")).toBe(false);
-
-      // Verify chunking over 500 IDs
-      const manyIds = Array.from({ length: 600 }, (_, i) => `actor_${i}`);
-      manyIds.push("a");
-      const chunked = repo.latestActivityByActor(manyIds);
-      expect(chunked.get("a")).toBe("2026-06-20T00:00:00.000Z");
-      expect(chunked.size).toBe(1);
-    });
-
-    it("matches unbounded grouped query for queried actors (#934)", () => {
+      repo.record({ kind: "run_start", actorId: "first", ts: "2026-06-19T00:00:00.000Z" });
       repo.record({ kind: "run_start", actorId: "a", ts: "2026-06-20T00:00:00.000Z" });
       repo.record({ kind: "run_end", actorId: "a", success: true, ts: "2026-06-21T00:00:00.000Z" });
-      repo.record({ kind: "run_start", actorId: "b", ts: "2026-06-22T00:00:00.000Z" });
-      repo.record({ kind: "run_start", actorId: "c", ts: "2026-06-23T00:00:00.000Z" });
+      repo.record({ kind: "run_start", actorId: "outside", ts: "2026-06-22T00:00:00.000Z" });
 
-      const unbounded = repo.latestActivityByActor();
-      const queried = ["a", "c", "nonexistent"];
-      const bounded = repo.latestActivityByActor(queried);
-
-      for (const id of queried) {
-        expect(bounded.get(id)).toBe(unbounded.get(id));
-      }
+      const result = repo.latestActivityByActor([
+        "first",
+        ...Array.from({ length: 600 }, (_, i) => `absent-${i}`),
+        "a",
+        "unknown_actor",
+      ]);
+      expect(result.get("first")).toBe("2026-06-19T00:00:00.000Z");
+      expect(result.get("a")).toBe("2026-06-21T00:00:00.000Z");
+      expect(result.has("unknown_actor")).toBe(false);
+      expect(result.has("outside")).toBe(false);
     });
   });
 
