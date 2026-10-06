@@ -603,18 +603,31 @@ function resolvePercentLeft(w: LlmQuotaWindow): number | string {
   return hasUsed ? 100 - value : value;
 }
 
+/** A printed whole-credit balance: grouped (`3,336`) or plain (`0`). */
+const PRINTED_CREDIT_BALANCE = /^(?:\d{1,3}(?:,\d{3})+|\d+)$/;
+
 /**
- * Read an optional Codex `Credits:` balance exactly as a non-negative printed
- * number. Codex groups whole credits (for example `3,336`); accepting a plain
- * decimal keeps this observation layer tolerant of a future fractional display
- * without treating an absent field as zero.
+ * The printed balances of the `Credits:` rows in a raw Codex `/status` panel.
+ * The model's copied value is accepted only when the source actually prints
+ * it, so a model that invents a balance for a panel without one cannot turn
+ * unknown into a number.
  */
-function parsePrintedCreditBalance(text: unknown): number | undefined {
-  if (typeof text !== "string") return undefined;
-  const trimmed = text.trim();
-  if (!/^(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?$/.test(trimmed)) return undefined;
-  const value = Number(trimmed.replaceAll(",", ""));
-  return Number.isFinite(value) && value >= 0 ? value : undefined;
+function printedCreditRows(output: string): string[] {
+  return [...output.matchAll(/(?:^|[\s│|])Credits:[ \t]*([^\s│|]+)/gm)].map((m) => m[1] ?? "");
+}
+
+/**
+ * Read an optional Codex `Credits:` balance as the whole number the panel
+ * prints. Anything else — absent, unprintable, or not on a `Credits:` row of
+ * the raw panel — is unknown, never zero. Credits are observation-only, so an
+ * unusable value never fails the parse: the windows the pacer reads survive.
+ */
+function readCodexRemainingCredits(value: unknown, output: string): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const printed = value.trim();
+  if (!PRINTED_CREDIT_BALANCE.test(printed)) return undefined;
+  if (!printedCreditRows(output).includes(printed)) return undefined;
+  return Number(printed.replaceAll(",", ""));
 }
 
 async function parseQuotaWithLlm(
@@ -835,15 +848,10 @@ async function parseQuotaWithLlm(
       throw new Error(`Quota parse failed: invalid status '${String(parsedObj.status)}'`);
     }
 
-    const hasRemainingCredits = Object.hasOwn(parsedObj, "remainingCredits");
-    const remainingCredits = hasRemainingCredits
-      ? parsePrintedCreditBalance(parsedObj.remainingCredits)
-      : undefined;
-    if (hasRemainingCredits && remainingCredits === undefined) {
-      throw new Error(
-        `Quota parse failed: invalid remainingCredits ${JSON.stringify(parsedObj.remainingCredits)}`
-      );
-    }
+    const remainingCredits =
+      provider === "codex"
+        ? readCodexRemainingCredits(parsedObj.remainingCredits, output)
+        : undefined;
 
     const limits: QuotaLimit[] = [];
     for (const rawWindow of parsedObj.windows) {
