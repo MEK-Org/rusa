@@ -183,6 +183,11 @@ describe("ObligationRepository", () => {
   it("holds matcher satisfaction behind live children, then finishes when the final child clears", () => {
     repository.create({ id: "parent", title: "parent", ownerId: "actor-a" });
     repository.create({ id: "child", title: "child", parentId: "parent", ownerId: "actor-a" });
+    const deployedRef = `github:MEK-Org/rusa/commits/${"b".repeat(40)}`;
+    // A manually attached artifact on the same deployed revision must keep its
+    // label and not conflict with or drop the matcher's observation note.
+    repository.attachArtifact("parent", deployedRef, { label: "prior manual evidence" });
+
     const parent = repository.setCompletionMatcher(
       "parent",
       { kind: "deployed", commit: "a".repeat(40) },
@@ -190,23 +195,51 @@ describe("ObligationRepository", () => {
     );
     const matcher = parent.completionMatcher;
     if (matcher === null) throw new Error("completion matcher was not persisted");
-    const deployedRef = `github:MEK-Org/rusa/commits/${"b".repeat(40)}`;
-    const observedNote = `Completion matcher satisfied: instance observer-1 running bbbbbbb contains aaaaaaa`;
+    const observedNote1 = `Completion matcher satisfied: instance observer-1 running bbbbbbb contains aaaaaaa`;
 
-    const observed = repository.satisfyCompletionMatcher("parent", matcher, {
-      note: observedNote,
+    const observed1 = repository.satisfyCompletionMatcher("parent", matcher, {
+      note: observedNote1,
       resolutionRef: deployedRef,
     });
-    expect(observed.obligation).toMatchObject({ status: "waiting" });
-    expect(observed.obligation.completionMatcher).toMatchObject({ satisfiedRef: deployedRef });
+    expect(observed1.obligation).toMatchObject({ status: "waiting" });
+    expect(observed1.obligation.completionMatcher).toMatchObject({ satisfiedRef: deployedRef });
+
+    // Retarget to another commit contained in the same deployed revision.
+    // The prior satisfaction observation is discarded and the new one is recorded.
+    const retargeted = repository.setCompletionMatcher(
+      "parent",
+      { kind: "deployed", commit: "c".repeat(40) },
+      "actor-a"
+    );
+    const matcher2 = retargeted.completionMatcher;
+    if (matcher2 === null) throw new Error("retargeted completion matcher was not persisted");
+    expect(matcher2.satisfiedAt).toBeNull();
+    expect(matcher2.satisfiedRef).toBeNull();
+
+    const observedNote2 = `Completion matcher satisfied: instance observer-2 running bbbbbbb contains ccccccc`;
+    const observed2 = repository.satisfyCompletionMatcher("parent", matcher2, {
+      note: observedNote2,
+      resolutionRef: deployedRef,
+    });
+    expect(observed2.obligation).toMatchObject({ status: "waiting" });
+    expect(observed2.obligation.completionMatcher).toMatchObject({ satisfiedRef: deployedRef });
 
     repository.setTerminalStatus("child", "done", "child finished", null, "actor-a");
     expect(repository.require("parent")).toMatchObject({
       status: "done",
       resolutionRef: deployedRef,
-      // The observing instance and both revisions survive the deferral.
-      terminalNote: observedNote,
+      // Distinguishes target C / observer-2 rather than the earlier target A observation.
+      terminalNote: observedNote2,
     });
+    // The manually attached artifact preserves its original label.
+    expect(repository.listArtifacts("parent")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          ref: deployedRef,
+          label: "prior manual evidence",
+        }),
+      ])
+    );
     // The child's transition is the caller's; the parent's completion is the mesh's.
     expect(repository.listHistory("child")[0]).toMatchObject({
       actingPrincipal: "actor-a",

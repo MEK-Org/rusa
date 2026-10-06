@@ -37,6 +37,7 @@ export type CompletionMatcherKind = "pr_merged" | "deployed";
 /** Versioned, application-validated data stored in a matcher's `spec_json`. */
 export interface CompletionMatcherSpec {
   schemaVersion: 1;
+  satisfiedNote?: string;
 }
 
 /** The one opt-in matcher currently attached to an obligation, if any. */

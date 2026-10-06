@@ -13,6 +13,7 @@ import {
   type CompletionMatcher,
   type CompletionMatcherInput,
   type CompletionMatcherKind,
+  type CompletionMatcherSpec,
   canonicalPullRequestTarget,
   type EntityId,
   isBlockingObligationStatus,
@@ -538,7 +539,7 @@ function toObligation(row: ObligationRow): Obligation {
   };
 }
 
-function parseCompletionMatcherSpec(raw: string): { schemaVersion: 1 } {
+function parseCompletionMatcherSpec(raw: string): CompletionMatcherSpec {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -549,12 +550,27 @@ function parseCompletionMatcherSpec(raw: string): { schemaVersion: 1 } {
     typeof parsed !== "object" ||
     parsed === null ||
     Array.isArray(parsed) ||
-    (parsed as { schemaVersion?: unknown }).schemaVersion !== 1 ||
-    Object.keys(parsed).some((key) => key !== "schemaVersion")
+    (parsed as { schemaVersion?: unknown }).schemaVersion !== 1
   ) {
     throw new ObligationValidationError("completion matcher spec_json has an unsupported shape");
   }
-  return { schemaVersion: 1 };
+  const obj = parsed as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    if (key === "schemaVersion") continue;
+    if (key === "satisfiedNote") {
+      if (typeof obj.satisfiedNote !== "string" || obj.satisfiedNote.trim().length === 0) {
+        throw new ObligationValidationError(
+          "completion matcher spec_json has an invalid satisfiedNote"
+        );
+      }
+      continue;
+    }
+    throw new ObligationValidationError("completion matcher spec_json has an unsupported shape");
+  }
+  return {
+    schemaVersion: 1,
+    ...(typeof obj.satisfiedNote === "string" ? { satisfiedNote: obj.satisfiedNote } : {}),
+  };
 }
 
 function toCompletionMatcher(row: ObligationRow): CompletionMatcher | null {
@@ -2265,24 +2281,17 @@ export class ObligationRepository {
       if (matcher.satisfiedAt === null) {
         const resolutionRef = parseObligationReference(satisfaction.resolutionRef).key;
         const satisfiedAt = this.stamp();
+        const updatedSpec: CompletionMatcherSpec = {
+          ...matcher.spec,
+          satisfiedNote: satisfaction.note,
+        };
         this.db
           .prepare(
             `UPDATE obligation_completion_matchers
-             SET satisfied_at = ?, satisfied_ref = ?
+             SET satisfied_at = ?, satisfied_ref = ?, spec_json = ?
              WHERE obligation_id = ? AND satisfied_at IS NULL`
           )
-          .run(satisfiedAt, resolutionRef, id);
-        // The observation itself (for `deployed`: which instance ran which
-        // revision) is evidence on the existing artifact boundary, so a
-        // completion deferred behind live children can cite the original fact
-        // instead of reconstructing it later from a different observer.
-        this.db
-          .prepare(
-            `INSERT INTO obligation_artifacts (id, obligation_id, ref, label, attached_by, attached_at)
-             VALUES (?, ?, ?, ?, NULL, ?)
-             ON CONFLICT(obligation_id, ref) DO NOTHING`
-          )
-          .run(randomUUID(), id, resolutionRef, satisfaction.note, satisfiedAt);
+          .run(satisfiedAt, resolutionRef, JSON.stringify(updatedSpec), id);
       }
 
       const liveChild = this.listChildren(id).find((child) =>
@@ -3887,17 +3896,11 @@ export class ObligationRepository {
     if (liveChildren.count !== 0) return;
     const matcher = obligation.completionMatcher;
     if (matcher !== null && matcher.satisfiedAt !== null && matcher.satisfiedRef !== null) {
-      // The observing instance recorded its own note as the satisfaction
-      // artifact's label; an artifact someone attached earlier under the same
-      // ref keeps its label and is not mistaken for that observation.
-      const observed = this.db
-        .prepare("SELECT label FROM obligation_artifacts WHERE obligation_id = ? AND ref = ?")
-        .get(id, matcher.satisfiedRef) as { label: string | null } | undefined;
-      const note = observed?.label?.startsWith("Completion matcher satisfied:")
-        ? observed.label
-        : matcher.kind === "pr_merged"
+      const note =
+        matcher.spec.satisfiedNote ??
+        (matcher.kind === "pr_merged"
           ? `Completion matcher satisfied: ${matcher.target} merged`
-          : `Completion matcher satisfied: deployed revision ${matcher.satisfiedRef} contains ${matcher.target}`;
+          : `Completion matcher satisfied: deployed revision ${matcher.satisfiedRef} contains ${matcher.target}`);
       this.setTerminalStatusInMutation(id, "done", note, matcher.satisfiedRef, "system:mesh");
       return;
     }
