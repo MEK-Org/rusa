@@ -62,10 +62,6 @@ function sessionCookie(req: IncomingMessage): string | undefined {
   return matches.length === 1 ? matches[0].slice(SESSION_COOKIE.length + 1) : undefined;
 }
 
-function sessionKeyOf(cookie: string): string {
-  return createHash("sha256").update(cookie).digest("hex");
-}
-
 function setCookie(res: ServerResponse, value: string, maxAge: number): void {
   res.setHeader(
     "Set-Cookie",
@@ -168,7 +164,7 @@ export class DashboardAuth {
     cookie: string,
     forceRevocation = false
   ): Promise<{ token: DecodedIdToken; principal: UserPrincipal }> {
-    const key = sessionKeyOf(cookie);
+    const key = createHash("sha256").update(cookie).digest("hex");
     const checkedAt = this.revocations.get(key);
     const checkRevoked =
       forceRevocation || checkedAt === undefined || this.now() - checkedAt >= REVOCATION_MS;

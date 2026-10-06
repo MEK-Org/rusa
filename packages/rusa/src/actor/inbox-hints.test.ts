@@ -332,7 +332,8 @@ describe("inbox hints", () => {
       );
       expect(hint).toContain("human-matt entered the Chat Room at 2026-10-05T18:00:00.000Z");
       expect(hint).toContain("it asks nothing and completes no obligation");
-      expect(hint).toContain("do not greet them or send an entry reply");
+      expect(hint).toContain("Do not greet them or send an entry reply");
+      expect(hint).toContain("your most recent human conversation, which may not be this Room");
       expect(hint).toContain("staying silent is fine");
     });
   });

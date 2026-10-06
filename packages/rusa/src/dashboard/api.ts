@@ -540,40 +540,12 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   );
 }
 
-/** A reader limit, distinct from malformed JSON or a failed transport. */
-class RequestBodyTooLargeError extends Error {
-  constructor() {
-    super("Request body too large");
-  }
-}
-
-/** Read a request, optionally capping accumulated bytes before concatenation. */
-export function readBody(
-  req: IncomingMessage,
-  maxBytes = Number.POSITIVE_INFINITY
-): Promise<string> {
+function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    let bytes = 0;
-    let exceeded = false;
-    const onData = (chunk: Buffer) => {
-      if (exceeded) return; // Drain later transport chunks without retaining them.
-      bytes += chunk.length;
-      if (bytes > maxBytes) {
-        exceeded = true;
-        chunks.length = 0;
-        reject(new RequestBodyTooLargeError());
-        return;
-      }
-      chunks.push(chunk);
-    };
-    req.on("data", onData);
-    req.once("end", () => {
-      req.off("data", onData);
-      req.off("error", reject);
-      if (!exceeded) resolve(Buffer.concat(chunks).toString("utf-8"));
-    });
-    req.once("error", reject);
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+    req.on("error", reject);
   });
 }
 
