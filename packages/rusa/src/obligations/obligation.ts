@@ -34,9 +34,19 @@ export type ObligationExternalRef = Reference;
 /** The event predicates v1 can use to finish an obligation. */
 export type CompletionMatcherKind = "pr_merged" | "deployed";
 
-/** Versioned, application-validated data stored in a matcher's `spec_json`. */
+/**
+ * Versioned, application-validated data stored in a matcher's `spec_json`:
+ * the matcher's specification plus, once satisfied, the observation recorded
+ * at satisfaction.
+ */
 export interface CompletionMatcherSpec {
   schemaVersion: 1;
+  /**
+   * The terminal note observed at satisfaction (e.g. which instance saw the
+   * deployed revision). Present exactly when the matcher's `satisfied_at` is
+   * set; replacing or clearing the matcher drops it with the other
+   * satisfaction columns.
+   */
   satisfiedNote?: string;
 }
 

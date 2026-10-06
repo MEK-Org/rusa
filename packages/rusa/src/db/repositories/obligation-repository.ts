@@ -586,10 +586,16 @@ function toCompletionMatcher(row: ObligationRow): CompletionMatcher | null {
   if (row.matcher_kind !== "pr_merged" && row.matcher_kind !== "deployed") {
     throw new ObligationValidationError("completion matcher has an unsupported kind");
   }
+  const spec = parseCompletionMatcherSpec(row.matcher_spec_json);
+  if (row.matcher_satisfied_at !== null && spec.satisfiedNote === undefined) {
+    throw new ObligationValidationError(
+      "completion matcher: satisfied matcher has no satisfiedNote"
+    );
+  }
   return {
     kind: row.matcher_kind,
     target: row.matcher_target,
-    spec: parseCompletionMatcherSpec(row.matcher_spec_json),
+    spec,
     setBy: validateEntityId(row.matcher_set_by),
     setAt: row.matcher_set_at,
     satisfiedAt: row.matcher_satisfied_at,
@@ -2279,6 +2285,11 @@ export class ObligationRepository {
       }
 
       if (matcher.satisfiedAt === null) {
+        if (satisfaction.note.trim().length === 0) {
+          throw new ObligationValidationError(
+            "completion matcher satisfaction note must not be blank"
+          );
+        }
         const resolutionRef = parseObligationReference(satisfaction.resolutionRef).key;
         const satisfiedAt = this.stamp();
         const updatedSpec: CompletionMatcherSpec = {
@@ -3896,12 +3907,13 @@ export class ObligationRepository {
     if (liveChildren.count !== 0) return;
     const matcher = obligation.completionMatcher;
     if (matcher !== null && matcher.satisfiedAt !== null && matcher.satisfiedRef !== null) {
-      const note =
-        matcher.spec.satisfiedNote ??
-        (matcher.kind === "pr_merged"
-          ? `Completion matcher satisfied: ${matcher.target} merged`
-          : `Completion matcher satisfied: deployed revision ${matcher.satisfiedRef} contains ${matcher.target}`);
-      this.setTerminalStatusInMutation(id, "done", note, matcher.satisfiedRef, "system:mesh");
+      this.setTerminalStatusInMutation(
+        id,
+        "done",
+        matcher.spec.satisfiedNote ?? null,
+        matcher.satisfiedRef,
+        "system:mesh"
+      );
       return;
     }
     if (!this.prerequisitesSatisfied(id)) return;

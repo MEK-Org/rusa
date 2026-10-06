@@ -251,6 +251,44 @@ describe("ObligationRepository", () => {
     });
   });
 
+  it("refuses a blank satisfaction note at the write and leaves the matcher unsatisfied", () => {
+    repository.create({ id: "blank", title: "blank", ownerId: "actor-a" });
+    const matcher = repository.setCompletionMatcher(
+      "blank",
+      { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      "actor-a"
+    ).completionMatcher;
+    if (matcher === null) throw new Error("completion matcher was not persisted");
+
+    expect(() =>
+      repository.satisfyCompletionMatcher("blank", matcher, {
+        note: "   ",
+        resolutionRef: "github:MEK-Org/rusa/pulls/190",
+      })
+    ).toThrow(/satisfaction note must not be blank/);
+    expect(repository.require("blank")).toMatchObject({
+      status: "ready",
+      completionMatcher: { satisfiedAt: null, satisfiedRef: null, spec: { schemaVersion: 1 } },
+    });
+  });
+
+  it("rejects a satisfied matcher row that has no satisfiedNote", () => {
+    repository.create({ id: "noted", title: "noted", ownerId: "actor-a" });
+    repository.setCompletionMatcher(
+      "noted",
+      { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      "actor-a"
+    );
+    db.prepare(
+      `UPDATE obligation_completion_matchers
+       SET satisfied_at = '2026-10-06T00:00:00.000Z',
+           satisfied_ref = 'github:MEK-Org/rusa/pulls/190'
+       WHERE obligation_id = 'noted'`
+    ).run();
+
+    expect(() => repository.require("noted")).toThrow(/satisfied matcher has no satisfiedNote/);
+  });
+
   it("stamps createdAt/updatedAt on create and advances updatedAt on mutation", async () => {
     const created = repository.create({
       title: "stamped",
