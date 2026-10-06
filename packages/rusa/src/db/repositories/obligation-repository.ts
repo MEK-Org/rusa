@@ -230,6 +230,10 @@ export interface ChildObligationPageOptions extends ObligationPageOptions {
 
 export interface OwnedObligationPageOptions extends ObligationPageOptions {
   status?: ObligationStatus;
+  /** Only rows this entity created: the questions an actor filed for a human (#890). */
+  creatorId?: EntityId;
+  /** Exclude done and cancelled rows. */
+  openOnly?: boolean;
 }
 
 /**
@@ -2082,12 +2086,21 @@ export class ObligationRepository {
     validateEntityId(ownerId);
     const { limit, offset } = validatePage(options);
     const params: Array<string | number> = [ownerId];
-    const statusClause = options.status === undefined ? "" : " AND obligation.status = ?";
-    if (options.status !== undefined) params.push(options.status);
+    let filter = "";
+    if (options.status !== undefined) {
+      filter += " AND obligation.status = ?";
+      params.push(options.status);
+    }
+    if (options.creatorId !== undefined) {
+      validateEntityId(options.creatorId);
+      filter += " AND obligation.creator_id = ?";
+      params.push(options.creatorId);
+    }
+    if (options.openOnly) filter += " AND obligation.status NOT IN ('done', 'cancelled')";
     const rows = this.db
       .prepare(
         `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
-         WHERE obligation.owner_id = ?${statusClause}
+         WHERE obligation.owner_id = ?${filter}
          ORDER BY ${OWNER_QUEUE_ORDER_SQL}
          LIMIT ? OFFSET ?`
       )
@@ -2096,7 +2109,7 @@ export class ObligationRepository {
       this.db
         .prepare(
           `SELECT COUNT(*) AS count FROM obligations obligation
-           WHERE obligation.owner_id = ?${statusClause}`
+           WHERE obligation.owner_id = ?${filter}`
         )
         .get(...params) as { count: number }
     ).count;

@@ -81,6 +81,10 @@ import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
 import type { InboxChatContextSources } from "../actor/inbox-chat-context.js";
 import { InboxFocusResolver, type ResolvedInboxFocus } from "../actor/inbox-focus.js";
+import {
+  type InboxOpenQuestionSources,
+  resolveInboxSenderPrincipal,
+} from "../actor/inbox-open-questions.js";
 import { HttpJevDecisionClient } from "../actor/jev-decision-client.js";
 import { createJevInboxTextResolver } from "../actor/jev-inbox-text-resolver.js";
 import {
@@ -1558,6 +1562,15 @@ async function composeStart(
     ...(slackClient ? { slackClient } : {}),
     meshChat: getRepositories().meshChat,
   });
+  const inboxOpenQuestionSources = (): InboxOpenQuestionSources => {
+    const { obligations, principals } = getRepositories();
+    return {
+      resolveSenderPrincipal: (entry) => resolveInboxSenderPrincipal(entry, principals),
+      listOpenQuestions: (ownerId, creatorId, limit) =>
+        obligations.listOwnedPage(ownerId, { creatorId, openOnly: true, limit }),
+      listArtifacts: (obligationId) => obligations.listArtifacts(obligationId),
+    };
+  };
   const responsiveInterruption =
     config.jevApiKeyFile === undefined
       ? undefined
@@ -3140,6 +3153,7 @@ async function composeStart(
             assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(id, entryIds),
             isVoiceSessionActive: () => voiceService?.hasActiveSession(id) ?? false,
             chatContext: inboxChatContextSources(),
+            openQuestions: inboxOpenQuestionSources(),
           })
         );
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
@@ -3584,6 +3598,7 @@ async function composeStart(
       assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(rootId, entryIds),
       isVoiceSessionActive: () => voiceService?.hasActiveSession(rootId) ?? false,
       chatContext: inboxChatContextSources(),
+      openQuestions: inboxOpenQuestionSources(),
     })
   );
   const rootMeshChatUrl = mcpHttp.addServer(`${rootId}:${MESH_CHAT_MCP_NAME}`, () =>

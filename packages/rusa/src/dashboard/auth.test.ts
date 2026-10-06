@@ -372,6 +372,36 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect(principals.getUser(user.id)?.identity).toEqual(user.identity);
   });
 
+  it("records the Google account id only from the verified ID token at sign-in", async () => {
+    // Synthetic Google account ids; never a real person's.
+    token = claim({
+      firebase: {
+        identities: { "google.com": ["100000000000000000001"] },
+        sign_in_provider: "google.com",
+      },
+    });
+    const cookie = await login();
+    const identity = { issuer: token.iss, subject: token.sub };
+    expect(principals.findUserByExternalIdentity(identity)?.googleAccountId).toBe(
+      "100000000000000000001"
+    );
+    // A later request authorized by the session cookie does not rewrite it.
+    cookies.set(
+      cookie,
+      claim({
+        ...cookies.get(cookie),
+        firebase: {
+          identities: { "google.com": ["100000000000000000002"] },
+          sign_in_provider: "google.com",
+        },
+      })
+    );
+    expect(await auth.authorize(authRequest(cookie), authResponse())).toBe(true);
+    expect(principals.findUserByExternalIdentity(identity)?.googleAccountId).toBe(
+      "100000000000000000001"
+    );
+  });
+
   it("resolves existing cookies across resolver restarts without claiming roots or changing history", async () => {
     const cookie = await login();
     const user = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });

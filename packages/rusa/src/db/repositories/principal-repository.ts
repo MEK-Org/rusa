@@ -20,6 +20,7 @@ type UserRow = {
   root_actor_id: string | null;
   disabled_at: string | null;
   last_authenticated_at: string | null;
+  google_account_id: string | null;
 };
 
 export interface CreateUserInput {
@@ -51,6 +52,7 @@ function toUser(row: UserRow, createdAt: string): UserPrincipal {
     ...(row.last_authenticated_at !== null
       ? { lastAuthenticatedAt: row.last_authenticated_at }
       : {}),
+    ...(row.google_account_id !== null ? { googleAccountId: row.google_account_id } : {}),
   };
 }
 
@@ -117,6 +119,14 @@ export class PrincipalRepository {
     const row = this.db
       .prepare("SELECT * FROM users WHERE firebase_issuer = ? AND firebase_subject = ?")
       .get(identity.issuer, identity.subject) as UserRow | undefined;
+    return row ? this.getUser(row.principal_id) : undefined;
+  }
+
+  /** Lookup by the Google account id recorded at a verified sign-in (#890). */
+  findUserByGoogleAccountId(googleAccountId: string): UserPrincipal | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM users WHERE google_account_id = ?")
+      .get(googleAccountId) as UserRow | undefined;
     return row ? this.getUser(row.principal_id) : undefined;
   }
 
@@ -314,6 +324,20 @@ export class PrincipalRepository {
       this.db
         .prepare("UPDATE users SET last_authenticated_at = ? WHERE principal_id = ?")
         .run(authenticatedAt, principalId);
+      return this.requireUser(principalId);
+    })();
+  }
+
+  /**
+   * Record the Google account id from a verified sign-in token (#890). Throws
+   * when another user already holds it; the unique index is the guard.
+   */
+  setGoogleAccountId(principalId: string, googleAccountId: string): UserPrincipal {
+    return this.db.transaction(() => {
+      this.requireUser(principalId);
+      this.db
+        .prepare("UPDATE users SET google_account_id = ? WHERE principal_id = ?")
+        .run(googleAccountId, principalId);
       return this.requireUser(principalId);
     })();
   }

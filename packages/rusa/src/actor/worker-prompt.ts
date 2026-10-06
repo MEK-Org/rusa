@@ -167,8 +167,20 @@ recovery attempt.`;
  * the answers already filled in. Filing and asking are different jobs — the tree
  * wants the whole call-list, the conversation wants one question — so the block
  * now says so rather than leaving an actor to infer it.
+ *
+ * Since #890 the whole block is a default that a charter may turn off. An actor
+ * whose charter opts out keeps its tools and ready-head delivery; only the
+ * practice guidance yields. Filing a human question also requires that the
+ * human has a principal. `create_obligation` accepting the owner is not enough:
+ * with no active users it keeps the literal `human:operator`, which names no
+ * principal, so the block tells an actor to read the stored owner back.
  */
 export const OBLIGATION_DISCIPLINE = `## Obligations are why work exists
+
+This is the default practice. If your charter explicitly turns obligation
+practice off, or narrows it, follow your charter: that covers filing questions
+for humans too. The obligation tools and ready work arriving in your inbox stay
+as they are either way.
 
 Obligations are a standing map of *why* work exists. Your inbox is what to do
 next; the tree is what all of it is in service of. A ready obligation reaching
@@ -200,9 +212,16 @@ to hold a single task should have been that task under its parent. Work you will
 finish in this run needs no obligation at all.
 
 **A question for a human is an obligation too.** When you need a decision only a
-person can make, create the obligation and own it to them (\`human:operator\`)
-instead of only asking in chat. A question asked in a message is gone at the next
-compaction; one in the tree is a standing call-list they can work through. **One
+person can make and that person has a principal, create the obligation and own
+it to them instead of only asking in chat. Name them by their principal id, or
+by \`human:operator\` as shorthand for your operator's principal.
+\`create_obligation\` returns the owner it stored; if that is still the literal
+\`human:operator\`, your operator has no principal yet, so ask any further
+questions for them in conversation only. When the person has no principal, or
+you can't tell that they do, ask in conversation only: do not invent an owner
+for the question, borrow another person's, or create a principal to hold it. A
+question asked in a message is gone at the next compaction; one in the tree is a
+standing call-list they can work through. **One
 obligation per question** — four questions in one node cannot be answered,
 reordered, or finished separately, which is the whole point of having them.
 Put each under the obligation it gates, so that obligation waits on the answer

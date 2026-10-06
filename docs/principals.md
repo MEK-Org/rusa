@@ -11,7 +11,11 @@ the work the next slice has to do.
 (`actor`, `user`, `system`). An actor's principal id **is** its actor id, so
 every id already written into an attribution column keeps resolving as itself.
 `users` is the subtype for admitted people, keyed by verified Firebase issuer +
-subject, with email as mutable admission metadata.
+subject, with email as mutable admission metadata. A user's nullable, unique
+`google_account_id` (#890) is copied at each dashboard sign-in from the
+verified ID token's `firebase.identities["google.com"][0]`, and is the only link
+from a Google Chat sender (`users/{id}`) to a user. Nothing else writes it, and
+an id another user already holds is logged and left with its holder.
 
 `PrincipalRepository` (`src/db/repositories/principal-repository.ts`) is the
 only writer. `SqliteActorRepository.upsert` records an actor's principal inside
