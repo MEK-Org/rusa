@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/breakpoints.dart';
+import 'package:rusa_dashboard/dashboard_timing.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/avatar.dart';
@@ -1499,6 +1500,62 @@ void main() {
           );
           expect(tester.takeException(), isNull);
           await store.dispose();
+        });
+      },
+    );
+
+    testWidgets(
+      'tracks primaryNavigation only when trackNavigation is explicitly true',
+      (tester) async {
+        await tester.runAsync(() async {
+          final api = FakeApi();
+          final store = DashboardStore(api: api, stream: FakeStream());
+          await store.init();
+          addTearDown(store.dispose);
+
+          // Cold start / default untracked mount
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: OverviewTab(
+                  key: const ValueKey('cold-start'),
+                  store: store,
+                  trackNavigation: false,
+                ),
+              ),
+            ),
+          );
+          await tester.pump();
+          await tester.pump();
+
+          expect(
+            api.timingInteractions.where(
+              (t) => t.interaction == DashboardInteraction.primaryNavigation,
+            ),
+            isEmpty,
+          );
+
+          // User-navigated / tracked mount
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: OverviewTab(
+                  key: const ValueKey('user-nav'),
+                  store: store,
+                  trackNavigation: true,
+                ),
+              ),
+            ),
+          );
+          await tester.pump();
+          await tester.pump();
+
+          expect(
+            api.timingInteractions.where(
+              (t) => t.interaction == DashboardInteraction.primaryNavigation,
+            ),
+            isNotEmpty,
+          );
         });
       },
     );

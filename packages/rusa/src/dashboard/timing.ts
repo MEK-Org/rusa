@@ -655,7 +655,7 @@ function summarize(
     clientServerCoverage: {
       clientRequestIds: clientRequestIds.size,
       serverRequestIds: serverRequestIds.size,
-      matchedRequestIds: correlatedRequestIds.length,
+      matchedRequestIds: [...clientRequestIds].filter((id) => serverRowsByRequestId.has(id)).length,
     },
     requestCoverage: {
       correlation: coverage(correlatedRequestIds.length, clientRequestIds.size),

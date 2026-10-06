@@ -185,6 +185,12 @@ describe("dashboard timing recorder", () => {
       since: new Date("2026-10-05T11:00:00.000Z"),
       label: "initial_load",
     });
+    // #923's legacy block counts any server row; exact pairs live only in requestCoverage.
+    expect(summary.clientServerCoverage).toEqual({
+      clientRequestIds: 5,
+      serverRequestIds: 4,
+      matchedRequestIds: 4,
+    });
     expect(summary.requestCoverage).toEqual({
       correlation: { numerator: 3, denominator: 5, state: "partial" },
       measurement: { numerator: 2, denominator: 5, state: "partial" },

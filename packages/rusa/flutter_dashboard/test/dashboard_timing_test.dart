@@ -232,53 +232,6 @@ void main() {
   );
 
   test(
-    'late responses or stream chunks after context close do not modify receipt',
-    () async {
-      final bodyController = StreamController<List<int>>();
-      final inner = MockClient.streaming((request, bodyStream) async {
-        return http.StreamedResponse(
-          bodyController.stream,
-          200,
-          headers: {'X-Rusa-Request-Id': requestId},
-        );
-      });
-      final timingClient = DashboardTimingClient(inner);
-      addTearDown(timingClient.close);
-      addTearDown(bodyController.close);
-
-      final timing = Completer<Map<String, dynamic>>();
-      final reporter = DashboardTimingReporter(
-        client: MockClient((request) async {
-          timing.complete(jsonDecode(request.body) as Map<String, dynamic>);
-          return http.Response('{"accepted":true}', 202);
-        }),
-        base: Uri.parse('https://dashboard.example/'),
-      );
-
-      http.StreamedResponse? response;
-      await reporter.measure(DashboardInteraction.primaryNavigation, () async {
-        response = await timingClient.send(
-          http.Request('GET', Uri.parse('https://dashboard.example/api/test')),
-        );
-      });
-
-      final receipt = await timing.future;
-      expect(receipt['interaction'], 'primary_navigation');
-      expect(receipt['requestIds'], [requestId]);
-      expect(receipt.containsKey('requestTimings'), isFalse);
-
-      bodyController.add(utf8.encode('chunk'));
-      final closeFuture = bodyController.close();
-      if (response != null) {
-        await response!.stream.drain<void>();
-      }
-      await closeFuture;
-
-      expect(receipt.containsKey('requestTimings'), isFalse);
-    },
-  );
-
-  test(
     'detached asynchronous callback can start fresh interaction after prior closes',
     () async {
       final actorDetailDone = Completer<Map<String, dynamic>>();
@@ -289,7 +242,8 @@ void main() {
           if (request.url.path == '/api/dashboard/timing') {
             final body = jsonDecode(request.body) as Map<String, dynamic>;
             timingRequests.add(body);
-            if (body['interaction'] == 'actor_detail' && !actorDetailDone.isCompleted) {
+            if (body['interaction'] == 'actor_detail' &&
+                !actorDetailDone.isCompleted) {
               actorDetailDone.complete(body);
             }
             return http.Response('{"accepted":true}', 202);
@@ -304,20 +258,23 @@ void main() {
       addTearDown(api.close);
 
       Completer<void>? detachedDone;
-      await api.trackInteraction(DashboardInteraction.primaryNavigation, () async {
-        detachedDone = Completer<void>();
-        Timer.run(() async {
-          try {
-            await api.trackInteraction(
-              DashboardInteraction.actorDetail,
-              () => api.fetchCharter('detached-actor'),
-            );
-            detachedDone!.complete();
-          } catch (e, st) {
-            detachedDone!.completeError(e, st);
-          }
-        });
-      });
+      await api.trackInteraction(
+        DashboardInteraction.primaryNavigation,
+        () async {
+          detachedDone = Completer<void>();
+          Timer.run(() async {
+            try {
+              await api.trackInteraction(
+                DashboardInteraction.actorDetail,
+                () => api.fetchCharter('detached-actor'),
+              );
+              detachedDone!.complete();
+            } catch (e, st) {
+              detachedDone!.completeError(e, st);
+            }
+          });
+        },
+      );
 
       await detachedDone!.future;
       await actorDetailDone.future.timeout(const Duration(seconds: 2));

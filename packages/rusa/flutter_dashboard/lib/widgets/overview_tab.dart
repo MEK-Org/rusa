@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:rxdart/rxdart.dart';
 
 import '../breakpoints.dart';
+import '../dashboard_timing.dart';
 import '../models.dart';
 import '../principals.dart';
 import '../store.dart';
@@ -19,10 +20,16 @@ import 'reference_preview.dart';
 
 /// Overview tab: displays quota history, my obligations queue, live workers, queued actors, and yields.
 class OverviewTab extends StatefulWidget {
-  const OverviewTab({super.key, required this.store, this.onSelectView});
+  const OverviewTab({
+    super.key,
+    required this.store,
+    this.onSelectView,
+    this.trackNavigation = false,
+  });
 
   final DashboardStore store;
   final ValueChanged<DashboardView>? onSelectView;
+  final bool trackNavigation;
 
   @override
   State<OverviewTab> createState() => _OverviewTabState();
@@ -57,6 +64,9 @@ class _OverviewTabState extends State<OverviewTab> {
         for (final ownerId in ownerIds)
           api.fetchObligations(ownerId: ownerId, queue: queue),
     ]);
+    if (!mounted) {
+      throw StateError('Overview queue load superseded or unmounted');
+    }
     // One obligation has one owner, but the two ids are queried separately,
     // so dedupe by id rather than trusting the pages to be disjoint.
     List<ObligationDto> merge(Iterable<ObligationPage> pages) {
@@ -78,6 +88,9 @@ class _OverviewTabState extends State<OverviewTab> {
     final blockers = await Future.wait(
       waiting.map((o) => api.fetchObligationDetail(o.id)),
     );
+    if (!mounted) {
+      throw StateError('Overview queue load superseded or unmounted');
+    }
     final blockerMap = {
       for (var i = 0; i < waiting.length; i++)
         waiting[i].id: blockers[i].blockingChildren,
@@ -100,7 +113,12 @@ class _OverviewTabState extends State<OverviewTab> {
   void initState() {
     super.initState();
     widget.store.refreshQuotaHistory();
-    _humanQueueFuture = _loadHumanQueue();
+    _humanQueueFuture = widget.trackNavigation
+        ? widget.store.api.trackInteraction(
+            DashboardInteraction.primaryNavigation,
+            _loadHumanQueue,
+          )
+        : _loadHumanQueue();
     // The dashboard config — and with it the durable user principal — is
     // fetched after init returns, so this first load can only have asked for
     // the alias. Re-ask once the server names the viewing principal, or a
@@ -1341,8 +1359,9 @@ class _OverviewTabState extends State<OverviewTab> {
   Widget _buildTerminalObligationRow(RecentActivityItem item) {
     final timeLabel = formatTs(item.time);
     final isDone = item.terminalStatus == 'done';
-    final statusColor =
-        isDone ? MeshColors.statusActive : MeshColors.statusIdle;
+    final statusColor = isDone
+        ? MeshColors.statusActive
+        : MeshColors.statusIdle;
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 10),
@@ -1473,10 +1492,7 @@ class _OverviewTabState extends State<OverviewTab> {
                             ? const Color(0xFF0D201D)
                             : MeshColors.bgSecondary,
                         border: Border(
-                          left: BorderSide(
-                            color: statusColor,
-                            width: 2,
-                          ),
+                          left: BorderSide(color: statusColor, width: 2),
                         ),
                       ),
                       child: Column(
