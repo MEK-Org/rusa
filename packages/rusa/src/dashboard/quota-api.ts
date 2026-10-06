@@ -704,8 +704,12 @@ const HISTORY_PATH = "/api/quota/history";
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   // Encode before writing headers: header write ends the route phase.
   const endSerialization = startDashboardPhase("serialization");
-  const encoded = JSON.stringify(body);
-  endSerialization();
+  let encoded: string;
+  try {
+    encoded = JSON.stringify(body);
+  } finally {
+    endSerialization();
+  }
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",

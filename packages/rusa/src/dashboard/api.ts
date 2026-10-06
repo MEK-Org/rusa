@@ -541,8 +541,12 @@ function compress(encoding: Encoding, payload: Buffer): Promise<Buffer> {
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const endSerialization = startDashboardPhase("serialization");
-  const payload = Buffer.from(JSON.stringify(body), "utf-8");
-  endSerialization();
+  let payload: Buffer;
+  try {
+    payload = Buffer.from(JSON.stringify(body), "utf-8");
+  } finally {
+    endSerialization();
+  }
   // `Vary` regardless of what this particular response did: the header
   // describes the endpoint's behaviour, and omitting it on the uncompressed
   // branch is how an intermediary caches a br body for a client that can't read it.

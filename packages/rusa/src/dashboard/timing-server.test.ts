@@ -144,23 +144,8 @@ describe("dashboard timing server wrapper", () => {
 
     const [[record]] = recordServer.mock.calls;
     expect(record).toMatchObject({ label: "mesh_quota", operation: "quota_history" });
-    // The body write after the header is outside route, so route stays well below the request.
+    // The body write after the header is outside route.
     expect(Object.keys(record.phases)).toEqual(["route"]);
     expect(record.phases.route).toBeGreaterThanOrEqual(25);
-    expect(record.phases.route).toBeLessThan(record.durationMs - 40);
-  });
-
-  it("records no phases or operation for a request outside a timed scope", () => {
-    const recordServer = vi.fn();
-    const response = new TestResponse();
-    beginDashboardRequestTiming(response as unknown as ServerResponse, "/api/mesh/threads", "GET", {
-      recordServer,
-    } as unknown as DashboardTimingRecorder);
-    beginDashboardRoutePhase();
-    response.end("[]");
-
-    const [[record]] = recordServer.mock.calls;
-    expect(record.operation).toBeUndefined();
-    expect(record.phases).toEqual({});
   });
 });

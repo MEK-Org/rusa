@@ -15,9 +15,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
  * - `compression`: asynchronous response compression, when negotiated.
  *
  * Phases are not additive and do not partition the request-wide duration:
- * URL parsing before auth, event-loop queueing, time between phases and
- * socket finish after the last write are outside every phase. A phase a
- * request never reached is absent, not zero.
+ * URL parsing before auth, event-loop queueing before a phase opens, gaps
+ * between phases and socket finish after the last write are outside every
+ * phase. Elapsed time while an interval is open — including a stalled await —
+ * remains part of that phase. A phase a request never reached is absent, not
+ * zero.
  */
 export const DASHBOARD_SERVER_PHASES = [
   "auth",
