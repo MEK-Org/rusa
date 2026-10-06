@@ -6,7 +6,9 @@ import '../event_coalesce.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../util.dart';
+import 'event_disclosure.dart';
 import 'kind_chip.dart';
+import 'run_start_details.dart';
 
 /// All mesh event kinds, for the filter dropdown (mirrors MeshEventKind).
 const _kKinds = [
@@ -117,7 +119,6 @@ class EventsTab extends StatelessWidget {
     final detail = row.isCoalesced
         ? (row.yielded!.body ?? e.detail)
         : (isMessage ? (e.body ?? e.detail) : e.detail);
-    final resolvedRunModel = e.resolvedRunModel;
 
     Widget? peerLabel;
     String? directionPeer;
@@ -171,6 +172,25 @@ class EventsTab extends StatelessWidget {
       );
     }
 
+    // Wrap (not Row) so the chip/pill/peer cluster reflows onto a second line
+    // instead of overflowing on narrow (mobile) widths. An expandable row's
+    // toggle follows the chip, ahead of the other labels.
+    Widget firstLine(Widget? toggle) => Wrap(
+      spacing: 6,
+      runSpacing: 4,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        KindChip(kind: e.kind),
+        ?toggle,
+        // The merged yield surfaced as a compact status pill, so the single
+        // row still shows the run both ended and yielded.
+        if (row.isCoalesced) _yieldPill(row.yieldStatus ?? ''),
+        if (multi && e.actorId != null)
+          _actorBadge(handles[e.actorId] ?? e.actorId!),
+        ?peerLabel,
+      ],
+    );
+
     return Container(
       decoration: const BoxDecoration(
         border: Border(
@@ -196,32 +216,21 @@ class EventsTab extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Wrap (not Row) so the chip/pill/peer cluster reflows onto a
-                // second line instead of overflowing on narrow (mobile) widths.
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 4,
-                  crossAxisAlignment: WrapCrossAlignment.center,
-                  children: [
-                    KindChip(kind: e.kind),
-                    // The merged yield surfaced as a compact status pill, so the
-                    // single row still shows the run both ended and yielded.
-                    if (row.isCoalesced) _yieldPill(row.yieldStatus ?? ''),
-                    if (multi && e.actorId != null)
-                      _actorBadge(handles[e.actorId] ?? e.actorId!),
-                    ?peerLabel,
-                  ],
-                ),
-                if (resolvedRunModel != null) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    'resolved model: $resolvedRunModel',
-                    style: kMonoStyle.copyWith(
-                      color: MeshColors.textSecondary,
-                      fontSize: 12,
+                if (e.kind == 'run_start')
+                  // The run's resolved model and launch prompt sit behind a
+                  // chevron right after the chip, fetched only when opened.
+                  EventDisclosure(
+                    key: ValueKey('run_start:${e.id}'),
+                    label: 'run details',
+                    header: firstLine,
+                    content: (_) => RunStartDetails(
+                      runId: e.runId,
+                      model: e.resolvedRunModel,
+                      api: store.api,
                     ),
-                  ),
-                ],
+                  )
+                else
+                  firstLine(null),
                 if ((detail ?? '').isNotEmpty) ...[
                   const SizedBox(height: 4),
                   Text(

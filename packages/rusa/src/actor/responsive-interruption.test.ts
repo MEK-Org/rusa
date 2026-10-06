@@ -181,7 +181,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       pendingEntryIds: [],
     });
 
-    expect(decision).toMatchObject({ outcome: "queue", reason: "timeout" });
+    expect(decision).toMatchObject({ outcome: "interrupt", reason: "timeout" });
     expect(receivedSignal?.aborted).toBe(true);
   });
 
@@ -253,7 +253,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     expect(asked[0].input.candidateEntryIds).toEqual(["selected-a"]);
   });
 
-  describe("fails closed to queue", () => {
+  describe("preserves baseline interrupt on fallback", () => {
     const cases: Array<{ what: string; response: unknown; reason: string }> = [
       {
         what: "a nonnumeric probability",
@@ -272,7 +272,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       },
     ];
     for (const { what, response, reason } of cases) {
-      it(`queues on ${what}`, async () => {
+      it(`interrupts on ${what}`, async () => {
         const classifier = new ShadowResponsiveInterruptionClassifier({
           threshold: 0.8,
           client: client(async () => response as never),
@@ -283,11 +283,11 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
           selectedEntryIds: ["selected-a"],
           pendingEntryIds: [],
         });
-        expect(decision).toMatchObject({ outcome: "queue", reason });
+        expect(decision).toMatchObject({ outcome: "interrupt", reason });
       });
     }
 
-    it("queues when the client throws, without propagating", async () => {
+    it("interrupts when the client throws, without propagating", async () => {
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.8,
         client: client(async () => {
@@ -300,13 +300,13 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
         selectedEntryIds: ["selected-a"],
         pendingEntryIds: [],
       });
-      expect(decision).toMatchObject({ outcome: "queue", reason: "client_error" });
+      expect(decision).toMatchObject({ outcome: "interrupt", reason: "client_error" });
       // The failure text is the other route by which operational content could
       // reach the audit. It does not.
       expect(JSON.stringify(decision)).not.toContain("socket hang up");
     });
 
-    it("records a missing arrival text apart from a failed call", async () => {
+    it("records a missing arrival text apart from a failed call while preserving interrupt", async () => {
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.8,
         client: client(async () => {
@@ -319,13 +319,13 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
         selectedEntryIds: ["selected-a"],
         pendingEntryIds: [],
       });
-      expect(decision).toMatchObject({ outcome: "queue", reason: "input_unavailable" });
+      expect(decision).toMatchObject({ outcome: "interrupt", reason: "input_unavailable" });
       expect(shadowPrediction(decision)).toBe(null);
       // The lookup key serves the client only; the audit stays ids of entries.
       expect(decision.input).not.toHaveProperty("actorId");
     });
 
-    it("queues when the client exceeds its deadline", async () => {
+    it("interrupts when the client exceeds its deadline", async () => {
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.8,
         timeoutMs: 10,
@@ -337,7 +337,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
         selectedEntryIds: ["selected-a"],
         pendingEntryIds: [],
       });
-      expect(decision).toMatchObject({ outcome: "queue", reason: "timeout" });
+      expect(decision).toMatchObject({ outcome: "interrupt", reason: "timeout" });
     });
 
     it("queues a below-threshold probability and retains it for audit", async () => {
@@ -363,7 +363,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       });
     });
 
-    it("queues with no client at all, and asks nothing", async () => {
+    it("interrupts with no client at all, and asks nothing", async () => {
       const classifier = new ShadowResponsiveInterruptionClassifier({ threshold: 0.8 });
       const decision = await classifier.evaluate({
         actorId: "actor",
@@ -371,10 +371,10 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
         selectedEntryIds: ["selected-a"],
         pendingEntryIds: [],
       });
-      expect(decision).toMatchObject({ outcome: "queue", reason: "unavailable" });
+      expect(decision).toMatchObject({ outcome: "interrupt", reason: "unavailable" });
     });
 
-    it("queues without a round trip when there is nothing to compare against", async () => {
+    it("interrupts without a round trip when there is nothing to compare against", async () => {
       let asked = 0;
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.8,
@@ -389,7 +389,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
         selectedEntryIds: [],
         pendingEntryIds: [],
       });
-      expect(decision).toMatchObject({ outcome: "queue", reason: "no_candidates" });
+      expect(decision).toMatchObject({ outcome: "interrupt", reason: "no_candidates" });
       expect(asked).toBe(0);
     });
   });

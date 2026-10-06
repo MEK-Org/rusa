@@ -25,6 +25,7 @@ import {
   type ObligationRepository,
 } from "../db/repositories/obligation-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import type { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import {
   type Obligation,
@@ -67,6 +68,7 @@ import {
 } from "./human-chat-scope.js";
 import { selectPrioritizedInboxItem } from "./inbox-selection.js";
 import type { SseHub } from "./sse.js";
+import type { DashboardTimingRecorder } from "./timing.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {
@@ -75,6 +77,8 @@ export interface DashboardDataDeps {
   /** Application logger for route diagnostics. Absent → nothing is logged. */
   logger?: Logger;
   meshEvents: MeshEventRepository;
+  /** Bounded, content-free dashboard timing recorder; absent in UI-only tests. */
+  timings?: DashboardTimingRecorder;
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
   obligations?: ObligationRepository;
@@ -85,6 +89,7 @@ export interface DashboardDataDeps {
   inbox?: InboxRepository;
   /** Completed selection intervals used only to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
+  runPrompts?: RunPromptRepository;
   /** Durable per-entry obligation associations for activity correlation. */
   inboxFocus?: InboxFocusRepository;
   sseHub: SseHub;
@@ -2128,6 +2133,18 @@ export async function handleMeshApiRequest(
     return true;
   }
 
+  // Complete launch text is fetched on demand through the existing dashboard access path.
+  const runPromptMatch = /^\/api\/mesh\/runs\/([^/]+)\/prompt$/.exec(pathname);
+  if (runPromptMatch && req.method === "GET") {
+    const retained = deps.runPrompts?.getById(decodeURIComponent(runPromptMatch[1]));
+    if (!retained) {
+      sendJson(res, 404, { error: "prompt not retained" });
+      return true;
+    }
+    sendJson(res, 200, { prompt: retained.prompt });
+    return true;
+  }
+
   // GET /api/mesh/chat?actors=&limit=&before= — direct chat history.
   if (pathname === "/api/mesh/chat") {
     const resolved = resolveChatQueryActors(parseActors(url), viewerScope());
@@ -2556,8 +2573,40 @@ export async function handleMeshApiRequest(
 
   // GET /api/mesh/stream?actors= — SSE: all mesh_event, live_output for `actors`.
   if (pathname === "/api/mesh/stream") {
+    const started = performance.now();
     const actors = parseActors(url);
-    sseHub.addConnection(res, actors.length > 0 ? new Set(actors) : null, humanChatViewer(req));
+    const connected = sseHub.addConnection(
+      res,
+      actors.length > 0 ? new Set(actors) : null,
+      humanChatViewer(req)
+    );
+    // `handleMeshApiRequest` also supports lightweight response doubles in
+    // API-only callers. The live HTTP wrapper always supplies this header.
+    const requestId = deps.timings
+      ? (res as unknown as { getHeader?: (name: string) => unknown }).getHeader?.(
+          "X-Rusa-Request-Id"
+        )
+      : undefined;
+    const requestIdString = typeof requestId === "string" ? requestId : undefined;
+    deps.timings?.recordServer({
+      label: "mesh_stream_open",
+      requestId: requestIdString,
+      durationMs: Math.round(performance.now() - started),
+      status: res.statusCode || (connected ? 200 : 503),
+      bytes: null,
+    });
+    if (connected) {
+      // A close is its own lifecycle observation, never a request-latency sample.
+      res.once("close", () =>
+        deps.timings?.recordServer({
+          label: "mesh_stream_close",
+          requestId: requestIdString,
+          durationMs: null,
+          status: res.statusCode || 200,
+          bytes: null,
+        })
+      );
+    }
     return true;
   }
 

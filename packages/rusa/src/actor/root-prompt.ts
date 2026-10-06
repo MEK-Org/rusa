@@ -9,9 +9,14 @@
  * from the MCP servers it's connected to at runtime.
  */
 import {
+  type MeshGitIdentityResolution,
+  resolveMeshGitIdentity,
+} from "../gitops/mesh-git-identity.js";
+import {
   DELEGATION_DISCIPLINE,
   EXTERNAL_CONDUCT_POLICY,
   GROUNDING_DISCIPLINE,
+  gitIdentityGuidance,
   INBOX_DISCIPLINE,
   OBLIGATION_DISCIPLINE,
   trackerWritingGuidance,
@@ -57,7 +62,8 @@ woke you and whether it actually calls for a response.`;
 export function buildRootPrompt(
   charter: string = ROOT_ACTOR_CHARTER,
   priorContext?: string,
-  actorHandle?: string
+  actorHandle?: string,
+  gitIdentity: MeshGitIdentityResolution = resolveMeshGitIdentity(undefined)
 ): string {
   return `${charter}
 
@@ -66,6 +72,8 @@ ${DELEGATION_DISCIPLINE}
 ${GROUNDING_DISCIPLINE}
 
 ${trackerWritingGuidance(actorHandle ?? "rusa")}
+
+${gitIdentityGuidance(gitIdentity)}
 
 ${INBOX_DISCIPLINE}
 

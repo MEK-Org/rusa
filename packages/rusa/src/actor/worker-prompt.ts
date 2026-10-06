@@ -1,3 +1,7 @@
+import {
+  type MeshGitIdentityResolution,
+  meshGitIdentityArgs,
+} from "../gitops/mesh-git-identity.js";
 import type { ActorHandle } from "./actor-record.js";
 import { generateHandle } from "./handle-generator.js";
 
@@ -52,6 +56,63 @@ say the origin is unknown. Never synthesize a plausible-sounding origin.`;
 /** Tell actors their handle without asking them to add a visible byline. */
 export function trackerWritingGuidance(handle: string): string {
   return `Your actor handle is **${handle}**. Do not sign your own name.`;
+}
+
+function shellQuote(arg: string): string {
+  return /^[\w@%+=:,./-]+$/.test(arg) ? arg : `'${arg.replaceAll("'", `'\\''`)}'`;
+}
+
+/**
+ * The mesh's Git identity for mesh-owned commits (#894, #909). It lives here, in
+ * the mesh-supplied prompt, rather than in any repository's agent instructions,
+ * which also reach people's own coding sessions. Command-scoped `-c` keeps every
+ * Git config file untouched, including on a machine where a person's global
+ * identity is set. This is guidance: rusa does not intercept actors' Git commands.
+ * Git identity variables override `-c`. rusa sets none, but an actor can inherit
+ * them from an interactive shell or a service environment, so the prompt says how
+ * to clear them only for a mesh Git command.
+ */
+export function gitIdentityGuidance(resolution: MeshGitIdentityResolution): string {
+  const shared = `Leave the identity keys (\`user.*\`, \`author.*\`, \`committer.*\`) in
+every Git config file — local, global, system — as you found them; they belong
+to whoever owns that machine or repository. Identity is the mesh's to supply,
+so don't add Git identity directives to a repository's agent instructions.`;
+  if (!resolution.identity) {
+    return `## Git identity
+The mesh has no Git identity: ${resolution.gap}. The operator sets the
+\`gitIdentity\` name and email in rusa's config.yaml. Until then, don't create
+commits in your mesh workspace — not under a Git config identity, an invented
+one or anyone else's. Report the gap where a commit is needed, and carry on with
+work that doesn't need one.
+
+${shared}`;
+  }
+  const { identity } = resolution;
+  const command = ["git", ...meshGitIdentityArgs(identity), "commit"].map(shellQuote).join(" ");
+  return `## Git identity
+Commits you make in your mesh workspace — the clones and worktrees the mesh
+owns — are authored as the mesh: **${identity.name}
+<${identity.email}>**, the \`gitIdentity\` in rusa's config.yaml. Pass it on
+each Git command that creates commits (commit, merge, revert, and the replays
+rebase, cherry-pick and am), for that one command only:
+
+    ${command} …
+
+A new commit records the mesh as both author and committer. A replay keeps each
+commit's original author and records the mesh as committer.
+
+Git identity variables override those \`-c\` arguments. If any of
+\`GIT_AUTHOR_NAME\`, \`GIT_AUTHOR_EMAIL\`, \`GIT_COMMITTER_NAME\` or
+\`GIT_COMMITTER_EMAIL\` is set, clear all four for that one mesh Git command:
+\`env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_COMMITTER_NAME -u
+GIT_COMMITTER_EMAIL git …\`. Do not clear them globally; keep the surrounding
+environment available for later non-mesh Git commands.
+
+In a checkout that belongs to a person rather than to the mesh, leave the
+commit's identity to that repository's own configuration instead of imposing
+the mesh identity.
+
+${shared}`;
 }
 
 export const INBOX_DISCIPLINE = `## Work from your inbox
@@ -249,6 +310,8 @@ export interface WorkerPromptContext {
   handles?: ResolvedHandle[];
   /** Whether the Integrated Understanding read-only filesystem mount is enabled. */
   understandingMountEnabled?: boolean;
+  /** The mesh's Git identity for mesh-owned commits, or the configuration gap. */
+  gitIdentity: MeshGitIdentityResolution;
 }
 
 /** A short, one-line label for an actor, derived from its charter. */
@@ -378,6 +441,8 @@ ${DELEGATION_DISCIPLINE}
 ${GROUNDING_DISCIPLINE}
 
 ${trackerWritingGuidance(generateHandle(ctx.threadId))}
+
+${gitIdentityGuidance(ctx.gitIdentity)}
 
 ${INBOX_DISCIPLINE}
 

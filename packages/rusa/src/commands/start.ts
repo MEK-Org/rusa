@@ -155,6 +155,7 @@ import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
 import type { DashboardAuth } from "../dashboard/auth.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
+import { DashboardTimingRecorder } from "../dashboard/timing.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import {
   finishDeferredRootSessionImport,
@@ -173,6 +174,7 @@ import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitops/issue-client.js";
+import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
 import { initEmptyBareRepo } from "../gitops/worktree.js";
 import { AGENT_EXEC_MCP_NAME, createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
 import {
@@ -181,6 +183,10 @@ import {
   createChatReadMcpServer,
   createChatWriteMcpServer,
 } from "../mcp/chat-mcp.js";
+import {
+  createDashboardTimingMcpServer,
+  DASHBOARD_TIMING_MCP_NAME,
+} from "../mcp/dashboard-timing-mcp.js";
 import type { DistillerMcpStore } from "../mcp/distiller-mcp.js";
 import {
   buildGrantableServers,
@@ -271,6 +277,7 @@ import {
 } from "../quota/coordinator-client.js";
 import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
 import {
+  closedGoverningWindow,
   HISTORY_WINDOW_MS,
   isPublishedModelLane,
   type ModelLanePacing,
@@ -1281,6 +1288,15 @@ async function composeStart(
 
   log.info("github_identity_resolved", { account: config.github.account });
 
+  // Resolved once from config.yaml's explicit gitIdentity and handed to every
+  // actor prompt, which applies it per command or reports the gap (#894, #909).
+  const meshGitIdentity = resolveMeshGitIdentity(config.gitIdentity);
+  if (meshGitIdentity.identity) {
+    log.info("mesh_git_identity_resolved", { name: meshGitIdentity.identity.name });
+  } else {
+    log.warn("mesh_git_identity_missing", { gap: meshGitIdentity.gap });
+  }
+
   // The root's configured identity : the display handle every
   // root-identity surface (signing byline, dashboard, avatar, commitment
   // ledger) routes through. Defaults to today's root-actor when
@@ -1593,6 +1609,12 @@ async function composeStart(
   // After persisting, broadcast the stored row to any live dashboard SSE clients
   // (best-effort — fan-out must never break the recording or the mesh).
   const meshEmitter = new MeshEventEmitter();
+  // Dashboard timings write only fixed, content-free metadata to mesh_events
+  // after each response has finished. The recorder prunes this one event kind
+  // at boot and in bounded batches; it never changes the SQLite schema.
+  const dashboardTimings = new DashboardTimingRecorder(getRepositories().meshEvents);
+  dashboardTimings.start();
+  resources.acquire("dashboard timing recorder", () => dashboardTimings.stop());
   // One child logger per actor run: `actorId` and `runId` ride every record the
   // run boundary writes, so a run reads back by field instead of by matching
   // prose across interleaved actors. The run's *output* never lands here — it is
@@ -1803,6 +1825,38 @@ async function composeStart(
       }
     }
   };
+  // Deduplicate governing window closure alerts by distinct window transition
+  // (${lane}:${window.key}:${window.resetAtIso}) (#794). Each distinct closed
+  // window alerts once, even across successive distinct closes without an
+  // intermediate open apply. Nothing is recorded before the alarm is bound,
+  // so a window already closed at boot still reaches root.
+  const closedGoverningWindows = new Set<string>();
+  let raiseGoverningWindowClosedAlarm:
+    | ((closed: {
+        provider: string;
+        window: string;
+        resetAt: string | null;
+        lastReadingAt: string;
+      }) => void)
+    | null = null;
+  const noteGoverningWindowClosure = (
+    lane: string,
+    status: PublishedThrottleProviderStatus
+  ): void => {
+    const window = closedGoverningWindow(status, Date.now());
+    if (!window) return;
+    const dedupKey = `${lane}:${window.key}:${window.resetAtIso ?? ""}`;
+    if (!raiseGoverningWindowClosedAlarm || closedGoverningWindows.has(dedupKey)) return;
+    closedGoverningWindows.add(dedupKey);
+    const closed = {
+      provider: lane,
+      window: window.key,
+      resetAt: window.resetAtIso,
+      lastReadingAt: status.updatedAt,
+    };
+    log.info("quota_governing_window_closed", closed);
+    raiseGoverningWindowClosedAlarm(closed);
+  };
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
     tick: QuotaThrottleTick,
@@ -1868,6 +1922,7 @@ async function composeStart(
     // Update the lanes before asking the shared admission list to re-scan them.
     applyThrottleStatusToPacer(pacer, status);
     applyModelLaneStatuses(providerName, status);
+    noteGoverningWindowClosure(providerName, status);
     const validModelLanes = Array.isArray(status.modelLanes)
       ? status.modelLanes.filter(isPublishedModelLane).map((lane) => ({
           models: [...lane.models],
@@ -2379,6 +2434,7 @@ async function composeStart(
     void mcpHttp.removeServer(`${actorId}:${QUOTA_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${CHAT_READ_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${SLACK_READ_MCP_NAME}`);
+    void mcpHttp.removeServer(`${actorId}:${DASHBOARD_TIMING_MCP_NAME}`);
     // Tear down EVERY granted-capability endpoint this actor could have mounted
     //  — iterate the full grantable set, not the current grants, so an
     // endpoint can't leak past retire even after a revoke cleared the grant.
@@ -2574,6 +2630,9 @@ async function composeStart(
       },
     });
     lifecycle.add({
+      onPrompt: (event) => {
+        getRepositories().runPrompts.recordForActor(id, event.runId, event.prompt);
+      },
       onQueued: (event) => {
         mesh.recordEvent({
           kind: "run_queued",
@@ -3136,12 +3195,16 @@ async function composeStart(
             quotaService
           )
         );
+        const dashboardTimingUrl = mcpHttp.addServer(`${id}:${DASHBOARD_TIMING_MCP_NAME}`, () =>
+          createDashboardTimingMcpServer(dashboardTimings)
+        );
 
         const perActorShared: McpServerSpec[] = [
           { name: TRACKER_MCP_NAME, url: trackerUrl },
           { name: REPO_MCP_NAME, url: repoUrl },
           { name: UNDERSTANDING_READ_MCP_NAME, url: understandingUrl },
           { name: QUOTA_MCP_NAME, url: quotaUrl },
+          { name: DASHBOARD_TIMING_MCP_NAME, url: dashboardTimingUrl },
         ];
         if (chatClient) {
           const chatReadUrl = mcpHttp.addServer(`${id}:${CHAT_READ_MCP_NAME}`, () =>
@@ -3261,6 +3324,7 @@ async function composeStart(
                   parentId: r.parentId ?? rootId,
                   handles,
                   understandingMountEnabled,
+                  gitIdentity: meshGitIdentity,
                 },
                 injection?.priorContext
               ),
@@ -3561,6 +3625,9 @@ async function composeStart(
       },
     })
   );
+  const rootDashboardTimingUrl = mcpHttp.addServer(`${rootId}:${DASHBOARD_TIMING_MCP_NAME}`, () =>
+    createDashboardTimingMcpServer(dashboardTimings)
+  );
 
   const cc = chatClient;
   let allowedSpaces: string[] = [];
@@ -3609,7 +3676,8 @@ async function composeStart(
     { name: INBOX_MCP_NAME, url: rootInboxUrl },
     { name: OBLIGATIONS_MCP_NAME, url: rootObligationsUrl },
     { name: MESH_CHAT_MCP_NAME, url: rootMeshChatUrl },
-    { name: PNPM_INSTALL_MCP_NAME, url: rootPnpmInstallUrl }
+    { name: PNPM_INSTALL_MCP_NAME, url: rootPnpmInstallUrl },
+    { name: DASHBOARD_TIMING_MCP_NAME, url: rootDashboardTimingUrl }
   );
   if (rootChatUrl) {
     rootMcp.push({ name: CHAT_WRITE_MCP_NAME, url: rootChatUrl });
@@ -3662,7 +3730,12 @@ async function composeStart(
         portableContextStore
       );
       return {
-        prompt: buildRootPrompt(rootActor.charter, injection?.priorContext, rootHandle),
+        prompt: buildRootPrompt(
+          rootActor.charter,
+          injection?.priorContext,
+          rootHandle,
+          meshGitIdentity
+        ),
         injectRecord: injection?.injectRecord,
       };
     },
@@ -4076,10 +4149,12 @@ async function composeStart(
           mesh,
           actors,
           meshEvents: getRepositories().meshEvents,
+          timings: dashboardTimings,
           meshChat: getRepositories().meshChat,
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,
           actorRuns: getRepositories().actorRuns,
+          runPrompts: getRepositories().runPrompts,
           inboxFocus: getRepositories().inboxFocus,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,
@@ -4538,6 +4613,11 @@ async function composeStart(
     handle.unref?.();
     resources.acquire(resource, () => clearInterval(handle));
   };
+  const pruneRunPrompts = () => {
+    getRepositories().runPrompts.prune();
+  };
+  pruneRunPrompts();
+  everyInterval("run prompt retention", pruneRunPrompts, 60 * 60 * 1000);
   // The interval handle says nothing about a probe already in flight, so keep
   // both a way to stop one (the signal) and a way to wait for it (the promise).
   // Acquired before the probe interval, so the interval stops first and no new
@@ -4650,6 +4730,35 @@ async function composeStart(
           fallback: outcome,
           provider,
           model,
+        });
+      }
+    });
+  };
+
+  raiseGoverningWindowClosedAlarm = (closed) => {
+    const message =
+      `Quota window closed without a reading: ${closed.provider}'s governing window ` +
+      `"${closed.window}" reset at ${closed.resetAt}, and no newer accepted quota reading has arrived since ` +
+      `${closed.lastReadingAt}. Check the scrapes to inspect collection.`;
+    void deliverHostAlarm({
+      deliver: () =>
+        mesh.deliverExternalEvent({
+          sourceType: "timer",
+          rawResource: "system:events",
+          rawPayload: { type: "system.quota_governing_window_closed", ...closed, message },
+          priority: "responsive",
+          eventSummary: message,
+        }),
+      message,
+      sendToErrorChat,
+      log,
+      alarmName: "quota_governing_window_closed",
+    }).then((outcome) => {
+      if (outcome !== "delivered") {
+        log.warn("quota_governing_window_closed_not_delivered_to_mesh", {
+          fallback: outcome,
+          provider: closed.provider,
+          window: closed.window,
         });
       }
     });

@@ -158,11 +158,12 @@ export class KimiProvider implements CodingProvider {
     }
     // NOTE: We do NOT self-generate a session id. The id is captured from stream-json output.
 
+    const launchPrompt = sanitizeArgvText(opts.prompt);
     const args: string[] = [
       "-p",
       // Assembled text, made spawnable before it enters argv (#206). The
       // `--add-dir` path below is a host path and stays verbatim.
-      sanitizeArgvText(opts.prompt),
+      launchPrompt,
       "--output-format",
       "stream-json",
       "--add-dir",
@@ -322,6 +323,7 @@ export class KimiProvider implements CodingProvider {
       };
 
       return runSubprocess({
+        onSpawn: () => opts.onPromptLaunched?.(launchPrompt),
         command: spawnCommand,
         args: spawnArgs,
         cwd: spawnCwd,

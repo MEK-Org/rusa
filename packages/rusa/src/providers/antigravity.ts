@@ -522,8 +522,9 @@ export class AntigravityProvider implements CodingProvider {
     }
     const logFile = opts.session ? join(logDir, `.rusa-agy-${randomUUID()}.log`) : undefined;
 
+    const launchPrompt = sanitizeArgvText(appendAntigravityCommandDiscipline(opts.prompt));
     const args = buildAntigravityArgs({
-      prompt: appendAntigravityCommandDiscipline(opts.prompt),
+      prompt: launchPrompt,
       model: selection.model,
       effort: selection.effort,
       conversationId: opts.session?.id,
@@ -702,6 +703,7 @@ export class AntigravityProvider implements CodingProvider {
       : undefined;
 
     return runSubprocess({
+      onSpawn: () => opts.onPromptLaunched?.(launchPrompt),
       command: spawnCommand,
       args: spawnArgs,
       cwd: spawnCwd,

@@ -246,6 +246,51 @@ export class MeshEventRepository {
   }
 
   /**
+   * Read one bounded, content-free event family without materialising unrelated
+   * transcript bodies. A capped read keeps the newest `limit` rows, returned
+   * oldest-first. Callers own the meaning of `kind`; this repository only
+   * supplies the append-only storage primitive.
+   */
+  listByKindSince(kind: string, sinceISO: string, limit: number): MeshEvent[] {
+    if (limit <= 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT id, ts, kind, actor_id, detail, body, payload, success
+         FROM (
+           SELECT rowid AS seq, id, ts, kind, actor_id, detail, NULL AS body, payload, success
+           FROM mesh_events
+           WHERE kind = ? AND ts >= ?
+           ORDER BY ts DESC, rowid DESC
+           LIMIT ?
+         )
+         ORDER BY ts ASC, seq ASC`
+      )
+      .all(kind, sinceISO, limit) as MeshEventRow[];
+    return rows.map(toMeshEvent);
+  }
+
+  /**
+   * Enforce both an age and a newest-record bound for one append-only event
+   * family. The predicates are deliberately scoped by `kind`: pruning a
+   * bounded diagnostic must never touch the ordinary mesh history.
+   */
+  pruneKind(kind: string, olderThanISO: string, maxRecords: number): void {
+    this.db.prepare(`DELETE FROM mesh_events WHERE kind = ? AND ts < ?`).run(kind, olderThanISO);
+    this.db
+      .prepare(`
+        DELETE FROM mesh_events
+        WHERE kind = ?
+          AND rowid IN (
+            SELECT rowid FROM mesh_events
+            WHERE kind = ?
+            ORDER BY ts DESC, rowid DESC
+            LIMIT -1 OFFSET ?
+          )
+      `)
+      .run(kind, kind, Math.max(0, maxRecords));
+  }
+
+  /**
    * The distiller's replay read of a bounded window (#537): every actor's
    * events in the half-open `[since, until)`, oldest-first, in pages that
    * resume exactly where the previous one stopped. The order is `ts, rowid`
@@ -266,7 +311,7 @@ export class MeshEventRepository {
       SELECT e.rowid AS rowid, e.*, c.body AS chat_body
       FROM mesh_events e
       LEFT JOIN mesh_chat c ON json_extract(e.payload, '$.messageId') = c.id
-      WHERE e.ts >= ?
+      WHERE e.ts >= ? AND e.kind != 'dashboard_timing'
     `;
     if (opts.until != null) {
       sql += ` AND e.ts < ?`;

@@ -56,9 +56,14 @@ class MockServerResponse extends EventEmitter {
   headersSent = false;
   writableEnded = false;
 
+  setHeader(name: string, value: string): this {
+    this.headers[name] = value;
+    return this;
+  }
+
   writeHead(statusCode: number, headers?: Record<string, string>): this {
     this.statusCode = statusCode;
-    this.headers = headers ?? {};
+    this.headers = { ...this.headers, ...headers };
     this.headersSent = true;
     return this;
   }

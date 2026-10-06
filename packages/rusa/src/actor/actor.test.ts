@@ -110,6 +110,49 @@ describe("Actor", () => {
     expect(provider.calls[0]?.prompt).toBe("PROMPT: inbox work");
   });
 
+  it("#866 forwards each launched fallback prompt under the same run id without blocking on persistence", async () => {
+    const observed: { runId: string; prompt: string }[] = [];
+    const lifecycle = createActorLifecycle([
+      {
+        onPrompt: (event) => {
+          observed.push(event);
+        },
+      },
+      {
+        onPrompt: () => {
+          throw new Error("fixture persistence failure");
+        },
+      },
+    ]);
+    const primary = new FakeProvider((opts) => {
+      opts.onPromptLaunched?.("primary actual prompt");
+      return { success: false, exitCode: 1, output: "capacity" };
+    }, "claude");
+    const fallback = new FakeProvider((opts) => {
+      opts.onPromptLaunched?.("fallback actual prompt + suffix");
+      return { success: true, exitCode: 0 };
+    }, "antigravity");
+    const actor = makeActor(
+      {
+        lifecycle,
+        modelConfig: [{ provider: "claude" }, { provider: "antigravity" }],
+        resolveProvider: (entry) => (entry.provider === "claude" ? primary : fallback),
+        classifyExhaustion: async () => ({ exhausted: true }),
+      },
+      primary
+    );
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    await flush();
+    expect(observed).toHaveLength(2);
+    expect(observed[0]?.runId).toBe(observed[1]?.runId);
+    expect(observed.map(({ prompt }) => prompt)).toEqual([
+      "primary actual prompt",
+      "fallback actual prompt + suffix",
+    ]);
+    expect(actor.isRunning).toBe(false);
+  });
+
   it("reports the instantiated provider immediately before it runs", async () => {
     const provider = new FakeProvider(
       () => {

@@ -544,7 +544,19 @@ void main() {
         await tester.pump(const Duration(milliseconds: 100));
       }
 
-      expect(find.text('resolved model: gpt-5.6-sol'), findsOneWidget);
+      // The model sits behind the chevron that follows the run_start chip.
+      expect(find.textContaining('gpt-5.6-sol'), findsNothing);
+      expect(find.text('Run prompt'), findsNothing);
+      final chip = tester.getRect(find.text('run_start').last);
+      final chevron = tester.getRect(find.byTooltip('Show run details'));
+      expect(chevron.left, greaterThan(chip.right));
+      expect((chevron.center.dy - chip.center.dy).abs(), lessThan(4));
+      await tester.tap(find.byTooltip('Show run details'));
+      for (int i = 0; i < 5; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.text('Resolved Model: gpt-5.6-sol'), findsOneWidget);
+      expect(find.text('Prompt:'), findsOneWidget);
       await store.dispose();
     });
   });

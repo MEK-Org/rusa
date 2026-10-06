@@ -1534,6 +1534,200 @@ describe("runStart webhook event routing (Phase 4)", () => {
         }
       });
     });
+
+    it("raises one root alarm per provider-wide governing window closing with no newer reading (#794)", async () => {
+      // A whole-lane reading as the coordinator publishes it: its governing
+      // window comes from that same reading.
+      const reading = (
+        resetMs: number,
+        intervalSeconds: number,
+        freshnessState: { stale: boolean; hardStale: boolean },
+        observedMs = resetMs - 60_000,
+        windowKey = "claude:weekly"
+      ) => {
+        const updatedAt = new Date(observedMs).toISOString();
+        const status = throttleStatus("claude", { intervalSeconds, updatedAt });
+        return {
+          ...status,
+          governingBucketKey: windowKey,
+          buckets: [
+            {
+              key: windowKey,
+              percentLeft: 50,
+              timeRemainingPct: 50,
+              error: 0,
+              derivative: 0,
+              requiredIntervalSeconds: intervalSeconds,
+              observedAt: updatedAt,
+              resetAtIso: new Date(resetMs).toISOString(),
+            },
+          ],
+          freshness: {
+            ...status.freshness,
+            stale: freshnessState.stale,
+            hardStale: freshnessState.hardStale,
+            staleAfterMs: 45 * 60_000,
+            hardStaleAfterMs: 60 * 60_000,
+          },
+        };
+      };
+
+      const now = Date.now();
+      let published = reading(now + 60 * 60_000, 300, { stale: false, hardStale: false }, now);
+      const { close, triggerQuotaThrottleTick, getThrottle } = await bootWithCoordinator(() => ({
+        claude: published,
+      }));
+      const closedAlarms = () =>
+        getRepositories()
+          .inbox.list("root")
+          .entries.filter(
+            (entry) =>
+              (entry.payload as { type?: string }).type === "system.quota_governing_window_closed"
+          );
+      try {
+        // 1. Window still open and reading is fresh: ordinary throttle applied, no alarm.
+        await triggerQuotaThrottleTick();
+        expect(getThrottle("claude")?.intervalSeconds).toBe(300);
+        expect(closedAlarms()).toEqual([]);
+
+        // 2. Healthy reset/recovery without an alert:
+        // A fresh reading at reset (reset has passed, but reading is still fresh < staleAfterMs).
+        // It stays quiet per the soft-stale timing amendment (#794).
+        const window1ResetMs = now - 60_000;
+        published = reading(
+          window1ResetMs,
+          300,
+          { stale: false, hardStale: false },
+          window1ResetMs - 10 * 60_000
+        );
+        await triggerQuotaThrottleTick();
+        expect(getThrottle("claude")?.intervalSeconds).toBe(300);
+        expect(closedAlarms()).toEqual([]);
+
+        // 3. Soft-stale crossing after reset:
+        // That same window reaches the soft-stale threshold without a newer reading.
+        // The first applied status after crossing soft-stale raises one responsive alarm.
+        published = reading(
+          window1ResetMs,
+          300,
+          { stale: true, hardStale: false },
+          window1ResetMs - 50 * 60_000
+        );
+        await triggerQuotaThrottleTick();
+        await vi.waitFor(() => expect(closedAlarms()).toHaveLength(1));
+        const alarm1 = closedAlarms()[0];
+        expect(alarm1).toMatchObject({
+          actorId: "root",
+          source: "system:events",
+          payload: expect.objectContaining({
+            provider: "claude",
+            window: "claude:weekly",
+            resetAt: new Date(window1ResetMs).toISOString(),
+            priority: "responsive",
+            message: expect.stringContaining("Check the scrapes to inspect collection"),
+          }),
+        });
+        const alarm1Msg = (alarm1.payload as unknown as { message: string }).message;
+        expect(alarm1Msg).toContain("no newer accepted quota reading has arrived since");
+        expect(alarm1Msg).not.toContain("conservative ceiling");
+        // Pin unchanged published/applied throttle value around the alert:
+        expect(getThrottle("claude")?.intervalSeconds).toBe(300);
+
+        // 4. Repeated applies of the same closed window are deduplicated:
+        await triggerQuotaThrottleTick();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(closedAlarms()).toHaveLength(1);
+        expect(getThrottle("claude")?.intervalSeconds).toBe(300);
+
+        // 5. A new reset for the same governing key arrives fresh, so it does
+        // not alert. When that same accepted reading later becomes stale, the
+        // second reset closes without an intermediate open apply. Keeping the
+        // key at claude:weekly proves resetAtIso is part of the dedup key.
+        const window2ResetMs = now - 30_000;
+        published = reading(
+          window2ResetMs,
+          300,
+          { stale: false, hardStale: false },
+          window2ResetMs - 10 * 60_000,
+          "claude:weekly"
+        );
+        await triggerQuotaThrottleTick();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(closedAlarms()).toHaveLength(1);
+
+        published = reading(
+          window2ResetMs,
+          300,
+          { stale: true, hardStale: true },
+          window2ResetMs - 10 * 60_000,
+          "claude:weekly"
+        );
+        await triggerQuotaThrottleTick();
+        await vi.waitFor(() => expect(closedAlarms()).toHaveLength(2));
+        const alarm2 = closedAlarms().find(
+          (entry) =>
+            (entry.payload as { window?: string; resetAt?: string }).resetAt ===
+            new Date(window2ResetMs).toISOString()
+        );
+        expect(alarm2).toMatchObject({
+          actorId: "root",
+          source: "system:events",
+          payload: expect.objectContaining({
+            provider: "claude",
+            window: "claude:weekly",
+            resetAt: new Date(window2ResetMs).toISOString(),
+            priority: "responsive",
+          }),
+        });
+        // The alert observes the published throttle; it does not select one.
+        expect(getThrottle("claude")?.intervalSeconds).toBe(published.intervalSeconds);
+
+        // Repeated apply of window 2 is also deduplicated:
+        await triggerQuotaThrottleTick();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(closedAlarms()).toHaveLength(2);
+        expect(getThrottle("claude")?.intervalSeconds).toBe(published.intervalSeconds);
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
+
+    it("raises the window-close alarm for a provider already closed when the instance boots (#794)", async () => {
+      const updatedAt = new Date(Date.now() - 2 * 60 * 60_000).toISOString();
+      const status = throttleStatus("claude", { intervalSeconds: 3600, updatedAt });
+      const { close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => ({
+        claude: {
+          ...status,
+          buckets: status.buckets.map((bucket) => ({
+            ...bucket,
+            observedAt: updatedAt,
+            resetAtIso: new Date(Date.now() - 60_000).toISOString(),
+          })),
+          freshness: { ...status.freshness, stale: true, hardStale: true },
+        },
+      }));
+      try {
+        // The boot apply runs before the alarm is bound; the next one raises it.
+        await triggerQuotaThrottleTick();
+        await vi.waitFor(() =>
+          expect(
+            getRepositories()
+              .inbox.list("root")
+              .entries.filter(
+                (entry) =>
+                  (entry.payload as { type?: string }).type ===
+                  "system.quota_governing_window_closed"
+              )
+          ).toHaveLength(1)
+        );
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
   });
 
   it("keeps an in-progress coordinator history warmup from reading as authoritative empty history at readiness (#527)", async () => {
@@ -8276,6 +8470,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "dashboard-timing",
         "pnpm-hardlinks",
         "update",
       ]);
@@ -8284,6 +8479,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "repo",
         "understanding",
         "quota",
+        "dashboard-timing",
         "mesh",
         "inbox",
         "obligations",
@@ -8293,6 +8489,20 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // Every worker endpoint is the worker's own; none is shared with root.
       const rootUrls = new Set(rootServers.map((server) => server.url));
       expect(workerServers.filter((server) => rootUrls.has(server.url))).toEqual([]);
+    });
+
+    it("unmounts a retired worker's dashboard timing endpoint", async () => {
+      withWorker("timing-retire-worker");
+      const { mesh } = await boot();
+      const dashboardTimingUrl = mcpServersOf(workerOf(mesh, "timing-retire-worker")).find(
+        (server) => server.name === "dashboard-timing"
+      )?.url;
+      expect(dashboardTimingUrl).toBeDefined();
+
+      mesh.retire("timing-retire-worker");
+      await vi.waitFor(async () => {
+        expect((await fetch(dashboardTimingUrl as string)).status).toBe(404);
+      });
     });
 
     it("adds chat read to both sets and chat write to the root only when chat is configured", async () => {
@@ -8314,6 +8524,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "dashboard-timing",
         "chat-write",
         "pnpm-hardlinks",
         "update",
@@ -8323,6 +8534,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "repo",
         "understanding",
         "quota",
+        "dashboard-timing",
         "chat-read",
         "mesh",
         "inbox",

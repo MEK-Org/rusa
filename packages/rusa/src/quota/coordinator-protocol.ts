@@ -428,9 +428,8 @@ export function publishedThrottle(
   // reporting for longer than the hard-stale horizon without it. When the
   // whole provider reading is missing or failed (including a coordinator that
   // stops collecting), both lanes age together and skip this retirement:
-  // `publishedLane` keeps each one's interval until its governing reset and
-  // widens it to the ceiling afterwards. This reverses #730, which widened
-  // that case to the ceiling at once.
+  // `publishedLane` keeps each one's interval when readings stop, including across
+  // governing window reset (#794).
   const modelLanes = (stored.modelLanes ?? []).flatMap(
     (lane: PersistedQuotaModelLaneStatus): PublishedThrottleModelLaneStatus[] => {
       const current = { ...publishedLane(lane, options), models: [...lane.models] };
@@ -479,17 +478,17 @@ function publishedLane(
 ): Omit<PublishedThrottleProviderStatus, "modelLanes"> {
   const maxIntervalSeconds = options?.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
   const freshness = calculateFreshness(stored, options);
-  const nowMs = options?.nowMs ?? Date.now();
 
   // A reachable coordinator can still have no newer reading for a whole lane.
-  // While that last computed governing window has not reset, retain the
-  // interval and expose its stale freshness honestly. A newer provider scrape
+  // When whole-lane scrapes stop or fail, retain the last computed interval
+  // (including across governing window reset, per #794 operator policy correction)
+  // and expose its stale freshness honestly. A newer provider scrape
   // that omitted only the governing window is the established partial-window
   // case and remains fail-safe. The client separately handles a coordinator it
   // cannot reach; a cold provider has no stored lane to publish at all.
-  const retainKnownWindow = governingWindowIsStillValid(stored, nowMs);
+  const retainPacing = wholeLaneReadingRetainsPacing(stored);
   const intervalSeconds =
-    freshness.hardStale && !retainKnownWindow
+    freshness.hardStale && !retainPacing
       ? Math.max(stored.intervalSeconds, maxIntervalSeconds)
       : stored.intervalSeconds;
 
@@ -509,18 +508,61 @@ function publishedLane(
   };
 }
 
-function governingWindowIsStillValid(
-  stored: Omit<PersistedQuotaProviderStatus, "modelLanes">,
-  nowMs: number
+function wholeLaneReadingRetainsPacing(
+  stored: Omit<PersistedQuotaProviderStatus, "modelLanes">
 ): boolean {
   if (!stored.governingBucketKey) return false;
   const governing = stored.buckets.find((bucket) => bucket.key === stored.governingBucketKey);
-  if (!governing?.resetAtIso) return false;
+  if (!governing) return false;
   // A newer scrape that leaves only this bucket out is not a whole-lane missing
   // reading. Keep the existing conservative partial-window election rule.
-  if (governing.observedAt !== stored.updatedAt) return false;
-  const resetMs = Date.parse(governing.resetAtIso);
-  return Number.isFinite(resetMs) && resetMs > nowMs;
+  return governing.observedAt === stored.updatedAt;
+}
+
+/**
+ * The governing window of the lane's newest stored reading, when it carries a
+ * reset. A newer scrape that leaves only this bucket out is not a whole-lane
+ * missing reading, so it has none: that keeps the existing conservative
+ * partial-window election rule.
+ */
+function wholeLaneGoverningWindow(
+  stored: Omit<PersistedQuotaProviderStatus, "modelLanes">
+): PersistedQuotaBucketStatus | null {
+  if (!stored.governingBucketKey) return null;
+  const governing = stored.buckets.find((bucket) => bucket.key === stored.governingBucketKey);
+  if (!governing?.resetAtIso || governing.observedAt !== stored.updatedAt) return null;
+  return Number.isFinite(Date.parse(governing.resetAtIso)) ? governing : null;
+}
+
+/**
+ * The provider-wide governing window that has closed with no newer accepted
+ * reading (#794), or null. Alerts on the first applied status where the governing
+ * window has reset, its retained accepted reading predates that reset, and that
+ * reading has passed the soft-stale threshold (probe TTL plus three ticks from
+ * observation, per #794 timing ruling 5992971926). Missing and failed scrapes look
+ * the same here, since neither replaces the stored reading. Detection only; it
+ * changes no published value.
+ */
+export function closedGoverningWindow(
+  status: Omit<PublishedThrottleProviderStatus, "modelLanes">,
+  nowMs: number
+): PersistedQuotaBucketStatus | null {
+  const governing = wholeLaneGoverningWindow(status);
+  if (!governing) return null;
+  const resetMs = Date.parse(governing.resetAtIso ?? "");
+  const observedMs = Date.parse(governing.observedAt);
+  // A reading accepted after its advertised reset supersedes the old window,
+  // even if that provider still reports the old reset. The alert is only for
+  // the retained pre-reset reading that has no successor and has passed the
+  // soft-stale horizon (reuse published freshness semantics).
+  const staleThresholdMs =
+    status.freshness.staleAfterMs ?? freshnessThresholds(status.freshness.mode).staleAfterMs;
+  const isStale =
+    status.freshness.stale ||
+    (Number.isFinite(observedMs) && nowMs - observedMs > staleThresholdMs);
+  return Number.isFinite(observedMs) && observedMs < resetMs && resetMs <= nowMs && isStale
+    ? governing
+    : null;
 }
 
 /** The pacing a model-scoped lane set imposes on one concrete candidate model. */

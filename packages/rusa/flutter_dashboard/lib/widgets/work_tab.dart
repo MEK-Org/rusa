@@ -16,6 +16,7 @@ import 'obligation_snooze.dart';
 import 'obligation_status.dart';
 import 'hierarchy_drag_drop.dart';
 import 'reference_preview.dart';
+import 'resizable_sidebar.dart';
 
 class WorkTab extends StatefulWidget {
   const WorkTab({
@@ -455,34 +456,29 @@ class _WorkTabState extends State<WorkTab> {
             return _sidebar(flattened, isNarrow: isNarrow);
           }
 
-          return Row(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              SizedBox(
-                width: 320,
-                child: _sidebar(flattened, isNarrow: isNarrow),
-              ),
-              const VerticalDivider(width: 1, color: MeshColors.border),
-              Expanded(
-                child: _selectedObligationId != null
-                    ? _DetailView(
-                        obligationId: _selectedObligationId!,
-                        store: widget.store,
-                        onSelectView: widget.onSelectView,
-                        onMutated: _handleMutation,
-                        openLink: widget.openLink,
-                      )
-                    : const Center(
-                        child: Text(
-                          'Select an obligation from the tree.',
-                          style: TextStyle(
-                            color: MeshColors.textMuted,
-                            fontSize: 14,
-                          ),
-                        ),
+          return ResizableSidebar(
+            defaultWidth: 320,
+            initialWidth: widget.store.sidebarWidth('work'),
+            onWidthChanged: (width) =>
+                widget.store.setSidebarWidth('work', width),
+            sidebar: _sidebar(flattened, isNarrow: isNarrow),
+            detail: _selectedObligationId != null
+                ? _DetailView(
+                    obligationId: _selectedObligationId!,
+                    store: widget.store,
+                    onSelectView: widget.onSelectView,
+                    onMutated: _handleMutation,
+                    openLink: widget.openLink,
+                  )
+                : const Center(
+                    child: Text(
+                      'Select an obligation from the tree.',
+                      style: TextStyle(
+                        color: MeshColors.textMuted,
+                        fontSize: 14,
                       ),
-              ),
-            ],
+                    ),
+                  ),
           );
         },
       ),
@@ -1913,6 +1909,7 @@ class _DetailViewState extends State<_DetailView> {
                   store: store,
                   showOwner: true,
                   showKindChip: false,
+                  openLink: openLink,
                   showActions:
                       false, // In the original, the work_tab children row didn't have actions menu.
                   contentPadding: const EdgeInsets.symmetric(
@@ -2040,6 +2037,7 @@ class _DetailViewState extends State<_DetailView> {
               showActions: false,
               showKindChip: false,
               onSelectView: onSelectView,
+              openLink: openLink,
               contentPadding: const EdgeInsets.symmetric(
                 horizontal: 16,
                 vertical: 12,

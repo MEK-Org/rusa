@@ -1088,6 +1088,13 @@ export class ActorHandle implements MeshActor {
           injectRecord: message.injectRecord,
           selected: message.selected,
         });
+      case "runPrompt":
+        if (message.runId !== this.startedRunId) return;
+        return ctx.lifecycle.emit("onPrompt", {
+          actorId: this.id,
+          runId: message.runId,
+          prompt: message.prompt,
+        });
       case "firstChunk":
         hooks?.onFirstChunk?.();
         break;

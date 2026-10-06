@@ -26,6 +26,8 @@ import { handleIuReportsApiRequest, type IuReportsApiDeps } from "../dashboard/i
 import type { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { handleQuotaApiRequest, type QuotaApiDeps } from "../dashboard/quota-api.js";
 import { SseHub } from "../dashboard/sse.js";
+import { handleDashboardTimingTelemetry } from "../dashboard/timing-http.js";
+import { beginDashboardRequestTiming } from "../dashboard/timing-server.js";
 import {
   handleUnderstandingOpsRequest,
   handleUnderstandingStringsRequest,
@@ -37,7 +39,12 @@ import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import type { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import {
+  type OperatorPrincipalSource,
+  resolveSoleActiveUser,
+} from "../principals/operator-principal.js";
 import type { QuotaCoordinatorClientHealth } from "../quota/coordinator-client.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { InboxRepository } from "../repositories/inbox-repository.js";
@@ -130,6 +137,8 @@ export interface DashboardMeshRefs {
   actors: ActorRepository;
   principals?: PrincipalRepository;
   meshEvents: MeshEventRepository;
+  /** Optional content-free timing recorder, owned by the live start wiring. */
+  timings?: DashboardDataDeps["timings"];
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
   obligations?: ObligationRepository;
@@ -137,6 +146,7 @@ export interface DashboardMeshRefs {
   inbox?: InboxRepository;
   /** Completed selection intervals used to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
+  runPrompts?: RunPromptRepository;
   /** Durable per-entry obligation associations for activity correlation. */
   inboxFocus?: InboxFocusRepository;
   emitter: MeshEventEmitter;
@@ -278,6 +288,12 @@ export function parseJsonObjectBody(body: string): JsonObjectParseResult {
   return { ok: true, value: parsed as Record<string, unknown> };
 }
 
+/** Auth-disabled mode cannot identify its viewer once several active users exist. */
+function localViewerIsAmbiguous(principals: OperatorPrincipalSource | undefined): boolean {
+  const sole = resolveSoleActiveUser(principals);
+  return !sole.ok && sole.reason === "ambiguous";
+}
+
 /**
  * Create the dashboard HTTP request handler.
  *
@@ -301,6 +317,8 @@ export function createDashboardRequestHandler(
     try {
       const requestUrl = new URL(req.url || "/", "http://localhost");
       const { pathname } = requestUrl;
+      const timings = dataDeps?.timings;
+      beginDashboardRequestTiming(res, pathname, req.method, timings);
 
       // Minimal liveness endpoint — always available, even without a live mesh.
       if (req.method === "GET" && pathname === "/api/health") {
@@ -337,9 +355,28 @@ export function createDashboardRequestHandler(
         !(await auth.authorize(req, res))
       )
         return;
+      // #866: complete prompts are available in sole-email/local mode only.
+      // Keep allowlist refusal at the established auth boundary, before storage reads.
+      // allowedEmails also fails closed for an unvalidated adapter object with both fields.
+      // Auth-disabled mode with several active users cannot identify its viewer (#590).
+      if (
+        req.method === "GET" &&
+        /^\/api\/mesh\/runs\/[^/]+\/prompt$/.test(pathname) &&
+        (auth
+          ? !auth.config?.email || Boolean(auth.config.allowedEmails)
+          : localViewerIsAmbiguous(dataDeps?.principals))
+      ) {
+        res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: "prompt not retained" }));
+        return;
+      }
       if (auth && (pathname === "/api/mesh/stream" || pathname === "/api/mesh/voice/stream")) {
         auth.guardStream(req, res);
       }
+
+      // This route is deliberately outside the recorder's own route map: it
+      // accepts client summaries but never generates recursive telemetry.
+      if (await handleDashboardTimingTelemetry(req, res, pathname, timings)) return;
 
       if (req.method === "GET" && pathname === "/api/dashboard/config") {
         res.writeHead(200, {
@@ -598,10 +635,12 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           principals,
           logger: options.logger,
           meshEvents: options.mesh.meshEvents,
+          timings: options.mesh.timings,
           meshChat: options.mesh.meshChat,
           obligations: options.mesh.obligations,
           inbox: options.mesh.inbox,
           actorRuns: options.mesh.actorRuns,
+          runPrompts: options.mesh.runPrompts,
           inboxFocus: options.mesh.inboxFocus,
           sseHub,
           mesh: options.mesh.mesh,

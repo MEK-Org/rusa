@@ -9,6 +9,7 @@ import { stringify } from "yaml";
 import { buildRootPrompt } from "../actor/root-prompt.js";
 import { buildWorkerPrompt } from "../actor/worker-prompt.js";
 import { loadConfig } from "../config/index.js";
+import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
 import { buildActorBwrapArgs } from "../providers/sandbox.js";
 import { getNodeContents } from "./graph-store.js";
 import { renderUnderstandingSnapshot } from "./snapshot.js";
@@ -262,6 +263,7 @@ describe("Issue #45: Integrated Understanding Read-Only Mount Prototype Validati
         threadId: "worker-123456",
         parentId: "root",
         understandingMountEnabled: true,
+        gitIdentity: resolveMeshGitIdentity(undefined),
       });
       expect(enabledPrompt).toContain(notice);
 
@@ -269,6 +271,7 @@ describe("Issue #45: Integrated Understanding Read-Only Mount Prototype Validati
         threadId: "worker-123456",
         parentId: "root",
         understandingMountEnabled: false,
+        gitIdentity: resolveMeshGitIdentity(undefined),
       });
       expect(disabledPrompt).not.toContain(notice);
 
