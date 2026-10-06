@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import type { RoomEntryEnterResult } from "../voice/room-entry.js";
 
 import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
@@ -101,7 +102,11 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
   let origin: string;
   const interrupt = vi.fn(() => ({ interrupted: true, status: "interrupted" }));
   const roomEntry = {
-    enter: vi.fn(() => ({ status: "entered", notified: true, episodeId: "ep" })),
+    enter: vi.fn<() => RoomEntryEnterResult>(() => ({
+      status: "entered",
+      notified: true,
+      episodeId: "ep",
+    })),
   };
   beforeEach(async () => {
     now = Date.now();

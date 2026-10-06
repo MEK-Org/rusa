@@ -42,9 +42,8 @@ describe("RoomEntryService", () => {
     const service = createService();
     const result = service.enter({ principalId: "human-matt" });
 
-    expect(result.status).toBe("entered");
+    if (result.status !== "entered" || !result.notified) throw new Error("expected notified entry");
     expect(result.notified).toBe(true);
-    if (!result.notified) throw new Error("expected notified");
     expect(result.episodeId).toMatch(/^[0-9a-f-]{36}$/);
 
     expect(appends).toHaveLength(2);
@@ -94,6 +93,7 @@ describe("RoomEntryService", () => {
   ])("$name", ({ advanceMs, principalId, expected, appendCount }) => {
     const service = createService();
     const first = service.enter({ principalId: "human-matt" });
+    if (first.status !== "entered" || !first.notified) throw new Error("expected notified entry");
     expect(first.notified).toBe(true);
     expect(appends).toHaveLength(2);
 
@@ -105,6 +105,7 @@ describe("RoomEntryService", () => {
   it("handles empty roster without creating appends", () => {
     const service = createService({ roster: () => [] });
     const result = service.enter({ principalId: "human-matt" });
+    if (result.status !== "entered" || !result.notified) throw new Error("expected notified entry");
     expect(result.notified).toBe(true);
     expect(appends).toHaveLength(0);
   });
@@ -148,6 +149,7 @@ describe("RoomEntryService", () => {
     });
 
     const result = service.enter({ principalId: "human-operator" });
+    if (result.status !== "entered" || !result.notified) throw new Error("expected notified entry");
     expect(result.notified).toBe(true);
 
     const entries = inbox.list("root", { status: "all" }).entries;
