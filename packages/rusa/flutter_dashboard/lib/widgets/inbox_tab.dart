@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../link_opener.dart';
+import '../dashboard_timing.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -99,7 +100,10 @@ class _InboxTabState extends State<InboxTab> {
   @override
   void initState() {
     super.initState();
-    _page = _loadInbox();
+    _page = widget.store.api.trackInteraction(
+      DashboardInteraction.primaryNavigation,
+      _loadInbox,
+    );
   }
 
   @override

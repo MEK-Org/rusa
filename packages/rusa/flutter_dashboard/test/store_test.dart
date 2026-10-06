@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/api.dart';
+import 'package:rusa_dashboard/dashboard_timing.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/obligations_cache.dart';
 import 'package:rusa_dashboard/store.dart';
@@ -1420,6 +1421,13 @@ void main() {
         async.flushMicrotasks();
         expect(store.actor('a'), isNull);
         expect(store.error.value, contains('offline'));
+        expect(
+          api.timingInteractions,
+          contains((
+            interaction: DashboardInteraction.initialLoad,
+            outcome: 'failure',
+          )),
+        );
 
         api.threadsError = null;
         async.elapse(const Duration(milliseconds: 250));

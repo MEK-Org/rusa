@@ -19,7 +19,7 @@ export function createDashboardTimingMcpServer(
     {
       title: "Summarize dashboard timing",
       description:
-        "Read content-free dashboard timing aggregates for a 1h–7d window. Returns percentiles, status/outcome buckets and client/server correlation coverage; never raw telemetry rows or identifiers.",
+        "Read content-free dashboard timing aggregates for a 1h–7d window. Returns percentiles, status/outcome buckets, exact-ID correlation and paired request/server coverage, never raw telemetry rows or identifiers.",
       inputSchema: {
         hours: z
           .number()
