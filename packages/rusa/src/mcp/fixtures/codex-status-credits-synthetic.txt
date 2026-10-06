@@ -1,0 +1,10 @@
+╭──────────────────────────────────────────────────────────────────────────────────────────────╮
+│  >_ OpenAI Codex                                                                             │
+│                                                                                              │
+│  Visit https://chatgpt.com/codex/settings/usage for up-to-date                              │
+│  information on rate limits and credits                                                      │
+│                                                                                              │
+│  Credits:                     3,336                                                         │
+│  5h limit:                    [████████████████████] 99% left (resets 23:32)                │
+│  Weekly limit:                [███████████████████░] 93% left (resets 12:34 on 14 Jul)      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────╯

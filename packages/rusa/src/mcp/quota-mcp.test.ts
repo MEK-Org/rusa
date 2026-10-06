@@ -249,6 +249,15 @@ describe("quota MCP server", () => {
       expect(systemInstruction).toContain("do NOT guess a number");
       expect(systemInstruction).toContain("do NOT fail the parse");
       expect(systemInstruction).toContain("do NOT emit an invented window");
+      const schema = (
+        mockGenerateContent.mock.calls[0][0] as {
+          config: { responseSchema: { properties: Record<string, { description?: string }> } };
+        }
+      ).config.responseSchema;
+      expect(schema.properties.remainingCredits?.description).toContain("literal `Credits:` row");
+      expect(schema.properties.remainingCredits?.description).toContain(
+        "absent means unknown, never zero"
+      );
       expect(systemInstruction).toContain("every window carries scope='provider'");
       expect(systemInstruction).toContain("gpt-reserve Weekly limit");
       expect(systemInstruction).toContain("beneath a standalone '<model name> limit:' heading");
@@ -260,6 +269,61 @@ describe("quota MCP server", () => {
       expect(systemInstruction).not.toContain("For agy:");
       expect(systemInstruction).not.toContain("session/week usage windows");
       expect(systemInstruction).not.toContain("reports quota REMAINING");
+    });
+
+    // The model's credit text is accepted only when the raw panel prints it on
+    // a `Credits:` row; anything else stays unknown and never fails the parse,
+    // so the windows the pacer reads always survive (#924 increment 1).
+    it.each([
+      ["absent from the reply", "codex-status-credits-synthetic.txt", {}, undefined],
+      ["printed zero", "codex-status-credits-synthetic.txt", { remainingCredits: "0" }, 0],
+      [
+        "grouped balance",
+        "codex-status-credits-synthetic.txt",
+        { remainingCredits: "3,336" },
+        3336,
+      ],
+      [
+        "unprintable",
+        "codex-status-credits-synthetic.txt",
+        { remainingCredits: "~3.3k" },
+        undefined,
+      ],
+      [
+        "not on the raw panel",
+        "codex-status-healthy.txt",
+        { remainingCredits: "3,336" },
+        undefined,
+      ],
+    ])("reads Codex remaining credits %s", async (_case, fixture, credits, expected) => {
+      const source = readFileSync(join(__dirname, "fixtures", fixture), "utf-8");
+      const printed = (credits as { remainingCredits?: string }).remainingCredits;
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            ...credits,
+            windows: [
+              { label: "5h", kind: "five_hour", remainingPercent: "99", resetInIso: "PT23H32M" },
+              {
+                label: "Weekly",
+                kind: "weekly",
+                remainingPercent: "93",
+                resetAtIso: "2026-07-14T12:34:00.000Z",
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseCodexQuota(
+        printed === "0" ? source.replace("3,336", "0") : source,
+        "test-key"
+      );
+      expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+      expect(parsed.status).toBe("available");
+      expect(parsed.limits).toHaveLength(2);
+      if (expected === undefined) expect(parsed).not.toHaveProperty("remainingCredits");
+      else expect(parsed.remainingCredits).toBe(expected);
     });
 
     it("parses Codex exhausted status from newly banked /status raw TUI fixture file successfully using LLM", async () => {
@@ -3973,6 +4037,8 @@ describe("quota MCP server", () => {
         const parsed = JSON.parse(textOf(result));
         expect(parsed.provider).toBe("codex");
         expect(parsed.status).toBe("available");
+        // The healthy capture prints no Credits row: unknown, never zero.
+        expect(parsed).not.toHaveProperty("remainingCredits");
         // Both windows (5h + Weekly) carried through, not just the binding one .
         expect(parsed.limits).toHaveLength(2);
         expect(parsed.limits[0]).toMatchObject({ label: "5h", kind: "five_hour", percentLeft: 99 });
@@ -3986,6 +4052,45 @@ describe("quota MCP server", () => {
         expect(scrapeCodexStatus).toHaveBeenCalledTimes(1);
         expect(scrapeCodexStatus.mock.calls[0][0].actorDir).toBe("/tmp/workers/quota-probe-codex");
         expect(mockCodexProvider.run).not.toHaveBeenCalled();
+      });
+
+      it("propagates a printed Codex credit balance into the reading", async () => {
+        // Synthetic/redacted fixture based on the public Codex `/status` Credits:
+        // row documented at https://github.com/steipete/CodexBar/blob/main/docs/codex.md.
+        const scrapeCodexStatus = vi
+          .fn()
+          .mockResolvedValue(fx("codex-status-credits-synthetic.txt"));
+        mockGenerateContent.mockResolvedValue({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              remainingCredits: "3,336",
+              windows: [
+                { label: "5h", kind: "five_hour", usedPercent: "1", resetInIso: "PT23H32M" },
+                {
+                  label: "Weekly",
+                  kind: "weekly",
+                  usedPercent: "7",
+                  resetAtIso: "2026-07-14T12:34:00.000Z",
+                },
+              ],
+            }),
+        });
+        const server = createQuotaMcpServer({
+          config: { ...mockConfig, geminiApiKey: "test-gemini-key" },
+          workersDir: "/tmp/workers",
+          resolveProvider: mockResolveProvider,
+          scrapeCodexStatus,
+        });
+        const client = await connect(server);
+        const result = (await client.callTool({
+          name: "get_quota",
+          arguments: { provider: "codex" },
+        })) as CallToolResult;
+
+        const parsed = JSON.parse(textOf(result));
+        expect(parsed.remainingCredits).toBe(3336);
+        expect(parsed.limits).toHaveLength(2);
       });
 
       it("reports exhausted from the exhausted /status scrape", async () => {

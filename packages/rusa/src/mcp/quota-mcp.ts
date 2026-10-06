@@ -167,6 +167,12 @@ export interface ProviderQuotaSnapshot {
    */
   limits?: QuotaLimit[];
   /**
+   * Optional balance from a Codex `/status` `Credits:` row. Its absence means
+   * the rendered panel did not report a balance; it never means zero. This is
+   * observation-only until #924's pacing design is approved.
+   */
+  remainingCredits?: number;
+  /**
    * ISO-8601 instant the underlying provider was actually scraped (ISSUE_NUM, ask
    * 5) — stamped once, at probe time, by whichever `probe*Quota` produced this
    * state. Rides unchanged through the TTL cache (a cache hit returns the
@@ -597,6 +603,33 @@ function resolvePercentLeft(w: LlmQuotaWindow): number | string {
   return hasUsed ? 100 - value : value;
 }
 
+/** A printed whole-credit balance: grouped (`3,336`) or plain (`0`). */
+const PRINTED_CREDIT_BALANCE = /^(?:\d{1,3}(?:,\d{3})+|\d+)$/;
+
+/**
+ * The printed balances of the `Credits:` rows in a raw Codex `/status` panel.
+ * The model's copied value is accepted only when the source actually prints
+ * it, so a model that invents a balance for a panel without one cannot turn
+ * unknown into a number.
+ */
+function printedCreditRows(output: string): string[] {
+  return [...output.matchAll(/(?:^|[\s│|])Credits:[ \t]*([^\s│|]+)/gm)].map((m) => m[1] ?? "");
+}
+
+/**
+ * Read an optional Codex `Credits:` balance as the whole number the panel
+ * prints. Anything else — absent, unprintable, or not on a `Credits:` row of
+ * the raw panel — is unknown, never zero. Credits are observation-only, so an
+ * unusable value never fails the parse: the windows the pacer reads survive.
+ */
+function readCodexRemainingCredits(value: unknown, output: string): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const printed = value.trim();
+  if (!PRINTED_CREDIT_BALANCE.test(printed)) return undefined;
+  if (!printedCreditRows(output).includes(printed)) return undefined;
+  return Number(printed.replaceAll(",", ""));
+}
+
 async function parseQuotaWithLlm(
   output: string,
   apiKey: string,
@@ -629,6 +662,18 @@ async function parseQuotaWithLlm(
       description:
         "Per-window breakdown, e.g. session + weekly (claude/kimi) or 5h + Weekly (codex/kimi).",
       items: LLM_WINDOW_ITEM_SCHEMA,
+    };
+  }
+
+  if (provider === "codex") {
+    properties.remainingCredits = {
+      type: Type.STRING,
+      description:
+        "Optional remaining credit balance. Emit only when the rendered `/status` panel has a " +
+        "literal `Credits:` row. Copy its printed non-negative number as text, preserving digit " +
+        "grouping (for example `3,336` or `0`). Omit this field when that row is absent; absent " +
+        "means unknown, never zero. Do not infer credits from URLs, rate-limit prose, plan names, " +
+        "or generic mentions of credits.",
     };
   }
 
@@ -791,7 +836,7 @@ async function parseQuotaWithLlm(
     if (!parsed || typeof parsed !== "object") {
       throw new Error("Quota parse failed: response is not an object");
     }
-    const parsedObj = parsed as { windows?: unknown; status?: unknown };
+    const parsedObj = parsed as { windows?: unknown; status?: unknown; remainingCredits?: unknown };
     if (!Array.isArray(parsedObj.windows)) {
       throw new Error("Quota parse failed: response omitted the required windows array");
     }
@@ -802,6 +847,11 @@ async function parseQuotaWithLlm(
     ) {
       throw new Error(`Quota parse failed: invalid status '${String(parsedObj.status)}'`);
     }
+
+    const remainingCredits =
+      provider === "codex"
+        ? readCodexRemainingCredits(parsedObj.remainingCredits, output)
+        : undefined;
 
     const limits: QuotaLimit[] = [];
     for (const rawWindow of parsedObj.windows) {
@@ -933,6 +983,7 @@ async function parseQuotaWithLlm(
     return {
       status,
       limits,
+      ...(remainingCredits !== undefined ? { remainingCredits } : {}),
     };
   };
 
@@ -1679,6 +1730,9 @@ export class QuotaService {
         status: parsed.status ?? "unknown",
         message: parsed.message,
         limits: parsed.limits,
+        ...(parsed.remainingCredits !== undefined
+          ? { remainingCredits: parsed.remainingCredits }
+          : {}),
         ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
         raw,
         scrapedAt,
