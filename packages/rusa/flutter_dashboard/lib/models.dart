@@ -689,6 +689,7 @@ class ThreadsSnapshot {
     this.runtimeCursor,
     this.schedulerWarning,
     this.supportedVoices = const [],
+    this.halt,
   });
 
   final bool halted;
@@ -706,6 +707,12 @@ class ThreadsSnapshot {
   /// working); this is the health-visible surface for that non-fatal state.
   final List<String>? schedulerWarning;
 
+  /// Structured view of the active halt (scope/providers/models/until), null
+  /// when no halt is active — what the header chip's tooltip explains. Absent
+  /// against an older server that predates the field (the bool above still
+  /// carries the badge).
+  final HaltStatusDto? halt;
+
   factory ThreadsSnapshot.fromJson(Map<String, dynamic> j) => ThreadsSnapshot(
     halted: j['halted'] as bool? ?? false,
     runtimeCursor: j['runtimeCursor'] == null
@@ -720,6 +727,43 @@ class ThreadsSnapshot {
     supportedVoices: (j['supportedVoices'] as List<dynamic>? ?? const [])
         .map(SupportedVoiceDto.fromJson)
         .toList(),
+    halt: j['halt'] == null
+        ? null
+        : HaltStatusDto.fromJson(j['halt'] as Map<String, dynamic>),
+  );
+}
+
+/// The authoritative halt sentinel's own shape, projected without its reason
+/// text: the chip explains scope and effect, not the operator's note.
+class HaltStatusDto {
+  const HaltStatusDto({
+    required this.scope,
+    this.providers = const [],
+    this.models = const [],
+    this.until,
+  });
+
+  /// `global` = every provider; `providers` = the named providers; `models` =
+  /// the named models on the named provider(s).
+  final String scope;
+  final List<String> providers;
+  final List<String> models;
+
+  /// Requested expiry, ISO-8601. It is in the future when the server builds
+  /// the snapshot — the sentinel retires expired halts; a client may present
+  /// that snapshot after its local clock has passed the expiry. Absence means
+  /// indefinite.
+  final String? until;
+
+  factory HaltStatusDto.fromJson(Map<String, dynamic> j) => HaltStatusDto(
+    scope: j['scope'] as String? ?? 'global',
+    providers: (j['providers'] as List<dynamic>? ?? const [])
+        .map((e) => e as String)
+        .toList(),
+    models: (j['models'] as List<dynamic>? ?? const [])
+        .map((e) => e as String)
+        .toList(),
+    until: j['until'] as String?,
   );
 }
 

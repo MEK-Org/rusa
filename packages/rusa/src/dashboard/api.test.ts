@@ -8,6 +8,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
+import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { RootChildRequest, RootControlService } from "../actor/root-control.js";
 import {
@@ -1854,6 +1855,58 @@ describe("handleMeshApiRequest", () => {
     expect(byId(UUID_A).runState).toBe("running");
     expect(byId(UUID_B).runState).toBe("queued");
     expect(byId("root").runState).toBe("idle");
+  });
+
+  it("GET /api/mesh/threads projects the active halt scope and expiry without its reason (#906)", async () => {
+    actors.upsert(rec("root", null, "active"));
+    const dir = mkdtempSync(join(tmpdir(), "mc-api-halt-scope-"));
+    try {
+      const now = Date.parse("2026-10-04T12:00:00.000Z");
+      const sw = new HaltSwitch(join(dir, "HALT"), () => now);
+      deps = {
+        ...deps,
+        isHalted: () => sw.hasActiveHalt(),
+        haltSnapshot: () => sw.state(),
+      };
+      const halt = async () =>
+        JSON.parse((await call(deps, "GET", "/api/mesh/threads")).res.body).halt;
+
+      expect(await halt()).toBeNull();
+
+      sw.halt("private operator note");
+      expect(await halt()).toEqual({ scope: "global" });
+      sw.resume();
+
+      sw.halt("note", { providers: ["codex"], until: "2026-10-04T17:52:00Z" });
+      expect(await halt()).toEqual({
+        scope: "providers",
+        providers: ["codex"],
+        until: "2026-10-04T17:52:00.000Z",
+      });
+      sw.resume();
+
+      sw.halt("", { providers: ["claude"], models: ["claude-opus-5-5"] });
+      const body = JSON.parse((await call(deps, "GET", "/api/mesh/threads")).res.body);
+      expect(body.halted).toBe(true);
+      expect(body.halt).toEqual({
+        scope: "models",
+        providers: ["claude"],
+        models: ["claude-opus-5-5"],
+      });
+      expect(JSON.stringify(body.halt)).not.toContain("reason");
+      sw.resume();
+
+      // An expired sentinel is retired by the switch: neither the badge nor the
+      // scope claims it is still active.
+      sw.halt("", { providers: ["codex"], until: "2026-10-04T12:30:00Z" });
+      const later = new HaltSwitch(join(dir, "HALT"), () => Date.parse("2026-10-04T13:00:00Z"));
+      deps = { ...deps, isHalted: () => later.hasActiveHalt(), haltSnapshot: () => later.state() };
+      const expired = JSON.parse((await call(deps, "GET", "/api/mesh/threads")).res.body);
+      expect(expired.halted).toBe(false);
+      expect(expired.halt).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("GET /api/mesh/threads projects active-run focus but never speculative queued focus", async () => {

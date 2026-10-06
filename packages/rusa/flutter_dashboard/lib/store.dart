@@ -347,6 +347,7 @@ class DashboardStore {
     const ActorStateSnapshot.empty(),
   );
   final _halted = BehaviorSubject<bool>.seeded(false);
+  final _haltStatus = BehaviorSubject<HaltStatusDto?>.seeded(null);
   final _schedulerWarning = BehaviorSubject<List<String>?>.seeded(null);
   final _supportedVoices = BehaviorSubject<List<SupportedVoiceDto>>.seeded(
     const [],
@@ -442,6 +443,7 @@ class DashboardStore {
   // ── Exposed streams ──
   ValueStream<ActorStateSnapshot> get actorStates => _actorStates.stream;
   ValueStream<bool> get halted => _halted.stream;
+  ValueStream<HaltStatusDto?> get haltStatus => _haltStatus.stream;
   ValueStream<List<String>?> get schedulerWarning => _schedulerWarning.stream;
   ValueStream<List<SupportedVoiceDto>> get supportedVoices =>
       _supportedVoices.stream;
@@ -1793,6 +1795,7 @@ class DashboardStore {
       _runtimeRetry = null;
       _runtimeRetryDelay = _kRuntimeRetryInitial;
       _halted.add(snap.halted);
+      _haltStatus.add(snap.halt);
       _schedulerWarning.add(snap.schedulerWarning);
       _supportedVoices.add(snap.supportedVoices);
       _updateActorStatesFromThreads(snap.threads);
@@ -1981,6 +1984,7 @@ class DashboardStore {
       _actorStates.close(),
       _runSelections.close(),
       _halted.close(),
+      _haltStatus.close(),
       _schedulerWarning.close(),
       _supportedVoices.close(),
       _showRetired.close(),
