@@ -2056,6 +2056,56 @@ describe("ActorMesh", () => {
     expect(rootEntries().some((entry) => entry.source === "obligation:ob-10")).toBe(true);
   });
 
+  it("announces an unmerged matcher close once per installation, and reconciles idempotently", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+    const firstSet = "2026-10-01T00:00:00.000Z";
+
+    expect(mesh.deliverCompletionMatcherClosedUnmergedAttention("root", "ob-7", firstSet)).toBe(
+      true
+    );
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+    expect(rootEntries()[0].source).toBe("obligation:ob-7");
+    expect(rootEntries()[0].payload).toMatchObject({
+      type: "obligation.completion_matcher_closed_unmerged",
+      obligationId: "ob-7",
+    });
+    expect(fake("root").calls.length).toBeGreaterThan(0);
+
+    // Every later observation of the same installation retries the notice;
+    // the installation key makes those, and boot reconciliation, silent.
+    expect(mesh.deliverCompletionMatcherClosedUnmergedAttention("root", "ob-7", firstSet)).toBe(
+      false
+    );
+    const callsBefore = fake("root").calls.length;
+    mesh.reconcileCompletionMatcherClosedUnmergedAttention({
+      listCompletionMatcherClosedUnmergedAttention: () => [
+        { obligationId: "ob-7", ownerId: "root", matcherSetAt: firstSet },
+      ],
+    });
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+    expect(fake("root").calls.length).toBe(callsBefore);
+
+    // A notice the live path lost is repaired at boot, and a replaced matcher
+    // that closes unmerged again is a new installation with its own notice.
+    mesh.reconcileCompletionMatcherClosedUnmergedAttention({
+      listCompletionMatcherClosedUnmergedAttention: () => [
+        { obligationId: "ob-7", ownerId: "root", matcherSetAt: "2026-10-02T00:00:00.000Z" },
+        { obligationId: "ob-8", ownerId: "root", matcherSetAt: firstSet },
+      ],
+    });
+    await tick();
+    expect(rootEntries()).toHaveLength(3);
+
+    // Human owners read the recorded state on the dashboard instead.
+    expect(
+      mesh.deliverCompletionMatcherClosedUnmergedAttention("human:operator", "ob-9", firstSet)
+    ).toBe(false);
+  });
+
   it("announces each ready episode separately behind a persistent head (#531)", async () => {
     const inboxStore = createMemoryInboxStore();
     const { mesh, tick } = setup({ inboxStore });

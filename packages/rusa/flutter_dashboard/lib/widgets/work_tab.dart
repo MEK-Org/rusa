@@ -1875,8 +1875,10 @@ class _DetailViewState extends State<_DetailView> {
         : 'Complete when this instance deploys a descendant build';
     final state = matcher.satisfiedAt != null
         ? 'Satisfied ${formatTs(matcher.satisfiedAt!)}'
+        // Recorded once and not cleared by a reopen, so it is stated as a past
+        // observation; a later merge of the reopened PR still satisfies it.
         : matcher.closedUnmergedAt != null
-        ? 'PR closed without merging ${formatTs(matcher.closedUnmergedAt!)}'
+        ? 'PR was closed without merging at ${formatTs(matcher.closedUnmergedAt!)}'
         : 'Pending';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1895,7 +1897,8 @@ class _DetailViewState extends State<_DetailView> {
           '$state · set by ${store.actorDisplay(matcher.setBy)}',
           style: const TextStyle(color: MeshColors.textMuted, fontSize: 11.5),
         ),
-        if (matcher.satisfiedRef != null) ...[
+        // A merged PR's resolution is its own target, already shown above.
+        if (matcher.kind == 'deployed' && matcher.satisfiedRef != null) ...[
           const SizedBox(height: 4),
           SelectableText(
             'Resolution: ${matcher.satisfiedRef}',

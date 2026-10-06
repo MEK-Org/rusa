@@ -112,11 +112,18 @@ describe("ObligationRepository", () => {
     );
     expect(first.completionMatcher).toMatchObject({
       kind: "pr_merged",
-      target: "github:MEK-Org/rusa/pulls/190",
+      // Canonical lowercase, so the webhook lookup is an exact indexed match.
+      target: "github:mek-org/rusa/pulls/190",
       spec: { schemaVersion: 1 },
       satisfiedAt: null,
       closedUnmergedAt: null,
     });
+    const firstMatcher = first.completionMatcher;
+    if (firstMatcher === null) throw new Error("completion matcher was not persisted");
+    // A real prior observation, so replacement has something stale to discard.
+    expect(
+      repository.recordCompletionMatcherClosedUnmerged("matcher", firstMatcher)?.completionMatcher
+    ).toMatchObject({ closedUnmergedAt: expect.any(String) });
 
     const replaced = repository.setCompletionMatcher(
       "matcher",
@@ -132,9 +139,45 @@ describe("ObligationRepository", () => {
       closedUnmergedAt: null,
     });
 
+    // Replacing with an equal predicate is still a new installation.
+    const second = repository.setCompletionMatcher(
+      "matcher",
+      { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      "actor-a"
+    );
+    const secondMatcher = second.completionMatcher;
+    if (secondMatcher === null) throw new Error("completion matcher was not persisted");
+    repository.recordCompletionMatcherClosedUnmerged("matcher", secondMatcher);
+    now += 1_000;
+    expect(
+      repository.setCompletionMatcher(
+        "matcher",
+        { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+        "actor-a"
+      ).completionMatcher
+    ).toMatchObject({ closedUnmergedAt: null, satisfiedAt: null });
+
     expect(
       repository.setCompletionMatcher("matcher", null, "actor-a").completionMatcher
     ).toBeNull();
+  });
+
+  it("refuses recurrence on an obligation that already carries a completion matcher", () => {
+    repository.create({ id: "matched", title: "matched", ownerId: "actor-a" });
+    repository.setCompletionMatcher(
+      "matched",
+      { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      "actor-a"
+    );
+
+    expect(() =>
+      repository.setRecurrence(
+        "matched",
+        { policy: "completion_interval", intervalSeconds: 60 },
+        "actor-a"
+      )
+    ).toThrow(/completion matcher cannot be recurring/);
+    expect(repository.require("matched").recurrencePolicy).toBeNull();
   });
 
   it("holds matcher satisfaction behind live children, then finishes when the final child clears", () => {
@@ -142,25 +185,36 @@ describe("ObligationRepository", () => {
     repository.create({ id: "child", title: "child", parentId: "parent", ownerId: "actor-a" });
     const parent = repository.setCompletionMatcher(
       "parent",
-      { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      { kind: "deployed", commit: "a".repeat(40) },
       "actor-a"
     );
     const matcher = parent.completionMatcher;
     if (matcher === null) throw new Error("completion matcher was not persisted");
+    const deployedRef = `github:MEK-Org/rusa/commits/${"b".repeat(40)}`;
+    const observedNote = `Completion matcher satisfied: instance observer-1 running bbbbbbb contains aaaaaaa`;
 
     const observed = repository.satisfyCompletionMatcher("parent", matcher, {
-      note: "Completion matcher satisfied: PR #190 merged",
-      resolutionRef: "github:MEK-Org/rusa/pulls/190",
+      note: observedNote,
+      resolutionRef: deployedRef,
     });
     expect(observed.obligation).toMatchObject({ status: "waiting" });
-    expect(observed.obligation.completionMatcher).toMatchObject({
-      satisfiedRef: "github:MEK-Org/rusa/pulls/190",
-    });
+    expect(observed.obligation.completionMatcher).toMatchObject({ satisfiedRef: deployedRef });
 
     repository.setTerminalStatus("child", "done", "child finished", null, "actor-a");
     expect(repository.require("parent")).toMatchObject({
       status: "done",
-      resolutionRef: "github:MEK-Org/rusa/pulls/190",
+      resolutionRef: deployedRef,
+      // The observing instance and both revisions survive the deferral.
+      terminalNote: observedNote,
+    });
+    // The child's transition is the caller's; the parent's completion is the mesh's.
+    expect(repository.listHistory("child")[0]).toMatchObject({
+      actingPrincipal: "actor-a",
+      after: { status: "done" },
+    });
+    expect(repository.listHistory("parent")[0]).toMatchObject({
+      actingPrincipal: "system:mesh",
+      after: { status: "done" },
     });
   });
 

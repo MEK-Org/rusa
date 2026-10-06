@@ -5226,6 +5226,47 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(requestRunCalls).toEqual([{ actorId: "root", reason: "{}" }]);
     });
 
+    it("delivers a bot-sender event NOT on the list — a merged PR must notify (github_branch deploy flows depend on merge-adjacent events)", async () => {
+      let emitGitHubEvent:
+        | ((event: string, payload: Record<string, unknown>) => Promise<void>)
+        | undefined;
+      let mesh: ActorMesh | undefined;
+
+      const issueClient = new MockIssueClient();
+      setIssueClient(issueClient as unknown as IssueClient);
+
+      const readyPromise = new Promise<void>((resolve) => {
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              emitGitHubEvent = handles.emitGitHubEvent;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+
+      await readyPromise;
+      if (!mesh || !emitGitHubEvent) {
+        throw new Error("Mesh or emitGitHubEvent not ready");
+      }
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
+
+      // pull_request/closed (a merge) is deliberately NOT suppressed: humans
+      // merge PRs, and staging-deploy flows subscribe to merge-adjacent
+      // events. Unknown/unlisted event types deliver by default.
+      await emitGitHubEvent("pull_request", {
+        action: "closed",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        pull_request: { number: 456, merged: true, body: "pr body" },
+        sender: { login: "mock-bot" },
+      });
+
+      expect(requestRunCalls).toEqual([{ actorId: "root", reason: "{}" }]);
+    });
+
     it("satisfies a bot-sender merged-PR matcher before routing, with no subscriber", async () => {
       let emitGitHubEvent:
         | ((event: string, payload: Record<string, unknown>) => Promise<void>)
@@ -5278,6 +5319,54 @@ describe("runStart webhook event routing (Phase 4)", () => {
         resolutionRef: "github:dummy-org/dummy-repo/pulls/456",
       });
       expect(requestRunCalls).toEqual([]);
+    });
+
+    it("still routes a merged-PR event when completion matching throws", async () => {
+      let emitGitHubEvent:
+        | ((event: string, payload: Record<string, unknown>) => Promise<void>)
+        | undefined;
+      let mesh: ActorMesh | undefined;
+
+      const issueClient = new MockIssueClient();
+      setIssueClient(issueClient as unknown as IssueClient);
+
+      const readyPromise = new Promise<void>((resolve) => {
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              emitGitHubEvent = handles.emitGitHubEvent;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+
+      await readyPromise;
+      if (!mesh || !emitGitHubEvent) {
+        throw new Error("Mesh or emitGitHubEvent not ready");
+      }
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
+      const failing = vi
+        .spyOn(getRepositories().obligations, "listLiveCompletionMatchers")
+        .mockImplementation(() => {
+          throw new Error("SQLITE_BUSY");
+        });
+
+      // A matcher failure is logged and left to boot reconciliation; it must
+      // not turn the webhook into a 500 or cost the subscriber its delivery.
+      await emitGitHubEvent("pull_request", {
+        action: "closed",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        pull_request: { number: 456, merged: true, body: "pr body" },
+        sender: { login: "mock-bot" },
+      });
+      const matcherCalls = failing.mock.calls.length;
+      failing.mockRestore();
+
+      expect(matcherCalls).toBeGreaterThan(0);
+      expect(requestRunCalls).toEqual([{ actorId: "root", reason: "{}" }]);
     });
   });
 

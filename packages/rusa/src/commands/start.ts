@@ -179,7 +179,7 @@ import { GoogleGmailClient } from "../email/gmail-client.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitops/issue-client.js";
 import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
-import { initEmptyBareRepo } from "../gitops/worktree.js";
+import { getRemoteUrl, initEmptyBareRepo } from "../gitops/worktree.js";
 import { AGENT_EXEC_MCP_NAME, createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
 import {
   CHAT_READ_MCP_NAME,
@@ -219,7 +219,11 @@ import {
   UNDERSTANDING_READ_MCP_NAME,
 } from "../mcp/understanding-mcp.js";
 import type { UpdateToolDeps } from "../mcp/update-mcp.js";
-import { CompletionMatcherEvaluator } from "../obligations/completion-matcher-evaluator.js";
+import {
+  CompletionMatcherEvaluator,
+  githubRepositoryFromRemote,
+  validateDeployedCompletionMatcher,
+} from "../obligations/completion-matcher-evaluator.js";
 import {
   type CompletionMatcherInput,
   type EntityId,
@@ -1626,7 +1630,17 @@ async function composeStart(
       .map((repo) => repo.toLowerCase())
   );
   const completionMatcherGit = repoRoot ? new GitRunner(repoRoot) : null;
-  const completionMatcherRepository = config.github.repos?.[0] ?? null;
+  // The repository this build's own checkout came from: `deployed` ancestry
+  // runs in that checkout, so its satisfaction cites that repository. The
+  // configured subscription list is unrelated and may name several repos.
+  const completionMatcherRepository = repoRoot
+    ? githubRepositoryFromRemote(getRemoteUrl(repoRoot))
+    : null;
+  // Same deferred-sink shape as the obligation listeners above: the mesh does
+  // not exist yet, and boot reconciliation re-derives anything missed.
+  let completionMatcherClosedUnmergedSink:
+    | ((ownerId: string, obligationId: string, matcherSetAt: string) => void)
+    | undefined;
   const completionMatcherEvaluator = new CompletionMatcherEvaluator({
     obligations: getRepositories().obligations,
     issueClient,
@@ -1637,26 +1651,19 @@ async function composeStart(
         : Promise.reject(new Error("local checkout unavailable")),
     repository: completionMatcherRepository,
     instanceName: rootHandle,
-    onClosedUnmerged: (obligation, matcher) => {
-      // A stable id makes retries (including boot reconciliation after a crash)
-      // deliver at most one owner notice for one matcher installation.
-      inboxStore.append([
-        {
-          id: `completion-matcher-unmerged:${obligation.id}:${matcher.setAt}`,
-          actorId: obligation.ownerId,
-          source: matcher.target,
-          payload: {
-            type: "completion_matcher_closed_unmerged",
-            obligationId: obligation.id,
-            matcher: { kind: matcher.kind, target: matcher.target },
-          },
-        },
-      ]);
-    },
+    onClosedUnmerged: (obligation, matcher) =>
+      completionMatcherClosedUnmergedSink?.(obligation.ownerId, obligation.id, matcher.setAt),
     log: (message) => log.warn("completion_matcher_warning", { message }),
   });
   const validateCompletionMatcher = async (matcher: CompletionMatcherInput): Promise<void> => {
-    if (matcher.kind !== "pr_merged") return;
+    if (matcher.kind === "deployed") {
+      await validateDeployedCompletionMatcher(matcher.commit, {
+        repository: completionMatcherRepository,
+        git: completionMatcherGit,
+        log: (message) => log.warn("completion_matcher_warning", { message }),
+      });
+      return;
+    }
     const target = asGitHubIssue(parseReference(matcher.pr));
     if (target && excludedGitHubRepos.has(`${target.owner}/${target.repo}`.toLowerCase())) {
       throw new Error(
@@ -3526,6 +3533,9 @@ async function composeStart(
   prerequisiteCancellationSink = ({ dependentId, dependentOwnerId, prerequisiteId }) => {
     mesh.deliverPrerequisiteCancelledAttention(dependentOwnerId, dependentId, prerequisiteId);
   };
+  completionMatcherClosedUnmergedSink = (ownerId, obligationId, matcherSetAt) => {
+    mesh.deliverCompletionMatcherClosedUnmergedAttention(ownerId, obligationId, matcherSetAt);
+  };
   statusChangeSink = (change) => mesh.recordEvent(obligationStatusChangedEvent(change));
   responsiveReadySink = (obligation, actingPrincipal) => {
     mesh.deliverResponsiveReadyAttention(
@@ -3989,15 +3999,6 @@ async function composeStart(
   mesh.reconcileInbox();
   getRepositories().obligations.reconcileScheduledObligations();
   try {
-    await completionMatcherEvaluator.reconcileAtBoot();
-  } catch (err) {
-    // One matcher read/checkout problem must not prevent the mesh from
-    // starting; an unchecked matcher is retried by the next boot or live event.
-    log.warn("completion_matcher_boot_reconcile_failed", {
-      err: err instanceof Error ? err.message : String(err),
-    });
-  }
-  try {
     mesh.reconcileReadyHeads(getRepositories().obligations);
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
@@ -4012,6 +4013,19 @@ async function composeStart(
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
   }
+  try {
+    mesh.reconcileCompletionMatcherClosedUnmergedAttention(getRepositories().obligations);
+  } catch (_err) {
+    // Database may be closed during test shutdown/teardown races
+  }
+  // One GitHub read per live `pr_merged` matcher: run it after startup rather
+  // than in front of it. Each row is isolated inside the evaluator; this catch
+  // only covers the listing itself (e.g. a teardown race).
+  void completionMatcherEvaluator.reconcileAtBoot().catch((err: unknown) => {
+    log.warn("completion_matcher_boot_reconcile_failed", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  });
   const restored = actors.list().filter((r) => r.status === "active" && r.id !== rootId);
   if (restored.length > 0) {
     console.log(`[mesh] rehydrated ${restored.length} active actor(s) from the repository`);
@@ -4063,11 +4077,19 @@ async function composeStart(
       const pull = payload.pull_request as { number?: number; merged?: boolean } | undefined;
       const number = pull?.number ?? (payload.number as number | undefined);
       if (typeof number === "number") {
-        await completionMatcherEvaluator.handlePullRequestClosed({
-          repo: repoFullName,
-          number,
-          merged: pull?.merged === true,
-        });
+        // Matching must never cost the delivery its ordinary routing; boot
+        // reconciliation re-reads the PR for anything this misses.
+        try {
+          await completionMatcherEvaluator.handlePullRequestClosed({
+            repo: repoFullName,
+            number,
+            merged: pull?.merged === true,
+          });
+        } catch (err) {
+          log.warn("completion_matcher_event_failed", {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
     }
     // Directive-only: this walks a parent fallback chain and must never feed authorship.

@@ -13,6 +13,7 @@ import {
   type CompletionMatcher,
   type CompletionMatcherInput,
   type CompletionMatcherKind,
+  canonicalPullRequestTarget,
   type EntityId,
   isBlockingObligationStatus,
   isDeadlineDue,
@@ -596,7 +597,7 @@ function normalizeCompletionMatcherInput(matcher: CompletionMatcherInput): {
     }
     return {
       kind: matcher.kind,
-      target: reference.key,
+      target: canonicalPullRequestTarget(`${pull.owner}/${pull.repo}`, pull.number),
       specJson: JSON.stringify({ schemaVersion: 1 }),
     };
   }
@@ -1000,6 +1001,13 @@ export class ObligationRepository {
   private isMutating = false;
 
   /**
+   * Per-obligation history attribution for this transaction when a nested
+   * transition belongs to a different principal than the mutation that
+   * caused it; everything else is recorded as the mutation's principal.
+   */
+  private historyPrincipalOverrides = new Map<string, EntityId>();
+
+  /**
    * `(dependentId, prerequisiteId)` keys whose cancellation-attention delivery
    * threw on a previous {@link mutate} call (#212) — e.g. a transient inbox
    * append failure. Kept only as keys, not the stale payload: the next
@@ -1243,6 +1251,7 @@ export class ObligationRepository {
     this.pendingCancellationAttention = [];
     this.pendingResponsiveReady = [];
     this.pendingStatusChanges = [];
+    this.historyPrincipalOverrides.clear();
     const actingPrincipal = validateEntityId(principal);
     this.installHistoryCapture();
     let afterHeads = new Map<string, string>();
@@ -1647,7 +1656,7 @@ export class ObligationRepository {
       insert.run(
         id,
         kind,
-        actingPrincipal,
+        this.historyPrincipalOverrides.get(id) ?? actingPrincipal,
         kind === "checkpoint" && a.checkpoint_at !== null ? a.checkpoint_at : this.stamp(),
         buildHistoryPayload(beforeState, afterState)
       );
@@ -2203,10 +2212,21 @@ export class ObligationRepository {
     ).map(toObligation);
   }
 
-  /** Every non-terminal row carrying a completion matcher, optionally of one kind. */
-  listLiveCompletionMatchers(kind?: CompletionMatcherKind): Obligation[] {
-    const kindClause = kind === undefined ? "" : " AND matcher.kind = ?";
-    const params = kind === undefined ? [] : [kind];
+  /**
+   * Every non-terminal row carrying a completion matcher, optionally of one
+   * kind and canonical target (the indexed webhook lookup).
+   */
+  listLiveCompletionMatchers(kind?: CompletionMatcherKind, target?: string): Obligation[] {
+    const params: string[] = [];
+    let kindClause = "";
+    if (kind !== undefined) {
+      kindClause += " AND matcher.kind = ?";
+      params.push(kind);
+      if (target !== undefined) {
+        kindClause += " AND matcher.target = ?";
+        params.push(target);
+      }
+    }
     return (
       this.db
         .prepare(
@@ -2244,13 +2264,25 @@ export class ObligationRepository {
 
       if (matcher.satisfiedAt === null) {
         const resolutionRef = parseObligationReference(satisfaction.resolutionRef).key;
+        const satisfiedAt = this.stamp();
         this.db
           .prepare(
             `UPDATE obligation_completion_matchers
              SET satisfied_at = ?, satisfied_ref = ?
              WHERE obligation_id = ? AND satisfied_at IS NULL`
           )
-          .run(this.stamp(), resolutionRef, id);
+          .run(satisfiedAt, resolutionRef, id);
+        // The observation itself (for `deployed`: which instance ran which
+        // revision) is evidence on the existing artifact boundary, so a
+        // completion deferred behind live children can cite the original fact
+        // instead of reconstructing it later from a different observer.
+        this.db
+          .prepare(
+            `INSERT INTO obligation_artifacts (id, obligation_id, ref, label, attached_by, attached_at)
+             VALUES (?, ?, ?, ?, NULL, ?)
+             ON CONFLICT(obligation_id, ref) DO NOTHING`
+          )
+          .run(randomUUID(), id, resolutionRef, satisfaction.note, satisfiedAt);
       }
 
       const liveChild = this.listChildren(id).find((child) =>
@@ -2268,6 +2300,35 @@ export class ObligationRepository {
         satisfied: true,
       };
     });
+  }
+
+  /**
+   * Live matchers whose PR was recorded closed without merging: the owner
+   * attention that fact earns, re-derivable at boot so a notice lost between
+   * the committed observation and its inbox append is still delivered.
+   */
+  listCompletionMatcherClosedUnmergedAttention(): Array<{
+    obligationId: string;
+    ownerId: EntityId;
+    matcherSetAt: string;
+  }> {
+    return (
+      this.db
+        .prepare(
+          `SELECT obligation.id AS obligation_id, obligation.owner_id AS owner_id, matcher.set_at AS set_at
+           FROM obligation_completion_matchers matcher
+           JOIN obligations obligation ON obligation.id = matcher.obligation_id
+           WHERE matcher.closed_unmerged_at IS NOT NULL
+             AND matcher.satisfied_at IS NULL
+             AND obligation.status IN ('ready', 'waiting')
+           ORDER BY obligation.id`
+        )
+        .all() as Array<{ obligation_id: string; owner_id: string; set_at: string }>
+    ).map((row) => ({
+      obligationId: row.obligation_id,
+      ownerId: row.owner_id,
+      matcherSetAt: row.set_at,
+    }));
   }
 
   /** Record a closed-without-merge observation without changing obligation status. */
@@ -3149,8 +3210,12 @@ export class ObligationRepository {
     status: "done" | "cancelled",
     note: string | null | undefined,
     resolutionRef: string | null | undefined,
-    _principal: EntityId
+    principal: EntityId
   ): Obligation {
+    // A cascade (e.g. matcher completion after the last child clears) runs
+    // inside the caller's mutation but is not the caller's action; record it
+    // under its own principal rather than the outer mutation's.
+    this.historyPrincipalOverrides.set(id, validateEntityId(principal));
     const obligation = this.require(id);
     if (isTerminalObligationStatus(obligation.status)) {
       throw new ObligationValidationError("terminal obligations cannot be reopened or changed");
@@ -3326,6 +3391,14 @@ export class ObligationRepository {
       // participating in the graph on either side would let a prohibited edge
       // exist anyway, just created in the opposite order.
       if (recurrence !== null) this.assertNotInDependencyGraph(id);
+      // The reverse of setCompletionMatcher's refusal: a matcher's done is
+      // final, while recurrence would turn it into a new cycle that keeps the
+      // old satisfaction.
+      if (recurrence !== null && obligation.completionMatcher !== null) {
+        throw new ObligationValidationError(
+          "obligations with a completion matcher cannot be recurring; clear the matcher first"
+        );
+      }
 
       if (recurrence === null) {
         // Every state this row can be in — including `scheduled`, where the
@@ -3814,8 +3887,15 @@ export class ObligationRepository {
     if (liveChildren.count !== 0) return;
     const matcher = obligation.completionMatcher;
     if (matcher !== null && matcher.satisfiedAt !== null && matcher.satisfiedRef !== null) {
-      const note =
-        matcher.kind === "pr_merged"
+      // The observing instance recorded its own note as the satisfaction
+      // artifact's label; an artifact someone attached earlier under the same
+      // ref keeps its label and is not mistaken for that observation.
+      const observed = this.db
+        .prepare("SELECT label FROM obligation_artifacts WHERE obligation_id = ? AND ref = ?")
+        .get(id, matcher.satisfiedRef) as { label: string | null } | undefined;
+      const note = observed?.label?.startsWith("Completion matcher satisfied:")
+        ? observed.label
+        : matcher.kind === "pr_merged"
           ? `Completion matcher satisfied: ${matcher.target} merged`
           : `Completion matcher satisfied: deployed revision ${matcher.satisfiedRef} contains ${matcher.target}`;
       this.setTerminalStatusInMutation(id, "done", note, matcher.satisfiedRef, "system:mesh");

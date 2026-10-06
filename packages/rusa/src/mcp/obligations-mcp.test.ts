@@ -597,7 +597,7 @@ describe("obligations MCP", () => {
     expect(set.isError).toBeFalsy();
     expect(repository.require("matched").completionMatcher).toMatchObject({
       kind: "pr_merged",
-      target: "github:MEK-Org/rusa/pulls/190",
+      target: "github:mek-org/rusa/pulls/190",
     });
 
     const cleared = (await client.callTool({
@@ -606,6 +606,32 @@ describe("obligations MCP", () => {
     })) as CallToolResult;
     expect(cleared.isError).toBeFalsy();
     expect(repository.require("matched").completionMatcher).toBeNull();
+  });
+
+  it("reports a committed matcher as unchecked when its evaluation throws", async () => {
+    repository.create({ title: "matched", id: "matched", ownerId: "actor-a" });
+    const client = await connect(
+      createObligationsMcpServer(repository, "actor-a", {
+        evaluateCompletionMatcher: async () => {
+          throw new Error("SQLITE_BUSY");
+        },
+      })
+    );
+
+    const set = (await client.callTool({
+      name: "set_completion_matcher",
+      arguments: {
+        id: "matched",
+        matcher: { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      },
+    })) as CallToolResult;
+
+    // The write committed, so the tool must not read as a failed write.
+    expect(set.isError).toBeFalsy();
+    expect(dataOf(set)).toMatchObject({
+      evaluation: "unchecked",
+    });
+    expect(repository.require("matched").completionMatcher).not.toBeNull();
   });
 
   it("rejects set_obligation_recurrence for a non-owner, and honors the owner-ancestor policy", async () => {

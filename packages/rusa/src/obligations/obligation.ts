@@ -52,6 +52,15 @@ export interface CompletionMatcher {
   closedUnmergedAt: string | null;
 }
 
+/**
+ * The stored `pr_merged` target. GitHub owner and repository names are
+ * case-insensitive, so the canonical form is lowercase and the webhook lookup
+ * can use the `(kind, target)` index with an exact comparison.
+ */
+export function canonicalPullRequestTarget(repo: string, number: number): string {
+  return `github:${repo.toLowerCase()}/pulls/${number}`;
+}
+
 /** Model-facing shape accepted by the create/set matcher boundary. */
 export type CompletionMatcherInput =
   | { kind: "pr_merged"; pr: string }

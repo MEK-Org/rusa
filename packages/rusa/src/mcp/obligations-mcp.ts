@@ -424,15 +424,23 @@ export function createObligationsMcpServer(
           creatorId: actorId,
         });
         const evaluation =
-          created.completionMatcher === null
-            ? null
-            : ((await options?.evaluateCompletionMatcher?.(created.id)) ?? "unchecked");
+          created.completionMatcher === null ? null : await evaluateCommitted(created.id);
         return toolOk({ obligation: repository.get(created.id) ?? created, evaluation });
       } catch (err) {
         return toolError(err);
       }
     }
   );
+
+  // The matcher is already committed when this runs, so an evaluation failure
+  // must not read as a failed (and retryable) write: it reports `unchecked`.
+  const evaluateCommitted = async (id: string): Promise<CompletionMatcherEvaluation> => {
+    try {
+      return (await options?.evaluateCompletionMatcher?.(id)) ?? "unchecked";
+    } catch {
+      return "unchecked";
+    }
+  };
 
   server.registerTool(
     "set_completion_matcher",
@@ -451,10 +459,7 @@ export function createObligationsMcpServer(
         if (!canManage(existing)) throw new Error("not authorized to manage this obligation");
         if (matcher !== null) await options?.validateCompletionMatcher?.(matcher);
         const written = repository.setCompletionMatcher(id, matcher, actorId);
-        const evaluation =
-          matcher === null
-            ? null
-            : ((await options?.evaluateCompletionMatcher?.(written.id)) ?? "unchecked");
+        const evaluation = matcher === null ? null : await evaluateCommitted(written.id);
         return toolOk({ obligation: repository.get(written.id) ?? written, evaluation });
       } catch (error) {
         return toolError(error);

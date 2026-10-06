@@ -8,8 +8,12 @@ import type { Migration } from "./types.js";
  * subset of leaves need one, its event lookup needs its own target index, and
  * keeping lifecycle observations with the predicate avoids making every
  * obligation row carry kind-specific nullable columns. `spec_json` stays
- * application-validated JSON so the schema can evolve without SQLite JSON
- * functions or a table rebuild.
+ * application-validated JSON (no SQLite JSON functions), so a kind's own
+ * parameters can gain fields without a column change. Adding a new kind still
+ * means a rebuild, because `kind` keeps the repository's usual CHECK.
+ *
+ * `pr_merged` targets are stored canonically lowercase, so the webhook lookup
+ * is an exact match on the `(kind, target)` index.
  */
 export const obligationCompletionMatchers: Migration = {
   id: "0059_obligation_completion_matchers",
