@@ -77,13 +77,12 @@ class DashboardApi {
   /// The thread list carries only a clipped preview, since it is the same field
   /// for every actor on every poll. The whole text is fetched here, for the one
   /// actor whose detail panel is open.
-  Future<String> fetchCharter(String threadId) =>
-      trackInteraction(DashboardInteraction.actorDetail, () async {
-        final json = await _getJson(
-          _u('/api/mesh/threads/charter', {'id': threadId}),
-        );
-        return json['charter'] as String? ?? '';
-      });
+  Future<String> fetchCharter(String threadId) async {
+    final json = await _getJson(
+      _u('/api/mesh/threads/charter', {'id': threadId}),
+    );
+    return json['charter'] as String? ?? '';
+  }
 
   Future<List<String>> fetchRootControlProviders() async {
     final json = await _getJson(_u('/api/mesh/control/options'));

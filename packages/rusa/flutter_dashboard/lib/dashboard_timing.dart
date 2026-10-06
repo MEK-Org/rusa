@@ -144,7 +144,8 @@ class DashboardTimingReporter {
     // Interaction scopes are deliberately not nestable. A nested scope would
     // otherwise replace its parent Zone and make one user action's request
     // set depend on call order. Call sites own one named interaction boundary.
-    if (Zone.current[_timingContextKey] is _TimingContext) return action();
+    final current = Zone.current[_timingContextKey];
+    if (current is _TimingContext && !current._closed) return action();
     final context = _TimingContext(interaction);
     return runZoned(() async {
       try {

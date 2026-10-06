@@ -480,6 +480,11 @@ export interface DashboardTimingSummary {
   since: string;
   sampleCount: number;
   droppedSinceStart: number;
+  clientServerCoverage: {
+    clientRequestIds: number;
+    serverRequestIds: number;
+    matchedRequestIds: number;
+  };
   /** Coverage is counted against the exact, de-duplicated IDs a client row references. */
   requestCoverage: {
     correlation: DashboardRequestCoverage;
@@ -571,6 +576,7 @@ function summarize(
       count: number;
     }
   >();
+  const serverRequestIds = new Set<string>();
   const clientRequestIds = new Set<string>();
   const serverRowsByRequestId = new Map<string, DashboardTimingPayload[]>();
   const clientMeasurementsByRequestId = new Map<
@@ -599,6 +605,7 @@ function summarize(
   }
   for (const { payload } of correlationRows) {
     if (payload.source === "server" && payload.requestId) {
+      serverRequestIds.add(payload.requestId);
       const serverRows = serverRowsByRequestId.get(payload.requestId) ?? [];
       serverRows.push(payload);
       serverRowsByRequestId.set(payload.requestId, serverRows);
@@ -645,6 +652,11 @@ function summarize(
     since,
     sampleCount: rows.length,
     droppedSinceStart,
+    clientServerCoverage: {
+      clientRequestIds: clientRequestIds.size,
+      serverRequestIds: serverRequestIds.size,
+      matchedRequestIds: correlatedRequestIds.length,
+    },
     requestCoverage: {
       correlation: coverage(correlatedRequestIds.length, clientRequestIds.size),
       measurement: coverage(pairedRequestIds, clientRequestIds.size),

@@ -585,7 +585,7 @@ class DashboardStore {
           throw StateError('initial thread snapshot unavailable');
         }
       });
-    } catch (_) {
+    } on StateError catch (_) {
       // `_runRuntimeSync` already exposed the original failure and scheduled
       // its existing retry. Keep the UI's resilient startup behaviour while
       // the timing receipt truthfully reports this first attempt as a failure.

@@ -60,7 +60,10 @@ void main() {
       addTearDown(api.close);
 
       expect(
-        await api.fetchCharter('actor-private-id'),
+        await api.trackInteraction(
+          DashboardInteraction.actorDetail,
+          () => api.fetchCharter('actor-private-id'),
+        ),
         'private charter text',
       );
 
@@ -101,7 +104,10 @@ void main() {
       addTearDown(api.close);
 
       await expectLater(
-        api.fetchCharter('actor-private-id'),
+        api.trackInteraction(
+          DashboardInteraction.actorDetail,
+          () => api.fetchCharter('actor-private-id'),
+        ),
         throwsA(isA<DashboardApiException>()),
       );
 
@@ -135,7 +141,10 @@ void main() {
       addTearDown(api.close);
 
       await expectLater(
-        api.fetchCharter('actor-private-id'),
+        api.trackInteraction(
+          DashboardInteraction.actorDetail,
+          () => api.fetchCharter('actor-private-id'),
+        ),
         throwsA(isA<DashboardApiException>()),
       );
 
@@ -160,12 +169,15 @@ void main() {
       final interaction = api.trackInteraction(
         DashboardInteraction.initialLoad,
         () async {
-          // This nested API scope must not replace the named outer interaction.
-          await api.fetchCharter('private-actor-id');
+          // This nested interaction scope must not replace the named outer interaction.
+          await api.trackInteraction(
+            DashboardInteraction.actorDetail,
+            () => api.fetchCharter('private-actor-id'),
+          );
           await Future<void>.delayed(const Duration(milliseconds: 20));
         },
       );
-      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(const Duration(milliseconds: 25));
       expect(client.timingRequest.isCompleted, isFalse);
 
       client.body.add(utf8.encode(jsonEncode({'charter': 'private charter'})));
@@ -184,10 +196,135 @@ void main() {
           (body['requestTimings'] as List<dynamic>).single
               as Map<String, dynamic>;
       expect(body['interaction'], 'initial_load');
+      expect(timing['requestMs'] as int, greaterThanOrEqualTo(20));
       expect(
         body['durationMs'] as int,
         greaterThan(timing['requestMs'] as int),
       );
+    },
+  );
+
+  test(
+    'untracked background requests execute without emitting timing receipts',
+    () async {
+      var timingCalled = false;
+      final api = DashboardApi(
+        base: Uri.parse('https://dashboard.example/'),
+        client: MockClient((request) async {
+          if (request.url.path == '/api/dashboard/timing') {
+            timingCalled = true;
+            return http.Response('{"accepted":true}', 202);
+          }
+          expect(request.url.path, '/api/mesh/threads/charter');
+          return http.Response(
+            jsonEncode({'charter': 'background charter'}),
+            200,
+            headers: {'X-Rusa-Request-Id': requestId},
+          );
+        }),
+      );
+      addTearDown(api.close);
+
+      expect(await api.fetchCharter('bg-actor'), 'background charter');
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(timingCalled, isFalse);
+    },
+  );
+
+  test(
+    'late responses or stream chunks after context close do not modify receipt',
+    () async {
+      final bodyController = StreamController<List<int>>();
+      final inner = MockClient.streaming((request, bodyStream) async {
+        return http.StreamedResponse(
+          bodyController.stream,
+          200,
+          headers: {'X-Rusa-Request-Id': requestId},
+        );
+      });
+      final timingClient = DashboardTimingClient(inner);
+      addTearDown(timingClient.close);
+      addTearDown(bodyController.close);
+
+      final timing = Completer<Map<String, dynamic>>();
+      final reporter = DashboardTimingReporter(
+        client: MockClient((request) async {
+          timing.complete(jsonDecode(request.body) as Map<String, dynamic>);
+          return http.Response('{"accepted":true}', 202);
+        }),
+        base: Uri.parse('https://dashboard.example/'),
+      );
+
+      http.StreamedResponse? response;
+      await reporter.measure(DashboardInteraction.primaryNavigation, () async {
+        response = await timingClient.send(
+          http.Request('GET', Uri.parse('https://dashboard.example/api/test')),
+        );
+      });
+
+      final receipt = await timing.future;
+      expect(receipt['interaction'], 'primary_navigation');
+      expect(receipt['requestIds'], [requestId]);
+      expect(receipt.containsKey('requestTimings'), isFalse);
+
+      bodyController.add(utf8.encode('chunk'));
+      final closeFuture = bodyController.close();
+      if (response != null) {
+        await response!.stream.drain<void>();
+      }
+      await closeFuture;
+
+      expect(receipt.containsKey('requestTimings'), isFalse);
+    },
+  );
+
+  test(
+    'detached asynchronous callback can start fresh interaction after prior closes',
+    () async {
+      final actorDetailDone = Completer<Map<String, dynamic>>();
+      final timingRequests = <Map<String, dynamic>>[];
+      final api = DashboardApi(
+        base: Uri.parse('https://dashboard.example/'),
+        client: MockClient((request) async {
+          if (request.url.path == '/api/dashboard/timing') {
+            final body = jsonDecode(request.body) as Map<String, dynamic>;
+            timingRequests.add(body);
+            if (body['interaction'] == 'actor_detail' && !actorDetailDone.isCompleted) {
+              actorDetailDone.complete(body);
+            }
+            return http.Response('{"accepted":true}', 202);
+          }
+          return http.Response(
+            jsonEncode({'charter': 'charter'}),
+            200,
+            headers: {'X-Rusa-Request-Id': requestId},
+          );
+        }),
+      );
+      addTearDown(api.close);
+
+      Completer<void>? detachedDone;
+      await api.trackInteraction(DashboardInteraction.primaryNavigation, () async {
+        detachedDone = Completer<void>();
+        Timer.run(() async {
+          try {
+            await api.trackInteraction(
+              DashboardInteraction.actorDetail,
+              () => api.fetchCharter('detached-actor'),
+            );
+            detachedDone!.complete();
+          } catch (e, st) {
+            detachedDone!.completeError(e, st);
+          }
+        });
+      });
+
+      await detachedDone!.future;
+      await actorDetailDone.future.timeout(const Duration(seconds: 2));
+
+      expect(timingRequests, hasLength(2));
+      expect(timingRequests[0]['interaction'], 'primary_navigation');
+      expect(timingRequests[1]['interaction'], 'actor_detail');
     },
   );
 }

@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:rxdart/rxdart.dart';
 
 import '../breakpoints.dart';
-import '../dashboard_timing.dart';
 import '../models.dart';
 import '../principals.dart';
 import '../store.dart';
@@ -101,10 +100,7 @@ class _OverviewTabState extends State<OverviewTab> {
   void initState() {
     super.initState();
     widget.store.refreshQuotaHistory();
-    _humanQueueFuture = widget.store.api.trackInteraction(
-      DashboardInteraction.primaryNavigation,
-      _loadHumanQueue,
-    );
+    _humanQueueFuture = _loadHumanQueue();
     // The dashboard config — and with it the durable user principal — is
     // fetched after init returns, so this first load can only have asked for
     // the alias. Re-ask once the server names the viewing principal, or a

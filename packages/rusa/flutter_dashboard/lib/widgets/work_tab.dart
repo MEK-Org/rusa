@@ -74,29 +74,36 @@ class _WorkTabState extends State<WorkTab> {
         _isBackgroundRefreshing = _rootTrees.isNotEmpty;
         _error = null;
       });
-      Future<ObligationForest> load() => widget.store.api.fetchObligationForest(
-        includeTerminalRoots: includeTerminal,
-      );
-      final forest = trackNavigation
-          ? await widget.store.api.trackInteraction(
-              DashboardInteraction.primaryNavigation,
-              load,
-            )
-          : await load();
-      if (!mounted || generation != _loadGeneration) return;
-      setState(() {
-        _rootTrees = forest.trees;
-        _fetchedTerminalRoots = includeTerminal;
-        _loading = false;
-        _isBackgroundRefreshing = false;
-      });
-      // Focus-link and Show Done requests include terminal roots. Persist only
-      // the default terminal-excluding forest so a later default view cannot
-      // paint rows it believes it did not fetch.
-      if (!includeTerminal) {
-        widget.store.saveObligationsSnapshot(forest.trees);
+      Future<void> runLoad() async {
+        final forest = await widget.store.api.fetchObligationForest(
+          includeTerminalRoots: includeTerminal,
+        );
+        if (!mounted || generation != _loadGeneration) {
+          throw StateError('Work queue load superseded or unmounted');
+        }
+        setState(() {
+          _rootTrees = forest.trees;
+          _fetchedTerminalRoots = includeTerminal;
+          _loading = false;
+          _isBackgroundRefreshing = false;
+        });
+        // Focus-link and Show Done requests include terminal roots. Persist only
+        // the default terminal-excluding forest so a later default view cannot
+        // paint rows it believes it did not fetch.
+        if (!includeTerminal) {
+          widget.store.saveObligationsSnapshot(forest.trees);
+        }
+        _checkFocusLink();
       }
-      _checkFocusLink();
+
+      if (trackNavigation) {
+        await widget.store.api.trackInteraction(
+          DashboardInteraction.primaryNavigation,
+          runLoad,
+        );
+      } else {
+        await runLoad();
+      }
     } catch (e) {
       if (!mounted || generation != _loadGeneration) return;
       setState(() {
@@ -964,26 +971,31 @@ class _DetailViewState extends State<_DetailView> {
 
   void _fetch({bool trackDetail = false}) {
     final gen = _beginFetch();
-    Future<ObligationDetailSnapshot> load() =>
-        store.api.fetchObligationDetail(widget.obligationId);
+    Future<ObligationDetailSnapshot> runFetch() async {
+      final data = await store.api.fetchObligationDetail(widget.obligationId);
+      if (!mounted || gen != _fetchGeneration) {
+        throw StateError('Obligation detail fetch superseded or unmounted');
+      }
+      _shownIds = _idsOf(data);
+      setState(() {
+        _history = data.history;
+        _historyNextBefore = data.historyNextBefore;
+        _completions = data.completions;
+        _completionsTotal = data.completionsTotal;
+        _completionsHasMore = data.completionsHasMore;
+        _schedulePendingRetry(data);
+      });
+      return data;
+    }
+
     final future = trackDetail
-        ? store.api.trackInteraction(DashboardInteraction.obligationDetail, load)
-        : load();
+        ? store.api.trackInteraction(
+            DashboardInteraction.obligationDetail,
+            runFetch,
+          )
+        : runFetch();
     _future = future;
-    future
-        .then((data) {
-          if (!mounted || gen != _fetchGeneration) return;
-          _shownIds = _idsOf(data);
-          setState(() {
-            _history = data.history;
-            _historyNextBefore = data.historyNextBefore;
-            _completions = data.completions;
-            _completionsTotal = data.completionsTotal;
-            _completionsHasMore = data.completionsHasMore;
-            _schedulePendingRetry(data);
-          });
-        })
-        .catchError((_) {});
+    future.then((_) {}).catchError((_) {});
   }
 
   void _loadMoreCompletions() {

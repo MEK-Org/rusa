@@ -19,6 +19,11 @@ describe("dashboard timing MCP", () => {
       since: "2026-10-05T11:00:00.000Z",
       sampleCount: 1,
       droppedSinceStart: 0,
+      clientServerCoverage: {
+        clientRequestIds: 0,
+        serverRequestIds: 0,
+        matchedRequestIds: 0,
+      },
       requestCoverage: {
         correlation: { numerator: 0, denominator: 0, state: "no-referenced-request" as const },
         measurement: { numerator: 0, denominator: 0, state: "no-referenced-request" as const },

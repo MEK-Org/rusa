@@ -112,6 +112,11 @@ describe("dashboard timing recorder", () => {
       since: new Date("2026-10-05T11:00:00.000Z"),
       label: "initial_load",
     });
+    expect(summary.clientServerCoverage).toEqual({
+      clientRequestIds: 1,
+      serverRequestIds: 20,
+      matchedRequestIds: 1,
+    });
     expect(summary.requestCoverage).toEqual({
       correlation: { numerator: 1, denominator: 1, state: "full" },
       measurement: { numerator: 1, denominator: 1, state: "full" },
