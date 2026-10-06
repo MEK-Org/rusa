@@ -13,6 +13,7 @@ import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { executeLegacyPrincipalMigration } from "../principals/legacy-migration.js";
+import type { RoomEntryEnterResult } from "../voice/room-entry.js";
 import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
 import {
@@ -97,7 +98,11 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
   let origin: string;
   const interrupt = vi.fn(() => ({ interrupted: true, status: "interrupted" }));
   const roomEntry = {
-    enter: vi.fn(() => ({ status: "entered", notified: true, episodeId: "ep" })),
+    enter: vi.fn<() => RoomEntryEnterResult>(() => ({
+      status: "entered",
+      notified: true,
+      episodeId: "ep",
+    })),
   };
   beforeEach(async () => {
     now = Date.now();

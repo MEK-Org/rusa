@@ -9884,9 +9884,9 @@ describe("ActorMesh", () => {
           roster: () => [first, second],
         });
 
-        // Two tabs: one notification due to cooldown, one notice per participant, no explicit dispatch.
-        rooms.enter({ principalId: "human-1", clientId: "tab-1" });
-        rooms.enter({ principalId: "human-1", clientId: "tab-2" });
+        // Repeated entry is cooldown-suppressed; recipient notices come only from the first entry.
+        rooms.enter({ principalId: "human-1" });
+        rooms.enter({ principalId: "human-1" });
         await vi.advanceTimersByTimeAsync(0);
 
         for (const actorId of [first, second]) {
