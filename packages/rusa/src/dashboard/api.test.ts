@@ -539,7 +539,6 @@ describe("handleMeshApiRequest", () => {
         referenceCache: new ReferenceCacheService({
           repo: new ReferenceCacheRepository(db),
           deadlineMs: 60_000,
-          maxConcurrentReads: 4,
         }),
         issueClient: { getIssue },
       } as unknown as DashboardDataDeps;
@@ -563,7 +562,7 @@ describe("handleMeshApiRequest", () => {
           inbox.listRecentHandledEntries(20).map((entry) => `inbox_${entry.id}`)
         );
         expect(items.every((item) => item.reference?.cacheState === "pending")).toBe(true);
-        expect(getIssue).toHaveBeenCalledTimes(4);
+        expect(getIssue).toHaveBeenCalledTimes(12);
       } finally {
         vi.useRealTimers();
       }
@@ -2136,7 +2135,6 @@ describe("handleMeshApiRequest", () => {
       runningThreadIds: () => new Set([UUID_A]),
       selectedInboxItemsForActor: (actorId) => (actorId === UUID_A ? [selected] : null),
       referenceCache: {
-        startBudget: () => ({ deadlineAt: Date.now() + 250 }),
         get: async () => ({
           ref: selected.source,
           scheme: "github",

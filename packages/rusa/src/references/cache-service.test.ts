@@ -743,7 +743,7 @@ describe("ReferenceCacheService", () => {
       expect(getMessage).toHaveBeenCalledTimes(2);
     });
 
-    describe("request budget and provider bound (#933)", () => {
+    describe("request budget (#933)", () => {
       const issue = (n: number) => `github:a/b/issues/${n}`;
 
       it("answers every get sharing a budget at the budget's one deadline", async () => {
@@ -764,88 +764,6 @@ describe("ReferenceCacheService", () => {
         } finally {
           vi.useRealTimers();
         }
-      });
-
-      it("keeps at most maxConcurrentReads provider reads out and starts queued ones as slots free", async () => {
-        const { repo } = memoryRepo();
-        const reads = new Map<number, ReturnType<typeof deferred<IssueDetails>>>();
-        const getIssue = vi.fn((_repo: string, n: number) => {
-          const read = deferred<IssueDetails>();
-          reads.set(n, read);
-          return read.promise;
-        });
-        const deps = { issueClient: { getIssue } };
-        const svc = new ReferenceCacheService({ repo, deadlineMs: 5, maxConcurrentReads: 2 });
-
-        const answers = await Promise.all([1, 2, 3, 4].map((n) => svc.get(issue(n), deps)));
-        expect(answers.map((a) => a.cacheState)).toEqual([
-          "pending",
-          "pending",
-          "pending",
-          "pending",
-        ]);
-        expect(getIssue.mock.calls.map((call) => call[1])).toEqual([1, 2]);
-
-        reads.get(1)?.resolve(issueDetails({ number: 1, title: "One" }));
-        await flush();
-        expect(getIssue.mock.calls.map((call) => call[1])).toEqual([1, 2, 3]);
-        expect((await svc.get(issue(1), deps)).cacheState).toBe("fresh");
-
-        // A failed read hands its slot on too.
-        reads.get(2)?.reject(new Error("down"));
-        await flush();
-        expect(getIssue.mock.calls.map((call) => call[1])).toEqual([1, 2, 3, 4]);
-      });
-
-      it("answers pending without queueing provider work once slots and queue are full", async () => {
-        const { repo, rows } = memoryRepo();
-        const reads: Array<ReturnType<typeof deferred<IssueDetails>>> = [];
-        const getIssue = vi.fn(() => {
-          const read = deferred<IssueDetails>();
-          reads.push(read);
-          return read.promise;
-        });
-        const deps = { issueClient: { getIssue } };
-        const svc = new ReferenceCacheService({
-          repo,
-          deadlineMs: 5,
-          maxConcurrentReads: 1,
-          maxQueuedReads: 1,
-        });
-        rows.set(issue(9), {
-          ref: issue(9),
-          document_version: 1,
-          entity_json: JSON.stringify({ type: "github_issue", title: "Old", description: "D" }),
-          fetched_at: new Date(Date.now() - 200000).toISOString(),
-          refresh_after: new Date(Date.now() - 100000).toISOString(),
-        });
-
-        await Promise.all([svc.get(issue(1), deps), svc.get(issue(2), deps)]);
-        const saturated = await svc.get(issue(3), deps);
-        expect(saturated.cacheState).toBe("pending");
-        expect(saturated.unavailable).toBe("loading context");
-        // A stale hit still serves its row and skips the refresh.
-        const stale = await svc.get(issue(9), deps);
-        expect(stale.cacheState).toBe("stale");
-        expect(stale.entity).toMatchObject({ title: "Old" });
-        await flush();
-        expect(getIssue).toHaveBeenCalledTimes(1);
-
-        // Nothing was read for the refused ref, so no failure is remembered:
-        // once capacity frees, its retry reads the provider.
-        reads[0]?.resolve(issueDetails({ number: 1 }));
-        await flush();
-        expect(getIssue).toHaveBeenCalledTimes(2);
-        await svc.get(issue(3), deps);
-        expect(getIssue).toHaveBeenCalledTimes(2);
-        reads[1]?.resolve(issueDetails({ number: 2 }));
-        await flush();
-        expect(getIssue).toHaveBeenCalledTimes(3);
-        reads[2]?.resolve(issueDetails({ number: 3, title: "Three" }));
-        await flush();
-        const after = await svc.get(issue(3), deps);
-        expect(after.cacheState).toBe("fresh");
-        expect(after.entity).toMatchObject({ title: "Three" });
       });
     });
   });

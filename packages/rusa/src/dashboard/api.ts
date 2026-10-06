@@ -587,7 +587,7 @@ async function resolveInboxPage(
   page: InboxPage,
   deps: DashboardDataDeps,
   chatScope: HumanChatScope,
-  budget = deps.referenceCache?.startBudget()
+  budget?: import("../references/cache-service.js").ReferenceBudget
 ): Promise<ResolvedInboxPage> {
   // Same cache/resolver an obligation's cited artifacts use, so an external
   // inbox entry gets the identical rich preview and "open in new tab" link
@@ -1958,8 +1958,6 @@ export async function handleMeshApiRequest(
     // Aggregate last activity once for all actors; the covering index on
     // mesh_events(actor_id, ts) makes this cheap .
     const lastActiveByActor = meshEvents.latestActivityByActor();
-    // Every actor's selected item waits on the same reference deadline (#933).
-    const referenceBudget = deps.referenceCache?.startBudget();
 
     const threads: ThreadDto[] = await Promise.all(
       actors.list().map(async (r) => {
@@ -2021,8 +2019,7 @@ export async function handleMeshApiRequest(
               await resolveInboxPage(
                 { entries: [inboxSelection.item], unhandledCount: 1, nextCursor: null },
                 deps,
-                chatScope,
-                referenceBudget
+                chatScope
               )
             ).entries[0]
           : null;
