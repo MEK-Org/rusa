@@ -51,6 +51,15 @@ interface InFlightRead {
   answeredPending: boolean;
 }
 
+/**
+ * One request's foreground wait for cold references (#933). Every get given
+ * the same budget gives up at the same instant, so a request that resolves
+ * many references waits one deadline in total rather than one per reference.
+ */
+export interface ReferenceBudget {
+  readonly deadlineAt: number;
+}
+
 export interface ReferenceCacheServiceOptions {
   repo: ReferenceCacheRepository;
   ttlMs?: number;
@@ -64,6 +73,14 @@ export interface ReferenceCacheServiceOptions {
    * on its own.
    */
   unavailableTtlMs?: number;
+  /** Provider reads allowed out at once; further reads queue for a slot. */
+  maxConcurrentReads?: number;
+  /**
+   * Reads allowed to wait for a slot. Beyond it a cold get answers "pending"
+   * without starting a read, and a stale hit skips its refresh, so one large
+   * page cannot queue unbounded provider work; a later get asks again.
+   */
+  maxQueuedReads?: number;
   logger?: {
     info: (event: string, data?: Record<string, unknown>) => void;
     error: (event: string, data?: Record<string, unknown>) => void;
@@ -75,6 +92,10 @@ export class ReferenceCacheService {
   private readonly ttlMs: number;
   private readonly deadlineMs: number;
   private readonly unavailableTtlMs: number;
+  private readonly maxConcurrentReads: number;
+  private readonly maxQueuedReads: number;
+  private activeReads = 0;
+  private readonly queuedReads: Array<() => void> = [];
   private readonly logger?: ReferenceCacheServiceOptions["logger"];
   /**
    * The provider read currently out for each canonical ref. A cold get, a
@@ -95,10 +116,21 @@ export class ReferenceCacheService {
     this.ttlMs = options.ttlMs ?? 1000 * 60 * 60; // 1 hour
     this.deadlineMs = options.deadlineMs ?? 250; // 250ms for UI deadline
     this.unavailableTtlMs = options.unavailableTtlMs ?? 30_000;
+    this.maxConcurrentReads = Math.max(1, options.maxConcurrentReads ?? 8);
+    this.maxQueuedReads = Math.max(0, options.maxQueuedReads ?? 128);
     this.logger = options.logger;
   }
 
-  async get(ref: string, deps: ReferenceResolverDeps): Promise<ResolvedReferenceWithEntity> {
+  /** Starts a foreground budget of one UI deadline, to share across a request's gets. */
+  startBudget(): ReferenceBudget {
+    return { deadlineAt: Date.now() + this.deadlineMs };
+  }
+
+  async get(
+    ref: string,
+    deps: ReferenceResolverDeps,
+    budget?: ReferenceBudget
+  ): Promise<ResolvedReferenceWithEntity> {
     const reference = parseReference(ref);
     const key = reference.key;
 
@@ -178,12 +210,23 @@ export class ReferenceCacheService {
       type: getResourceShape(reference),
     });
     const shared = this.sharedProviderRead(key, deps);
+    if (!shared) {
+      // Every slot and queue place is taken: answer pending without adding
+      // provider work. Nothing was read, so nothing is remembered as failed.
+      this.logger?.info("reference_cache_saturated", {
+        scheme: reference.scheme,
+        type: getResourceShape(reference),
+      });
+      const base = resolveReferenceSync(key, deps);
+      return { ...base, unavailable: "loading context", cacheState: "pending" };
+    }
     const readPromise = shared.read;
+    const waitMs = budget ? Math.max(0, budget.deadlineAt - Date.now()) : this.deadlineMs;
     const deadlinePromise = new Promise<"deadline">((resolve) =>
       setTimeout(() => {
         shared.answeredPending = true;
         resolve("deadline");
-      }, this.deadlineMs)
+      }, waitMs)
     );
 
     const result = await Promise.race([readPromise, deadlinePromise]);
@@ -221,8 +264,10 @@ export class ReferenceCacheService {
 
   private async triggerRefresh(ref: string, deps: ReferenceResolverDeps): Promise<void> {
     const reference = parseReference(ref);
+    const shared = this.sharedProviderRead(ref, deps);
+    if (!shared) return; // saturated: a later stale hit refreshes it.
     try {
-      const result = await this.sharedProviderRead(ref, deps).read;
+      const result = await shared.read;
       if (result) {
         this.logger?.info("reference_cache_refresh", {
           scheme: reference.scheme,
@@ -244,11 +289,18 @@ export class ReferenceCacheService {
    * Joins the read already out for `key`, or starts one. Either way its
    * outcome is recorded once: a failure (null or thrown) of a read some get
    * answered "pending" is remembered for `unavailableTtlMs`; a success clears
-   * that memory.
+   * that memory. Null when no read is out for `key` and the provider slots
+   * and queue are full.
    */
-  private sharedProviderRead(key: string, deps: ReferenceResolverDeps): InFlightRead {
+  private sharedProviderRead(key: string, deps: ReferenceResolverDeps): InFlightRead | null {
     const existing = this.inFlight.get(key);
     if (existing) return existing;
+    if (
+      this.activeReads >= this.maxConcurrentReads &&
+      this.queuedReads.length >= this.maxQueuedReads
+    ) {
+      return null;
+    }
     // The handlers run only after the provider read settles, by which time
     // `shared` exists and any get that gave up on it has marked it.
     const failed = () => {
@@ -288,9 +340,37 @@ export class ReferenceCacheService {
    * Reads through the shared async resolver seam rather than fetching and
    * normalizing providers here, so authorization/error/shape behavior cannot
    * drift between two implementations of the same GitHub/Google Chat reads.
-   * This service owns only cache policy: whether to persist, and for how long.
+   * This service owns only cache policy: whether to persist, for how long,
+   * and how many reads are out at once.
    */
   private async performProviderRead(
+    ref: string,
+    deps: ReferenceResolverDeps
+  ): Promise<ReferenceEntity | null> {
+    await this.acquireReadSlot();
+    try {
+      return await this.readAndStore(ref, deps);
+    } finally {
+      this.releaseReadSlot();
+    }
+  }
+
+  /** Takes a provider slot now, or once a running read hands its slot on. */
+  private acquireReadSlot(): Promise<void> {
+    if (this.activeReads < this.maxConcurrentReads) {
+      this.activeReads++;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this.queuedReads.push(resolve));
+  }
+
+  private releaseReadSlot(): void {
+    const next = this.queuedReads.shift();
+    if (next) next();
+    else this.activeReads--;
+  }
+
+  private async readAndStore(
     ref: string,
     deps: ReferenceResolverDeps
   ): Promise<ReferenceEntity | null> {
