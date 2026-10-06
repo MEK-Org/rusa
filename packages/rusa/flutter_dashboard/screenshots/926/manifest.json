@@ -12,9 +12,9 @@
       "workTabBlob": "029aad2ef7da1d0771c3f5d5ce6b92e237d72430"
     },
     "afterSource": {
-      "commit": "70d3213cd75401e1b2d8cd11f7525b220e0b2cba",
+      "commit": "85d2cc4b4b53a0a850c6e97bccc2532efb2a5f99",
       "modelsBlob": "bfa1cc0b5a2181b06a1b8cdae4c9af9be5321499",
-      "workTabBlob": "cad3d995edbe0ced49e5b820df11445de3afcf92"
+      "workTabBlob": "a5640ecabfa81311eee27eb1bf23098ffe06cbf1"
     },
     "observed": {
       "beforeTest": "2 passed",
@@ -27,8 +27,8 @@
       "phase": "before",
       "viewport": [1400, 900],
       "pixels": [2800, 1800],
-      "bytes": 197805,
-      "sha256": "936cd92ef8fea01663d01e0a998bf8393fec7f56f0f95709a70bd0e0ac9ade49"
+      "bytes": 200131,
+      "sha256": "02524280f74c94ab056c751272c44b7609cc612493fa2f3365d171aec3991b8e"
     },
     {
       "path": "completion_matcher_narrow_before.png",
@@ -43,16 +43,16 @@
       "phase": "after",
       "viewport": [1400, 900],
       "pixels": [2800, 1800],
-      "bytes": 239434,
-      "sha256": "d8565b3720c8f2075c76f9a909a244a276b2eabeb57eedf03396e0d20a90e518"
+      "bytes": 237030,
+      "sha256": "b8cc7e133240ddc4259ec43bebce6d7854df78434a0de04c3777e18dc99db203"
     },
     {
       "path": "completion_matcher_narrow_after.png",
       "phase": "after",
       "viewport": [390, 844],
       "pixels": [780, 1688],
-      "bytes": 150560,
-      "sha256": "873947d985ac1ceb9ec6347aca0bd8020c59323d13de813ad0e617cb54ac6847"
+      "bytes": 149776,
+      "sha256": "f4ba44136ff3bbe119bb338ba735aba6329e99894e0d68c98228120966e21a76"
     }
   ]
 }

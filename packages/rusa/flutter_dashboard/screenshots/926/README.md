@@ -5,10 +5,12 @@ read-only completion matcher in the Work detail's facts column, at wide
 (1400 × 900) and narrow (390 × 844) viewports, at pixel ratio 2.
 
 The fixture uses only synthetic identifiers and a synthetic `pr_merged`
-matcher in the detail-snapshot JSON. Both phases receive the same JSON. The
+matcher, recorded as closed without merging, in the detail-snapshot JSON. Both phases receive the same JSON. The
 pre-change dashboard at merge-base `39cfeb0c86f707195dfab6c5bdeeac30f87d9179`
 ignores the then-unknown `completionMatcher` key; #926's dashboard decodes it
-and renders the panel in its satisfied state with target, setter and resolution.
+and renders the panel in its unmerged-close state: the canonical target, the
+hedged "PR was closed without merging at" label, and the setter. The
+resolution line is reserved for deployed matchers and is absent here.
 No dashboard service, actor, or live obligation is queried.
 
 Run from the repository root with a writable Flutter SDK:
