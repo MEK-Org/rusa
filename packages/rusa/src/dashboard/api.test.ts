@@ -2111,6 +2111,8 @@ describe("handleMeshApiRequest", () => {
     actors.upsert(rec("root", null, "active"));
     actors.upsert(rec(UUID_A, "root", "active"));
     actors.upsert(rec(UUID_B, "root", "retired"));
+    actors.upsert(rec("empty_active", "root", "active"));
+    actors.upsert(rec("retired_with_events", "root", "retired"));
 
     meshEvents.record({ kind: "run_start", actorId: UUID_A, ts: "2026-06-21T00:00:00.000Z" });
     meshEvents.record({
@@ -2119,12 +2121,20 @@ describe("handleMeshApiRequest", () => {
       success: true,
       ts: "2026-06-22T00:00:00.000Z",
     });
+    meshEvents.record({
+      kind: "run_end",
+      actorId: "retired_with_events",
+      success: true,
+      ts: "2026-06-23T00:00:00.000Z",
+    });
 
     const { res } = await call(deps, "GET", "/api/mesh/threads");
     const body = JSON.parse(res.body);
     const byId = (id: string) => body.threads.find((t: { id: string }) => t.id === id);
     expect(byId(UUID_A).lastActiveAt).toBe("2026-06-22T00:00:00.000Z");
+    expect(byId("retired_with_events").lastActiveAt).toBe("2026-06-23T00:00:00.000Z");
     expect(byId(UUID_B).lastActiveAt).toBeNull();
+    expect(byId("empty_active").lastActiveAt).toBeNull();
     expect(byId("root").lastActiveAt).toBeNull();
   });
 

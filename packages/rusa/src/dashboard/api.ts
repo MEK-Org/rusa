@@ -1954,12 +1954,13 @@ export async function handleMeshApiRequest(
     );
     const rootHandle = deps.rootIdentity?.handle ?? generateHandle("root");
     const chatScope = viewerScope();
-    // Aggregate last activity once for all actors; the covering index on
-    // mesh_events(actor_id, ts) makes this cheap .
-    const lastActiveByActor = meshEvents.latestActivityByActor();
+    // Aggregate last activity once for all displayed actors; bounded indexed
+    // seeks on idx_mesh_events_actor_ts scale with actor count rather than event history (#934).
+    const actorList = actors.list();
+    const lastActiveByActor = meshEvents.latestActivityByActor(actorList.map((a) => a.id));
 
     const threads: ThreadDto[] = await Promise.all(
-      actors.list().map(async (r) => {
+      actorList.map(async (r) => {
         let runState: "running" | "queued" | "idle" = "idle";
         if (runtime) {
           runState = runtime.states.get(r.id) ?? "idle";

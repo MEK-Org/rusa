@@ -481,19 +481,54 @@ export class MeshEventRepository {
 
   /**
    * Returns the most recent event timestamp (`MAX(ts)`) for every actor that has
-   * at least one mesh event. One grouped query, not N+1; the `idx_mesh_events_actor_ts`
-   * covering index supplies the answer without touching the table rows.
+   * at least one mesh event.
+   *
+   * When `actorIds` is provided, retrieves last activity only for those specified
+   * actors using bounded indexed seeks on `idx_mesh_events_actor_ts` (#934).
+   * When `actorIds` is omitted, performs the grouped query over all actors to
+   * preserve existing semantics for other callers.
    */
-  latestActivityByActor(): Map<string, string> {
-    const rows = this.db
-      .prepare(
-        `SELECT actor_id AS actorId, MAX(ts) AS ts
-         FROM mesh_events
-         WHERE actor_id IS NOT NULL
-         GROUP BY actor_id`
-      )
-      .all() as { actorId: string; ts: string }[];
-    return new Map(rows.map((r) => [r.actorId, r.ts]));
+  latestActivityByActor(actorIds?: Iterable<string>): Map<string, string> {
+    if (actorIds === undefined) {
+      const rows = this.db
+        .prepare(
+          `SELECT actor_id AS actorId, MAX(ts) AS ts
+           FROM mesh_events
+           WHERE actor_id IS NOT NULL
+           GROUP BY actor_id`
+        )
+        .all() as { actorId: string; ts: string }[];
+      return new Map(rows.map((r) => [r.actorId, r.ts]));
+    }
+
+    const uniqueIds = Array.from(new Set(actorIds)).filter(
+      (id): id is string => typeof id === "string" && id.length > 0
+    );
+    if (uniqueIds.length === 0) {
+      return new Map();
+    }
+
+    const result = new Map<string, string>();
+    const CHUNK_SIZE = 500;
+    for (let i = 0; i < uniqueIds.length; i += CHUNK_SIZE) {
+      const chunk = uniqueIds.slice(i, i + CHUNK_SIZE);
+      const valuesClause = chunk.map(() => "(?)").join(", ");
+      const rows = this.db
+        .prepare(
+          `WITH actor_ids(id) AS (VALUES ${valuesClause})
+           SELECT id, (SELECT MAX(ts) FROM mesh_events WHERE actor_id = actor_ids.id) AS ts
+           FROM actor_ids`
+        )
+        .all(...chunk) as { id: string; ts: string | null }[];
+
+      for (const row of rows) {
+        if (row.ts !== null && row.ts !== undefined) {
+          result.set(row.id, row.ts);
+        }
+      }
+    }
+
+    return result;
   }
 }
 
