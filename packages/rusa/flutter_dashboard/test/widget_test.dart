@@ -496,6 +496,39 @@ void main() {
         expect(find.text('from b-handle'), findsOneWidget);
         expect(find.text('→ b-handle'), findsNWidgets(2));
         expect(find.text('to unknown'), findsNothing);
+
+        // Message bodies wait behind a chevron that sits right after the
+        // chip, ahead of the `to …` / `from …` label (#922). Rows with no
+        // body (spawn, handle grant) get no chevron.
+        final chevrons = find.byTooltip('Show message');
+        expect(chevrons, findsNWidgets(2));
+        expect(find.byTooltip('Show details'), findsNothing);
+        expect(find.text('I will check it now.'), findsNothing);
+        expect(
+          find.text('Please check the dashboard event log.'),
+          findsNothing,
+        );
+        final sentLine = find.ancestor(
+          of: find.text('to b-handle'),
+          matching: find.byType(Wrap),
+        );
+        Rect inSentLine(Finder f) =>
+            tester.getRect(find.descendant(of: sentLine, matching: f));
+        final chip = inSentLine(find.text('message_sent'));
+        final chevron = inSentLine(find.byTooltip('Show message'));
+        final label = tester.getRect(find.text('to b-handle'));
+        expect(chevron.left, greaterThan(chip.right));
+        // The label follows the chevron, on the same line or a wrapped one.
+        expect(
+          label.left > chevron.right || label.top >= chevron.bottom,
+          isTrue,
+        );
+        expect((chevron.center.dy - chip.center.dy).abs(), lessThan(4));
+
+        await tester.tap(chevrons.first);
+        await tester.tap(chevrons.last);
+        await tester.pump(const Duration(milliseconds: 50));
+        expect(find.byTooltip('Hide message'), findsNWidgets(2));
         expect(
           find.text('Please check the dashboard event log.'),
           findsOneWidget,
