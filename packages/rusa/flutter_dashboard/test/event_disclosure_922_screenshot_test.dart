@@ -46,6 +46,7 @@ List<MeshEvent> _events() => [
     'start',
     'run_start',
     actor: _actor,
+    detail: 'ctx 2048B/2r/a1b2c3d4e5f6',
     payload: '{"runId":"fixture-run","provider":"claude","model":"m"}',
   ),
   makeEvent(
@@ -98,7 +99,7 @@ void main() {
             await tester.pump(const Duration(milliseconds: 50));
           }
           if (state == 'expanded') {
-            for (final label in ['message', 'yield', 'details']) {
+            for (final label in ['message', 'yield', 'details', 'run details']) {
               for (final chevron in find.byTooltip('Show $label').evaluate()) {
                 await tester.tap(find.byWidget(chevron.widget));
               }
@@ -115,6 +116,7 @@ void main() {
               find.text('Parser fix pushed with a regression test.'),
               findsOneWidget,
             );
+            expect(find.text('ctx 2048B/2r/a1b2c3d4e5f6'), findsOneWidget);
           }
           expect(tester.takeException(), isNull);
           final name = _suffix.isEmpty ? state : '${state}_$_suffix';
