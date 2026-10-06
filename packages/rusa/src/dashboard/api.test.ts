@@ -5022,6 +5022,41 @@ describe("handleMeshApiRequest", () => {
         expect(JSON.parse(res.body).obligation.ownerId).toBe(LOCAL_USER);
       });
 
+      it("records an optional message in the obligation's history (#941)", async () => {
+        actors.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({ title: "review", id: "review", ownerId: LOCAL_USER });
+        const { res } = await call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/review/reassign",
+          JSON.stringify({ ownerId: UUID_A, message: "Please answer seat 2 first." })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(res.statusCode).toBe(200);
+
+        const detail = await call(deps, "GET", "/api/mesh/obligations/review?history_limit=1");
+        expect(JSON.parse(detail.res.body).history[0]).toMatchObject({
+          mutationKind: "reassign",
+          actingPrincipal: LOCAL_USER,
+          after: { ownerId: UUID_A, message: "Please answer seat 2 first." },
+        });
+      });
+
+      it("rejects a non-string message without reassigning (#941)", async () => {
+        actors.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({ title: "review", id: "review", ownerId: LOCAL_USER });
+        const { res } = await call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/review/reassign",
+          JSON.stringify({ ownerId: UUID_A, message: 42 })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(res.statusCode).toBe(400);
+        expect(JSON.parse(res.body).error).toMatch(/message/);
+        expect(obligations.get("review")?.ownerId).toBe(LOCAL_USER);
+      });
+
       it("validates the new owner and returns 404 for missing work", async () => {
         obligations.create({
           title: "task-owner",

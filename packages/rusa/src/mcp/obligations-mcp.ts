@@ -715,16 +715,22 @@ export function createObligationsMcpServer(
       inputSchema: {
         id: z.string().trim().min(1),
         owner_id: z.string().trim().min(1),
+        message: z
+          .string()
+          .optional()
+          .describe(
+            "Optional note to the new owner saying why it is arriving, recorded in the obligation's history with the owner change. Does not change how the new owner is notified."
+          ),
       },
     },
-    async ({ id, owner_id }) => {
+    async ({ id, owner_id, message }) => {
       try {
         const current = repository.get(id);
         if (!current) throw new Error("obligation not found");
         if (!canManage(current)) throw new Error("not authorized to reassign this obligation");
         const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
         if (!owner.ok) throw new Error(owner.error);
-        const obligation = repository.reassign(id, owner.ownerId, actorId);
+        const obligation = repository.reassign(id, owner.ownerId, actorId, message);
         return toolOk({ obligation, previousOwnerId: current.ownerId });
       } catch (err) {
         return toolError(err);

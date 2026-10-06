@@ -1465,7 +1465,8 @@ class _DetailViewState extends State<_DetailView> {
                 label: _historyLabel(h),
                 body:
                     h.after['checkpoint'] as String? ??
-                    h.after['terminalNote'] as String?,
+                    h.after['terminalNote'] as String? ??
+                    h.after['message'] as String?,
                 latest:
                     o.hasCheckpoint &&
                     h.after['checkpoint'] == o.checkpoint &&

@@ -408,6 +408,7 @@ Future<void> showReassignObligationDialog(
 }) async {
   final formKey = GlobalKey<FormState>();
   final ownerIdCtrl = TextEditingController(text: '');
+  final messageCtrl = TextEditingController(text: '');
   var isSubmitting = false;
 
   await showDialog<void>(
@@ -443,6 +444,24 @@ Future<void> showReassignObligationDialog(
                     contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                   ),
                 ),
+                const SizedBox(height: 12),
+                // Recorded in the obligation's history with the owner change
+                // (#941); the server enforces the same 500-character bound.
+                TextFormField(
+                  controller: messageCtrl,
+                  minLines: 2,
+                  maxLines: 4,
+                  maxLength: 500,
+                  style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
+                  decoration: const InputDecoration(
+                    labelText: 'Message (optional)',
+                    hintText: 'Why is this coming to them?',
+                    filled: true,
+                    fillColor: MeshColors.bgPrimary,
+                    border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
+                    contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  ),
+                ),
               ],
             ),
           ),
@@ -468,6 +487,7 @@ Future<void> showReassignObligationDialog(
                       await store.api.reassignObligation(
                         obligation.id,
                         ownerId: resolvedId,
+                        message: messageCtrl.text.trim(),
                       );
                       store.invalidateObligationsCache();
                       if (context.mounted) {
