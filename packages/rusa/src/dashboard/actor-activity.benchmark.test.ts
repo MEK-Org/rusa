@@ -30,7 +30,7 @@ class BenchResponse extends EventEmitter {
   req: EventEmitter & { headers?: Record<string, string> } = new EventEmitter();
   statusCode = 0;
   headers: Record<string, string> = {};
-  body = Buffer.alloc(0);
+  body: Uint8Array = Buffer.alloc(0);
   ended = false;
 
   writeHead(status: number, headers?: Record<string, string>): this {
