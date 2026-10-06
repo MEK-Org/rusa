@@ -17,9 +17,8 @@ export const INBOX_MCP_NAME = "inbox";
 
 /**
  * What one `select` committed: the entries, the run's resolved focus, and —
- * only when the mesh armed an experiment-specific rule on this very selection
- * — the discipline that rule holds the run to. Omitted, not empty, for every
- * run nothing is armed for, so an unenrolled actor's selection is unchanged.
+ * only when the run has armed head obligations to close — the discipline that
+ * holds the run to. Omitted, not empty, for every run nothing is armed for.
  */
 export interface SelectedInboxRun {
   entries: InboxEntry[];

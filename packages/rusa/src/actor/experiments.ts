@@ -38,52 +38,54 @@ export interface ExperimentDefinition {
 }
 
 /**
- * The `strict_obligation_handling` experiment: holding an enrolled actor to a
- * stricter standard for how it handles its obligations. Its rule is head
- * closure (#382, #828) — a run that selects a head obligation must finish,
- * decompose, snooze or hand it off before it returns. Named here so the
- * rollout boundary exists apart from the behavior; the mesh consumes it, and
- * this package deliberately carries none of that behavior.
+ * The shape of an experiment registry: experiment name to definition. The mesh
+ * evaluates names against one of these — {@link EXPERIMENTS} in production — so
+ * the registry stays code rather than data.
  */
-export const STRICT_OBLIGATION_HANDLING_EXPERIMENT = "strict_obligation_handling";
+export type ExperimentRegistry = Readonly<Record<string, ExperimentDefinition>>;
 
 /**
  * The complete set of experiments an actor may be enrolled in. Adding one is a
  * code change here and nowhere else — no migration, no schema constraint, no
  * data backfill. Removing one is the same edit plus deleting its rows, which is
  * exactly the disposability an experiment is supposed to have.
+ *
+ * Empty while nothing is being rolled out. `strict_obligation_handling` (#382)
+ * was the last entry; strict head closure is now every actor's behavior
+ * (#917), so its rows are stale and cleared with `unenroll_actor_experiment`.
  */
-export const EXPERIMENTS = {
-  [STRICT_OBLIGATION_HANDLING_EXPERIMENT]: {
-    intent:
-      "Hold the actor to stricter obligation handling: a run that selects a new head obligation must finish, decompose, snooze or hand it off before it returns.",
-  },
-} as const satisfies Record<string, ExperimentDefinition>;
-
-/** The registered experiment names, as a type. */
-export type ExperimentName = keyof typeof EXPERIMENTS;
+export const EXPERIMENTS: ExperimentRegistry = {};
 
 /** The registered names in a stable order, for readback and error messages. */
-export const EXPERIMENT_NAMES: readonly ExperimentName[] = Object.keys(
-  EXPERIMENTS
-).sort() as ExperimentName[];
+export function experimentNames(registry: ExperimentRegistry = EXPERIMENTS): string[] {
+  return Object.keys(registry).sort();
+}
 
 /**
  * Whether `name` is a registered experiment. `Object.hasOwn`, not `in`: an
  * inherited `Object` key ("constructor", "toString") is not an experiment,
  * however much it resolves like one.
  */
-export function isKnownExperiment(name: string): name is ExperimentName {
-  return Object.hasOwn(EXPERIMENTS, name);
+export function isKnownExperiment(
+  name: string,
+  registry: ExperimentRegistry = EXPERIMENTS
+): boolean {
+  return Object.hasOwn(registry, name);
 }
 
 /**
- * Narrow `name` to a registered experiment or refuse it, naming the registry so
+ * Accept `name` as a registered experiment or refuse it, naming the registry so
  * the caller learns what it could have said instead of guessing again.
  */
-export function assertKnownExperiment(name: string): ExperimentName {
-  if (!isKnownExperiment(name)) {
-    throw new Error(`unknown experiment: ${name} (known: ${EXPERIMENT_NAMES.join(", ")})`);
+export function assertKnownExperiment(
+  name: string,
+  registry: ExperimentRegistry = EXPERIMENTS
+): string {
+  if (!isKnownExperiment(name, registry)) {
+    const known = experimentNames(registry);
+    throw new Error(
+      `unknown experiment: ${name} (known: ${known.length > 0 ? known.join(", ") : "none"})`
+    );
   }
   return name;
 }

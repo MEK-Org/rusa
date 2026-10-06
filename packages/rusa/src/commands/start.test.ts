@@ -1937,7 +1937,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   });
 
-  it("tells a root-enrolled worker its closure rule across the live MCP boundary while an unenrolled control is untouched", async () => {
+  it("tells every worker its closure rule across the live MCP boundary, with no enrollment (#917)", async () => {
     let mesh: ActorMesh | undefined;
     let root: Actor | undefined;
     await new Promise<void>((resolve) => {
@@ -1984,27 +1984,34 @@ describe("runStart webhook event routing (Phase 4)", () => {
         parentId: "root",
         modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
       });
-    const optedIn = spawnWorker("live opted-in worker");
-    const control = spawnWorker("live unenrolled control");
+    const first = spawnWorker("live first worker");
+    const second = spawnWorker("live second worker");
     const actorOf = (id: string) => {
       const actor = liveMesh.get(id) as Actor | undefined;
       if (!actor) throw new Error(`worker MCP endpoints missing: ${id}`);
       return actor;
     };
 
-    // Root-only enrollment, through root's own live mesh endpoint.
-    const enrolled = await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
-      actor_id: optedIn,
-      experiment: "strict_obligation_handling",
-    });
-    expect(enrolled.isError).toBeFalsy();
+    // The retired experiment is gone from the live surface: nothing is listed,
+    // and its name can no longer be enrolled. Strict closure needs neither.
+    expect(
+      payloadOf(await call(urlOf(root, "mesh"), "list_actor_experiments", {})).experiments
+    ).toEqual([]);
+    expect(
+      (
+        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
+          actor_id: first,
+          experiment: "strict_obligation_handling",
+        })
+      ).isError
+    ).toBe(true);
 
     // Attention arrives the way production delivers it: creating the obligation
     // moves each worker's ready head, and runStart's ready-head listener routes
     // that transition into the worker's durable inbox. Nothing is injected.
     for (const [actorId, title] of [
-      [optedIn, "live strict head"],
-      [control, "live control head"],
+      [first, "live strict head"],
+      [second, "live second head"],
     ]) {
       getRepositories().obligations.create({ title, ownerId: actorId });
     }
@@ -2049,51 +2056,40 @@ describe("runStart webhook event routing (Phase 4)", () => {
         runId,
       };
     };
-    const strict = await selectHeadOverMcp(optedIn);
+    const strict = await selectHeadOverMcp(first);
     const strictHeadId = strict.obligationId;
-    const controlSelection = await selectHeadOverMcp(control);
+    const secondRun = await selectHeadOverMcp(second);
 
-    // The selection that arms the experiment is also what states the rule, so the
+    // The selection that arms closure is also what states the rule, so the
     // worker learns it before its run returns.
-    // The rule is stated directly without mentioning the experiment itself.
-    expect(String(strict.selection.discipline)).not.toContain("strict_obligation_handling");
     expect(String(strict.selection.discipline)).not.toMatch(/experiment/i);
     expect(String(strict.selection.discipline)).toContain(strictHeadId);
     expect(String(strict.selection.discipline)).toMatch(/every selected head/);
     expect(String(strict.selection.discipline)).toContain(
       "complete it, cancel it, schedule it, snooze it until a future time with `set_snooze`, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor"
     );
-    // The unenrolled control's selection carries no trace of the experiment.
-    expect(controlSelection.selection).not.toHaveProperty("discipline");
-    expect(JSON.stringify(controlSelection.selection)).not.toContain("strict_obligation_handling");
+    // Every worker is held to it; none is a control.
+    expect(String(secondRun.selection.discipline)).toContain(secondRun.obligationId);
 
-    // The rule is held, not only stated: the strict head's attention cannot be
-    // marked handled while the head is as it was found, and the control's can.
+    // The rule is held, not only stated: neither head's attention can be
+    // marked handled while the head is as it was found.
     const markHandled = (actorId: string, entryId: string) =>
       call(urlOf(actorOf(actorId), "inbox"), "mark_handled", {
         entry_id: entryId,
         note: "handled in this run",
       });
-    const refused = await markHandled(optedIn, strict.entryId);
+    const refused = await markHandled(first, strict.entryId);
     expect(refused.isError).toBe(true);
     expect(JSON.stringify(refused)).toContain(
       `Cannot mark handled: selected head obligation ${strictHeadId}`
     );
-    expect((await markHandled(control, controlSelection.entryId)).isError).toBeFalsy();
+    expect((await markHandled(second, secondRun.entryId)).isError).toBe(true);
 
     // Direct focus takes the separate production path: an ordinary mesh
     // message plus an explicit owned obligation, selected through the same
     // live inbox MCP endpoint. It must arm independently of ready-head
     // delivery and describe that commitment.
     const direct = spawnWorker("live direct-focus worker");
-    expect(
-      (
-        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
-          actor_id: direct,
-          experiment: "strict_obligation_handling",
-        })
-      ).isError
-    ).toBeFalsy();
     const directId = getRepositories().obligations.create({
       title: "live direct focus",
       ownerId: direct,
@@ -2122,13 +2118,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await endLifecycleRun(actorOf(direct), directRunId, { success: true, output: "", exitCode: 0 });
 
     // Decomposing it through the worker's own obligations MCP is a legal exit.
-    const child = await call(urlOf(actorOf(optedIn), "obligations"), "create_obligation", {
-      owner_id: optedIn,
+    const child = await call(urlOf(actorOf(first), "obligations"), "create_obligation", {
+      owner_id: first,
       parent_id: strictHeadId,
       title: "Review the strict head",
     });
     expect(child.isError).toBeFalsy();
-    expect((await markHandled(optedIn, strict.entryId)).isError).toBeFalsy();
+    expect((await markHandled(first, strict.entryId)).isError).toBeFalsy();
 
     // Handing the head to a sibling is a legal exit too (#420), through the
     // worker's own obligations MCP under the production owner-or-ancestor
@@ -2137,14 +2133,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // sink in this process — no restart, no injection.
     const handoffSource = spawnWorker("live handoff source");
     const recipient = spawnWorker("live handoff recipient");
-    expect(
-      (
-        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
-          actor_id: handoffSource,
-          experiment: "strict_obligation_handling",
-        })
-      ).isError
-    ).toBeFalsy();
     const handoffHeadId = getRepositories().obligations.create({
       title: "live handoff head",
       ownerId: handoffSource,
@@ -2191,58 +2179,24 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
     expect((await markHandled(handoffSource, handoffRun.entryId)).isError).toBeFalsy();
 
-    // A root enrollment change lands at the next selection across the same
-    // live boundary.
-    const switched = spawnWorker("live enrollment-change worker");
-    expect(
-      (
-        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
-          actor_id: switched,
-          experiment: "strict_obligation_handling",
-        })
-      ).isError
-    ).toBeFalsy();
-    getRepositories().obligations.create({ title: "live enrolled head", ownerId: switched });
-    const enrolledRun = await selectHeadOverMcp(switched);
-    expect(String(enrolledRun.selection.discipline)).toContain(enrolledRun.obligationId);
-    expect(String(enrolledRun.selection.discipline)).not.toContain("strict_obligation_handling");
-    expect(String(enrolledRun.selection.discipline)).not.toMatch(/experiment/i);
-
-    expect(
-      (
-        await call(urlOf(root, "mesh"), "unenroll_actor_experiment", {
-          actor_id: switched,
-          experiment: "strict_obligation_handling",
-        })
-      ).isError
-    ).toBeFalsy();
-    // End the run the way production ends it, then move this worker's head
-    // with a higher-priority obligation so the next run selects fresh.
-    await endLifecycleRun(actorOf(switched), enrolledRun.runId, {
+    // End the second run the way production ends it, with its armed head as
+    // found: the return is recorded as rejected and the attention stays
+    // unhandled. The direct-focus run above closed its head first and
+    // returned clean.
+    await endLifecycleRun(actorOf(second), secondRun.runId, {
       success: true,
       output: "",
       exitCode: 0,
     });
-    // That run returned with its armed head as found, so the return is
-    // recorded as rejected and the attention stays unhandled. The direct-focus
-    // run above closed its head first and returned clean.
     const returnRejections = (actorId: string) =>
       getRepositories().meshEvents.listEventsByActors([actorId], {
         limit: 20,
         kinds: ["run_return_rejected"],
       }).events;
-    expect(returnRejections(switched).map((event) => JSON.parse(event.payload ?? "{}"))).toEqual([
-      expect.objectContaining({ obligationId: enrolledRun.obligationId }),
+    expect(returnRejections(second).map((event) => JSON.parse(event.payload ?? "{}"))).toEqual([
+      expect.objectContaining({ obligationId: secondRun.obligationId }),
     ]);
     expect(returnRejections(direct)).toEqual([]);
-    getRepositories().obligations.create({
-      title: "live released head",
-      ownerId: switched,
-      priority: 100,
-    });
-    const releasedRun = await selectHeadOverMcp(switched);
-    expect(releasedRun.obligationId).not.toBe(enrolledRun.obligationId);
-    expect(releasedRun.selection).not.toHaveProperty("discipline");
   }, 10_000);
 
   describe("root pool fallback is root-only ", () => {

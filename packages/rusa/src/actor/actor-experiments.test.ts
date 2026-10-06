@@ -4,13 +4,17 @@ import type { Actor } from "./actor.js";
 import { ActorMesh } from "./actor-mesh.js";
 import { EXPERIMENT_ADMIN_CAPABILITY } from "./administrative-capabilities.js";
 import { InMemoryCapabilityGrantStore } from "./capability-grants.js";
-import {
-  InMemoryExperimentEnrollmentStore,
-  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
-} from "./experiments.js";
+import { type ExperimentRegistry, InMemoryExperimentEnrollmentStore } from "./experiments.js";
 import type { MeshEventInput } from "./mesh-events.js";
 
-const EXPERIMENT = STRICT_OBLIGATION_HANDLING_EXPERIMENT;
+/**
+ * The production registry is empty between rollouts, so the seam is exercised
+ * against a fixture registry the mesh is constructed with.
+ */
+const EXPERIMENT = "fixture_rollout";
+const FIXTURE_REGISTRY: ExperimentRegistry = {
+  [EXPERIMENT]: { intent: "Exercise the rollout seam." },
+};
 
 /**
  * A mesh over a fixed topology: root, a worker, the worker's parent, and a
@@ -23,6 +27,7 @@ function setup(
   opts: {
     events?: (event: MeshEventInput) => void;
     experimentEnrollments?: InMemoryExperimentEnrollmentStore;
+    experimentRegistry?: ExperimentRegistry;
     workerStatus?: "active" | "retired";
     rootId?: string;
   } = {}
@@ -67,6 +72,7 @@ function setup(
     capabilityGrants,
     createActor: () => ({}) as unknown as Actor,
     experimentEnrollments: enrollments,
+    experimentRegistry: "experimentRegistry" in opts ? opts.experimentRegistry : FIXTURE_REGISTRY,
     events: opts.events,
     now: () => "2026-09-10T00:00:00Z",
   });
@@ -208,6 +214,19 @@ describe("actor experiment enrollment", () => {
     ]);
   });
 
+  it("treats a leftover strict_obligation_handling row as inert (#917)", () => {
+    const enrollments = new InMemoryExperimentEnrollmentStore();
+    const { mesh } = setup({ experimentEnrollments: enrollments, experimentRegistry: undefined });
+    // A row a deployed rollout left behind.
+    enrollments.enroll({
+      actorId: "worker",
+      experiment: "strict_obligation_handling",
+      enrolledBy: "root",
+      enrolledAt: "2026-09-10T00:00:00Z",
+    });
+    expect(mesh.isEnrolledInExperiment("worker", "strict_obligation_handling")).toBe(false);
+  });
+
   it("admits only an experiment-admin holder: the actor itself, its parent, and a sibling are all refused", () => {
     const { mesh, enrollments } = setup();
     for (const caller of ["worker", "parent", "sibling", "ghost-caller"]) {
@@ -328,6 +347,7 @@ describe("actor experiment enrollment", () => {
       rootId: "root",
       capabilityGrants,
       createActor: () => ({}) as unknown as Actor,
+      experimentRegistry: FIXTURE_REGISTRY,
     });
     expect(mesh.enrollActorInExperiment("root", EXPERIMENT, "root").changed).toBe(true);
     expect(mesh.isEnrolledInExperiment("root", EXPERIMENT)).toBe(true);
