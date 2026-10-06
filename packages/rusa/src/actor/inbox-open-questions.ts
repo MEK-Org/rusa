@@ -21,7 +21,8 @@ export interface InboxOpenQuestion {
 /**
  * The open questions the receiving actor filed for the human who sent a
  * selected message (#890), with the reference to close them against. Entries
- * from the same sender share one list; later ones point at the first.
+ * from the same sender share one list; later ones point at the first that
+ * returned it.
  */
 export type InboxOpenQuestions = {
   principalId: string;
@@ -74,7 +75,8 @@ export function resolveInboxSenderPrincipal(
   if (!MESH_HUMAN_PAYLOAD_TYPES.has(String(payload.type))) return undefined;
   const fromId = payload.fromId;
   if (typeof fromId !== "string" || source !== `mesh:${fromId}`) return undefined;
-  return principals.get(fromId)?.kind === "user" ? fromId : undefined;
+  const principal = principals.get(fromId);
+  return principal?.kind === "user" && principal.disabledAt === undefined ? fromId : undefined;
 }
 
 function isMessageReference(ref: string): boolean {
@@ -122,7 +124,6 @@ export function attachOpenQuestions(
       }
       const page = sources.listOpenQuestions(principalId, actorId, limit);
       if (page.obligations.length === 0) return entry;
-      firstEntryByPrincipal.set(principalId, entry.id);
       const questions = page.obligations.map((obligation): InboxOpenQuestion => {
         const askRef = askRefOf(sources.listArtifacts(obligation.id));
         return {
@@ -131,6 +132,8 @@ export function attachOpenQuestions(
           ...(askRef === undefined ? {} : { askRef }),
         };
       });
+      // Only a list that was actually returned can be pointed at by later entries.
+      firstEntryByPrincipal.set(principalId, entry.id);
       return {
         ...entry,
         openQuestions: { ...base, questions, total: page.total, truncated: page.hasMore },

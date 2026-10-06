@@ -127,6 +127,9 @@ describe("attachOpenQuestions", () => {
 
   it("leaves unmatched senders without questions", () => {
     ask("q", alice);
+    ask("bobs", bob);
+    repos.principals.setDisabled(bob, AT);
+    const disabledUser = humanMessage("disabled", bob);
     const legacyOperator = humanMessage("legacy", "human:operator");
     const unknownUser = humanMessage("unknown", "00000000-0000-4000-8000-000000000000");
     const actorSent: InboxEntry = {
@@ -149,7 +152,7 @@ describe("attachOpenQuestions", () => {
     };
 
     const result = attachOpenQuestions(
-      [legacyOperator, unknownUser, actorSent, spoofedSource, gchat],
+      [legacyOperator, unknownUser, disabledUser, actorSent, spoofedSource, gchat],
       "asker",
       sources
     );
@@ -259,5 +262,22 @@ describe("attachOpenQuestions", () => {
 
     expect(result[0]).toMatchObject({ id: "e1", openQuestionsError: "database is locked" });
     expect(result[1]).not.toHaveProperty("openQuestionsError");
+
+    // A later message from the same sender never points at a list that failed.
+    const failingArtifacts: InboxOpenQuestionSources = {
+      ...sources,
+      listArtifacts: () => {
+        throw new Error("database is locked");
+      },
+    };
+    const sameSender = attachOpenQuestions(
+      [humanMessage("e3", alice), humanMessage("e4", alice)],
+      "asker",
+      failingArtifacts
+    );
+    for (const entry of sameSender) {
+      expect(entry).toMatchObject({ openQuestionsError: "database is locked" });
+      expect(entry).not.toHaveProperty("openQuestions");
+    }
   });
 });
