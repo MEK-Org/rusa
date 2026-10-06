@@ -13,9 +13,11 @@ import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { ReferenceCacheRepository } from "../db/repositories/reference-cache-repository.js";
 import { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { createDashboardRequestHandler } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
@@ -670,6 +672,49 @@ describe("human chat isolation (#590)", () => {
     expect(bobCard?.moreInboxItemsCount).toBeUndefined();
     expect(JSON.stringify(bobThreads.body)).not.toContain(a.id);
     expect(JSON.stringify(bobThreads.body)).not.toContain("alice asks");
+  });
+
+  it("omits another human's message from recent activity resolved alongside cold references (#933)", async () => {
+    const a = await login(alice);
+    const b = await login(bob);
+    await seedBothConversations(a, b);
+    inbox.append([
+      {
+        id: "cold-issue",
+        actorId: ACTOR,
+        source: "github:o/r/issues/1",
+        payload: { type: "issues.opened" },
+      },
+    ]);
+    const handled = inbox.list(ACTOR, { status: "unhandled", limit: 100 }).entries;
+    inbox.markHandled(
+      ACTOR,
+      handled.map((entry) => entry.id),
+      new Date(),
+      "Addressed"
+    );
+    // A provider that never answers keeps the GitHub card pending while the
+    // mesh messages resolve in the same pass.
+    deps.referenceCache = new ReferenceCacheService({
+      repo: new ReferenceCacheRepository(db),
+      deadlineMs: 20,
+    });
+    deps.issueClient = {
+      getIssue: () => new Promise<never>(() => {}),
+    } as unknown as DashboardDataDeps["issueClient"];
+
+    const activity = await getJson<{
+      items: Array<{ sourceRef: string; reference?: { body: string | null; cacheState?: string } }>;
+    }>("/api/mesh/recent-activity?limit=10", a.cookie);
+    expect(activity.status).toBe(200);
+    expect(activity.body.items.map((item) => item.reference?.body ?? null)).toContain("alice asks");
+    expect(
+      activity.body.items.find((item) => item.sourceRef === "github:o/r/issues/1")?.reference
+        ?.cacheState
+    ).toBe("pending");
+    const serialized = JSON.stringify(activity.body);
+    expect(serialized).not.toContain("bob asks");
+    expect(serialized).not.toContain(b.id);
   });
 
   it("streams live message frames only to the human they belong to", async () => {

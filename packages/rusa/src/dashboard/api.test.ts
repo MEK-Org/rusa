@@ -521,6 +521,53 @@ describe("handleMeshApiRequest", () => {
         resolutionRef: "mesh:messages/original-terminal",
       });
     });
+
+    it("resolves a page of cold references against one deadline, bounded and in store order (#933)", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      const ids = Array.from({ length: 12 }, (_, i) => `cold-${String(i).padStart(2, "0")}`);
+      inbox.append(
+        ids.map((id, i) => ({
+          id,
+          actorId: UUID_A,
+          source: `github:o/r/issues/${i + 1}`,
+          payload: { type: "issues.opened" },
+        }))
+      );
+      inbox.markHandled(UUID_A, ids, new Date("2026-09-26T03:15:00.000Z"), "Addressed");
+      const getIssue = vi.fn(() => new Promise<never>(() => {}));
+      const coldDeps = {
+        ...deps,
+        referenceCache: new ReferenceCacheService({
+          repo: new ReferenceCacheRepository(db),
+          deadlineMs: 60_000,
+        }),
+        issueClient: { getIssue },
+      } as unknown as DashboardDataDeps;
+
+      vi.useFakeTimers({ toFake: ["setTimeout"] });
+      try {
+        let answered = false;
+        const response = call(coldDeps, "GET", "/api/mesh/recent-activity?limit=20").then((r) => {
+          answered = true;
+          return r;
+        });
+        // One deadline answers the whole page; resolving entry by entry
+        // waited one deadline per entry.
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(answered).toBe(true);
+        const items = JSON.parse((await response).res.body).items as Array<{
+          id: string;
+          reference?: { cacheState?: string };
+        }>;
+        expect(items.map((item) => item.id)).toEqual(
+          inbox.listRecentHandledEntries(20).map((entry) => `inbox_${entry.id}`)
+        );
+        expect(items.every((item) => item.reference?.cacheState === "pending")).toBe(true);
+        expect(getIssue).toHaveBeenCalledTimes(12);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   it("GET /api/mesh/threads surfaces exhausted selected work as needs attention (#664)", async () => {
@@ -4107,6 +4154,7 @@ describe("handleMeshApiRequest", () => {
         const depsWithCache = {
           ...deps,
           referenceCache: {
+            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
             get: async (ref: string) => {
               if (ref.includes("issues/1")) {
                 return {
@@ -4170,6 +4218,7 @@ describe("handleMeshApiRequest", () => {
         const depsWithCache = {
           ...deps,
           referenceCache: {
+            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
             get: async (ref: string) => {
               if (ref.includes("issues/345")) {
                 return {
@@ -4245,6 +4294,7 @@ describe("handleMeshApiRequest", () => {
         const depsWithCache = {
           ...deps,
           referenceCache: {
+            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
             get: async (ref: string) => {
               if (ref.includes("comments")) {
                 return {
@@ -4352,6 +4402,38 @@ describe("handleMeshApiRequest", () => {
           contents: "Arrived after the deadline",
         });
         expect(getMessage).toHaveBeenCalledTimes(1);
+      });
+
+      it("waits one deadline for a cold artifact and a different cold external reference (#933)", async () => {
+        obligations.create({ title: "two-cold", id: "two-cold", ownerId: "actor-1" });
+        obligations.attachArtifact("two-cold", "github:o/r/issues/1");
+        obligations.setExternalRef("two-cold", "github:o/r/issues/2", "system:mesh");
+        const getIssue = vi.fn(() => new Promise<never>(() => {}));
+        const coldDeps = {
+          ...deps,
+          referenceCache: new ReferenceCacheService({
+            repo: new ReferenceCacheRepository(db),
+            deadlineMs: 60_000,
+          }),
+          issueClient: { getIssue },
+        } as unknown as DashboardDataDeps;
+
+        vi.useFakeTimers({ toFake: ["setTimeout"] });
+        try {
+          let answered = false;
+          const response = call(coldDeps, "GET", "/api/mesh/obligations/two-cold").then((r) => {
+            answered = true;
+            return r;
+          });
+          await vi.advanceTimersByTimeAsync(60_000);
+          expect(answered).toBe(true);
+          const data = JSON.parse((await response).res.body);
+          expect(data.artifacts[0].reference.cacheState).toBe("pending");
+          expect(data.externalReference.cacheState).toBe("pending");
+          expect(getIssue).toHaveBeenCalledTimes(2);
+        } finally {
+          vi.useRealTimers();
+        }
       });
 
       it("404s when obligation not found", async () => {

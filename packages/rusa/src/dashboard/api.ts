@@ -621,7 +621,8 @@ function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
 async function resolveInboxPage(
   page: InboxPage,
   deps: DashboardDataDeps,
-  chatScope: HumanChatScope
+  chatScope: HumanChatScope,
+  budget?: import("../references/cache-service.js").ReferenceBudget
 ): Promise<ResolvedInboxPage> {
   // Same cache/resolver an obligation's cited artifacts use, so an external
   // inbox entry gets the identical rich preview and "open in new tab" link
@@ -629,7 +630,7 @@ async function resolveInboxPage(
   const resolve = (ref: string) =>
     deps.referenceCache
       ? deps.referenceCache
-          .get(ref, deps)
+          .get(ref, deps, budget)
           .catch(() => resolveReferenceSync(ref, { meshChat: deps.meshChat }))
       : resolveReferenceSync(ref, { meshChat: deps.meshChat });
   const entries: Array<ResolvedInboxEntry | null> = await Promise.all(
@@ -2389,10 +2390,13 @@ export async function handleMeshApiRequest(
     // another human's conversation is projected without its content or ends
     // (#590). Mesh refs are resolved locally by the cache service rather than
     // stored, so the scope applies to the cached and uncached paths alike.
+    // Citations and the external reference start together and share one
+    // deadline, so two cold references wait one window, not two (#933).
+    const referenceBudget = deps.referenceCache?.startBudget();
     const resolveCited = async (ref: string): Promise<ResolvedReferenceWithEntity> =>
       scopeMeshMessageReference(
         deps.referenceCache
-          ? await deps.referenceCache.get(ref, deps).catch(() => ({
+          ? await deps.referenceCache.get(ref, deps, referenceBudget).catch(() => ({
               ...resolveReferenceSync(ref, { meshChat: deps.meshChat }),
               unavailable: "could not load context",
               cacheState: "unavailable" as const,
@@ -2400,14 +2404,16 @@ export async function handleMeshApiRequest(
           : resolveReferenceSync(ref, { meshChat: deps.meshChat }),
         viewerScope()
       );
-    const artifacts = await Promise.all(
-      deps.obligations.listArtifacts(id).map(async (artifact) => ({
-        artifact,
-        reference: await resolveCited(artifact.ref),
-      }))
-    );
     const externalRefKey = obligation.externalRef?.key;
-    const externalReference = externalRefKey ? await resolveCited(externalRefKey) : null;
+    const [artifacts, externalReference] = await Promise.all([
+      Promise.all(
+        deps.obligations.listArtifacts(id).map(async (artifact) => ({
+          artifact,
+          reference: await resolveCited(artifact.ref),
+        }))
+      ),
+      externalRefKey ? resolveCited(externalRefKey) : null,
+    ]);
     sendJson(res, 200, {
       obligation,
       parent,
@@ -2454,14 +2460,27 @@ export async function handleMeshApiRequest(
     const completedFocuses = deps.actorRuns?.listRecentCompletedFocuses(limit * 2) ?? [];
     const handledItems: Array<Record<string, unknown>> = [];
 
-    for (const entry of handledEntries) {
+    // Resolve the whole page at once against one reference deadline (#933);
+    // the loop below then assembles cards in the store's order.
+    const referenceBudget = deps.referenceCache?.startBudget();
+    const resolvedEntries = await Promise.all(
+      handledEntries.map(async (entry) =>
+        entry.handledAt
+          ? (
+              await resolveInboxPage(
+                { entries: [entry], unhandledCount: 1, nextCursor: null },
+                deps,
+                chatScope,
+                referenceBudget
+              )
+            ).entries[0]
+          : undefined
+      )
+    );
+
+    for (const [index, entry] of handledEntries.entries()) {
       if (!entry.handledAt) continue;
-      const page = await resolveInboxPage(
-        { entries: [entry], unhandledCount: 1, nextCursor: null },
-        deps,
-        chatScope
-      );
-      const resolved = page.entries[0];
+      const resolved = resolvedEntries[index];
       if (!resolved) continue;
 
       const { handle, model } = actorDisplayInfo(entry.actorId);
