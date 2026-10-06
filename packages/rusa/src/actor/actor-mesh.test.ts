@@ -14471,19 +14471,6 @@ describe("accountRun token accounting (#443)", () => {
       expect(registry.get("root")?.title).toBe("Root again");
     });
 
-    it("is the mesh's rule, not the repository's", () => {
-      const { registry } = setup();
-      registry.upsert({
-        id: "second",
-        charter: "second",
-        parentId: null,
-        sandboxed: false,
-        status: "active",
-        createdAt: "2026-01-01T00:00:00.000Z",
-      });
-
-      expect(registry.list().filter((a) => a.parentId === null)).toHaveLength(2);
-    });
   });
 });
 

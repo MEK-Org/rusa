@@ -21,8 +21,9 @@ import type { Migration } from "./types.js";
  *   unsandboxed and every descendant sandboxed.
  * - A v2 `context_config` (#326) is the only place `executionTarget` was
  *   stored. The target is copied across verbatim, and the context document is
- *   rewritten as v1 with everything else unchanged. A document that is not
- *   valid JSON is left as it is; its read already fails closed.
+ *   rewritten as v1 with everything else unchanged. Only a strictly valid v2
+ *   document is rewritten; malformed JSON and malformed v2 documents are
+ *   left as they are so the new reader continues to fail closed.
  *
  * It also drops `actors_single_root_idx`, so the repository can store several
  * parentless actors. Until the forest-boot slice lands, running creation and
@@ -56,11 +57,10 @@ export const actorExecutionConfig: Migration = {
     for (const row of rows) {
       let contextConfig = row.context_config;
       let executionTarget: string | undefined;
-      const context = parseObject(row.context_config);
-      if (context?.schemaVersion === 2) {
-        const { executionTarget: target, ...rest } = context;
-        if (typeof target === "string") executionTarget = target;
-        contextConfig = JSON.stringify({ ...rest, schemaVersion: 1 });
+      const context = extractLegacyV2Context(row.context_config);
+      if (context) {
+        executionTarget = context.executionTarget;
+        contextConfig = context.contextConfig;
       }
       update.run(
         JSON.stringify({
@@ -74,6 +74,51 @@ export const actorExecutionConfig: Migration = {
     }
   },
 };
+
+function extractLegacyV2Context(
+  json: string | null
+): { contextConfig: string; executionTarget?: string } | undefined {
+  const context = parseObject(json);
+  if (context?.schemaVersion !== 2) return undefined;
+
+  const hasExecutionTarget = Object.hasOwn(context, "executionTarget");
+  const executionTarget = context.executionTarget;
+  if (hasExecutionTarget && typeof executionTarget !== "string") return undefined;
+
+  const { executionTarget: _target, ...rest } = context;
+  if (!isLegacyContext(rest)) return undefined;
+  return {
+    contextConfig: JSON.stringify({ ...rest, schemaVersion: 1 }),
+    ...(typeof executionTarget === "string" ? { executionTarget } : {}),
+  };
+}
+
+function isLegacyContext(context: Record<string, unknown>): boolean {
+  const keys = Object.keys(context);
+  if (
+    context.schemaVersion !== 2 ||
+    (context.type !== "native" && context.type !== "portable")
+  ) {
+    return false;
+  }
+  if (context.type === "native") {
+    return (
+      keys.every((key) => key === "schemaVersion" || key === "type" || key === "sessionId") &&
+      (context.sessionId === undefined || typeof context.sessionId === "string")
+    );
+  }
+  return (
+    keys.every(
+      (key) =>
+        key === "schemaVersion" ||
+        key === "type" ||
+        key === "mode" ||
+        key === "compactionModel"
+    ) &&
+    (context.mode === "tail" || context.mode === "ledger") &&
+    (context.compactionModel === undefined || typeof context.compactionModel === "string")
+  );
+}
 
 function parseObject(json: string | null): Record<string, unknown> | undefined {
   if (json === null) return undefined;

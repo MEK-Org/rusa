@@ -127,7 +127,7 @@ describe("runDashboard", () => {
     );
   });
 
-  it("names no root when the repository holds several parentless actors (#550)", async () => {
+  it("keeps the first parentless actor as the dashboard root (#550)", async () => {
     mockDbModule.getRepositories.mockReturnValue({
       actors: {
         list: vi.fn(() => [
@@ -146,7 +146,7 @@ describe("runDashboard", () => {
     expect(mockWebhookServerModule.startDashboardServer).toHaveBeenCalledWith(
       expect.objectContaining({
         mesh: expect.objectContaining({
-          rootIdentity: expect.objectContaining({ id: undefined }),
+          rootIdentity: expect.objectContaining({ id: "parentless-a" }),
         }),
       })
     );

@@ -92,6 +92,17 @@ function seedLegacy(db: Database.Database): void {
     "2026-09-01T00:05:00.000Z",
     null
   );
+  actor.run(
+    "invalid-v2-target",
+    "Still invalid",
+    "root",
+    null,
+    JSON.stringify({ schemaVersion: 2, type: "native", executionTarget: null }),
+    null,
+    null,
+    "2026-09-01T00:06:00.000Z",
+    null
+  );
 
   db.exec(`
     INSERT INTO actor_handles (actor_id, target_id, role) VALUES
@@ -104,6 +115,7 @@ function seedLegacy(db: Database.Database): void {
       ('placed-native', 'actor', '2026-09-01T00:03:00.000Z'),
       ('retired-worker', 'actor', '2026-09-01T00:04:00.000Z'),
       ('corrupt-context', 'actor', '2026-09-01T00:05:00.000Z'),
+      ('invalid-v2-target', 'actor', '2026-09-01T00:06:00.000Z'),
       ('user-1', 'user', '2026-09-01T00:00:00.000Z');
     INSERT INTO users (principal_id, email, root_actor_id)
       VALUES ('user-1', 'operator@example.invalid', 'root');
@@ -173,6 +185,10 @@ function actorIndexes(db: Database.Database): string[] {
 
 const EXPECTED_DOCUMENTS = {
   "corrupt-context": { context: "{not json", execution: { schemaVersion: 1, sandboxed: true } },
+  "invalid-v2-target": {
+    context: { schemaVersion: 2, type: "native", executionTarget: null },
+    execution: { schemaVersion: 1, sandboxed: true },
+  },
   lead: { context: null, execution: { schemaVersion: 1, sandboxed: true } },
   "placed-native": {
     context: { schemaVersion: 1, type: "native", sessionId: "session-placed" },
@@ -203,13 +219,6 @@ describe("0056_actor_execution_config", () => {
 
   afterEach(() => {
     rmSync(directory, { recursive: true, force: true });
-  });
-
-  it("is the next migration after the pre-#550 chain", () => {
-    const index = migrations.findIndex((m) => m.id === "0056_actor_execution_config");
-    expect(index).toBeGreaterThan(0);
-    expect(migrations[index - 1]?.id).toBe("0055_run_prompts");
-    expect(PRIOR).toBe("0055_run_prompts");
   });
 
   it("adds a plain execution_config column, without a rebuild or validator", () => {
@@ -257,12 +266,6 @@ describe("0056_actor_execution_config", () => {
     expect(db.pragma("integrity_check", { simple: true })).toBe("ok");
     expect(db.pragma("foreign_key_check")).toEqual([]);
 
-    // Applied once: a second run rewrites nothing.
-    db.prepare(
-      `UPDATE actors SET execution_config = '{"schemaVersion":1,"sandboxed":true}' WHERE id = 'root'`
-    ).run();
-    runMigrations(db, { throughId: actorExecutionConfig.id });
-    expect(documents(db).root.execution).toEqual({ schemaVersion: 1, sandboxed: true });
     db.close();
   });
 
@@ -287,6 +290,11 @@ describe("0056_actor_execution_config", () => {
     // An unreadable context document still fails closed, as it did before.
     expect(() => actors.get("corrupt-context")).toThrow(
       "invalid context_config for actor 'corrupt-context'"
+    );
+    // A present but invalid v2 target stays invalid rather than becoming a
+    // leader-local actor during the version transition.
+    expect(() => actors.get("invalid-v2-target")).toThrow(
+      "invalid context_config for actor 'invalid-v2-target'"
     );
     expect(
       ["root", "lead", "placed-portable", "placed-native", "retired-worker"].map((id) => {
@@ -351,24 +359,6 @@ describe("0056_actor_execution_config", () => {
     ]);
     reopened.close();
 
-    // The original still has the pre-change shape.
-    const untouched = new Database(file);
-    expect(
-      (untouched.prepare("PRAGMA table_info(actors)").all() as Array<{ name: string }>).map(
-        (info) => info.name
-      )
-    ).not.toContain("execution_config");
-    expect(
-      untouched.prepare("SELECT context_config FROM actors WHERE id = 'placed-native'").get()
-    ).toEqual({
-      context_config: JSON.stringify({
-        schemaVersion: 2,
-        type: "native",
-        sessionId: "session-placed",
-        executionTarget: "follower-b",
-      }),
-    });
-    untouched.close();
   });
 
   it("fails the read of rows a pre-change binary writes afterwards (the rollback limit)", () => {

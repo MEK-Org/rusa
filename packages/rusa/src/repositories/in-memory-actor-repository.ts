@@ -10,12 +10,6 @@ export class InMemoryActorRepository implements ActorRepository {
   private readonly records = new Map<string, ActorRecord>();
 
   upsert(record: ActorRecord): void {
-    // Mirrors the SQLite repository: every write states whether it is sandboxed (#550).
-    if (typeof record.sandboxed !== "boolean") {
-      throw new Error(
-        `InMemoryActorRepository: invalid sandboxed for actor '${record.id}': ${JSON.stringify(record.sandboxed)}`
-      );
-    }
     this.records.set(record.id, structuredClone(record));
   }
 
