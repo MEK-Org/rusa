@@ -287,7 +287,11 @@ async function run(): Promise<void> {
 
     try {
       if (eventQueue.hasPending && !eventQueue.isFlushing) void flush();
-      const commands = await post<FollowerCommand[]>("/poll", {});
+      // Each poll reports the parked head, or null, so follower status can tell a
+      // blocked queue from an idle one without the logs (#880).
+      const commands = await post<FollowerCommand[]>("/poll", {
+        parkedEvent: eventQueue.parkedHead ?? null,
+      });
       for (const command of commands) {
         if ("actorId" in command) {
           instance.dispatch(command);

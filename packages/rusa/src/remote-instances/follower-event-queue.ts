@@ -7,6 +7,7 @@ import {
   type EventTransferReply,
   FOLLOWER_EVENT_BATCH_MAX_EVENTS,
   FOLLOWER_HTTP_BODY_LIMIT_BYTES,
+  type FollowerParkedEvent,
 } from "./protocol.js";
 
 /**
@@ -141,6 +142,10 @@ export class FollowerEventQueue {
    * until the queue is cleared.
    */
   private acceptanceFailed: QueuedEvent | undefined;
+  /** The head as last parked; cleared when it is sent again or the queue is cleared. */
+  private parked: FollowerParkedEvent | undefined;
+
+  constructor(private readonly now: () => number = Date.now) {}
 
   enqueue(event: FollowerEvent): void {
     const json = JSON.stringify(event);
@@ -156,6 +161,11 @@ export class FollowerEventQueue {
     return this.pendingBatch !== undefined || this.events.length > 0;
   }
 
+  /** The parked head, content-free, for follower status (#880). */
+  get parkedHead(): FollowerParkedEvent | undefined {
+    return this.parked && { ...this.parked };
+  }
+
   /** False once `clear()` has fenced the delivery still in flight. */
   get isFlushing(): boolean {
     return this.inFlight?.epoch === this.epoch;
@@ -168,6 +178,7 @@ export class FollowerEventQueue {
     this.parkedKey = undefined;
     this.refused = undefined;
     this.acceptanceFailed = undefined;
+    this.parked = undefined;
     this.events.length = 0;
   }
 
@@ -238,6 +249,8 @@ export class FollowerEventQueue {
         }
         if (count > 0) this.pendingBatch = { batchId, events: this.events.slice(0, count) };
         else this.pendingTransfer = this.startTransfer(this.events[0] as QueuedEvent, transfer);
+        // Parking throws above, so reaching here means the head is being sent again.
+        this.parked = undefined;
       }
       if (this.pendingTransfer) {
         await this.sendFragment(this.pendingTransfer, envelope, transfer);
@@ -276,6 +289,15 @@ export class FollowerEventQueue {
     const key = `${event.eventId}:${reason}`;
     const repeated = this.parkedKey === key;
     this.parkedKey = key;
+    if (this.parked?.eventId !== event.eventId || this.parked.reason !== reason) {
+      this.parked = {
+        reason,
+        eventId: event.eventId,
+        eventType: event.eventType,
+        bytes: event.bytes,
+        since: new Date(this.now()).toISOString(),
+      };
+    }
     throw new FollowerEventParkedError(
       reason,
       event.eventId,

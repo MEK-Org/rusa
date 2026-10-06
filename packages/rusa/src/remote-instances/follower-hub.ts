@@ -17,6 +17,7 @@ import type { FollowerUpdateTriggerStore } from "./follower-update-trigger-store
 import { isFullCommitSha, isSafeFollowerBranch } from "./follower-update-validation.js";
 import type {
   ActorEvent,
+  FollowerParkedEvent,
   FollowerUpdateCommand,
   FollowerUpdateStatus,
   FollowerUpdateStatusEvent,
@@ -39,6 +40,8 @@ export interface FollowerInfo {
   commitSha?: string;
   protocolVersion?: number;
   updateStatus?: FollowerUpdateStatus;
+  /** The follower's parked queue head, `null` when none; absent if it has not reported (#880). */
+  parkedEvent?: FollowerParkedEvent | null;
 }
 
 export interface FollowerActorCommand {
@@ -74,6 +77,41 @@ function isFollowerEvent(event: unknown): event is FollowerEvent {
     !!candidate.message &&
     typeof candidate.message.type === "string"
   );
+}
+
+const PARKED_CODE = /^[a-z0-9_]{1,64}$/;
+const PARKED_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+/**
+ * Rebuilds a reported parked head from its known fields, so nothing else a
+ * follower sends reaches status. A malformed report reads as not reported.
+ */
+function parseParkedEvent(value: unknown): FollowerParkedEvent | null | undefined {
+  if (value === null) return null;
+  const candidate = value as Partial<Record<keyof FollowerParkedEvent, unknown>> | undefined;
+  if (typeof candidate !== "object") return undefined;
+  const { reason, eventId, eventType, bytes, since } = candidate;
+  const parkedAt = typeof since === "string" ? Date.parse(since) : Number.NaN;
+  if (
+    typeof reason !== "string" ||
+    !PARKED_CODE.test(reason) ||
+    typeof eventId !== "string" ||
+    !PARKED_ID.test(eventId) ||
+    typeof eventType !== "string" ||
+    !PARKED_ID.test(eventType) ||
+    !Number.isSafeInteger(bytes) ||
+    (bytes as number) < 0 ||
+    !Number.isFinite(parkedAt)
+  ) {
+    return undefined;
+  }
+  return {
+    reason,
+    eventId,
+    eventType,
+    bytes: bytes as number,
+    since: new Date(parkedAt).toISOString(),
+  };
 }
 
 async function readJson(req: IncomingMessage): Promise<unknown> {
@@ -222,6 +260,7 @@ export class FollowerHub {
       commitSha: f.commitSha,
       protocolVersion: f.protocolVersion,
       updateStatus: f.updateStatus,
+      parkedEvent: f.parkedEvent,
     }));
   }
   updateFollower(
@@ -606,6 +645,9 @@ export class FollowerHub {
       return;
     }
     if (path === "/poll") {
+      // Like contact age, each authenticated poll refreshes the report, even one
+      // refused below as a duplicate. A follower that omits it is left unreported.
+      if ("parkedEvent" in body) follower.parkedEvent = parseParkedEvent(body.parkedEvent);
       if (follower.poll) {
         reply(res, 409, { error: "Poll already pending" });
         return;

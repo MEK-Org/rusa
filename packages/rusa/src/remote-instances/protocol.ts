@@ -59,6 +59,23 @@ export type EventTransferReply =
   | { status: "busy"; reason: string }
   | { status: "refused"; reason: string; maxEventBytes?: number };
 
+/**
+ * The event a follower's queue holds parked at its head (#880): identities and
+ * sizes only, never content. The follower reports it, or `null` when nothing
+ * is parked, on each `/poll`; the leader lists the latest report in follower
+ * status. It is additive and does not change the protocol version: a leader
+ * built before it ignores the field, and a follower built before it omits it.
+ */
+export interface FollowerParkedEvent {
+  reason: string;
+  eventId: string;
+  eventType: string;
+  /** Byte length of the original serialized event. */
+  bytes: number;
+  /** ISO time the head parked for this reason; kept while it stays parked. */
+  since: string;
+}
+
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
 //
 // Compatibility rule (#719): the leader deploys first and must keep followers on the
