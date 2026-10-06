@@ -47,17 +47,14 @@ void main() {
   group('haltTooltipText', () {
     final now = DateTime(2026, 10, 4, 12);
 
-    test('global halt: every new run is skipped, indefinite', () {
+    test('global halt: scope only when indefinite', () {
       expect(
         haltTooltipText(const HaltStatusDto(scope: 'global'), now: now),
-        'Halt scope: all providers.\n'
-        'No new runs start.\n'
-        'Runs already in flight finish.\n'
-        'No expiry — holds until resumed.',
+        'Halt scope: all providers.',
       );
     });
 
-    test('provider halt names the providers and the pool fallback', () {
+    test('provider halt names the providers with expiry', () {
       final until = DateTime(2026, 10, 4, 17, 52);
       final text = haltTooltipText(
         HaltStatusDto(
@@ -67,19 +64,12 @@ void main() {
         ),
         now: now,
       );
-      expect(text, startsWith('Halt scope: codex, kimi.\n'));
-      expect(
-        text,
-        contains(
-          'Actors run on an unheld candidate in their pool instead; an actor '
-          'whose whole pool is held waits.\nRuns already in flight finish.',
-        ),
-      );
-      expect(text, endsWith('Expires today 5:52 PM.'));
-      expect(text, isNot(contains('No new runs start')));
+      expect(text, 'Halt scope: codex, kimi.\nExpires today 5:52 PM.');
+      expect(text, isNot(contains('Actors run')));
+      expect(text, isNot(contains('in flight')));
     });
 
-    test('model halt names the models on their provider', () {
+    test('model halt names the models on their provider without expiry line', () {
       final text = haltTooltipText(
         const HaltStatusDto(
           scope: 'models',
@@ -88,8 +78,9 @@ void main() {
         ),
         now: now,
       );
-      expect(text, startsWith('Halt scope: claude-opus-5-5 on claude.\n'));
-      expect(text, endsWith('No expiry — holds until resumed.'));
+      expect(text, 'Halt scope: claude-opus-5-5 on claude.');
+      expect(text, isNot(contains('No expiry')));
+      expect(text, isNot(contains('Actors run')));
     });
 
     test('an expiry on a later day carries the date', () {
@@ -100,7 +91,7 @@ void main() {
         ),
         now: now,
       );
-      expect(text, endsWith('Expires Tue Oct 6, 9:05 AM.'));
+      expect(text, 'Halt scope: all providers.\nExpires Tue Oct 6, 9:05 AM.');
     });
 
     test('a passed expiry is not worded as pending', () {
@@ -113,21 +104,18 @@ void main() {
       );
       expect(
         text,
-        startsWith(
-          'Reported halt scope: all providers.\n'
-          'While this reported halt is in force, no new runs start.\n'
-          'A reported halt does not interrupt runs already in flight.',
-        ),
+        'Reported halt scope: all providers.\n'
+        'Expiry passed today 11:30 AM.',
       );
-      expect(text, endsWith('Expiry passed today 11:30 AM.'));
+      expect(text, isNot(contains('in force')));
+      expect(text, isNot(contains('in flight')));
       expect(text, isNot(contains('Expires')));
     });
 
     test('an older server without the field claims no scope', () {
       expect(
         haltTooltipText(null, now: now),
-        'Mesh halted — scope not reported by this server.\n'
-        'Runs already in flight finish.',
+        'Mesh halted — scope not reported by this server.',
       );
     });
   });
@@ -222,11 +210,25 @@ void main() {
 
       const expectedSemantics =
           'Halted. Reported halt scope: claude-opus-5-5 on claude.\n'
-          'While this reported halt is in force, actors run on an unheld '
-          'candidate in their pool instead; an actor whose whole pool is held '
-          'waits.\n'
-          'A reported halt does not interrupt runs already in flight.\n'
           'Reported expiry: Sun Oct 4, 2026, 5:52 PM UTC.';
+      expect(find.bySemanticsLabel(expectedSemantics), findsOneWidget);
+      handle.dispose();
+      await tester.runAsync(store.dispose);
+    },
+  );
+
+  testWidgets(
+    'the chip announces its scope without expiry line when indefinite',
+    (tester) async {
+      final handle = tester.ensureSemantics();
+      final store = await _store(
+        tester,
+        const HaltStatusDto(scope: 'global'),
+      );
+      await tester.pumpWidget(_header(store));
+      await tester.pump();
+
+      const expectedSemantics = 'Halted. Reported halt scope: all providers.';
       expect(find.bySemanticsLabel(expectedSemantics), findsOneWidget);
       handle.dispose();
       await tester.runAsync(store.dispose);

@@ -1094,40 +1094,25 @@ Color _legacyColorForRemaining(double remainingPercent) {
   return MeshColors.statusActive;
 }
 
-const _scopedHaltEffect =
-    'Actors run on an unheld candidate in their pool instead; an actor whose '
-    'whole pool is held waits.';
-const _reportedScopedHaltEffect =
-    'While this reported halt is in force, actors run on an unheld candidate '
-    'in their pool instead; an actor whose whole pool is held waits.';
-
-/// Plain-text explanation of the active halt for the header chip's tooltip
-/// (#906): the authoritative scope, its scheduling effect, and the expiry.
+/// Plain-text summary of the active halt for the header chip's tooltip
+/// (#906): the authoritative scope and the expiry (if timed).
 /// The server retires an expired sentinel, but an idle mesh may not refresh
 /// the snapshot at `until`, so a past expiry is worded as passed rather than
-/// pending; a missing `until` means indefinite.
-///
-/// The effect lines mirror `HaltSwitch` and `ActorMesh.prepareRun`: a global
-/// halt skips every new run; a scoped halt only skips a run when every
-/// candidate in the actor's pool is held, so actors with an unheld candidate
-/// keep running there. In-flight runs always finish.
+/// pending; an indefinite halt displays no expiry line.
 String haltTooltipText(HaltStatusDto? halt, {DateTime? now}) {
   final untilString = halt?.until;
   final until = untilString == null
       ? null
       : DateTime.tryParse(untilString)?.toLocal();
   final local = (now ?? DateTime.now()).toLocal();
-  final String expiry;
+  final String? expiry;
   if (until == null) {
-    expiry = 'No expiry — holds until resumed.';
+    expiry = null;
   } else if (until.isAfter(local)) {
     expiry = 'Expires ${_haltExpiryFormat(until, local)}.';
   } else {
     expiry = 'Expiry passed ${_haltExpiryFormat(until, local)}.';
   }
-  // A stale snapshot can still carry a halt after its locally observed
-  // expiry. Describe its effects as reported and conditional in that case,
-  // rather than implying that they remain in force.
   return _haltDescription(
     halt,
     expiry,
@@ -1144,7 +1129,7 @@ String haltSemanticsText(HaltStatusDto? halt) {
       ? null
       : DateTime.tryParse(untilString)?.toUtc();
   final expiry = until == null
-      ? 'No expiry — holds until resumed.'
+      ? null
       : 'Reported expiry: '
             "${DateFormat('EEE MMM d, y, h:mm a').format(until)} UTC.";
   return _haltDescription(halt, expiry, reported: true);
@@ -1152,37 +1137,31 @@ String haltSemanticsText(HaltStatusDto? halt) {
 
 String _haltDescription(
   HaltStatusDto? halt,
-  String expiry, {
+  String? expiry, {
   bool reported = false,
 }) {
-  final inFlight = reported
-      ? 'A reported halt does not interrupt runs already in flight.'
-      : 'Runs already in flight finish.';
   if (halt == null) {
     // Older server without the structured halt field: the chip is right,
     // the scope is unknown.
-    return 'Mesh halted — scope not reported by this server.\n$inFlight';
+    return 'Mesh halted — scope not reported by this server.';
   }
   final providers = halt.providers.isEmpty
       ? 'any provider'
       : halt.providers.join(', ');
   final String scope;
-  final String effect;
   switch (halt.scope) {
     case 'models':
       scope = '${halt.models.join(', ')} on $providers';
-      effect = reported ? _reportedScopedHaltEffect : _scopedHaltEffect;
     case 'providers':
       scope = providers;
-      effect = reported ? _reportedScopedHaltEffect : _scopedHaltEffect;
     default:
       scope = 'all providers';
-      effect = reported
-          ? 'While this reported halt is in force, no new runs start.'
-          : 'No new runs start.';
   }
   final label = reported ? 'Reported halt scope' : 'Halt scope';
-  return '$label: $scope.\n$effect\n$inFlight\n$expiry';
+  if (expiry == null || expiry.isEmpty) {
+    return '$label: $scope.';
+  }
+  return '$label: $scope.\n$expiry';
 }
 
 /// Same-day expiries read as a time; later ones carry the weekday and date.
