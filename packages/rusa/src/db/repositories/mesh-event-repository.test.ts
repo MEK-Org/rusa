@@ -442,20 +442,24 @@ describe("MeshEventRepository", () => {
   });
 
   describe("latestActivityByActor", () => {
-    it("returns the latest ts per actor, ignoring null actor_ids", () => {
+    it("returns latest ts only for requested actor ids with one JSON input (#934)", () => {
+      expect(repo.latestActivityByActor([])).toEqual(new Map());
+
+      repo.record({ kind: "run_start", actorId: "first", ts: "2026-06-19T00:00:00.000Z" });
       repo.record({ kind: "run_start", actorId: "a", ts: "2026-06-20T00:00:00.000Z" });
       repo.record({ kind: "run_end", actorId: "a", success: true, ts: "2026-06-21T00:00:00.000Z" });
-      repo.record({ kind: "run_start", actorId: "b", ts: "2026-06-22T00:00:00.000Z" });
-      repo.record({ kind: "actor_retired", actorId: null, ts: "2026-06-23T00:00:00.000Z" });
+      repo.record({ kind: "run_start", actorId: "outside", ts: "2026-06-22T00:00:00.000Z" });
 
-      const latest = repo.latestActivityByActor();
-      expect(latest.get("a")).toBe("2026-06-21T00:00:00.000Z");
-      expect(latest.get("b")).toBe("2026-06-22T00:00:00.000Z");
-      expect(latest.has("c")).toBe(false);
-    });
-
-    it("returns an empty map when no events exist", () => {
-      expect(repo.latestActivityByActor()).toEqual(new Map());
+      const result = repo.latestActivityByActor([
+        "first",
+        ...Array.from({ length: 600 }, (_, i) => `absent-${i}`),
+        "a",
+        "unknown_actor",
+      ]);
+      expect(result.get("first")).toBe("2026-06-19T00:00:00.000Z");
+      expect(result.get("a")).toBe("2026-06-21T00:00:00.000Z");
+      expect(result.has("unknown_actor")).toBe(false);
+      expect(result.has("outside")).toBe(false);
     });
   });
 

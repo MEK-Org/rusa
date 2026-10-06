@@ -481,19 +481,29 @@ export class MeshEventRepository {
 
   /**
    * Returns the most recent event timestamp (`MAX(ts)`) for every actor that has
-   * at least one mesh event. One grouped query, not N+1; the `idx_mesh_events_actor_ts`
-   * covering index supplies the answer without touching the table rows.
+   * at least one mesh event.
+   *
+   * Retrieves last activity only for the requested actors using bounded indexed
+   * seeks on `idx_mesh_events_actor_ts` (#934).
    */
-  latestActivityByActor(): Map<string, string> {
+  latestActivityByActor(actorIds: Iterable<string>): Map<string, string> {
+    const ids = Array.from(actorIds);
+    if (ids.length === 0) {
+      return new Map();
+    }
+
     const rows = this.db
       .prepare(
-        `SELECT actor_id AS actorId, MAX(ts) AS ts
-         FROM mesh_events
-         WHERE actor_id IS NOT NULL
-         GROUP BY actor_id`
+        `WITH actor_ids(id) AS (SELECT value FROM json_each(?))
+         SELECT id, (SELECT MAX(ts) FROM mesh_events WHERE actor_id = actor_ids.id) AS ts
+         FROM actor_ids`
       )
-      .all() as { actorId: string; ts: string }[];
-    return new Map(rows.map((r) => [r.actorId, r.ts]));
+      .all(JSON.stringify(ids)) as { id: string; ts: string | null }[];
+    return new Map(
+      rows
+        .filter((row): row is { id: string; ts: string } => row.ts !== null)
+        .map((row) => [row.id, row.ts])
+    );
   }
 }
 
