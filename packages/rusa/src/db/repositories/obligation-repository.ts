@@ -114,6 +114,7 @@ interface TrackedObligationRow {
   checkpoint: string | null;
   checkpoint_at: string | null;
   checkpoint_by: string | null;
+  responsive: boolean | null;
 }
 
 /** One captured UPDATE, as the TEMP history-capture trigger records it. */
@@ -130,6 +131,7 @@ interface ObligationDeltaRow {
   before_checkpoint: string | null;
   before_checkpoint_at: string | null;
   before_checkpoint_by: string | null;
+  before_responsive: number | null;
   after_owner_id: string;
   after_parent_id: string | null;
   after_priority: number | null;
@@ -141,6 +143,7 @@ interface ObligationDeltaRow {
   after_checkpoint: string | null;
   after_checkpoint_at: string | null;
   after_checkpoint_by: string | null;
+  after_responsive: number | null;
 }
 
 export interface CreateObligationInput {
@@ -736,6 +739,7 @@ export class ObligationRepository {
         before_checkpoint TEXT,
         before_checkpoint_at TEXT,
         before_checkpoint_by TEXT,
+        before_responsive   INTEGER,
         after_owner_id      TEXT NOT NULL,
         after_parent_id     TEXT,
         after_priority      REAL,
@@ -746,7 +750,8 @@ export class ObligationRepository {
         after_snoozed_until TEXT,
         after_checkpoint TEXT,
         after_checkpoint_at TEXT,
-        after_checkpoint_by TEXT
+        after_checkpoint_by TEXT,
+        after_responsive    INTEGER
       );
 
       CREATE TEMP TRIGGER IF NOT EXISTS obligation_history_capture
@@ -762,19 +767,24 @@ export class ObligationRepository {
         OR old.checkpoint IS NOT new.checkpoint
         OR old.checkpoint_at IS NOT new.checkpoint_at
         OR old.checkpoint_by IS NOT new.checkpoint_by
+        OR old.responsive IS NOT new.responsive
       BEGIN
         INSERT INTO obligation_history_delta (
           obligation_id,
           before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
           before_terminal_note, before_resolution_ref, before_snoozed_until, before_checkpoint, before_checkpoint_at, before_checkpoint_by,
+          before_responsive,
           after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
-          after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint, after_checkpoint_at, after_checkpoint_by
+          after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint, after_checkpoint_at, after_checkpoint_by,
+          after_responsive
         ) VALUES (
           new.id,
           old.owner_id, old.parent_id, old.priority, old.status, old.external_ref,
           old.terminal_note, old.resolution_ref, old.snoozed_until, old.checkpoint, old.checkpoint_at, old.checkpoint_by,
+          old.responsive,
           new.owner_id, new.parent_id, new.priority, new.status, new.external_ref,
-          new.terminal_note, new.resolution_ref, new.snoozed_until, new.checkpoint, new.checkpoint_at, new.checkpoint_by
+          new.terminal_note, new.resolution_ref, new.snoozed_until, new.checkpoint, new.checkpoint_at, new.checkpoint_by,
+          new.responsive
         );
       END;
     `);
@@ -1107,6 +1117,25 @@ export class ObligationRepository {
       if (!obligation.responsive) {
         this.db
           .prepare("UPDATE obligations SET responsive = 1, updated_at = ? WHERE id = ?")
+          .run(this.stamp(), id);
+      }
+      return this.require(id);
+    });
+  }
+
+  /**
+   * Remove an explicit responsive mark from a live obligation.
+   */
+  clearResponsive(id: string, principal: EntityId): Obligation {
+    return this.mutate(principal, () => {
+      const obligation = this.require(id);
+      if (isTerminalObligationStatus(obligation.status)) {
+        throw new ObligationValidationError("terminal obligations cannot be modified");
+      }
+
+      if (obligation.responsive) {
+        this.db
+          .prepare("UPDATE obligations SET responsive = NULL, updated_at = ? WHERE id = ?")
           .run(this.stamp(), id);
       }
       return this.require(id);
@@ -1536,8 +1565,10 @@ export class ObligationRepository {
         `SELECT obligation_id,
                 before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
                 before_terminal_note, before_resolution_ref, before_snoozed_until, before_checkpoint, before_checkpoint_at, before_checkpoint_by,
+                before_responsive,
                 after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
-                after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint, after_checkpoint_at, after_checkpoint_by
+                after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint, after_checkpoint_at, after_checkpoint_by,
+                after_responsive
          FROM obligation_history_delta
          ORDER BY seq`
       )
@@ -1560,6 +1591,7 @@ export class ObligationRepository {
         checkpoint: delta.after_checkpoint,
         checkpoint_at: delta.after_checkpoint_at,
         checkpoint_by: delta.after_checkpoint_by,
+        responsive: delta.after_responsive === 1 ? true : null,
       };
       const existing = net.get(delta.obligation_id);
       if (existing) {
@@ -1580,6 +1612,7 @@ export class ObligationRepository {
           checkpoint: delta.before_checkpoint,
           checkpoint_at: delta.before_checkpoint_at,
           checkpoint_by: delta.before_checkpoint_by,
+          responsive: delta.before_responsive === 1 ? true : null,
         },
         after,
       });
@@ -1603,6 +1636,7 @@ export class ObligationRepository {
         b.checkpoint !== a.checkpoint ||
         b.checkpoint_at !== a.checkpoint_at ||
         b.checkpoint_by !== a.checkpoint_by;
+      const responsiveChanged = b.responsive !== a.responsive;
 
       if (
         !ownerChanged &&
@@ -1613,7 +1647,8 @@ export class ObligationRepository {
         !terminalNoteChanged &&
         !resolutionRefChanged &&
         !snoozeChanged &&
-        !checkpointChanged
+        !checkpointChanged &&
+        !responsiveChanged
       ) {
         continue;
       }
@@ -1660,6 +1695,11 @@ export class ObligationRepository {
         afterState.checkpoint = a.checkpoint;
       }
 
+      if (responsiveChanged) {
+        beforeState.responsive = b.responsive;
+        afterState.responsive = a.responsive;
+      }
+
       // Map the primary modified field to its semantic mutation kind.
       const kind: ObligationMutationKind = ownerChanged
         ? "reassign"
@@ -1673,7 +1713,9 @@ export class ObligationRepository {
                 ? "snooze"
                 : checkpointChanged && !externalRefChanged
                   ? "checkpoint"
-                  : "external_ref";
+                  : responsiveChanged && !externalRefChanged
+                    ? "responsive"
+                    : "external_ref";
 
       insert.run(
         id,

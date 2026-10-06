@@ -824,6 +824,28 @@ describe("ObligationRepository", () => {
         ]);
       });
 
+      it("clears explicit responsiveness with clearResponsive", () => {
+        repository.create({ title: "hotfix", id: "hotfix", ownerId: "actor-a" });
+        repository.markResponsive("hotfix", "system:mesh");
+        expect(repository.require("hotfix").responsive).toBe(true);
+
+        const cleared = repository.clearResponsive("hotfix", "system:mesh");
+        expect(cleared.responsive).toBeNull();
+        expect(repository.require("hotfix").responsive).toBeNull();
+      });
+
+      it("rejects marking or clearing responsiveness on a terminal obligation", () => {
+        repository.create({ title: "terminal", id: "terminal-task", ownerId: "actor-a" });
+        repository.setTerminalStatus("terminal-task", "done", null, null, "system:mesh");
+
+        expect(() => repository.markResponsive("terminal-task", "system:mesh")).toThrow(
+          "terminal obligations cannot be marked responsive"
+        );
+        expect(() => repository.clearResponsive("terminal-task", "system:mesh")).toThrow(
+          "terminal obligations cannot be modified"
+        );
+      });
+
       it("announces a direct scheduled-to-ready recurrence update behind an existing head", () => {
         repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
         repository.create({

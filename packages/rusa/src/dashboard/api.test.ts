@@ -3974,6 +3974,32 @@ describe("handleMeshApiRequest", () => {
         expect(page.historyNextBefore).not.toBeNull(); // creation remains in the tail
       });
 
+      it("returns responsive history entries through GET /api/mesh/obligations/:id (#903)", async () => {
+        obligations.create({ id: "hot-task", title: "Hot", ownerId: "actor-1" });
+        obligations.markResponsive("hot-task", "actor-1");
+        obligations.clearResponsive("hot-task", "actor-2");
+
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/hot-task");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+        const responsiveEntries = data.history.filter(
+          (h: { mutationKind: string }) => h.mutationKind === "responsive"
+        );
+        expect(responsiveEntries).toHaveLength(2);
+        expect(responsiveEntries[0]).toMatchObject({
+          mutationKind: "responsive",
+          actingPrincipal: "actor-2",
+          before: { responsive: true },
+          after: { responsive: null },
+        });
+        expect(responsiveEntries[1]).toMatchObject({
+          mutationKind: "responsive",
+          actingPrincipal: "actor-1",
+          before: { responsive: null },
+          after: { responsive: true },
+        });
+      });
+
       it("returns obligation with parent, children, and blockingChildren", async () => {
         obligations.create({
           title: "root-task",
