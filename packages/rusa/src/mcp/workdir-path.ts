@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { type FileHandle, open, realpath, stat } from "node:fs/promises";
+import { type FileHandle, open, realpath, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 function isContained(parent: string, child: string): boolean {
@@ -127,6 +128,89 @@ export async function writeNewFileInWorkdir(
     await handle.writeFile(data);
   } finally {
     await handle.close();
+  }
+}
+
+async function cancelStream(stream: unknown): Promise<void> {
+  if (
+    stream &&
+    typeof stream === "object" &&
+    "cancel" in stream &&
+    typeof (stream as { cancel: () => Promise<unknown> }).cancel === "function"
+  ) {
+    try {
+      await (stream as { cancel: () => Promise<unknown> }).cancel();
+    } catch (_) {}
+  } else if (
+    stream &&
+    typeof stream === "object" &&
+    "destroy" in stream &&
+    typeof (stream as { destroy: () => unknown }).destroy === "function"
+  ) {
+    try {
+      (stream as { destroy: () => unknown }).destroy();
+    } catch (_) {}
+  }
+}
+
+/**
+ * Stream data into a new file at a {@link resolveDownloadPath} target, computing
+ * sha256 and enforcing `maxBytes` on total written bytes without buffering the
+ * whole payload. If writing fails or byte limit is exceeded, partial output is
+ * unlinked.
+ */
+export async function streamNewFileInWorkdir(
+  workDir: string,
+  path: string,
+  stream:
+    | Iterable<Uint8Array | Buffer | string>
+    | AsyncIterable<Uint8Array | Buffer | string>
+    | ReadableStream<Uint8Array>,
+  maxBytes: number,
+  noun = "file"
+): Promise<{ bytes: number; sha256: string }> {
+  const handle = await openInWorkdir(
+    workDir,
+    path,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o666
+  );
+  const hash = createHash("sha256");
+  let bytesWritten = 0;
+  let cleanSuccess = false;
+  try {
+    const iterable =
+      Symbol.asyncIterator in stream
+        ? (stream as AsyncIterable<Uint8Array | Buffer | string>)
+        : Symbol.iterator in stream
+          ? (stream as Iterable<Uint8Array | Buffer | string>)
+          : (stream as unknown as { [Symbol.asyncIterator](): AsyncIterator<Uint8Array> });
+
+    for await (const chunk of iterable) {
+      const buf =
+        typeof chunk === "string"
+          ? Buffer.from(chunk)
+          : chunk instanceof Uint8Array
+            ? chunk
+            : Buffer.from(chunk);
+      bytesWritten += buf.byteLength;
+      if (bytesWritten > maxBytes) {
+        await cancelStream(stream);
+        throw new Error(`${noun} size limit exceeded: ${noun} is larger than ${maxBytes} bytes`);
+      }
+      hash.update(buf);
+      await handle.writeFile(buf);
+    }
+    cleanSuccess = true;
+    return { bytes: bytesWritten, sha256: hash.digest("hex") };
+  } catch (err) {
+    await cancelStream(stream);
+    throw err;
+  } finally {
+    await handle.close().catch(() => {});
+    if (!cleanSuccess) {
+      await unlink(path).catch(() => {});
+    }
   }
 }
 

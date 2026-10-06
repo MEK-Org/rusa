@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import {
   type ChatAttachment,
   type ChatClient,
@@ -147,7 +148,39 @@ export class FakeChatClient implements ChatClient {
     throw new Error(`attachment not found: ${attachmentName}`);
   }
 
-  async downloadAttachment(resourceName: string): Promise<Buffer> {
+  async downloadAttachmentStream(resourceName: string): Promise<{
+    resp: Response;
+    name: string;
+    contentType: string;
+  }> {
+    let name = basename(resourceName);
+    let contentType = "application/octet-stream";
+    if (resourceName.startsWith("spaces/")) {
+      const metadata = await this.getAttachment(resourceName);
+      if (metadata.source === "DRIVE_FILE") {
+        throw new Error(
+          `attachment ${resourceName} is a Drive file; access it using the Drive API instead of downloadAttachment`
+        );
+      }
+      if (metadata.contentName) name = metadata.contentName;
+      if (metadata.contentType) contentType = metadata.contentType;
+    }
+    const buf = await this.downloadAttachment(resourceName);
+    const body: BodyInit =
+      typeof (buf as { toString?: () => string })?.toString === "function" && !Buffer.isBuffer(buf)
+        ? (buf as { toString(): string }).toString()
+        : (buf as unknown as BodyInit);
+    const resp = new Response(body, {
+      status: 200,
+      headers: {
+        "content-length": String(buf.length),
+        "content-type": contentType,
+      },
+    });
+    return { resp, name, contentType };
+  }
+
+  async downloadAttachment(resourceName: string, maxBytes?: number): Promise<Buffer> {
     let targetRef: string;
     if (resourceName.startsWith("spaces/")) {
       const metadata = await this.getAttachment(resourceName);
@@ -188,10 +221,9 @@ export class FakeChatClient implements ChatClient {
     if (!data) {
       throw new Error(`attachment not found: ${resourceName}`);
     }
-    if (data.length > this.maxSizeBytes) {
-      throw new Error(
-        `attachment size limit exceeded: attachment is larger than ${this.maxSizeBytes} bytes`
-      );
+    const limit = maxBytes ?? this.maxSizeBytes;
+    if (data.length > limit) {
+      throw new Error(`attachment size limit exceeded: attachment is larger than ${limit} bytes`);
     }
     return data;
   }

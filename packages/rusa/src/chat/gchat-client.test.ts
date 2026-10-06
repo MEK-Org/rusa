@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GchatClient } from "./gchat-client.js";
+import { MAX_CHAT_ATTACHMENT_BYTES, MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES } from "./types.js";
 
 const dirs: string[] = [];
 
@@ -422,12 +423,61 @@ describe("GchatClient reads", () => {
     ).rejects.toThrow("attachment size limit exceeded");
   });
 
-  it("rejects downloadAttachment if streaming body exceeds maxSizeBytes", async () => {
+  it("accepts declared 1 GiB download Content-Length boundary without allocating it", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
+          status: 200,
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response("", {
+          status: 200,
+          headers: { "content-length": String(MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES) },
+        })
+      );
+
+    await expect(
+      new GchatClient(credentialsDir()).downloadAttachment("media/spaces/A/attachments/ATT1")
+    ).resolves.toEqual(Buffer.alloc(0));
+  });
+
+  it("rejects declared Content-Length one byte beyond the 1 GiB default and cancels stream", async () => {
+    let cancelled = false;
+    const stream = new ReadableStream({
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
+          status: 200,
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(stream, {
+          status: 200,
+          headers: { "content-length": String(MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES + 1) },
+        })
+      );
+
+    await expect(
+      new GchatClient(credentialsDir()).downloadAttachment("media/spaces/A/attachments/ATT1")
+    ).rejects.toThrow("attachment size limit exceeded");
+    expect(cancelled).toBe(true);
+  });
+
+  it("rejects downloadAttachment and cancels stream if streaming body exceeds maxSizeBytes", async () => {
+    let cancelled = false;
     const stream = new ReadableStream({
       start(controller) {
         controller.enqueue(new Uint8Array(50));
         controller.enqueue(new Uint8Array(60));
-        controller.close();
+      },
+      cancel() {
+        cancelled = true;
       },
     });
 
@@ -442,6 +492,7 @@ describe("GchatClient reads", () => {
     await expect(
       new GchatClient(credentialsDir(), 80).downloadAttachment("media/spaces/A/attachments/ATT1")
     ).rejects.toThrow("attachment size limit exceeded");
+    expect(cancelled).toBe(true);
   });
 
   it("rejects uploadAttachment if payload size exceeds maxSizeBytes", async () => {
@@ -452,6 +503,21 @@ describe("GchatClient reads", () => {
         "spaces/A",
         "doc.txt",
         largeBytes,
+        "text/plain"
+      )
+    ).rejects.toThrow("attachment size limit exceeded");
+  });
+
+  it("keeps the default upload ceiling at 50 MiB without allocating a large buffer", async () => {
+    const syntheticOversize = {
+      byteLength: MAX_CHAT_ATTACHMENT_BYTES + 1,
+    } as unknown as Uint8Array;
+
+    await expect(
+      new GchatClient(credentialsDir()).uploadAttachment(
+        "spaces/A",
+        "doc.txt",
+        syntheticOversize,
         "text/plain"
       )
     ).rejects.toThrow("attachment size limit exceeded");

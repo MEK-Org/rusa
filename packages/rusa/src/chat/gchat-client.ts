@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import { defaultGchatConfigDir, GchatOAuth } from "./gchat-oauth.js";
 import {
   type ChatAttachment,
@@ -14,6 +15,7 @@ import {
   type ListChatSpaceMembersOptions,
   type ListChatSpacesOptions,
   MAX_CHAT_ATTACHMENT_BYTES,
+  MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
   MESSAGE_ATTACHMENT_NAME_RE,
 } from "./types.js";
 
@@ -30,11 +32,18 @@ const EYES = "\u{1F440}"; // 👀
  */
 export class GchatClient implements ChatClient {
   private readonly oauth: GchatOAuth;
-  private readonly maxSizeBytes: number;
+  private readonly maxDownloadSizeBytes: number;
+  private readonly maxUploadSizeBytes: number;
 
-  constructor(configDir = defaultGchatConfigDir(), maxSizeBytes = MAX_CHAT_ATTACHMENT_BYTES) {
+  /**
+   * An explicit size continues to constrain both directions for callers that
+   * intentionally set a lower cap. Defaults distinguish the 1 GiB read limit
+   * from the unchanged 50 MiB send limit.
+   */
+  constructor(configDir = defaultGchatConfigDir(), maxSizeBytes?: number) {
     this.oauth = new GchatOAuth(configDir);
-    this.maxSizeBytes = maxSizeBytes;
+    this.maxDownloadSizeBytes = maxSizeBytes ?? MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES;
+    this.maxUploadSizeBytes = maxSizeBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
   }
 
   private token(): Promise<string> {
@@ -223,19 +232,22 @@ export class GchatClient implements ChatClient {
       } finally {
         reader.releaseLock();
       }
-      return Buffer.concat(chunks.map((c) => Buffer.from(c)));
+      return Buffer.concat(chunks);
     }
 
     if (
       body &&
       typeof (body as unknown as AsyncIterable<unknown>)[Symbol.asyncIterator] === "function"
     ) {
-      const chunks: Buffer[] = [];
+      const chunks: Uint8Array[] = [];
       let totalSize = 0;
       for await (const chunk of body as unknown as AsyncIterable<Uint8Array | string>) {
-        const buf = Buffer.from(chunk);
-        totalSize += buf.length;
+        const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+        totalSize += buf.byteLength;
         if (totalSize > maxBytes) {
+          try {
+            await resp.body?.cancel();
+          } catch (_) {}
           throw new Error(
             `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
           );
@@ -254,8 +266,14 @@ export class GchatClient implements ChatClient {
     return Buffer.from(arrayBuffer);
   }
 
-  async downloadAttachment(resourceName: string): Promise<Buffer> {
+  async downloadAttachmentStream(resourceName: string): Promise<{
+    resp: Response;
+    name: string;
+    contentType: string;
+  }> {
     let dataRef: string;
+    let name = basename(resourceName);
+    let contentType = "application/octet-stream";
     if (resourceName.startsWith("spaces/")) {
       const attachment = await this.getAttachment(resourceName);
       if (attachment.source === "DRIVE_FILE") {
@@ -263,6 +281,8 @@ export class GchatClient implements ChatClient {
           `attachment ${resourceName} is a Drive file; access it using the Drive API instead of downloadAttachment`
         );
       }
+      if (attachment.contentName) name = attachment.contentName;
+      if (attachment.contentType) contentType = attachment.contentType;
       const ref = attachment.attachmentDataRef?.resourceName;
       if (!ref) {
         throw new Error(`attachment ${resourceName} does not contain an attachmentDataRef`);
@@ -287,13 +307,24 @@ export class GchatClient implements ChatClient {
         `gchat download attachment ${resourceName} -> HTTP ${resp.status} ${(await resp.text()).slice(0, 300)}`
       );
     }
-    const contentLength = resp.headers.get("content-length");
-    if (contentLength && parseInt(contentLength, 10) > this.maxSizeBytes) {
-      throw new Error(
-        `attachment size limit exceeded: attachment is larger than ${this.maxSizeBytes} bytes`
-      );
+    const headerType = resp.headers.get("content-type");
+    if (headerType && contentType === "application/octet-stream") {
+      contentType = headerType;
     }
-    return this.readBodyWithLimit(resp, this.maxSizeBytes);
+    return { resp, name, contentType };
+  }
+
+  async downloadAttachment(resourceName: string, maxBytes?: number): Promise<Buffer> {
+    const limit = maxBytes ?? this.maxDownloadSizeBytes;
+    const { resp } = await this.downloadAttachmentStream(resourceName);
+    const contentLength = resp.headers.get("content-length");
+    if (contentLength && parseInt(contentLength, 10) > limit) {
+      try {
+        await resp.body?.cancel();
+      } catch (_) {}
+      throw new Error(`attachment size limit exceeded: attachment is larger than ${limit} bytes`);
+    }
+    return this.readBodyWithLimit(resp, limit);
   }
 
   async uploadAttachment(
@@ -303,9 +334,9 @@ export class GchatClient implements ChatClient {
     mimeType = "application/octet-stream"
   ): Promise<ChatUploadAttachmentResult> {
     const size = Buffer.isBuffer(content) ? content.length : content.byteLength;
-    if (size > this.maxSizeBytes) {
+    if (size > this.maxUploadSizeBytes) {
       throw new Error(
-        `attachment size limit exceeded: attachment is larger than ${this.maxSizeBytes} bytes`
+        `attachment size limit exceeded: attachment is larger than ${this.maxUploadSizeBytes} bytes`
       );
     }
     const token = await this.token();

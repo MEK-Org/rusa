@@ -1,9 +1,11 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -17,6 +19,7 @@ import {
   readBoundedRegularFile,
   resolveAttachmentPath,
   resolveDownloadPath,
+  streamNewFileInWorkdir,
   writeNewFileInWorkdir,
 } from "./workdir-path.js";
 
@@ -138,5 +141,47 @@ describe("workdir root acquisition", () => {
       "access denied"
     );
     expect(existsSync(join(outside, "root", "new.txt"))).toBe(false);
+  });
+});
+
+describe("streamNewFileInWorkdir", () => {
+  it("streams chunks into a new file, computing sha256 and byte length", async () => {
+    const dir = workdir();
+    const destination = await resolveDownloadPath(dir, "streamed.bin");
+    const chunks = [Buffer.from("hello "), Buffer.from("world")];
+    const result = await streamNewFileInWorkdir(dir, destination, chunks, 1024);
+    expect(result.bytes).toBe(11);
+    expect(result.sha256).toBe(createHash("sha256").update("hello world").digest("hex"));
+    expect(readFileSync(destination, "utf-8")).toBe("hello world");
+  });
+
+  it("rejects and unlinks partial output when streamed bytes exceed maxBytes", async () => {
+    const dir = workdir();
+    const destination = await resolveDownloadPath(dir, "oversized.bin");
+    const chunks = [Buffer.from("chunk1-"), Buffer.from("chunk2-overflow")];
+    await expect(streamNewFileInWorkdir(dir, destination, chunks, 10)).rejects.toThrow(
+      "file size limit exceeded"
+    );
+    expect(existsSync(destination)).toBe(false);
+  });
+
+  it("cancels readable stream when maxBytes is exceeded", async () => {
+    const dir = workdir();
+    const destination = await resolveDownloadPath(dir, "cancelled.bin");
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(20));
+        controller.enqueue(new Uint8Array(20));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    await expect(streamNewFileInWorkdir(dir, destination, stream, 25)).rejects.toThrow(
+      "file size limit exceeded"
+    );
+    expect(cancelled).toBe(true);
+    expect(existsSync(destination)).toBe(false);
   });
 });

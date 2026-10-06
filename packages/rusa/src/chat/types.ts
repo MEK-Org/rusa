@@ -9,7 +9,14 @@
  * everything-is-MCP direction).
  */
 
-export const MAX_CHAT_ATTACHMENT_BYTES = 50 * 1024 * 1024; // 50MB default
+/** Default ceiling for attachments sent to Chat. */
+export const MAX_CHAT_ATTACHMENT_BYTES = 50 * 1024 * 1024; // 50 MiB
+
+/** Default ceiling for attachments fetched from Chat. */
+export const MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES = 1024 * 1024 * 1024; // 1 GiB
+
+/** Default ceiling for inline base64 attachment responses. */
+export const MAX_CHAT_ATTACHMENT_INLINE_BYTES = 50 * 1024 * 1024; // 50 MiB
 
 /**
  * Exact grammar of a message-attachment resource name. Capture group 1 is the
@@ -197,7 +204,13 @@ export interface ChatClient {
   /** Read attachment metadata by its full Google Chat resource name. */
   getAttachment(attachmentName: string): Promise<ChatAttachment>;
   /** Download an attachment's binary content by its resource name (or attachmentDataRef resourceName). */
-  downloadAttachment(resourceName: string): Promise<Buffer>;
+  downloadAttachment(resourceName: string, maxBytes?: number): Promise<Buffer>;
+  /** Stream an attachment's response directly without buffering the payload. */
+  downloadAttachmentStream?(resourceName: string): Promise<{
+    resp: Response;
+    name: string;
+    contentType: string;
+  }>;
   /** Upload a file as an attachment to a space, returning its attachmentDataRef for use in send(). */
   uploadAttachment(
     spaceName: string,

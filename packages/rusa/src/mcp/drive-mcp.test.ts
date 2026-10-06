@@ -1,8 +1,16 @@
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it, vi } from "vitest";
-import type { DriveClient } from "../drive/drive-client.js";
+import {
+  type DriveClient,
+  MAX_DRIVE_FILE_DOWNLOAD_BYTES,
+  MAX_DRIVE_FILE_INLINE_BYTES,
+} from "../drive/drive-client.js";
 import { createDriveReadMcpServer, type DriveReadObservation } from "./drive-mcp.js";
 
 function fakeDriveClient() {
@@ -63,11 +71,17 @@ async function connect(
   allowedFolders: string[],
   options: {
     onRead?: (actorId: string, observation: DriveReadObservation) => void;
+    workDir?: string;
+    fileToolsAvailable?: boolean | (() => boolean);
+    maxDownloadBytes?: number;
   } = {}
 ) {
   const server = createDriveReadMcpServer("actor-1", driveClient, {
     allowedFolders,
     onRead: options.onRead,
+    workDir: options.workDir,
+    fileToolsAvailable: options.fileToolsAvailable,
+    maxDownloadBytes: options.maxDownloadBytes,
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -236,6 +250,191 @@ describe("drive-read MCP server", () => {
 
       expect(result.isError).toBeTruthy();
       expect(textOf(result)).toContain("file size limit exceeded");
+    });
+
+    it("rejects download exceeding 50 MiB inline and directs to destinationPath", async () => {
+      const fake = fakeDriveClient();
+      fake.client.downloadFile = async () => {
+        throw new Error(
+          `file size limit exceeded: file is larger than ${MAX_DRIVE_FILE_INLINE_BYTES} bytes`
+        );
+      };
+      const client = await connect(fake.client, []);
+
+      const result = (await client.callTool({
+        name: "download_file",
+        arguments: { fileId: "file-1" },
+      })) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("file size limit exceeded");
+      expect(textOf(result)).toContain("specify destinationPath to download up to 1 GiB");
+    });
+
+    it("streams downloads up to 1 GiB to destinationPath without allocating full buffer", async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "drive-mcp-download-"));
+      const fake = fakeDriveClient();
+      fake.client.getFileMetadata = async (fileId) => ({
+        id: fileId,
+        name: "big.bin",
+        mimeType: "application/octet-stream",
+        size: String(MAX_DRIVE_FILE_DOWNLOAD_BYTES),
+      });
+      fake.client.downloadFileStream = async () =>
+        new Response("", {
+          status: 200,
+          headers: {
+            "content-length": String(MAX_DRIVE_FILE_DOWNLOAD_BYTES),
+            "content-type": "application/octet-stream",
+          },
+        });
+
+      const client = await connect(fake.client, [], {
+        workDir,
+        fileToolsAvailable: true,
+      });
+
+      const result = (await client.callTool({
+        name: "download_file",
+        arguments: { fileId: "file-1", destinationPath: "out.bin" },
+      })) as CallToolResult;
+
+      expect(result.isError).toBeFalsy();
+      const data = JSON.parse(textOf(result));
+      expect(data.path).toBe(join(workDir, "out.bin"));
+      expect(data.name).toBe("big.bin");
+      expect(data.bytes).toBe(0);
+      expect(existsSync(join(workDir, "out.bin"))).toBe(true);
+      rmSync(workDir, { recursive: true, force: true });
+    });
+
+    it("rejects download exceeding 1 GiB before writing when metadata declares over 1 GiB", async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "drive-mcp-download-"));
+      const fake = fakeDriveClient();
+      fake.client.getFileMetadata = async (fileId) => ({
+        id: fileId,
+        name: "toolarge.bin",
+        mimeType: "application/octet-stream",
+        size: String(MAX_DRIVE_FILE_DOWNLOAD_BYTES + 1),
+      });
+
+      const client = await connect(fake.client, [], {
+        workDir,
+        fileToolsAvailable: true,
+      });
+
+      const result = (await client.callTool({
+        name: "download_file",
+        arguments: { fileId: "file-1", destinationPath: "out.bin" },
+      })) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("file size limit exceeded");
+      expect(existsSync(join(workDir, "out.bin"))).toBe(false);
+      rmSync(workDir, { recursive: true, force: true });
+    });
+
+    it("streams synthetic payload > 50 MiB through destinationPath and computes hash without full buffering", async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "drive-mcp-download-"));
+      const fake = fakeDriveClient();
+      const chunkSize = 1024 * 1024; // 1 MiB
+      const chunkCount = 55; // 55 MiB (> 50 MiB inline limit)
+      const singleChunk = Buffer.alloc(chunkSize, "d");
+      const hash = createHash("sha256");
+      for (let i = 0; i < chunkCount; i++) {
+        hash.update(singleChunk);
+      }
+      const expectedSha256 = hash.digest("hex");
+
+      fake.client.getFileMetadata = async (fileId) => ({
+        id: fileId,
+        name: "synthetic.bin",
+        mimeType: "application/octet-stream",
+        size: String(chunkSize * chunkCount),
+      });
+
+      fake.client.downloadFileStream = async () => {
+        async function* generate() {
+          for (let i = 0; i < chunkCount; i++) {
+            yield singleChunk;
+          }
+        }
+        const stream = new ReadableStream({
+          async start(controller) {
+            for await (const chunk of generate()) {
+              controller.enqueue(chunk);
+            }
+            controller.close();
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            "content-length": String(chunkSize * chunkCount),
+            "content-type": "application/octet-stream",
+          },
+        });
+      };
+
+      const client = await connect(fake.client, [], {
+        workDir,
+        fileToolsAvailable: true,
+      });
+
+      const result = (await client.callTool({
+        name: "download_file",
+        arguments: { fileId: "file-1", destinationPath: "downloaded.bin" },
+      })) as CallToolResult;
+
+      expect(result.isError).toBeFalsy();
+      const data = JSON.parse(textOf(result));
+      expect(data.path).toBe(join(workDir, "downloaded.bin"));
+      expect(data.bytes).toBe(chunkSize * chunkCount);
+      expect(data.sha256).toBe(expectedSha256);
+      expect(data.name).toBe("synthetic.bin");
+      expect(data.contentType).toBe("application/octet-stream");
+
+      const stat = statSync(join(workDir, "downloaded.bin"));
+      expect(stat.size).toBe(chunkSize * chunkCount);
+      rmSync(workDir, { recursive: true, force: true });
+    });
+
+    it("rejects destinationPath escaping workdir", async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "drive-mcp-download-"));
+      const fake = fakeDriveClient();
+      const client = await connect(fake.client, [], {
+        workDir,
+        fileToolsAvailable: true,
+      });
+
+      const result = (await client.callTool({
+        name: "download_file",
+        arguments: { fileId: "file-1", destinationPath: "../escape.bin" },
+      })) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("escapes the actor workdir");
+      rmSync(workDir, { recursive: true, force: true });
+    });
+
+    it("rejects destinationPath for follower-hosted actors", async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "drive-mcp-download-"));
+      const fake = fakeDriveClient();
+      const client = await connect(fake.client, [], {
+        workDir,
+        fileToolsAvailable: false,
+      });
+
+      const result = (await client.callTool({
+        name: "download_file",
+        arguments: { fileId: "file-1", destinationPath: "out.bin" },
+      })) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain(
+        "Drive file tools are unavailable for follower-hosted actors"
+      );
+      rmSync(workDir, { recursive: true, force: true });
     });
   });
 });
