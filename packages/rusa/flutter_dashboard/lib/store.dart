@@ -714,8 +714,21 @@ class DashboardStore {
       _activityReferences.addAll(fetched);
       emit();
     } catch (_) {
-      // A card keeps its existing preview or loading placeholder until the
-      // next refresh asks again; the feed itself has already painted.
+      // Keep an already-filled preview, but settle a new card rather than
+      // leaving its placeholder pending until a later feed refresh. That
+      // refresh still asks this key again and can replace the fallback.
+      _activityReferences.addAll({
+        for (final key in keys)
+          if (!_activityReferences.containsKey(key))
+            key: ReferenceDto(
+              ref: key,
+              scheme: key.split(':').first,
+              title: key,
+              unavailable: 'could not load context',
+              cacheState: 'unavailable',
+            ),
+      });
+      emit();
     }
   }
 

@@ -171,6 +171,28 @@ void main() {
     await tester.runAsync(store.dispose);
   });
 
+  testWidgets(
+    'a transport failure also reaches the bounded unavailable fallback',
+    (tester) async {
+      serve((_) => _pending());
+      api.referencesError = StateError('offline');
+      await mount(tester);
+      await open(tester, 'Cites a chat');
+
+      for (final delay in pendingReferenceRetryDelays) {
+        await tester.pump(delay);
+        await tester.pump();
+      }
+      await tester.pump(_pastCeiling);
+      await tester.pump();
+
+      expect(asksFor(_ref), 1 + pendingReferenceRetryDelays.length);
+      expect(find.text('could not load context'), findsOneWidget);
+      expect(find.text('loading context'), findsNothing);
+      await tester.runAsync(store.dispose);
+    },
+  );
+
   testWidgets('a citation that turns pending after another gave up gets its '
       'own retries', (tester) async {
     const refB = 'github:MEK-Org/rusa/issues/2';

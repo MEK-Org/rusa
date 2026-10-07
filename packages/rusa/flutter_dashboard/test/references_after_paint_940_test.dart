@@ -68,6 +68,41 @@ void main() {
       expect(await api.fetchReferences(const []), isEmpty);
       expect(requested, hasLength(2));
     });
+
+    test(
+      'serializes batches so a large fill-in uses one server budget at a time',
+      () async {
+        final requested = <List<String>>[];
+        final first = Completer<void>();
+        final client = MockClient((req) async {
+          final body = jsonDecode(req.body) as Map<String, dynamic>;
+          final refs = (body['refs'] as List<dynamic>).cast<String>();
+          requested.add(refs);
+          if (requested.length == 1) await first.future;
+          return http.Response(
+            jsonEncode({
+              'references': {
+                for (final ref in refs) ref: {'ref': ref, 'scheme': 'github'},
+              },
+            }),
+            200,
+          );
+        });
+        final api = DashboardApi(
+          client: client,
+          base: Uri.parse('http://localhost:3000'),
+        );
+        final refs = [for (var i = 1; i <= 21; i++) 'github:o/r/issues/$i'];
+
+        final resolved = api.fetchReferences(refs);
+        await Future<void>.delayed(Duration.zero);
+        expect(requested, hasLength(1));
+
+        first.complete();
+        await resolved;
+        expect(requested.map((batch) => batch.length), [20, 1]);
+      },
+    );
   });
 
   testWidgets(
@@ -273,6 +308,31 @@ void main() {
     expect(items.map((i) => i.id), ['inbox_2']);
     await store.dispose();
   });
+
+  test(
+    'Recent Activity settles a reference request failure as unavailable',
+    () async {
+      final api = FakeApi()
+        ..recentActivityResult = const [
+          RecentActivityItem(
+            id: 'inbox_1',
+            kind: 'handled_inbox',
+            time: '2026-09-23T14:21:37.000Z',
+            actorId: 'actor-1',
+            referenceKey: _cited,
+          ),
+        ]
+        ..referencesError = StateError('offline');
+      final store = DashboardStore(api: api, stream: FakeStream());
+
+      await store.refreshRecentActivity();
+
+      final item = store.recentActivity.value.single;
+      expect(item.reference?.cacheState, 'unavailable');
+      expect(item.reference?.unavailable, 'could not load context');
+      await store.dispose();
+    },
+  );
 
   test('DashboardApi.fetchReferences posts a JSON ref batch', () async {
     http.Request? capturedRequest;

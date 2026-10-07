@@ -4603,6 +4603,7 @@ describe("handleMeshApiRequest", () => {
           { refs: [...refs, "github:o/r/issues/21"] },
           { refs: [`github:o/r/issues/${"9".repeat(600)}`] },
           { refs: [] },
+          { refs: [refs[0], 42] },
         ]) {
           const { res } = await call(counted, "POST", "/api/mesh/references", JSON.stringify(body));
           expect(res.statusCode).toBe(400);
@@ -4634,11 +4635,19 @@ describe("handleMeshApiRequest", () => {
         expect(Object.keys(res)).toHaveLength(20);
         expect(get).toHaveBeenCalledTimes(20);
 
-        // This route validates a post-buffer request-body character limit; it
+        // This route validates a post-buffer UTF-8 byte limit; it
         // deliberately makes no transport-memory claim shared `readBody` does
         // not provide.
         const hugePost = await call(counted, "POST", "/api/mesh/references", "x".repeat(70_000));
         expect(hugePost.res.statusCode).toBe(413);
+        const utf8HugePost = await call(
+          counted,
+          "POST",
+          "/api/mesh/references",
+          "\ud83d\ude00".repeat(20_000)
+        );
+        expect("\ud83d\ude00".repeat(20_000).length).toBeLessThan(64 * 1024);
+        expect(utf8HugePost.res.statusCode).toBe(413);
       });
 
       it("isolates sync resolution and projection exceptions to the failing reference", async () => {

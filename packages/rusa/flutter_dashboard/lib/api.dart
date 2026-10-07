@@ -549,37 +549,32 @@ class DashboardApi {
   ) async {
     final distinct = refs.toSet().toList();
     if (distinct.isEmpty) return const {};
-    final pages = await Future.wait([
-      for (var start = 0; start < distinct.length; start += referenceBatchLimit)
-        (() async {
-          final uri = _u('/api/mesh/references');
-          final chunk = distinct.sublist(
-            start,
-            (start + referenceBatchLimit).clamp(0, distinct.length),
-          );
-          final res = await _client.post(
-            uri,
-            headers: {
-              'Accept': 'application/json',
-              'Content-Type': 'application/json',
-            },
-            body: jsonEncode({'refs': chunk}),
-          );
-          if (res.statusCode != 200) {
-            throw DashboardApiException(uri, res.statusCode, res.body);
-          }
-          final json = jsonDecode(res.body) as Map<String, dynamic>;
-          final rawRefs =
-              json['references'] as Map<String, dynamic>? ?? const {};
-          return rawRefs.map(
-            (k, v) =>
-                MapEntry(k, ReferenceDto.fromJson(v as Map<String, dynamic>)),
-          );
-        })(),
-    ]);
     final merged = <String, ReferenceDto>{};
-    for (final page in pages) {
-      merged.addAll(page);
+    for (var start = 0; start < distinct.length; start += referenceBatchLimit) {
+      final uri = _u('/api/mesh/references');
+      final chunk = distinct.sublist(
+        start,
+        (start + referenceBatchLimit).clamp(0, distinct.length),
+      );
+      final res = await _client.post(
+        uri,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({'refs': chunk}),
+      );
+      if (res.statusCode != 200) {
+        throw DashboardApiException(uri, res.statusCode, res.body);
+      }
+      final json = jsonDecode(res.body) as Map<String, dynamic>;
+      final rawRefs = json['references'] as Map<String, dynamic>? ?? const {};
+      merged.addAll(
+        rawRefs.map(
+          (k, v) =>
+              MapEntry(k, ReferenceDto.fromJson(v as Map<String, dynamic>)),
+        ),
+      );
     }
     return merged;
   }

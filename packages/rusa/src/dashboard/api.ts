@@ -1853,7 +1853,7 @@ export async function handleMeshApiRequest(
         return true;
       }
       const bodyStr = await readBody(req);
-      if (bodyStr.length > 64 * 1024) {
+      if (Buffer.byteLength(bodyStr, "utf8") > 64 * 1024) {
         sendJson(res, 413, { error: "request body too large" });
         return true;
       }
@@ -1872,11 +1872,12 @@ export async function handleMeshApiRequest(
         sendJson(res, 400, { error: "Missing or invalid refs array" });
         return true;
       }
-      const refs = [
-        ...new Set(
-          (parsed as { refs: unknown[] }).refs.filter((r): r is string => typeof r === "string")
-        ),
-      ];
+      const rawRefs = (parsed as { refs: unknown[] }).refs;
+      if (!rawRefs.every((ref): ref is string => typeof ref === "string")) {
+        sendJson(res, 400, { error: "refs must contain only strings" });
+        return true;
+      }
+      const refs = [...new Set(rawRefs)];
       return resolveReferenceBatch(res, refs, deps, viewerScope());
     }
   }
