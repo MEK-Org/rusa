@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { dropActorExperiments } from "./0060_drop_actor_experiments.js";
+import { Repositories } from "../repositories/index.js";
 import { runMigrations } from "./runner.js";
 
 function tableExists(db: Database.Database, tableName: string): boolean {
@@ -11,67 +11,68 @@ function tableExists(db: Database.Database, tableName: string): boolean {
 }
 
 describe("0060_drop_actor_experiments", () => {
-  it("drops actor_experiments table and deletes experiment-admin capability grants", () => {
+  it("upgrades the populated 0059 schema, revokes live grants, and preserves history", () => {
     const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    runMigrations(db, { throughId: "0059_obligation_completion_matchers" });
+    const repositories = new Repositories(db);
     db.exec(`
-      CREATE TABLE actors (
-        id TEXT PRIMARY KEY,
-        charter TEXT NOT NULL,
-        status TEXT NOT NULL
-      );
-      CREATE TABLE actor_experiments (
-        actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
-        experiment TEXT NOT NULL,
-        enrolled_by TEXT NOT NULL,
-        enrolled_at TEXT NOT NULL,
-        PRIMARY KEY (actor_id, experiment)
-      );
-      CREATE TABLE capability_grants (
-        actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
-        capability TEXT NOT NULL,
-        granted_by TEXT NOT NULL,
-        granted_at TEXT NOT NULL,
-        revoked_at TEXT,
-        PRIMARY KEY (actor_id, capability)
-      );
-
-      INSERT INTO actors (id, charter, status) VALUES ('actor-1', 'test actor', 'active');
+      INSERT INTO actors (id, charter, parent_id, created_at)
+      VALUES
+        ('root', 'test root', NULL, '2026-10-06T00:00:00.000Z'),
+        ('actor-1', 'test actor', 'root', '2026-10-06T00:00:00.000Z'),
+        ('actor-2', 'test actor', 'root', '2026-10-06T00:00:00.000Z');
       INSERT INTO actor_experiments (actor_id, experiment, enrolled_by, enrolled_at)
       VALUES ('actor-1', 'fixture_rollout', 'root', '2026-10-06T00:00:00.000Z');
 
-      INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at)
-      VALUES ('actor-1', 'experiment-admin', 'system:bootstrap', '2026-10-06T00:00:00.000Z');
-      INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at)
-      VALUES ('actor-1', 'model-admin', 'system:bootstrap', '2026-10-06T00:00:00.000Z');
+      INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
+      VALUES ('actor-1', 'experiment-admin', 'system:bootstrap', '2026-10-06T00:00:00.000Z', NULL);
+      INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
+      VALUES ('actor-2', 'experiment-admin', 'system:bootstrap', '2026-10-06T00:00:00.000Z', '2026-10-06T01:00:00.000Z');
+      INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
+      VALUES ('actor-1', 'model-admin', 'system:bootstrap', '2026-10-06T00:00:00.000Z', NULL);
     `);
+    repositories.meshEvents.record({
+      kind: "experiment_enrolled",
+      actorId: "actor-1",
+      detail: "fixture_rollout",
+    });
+    repositories.meshEvents.record({
+      kind: "experiment_unenrolled",
+      actorId: "actor-1",
+      detail: "fixture_rollout",
+    });
 
     expect(tableExists(db, "actor_experiments")).toBe(true);
-    expect(
-      db.prepare("SELECT capability FROM capability_grants WHERE actor_id = 'actor-1'").all()
-    ).toEqual([{ capability: "experiment-admin" }, { capability: "model-admin" }]);
-
-    dropActorExperiments.up(db);
-
-    expect(tableExists(db, "actor_experiments")).toBe(false);
-    expect(
-      db.prepare("SELECT capability FROM capability_grants WHERE actor_id = 'actor-1'").all()
-    ).toEqual([{ capability: "model-admin" }]);
-  });
-
-  it("is safe when actor_experiments does not exist", () => {
-    const db = new Database(":memory:");
-    expect(tableExists(db, "actor_experiments")).toBe(false);
-    expect(() => dropActorExperiments.up(db)).not.toThrow();
-    expect(tableExists(db, "actor_experiments")).toBe(false);
-  });
-
-  it("runs cleanly in the full migration chain", () => {
-    const db = new Database(":memory:");
     runMigrations(db);
-    const applied = (db.prepare("SELECT id FROM _migrations").all() as Array<{ id: string }>).map(
-      (m) => m.id
-    );
-    expect(applied).toContain("0060_drop_actor_experiments");
+
     expect(tableExists(db, "actor_experiments")).toBe(false);
+    expect(repositories.capabilityGrants.list()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actorId: "actor-1",
+          capability: "experiment-admin",
+          revokedAt: expect.any(String),
+        }),
+        expect.objectContaining({
+          actorId: "actor-2",
+          capability: "experiment-admin",
+          revokedAt: "2026-10-06T01:00:00.000Z",
+        }),
+        expect.objectContaining({
+          actorId: "actor-1",
+          capability: "model-admin",
+        }),
+      ])
+    );
+    expect(repositories.capabilityGrants.activeFor("actor-1")).toEqual(["model-admin"]);
+    expect(
+      repositories.meshEvents
+        .listByKinds(["experiment_enrolled", "experiment_unenrolled"], { bodyKinds: [] })
+        .map((event) => event.kind)
+    ).toEqual(["experiment_enrolled", "experiment_unenrolled"]);
+    expect(
+      db.prepare("SELECT id FROM _migrations WHERE id = '0060_drop_actor_experiments'").get()
+    ).toBeDefined();
   });
 });

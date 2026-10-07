@@ -150,15 +150,9 @@ export type MeshEventKind =
   // `detail` = the capability name.
   | "capability_granted"
   | "capability_revoked"
-  // Experiment enrollment (#394): the root enrolled an actor in a hard-coded
-  // experiment, or removed that enrollment. `actorId` = the ENROLLED actor (not
-  // the root), so an actor's timeline shows the rollouts it was moved into and
-  // out of; `detail` = the experiment name as stored, so the (kind, detail)
-  // index answers "who is in this experiment, and since when?" — an unenroll
-  // may name an experiment since deleted from the registry (stale-row cleanup),
-  // and no consumer validates `detail` against it; `payload` =
-  // { enrolledBy } / { unenrolledBy }. Emitted only on a real change: a repeat
-  // of an enrollment already in force records nothing.
+  // Historical experiment enrollment (#394). These names remain solely so
+  // persisted rows keep decoding after the experiment seam's removal; no
+  // current producer emits them.
   | "experiment_enrolled"
   | "experiment_unenrolled"
   // Mechanical nightly trigger (ISSUE_NUM, phase 1c): a cron job hit the wake endpoint
