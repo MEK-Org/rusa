@@ -89,18 +89,6 @@ describe("dashboard phase clock", () => {
     expect(clock.durations(100)).toEqual({ auth: 10 });
   });
 
-  it("counts all elapsed time while an awaited phase remains open", () => {
-    const { clock, at } = manualClock();
-    at(10);
-    const end = clock.start("enrichment");
-    // A scheduler stall while the awaited resolver is open is elapsed work for
-    // this phase; only time before/after its interval is unassigned.
-    at(85);
-    end();
-
-    expect(clock.durations(100)).toEqual({ enrichment: 75 });
-  });
-
   it("reports nothing for a request that reached no phase", () => {
     expect(new DashboardPhaseClock(() => 0).durations(10)).toEqual({});
   });

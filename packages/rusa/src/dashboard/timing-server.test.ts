@@ -147,5 +147,7 @@ describe("dashboard timing server wrapper", () => {
     // The body write after the header is outside route.
     expect(Object.keys(record.phases)).toEqual(["route"]);
     expect(record.phases.route).toBeGreaterThanOrEqual(25);
+    // Route stops at writeHead; the post-header sleep is outside it.
+    expect(record.durationMs - record.phases.route).toBeGreaterThanOrEqual(55);
   });
 });
