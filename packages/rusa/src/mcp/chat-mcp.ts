@@ -9,7 +9,6 @@ import {
   type ChatSpace,
   MAX_CHAT_ATTACHMENT_BYTES,
   MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
-  MAX_CHAT_ATTACHMENT_INLINE_BYTES,
   MEDIA_TOKEN_RE,
   MESSAGE_ATTACHMENT_NAME_RE,
 } from "../chat/types.js";
@@ -24,7 +23,6 @@ import {
   resolveAttachmentPath,
   resolveDownloadPath,
   streamNewFileInWorkdir,
-  withFileModeHint,
 } from "./workdir-path.js";
 
 export const CHAT_WRITE_MCP_NAME = "chat-write";
@@ -37,8 +35,8 @@ export function inferChatMimeType(filename: string): string {
 export interface ChatReadMcpOptions {
   allowedSpaces?: string[];
   /**
-   * Optional policy ceiling. It can lower each mode's absolute ceiling but
-   * never raise the 50 MiB inline or 1 GiB file-mode maximum.
+   * Optional policy ceiling. It can lower, but never raise, the 1 GiB
+   * downloaded-attachment maximum.
    */
   maxAttachmentBytes?: number;
   workDir?: string;
@@ -136,7 +134,7 @@ export function createChatReadMcpServer(
     {
       title: "Download a Google Chat attachment's binary content",
       description:
-        "Download an attachment's raw bytes. Returns base64 inline (up to 50 MiB), or streams to destinationPath inside your working directory (up to 1 GiB). For space-scoped actors, requires the attachment resource name (spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT); unscoped servers also accept opaque media tokens (media/...).",
+        "Stream an attachment to destinationPath inside your working directory (up to 1 GiB) and return its path, byte count, SHA-256, content type, and name. For space-scoped actors, requires the attachment resource name (spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT); unscoped servers also accept opaque media tokens (media/...).",
       inputSchema: {
         resourceName: z
           .string()
@@ -145,9 +143,8 @@ export function createChatReadMcpServer(
           ),
         destinationPath: z
           .string()
-          .optional()
           .describe(
-            "Optional file path inside your working directory to stream the attachment to disk instead of returning base64. Required for attachments larger than 50 MiB (up to 1 GiB). Unavailable for follower-hosted actors (see #812)."
+            "New file path inside your working directory for the streamed attachment. Unavailable for follower-hosted actors (see #812)."
           ),
       },
     },
@@ -173,30 +170,14 @@ export function createChatReadMcpServer(
           throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
         }
 
-        const inlineLimit = Math.min(
-          options?.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_INLINE_BYTES,
-          MAX_CHAT_ATTACHMENT_INLINE_BYTES
-        );
         const fileLimit = Math.min(
           options?.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
           MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES
         );
 
-        if (!destinationPath) {
-          const result = await chatClient
-            .downloadAttachment(resourceName, inlineLimit)
-            .catch((err: unknown) => {
-              throw withFileModeHint(err);
-            });
-          return toolOk(result.toString("base64"));
-        }
-
         requireFileToolsAvailable(options ?? {});
         const workDir = requireWorkDir(options ?? {});
         const target = await resolveDownloadPath(workDir, destinationPath);
-        if (!chatClient.downloadAttachmentStream) {
-          throw new Error("destinationPath needs a Chat client that can stream downloads");
-        }
         const { resp, name, contentType } = await chatClient.downloadAttachmentStream(
           resourceName,
           fileLimit

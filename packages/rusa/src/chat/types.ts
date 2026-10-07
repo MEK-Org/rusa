@@ -15,9 +15,6 @@ export const MAX_CHAT_ATTACHMENT_BYTES = 50 * 1024 * 1024; // 50 MiB
 /** Default ceiling for attachments fetched from Chat. */
 export const MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES = 1024 * 1024 * 1024; // 1 GiB
 
-/** Default ceiling for inline base64 attachment responses. */
-export const MAX_CHAT_ATTACHMENT_INLINE_BYTES = 50 * 1024 * 1024; // 50 MiB
-
 /**
  * Exact grammar of a message-attachment resource name. Capture group 1 is the
  * parent message name, which is where an attachment's metadata actually lives
@@ -204,12 +201,10 @@ export interface ChatClient {
   /** Read attachment metadata by its full Google Chat resource name. */
   getAttachment(attachmentName: string): Promise<ChatAttachment>;
   /**
-   * Download an attachment's binary content by its resource name (or attachmentDataRef
+   * Stream an attachment's binary content by resource name (or attachmentDataRef
    * resourceName). `maxBytes` can only lower the client's configured limit.
    */
-  downloadAttachment(resourceName: string, maxBytes?: number): Promise<Buffer>;
-  /** Stream an attachment's response, bounded like {@link downloadAttachment}, without buffering it. */
-  downloadAttachmentStream?(
+  downloadAttachmentStream(
     resourceName: string,
     maxBytes?: number
   ): Promise<{

@@ -17,6 +17,7 @@ import {
   type ListChatSpaceMembersOptions,
   type ListChatSpacesOptions,
   MAX_CHAT_ATTACHMENT_BYTES,
+  MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
 } from "./types.js";
 
 /** In-memory {@link ChatSource} for tests/e2e: deliver messages via {@link emit}. */
@@ -40,10 +41,12 @@ export class FakeChatSource implements ChatSource {
 
 /** Records outbound actions instead of calling the Chat API. */
 export class FakeChatClient implements ChatClient {
-  readonly maxSizeBytes: number;
+  readonly maxDownloadSizeBytes: number;
+  readonly maxUploadSizeBytes: number;
 
   constructor(options?: { maxSizeBytes?: number }) {
-    this.maxSizeBytes = options?.maxSizeBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
+    this.maxDownloadSizeBytes = options?.maxSizeBytes ?? MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES;
+    this.maxUploadSizeBytes = options?.maxSizeBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
   }
 
   readonly messages: ChatReadMessage[] = [];
@@ -163,15 +166,6 @@ export class FakeChatClient implements ChatClient {
       if (metadata.contentName) name = metadata.contentName;
       if (metadata.contentType) contentType = metadata.contentType;
     }
-    const data = await this.downloadAttachment(resourceName, maxBytes);
-    const resp = new Response(new Uint8Array(data), {
-      status: 200,
-      headers: { "content-length": String(data.length), "content-type": contentType },
-    });
-    return { resp, name, contentType };
-  }
-
-  async downloadAttachment(resourceName: string, maxBytes?: number): Promise<Buffer> {
     let targetRef: string;
     if (resourceName.startsWith("spaces/")) {
       const metadata = await this.getAttachment(resourceName);
@@ -198,25 +192,27 @@ export class FakeChatClient implements ChatClient {
       if (uploaded) {
         data = uploaded.content;
       } else {
-        for (const [, v] of this.attachments.entries()) {
+        for (const [, value] of this.attachments.entries()) {
           if (
-            v.metadata.attachmentDataRef?.resourceName === targetRef ||
-            v.metadata.name === targetRef
+            value.metadata.attachmentDataRef?.resourceName === targetRef ||
+            value.metadata.name === targetRef
           ) {
-            data = v.data;
+            data = value.data;
             break;
           }
         }
       }
     }
-    if (!data) {
-      throw new Error(`attachment not found: ${resourceName}`);
-    }
-    const limit = Math.min(this.maxSizeBytes, maxBytes ?? this.maxSizeBytes);
+    if (!data) throw new Error(`attachment not found: ${resourceName}`);
+    const limit = Math.min(this.maxDownloadSizeBytes, maxBytes ?? this.maxDownloadSizeBytes);
     if (data.length > limit) {
       throw new Error(`attachment size limit exceeded: attachment is larger than ${limit} bytes`);
     }
-    return data;
+    const resp = new Response(new Uint8Array(data), {
+      status: 200,
+      headers: { "content-length": String(data.length), "content-type": contentType },
+    });
+    return { resp, name, contentType };
   }
 
   async uploadAttachment(
@@ -226,9 +222,9 @@ export class FakeChatClient implements ChatClient {
     mimeType?: string
   ): Promise<ChatUploadAttachmentResult> {
     const buf = Buffer.isBuffer(content) ? content : Buffer.from(content);
-    if (buf.length > this.maxSizeBytes) {
+    if (buf.length > this.maxUploadSizeBytes) {
       throw new Error(
-        `attachment size limit exceeded: attachment is larger than ${this.maxSizeBytes} bytes`
+        `attachment size limit exceeded: attachment is larger than ${this.maxUploadSizeBytes} bytes`
       );
     }
     const resourceName = `${spaceName}/attachments/fake-${this.uploadedAttachments.length + 1}`;

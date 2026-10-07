@@ -7,9 +7,6 @@ const DRIVE_API = "https://www.googleapis.com/drive/v3";
 /** Default ceiling for downloaded Drive files. */
 export const MAX_DRIVE_FILE_DOWNLOAD_BYTES = 1024 * 1024 * 1024; // 1 GiB
 
-/** Default ceiling for inline base64 Drive file responses. */
-export const MAX_DRIVE_FILE_INLINE_BYTES = 50 * 1024 * 1024; // 50 MiB
-
 const MAX_DRIVE_EXPORT_BYTES = 50 * 1024 * 1024; // 50 MiB
 
 export interface DriveFileMetadata {
@@ -24,10 +21,8 @@ export interface DriveFileMetadata {
 export interface DriveClient {
   listChildren(folderId: string, recursive?: boolean): Promise<DriveFileMetadata[]>;
   getFileMetadata(fileId: string): Promise<DriveFileMetadata>;
-  /** Download a file; `maxBytes` can only lower the client's configured limit. */
-  downloadFile(fileId: string, maxBytes?: number): Promise<Buffer>;
-  /** Stream a file's response, bounded like {@link downloadFile}, without buffering it. */
-  downloadFileStream?(fileId: string, maxBytes?: number): Promise<Response>;
+  /** Stream a file's response; `maxBytes` can only lower the client's configured limit. */
+  downloadFileStream(fileId: string, maxBytes?: number): Promise<Response>;
   exportDoc(fileId: string, mimeType: string): Promise<Buffer>;
 }
 
@@ -196,11 +191,6 @@ export class GoogleDriveClient implements DriveClient {
       );
     }
     return boundedResponse(resp, this.downloadLimit(maxBytes), "file");
-  }
-
-  async downloadFile(fileId: string, maxBytes?: number): Promise<Buffer> {
-    const limit = this.downloadLimit(maxBytes);
-    return this.readBodyWithLimit(await this.downloadFileStream(fileId, limit), limit);
   }
 
   /** A per-call limit can lower the configured limit, never raise it. */

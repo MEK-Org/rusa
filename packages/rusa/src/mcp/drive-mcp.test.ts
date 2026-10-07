@@ -10,7 +10,6 @@ import {
   type DriveClient,
   GoogleDriveClient,
   MAX_DRIVE_FILE_DOWNLOAD_BYTES,
-  MAX_DRIVE_FILE_INLINE_BYTES,
 } from "../drive/drive-client.js";
 import { createDriveReadMcpServer, type DriveReadObservation } from "./drive-mcp.js";
 
@@ -53,10 +52,10 @@ function fakeDriveClient() {
         parents: ["allowed-folder"],
       };
     },
-    downloadFile: async (fileId) => {
-      calls.push({ method: "downloadFile", id: fileId });
+    downloadFileStream: async (fileId) => {
+      calls.push({ method: "downloadFileStream", id: fileId });
       if (fileId === "error-file") throw new Error("Google API error");
-      return Buffer.from("mock-binary-data");
+      return new Response("mock-binary-data", { status: 200 });
     },
     exportDoc: async (fileId, mimeType) => {
       calls.push({ method: "exportDoc", id: fileId, mimeType });
@@ -113,7 +112,8 @@ describe("drive-read MCP server", () => {
   it("handles the drive-wide happy path (empty allowedFolders)", async () => {
     const fake = fakeDriveClient();
     const onRead = vi.fn();
-    const client = await connect(fake.client, [], { onRead });
+    const workDir = mkdtempSync(join(tmpdir(), "drive-mcp-download-"));
+    const client = await connect(fake.client, [], { onRead, workDir, fileToolsAvailable: true });
 
     const listRes = (await client.callTool({
       name: "list_children",
@@ -127,7 +127,7 @@ describe("drive-read MCP server", () => {
 
     const downloadRes = (await client.callTool({
       name: "download_file",
-      arguments: { fileId: "file-1" },
+      arguments: { fileId: "file-1", destinationPath: "mock.bin" },
     })) as CallToolResult;
 
     const exportRes = (await client.callTool({
@@ -142,13 +142,18 @@ describe("drive-read MCP server", () => {
 
     expect(JSON.parse(textOf(listRes))).toHaveLength(2);
     expect(JSON.parse(textOf(metaRes)).name).toBe("Mock File");
-    expect(textOf(downloadRes)).toBe(Buffer.from("mock-binary-data").toString("base64"));
+    expect(JSON.parse(textOf(downloadRes))).toMatchObject({
+      path: join(workDir, "mock.bin"),
+      bytes: Buffer.byteLength("mock-binary-data"),
+      name: "Mock File",
+    });
     expect(textOf(exportRes)).toBe(Buffer.from("mock-exported-pdf").toString("base64"));
 
     expect(fake.calls).toEqual([
       { method: "listChildren", id: "root-folder", recursive: true },
       { method: "getFileMetadata", id: "file-1" },
-      { method: "downloadFile", id: "file-1" },
+      { method: "getFileMetadata", id: "file-1" },
+      { method: "downloadFileStream", id: "file-1" },
       { method: "exportDoc", id: "file-1", mimeType: "application/pdf" },
     ]);
 
@@ -158,6 +163,7 @@ describe("drive-read MCP server", () => {
       ["actor-1", { operation: "download_file", fileId: "file-1" }],
       ["actor-1", { operation: "export_doc", fileId: "file-1", mimeType: "application/pdf" }],
     ]);
+    rmSync(workDir, { recursive: true, force: true });
   });
 
   it("handles the drive-wide error paths", async () => {
@@ -223,18 +229,20 @@ describe("drive-read MCP server", () => {
   describe("oversized response size limit handling", () => {
     it("returns error on download when file size limit is exceeded", async () => {
       const fake = fakeDriveClient();
-      fake.client.downloadFile = async (_fileId) => {
+      fake.client.downloadFileStream = async (_fileId) => {
         throw new Error("file size limit exceeded: file is larger than 5 bytes");
       };
-      const client = await connect(fake.client, []);
+      const workDir = mkdtempSync(join(tmpdir(), "drive-mcp-download-"));
+      const client = await connect(fake.client, [], { workDir, fileToolsAvailable: true });
 
       const result = (await client.callTool({
         name: "download_file",
-        arguments: { fileId: "file-1" },
+        arguments: { fileId: "file-1", destinationPath: "out.bin" },
       })) as CallToolResult;
 
       expect(result.isError).toBeTruthy();
       expect(textOf(result)).toContain("file size limit exceeded");
+      rmSync(workDir, { recursive: true, force: true });
     });
 
     it("returns error on export when exported file size limit is exceeded", async () => {
@@ -251,26 +259,6 @@ describe("drive-read MCP server", () => {
 
       expect(result.isError).toBeTruthy();
       expect(textOf(result)).toContain("file size limit exceeded");
-    });
-
-    it("bounds inline downloads at 50 MiB and directs larger ones to destinationPath", async () => {
-      const fake = fakeDriveClient();
-      let requested: number | undefined;
-      fake.client.downloadFile = async (_fileId, maxBytes) => {
-        requested = maxBytes;
-        throw new Error(`file size limit exceeded: file is larger than ${maxBytes} bytes`);
-      };
-      const client = await connect(fake.client, []);
-
-      const result = (await client.callTool({
-        name: "download_file",
-        arguments: { fileId: "file-1" },
-      })) as CallToolResult;
-
-      expect(requested).toBe(MAX_DRIVE_FILE_INLINE_BYTES);
-      expect(result.isError).toBe(true);
-      expect(textOf(result)).toContain("file size limit exceeded");
-      expect(textOf(result)).toContain("specify destinationPath to download up to 1 GiB");
     });
 
     it("asks the client stream for the 1 GiB file-mode limit", async () => {
@@ -458,22 +446,6 @@ describe("drive-read MCP server", () => {
       expect(result.isError).toBe(true);
       expect(cancelled).toBe(true);
       expect(readFileSync(join(workDir, "out.bin"), "utf-8")).toBe("original");
-      rmSync(workDir, { recursive: true, force: true });
-    });
-
-    it("requires a streaming client for destinationPath", async () => {
-      const workDir = mkdtempSync(join(tmpdir(), "drive-mcp-download-"));
-      const fake = fakeDriveClient();
-      const client = await connect(fake.client, [], { workDir, fileToolsAvailable: true });
-
-      const result = (await client.callTool({
-        name: "download_file",
-        arguments: { fileId: "file-1", destinationPath: "out.bin" },
-      })) as CallToolResult;
-
-      expect(result.isError).toBe(true);
-      expect(textOf(result)).toContain("needs a Drive client that can stream downloads");
-      expect(fake.calls.map((call) => call.method)).not.toContain("downloadFile");
       rmSync(workDir, { recursive: true, force: true });
     });
 

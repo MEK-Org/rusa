@@ -160,7 +160,7 @@ describe("GoogleDriveClient & DriveOAuth", () => {
     expect(meta).toEqual({ id: "file-1", name: "test-file", mimeType: "text/plain" });
   });
 
-  it("downloads a binary file via alt=media", async () => {
+  it("opens a bounded binary file stream via alt=media", async () => {
     const dir = setupConfigDir();
     const fetchImpl = vi
       .fn<typeof fetch>()
@@ -172,9 +172,9 @@ describe("GoogleDriveClient & DriveOAuth", () => {
       .mockResolvedValueOnce(new Response("raw-file-content", { status: 200 }));
 
     const client = new GoogleDriveClient(dir, fetchImpl);
-    const data = await client.downloadFile("file-1");
+    const resp = await client.downloadFileStream("file-1");
 
-    expect(data.toString()).toBe("raw-file-content");
+    expect(await resp.text()).toBe("raw-file-content");
     expect(fetchImpl.mock.calls.map((call) => call[0])).toEqual([
       "https://oauth2.googleapis.com/token",
       "https://www.googleapis.com/drive/v3/files/file-1?alt=media",
@@ -197,9 +197,8 @@ describe("GoogleDriveClient & DriveOAuth", () => {
         })
       );
 
-    await expect(new GoogleDriveClient(dir, fetchImpl).downloadFile("file-1")).resolves.toEqual(
-      Buffer.alloc(0)
-    );
+    const resp = await new GoogleDriveClient(dir, fetchImpl).downloadFileStream("file-1");
+    expect(resp.headers.get("content-length")).toBe(String(MAX_DRIVE_FILE_DOWNLOAD_BYTES));
   });
 
   it("exports a Google-native document to a portable format", async () => {
@@ -223,7 +222,7 @@ describe("GoogleDriveClient & DriveOAuth", () => {
     ]);
   });
 
-  it("fails to download a file exceeding the maximum size limit", async () => {
+  it("bounds a streamed file at the configured maximum size limit", async () => {
     const dir = setupConfigDir();
     const fetchImpl = vi
       .fn<typeof fetch>()
@@ -236,7 +235,8 @@ describe("GoogleDriveClient & DriveOAuth", () => {
 
     // Limit to 5 bytes, whereas "too-large-content" is 17 bytes
     const client = new GoogleDriveClient(dir, fetchImpl, "drive-token.json", 5);
-    await expect(client.downloadFile("file-1")).rejects.toThrow("file size limit exceeded");
+    const resp = await client.downloadFileStream("file-1");
+    await expect(resp.arrayBuffer()).rejects.toThrow("file size limit exceeded");
   });
 
   it("fails to export a document exceeding the maximum size limit", async () => {
@@ -276,12 +276,12 @@ describe("GoogleDriveClient & DriveOAuth", () => {
       .mockResolvedValueOnce(mockResp);
 
     const client = new GoogleDriveClient(dir, fetchImpl);
-    await expect(client.downloadFile("file-1")).rejects.toThrow(
+    await expect(client.downloadFileStream("file-1")).rejects.toThrow(
       "cannot enforce size limit: response body is not streamable"
     );
   });
 
-  it("cancels the stream reader when the file exceeds the size limit", async () => {
+  it("cancels the stream when the file exceeds the size limit", async () => {
     const dir = setupConfigDir();
     const mockCancel = vi.fn();
     const mockResp = new Response(
@@ -306,7 +306,8 @@ describe("GoogleDriveClient & DriveOAuth", () => {
 
     // Set maxSizeBytes = 4. The first read (3 bytes) is fine, the second read (3 bytes, total 6) triggers the limit.
     const client = new GoogleDriveClient(dir, fetchImpl, "drive-token.json", 4);
-    await expect(client.downloadFile("file-1")).rejects.toThrow("file size limit exceeded");
+    const resp = await client.downloadFileStream("file-1");
+    await expect(resp.arrayBuffer()).rejects.toThrow("file size limit exceeded");
     expect(mockCancel).toHaveBeenCalled();
   });
 
@@ -356,11 +357,11 @@ describe("GoogleDriveClient & DriveOAuth", () => {
       );
 
     const client = new GoogleDriveClient(dir, fetchImpl);
-    await expect(client.downloadFile("file-1")).rejects.toThrow("file size limit exceeded");
+    await expect(client.downloadFileStream("file-1")).rejects.toThrow("file size limit exceeded");
     expect(cancelled).toBe(true);
   });
 
-  it("honors custom maxBytes override in downloadFile", async () => {
+  it("honors custom maxBytes override in downloadFileStream", async () => {
     const dir = setupConfigDir();
     const fetchImpl = vi
       .fn<typeof fetch>()
@@ -376,10 +377,11 @@ describe("GoogleDriveClient & DriveOAuth", () => {
       );
 
     const client = new GoogleDriveClient(dir, fetchImpl);
-    await expect(client.downloadFile("file-1", 5)).rejects.toThrow("file size limit exceeded");
+    const resp = await client.downloadFileStream("file-1", 5);
+    await expect(resp.arrayBuffer()).rejects.toThrow("file size limit exceeded");
   });
 
-  it("keeps a lower configured limit when a call asks for more, buffered or streamed", async () => {
+  it("keeps a lower configured limit when a stream call asks for more", async () => {
     const dir = setupConfigDir();
     const body = () => new Response(new Uint8Array(100), { status: 200 });
     const fetchImpl = vi
@@ -389,13 +391,9 @@ describe("GoogleDriveClient & DriveOAuth", () => {
           status: 200,
         })
       )
-      .mockResolvedValueOnce(body())
       .mockResolvedValueOnce(body());
 
     const client = new GoogleDriveClient(dir, fetchImpl, "drive-token.json", 80);
-    await expect(client.downloadFile("file-1", MAX_DRIVE_FILE_DOWNLOAD_BYTES)).rejects.toThrow(
-      "file is larger than 80 bytes"
-    );
     const streamed = await client.downloadFileStream("file-1", MAX_DRIVE_FILE_DOWNLOAD_BYTES);
     await expect(streamed.arrayBuffer()).rejects.toThrow("file is larger than 80 bytes");
   });

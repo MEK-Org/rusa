@@ -242,16 +242,6 @@ async function unlinkIfSame(dir: FileHandle, name: string, handle: FileHandle): 
   } catch (_) {}
 }
 
-/** Point an inline-mode size rejection at file mode, which allows up to 1 GiB. */
-export function withFileModeHint(err: unknown): unknown {
-  if (err instanceof Error && err.message.includes("size limit exceeded")) {
-    return new Error(
-      `${err.message}; specify destinationPath to download up to 1 GiB to a file in your workdir`
-    );
-  }
-  return err;
-}
-
 const READ_CHUNK_BYTES = 64 * 1024;
 
 /**

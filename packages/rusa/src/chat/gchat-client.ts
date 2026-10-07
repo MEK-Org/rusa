@@ -201,72 +201,6 @@ export class GchatClient implements ChatClient {
     return attachment;
   }
 
-  private async readBodyWithLimit(resp: Response, maxBytes: number): Promise<Buffer> {
-    const body = resp.body;
-    if (!body) {
-      return Buffer.alloc(0);
-    }
-
-    if (typeof (body as unknown as ReadableStream).getReader === "function") {
-      const reader = (body as unknown as ReadableStream).getReader();
-      const chunks: Uint8Array[] = [];
-      let totalSize = 0;
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) {
-            totalSize += value.byteLength;
-            if (totalSize > maxBytes) {
-              throw new Error(
-                `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
-              );
-            }
-            chunks.push(value);
-          }
-        }
-      } catch (err) {
-        try {
-          await reader.cancel(err instanceof Error ? err.message : String(err));
-        } catch (_) {}
-        throw err;
-      } finally {
-        reader.releaseLock();
-      }
-      return Buffer.concat(chunks);
-    }
-
-    if (
-      body &&
-      typeof (body as unknown as AsyncIterable<unknown>)[Symbol.asyncIterator] === "function"
-    ) {
-      const chunks: Uint8Array[] = [];
-      let totalSize = 0;
-      for await (const chunk of body as unknown as AsyncIterable<Uint8Array | string>) {
-        const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-        totalSize += buf.byteLength;
-        if (totalSize > maxBytes) {
-          try {
-            await resp.body?.cancel();
-          } catch (_) {}
-          throw new Error(
-            `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
-          );
-        }
-        chunks.push(buf);
-      }
-      return Buffer.concat(chunks);
-    }
-
-    const arrayBuffer = await resp.arrayBuffer();
-    if (arrayBuffer.byteLength > maxBytes) {
-      throw new Error(
-        `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
-      );
-    }
-    return Buffer.from(arrayBuffer);
-  }
-
   async downloadAttachmentStream(
     resourceName: string,
     maxBytes?: number
@@ -317,12 +251,6 @@ export class GchatClient implements ChatClient {
     }
     const bounded = await boundedResponse(resp, this.downloadLimit(maxBytes), "attachment");
     return { resp: bounded, name, contentType };
-  }
-
-  async downloadAttachment(resourceName: string, maxBytes?: number): Promise<Buffer> {
-    const limit = this.downloadLimit(maxBytes);
-    const { resp } = await this.downloadAttachmentStream(resourceName, limit);
-    return this.readBodyWithLimit(resp, limit);
   }
 
   /** A per-call limit can lower the configured limit, never raise it. */

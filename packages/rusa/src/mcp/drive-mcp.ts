@@ -1,13 +1,9 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import {
-  type DriveClient,
-  MAX_DRIVE_FILE_DOWNLOAD_BYTES,
-  MAX_DRIVE_FILE_INLINE_BYTES,
-} from "../drive/drive-client.js";
+import { type DriveClient, MAX_DRIVE_FILE_DOWNLOAD_BYTES } from "../drive/drive-client.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
-import { resolveDownloadPath, streamNewFileInWorkdir, withFileModeHint } from "./workdir-path.js";
+import { resolveDownloadPath, streamNewFileInWorkdir } from "./workdir-path.js";
 
 export const DRIVE_READ_MCP_NAME = "drive-read";
 
@@ -116,14 +112,13 @@ export function createDriveReadMcpServer(
     {
       title: "Download a file's binary contents",
       description:
-        "Download a file's raw bytes. Returns base64 inline (up to 50 MiB), or streams to destinationPath inside your working directory (up to 1 GiB).",
+        "Stream a file to destinationPath inside your working directory (up to 1 GiB) and return its path, byte count, SHA-256, content type, and name.",
       inputSchema: {
         fileId: z.string().describe("The ID of the file to download"),
         destinationPath: z
           .string()
-          .optional()
           .describe(
-            "Optional file path inside your working directory to stream the file to disk instead of returning base64. Required for files larger than 50 MiB (up to 1 GiB). Unavailable for follower-hosted actors (see #812)."
+            "New file path inside your working directory for the streamed file. Unavailable for follower-hosted actors (see #812)."
           ),
       },
     },
@@ -131,29 +126,14 @@ export function createDriveReadMcpServer(
       try {
         await checkFileAccess(fileId);
 
-        const inlineLimit = Math.min(
-          options.maxDownloadBytes ?? MAX_DRIVE_FILE_INLINE_BYTES,
-          MAX_DRIVE_FILE_INLINE_BYTES
-        );
         const fileLimit = Math.min(
           options.maxDownloadBytes ?? MAX_DRIVE_FILE_DOWNLOAD_BYTES,
           MAX_DRIVE_FILE_DOWNLOAD_BYTES
         );
 
-        if (!destinationPath) {
-          const result = await client.downloadFile(fileId, inlineLimit).catch((err: unknown) => {
-            throw withFileModeHint(err);
-          });
-          options.onRead?.(actorId, { operation: "download_file", fileId });
-          return toolOk(result.toString("base64"));
-        }
-
         requireFileToolsAvailable(options);
         const workDir = requireWorkDir(options);
         const target = await resolveDownloadPath(workDir, destinationPath);
-        if (!client.downloadFileStream) {
-          throw new Error("destinationPath needs a Drive client that can stream downloads");
-        }
         const meta = await client.getFileMetadata(fileId);
         if (meta.size && Number.parseInt(meta.size, 10) > fileLimit) {
           throw new Error(`file size limit exceeded: file is larger than ${fileLimit} bytes`);
