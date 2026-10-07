@@ -208,6 +208,13 @@ export interface UpdateDeps {
    * leader reverted. By the time this runs there is no rollback left to contradict it.
    */
   onCommitted?: (newSha: string, branch: string) => Promise<void> | void;
+  /**
+   * Fires after the update has no remaining rollback path and before its
+   * origin-aware restart announcement. The startup owner uses this boundary to
+   * persist a requested transition and, when the selected inbox entry proves
+   * one, announce in that exact originating Chat conversation.
+   */
+  onRestarting?: (newSha: string, branch: string, subject: string) => Promise<void> | void;
   log?: (msg: string) => void;
 }
 
@@ -465,6 +472,20 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
       `[update] drained after ${drain.waitedMs}ms` +
         (drain.quiesced ? " (quiesced)" : " (timeout — proceeding)")
     );
+
+    if (deps.onRestarting) {
+      // A transition record must precede the origin-aware restart notice. The
+      // drain has completed, so there is no later update step that can roll this
+      // checkout back; persistence or delivery failure is surfaced in logs but
+      // cannot strand a green, already-promoted deploy.
+      try {
+        await deps.onRestarting(newSha, plan.branch, subject);
+      } catch (restartHookErr) {
+        log(
+          `[update] restart lifecycle hook failed: ${restartHookErr instanceof Error ? restartHookErr.message : String(restartHookErr)}`
+        );
+      }
+    }
 
     // ── 4. EXIT — systemd restarts onto the fresh build. ─────────────────
     const drainSummary = drain.quiesced ? "quiesced" : `timeout after ${drain.waitedMs}ms`;

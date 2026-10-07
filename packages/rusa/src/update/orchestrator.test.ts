@@ -214,6 +214,38 @@ describe("executeUpdate — happy path (green build → drain → exit)", () => 
     expect(exits).toEqual([0]);
   });
 
+  it("records restart lifecycle evidence after drain and before exit", async () => {
+    const { deps } = makeDeps();
+    const order: string[] = [];
+    deps.onRestarting = (sha, branch, subject) => {
+      order.push(`lifecycle:${sha}:${branch}:${subject}`);
+    };
+    deps.notify = {
+      async notify() {
+        order.push("notify");
+      },
+    };
+    deps.exit = () => {
+      order.push("exit");
+    };
+
+    await executeUpdate(plan({ branch: "staging" }), deps);
+
+    expect(order).toEqual(["notify", "notify", `lifecycle:${NEW}:staging:feat: new thing`, "exit"]);
+  });
+
+  it("does not turn a lifecycle-record failure into a failed committed deploy", async () => {
+    const { deps, exits } = makeDeps();
+    deps.onRestarting = () => {
+      throw new Error("state disk unavailable");
+    };
+
+    const result = await executeUpdate(plan(), deps);
+
+    expect(result.restarting).toBe(true);
+    expect(exits).toEqual([0]);
+  });
+
   it("materializes submodules AFTER resetHard and BEFORE the build (deploy path-deps)", async () => {
     const { deps, git, build } = makeDeps();
     const order: string[] = [];
@@ -743,8 +775,12 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     // reverted — and would later deploy followers onto it.
     const { deps, git, drain, build } = makeDeps();
     const committed: { sha: string; branch: string }[] = [];
+    const restarting: { sha: string; branch: string; subject: string }[] = [];
     deps.onCommitted = (sha, branch) => {
       committed.push({ sha, branch });
+    };
+    deps.onRestarting = (sha, branch, subject) => {
+      restarting.push({ sha, branch, subject });
     };
     drain.waitForQuiescence = async () => {
       throw new StepError("drain", "drain exploded", false);
@@ -754,6 +790,7 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
 
     expect(res.ok).toBe(false);
     expect(committed).toHaveLength(0);
+    expect(restarting).toHaveLength(0);
     expect(git.resets).toEqual([NEW, OLD]); // rolled back off the revision no trigger names
     expect(build.rollbackCalls).toBe(1); // returned to the last bootable dist as well
   });

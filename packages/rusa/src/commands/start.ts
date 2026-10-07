@@ -362,6 +362,7 @@ import {
   WebhookSilenceDetector,
 } from "../webhook/silence-detector.js";
 import { resolveRepoRoot } from "./service-instance.js";
+import { resolveRequestedRestartDestination, ServiceLifecycleStore } from "./service-lifecycle.js";
 
 // `update` tool bounds . Per-step HARD timeouts so a hung build can't wedge
 // root; a bounded drain so a stuck worker can't block the restart forever.
@@ -2248,6 +2249,10 @@ async function composeStart(
   const followerTriggerStore = new FollowerUpdateTriggerStore(
     join(mcHome, "data", "follower-update-trigger.json")
   );
+  const serviceLifecycleStore = new ServiceLifecycleStore(
+    join(mcHome, "data", "service-lifecycle.json")
+  );
+  let requestedRestartTransitionId: string | undefined;
   let updateToolDepsFor: ((selfId: string) => UpdateToolDeps) | undefined;
   try {
     const repoRoot = resolveRepoRoot();
@@ -2274,6 +2279,65 @@ async function composeStart(
           log: (m) => log.info("update_coordinator", { detail: m }),
         }),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
+        onRestarting: async (newSha, branch, subject) => {
+          requestedRestartTransitionId = undefined;
+          const origin = resolveRequestedRestartDestination(selectedInboxEntriesForActor(selfId));
+          let transitionId: string;
+          try {
+            const intent = serviceLifecycleStore.recordRequestedRestart({
+              targetSha: newSha,
+              branch,
+              subject,
+              ...(origin ? { origin } : {}),
+            });
+            transitionId = intent.id;
+            requestedRestartTransitionId = transitionId;
+          } catch (error) {
+            log.warn("service_restart_intent_persist_failed", {
+              targetSha: newSha,
+              branch,
+              err: error,
+            });
+            return;
+          }
+
+          if (!origin || !chatClient) {
+            try {
+              serviceLifecycleStore.recordAnnouncement(
+                transitionId,
+                "unavailable",
+                origin ? "chat client unavailable" : "originating Chat destination unknown"
+              );
+            } catch (error) {
+              log.warn("service_restart_announcement_record_failed", { transitionId, err: error });
+            }
+            log.warn("service_restart_announcement_unavailable", {
+              transitionId,
+              reason: origin ? "chat_client_unavailable" : "origin_unknown",
+            });
+            return;
+          }
+
+          try {
+            await chatClient.send(
+              origin.spaceName,
+              `🔄 Updating → ${newSha.slice(0, 7)} (${subject}) — draining + restarting`,
+              origin.threadName ? { threadName: origin.threadName } : undefined
+            );
+            serviceLifecycleStore.recordAnnouncement(transitionId, "delivered");
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            try {
+              serviceLifecycleStore.recordAnnouncement(transitionId, "failed", detail);
+            } catch (recordError) {
+              log.warn("service_restart_announcement_record_failed", {
+                transitionId,
+                err: recordError,
+              });
+            }
+            log.warn("service_restart_announcement_failed", { transitionId, err: error });
+          }
+        },
         onCommitted: (newSha, branch) => {
           try {
             followerTriggerStore.createTrigger({
@@ -4700,6 +4764,17 @@ async function composeStart(
     e2eInstance.stopForMeshShutdown();
     running = false;
     console.log("\n🛑 Shutting down...");
+    try {
+      serviceLifecycleStore.recordCleanShutdown(
+        reason === "deploy" ? "deploy" : "signal",
+        reason === "deploy" ? requestedRestartTransitionId : undefined
+      );
+    } catch (error) {
+      log.warn("service_shutdown_evidence_persist_failed", {
+        reason: reason ?? "signal",
+        err: error,
+      });
+    }
     await resources.close();
     log.info("service_stopped", { reason });
     process.exit(exitCode ?? getShutdownExitCode(reason));
@@ -4977,6 +5052,34 @@ async function composeStart(
   });
 
   console.log("\n✓ Root actor live. Waiting for events...\n");
+
+  // Every successful boot creates durable root work. The file records the boot
+  // before this append; if this process dies between them, the next boot retries
+  // the same deterministic inbox id before adding its own distinct wake.
+  try {
+    for (const wake of serviceLifecycleStore.beginBoot()) {
+      inboxStore.append([
+        {
+          id: `service-boot:${wake.bootId}`,
+          actorId: rootId,
+          source: "system:service-lifecycle",
+          payload: {
+            type: "service.boot",
+            priority: "responsive",
+            bootId: wake.bootId,
+            prior: wake.prior,
+            ...(wake.requestedRestart ? { requestedRestart: wake.requestedRestart } : {}),
+            ...(wake.cleanShutdown ? { cleanShutdown: wake.cleanShutdown } : {}),
+            prompt:
+              "Assess the preceding service-transition evidence. Investigate an unexpected or unknown startup; do not infer a cause beyond the recorded evidence.",
+          },
+        },
+      ]);
+      serviceLifecycleStore.acknowledgeBootWake(wake.bootId);
+    }
+  } catch (error) {
+    log.warn("service_boot_wake_failed", { err: error });
+  }
 
   // Mechanical lifecycle ping : emitted by startup once the mesh is up.
   // A lone "back online" with no preceding "updating" ping is the restart/crash signal.
