@@ -103,6 +103,35 @@ void main() {
         expect(requested.map((batch) => batch.length), [20, 1]);
       },
     );
+
+    test('retains earlier batch answers when a later batch fails', () async {
+      final client = MockClient((req) async {
+        final body = jsonDecode(req.body) as Map<String, dynamic>;
+        final refs = (body['refs'] as List<dynamic>).cast<String>();
+        if (refs.first.endsWith('/21')) return http.Response('offline', 503);
+        return http.Response(
+          jsonEncode({
+            'references': {
+              for (final ref in refs) ref: {'ref': ref, 'scheme': 'github'},
+            },
+          }),
+          200,
+        );
+      });
+      final api = DashboardApi(
+        client: client,
+        base: Uri.parse('http://localhost:3000'),
+      );
+      final refs = [for (var i = 1; i <= 21; i++) 'github:o/r/issues/$i'];
+
+      try {
+        await api.fetchReferences(refs);
+        fail('expected a partial batch failure');
+      } on PartialReferenceFetchException catch (error) {
+        expect(error.resolved.keys, refs.take(referenceBatchLimit));
+        expect(error.unresolved, {refs.last});
+      }
+    });
   });
 
   testWidgets(
@@ -237,7 +266,9 @@ void main() {
 
         // A later refresh keeps the shown card preview while revalidating
         // in the background.
-        api.referencesResult = {_cited: _issue(_cited, 'The updated bug title')};
+        api.referencesResult = {
+          _cited: _issue(_cited, 'The updated bug title'),
+        };
         await store.refreshRecentActivity();
         await Future<void>.delayed(Duration.zero);
         await tester.pump();
@@ -248,66 +279,74 @@ void main() {
     },
   );
 
-  test('refreshRecentActivity generation check guards against out-of-order responses', () async {
-    final completer1 = Completer<List<RecentActivityItem>>();
-    final completer2 = Completer<List<RecentActivityItem>>();
-    var callCount = 0;
-    final client = MockClient((req) async {
-      if (req.url.path == '/api/mesh/recent-activity') {
-        callCount++;
-        final items = callCount == 1
-            ? await completer1.future
-            : await completer2.future;
-        return http.Response(
-          jsonEncode({
-            'items': items
-                .map((i) => {
-                  'id': i.id,
-                  'kind': i.kind,
-                  'time': i.time,
-                  'actorId': i.actorId,
-                  'referenceKey': i.referenceKey,
-                })
-                .toList(),
-          }),
-          200,
-        );
-      }
-      return http.Response(jsonEncode({'references': {}}), 200);
-    });
-    final api = DashboardApi(client: client, base: Uri.parse('http://localhost:3000'));
-    final store = DashboardStore(api: api, stream: FakeStream());
-    await store.init();
+  test(
+    'refreshRecentActivity generation check guards against out-of-order responses',
+    () async {
+      final completer1 = Completer<List<RecentActivityItem>>();
+      final completer2 = Completer<List<RecentActivityItem>>();
+      var callCount = 0;
+      final client = MockClient((req) async {
+        if (req.url.path == '/api/mesh/recent-activity') {
+          callCount++;
+          final items = callCount == 1
+              ? await completer1.future
+              : await completer2.future;
+          return http.Response(
+            jsonEncode({
+              'items': items
+                  .map(
+                    (i) => {
+                      'id': i.id,
+                      'kind': i.kind,
+                      'time': i.time,
+                      'actorId': i.actorId,
+                      'referenceKey': i.referenceKey,
+                    },
+                  )
+                  .toList(),
+            }),
+            200,
+          );
+        }
+        return http.Response(jsonEncode({'references': {}}), 200);
+      });
+      final api = DashboardApi(
+        client: client,
+        base: Uri.parse('http://localhost:3000'),
+      );
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
 
-    final f1 = store.refreshRecentActivity();
-    final f2 = store.refreshRecentActivity();
+      final f1 = store.refreshRecentActivity();
+      final f2 = store.refreshRecentActivity();
 
-    completer2.complete([
-      const RecentActivityItem(
-        id: 'inbox_2',
-        kind: 'handled_inbox',
-        time: '2026-09-23T14:22:00.000Z',
-        actorId: 'actor-2',
-        referenceKey: 'github:o/r/issues/2',
-      ),
-    ]);
-    await f2;
+      completer2.complete([
+        const RecentActivityItem(
+          id: 'inbox_2',
+          kind: 'handled_inbox',
+          time: '2026-09-23T14:22:00.000Z',
+          actorId: 'actor-2',
+          referenceKey: 'github:o/r/issues/2',
+        ),
+      ]);
+      await f2;
 
-    completer1.complete([
-      const RecentActivityItem(
-        id: 'inbox_1',
-        kind: 'handled_inbox',
-        time: '2026-09-23T14:21:00.000Z',
-        actorId: 'actor-1',
-        referenceKey: 'github:o/r/issues/1',
-      ),
-    ]);
-    await f1;
+      completer1.complete([
+        const RecentActivityItem(
+          id: 'inbox_1',
+          kind: 'handled_inbox',
+          time: '2026-09-23T14:21:00.000Z',
+          actorId: 'actor-1',
+          referenceKey: 'github:o/r/issues/1',
+        ),
+      ]);
+      await f1;
 
-    final items = await store.recentActivity.first;
-    expect(items.map((i) => i.id), ['inbox_2']);
-    await store.dispose();
-  });
+      final items = await store.recentActivity.first;
+      expect(items.map((i) => i.id), ['inbox_2']);
+      await store.dispose();
+    },
+  );
 
   test(
     'Recent Activity settles a reference request failure as unavailable',
@@ -334,39 +373,35 @@ void main() {
     },
   );
 
-  test('DashboardApi.fetchReferences posts a JSON ref batch', () async {
-    http.Request? capturedRequest;
-    final client = MockClient((req) async {
-      if (req.url.path == '/api/mesh/references') {
-        capturedRequest = req;
-        return http.Response(
-          jsonEncode({
-            'references': {
-              'github:o/r/issues/1': {
-                'ref': 'github:o/r/issues/1',
-                'scheme': 'github',
-                'title': 'Test Issue',
-                'cacheState': 'fresh',
-              },
-            },
-          }),
-          200,
-        );
-      }
-      return http.Response('not found', 404);
-    });
-    final api = DashboardApi(
-      client: client,
-      base: Uri.parse('http://localhost:3000'),
-    );
-    final result = await api.fetchReferences(['github:o/r/issues/1']);
+  test(
+    'Recent Activity replaces a pending placeholder after a later transport failure',
+    () async {
+      final pending = ReferenceDto.loading(_cited);
+      final api = FakeApi()
+        ..recentActivityResult = const [
+          RecentActivityItem(
+            id: 'inbox_1',
+            kind: 'handled_inbox',
+            time: '2026-09-23T14:21:37.000Z',
+            actorId: 'actor-1',
+            referenceKey: _cited,
+          ),
+        ]
+        ..referencesResult = {_cited: pending};
+      final store = DashboardStore(api: api, stream: FakeStream());
 
-    expect(capturedRequest, isNotNull);
-    expect(capturedRequest!.method, 'POST');
-    expect(capturedRequest!.url.path, '/api/mesh/references');
-    expect(jsonDecode(capturedRequest!.body), {
-      'refs': ['github:o/r/issues/1'],
-    });
-    expect(result['github:o/r/issues/1']?.title, 'Test Issue');
-  });
+      await store.refreshRecentActivity();
+      expect(
+        store.recentActivity.value.single.reference?.cacheState,
+        'pending',
+      );
+
+      api.referencesError = StateError('offline');
+      await store.refreshRecentActivity();
+      final item = store.recentActivity.value.single;
+      expect(item.reference?.cacheState, 'unavailable');
+      expect(item.reference?.unavailable, 'could not load context');
+      await store.dispose();
+    },
+  );
 }

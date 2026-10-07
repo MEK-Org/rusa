@@ -628,12 +628,17 @@ describe("handleMeshApiRequest", () => {
       expect(actorRead).not.toHaveBeenCalled();
     });
 
-    it("scopes legacy mesh pointers by their source without reading chat (#590, #940)", async () => {
+    it("scopes legacy mesh pointers by their canonical record (#590, #940)", async () => {
       actors.upsert(rec(UUID_A, "root", "active"));
       const other = principals.createUser({
         email: "second@example.com",
         createdAt: "2026-06-22T00:00:00.000Z",
       }).id;
+      const hiddenMessageId = meshChat.record({
+        senderId: other,
+        recipientId: UUID_A,
+        body: "not this viewer's conversation",
+      });
       inbox.append([
         {
           id: "theirs",
@@ -648,6 +653,12 @@ describe("handleMeshApiRequest", () => {
           payload: { type: "human.message", messageId: "m-unsigned" },
         },
         {
+          id: "hidden-canonical",
+          actorId: UUID_A,
+          source: "mesh:unknown",
+          payload: { type: "human.message", messageId: hiddenMessageId },
+        },
+        {
           id: "peer",
           actorId: UUID_A,
           source: `mesh:${UUID_B}`,
@@ -656,7 +667,7 @@ describe("handleMeshApiRequest", () => {
       ]);
       inbox.markHandled(
         UUID_A,
-        ["theirs", "unsigned", "peer"],
+        ["theirs", "unsigned", "hidden-canonical", "peer"],
         new Date("2026-09-26T03:15:00.000Z"),
         "Addressed"
       );
@@ -666,15 +677,16 @@ describe("handleMeshApiRequest", () => {
       expect(res.statusCode).toBe(200);
       const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
       // The second local user is not the viewer, so their conversation with
-      // the actor is not in the feed at all. A legacy entry with no `fromId`
-      // remains visible, matching the old endpoint, but still causes no
-      // first-paint chat read. Actor↔actor chat stays shared.
+      // the actor is not in the feed at all. Even a legacy entry that omits
+      // sender/source is omitted when its canonical mesh record says that;
+      // an unresolvable legacy pointer remains visible as it did at staging.
+      // Actor↔actor chat stays shared.
       expect(items.map((item) => item.id)).toEqual(["inbox_unsigned", "inbox_peer"]);
       expect(items.find((item) => item.id === "inbox_unsigned")).toMatchObject({
         referenceKey: "mesh:messages/m-unsigned",
       });
       expect(res.body).not.toContain(other);
-      expect(chatRead).not.toHaveBeenCalled();
+      expect(chatRead).toHaveBeenCalledWith(hiddenMessageId);
     });
   });
 
@@ -4378,8 +4390,19 @@ describe("handleMeshApiRequest", () => {
         expect(res.statusCode).toBe(200);
         return (JSON.parse(res.body) as ReferencesBody).references;
       };
+      let citation = 0;
+      const cite = (...refs: string[]) => {
+        const obligation = obligations.create({
+          id: `reference-citation-${citation}`,
+          ownerId: UUID_A,
+          title: "Reference citation",
+          externalRef: `github:MEK-Org/rusa/issues/${10_000 + citation++}`,
+        });
+        for (const ref of refs) obligations.attachArtifact(obligation.id, ref);
+      };
 
       it("resolves each requested ref through the cache and isolates faults", async () => {
+        cite("github:MEK-Org/rusa/issues/345", "github:MEK-Org/rusa/issues/999");
         const depsWithCache = {
           ...deps,
           referenceCache: {
@@ -4432,6 +4455,10 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("resolves a PR comment and a PR review, not just a plain issue", async () => {
+        cite(
+          "github:MEK-Org/rusa/pulls/76/comments/12345",
+          "github:MEK-Org/rusa/pulls/76/reviews/9001"
+        );
         const depsWithCache = {
           ...deps,
           referenceCache: {
@@ -4484,6 +4511,7 @@ describe("handleMeshApiRequest", () => {
           body: "A monster-catching JRPG in a cave.",
         });
         const chatRef = `mesh:messages/${messageId}`;
+        cite("github:MEK-Org/rusa/issues/33", chatRef);
         const resolved = await references(deps, [chatRef, "github:MEK-Org/rusa/issues/33"]);
         expect(resolved[chatRef].body).toBe("A monster-catching JRPG in a cave.");
         // Without a cache the GitHub ref still comes back with an explicit
@@ -4496,6 +4524,7 @@ describe("handleMeshApiRequest", () => {
 
       it("converges a pending Google Chat reference on re-fetch with one provider read (#595)", async () => {
         const ref = "gchat:spaces/AAAA123/messages/BBBB.CCCC";
+        cite(ref);
         let finishRead!: () => void;
         const readGate = new Promise<void>((resolve) => {
           finishRead = resolve;
@@ -4541,6 +4570,7 @@ describe("handleMeshApiRequest", () => {
 
       it("waits one deadline for a whole batch of cold references (#933)", async () => {
         const refs = Array.from({ length: 12 }, (_, i) => `github:o/r/issues/${i + 1}`);
+        cite(...refs);
         const getIssue = vi.fn(() => new Promise<never>(() => {}));
         const coldDeps = {
           ...deps,
@@ -4593,6 +4623,7 @@ describe("handleMeshApiRequest", () => {
           } as unknown as ReferenceCacheService,
         };
         const refs = Array.from({ length: 20 }, (_, i) => `github:o/r/issues/${i + 1}`);
+        cite(...refs);
 
         const full = await references(counted, [...refs, refs[0], refs[1]]);
         expect(Object.keys(full)).toEqual(refs);
@@ -4631,6 +4662,7 @@ describe("handleMeshApiRequest", () => {
           `github:o/r/issues/${i}_`.padEnd(512, "x")
         );
         expect(maxKeys.every((k) => k.length === 512)).toBe(true);
+        cite(...maxKeys);
         const res = await references(counted, maxKeys);
         expect(Object.keys(res)).toHaveLength(20);
         expect(get).toHaveBeenCalledTimes(20);
@@ -4656,7 +4688,7 @@ describe("handleMeshApiRequest", () => {
           referenceCache: {
             startBudget: () => ({ deadlineAt: Date.now() + 250 }),
             get: async (ref: string) => {
-              if (ref === "bad:ref") {
+              if (ref === "github:o/r/issues/2") {
                 throw new Error("unexpected parser exception");
               }
               return {
@@ -4670,10 +4702,41 @@ describe("handleMeshApiRequest", () => {
             },
           } as unknown as ReferenceCacheService,
         };
-        const res = await references(brokenDeps, ["github:o/r/issues/1", "bad:ref"]);
+        cite("github:o/r/issues/1", "github:o/r/issues/2");
+        const res = await references(brokenDeps, ["github:o/r/issues/1", "github:o/r/issues/2"]);
         expect(res["github:o/r/issues/1"].cacheState).toBe("fresh");
-        expect(res["bad:ref"].cacheState).toBe("unavailable");
-        expect(res["bad:ref"].unavailable).toBe("could not load context");
+        expect(res["github:o/r/issues/2"].cacheState).toBe("unavailable");
+        expect(res["github:o/r/issues/2"].unavailable).toBe("could not load context");
+      });
+
+      it("does not resolve a client-invented reference", async () => {
+        const allowed = "github:MEK-Org/rusa/issues/345";
+        const invented = "github:private/repo/issues/999";
+        cite(allowed);
+        const get = vi.fn(async (ref: string) => ({
+          ref,
+          scheme: "github",
+          title: ref,
+          body: null,
+          cacheState: "fresh" as const,
+          unavailable: null,
+        }));
+        const counted = {
+          ...deps,
+          referenceCache: {
+            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
+            get,
+          } as unknown as ReferenceCacheService,
+        };
+
+        const resolved = await references(counted, [allowed, invented]);
+        expect(get).toHaveBeenCalledTimes(1);
+        expect(get).toHaveBeenCalledWith(allowed, counted, expect.anything());
+        expect(resolved[allowed].cacheState).toBe("fresh");
+        expect(resolved[invented]).toMatchObject({
+          cacheState: "unavailable",
+          unavailable: "could not load context",
+        });
       });
     });
 

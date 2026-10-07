@@ -10,6 +10,19 @@ import 'session_client.dart';
 /// `MAX_REFERENCE_BATCH` on the server, which refuses a larger batch.
 const int referenceBatchLimit = 20;
 
+/// A serial reference fill completed some earlier batches before one request
+/// failed. Detail keeps the failed keys pending for its bounded retry ladder;
+/// activity can retain the completed previews and settle only the failed keys.
+class PartialReferenceFetchException implements Exception {
+  const PartialReferenceFetchException({
+    required this.resolved,
+    required this.unresolved,
+  });
+
+  final Map<String, ReferenceDto> resolved;
+  final Set<String> unresolved;
+}
+
 /// REST client for the PR2 dashboard Data API. All paths are resolved against
 /// the page origin (`Uri.base`), so the same build works on localhost and
 /// behind `tailscale serve` (relative paths, no hard-coded host).
@@ -556,25 +569,32 @@ class DashboardApi {
         start,
         (start + referenceBatchLimit).clamp(0, distinct.length),
       );
-      final res = await _client.post(
-        uri,
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-        },
-        body: jsonEncode({'refs': chunk}),
-      );
-      if (res.statusCode != 200) {
-        throw DashboardApiException(uri, res.statusCode, res.body);
+      try {
+        final res = await _client.post(
+          uri,
+          headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'refs': chunk}),
+        );
+        if (res.statusCode != 200) {
+          throw DashboardApiException(uri, res.statusCode, res.body);
+        }
+        final json = jsonDecode(res.body) as Map<String, dynamic>;
+        final rawRefs = json['references'] as Map<String, dynamic>? ?? const {};
+        merged.addAll(
+          rawRefs.map(
+            (k, v) =>
+                MapEntry(k, ReferenceDto.fromJson(v as Map<String, dynamic>)),
+          ),
+        );
+      } catch (_) {
+        throw PartialReferenceFetchException(
+          resolved: merged,
+          unresolved: distinct.sublist(start).toSet(),
+        );
       }
-      final json = jsonDecode(res.body) as Map<String, dynamic>;
-      final rawRefs = json['references'] as Map<String, dynamic>? ?? const {};
-      merged.addAll(
-        rawRefs.map(
-          (k, v) =>
-              MapEntry(k, ReferenceDto.fromJson(v as Map<String, dynamic>)),
-        ),
-      );
     }
     return merged;
   }

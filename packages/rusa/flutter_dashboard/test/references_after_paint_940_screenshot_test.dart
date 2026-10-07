@@ -1,6 +1,8 @@
 // Real WorkTab and OverviewTab screenshots with synthetic data only (#940):
 // each pane as it first paints, its references still loading, and once
-// `/api/mesh/references` has filled them in.
+// `/api/mesh/references` has filled them in. The committed *_staging_before
+// captures were generated from origin/staging fdbbb89f with this same fixture,
+// so the PR presents an actual baseline alongside the new states.
 import 'dart:async';
 import 'dart:io';
 

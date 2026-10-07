@@ -713,13 +713,18 @@ class DashboardStore {
       if (generation != _recentActivityGeneration) return;
       _activityReferences.addAll(fetched);
       emit();
-    } catch (_) {
+    } catch (error) {
+      final partial = error is PartialReferenceFetchException ? error : null;
+      if (partial != null) _activityReferences.addAll(partial.resolved);
+      final unresolved = partial?.unresolved ?? keys;
       // Keep an already-filled preview, but settle a new card rather than
-      // leaving its placeholder pending until a later feed refresh. That
-      // refresh still asks this key again and can replace the fallback.
+      // leaving its placeholder pending until a later feed refresh. A pending
+      // cache answer is a placeholder, not a filled preview. That refresh
+      // still asks the failed key again and can replace the fallback.
       _activityReferences.addAll({
-        for (final key in keys)
-          if (!_activityReferences.containsKey(key))
+        for (final key in unresolved)
+          if (_activityReferences[key]?.cacheState == null ||
+              _activityReferences[key]?.cacheState == 'pending')
             key: ReferenceDto(
               ref: key,
               scheme: key.split(':').first,

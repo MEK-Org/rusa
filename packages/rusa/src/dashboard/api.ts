@@ -754,6 +754,45 @@ function scopeMeshMessageReference(
   };
 }
 
+/**
+ * A fill-in request may only name a reference the dashboard already projects
+ * from durable state.  The client has those keys after its first-paint route;
+ * accepting an arbitrary key here would turn this read endpoint into a
+ * provider-credential oracle and cache warmer.
+ *
+ * The activity feed is capped at 100 rows, so its current projection and this
+ * allowlist use the same bounded source.  Obligation references come from the
+ * durable external-ref and artifact records, not from a client assertion.
+ */
+function dashboardReferenceKeys(deps: DashboardDataDeps): Set<string> {
+  const keys = new Set<string>();
+  for (const obligation of deps.obligations?.list() ?? []) {
+    if (obligation.externalRef) keys.add(obligation.externalRef.key);
+    for (const artifact of deps.obligations?.listArtifacts(obligation.id) ?? [])
+      keys.add(artifact.ref);
+  }
+  for (const entry of deps.inbox?.listRecentHandledEntries(100) ?? []) {
+    const { messageId } = entry.payload as { messageId?: unknown };
+    if (typeof messageId === "string") {
+      keys.add(`mesh:messages/${messageId}`);
+    } else if (entry.source.startsWith("github:") || entry.source.startsWith("slack:")) {
+      keys.add(entry.source);
+    } else {
+      const ref = gchatInboxMessageReference(entry.source, entry.payload);
+      if (ref) keys.add(ref);
+    }
+  }
+  return keys;
+}
+
+function unavailableReference(ref: string): ResolvedReferenceWithEntity {
+  return {
+    ...resolveReferenceSync(ref, {}),
+    unavailable: "could not load context",
+    cacheState: "unavailable",
+  };
+}
+
 function parseKinds(url: URL): string[] | undefined {
   const raw = url.searchParams.get("kinds");
   if (!raw) return undefined;
@@ -847,8 +886,13 @@ async function resolveReferenceBatch(
   // (#933).
   const { referenceCache } = deps;
   const referenceBudget = referenceCache?.startBudget();
+  const available = dashboardReferenceKeys(deps);
   const resolved = await Promise.all(
     refs.map(async (ref) => {
+      // Do not permit an authenticated browser to use this endpoint to query
+      // a provider object it was never shown by a first-paint projection.
+      // In particular, never call ReferenceCacheService for an unknown key.
+      if (!available.has(ref)) return unavailableReference(ref);
       try {
         const res = referenceCache
           ? await measureDashboardPhase("enrichment", () =>
@@ -861,14 +905,7 @@ async function resolveReferenceBatch(
           : resolveReferenceSync(ref, { meshChat: deps.meshChat });
         return scopeMeshMessageReference(res, scope);
       } catch {
-        return {
-          ref,
-          scheme: ref.split(":")[0] ?? "",
-          title: ref,
-          body: null,
-          unavailable: "could not load context",
-          cacheState: "unavailable" as const,
-        };
+        return unavailableReference(ref);
       }
     })
   );
@@ -2524,15 +2561,23 @@ export async function handleMeshApiRequest(
         // A human's message is that human's conversation with the actor.
         // Another viewer is shown nothing of it — not that it exists — and a
         // legacy pointer gets its sender from the canonical mesh source. The
-        // inbox row is always the recipient's. When neither says who sent the
-        // message, retain the card as the older endpoint did; the subsequent
-        // scoped reference projection still withholds any unseen content (#590).
+        // inbox row is always the recipient's. Payload/source are hints only:
+        // the local canonical record remains the #590 visibility authority.
         const sourceSender =
           source.startsWith("mesh:") && source !== "mesh:unknown"
             ? source.slice("mesh:".length)
             : undefined;
         const senderId = typeof fromId === "string" ? fromId : sourceSender;
         if (senderId && !chatScope.canSee(senderId, entry.actorId)) continue;
+        const reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
+          meshChat: deps.meshChat,
+        });
+        if (
+          reference.entity?.type === "mesh_message" &&
+          !chatScope.canSee(reference.entity.senderId, reference.entity.recipientId)
+        ) {
+          continue;
+        }
         referenceKey = `mesh:messages/${messageId}`;
       } else if (source.startsWith("github:") || source.startsWith("slack:")) {
         // Canonical external reference: resolve key after first paint.

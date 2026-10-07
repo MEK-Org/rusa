@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:flutter/material.dart';
 
+import '../api.dart';
 import '../breakpoints.dart';
 import '../dashboard_timing.dart';
 import '../link_opener.dart';
@@ -948,7 +949,9 @@ class _DetailViewState extends State<_DetailView> {
     final gen = _fetchGeneration;
     _referencesInFlight = {..._referencesInFlight, ...wanted};
     void settle([Map<String, ReferenceDto> resolved = const {}]) {
-      if (!mounted || gen != _fetchGeneration || id != widget.obligationId) return;
+      if (!mounted || gen != _fetchGeneration || id != widget.obligationId) {
+        return;
+      }
       setState(() {
         _referencesInFlight = _referencesInFlight.difference(wanted);
         _references = {..._references, ...resolved};
@@ -956,7 +959,14 @@ class _DetailViewState extends State<_DetailView> {
       });
     }
 
-    store.api.fetchReferences(wanted).then(settle, onError: (_) => settle());
+    store.api
+        .fetchReferences(wanted)
+        .then(
+          settle,
+          onError: (Object error, StackTrace _) => settle(
+            error is PartialReferenceFetchException ? error.resolved : const {},
+          ),
+        );
   }
 
   /// Schedules the next bounded re-ask when a ref [data] cites is still
