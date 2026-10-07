@@ -1,11 +1,24 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname } from "node:path";
 import { isGchatThreadHead } from "../actor/inbox-hints.js";
-import type { InboxEntry } from "../repositories/inbox-repository.js";
+import type { ChatClient } from "../chat/types.js";
+import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 
 /** Versioned, host-local evidence for the service transition immediately before a boot. */
 export const SERVICE_LIFECYCLE_VERSION = 1;
+/** A restart notice must never hold an already-drained update indefinitely. */
+export const RESTART_ANNOUNCEMENT_TIMEOUT_MS = 10_000;
 
 export interface GchatRestartDestination {
   kind: "gchat";
@@ -50,6 +63,8 @@ export interface ServiceBootWake {
   prior: PriorServiceState;
   requestedRestart?: RequestedRestartIntent;
   cleanShutdown?: CleanShutdownEvidence;
+  /** Present only when corrupt lifecycle state prevented evidence recovery. */
+  lifecycleError?: string;
 }
 
 interface ServiceLifecycleDocument {
@@ -200,6 +215,111 @@ export function resolveRequestedRestartDestination(
   };
 }
 
+type LifecycleWarning = (event: string, fields: Record<string, unknown>) => void;
+
+function errorDetail(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function withinDeadline<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`restart announcement timed out after ${timeoutMs}ms`)),
+          timeoutMs
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * Persist a committed restart intent, then make its bounded best-effort Chat
+ * announcement. The local receipt is intentionally independent of transport:
+ * a receipt-write failure never rewrites a delivered message as failed.
+ */
+export async function recordAndAnnounceRequestedRestart(args: {
+  lifecycle: Pick<ServiceLifecycleStore, "recordRequestedRestart" | "recordAnnouncement">;
+  entries: readonly InboxEntry[];
+  chatClient?: Pick<ChatClient, "send">;
+  targetSha: string;
+  branch: string;
+  subject: string;
+  timeoutMs?: number;
+  onWarning: LifecycleWarning;
+}): Promise<string | undefined> {
+  const origin = resolveRequestedRestartDestination(args.entries);
+  let intent: RequestedRestartIntent;
+  try {
+    intent = args.lifecycle.recordRequestedRestart({
+      targetSha: args.targetSha,
+      branch: args.branch,
+      subject: args.subject,
+      ...(origin ? { origin } : {}),
+    });
+  } catch (error) {
+    args.onWarning("service_restart_intent_persist_failed", {
+      targetSha: args.targetSha,
+      branch: args.branch,
+      err: error,
+    });
+    return undefined;
+  }
+
+  const recordOutcome = (
+    outcome: "delivered" | "failed" | "unavailable",
+    detail?: string
+  ): void => {
+    try {
+      args.lifecycle.recordAnnouncement(intent.id, outcome, detail);
+    } catch (error) {
+      args.onWarning("service_restart_announcement_record_failed", {
+        transitionId: intent.id,
+        outcome,
+        err: error,
+      });
+    }
+  };
+
+  if (!origin || !args.chatClient) {
+    recordOutcome(
+      "unavailable",
+      origin ? "chat client unavailable" : "originating Chat destination unknown"
+    );
+    args.onWarning("service_restart_announcement_unavailable", {
+      transitionId: intent.id,
+      reason: origin ? "chat_client_unavailable" : "origin_unknown",
+    });
+    return intent.id;
+  }
+
+  try {
+    await withinDeadline(
+      args.chatClient.send(
+        origin.spaceName,
+        `🔄 Updating → ${args.targetSha.slice(0, 7)} (${args.subject}) — draining + restarting`,
+        origin.threadName ? { threadName: origin.threadName } : undefined
+      ),
+      args.timeoutMs ?? RESTART_ANNOUNCEMENT_TIMEOUT_MS
+    );
+  } catch (error) {
+    const detail = errorDetail(error);
+    recordOutcome("failed", detail);
+    args.onWarning("service_restart_announcement_failed", { transitionId: intent.id, err: error });
+    return intent.id;
+  }
+
+  // This is deliberately outside the send try/catch: transport success remains
+  // true even when the local receipt cannot be written after it.
+  recordOutcome("delivered");
+  return intent.id;
+}
+
 /**
  * A deliberately small, atomically replaced host record. It is not an alternate
  * inbox: the inbox owns root work; this record only binds a controlled transition
@@ -324,7 +444,22 @@ export class ServiceLifecycleStore {
         encoding: "utf8",
         mode: 0o600,
       });
+      const temporaryFd = openSync(temporary, "r");
+      try {
+        fsyncSync(temporaryFd);
+      } finally {
+        closeSync(temporaryFd);
+      }
       renameSync(temporary, this.filePath);
+      // `rename` is atomic, but syncing the containing directory is what makes
+      // that replacement durable across the supported host-filesystem reboot
+      // boundary. It cannot promise survival of hardware or filesystem lies.
+      const directoryFd = openSync(dir, "r");
+      try {
+        fsyncSync(directoryFd);
+      } finally {
+        closeSync(directoryFd);
+      }
     } catch (error) {
       try {
         if (existsSync(temporary)) rmSync(temporary, { force: true });
@@ -332,6 +467,67 @@ export class ServiceLifecycleStore {
         // Keep the original error authoritative; cleanup is best effort.
       }
       throw error;
+    }
+  }
+}
+
+function appendBootWake(inboxStore: InboxRepository, rootId: string, wake: ServiceBootWake): void {
+  inboxStore.append([
+    {
+      id: `service-boot:${wake.bootId}`,
+      actorId: rootId,
+      source: "system:service-lifecycle",
+      payload: {
+        type: "service.boot",
+        priority: "responsive",
+        bootId: wake.bootId,
+        prior: wake.prior,
+        ...(wake.requestedRestart ? { requestedRestart: wake.requestedRestart } : {}),
+        ...(wake.cleanShutdown ? { cleanShutdown: wake.cleanShutdown } : {}),
+        ...(wake.lifecycleError ? { lifecycleError: wake.lifecycleError } : {}),
+        prompt:
+          "Assess the preceding service-transition evidence. Investigate an unexpected or unknown startup; do not infer a cause beyond the recorded evidence.",
+      },
+    },
+  ]);
+}
+
+/**
+ * Delivers every persisted boot wake through the authoritative inbox. A failed
+ * evidence read is itself an unknown startup, never a reason to suppress root
+ * work; the fallback row is durable even though corrupt evidence is retained.
+ */
+export function appendServiceBootWakes(args: {
+  lifecycle: Pick<ServiceLifecycleStore, "beginBoot" | "acknowledgeBootWake">;
+  inboxStore: InboxRepository;
+  rootId: string;
+  onLifecycleError: LifecycleWarning;
+}): void {
+  let wakes: ServiceBootWake[];
+  try {
+    wakes = args.lifecycle.beginBoot();
+  } catch (error) {
+    args.onLifecycleError("service_boot_evidence_read_failed", { err: error });
+    appendBootWake(args.inboxStore, args.rootId, {
+      bootId: `invalid-${randomUUID()}`,
+      createdAt: new Date().toISOString(),
+      prior: "unknown",
+      lifecycleError: errorDetail(error),
+    });
+    return;
+  }
+
+  for (const wake of wakes) {
+    appendBootWake(args.inboxStore, args.rootId, wake);
+    try {
+      args.lifecycle.acknowledgeBootWake(wake.bootId);
+    } catch (error) {
+      // The inbox row committed first, so keeping this wake pending is a safe
+      // retry. A later boot re-appends the same deterministic inbox id.
+      args.onLifecycleError("service_boot_wake_acknowledgement_failed", {
+        bootId: wake.bootId,
+        err: error,
+      });
     }
   }
 }
