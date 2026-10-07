@@ -1188,7 +1188,7 @@ class _OverviewTabState extends State<OverviewTab> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        widget.store.ownerLabel(item.actorId),
+                        widget.store.actorDisplay(item.actorId),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: kMonoStyle.copyWith(
@@ -1374,7 +1374,7 @@ class _OverviewTabState extends State<OverviewTab> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        widget.store.ownerLabel(item.actorId),
+                        widget.store.actorDisplay(item.actorId),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: kMonoStyle.copyWith(

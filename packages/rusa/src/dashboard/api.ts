@@ -2496,18 +2496,6 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  // GET /api/mesh/references?ref=<key>&ref=<key>… — query parameter fallback (#940).
-  // The detail and recent-activity routes answer with keys alone; this is where those
-  // keys become previews after the page has painted.
-  if (pathname === "/api/mesh/references") {
-    if (url.search.length > 4096) {
-      sendJson(res, 400, { error: "query string exceeds maximum allowed length" });
-      return true;
-    }
-    const refs = [...new Set(url.searchParams.getAll("ref"))];
-    return resolveReferenceBatch(res, refs, deps, viewerScope());
-  }
-
   // GET /api/mesh/recent-activity?limit= — newest-first activity items: handled inbox cards + terminal obligation changes
   if (pathname === "/api/mesh/recent-activity") {
     const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
@@ -2534,10 +2522,16 @@ export async function handleMeshApiRequest(
       if (typeof messageId === "string") {
         // A human's message is that human's conversation with the actor.
         // Another viewer is shown nothing of it — not that it exists — and a
-        // pointer that does not say whose it is is shown to nobody (#590).
-        // Every writer of a message pointer names its sender, and the inbox
-        // row is the recipient's.
-        if (typeof fromId !== "string" || !chatScope.canSee(fromId, entry.actorId)) continue;
+        // legacy pointer gets its sender from the canonical mesh source. The
+        // inbox row is always the recipient's. When neither says who sent the
+        // message, retain the card as the older endpoint did; the subsequent
+        // scoped reference projection still withholds any unseen content (#590).
+        const sourceSender =
+          source.startsWith("mesh:") && source !== "mesh:unknown"
+            ? source.slice("mesh:".length)
+            : undefined;
+        const senderId = typeof fromId === "string" ? fromId : sourceSender;
+        if (senderId && !chatScope.canSee(senderId, entry.actorId)) continue;
         referenceKey = `mesh:messages/${messageId}`;
       } else if (source.startsWith("github:") || source.startsWith("slack:")) {
         // Canonical external reference: resolve key after first paint.

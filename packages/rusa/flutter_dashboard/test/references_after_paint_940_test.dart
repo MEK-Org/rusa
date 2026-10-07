@@ -1,6 +1,6 @@
 // #940: the obligation detail and Recent Activity answer with ref keys and
 // actor ids alone. The client paints from that, then resolves the keys through
-// `GET /api/mesh/references` and fills the references in as they arrive;
+// `POST /api/mesh/references` and fills the references in as they arrive;
 // actors are labelled from the threads snapshot.
 
 import 'dart:async';
@@ -274,7 +274,7 @@ void main() {
     await store.dispose();
   });
 
-  test('DashboardApi.fetchReferences posts JSON body within bounded envelope', () async {
+  test('DashboardApi.fetchReferences posts a JSON ref batch', () async {
     http.Request? capturedRequest;
     final client = MockClient((req) async {
       if (req.url.path == '/api/mesh/references') {

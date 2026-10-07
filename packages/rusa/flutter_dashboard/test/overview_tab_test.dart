@@ -236,6 +236,42 @@ void main() {
   });
 
   testWidgets(
+    'Recent Activity never shows a raw id when its actor is absent from the snapshot',
+    (tester) async {
+      await tester.runAsync(() async {
+        const actor = '11111111-1111-4111-8111-111111111112';
+        final api = FakeApi()
+          ..recentActivityResult = const [
+            RecentActivityItem(
+              id: 'inbox_missing_actor',
+              kind: 'handled_inbox',
+              time: '2026-09-23T14:21:37.000Z',
+              actorId: actor,
+              sourceKind: 'GITHUB ISSUE',
+              sourceRef: 'github:MEK-Org/rusa/issues/664',
+              summary: 'review feedback',
+              handledTime: '2026-09-23T14:21:37.000Z',
+              addressedNote: 'Reviewed',
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
+
+        await tester.binding.setSurfaceSize(const Size(1500, 1400));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Unknown actor'), findsOneWidget);
+        expect(find.text(actor), findsNothing);
+        expect(tester.takeException(), isNull);
+      });
+    },
+  );
+
+  testWidgets(
     'OverviewTab renders empty state when 00000000-0000-4000-8000-000000000001 has no obligations ',
     (tester) async {
       await tester.runAsync(() async {

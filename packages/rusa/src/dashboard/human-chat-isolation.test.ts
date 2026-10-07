@@ -281,6 +281,15 @@ describe("human chat isolation (#590)", () => {
     return { status: res.status, body: text ? (JSON.parse(text) as T) : (null as T) };
   }
 
+  async function referencesJson<T>(
+    refs: string[],
+    cookie?: string
+  ): Promise<{ status: number; body: T }> {
+    const res = await post("/api/mesh/references", { refs }, cookie);
+    const text = await res.text();
+    return { status: res.status, body: text ? (JSON.parse(text) as T) : (null as T) };
+  }
+
   type ChatPage = { chat: Array<{ senderId: string; recipientId: string; body: string }> };
   type EventPage = { events: Array<{ kind: string; actorId: string | null; body: string | null }> };
   type WindowPage = EventPage & { hasMore: boolean };
@@ -301,8 +310,6 @@ describe("human chat isolation (#590)", () => {
     entity?: unknown;
   };
   type ReferencesPage = { references: Record<string, CitedReference> };
-  const referencesPath = (refs: string[]) =>
-    `/api/mesh/references?${refs.map((ref) => `ref=${encodeURIComponent(ref)}`).join("&")}`;
 
   type ThreadsPage = {
     threads: Array<{
@@ -600,7 +607,7 @@ describe("human chat isolation (#590)", () => {
 
     // Resolved after first paint, in one batch that mixes alice's own
     // citation with bob's: batching reveals nothing scoping per ref would not.
-    const cited = await getJson<ReferencesPage>(referencesPath(refs), a.cookie);
+    const cited = await referencesJson<ReferencesPage>(refs, a.cookie);
     expect(cited.status).toBe(200);
     expect(cited.body.references[`mesh:messages/${fromAlice}`]?.body).toBe("alice decided it");
     // Actor↔actor citations are shared mesh visibility, as before.
@@ -622,13 +629,13 @@ describe("human chat isolation (#590)", () => {
     expect(serialized).not.toContain(b.id);
 
     // The same batch is bob's own citation for bob.
-    const bobCited = await getJson<ReferencesPage>(referencesPath(refs), b.cookie);
+    const bobCited = await referencesJson<ReferencesPage>(refs, b.cookie);
     expect(bobCited.body.references[`mesh:messages/${fromBob}`]?.body).toBe("bob decided it");
     expect(bobCited.body.references[`mesh:messages/${fromAlice}`]?.body).toBeNull();
     expect(JSON.stringify(bobCited.body)).not.toContain(a.id);
 
     // Signed in like every other dashboard read.
-    expect((await fetch(origin + referencesPath(refs))).status).toBe(401);
+    expect((await post("/api/mesh/references", { refs })).status).toBe(401);
   });
 
   it("omits another human's message from the actor's inbox and thread projections", async () => {
@@ -710,7 +717,7 @@ describe("human chat isolation (#590)", () => {
     expect(serialized).not.toContain(b.id);
     expect(serialized).not.toContain(String(bobsEntry?.payload.messageId));
 
-    const resolved = await getJson<ReferencesPage>(referencesPath(keys), a.cookie);
+    const resolved = await referencesJson<ReferencesPage>(keys, a.cookie);
     expect(resolved.status).toBe(200);
     expect(Object.values(resolved.body.references).map((r) => r.body)).toContain("alice asks");
     expect(resolved.body.references["github:o/r/issues/1"]?.cacheState).toBe("pending");
@@ -718,7 +725,7 @@ describe("human chat isolation (#590)", () => {
     // Naming bob's message outright, alone or batched with alice's own,
     // resolves it without its content or its ends.
     const bobsRef = `mesh:messages/${String(bobsEntry?.payload.messageId)}`;
-    const guessed = await getJson<ReferencesPage>(referencesPath([...keys, bobsRef]), a.cookie);
+    const guessed = await referencesJson<ReferencesPage>([...keys, bobsRef], a.cookie);
     expect(guessed.body.references[bobsRef]).toMatchObject({ body: null, author: null });
     expect(JSON.stringify(guessed.body)).not.toContain("bob asks");
     expect(JSON.stringify(guessed.body)).not.toContain(b.id);

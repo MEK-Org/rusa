@@ -1,7 +1,6 @@
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
@@ -629,7 +628,7 @@ describe("handleMeshApiRequest", () => {
       expect(actorRead).not.toHaveBeenCalled();
     });
 
-    it("omits a mesh message the viewer cannot see, and one naming no sender, from the payload alone (#590, #940)", async () => {
+    it("scopes legacy mesh pointers by their source without reading chat (#590, #940)", async () => {
       actors.upsert(rec(UUID_A, "root", "active"));
       const other = principals.createUser({
         email: "second@example.com",
@@ -667,9 +666,13 @@ describe("handleMeshApiRequest", () => {
       expect(res.statusCode).toBe(200);
       const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
       // The second local user is not the viewer, so their conversation with
-      // the actor is not in the feed at all; neither is a message pointer
-      // that does not say whose it is. Actor↔actor chat stays shared.
-      expect(items.map((item) => item.id)).toEqual(["inbox_peer"]);
+      // the actor is not in the feed at all. A legacy entry with no `fromId`
+      // remains visible, matching the old endpoint, but still causes no
+      // first-paint chat read. Actor↔actor chat stays shared.
+      expect(items.map((item) => item.id)).toEqual(["inbox_unsigned", "inbox_peer"]);
+      expect(items.find((item) => item.id === "inbox_unsigned")).toMatchObject({
+        referenceKey: "mesh:messages/m-unsigned",
+      });
       expect(res.body).not.toContain(other);
       expect(chatRead).not.toHaveBeenCalled();
     });
@@ -4355,7 +4358,7 @@ describe("handleMeshApiRequest", () => {
       });
     });
 
-    describe("GET /api/mesh/references (#940)", () => {
+    describe("POST /api/mesh/references (#940)", () => {
       type ReferencesBody = {
         references: Record<
           string,
@@ -4370,8 +4373,6 @@ describe("handleMeshApiRequest", () => {
           }
         >;
       };
-      const query = (refs: string[]) =>
-        `/api/mesh/references?${refs.map((ref) => `ref=${encodeURIComponent(ref)}`).join("&")}`;
       const references = async (d: DashboardDataDeps, refs: string[]) => {
         const { res } = await call(d, "POST", "/api/mesh/references", JSON.stringify({ refs }));
         expect(res.statusCode).toBe(200);
@@ -4553,7 +4554,12 @@ describe("handleMeshApiRequest", () => {
         vi.useFakeTimers({ toFake: ["setTimeout"] });
         try {
           let answered = false;
-          const response = call(coldDeps, "GET", query(refs)).then((r) => {
+          const response = call(
+            coldDeps,
+            "POST",
+            "/api/mesh/references",
+            JSON.stringify({ refs })
+          ).then((r) => {
             answered = true;
             return r;
           });
@@ -4593,18 +4599,18 @@ describe("handleMeshApiRequest", () => {
         expect(get).toHaveBeenCalledTimes(20);
 
         get.mockClear();
-        for (const path of [
-          query([...refs, "github:o/r/issues/21"]),
-          query([`github:o/r/issues/${"9".repeat(600)}`]),
-          "/api/mesh/references",
+        for (const body of [
+          { refs: [...refs, "github:o/r/issues/21"] },
+          { refs: [`github:o/r/issues/${"9".repeat(600)}`] },
+          { refs: [] },
         ]) {
-          const { res } = await call(counted, "GET", path);
+          const { res } = await call(counted, "POST", "/api/mesh/references", JSON.stringify(body));
           expect(res.statusCode).toBe(400);
         }
         expect(get).not.toHaveBeenCalled();
       });
 
-      it("accepts a full batch of 20 maximum-length keys within HTTP parser bounds", async () => {
+      it("accepts a full batch of 20 maximum-length keys and validates the request body", async () => {
         const get = vi.fn(async (ref: string) => ({
           ref,
           scheme: "github",
@@ -4628,69 +4634,11 @@ describe("handleMeshApiRequest", () => {
         expect(Object.keys(res)).toHaveLength(20);
         expect(get).toHaveBeenCalledTimes(20);
 
-        // Also accepts GET for backwards compatibility when query is within 4096 bytes
-        const getRes = await call(counted, "GET", query(maxKeys.slice(0, 3)));
-        expect(getRes.res.statusCode).toBe(200);
-
-        // Rejects GET when query string exceeds 4096 bytes
-        const hugeGet = await call(counted, "GET", `/api/mesh/references?${"a".repeat(5000)}`);
-        expect(hugeGet.res.statusCode).toBe(400);
-
-        // Rejects POST when body exceeds 64 KiB
+        // This route validates a post-buffer request-body character limit; it
+        // deliberately makes no transport-memory claim shared `readBody` does
+        // not provide.
         const hugePost = await call(counted, "POST", "/api/mesh/references", "x".repeat(70_000));
         expect(hugePost.res.statusCode).toBe(413);
-      });
-
-      it("proves the accepted worst case via the real Node HTTP parser plus auth headers", async () => {
-        const get = vi.fn(async (ref: string) => ({
-          ref,
-          scheme: "github",
-          title: "issue",
-          body: null,
-          cacheState: "fresh",
-          unavailable: null,
-        }));
-        const counted = {
-          ...deps,
-          referenceCache: {
-            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
-            get,
-          } as unknown as ReferenceCacheService,
-        };
-
-        const server = createServer(async (req, res) => {
-          const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-          await handleMeshApiRequest(req, res, url, counted);
-        });
-
-        await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-        const address = server.address() as AddressInfo;
-        const port = address.port;
-
-        try {
-          // Worst-case 20 keys: each 512 characters with colons, slashes, and unicode characters
-          // that would balloon if percent-encoded in query parameters
-          const worstCaseKeys = Array.from({ length: 20 }, (_, i) =>
-            `github:o/r/issues/batch:${i}:🔑:`.padEnd(512, "x")
-          );
-          const response = await fetch(`http://127.0.0.1:${port}/api/mesh/references`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${"a".repeat(1024)}`,
-              Cookie: `session=${"b".repeat(1024)}; other=${"c".repeat(1024)}`,
-              "X-Custom-Client-Envelope": "d".repeat(2048),
-            },
-            body: JSON.stringify({ refs: worstCaseKeys }),
-          });
-
-          expect(response.status).toBe(200);
-          const data = (await response.json()) as ReferencesBody;
-          expect(Object.keys(data.references)).toHaveLength(20);
-          expect(get).toHaveBeenCalledTimes(20);
-        } finally {
-          await new Promise<void>((resolve) => server.close(() => resolve()));
-        }
       });
 
       it("isolates sync resolution and projection exceptions to the failing reference", async () => {
