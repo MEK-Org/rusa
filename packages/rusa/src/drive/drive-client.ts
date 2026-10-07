@@ -21,8 +21,8 @@ export interface DriveFileMetadata {
 export interface DriveClient {
   listChildren(folderId: string, recursive?: boolean): Promise<DriveFileMetadata[]>;
   getFileMetadata(fileId: string): Promise<DriveFileMetadata>;
-  /** Stream a file's response; `maxBytes` can only lower the client's configured limit. */
-  downloadFileStream(fileId: string, maxBytes?: number): Promise<Response>;
+  /** Stream a file's response bounded at the client's configured ceiling. */
+  downloadFileStream(fileId: string): Promise<Response>;
   exportDoc(fileId: string, mimeType: string): Promise<Buffer>;
 }
 
@@ -40,7 +40,10 @@ export class GoogleDriveClient implements DriveClient {
     maxSizeBytes?: number
   ) {
     this.oauth = new DriveOAuth(configDir, fetchImpl, tokenFilename);
-    this.maxDownloadSizeBytes = maxSizeBytes ?? MAX_DRIVE_FILE_DOWNLOAD_BYTES;
+    this.maxDownloadSizeBytes = Math.min(
+      maxSizeBytes ?? MAX_DRIVE_FILE_DOWNLOAD_BYTES,
+      MAX_DRIVE_FILE_DOWNLOAD_BYTES
+    );
     this.maxExportSizeBytes = maxSizeBytes ?? MAX_DRIVE_EXPORT_BYTES;
   }
 
@@ -177,7 +180,7 @@ export class GoogleDriveClient implements DriveClient {
     throw new Error("cannot enforce size limit: response body is not streamable");
   }
 
-  async downloadFileStream(fileId: string, maxBytes?: number): Promise<Response> {
+  async downloadFileStream(fileId: string): Promise<Response> {
     const token = await this.oauth.token();
     const resp = await this.fetchImpl(
       `${DRIVE_API}/files/${encodeURIComponent(fileId)}?alt=media`,
@@ -190,12 +193,7 @@ export class GoogleDriveClient implements DriveClient {
         `drive download ${fileId} -> HTTP ${resp.status} ${(await resp.text()).slice(0, 300)}`
       );
     }
-    return boundedResponse(resp, this.downloadLimit(maxBytes), "file");
-  }
-
-  /** A per-call limit can lower the configured limit, never raise it. */
-  private downloadLimit(maxBytes?: number): number {
-    return Math.min(this.maxDownloadSizeBytes, maxBytes ?? this.maxDownloadSizeBytes);
+    return boundedResponse(resp, this.maxDownloadSizeBytes, "file");
   }
 
   async exportDoc(fileId: string, mimeType: string): Promise<Buffer> {

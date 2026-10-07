@@ -43,7 +43,10 @@ export class GchatClient implements ChatClient {
    */
   constructor(configDir = defaultGchatConfigDir(), maxSizeBytes?: number) {
     this.oauth = new GchatOAuth(configDir);
-    this.maxDownloadSizeBytes = maxSizeBytes ?? MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES;
+    this.maxDownloadSizeBytes = Math.min(
+      maxSizeBytes ?? MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
+      MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES
+    );
     this.maxUploadSizeBytes = maxSizeBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
   }
 

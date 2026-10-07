@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -41,6 +42,15 @@ vi.mock("node:fs/promises", async () => {
 
 function workdir(): string {
   return mkdtempSync(join(tmpdir(), "rusa-workdir-path-"));
+}
+
+function streamFrom(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
 }
 
 describe("readBoundedRegularFile", () => {
@@ -150,7 +160,7 @@ describe("streamNewFileInWorkdir", () => {
     const dir = workdir();
     const destination = await resolveDownloadPath(dir, "streamed.bin");
     const chunks = [Buffer.from("hello "), Buffer.from("world")];
-    const result = await streamNewFileInWorkdir(dir, destination, chunks, 1024);
+    const result = await streamNewFileInWorkdir(dir, destination, streamFrom(chunks));
     expect(result.bytes).toBe(11);
     expect(result.sha256).toBe(createHash("sha256").update("hello world").digest("hex"));
     expect(readFileSync(destination, "utf-8")).toBe("hello world");
@@ -163,40 +173,29 @@ describe("streamNewFileInWorkdir", () => {
     await probe.close();
     const destination = await resolveDownloadPath(dir, "synced.bin");
 
-    await streamNewFileInWorkdir(dir, destination, [Buffer.from("complete")], 1024);
+    await streamNewFileInWorkdir(dir, destination, streamFrom([Buffer.from("complete")]));
 
     expect(sync).toHaveBeenCalledTimes(1);
     sync.mockRestore();
   });
 
-  it("rejects and unlinks partial output when streamed bytes exceed maxBytes", async () => {
+  it("unlinks partial output when the source stream fails", async () => {
     const dir = workdir();
     const destination = await resolveDownloadPath(dir, "oversized.bin");
-    const chunks = [Buffer.from("chunk1-"), Buffer.from("chunk2-overflow")];
-    await expect(streamNewFileInWorkdir(dir, destination, chunks, 10)).rejects.toThrow(
-      "file size limit exceeded"
-    );
-    expect(existsSync(destination)).toBe(false);
-  });
-
-  it("cancels readable stream when maxBytes is exceeded", async () => {
-    const dir = workdir();
-    const destination = await resolveDownloadPath(dir, "cancelled.bin");
-    let cancelled = false;
+    let first = true;
     const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new Uint8Array(20));
-        controller.enqueue(new Uint8Array(20));
-      },
-      cancel() {
-        cancelled = true;
+      pull(controller) {
+        if (first) {
+          first = false;
+          controller.enqueue(Buffer.from("partial"));
+          return;
+        }
+        controller.error(new Error("source failed"));
       },
     });
-    await expect(streamNewFileInWorkdir(dir, destination, stream, 25)).rejects.toThrow(
-      "file size limit exceeded"
-    );
-    expect(cancelled).toBe(true);
+    await expect(streamNewFileInWorkdir(dir, destination, stream)).rejects.toThrow("source failed");
     expect(existsSync(destination)).toBe(false);
+    expect(readdirSync(dir)).toEqual([]);
   });
 
   it("cancels the source and keeps an existing destination it refuses to overwrite", async () => {
@@ -205,7 +204,7 @@ describe("streamNewFileInWorkdir", () => {
     const destination = await resolveDownloadPath(dir, "existing.bin");
     const cancel = vi.fn();
     const stream = new ReadableStream<Uint8Array>({ cancel });
-    await expect(streamNewFileInWorkdir(dir, destination, stream, 1024)).rejects.toMatchObject({
+    await expect(streamNewFileInWorkdir(dir, destination, stream)).rejects.toMatchObject({
       code: "EEXIST",
     });
     expect(cancel).toHaveBeenCalled();
@@ -218,16 +217,22 @@ describe("streamNewFileInWorkdir", () => {
     writeFileSync(join(outside, "partial.bin"), "unrelated");
     mkdirSync(join(dir, "sub"));
     const destination = await resolveDownloadPath(dir, "sub/partial.bin");
-    async function* swapThenOverflow() {
-      yield Buffer.from("first");
-      renameSync(join(dir, "sub"), join(dir, "sub-moved"));
-      symlinkSync(outside, join(dir, "sub"));
-      yield Buffer.from("-overflow");
-    }
-    await expect(streamNewFileInWorkdir(dir, destination, swapThenOverflow(), 8)).rejects.toThrow(
-      "file size limit exceeded"
-    );
+    let first = true;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (first) {
+          first = false;
+          controller.enqueue(Buffer.from("first"));
+          return;
+        }
+        renameSync(join(dir, "sub"), join(dir, "sub-moved"));
+        symlinkSync(outside, join(dir, "sub"));
+        controller.error(new Error("source failed"));
+      },
+    });
+    await expect(streamNewFileInWorkdir(dir, destination, stream)).rejects.toThrow("source failed");
     expect(existsSync(join(dir, "sub-moved", "partial.bin"))).toBe(false);
+    expect(readdirSync(join(dir, "sub-moved"))).toEqual([]);
     expect(readFileSync(join(outside, "partial.bin"), "utf-8")).toBe("unrelated");
   });
 });

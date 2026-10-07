@@ -42,6 +42,13 @@ function textOf(result: CallToolResult): string {
 }
 
 describe("chat MCP server", () => {
+  it("clamps an oversized fake download configuration to the binary ceiling", () => {
+    expect(
+      new FakeChatClient({ maxSizeBytes: MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES + 1 })
+        .maxDownloadSizeBytes
+    ).toBe(MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES);
+  });
+
   it("exposes source-backed reads separately from scoped writes", async () => {
     const client = await connect(createChatReadMcpServer(new FakeChatClient()));
     const { tools } = await client.listTools();
@@ -531,77 +538,6 @@ describe("chat MCP server", () => {
     rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("stops an undeclared stream past the limit, cancels it, and removes the partial file", async () => {
-    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
-    const fake = new FakeChatClient();
-    let cancelled = false;
-    let sent = 0;
-    fake.downloadAttachmentStream = async () => ({
-      resp: new Response(
-        new ReadableStream<Uint8Array>({
-          pull(controller) {
-            if (sent++ < 5) controller.enqueue(new Uint8Array(1024));
-            else controller.close();
-          },
-          cancel() {
-            cancelled = true;
-          },
-        }),
-        { status: 200 }
-      ),
-      name: "undeclared.bin",
-      contentType: "application/octet-stream",
-    });
-    const client = await connect(
-      createChatReadMcpServer(fake, {
-        workDir,
-        fileToolsAvailable: true,
-        maxAttachmentBytes: 3 * 1024,
-      })
-    );
-
-    const res = (await client.callTool({
-      name: "download_attachment",
-      arguments: { resourceName: "media/spaces/A/attachments/ATT1", destinationPath: "out.bin" },
-    })) as CallToolResult;
-    expect(res.isError).toBe(true);
-    expect(textOf(res)).toContain("attachment is larger than 3072 bytes");
-    expect(cancelled).toBe(true);
-    expect(existsSync(join(workDir, "out.bin"))).toBe(false);
-    rmSync(workDir, { recursive: true, force: true });
-  });
-
-  it("refuses an existing destination, cancels the download, and keeps the original", async () => {
-    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
-    writeFileSync(join(workDir, "out.bin"), "original");
-    const fake = new FakeChatClient();
-    let cancelled = false;
-    fake.downloadAttachmentStream = async () => ({
-      resp: new Response(
-        new ReadableStream<Uint8Array>({
-          cancel() {
-            cancelled = true;
-          },
-        }),
-        { status: 200 }
-      ),
-      name: "out.bin",
-      contentType: "application/octet-stream",
-    });
-    const client = await connect(
-      createChatReadMcpServer(fake, { workDir, fileToolsAvailable: true })
-    );
-
-    const res = (await client.callTool({
-      name: "download_attachment",
-      arguments: { resourceName: "media/spaces/A/attachments/ATT1", destinationPath: "out.bin" },
-    })) as CallToolResult;
-    expect(res.isError).toBe(true);
-    expect(cancelled).toBe(true);
-    expect(readFileSync(join(workDir, "out.bin"), "utf-8")).toBe("original");
-    rmSync(workDir, { recursive: true, force: true });
-  });
-
   it("keeps a lower GchatClient limit through file mode", async () => {
     const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
     const configDir = mkdtempSync(join(tmpdir(), "chat-mcp-gchat-"));
@@ -693,25 +629,6 @@ describe("chat MCP server", () => {
 
     const stat = statSync(join(workDir, "streamed.bin"));
     expect(stat.size).toBe(chunkSize * chunkCount);
-    rmSync(workDir, { recursive: true, force: true });
-  });
-
-  it("rejects destinationPath escaping workdir", async () => {
-    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
-    const fake = new FakeChatClient();
-    const client = await connect(
-      createChatReadMcpServer(fake, { workDir, fileToolsAvailable: true })
-    );
-
-    const res = (await client.callTool({
-      name: "download_attachment",
-      arguments: {
-        resourceName: "media/spaces/A/attachments/ATT1",
-        destinationPath: "../escaped.bin",
-      },
-    })) as CallToolResult;
-    expect(res.isError).toBe(true);
-    expect(textOf(res)).toContain("escapes the actor workdir");
     rmSync(workDir, { recursive: true, force: true });
   });
 

@@ -154,51 +154,29 @@ export async function writeNewFileInWorkdir(
   }
 }
 
-async function cancelStream(stream: unknown): Promise<void> {
-  if (
-    stream &&
-    typeof stream === "object" &&
-    "cancel" in stream &&
-    typeof (stream as { cancel: () => Promise<unknown> }).cancel === "function"
-  ) {
-    try {
-      await (stream as { cancel: () => Promise<unknown> }).cancel();
-    } catch (_) {}
-  } else if (
-    stream &&
-    typeof stream === "object" &&
-    "destroy" in stream &&
-    typeof (stream as { destroy: () => unknown }).destroy === "function"
-  ) {
-    try {
-      (stream as { destroy: () => unknown }).destroy();
-    } catch (_) {}
-  }
-}
-
 /**
  * Stream data into a new file at a {@link resolveDownloadPath} target, computing
- * sha256 and enforcing `maxBytes` on total written bytes without buffering the
- * whole payload. On any failure, including failing to create the destination,
- * the source stream is cancelled; output this call created is unlinked through
- * the same directory descriptor it was created in, and only while that name
- * still refers to the file this call wrote.
+ * sha256 without buffering the whole payload. The client supplies a response
+ * already bounded at its download limit; this helper owns only confined,
+ * safe artifact publication. It opens the destination file exclusively (`O_EXCL`)
+ * through the parent directory descriptor. On failure, the source stream is
+ * cancelled and partial output is unlinked via `unlinkIfSame` through the same
+ * directory descriptor. Callers operate within their actor workdir and must
+ * not concurrently replace destination pathnames during an active download.
  */
 export async function streamNewFileInWorkdir(
   workDir: string,
   path: string,
-  stream:
-    | Iterable<Uint8Array | Buffer | string>
-    | AsyncIterable<Uint8Array | Buffer | string>
-    | ReadableStream<Uint8Array>,
-  maxBytes: number,
-  noun = "file"
+  stream: ReadableStream<Uint8Array> | null
 ): Promise<{ bytes: number; sha256: string }> {
   let dir: FileHandle | undefined;
   let handle: FileHandle | undefined;
   let name = "";
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   try {
-    ({ dir, name } = await openParentInWorkdir(workDir, path));
+    const parent = await openParentInWorkdir(workDir, path);
+    dir = parent.dir;
+    name = parent.name;
     handle = await open(
       inDir(dir, name),
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -208,14 +186,16 @@ export async function streamNewFileInWorkdir(
     });
     const hash = createHash("sha256");
     let bytesWritten = 0;
-    for await (const chunk of stream as AsyncIterable<Uint8Array | Buffer | string>) {
-      const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-      bytesWritten += buf.byteLength;
-      if (bytesWritten > maxBytes) {
-        throw new Error(`${noun} size limit exceeded: ${noun} is larger than ${maxBytes} bytes`);
+    if (stream) {
+      reader = stream.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        bytesWritten += value.byteLength;
+        hash.update(value);
+        await handle.writeFile(value);
       }
-      hash.update(buf);
-      await handle.writeFile(buf);
     }
     // A successful file-mode result promises a completed artifact, not merely
     // bytes queued in the process. Keep the bounded write path, then ask the
@@ -225,10 +205,12 @@ export async function streamNewFileInWorkdir(
     handle = undefined;
     return { bytes: bytesWritten, sha256: hash.digest("hex") };
   } catch (err) {
-    await cancelStream(stream);
+    await reader?.cancel().catch(() => {});
+    if (!reader) await stream?.cancel().catch(() => {});
     if (dir && handle) await unlinkIfSame(dir, name, handle);
     throw err;
   } finally {
+    reader?.releaseLock();
     await handle?.close().catch(() => {});
     await dir?.close().catch(() => {});
   }

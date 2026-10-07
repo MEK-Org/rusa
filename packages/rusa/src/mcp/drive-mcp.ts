@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { type DriveClient, MAX_DRIVE_FILE_DOWNLOAD_BYTES } from "../drive/drive-client.js";
+import type { DriveClient, DriveFileMetadata } from "../drive/drive-client.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 import { resolveDownloadPath, streamNewFileInWorkdir } from "./workdir-path.js";
@@ -20,7 +20,6 @@ export interface DriveReadMcpOptions {
   onRead?: (actorId: string, observation: DriveReadObservation) => void;
   workDir?: string;
   fileToolsAvailable?: boolean | (() => boolean);
-  maxDownloadBytes?: number;
 }
 
 function requireWorkDir(options: DriveReadMcpOptions): string {
@@ -53,14 +52,15 @@ export function createDriveReadMcpServer(
     }
   };
 
-  const checkFileAccess = async (fileId: string) => {
-    if (!options.allowedFolders || options.allowedFolders.length === 0) return;
+  const checkFileAccess = async (fileId: string): Promise<DriveFileMetadata | undefined> => {
+    if (!options.allowedFolders || options.allowedFolders.length === 0) return undefined;
     const meta = await client.getFileMetadata(fileId);
     const parents = meta.parents ?? [];
     const isAllowed = parents.some((p) => options.allowedFolders.includes(p));
     if (!isAllowed) {
       throw new Error(`access denied: file ${fileId} does not belong to allowed folders`);
     }
+    return meta;
   };
 
   server.registerTool(
@@ -124,28 +124,14 @@ export function createDriveReadMcpServer(
     },
     async ({ fileId, destinationPath }) => {
       try {
-        await checkFileAccess(fileId);
-
-        const fileLimit = Math.min(
-          options.maxDownloadBytes ?? MAX_DRIVE_FILE_DOWNLOAD_BYTES,
-          MAX_DRIVE_FILE_DOWNLOAD_BYTES
-        );
+        const authorizedMeta = await checkFileAccess(fileId);
 
         requireFileToolsAvailable(options);
         const workDir = requireWorkDir(options);
         const target = await resolveDownloadPath(workDir, destinationPath);
-        const meta = await client.getFileMetadata(fileId);
-        if (meta.size && Number.parseInt(meta.size, 10) > fileLimit) {
-          throw new Error(`file size limit exceeded: file is larger than ${fileLimit} bytes`);
-        }
-        const resp = await client.downloadFileStream(fileId, fileLimit);
-        const { bytes, sha256 } = await streamNewFileInWorkdir(
-          workDir,
-          target,
-          resp.body ?? [],
-          fileLimit,
-          "file"
-        );
+        const meta = authorizedMeta ?? (await client.getFileMetadata(fileId));
+        const resp = await client.downloadFileStream(fileId);
+        const { bytes, sha256 } = await streamNewFileInWorkdir(workDir, target, resp.body);
         options.onRead?.(actorId, { operation: "download_file", fileId });
         return toolOk({
           path: target,

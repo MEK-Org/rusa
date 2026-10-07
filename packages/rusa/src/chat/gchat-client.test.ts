@@ -471,7 +471,10 @@ describe("GchatClient reads", () => {
       );
 
     await expect(
-      new GchatClient(credentialsDir()).downloadAttachmentStream("media/spaces/A/attachments/ATT1")
+      new GchatClient(
+        credentialsDir(),
+        MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES + 1
+      ).downloadAttachmentStream("media/spaces/A/attachments/ATT1")
     ).rejects.toThrow("attachment size limit exceeded");
     expect(cancelled).toBe(true);
   });

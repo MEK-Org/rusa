@@ -182,13 +182,7 @@ export function createChatReadMcpServer(
           resourceName,
           fileLimit
         );
-        const { bytes, sha256 } = await streamNewFileInWorkdir(
-          workDir,
-          target,
-          resp.body ?? [],
-          fileLimit,
-          "attachment"
-        );
+        const { bytes, sha256 } = await streamNewFileInWorkdir(workDir, target, resp.body);
         return toolOk({ path: target, bytes, sha256, contentType, name });
       } catch (err) {
         return toolError(err);

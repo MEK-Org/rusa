@@ -45,7 +45,10 @@ export class FakeChatClient implements ChatClient {
   readonly maxUploadSizeBytes: number;
 
   constructor(options?: { maxSizeBytes?: number }) {
-    this.maxDownloadSizeBytes = options?.maxSizeBytes ?? MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES;
+    this.maxDownloadSizeBytes = Math.min(
+      options?.maxSizeBytes ?? MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
+      MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES
+    );
     this.maxUploadSizeBytes = options?.maxSizeBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
   }
 
