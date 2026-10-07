@@ -1,6 +1,5 @@
 import type Database from "better-sqlite3";
 import type { CapabilityGrantStore } from "../../actor/capability-grants.js";
-import type { ExperimentEnrollmentStore } from "../../actor/experiments.js";
 import type { HostJobStore } from "../../actor/host-job-store.js";
 import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
 import type { ActorRepository } from "../../repositories/actor-repository.js";
@@ -10,7 +9,6 @@ import { DbCapabilityGrantStore } from "./capability-grant-repository.js";
 import { ChatRoomRepository } from "./chat-room-repository.js";
 import { DbEventSourceOwnerStore } from "./event-source-owner-repository.js";
 import { DbEventSourceSubscriptionStore } from "./event-source-subscription-repository.js";
-import { DbExperimentEnrollmentStore } from "./experiment-enrollment-repository.js";
 import { DbHostJobStore } from "./host-job-repository.js";
 import { InboxFocusRepository } from "./inbox-focus-repository.js";
 import { LegacyImportReceiptRepository } from "./legacy-import-receipt-repository.js";
@@ -47,7 +45,6 @@ export class Repositories {
   readonly capabilityGrants: CapabilityGrantStore;
   readonly chatRoom: ChatRoomRepository;
   readonly eventSourceOwners: DbEventSourceOwnerStore;
-  readonly experimentEnrollments: ExperimentEnrollmentStore;
   readonly eventSourceSubscriptions: DbEventSourceSubscriptionStore;
   readonly hostJobs: HostJobStore;
   readonly legacyImportReceipts: LegacyImportReceiptRepository;
@@ -84,7 +81,6 @@ export class Repositories {
     this.capabilityGrants = new DbCapabilityGrantStore(db);
     this.chatRoom = new ChatRoomRepository(db);
     this.eventSourceOwners = new DbEventSourceOwnerStore(db);
-    this.experimentEnrollments = new DbExperimentEnrollmentStore(db);
     this.eventSourceSubscriptions = new DbEventSourceSubscriptionStore(db);
     this.hostJobs = new DbHostJobStore(db);
     this.legacyImportReceipts = new LegacyImportReceiptRepository(db);
@@ -140,7 +136,6 @@ export type { ChatRoomMember } from "./chat-room-repository.js";
 export { ChatRoomRepository } from "./chat-room-repository.js";
 export { DbEventSourceOwnerStore } from "./event-source-owner-repository.js";
 export { DbEventSourceSubscriptionStore } from "./event-source-subscription-repository.js";
-export { DbExperimentEnrollmentStore } from "./experiment-enrollment-repository.js";
 export { DbHostJobStore } from "./host-job-repository.js";
 export type { InboxFocusResolution, RunInboxFocus } from "./inbox-focus-repository.js";
 export { InboxFocusRepository } from "./inbox-focus-repository.js";

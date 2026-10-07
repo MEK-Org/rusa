@@ -2873,10 +2873,6 @@ async function composeStart(
     completedFocusEntryCounts: (actorId, excludeRunId) =>
       getRepositories().actorRuns.completedFocusEntryCounts(actorId, excludeRunId),
     capabilityGrants,
-    // Experiment enrollments (#394): the durable, actor-id-keyed rollout state
-    // behind `enroll_actor_experiment`. SQLite-backed so an enrollment survives
-    // a restart; the registry of legal experiment names stays in code.
-    experimentEnrollments: getRepositories().experimentEnrollments,
     eventSourceOwners,
     eventSourceSubscriptions,
     // One seam: the manager carries the kernel built above, so mesh authority

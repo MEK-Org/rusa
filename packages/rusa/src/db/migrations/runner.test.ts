@@ -112,6 +112,7 @@ describe("Database Migration System", () => {
       "0055_run_prompts",
       "0058_user_google_account_id",
       "0059_obligation_completion_matchers",
+      "0060_drop_actor_experiments",
     ]);
 
     const tableNames = (
@@ -120,6 +121,7 @@ describe("Database Migration System", () => {
       }>
     ).map((t) => t.name);
     expect(tableNames).not.toContain("obligation_ready_heads");
+    expect(tableNames).not.toContain("actor_experiments");
     expect(tableNames).toContain("chat_room_participants");
     expect(tableNames).toContain("obligation_completion_matchers");
 

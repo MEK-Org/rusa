@@ -6,7 +6,6 @@ import {
   CAPABILITY_ADMIN_CAPABILITY,
   CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES,
   CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR,
-  EXPERIMENT_ADMIN_CAPABILITY,
   MODEL_ADMIN_CAPABILITY,
   ROOM_ADMIN_CAPABILITY,
   seedConfiguredActorGrants,
@@ -19,7 +18,6 @@ describe("administrative capabilities", () => {
   it("names exactly the administrative surfaces the configured actor is seeded with", () => {
     expect(CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES).toEqual([
       CAPABILITY_ADMIN_CAPABILITY,
-      EXPERIMENT_ADMIN_CAPABILITY,
       MODEL_ADMIN_CAPABILITY,
       ACTOR_ADMIN_CAPABILITY,
       ROOM_ADMIN_CAPABILITY,
@@ -59,7 +57,6 @@ describe("administrative capabilities", () => {
   it("seeds the host-maintenance capabilities only when the boot can mount them", () => {
     expect(bootstrapCapabilitiesFor(new Set(["pnpm-hardlinks", "understanding-write"]))).toEqual([
       CAPABILITY_ADMIN_CAPABILITY,
-      EXPERIMENT_ADMIN_CAPABILITY,
       MODEL_ADMIN_CAPABILITY,
       ACTOR_ADMIN_CAPABILITY,
       ROOM_ADMIN_CAPABILITY,

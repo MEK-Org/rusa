@@ -20,9 +20,6 @@ import type { CapabilityGrantStore } from "./capability-grants.js";
 /** Grant or revoke any grantable capability within the holder's subtree, and inspect the grant ledger. */
 export const CAPABILITY_ADMIN_CAPABILITY = "capability-admin";
 
-/** Enroll, unenroll, and list experiment rollouts within the holder's subtree. */
-export const EXPERIMENT_ADMIN_CAPABILITY = "experiment-admin";
-
 /**
  * Administer the host's model policy: the runtime model-class registry, which
  * is mesh-global (a class edit reaches every future spawn or model change on
@@ -56,7 +53,6 @@ export const ROOM_ADMIN_CAPABILITY = "room-admin";
  */
 export const ADMINISTRATIVE_CAPABILITIES: ReadonlySet<string> = new Set([
   CAPABILITY_ADMIN_CAPABILITY,
-  EXPERIMENT_ADMIN_CAPABILITY,
   MODEL_ADMIN_CAPABILITY,
   ACTOR_ADMIN_CAPABILITY,
   ROOM_ADMIN_CAPABILITY,

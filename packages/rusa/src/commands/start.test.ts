@@ -1992,20 +1992,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       return actor;
     };
 
-    // The retired experiment is gone from the live surface: nothing is listed,
-    // and its name can no longer be enrolled. Strict closure needs neither.
-    expect(
-      payloadOf(await call(urlOf(root, "mesh"), "list_actor_experiments", {})).experiments
-    ).toEqual([]);
-    expect(
-      (
-        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
-          actor_id: first,
-          experiment: "strict_obligation_handling",
-        })
-      ).isError
-    ).toBe(true);
-
     // Attention arrives the way production delivers it: creating the obligation
     // moves each worker's ready head, and runStart's ready-head listener routes
     // that transition into the worker's durable inbox. Nothing is injected.

@@ -4,7 +4,6 @@ import type { ActorMesh } from "../actor/actor-mesh.js";
 import {
   ACTOR_ADMIN_CAPABILITY,
   CAPABILITY_ADMIN_CAPABILITY,
-  EXPERIMENT_ADMIN_CAPABILITY,
   MODEL_ADMIN_CAPABILITY,
   ROOM_ADMIN_CAPABILITY,
 } from "../actor/administrative-capabilities.js";
@@ -1196,112 +1195,6 @@ export function createAgentExecMcpServer(
         }
       );
     }
-  }
-
-  // ── Experiment enrollment (#394) ── Rollout state, not actor configuration:
-  // an actor is enrolled in a hard-coded experiment or it is not. Registered
-  // only for an `experiment-admin` holder, each handler re-checks the grant,
-  // and the mesh enforces the same capability plus subtree scoping again.
-  if (holds(EXPERIMENT_ADMIN_CAPABILITY)) {
-    const assertExperimentAdmin = () => assertCapability(EXPERIMENT_ADMIN_CAPABILITY);
-    server.registerTool(
-      "enroll_actor_experiment",
-      {
-        title: "Enroll an actor in an experiment (experiment-admin)",
-        description:
-          "Enroll an existing actor in one of the hard-coded experiments (see list_actor_experiments for the registry). Requires the experiment-admin capability and is confined to the caller's own subtree. Enrollment is always post-spawn and applies to the named actor alone; an unknown experiment name is rejected rather than stored. Idempotent — re-enrolling an already-enrolled actor reports changed: false and leaves the original enrollment in force. Refused for a retired thread.",
-        inputSchema: {
-          actor_id: z.string().describe("The thread id of the actor to enroll."),
-          experiment: z
-            .string()
-            .describe("A registered experiment name (see list_actor_experiments)."),
-        },
-      },
-      async ({ actor_id, experiment }) => {
-        const denied = assertExperimentAdmin();
-        if (denied) return denied;
-        try {
-          // Echo the canonical id the row is keyed on, not the address typed,
-          // so the response correlates with list_actor_experiments.
-          const { actorId, changed } = mesh.enrollActorInExperiment(actor_id, experiment, selfId);
-          return toolOk({ actor_id: actorId, experiment, enrolled: true, changed });
-        } catch (err) {
-          return toolError(err);
-        }
-      }
-    );
-
-    server.registerTool(
-      "unenroll_actor_experiment",
-      {
-        title: "Remove an actor's experiment enrollment (experiment-admin)",
-        description:
-          "Remove an actor's enrollment in an experiment. Requires the experiment-admin capability and is confined to the caller's own subtree. Idempotent — unenrolling an actor that is not enrolled reports changed: false. Also accepts unregistered experiment names to clean up stale rows after an experiment is retired from the registry. Permitted for a retired thread, so a rollout can be withdrawn without reviving it; an enrollment otherwise survives retirement and applies again if the thread is revived.",
-        inputSchema: {
-          actor_id: z.string().describe("The thread id of the actor to unenroll."),
-          experiment: z
-            .string()
-            .describe(
-              "The experiment name to remove. Accepts registered names or unregistered names from retired experiments awaiting cleanup."
-            ),
-        },
-      },
-      async ({ actor_id, experiment }) => {
-        const denied = assertExperimentAdmin();
-        if (denied) return denied;
-        try {
-          const { actorId, changed } = mesh.unenrollActorFromExperiment(
-            actor_id,
-            experiment,
-            selfId
-          );
-          return toolOk({ actor_id: actorId, experiment, enrolled: false, changed });
-        } catch (err) {
-          return toolError(err);
-        }
-      }
-    );
-
-    server.registerTool(
-      "list_actor_experiments",
-      {
-        title: "List experiments and current enrollments (experiment-admin)",
-        description:
-          "List the hard-coded experiment registry and the enrollments currently in force. Requires the experiment-admin capability. Pass actor_id to scope the enrollments to one actor in your own subtree; omit it for every enrollment in your subtree. This is the deterministic readback for enroll_actor_experiment and unenroll_actor_experiment.",
-        inputSchema: {
-          actor_id: z
-            .string()
-            .optional()
-            .describe("Scope the enrollments to this thread id. Omit for all actors."),
-        },
-      },
-      async ({ actor_id }) => {
-        const denied = assertExperimentAdmin();
-        if (denied) return denied;
-        try {
-          if (actor_id !== undefined) {
-            assertInSubtree(EXPERIMENT_ADMIN_CAPABILITY, actor_id, "inspect");
-          }
-          const enrollments = mesh
-            .listExperimentEnrollments(actor_id)
-            .filter((enrollment) => inSubtree(enrollment.actorId))
-            .map((enrollment) => ({
-              actor_id: enrollment.actorId,
-              experiment: enrollment.experiment,
-              enrolled_by: enrollment.enrolledBy,
-              enrolled_at: enrollment.enrolledAt,
-            }));
-          return toolOk({
-            experiments: mesh
-              .listRegisteredExperiments()
-              .map(({ name, intent }) => ({ name, intent })),
-            enrollments,
-          });
-        } catch (err) {
-          return toolError(err);
-        }
-      }
-    );
   }
 
   // ── Actor administration ── Lifecycle, record and routing edits on other

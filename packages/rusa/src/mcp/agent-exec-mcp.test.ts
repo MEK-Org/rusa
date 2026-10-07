@@ -19,15 +19,11 @@ import {
   ACTOR_ADMIN_CAPABILITY,
   ADMINISTRATIVE_CAPABILITIES,
   CAPABILITY_ADMIN_CAPABILITY,
-  EXPERIMENT_ADMIN_CAPABILITY,
   MODEL_ADMIN_CAPABILITY,
   ROOM_ADMIN_CAPABILITY,
   seedConfiguredActorGrants,
 } from "../actor/administrative-capabilities.js";
-import {
-  InMemoryCapabilityGrantStore,
-  PARENT_GRANTABLE_CAPABILITIES,
-} from "../actor/capability-grants.js";
+import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
 import {
   type EventSourceOwnerStore,
   InMemoryEventSourceOwnerStore,
@@ -35,10 +31,6 @@ import {
   parentOf,
   reconcileEventSources,
 } from "../actor/event-subscriptions.js";
-import {
-  type ExperimentEnrollmentStore,
-  InMemoryExperimentEnrollmentStore,
-} from "../actor/experiments.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import type { RusaConfig } from "../config/types.js";
@@ -71,9 +63,6 @@ async function connect(server: McpServer): Promise<Client> {
   await client.connect(clientTransport);
   return client;
 }
-
-/** A fixture rollout: the production experiment registry is empty between rollouts. */
-const FIXTURE_EXPERIMENT = "fixture_rollout";
 
 function dataOf(result: CallToolResult): unknown {
   const first = result.content[0];
@@ -142,7 +131,6 @@ function setup(
     voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
     listVoiceSessionChat?: ActorMeshOptions["listVoiceSessionChat"];
     rootId?: string;
-    experimentEnrollments?: ExperimentEnrollmentStore;
     secretsDir?: string;
     /**
      * Seed the configured actor with the bootstrap administrative grants, as
@@ -208,10 +196,6 @@ function setup(
     eventManager,
     inboxStore,
     completedFocusEntryCounts: opts.completedFocusEntryCounts,
-    experimentEnrollments: opts.experimentEnrollments,
-    // The production registry is empty between rollouts; the tools are
-    // exercised against a fixture rollout instead.
-    experimentRegistry: { [FIXTURE_EXPERIMENT]: { intent: "Exercise the rollout seam." } },
     isVoiceSessionActive: opts.isVoiceSessionActive,
     voiceSessionTransfer: opts.voiceSessionTransfer,
     listVoiceSessionChat: opts.listVoiceSessionChat,
@@ -275,11 +259,6 @@ function setup(
 /** Tools that exist only for a holder of an administrative capability. */
 const MANAGEMENT_TOOLS: Record<string, readonly string[]> = {
   [CAPABILITY_ADMIN_CAPABILITY]: ["list_grants"],
-  [EXPERIMENT_ADMIN_CAPABILITY]: [
-    "enroll_actor_experiment",
-    "unenroll_actor_experiment",
-    "list_actor_experiments",
-  ],
   [MODEL_ADMIN_CAPABILITY]: ["list_model_classes", "set_model_class", "delete_model_class"],
   [ACTOR_ADMIN_CAPABILITY]: [
     "revive_thread",
@@ -421,29 +400,29 @@ describe("administrative capability gating of management tools (#549)", () => {
     });
     capabilityGrants.grant({
       actorId: "0b2c3d4e-steward",
-      capability: EXPERIMENT_ADMIN_CAPABILITY,
+      capability: CAPABILITY_ADMIN_CAPABILITY,
       grantedBy: "test",
       grantedAt: "2026-01-01T00:00:00Z",
     });
     const client = await connect(createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root"));
     const before = (await client.callTool({
-      name: "list_actor_experiments",
+      name: "list_grants",
       arguments: {},
     })) as CallToolResult;
     expect(before.isError).toBeFalsy();
 
     capabilityGrants.revoke(
       "0b2c3d4e-steward",
-      EXPERIMENT_ADMIN_CAPABILITY,
+      CAPABILITY_ADMIN_CAPABILITY,
       "2026-01-01T00:00:01Z"
     );
 
     const after = (await client.callTool({
-      name: "list_actor_experiments",
+      name: "list_grants",
       arguments: {},
     })) as CallToolResult;
     expect(after.isError).toBe(true);
-    expect(dataOf(after)).toMatch(/experiment-admin/);
+    expect(dataOf(after)).toMatch(/capability-admin/);
   });
 
   it("lets the seeded configured actor manage the Chat Room and hides it from a child (#663)", async () => {
@@ -591,8 +570,7 @@ describe("administrative capability gating of management tools (#549)", () => {
   });
 
   it("confines the inspection reads to the holder's subtree", async () => {
-    const experiments = new InMemoryExperimentEnrollmentStore();
-    const fixture = setup({ seedRootGrants: false, experimentEnrollments: experiments });
+    const fixture = setup({ seedRootGrants: false });
     const { mesh, registry, capabilityGrants } = fixture;
     for (const [id, parentId] of [
       ["0b2c3d4e-steward", "root"],
@@ -607,11 +585,7 @@ describe("administrative capability gating of management tools (#549)", () => {
         createdAt: "2026-01-01T00:00:00Z",
       });
     }
-    for (const capability of [
-      CAPABILITY_ADMIN_CAPABILITY,
-      EXPERIMENT_ADMIN_CAPABILITY,
-      ACTOR_ADMIN_CAPABILITY,
-    ]) {
+    for (const capability of [CAPABILITY_ADMIN_CAPABILITY, ACTOR_ADMIN_CAPABILITY]) {
       capabilityGrants.grant({
         actorId: "0b2c3d4e-steward",
         capability,
@@ -626,12 +600,6 @@ describe("administrative capability gating of management tools (#549)", () => {
         capability: "understanding-write",
         grantedBy: "test",
         grantedAt: "2026-01-01T00:00:00Z",
-      });
-      experiments.enroll({
-        actorId,
-        experiment: FIXTURE_EXPERIMENT,
-        enrolledBy: "test",
-        enrolledAt: "2026-01-01T00:00:00Z",
       });
     }
     mesh.subscribeEventSource("github:inside-org", "steward-child", "0b2c3d4e-steward");
@@ -655,19 +623,6 @@ describe("administrative capability gating of management tools (#549)", () => {
     expect(new Set(grants.map((g) => g.actorId))).toEqual(
       new Set(["0b2c3d4e-steward", "steward-child"])
     );
-
-    const enrollments = (
-      dataOf(
-        (await client.callTool({ name: "list_actor_experiments", arguments: {} })) as CallToolResult
-      ) as { enrollments: { actor_id: string }[] }
-    ).enrollments;
-    expect(enrollments.map((e) => e.actor_id)).toEqual(["steward-child"]);
-    const outside = (await client.callTool({
-      name: "list_actor_experiments",
-      arguments: { actor_id: "sibling" },
-    })) as CallToolResult;
-    expect(outside.isError).toBe(true);
-    expect(dataOf(outside)).toMatch(/subtree/);
 
     const subscriptions = dataOf(
       (await client.callTool({ name: "list_subscriptions", arguments: {} })) as CallToolResult
@@ -772,11 +727,9 @@ describe("agent-execution MCP server", () => {
       [
         "cancel_scheduled_message",
         "delegate_event_source",
-        "enroll_actor_experiment",
         "list_event_sources",
         "grant_capability",
         "introduce",
-        "list_actor_experiments",
         "list_followers",
         "list_grants",
         "list_pending_messages",
@@ -797,7 +750,6 @@ describe("agent-execution MCP server", () => {
         "spawn_thread",
         "subscribe_event_source",
         "transfer_voice_session",
-        "unenroll_actor_experiment",
         "unsubscribe_event_source",
       ].sort()
     );
@@ -1053,11 +1005,6 @@ describe("agent-execution MCP server", () => {
     expect(names).not.toContain("list_grants");
     expect(names).not.toContain("revive_thread");
     expect(names).not.toContain("reparent_thread");
-    // Experiment enrollment is root-only and ungrantable: a worker endpoint
-    // never carries the administrative tools at all.
-    expect(names).not.toContain("enroll_actor_experiment");
-    expect(names).not.toContain("unenroll_actor_experiment");
-    expect(names).not.toContain("list_actor_experiments");
     expect(names.sort()).toEqual(
       [
         "cancel_scheduled_message",
@@ -4542,421 +4489,162 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
   });
 });
 
-describe("actor experiment enrollment (root-only, ungrantable)", () => {
-  /** The tools answer with `{ enrolled }`/`{ unenrolled }` plus the changed bit. */
-  function changeOf(result: CallToolResult): unknown {
-    return dataOf(result);
-  }
+describe("exhausted inbox escalation tools (#748)", () => {
+  it("releases selection lock via release_selection_lock tool", async () => {
+    const countsMap = new Map([["item-1", 2]]);
 
-  it("enrolls an actor after spawn, reads it back, evaluates it, and unenrolls it", async () => {
-    const { mesh } = setup();
-    const root = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const { mesh, inboxStore } = setup({
+      completedFocusEntryCounts: () => countsMap,
+    });
 
-    const spawned = (await root.callTool({
-      name: "spawn_thread",
+    const parent = mesh.spawn({
+      charter: "parent",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+    });
+    const child = mesh.spawn({
+      charter: "child",
+      parentId: parent,
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+    });
+    inboxStore.append([
+      {
+        id: "item-1",
+        actorId: child,
+        source: "mesh:parent",
+        payload: { type: "mesh.message", messageId: "m1", fromId: parent },
+      },
+    ]);
+
+    const parentClient = await connect(createAgentExecMcpServer(mesh, parent, parent));
+    const res = (await parentClient.callTool({
+      name: "release_selection_lock",
       arguments: {
-        charter: "rollout subject",
-        model_config: { provider: "claude", model: "claude-sonnet-5" },
+        thread_id: child,
+        entry_ids: ["item-1"],
+        note: "releasing for retry",
       },
     })) as CallToolResult;
-    const threadId = (dataOf(spawned) as { thread_id: string }).thread_id;
-    // Enrollment is strictly post-spawn: the actor exists first, unenrolled.
-    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(false);
 
-    const enrolled = (await root.callTool({
-      name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
-    })) as CallToolResult;
-    expect(enrolled.isError).toBeFalsy();
-    expect(changeOf(enrolled)).toMatchObject({
-      actor_id: threadId,
-      experiment: FIXTURE_EXPERIMENT,
-      enrolled: true,
-      changed: true,
-    });
-    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(true);
+    expect(res.isError).toBeFalsy();
+    const data = dataOf(res) as { released: string[]; replacements: string[] };
+    expect(data.released).toEqual(["item-1"]);
+    expect(data.replacements).toHaveLength(1);
 
-    const listed = (await root.callTool({
-      name: "list_actor_experiments",
-      arguments: { actor_id: threadId },
-    })) as CallToolResult;
-    expect(dataOf(listed)).toMatchObject({
-      experiments: [{ name: FIXTURE_EXPERIMENT }],
-      enrollments: [
-        {
-          actor_id: threadId,
-          experiment: FIXTURE_EXPERIMENT,
-          enrolled_by: "root",
-        },
-      ],
-    });
-
-    const unenrolled = (await root.callTool({
-      name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
-    })) as CallToolResult;
-    expect(unenrolled.isError).toBeFalsy();
-    expect(changeOf(unenrolled)).toMatchObject({ enrolled: false, changed: true });
-    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(false);
-    const afterList = (await root.callTool({
-      name: "list_actor_experiments",
-      arguments: {},
-    })) as CallToolResult;
-    expect(dataOf(afterList)).toMatchObject({ enrollments: [] });
-  });
-
-  it("is idempotent at the tool boundary in both directions", async () => {
-    const { mesh } = setup();
-    const root = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-    const threadId = mesh.spawn({
-      charter: "subject",
-      parentId: "root",
-      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-    });
-
-    const first = (await root.callTool({
-      name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
-    })) as CallToolResult;
-    const second = (await root.callTool({
-      name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
-    })) as CallToolResult;
-    expect(second.isError).toBeFalsy();
-    expect(changeOf(first)).toMatchObject({ enrolled: true, changed: true });
-    expect(changeOf(second)).toMatchObject({ enrolled: true, changed: false });
-
-    await root.callTool({
-      name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
-    });
-    const repeatOff = (await root.callTool({
-      name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
-    })) as CallToolResult;
-    expect(repeatOff.isError).toBeFalsy();
-    expect(changeOf(repeatOff)).toMatchObject({ enrolled: false, changed: false });
-  });
-
-  it("refuses an unknown experiment name and an unknown actor", async () => {
-    const { mesh } = setup();
-    const root = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-    const threadId = mesh.spawn({
-      charter: "subject",
-      parentId: "root",
-      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-    });
-
-    const unknownExperiment = (await root.callTool({
-      name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "not_an_experiment" },
-    })) as CallToolResult;
-    expect(unknownExperiment.isError).toBe(true);
-    expect(String(dataOf(unknownExperiment))).toContain("unknown experiment: not_an_experiment");
-
-    const unknownActor = (await root.callTool({
-      name: "enroll_actor_experiment",
-      arguments: { actor_id: "no-such-thread", experiment: FIXTURE_EXPERIMENT },
-    })) as CallToolResult;
-    expect(unknownActor.isError).toBe(true);
-    expect(mesh.listExperimentEnrollments()).toEqual([]);
-  });
-
-  it("keeps a retired actor's enrollment readable, refuses re-enrollment, and allows withdrawal", async () => {
-    const { mesh } = setup();
-    const root = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-    const threadId = mesh.spawn({
-      charter: "subject",
-      parentId: "root",
-      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-    });
-    await root.callTool({
-      name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
-    });
-    mesh.retire(threadId);
-
-    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(true);
-    const reEnroll = (await root.callTool({
-      name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
-    })) as CallToolResult;
-    expect(reEnroll.isError).toBe(true);
-    expect(String(dataOf(reEnroll))).toContain("retired");
-
-    const withdraw = (await root.callTool({
-      name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
-    })) as CallToolResult;
-    expect(withdraw.isError).toBeFalsy();
-    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(false);
-  });
-
-  it("is not a grantable capability, so no grant can hand it to a worker", async () => {
-    expect(PARENT_GRANTABLE_CAPABILITIES.has("enroll_actor_experiment")).toBe(false);
-    expect(PARENT_GRANTABLE_CAPABILITIES.has("unenroll_actor_experiment")).toBe(false);
-    expect(PARENT_GRANTABLE_CAPABILITIES.has("list_actor_experiments")).toBe(false);
-
-    const { mesh } = setup();
-    const worker = mesh.spawn({
-      charter: "worker",
-      parentId: "root",
-      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-    });
-    expect(() => mesh.grantCapability(worker, "enroll_actor_experiment", "root")).toThrow(
-      /not a grantable capability/
+    const entry1 = inboxStore.read(child, "item-1");
+    expect(entry1?.handledAt).not.toBeNull();
+    expect(entry1?.handledNote).toBe(
+      `Released by parent (${parent}) for re-handling: releasing for retry`
     );
-    const workerClient = await connect(createAgentExecMcpServer(mesh, worker, "root"));
-    const names = (await workerClient.listTools()).tools.map((tool) => tool.name);
-    expect(names).not.toContain("enroll_actor_experiment");
-    expect(names).not.toContain("unenroll_actor_experiment");
-    expect(names).not.toContain("list_actor_experiments");
+
+    const replacement = inboxStore.read(child, data.replacements[0]);
+    expect(replacement?.handledAt).toBeNull();
+    expect(replacement?.source).toBe("mesh:parent");
+    expect(replacement?.payload).toEqual({
+      type: "mesh.message",
+      messageId: "m1",
+      fromId: parent,
+    });
   });
 
-  it("resolves configured non-literal root id in list_actor_experiments and mutations", async () => {
-    const configuredRootId = "root-thread-configured";
-    const { mesh } = setup({ rootId: configuredRootId });
-    const root = await connect(createAgentExecMcpServer(mesh, configuredRootId, configuredRootId));
+  it("marks exhausted child entries handled with note via mark_exhausted_inbox_handled", async () => {
+    const countsMap = new Map([["item-1", 2]]);
 
-    const enrolled = (await root.callTool({
-      name: "enroll_actor_experiment",
-      arguments: { actor_id: "root", experiment: FIXTURE_EXPERIMENT },
-    })) as CallToolResult;
-    expect(enrolled.isError).toBeFalsy();
-    // The response names the thread the row was written under, not the
-    // legacy address the caller typed, so it correlates with the readback.
-    expect(changeOf(enrolled)).toMatchObject({ actor_id: configuredRootId, changed: true });
-    expect(mesh.isEnrolledInExperiment(configuredRootId, FIXTURE_EXPERIMENT)).toBe(true);
-
-    const listed = (await root.callTool({
-      name: "list_actor_experiments",
-      arguments: { actor_id: "root" },
-    })) as CallToolResult;
-    expect(dataOf(listed)).toMatchObject({
-      enrollments: [
-        {
-          actor_id: configuredRootId,
-          experiment: FIXTURE_EXPERIMENT,
-        },
-      ],
+    const { mesh, inboxStore } = setup({
+      completedFocusEntryCounts: () => countsMap,
     });
 
-    const unenrolled = (await root.callTool({
-      name: "unenroll_actor_experiment",
-      arguments: { actor_id: "root", experiment: FIXTURE_EXPERIMENT },
-    })) as CallToolResult;
-    expect(unenrolled.isError).toBeFalsy();
-    expect(changeOf(unenrolled)).toMatchObject({ actor_id: configuredRootId, changed: true });
-    expect(mesh.isEnrolledInExperiment(configuredRootId, FIXTURE_EXPERIMENT)).toBe(false);
-  });
-
-  it("deletes a stale row for an experiment no longer in the registry via the tool", async () => {
-    const experimentEnrollments = new InMemoryExperimentEnrollmentStore();
-    const { mesh } = setup({ experimentEnrollments });
-    const root = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-    const threadId = mesh.spawn({
-      charter: "subject",
+    const parent = mesh.spawn({
+      charter: "parent",
       parentId: "root",
       modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
-    // A row left behind by an experiment since deleted from `EXPERIMENTS` —
-    // strict obligation handling, now every actor's behavior (#917): nothing at
-    // the mesh or tool layer can write this name any more.
-    experimentEnrollments.enroll({
-      actorId: threadId,
-      experiment: "strict_obligation_handling",
-      enrolledBy: "root",
-      enrolledAt: "2026-01-01T00:00:00Z",
+    const child = mesh.spawn({
+      charter: "child",
+      parentId: parent,
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
+    inboxStore.append([
+      {
+        id: "item-1",
+        actorId: child,
+        source: "mesh:parent",
+        payload: { type: "mesh.message", messageId: "m1", fromId: parent },
+      },
+      {
+        id: "item-2",
+        actorId: child,
+        source: "mesh:parent",
+        payload: { type: "mesh.message", messageId: "m2", fromId: parent },
+      },
+    ]);
 
-    const unenrollStale = (await root.callTool({
-      name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
-    })) as CallToolResult;
-    expect(unenrollStale.isError).toBeFalsy();
-    expect(changeOf(unenrollStale)).toMatchObject({ enrolled: false, changed: true });
-    expect(experimentEnrollments.list()).toEqual([]);
+    const parentClient = await connect(createAgentExecMcpServer(mesh, parent, parent));
 
-    // Enrolling under that name is still refused — cleanup is one-way.
-    const reEnroll = (await root.callTool({
-      name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+    const res1 = (await parentClient.callTool({
+      name: "mark_exhausted_inbox_handled",
+      arguments: {
+        thread_id: child,
+        entry_ids: ["item-1"],
+        note: "cleared after review",
+      },
     })) as CallToolResult;
-    expect(reEnroll.isError).toBe(true);
+
+    expect(res1.isError).toBeFalsy();
+    const data1 = dataOf(res1) as { handled: Array<{ id: string; handledAt: string }> };
+    expect(data1.handled).toHaveLength(1);
+    expect(data1.handled[0].id).toBe("item-1");
+
+    const entry1 = inboxStore.read(child, "item-1");
+    expect(entry1?.handledAt).not.toBeNull();
+    expect(entry1?.handledNote).toBe(`Marked handled by parent (${parent}): cleared after review`);
+    expect(inboxStore.read(child, "item-2")?.handledAt).toBeNull();
   });
 
-  it("describes the unregistered stale-row cleanup path in unenroll_actor_experiment tool schema", async () => {
-    const { mesh } = setup();
-    const root = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-    const { tools } = await root.listTools();
-    const tool = tools.find((t) => t.name === "unenroll_actor_experiment");
-    expect(tool?.description).toMatch(/unregistered/i);
-    expect(tool?.description).toMatch(/clean\s*up/i);
-    const experimentProp = (
-      tool?.inputSchema as { properties?: Record<string, { description?: string }> }
-    )?.properties?.experiment;
-    expect(experimentProp?.description).toMatch(/unregistered/i);
-  });
+  it("translates mesh authority errors to tool errors at MCP boundary", async () => {
+    const countsMap = new Map([["exhausted-1", 2]]);
 
-  describe("exhausted inbox escalation tools (#748)", () => {
-    it("releases selection lock via release_selection_lock tool", async () => {
-      const countsMap = new Map([["item-1", 2]]);
-
-      const { mesh, inboxStore } = setup({
-        completedFocusEntryCounts: () => countsMap,
-      });
-
-      const parent = mesh.spawn({
-        charter: "parent",
-        parentId: "root",
-        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-      });
-      const child = mesh.spawn({
-        charter: "child",
-        parentId: parent,
-        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-      });
-      inboxStore.append([
-        {
-          id: "item-1",
-          actorId: child,
-          source: "mesh:parent",
-          payload: { type: "mesh.message", messageId: "m1", fromId: parent },
-        },
-      ]);
-
-      const parentClient = await connect(createAgentExecMcpServer(mesh, parent, parent));
-      const res = (await parentClient.callTool({
-        name: "release_selection_lock",
-        arguments: {
-          thread_id: child,
-          entry_ids: ["item-1"],
-          note: "releasing for retry",
-        },
-      })) as CallToolResult;
-
-      expect(res.isError).toBeFalsy();
-      const data = dataOf(res) as { released: string[]; replacements: string[] };
-      expect(data.released).toEqual(["item-1"]);
-      expect(data.replacements).toHaveLength(1);
-
-      const entry1 = inboxStore.read(child, "item-1");
-      expect(entry1?.handledAt).not.toBeNull();
-      expect(entry1?.handledNote).toBe(
-        `Released by parent (${parent}) for re-handling: releasing for retry`
-      );
-
-      const replacement = inboxStore.read(child, data.replacements[0]);
-      expect(replacement?.handledAt).toBeNull();
-      expect(replacement?.source).toBe("mesh:parent");
-      expect(replacement?.payload).toEqual({
-        type: "mesh.message",
-        messageId: "m1",
-        fromId: parent,
-      });
+    const { mesh, inboxStore } = setup({
+      completedFocusEntryCounts: () => countsMap,
     });
 
-    it("marks exhausted child entries handled with note via mark_exhausted_inbox_handled", async () => {
-      const countsMap = new Map([["item-1", 2]]);
-
-      const { mesh, inboxStore } = setup({
-        completedFocusEntryCounts: () => countsMap,
-      });
-
-      const parent = mesh.spawn({
-        charter: "parent",
-        parentId: "root",
-        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-      });
-      const child = mesh.spawn({
-        charter: "child",
-        parentId: parent,
-        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-      });
-      inboxStore.append([
-        {
-          id: "item-1",
-          actorId: child,
-          source: "mesh:parent",
-          payload: { type: "mesh.message", messageId: "m1", fromId: parent },
-        },
-        {
-          id: "item-2",
-          actorId: child,
-          source: "mesh:parent",
-          payload: { type: "mesh.message", messageId: "m2", fromId: parent },
-        },
-      ]);
-
-      const parentClient = await connect(createAgentExecMcpServer(mesh, parent, parent));
-
-      const res1 = (await parentClient.callTool({
-        name: "mark_exhausted_inbox_handled",
-        arguments: {
-          thread_id: child,
-          entry_ids: ["item-1"],
-          note: "cleared after review",
-        },
-      })) as CallToolResult;
-
-      expect(res1.isError).toBeFalsy();
-      const data1 = dataOf(res1) as { handled: Array<{ id: string; handledAt: string }> };
-      expect(data1.handled).toHaveLength(1);
-      expect(data1.handled[0].id).toBe("item-1");
-
-      const entry1 = inboxStore.read(child, "item-1");
-      expect(entry1?.handledAt).not.toBeNull();
-      expect(entry1?.handledNote).toBe(
-        `Marked handled by parent (${parent}): cleared after review`
-      );
-      expect(inboxStore.read(child, "item-2")?.handledAt).toBeNull();
+    const parent = mesh.spawn({
+      charter: "parent",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+    });
+    const child = mesh.spawn({
+      charter: "child",
+      parentId: parent,
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+    });
+    const stranger = mesh.spawn({
+      charter: "stranger",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
 
-    it("translates mesh authority errors to tool errors at MCP boundary", async () => {
-      const countsMap = new Map([["exhausted-1", 2]]);
+    inboxStore.append([
+      {
+        id: "exhausted-1",
+        actorId: child,
+        source: "mesh:parent",
+        payload: { type: "mesh.message", messageId: "m1", fromId: parent },
+      },
+    ]);
 
-      const { mesh, inboxStore } = setup({
-        completedFocusEntryCounts: () => countsMap,
-      });
+    const strangerClient = await connect(createAgentExecMcpServer(mesh, stranger, stranger));
 
-      const parent = mesh.spawn({
-        charter: "parent",
-        parentId: "root",
-        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-      });
-      const child = mesh.spawn({
-        charter: "child",
-        parentId: parent,
-        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-      });
-      const stranger = mesh.spawn({
-        charter: "stranger",
-        parentId: "root",
-        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
-      });
-
-      inboxStore.append([
-        {
-          id: "exhausted-1",
-          actorId: child,
-          source: "mesh:parent",
-          payload: { type: "mesh.message", messageId: "m1", fromId: parent },
-        },
-      ]);
-
-      const strangerClient = await connect(createAgentExecMcpServer(mesh, stranger, stranger));
-
-      const strangerClear = (await strangerClient.callTool({
-        name: "release_selection_lock",
-        arguments: {
-          thread_id: child,
-          entry_ids: ["exhausted-1"],
-          note: "unauthorized release",
-        },
-      })) as CallToolResult;
-      expect(strangerClear.isError).toBe(true);
-      expect(JSON.stringify(strangerClear.content)).toMatch(/Only the parent thread/i);
-    });
+    const strangerClear = (await strangerClient.callTool({
+      name: "release_selection_lock",
+      arguments: {
+        thread_id: child,
+        entry_ids: ["exhausted-1"],
+        note: "unauthorized release",
+      },
+    })) as CallToolResult;
+    expect(strangerClear.isError).toBe(true);
+    expect(JSON.stringify(strangerClear.content)).toMatch(/Only the parent thread/i);
   });
 });
 
