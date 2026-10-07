@@ -3,7 +3,6 @@ import { join } from "node:path";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import { CAPABILITY_GRANTS_FILENAME, type CapabilityGrant } from "../actor/capability-grants.js";
-import { RETIRED_CAPABILITIES } from "./migrations/0060_drop_actor_experiments.js";
 import type { Repositories } from "./repositories/index.js";
 
 /** The read-only slice of {@link Repositories} a plan is allowed to touch. */
@@ -114,12 +113,7 @@ export function planLegacyCapabilityGrantImport(options: {
       ...(g.revokedAt ? { revokedAt: toCanonicalTimestamp(g.revokedAt) } : {}),
     });
   }
-  // `start` runs migrations before this importer. A leftover legacy file may
-  // therefore still name a capability the latest migration retired after an
-  // earlier boot committed its durable row but before it archived the source.
-  // Ignore those capabilities on both sides of the crash-recovery comparison;
-  // every other grant retains the exact divergence protection below.
-  const expected = [...byKey.values()].filter((g) => !RETIRED_CAPABILITIES.has(g.capability));
+  const expected = [...byKey.values()];
 
   const actorIds = new Set(options.repositories.actors.list().map((a) => a.id));
   for (const g of expected) {
@@ -130,9 +124,7 @@ export function planLegacyCapabilityGrantImport(options: {
     }
   }
 
-  const existing = options.repositories.capabilityGrants
-    .list()
-    .filter((g) => !RETIRED_CAPABILITIES.has(g.capability));
+  const existing = options.repositories.capabilityGrants.list();
   if (existing.length > 0) {
     const expectedByKey = new Map(expected.map((g) => [grantKey(g), canonical(g)]));
     const existingByKey = new Map(existing.map((g) => [grantKey(g), canonical(g)]));
@@ -144,12 +136,6 @@ export function planLegacyCapabilityGrantImport(options: {
         "Legacy capability-grant import: capability-grants.json diverges from SQLite; refusing to overwrite durable grants"
       );
     }
-    return { plan: { kind: "already-imported" }, hasFile, filePath };
-  }
-
-  // The source named only retired capabilities. There is nothing to import,
-  // but archive it so a later boot does not keep reconsidering it.
-  if (expected.length === 0) {
     return { plan: { kind: "already-imported" }, hasFile, filePath };
   }
 

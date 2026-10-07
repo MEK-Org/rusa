@@ -1,9 +1,6 @@
 import type { Database } from "better-sqlite3";
 import type { Migration } from "./types.js";
 
-/** Capabilities removed by this migration and ignored by legacy-file import. */
-export const RETIRED_CAPABILITIES = new Set(["experiment-admin"]);
-
 /**
  * Remove the actor experiment seam entirely (#939).
  *
@@ -15,11 +12,10 @@ export const dropActorExperiments: Migration = {
   up: (db: Database) => {
     db.exec(`DROP TABLE IF EXISTS actor_experiments;`);
     const revokedAt = new Date().toISOString();
-    const revoke = db.prepare(
+    db.prepare(
       `UPDATE capability_grants
        SET revoked_at = ?
-       WHERE capability = ? AND revoked_at IS NULL`
-    );
-    for (const capability of RETIRED_CAPABILITIES) revoke.run(revokedAt, capability);
+       WHERE capability = 'experiment-admin' AND revoked_at IS NULL`
+    ).run(revokedAt);
   },
 };
