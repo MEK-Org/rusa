@@ -42,6 +42,8 @@ import {
 import {
   type DeploymentMode,
   type ExecutableSource,
+  HOST_WATCHDOG_LOG_BOUNDS,
+  hostWatchdogUnitNames,
   logRotationUnitNames,
   type ProbePathEnv,
   readUnitEnvironment,
@@ -271,7 +273,17 @@ export function buildLogRotateUnit(opts: {
   rotateScript: string;
   mcHome: string;
   logPath: string;
+  /**
+   * Further logs rotated by the same oneshot with bounds fixed in the unit
+   * (#955's host watchdog log). The arguments override the `.env` bounds and
+   * opt-out, so an instance-wide setting cannot unbound a log whose budget is
+   * part of its design.
+   */
+  pinnedLogs?: { path: string; maxBytes: number; keep: number }[];
 }): string {
+  const rotate = (args: string[]) =>
+    `ExecStart=${[opts.nodePath, opts.rotateScript, ...args].map(quoteExecArg).join(" ")}`;
+  const unitPath = (path: string) => path.replaceAll("$", () => "$$");
   return [
     "[Unit]",
     `Description=${opts.description}`,
@@ -279,7 +291,10 @@ export function buildLogRotateUnit(opts: {
     "[Service]",
     "Type=oneshot",
     `EnvironmentFile=-${join(opts.mcHome, ".env")}`,
-    `ExecStart=${quoteExecArg(opts.nodePath)} ${quoteExecArg(opts.rotateScript)} ${quoteExecArg(opts.logPath.replaceAll("$", () => "$$"))}`,
+    rotate([unitPath(opts.logPath)]),
+    ...(opts.pinnedLogs ?? []).map((log) =>
+      rotate([unitPath(log.path), String(log.maxBytes), String(log.keep)])
+    ),
     "",
   ].join("\n");
 }
@@ -313,6 +328,7 @@ export function writeLogRotationUnits(opts: {
   rotateScript: string;
   mcHome: string;
   logPath: string;
+  pinnedLogs?: { path: string; maxBytes: number; keep: number }[];
 }): { service: string; timer: string } {
   const names = logRotationUnitNames(opts.serviceBasename);
   installUnit(
@@ -324,6 +340,7 @@ export function writeLogRotationUnits(opts: {
       rotateScript: opts.rotateScript,
       mcHome: opts.mcHome,
       logPath: opts.logPath,
+      pinnedLogs: opts.pinnedLogs,
     })
   );
   installUnit(
@@ -332,6 +349,87 @@ export function writeLogRotationUnits(opts: {
     buildLogRotateTimer({
       description: `Rusa log rotation timer (${opts.serviceBasename})`,
       rotateUnit: names.service,
+    })
+  );
+  return names;
+}
+
+/**
+ * #955: a oneshot that appends one host-telemetry line (PSI, memory, top
+ * processes by interval CPU and I/O, connectivity probes) per run. It runs the
+ * standalone `scripts/host-watchdog.mjs` so it keeps sampling when the build or
+ * the service is broken. No `EnvironmentFile=`: nothing in the instance `.env`
+ * should retarget or reshape it, and the log path is an argument for the same
+ * reason as the rotation unit's.
+ */
+export function buildHostWatchdogUnit(opts: {
+  description: string;
+  nodePath: string;
+  watchdogScript: string;
+  logPath: string;
+}): string {
+  return [
+    "[Unit]",
+    `Description=${opts.description}`,
+    "",
+    "[Service]",
+    "Type=oneshot",
+    // One run samples for ~1 s with sub-second probes; a run that cannot
+    // finish in this bound is killed rather than piling up behind the timer.
+    "TimeoutStartSec=30",
+    `ExecStart=${[opts.nodePath, opts.watchdogScript, opts.logPath.replaceAll("$", () => "$$")].map(quoteExecArg).join(" ")}`,
+    "",
+  ].join("\n");
+}
+
+/**
+ * Fires {@link buildHostWatchdogUnit} once a minute. Not `Persistent=`: a missed
+ * sample cannot be taken after the fact, so catching up would only add noise.
+ */
+export function buildHostWatchdogTimer(opts: {
+  description: string;
+  watchdogUnit: string;
+}): string {
+  return [
+    "[Unit]",
+    `Description=${opts.description}`,
+    "",
+    "[Timer]",
+    "OnCalendar=minutely",
+    "AccuracySec=1s",
+    `Unit=${opts.watchdogUnit}`,
+    "",
+    "[Install]",
+    "WantedBy=timers.target",
+    "",
+  ].join("\n");
+}
+
+/** Write one instance's host watchdog service + timer; enabling is left to the caller. */
+export function writeHostWatchdogUnits(opts: {
+  systemdUserDir: string;
+  serviceBasename: string;
+  nodePath: string;
+  watchdogScript: string;
+  logPath: string;
+}): { service: string; timer: string } {
+  const names = hostWatchdogUnitNames(opts.serviceBasename);
+  installUnit(
+    opts.systemdUserDir,
+    names.service,
+    buildHostWatchdogUnit({
+      description: `Rusa host watchdog (${opts.serviceBasename})`,
+      nodePath: opts.nodePath,
+      watchdogScript: opts.watchdogScript,
+      logPath: opts.logPath,
+    })
+  );
+  installUnit(
+    opts.systemdUserDir,
+    names.timer,
+    buildHostWatchdogTimer({
+      description: `Rusa host watchdog timer (${opts.serviceBasename})`,
+      watchdogUnit: names.service,
     })
   );
   return names;
@@ -707,21 +805,36 @@ function installSingleRusaService(opts: {
     })
   );
 
+  // #955: per-minute host telemetry, so a host lockup can be attributed to a
+  // process. Its log rides the rotation oneshot below with pinned bounds.
+  const scriptsDir = join(dirname(dirname(executableSource.cliPath)), "scripts");
+  const hostWatchdogLog = join(instance.mcHome, "logs", "host-watchdog.log");
+  const hostWatchdog = writeHostWatchdogUnits({
+    systemdUserDir: opts.systemdUserDir,
+    serviceBasename: instance.serviceBasename,
+    nodePath,
+    watchdogScript: join(scriptsDir, "host-watchdog.mjs"),
+    logPath: hostWatchdogLog,
+  });
+
   // #580: bound the append-to-file log. Installed even for a journal-logging
   // instance, where it keeps any file left from an earlier install bounded too.
   const logRotation = writeLogRotationUnits({
     systemdUserDir: opts.systemdUserDir,
     serviceBasename: instance.serviceBasename,
     nodePath,
-    rotateScript: join(dirname(dirname(executableSource.cliPath)), "scripts", "rotate-log.mjs"),
+    rotateScript: join(scriptsDir, "rotate-log.mjs"),
     mcHome: instance.mcHome,
     logPath: instance.logPath,
+    pinnedLogs: [{ path: hostWatchdogLog, ...HOST_WATCHDOG_LOG_BOUNDS }],
   });
 
   runOrThrow("systemctl", ["--user", "daemon-reload"]);
-  // Enabling the timer never touches the orchestrator, so it runs under --no-restart too.
-  runOrThrow("systemctl", ["--user", "enable", "--now", logRotation.timer]);
-  console.log(`✓ Enabled ${logRotation.timer}`);
+  // Enabling the timers never touches the orchestrator, so they run under --no-restart too.
+  for (const timer of [logRotation.timer, hostWatchdog.timer]) {
+    runOrThrow("systemctl", ["--user", "enable", "--now", timer]);
+    console.log(`✓ Enabled ${timer}`);
+  }
   if (opts.restart === false) {
     // Non-disruptive re-apply: ensure enabled + reload (above) so the new unit is on
     // disk and known to systemd, but leave the running process alone. The new policy

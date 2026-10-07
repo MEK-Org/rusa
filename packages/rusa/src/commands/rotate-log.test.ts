@@ -251,4 +251,35 @@ describe("rotate-log (#580)", () => {
     expect(result.status).toBe(0);
     expect(readFileSync(`${log}.1`, "utf8")).toBe("over the bound now\n");
   });
+
+  it("pins explicit bound and retention arguments over the .env bounds and opt-out (#955)", () => {
+    const dir = logDir();
+    const log = join(dir, "host-watchdog.log");
+    for (const n of [1, 2, 3]) writeFileSync(`${log}.${n}`, `old ${n}\n`);
+    writeFileSync(log, "over the pinned bound\n");
+    // The instance-wide overrides would keep everything and never rotate.
+    const result = spawnSync(
+      process.execPath,
+      [resolve("scripts/rotate-log.mjs"), log, "10", "2"],
+      {
+        cwd: resolve("."),
+        env: {
+          ...process.env,
+          RUSA_LOG_ROTATE: "off",
+          RUSA_LOG_ROTATE_MAX_BYTES: "1000000",
+          RUSA_LOG_ROTATE_KEEP: "100",
+        },
+        encoding: "utf8",
+      }
+    );
+    expect(result.status).toBe(0);
+    expect(readdirSync(dir).sort()).toEqual([
+      "host-watchdog.log",
+      "host-watchdog.log.1",
+      "host-watchdog.log.2",
+    ]);
+    expect(readFileSync(`${log}.1`, "utf8")).toBe("over the pinned bound\n");
+    expect(readFileSync(`${log}.2`, "utf8")).toBe("old 1\n");
+    expect(readFileSync(log, "utf8")).toBe("");
+  });
 });
