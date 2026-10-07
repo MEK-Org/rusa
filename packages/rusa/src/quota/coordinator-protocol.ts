@@ -162,6 +162,11 @@ export interface PublishedHistoryRecord {
   observedAt: string;
   percentLeft: number;
   resetAtIso: string | null;
+  /**
+   * Duration inferred when this observation was stored. Older peers may omit
+   * it; readers retain their legacy presentation only for those old rows.
+   */
+  windowMs?: number;
   controllerError: number | null;
   intervalSeconds: number | null;
 }
@@ -213,6 +218,7 @@ export function isValidHistoryRecord(record: unknown): record is PublishedHistor
     typeof r.observedAt === "string" &&
     typeof r.percentLeft === "number" &&
     (r.resetAtIso === null || typeof r.resetAtIso === "string") &&
+    (r.windowMs === undefined || (typeof r.windowMs === "number" && r.windowMs > 0)) &&
     (r.controllerError === null || typeof r.controllerError === "number") &&
     (r.intervalSeconds === null || typeof r.intervalSeconds === "number")
   );
