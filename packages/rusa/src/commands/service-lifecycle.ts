@@ -393,8 +393,12 @@ export class ServiceLifecycleStore {
     this.save(document);
   }
 
-  /** Persist this boot before attempting its root wake; returned rows include interrupted prior delivery. */
-  beginBoot(): ServiceBootWake[] {
+  /**
+   * Persist this boot before attempting its root wake; returned rows include
+   * interrupted prior delivery. The caller supplies `bootId` so a fallback wake
+   * after a post-publication failure shares this boot's inbox identity.
+   */
+  beginBoot(bootId: string = randomUUID()): ServiceBootWake[] {
     const loaded = this.read();
     let document: ServiceLifecycleDocument;
     let lifecycleError: string | undefined;
@@ -407,7 +411,6 @@ export class ServiceLifecycleStore {
       this.rotateInvalidEvidence();
       document = emptyDocument();
     }
-    const bootId = randomUUID();
     const intent = document.requestedRestart;
     const shutdown = document.cleanShutdown;
     const pendingIntent = intent?.consumedByBootId === undefined ? intent : undefined;
@@ -527,13 +530,17 @@ export function appendServiceBootWakes(args: {
   rootId: string;
   onLifecycleError: LifecycleWarning;
 }): void {
+  // One identity per boot: `save()` can throw after its rename published this
+  // boot's pending wake, so the fallback reuses that id and a later retry of
+  // the published wake deduplicates against it in the inbox.
+  const bootId = randomUUID();
   let wakes: ServiceBootWake[];
   try {
-    wakes = args.lifecycle.beginBoot();
+    wakes = args.lifecycle.beginBoot(bootId);
   } catch (error) {
     args.onLifecycleError("service_boot_evidence_read_failed", { err: error });
     appendBootWake(args.inboxStore, args.rootId, {
-      bootId: `invalid-${randomUUID()}`,
+      bootId,
       createdAt: new Date().toISOString(),
       prior: "unknown",
       lifecycleError: errorDetail(error),

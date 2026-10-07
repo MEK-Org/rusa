@@ -162,7 +162,7 @@ describe("service lifecycle evidence", () => {
     const durableInbox = inbox();
     const warnings: string[] = [];
     const interruptedLifecycle = {
-      beginBoot: () => lifecycle.beginBoot(),
+      beginBoot: (bootId?: string) => lifecycle.beginBoot(bootId),
       acknowledgeBootWake: () => {
         throw new Error("simulated process interruption before acknowledgement");
       },
@@ -193,6 +193,56 @@ describe("service lifecycle evidence", () => {
     expect(recovered).toHaveLength(2);
     expect(recovered.map((wake) => wake.id)).toContain(afterInterruptedAppend[0]?.id);
     expect(new Set(recovered.map((wake) => wake.id)).size).toBe(2);
+    expect(restarted.read()).toMatchObject({ kind: "ok", document: { pendingBootWakes: [] } });
+  });
+
+  it("keeps one wake identity when the boot record publishes but its directory sync fails", () => {
+    const lifecycle = store();
+    const durableInbox = inbox();
+    const intent = lifecycle.recordRequestedRestart({
+      targetSha: "9".repeat(40),
+      branch: "staging",
+      subject: "post-publication failure",
+    });
+    lifecycle.recordCleanShutdown("deploy", intent.id);
+    const directorySync = vi
+      .spyOn(lifecycle as unknown as { syncDirectory: (dir: string) => void }, "syncDirectory")
+      .mockImplementationOnce(() => {
+        throw new Error("EIO: directory sync failed after rename");
+      });
+    const warnings: string[] = [];
+
+    appendServiceBootWakes({
+      lifecycle,
+      inboxStore: durableInbox,
+      rootId: "root",
+      onLifecycleError: (event) => warnings.push(event),
+    });
+    directorySync.mockRestore();
+
+    const [fallback] = durableInbox.list("root").entries;
+    expect(warnings).toEqual(["service_boot_evidence_read_failed"]);
+    expect(fallback).toMatchObject({
+      payload: { prior: "unknown", lifecycleError: expect.any(String) },
+    });
+    // The published document still holds this boot's pending wake under the same id.
+    const published = lifecycle.read();
+    if (published.kind !== "ok") throw new Error("boot record was not published");
+    expect(
+      published.document.pendingBootWakes.map((wake) => `service-boot:${wake.bootId}`)
+    ).toEqual([fallback?.id]);
+
+    const restarted = new ServiceLifecycleStore(lifecycle.filePath);
+    appendServiceBootWakes({
+      lifecycle: restarted,
+      inboxStore: durableInbox,
+      rootId: "root",
+      onLifecycleError: (event) => warnings.push(event),
+    });
+
+    const entries = durableInbox.list("root").entries;
+    expect(entries).toHaveLength(2);
+    expect(new Set(entries.map((wake) => wake.id)).size).toBe(2);
     expect(restarted.read()).toMatchObject({ kind: "ok", document: { pendingBootWakes: [] } });
   });
 

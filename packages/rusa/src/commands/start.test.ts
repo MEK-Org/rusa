@@ -8512,6 +8512,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     const exitMock = () => process.exit as unknown as ReturnType<typeof vi.fn>;
 
+    // Clean-completion evidence the next boot reads; absent means "not clean".
+    const cleanShutdownEvidence = (): unknown => {
+      const path = join(homeDir, "data", "service-lifecycle.json");
+      if (!existsSync(path)) return undefined;
+      return (JSON.parse(readFileSync(path, "utf8")) as { cleanShutdown?: unknown }).cleanShutdown;
+    };
+
     beforeEach(() => {
       logCapture.lines.length = 0;
     });
@@ -8895,7 +8902,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!gitBridge) throw new Error("git bridge not started");
       dbMock.closeDb.mockClear();
       try {
+        let evidenceDuringCleanup: unknown = "unobserved";
         vi.spyOn(mesh, "shutdownAll").mockImplementation(() => {
+          evidenceDuringCleanup = cleanShutdownEvidence();
           throw new Error("actor refused to stop");
         });
 
@@ -8903,6 +8912,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
         expect(records("shutdown_disposer_failed")).toEqual([
           expect.objectContaining({ resource: "actor mesh" }),
+        ]);
+        // #950: a failed disposer is an incomplete shutdown, so no clean
+        // evidence exists while cleanup runs or after it fails.
+        expect(evidenceDuringCleanup).toBeUndefined();
+        expect(cleanShutdownEvidence()).toBeUndefined();
+        expect(records("service_shutdown_incomplete")).toEqual([
+          expect.objectContaining({ failures: ["actor mesh"] }),
         ]);
         // #389 requires attempting every later disposer even after a failure:
         // the release must run past the mesh all the way to the database and
@@ -8914,6 +8930,23 @@ describe("runStart webhook event routing (Phase 4)", () => {
       } finally {
         mcpClose.mockRestore();
       }
+    });
+
+    it("records clean shutdown evidence only after every disposer has finished", async () => {
+      const { mesh, shutdown } = await boot();
+      shutdownFn = undefined;
+      let evidenceDuringCleanup: unknown = "unobserved";
+      const meshShutdown = mesh.shutdownAll.bind(mesh);
+      vi.spyOn(mesh, "shutdownAll").mockImplementation(() => {
+        evidenceDuringCleanup = cleanShutdownEvidence();
+        meshShutdown();
+      });
+
+      await shutdown();
+
+      expect(evidenceDuringCleanup).toBeUndefined();
+      expect(cleanShutdownEvidence()).toMatchObject({ reason: "signal" });
+      expect(exitMock()).toHaveBeenCalledWith(0);
     });
 
     // Distinguishes post-handler boot failure from earlier pre-handler partial-boot tests.
