@@ -193,6 +193,89 @@ void main() {
     },
   );
 
+  testWidgets('a same-obligation refresh revalidates a settled reference', (
+    tester,
+  ) async {
+    serve((_) => _pending());
+    var answers = 0;
+    api.referenceFor = (_) {
+      answers++;
+      return ReferenceDto(
+        ref: _ref,
+        scheme: 'gchat',
+        title: answers == 1 ? 'First version' : 'Refreshed version',
+        cacheState: 'fresh',
+      );
+    };
+    await mount(tester);
+    await open(tester, 'Cites a chat');
+    expect(find.text('First version'), findsOneWidget);
+
+    final refreshGate = Completer<void>();
+    api.referencesGate = refreshGate;
+    stream.meshCtrl.add(
+      MeshEvent(
+        id: 'refresh-settled',
+        ts: '2026-10-01T21:00:00.000Z',
+        kind: 'obligation_checkpoint_set',
+        actorId: 'root',
+        detail: obA.id,
+        body: null,
+        payload: '{"cleared":false}',
+        success: null,
+      ),
+    );
+    for (var i = 0; i < 4; i += 1) {
+      await tester.pump();
+    }
+
+    expect(asksFor(_ref), 2);
+    expect(find.text('First version'), findsOneWidget);
+    refreshGate.complete();
+    await tester.pump();
+
+    expect(find.text('Refreshed version'), findsOneWidget);
+    await tester.runAsync(store.dispose);
+  });
+
+  testWidgets('a same-obligation refresh releases a superseded in-flight ref', (
+    tester,
+  ) async {
+    serve((_) => _resolved());
+    final firstGate = Completer<void>();
+    final secondGate = Completer<void>();
+    api.referencesGate = firstGate;
+    await mount(tester);
+    await open(tester, 'Cites a chat');
+    expect(find.text('loading context'), findsOneWidget);
+
+    api.referencesGate = secondGate;
+    stream.meshCtrl.add(
+      MeshEvent(
+        id: 'refresh-in-flight',
+        ts: '2026-10-01T21:00:00.000Z',
+        kind: 'obligation_checkpoint_set',
+        actorId: 'root',
+        detail: obA.id,
+        body: null,
+        payload: '{"cleared":false}',
+        success: null,
+      ),
+    );
+    for (var i = 0; i < 4; i += 1) {
+      await tester.pump();
+    }
+    firstGate.complete();
+    await tester.pump();
+
+    expect(asksFor(_ref), 2);
+    secondGate.complete();
+    await tester.pump();
+
+    expect(find.text('Chat message'), findsOneWidget);
+    await tester.runAsync(store.dispose);
+  });
+
   testWidgets('a citation that turns pending after another gave up gets its '
       'own retries', (tester) async {
     const refB = 'github:MEK-Org/rusa/issues/2';

@@ -904,6 +904,10 @@ class _DetailViewState extends State<_DetailView> {
   int _beginFetch() {
     _pendingRetry?.cancel();
     _pendingRetry = null;
+    // A superseded reference request may never get to its generation-guarded
+    // settle callback. Its keys therefore belong to that old generation too:
+    // release them before the new snapshot asks for its own current refs.
+    _referencesInFlight = const {};
     return ++_fetchGeneration;
   }
 
@@ -928,18 +932,17 @@ class _DetailViewState extends State<_DetailView> {
         ref,
   };
 
-  /// Asks the references route for every ref [data] cites that has no settled
-  /// answer and is not already asked for. The detail itself is never
-  /// refetched for this; a failed ask spends a ladder attempt. A ladder tick
-  /// asks only refs still on a ladder, while a fresh detail load also re-asks
-  /// one whose ladder gave up, as the whole-detail refetch used to.
+  /// A fresh detail snapshot revalidates every reference it cites while the
+  /// existing preview stays visible. A ladder tick asks only pending refs, so
+  /// a provider's cold read remains bounded. A failed ask spends a ladder
+  /// attempt, and a fresh detail load may re-ask a ref whose ladder gave up.
   void _resolveReferences(
     ObligationDetailSnapshot data, {
     bool retrying = false,
   }) {
     final wanted = retrying
         ? _pendingRefs(data).difference(_pendingGaveUp)
-        : _pendingRefs(data);
+        : _refsOf(data).difference(_referencesInFlight);
     if (wanted.isEmpty) return;
     final id = widget.obligationId;
     final gen = _fetchGeneration;
