@@ -155,8 +155,6 @@ void main() {
             kind: 'handled_inbox',
             time: '2026-09-23T14:21:37.000Z',
             actorId: actor,
-            actorHandle: 'kestrel-coder',
-            actorModel: 'claude-opus-4-6, high',
             sourceKind: 'GITHUB ISSUE',
             sourceRef: 'github:MEK-Org/rusa/issues/664',
             summary: 'UI proposal feedback on #664',
@@ -178,7 +176,7 @@ void main() {
 
       expect(tester.takeException(), isNull);
       expect(find.text('Recent Activity'), findsOneWidget);
-      expect(find.text('kestrel-coder'), findsOneWidget);
+      expect(find.text('$actor-handle'), findsOneWidget);
       expect(
         find.textContaining('Packaged design proposal into PR #665'),
         findsOneWidget,
@@ -205,8 +203,6 @@ void main() {
             kind: 'terminal_obligation',
             time: '2026-09-23T14:21:37.000Z',
             actorId: actor,
-            actorHandle: 'kestrel-coder',
-            actorModel: 'claude-opus-4-6, high',
             sourceKind: 'OBLIGATION',
             sourceRef: 'github:MEK-Org/rusa/issues/664',
             summary: 'Render work-outcome dashboard mock-up',
@@ -227,7 +223,7 @@ void main() {
 
       expect(tester.takeException(), isNull);
       expect(find.text('Recent Activity'), findsOneWidget);
-      expect(find.text('kestrel-coder'), findsOneWidget);
+      expect(find.text('$actor-handle'), findsOneWidget);
       expect(find.text('DONE'), findsOneWidget);
       expect(find.textContaining('Landed mock-up and tests'), findsOneWidget);
       expect(

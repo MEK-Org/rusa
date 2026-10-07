@@ -35,6 +35,7 @@ const SERVER_LABELS = [
   "mesh_obligation_tree",
   "mesh_obligation_forest",
   "mesh_obligation_mutation",
+  "mesh_references",
   "mesh_events",
   "mesh_quota",
   "mesh_stream_open",
@@ -170,6 +171,7 @@ export function dashboardTimingLabelForRoute(
   if (pathname === "/api/mesh/chat") return "mesh_actor_chat";
   if (pathname === "/api/mesh/inbox") return "mesh_actor_inbox";
   if (pathname === "/api/mesh/events") return "mesh_events";
+  if (pathname === "/api/mesh/references") return "mesh_references";
   if (pathname === "/api/quota" || pathname === "/api/quota/history") return "mesh_quota";
   if (pathname === "/api/mesh/stream") return "mesh_stream_open";
   if (pathname === "/api/mesh/obligations")

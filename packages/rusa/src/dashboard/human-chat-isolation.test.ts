@@ -290,19 +290,20 @@ describe("human chat isolation (#590)", () => {
       reference?: { body: string | null; unavailable: string | null };
     }>;
   };
-  type ObligationDetail = {
-    artifacts: Array<{
-      artifact: { ref: string };
-      reference: {
-        title: string;
-        body: string | null;
-        author: string | null;
-        timestamp: string | null;
-        unavailable: string | null;
-        entity?: unknown;
-      };
-    }>;
+  type ObligationDetail = { artifacts: Array<{ artifact: { ref: string } }> };
+  type CitedReference = {
+    title: string;
+    body: string | null;
+    author: string | null;
+    timestamp: string | null;
+    unavailable: string | null;
+    cacheState?: string;
+    entity?: unknown;
   };
+  type ReferencesPage = { references: Record<string, CitedReference> };
+  const referencesPath = (refs: string[]) =>
+    `/api/mesh/references?${refs.map((ref) => `ref=${encodeURIComponent(ref)}`).join("&")}`;
+
   type ThreadsPage = {
     threads: Array<{
       id: string;
@@ -584,22 +585,29 @@ describe("human chat isolation (#590)", () => {
     const fromBob = record(b.id, ACTOR, "bob decided it");
     const fromPeer = record(PEER, ACTOR, "child reported in");
     const obligation = obligations.create({ ownerId: ACTOR, title: "Shared work" });
-    for (const messageId of [fromAlice, fromBob, fromPeer]) {
-      obligations.attachArtifact(obligation.id, `mesh:messages/${messageId}`);
-    }
+    const refs = [fromAlice, fromBob, fromPeer].map((messageId) => `mesh:messages/${messageId}`);
+    for (const ref of refs) obligations.attachArtifact(obligation.id, ref);
 
+    // The detail lists every citation — the obligation's own record of what
+    // settled it — and resolves none of them (#940).
     const detail = await getJson<ObligationDetail>(
       `/api/mesh/obligations/${obligation.id}`,
       a.cookie
     );
     expect(detail.status).toBe(200);
-    const cited = new Map(detail.body.artifacts.map((e) => [e.artifact.ref, e.reference]));
-    expect(cited.get(`mesh:messages/${fromAlice}`)?.body).toBe("alice decided it");
+    expect(detail.body.artifacts.map((e) => e.artifact.ref).sort()).toEqual([...refs].sort());
+    expect(JSON.stringify(detail.body)).not.toContain("decided it");
+
+    // Resolved after first paint, in one batch that mixes alice's own
+    // citation with bob's: batching reveals nothing scoping per ref would not.
+    const cited = await getJson<ReferencesPage>(referencesPath(refs), a.cookie);
+    expect(cited.status).toBe(200);
+    expect(cited.body.references[`mesh:messages/${fromAlice}`]?.body).toBe("alice decided it");
     // Actor↔actor citations are shared mesh visibility, as before.
-    expect(cited.get(`mesh:messages/${fromPeer}`)?.body).toBe("child reported in");
-    // Bob's citation is still listed — the obligation's own record of what
-    // settled it — but says nothing about whose conversation it was.
-    const hidden = cited.get(`mesh:messages/${fromBob}`);
+    expect(cited.body.references[`mesh:messages/${fromPeer}`]?.body).toBe("child reported in");
+    // Bob's citation still resolves to something, but says nothing about
+    // whose conversation it was.
+    const hidden = cited.body.references[`mesh:messages/${fromBob}`];
     expect(hidden).toBeDefined();
     expect(hidden).toMatchObject({
       body: null,
@@ -609,19 +617,18 @@ describe("human chat isolation (#590)", () => {
     });
     expect(hidden?.unavailable).not.toBeNull();
     expect(hidden?.entity).toBeUndefined();
-    const serialized = JSON.stringify(detail.body);
+    const serialized = JSON.stringify(cited.body);
     expect(serialized).not.toContain("bob decided it");
     expect(serialized).not.toContain(b.id);
 
-    // The same obligation is bob's own citation for bob.
-    const bobDetail = await getJson<ObligationDetail>(
-      `/api/mesh/obligations/${obligation.id}`,
-      b.cookie
-    );
-    const bobCited = new Map(bobDetail.body.artifacts.map((e) => [e.artifact.ref, e.reference]));
-    expect(bobCited.get(`mesh:messages/${fromBob}`)?.body).toBe("bob decided it");
-    expect(bobCited.get(`mesh:messages/${fromAlice}`)?.body).toBeNull();
-    expect(JSON.stringify(bobDetail.body)).not.toContain(a.id);
+    // The same batch is bob's own citation for bob.
+    const bobCited = await getJson<ReferencesPage>(referencesPath(refs), b.cookie);
+    expect(bobCited.body.references[`mesh:messages/${fromBob}`]?.body).toBe("bob decided it");
+    expect(bobCited.body.references[`mesh:messages/${fromAlice}`]?.body).toBeNull();
+    expect(JSON.stringify(bobCited.body)).not.toContain(a.id);
+
+    // Signed in like every other dashboard read.
+    expect((await fetch(origin + referencesPath(refs))).status).toBe(401);
   });
 
   it("omits another human's message from the actor's inbox and thread projections", async () => {
@@ -658,7 +665,7 @@ describe("human chat isolation (#590)", () => {
     expect(JSON.stringify(bobThreads.body)).not.toContain("alice asks");
   });
 
-  it("omits another human's message from recent activity resolved alongside cold references (#933)", async () => {
+  it("omits another human's message from recent activity and its after-paint references (#933, #940)", async () => {
     const a = await login(alice);
     const b = await login(bob);
     await seedBothConversations(a, b);
@@ -671,6 +678,8 @@ describe("human chat isolation (#590)", () => {
       },
     ]);
     const handled = inbox.list(ACTOR, { status: "unhandled", limit: 100 }).entries;
+    const bobsEntry = handled.find((entry) => entry.payload.fromId === b.id);
+    expect(bobsEntry).toBeDefined();
     inbox.markHandled(
       ACTOR,
       handled.map((entry) => entry.id),
@@ -678,7 +687,7 @@ describe("human chat isolation (#590)", () => {
       "Addressed"
     );
     // A provider that never answers keeps the GitHub card pending while the
-    // mesh messages resolve in the same pass.
+    // mesh message resolves in the same batch.
     deps.referenceCache = new ReferenceCacheService({
       repo: new ReferenceCacheRepository(db),
       deadlineMs: 20,
@@ -688,17 +697,31 @@ describe("human chat isolation (#590)", () => {
     } as unknown as DashboardDataDeps["issueClient"];
 
     const activity = await getJson<{
-      items: Array<{ sourceRef: string; reference?: { body: string | null; cacheState?: string } }>;
+      items: Array<{ sourceRef: string; referenceKey?: string }>;
     }>("/api/mesh/recent-activity?limit=10", a.cookie);
     expect(activity.status).toBe(200);
-    expect(activity.body.items.map((item) => item.reference?.body ?? null)).toContain("alice asks");
-    expect(
-      activity.body.items.find((item) => item.sourceRef === "github:o/r/issues/1")?.reference
-        ?.cacheState
-    ).toBe("pending");
+    const keys = activity.body.items
+      .map((item) => item.referenceKey)
+      .filter((key): key is string => key !== undefined);
+    expect(keys).toHaveLength(2);
+    expect(keys).toContain("github:o/r/issues/1");
     const serialized = JSON.stringify(activity.body);
     expect(serialized).not.toContain("bob asks");
     expect(serialized).not.toContain(b.id);
+    expect(serialized).not.toContain(String(bobsEntry?.payload.messageId));
+
+    const resolved = await getJson<ReferencesPage>(referencesPath(keys), a.cookie);
+    expect(resolved.status).toBe(200);
+    expect(Object.values(resolved.body.references).map((r) => r.body)).toContain("alice asks");
+    expect(resolved.body.references["github:o/r/issues/1"]?.cacheState).toBe("pending");
+
+    // Naming bob's message outright, alone or batched with alice's own,
+    // resolves it without its content or its ends.
+    const bobsRef = `mesh:messages/${String(bobsEntry?.payload.messageId)}`;
+    const guessed = await getJson<ReferencesPage>(referencesPath([...keys, bobsRef]), a.cookie);
+    expect(guessed.body.references[bobsRef]).toMatchObject({ body: null, author: null });
+    expect(JSON.stringify(guessed.body)).not.toContain("bob asks");
+    expect(JSON.stringify(guessed.body)).not.toContain(b.id);
   });
 
   it("scopes voice streams, audio, backlog, acknowledgements, and sessions to the authenticated user", async () => {

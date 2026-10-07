@@ -526,6 +526,18 @@ class DashboardStore {
     return actor(id)?.handle;
   }
 
+  /// The model an actor runs on, from the threads snapshot, as the Recent
+  /// Activity cards label it: its first configured model and effort, or
+  /// 'default' when it has none.
+  String actorModelLabel(String id) {
+    final configs = actor(id)?.thread.modelConfig ?? const [];
+    if (configs.isEmpty) return 'default';
+    final effort = configs.first.effort;
+    return effort == null
+        ? configs.first.model
+        : '${configs.first.model}, $effort';
+  }
+
   void setWalkieActive(bool active) {
     if (!_walkieActive.isClosed) {
       _walkieActive.add(active);
@@ -660,13 +672,51 @@ class DashboardStore {
     await _requestRuntimeSync();
   }
 
+  /// References already resolved for Recent Activity, kept across refreshes
+  /// so a card does not fall back to loading each time the feed reloads.
+  final _activityReferences = <String, ReferenceDto>{};
+  int _recentActivityGeneration = 0;
+
+  /// Paints the feed from its ref keys, then fills each card's reference in
+  /// as `/api/mesh/references` answers (#940). Known cards keep their shown
+  /// previews on reload while revalidation refreshes them in the background.
   Future<void> refreshRecentActivity() async {
+    final generation = ++_recentActivityGeneration;
+    final List<RecentActivityItem> items;
     try {
-      final items = await _api.fetchRecentActivity(limit: 50);
-      if (!_recentActivity.isClosed) {
-        _recentActivity.add(items);
+      items = await _api.fetchRecentActivity(limit: 50);
+    } catch (_) {
+      return;
+    }
+    if (generation != _recentActivityGeneration) return;
+    final keys = {for (final item in items) ?item.referenceKey};
+    _activityReferences.removeWhere((ref, _) => !keys.contains(ref));
+    void emit() {
+      if (generation != _recentActivityGeneration || _recentActivity.isClosed) {
+        return;
       }
-    } catch (_) {}
+      _recentActivity.add([
+        for (final item in items)
+          item.referenceKey == null
+              ? item
+              : item.withReference(
+                  _activityReferences[item.referenceKey] ??
+                      ReferenceDto.loading(item.referenceKey!),
+                ),
+      ]);
+    }
+
+    emit();
+    if (keys.isEmpty) return;
+    try {
+      final fetched = await _api.fetchReferences(keys);
+      if (generation != _recentActivityGeneration) return;
+      _activityReferences.addAll(fetched);
+      emit();
+    } catch (_) {
+      // A card keeps its existing preview or loading placeholder until the
+      // next refresh asks again; the feed itself has already painted.
+    }
   }
 
   Future<List<String>> fetchRootControlProviders() =>

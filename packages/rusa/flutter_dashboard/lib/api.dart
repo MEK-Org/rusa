@@ -6,6 +6,10 @@ import 'dashboard_timing.dart';
 import 'models.dart';
 import 'session_client.dart';
 
+/// Most refs one `/api/mesh/references` request may name; mirrors
+/// `MAX_REFERENCE_BATCH` on the server, which refuses a larger batch.
+const int referenceBatchLimit = 20;
+
 /// REST client for the PR2 dashboard Data API. All paths are resolved against
 /// the page origin (`Uri.base`), so the same build works on localhost and
 /// behind `tailscale serve` (relative paths, no hard-coded host).
@@ -534,6 +538,50 @@ class DashboardApi {
     return ObligationDetailSnapshot.fromJson(
       await _getJson(_u('/api/mesh/obligations/$id', q)),
     );
+  }
+
+  /// `POST /api/mesh/references` → each ref resolved through the
+  /// server's reference cache under the viewer's chat scope (#940). The pages
+  /// that cite refs send their keys alone, and this fills them in after paint.
+  /// Refs are asked for once each, in batches no larger than the server takes.
+  Future<Map<String, ReferenceDto>> fetchReferences(
+    Iterable<String> refs,
+  ) async {
+    final distinct = refs.toSet().toList();
+    if (distinct.isEmpty) return const {};
+    final pages = await Future.wait([
+      for (var start = 0; start < distinct.length; start += referenceBatchLimit)
+        (() async {
+          final uri = _u('/api/mesh/references');
+          final chunk = distinct.sublist(
+            start,
+            (start + referenceBatchLimit).clamp(0, distinct.length),
+          );
+          final res = await _client.post(
+            uri,
+            headers: {
+              'Accept': 'application/json',
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode({'refs': chunk}),
+          );
+          if (res.statusCode != 200) {
+            throw DashboardApiException(uri, res.statusCode, res.body);
+          }
+          final json = jsonDecode(res.body) as Map<String, dynamic>;
+          final rawRefs =
+              json['references'] as Map<String, dynamic>? ?? const {};
+          return rawRefs.map(
+            (k, v) =>
+                MapEntry(k, ReferenceDto.fromJson(v as Map<String, dynamic>)),
+          );
+        })(),
+    ]);
+    final merged = <String, ReferenceDto>{};
+    for (final page in pages) {
+      merged.addAll(page);
+    }
+    return merged;
   }
 
   Future<ObligationTreeDto> fetchObligationTree(String id) async =>

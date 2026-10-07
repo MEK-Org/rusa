@@ -55,7 +55,7 @@ void main() {
   });
 
   group('ObligationArtifactDto', () {
-    test('reads the server shape of artifact plus resolved reference', () {
+    test('reads the server shape of an artifact as its ref alone (#940)', () {
       final dto = ObligationArtifactDto.fromJson(const {
         'artifact': {
           'ref': 'mesh:messages/abc',
@@ -63,27 +63,11 @@ void main() {
           'attachedBy': 'root',
           'attachedAt': '2026-08-30T12:00:00.000Z',
         },
-        'reference': {
-          'ref': 'mesh:messages/abc',
-          'scheme': 'mesh',
-          'title': '00000000-0000-4000-8000-000000000001 → root',
-          'body': 'the answer',
-        },
       });
 
       expect(dto.ref, 'mesh:messages/abc');
       expect(dto.label, "Operator's opening ask");
-      expect(dto.reference?.body, 'the answer');
-    });
-
-    test('tolerates an artifact whose reference could not be resolved', () {
-      final dto = ObligationArtifactDto.fromJson(const {
-        'artifact': {'ref': 'github:MEK-Org/rusa/issues/33'},
-        'reference': null,
-      });
-
-      expect(dto.ref, 'github:MEK-Org/rusa/issues/33');
-      expect(dto.reference, isNull);
+      expect(dto.attachedBy, 'root');
     });
   });
 

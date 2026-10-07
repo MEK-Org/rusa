@@ -290,6 +290,45 @@ class FakeApi extends DashboardApi {
     return chatRoomParticipants;
   }
 
+  /// What `/api/mesh/references` answers (#940); a ref missing here comes
+  /// back unavailable, as the server answers a ref it cannot resolve.
+  Map<String, ReferenceDto> referencesResult = {};
+
+  /// Each batch asked for, in order.
+  final referenceRequests = <List<String>>[];
+
+  /// When set, each references answer waits on this, so a test can see the
+  /// pane painted before its references arrive.
+  Completer<void>? referencesGate;
+  Object? referencesError;
+
+  /// When set, answers each ref ahead of [referencesResult]; null defers.
+  ReferenceDto? Function(String ref)? referenceFor;
+
+  @override
+  Future<Map<String, ReferenceDto>> fetchReferences(
+    Iterable<String> refs,
+  ) async {
+    final batch = refs.toSet().toList();
+    referenceRequests.add(batch);
+    await referencesGate?.future;
+    final error = referencesError;
+    if (error != null) throw error;
+    return {
+      for (final ref in batch)
+        ref:
+            referenceFor?.call(ref) ??
+            referencesResult[ref] ??
+            ReferenceDto(
+              ref: ref,
+              scheme: ref.split(':').first,
+              title: ref,
+              unavailable: 'could not load context',
+              cacheState: 'unavailable',
+            ),
+    };
+  }
+
   List<RecentActivityItem> recentActivityResult = [];
   int recentActivityCallCount = 0;
 
@@ -676,7 +715,6 @@ class FakeApi extends DashboardApi {
   // ── Obligations routes ──
   List<ObligationDto> obligationsResult = [];
   Map<String, ObligationDetailSnapshot> obligationDetails = {};
-  Map<String, ReferenceDto?> obExternalReferences = {};
   Map<String, List<ObligationDto>> obBlockedBy = {};
   Map<String, int> obBlockedByTotal = {};
   Map<String, bool> obBlockedByHasMore = {};
@@ -814,7 +852,6 @@ class FakeApi extends DashboardApi {
       blocks: blocks,
       blocksTotal: obBlocksTotal[id] ?? blocks.length,
       blocksHasMore: obBlocksHasMore[id] ?? false,
-      externalReference: obExternalReferences[id],
     );
   }
 

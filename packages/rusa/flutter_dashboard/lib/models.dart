@@ -540,10 +540,9 @@ class RecentActivityItem {
     required this.kind,
     required this.time,
     required this.actorId,
-    required this.actorHandle,
-    required this.actorModel,
     this.sourceKind,
     this.sourceRef,
+    this.referenceKey,
     this.reference,
     this.summary,
     this.handledTime,
@@ -561,12 +560,16 @@ class RecentActivityItem {
   final String kind;
   final String time;
   final String actorId;
-  final String actorHandle;
-  final String actorModel;
 
   // Handled inbox fields
   final String? sourceKind;
   final String? sourceRef;
+
+  /// The ref this item cites, sent as its key alone (#940).
+  final String? referenceKey;
+
+  /// [referenceKey] resolved, filled in by the store after the feed has
+  /// painted; never on the wire.
   final ReferenceDto? reference;
   final String? summary;
   final String? handledTime;
@@ -582,19 +585,35 @@ class RecentActivityItem {
   bool get isHandledInbox => kind == 'handled_inbox';
   bool get isTerminalObligation => kind == 'terminal_obligation';
 
+  RecentActivityItem withReference(ReferenceDto? reference) =>
+      RecentActivityItem(
+        id: id,
+        kind: kind,
+        time: time,
+        actorId: actorId,
+        sourceKind: sourceKind,
+        sourceRef: sourceRef,
+        referenceKey: referenceKey,
+        reference: reference,
+        summary: summary,
+        handledTime: handledTime,
+        addressedNote: addressedNote,
+        linkedObligation: linkedObligation,
+        obligationId: obligationId,
+        terminalStatus: terminalStatus,
+        terminalNote: terminalNote,
+        resolutionRef: resolutionRef,
+      );
+
   factory RecentActivityItem.fromJson(Map<String, dynamic> j) =>
       RecentActivityItem(
         id: j['id'] as String? ?? '',
         kind: j['kind'] as String? ?? 'handled_inbox',
         time: j['time'] as String? ?? '',
         actorId: j['actorId'] as String? ?? '',
-        actorHandle: j['actorHandle'] as String? ?? '',
-        actorModel: j['actorModel'] as String? ?? '',
         sourceKind: j['sourceKind'] as String?,
         sourceRef: j['sourceRef'] as String?,
-        reference: j['reference'] is Map<String, dynamic>
-            ? ReferenceDto.fromJson(j['reference'] as Map<String, dynamic>)
-            : null,
+        referenceKey: j['referenceKey'] as String?,
         summary: j['summary'] as String?,
         handledTime: j['handledTime'] as String?,
         addressedNote: j['addressedNote'] as String?,
@@ -1859,6 +1878,19 @@ class ReferenceDto {
 
   bool get isResolved => unavailable == null;
 
+  /// The placeholder shown for [ref] until `/api/mesh/references` answers
+  /// (#940), in the same pending shape the server gives a cold read.
+  factory ReferenceDto.loading(String ref) {
+    final colon = ref.indexOf(':');
+    return ReferenceDto(
+      ref: ref,
+      scheme: colon > 0 ? ref.substring(0, colon) : '',
+      title: ref,
+      unavailable: 'loading context',
+      cacheState: 'pending',
+    );
+  }
+
   factory ReferenceDto.fromJson(Map<String, dynamic> j) => ReferenceDto(
     ref: j['ref'] as String? ?? '',
     scheme: j['scheme'] as String? ?? '',
@@ -1873,33 +1905,28 @@ class ReferenceDto {
   );
 }
 
-/// An artifact cited by an obligation, with its reference resolved when we can.
+/// An artifact cited by an obligation. Its reference is resolved by the
+/// client after the detail has painted (#940).
 class ObligationArtifactDto {
   const ObligationArtifactDto({
     required this.ref,
     this.label,
     this.attachedBy,
     this.attachedAt,
-    this.reference,
   });
 
   final String ref;
   final String? label;
   final String? attachedBy;
   final String? attachedAt;
-  final ReferenceDto? reference;
 
   factory ObligationArtifactDto.fromJson(Map<String, dynamic> j) {
     final artifact = (j['artifact'] as Map<String, dynamic>?) ?? j;
-    final resolved = j['reference'];
     return ObligationArtifactDto(
       ref: artifact['ref'] as String? ?? '',
       label: artifact['label'] as String?,
       attachedBy: artifact['attachedBy'] as String?,
       attachedAt: artifact['attachedAt'] as String?,
-      reference: resolved is Map<String, dynamic>
-          ? ReferenceDto.fromJson(resolved)
-          : null,
     );
   }
 }
@@ -2395,7 +2422,6 @@ class ObligationDetailSnapshot {
     this.completions = const [],
     this.completionsTotal = 0,
     this.completionsHasMore = false,
-    this.externalReference,
   });
 
   final ObligationDto obligation;
@@ -2415,7 +2441,6 @@ class ObligationDetailSnapshot {
   final List<ObligationCompletionDto> completions;
   final int completionsTotal;
   final bool completionsHasMore;
-  final ReferenceDto? externalReference;
 
   factory ObligationDetailSnapshot.fromJson(
     Map<String, dynamic> j,
@@ -2474,8 +2499,5 @@ class ObligationDetailSnapshot {
         .toList(),
     completionsTotal: j['completionsTotal'] as int? ?? 0,
     completionsHasMore: j['completionsHasMore'] as bool? ?? false,
-    externalReference: j['externalReference'] is Map<String, dynamic>
-        ? ReferenceDto.fromJson(j['externalReference'] as Map<String, dynamic>)
-        : null,
   );
 }

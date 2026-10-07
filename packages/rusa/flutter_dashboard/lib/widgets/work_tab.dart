@@ -768,9 +768,9 @@ class _FlatNode {
   final bool isCollapsed;
 }
 
-/// The waits before each refetch of an open obligation whose snapshot still
-/// carries a reference the server answered "pending" (#595). Bounded: after
-/// the last, a still-pending reference is shown as unavailable.
+/// The waits before each re-ask of a reference the open obligation cites that
+/// the server answered "pending" (#595). Bounded: after the last, a
+/// still-pending reference is shown as unavailable.
 const pendingReferenceRetryDelays = [
   Duration(seconds: 1),
   Duration(seconds: 2),
@@ -824,11 +824,17 @@ class _DetailViewState extends State<_DetailView> {
   StreamSubscription<ObligationRefresh>? _checkpointSub;
   int _fetchGeneration = 0;
 
-  /// The scheduled refetch while a reference in the loaded snapshot is still
-  /// pending on the server's background read (#595), and how many the
-  /// current ladder has spent. A ladder covers the pending refs it started
-  /// with; a ref seen pending for the first time starts a fresh one, so each
-  /// distinct ref buys at most one ladder while this obligation is open.
+  /// The references the loaded snapshot cites, resolved through
+  /// `/api/mesh/references` after the pane has painted (#940), and the refs
+  /// asked for and not yet answered.
+  Map<String, ReferenceDto> _references = const {};
+  Set<String> _referencesInFlight = const {};
+
+  /// The scheduled re-ask while a cited reference is still pending on the
+  /// server's background read (#595), and how many the current ladder has
+  /// spent. A ladder covers the pending refs it started with; a ref seen
+  /// pending for the first time starts a fresh one, so each distinct ref buys
+  /// at most one ladder while this obligation is open.
   Timer? _pendingRetry;
   int _pendingAttempts = 0;
   Set<String> _pendingSeen = const {};
@@ -877,6 +883,8 @@ class _DetailViewState extends State<_DetailView> {
       _completionsTotal = 0;
       _completionsHasMore = false;
       _showDoneChildren = false;
+      _references = const {};
+      _referencesInFlight = const {};
       _pendingAttempts = 0;
       _pendingSeen = const {};
       _pendingGaveUp = const {};
@@ -899,19 +907,62 @@ class _DetailViewState extends State<_DetailView> {
     return ++_fetchGeneration;
   }
 
-  static Set<String> _pendingRefs(ObligationDetailSnapshot data) => {
-    for (final reference in [
-      data.externalReference,
-      for (final artifact in data.artifacts) artifact.reference,
+  /// The refs the pane shows: the external link, keyed as its panel trims
+  /// it, and each artifact. An empty ref names nothing to resolve.
+  static Set<String> _refsOf(ObligationDetailSnapshot data) => {
+    for (final ref in [
+      data.obligation.externalRef?.trim() ?? '',
+      for (final artifact in data.artifacts) artifact.ref,
     ])
-      if (reference?.cacheState == 'pending') reference!.ref,
+      if (ref.isNotEmpty) ref,
   };
 
-  /// Schedules the next bounded refetch when [data] still carries a pending
-  /// reference. The server shares one provider read across these, so they
-  /// cost no extra provider traffic; the timer belongs to this load's
-  /// generation, so navigating away or a newer load leaves it inert.
+  /// A ref with no answer yet reads as pending, like the server's cold read.
+  ReferenceDto _referenceFor(String ref) =>
+      _references[ref] ?? ReferenceDto.loading(ref);
+
+  Set<String> _pendingRefs(ObligationDetailSnapshot data) => {
+    for (final ref in _refsOf(data))
+      if (_referenceFor(ref).cacheState == 'pending' &&
+          !_referencesInFlight.contains(ref))
+        ref,
+  };
+
+  /// Asks the references route for every ref [data] cites that has no settled
+  /// answer and is not already asked for. The detail itself is never
+  /// refetched for this; a failed ask spends a ladder attempt. A ladder tick
+  /// asks only refs still on a ladder, while a fresh detail load also re-asks
+  /// one whose ladder gave up, as the whole-detail refetch used to.
+  void _resolveReferences(
+    ObligationDetailSnapshot data, {
+    bool retrying = false,
+  }) {
+    final wanted = retrying
+        ? _pendingRefs(data).difference(_pendingGaveUp)
+        : _pendingRefs(data);
+    if (wanted.isEmpty) return;
+    final id = widget.obligationId;
+    final gen = _fetchGeneration;
+    _referencesInFlight = {..._referencesInFlight, ...wanted};
+    void settle([Map<String, ReferenceDto> resolved = const {}]) {
+      if (!mounted || gen != _fetchGeneration || id != widget.obligationId) return;
+      setState(() {
+        _referencesInFlight = _referencesInFlight.difference(wanted);
+        _references = {..._references, ...resolved};
+        _schedulePendingRetry(data);
+      });
+    }
+
+    store.api.fetchReferences(wanted).then(settle, onError: (_) => settle());
+  }
+
+  /// Schedules the next bounded re-ask when a ref [data] cites is still
+  /// pending. The server shares one provider read across these, so they cost
+  /// no extra provider traffic; the timer belongs to this load's generation,
+  /// so navigating away or a newer load leaves it inert.
   void _schedulePendingRetry(ObligationDetailSnapshot data) {
+    _pendingRetry?.cancel();
+    _pendingRetry = null;
     final pending = _pendingRefs(data).difference(_pendingGaveUp);
     if (pending.isEmpty) return;
     if (!_pendingSeen.containsAll(pending)) {
@@ -924,48 +975,30 @@ class _DetailViewState extends State<_DetailView> {
     }
     final gen = _fetchGeneration;
     _pendingRetry = Timer(pendingReferenceRetryDelays[_pendingAttempts++], () {
-      if (mounted && gen == _fetchGeneration) _retryPending(data);
+      if (mounted && gen == _fetchGeneration) {
+        _resolveReferences(data, retrying: true);
+      }
     });
-  }
-
-  /// Refetches in place: the shown snapshot stays up until the new one has
-  /// arrived, and a failed retry spends an attempt rather than replacing the
-  /// pane with an error.
-  void _retryPending(ObligationDetailSnapshot shown) {
-    final gen = _beginFetch();
-    store.api
-        .fetchObligationDetail(widget.obligationId)
-        .then((data) {
-          if (!mounted || gen != _fetchGeneration) return;
-          _shownIds = _idsOf(data);
-          setState(() {
-            _future = Future.value(data);
-            _applyRefreshed(data);
-          });
-        })
-        .catchError((_) {
-          if (!mounted || gen != _fetchGeneration) return;
-          setState(() => _schedulePendingRetry(shown));
-        });
   }
 
   /// A reference still pending once its retries ran out is shown as the
   /// server shows any read it could not complete.
-  ReferenceDto? _settled(ReferenceDto? reference) =>
-      reference?.cacheState == 'pending' &&
-          _pendingGaveUp.contains(reference!.ref)
-      ? ReferenceDto(
-          ref: reference.ref,
-          scheme: reference.scheme,
-          title: reference.title,
-          body: reference.body,
-          author: reference.author,
-          timestamp: reference.timestamp,
-          url: reference.url,
-          unavailable: 'could not load context',
-          cacheState: 'unavailable',
-        )
-      : reference;
+  ReferenceDto _settled(String ref) {
+    final reference = _referenceFor(ref);
+    return reference.cacheState == 'pending' && _pendingGaveUp.contains(ref)
+        ? ReferenceDto(
+            ref: reference.ref,
+            scheme: reference.scheme,
+            title: reference.title,
+            body: reference.body,
+            author: reference.author,
+            timestamp: reference.timestamp,
+            url: reference.url,
+            unavailable: 'could not load context',
+            cacheState: 'unavailable',
+          )
+        : reference;
+  }
 
   void _fetch({bool trackDetail = false}) {
     final gen = _beginFetch();
@@ -981,7 +1014,7 @@ class _DetailViewState extends State<_DetailView> {
         _completions = data.completions;
         _completionsTotal = data.completionsTotal;
         _completionsHasMore = data.completionsHasMore;
-        _schedulePendingRetry(data);
+        _resolveReferences(data);
       });
       return data;
     }
@@ -1014,7 +1047,7 @@ class _DetailViewState extends State<_DetailView> {
             _completions = mergeCompletions(data.completions, _completions);
             _completionsTotal = data.completionsTotal;
             _completionsHasMore = _completions.length < data.completionsTotal;
-            _schedulePendingRetry(data);
+            _resolveReferences(data);
           });
         })
         .catchError((_) {});
@@ -1080,7 +1113,7 @@ class _DetailViewState extends State<_DetailView> {
       _completionsTotal = data.completionsTotal;
       _completionsHasMore = _completions.length < data.completionsTotal;
     }
-    _schedulePendingRetry(data);
+    _resolveReferences(data);
   }
 
   @override
@@ -1232,13 +1265,7 @@ class _DetailViewState extends State<_DetailView> {
         _SectionHeader('ARTIFACTS'),
         for (final artifact in data.artifacts)
           _referenceLine(
-            _settled(artifact.reference) ??
-                ReferenceDto(
-                  ref: artifact.ref,
-                  scheme: artifact.ref.split(':').first,
-                  title: artifact.ref,
-                  unavailable: 'Not resolvable yet.',
-                ),
+            _settled(artifact.ref),
             label: artifact.label,
             attachedBy: artifact.attachedBy,
           ),
@@ -1856,15 +1883,7 @@ class _DetailViewState extends State<_DetailView> {
         ],
       );
     }
-    final reference =
-        _settled(data.externalReference) ??
-        ReferenceDto(
-          ref: ref,
-          scheme: ref.split(':').first,
-          title: ref,
-          unavailable: 'Not resolvable yet.',
-        );
-    return _referenceLine(reference, action: edit);
+    return _referenceLine(_settled(ref), action: edit);
   }
 
   Widget _completionMatcherPanel(CompletionMatcherDto matcher) {
