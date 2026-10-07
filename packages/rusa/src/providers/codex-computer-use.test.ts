@@ -70,8 +70,6 @@ const plugins = Object.entries(config.plugins || {}).filter(([, c]) => c.enabled
 const inventory = { servers, plugins };
 if (process.env.FAKE_RECEIPT_PATH) fs.appendFileSync(process.env.FAKE_RECEIPT_PATH, JSON.stringify({ args, inventory }) + "\\n");
 if (args.includes("mcp")) {
-  // The installed CLI's helper-alias warning under CODEX_HOME=/tmp, verbatim shape.
-  if (process.env.FAKE_HELPER_WARNING) console.error('WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp"');
   if (process.env.FAKE_DISCOVERY_STDERR) console.error(process.env.FAKE_DISCOVERY_STDERR);
   const shape = process.env.FAKE_DISCOVERY_SHAPE;
   if (shape === "exit") process.exit(1);
@@ -205,35 +203,15 @@ describe("Codex computer-use fake inventories (#885)", () => {
     expect(receipts[1].args).not.toContain("mcp_servers.computer-use.enabled=false");
   });
 
-  it("proceeds past the CLI's helper-alias warning under the sandbox's CODEX_HOME=/tmp and still denies", async () => {
-    const f = fixture();
-    vi.stubEnv("FAKE_HELPER_WARNING", "1");
-    appendFileSync(
-      f.configPath,
-      '[plugins."computer-use@openai-bundled"]\nenabled=true\n[plugins."unrelated@fixture"]\nenabled=true\n'
-    );
-    const result = await f.provider.run({
-      prompt: "synthetic",
-      cwd: f.project,
-      computerUse: false,
-      mcpServers: [{ name: "docs", url: "https://example.invalid/docs" }],
-      sandbox: { worktreePath: f.project },
-    });
-    expect(result.success, result.output).toBe(true);
-    expect(inventory(result.output).plugins).toEqual(["unrelated@fixture"]);
-    expect(inventory(result.output).servers).toMatchObject([{ name: "docs", enabled: true }]);
-  });
-
   const outcomes = {
-    exit: "codex mcp list exited 1; stderr: WARNING: proceeding",
-    empty: "codex mcp list exited 0 with no output; stderr: WARNING: proceeding",
+    exit: "codex mcp list exited 1",
+    empty: "codex mcp list exited 0 with no output",
     truncated: "codex mcp list exited 0 with invalid JSON (",
     object: "codex mcp list exited 0 with JSON that is not a server list",
   } as const;
   for (const [shape, expected] of Object.entries(outcomes)) {
     it(`names a ${shape} discovery outcome without argv or stdout and fails closed before exec`, async () => {
       const f = fixture();
-      vi.stubEnv("FAKE_HELPER_WARNING", "1");
       vi.stubEnv("FAKE_DISCOVERY_SHAPE", shape);
       appendFileSync(
         f.configPath,
@@ -261,20 +239,19 @@ describe("Codex computer-use fake inventories (#885)", () => {
     });
   }
 
-  it("bounds the stderr carried by a failed discovery to its tail", async () => {
+  it("does not carry arbitrary stderr from a failed discovery", async () => {
     const f = fixture();
     vi.stubEnv("FAKE_DISCOVERY_SHAPE", "exit");
-    vi.stubEnv("FAKE_DISCOVERY_STDERR", `HEAD${"x".repeat(10_000)}TAIL`);
+    vi.stubEnv("FAKE_DISCOVERY_STDERR", "token=SYNTHETIC_DISCOVERY_SECRET");
     const result = await f.provider.run({
       prompt: "synthetic",
       cwd: f.project,
       computerUse: false,
     });
     expect(result.success).toBe(false);
-    expect(result.output).toContain("codex mcp list exited 1; stderr: …");
-    expect(result.output).toContain("TAIL");
-    expect(result.output).not.toContain("HEAD");
-    expect(result.output.length).toBeLessThan(2_200);
+    expect(result.output).toContain("codex mcp list exited 1");
+    expect(result.output).not.toContain("token=");
+    expect(result.output).not.toContain("SYNTHETIC_DISCOVERY_SECRET");
   });
 
   for (const problem of ["unsupported-json", "invalid-transport"] as const) {

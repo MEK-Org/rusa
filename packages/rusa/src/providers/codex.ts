@@ -380,33 +380,22 @@ export interface ListEffectiveCodexMcpServersOptions {
   signal?: AbortSignal;
 }
 
-/** Trailing stderr kept in a discovery failure; the full stream is the CLI's to size. */
-const DISCOVERY_STDERR_TAIL_CHARS = 2_000;
-
 /**
  * How discovery failed, for the run's failure output. Node's own error message is
  * `Command failed: <argv>\n<stderr>` for a nonzero exit and for a timeout kill
- * alike, so the CLI's stderr — whose first line is usually the benign
- * "could not create PATH aliases" warning under CODEX_HOME=/tmp — reads as the
- * cause either way. Name the outcome first, then the stderr tail. Neither the
- * argv nor stdout is repeated: stdout lists each server's transport, env included.
+ * alike, so the CLI's stderr can make a benign warning read as the cause. Name
+ * the outcome without repeating argv, stdout, or stderr: all three are
+ * untrusted command output and may contain configuration or credentials.
  */
-function describeDiscoveryFailure(outcome: string, stderr: string | undefined): Error {
-  const trimmed = (stderr ?? "").trim();
-  const tail =
-    trimmed.length > DISCOVERY_STDERR_TAIL_CHARS
-      ? `…${trimmed.slice(-DISCOVERY_STDERR_TAIL_CHARS)}`
-      : trimmed;
-  return new Error(
-    tail ? `codex mcp list ${outcome}; stderr: ${tail}` : `codex mcp list ${outcome}`
-  );
+function describeDiscoveryFailure(outcome: string): Error {
+  return new Error(`codex mcp list ${outcome}`);
 }
 
 /**
  * Discover configured MCP servers in the effective configuration using `codex mcp list --json`.
  * Runs with the actual invocation's effective config/context (including bwrap/overrides/signal).
  * Throws if the discovery command fails, is cancelled, or its output is not a JSON list; the
- * error names which, with a bounded stderr tail.
+ * error names which, without copying untrusted process output.
  */
 export async function listEffectiveCodexMcpServers(
   options: ListEffectiveCodexMcpServersOptions
@@ -424,7 +413,7 @@ export async function listEffectiveCodexMcpServers(
         signal: options.signal,
         maxBuffer: 10 * 1024 * 1024,
       },
-      (error, stdout, stderr) => {
+      (error, stdout) => {
         if (error) {
           // A string code is a spawn/abort/buffer failure; `killed` is Node's own
           // kill (the timeout); a bare signal came from elsewhere.
@@ -436,11 +425,11 @@ export async function listEffectiveCodexMcpServers(
                 : error.signal
                   ? `was terminated by ${error.signal}`
                   : `exited ${error.code ?? "unsuccessfully"}`;
-          reject(describeDiscoveryFailure(outcome, stderr));
+          reject(describeDiscoveryFailure(outcome));
           return;
         }
         if (stdout.trim() === "") {
-          reject(describeDiscoveryFailure("exited 0 with no output", stderr));
+          reject(describeDiscoveryFailure("exited 0 with no output"));
           return;
         }
         let parsed: unknown;
@@ -449,14 +438,13 @@ export async function listEffectiveCodexMcpServers(
         } catch {
           reject(
             describeDiscoveryFailure(
-              `exited 0 with invalid JSON (${Buffer.byteLength(stdout)} bytes)`,
-              stderr
+              `exited 0 with invalid JSON (${Buffer.byteLength(stdout)} bytes)`
             )
           );
           return;
         }
         if (!Array.isArray(parsed)) {
-          reject(describeDiscoveryFailure("exited 0 with JSON that is not a server list", stderr));
+          reject(describeDiscoveryFailure("exited 0 with JSON that is not a server list"));
           return;
         }
         resolve(parsed as Array<{ name: string; enabled?: boolean; transport?: unknown }>);
