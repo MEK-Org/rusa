@@ -310,4 +310,3 @@ void main() {
     expect(result['github:o/r/issues/1']?.title, 'Test Issue');
   });
 }
-

@@ -355,4 +355,3 @@ void main() {
     await tester.runAsync(store.dispose);
   });
 }
-
