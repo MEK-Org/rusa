@@ -65,6 +65,8 @@ describe("dashboard server phase timing", () => {
     obligations.attachArtifact("phase-fixture", "github:example-org/example/issues/1");
     obligations.attachArtifact("phase-fixture", "github:example-org/example/issues/2");
     const referenceCache = {
+      // The production cache shares one budget across these two parallel lookups.
+      startBudget: () => ({ deadlineAt: Date.now() + 1_000 }),
       get: async (ref: string) => {
         await sleep(delays.enrichment);
         return { ref, scheme: "github", cacheState: "fresh", unavailable: null };
