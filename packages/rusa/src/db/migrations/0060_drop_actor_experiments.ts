@@ -14,17 +14,12 @@ export const dropActorExperiments: Migration = {
   id: "0060_drop_actor_experiments",
   up: (db: Database) => {
     db.exec(`DROP TABLE IF EXISTS actor_experiments;`);
-    const hasCapabilityGrants = db
-      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'capability_grants'")
-      .get();
-    if (hasCapabilityGrants) {
-      const revokedAt = new Date().toISOString();
-      const revoke = db.prepare(
-        `UPDATE capability_grants
-         SET revoked_at = ?
-         WHERE capability = ? AND revoked_at IS NULL`
-      );
-      for (const capability of RETIRED_CAPABILITIES) revoke.run(revokedAt, capability);
-    }
+    const revokedAt = new Date().toISOString();
+    const revoke = db.prepare(
+      `UPDATE capability_grants
+       SET revoked_at = ?
+       WHERE capability = ? AND revoked_at IS NULL`
+    );
+    for (const capability of RETIRED_CAPABILITIES) revoke.run(revokedAt, capability);
   },
 };
