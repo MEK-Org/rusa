@@ -640,8 +640,8 @@ async function resolveInboxPage(
   const { referenceCache } = deps;
   const resolve = (ref: string) =>
     referenceCache
-      ? measureDashboardPhase("enrichment", () => referenceCache.get(ref, deps, budget)).catch(
-          () => resolveReferenceSync(ref, { meshChat: deps.meshChat })
+      ? measureDashboardPhase("enrichment", () => referenceCache.get(ref, deps, budget)).catch(() =>
+          resolveReferenceSync(ref, { meshChat: deps.meshChat })
         )
       : resolveReferenceSync(ref, { meshChat: deps.meshChat });
   const entries: Array<ResolvedInboxEntry | null> = await Promise.all(
@@ -2410,13 +2410,11 @@ export async function handleMeshApiRequest(
         referenceCache
           ? await measureDashboardPhase("enrichment", () =>
               referenceCache.get(ref, deps, referenceBudget)
-            ).catch(
-              () => ({
-                ...resolveReferenceSync(ref, { meshChat: deps.meshChat }),
-                unavailable: "could not load context",
-                cacheState: "unavailable" as const,
-              })
-            )
+            ).catch(() => ({
+              ...resolveReferenceSync(ref, { meshChat: deps.meshChat }),
+              unavailable: "could not load context",
+              cacheState: "unavailable" as const,
+            }))
           : resolveReferenceSync(ref, { meshChat: deps.meshChat }),
         viewerScope()
       );
