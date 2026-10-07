@@ -741,6 +741,15 @@ export function shouldBindWebhookServer(params: { e2eMode: boolean }): boolean {
   return !params.e2eMode;
 }
 
+/**
+ * Every production boot wakes root with its transition evidence. The e2e
+ * launcher boots disposable scratch compositions in-process, so it owns its
+ * root inbox the same way it omits system:events.
+ */
+export function shouldAppendServiceBootWake(params: { e2eMode: boolean }): boolean {
+  return !params.e2eMode;
+}
+
 export function shouldBindDashboardServer(params: {
   e2eMode: boolean;
   e2eDashboard: boolean;
@@ -5021,15 +5030,17 @@ async function composeStart(
   // before this append; if this process dies between them, the next boot retries
   // the same deterministic inbox id before adding its own distinct wake. A
   // corrupt evidence file is retained and produces its own unknown-evidence wake.
-  try {
-    appendServiceBootWakes({
-      lifecycle: serviceLifecycleStore,
-      inboxStore,
-      rootId,
-      onLifecycleError: (event, fields) => log.warn(event, fields),
-    });
-  } catch (error) {
-    log.warn("service_boot_wake_failed", { err: error });
+  if (shouldAppendServiceBootWake({ e2eMode })) {
+    try {
+      appendServiceBootWakes({
+        lifecycle: serviceLifecycleStore,
+        inboxStore,
+        rootId,
+        onLifecycleError: (event, fields) => log.warn(event, fields),
+      });
+    } catch (error) {
+      log.warn("service_boot_wake_failed", { err: error });
+    }
   }
 
   // Mechanical lifecycle ping : emitted by startup once the mesh is up.

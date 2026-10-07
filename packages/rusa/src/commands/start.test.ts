@@ -235,6 +235,7 @@ import {
   type RunStartOptions,
   reactToQueuedInboxEntries,
   runStart,
+  shouldAppendServiceBootWake,
   shouldBindDashboardServer,
   shouldBindWebhookServer,
   warnMissingConfiguredEventSubscriptionsAtBoot,
@@ -449,6 +450,11 @@ describe("start command tests", () => {
   it("binds the webhook server whenever the runner is not driving events in-process", () => {
     expect(shouldBindWebhookServer({ e2eMode: false })).toBe(true);
     expect(shouldBindWebhookServer({ e2eMode: true })).toBe(false);
+  });
+
+  it("wakes root on every production boot but leaves e2e root inboxes to the launcher", () => {
+    expect(shouldAppendServiceBootWake({ e2eMode: false })).toBe(true);
+    expect(shouldAppendServiceBootWake({ e2eMode: true })).toBe(false);
   });
 
   it("binds the dashboard in e2e only when explicitly enabled", () => {
