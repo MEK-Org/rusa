@@ -69,7 +69,17 @@ const servers = Object.entries(config.mcp_servers || {}).map(([name, c]) => {
 const plugins = Object.entries(config.plugins || {}).filter(([, c]) => c.enabled !== false).map(([id]) => id);
 const inventory = { servers, plugins };
 if (process.env.FAKE_RECEIPT_PATH) fs.appendFileSync(process.env.FAKE_RECEIPT_PATH, JSON.stringify({ args, inventory }) + "\\n");
-if (args.includes("mcp")) { console.log(JSON.stringify(servers)); process.exit(0); }
+if (args.includes("mcp")) {
+  // The installed CLI's helper-alias warning under CODEX_HOME=/tmp, verbatim shape.
+  if (process.env.FAKE_HELPER_WARNING) console.error('WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp"');
+  if (process.env.FAKE_DISCOVERY_STDERR) console.error(process.env.FAKE_DISCOVERY_STDERR);
+  const shape = process.env.FAKE_DISCOVERY_SHAPE;
+  if (shape === "exit") process.exit(1);
+  if (shape === "empty") process.exit(0);
+  if (shape === "truncated") { process.stdout.write(JSON.stringify(servers).slice(0, -1)); process.exit(0); }
+  if (shape === "object") { console.log(JSON.stringify({ servers })); process.exit(0); }
+  console.log(JSON.stringify(servers)); process.exit(0);
+}
 if (args.includes("resume") && process.env.FAKE_RESUME_FAIL) process.exit(1);
 if (args.includes("exec")) {
   console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(inventory) } }));
@@ -195,6 +205,78 @@ describe("Codex computer-use fake inventories (#885)", () => {
     expect(receipts[1].args).not.toContain("mcp_servers.computer-use.enabled=false");
   });
 
+  it("proceeds past the CLI's helper-alias warning under the sandbox's CODEX_HOME=/tmp and still denies", async () => {
+    const f = fixture();
+    vi.stubEnv("FAKE_HELPER_WARNING", "1");
+    appendFileSync(
+      f.configPath,
+      '[plugins."computer-use@openai-bundled"]\nenabled=true\n[plugins."unrelated@fixture"]\nenabled=true\n'
+    );
+    const result = await f.provider.run({
+      prompt: "synthetic",
+      cwd: f.project,
+      computerUse: false,
+      mcpServers: [{ name: "docs", url: "https://example.invalid/docs" }],
+      sandbox: { worktreePath: f.project },
+    });
+    expect(result.success, result.output).toBe(true);
+    expect(inventory(result.output).plugins).toEqual(["unrelated@fixture"]);
+    expect(inventory(result.output).servers).toMatchObject([{ name: "docs", enabled: true }]);
+  });
+
+  const outcomes = {
+    exit: "codex mcp list exited 1; stderr: WARNING: proceeding",
+    empty: "codex mcp list exited 0 with no output; stderr: WARNING: proceeding",
+    truncated: "codex mcp list exited 0 with invalid JSON (",
+    object: "codex mcp list exited 0 with JSON that is not a server list",
+  } as const;
+  for (const [shape, expected] of Object.entries(outcomes)) {
+    it(`names a ${shape} discovery outcome without argv or stdout and fails closed before exec`, async () => {
+      const f = fixture();
+      vi.stubEnv("FAKE_HELPER_WARNING", "1");
+      vi.stubEnv("FAKE_DISCOVERY_SHAPE", shape);
+      appendFileSync(
+        f.configPath,
+        '[mcp_servers.docs]\ncommand="fake-stdout-only-never-launched"\n'
+      );
+      const result = await f.provider.run({
+        prompt: "synthetic",
+        cwd: f.project,
+        computerUse: false,
+        sandbox: { worktreePath: f.project },
+      });
+      expect(result.success).toBe(false);
+      expect(result.output).toContain(
+        `Failed to determine effective MCP configuration for computer-use denial: ${expected}`
+      );
+      expect(result.output).not.toContain("Command failed");
+      expect(result.output).not.toContain("bwrap");
+      expect(result.output).not.toContain("fake-stdout-only-never-launched");
+      const invocations = readFileSync(f.receipt, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line).args as string[]);
+      expect(invocations).toHaveLength(1);
+      expect(invocations[0]).toContain("mcp");
+    });
+  }
+
+  it("bounds the stderr carried by a failed discovery to its tail", async () => {
+    const f = fixture();
+    vi.stubEnv("FAKE_DISCOVERY_SHAPE", "exit");
+    vi.stubEnv("FAKE_DISCOVERY_STDERR", `HEAD${"x".repeat(10_000)}TAIL`);
+    const result = await f.provider.run({
+      prompt: "synthetic",
+      cwd: f.project,
+      computerUse: false,
+    });
+    expect(result.success).toBe(false);
+    expect(result.output).toContain("codex mcp list exited 1; stderr: …");
+    expect(result.output).toContain("TAIL");
+    expect(result.output).not.toContain("HEAD");
+    expect(result.output.length).toBeLessThan(2_200);
+  });
+
   for (const problem of ["unsupported-json", "invalid-transport"] as const) {
     it(`fails closed before exec on ${problem}`, async () => {
       const f = fixture();
@@ -251,6 +333,9 @@ describe("Codex computer-use fake inventories (#885)", () => {
     expect(result.success).toBe(false);
     expect(result.cancelled).not.toBe(true);
     expect(result.output).toContain("Failed to determine effective MCP configuration");
+    expect(result.output).toContain(
+      "codex mcp list did not finish within 25ms (terminated by SIGTERM)"
+    );
     expect(() => readFileSync(f.receipt)).toThrow();
   });
 
