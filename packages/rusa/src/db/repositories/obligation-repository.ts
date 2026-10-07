@@ -1124,25 +1124,6 @@ export class ObligationRepository {
   }
 
   /**
-   * Remove an explicit responsive mark from a live obligation.
-   */
-  clearResponsive(id: string, principal: EntityId): Obligation {
-    return this.mutate(principal, () => {
-      const obligation = this.require(id);
-      if (isTerminalObligationStatus(obligation.status)) {
-        throw new ObligationValidationError("terminal obligations cannot be modified");
-      }
-
-      if (obligation.responsive) {
-        this.db
-          .prepare("UPDATE obligations SET responsive = NULL, updated_at = ? WHERE id = ?")
-          .run(this.stamp(), id);
-      }
-      return this.require(id);
-    });
-  }
-
-  /**
    * Every live ready responsive actor-owned obligation that is not its owner's
    * current ready head — the set the responsive-ready listener announces.
    * Derived fresh from persisted state (status, responsiveness resolved

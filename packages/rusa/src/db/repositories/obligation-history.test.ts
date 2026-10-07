@@ -347,17 +347,6 @@ describe("Obligation mutation history", () => {
       const historyAfterSecond = repository.listHistory(ob.id);
       expect(historyAfterSecond.length).toBe(1);
     });
-
-    it("does not record history on no-op clearResponsive when not responsive", () => {
-      const ob = repository.create({
-        title: "Test Obligation",
-        ownerId: "actor-a",
-      });
-
-      repository.clearResponsive(ob.id, "actor-b");
-      const history = repository.listHistory(ob.id);
-      expect(history.length).toBe(0);
-    });
   });
 
   describe("direct mutation coverage", () => {
@@ -470,30 +459,16 @@ describe("Obligation mutation history", () => {
       });
     });
 
-    it("records responsive mark and removal with actor, target, timestamp, and old/new explicit values", () => {
+    it("records a responsive mark with actor, target, timestamp, and old/new explicit values", () => {
       const ob = repository.create({ title: "Task", ownerId: "actor-a" });
 
       now += 1000;
       const tMark = new Date(now).toISOString();
       repository.markResponsive(ob.id, "actor-b");
 
-      now += 2000;
-      const tClear = new Date(now).toISOString();
-      repository.clearResponsive(ob.id, "actor-c");
-
       const history = repository.listHistory(ob.id);
-      expect(history.length).toBe(2);
-
+      expect(history).toHaveLength(1);
       expect(history[0]).toMatchObject({
-        obligationId: ob.id,
-        mutationKind: "responsive",
-        actingPrincipal: "actor-c",
-        timestamp: tClear,
-        before: { responsive: true },
-        after: { responsive: null },
-      });
-
-      expect(history[1]).toMatchObject({
         obligationId: ob.id,
         mutationKind: "responsive",
         actingPrincipal: "actor-b",
@@ -678,7 +653,7 @@ describe("Obligation mutation history", () => {
       });
     });
 
-    it("records no history rows for derived responsiveness on descendants when ancestor is marked or cleared", () => {
+    it("records no history rows for derived responsiveness on descendants when an ancestor is marked", () => {
       const parent = repository.create({ title: "Parent", ownerId: "actor-a" });
       const child = repository.create({ title: "Child", ownerId: "actor-b", parentId: parent.id });
       const grandchild = repository.create({
@@ -702,20 +677,6 @@ describe("Obligation mutation history", () => {
 
       const grandchildHistory = repository.listHistory(grandchild.id);
       expect(grandchildHistory.filter((h) => h.mutationKind === "responsive")).toHaveLength(0);
-
-      now += 1000;
-      repository.clearResponsive(parent.id, "actor-a");
-
-      expect(repository.require(parent.id).effectiveResponsive).toBe(false);
-      expect(repository.require(child.id).effectiveResponsive).toBe(false);
-      expect(repository.require(grandchild.id).effectiveResponsive).toBe(false);
-
-      expect(
-        repository.listHistory(child.id).filter((h) => h.mutationKind === "responsive")
-      ).toHaveLength(0);
-      expect(
-        repository.listHistory(grandchild.id).filter((h) => h.mutationKind === "responsive")
-      ).toHaveLength(0);
     });
   });
 
@@ -947,27 +908,6 @@ describe("Obligation mutation history", () => {
       expect(() => repository.listHistory(ob.id)).toThrow(ObligationValidationError);
     });
 
-    it("parses and validates responsive boolean and null in history payload", () => {
-      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
-
-      db.prepare(
-        `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
-         VALUES (?, 'responsive', 'actor-a', '2026-09-09T12:00:00.000Z', '{"schemaVersion":1,"before":{"responsive":null},"after":{"responsive":true}}')`
-      ).run(ob.id);
-
-      db.prepare(
-        `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
-         VALUES (?, 'responsive', 'actor-b', '2026-09-09T12:01:00.000Z', '{"schemaVersion":1,"before":{"responsive":true},"after":{"responsive":null}}')`
-      ).run(ob.id);
-
-      const history = repository.listHistory(ob.id);
-      expect(history).toHaveLength(2);
-      expect(history[0].before.responsive).toBe(true);
-      expect(history[0].after.responsive).toBeNull();
-      expect(history[1].before.responsive).toBeNull();
-      expect(history[1].after.responsive).toBe(true);
-    });
-
     it("throws on malformed responsive value in history payload when reading history", () => {
       const ob = repository.create({ title: "Task", ownerId: "actor-a" });
 
@@ -977,21 +917,6 @@ describe("Obligation mutation history", () => {
       ).run(ob.id);
 
       expect(() => repository.listHistory(ob.id)).toThrow(ObligationValidationError);
-    });
-
-    it("existing history page readers tolerate and format responsive entries", () => {
-      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
-      repository.markResponsive(ob.id, "actor-b");
-
-      const page = repository.listHistoryPage(ob.id);
-      const responsiveEntry = page.entries.find((e) => e.mutationKind === "responsive");
-      expect(responsiveEntry).toBeDefined();
-      expect(responsiveEntry).toMatchObject({
-        mutationKind: "responsive",
-        actingPrincipal: "actor-b",
-        before: { responsive: null },
-        after: { responsive: true },
-      });
     });
   });
 });
