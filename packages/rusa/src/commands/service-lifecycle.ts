@@ -154,7 +154,8 @@ function isBootWake(value: unknown): value is ServiceBootWake {
   }
   return (
     (candidate.requestedRestart === undefined || isIntent(candidate.requestedRestart)) &&
-    (candidate.cleanShutdown === undefined || isCleanShutdown(candidate.cleanShutdown))
+    (candidate.cleanShutdown === undefined || isCleanShutdown(candidate.cleanShutdown)) &&
+    (candidate.lifecycleError === undefined || typeof candidate.lifecycleError === "string")
   );
 }
 
@@ -302,7 +303,7 @@ export async function recordAndAnnounceRequestedRestart(args: {
     await withinDeadline(
       args.chatClient.send(
         origin.spaceName,
-        `🔄 Updating → ${args.targetSha.slice(0, 7)} (${args.subject}) — draining + restarting`,
+        `↪ Restart requested here → ${args.targetSha.slice(0, 7)} (${args.subject}) — draining + restarting`,
         origin.threadName ? { threadName: origin.threadName } : undefined
       ),
       args.timeoutMs ?? RESTART_ANNOUNCEMENT_TIMEOUT_MS
@@ -394,7 +395,18 @@ export class ServiceLifecycleStore {
 
   /** Persist this boot before attempting its root wake; returned rows include interrupted prior delivery. */
   beginBoot(): ServiceBootWake[] {
-    const document = this.requireDocument();
+    const loaded = this.read();
+    let document: ServiceLifecycleDocument;
+    let lifecycleError: string | undefined;
+    if (loaded.kind === "ok") {
+      document = structuredClone(loaded.document);
+    } else if (loaded.kind === "absent") {
+      document = emptyDocument();
+    } else {
+      lifecycleError = loaded.reason;
+      this.rotateInvalidEvidence();
+      document = emptyDocument();
+    }
     const bootId = randomUUID();
     const intent = document.requestedRestart;
     const shutdown = document.cleanShutdown;
@@ -413,6 +425,7 @@ export class ServiceLifecycleStore {
       prior,
       ...(pendingIntent ? { requestedRestart: structuredClone(pendingIntent) } : {}),
       ...(pendingShutdown ? { cleanShutdown: structuredClone(pendingShutdown) } : {}),
+      ...(lifecycleError ? { lifecycleError } : {}),
     };
     if (pendingIntent) pendingIntent.consumedByBootId = bootId;
     if (pendingShutdown) pendingShutdown.consumedByBootId = bootId;
@@ -454,12 +467,7 @@ export class ServiceLifecycleStore {
       // `rename` is atomic, but syncing the containing directory is what makes
       // that replacement durable across the supported host-filesystem reboot
       // boundary. It cannot promise survival of hardware or filesystem lies.
-      const directoryFd = openSync(dir, "r");
-      try {
-        fsyncSync(directoryFd);
-      } finally {
-        closeSync(directoryFd);
-      }
+      this.syncDirectory(dir);
     } catch (error) {
       try {
         if (existsSync(temporary)) rmSync(temporary, { force: true });
@@ -467,6 +475,22 @@ export class ServiceLifecycleStore {
         // Keep the original error authoritative; cleanup is best effort.
       }
       throw error;
+    }
+  }
+
+  private rotateInvalidEvidence(): void {
+    const dir = dirname(this.filePath);
+    const backup = `${this.filePath}.${randomUUID()}.invalid`;
+    renameSync(this.filePath, backup);
+    this.syncDirectory(dir);
+  }
+
+  private syncDirectory(dir: string): void {
+    const directoryFd = openSync(dir, "r");
+    try {
+      fsyncSync(directoryFd);
+    } finally {
+      closeSync(directoryFd);
     }
   }
 }

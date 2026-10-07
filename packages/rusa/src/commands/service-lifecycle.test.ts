@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -196,13 +196,12 @@ describe("service lifecycle evidence", () => {
     expect(restarted.read()).toMatchObject({ kind: "ok", document: { pendingBootWakes: [] } });
   });
 
-  it("retains malformed evidence but still appends an unknown durable root wake", () => {
+  it("archives malformed evidence, recovers future transitions, and still appends an unknown root wake", () => {
     const lifecycle = store();
     const durableInbox = inbox();
     writeFileSync(lifecycle.filePath, "{ bad json", "utf8");
 
     expect(lifecycle.read()).toMatchObject({ kind: "invalid" });
-    expect(() => lifecycle.beginBoot()).toThrow("service lifecycle state is invalid");
     appendServiceBootWakes({
       lifecycle,
       inboxStore: durableInbox,
@@ -212,10 +211,30 @@ describe("service lifecycle evidence", () => {
     expect(durableInbox.list("root").entries).toMatchObject([
       {
         source: "system:service-lifecycle",
-        payload: { type: "service.boot", priority: "responsive", prior: "unknown" },
+        payload: {
+          type: "service.boot",
+          priority: "responsive",
+          prior: "unknown",
+          lifecycleError: expect.any(String),
+        },
       },
     ]);
-    expect(readFileSync(lifecycle.filePath, "utf8")).toBe("{ bad json");
+    expect(lifecycle.read()).toMatchObject({ kind: "ok" });
+    const archived = readdirSync(join(lifecycle.filePath, "..")).find((name) =>
+      name.endsWith(".invalid")
+    );
+    expect(archived).toBeTruthy();
+    expect(readFileSync(join(lifecycle.filePath, "..", archived ?? "missing"), "utf8")).toBe(
+      "{ bad json"
+    );
+
+    expect(() =>
+      lifecycle.recordRequestedRestart({
+        targetSha: "c".repeat(40),
+        branch: "staging",
+        subject: "recovered update",
+      })
+    ).not.toThrow();
   });
 
   it("uses the actual restart callback path to announce exactly in the selected thread", async () => {
@@ -247,7 +266,7 @@ describe("service lifecycle evidence", () => {
     expect(sent).toEqual([
       {
         space: "spaces/SPACE",
-        text: "🔄 Updating → ddddddd (synthetic update) — draining + restarting",
+        text: "↪ Restart requested here → ddddddd (synthetic update) — draining + restarting",
         thread: "spaces/SPACE/threads/HEAD",
       },
     ]);
