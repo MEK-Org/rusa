@@ -251,6 +251,227 @@ describe("dashboard timing recorder", () => {
     ]);
   });
 
+  it("takes paired phases only from the exact unambiguous cohort, with phase coverage", () => {
+    const recorder = new DashboardTimingRecorder(
+      events,
+      () => new Date("2026-10-05T12:00:00.000Z")
+    );
+    const first = randomUUID();
+    const second = randomUUID();
+    const duplicate = randomUUID();
+    const unpaired = randomUUID();
+    for (const [requestId, durationMs, phases] of [
+      [first, 60, { auth: 10, route: 30, enrichment: 20 }],
+      [second, 70, { route: 50 }],
+      [duplicate, 900, { auth: 500 }],
+      [duplicate, 901, { auth: 500 }],
+      [unpaired, 950, { auth: 900 }],
+    ] as const) {
+      recorder.recordServer({
+        label: "mesh_threads",
+        requestId,
+        durationMs,
+        status: 200,
+        bytes: 1,
+        phases,
+      });
+    }
+    recorder.recordClient({
+      interaction: "initial_load",
+      durationMs: 300,
+      requestIds: [first, second, duplicate],
+      requestTimings: [
+        { requestId: first, requestMs: 90 },
+        { requestId: second, requestMs: 100 },
+        { requestId: duplicate, requestMs: 110 },
+      ],
+      outcome: "success",
+    });
+    while (timingRows().length < 6) recorder.flush();
+
+    const summary = recorder.summary({ since: new Date("2026-10-05T11:00:00.000Z") });
+    // The duplicate and unpaired servers' slow auth never reaches the paired cohort.
+    expect(summary.pairedRequestDurations).toEqual([
+      expect.objectContaining({
+        sampleCount: 2,
+        serverPhaseMs: {
+          auth: {
+            p50Ms: 10,
+            p95Ms: 10,
+            p99Ms: 10,
+            maxMs: 10,
+            coverage: { numerator: 1, denominator: 2, state: "partial" },
+          },
+          route: {
+            p50Ms: 30,
+            p95Ms: 50,
+            p99Ms: 50,
+            maxMs: 50,
+            coverage: { numerator: 2, denominator: 2, state: "full" },
+          },
+          enrichment: {
+            p50Ms: 20,
+            p95Ms: 20,
+            p99Ms: 20,
+            maxMs: 20,
+            coverage: { numerator: 1, denominator: 2, state: "partial" },
+          },
+        },
+      }),
+    ]);
+    // The server view counts every record of the label, measured or not.
+    expect(summary.serverPhases).toEqual([
+      expect.objectContaining({
+        label: "mesh_threads",
+        sampleCount: 5,
+        durationMs: { p50Ms: 900, p95Ms: 950, p99Ms: 950, maxMs: 950 },
+        phases: expect.objectContaining({
+          auth: expect.objectContaining({
+            maxMs: 900,
+            coverage: { numerator: 4, denominator: 5, state: "partial" },
+          }),
+        }),
+      }),
+    ]);
+    expect(summary.serverPhases[0].phases.serialization).toBeUndefined();
+    expect(summary.serverPhases[0].phases.compression).toBeUndefined();
+  });
+
+  it("splits quota snapshot and history pairs and keeps pre-phase records unchanged", () => {
+    const recorder = new DashboardTimingRecorder(
+      events,
+      () => new Date("2026-10-05T12:00:00.000Z")
+    );
+    const snapshot = randomUUID();
+    const history = randomUUID();
+    const legacy = randomUUID();
+    recorder.recordServer({
+      label: "mesh_quota",
+      operation: "quota_snapshot",
+      requestId: snapshot,
+      durationMs: 5,
+      status: 200,
+      bytes: 1,
+      phases: { route: 3 },
+    });
+    recorder.recordServer({
+      label: "mesh_quota",
+      operation: "quota_history",
+      requestId: history,
+      durationMs: 400,
+      status: 200,
+      bytes: 1,
+      phases: { auth: 2, route: 390 },
+    });
+    recorder.recordServer({
+      label: "mesh_threads",
+      requestId: legacy,
+      durationMs: 40,
+      status: 200,
+      bytes: 1,
+      phases: {},
+    });
+    recorder.recordClient({
+      interaction: "initial_load",
+      durationMs: 500,
+      requestIds: [snapshot, history, legacy],
+      requestTimings: [
+        { requestId: snapshot, requestMs: 20 },
+        { requestId: history, requestMs: 450 },
+        { requestId: legacy, requestMs: 60 },
+      ],
+      outcome: "success",
+    });
+    while (timingRows().length < 4) recorder.flush();
+
+    const summary = recorder.summary({ since: new Date("2026-10-05T11:00:00.000Z") });
+    expect(
+      summary.pairedRequestDurations.map(({ serverLabel, serverOperation, serverPhaseMs }) => ({
+        serverLabel,
+        serverOperation,
+        route: serverPhaseMs?.route?.p50Ms,
+      }))
+    ).toEqual([
+      { serverLabel: "mesh_quota", serverOperation: "quota_history", route: 390 },
+      { serverLabel: "mesh_quota", serverOperation: "quota_snapshot", route: 3 },
+      { serverLabel: "mesh_threads", serverOperation: undefined, route: undefined },
+    ]);
+    // A pair with no measured phase keeps the pre-phase shape exactly.
+    expect(Object.keys(summary.pairedRequestDurations[2]).sort()).toEqual([
+      "clientRequestMs",
+      "interaction",
+      "sampleCount",
+      "serverDurationMs",
+      "serverLabel",
+    ]);
+    expect(
+      summary.serverPhases.map(({ label, operation, phases }) => ({
+        label,
+        operation,
+        phases: Object.keys(phases),
+      }))
+    ).toEqual([
+      { label: "mesh_quota", operation: "quota_history", phases: ["auth", "route"] },
+      { label: "mesh_quota", operation: "quota_snapshot", phases: ["route"] },
+      { label: "mesh_threads", operation: undefined, phases: [] },
+    ]);
+    // The legacy endpoint groups are still one per source and label.
+    expect(summary.groups.filter((group) => group.label === "mesh_quota")).toHaveLength(1);
+    const stored = timingRows().map((row) => JSON.parse(row.payload ?? "{}"));
+    expect(stored.every((payload) => payload.v === 1)).toBe(true);
+    expect(stored.find((payload) => payload.label === "mesh_threads")).not.toHaveProperty("phases");
+  });
+
+  it("ignores rows that carry phases or operations outside their fixed server shape", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    const base = {
+      v: 1,
+      source: "server",
+      requestId: randomUUID(),
+      durationMs: 10,
+      status: 200,
+      bytes: 1,
+      outcome: null,
+    };
+    const invalid = [
+      { ...base, label: "mesh_threads", phases: { network: 5 } },
+      { ...base, label: "mesh_threads", phases: { auth: 1.5 } },
+      { ...base, label: "mesh_threads", operation: "quota_history" },
+      { ...base, label: "mesh_quota", operation: "/api/quota?provider=x" },
+      {
+        ...base,
+        source: "client",
+        label: "initial_load",
+        requestId: undefined,
+        status: null,
+        bytes: null,
+        outcome: "success",
+        requestIds: [],
+        phases: { auth: 1 },
+      },
+    ];
+    for (const payload of invalid) {
+      events.record({
+        kind: DASHBOARD_TIMING_EVENT_KIND,
+        actorId: null,
+        detail: "synthetic",
+        payload: JSON.stringify(payload),
+      });
+    }
+    events.record({
+      kind: DASHBOARD_TIMING_EVENT_KIND,
+      actorId: null,
+      detail: "synthetic",
+      payload: JSON.stringify({ ...base, label: "mesh_quota", operation: "quota_history" }),
+    });
+
+    const summary = recorder.summary({ since: new Date(Date.now() - 60_000) });
+    expect(summary.sampleCount).toBe(1);
+    expect(summary.serverPhases).toEqual([
+      expect.objectContaining({ label: "mesh_quota", operation: "quota_history", phases: {} }),
+    ]);
+  });
+
   it("reports missing and no-referenced-request coverage separately", () => {
     const recorder = new DashboardTimingRecorder(events);
     recorder.recordClient({

@@ -10,6 +10,12 @@ import {
   DASHBOARD_TIMING_MAX_RECORDS,
   DashboardTimingRecorder,
 } from "./timing.js";
+import {
+  beginDashboardRoutePhase,
+  measureDashboardPhase,
+  runDashboardRequestScope,
+  startDashboardPhase,
+} from "./timing-phases.js";
 import { beginDashboardRequestTiming } from "./timing-server.js";
 
 const BATCH_SIZE = 32;
@@ -22,6 +28,11 @@ class BenchResponse extends EventEmitter {
 
   setHeader(name: string, value: string): this {
     this.headers[name] = value;
+    return this;
+  }
+
+  writeHead(status: number): this {
+    this.statusCode = status;
     return this;
   }
 
@@ -85,14 +96,26 @@ describe.skipIf(process.env.RUSA_BENCH_DASHBOARD_TIMING !== "1")(
         const started = performance.now();
         const response = new BenchResponse();
         if (timings) {
-          beginDashboardRequestTiming(
-            response as unknown as ServerResponse,
-            "/api/mesh/threads",
-            "GET",
-            timings
-          );
+          // The instrumented arm pays for the request scope and every phase
+          // boundary a typical authenticated JSON read crosses (#935).
+          await runDashboardRequestScope(async () => {
+            beginDashboardRequestTiming(
+              response as unknown as ServerResponse,
+              "/api/mesh/threads",
+              "GET",
+              timings
+            );
+            await measureDashboardPhase("auth", async () => true);
+            beginDashboardRoutePhase();
+            await measureDashboardPhase("enrichment", async () => null);
+            const endSerialization = startDashboardPhase("serialization");
+            endSerialization();
+            response.writeHead(200);
+            response.end(BODY);
+          });
+        } else {
+          response.end(BODY);
         }
-        response.end(BODY);
         // The recorder's setImmediate flush is queued by `finish`; awaiting a
         // following turn includes that real SQLite overlap in each interval.
         await nextTurn();
@@ -129,7 +152,7 @@ describe.skipIf(process.env.RUSA_BENCH_DASHBOARD_TIMING !== "1")(
           p95DeltaMs: instrumentedP95Ms - baselineP95Ms,
           baselineMaxMs: percentile(baseline, 1),
           instrumentedMaxMs: percentile(instrumented, 1),
-          note: "Includes UUID/header/response wrapper/enqueue and next-turn SQLite flush against retained timing rows; it is not an end-to-end dashboard-load latency claim.",
+          note: "Includes request scope, phase boundaries, UUID/header/response wrapper/enqueue and next-turn SQLite flush against retained timing rows; it is not an end-to-end dashboard-load latency claim.",
         })
       );
       expect(baseline).toHaveLength(SAMPLES * BATCH_SIZE);
