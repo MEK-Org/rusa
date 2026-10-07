@@ -171,9 +171,10 @@ recovery attempt.`;
  * Since #890 the whole block is a default that a charter may turn off. An actor
  * whose charter opts out keeps its tools and ready-head delivery; only the
  * practice guidance yields. Filing a human question also requires that the
- * human has a principal. `create_obligation` accepting the owner is not enough:
- * with no active users it keeps the literal `human:operator`, which names no
- * principal, so the block tells an actor to read the stored owner back.
+ * human has a durable principal. The owner resolver accepts only a live actor
+ * or a user principal id, with no `human:operator` alias, so the block names
+ * where an actor gets that id: the verified `fromId` of the person's mesh
+ * message, or its parent's mapping. Lacking one, the actor asks in conversation.
  */
 export const OBLIGATION_DISCIPLINE = `## Obligations are why work exists
 
@@ -213,15 +214,15 @@ finish in this run needs no obligation at all.
 
 **A question for a human is an obligation too.** When you need a decision only a
 person can make and that person has a principal, create the obligation and own
-it to them instead of only asking in chat. Name them by their principal id, or
-by \`human:operator\` as shorthand for your operator's principal.
-\`create_obligation\` returns the owner it stored; if that is still the literal
-\`human:operator\`, your operator has no principal yet, so ask any further
-questions for them in conversation only. When the person has no principal, or
-you can't tell that they do, ask in conversation only: do not invent an owner
-for the question, borrow another person's, or create a principal to hold it. A
-question asked in a message is gone at the next compaction; one in the tree is a
-standing call-list they can work through. **One
+it to their durable principal id instead of only asking in chat. Copy the
+verified \`fromId\` of their human mesh message, or ask your parent for the
+verified durable principal mapping if you only have a delegated task or an
+external sender. Google Chat, Slack and GitHub sender identifiers are not mesh
+principal ids. When the person has no principal, or you can't tell that they
+do, ask in conversation only: do not invent an owner for the question, borrow
+another person's, or create a principal to hold it. A question asked in a
+message is gone at the next compaction; one in the tree is a standing call-list
+they can work through. **One
 obligation per question** — four questions in one node cannot be answered,
 reordered, or finished separately, which is the whole point of having them.
 Put each under the obligation it gates, so that obligation waits on the answer
