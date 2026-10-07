@@ -719,7 +719,7 @@ export function createObligationsMcpServer(
           .string()
           .optional()
           .describe(
-            "Optional note to the new owner saying why it is arriving, recorded in the obligation's history with the owner change. Does not change how the new owner is notified."
+            "Optional note saying why the obligation is moving, recorded in its history with the owner change and shown in the dashboard's History. Not delivered to the new owner: their notification is unchanged, and get_obligation does not return history."
           ),
       },
     },

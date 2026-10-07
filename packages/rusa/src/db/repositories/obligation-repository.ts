@@ -2745,6 +2745,10 @@ export class ObligationRepository {
   /**
    * Change the owner of one live obligation without changing its identity,
    * position, ancestry, or state. Authorization belongs to the calling surface.
+   *
+   * A `message` (#941) is recorded on the owner-change history row. A
+   * reassignment to the current owner changes nothing and records nothing, so
+   * its message is validated and then dropped.
    */
   reassign(
     id: string,
