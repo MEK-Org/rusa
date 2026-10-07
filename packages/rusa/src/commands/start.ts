@@ -1570,7 +1570,10 @@ async function composeStart(
         : null;
   if (chatClient) {
     const workDir = join(mcHome, "root-agent");
-    servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient, { workDir });
+    // This root-owned server runs on the local leader; follower placement is
+    // checked dynamically on the per-actor server below.
+    servers[CHAT_READ_MCP_NAME] = () =>
+      createChatReadMcpServer(chatClient, { workDir, fileToolsAvailable: true });
   }
   if (slackClient) {
     // Only root mounts the shared server, so its downloads land in root's workdir.

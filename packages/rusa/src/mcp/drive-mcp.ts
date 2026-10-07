@@ -7,7 +7,7 @@ import {
 } from "../drive/drive-client.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
-import { resolveDownloadPath, streamNewFileInWorkdir } from "./workdir-path.js";
+import { resolveDownloadPath, streamNewFileInWorkdir, withFileModeHint } from "./workdir-path.js";
 
 export const DRIVE_READ_MCP_NAME = "drive-read";
 
@@ -141,132 +141,40 @@ export function createDriveReadMcpServer(
         );
 
         if (!destinationPath) {
-          if (client.downloadFileStream) {
-            const resp = await client.downloadFileStream(fileId);
-            const contentLength = resp.headers.get("content-length");
-            if (contentLength && parseInt(contentLength, 10) > inlineLimit) {
-              await resp.body?.cancel().catch(() => {});
-              throw new Error(
-                `file size limit exceeded: file is larger than ${inlineLimit} bytes; specify destinationPath to download up to 1 GiB to a file in your workdir`
-              );
-            }
-            try {
-              const chunks: Uint8Array[] = [];
-              let totalSize = 0;
-              const body = resp.body;
-              if (
-                body &&
-                typeof (body as unknown as AsyncIterable<Uint8Array | string>)[
-                  Symbol.asyncIterator
-                ] === "function"
-              ) {
-                for await (const chunk of body as unknown as AsyncIterable<Uint8Array | string>) {
-                  const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-                  totalSize += buf.byteLength;
-                  if (totalSize > inlineLimit) {
-                    await resp.body?.cancel().catch(() => {});
-                    throw new Error(
-                      `file size limit exceeded: file is larger than ${inlineLimit} bytes; specify destinationPath to download up to 1 GiB to a file in your workdir`
-                    );
-                  }
-                  chunks.push(buf);
-                }
-              }
-              const result = Buffer.concat(chunks);
-              options.onRead?.(actorId, { operation: "download_file", fileId });
-              return toolOk(result.toString("base64"));
-            } catch (err: unknown) {
-              await resp.body?.cancel().catch(() => {});
-              if (err instanceof Error && err.message.includes("file size limit exceeded")) {
-                throw new Error(
-                  `file size limit exceeded: file is larger than ${inlineLimit} bytes; specify destinationPath to download up to 1 GiB to a file in your workdir`
-                );
-              }
-              throw err;
-            }
-          } else {
-            try {
-              const result = await client.downloadFile(fileId, inlineLimit);
-              if (result.length > inlineLimit) {
-                throw new Error(
-                  `file size limit exceeded: file is larger than ${inlineLimit} bytes; specify destinationPath to download up to 1 GiB to a file in your workdir`
-                );
-              }
-              options.onRead?.(actorId, { operation: "download_file", fileId });
-              return toolOk(result.toString("base64"));
-            } catch (err: unknown) {
-              if (err instanceof Error && err.message.includes("file size limit exceeded")) {
-                throw new Error(
-                  `file size limit exceeded: file is larger than ${inlineLimit} bytes; specify destinationPath to download up to 1 GiB to a file in your workdir`
-                );
-              }
-              throw err;
-            }
-          }
+          const result = await client.downloadFile(fileId, inlineLimit).catch((err: unknown) => {
+            throw withFileModeHint(err);
+          });
+          options.onRead?.(actorId, { operation: "download_file", fileId });
+          return toolOk(result.toString("base64"));
         }
 
         requireFileToolsAvailable(options);
         const workDir = requireWorkDir(options);
         const target = await resolveDownloadPath(workDir, destinationPath);
-
+        if (!client.downloadFileStream) {
+          throw new Error("destinationPath needs a Drive client that can stream downloads");
+        }
         const meta = await client.getFileMetadata(fileId);
-        if (meta.size && parseInt(meta.size, 10) > fileLimit) {
+        if (meta.size && Number.parseInt(meta.size, 10) > fileLimit) {
           throw new Error(`file size limit exceeded: file is larger than ${fileLimit} bytes`);
         }
-
-        const name = meta.name;
-        let contentType = meta.mimeType || "application/octet-stream";
-
-        if (client.downloadFileStream) {
-          const resp = await client.downloadFileStream(fileId);
-          const contentLength = resp.headers.get("content-length");
-          if (contentLength && parseInt(contentLength, 10) > fileLimit) {
-            await resp.body?.cancel().catch(() => {});
-            throw new Error(`file size limit exceeded: file is larger than ${fileLimit} bytes`);
-          }
-          const headerType = resp.headers.get("content-type");
-          if (headerType) {
-            contentType = meta.mimeType || headerType;
-          }
-          if (!resp.body) {
-            throw new Error("response body is not readable");
-          }
-          const { bytes, sha256 } = await streamNewFileInWorkdir(
-            workDir,
-            target,
-            resp.body,
-            fileLimit,
-            "file"
-          );
-          options.onRead?.(actorId, { operation: "download_file", fileId });
-          return toolOk({
-            path: target,
-            bytes,
-            sha256,
-            contentType,
-            name,
-          });
-        } else {
-          const buf = await client.downloadFile(fileId, fileLimit);
-          if (buf.length > fileLimit) {
-            throw new Error(`file size limit exceeded: file is larger than ${fileLimit} bytes`);
-          }
-          const { bytes, sha256 } = await streamNewFileInWorkdir(
-            workDir,
-            target,
-            [buf],
-            fileLimit,
-            "file"
-          );
-          options.onRead?.(actorId, { operation: "download_file", fileId });
-          return toolOk({
-            path: target,
-            bytes,
-            sha256,
-            contentType: meta.mimeType || "application/octet-stream",
-            name: meta.name,
-          });
-        }
+        const resp = await client.downloadFileStream(fileId, fileLimit);
+        const { bytes, sha256 } = await streamNewFileInWorkdir(
+          workDir,
+          target,
+          resp.body ?? [],
+          fileLimit,
+          "file"
+        );
+        options.onRead?.(actorId, { operation: "download_file", fileId });
+        return toolOk({
+          path: target,
+          bytes,
+          sha256,
+          contentType:
+            meta.mimeType || resp.headers.get("content-type") || "application/octet-stream",
+          name: meta.name,
+        });
       } catch (err) {
         return toolError(err);
       }

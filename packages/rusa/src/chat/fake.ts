@@ -148,7 +148,10 @@ export class FakeChatClient implements ChatClient {
     throw new Error(`attachment not found: ${attachmentName}`);
   }
 
-  async downloadAttachmentStream(resourceName: string): Promise<{
+  async downloadAttachmentStream(
+    resourceName: string,
+    maxBytes?: number
+  ): Promise<{
     resp: Response;
     name: string;
     contentType: string;
@@ -157,25 +160,13 @@ export class FakeChatClient implements ChatClient {
     let contentType = "application/octet-stream";
     if (resourceName.startsWith("spaces/")) {
       const metadata = await this.getAttachment(resourceName);
-      if (metadata.source === "DRIVE_FILE") {
-        throw new Error(
-          `attachment ${resourceName} is a Drive file; access it using the Drive API instead of downloadAttachment`
-        );
-      }
       if (metadata.contentName) name = metadata.contentName;
       if (metadata.contentType) contentType = metadata.contentType;
     }
-    const buf = await this.downloadAttachment(resourceName);
-    const body: BodyInit =
-      typeof (buf as { toString?: () => string })?.toString === "function" && !Buffer.isBuffer(buf)
-        ? (buf as { toString(): string }).toString()
-        : (buf as unknown as BodyInit);
-    const resp = new Response(body, {
+    const data = await this.downloadAttachment(resourceName, maxBytes);
+    const resp = new Response(new Uint8Array(data), {
       status: 200,
-      headers: {
-        "content-length": String(buf.length),
-        "content-type": contentType,
-      },
+      headers: { "content-length": String(data.length), "content-type": contentType },
     });
     return { resp, name, contentType };
   }
@@ -221,7 +212,7 @@ export class FakeChatClient implements ChatClient {
     if (!data) {
       throw new Error(`attachment not found: ${resourceName}`);
     }
-    const limit = maxBytes ?? this.maxSizeBytes;
+    const limit = Math.min(this.maxSizeBytes, maxBytes ?? this.maxSizeBytes);
     if (data.length > limit) {
       throw new Error(`attachment size limit exceeded: attachment is larger than ${limit} bytes`);
     }

@@ -203,10 +203,16 @@ export interface ChatClient {
   send(spaceName: string, text: string, opts?: ChatSendMessageOptions): Promise<{ name: string }>;
   /** Read attachment metadata by its full Google Chat resource name. */
   getAttachment(attachmentName: string): Promise<ChatAttachment>;
-  /** Download an attachment's binary content by its resource name (or attachmentDataRef resourceName). */
+  /**
+   * Download an attachment's binary content by its resource name (or attachmentDataRef
+   * resourceName). `maxBytes` can only lower the client's configured limit.
+   */
   downloadAttachment(resourceName: string, maxBytes?: number): Promise<Buffer>;
-  /** Stream an attachment's response directly without buffering the payload. */
-  downloadAttachmentStream?(resourceName: string): Promise<{
+  /** Stream an attachment's response, bounded like {@link downloadAttachment}, without buffering it. */
+  downloadAttachmentStream?(
+    resourceName: string,
+    maxBytes?: number
+  ): Promise<{
     resp: Response;
     name: string;
     contentType: string;

@@ -1,4 +1,5 @@
 import { basename } from "node:path";
+import { boundedResponse } from "./bounded-response.js";
 import { defaultGchatConfigDir, GchatOAuth } from "./gchat-oauth.js";
 import {
   type ChatAttachment,
@@ -266,7 +267,10 @@ export class GchatClient implements ChatClient {
     return Buffer.from(arrayBuffer);
   }
 
-  async downloadAttachmentStream(resourceName: string): Promise<{
+  async downloadAttachmentStream(
+    resourceName: string,
+    maxBytes?: number
+  ): Promise<{
     resp: Response;
     name: string;
     contentType: string;
@@ -311,20 +315,19 @@ export class GchatClient implements ChatClient {
     if (headerType && contentType === "application/octet-stream") {
       contentType = headerType;
     }
-    return { resp, name, contentType };
+    const bounded = await boundedResponse(resp, this.downloadLimit(maxBytes), "attachment");
+    return { resp: bounded, name, contentType };
   }
 
   async downloadAttachment(resourceName: string, maxBytes?: number): Promise<Buffer> {
-    const limit = maxBytes ?? this.maxDownloadSizeBytes;
-    const { resp } = await this.downloadAttachmentStream(resourceName);
-    const contentLength = resp.headers.get("content-length");
-    if (contentLength && parseInt(contentLength, 10) > limit) {
-      try {
-        await resp.body?.cancel();
-      } catch (_) {}
-      throw new Error(`attachment size limit exceeded: attachment is larger than ${limit} bytes`);
-    }
+    const limit = this.downloadLimit(maxBytes);
+    const { resp } = await this.downloadAttachmentStream(resourceName, limit);
     return this.readBodyWithLimit(resp, limit);
+  }
+
+  /** A per-call limit can lower the configured limit, never raise it. */
+  private downloadLimit(maxBytes?: number): number {
+    return Math.min(this.maxDownloadSizeBytes, maxBytes ?? this.maxDownloadSizeBytes);
   }
 
   async uploadAttachment(

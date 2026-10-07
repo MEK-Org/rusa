@@ -24,6 +24,7 @@ import {
   resolveAttachmentPath,
   resolveDownloadPath,
   streamNewFileInWorkdir,
+  withFileModeHint,
 } from "./workdir-path.js";
 
 export const CHAT_WRITE_MCP_NAME = "chat-write";
@@ -35,6 +36,10 @@ export function inferChatMimeType(filename: string): string {
 
 export interface ChatReadMcpOptions {
   allowedSpaces?: string[];
+  /**
+   * Optional policy ceiling. It can lower each mode's absolute ceiling but
+   * never raise the 50 MiB inline or 1 GiB file-mode maximum.
+   */
   maxAttachmentBytes?: number;
   workDir?: string;
   fileToolsAvailable?: boolean | (() => boolean);
@@ -129,7 +134,7 @@ export function createChatReadMcpServer(
   server.registerTool(
     "download_attachment",
     {
-      title: "Download a Chat message attachment",
+      title: "Download a Google Chat attachment's binary content",
       description:
         "Download an attachment's raw bytes. Returns base64 inline (up to 50 MiB), or streams to destinationPath inside your working directory (up to 1 GiB). For space-scoped actors, requires the attachment resource name (spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT); unscoped servers also accept opaque media tokens (media/...).",
       inputSchema: {
@@ -178,114 +183,32 @@ export function createChatReadMcpServer(
         );
 
         if (!destinationPath) {
-          if (chatClient.downloadAttachmentStream) {
-            const { resp } = await chatClient.downloadAttachmentStream(resourceName);
-            const contentLength = resp.headers.get("content-length");
-            if (contentLength && parseInt(contentLength, 10) > inlineLimit) {
-              await resp.body?.cancel().catch(() => {});
-              throw new Error(
-                `attachment size limit exceeded: attachment is larger than ${inlineLimit} bytes; specify destinationPath to download up to 1 GiB to a file in your workdir`
-              );
-            }
-            try {
-              const chunks: Uint8Array[] = [];
-              let totalSize = 0;
-              const body = resp.body;
-              if (
-                body &&
-                typeof (body as unknown as AsyncIterable<Uint8Array | string>)[
-                  Symbol.asyncIterator
-                ] === "function"
-              ) {
-                for await (const chunk of body as unknown as AsyncIterable<Uint8Array | string>) {
-                  const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-                  totalSize += buf.byteLength;
-                  if (totalSize > inlineLimit) {
-                    await resp.body?.cancel().catch(() => {});
-                    throw new Error(
-                      `attachment size limit exceeded: attachment is larger than ${inlineLimit} bytes; specify destinationPath to download up to 1 GiB to a file in your workdir`
-                    );
-                  }
-                  chunks.push(buf);
-                }
-              }
-              const result = Buffer.concat(chunks);
-              return toolOk(result.toString("base64"));
-            } catch (err) {
-              await resp.body?.cancel().catch(() => {});
-              throw err;
-            }
-          } else {
-            const result = await chatClient.downloadAttachment(resourceName, inlineLimit);
-            if (result.length > inlineLimit) {
-              throw new Error(
-                `attachment size limit exceeded: attachment is larger than ${inlineLimit} bytes; specify destinationPath to download up to 1 GiB to a file in your workdir`
-              );
-            }
-            return toolOk(result.toString("base64"));
-          }
+          const result = await chatClient
+            .downloadAttachment(resourceName, inlineLimit)
+            .catch((err: unknown) => {
+              throw withFileModeHint(err);
+            });
+          return toolOk(result.toString("base64"));
         }
 
         requireFileToolsAvailable(options ?? {});
         const workDir = requireWorkDir(options ?? {});
         const target = await resolveDownloadPath(workDir, destinationPath);
-
-        if (chatClient.downloadAttachmentStream) {
-          const { resp, name, contentType } =
-            await chatClient.downloadAttachmentStream(resourceName);
-          const contentLength = resp.headers.get("content-length");
-          if (contentLength && parseInt(contentLength, 10) > fileLimit) {
-            await resp.body?.cancel().catch(() => {});
-            throw new Error(
-              `attachment size limit exceeded: attachment is larger than ${fileLimit} bytes`
-            );
-          }
-          if (!resp.body) {
-            throw new Error("response body is not readable");
-          }
-          const { bytes, sha256 } = await streamNewFileInWorkdir(
-            workDir,
-            target,
-            resp.body,
-            fileLimit,
-            "attachment"
-          );
-          return toolOk({
-            path: target,
-            bytes,
-            sha256,
-            contentType,
-            name,
-          });
-        } else {
-          let name = basename(resourceName);
-          let contentType = "application/octet-stream";
-          if (resourceName.startsWith("spaces/")) {
-            const attachment = await chatClient.getAttachment(resourceName).catch(() => undefined);
-            if (attachment?.contentName) name = attachment.contentName;
-            if (attachment?.contentType) contentType = attachment.contentType;
-          }
-          const buf = await chatClient.downloadAttachment(resourceName, fileLimit);
-          if (buf.length > fileLimit) {
-            throw new Error(
-              `attachment size limit exceeded: attachment is larger than ${fileLimit} bytes`
-            );
-          }
-          const { bytes, sha256 } = await streamNewFileInWorkdir(
-            workDir,
-            target,
-            [buf],
-            fileLimit,
-            "attachment"
-          );
-          return toolOk({
-            path: target,
-            bytes,
-            sha256,
-            contentType,
-            name,
-          });
+        if (!chatClient.downloadAttachmentStream) {
+          throw new Error("destinationPath needs a Chat client that can stream downloads");
         }
+        const { resp, name, contentType } = await chatClient.downloadAttachmentStream(
+          resourceName,
+          fileLimit
+        );
+        const { bytes, sha256 } = await streamNewFileInWorkdir(
+          workDir,
+          target,
+          resp.body ?? [],
+          fileLimit,
+          "attachment"
+        );
+        return toolOk({ path: target, bytes, sha256, contentType, name });
       } catch (err) {
         return toolError(err);
       }

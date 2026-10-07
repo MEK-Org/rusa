@@ -1,3 +1,4 @@
+import { boundedResponse } from "../chat/bounded-response.js";
 import { defaultGchatConfigDir } from "../chat/gchat-oauth.js";
 import { DriveOAuth } from "./drive-oauth.js";
 
@@ -23,8 +24,10 @@ export interface DriveFileMetadata {
 export interface DriveClient {
   listChildren(folderId: string, recursive?: boolean): Promise<DriveFileMetadata[]>;
   getFileMetadata(fileId: string): Promise<DriveFileMetadata>;
+  /** Download a file; `maxBytes` can only lower the client's configured limit. */
   downloadFile(fileId: string, maxBytes?: number): Promise<Buffer>;
-  downloadFileStream?(fileId: string): Promise<Response>;
+  /** Stream a file's response, bounded like {@link downloadFile}, without buffering it. */
+  downloadFileStream?(fileId: string, maxBytes?: number): Promise<Response>;
   exportDoc(fileId: string, mimeType: string): Promise<Buffer>;
 }
 
@@ -179,7 +182,7 @@ export class GoogleDriveClient implements DriveClient {
     throw new Error("cannot enforce size limit: response body is not streamable");
   }
 
-  async downloadFileStream(fileId: string): Promise<Response> {
+  async downloadFileStream(fileId: string, maxBytes?: number): Promise<Response> {
     const token = await this.oauth.token();
     const resp = await this.fetchImpl(
       `${DRIVE_API}/files/${encodeURIComponent(fileId)}?alt=media`,
@@ -192,20 +195,17 @@ export class GoogleDriveClient implements DriveClient {
         `drive download ${fileId} -> HTTP ${resp.status} ${(await resp.text()).slice(0, 300)}`
       );
     }
-    return resp;
+    return boundedResponse(resp, this.downloadLimit(maxBytes), "file");
   }
 
   async downloadFile(fileId: string, maxBytes?: number): Promise<Buffer> {
-    const limit = maxBytes ?? this.maxDownloadSizeBytes;
-    const resp = await this.downloadFileStream(fileId);
-    const contentLength = resp.headers.get("content-length");
-    if (contentLength && parseInt(contentLength, 10) > limit) {
-      try {
-        await resp.body?.cancel();
-      } catch (_) {}
-      throw new Error(`file size limit exceeded: file is larger than ${limit} bytes`);
-    }
-    return this.readBodyWithLimit(resp, limit);
+    const limit = this.downloadLimit(maxBytes);
+    return this.readBodyWithLimit(await this.downloadFileStream(fileId, limit), limit);
+  }
+
+  /** A per-call limit can lower the configured limit, never raise it. */
+  private downloadLimit(maxBytes?: number): number {
+    return Math.min(this.maxDownloadSizeBytes, maxBytes ?? this.maxDownloadSizeBytes);
   }
 
   async exportDoc(fileId: string, mimeType: string): Promise<Buffer> {

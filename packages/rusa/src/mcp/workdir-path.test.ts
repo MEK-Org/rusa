@@ -12,6 +12,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { open as openFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -155,6 +156,19 @@ describe("streamNewFileInWorkdir", () => {
     expect(readFileSync(destination, "utf-8")).toBe("hello world");
   });
 
+  it("syncs the completed file before reporting its digest", async () => {
+    const dir = workdir();
+    const probe = await openFile(join(dir, "probe"), "w");
+    const sync = vi.spyOn(Object.getPrototypeOf(probe), "sync");
+    await probe.close();
+    const destination = await resolveDownloadPath(dir, "synced.bin");
+
+    await streamNewFileInWorkdir(dir, destination, [Buffer.from("complete")], 1024);
+
+    expect(sync).toHaveBeenCalledTimes(1);
+    sync.mockRestore();
+  });
+
   it("rejects and unlinks partial output when streamed bytes exceed maxBytes", async () => {
     const dir = workdir();
     const destination = await resolveDownloadPath(dir, "oversized.bin");
@@ -183,5 +197,37 @@ describe("streamNewFileInWorkdir", () => {
     );
     expect(cancelled).toBe(true);
     expect(existsSync(destination)).toBe(false);
+  });
+
+  it("cancels the source and keeps an existing destination it refuses to overwrite", async () => {
+    const dir = workdir();
+    writeFileSync(join(dir, "existing.bin"), "original");
+    const destination = await resolveDownloadPath(dir, "existing.bin");
+    const cancel = vi.fn();
+    const stream = new ReadableStream<Uint8Array>({ cancel });
+    await expect(streamNewFileInWorkdir(dir, destination, stream, 1024)).rejects.toMatchObject({
+      code: "EEXIST",
+    });
+    expect(cancel).toHaveBeenCalled();
+    expect(readFileSync(destination, "utf-8")).toBe("original");
+  });
+
+  it("removes partial output from the directory it opened after an ancestor swap", async () => {
+    const dir = workdir();
+    const outside = workdir();
+    writeFileSync(join(outside, "partial.bin"), "unrelated");
+    mkdirSync(join(dir, "sub"));
+    const destination = await resolveDownloadPath(dir, "sub/partial.bin");
+    async function* swapThenOverflow() {
+      yield Buffer.from("first");
+      renameSync(join(dir, "sub"), join(dir, "sub-moved"));
+      symlinkSync(outside, join(dir, "sub"));
+      yield Buffer.from("-overflow");
+    }
+    await expect(streamNewFileInWorkdir(dir, destination, swapThenOverflow(), 8)).rejects.toThrow(
+      "file size limit exceeded"
+    );
+    expect(existsSync(join(dir, "sub-moved", "partial.bin"))).toBe(false);
+    expect(readFileSync(join(outside, "partial.bin"), "utf-8")).toBe("unrelated");
   });
 });

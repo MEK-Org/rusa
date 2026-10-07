@@ -423,7 +423,7 @@ describe("GchatClient reads", () => {
     ).rejects.toThrow("attachment size limit exceeded");
   });
 
-  it("accepts declared 1 GiB download Content-Length boundary without allocating it", async () => {
+  it("declared-size guard: accepts a declared 1 GiB without reading a body", async () => {
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
@@ -442,7 +442,7 @@ describe("GchatClient reads", () => {
     ).resolves.toEqual(Buffer.alloc(0));
   });
 
-  it("rejects declared Content-Length one byte beyond the 1 GiB default and cancels stream", async () => {
+  it("declared-size guard: rejects a declared 1 GiB + 1 before reading and cancels the body", async () => {
     let cancelled = false;
     const stream = new ReadableStream({
       cancel() {
@@ -493,6 +493,30 @@ describe("GchatClient reads", () => {
       new GchatClient(credentialsDir(), 80).downloadAttachment("media/spaces/A/attachments/ATT1")
     ).rejects.toThrow("attachment size limit exceeded");
     expect(cancelled).toBe(true);
+  });
+
+  it("keeps a lower configured limit when a call asks for more, buffered or streamed", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
+          status: 200,
+        })
+      )
+      .mockResolvedValueOnce(new Response(new Uint8Array(100), { status: 200 }))
+      .mockResolvedValueOnce(new Response(new Uint8Array(100), { status: 200 }));
+
+    const client = new GchatClient(credentialsDir(), 80);
+    await expect(
+      client.downloadAttachment(
+        "media/spaces/A/attachments/ATT1",
+        MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES
+      )
+    ).rejects.toThrow("attachment is larger than 80 bytes");
+    const { resp } = await client.downloadAttachmentStream(
+      "media/spaces/A/attachments/ATT1",
+      MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES
+    );
+    await expect(resp.arrayBuffer()).rejects.toThrow("attachment is larger than 80 bytes");
   });
 
   it("rejects uploadAttachment if payload size exceeds maxSizeBytes", async () => {

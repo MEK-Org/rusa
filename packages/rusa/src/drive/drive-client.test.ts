@@ -181,7 +181,7 @@ describe("GoogleDriveClient & DriveOAuth", () => {
     ]);
   });
 
-  it("accepts the 1 GiB download boundary without allocating it", async () => {
+  it("declared-size guard: accepts a declared 1 GiB without reading a body", async () => {
     const dir = setupConfigDir();
     const fetchImpl = vi
       .fn<typeof fetch>()
@@ -199,27 +199,6 @@ describe("GoogleDriveClient & DriveOAuth", () => {
 
     await expect(new GoogleDriveClient(dir, fetchImpl).downloadFile("file-1")).resolves.toEqual(
       Buffer.alloc(0)
-    );
-  });
-
-  it("rejects a download one byte beyond the 1 GiB default without allocating it", async () => {
-    const dir = setupConfigDir();
-    const fetchImpl = vi
-      .fn<typeof fetch>()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ access_token: "mock-access", expires_in: 3600 }), {
-          status: 200,
-        })
-      )
-      .mockResolvedValueOnce(
-        new Response("", {
-          status: 200,
-          headers: { "content-length": String(MAX_DRIVE_FILE_DOWNLOAD_BYTES + 1) },
-        })
-      );
-
-    await expect(new GoogleDriveClient(dir, fetchImpl).downloadFile("file-1")).rejects.toThrow(
-      "file size limit exceeded"
     );
   });
 
@@ -304,24 +283,17 @@ describe("GoogleDriveClient & DriveOAuth", () => {
 
   it("cancels the stream reader when the file exceeds the size limit", async () => {
     const dir = setupConfigDir();
-    const mockCancel = vi.fn().mockResolvedValue(undefined);
-    const mockReader = {
-      read: vi
-        .fn()
-        .mockResolvedValueOnce({ done: false, value: new Uint8Array([1, 2, 3]) })
-        .mockResolvedValueOnce({ done: false, value: new Uint8Array([4, 5, 6]) }),
-      cancel: mockCancel,
-      releaseLock: vi.fn(),
-    };
-    const mockBody = {
-      getReader: () => mockReader,
-    };
-    const mockResp = new Response("", { status: 200 });
-    Object.defineProperty(mockResp, "body", {
-      get() {
-        return mockBody;
-      },
-    });
+    const mockCancel = vi.fn();
+    const mockResp = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+          controller.enqueue(new Uint8Array([4, 5, 6]));
+        },
+        cancel: mockCancel,
+      }),
+      { status: 200 }
+    );
 
     const fetchImpl = vi
       .fn<typeof fetch>()
@@ -360,7 +332,7 @@ describe("GoogleDriveClient & DriveOAuth", () => {
     expect(await resp.text()).toBe("stream-content");
   });
 
-  it("rejects declared Content-Length exceeding maxBytes and cancels stream", async () => {
+  it("declared-size guard: rejects a declared 1 GiB + 1 before reading and cancels the body", async () => {
     const dir = setupConfigDir();
     let cancelled = false;
     const stream = new ReadableStream({
@@ -405,5 +377,26 @@ describe("GoogleDriveClient & DriveOAuth", () => {
 
     const client = new GoogleDriveClient(dir, fetchImpl);
     await expect(client.downloadFile("file-1", 5)).rejects.toThrow("file size limit exceeded");
+  });
+
+  it("keeps a lower configured limit when a call asks for more, buffered or streamed", async () => {
+    const dir = setupConfigDir();
+    const body = () => new Response(new Uint8Array(100), { status: 200 });
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "mock-access", expires_in: 3600 }), {
+          status: 200,
+        })
+      )
+      .mockResolvedValueOnce(body())
+      .mockResolvedValueOnce(body());
+
+    const client = new GoogleDriveClient(dir, fetchImpl, "drive-token.json", 80);
+    await expect(client.downloadFile("file-1", MAX_DRIVE_FILE_DOWNLOAD_BYTES)).rejects.toThrow(
+      "file is larger than 80 bytes"
+    );
+    const streamed = await client.downloadFileStream("file-1", MAX_DRIVE_FILE_DOWNLOAD_BYTES);
+    await expect(streamed.arrayBuffer()).rejects.toThrow("file is larger than 80 bytes");
   });
 });

@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   statSync,
@@ -15,8 +16,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FakeChatClient } from "../chat/fake.js";
+import { GchatClient } from "../chat/gchat-client.js";
 import {
   MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
   MAX_CHAT_ATTACHMENT_INLINE_BYTES,
@@ -432,74 +434,236 @@ describe("chat MCP server", () => {
     expect(textOf(res)).toContain("attachment size limit exceeded");
   });
 
-  it("rejects downloads exceeding 50 MiB inline and directs to destinationPath", async () => {
+  it("bounds inline downloads at 50 MiB and directs larger ones to destinationPath", async () => {
     const fake = new FakeChatClient();
-    const overInline = {
-      length: MAX_CHAT_ATTACHMENT_INLINE_BYTES + 1,
-      toString: () => "",
-    } as unknown as Buffer;
-    fake.downloadAttachment = async () => overInline;
+    let requested: number | undefined;
+    fake.downloadAttachment = async (_resourceName, maxBytes) => {
+      requested = maxBytes;
+      throw new Error(
+        `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
+      );
+    };
     const client = await connect(createChatReadMcpServer(fake));
 
     const res = (await client.callTool({
       name: "download_attachment",
       arguments: { resourceName: "media/spaces/A/attachments/ATT1" },
     })) as CallToolResult;
+    expect(requested).toBe(MAX_CHAT_ATTACHMENT_INLINE_BYTES);
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain("attachment size limit exceeded");
     expect(textOf(res)).toContain("specify destinationPath to download up to 1 GiB");
   });
 
-  it("streams downloads up to 1 GiB to destinationPath without allocating full buffer", async () => {
+  it("asks the client stream for the 1 GiB file-mode limit", async () => {
     const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
     const fake = new FakeChatClient();
-    const exactBoundary = {
-      length: MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
-      toString: () => "",
-    } as unknown as Buffer;
-    fake.downloadAttachment = async () => exactBoundary;
+    let requested: number | undefined;
+    fake.downloadAttachmentStream = async (_resourceName, maxBytes) => {
+      requested = maxBytes;
+      return {
+        resp: new Response("hello", { status: 200 }),
+        name: "small.bin",
+        contentType: "application/octet-stream",
+      };
+    };
     const client = await connect(
       createChatReadMcpServer(fake, { workDir, fileToolsAvailable: true })
     );
 
-    const accepted = (await client.callTool({
+    const res = (await client.callTool({
       name: "download_attachment",
-      arguments: {
-        resourceName: "media/spaces/A/attachments/ATT1",
-        destinationPath: "out.bin",
-      },
+      arguments: { resourceName: "media/spaces/A/attachments/ATT1", destinationPath: "out.bin" },
     })) as CallToolResult;
-    expect(accepted.isError).toBeFalsy();
-    const data = JSON.parse(textOf(accepted));
-    expect(data.path).toBe(join(workDir, "out.bin"));
-    expect(data.bytes).toBe(0);
-    expect(existsSync(join(workDir, "out.bin"))).toBe(true);
+    expect(res.isError).toBeFalsy();
+    expect(requested).toBe(MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES);
+    expect(JSON.parse(textOf(res))).toMatchObject({ path: join(workDir, "out.bin"), bytes: 5 });
     rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("rejects downloads exceeding 1 GiB in destinationPath mode", async () => {
+  it("treats maxAttachmentBytes as an upper bound for each mode", async () => {
     const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
     const fake = new FakeChatClient();
-    const overBoundary = {
-      length: MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES + 1,
-      toString: () => "",
-    } as unknown as Buffer;
-    fake.downloadAttachment = async () => overBoundary;
+    let inlineRequested: number | undefined;
+    let fileRequested: number | undefined;
+    fake.downloadAttachment = async (_resourceName, maxBytes) => {
+      inlineRequested = maxBytes;
+      return Buffer.from("inline");
+    };
+    fake.downloadAttachmentStream = async (_resourceName, maxBytes) => {
+      fileRequested = maxBytes;
+      return {
+        resp: new Response("file", { status: 200 }),
+        name: "file.bin",
+        contentType: "application/octet-stream",
+      };
+    };
+    const client = await connect(
+      createChatReadMcpServer(fake, {
+        workDir,
+        fileToolsAvailable: true,
+        maxAttachmentBytes: 75 * 1024 * 1024,
+      })
+    );
+
+    const resourceName = "media/spaces/A/attachments/ATT1";
+    const inline = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName },
+    })) as CallToolResult;
+    const file = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName, destinationPath: "out.bin" },
+    })) as CallToolResult;
+
+    expect(inline.isError).toBeFalsy();
+    expect(file.isError).toBeFalsy();
+    expect(inlineRequested).toBe(MAX_CHAT_ATTACHMENT_INLINE_BYTES);
+    expect(fileRequested).toBe(75 * 1024 * 1024);
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("writes nothing when the client stream rejects a declared size", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
+    const fake = new FakeChatClient();
+    fake.downloadAttachmentStream = async (_resourceName, maxBytes) => {
+      throw new Error(
+        `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
+      );
+    };
     const client = await connect(
       createChatReadMcpServer(fake, { workDir, fileToolsAvailable: true })
     );
 
-    const rejected = (await client.callTool({
+    const res = (await client.callTool({
       name: "download_attachment",
-      arguments: {
-        resourceName: "media/spaces/A/attachments/ATT1",
-        destinationPath: "out.bin",
-      },
+      arguments: { resourceName: "media/spaces/A/attachments/ATT1", destinationPath: "out.bin" },
     })) as CallToolResult;
-    expect(rejected.isError).toBe(true);
-    expect(textOf(rejected)).toContain("attachment size limit exceeded");
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("attachment size limit exceeded");
     expect(existsSync(join(workDir, "out.bin"))).toBe(false);
     rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("stops an undeclared stream past the limit, cancels it, and removes the partial file", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
+    const fake = new FakeChatClient();
+    let cancelled = false;
+    let sent = 0;
+    fake.downloadAttachmentStream = async () => ({
+      resp: new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (sent++ < 5) controller.enqueue(new Uint8Array(1024));
+            else controller.close();
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { status: 200 }
+      ),
+      name: "undeclared.bin",
+      contentType: "application/octet-stream",
+    });
+    const client = await connect(
+      createChatReadMcpServer(fake, {
+        workDir,
+        fileToolsAvailable: true,
+        maxAttachmentBytes: 3 * 1024,
+      })
+    );
+
+    const res = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName: "media/spaces/A/attachments/ATT1", destinationPath: "out.bin" },
+    })) as CallToolResult;
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("attachment is larger than 3072 bytes");
+    expect(cancelled).toBe(true);
+    expect(existsSync(join(workDir, "out.bin"))).toBe(false);
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("refuses an existing destination, cancels the download, and keeps the original", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
+    writeFileSync(join(workDir, "out.bin"), "original");
+    const fake = new FakeChatClient();
+    let cancelled = false;
+    fake.downloadAttachmentStream = async () => ({
+      resp: new Response(
+        new ReadableStream<Uint8Array>({
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { status: 200 }
+      ),
+      name: "out.bin",
+      contentType: "application/octet-stream",
+    });
+    const client = await connect(
+      createChatReadMcpServer(fake, { workDir, fileToolsAvailable: true })
+    );
+
+    const res = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName: "media/spaces/A/attachments/ATT1", destinationPath: "out.bin" },
+    })) as CallToolResult;
+    expect(res.isError).toBe(true);
+    expect(cancelled).toBe(true);
+    expect(readFileSync(join(workDir, "out.bin"), "utf-8")).toBe("original");
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("requires a streaming client for destinationPath", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
+    const fake = new FakeChatClient();
+    Object.assign(fake, { downloadAttachmentStream: undefined });
+    const client = await connect(
+      createChatReadMcpServer(fake, { workDir, fileToolsAvailable: true })
+    );
+
+    const res = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName: "media/spaces/A/attachments/ATT1", destinationPath: "out.bin" },
+    })) as CallToolResult;
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("needs a Chat client that can stream downloads");
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("keeps a lower GchatClient limit through file mode", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
+    const configDir = mkdtempSync(join(tmpdir(), "chat-mcp-gchat-"));
+    writeFileSync(
+      join(configDir, "client.json"),
+      JSON.stringify({ installed: { client_id: "client", client_secret: "secret" } })
+    );
+    writeFileSync(join(configDir, "token.json"), JSON.stringify({ refresh_token: "refresh" }));
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), { status: 200 })
+      )
+      .mockResolvedValueOnce(new Response(new Uint8Array(100), { status: 200 }));
+    const client = await connect(
+      createChatReadMcpServer(new GchatClient(configDir, 80), {
+        workDir,
+        fileToolsAvailable: true,
+      })
+    );
+
+    const res = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName: "media/spaces/A/attachments/ATT1", destinationPath: "out.bin" },
+    })) as CallToolResult;
+    fetchSpy.mockRestore();
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("attachment is larger than 80 bytes");
+    expect(existsSync(join(workDir, "out.bin"))).toBe(false);
+    rmSync(workDir, { recursive: true, force: true });
+    rmSync(configDir, { recursive: true, force: true });
   });
 
   it("streams synthetic payload > 50 MiB through destinationPath and computes hash without full buffering", async () => {
