@@ -2644,9 +2644,10 @@ async function composeStart(
         raiseAttention: ({ actorId: childId, reason }) => {
           const parentId = repositories.actors.parentOf(childId);
           if (parentId === null || parentId === undefined) {
-            console.warn(
-              `[portable-context] brief rewrites frozen for ${childId} with no parent to alert: ${reason}`
-            );
+            log.warn("portable_context_brief_freeze_no_parent", {
+              actorId: childId,
+              reason,
+            });
             return;
           }
           repositories.inbox.append([
@@ -2661,14 +2662,15 @@ async function composeStart(
             },
           ]);
         },
-        log: (message) => log.warn(message),
+        log: (message) => log.warn("portable_context_brief_warning", { message }),
       });
     } catch (err) {
       // Keep the previous brief and cursor; the next run retries. The rejection
       // reason also rides the per-attempt telemetry row whenever the cycle ran.
-      console.warn(
-        `[portable-context] brief rewrite failed for ${actorId}: ${err instanceof Error ? err.message : String(err)}`
-      );
+      log.warn("portable_context_brief_rewrite_failed", {
+        actorId,
+        err: err instanceof Error ? err.message : String(err),
+      });
     }
   };
 

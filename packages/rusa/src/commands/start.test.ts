@@ -30,6 +30,7 @@ import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
+import { PORTABLE_CONTEXT_SCHEMA_VERSION } from "../actor/portable-context-state.js";
 import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
 import { RootModelConfigStartupError } from "../actor/root-model-config.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
@@ -7669,7 +7670,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         .all() as { actor_id: string; snapshot: string }[];
       expect(committed.map((row) => row.actor_id)).toEqual(["root"]);
       expect(JSON.parse(committed[0]?.snapshot ?? "")).toMatchObject({
-        schemaVersion: 3,
+        schemaVersion: PORTABLE_CONTEXT_SCHEMA_VERSION,
         generation: 5,
       });
 
