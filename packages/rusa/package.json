@@ -9,6 +9,7 @@
   "files": [
     "dist/",
     "scripts/gh-hint-wrapper.sh",
+    "scripts/host-watchdog.mjs",
     "scripts/notify-failure.mjs",
     "scripts/rotate-log.mjs",
     "scripts/verify-build.mjs"

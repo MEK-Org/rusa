@@ -3,6 +3,7 @@ import { existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
+  hostWatchdogUnitNames,
   logRotationUnitNames,
   resolveServiceInstance,
   type ServiceEnvironment,
@@ -59,15 +60,20 @@ export async function runUninstallService(opts?: {
     console.log(`ℹ️  Unit file not found at ${unitPath}`);
   }
 
-  // #580: the instance's log-rotation timer goes with it; rotated generations
-  // stay on disk for the operator to keep or delete.
-  const logRotation = logRotationUnitNames(instance.serviceBasename);
-  runSystemctlBestEffort(["--user", "disable", "--now", logRotation.timer]);
-  for (const unit of [logRotation.timer, logRotation.service]) {
-    const path = join(systemdUserDir, unit);
-    if (existsSync(path)) {
-      rmSync(path);
-      console.log(`✓ Removed ${path}`);
+  // #580/#955: the instance's log-rotation and host-watchdog timers go with
+  // it; logs and rotated generations stay on disk for the operator to keep or
+  // delete.
+  for (const units of [
+    logRotationUnitNames(instance.serviceBasename),
+    hostWatchdogUnitNames(instance.serviceBasename),
+  ]) {
+    runSystemctlBestEffort(["--user", "disable", "--now", units.timer]);
+    for (const unit of [units.timer, units.service]) {
+      const path = join(systemdUserDir, unit);
+      if (existsSync(path)) {
+        rmSync(path);
+        console.log(`✓ Removed ${path}`);
+      }
     }
   }
 
