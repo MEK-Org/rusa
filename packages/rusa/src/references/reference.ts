@@ -13,6 +13,10 @@
  *   gchat:spaces/AAAA/messages/BBBB                  a Google Chat message
  *   mesh:messages/<uuid>                             a mesh chat message
  *   mesh:actors/<actor id>/inbox/<entry id>          an actor's inbox entry
+ *   mesh:actors/<actor id>/charter                   an actor's charter (the one
+ *                                                    property-of exception to
+ *                                                    strict collection/id pairs)
+ *   mesh:actors/<actor id>/runs/<run id>             one of an actor's recorded runs
  *
  * **The path is alternating `collection/id` pairs.** A reference may cite a
  * resource at any level, including a whole GitHub owner or repository; callers
@@ -147,10 +151,19 @@ export function parseReference(value: string): Reference {
     (((scheme === "gchat" && segments[0] === "spaces") ||
       (scheme === "slack" && segments[0] === "channels")) &&
       segments.length === 1);
+  // The one deliberate single-entity exception to strict collection/id pairs:
+  // an actor's charter is a property OF the actor resource, not a collection
+  // beneath it, so `mesh:actors/<id>/charter` carries no id of its own (#954
+  // seeds the portable-context brief's charter line with exactly this ref).
+  const isActorCharter =
+    scheme === "mesh" &&
+    segments.length === 3 &&
+    segments[0] === "actors" &&
+    segments[2] === "charter";
   if (segments.length < 1) {
     throw new InvalidReferenceError(`a ${scheme} reference needs at least one path segment`);
   }
-  if (!isPartialRoot && (segments.length - root) % 2 !== 0) {
+  if (!isPartialRoot && !isActorCharter && (segments.length - root) % 2 !== 0) {
     throw new InvalidReferenceError(
       `a ${scheme} reference must be ${root ? "OWNER/REPO followed by " : ""}collection/id pairs`
     );

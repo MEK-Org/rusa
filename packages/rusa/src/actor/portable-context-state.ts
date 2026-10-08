@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PORTABLE_CONTEXT_SCHEMA_VERSION = 3 as const;
+export const PORTABLE_CONTEXT_SCHEMA_VERSION = 4 as const;
 
 /**
  * Every kind a *persisted* ledger snapshot may contain.
@@ -71,6 +71,68 @@ const portableMemoryItemSchema = z.object({
 });
 export type PortableMemoryItem = z.infer<typeof portableMemoryItemSchema>;
 
+/**
+ * The brief's own monotonic position in the durable source stream, mirroring
+ * the ledger source ordering (`ts`, then the message/yield discriminator,
+ * then id as the tiebreak — never a UUID comparison on its own). `null` means
+ * "before every source": either the actor was switched to brief mode before
+ * any durable source existed, or no source has been incorporated yet.
+ */
+export const briefCursorSchema = z.object({
+  ts: z.string().min(1),
+  sourceOrder: z.number().int().min(0),
+  id: z.string().min(1),
+});
+export type BriefCursor = z.infer<typeof briefCursorSchema>;
+
+/**
+ * The per-actor `brief` portable-context mode document (#954 iteration 1).
+ *
+ * Stored INSIDE the versioned snapshot document (schemaVersion v4) rather than
+ * in its own table: `portable_context_snapshots` is already one versioned JSON
+ * document per actor with no database-level shape constraint, and keeping the
+ * brief beside the ledger is what makes switch-back free — the ledger `items`,
+ * ledger generation and `lastFoldedSourceId` stay in the same document,
+ * untouched by brief rewrites.
+ *
+ * The brief cursor and generation are the brief's OWN sequence position and
+ * counter, fully independent of the ledger watermark and ledger generation:
+ * a brief rewrite must never advance or otherwise touch the ledger fields.
+ *
+ * `consecutiveFailures`, `frozen` and `resolvedRefs` are the minimal
+ * retry/freeze/resolved-ref-cache bookkeeping the rewrite cycle needs to
+ * survive restarts; their shape is enforced here, at the point of
+ * consumption, exactly like the rest of the document.
+ */
+export const portableBriefSchema = z.object({
+  /** The rendered three-section brief text (WHAT/HOW/DOMAIN), verbatim. */
+  text: z.string(),
+  cursor: briefCursorSchema.nullable(),
+  generation: z.number().int().nonnegative(),
+  /** The Gemini model that produced the current text; null on the seed. */
+  model: z.string().nullable(),
+  updatedAt: z.string().min(1),
+  /** Failed rewrite cycles since the last accepted rewrite (repair retries inside one cycle count once). */
+  consecutiveFailures: z.number().int().nonnegative(),
+  /**
+   * Rewrites are frozen after three consecutive failed cycles until the
+   * raised needs-attention item is handled. Handling releases the freeze: any
+   * inbound human or ancestor message after the frozen cursor is the parent's
+   * handling reply reaching the actor, and the cycle that sees it clears
+   * `frozen` and resets the failure budget before rewriting (see
+   * portable-context-brief.ts).
+   */
+  frozen: z.boolean(),
+  /**
+   * Per-actor resolved-ref cache, keyed by the canonical ref string: every ref
+   * that has been successfully resolved at least once. A ref is resolved only
+   * on its first appearance for the actor; a rewrite that introduces no new
+   * ref makes zero resolution calls (for GitHub refs: zero tracker calls).
+   */
+  resolvedRefs: z.array(z.string().min(1)),
+});
+export type PortableBrief = z.infer<typeof portableBriefSchema>;
+
 const portableContextStateFields = {
   actorId: z.string().min(1),
   generation: z.number().int().nonnegative(),
@@ -89,6 +151,8 @@ export const portableContextStateSchema = z.object({
   ...portableContextStateFields,
   /** Durable mesh_chat or actor_runs id; never a mesh_events cursor after v3 writes. */
   lastFoldedSourceId: z.string().min(1).nullable(),
+  /** The brief-mode document; null until the actor is switched to brief mode. */
+  brief: portableBriefSchema.nullable(),
 });
 export type PortableContextState = z.infer<typeof portableContextStateSchema>;
 
@@ -96,6 +160,13 @@ const portableContextStateV2Schema = z.object({
   schemaVersion: z.literal(2),
   ...portableContextStateFields,
   lastFoldedMessageEventId: z.string().min(1).nullable(),
+});
+
+/** A v3 document: identical to v4 except it predates the `brief` object. */
+const portableContextStateV3Schema = z.object({
+  schemaVersion: z.literal(3),
+  ...portableContextStateFields,
+  lastFoldedSourceId: z.string().min(1).nullable(),
 });
 
 /**
@@ -107,19 +178,34 @@ const portableContextStateV2Schema = z.object({
  * document only ever becomes state by passing through here. Exported because
  * both consumers need the same forward read — the durable store on every load,
  * and the one-time legacy importer on every file it parses.
+ *
+ * The chain is incremental, one version at a time, exactly as v2→v3 was: v2
+ * renames the event watermark to the durable-source cursor, v3→v4 (#954)
+ * adds the nullable `brief` object. Each step only ever ADDS fields, so a
+ * document written by any older build reads forward without data loss and the
+ * ledger fields it already carried round-trip byte-identically.
  */
 export function parsePortableContextState(value: unknown): PortableContextState {
   const version =
     value !== null && typeof value === "object" && "schemaVersion" in value
       ? (value as { schemaVersion?: unknown }).schemaVersion
       : undefined;
-  if (version !== 2) return portableContextStateSchema.parse(value);
+  if (version !== 2 && version !== 3) return portableContextStateSchema.parse(value);
+  if (version === 3) {
+    const v3 = portableContextStateV3Schema.parse(value);
+    return portableContextStateSchema.parse({
+      ...v3,
+      schemaVersion: PORTABLE_CONTEXT_SCHEMA_VERSION,
+      brief: null,
+    });
+  }
   const legacy = portableContextStateV2Schema.parse(value);
   return portableContextStateSchema.parse({
     ...legacy,
     schemaVersion: PORTABLE_CONTEXT_SCHEMA_VERSION,
     lastFoldedSourceId: legacy.lastFoldedMessageEventId,
     lastFoldedMessageEventId: undefined,
+    brief: null,
   });
 }
 
@@ -132,6 +218,7 @@ export function emptyPortableContextState(actorId: string): PortableContextState
     lastFoldedSourceId: null,
     compactor: null,
     items: [],
+    brief: null,
   };
 }
 

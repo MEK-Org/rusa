@@ -1,6 +1,8 @@
 import type { ChatClient } from "../chat/types.js";
+import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
+import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { InboxRepository } from "../repositories/inbox-repository.js";
 import type { SlackClient } from "../slack/slack-client.js";
 import {
@@ -72,6 +74,10 @@ export interface ReferenceResolverDeps {
       "getIssue" | "listIssueComments" | "getPrReviewComments" | "getPullRequestReview"
     >
   >;
+  /** Reads actor records; powers `mesh:actors/<id>/charter` resolution. */
+  actors?: Pick<ActorRepository, "get">;
+  /** Reads actor runs; powers `mesh:actors/<id>/runs/<runId>` resolution. */
+  actorRuns?: Pick<ActorRunRepository, "getById">;
 }
 
 function unresolved(reference: Reference, title: string, reason: string): ResolvedReference {
@@ -139,6 +145,44 @@ function resolveMesh(
       body: JSON.stringify(entry.payload ?? null, null, 2),
       author: first[1],
       timestamp: entry.deliveredAt?.toISOString() ?? null,
+      url: null,
+      unavailable: null,
+    };
+  }
+
+  if (first?.[0] === "actors" && reference.segments[2] === "charter") {
+    // `mesh:actors/<id>/charter` — the charter is a property OF the actor
+    // resource, so it carries no id segment of its own (the one deliberate
+    // exception to strict collection/id pairs in the grammar). The brief seeds
+    // its WHAT/HOW line with exactly this ref (#954).
+    if (!deps.actors) return unresolved(reference, "Actor charter", "actor store not available");
+    const actor = deps.actors.get(first[1]);
+    if (!actor) return unresolved(reference, "Actor charter", "actor not found");
+    return {
+      ref: reference.key,
+      scheme: reference.scheme,
+      title: `Charter of ${actor.id}`,
+      body: actor.charter,
+      author: null,
+      timestamp: actor.createdAt,
+      url: null,
+      unavailable: null,
+    };
+  }
+
+  if (first?.[0] === "actors" && second?.[0] === "runs") {
+    if (!deps.actorRuns) return unresolved(reference, "Actor run", "run store not available");
+    const run = deps.actorRuns.getById(second[1]);
+    if (!run || run.actorId !== first[1]) {
+      return unresolved(reference, "Actor run", "run not found for actor");
+    }
+    return {
+      ref: reference.key,
+      scheme: reference.scheme,
+      title: `Run ${run.id}`,
+      body: run.output,
+      author: run.actorId,
+      timestamp: run.endedAt ?? run.startedAt,
       url: null,
       unavailable: null,
     };
