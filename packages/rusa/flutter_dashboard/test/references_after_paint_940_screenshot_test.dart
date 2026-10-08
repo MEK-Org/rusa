@@ -113,7 +113,10 @@ void main() {
       gate.complete();
       await _frames(tester);
       expect(find.text('loading context'), findsNothing);
-      await captureBoundary(key, 'screenshots/references_940_detail_filled.png');
+      await captureBoundary(
+        key,
+        'screenshots/references_940_detail_filled.png',
+      );
       expect(tester.takeException(), isNull);
     });
   });
@@ -129,18 +132,20 @@ void main() {
       await tester.binding.setSurfaceSize(const Size(1500, 1000));
       final gate = Completer<void>();
       final api = FakeApi()
+        // Both actors carry the model the staging baseline labelled them
+        // with, so the before and after captures differ only in references.
         ..threadsResult = [
-          makeThread(
-            'coder',
-            modelConfig: const [
-              ProviderModelConfig(
-                provider: 'claude',
-                model: 'claude-opus-4-6',
-                effort: 'high',
-              ),
-            ],
-          ),
-          makeThread('steward'),
+          for (final id in ids)
+            makeThread(
+              id,
+              modelConfig: const [
+                ProviderModelConfig(
+                  provider: 'claude',
+                  model: 'claude-opus-4-6',
+                  effort: 'high',
+                ),
+              ],
+            ),
         ]
         ..recentActivityResult = const [
           RecentActivityItem(

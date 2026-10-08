@@ -762,15 +762,11 @@ function scopeMeshMessageReference(
  *
  * The activity feed is capped at 100 rows, so its current projection and this
  * allowlist use the same bounded source.  Obligation references come from the
- * durable external-ref and artifact records, not from a client assertion.
+ * durable external-ref and artifact records, not from a client assertion, and
+ * are looked up only for the requested batch rather than scanned in full.
  */
-function dashboardReferenceKeys(deps: DashboardDataDeps): Set<string> {
-  const keys = new Set<string>();
-  for (const obligation of deps.obligations?.list() ?? []) {
-    if (obligation.externalRef) keys.add(obligation.externalRef.key);
-    for (const artifact of deps.obligations?.listArtifacts(obligation.id) ?? [])
-      keys.add(artifact.ref);
-  }
+function dashboardReferenceKeys(deps: DashboardDataDeps, refs: readonly string[]): Set<string> {
+  const keys = deps.obligations?.citedReferences(refs) ?? new Set<string>();
   for (const entry of deps.inbox?.listRecentHandledEntries(100) ?? []) {
     const { messageId } = entry.payload as { messageId?: unknown };
     if (typeof messageId === "string") {
@@ -886,7 +882,7 @@ async function resolveReferenceBatch(
   // (#933).
   const { referenceCache } = deps;
   const referenceBudget = referenceCache?.startBudget();
-  const available = dashboardReferenceKeys(deps);
+  const available = dashboardReferenceKeys(deps, refs);
   const resolved = await Promise.all(
     refs.map(async (ref) => {
       // Do not permit an authenticated browser to use this endpoint to query

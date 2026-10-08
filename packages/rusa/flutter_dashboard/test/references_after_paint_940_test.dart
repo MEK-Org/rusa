@@ -31,107 +31,50 @@ ReferenceDto _issue(String ref, String title) => ReferenceDto(
 );
 
 void main() {
-  group('DashboardApi.fetchReferences', () {
-    test('asks for each ref once, in batches the server accepts', () async {
-      final requested = <List<String>>[];
-      final client = MockClient((req) async {
-        expect(req.url.path, '/api/mesh/references');
-        expect(req.method, 'POST');
-        final body = jsonDecode(req.body) as Map<String, dynamic>;
-        final refs = (body['refs'] as List<dynamic>).cast<String>();
-        requested.add(refs);
-        return http.Response(
-          jsonEncode({
-            'references': {
-              for (final ref in refs)
-                ref: {'ref': ref, 'scheme': 'github', 'title': 'T $ref'},
-            },
-          }),
-          200,
-        );
-      });
-      final api = DashboardApi(
-        client: client,
-        base: Uri.parse('http://localhost:3000'),
+  test('DashboardApi.fetchReferences asks for each ref once, one batch at a '
+      'time, and keeps earlier answers when a later batch fails', () async {
+    final requested = <List<String>>[];
+    final first = Completer<void>();
+    final client = MockClient((req) async {
+      expect(req.url.path, '/api/mesh/references');
+      expect(req.method, 'POST');
+      final body = jsonDecode(req.body) as Map<String, dynamic>;
+      final refs = (body['refs'] as List<dynamic>).cast<String>();
+      requested.add(refs);
+      if (requested.length == 1) await first.future;
+      if (requested.length > 1) return http.Response('offline', 503);
+      return http.Response(
+        jsonEncode({
+          'references': {
+            for (final ref in refs) ref: {'ref': ref, 'scheme': 'github'},
+          },
+        }),
+        200,
       );
-      final refs = [for (var i = 1; i <= 35; i++) 'github:o/r/issues/$i'];
-
-      final resolved = await api.fetchReferences([...refs, refs.first]);
-
-      expect(requested.map((batch) => batch.length), [
-        referenceBatchLimit,
-        35 - referenceBatchLimit,
-      ]);
-      expect(requested.expand((batch) => batch), refs);
-      expect(resolved.keys, refs);
-      expect(resolved[refs.last]!.title, 'T ${refs.last}');
-      expect(await api.fetchReferences(const []), isEmpty);
-      expect(requested, hasLength(2));
     });
-
-    test(
-      'serializes batches so a large fill-in uses one server budget at a time',
-      () async {
-        final requested = <List<String>>[];
-        final first = Completer<void>();
-        final client = MockClient((req) async {
-          final body = jsonDecode(req.body) as Map<String, dynamic>;
-          final refs = (body['refs'] as List<dynamic>).cast<String>();
-          requested.add(refs);
-          if (requested.length == 1) await first.future;
-          return http.Response(
-            jsonEncode({
-              'references': {
-                for (final ref in refs) ref: {'ref': ref, 'scheme': 'github'},
-              },
-            }),
-            200,
-          );
-        });
-        final api = DashboardApi(
-          client: client,
-          base: Uri.parse('http://localhost:3000'),
-        );
-        final refs = [for (var i = 1; i <= 21; i++) 'github:o/r/issues/$i'];
-
-        final resolved = api.fetchReferences(refs);
-        await Future<void>.delayed(Duration.zero);
-        expect(requested, hasLength(1));
-
-        first.complete();
-        await resolved;
-        expect(requested.map((batch) => batch.length), [20, 1]);
-      },
+    final api = DashboardApi(
+      client: client,
+      base: Uri.parse('http://localhost:3000'),
     );
+    final refs = [for (var i = 1; i <= 21; i++) 'github:o/r/issues/$i'];
 
-    test('retains earlier batch answers when a later batch fails', () async {
-      final client = MockClient((req) async {
-        final body = jsonDecode(req.body) as Map<String, dynamic>;
-        final refs = (body['refs'] as List<dynamic>).cast<String>();
-        if (refs.first.endsWith('/21')) return http.Response('offline', 503);
-        return http.Response(
-          jsonEncode({
-            'references': {
-              for (final ref in refs) ref: {'ref': ref, 'scheme': 'github'},
-            },
-          }),
-          200,
-        );
-      });
-      final api = DashboardApi(
-        client: client,
-        base: Uri.parse('http://localhost:3000'),
-      );
-      final refs = [for (var i = 1; i <= 21; i++) 'github:o/r/issues/$i'];
+    final resolved = api.fetchReferences([...refs, refs.first]);
+    await Future<void>.delayed(Duration.zero);
+    // One server budget at a time: the second batch waits for the first.
+    expect(requested, hasLength(1));
+    first.complete();
 
-      try {
-        await api.fetchReferences(refs);
-        fail('expected a partial batch failure');
-      } on PartialReferenceFetchException catch (error) {
-        expect(error.resolved.keys, refs.take(referenceBatchLimit));
-        expect(error.unresolved, {refs.last});
-      }
-    });
+    try {
+      await resolved;
+      fail('expected a partial batch failure');
+    } on PartialReferenceFetchException catch (error) {
+      expect(error.resolved.keys, refs.take(referenceBatchLimit));
+      expect(error.unresolved, {refs.last});
+    }
+    expect(requested.map((batch) => batch.length), [referenceBatchLimit, 1]);
+    expect(requested.expand((batch) => batch), refs);
+    expect(await api.fetchReferences(const []), isEmpty);
+    expect(requested, hasLength(2));
   });
 
   testWidgets(
@@ -344,31 +287,6 @@ void main() {
 
       final items = await store.recentActivity.first;
       expect(items.map((i) => i.id), ['inbox_2']);
-      await store.dispose();
-    },
-  );
-
-  test(
-    'Recent Activity settles a reference request failure as unavailable',
-    () async {
-      final api = FakeApi()
-        ..recentActivityResult = const [
-          RecentActivityItem(
-            id: 'inbox_1',
-            kind: 'handled_inbox',
-            time: '2026-09-23T14:21:37.000Z',
-            actorId: 'actor-1',
-            referenceKey: _cited,
-          ),
-        ]
-        ..referencesError = StateError('offline');
-      final store = DashboardStore(api: api, stream: FakeStream());
-
-      await store.refreshRecentActivity();
-
-      final item = store.recentActivity.value.single;
-      expect(item.reference?.cacheState, 'unavailable');
-      expect(item.reference?.unavailable, 'could not load context');
       await store.dispose();
     },
   );

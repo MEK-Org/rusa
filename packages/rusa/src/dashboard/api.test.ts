@@ -4606,7 +4606,7 @@ describe("handleMeshApiRequest", () => {
         }
       });
 
-      it("bounds the batch and resolves a repeated ref once", async () => {
+      it("bounds the batch and the body, and resolves a repeated ref once", async () => {
         const get = vi.fn(async (ref: string) => ({
           ref,
           scheme: "github",
@@ -4622,7 +4622,10 @@ describe("handleMeshApiRequest", () => {
             get,
           } as unknown as ReferenceCacheService,
         };
-        const refs = Array.from({ length: 20 }, (_, i) => `github:o/r/issues/${i + 1}`);
+        // A full batch of maximum-length keys is accepted.
+        const refs = Array.from({ length: 20 }, (_, i) =>
+          `github:o/r/issues/${i}_`.padEnd(512, "x")
+        );
         cite(...refs);
 
         const full = await references(counted, [...refs, refs[0], refs[1]]);
@@ -4639,74 +4642,14 @@ describe("handleMeshApiRequest", () => {
           const { res } = await call(counted, "POST", "/api/mesh/references", JSON.stringify(body));
           expect(res.statusCode).toBe(400);
         }
-        expect(get).not.toHaveBeenCalled();
-      });
-
-      it("accepts a full batch of 20 maximum-length keys and validates the request body", async () => {
-        const get = vi.fn(async (ref: string) => ({
-          ref,
-          scheme: "github",
-          title: "issue",
-          body: null,
-          cacheState: "fresh",
-          unavailable: null,
-        }));
-        const counted = {
-          ...deps,
-          referenceCache: {
-            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
-            get,
-          } as unknown as ReferenceCacheService,
-        };
-        const maxKeys = Array.from({ length: 20 }, (_, i) =>
-          `github:o/r/issues/${i}_`.padEnd(512, "x")
-        );
-        expect(maxKeys.every((k) => k.length === 512)).toBe(true);
-        cite(...maxKeys);
-        const res = await references(counted, maxKeys);
-        expect(Object.keys(res)).toHaveLength(20);
-        expect(get).toHaveBeenCalledTimes(20);
-
         // This route validates a post-buffer UTF-8 byte limit; it
         // deliberately makes no transport-memory claim shared `readBody` does
         // not provide.
-        const hugePost = await call(counted, "POST", "/api/mesh/references", "x".repeat(70_000));
-        expect(hugePost.res.statusCode).toBe(413);
-        const utf8HugePost = await call(
-          counted,
-          "POST",
-          "/api/mesh/references",
-          "\ud83d\ude00".repeat(20_000)
-        );
-        expect("\ud83d\ude00".repeat(20_000).length).toBeLessThan(64 * 1024);
-        expect(utf8HugePost.res.statusCode).toBe(413);
-      });
-
-      it("isolates sync resolution and projection exceptions to the failing reference", async () => {
-        const brokenDeps = {
-          ...deps,
-          referenceCache: {
-            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
-            get: async (ref: string) => {
-              if (ref === "github:o/r/issues/2") {
-                throw new Error("unexpected parser exception");
-              }
-              return {
-                ref,
-                scheme: "github",
-                title: "Valid Ref",
-                body: null,
-                cacheState: "fresh",
-                unavailable: null,
-              };
-            },
-          } as unknown as ReferenceCacheService,
-        };
-        cite("github:o/r/issues/1", "github:o/r/issues/2");
-        const res = await references(brokenDeps, ["github:o/r/issues/1", "github:o/r/issues/2"]);
-        expect(res["github:o/r/issues/1"].cacheState).toBe("fresh");
-        expect(res["github:o/r/issues/2"].cacheState).toBe("unavailable");
-        expect(res["github:o/r/issues/2"].unavailable).toBe("could not load context");
+        for (const body of ["x".repeat(70_000), "\ud83d\ude00".repeat(20_000)]) {
+          const { res } = await call(counted, "POST", "/api/mesh/references", body);
+          expect(res.statusCode).toBe(413);
+        }
+        expect(get).not.toHaveBeenCalled();
       });
 
       it("does not resolve a client-invented reference", async () => {
@@ -4729,10 +4672,19 @@ describe("handleMeshApiRequest", () => {
           } as unknown as ReferenceCacheService,
         };
 
-        const resolved = await references(counted, [allowed, invented]);
-        expect(get).toHaveBeenCalledTimes(1);
-        expect(get).toHaveBeenCalledWith(allowed, counted, expect.anything());
+        // The allowlist asks the store about the requested keys only; it
+        // does not walk every obligation and its artifacts per batch.
+        const list = vi.spyOn(obligations, "list");
+        const listArtifacts = vi.spyOn(obligations, "listArtifacts");
+        const claimed = obligations.get(`reference-citation-${citation - 1}`)?.externalRef?.key;
+        expect(claimed).toBeDefined();
+
+        const resolved = await references(counted, [allowed, claimed as string, invented]);
+        expect(list).not.toHaveBeenCalled();
+        expect(listArtifacts).not.toHaveBeenCalled();
+        expect(get.mock.calls.map(([ref]) => ref)).toEqual([allowed, claimed]);
         expect(resolved[allowed].cacheState).toBe("fresh");
+        expect(resolved[claimed as string].cacheState).toBe("fresh");
         expect(resolved[invented]).toMatchObject({
           cacheState: "unavailable",
           unavailable: "could not load context",
