@@ -7,6 +7,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart' show MockClient;
@@ -149,6 +150,7 @@ void main() {
     (tester) async {
       await tester.runAsync(() async {
         const actor = '11111111-1111-4111-8111-111111111111';
+        SchedulerPhase? fetchPhase;
         final gate = Completer<void>();
         final api = FakeApi()
           ..threadsResult = [
@@ -177,6 +179,9 @@ void main() {
               addressedNote: 'Triaged it',
             ),
           ]
+          ..onFetchReferences = () {
+            fetchPhase = SchedulerBinding.instance.schedulerPhase;
+          }
           ..referencesGate = gate
           ..referencesResult = {_cited: _issue(_cited, 'The cited bug')};
         final store = DashboardStore(api: api, stream: FakeStream());
@@ -192,6 +197,7 @@ void main() {
         await tester.pump();
         await tester.pump();
 
+        expect(fetchPhase, SchedulerPhase.postFrameCallbacks);
         expect(find.text('$actor-handle'), findsOneWidget);
         expect(find.text('claude-opus-4-6, high'), findsOneWidget);
         expect(find.textContaining('Triaged it'), findsOneWidget);
@@ -213,6 +219,7 @@ void main() {
           _cited: _issue(_cited, 'The updated bug title'),
         };
         await store.refreshRecentActivity();
+        await tester.pump();
         await Future<void>.delayed(Duration.zero);
         await tester.pump();
         expect(find.text('The updated bug title'), findsOneWidget);
@@ -260,8 +267,8 @@ void main() {
       final store = DashboardStore(api: api, stream: FakeStream());
       await store.init();
 
-      final f1 = store.refreshRecentActivity();
-      final f2 = store.refreshRecentActivity();
+      final f1 = store.refreshRecentActivity(deferUntilPostFrame: false);
+      final f2 = store.refreshRecentActivity(deferUntilPostFrame: false);
 
       completer2.complete([
         const RecentActivityItem(
@@ -308,14 +315,14 @@ void main() {
         ..referencesResult = {_cited: pending};
       final store = DashboardStore(api: api, stream: FakeStream());
 
-      await store.refreshRecentActivity();
+      await store.refreshRecentActivity(deferUntilPostFrame: false);
       expect(
         store.recentActivity.value.single.reference?.cacheState,
         'pending',
       );
 
       api.referencesError = StateError('offline');
-      await store.refreshRecentActivity();
+      await store.refreshRecentActivity(deferUntilPostFrame: false);
       final item = store.recentActivity.value.single;
       expect(item.reference?.cacheState, 'unavailable');
       expect(item.reference?.unavailable, 'could not load context');
@@ -360,9 +367,9 @@ void main() {
         ]);
       final store = DashboardStore(api: api, stream: FakeStream());
 
-      final first = store.refreshRecentActivity();
+      final first = store.refreshRecentActivity(deferUntilPostFrame: false);
       await Future<void>.delayed(Duration.zero);
-      final newer = store.refreshRecentActivity();
+      final newer = store.refreshRecentActivity(deferUntilPostFrame: false);
       await newer;
       expect(
         store.recentActivity.value.single.reference?.title,
@@ -372,7 +379,8 @@ void main() {
       firstAnswer.complete();
       await first;
 
-      final revalidation = store.refreshRecentActivity();
+      final revalidation =
+          store.refreshRecentActivity(deferUntilPostFrame: false);
       await Future<void>.delayed(Duration.zero);
       // The new generation paints from its cache while enrichment is held.
       // Without the catch-side generation guard, the stale partial failure

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/widgets.dart';
 import 'package:rxdart/rxdart.dart';
 
 import 'actor_display.dart';
@@ -680,7 +681,7 @@ class DashboardStore {
   /// Paints the feed from its ref keys, then fills each card's reference in
   /// as `/api/mesh/references` answers (#940). Known cards keep their shown
   /// previews on reload while revalidation refreshes them in the background.
-  Future<void> refreshRecentActivity() async {
+  Future<void> refreshRecentActivity({bool deferUntilPostFrame = true}) async {
     final generation = ++_recentActivityGeneration;
     final List<RecentActivityItem> items;
     try {
@@ -708,34 +709,51 @@ class DashboardStore {
 
     emit();
     if (keys.isEmpty) return;
-    try {
-      final fetched = await _api.fetchReferences(keys);
-      if (generation != _recentActivityGeneration) return;
-      _activityReferences.addAll(fetched);
-      emit();
-    } catch (error) {
-      if (generation != _recentActivityGeneration) return;
-      final partial = error is PartialReferenceFetchException ? error : null;
-      if (partial != null) _activityReferences.addAll(partial.resolved);
-      final unresolved = partial?.unresolved ?? keys;
-      // Keep an already-filled preview, but settle a new card rather than
-      // leaving its placeholder pending until a later feed refresh. A pending
-      // cache answer is a placeholder, not a filled preview. That refresh
-      // still asks the failed key again and can replace the fallback.
-      _activityReferences.addAll({
-        for (final key in unresolved)
-          if (_activityReferences[key]?.cacheState == null ||
-              _activityReferences[key]?.cacheState == 'pending')
-            key: ReferenceDto(
-              ref: key,
-              scheme: key.split(':').first,
-              title: key,
-              unavailable: 'could not load context',
-              cacheState: 'unavailable',
-            ),
-      });
-      emit();
+
+    Future<void> resolve() async {
+      try {
+        final fetched = await _api.fetchReferences(keys);
+        if (generation != _recentActivityGeneration) return;
+        _activityReferences.addAll(fetched);
+        emit();
+      } catch (error) {
+        if (generation != _recentActivityGeneration) return;
+        final partial = error is PartialReferenceFetchException ? error : null;
+        if (partial != null) _activityReferences.addAll(partial.resolved);
+        final unresolved = partial?.unresolved ?? keys;
+        // Keep an already-filled preview, but settle a new card rather than
+        // leaving its placeholder pending until a later feed refresh. A pending
+        // cache answer is a placeholder, not a filled preview. That refresh
+        // still asks the failed key again and can replace the fallback.
+        _activityReferences.addAll({
+          for (final key in unresolved)
+            if (_activityReferences[key]?.cacheState == null ||
+                _activityReferences[key]?.cacheState == 'pending')
+              key: ReferenceDto(
+                ref: key,
+                scheme: key.split(':').first,
+                title: key,
+                unavailable: 'could not load context',
+                cacheState: 'unavailable',
+              ),
+        });
+        emit();
+      }
     }
+
+    if (deferUntilPostFrame) {
+      try {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (generation == _recentActivityGeneration) {
+            unawaited(resolve());
+          }
+        });
+        return;
+      } catch (_) {
+        // Fall back to immediate resolution when no WidgetsBinding is bound.
+      }
+    }
+    await resolve();
   }
 
   Future<List<String>> fetchRootControlProviders() =>
