@@ -969,6 +969,20 @@ class _DetailViewState extends State<_DetailView> {
         );
   }
 
+  /// Lets the raw detail snapshot render before asking the separate reference
+  /// route to enrich it. A later navigation or refresh invalidates this
+  /// callback just as it invalidates an in-flight reference response.
+  void _resolveReferencesAfterFirstPaint(ObligationDetailSnapshot data) {
+    final id = widget.obligationId;
+    final gen = _fetchGeneration;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || gen != _fetchGeneration || id != widget.obligationId) {
+        return;
+      }
+      _resolveReferences(data);
+    });
+  }
+
   /// Schedules the next bounded re-ask when a ref [data] cites is still
   /// pending. The server shares one provider read across these, so they cost
   /// no extra provider traffic; the timer belongs to this load's generation,
@@ -1027,7 +1041,7 @@ class _DetailViewState extends State<_DetailView> {
         _completions = data.completions;
         _completionsTotal = data.completionsTotal;
         _completionsHasMore = data.completionsHasMore;
-        _resolveReferences(data);
+        _resolveReferencesAfterFirstPaint(data);
       });
       return data;
     }
@@ -1060,7 +1074,7 @@ class _DetailViewState extends State<_DetailView> {
             _completions = mergeCompletions(data.completions, _completions);
             _completionsTotal = data.completionsTotal;
             _completionsHasMore = _completions.length < data.completionsTotal;
-            _resolveReferences(data);
+            _resolveReferencesAfterFirstPaint(data);
           });
         })
         .catchError((_) {});
@@ -1126,7 +1140,7 @@ class _DetailViewState extends State<_DetailView> {
       _completionsTotal = data.completionsTotal;
       _completionsHasMore = _completions.length < data.completionsTotal;
     }
-    _resolveReferences(data);
+    _resolveReferencesAfterFirstPaint(data);
   }
 
   @override

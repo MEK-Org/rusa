@@ -6,6 +6,7 @@
 
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
@@ -78,6 +79,9 @@ void main() {
     await tester.tap(find.text(intent));
     await tester.pump();
     await tester.pump();
+    // The separate enrichment request begins in a post-frame callback, and
+    // an immediate fake response settles on the following frame.
+    await tester.pump();
   }
 
   setUp(() {
@@ -130,6 +134,23 @@ void main() {
     await tester.pump(_pastCeiling);
     expect(asksFor(_ref), 2);
     expect(detailCalls, [obA.id]);
+    await tester.runAsync(store.dispose);
+  });
+
+  testWidgets('starts reference enrichment in the post-frame phase', (
+    tester,
+  ) async {
+    serve((_) => _resolved());
+    SchedulerPhase? fetchPhase;
+    api.onFetchReferences = () {
+      fetchPhase = SchedulerBinding.instance.schedulerPhase;
+    };
+
+    await mount(tester);
+    await open(tester, 'Cites a chat');
+
+    expect(fetchPhase, SchedulerPhase.postFrameCallbacks);
+    expect(find.text('Chat message'), findsOneWidget);
     await tester.runAsync(store.dispose);
   });
 

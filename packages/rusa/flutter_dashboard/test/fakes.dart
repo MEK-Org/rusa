@@ -297,6 +297,9 @@ class FakeApi extends DashboardApi {
   /// Each batch asked for, in order.
   final referenceRequests = <List<String>>[];
 
+  /// Optional observer for assertions about when enrichment starts.
+  void Function()? onFetchReferences;
+
   /// When set, each references answer waits on this, so a test can see the
   /// pane painted before its references arrive.
   Completer<void>? referencesGate;
@@ -316,6 +319,7 @@ class FakeApi extends DashboardApi {
   ) async {
     final batch = refs.toSet().toList();
     referenceRequests.add(batch);
+    onFetchReferences?.call();
     if (scriptedReferenceResponses.isNotEmpty) {
       return scriptedReferenceResponses.removeAt(0)(batch);
     }
