@@ -82,6 +82,47 @@ describe("buildQuotaHistory", () => {
   });
 });
 
+describe("buildQuotaSnapshot stored window lengths", () => {
+  it("uses the lane's latest stored window length for a newer live reading", async () => {
+    const day = 24 * 60 * 60 * 1000;
+    const scrapedAt = "2030-01-01T00:10:00.000Z";
+    const snapshot = await buildQuotaSnapshot({
+      providers: ["claude"],
+      now: () => Date.parse(scrapedAt),
+      getQuota: async () => ({
+        provider: "claude",
+        status: "available",
+        scrapedAt,
+        limits: [
+          {
+            label: "Weekly",
+            kind: "weekly",
+            scope: "provider",
+            percentLeft: 90,
+            resetAtIso: "2030-01-07T00:00:00.000Z",
+          },
+        ],
+      }),
+      // The live read is newer than any stored row, so no row shares its timestamp.
+      listHistory: () => [
+        historyPoint({
+          observedAt: "2030-01-01T00:00:00.000Z",
+          percentLeft: 91,
+          resetAtIso: "2030-01-07T00:00:00.000Z",
+          windowMs: 6 * day,
+        }),
+        historyPoint({
+          observedAt: "2029-12-25T00:00:00.000Z",
+          percentLeft: 95,
+          resetAtIso: "2030-01-01T00:00:00.000Z",
+          windowMs: day,
+        }),
+      ],
+    });
+    expect(snapshot.providers[0]?.windows[0]?.windowMs).toBe(6 * day);
+  });
+});
+
 function fakeReq(method: string): IncomingMessage {
   return { method, headers: {} } as unknown as IncomingMessage;
 }

@@ -37,10 +37,8 @@ const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 
 /**
- * Fixed duration of a window, keyed by its `id`. Every provider models the
- * same two window shapes today — a 7-day weekly window and a short
- * session/5h window — so this is a simple id switch rather than a per-window
- * config: "weekly" is 7 days, everything else is 5 hours.
+ * Compatibility duration for a legacy history record that predates stored
+ * window lengths. New records always carry the duration inferred at insert.
  */
 function windowMsFor(id: string): number {
   return id === "weekly" ? WEEK_MS : FIVE_HOUR_MS;
@@ -67,9 +65,9 @@ export interface QuotaWindowDto {
    */
   headline: boolean;
   /**
-   * Fixed duration of this window in milliseconds (weekly = 7d, session/5h =
-   * 5h). Lets the frontend compute how far through the window `resetAt` is
-   * without needing to know each provider's window length itself.
+   * Duration inferred from this lane's reset evidence and stored with its
+   * reading. Lets the frontend compute progress without guessing a provider's
+   * window shape.
    */
   windowMs: number;
   /**
@@ -606,7 +604,7 @@ function withEstimates(
       status: last.percentLeft <= 0 ? "exhausted" : "available",
       resetAtIso: last.resetAtIso,
       headline: last.kind === "weekly",
-      windowMs: windowMsFor(last.kind),
+      windowMs: storedWindowMs(last),
       scrapedAt: last.observedAt,
       estimated: false,
     };
@@ -641,6 +639,43 @@ function withEstimates(
   };
 }
 
+function storedWindowMs(point: QuotaHistorySource): number {
+  return typeof point.windowMs === "number" && point.windowMs > 0
+    ? point.windowMs
+    : windowMsFor(point.kind);
+}
+
+/**
+ * Give each live window its lane's latest stored duration, the same length the
+ * pacer reads, so the dashboard and pacer agree even when the live read has
+ * not been stored under that exact timestamp.
+ */
+function withStoredWindowMs(
+  dto: ProviderQuotaDto,
+  history: readonly QuotaHistorySource[]
+): ProviderQuotaDto {
+  const latestByLane = new Map<string, QuotaHistorySource>();
+  for (const point of history) {
+    if (typeof point.windowMs !== "number" || point.windowMs <= 0) continue;
+    const lane = quotaLaneKey(point.scope, point.models ?? [], point.kind);
+    const current = latestByLane.get(lane);
+    if (!current || point.observedAt >= current.observedAt) latestByLane.set(lane, point);
+  }
+  const replace = <W extends QuotaWindowDto>(
+    window: W,
+    scope: "provider" | "model",
+    models: readonly string[]
+  ): W => {
+    const windowMs = latestByLane.get(quotaLaneKey(scope, models, window.id))?.windowMs;
+    return windowMs === undefined ? window : { ...window, windowMs };
+  };
+  return {
+    ...dto,
+    windows: dto.windows.map((window) => replace(window, "provider", [])),
+    modelWindows: dto.modelWindows.map((window) => replace(window, "model", window.modelIds)),
+  };
+}
+
 function historyPointLimit(provider: SupportedProvider, point: QuotaHistorySource): QuotaLimit {
   return {
     label: point.label,
@@ -669,7 +704,10 @@ export async function buildQuotaSnapshot(deps: QuotaApiDeps): Promise<QuotaSnaps
     if (state.status === "unknown" || !state.limits || state.limits.length === 0) {
       state = latestStateFromHistory(provider, history, nowMs) ?? state;
     }
-    const dto = toProviderDto(provider, state, deps.getThrottle?.(provider) ?? null);
+    const dto = withStoredWindowMs(
+      toProviderDto(provider, state, deps.getThrottle?.(provider) ?? null),
+      history
+    );
     const staleAfterMs = state.freshness?.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
     return withEstimates(dto, history, staleAfterMs, nowMs);
   });
