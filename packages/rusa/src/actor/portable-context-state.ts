@@ -86,6 +86,37 @@ export const briefCursorSchema = z.object({
 export type BriefCursor = z.infer<typeof briefCursorSchema>;
 
 /**
+ * Auditable accounting for one WHAT/HOW line changed or retired by a brief
+ * rewrite. It is rewrite bookkeeping, never rendered as part of the brief.
+ */
+export const portableBriefSupersessionSchema = z.object({
+  previous: z.object({
+    section: z.enum(["WHAT", "HOW"]),
+    /** The exact raw prior line, including its citation tail. */
+    line: z.string().min(1),
+    /** One-based occurrence of that raw line within its previous section. */
+    occurrence: z.number().int().positive(),
+  }),
+  /** Newer eligible human/ancestor citation authorizing this one change. */
+  source: z.string().min(1),
+  /** Omitted only for a deletion; otherwise an exact candidate line in the same section. */
+  replacement: z
+    .object({
+      section: z.enum(["WHAT", "HOW"]),
+      line: z.string().min(1),
+    })
+    .optional(),
+});
+export type PortableBriefSupersession = z.infer<typeof portableBriefSupersessionSchema>;
+
+/** Verified authority facts retained for cited WHAT/HOW instructions. */
+export const portableBriefAuthoritySchema = z.object({
+  sourceClass: z.enum(["human", "ancestor"]),
+  observedAt: z.string().min(1),
+});
+export type PortableBriefAuthority = z.infer<typeof portableBriefAuthoritySchema>;
+
+/**
  * The per-actor `brief` portable-context mode document (#954 iteration 1).
  *
  * Stored INSIDE the versioned snapshot document (schemaVersion v4) rather than
@@ -134,6 +165,18 @@ export const portableBriefSchema = z.object({
    * ref makes zero resolution calls (for GitHub refs: zero tracker calls).
    */
   resolvedRefs: z.array(z.string().min(1)),
+  /**
+   * The most recent accepted rewrite's per-line change ledger.  It is bounded
+   * by the rewrite validator and remains with the snapshot for audit while the
+   * rendered prompt receives only {@link text}.
+   */
+  supersessions: z.array(portableBriefSupersessionSchema).default([]),
+  /**
+   * Source classes observed at acceptance time.  They let a later rewrite
+   * prove it is not lowering the authority of the line it replaces without
+   * re-resolving historical citations.
+   */
+  citationAuthorities: z.record(z.string(), portableBriefAuthoritySchema).default({}),
 });
 export type PortableBrief = z.infer<typeof portableBriefSchema>;
 

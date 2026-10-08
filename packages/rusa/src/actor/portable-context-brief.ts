@@ -5,7 +5,14 @@ import {
   getGeminiClient,
   withGeminiRetry,
 } from "../understanding/gemini-utils.js";
-import type { BriefCursor, PortableBrief, PortableContextState } from "./portable-context-state.js";
+import type {
+  BriefCursor,
+  PortableBrief,
+  PortableBriefAuthority,
+  PortableBriefSupersession,
+  PortableContextState,
+} from "./portable-context-state.js";
+import { portableBriefSupersessionSchema } from "./portable-context-state.js";
 
 /**
  * The portable-context `brief` mode (#954 iteration 1). Where the `ledger`
@@ -42,6 +49,10 @@ export const PORTABLE_CONTEXT_BRIEF_MAX_SLICE_BYTES = 96 * 1024;
 export const PORTABLE_CONTEXT_BRIEF_MAX_CONSECUTIVE_FAILURES = 3;
 /** Validator-error feedback on the repair retry is itself bounded. */
 export const PORTABLE_CONTEXT_BRIEF_MAX_VALIDATION_ERROR_BYTES = 4 * 1024;
+/** A rewrite can account for a bounded number of prior WHAT/HOW changes. */
+export const PORTABLE_CONTEXT_BRIEF_MAX_SUPERSESSIONS = 64;
+/** The model response includes the 16 KB brief plus bounded audit records. */
+export const PORTABLE_CONTEXT_BRIEF_MAX_RESPONSE_BYTES = 64 * 1024;
 
 const byteLen = (s: string): number => Buffer.byteLength(s, "utf8");
 
@@ -179,6 +190,66 @@ export interface ParsedBrief {
   sections: Record<BriefSection, string[]>;
 }
 
+/** The model's text-only envelope around a candidate brief and its audit records. */
+export interface BriefRewriteResponse {
+  text: string;
+  supersessions: PortableBriefSupersession[];
+}
+
+const BRIEF_RESPONSE_OPEN = "<brief>";
+const BRIEF_RESPONSE_CLOSE = "</brief>";
+const SUPERSESSIONS_RESPONSE_OPEN = "<supersessions>";
+const SUPERSESSIONS_RESPONSE_CLOSE = "</supersessions>";
+
+/**
+ * Parse the response contract without requesting provider-side structured
+ * output. Plain brief text remains readable for an unchanged rewrite, but a
+ * response that changes WHAT/HOW must use the envelope so its records can be
+ * checked before acceptance.
+ */
+export function parseBriefRewriteResponse(value: string): {
+  response?: BriefRewriteResponse;
+  errors: string[];
+} {
+  if (byteLen(value) > PORTABLE_CONTEXT_BRIEF_MAX_RESPONSE_BYTES) {
+    return {
+      errors: [
+        `rewrite response is ${byteLen(value)} bytes, over the ${PORTABLE_CONTEXT_BRIEF_MAX_RESPONSE_BYTES}-byte audit bound`,
+      ],
+    };
+  }
+  if (!value.startsWith(BRIEF_RESPONSE_OPEN)) {
+    return { response: { text: value, supersessions: [] }, errors: [] };
+  }
+  if (!value.startsWith(`${BRIEF_RESPONSE_OPEN}\n`)) {
+    return { errors: ["rewrite response must put the brief on lines inside its envelope"] };
+  }
+  const separator = `\n${BRIEF_RESPONSE_CLOSE}\n${SUPERSESSIONS_RESPONSE_OPEN}\n`;
+  const suffix = `\n${SUPERSESSIONS_RESPONSE_CLOSE}`;
+  if (!value.endsWith(suffix)) {
+    return { errors: ["rewrite response is missing its closing supersessions envelope"] };
+  }
+  const body = value.slice(BRIEF_RESPONSE_OPEN.length);
+  const separatorIndex = body.indexOf(separator);
+  if (separatorIndex < 0 || body.indexOf(separator, separatorIndex + separator.length) >= 0) {
+    return { errors: ["rewrite response must contain exactly one brief/supersessions envelope"] };
+  }
+  const text = body.slice(1, separatorIndex);
+  const recordsText = body.slice(separatorIndex + separator.length, -suffix.length);
+  const supersessions: PortableBriefSupersession[] = [];
+  for (const [index, line] of recordsText.split("\n").entries()) {
+    if (line.trim() === "") continue;
+    try {
+      const parsed = portableBriefSupersessionSchema.parse(JSON.parse(line));
+      supersessions.push(parsed);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return { errors: [`supersession record ${index + 1} is invalid JSON: ${reason}`] };
+    }
+  }
+  return { response: { text, supersessions }, errors: [] };
+}
+
 /**
  * Parse the three-section document. Returns the structured lines plus every
  * shape problem found; a line with no parseable trailing `[ref]` citation is
@@ -271,6 +342,14 @@ export interface BriefValidationInput {
    * human/ancestor supersession.
    */
   authorityCitations: ReadonlySet<string>;
+  /**
+   * Verified source-class facts retained from prior accepted rewrites and the
+   * current delta. They prove a superseding source is not lower authority than
+   * the prior instruction it changes.
+   */
+  citationAuthorities?: ReadonlyMap<string, PortableBriefAuthority>;
+  /** One explicit record for every prior WHAT/HOW line that disappears or changes. */
+  supersessions?: readonly PortableBriefSupersession[];
   /** Refs the model may copy this cycle: current delta, charter, or carried lines. */
   allowedCitations?: ReadonlySet<string>;
   /**
@@ -358,18 +437,95 @@ export function validateBriefText(input: BriefValidationInput): {
   }
 
   if (previous) {
+    const records = input.supersessions ?? [];
+    if (records.length > PORTABLE_CONTEXT_BRIEF_MAX_SUPERSESSIONS) {
+      errors.push(
+        `rewrite has ${records.length} supersession records, over the ${PORTABLE_CONTEXT_BRIEF_MAX_SUPERSESSIONS}-record audit bound`
+      );
+    }
+    const rank = (sourceClass: PortableBriefAuthority["sourceClass"]): number =>
+      sourceClass === "human" ? 2 : 1;
+    const accounted = new Set<number>();
     for (const section of ["WHAT", "HOW"] as const) {
-      const before = previousWhatHowBySection.get(section) ?? new Set<string>();
       const after = newWhatHowBySection.get(section) ?? [];
-      const afterRaw = new Set(after.map((line) => line.raw));
-      const dropped = [...before].filter((raw) => !afterRaw.has(raw));
-      if (dropped.length === 0) continue;
-      const citedReplacements = after.filter(
-        (line) => !before.has(line.raw) && line.refs.some((ref) => authority.has(ref))
-      ).length;
-      if (citedReplacements < dropped.length) {
+      const priorLines = previous.lines.filter((line) => line.section === section);
+      const remainingAfter = new Map<string, number>();
+      for (const line of after)
+        remainingAfter.set(line.raw, (remainingAfter.get(line.raw) ?? 0) + 1);
+      const occurrences = new Map<string, number>();
+      for (const prior of priorLines) {
+        const occurrence = (occurrences.get(prior.raw) ?? 0) + 1;
+        occurrences.set(prior.raw, occurrence);
+        const remaining = remainingAfter.get(prior.raw) ?? 0;
+        if (remaining > 0) {
+          remainingAfter.set(prior.raw, remaining - 1);
+          continue;
+        }
+        const raw = prior.raw;
+        const matches = records
+          .map((record, index) => ({ record, index }))
+          .filter(
+            ({ record }) =>
+              record.previous.section === section &&
+              record.previous.line === raw &&
+              record.previous.occurrence === occurrence
+          );
+        if (matches.length !== 1) {
+          errors.push(
+            `previous ${section} line is missing exactly one supersession record: ${JSON.stringify(raw)}`
+          );
+          continue;
+        }
+        const { record, index } = matches[0];
+        accounted.add(index);
+        if (!authority.has(record.source)) {
+          errors.push(
+            `supersession source is not a newer eligible human/ancestor citation: ${record.source}`
+          );
+        }
+        const sourceAuthority = input.citationAuthorities?.get(record.source);
+        const priorAuthority = prior.refs
+          .map((ref) => input.citationAuthorities?.get(ref))
+          .filter((entry): entry is PortableBriefAuthority => entry !== undefined);
+        if (!sourceAuthority) {
+          errors.push(`supersession source has no verified authority record: ${record.source}`);
+        }
+        if (!priorAuthority || priorAuthority.length === 0) {
+          errors.push(
+            `previous ${section} line has no verified authority record for comparison: ${JSON.stringify(raw)}`
+          );
+        } else if (
+          sourceAuthority &&
+          rank(sourceAuthority.sourceClass) <
+            Math.max(...priorAuthority.map((entry) => rank(entry.sourceClass)))
+        ) {
+          errors.push(
+            `supersession source has lower authority than the previous ${section} line: ${record.source}`
+          );
+        }
+        if (record.replacement) {
+          if (record.replacement.section !== section) {
+            errors.push(
+              `supersession replacement crosses sections from ${section} to ${record.replacement.section}`
+            );
+          }
+          const replacement = after.find((line) => line.raw === record.replacement?.line);
+          if (!replacement) {
+            errors.push(
+              `supersession replacement is absent from candidate ${section}: ${record.replacement.line}`
+            );
+          } else if (!replacement.refs.includes(record.source)) {
+            errors.push(
+              `supersession replacement does not cite its mapped source ${record.source}: ${record.replacement.line}`
+            );
+          }
+        }
+      }
+    }
+    for (const [index, record] of records.entries()) {
+      if (!accounted.has(index)) {
         errors.push(
-          `${dropped.length} previous ${section} line(s) dropped without equally cited human/ancestor supersession(s)`
+          `supersession record does not map a removed or changed prior WHAT/HOW line: ${record.previous.section} ${JSON.stringify(record.previous.line)}`
         );
       }
     }
@@ -424,7 +580,7 @@ export const BRIEF_REWRITE_SYSTEM_INSTRUCTION =
   "Maintain a brief with three sections in order: WHAT (purpose and standing commitments), " +
   "HOW (operating rules and method constraints), DOMAIN (understanding of concepts, mechanisms, " +
   "ownership and recurring failure shapes). One statement per line. Every line ends with one or " +
-  "more structured citations, each in square brackets.\n" +
+  "more structured citations, each in square brackets and adjacent with no punctuation between them.\n" +
   "\n" +
   "Input is the current brief and a bounded delta. Each new message has a verified class and a " +
   "ready-made citation. Human outranks ancestor, which outranks descendant; peer and the actor's " +
@@ -442,8 +598,12 @@ export const BRIEF_REWRITE_SYSTEM_INSTRUCTION =
   "contributes no new lines and at most refines an existing DOMAIN line. These exclusions do not " +
   "apply to citation identifiers.\n" +
   "\n" +
-  "Output the complete three-section brief within 16 KB UTF-8. Keep lines whole and cited. Output " +
-  "nothing else. If supplied validator errors for a repair retry, correct them using the same sources.";
+  "Output the complete three-section brief within 16 KB UTF-8. Keep lines whole and cited. " +
+  "Wrap it exactly in <brief> and </brief>. Then emit <supersessions> and </supersessions>; between " +
+  "them, emit one compact JSON object per changed or removed WHAT/HOW line with previous {section,line,occurrence}, " +
+  "source, and optional replacement {section,line}. A replacement is in the same section and cites source; omit " +
+  "it for deletion. The record block is audit bookkeeping, not brief text. Emit no other prose. If supplied validator " +
+  "errors for a repair retry, correct them using the same sources.";
 
 export const BRIEF_ACCEPTED_CITATION_FORMS = [
   "mesh:messages/<id>",
@@ -517,15 +677,18 @@ export function seedBriefText(actorId: string): string {
 }
 
 /**
- * A steward/peer/descendant status message about PR, check, review or merge
- * progress. Human messages are never milestones: their wording about reviews
- * or merges is direction, and they keep full WHAT/HOW authority.
+ * A completed operational status, not merely prose that mentions a PR, review
+ * or check. Ancestors regularly give durable procedural direction using those
+ * words, and that direction must retain its normal WHAT/HOW authority.
  */
 function isBriefMilestone(message: BriefDeltaMessage): boolean {
   if (message.sourceClass === "human") return false;
-  return /\b(?:pull request|PR\s*#?\d+|checks?|review(?:ed|ing)?|merge[sd]?|staging|gate)\b/i.test(
-    message.body
-  );
+  return [
+    /\b(?:merged?|landed|deployed)\b/i,
+    /\b(?:checks?|CI)\s+(?:are|is|were|was)?\s*(?:green|passed|successful|success|failed|failing|in[ -]?progress)\b/i,
+    /\breview\s+(?:is\s+)?(?:approved|rejected|submitted|complete|completed|pending)\b/i,
+    /\bgate\s+\d+\s*\/\s*\d+\b/i,
+  ].some((pattern) => pattern.test(message.body));
 }
 
 /** Seed the durable brief at the exact switch boundary without touching ledger fields. */
@@ -549,6 +712,10 @@ export function seedPortableBriefState(
       freezeAttentionId: null,
       freezeAttentionOwnerId: null,
       resolvedRefs: [charterRef],
+      supersessions: [],
+      citationAuthorities: {
+        [charterRef]: { sourceClass: "human", observedAt: now },
+      },
     },
   };
 }
@@ -802,6 +969,16 @@ export async function runPortableContextBriefCycle(
       .filter((m) => !milestoneCitations.has(m.citation))
       .map((m) => m.citation)
   );
+  const citationAuthorities = new Map<string, PortableBriefAuthority>(
+    Object.entries(brief.citationAuthorities)
+  );
+  for (const message of delta) {
+    if (!authorityCitations.has(message.citation)) continue;
+    citationAuthorities.set(message.citation, {
+      sourceClass: message.sourceClass as PortableBriefAuthority["sourceClass"],
+      observedAt: message.ts,
+    });
+  }
 
   const resolvedRefs = new Set(brief.resolvedRefs);
   const failedRefsThisCycle = new Set<string>();
@@ -813,7 +990,13 @@ export async function runPortableContextBriefCycle(
     attempt: "initial" | "repair",
     validatorErrors?: string[]
   ): Promise<
-    | { outcome: "accepted"; text: string; inputBytes: number; latencyMs: number }
+    | {
+        outcome: "accepted";
+        text: string;
+        supersessions: PortableBriefSupersession[];
+        inputBytes: number;
+        latencyMs: number;
+      }
     | { outcome: "unavailable"; reason: string }
     | null
   > => {
@@ -825,9 +1008,9 @@ export async function runPortableContextBriefCycle(
     });
     const inputBytes = byteLen(contents);
     const started = Date.now();
-    let text: string;
+    let responseText: string;
     try {
-      text = await deps.rewriter.rewrite(contents);
+      responseText = await deps.rewriter.rewrite(contents);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       deps.recordAttempt({
@@ -845,6 +1028,23 @@ export async function runPortableContextBriefCycle(
     }
     const latencyMs = Date.now() - started;
 
+    const parsedResponse = parseBriefRewriteResponse(responseText);
+    if (!parsedResponse.response) {
+      deps.recordAttempt({
+        attempt,
+        outcome: "rejected",
+        generation: brief.generation + 1,
+        inputBytes,
+        outputBytes: byteLen(responseText),
+        latencyMs,
+        model: deps.rewriter.model,
+        reason: parsedResponse.errors.join("; ").slice(0, 500),
+      });
+      lastErrors = parsedResponse.errors;
+      return null;
+    }
+    const { text, supersessions } = parsedResponse.response;
+
     const candidateRefs = new Set<string>();
     const carriedParsed = parseBriefDocument(brief.text).parsed;
     const carried = new Set(carriedParsed?.lines.map((line) => line.raw) ?? []);
@@ -857,6 +1057,8 @@ export async function runPortableContextBriefCycle(
       text,
       previousText: brief.text,
       authorityCitations,
+      citationAuthorities,
+      supersessions,
       allowedCitations,
       milestoneCitations,
       milestoneOnly,
@@ -936,7 +1138,7 @@ export async function runPortableContextBriefCycle(
       return null;
     }
     for (const ref of candidateRefs) resolvedRefs.add(ref);
-    return { outcome: "accepted", text, inputBytes, latencyMs };
+    return { outcome: "accepted", text, supersessions, inputBytes, latencyMs };
   };
 
   const initial = await tryAttempt("initial");
@@ -991,6 +1193,8 @@ export async function runPortableContextBriefCycle(
       freezeAttentionId: null,
       freezeAttentionOwnerId: null,
       resolvedRefs: [...resolvedRefs],
+      supersessions: accepted.supersessions,
+      citationAuthorities: Object.fromEntries(citationAuthorities),
     },
   });
   return { outcome: "accepted", released, attempts };

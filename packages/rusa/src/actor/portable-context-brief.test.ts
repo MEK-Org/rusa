@@ -31,6 +31,7 @@ import {
   type BriefCursor,
   emptyPortableContextState,
   InMemoryPortableContextStore,
+  type PortableBriefSupersession,
   type PortableContextState,
 } from "./portable-context-state.js";
 
@@ -337,6 +338,24 @@ describe("validateBriefText", () => {
       ),
       previousText: seed,
       authorityCitations: authority,
+      citationAuthorities: new Map([
+        [`mesh:actors/${ACTOR}/charter`, { sourceClass: "human" as const, observedAt: "seed" }],
+        ["mesh:messages/auth-1", { sourceClass: "human" as const, observedAt: "new" }],
+      ]),
+      supersessions: [
+        {
+          previous: {
+            section: "WHAT",
+            line: `The charter is in force; it is rendered in the prompt. [mesh:actors/${ACTOR}/charter]`,
+            occurrence: 1,
+          },
+          source: "mesh:messages/auth-1",
+          replacement: {
+            section: "WHAT",
+            line: `The charter governs everything the actor does. [mesh:actors/${ACTOR}/charter] [mesh:messages/auth-1]`,
+          },
+        },
+      ],
     }).errors;
     expect(withAuthority).toEqual([]);
   });
@@ -351,7 +370,7 @@ describe("validateBriefText", () => {
       previousText: seed,
       authorityCitations: new Set(),
     }).errors;
-    expect(errors.join("\n")).toContain("dropped without equally cited human/ancestor");
+    expect(errors.join("\n")).toContain("missing exactly one supersession record");
   });
 
   it("rejects a WHAT/HOW deletion when an unrelated authority message is present", () => {
@@ -365,7 +384,7 @@ describe("validateBriefText", () => {
       previousText: previous,
       authorityCitations: new Set(["mesh:messages/new-authority"]),
     }).errors;
-    expect(errors.join("\n")).toContain("previous HOW line(s) dropped");
+    expect(errors.join("\n")).toContain("missing exactly one supersession record");
   });
 
   it("a milestone yields no new lines and at most one refined DOMAIN line", () => {
@@ -457,7 +476,7 @@ describe("validateBriefText", () => {
       authorityCitations: new Set(["mesh:messages/new-authority"]),
     }).errors.join("\n");
     expect(descendant).toContain("HOW line changed without a cited human/ancestor supersession");
-    expect(descendant).toContain("1 previous HOW line(s) dropped");
+    expect(descendant).toContain("missing exactly one supersession record");
     // Human/ancestor-cited same-section replacement from this delta: accepted.
     // Which old line it supersedes is the model's judgment under the normative
     // instruction; the deterministic guard proves only the cited, one-for-one,
@@ -467,6 +486,24 @@ describe("validateBriefText", () => {
         text: replaced("mesh:messages/new-authority"),
         previousText: previous,
         authorityCitations: new Set(["mesh:messages/new-authority"]),
+        citationAuthorities: new Map([
+          ["mesh:messages/old-rule", { sourceClass: "ancestor" as const, observedAt: "old" }],
+          ["mesh:messages/new-authority", { sourceClass: "ancestor" as const, observedAt: "new" }],
+        ]),
+        supersessions: [
+          {
+            previous: {
+              section: "HOW",
+              line: "Keep validation deterministic. [mesh:messages/old-rule]",
+              occurrence: 1,
+            },
+            source: "mesh:messages/new-authority",
+            replacement: {
+              section: "HOW",
+              line: "Prefer reproducible checks. [mesh:messages/new-authority]",
+            },
+          },
+        ],
       }).errors
     ).toEqual([]);
     // One authority line cannot pay for two dropped lines.
@@ -480,7 +517,115 @@ describe("validateBriefText", () => {
         previousText: twoPrevious,
         authorityCitations: new Set(["mesh:messages/new-authority"]),
       }).errors.join("\n")
-    ).toContain("2 previous HOW line(s) dropped");
+    ).toContain("missing exactly one supersession record");
+  });
+
+  it("accepts bounded per-line 3→1 consolidation and 1→0 deletion", () => {
+    const previous =
+      "## WHAT\n" +
+      "Rule A. [mesh:messages/old-a]\n" +
+      "Rule B. [mesh:messages/old-b]\n" +
+      "Rule C. [mesh:messages/old-c]\n\n" +
+      "## HOW\nRetire this method. [mesh:messages/old-how]\n\n## DOMAIN\n";
+    const consolidated =
+      "## WHAT\nOne replacement rule. [mesh:messages/new-human]\n\n## HOW\n\n## DOMAIN\n";
+    const authorities = new Map([
+      ["mesh:messages/old-a", { sourceClass: "ancestor" as const, observedAt: "old" }],
+      ["mesh:messages/old-b", { sourceClass: "ancestor" as const, observedAt: "old" }],
+      ["mesh:messages/old-c", { sourceClass: "ancestor" as const, observedAt: "old" }],
+      ["mesh:messages/old-how", { sourceClass: "ancestor" as const, observedAt: "old" }],
+      ["mesh:messages/new-human", { sourceClass: "human" as const, observedAt: "new" }],
+    ]);
+    const records: PortableBriefSupersession[] = ["Rule A.", "Rule B.", "Rule C."].map(
+      (statement, index) => ({
+        previous: {
+          section: "WHAT" as const,
+          line: `${statement} [mesh:messages/old-${String.fromCharCode(97 + index)}]`,
+          occurrence: 1,
+        },
+        source: "mesh:messages/new-human",
+        replacement: {
+          section: "WHAT" as const,
+          line: "One replacement rule. [mesh:messages/new-human]",
+        },
+      })
+    );
+    records.push({
+      previous: {
+        section: "HOW" as const,
+        line: "Retire this method. [mesh:messages/old-how]",
+        occurrence: 1,
+      },
+      source: "mesh:messages/new-human",
+    });
+    expect(
+      validateBriefText({
+        text: consolidated,
+        previousText: previous,
+        authorityCitations: new Set(["mesh:messages/new-human"]),
+        citationAuthorities: authorities,
+        supersessions: records,
+      }).errors
+    ).toEqual([]);
+  });
+
+  it("rejects missing, stale, lower-authority, descendant/peer, and cross-section accounting", () => {
+    const previous = "## WHAT\nOld purpose. [mesh:messages/old-human]\n\n## HOW\n\n## DOMAIN\n";
+    const replacement =
+      "## WHAT\nNew purpose. [mesh:messages/new-ancestor]\n\n## HOW\n\n## DOMAIN\n";
+    const base = {
+      text: replacement,
+      previousText: previous,
+      authorityCitations: new Set(["mesh:messages/new-ancestor"]),
+      citationAuthorities: new Map([
+        ["mesh:messages/old-human", { sourceClass: "human" as const, observedAt: "old" }],
+        ["mesh:messages/new-ancestor", { sourceClass: "ancestor" as const, observedAt: "new" }],
+        ["mesh:messages/child", { sourceClass: "ancestor" as const, observedAt: "new" }],
+      ]),
+    };
+    const record = (
+      source: string,
+      replacementLine = "New purpose. [mesh:messages/new-ancestor]",
+      replacementSection: "WHAT" | "HOW" = "WHAT"
+    ): PortableBriefSupersession => ({
+      previous: {
+        section: "WHAT" as const,
+        line: "Old purpose. [mesh:messages/old-human]",
+        occurrence: 1,
+      },
+      source,
+      replacement: { section: replacementSection, line: replacementLine },
+    });
+    expect(validateBriefText(base).errors.join("\n")).toContain("missing exactly one");
+    expect(
+      validateBriefText({
+        ...base,
+        supersessions: [record("mesh:messages/old-human")],
+      }).errors.join("\n")
+    ).toContain("not a newer eligible");
+    expect(
+      validateBriefText({ ...base, supersessions: [record("mesh:messages/child")] }).errors.join(
+        "\n"
+      )
+    ).toContain("not a newer eligible");
+    expect(
+      validateBriefText({
+        ...base,
+        supersessions: [record("mesh:messages/new-ancestor")],
+      }).errors.join("\n")
+    ).toContain("lower authority");
+    expect(
+      validateBriefText({
+        ...base,
+        supersessions: [
+          record(
+            "mesh:messages/new-ancestor",
+            "A HOW replacement. [mesh:messages/new-ancestor]",
+            "HOW"
+          ),
+        ],
+      }).errors.join("\n")
+    ).toContain("crosses sections");
   });
 
   it("rejects state material in DOMAIN while the citation tail stays valid", () => {
@@ -660,6 +805,61 @@ describe("runPortableContextBriefCycle", () => {
     expect(h.attempts[0].outputBytes).toBeGreaterThan(0);
   });
 
+  it("persists accepted per-line supersession accounting beside the rendered brief", async () => {
+    const previous =
+      `## WHAT\nThe charter is in force; it is rendered in the prompt. [mesh:actors/${ACTOR}/charter]\n\n` +
+      "## HOW\nOld method. [mesh:messages/old-method]\n\n## DOMAIN\n";
+    const candidate =
+      `## WHAT\nThe charter is in force; it is rendered in the prompt. [mesh:actors/${ACTOR}/charter]\n\n` +
+      "## HOW\nNew method. [mesh:messages/m-auth]\n\n## DOMAIN\n";
+    const response =
+      `<brief>\n${candidate}</brief>\n<supersessions>\n` +
+      `${JSON.stringify({
+        previous: {
+          section: "HOW",
+          line: "Old method. [mesh:messages/old-method]",
+          occurrence: 1,
+        },
+        source: "mesh:messages/m-auth",
+        replacement: { section: "HOW", line: "New method. [mesh:messages/m-auth]" },
+      })}\n</supersessions>`;
+    const h = cycleHarness({ sources: [humanMsg], rewriterText: response });
+    await runPortableContextBriefCycle(h.deps); // seed
+    const seeded = h.store.load(ACTOR);
+    const seededBrief = seeded.brief;
+    if (!seededBrief) throw new Error("expected seeded brief");
+    h.store.save({
+      ...seeded,
+      brief: {
+        ...seededBrief,
+        text: previous,
+        cursor: null,
+        citationAuthorities: {
+          [`mesh:actors/${ACTOR}/charter`]: { sourceClass: "human", observedAt: "seed" },
+          "mesh:messages/old-method": { sourceClass: "ancestor", observedAt: "old" },
+        },
+      },
+    });
+    expect(await runPortableContextBriefCycle(h.deps)).toMatchObject({ outcome: "accepted" });
+    const brief = h.store.load(ACTOR).brief;
+    if (!brief) throw new Error("expected accepted brief");
+    expect(brief.text).toBe(candidate.trimEnd());
+    expect(brief.supersessions).toEqual([
+      {
+        previous: {
+          section: "HOW",
+          line: "Old method. [mesh:messages/old-method]",
+          occurrence: 1,
+        },
+        source: "mesh:messages/m-auth",
+        replacement: { section: "HOW", line: "New method. [mesh:messages/m-auth]" },
+      },
+    ]);
+    expect(brief.citationAuthorities["mesh:messages/m-auth"]).toMatchObject({
+      sourceClass: "human",
+    });
+  });
+
   it("rejects a descendant-authored WHAT change, repairs once, and keeps text and cursor on failure", async () => {
     const selfSourced =
       `## WHAT\n` +
@@ -715,6 +915,22 @@ describe("runPortableContextBriefCycle", () => {
     expect(await runPortableContextBriefCycle(allowed.deps)).toMatchObject({
       outcome: "accepted",
     });
+  });
+
+  it("keeps ancestor procedural direction authoritative when it merely mentions reviews and checks", async () => {
+    const procedure = chatSource(
+      "m-procedure",
+      "2026-10-07T00:00:01Z",
+      "steward",
+      "Review the diff, verify checks succeed, and post questions before a verdict."
+    );
+    const rewritten = SEED_TEXT.replace(
+      "## HOW\n\n",
+      "## HOW\nRead evidence before a verdict. [mesh:messages/m-procedure]\n\n"
+    );
+    const h = cycleHarness({ sources: [procedure], rewriterText: rewritten });
+    await runPortableContextBriefCycle(h.deps); // seed
+    expect(await runPortableContextBriefCycle(h.deps)).toMatchObject({ outcome: "accepted" });
   });
 
   it("rejects unresolvable citations and resolves a ref only on its first appearance", async () => {
@@ -987,6 +1203,8 @@ describe("brief render", () => {
         freezeAttentionId: null,
         freezeAttentionOwnerId: null,
         resolvedRefs: [`mesh:actors/${ACTOR}/charter`],
+        supersessions: [],
+        citationAuthorities: {},
       },
     };
     const portable = assemblePortableContextV2({

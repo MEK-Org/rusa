@@ -65,6 +65,8 @@ describe("parsePortableContextState", () => {
         freezeAttentionId: "attention-entry-1",
         freezeAttentionOwnerId: "parent-actor",
         resolvedRefs: ["mesh:actors/actor-a/charter", "mesh:messages/message-1"],
+        supersessions: [],
+        citationAuthorities: {},
       },
     };
 
