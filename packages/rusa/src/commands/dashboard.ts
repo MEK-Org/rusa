@@ -77,6 +77,7 @@ ${"━".repeat(26)}
       // Read-only: stat the shared HALT sentinel. No live actors here, so
       // `runningThreadIds` is intentionally omitted → every thread reads idle.
       isHalted: () => haltSwitch.hasActiveHalt(),
+      haltSnapshot: () => haltSwitch.state(),
       geminiApiKey: config.geminiApiKey,
       rootIdentity: {
         id: rootRecord?.id,

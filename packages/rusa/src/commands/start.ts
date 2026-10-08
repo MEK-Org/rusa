@@ -81,6 +81,10 @@ import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
 import type { InboxChatContextSources } from "../actor/inbox-chat-context.js";
 import { InboxFocusResolver, type ResolvedInboxFocus } from "../actor/inbox-focus.js";
+import {
+  type InboxOpenQuestionSources,
+  resolveInboxSenderPrincipal,
+} from "../actor/inbox-open-questions.js";
 import { HttpJevDecisionClient } from "../actor/jev-decision-client.js";
 import { createJevInboxTextResolver } from "../actor/jev-inbox-text-resolver.js";
 import {
@@ -175,7 +179,7 @@ import { GoogleGmailClient } from "../email/gmail-client.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitops/issue-client.js";
 import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
-import { initEmptyBareRepo } from "../gitops/worktree.js";
+import { getRemoteUrl, initEmptyBareRepo } from "../gitops/worktree.js";
 import { AGENT_EXEC_MCP_NAME, createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
 import {
   CHAT_READ_MCP_NAME,
@@ -216,6 +220,12 @@ import {
 } from "../mcp/understanding-mcp.js";
 import type { UpdateToolDeps } from "../mcp/update-mcp.js";
 import {
+  CompletionMatcherEvaluator,
+  githubRepositoryFromRemote,
+  validateDeployedCompletionMatcher,
+} from "../obligations/completion-matcher-evaluator.js";
+import {
+  type CompletionMatcherInput,
   type EntityId,
   isTerminalObligationStatus,
   type Obligation,
@@ -343,6 +353,7 @@ import {
 } from "../webhook/directed-delivery.js";
 import {
   createDashboardRequestHandler,
+  deployedSha,
   startDashboardServer,
   startWebhookServer,
 } from "../webhook/server.js";
@@ -351,6 +362,11 @@ import {
   WebhookSilenceDetector,
 } from "../webhook/silence-detector.js";
 import { resolveRepoRoot } from "./service-instance.js";
+import {
+  appendServiceBootWakes,
+  recordAndAnnounceRequestedRestart,
+  ServiceLifecycleStore,
+} from "./service-lifecycle.js";
 
 // `update` tool bounds . Per-step HARD timeouts so a hung build can't wedge
 // root; a bounded drain so a stuck worker can't block the restart forever.
@@ -722,6 +738,15 @@ export interface RunStartOptions {
  * the runner is not driving events in-process (e2e mode).
  */
 export function shouldBindWebhookServer(params: { e2eMode: boolean }): boolean {
+  return !params.e2eMode;
+}
+
+/**
+ * Every production boot wakes root with its transition evidence. The e2e
+ * launcher boots disposable scratch compositions in-process, so it owns its
+ * root inbox the same way it omits system:events.
+ */
+export function shouldAppendServiceBootWake(params: { e2eMode: boolean }): boolean {
   return !params.e2eMode;
 }
 
@@ -1544,7 +1569,10 @@ async function composeStart(
         ? (text: string) => slackClient.send(errorSink.target, text).then(() => {})
         : null;
   if (chatClient) {
-    servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
+    const workDir = join(mcHome, "root-agent");
+    // This root-owned server runs on the local leader; follower placement is
+    // checked dynamically on the per-actor server below.
+    servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient, { workDir });
   }
   if (slackClient) {
     // Only root mounts the shared server, so its downloads land in root's workdir.
@@ -1558,6 +1586,15 @@ async function composeStart(
     ...(slackClient ? { slackClient } : {}),
     meshChat: getRepositories().meshChat,
   });
+  const inboxOpenQuestionSources = (): InboxOpenQuestionSources => {
+    const { obligations, principals } = getRepositories();
+    return {
+      resolveSenderPrincipal: (entry) => resolveInboxSenderPrincipal(entry, principals),
+      listOpenQuestions: (ownerId, creatorId, limit) =>
+        obligations.listOwnedPage(ownerId, { creatorId, openOnly: true, limit }),
+      listArtifacts: (obligationId) => obligations.listArtifacts(obligationId),
+    };
+  };
   const responsiveInterruption =
     config.jevApiKeyFile === undefined
       ? undefined
@@ -1604,6 +1641,53 @@ async function composeStart(
     }
   })();
   const addDirs: string[] = repoRoot ? [repoRoot] : [];
+  const excludedGitHubRepos = new Set(
+    (config.github.orgs ?? [])
+      .flatMap((entry) => entry.excludedRepos ?? [])
+      .map((repo) => repo.toLowerCase())
+  );
+  const completionMatcherGit = repoRoot ? new GitRunner(repoRoot) : null;
+  // The repository this build's own checkout came from: `deployed` ancestry
+  // runs in that checkout, so its satisfaction cites that repository. The
+  // configured subscription list is unrelated and may name several repos.
+  const completionMatcherRepository = repoRoot
+    ? githubRepositoryFromRemote(getRemoteUrl(repoRoot))
+    : null;
+  // Same deferred-sink shape as the obligation listeners above: the mesh does
+  // not exist yet, and boot reconciliation re-derives anything missed.
+  let completionMatcherClosedUnmergedSink:
+    | ((ownerId: string, obligationId: string, matcherSetAt: string) => void)
+    | undefined;
+  const completionMatcherEvaluator = new CompletionMatcherEvaluator({
+    obligations: getRepositories().obligations,
+    issueClient,
+    deployedSha: () => deployedSha,
+    isAncestor: (ancestor, descendant) =>
+      completionMatcherGit
+        ? completionMatcherGit.isAncestor(ancestor, descendant)
+        : Promise.reject(new Error("local checkout unavailable")),
+    repository: completionMatcherRepository,
+    instanceName: rootHandle,
+    onClosedUnmerged: (obligation, matcher) =>
+      completionMatcherClosedUnmergedSink?.(obligation.ownerId, obligation.id, matcher.setAt),
+    log: (message) => log.warn("completion_matcher_warning", { message }),
+  });
+  const validateCompletionMatcher = async (matcher: CompletionMatcherInput): Promise<void> => {
+    if (matcher.kind === "deployed") {
+      await validateDeployedCompletionMatcher(matcher.commit, {
+        repository: completionMatcherRepository,
+        git: completionMatcherGit,
+        log: (message) => log.warn("completion_matcher_warning", { message }),
+      });
+      return;
+    }
+    const target = asGitHubIssue(parseReference(matcher.pr));
+    if (target && excludedGitHubRepos.has(`${target.owner}/${target.repo}`.toLowerCase())) {
+      throw new Error(
+        `completion matcher refuses configured excluded repository: ${target.owner}/${target.repo}`
+      );
+    }
+  };
   // Append-only observability log: every message, wake, spawn, and retire lands
   // in `mesh_events` so a run can be replayed as a timeline by `rusa report`.
   // After persisting, broadcast the stored row to any live dashboard SSE clients
@@ -2181,6 +2265,10 @@ async function composeStart(
   const followerTriggerStore = new FollowerUpdateTriggerStore(
     join(mcHome, "data", "follower-update-trigger.json")
   );
+  const serviceLifecycleStore = new ServiceLifecycleStore(
+    join(mcHome, "data", "service-lifecycle.json")
+  );
+  let requestedRestartTransitionId: string | undefined;
   let updateToolDepsFor: ((selfId: string) => UpdateToolDeps) | undefined;
   try {
     const repoRoot = resolveRepoRoot();
@@ -2207,6 +2295,18 @@ async function composeStart(
           log: (m) => log.info("update_coordinator", { detail: m }),
         }),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
+        onRestarting: async (newSha, branch, subject) => {
+          requestedRestartTransitionId = undefined;
+          requestedRestartTransitionId = await recordAndAnnounceRequestedRestart({
+            lifecycle: serviceLifecycleStore,
+            entries: selectedInboxEntriesForActor(selfId),
+            chatClient: chatClient ?? undefined,
+            targetSha: newSha,
+            branch,
+            subject,
+            onWarning: (event, fields) => log.warn(event, fields),
+          });
+        },
         onCommitted: (newSha, branch) => {
           try {
             followerTriggerStore.createTrigger({
@@ -2827,9 +2927,8 @@ async function composeStart(
     // here rather than at routing time hangs boot.
     obligations: {
       findLiveByExternalRef: (ref) => getRepositories().obligations.findLiveByExternalRef(ref),
-      // Strict-obligation handling snapshots these unbounded edge reads at
-      // selection. Keep the production wiring on the same durable repository
-      // seam as the experiment registry.
+      // Strict head closure (#917) snapshots these unbounded edge reads at
+      // every head selection, so they read the same durable repository.
       get: (id) => getRepositories().obligations.get(id),
       listDirectChildEdges: (parentId) =>
         getRepositories().obligations.listDirectChildEdges(parentId),
@@ -3140,6 +3239,7 @@ async function composeStart(
             assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(id, entryIds),
             isVoiceSessionActive: () => voiceService?.hasActiveSession(id) ?? false,
             chatContext: inboxChatContextSources(),
+            openQuestions: inboxOpenQuestionSources(),
           })
         );
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
@@ -3149,6 +3249,9 @@ async function composeStart(
             canManage: (callerId, obligation) =>
               canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
             recordEvent: (event) => mesh.recordEvent(event),
+            validateCompletionMatcher,
+            evaluateCompletionMatcher: (obligationId) =>
+              completionMatcherEvaluator.evaluate(obligationId),
           })
         );
         const meshChatUrl = mcpHttp.addServer(`${id}:${MESH_CHAT_MCP_NAME}`, () =>
@@ -3208,7 +3311,10 @@ async function composeStart(
         ];
         if (chatClient) {
           const chatReadUrl = mcpHttp.addServer(`${id}:${CHAT_READ_MCP_NAME}`, () =>
-            createChatReadMcpServer(chatClient)
+            createChatReadMcpServer(chatClient, {
+              workDir: join(workersDir, id),
+              fileToolsAvailable: () => actors.get(id)?.executionTarget === undefined,
+            })
           );
           perActorShared.push({ name: CHAT_READ_MCP_NAME, url: chatReadUrl });
         }
@@ -3462,6 +3568,9 @@ async function composeStart(
   prerequisiteCancellationSink = ({ dependentId, dependentOwnerId, prerequisiteId }) => {
     mesh.deliverPrerequisiteCancelledAttention(dependentOwnerId, dependentId, prerequisiteId);
   };
+  completionMatcherClosedUnmergedSink = (ownerId, obligationId, matcherSetAt) => {
+    mesh.deliverCompletionMatcherClosedUnmergedAttention(ownerId, obligationId, matcherSetAt);
+  };
   statusChangeSink = (change) => mesh.recordEvent(obligationStatusChangedEvent(change));
   responsiveReadySink = (obligation, actingPrincipal) => {
     mesh.deliverResponsiveReadyAttention(
@@ -3584,6 +3693,7 @@ async function composeStart(
       assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(rootId, entryIds),
       isVoiceSessionActive: () => voiceService?.hasActiveSession(rootId) ?? false,
       chatContext: inboxChatContextSources(),
+      openQuestions: inboxOpenQuestionSources(),
     })
   );
   const rootMeshChatUrl = mcpHttp.addServer(`${rootId}:${MESH_CHAT_MCP_NAME}`, () =>
@@ -3595,6 +3705,9 @@ async function composeStart(
       canManage: () => true,
       resolveOwner: (raw) => resolveObligationOwner(actors, raw, getRepositories().principals),
       recordEvent: (event) => mesh.recordEvent(event),
+      validateCompletionMatcher,
+      evaluateCompletionMatcher: (obligationId) =>
+        completionMatcherEvaluator.evaluate(obligationId),
     })
   );
   const rootPnpmInstallUrl = mcpHttp.addServer(`${rootId}:${PNPM_INSTALL_MCP_NAME}`, () =>
@@ -3935,6 +4048,19 @@ async function composeStart(
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
   }
+  try {
+    mesh.reconcileCompletionMatcherClosedUnmergedAttention(getRepositories().obligations);
+  } catch (_err) {
+    // Database may be closed during test shutdown/teardown races
+  }
+  // One GitHub read per live `pr_merged` matcher: run it after startup rather
+  // than in front of it. Each row is isolated inside the evaluator; this catch
+  // only covers the listing itself (e.g. a teardown race).
+  void completionMatcherEvaluator.reconcileAtBoot().catch((err: unknown) => {
+    log.warn("completion_matcher_boot_reconcile_failed", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  });
   const restored = actors.list().filter((r) => r.status === "active" && r.id !== rootId);
   if (restored.length > 0) {
     console.log(`[mesh] rehydrated ${restored.length} active actor(s) from the repository`);
@@ -3959,12 +4085,6 @@ async function composeStart(
   const dashboardPort = config.dashboard?.port ?? 8080;
   const dashboardBindHost = config.dashboard?.bindHost ?? "127.0.0.1";
   const botLogin = config.github.account?.toLowerCase();
-  const excludedGitHubRepos = new Set(
-    (config.github.orgs ?? [])
-      .flatMap((entry) => entry.excludedRepos ?? [])
-      .map((repo) => repo.toLowerCase())
-  );
-
   const onEvent = async (
     event: string,
     payload: Record<string, unknown>,
@@ -3983,6 +4103,29 @@ async function composeStart(
         `[github] configured excluded repository event dropped: ${event} on ${repoFullName}`
       );
       return;
+    }
+    // Completion matching deliberately runs before every authorship, bot, and
+    // subscription delivery filter. A staging merge made by the bot must close
+    // its explicitly-matched obligation even when no actor subscribed to the
+    // repository and even when no routable owner exists for this webhook.
+    if (event === "pull_request" && action === "closed" && repoFullName) {
+      const pull = payload.pull_request as { number?: number; merged?: boolean } | undefined;
+      const number = pull?.number ?? (payload.number as number | undefined);
+      if (typeof number === "number") {
+        // Matching must never cost the delivery its ordinary routing; boot
+        // reconciliation re-reads the PR for anything this misses.
+        try {
+          await completionMatcherEvaluator.handlePullRequestClosed({
+            repo: repoFullName,
+            number,
+            merged: pull?.merged === true,
+          });
+        } catch (err) {
+          log.warn("completion_matcher_event_failed", {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
     }
     // Directive-only: this walks a parent fallback chain and must never feed authorship.
     // See authorStampBodyForWebhookPayload.
@@ -4168,6 +4311,7 @@ async function composeStart(
           // which actors are executing a run right now — for the header HALTED
           // indicator and per-thread run-state dots. No new mesh behavior.
           isHalted: () => haltSwitch.hasActiveHalt(),
+          haltSnapshot: () => haltSwitch.state(),
           // Surfaces the boot-time `at`/`atrm`/`atd`/`atq` AND `crontab`/crond/
           // cron.allow-cron.deny preflights so a missing one-shot facility or an
           // unusable crontab is dashboard/health-visible, not just a startup
@@ -4592,7 +4736,25 @@ async function composeStart(
     e2eInstance.stopForMeshShutdown();
     running = false;
     console.log("\n🛑 Shutting down...");
-    await resources.close();
+    const disposeFailures = await resources.close();
+    if (disposeFailures.length === 0) {
+      try {
+        serviceLifecycleStore.recordCleanShutdown(
+          reason === "deploy" ? "deploy" : "signal",
+          reason === "deploy" ? requestedRestartTransitionId : undefined
+        );
+      } catch (error) {
+        log.warn("service_shutdown_evidence_persist_failed", {
+          reason: reason ?? "signal",
+          err: error,
+        });
+      }
+    } else {
+      log.warn("service_shutdown_incomplete", {
+        reason: reason ?? "signal",
+        failures: disposeFailures.map((failure) => failure.resource),
+      });
+    }
     log.info("service_stopped", { reason });
     process.exit(exitCode ?? getShutdownExitCode(reason));
   };
@@ -4869,6 +5031,23 @@ async function composeStart(
   });
 
   console.log("\n✓ Root actor live. Waiting for events...\n");
+
+  // Every successful boot creates durable root work. The file records the boot
+  // before this append; if this process dies between them, the next boot retries
+  // the same deterministic inbox id before adding its own distinct wake. A
+  // corrupt evidence file is retained and produces its own unknown-evidence wake.
+  if (shouldAppendServiceBootWake({ e2eMode })) {
+    try {
+      appendServiceBootWakes({
+        lifecycle: serviceLifecycleStore,
+        inboxStore,
+        rootId,
+        onLifecycleError: (event, fields) => log.warn(event, fields),
+      });
+    } catch (error) {
+      log.warn("service_boot_wake_failed", { err: error });
+    }
+  }
 
   // Mechanical lifecycle ping : emitted by startup once the mesh is up.
   // A lone "back online" with no preceding "updating" ping is the restart/crash signal.

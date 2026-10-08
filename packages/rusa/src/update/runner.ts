@@ -189,6 +189,42 @@ export class GitRunner implements GitSeam {
       throw error;
     }
   }
+  /** Whether this checkout already has `sha` as a commit object. */
+  async hasCommit(sha: string): Promise<boolean> {
+    try {
+      await this.git("git-has-commit", ["cat-file", "-e", `${sha}^{commit}`]);
+      return true;
+    } catch (error) {
+      if (error instanceof StepError && /exited 128(?:\D|$)/.test(error.message)) return false;
+      throw error;
+    }
+  }
+  /**
+   * Fetch one commit by SHA from this checkout's remote without moving any
+   * ref. Returns false when the remote refuses it as not its own ("not our
+   * ref"); any other failure (network, timeout) throws so callers can tell
+   * "foreign or mistyped" from "could not ask".
+   */
+  async fetchCommit(sha: string): Promise<boolean> {
+    try {
+      await this.git(
+        "git-fetch-commit",
+        [
+          "fetch",
+          "--no-tags",
+          "--no-recurse-submodules",
+          "--no-write-fetch-head",
+          this.remote,
+          sha,
+        ],
+        120_000
+      );
+      return true;
+    } catch (error) {
+      if (error instanceof StepError && /not our ref/i.test(error.message)) return false;
+      throw error;
+    }
+  }
   async resetHard(ref: string): Promise<void> {
     await this.git("git-reset", ["reset", "--hard", ref]);
   }

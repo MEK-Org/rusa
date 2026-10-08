@@ -51,6 +51,15 @@ interface InFlightRead {
   answeredPending: boolean;
 }
 
+/**
+ * One request's foreground wait for cold references (#933). Every get given
+ * the same budget gives up at the same instant, so a request that resolves
+ * many references waits one deadline in total rather than one per reference.
+ */
+export interface ReferenceBudget {
+  readonly deadlineAt: number;
+}
+
 export interface ReferenceCacheServiceOptions {
   repo: ReferenceCacheRepository;
   ttlMs?: number;
@@ -98,7 +107,16 @@ export class ReferenceCacheService {
     this.logger = options.logger;
   }
 
-  async get(ref: string, deps: ReferenceResolverDeps): Promise<ResolvedReferenceWithEntity> {
+  /** Starts a foreground budget of one UI deadline, to share across a request's gets. */
+  startBudget(): ReferenceBudget {
+    return { deadlineAt: Date.now() + this.deadlineMs };
+  }
+
+  async get(
+    ref: string,
+    deps: ReferenceResolverDeps,
+    budget?: ReferenceBudget
+  ): Promise<ResolvedReferenceWithEntity> {
     const reference = parseReference(ref);
     const key = reference.key;
 
@@ -179,11 +197,12 @@ export class ReferenceCacheService {
     });
     const shared = this.sharedProviderRead(key, deps);
     const readPromise = shared.read;
+    const waitMs = budget ? Math.max(0, budget.deadlineAt - Date.now()) : this.deadlineMs;
     const deadlinePromise = new Promise<"deadline">((resolve) =>
       setTimeout(() => {
         shared.answeredPending = true;
         resolve("deadline");
-      }, this.deadlineMs)
+      }, waitMs)
     );
 
     const result = await Promise.race([readPromise, deadlinePromise]);

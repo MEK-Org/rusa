@@ -7,6 +7,7 @@ import {
   type EventTransferReply,
   FOLLOWER_EVENT_BATCH_MAX_EVENTS,
   FOLLOWER_HTTP_BODY_LIMIT_BYTES,
+  type FollowerParkedEvent,
 } from "./protocol.js";
 
 /**
@@ -141,6 +142,14 @@ export class FollowerEventQueue {
    * until the queue is cleared.
    */
   private acceptanceFailed: QueuedEvent | undefined;
+  /**
+   * The head as last parked. It clears only when a request is sent or on
+   * `clear()`, so a head that keeps parking before reaching the wire keeps
+   * its `since`.
+   */
+  private parked: FollowerParkedEvent | undefined;
+
+  constructor(private readonly now: () => number = Date.now) {}
 
   enqueue(event: FollowerEvent): void {
     const json = JSON.stringify(event);
@@ -156,6 +165,11 @@ export class FollowerEventQueue {
     return this.pendingBatch !== undefined || this.events.length > 0;
   }
 
+  /** The parked head, content-free, for follower status (#880). */
+  get parkedHead(): FollowerParkedEvent | undefined {
+    return this.parked && { ...this.parked };
+  }
+
   /** False once `clear()` has fenced the delivery still in flight. */
   get isFlushing(): boolean {
     return this.inFlight?.epoch === this.epoch;
@@ -168,6 +182,7 @@ export class FollowerEventQueue {
     this.parkedKey = undefined;
     this.refused = undefined;
     this.acceptanceFailed = undefined;
+    this.parked = undefined;
     this.events.length = 0;
   }
 
@@ -245,6 +260,7 @@ export class FollowerEventQueue {
       }
       const batch = this.pendingBatch as PendingBatch;
       const prefix = JSON.stringify({ ...envelope, batchId: batch.batchId }).slice(0, -1);
+      this.parked = undefined;
       try {
         await deliver({
           batchId: batch.batchId,
@@ -276,6 +292,15 @@ export class FollowerEventQueue {
     const key = `${event.eventId}:${reason}`;
     const repeated = this.parkedKey === key;
     this.parkedKey = key;
+    if (this.parked?.eventId !== event.eventId || this.parked.reason !== reason) {
+      this.parked = {
+        reason,
+        eventId: event.eventId,
+        eventType: event.eventType,
+        bytes: event.bytes,
+        since: new Date(this.now()).toISOString(),
+      };
+    }
     throw new FollowerEventParkedError(
       reason,
       event.eventId,
@@ -348,6 +373,7 @@ export class FollowerEventQueue {
       this.pendingTransfer = undefined;
       return this.park(pending.event, "fragment_too_large", FOLLOWER_HTTP_BODY_LIMIT_BYTES);
     }
+    this.parked = undefined;
     const reply = await transfer.send(fragment);
     // A leader-incarnation fence cleared the queue while this request was in flight.
     if (this.pendingTransfer !== pending) return;

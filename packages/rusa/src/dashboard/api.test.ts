@@ -8,6 +8,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
+import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { RootChildRequest, RootControlService } from "../actor/root-control.js";
 import {
@@ -519,6 +520,53 @@ describe("handleMeshApiRequest", () => {
         terminalNote: "Original terminal note",
         resolutionRef: "mesh:messages/original-terminal",
       });
+    });
+
+    it("resolves a page of cold references against one deadline, bounded and in store order (#933)", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      const ids = Array.from({ length: 12 }, (_, i) => `cold-${String(i).padStart(2, "0")}`);
+      inbox.append(
+        ids.map((id, i) => ({
+          id,
+          actorId: UUID_A,
+          source: `github:o/r/issues/${i + 1}`,
+          payload: { type: "issues.opened" },
+        }))
+      );
+      inbox.markHandled(UUID_A, ids, new Date("2026-09-26T03:15:00.000Z"), "Addressed");
+      const getIssue = vi.fn(() => new Promise<never>(() => {}));
+      const coldDeps = {
+        ...deps,
+        referenceCache: new ReferenceCacheService({
+          repo: new ReferenceCacheRepository(db),
+          deadlineMs: 60_000,
+        }),
+        issueClient: { getIssue },
+      } as unknown as DashboardDataDeps;
+
+      vi.useFakeTimers({ toFake: ["setTimeout"] });
+      try {
+        let answered = false;
+        const response = call(coldDeps, "GET", "/api/mesh/recent-activity?limit=20").then((r) => {
+          answered = true;
+          return r;
+        });
+        // One deadline answers the whole page; resolving entry by entry
+        // waited one deadline per entry.
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(answered).toBe(true);
+        const items = JSON.parse((await response).res.body).items as Array<{
+          id: string;
+          reference?: { cacheState?: string };
+        }>;
+        expect(items.map((item) => item.id)).toEqual(
+          inbox.listRecentHandledEntries(20).map((entry) => `inbox_${entry.id}`)
+        );
+        expect(items.every((item) => item.reference?.cacheState === "pending")).toBe(true);
+        expect(getIssue).toHaveBeenCalledTimes(12);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -1856,6 +1904,58 @@ describe("handleMeshApiRequest", () => {
     expect(byId("root").runState).toBe("idle");
   });
 
+  it("GET /api/mesh/threads projects the active halt scope and expiry without its reason (#906)", async () => {
+    actors.upsert(rec("root", null, "active"));
+    const dir = mkdtempSync(join(tmpdir(), "mc-api-halt-scope-"));
+    try {
+      const now = Date.parse("2026-10-04T12:00:00.000Z");
+      const sw = new HaltSwitch(join(dir, "HALT"), () => now);
+      deps = {
+        ...deps,
+        isHalted: () => sw.hasActiveHalt(),
+        haltSnapshot: () => sw.state(),
+      };
+      const halt = async () =>
+        JSON.parse((await call(deps, "GET", "/api/mesh/threads")).res.body).halt;
+
+      expect(await halt()).toBeNull();
+
+      sw.halt("private operator note");
+      expect(await halt()).toEqual({ scope: "global" });
+      sw.resume();
+
+      sw.halt("note", { providers: ["codex"], until: "2026-10-04T17:52:00Z" });
+      expect(await halt()).toEqual({
+        scope: "providers",
+        providers: ["codex"],
+        until: "2026-10-04T17:52:00.000Z",
+      });
+      sw.resume();
+
+      sw.halt("", { providers: ["claude"], models: ["claude-opus-5-5"] });
+      const body = JSON.parse((await call(deps, "GET", "/api/mesh/threads")).res.body);
+      expect(body.halted).toBe(true);
+      expect(body.halt).toEqual({
+        scope: "models",
+        providers: ["claude"],
+        models: ["claude-opus-5-5"],
+      });
+      expect(JSON.stringify(body.halt)).not.toContain("reason");
+      sw.resume();
+
+      // An expired sentinel is retired by the switch: neither the badge nor the
+      // scope claims it is still active.
+      sw.halt("", { providers: ["codex"], until: "2026-10-04T12:30:00Z" });
+      const later = new HaltSwitch(join(dir, "HALT"), () => Date.parse("2026-10-04T13:00:00Z"));
+      deps = { ...deps, isHalted: () => later.hasActiveHalt(), haltSnapshot: () => later.state() };
+      const expired = JSON.parse((await call(deps, "GET", "/api/mesh/threads")).res.body);
+      expect(expired.halted).toBe(false);
+      expect(expired.halt).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("GET /api/mesh/threads projects active-run focus but never speculative queued focus", async () => {
     actors.upsert(rec("root", null, "active"));
     actors.upsert(rec(UUID_A, "root", "active"));
@@ -2111,6 +2211,8 @@ describe("handleMeshApiRequest", () => {
     actors.upsert(rec("root", null, "active"));
     actors.upsert(rec(UUID_A, "root", "active"));
     actors.upsert(rec(UUID_B, "root", "retired"));
+    actors.upsert(rec("empty_active", "root", "active"));
+    actors.upsert(rec("retired_with_events", "root", "retired"));
 
     meshEvents.record({ kind: "run_start", actorId: UUID_A, ts: "2026-06-21T00:00:00.000Z" });
     meshEvents.record({
@@ -2119,12 +2221,20 @@ describe("handleMeshApiRequest", () => {
       success: true,
       ts: "2026-06-22T00:00:00.000Z",
     });
+    meshEvents.record({
+      kind: "run_end",
+      actorId: "retired_with_events",
+      success: true,
+      ts: "2026-06-23T00:00:00.000Z",
+    });
 
     const { res } = await call(deps, "GET", "/api/mesh/threads");
     const body = JSON.parse(res.body);
     const byId = (id: string) => body.threads.find((t: { id: string }) => t.id === id);
     expect(byId(UUID_A).lastActiveAt).toBe("2026-06-22T00:00:00.000Z");
+    expect(byId("retired_with_events").lastActiveAt).toBe("2026-06-23T00:00:00.000Z");
     expect(byId(UUID_B).lastActiveAt).toBeNull();
+    expect(byId("empty_active").lastActiveAt).toBeNull();
     expect(byId("root").lastActiveAt).toBeNull();
   });
 
@@ -4044,6 +4154,7 @@ describe("handleMeshApiRequest", () => {
         const depsWithCache = {
           ...deps,
           referenceCache: {
+            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
             get: async (ref: string) => {
               if (ref.includes("issues/1")) {
                 return {
@@ -4107,6 +4218,7 @@ describe("handleMeshApiRequest", () => {
         const depsWithCache = {
           ...deps,
           referenceCache: {
+            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
             get: async (ref: string) => {
               if (ref.includes("issues/345")) {
                 return {
@@ -4182,6 +4294,7 @@ describe("handleMeshApiRequest", () => {
         const depsWithCache = {
           ...deps,
           referenceCache: {
+            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
             get: async (ref: string) => {
               if (ref.includes("comments")) {
                 return {
@@ -4289,6 +4402,38 @@ describe("handleMeshApiRequest", () => {
           contents: "Arrived after the deadline",
         });
         expect(getMessage).toHaveBeenCalledTimes(1);
+      });
+
+      it("waits one deadline for a cold artifact and a different cold external reference (#933)", async () => {
+        obligations.create({ title: "two-cold", id: "two-cold", ownerId: "actor-1" });
+        obligations.attachArtifact("two-cold", "github:o/r/issues/1");
+        obligations.setExternalRef("two-cold", "github:o/r/issues/2", "system:mesh");
+        const getIssue = vi.fn(() => new Promise<never>(() => {}));
+        const coldDeps = {
+          ...deps,
+          referenceCache: new ReferenceCacheService({
+            repo: new ReferenceCacheRepository(db),
+            deadlineMs: 60_000,
+          }),
+          issueClient: { getIssue },
+        } as unknown as DashboardDataDeps;
+
+        vi.useFakeTimers({ toFake: ["setTimeout"] });
+        try {
+          let answered = false;
+          const response = call(coldDeps, "GET", "/api/mesh/obligations/two-cold").then((r) => {
+            answered = true;
+            return r;
+          });
+          await vi.advanceTimersByTimeAsync(60_000);
+          expect(answered).toBe(true);
+          const data = JSON.parse((await response).res.body);
+          expect(data.artifacts[0].reference.cacheState).toBe("pending");
+          expect(data.externalReference.cacheState).toBe("pending");
+          expect(getIssue).toHaveBeenCalledTimes(2);
+        } finally {
+          vi.useRealTimers();
+        }
       });
 
       it("404s when obligation not found", async () => {

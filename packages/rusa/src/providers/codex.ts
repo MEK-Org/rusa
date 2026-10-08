@@ -381,13 +381,26 @@ export interface ListEffectiveCodexMcpServersOptions {
 }
 
 /**
+ * How discovery failed, for the run's failure output. Node's own error message is
+ * `Command failed: <argv>\n<stderr>` for a nonzero exit and for a timeout kill
+ * alike, so the CLI's stderr can make a benign warning read as the cause. Name
+ * the outcome without repeating argv, stdout, or stderr: all three are
+ * untrusted command output and may contain configuration or credentials.
+ */
+function describeDiscoveryFailure(outcome: string): Error {
+  return new Error(`codex mcp list ${outcome}`);
+}
+
+/**
  * Discover configured MCP servers in the effective configuration using `codex mcp list --json`.
  * Runs with the actual invocation's effective config/context (including bwrap/overrides/signal).
- * Throws if the discovery command fails, is cancelled, or output cannot be parsed.
+ * Throws if the discovery command fails, is cancelled, or its output is not a JSON list; the
+ * error names which, without copying untrusted process output.
  */
 export async function listEffectiveCodexMcpServers(
   options: ListEffectiveCodexMcpServersOptions
 ): Promise<Array<{ name: string; enabled?: boolean; transport?: unknown }>> {
+  const timeoutMs = options.timeoutMs ?? 5_000;
   return new Promise((resolve, reject) => {
     execFile(
       options.command,
@@ -396,26 +409,45 @@ export async function listEffectiveCodexMcpServers(
         cwd: options.cwd,
         env: options.env ?? process.env,
         encoding: "utf-8",
-        timeout: options.timeoutMs ?? 5_000,
+        timeout: timeoutMs,
         signal: options.signal,
         maxBuffer: 10 * 1024 * 1024,
       },
       (error, stdout) => {
         if (error) {
-          reject(error);
+          // A string code is a spawn/abort/buffer failure; `killed` is Node's own
+          // kill (the timeout); a bare signal came from elsewhere.
+          const outcome =
+            typeof error.code === "string"
+              ? `could not complete (${error.code})`
+              : error.killed
+                ? `did not finish within ${timeoutMs}ms (terminated by ${error.signal ?? "kill"})`
+                : error.signal
+                  ? `was terminated by ${error.signal}`
+                  : `exited ${error.code ?? "unsuccessfully"}`;
+          reject(describeDiscoveryFailure(outcome));
           return;
         }
-        try {
-          resolve(
-            JSON.parse(stdout) as Array<{
-              name: string;
-              enabled?: boolean;
-              transport?: unknown;
-            }>
-          );
-        } catch (err) {
-          reject(err);
+        if (stdout.trim() === "") {
+          reject(describeDiscoveryFailure("exited 0 with no output"));
+          return;
         }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(stdout);
+        } catch {
+          reject(
+            describeDiscoveryFailure(
+              `exited 0 with invalid JSON (${Buffer.byteLength(stdout)} bytes)`
+            )
+          );
+          return;
+        }
+        if (!Array.isArray(parsed)) {
+          reject(describeDiscoveryFailure("exited 0 with JSON that is not a server list"));
+          return;
+        }
+        resolve(parsed as Array<{ name: string; enabled?: boolean; transport?: unknown }>);
       }
     );
   });

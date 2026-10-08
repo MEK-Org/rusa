@@ -73,6 +73,7 @@ const OBLIGATION_PAYLOAD_TYPES = new Set([
   "obligation.ready_head",
   "obligation.ready_responsive",
   "obligation.prerequisite_cancelled",
+  "obligation.completion_matcher_closed_unmerged",
 ]);
 
 /** The canonical key of a GitHub issue or PR source, or null for anything else. */

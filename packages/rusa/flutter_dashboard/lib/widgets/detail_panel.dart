@@ -4,6 +4,7 @@ import 'dart:async';
 import 'package:rxdart/rxdart.dart';
 
 import '../breakpoints.dart';
+import '../dashboard_timing.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -609,7 +610,7 @@ class _InfoViewState extends State<_InfoView> {
   @override
   void initState() {
     super.initState();
-    _loadCharter();
+    _loadCharter(trackDetail: true);
   }
 
   @override
@@ -619,22 +620,36 @@ class _InfoViewState extends State<_InfoView> {
     // re-fetch are one condition: a new actor (the tab is reused across
     // selections, so otherwise the panel shows the previous actor's charter
     // under a new handle), and a fetch that failed.
-    _loadCharter();
+    final isNewActor = old.actor.id != widget.actor.id;
+    _loadCharter(trackDetail: isNewActor);
   }
 
-  Future<void> _loadCharter() async {
+  Future<void> _loadCharter({bool trackDetail = false}) async {
     final id = widget.actor.id;
     if (_loadedFor == id) return;
     _loadedFor = id;
     final fetch = ++_fetch;
     setState(() => _charter = null);
-    try {
+    Future<void> runFetch() async {
       final charter = await widget.store.fetchCharter(id);
       // Anything sent since this supersedes it, whichever actor it was asking
       // for: another actor selected, or a second look at the same one after a
       // failure. Only the newest answer is allowed to land.
-      if (!mounted || fetch != _fetch) return;
+      if (!mounted || fetch != _fetch) {
+        throw StateError('Actor detail fetch superseded or unmounted');
+      }
       setState(() => _charter = charter);
+    }
+
+    try {
+      if (trackDetail) {
+        await widget.store.api.trackInteraction(
+          DashboardInteraction.actorDetail,
+          runFetch,
+        );
+      } else {
+        await runFetch();
+      }
     } catch (_) {
       // The preview stays on screen and the store has already surfaced the
       // error — but release the id, so the next poll retries rather than

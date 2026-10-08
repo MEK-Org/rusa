@@ -6,6 +6,7 @@ import 'package:rxdart/rxdart.dart';
 import 'actor_display.dart';
 import 'actor_hierarchy_cache.dart';
 import 'api.dart';
+import 'dashboard_timing.dart';
 import 'avatar_platform.dart';
 import 'mesh_stream.dart';
 import 'models.dart';
@@ -346,6 +347,7 @@ class DashboardStore {
     const ActorStateSnapshot.empty(),
   );
   final _halted = BehaviorSubject<bool>.seeded(false);
+  final _haltStatus = BehaviorSubject<HaltStatusDto?>.seeded(null);
   final _schedulerWarning = BehaviorSubject<List<String>?>.seeded(null);
   final _supportedVoices = BehaviorSubject<List<SupportedVoiceDto>>.seeded(
     const [],
@@ -434,12 +436,14 @@ class DashboardStore {
   RuntimeCursor? _runtimeCursor;
   final List<ActorRuntimeStateDelta> _runtimeBuffer = [];
   Future<void>? _runtimeSyncTask;
+  int _authoritativeThreadSnapshots = 0;
   bool _runtimeSyncAgain = false;
   Duration _runtimeRetryDelay = _kRuntimeRetryInitial;
 
   // ── Exposed streams ──
   ValueStream<ActorStateSnapshot> get actorStates => _actorStates.stream;
   ValueStream<bool> get halted => _halted.stream;
+  ValueStream<HaltStatusDto?> get haltStatus => _haltStatus.stream;
   ValueStream<List<String>?> get schedulerWarning => _schedulerWarning.stream;
   ValueStream<List<SupportedVoiceDto>> get supportedVoices =>
       _supportedVoices.stream;
@@ -572,7 +576,22 @@ class DashboardStore {
     _subs.add(_stream.avatarUpdates.listen(_onAvatarUpdate));
     _subs.add(_actorStates.listen(_syncRunSelections));
     _stream.connect(const []); // mesh_event flows for all actors regardless
-    await refreshThreads();
+    try {
+      await _api.trackInteraction(DashboardInteraction.initialLoad, () async {
+        final snapshotsBefore = _authoritativeThreadSnapshots;
+        await refreshThreads();
+        // `_requestRuntimeSync` deliberately catches and retries a transient
+        // failure for the dashboard. The initial interaction is not usable
+        // until that first authoritative thread snapshot has actually landed.
+        if (_authoritativeThreadSnapshots == snapshotsBefore) {
+          throw StateError('initial thread snapshot unavailable');
+        }
+      });
+    } on StateError catch (_) {
+      // `_runRuntimeSync` already exposed the original failure and scheduled
+      // its existing retry. Keep the UI's resilient startup behaviour while
+      // the timing receipt truthfully reports this first attempt as a failure.
+    }
     unawaited(refreshDashboardConfig());
     unawaited(refreshRecentActivity());
     unawaited(refreshQuota());
@@ -1776,6 +1795,7 @@ class DashboardStore {
       _runtimeRetry = null;
       _runtimeRetryDelay = _kRuntimeRetryInitial;
       _halted.add(snap.halted);
+      _haltStatus.add(snap.halt);
       _schedulerWarning.add(snap.schedulerWarning);
       _supportedVoices.add(snap.supportedVoices);
       _updateActorStatesFromThreads(snap.threads);
@@ -1788,6 +1808,7 @@ class DashboardStore {
       _actorsStale.add(false);
       _persistActorHierarchy(snap.threads);
       _runtimeCursor = snap.runtimeCursor;
+      _authoritativeThreadSnapshots += 1;
       _error.add(null);
       if (!_drainRuntimeBuffer()) _runtimeSyncAgain = true;
     }
@@ -1963,6 +1984,7 @@ class DashboardStore {
       _actorStates.close(),
       _runSelections.close(),
       _halted.close(),
+      _haltStatus.close(),
       _schedulerWarning.close(),
       _supportedVoices.close(),
       _showRetired.close(),

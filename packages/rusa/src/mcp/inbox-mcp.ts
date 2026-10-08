@@ -3,6 +3,10 @@ import { z } from "zod";
 import { attachChatContext, type InboxChatContextSources } from "../actor/inbox-chat-context.js";
 import type { ResolvedInboxFocus } from "../actor/inbox-focus.js";
 import { attachInboxHints, type SelectedInboxEntry } from "../actor/inbox-hints.js";
+import {
+  attachOpenQuestions,
+  type InboxOpenQuestionSources,
+} from "../actor/inbox-open-questions.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
@@ -13,9 +17,8 @@ export const INBOX_MCP_NAME = "inbox";
 
 /**
  * What one `select` committed: the entries, the run's resolved focus, and —
- * only when the mesh armed an experiment-specific rule on this very selection
- * — the discipline that rule holds the run to. Omitted, not empty, for every
- * run nothing is armed for, so an unenrolled actor's selection is unchanged.
+ * only when the run has armed head obligations to close — the discipline that
+ * holds the run to. Omitted, not empty, for every run nothing is armed for.
  */
 export interface SelectedInboxRun {
   entries: InboxEntry[];
@@ -33,6 +36,8 @@ export interface InboxMcpRunScope {
   isVoiceSessionActive?: () => boolean;
   /** Where selected chat entries read their recent conversation from (#651). Omitted: no chat context. */
   chatContext?: InboxChatContextSources;
+  /** Where a human sender's open questions are read from (#890). Omitted: none listed. */
+  openQuestions?: InboxOpenQuestionSources;
 }
 
 /** Actor-bound durable notification tools. The model never supplies actor_id. */
@@ -60,7 +65,12 @@ export function createInboxMcpServer(
     } satisfies InboxMcpRunScope);
   const enrich = async (entries: InboxEntry[]): Promise<SelectedInboxEntry[]> => {
     const hinted = attachInboxHints(entries);
-    return scope.chatContext ? attachChatContext(hinted, actorId, scope.chatContext) : hinted;
+    const withQuestions = scope.openQuestions
+      ? attachOpenQuestions(hinted, actorId, scope.openQuestions)
+      : hinted;
+    return scope.chatContext
+      ? attachChatContext(withQuestions, actorId, scope.chatContext)
+      : withQuestions;
   };
   server.registerTool(
     "list",
@@ -97,7 +107,7 @@ export function createInboxMcpServer(
     {
       title: "Select inbox work for this run",
       description:
-        "Select the bounded set of unhandled entries this run will address. Selection is required before mark_handled and durably resolves the run's primary obligation when possible. During the observe-first rollout, ambiguous or unrelated work is reported in focus diagnostics rather than rejected. Selected entries retain source-specific handling hints. Chat entries also carry `chatContext`: the most recent messages of their thread, top-level channel, or mesh conversation, both sides, with ids to page further back using the read tools.",
+        "Select the bounded set of unhandled entries this run will address. Selection is required before mark_handled and durably resolves the run's primary obligation when possible. During the observe-first rollout, ambiguous or unrelated work is reported in focus diagnostics rather than rejected. Selected entries retain source-specific handling hints. Chat entries also carry `chatContext`: the most recent messages of their thread, top-level channel, or mesh conversation, both sides, with ids to page further back using the read tools. A message from a human who resolves to a user principal also carries `openQuestions`: the open obligations this actor filed for that human, with the exact `resolution_ref` to close any the message answers.",
       inputSchema: {
         entry_ids: z.array(z.string().min(1)).min(1).max(100),
         obligation_id: z

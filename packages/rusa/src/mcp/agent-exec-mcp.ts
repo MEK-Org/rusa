@@ -14,7 +14,6 @@ import {
   normalizeEventResource,
   resourceKey,
 } from "../actor/event-subscriptions.js";
-import { EXPERIMENT_NAMES, EXPERIMENTS } from "../actor/experiments.js";
 import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
@@ -1215,7 +1214,7 @@ export function createAgentExecMcpServer(
           actor_id: z.string().describe("The thread id of the actor to enroll."),
           experiment: z
             .string()
-            .describe("A registered experiment name, e.g. 'strict_obligation_handling'."),
+            .describe("A registered experiment name (see list_actor_experiments)."),
         },
       },
       async ({ actor_id, experiment }) => {
@@ -1293,10 +1292,9 @@ export function createAgentExecMcpServer(
               enrolled_at: enrollment.enrolledAt,
             }));
           return toolOk({
-            experiments: EXPERIMENT_NAMES.map((name) => ({
-              name,
-              intent: EXPERIMENTS[name].intent,
-            })),
+            experiments: mesh
+              .listRegisteredExperiments()
+              .map(({ name, intent }) => ({ name, intent })),
             enrollments,
           });
         } catch (err) {

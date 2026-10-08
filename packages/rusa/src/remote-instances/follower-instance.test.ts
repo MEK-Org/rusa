@@ -5,12 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ActorFactoryContext, ActorMeshOptions } from "../actor/actor-mesh.js";
-import { EXPERIMENT_ADMIN_CAPABILITY } from "../actor/administrative-capabilities.js";
 import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../actor/computer-use-lock.js";
-import {
-  InMemoryExperimentEnrollmentStore,
-  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
-} from "../actor/experiments.js";
 import { ProviderPacer } from "../actor/provider-pacer.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
@@ -33,7 +28,6 @@ function setup(
     onEvent?: (actorId: string, event: ActorEvent) => void;
     maxConcurrent?: number;
     obligations?: ActorMeshOptions["obligations"];
-    experimentEnrollments?: ActorMeshOptions["experimentEnrollments"];
   } = {}
 ) {
   const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-unit-"));
@@ -48,7 +42,6 @@ function setup(
     onEvent: options.onEvent,
     maxConcurrent: options.maxConcurrent,
     obligations: options.obligations,
-    experimentEnrollments: options.experimentEnrollments,
     providerFactory: options.failInit
       ? () => {
           throw new Error("test provider initialization failed");
@@ -2442,10 +2435,8 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
     });
     runMigrations(db);
     const repo = new ObligationRepository(db);
-    const enrollments = new InMemoryExperimentEnrollmentStore();
     const h = setup({
       delayMs: 300,
-      experimentEnrollments: enrollments,
       obligations: {
         findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
         get: (id) => repo.get(id),
@@ -2454,18 +2445,11 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
         expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
       },
     });
-    h.capabilityGrants.grant({
-      actorId: "root",
-      capability: EXPERIMENT_ADMIN_CAPABILITY,
-      grantedBy: "root",
-      grantedAt: "2026-10-01T00:00:00Z",
-    });
     const id = h.mesh.spawn({
       charter: "strict follower",
       parentId: "root",
       modelConfig: { provider: "instance-fixture", model: "scripted" },
     });
-    h.mesh.enrollActorInExperiment(id, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
     repo.create({ id: "remote-head", title: "Remote head", ownerId: id });
     h.mesh.deliverReadyHeadAttention(id, { id: "remote-head", intent: "handle it" }, null);
     await waitUntil(() => h.runtime(id).isRunning);

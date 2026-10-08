@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { request as httpRequest } from "node:http";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   FollowerEventAcceptanceFailedError,
   type FollowerEventBatch,
@@ -912,5 +912,198 @@ describe("negotiated event transfer over the follower gateway", () => {
     expect(receiver.usage).toEqual({ transfers: 0, reservedBytes: 0 });
     const response = await h.post("/events/transfer", { ...h.identity, ...frags[1] });
     expect(await response.json()).toEqual({ status: "restart", reason: "unknown_transfer" });
+  });
+});
+
+describe("parked queue diagnostic (#880)", () => {
+  const at = (ms: number) => new Date(ms).toISOString();
+  const bytesOf = (event: FollowerEvent) => Buffer.byteLength(JSON.stringify(event));
+
+  /** Hold a poll open, as the follower does, without reporting anything. */
+  async function hold(h: Awaited<ReturnType<typeof setup>>) {
+    void h.post("/poll", h.identity).catch(() => {});
+    await vi.waitFor(async () => expect((await h.post("/poll", h.identity)).status).toBe(409));
+  }
+  /**
+   * Report on a duplicate `/poll`, which the hub answers 409 only after
+   * recording the report, then read the hub's status listing once.
+   */
+  async function listed(h: Awaited<ReturnType<typeof setup>>, parkedEvent: unknown) {
+    expect((await h.post("/poll", { ...h.identity, parkedEvent })).status).toBe(409);
+    const response = await fetch(`${h.origin}/followers`, {
+      headers: { authorization: `Bearer ${h.token}` },
+    });
+    expect(response.status).toBe(200);
+    const followers = (await response.json()) as Array<Record<string, unknown>>;
+    expect(followers).toHaveLength(1);
+    return followers[0];
+  }
+
+  it("distinguishes idle, parked and unreported queues through follower status", async () => {
+    const now = Date.parse("2026-10-06T12:00:00.000Z");
+    const h = await setup();
+    const queue = new FollowerEventQueue(() => now);
+    const unreported = (await (
+      await fetch(`${h.origin}/followers`, { headers: { authorization: `Bearer ${h.token}` } })
+    ).json()) as Array<Record<string, unknown>>;
+    expect(unreported[0]).not.toHaveProperty("parkedEvent");
+    expect(queue.parkedHead).toBeUndefined();
+    await hold(h);
+    expect((await listed(h, queue.parkedHead ?? null)).parkedEvent).toBeNull();
+
+    const big = log("big", "x".repeat(9 * MiB));
+    queue.enqueue(big);
+    queue.enqueue(ready());
+    await expect(queue.flush(h.deliver, h.identity)).rejects.toBeInstanceOf(
+      FollowerEventParkedError
+    );
+    const parked = {
+      reason: "capability_missing",
+      eventId: "big",
+      eventType: "log",
+      bytes: bytesOf(big),
+      since: at(now),
+    };
+    expect(queue.parkedHead).toEqual(parked);
+    const status = await listed(h, queue.parkedHead);
+    expect(status.parkedEvent).toEqual(parked);
+    expect(JSON.stringify(status)).not.toContain("xxx");
+  });
+
+  it("keeps since while unchanged and clears when the head resumes or the queue clears", async () => {
+    let now = Date.parse("2026-10-06T12:00:00.000Z");
+    const parkedAt = now;
+    const h = await setup();
+    const queue = new FollowerEventQueue(() => now);
+    queue.enqueue(log("big", "x".repeat(9 * MiB)));
+    queue.enqueue(ready());
+    await queue.flush(h.deliver, h.identity).catch(() => {});
+    now += 60_000;
+    await queue.flush(h.deliver, h.identity).catch(() => {});
+    expect(queue.parkedHead).toMatchObject({ reason: "capability_missing", since: at(parkedAt) });
+
+    // A registration bringing transfer resumes the same head, then later FIFO members.
+    const transfer = h.sender(h.registration.eventTransfer as EventTransferCapability);
+    expect(await drain(queue, () => queue.flush(h.deliver, h.identity, transfer))).toEqual([]);
+    expect(queue.parkedHead).toBeUndefined();
+    expect(h.received.map((m) => (m as { type: string }).type)).toEqual(["log", "ready"]);
+
+    const fenced = new FollowerEventQueue(() => now);
+    fenced.enqueue(log("fenced", "x".repeat(9 * MiB)));
+    await fenced.flush(h.deliver, h.identity).catch(() => {});
+    expect(fenced.parkedHead).toMatchObject({ eventId: "fenced" });
+    fenced.clear();
+    expect(fenced.parkedHead).toBeUndefined();
+  });
+
+  it("keeps since for a fragment that can never be sent", async () => {
+    let now = Date.parse("2026-10-06T12:00:00.000Z");
+    const parkedAt = now;
+    const h = await setup();
+    const queue = new FollowerEventQueue(() => now);
+    queue.enqueue(log("unsendable", "small"));
+    // An envelope at the body limit leaves no room for any fragment.
+    const envelope = { ...h.identity, pad: "x".repeat(FOLLOWER_HTTP_BODY_LIMIT_BYTES) };
+    const transfer = h.sender(h.registration.eventTransfer as EventTransferCapability);
+    await queue.flush(h.deliver, envelope, transfer).catch(() => {});
+    now += 60_000;
+    await queue.flush(h.deliver, envelope, transfer).catch(() => {});
+    expect(queue.parkedHead).toMatchObject({
+      reason: "fragment_too_large",
+      eventId: "unsendable",
+      since: at(parkedAt),
+    });
+    expect(h.requests).toEqual([]);
+  });
+
+  it("reports an oversize leader refusal until a different capability is retried", async () => {
+    let now = Date.parse("2026-10-06T12:00:00.000Z");
+    const parkedAt = now;
+    const limits = { ...EVENT_TRANSFER_LIMITS, maxEventBytes: 10 * MiB };
+    const h = await setup({ receiver: new EventTransferReceiver(limits) });
+    const queue = new FollowerEventQueue(() => now);
+    const over = log("over-10", "x".repeat(11 * MiB));
+    queue.enqueue(over);
+    queue.enqueue(ready());
+    const capability = EVENT_TRANSFER_CAPABILITY;
+    await queue.flush(h.deliver, h.identity, h.sender(capability)).catch(() => {});
+    const refused = {
+      reason: "event_too_large",
+      eventId: "over-10",
+      eventType: "log",
+      bytes: bytesOf(over),
+      since: at(parkedAt),
+    };
+    expect(queue.parkedHead).toEqual(refused);
+    now += 60_000;
+    await queue.flush(h.deliver, h.identity, h.sender({ ...capability })).catch(() => {});
+    expect(queue.parkedHead).toEqual(refused);
+    expect(h.requests).toHaveLength(1);
+
+    // A different capability is a fresh attempt; its refusal parks anew.
+    await queue
+      .flush(h.deliver, h.identity, h.sender({ ...capability, maxEventBytes: 32 * MiB }))
+      .catch(() => {});
+    expect(h.requests).toHaveLength(2);
+    expect(queue.parkedHead).toEqual({ ...refused, since: at(now) });
+    expect(queue.hasPending).toBe(true);
+  });
+
+  it("reports terminal acceptance_failed behind the accepted prefix without replay", async () => {
+    const now = Date.parse("2026-10-06T12:00:00.000Z");
+    const h = await setup();
+    const failed = log("failed", "synthetic failing content");
+    h.host.on("message", (message) => {
+      if (message.type === "log" && message.chunk === "synthetic failing content") {
+        throw new Error("synthetic listener failure");
+      }
+    });
+    const queue = new FollowerEventQueue(() => now);
+    for (const event of [log("prefix", "accepted"), failed, ready()]) queue.enqueue(event);
+    await queue.flush(h.deliver, h.identity).catch(() => {});
+    await queue.flush(h.deliver, h.identity).catch(() => {});
+    const parked = {
+      reason: "acceptance_failed",
+      eventId: "failed",
+      eventType: "log",
+      bytes: bytesOf(failed),
+      since: at(now),
+    };
+    expect(queue.parkedHead).toEqual(parked);
+    expect(h.requests).toHaveLength(1);
+    expect(h.received).toHaveLength(2);
+    await hold(h);
+    const status = await listed(h, queue.parkedHead);
+    expect(status.parkedEvent).toEqual(parked);
+    expect(JSON.stringify(status)).not.toContain("synthetic failing content");
+  });
+
+  it("lists only a bounded, well-formed report and drops anything else", async () => {
+    const h = await setup();
+    const valid = {
+      reason: "acceptance_failed",
+      eventId: "failed",
+      eventType: "log",
+      bytes: 42,
+      since: "2026-10-06T12:00:00.000Z",
+    };
+    await hold(h);
+    expect(
+      (await listed(h, { ...valid, chunk: "private content", token: "secret" })).parkedEvent
+    ).toEqual(valid);
+    for (const invalid of [
+      { ...valid, reason: "x".repeat(65) },
+      { ...valid, reason: "has spaces and content" },
+      { ...valid, eventId: "e".repeat(129) },
+      { ...valid, eventType: { nested: true } },
+      { ...valid, bytes: -1 },
+      { ...valid, bytes: 1.5 },
+      { ...valid, since: "not a time" },
+      "parked",
+    ]) {
+      // A valid report first, so each malformed one has something to drop.
+      expect((await listed(h, valid)).parkedEvent).toEqual(valid);
+      expect(await listed(h, invalid)).not.toHaveProperty("parkedEvent");
+    }
   });
 });

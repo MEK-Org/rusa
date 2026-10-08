@@ -65,13 +65,13 @@ export function buildRootPrompt(
   actorHandle?: string,
   gitIdentity: MeshGitIdentityResolution = resolveMeshGitIdentity(undefined)
 ): string {
-  return `${charter}
+  return `${trackerWritingGuidance(actorHandle ?? "rusa")}
+
+${charter}
 
 ${DELEGATION_DISCIPLINE}
 
 ${GROUNDING_DISCIPLINE}
-
-${trackerWritingGuidance(actorHandle ?? "rusa")}
 
 ${gitIdentityGuidance(gitIdentity)}
 

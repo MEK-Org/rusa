@@ -213,6 +213,8 @@ export interface QuotaHistoryRecord {
   observedAt: string;
   percentLeft: number;
   resetAtIso: string | null;
+  /** Duration inferred from the lane's reset evidence when this row was inserted. */
+  windowMs: number;
   /** Positive means quota is being consumed faster than even pacing. */
   controllerError: number | null;
   /** Null when the observation did not produce a reasoned control decision. */
@@ -238,6 +240,7 @@ interface ReasonedObservation {
   controllerIntegral: number | null;
   percentLeft: number;
   observedAt: string;
+  windowMs: number;
 }
 
 interface StoredScrapeRow {
@@ -943,7 +946,7 @@ export class SharedQuotaStore {
     const rows = this.db
       .prepare(
         `SELECT model_scope AS modelScope, kind, label, observed_at AS observedAt,
-                percent_left AS percentLeft, reset_at_iso AS resetAtIso,
+                percent_left AS percentLeft, reset_at_iso AS resetAtIso, window_ms AS windowMs,
                 controller_error AS controllerError, interval_seconds AS intervalSeconds
          FROM quota_observations
          WHERE provider = ? AND observed_at >= ?
@@ -1389,7 +1392,7 @@ export class SharedQuotaStore {
                 controller_error AS controllerError,
                 controller_derivative AS controllerDerivative,
                 controller_integral AS controllerIntegral,
-                percent_left AS percentLeft, observed_at AS observedAt
+                percent_left AS percentLeft, observed_at AS observedAt, window_ms AS windowMs
          FROM quota_observations o
          WHERE provider = ? AND model_scope = ? AND interval_seconds IS NOT NULL
            AND NOT EXISTS (
@@ -1405,7 +1408,7 @@ export class SharedQuotaStore {
     const current = this.db
       .prepare(
         `SELECT kind, label, reset_at_iso AS resetAtIso,
-                percent_left AS percentLeft, observed_at AS observedAt
+                percent_left AS percentLeft, observed_at AS observedAt, window_ms AS windowMs
          FROM quota_observations o
          WHERE provider = ? AND model_scope = ?
            AND NOT EXISTS (
@@ -1422,6 +1425,7 @@ export class SharedQuotaStore {
       resetAtIso: string | null;
       percentLeft: number;
       observedAt: string;
+      windowMs: number;
     }>;
     if (current.length === 0) return null;
     const currentByKind = new Map(current.map((row) => [row.kind, row]));
@@ -1477,7 +1481,7 @@ export class SharedQuotaStore {
                   100,
                   Math.max(
                     0,
-                    ((Date.parse(latest.resetAtIso) - observedMs) / quotaWindowMs(row.kind)) * 100
+                    ((Date.parse(latest.resetAtIso) - observedMs) / latest.windowMs) * 100
                   )
                 )
               : 0,
@@ -1545,7 +1549,14 @@ export class SharedQuotaStore {
         slot: Math.floor(observedMs / SLOT_MS),
         percentLeft: limit.percentLeft,
         resetAtIso: limit.resetAtIso ?? null,
-        windowMs: quotaWindowMs(kind),
+        windowMs: this.windowMsForCandidate({
+          provider,
+          modelScope,
+          kind,
+          observedAt,
+          percentLeft: limit.percentLeft,
+          resetAtIso: limit.resetAtIso ?? null,
+        }),
         processed: 0,
       };
       const existing = this.db
@@ -1597,5 +1608,65 @@ export class SharedQuotaStore {
         );
       observed("recorded");
     }
+  }
+
+  /**
+   * Derive one lane's window duration at the persistence seam. A material
+   * reset change starts the next window, so the latest stored cycle is the
+   * previous window and this one's length is the distance between ends. That cycle
+   * ended at its reset, or at the latest by this reading if the provider reset
+   * early. Before the store has seen a prior end, the first reading is the only
+   * honest lower bound for the start. Tiny reset changes are display jitter:
+   * retain the current cycle's stored duration. Five-hour lanes keep their
+   * standard 5h denominator (#924 item 6): a session starts on first use, so
+   * the gap between successive ends includes idle time.
+   */
+  private windowMsForCandidate(
+    candidate: Pick<
+      StoredObservation,
+      "provider" | "modelScope" | "kind" | "observedAt" | "percentLeft" | "resetAtIso"
+    >
+  ): number {
+    if (candidate.kind === "session" || candidate.kind === "five_hour")
+      return quotaWindowMs(candidate.kind);
+    const observedMs = Date.parse(candidate.observedAt);
+    const resetMs = candidate.resetAtIso ? Date.parse(candidate.resetAtIso) : Number.NaN;
+    if (!Number.isFinite(observedMs) || !Number.isFinite(resetMs) || resetMs <= observedMs)
+      return quotaWindowMs(candidate.kind);
+
+    const latest = this.db
+      .prepare(
+        `SELECT reset_at_iso AS resetAtIso, window_ms AS windowMs
+         FROM quota_observations
+         WHERE provider = ? AND model_scope = ? AND kind = ? AND reset_at_iso IS NOT NULL
+         ORDER BY observed_at DESC, rowid DESC LIMIT 1`
+      )
+      .get(candidate.provider, candidate.modelScope, candidate.kind) as
+      | { resetAtIso: string; windowMs: number }
+      | undefined;
+    if (latest) {
+      // Only a moved end starts the next window; a refill under the same end
+      // stays in the current one.
+      const endMoved = quotaCycleChanged(
+        { percentLeft: candidate.percentLeft, resetAtIso: latest.resetAtIso },
+        candidate,
+        latest.windowMs
+      );
+      if (!endMoved) return latest.windowMs;
+      const previousEndMs = Math.min(Date.parse(latest.resetAtIso), observedMs);
+      if (Number.isFinite(previousEndMs)) return resetMs - previousEndMs;
+    }
+
+    const earliest = this.db
+      .prepare(
+        `SELECT observed_at AS observedAt FROM quota_observations
+         WHERE provider = ? AND model_scope = ? AND kind = ?
+         ORDER BY observed_at ASC, rowid ASC LIMIT 1`
+      )
+      .get(candidate.provider, candidate.modelScope, candidate.kind) as
+      | { observedAt: string }
+      | undefined;
+    const firstObservedMs = earliest ? Date.parse(earliest.observedAt) : observedMs;
+    return resetMs - Math.min(observedMs, firstObservedMs);
   }
 }

@@ -27,8 +27,8 @@ const _kKinds = [
 ];
 
 /// Events Log tab: kind filter + a merged, newest-first, paginated list. Each row
-/// is timestamp + inline kind chip + detail (+ a handle badge when multiple
-/// actors are selected). No multi-column table (cut).
+/// is timestamp + inline kind chip (+ a handle badge when multiple actors are
+/// selected), with any detail behind a chevron. No multi-column table (cut).
 class EventsTab extends StatelessWidget {
   const EventsTab({super.key, required this.store});
 
@@ -191,6 +191,16 @@ class EventsTab extends StatelessWidget {
       ],
     );
 
+    final secondLine = (detail ?? '').isEmpty
+        ? null
+        : Text(
+            detail!,
+            style: const TextStyle(
+              color: MeshColors.textSecondary,
+              fontSize: 13,
+            ),
+          );
+
     return Container(
       decoration: const BoxDecoration(
         border: Border(
@@ -223,24 +233,34 @@ class EventsTab extends StatelessWidget {
                     key: ValueKey('run_start:${e.id}'),
                     label: 'run details',
                     header: firstLine,
-                    content: (_) => RunStartDetails(
-                      runId: e.runId,
-                      model: e.resolvedRunModel,
-                      api: store.api,
+                    content: (_) => Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (secondLine != null) ...[
+                          secondLine,
+                          const SizedBox(height: 6),
+                        ],
+                        RunStartDetails(
+                          runId: e.runId,
+                          model: e.resolvedRunModel,
+                          api: store.api,
+                        ),
+                      ],
                     ),
+                  )
+                else if (secondLine != null)
+                  // Anything below the first line (message, yield or detail
+                  // body) waits behind the same chevron (#922).
+                  EventDisclosure(
+                    key: ValueKey('event:${e.id}'),
+                    label: isMessage
+                        ? 'message'
+                        : (row.isCoalesced ? 'yield' : 'details'),
+                    header: firstLine,
+                    content: (_) => secondLine,
                   )
                 else
                   firstLine(null),
-                if ((detail ?? '').isNotEmpty) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    detail!,
-                    style: const TextStyle(
-                      color: MeshColors.textSecondary,
-                      fontSize: 13,
-                    ),
-                  ),
-                ],
               ],
             ),
           ),

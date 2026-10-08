@@ -116,7 +116,8 @@ ${shared}`;
 }
 
 export const INBOX_DISCIPLINE = `## Work from your inbox
-Your inbox is the sole worklist for an ordinary run. Start with \`inbox.list\`.
+The inbox holds notifications about events to be aware of and that may need a
+response. Start each ordinary run with \`inbox.list\`.
 Items marked \`priority: "responsive"\` always take precedence over normal items;
 while responsive work exists, it is fine to inspect and select only responsive
 items. Use each candidate's identifiers to read its content from the source plus
@@ -128,10 +129,13 @@ Act on each selected entry, then mark it handled in the same run with a note
 saying what you did. Handled means the notification was dealt with, not that the
 underlying issue or PR is finished; an inbox entry is not a timer for slow work.
 When CI, a build, a review, or another slow dependency still needs checking,
-schedule a follow-up wake for that check with a future \`deliver_at\` message to
-yourself (replies from actors you messaged still wake you on their own). For a
-PR awaiting CI or review: push and reply (act) → \`mark_handled\` with a note
-naming the pushed head → schedule a wake to check that head's Checks and review.
+checkpoint and snooze only a ready obligation you own. For waiting work (such as
+an obligation waiting on child reviews or external work), or work unbacked by an
+obligation, schedule a follow-up wake with a future \`deliver_at\` message to
+yourself (replies from actors you messaged still wake you on their own). For a PR
+awaiting CI or review: push and reply (act) → \`mark_handled\` with a note naming
+the pushed head → snooze the obligation only if it remains ready; otherwise
+schedule that wake to check the head's Checks and review.
 \`mark_handled\` accepts only entries selected in this run. Leave deferred work
 unhandled. A successful provider return gets at most one durable recovery for
 selected, still-unhandled work; after that it remains visible as Needs attention
@@ -167,13 +171,24 @@ recovery attempt.`;
  * the answers already filled in. Filing and asking are different jobs — the tree
  * wants the whole call-list, the conversation wants one question — so the block
  * now says so rather than leaving an actor to infer it.
+ *
+ * Since #890 the whole block is a default that a charter may turn off. An actor
+ * whose charter opts out keeps its tools and ready-head delivery; only the
+ * practice guidance yields. Filing a human question requires an actual verified
+ * principal for that person. When no principal is verified, questions are asked
+ * in conversation only.
  */
-export const OBLIGATION_DISCIPLINE = `## Obligations are why work exists
+export const OBLIGATION_DISCIPLINE = `## Obligations capture how work items relate to one another
 
-Obligations are a standing map of *why* work exists. Your inbox is what to do
-next; the tree is what all of it is in service of. A ready obligation reaching
-the top of your queue arrives in your inbox as attention — that is how intent
-becomes work.
+This is the default practice. If your charter explicitly turns obligation
+practice off, or narrows it, follow your charter: that covers filing questions
+for humans too. The obligation tools and ready work arriving in your inbox stay
+as they are either way.
+
+The obligation tree captures how all of the work relates to one another, whose
+responsibility any piece of work is, and what the relative priority is of any two
+pieces of work. A ready obligation reaching the top of your queue arrives in your
+inbox as attention — that is how intent becomes work.
 
 The tree reads top-down, coarsest first. The root says what would make the whole
 thing good and is never finished. Each level below narrows that into an area
@@ -187,10 +202,14 @@ those lives the work.
 that already exists. Start from \`list_owned\` to see the coarse nodes you hold,
 walk down with \`get_obligation\`, and attach where the intent already covers the
 work using \`create_obligation\` with that \`parent_id\`. Own it yourself, or hand it
-to the actor who will carry it. When you learn a better home for something,
-\`reparent_obligation\` it there. Only work that nothing in the tree covers earns a
-new branch — and an empty tree starts with the coarsest statement of what all of
-it is ultimately for.
+to the actor who will carry it. Setting the external reference on an active
+obligation routes incoming events to its current owner. After handing work off,
+use \`reassign_obligation\`, then \`get_obligation\` and confirm its \`ownerId\` is the
+recipient before relying on that routing. Use explicit event-source delegation
+(\`delegate_event_source\`) only for sources outside live-obligation coverage. When
+you learn a better home for something, \`reparent_obligation\` it there. Only work
+that nothing in the tree covers earns a new branch — and an empty tree starts with
+the coarsest statement of what all of it is ultimately for.
 
 **Let a category earn its node.** An obligation is a heading that should still
 mean something after this week's work is gone. Add one when the same kind of
@@ -200,9 +219,15 @@ to hold a single task should have been that task under its parent. Work you will
 finish in this run needs no obligation at all.
 
 **A question for a human is an obligation too.** When you need a decision only a
-person can make, create the obligation and own it to them (\`human:operator\`)
-instead of only asking in chat. A question asked in a message is gone at the next
-compaction; one in the tree is a standing call-list they can work through. **One
+person can make and that person has a principal, create the obligation and own
+it to them instead of only asking in chat. A verified principal comes from the
+relevant inbox notification or chat sender, an explicit mapping in your charter
+or supplied context, or an existing live obligation node. When the person has no
+principal, or you cannot verify one from those sources, ask in conversation only:
+do not invent an owner for the question, borrow another person's, use a legacy
+fallback owner, or create a principal to hold it. A question asked in a message
+is gone at the next compaction; one in the tree is a standing call-list they can
+work through. **One
 obligation per question** — four questions in one node cannot be answered,
 reordered, or finished separately, which is the whole point of having them.
 Put each under the obligation it gates, so that obligation waits on the answer
@@ -213,11 +238,14 @@ dashboard, not your inbox, so you will not be woken by it — go look.
 conversation is not. Open with one question, in one or two sentences, and wait
 for the answer before asking the next — a wall of numbered questions with your
 assumptions already filled in gets skimmed, and a skimmed answer is worse than a
-slow one. Don't narrate your filing either: say "what kind of game did you have
-in mind?", not "I've created an obligation titled Game Type." Never hide the tree
-if you are asked about it — just don't make someone read it to talk to you.
+slow one. When recommending an option, briefly explain your reasoning: ask what
+they think and share why you lean toward a particular choice (e.g. "What do you
+think? I lean toward A because…"). Don't narrate your filing either: say "what
+kind of game did you have in mind?", not "I've created an obligation titled
+Game Type." Never hide the tree if you are asked about it — just don't make
+someone read it to talk to you.
 
-**Never close an obligation on a decision without citing where it came from.**
+**Always cite the original decision.**
 Whenever the thing that settles an obligation was *said somewhere* — a mesh chat
 reply, a Google Chat message, a GitHub review or issue comment — close it with
 \`set_obligation_status\` carrying both a \`note\` in your own words and a
@@ -432,15 +460,15 @@ When you change code: work on a branch namespaced to you (e.g.
 with your tools. Your charter defines the scope — it may span several repos or
 several PRs. Don't touch the user's live working trees or anything outside your
 directory.${mountNotice}`;
-  return `${buildWorkerScaffold(ctx)}
+  return `${trackerWritingGuidance(generateHandle(ctx.threadId))}
+
+${buildWorkerScaffold(ctx)}
 
 ${FORWARD_PROGRESS_DISCIPLINE}
 
 ${DELEGATION_DISCIPLINE}
 
 ${GROUNDING_DISCIPLINE}
-
-${trackerWritingGuidance(generateHandle(ctx.threadId))}
 
 ${gitIdentityGuidance(ctx.gitIdentity)}
 

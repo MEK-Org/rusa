@@ -90,12 +90,15 @@ import {
 } from "./event-subscriptions.js";
 import {
   assertKnownExperiment,
+  EXPERIMENTS,
+  type ExperimentDefinition,
   type ExperimentEnrollment,
   type ExperimentEnrollmentChange,
   type ExperimentEnrollmentStore,
+  type ExperimentRegistry,
+  experimentNames,
   InMemoryExperimentEnrollmentStore,
   isKnownExperiment,
-  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
 } from "./experiments.js";
 import { generateHandle } from "./handle-generator.js";
 import {
@@ -276,11 +279,12 @@ export interface MeshObligationPort {
 /**
  * The narrower contract strict obligation handling (#382) actually requires.
  *
- * These reads stay optional on {@link MeshObligationPort} so an embedder built
- * before #382 keeps working, but they are not optional for an *enrolled* actor:
- * enrollment without this contract is a misconfiguration, not a soft mode.
+ * These reads stay optional on {@link MeshObligationPort} so an embedder that
+ * never selects obligation attention keeps working, but they are not optional
+ * for head selection: every actor is held to head closure (#917), so selecting
+ * a head without this contract is a misconfiguration, not a soft mode.
  * {@link ActorMesh.selectInboxEntries} refuses head attention in that state
- * rather than arming an enrolled run whose heads it could not read.
+ * rather than arming a run whose heads it could not read.
  */
 export type MeshObligationClosurePort = MeshObligationPort &
   Required<
@@ -731,6 +735,12 @@ export interface ActorMeshOptions {
    * — both enforced here in the mesh, never in the store.
    */
   experimentEnrollments?: ExperimentEnrollmentStore;
+  /**
+   * The experiment registry enrollments are checked against. Defaults to the
+   * hard-coded {@link EXPERIMENTS}; tests of the rollout seam supply their own
+   * so it stays exercised while the production registry is empty.
+   */
+  experimentRegistry?: ExperimentRegistry;
   eventSourceOwners?: EventSourceOwnerStore;
   eventSourceSubscriptions?: EventSourceSubscriptionStore;
   /**
@@ -801,8 +811,8 @@ export interface ActorMeshOptions {
 }
 
 /**
- * The exits a strict head-obligation run has, worded once: the discipline an
- * enrolled run is told when its selection arms it.
+ * The exits a strict head-obligation run has, worded once: the discipline a
+ * run is told when its selection arms it.
  */
 const STRICT_HEAD_CLOSURE_EXITS =
   "complete it, cancel it, schedule it, snooze it until a future time with `set_snooze`, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
@@ -924,6 +934,7 @@ export class ActorMesh {
   readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
   private readonly experiments: ExperimentEnrollmentStore;
+  private readonly experimentRegistry: ExperimentRegistry;
   private readonly eventSourceOwners: EventSourceOwnerStore;
   private readonly eventSourceSubscriptions: EventSourceSubscriptionStore;
   private readonly configuredEventSources: readonly EventResource[] | undefined;
@@ -1031,6 +1042,7 @@ export class ActorMesh {
     this.validateModel = opts.validateModel;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
     this.experiments = opts.experimentEnrollments ?? new InMemoryExperimentEnrollmentStore();
+    this.experimentRegistry = opts.experimentRegistry ?? EXPERIMENTS;
     this.eventSourceOwners = opts.eventSourceOwners ?? new InMemoryEventSourceOwnerStore();
     this.eventSourceSubscriptions =
       opts.eventSourceSubscriptions ?? new InMemoryEventSourceSubscriptionStore();
@@ -1724,46 +1736,35 @@ export class ActorMesh {
       }
       return entry;
     });
-    // Capture experiment membership now. Root can revise enrollment later, but
-    // that governs a future selection rather than retroactively releasing or
-    // constraining this already-running actor.
     // Snapshot the selected focus now. A direct focus and selected ready-head
     // attention both contribute: supplying an explicit id must not let an
     // actor bypass a ready head included in the same selection. Direct focus
     // only arms its owning actor; the resolver may record another live row as
     // context, but strict head closure is a commitment of its owner.
-    const strictEnrolled = this.isEnrolledInExperiment(
-      actorId,
-      STRICT_OBLIGATION_HANDLING_EXPERIMENT
+    const readyHeadObligationIds = entries.flatMap((entry) =>
+      entry.payload.type === "obligation.ready_head" &&
+      typeof entry.payload.obligationId === "string"
+        ? [entry.payload.obligationId]
+        : []
     );
-    const readyHeadObligationIds = strictEnrolled
-      ? entries.flatMap((entry) =>
-          entry.payload.type === "obligation.ready_head" &&
-          typeof entry.payload.obligationId === "string"
-            ? [entry.payload.obligationId]
-            : []
-        )
-      : [];
-    const focusedObligationIds = strictEnrolled
-      ? [
-          ...(focusedObligationId !== undefined ? [focusedObligationId] : []),
-          ...readyHeadObligationIds,
-        ]
-      : [];
+    const focusedObligationIds = [
+      ...(focusedObligationId !== undefined ? [focusedObligationId] : []),
+      ...readyHeadObligationIds,
+    ];
     // Fail closed, and fail here — before the selection commits, so nothing has
-    // run yet on heads the mesh cannot read. An enrolled actor in a mesh
-    // without closure reads is a misconfiguration the root must fix by wiring
-    // the port or unenrolling, not a run that silently opts out.
+    // run yet on heads the mesh cannot read. Every actor is held to head
+    // closure (#917), so a mesh without closure reads is a misconfiguration to
+    // fix by wiring the port, not a run that silently opts out.
     const closure = this.obligations;
     if (focusedObligationIds.length > 0 && !supportsObligationClosureReads(closure)) {
       throw new Error(
-        `Cannot select head attention: ${actorId} is enrolled in ${STRICT_OBLIGATION_HANDLING_EXPERIMENT}, but this mesh has no obligation closure port (get, listDirectChildEdges, listPrerequisiteEdges, expireDueSnoozes) wired. Wire the closure port or unenroll the actor.`
+        `Cannot select head attention for ${actorId}: this mesh has no obligation closure port (get, listDirectChildEdges, listPrerequisiteEdges, expireDueSnoozes) wired, and every head selection is held to strict closure. Wire the closure port.`
       );
     }
-    // Membership and status are both selection-time facts. Keeping only ready
-    // focuses in the run state makes a later waiting -> ready transition stay
-    // unarmed, while a ready -> waiting transition retains the existing legal
-    // exit checks for the run that selected it. A transiently unreadable row
+    // Status is a selection-time fact. Keeping only ready focuses in the run
+    // state makes a later waiting -> ready transition stay unarmed, while a
+    // ready -> waiting transition retains the existing legal exit checks for
+    // the run that selected it. A transiently unreadable row
     // remains fail-closed, as it did before status-aware selection: silently
     // releasing a strict run on a failed closure read would be less safe.
     const headObligationIds = supportsObligationClosureReads(closure)
@@ -1853,16 +1854,13 @@ export class ActorMesh {
   }
 
   /**
-   * The experiment-specific discipline in force for this actor's current run,
-   * or undefined when none is — the text an enrolled actor is told at
+   * The head-closure discipline in force for this actor's current run, or
+   * undefined when its selections armed no head — the text an actor is told at
    * selection.
    *
-   * This reads the armed run state rather than re-evaluating enrollment, so a
-   * root enrollment change lands at the next selection and not in between.
-   *
-   * States the obligation rule directly without experiment framing, and per
-   * head: a selection of several is told that each one must take a legal exit,
-   * not just the first.
+   * This reads the armed run state, so it states exactly the heads selection
+   * armed. It is per head: a selection of several is told that each one must
+   * take a legal exit, not just the first.
    */
   runDisciplineNotice(actorId: string): string | undefined {
     actorId = this.resolveThreadId(actorId);
@@ -2790,6 +2788,66 @@ export class ActorMesh {
     }
   }
 
+  /**
+   * Durable owner attention for a completion matcher whose PR closed without
+   * merging (#190). One notice per matcher installation: the key carries the
+   * matcher's `set_at`, so replays and boot reconciliation are silent no-ops
+   * while a replaced matcher that closes unmerged again is announced again.
+   * Human owners see the recorded state on the dashboard instead.
+   */
+  deliverCompletionMatcherClosedUnmergedAttention(
+    ownerId: string,
+    obligationId: string,
+    matcherSetAt: string
+  ): boolean {
+    if (!this.inboxStore) return false;
+    if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) return false;
+    const actorId = this.resolveThreadId(ownerId);
+    const record = this.actors.get(actorId);
+    if (!record || record.status !== "active") return false;
+    const entries = this.inboxStore.append([
+      {
+        id: deduplicatedInboxEntryId(
+          `obligation-matcher-closed-unmerged:${obligationId}:${matcherSetAt}`,
+          actorId
+        ),
+        actorId,
+        source: `obligation:${obligationId}`,
+        payload: {
+          type: "obligation.completion_matcher_closed_unmerged",
+          obligationId,
+        } as unknown as InboxPayload,
+      },
+    ]);
+    if (entries.length === 0) return false;
+    this.dispatch(actorId);
+    return true;
+  }
+
+  /** Boot recovery for {@link deliverCompletionMatcherClosedUnmergedAttention}. */
+  reconcileCompletionMatcherClosedUnmergedAttention(obligations: {
+    listCompletionMatcherClosedUnmergedAttention(): Iterable<{
+      obligationId: string;
+      ownerId: string;
+      matcherSetAt: string;
+    }>;
+  }): void {
+    if (!this.inboxStore) return;
+    try {
+      for (const attention of obligations.listCompletionMatcherClosedUnmergedAttention()) {
+        this.deliverCompletionMatcherClosedUnmergedAttention(
+          attention.ownerId,
+          attention.obligationId,
+          attention.matcherSetAt
+        );
+      }
+    } catch (err) {
+      this.log(
+        `completion-matcher attention reconciliation failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
   inboxHandled(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     if (this.inboxStore && this.inboxStore.countUnhandled(actorId) > 0) {
@@ -3370,7 +3428,7 @@ export class ActorMesh {
   ): ExperimentEnrollmentChange {
     actorId = this.resolveThreadId(actorId);
     enrolledBy = this.resolveThreadId(enrolledBy);
-    const name = assertKnownExperiment(experiment);
+    const name = assertKnownExperiment(experiment, this.experimentRegistry);
     const record = this.assertExperimentAuthority(enrolledBy, actorId, "enroll");
     if (record.status === "retired") {
       throw new Error(`Cannot enroll a retired thread: ${actorId}`);
@@ -3437,8 +3495,16 @@ export class ActorMesh {
    * not have to guard against its own registry constant.
    */
   isEnrolledInExperiment(actorId: string, experiment: string): boolean {
-    if (!isKnownExperiment(experiment)) return false;
+    if (!isKnownExperiment(experiment, this.experimentRegistry)) return false;
     return this.experiments.isEnrolled(this.resolveThreadId(actorId), experiment);
+  }
+
+  /** The registered experiments in name order — the registry half of the readback view. */
+  listRegisteredExperiments(): Array<{ name: string } & ExperimentDefinition> {
+    return experimentNames(this.experimentRegistry).map((name) => ({
+      name,
+      ...this.experimentRegistry[name],
+    }));
   }
 
   /** Every current enrollment in (actorId, experiment) order — the administrator's readback view. */

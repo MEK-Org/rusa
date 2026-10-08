@@ -64,6 +64,7 @@ class DashboardBody extends StatefulWidget {
 
 class _DashboardBodyState extends State<DashboardBody> {
   late DashboardView _view;
+  bool _hasNavigated = false;
   StreamSubscription<String?>? _focusSub;
   StreamSubscription<String?>? _actorSub;
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
@@ -177,6 +178,7 @@ class _DashboardBodyState extends State<DashboardBody> {
 
   void _selectView(DashboardView view) {
     if (_view == view) return;
+    _hasNavigated = true;
     setState(() => _view = view);
     writeDashboardViewToUrl(
       view,
@@ -209,6 +211,7 @@ class _DashboardBodyState extends State<DashboardBody> {
     }
 
     if (_view != targetView) {
+      _hasNavigated = true;
       setState(() => _view = targetView);
       if (widget.onNavigation != null) {
         unawaited(widget.onNavigation!());
@@ -318,7 +321,11 @@ class _DashboardBodyState extends State<DashboardBody> {
           if (!hideRoomHeader) phoneHeader,
           Expanded(
             child: _view == DashboardView.overview
-                ? OverviewTab(store: widget.store, onSelectView: _selectView)
+                ? OverviewTab(
+                    store: widget.store,
+                    onSelectView: _selectView,
+                    trackNavigation: _hasNavigated,
+                  )
                 : (_view == DashboardView.understanding ||
                       _view == DashboardView.reports)
                 ? _IuBody(

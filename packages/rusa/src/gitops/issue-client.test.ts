@@ -1859,6 +1859,7 @@ describe("GitHubIssueClient", () => {
           head: { ref: "mc/issue-3", sha: "details-head-sha" },
           base: { ref: "staging" },
           state: "open",
+          merged: false,
         },
       },
     });
@@ -1873,6 +1874,7 @@ describe("GitHubIssueClient", () => {
       baseRef: "staging",
       headSha: "details-head-sha",
       state: "open",
+      merged: false,
     });
   });
 

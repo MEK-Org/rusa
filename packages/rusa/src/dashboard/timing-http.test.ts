@@ -50,6 +50,7 @@ describe("dashboard timing telemetry route", () => {
         interaction: "initial_load",
         durationMs: 25,
         requestIds: [requestId],
+        requestTimings: [{ requestId, requestMs: 20 }],
       }),
     });
     expect(accepted.status).toBe(202);
@@ -60,10 +61,21 @@ describe("dashboard timing telemetry route", () => {
         interaction: "initial_load",
         durationMs: 25,
         requestIds: [requestId],
-        rawUrl: "/api/mesh/threads?should-not-be-accepted",
+        requestTimings: [{ requestId, requestMs: 20.5 }],
       }),
     });
     expect(rejected.status).toBe(400);
+    const rawField = await fetch(`${origin}/api/dashboard/timing`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        interaction: "initial_load",
+        durationMs: 25,
+        requestIds: [requestId],
+        rawUrl: "/api/mesh/threads?should-not-be-accepted",
+      }),
+    });
+    expect(rawField.status).toBe(400);
 
     timings.flush();
     const rows = events.listByKindSince(

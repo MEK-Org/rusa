@@ -1,12 +1,25 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FakeChatClient } from "../chat/fake.js";
+import { GchatClient } from "../chat/gchat-client.js";
+import { MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES } from "../chat/types.js";
 import type { Logger } from "../observability/logger.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import {
@@ -29,6 +42,13 @@ function textOf(result: CallToolResult): string {
 }
 
 describe("chat MCP server", () => {
+  it("clamps an oversized fake download configuration to the binary ceiling", () => {
+    expect(
+      new FakeChatClient({ maxSizeBytes: MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES + 1 })
+        .maxDownloadSizeBytes
+    ).toBe(MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES);
+  });
+
   it("exposes source-backed reads separately from scoped writes", async () => {
     const client = await connect(createChatReadMcpServer(new FakeChatClient()));
     const { tools } = await client.listTools();
@@ -119,7 +139,7 @@ describe("chat MCP server", () => {
     });
   });
 
-  it("gets an attachment and downloads attachment bytes", async () => {
+  it("gets attachment metadata and streams attachment bytes to the workdir", async () => {
     const fake = new FakeChatClient();
     const sampleBytes = Buffer.from("sample binary file content");
     fake.attachments.set("spaces/A/messages/M1/attachments/ATT1", {
@@ -131,7 +151,10 @@ describe("chat MCP server", () => {
       },
       data: sampleBytes,
     });
-    const client = await connect(createChatReadMcpServer(fake));
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
+    const client = await connect(
+      createChatReadMcpServer(fake, { workDir, fileToolsAvailable: true })
+    );
 
     const metaRes = (await client.callTool({
       name: "get_attachment",
@@ -146,10 +169,20 @@ describe("chat MCP server", () => {
 
     const dlRes = (await client.callTool({
       name: "download_attachment",
-      arguments: { resourceName: "spaces/A/messages/M1/attachments/ATT1" },
+      arguments: {
+        resourceName: "spaces/A/messages/M1/attachments/ATT1",
+        destinationPath: "spec.pdf",
+      },
     })) as CallToolResult;
     expect(dlRes.isError).toBeFalsy();
-    expect(textOf(dlRes)).toBe(sampleBytes.toString("base64"));
+    expect(JSON.parse(textOf(dlRes))).toMatchObject({
+      path: join(workDir, "spec.pdf"),
+      bytes: sampleBytes.length,
+      contentType: "application/pdf",
+      name: "spec.pdf",
+    });
+    expect(readFileSync(join(workDir, "spec.pdf"))).toEqual(sampleBytes);
+    rmSync(workDir, { recursive: true, force: true });
   });
 
   it("lists a paginated thread without crossing spaces", async () => {
@@ -390,7 +423,7 @@ describe("chat MCP server", () => {
     ]) {
       const res = (await client.callTool({
         name: "download_attachment",
-        arguments: { resourceName: invalid },
+        arguments: { resourceName: invalid, destinationPath: "out.bin" },
       })) as CallToolResult;
       expect(res.isError).toBe(true);
       expect(textOf(res)).toContain("resourceName must be in format");
@@ -408,14 +441,214 @@ describe("chat MCP server", () => {
       },
       data: largeBytes,
     });
-    const client = await connect(createChatReadMcpServer(fake, { maxAttachmentBytes: 50 }));
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
+    const client = await connect(
+      createChatReadMcpServer(fake, { workDir, fileToolsAvailable: true, maxAttachmentBytes: 50 })
+    );
 
     const res = (await client.callTool({
       name: "download_attachment",
-      arguments: { resourceName: "spaces/A/messages/M1/attachments/ATT1" },
+      arguments: {
+        resourceName: "spaces/A/messages/M1/attachments/ATT1",
+        destinationPath: "large.bin",
+      },
     })) as CallToolResult;
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain("attachment size limit exceeded");
+    expect(existsSync(join(workDir, "large.bin"))).toBe(false);
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("asks the client stream for the 1 GiB file-mode limit", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
+    const fake = new FakeChatClient();
+    let requested: number | undefined;
+    fake.downloadAttachmentStream = async (_resourceName, maxBytes) => {
+      requested = maxBytes;
+      return {
+        resp: new Response("hello", { status: 200 }),
+        name: "small.bin",
+        contentType: "application/octet-stream",
+      };
+    };
+    const client = await connect(
+      createChatReadMcpServer(fake, { workDir, fileToolsAvailable: true })
+    );
+
+    const res = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName: "media/spaces/A/attachments/ATT1", destinationPath: "out.bin" },
+    })) as CallToolResult;
+    expect(res.isError).toBeFalsy();
+    expect(requested).toBe(MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES);
+    expect(JSON.parse(textOf(res))).toMatchObject({ path: join(workDir, "out.bin"), bytes: 5 });
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("treats maxAttachmentBytes as an upper bound for streamed downloads", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
+    const fake = new FakeChatClient();
+    let requested: number | undefined;
+    fake.downloadAttachmentStream = async (_resourceName, maxBytes) => {
+      requested = maxBytes;
+      return {
+        resp: new Response("file", { status: 200 }),
+        name: "file.bin",
+        contentType: "application/octet-stream",
+      };
+    };
+    const client = await connect(
+      createChatReadMcpServer(fake, {
+        workDir,
+        fileToolsAvailable: true,
+        maxAttachmentBytes: 75 * 1024 * 1024,
+      })
+    );
+
+    const resourceName = "media/spaces/A/attachments/ATT1";
+    const result = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName, destinationPath: "out.bin" },
+    })) as CallToolResult;
+
+    expect(result.isError).toBeFalsy();
+    expect(requested).toBe(75 * 1024 * 1024);
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("writes nothing when the client stream rejects a declared size", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
+    const fake = new FakeChatClient();
+    fake.downloadAttachmentStream = async (_resourceName, maxBytes) => {
+      throw new Error(
+        `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
+      );
+    };
+    const client = await connect(
+      createChatReadMcpServer(fake, { workDir, fileToolsAvailable: true })
+    );
+
+    const res = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName: "media/spaces/A/attachments/ATT1", destinationPath: "out.bin" },
+    })) as CallToolResult;
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("attachment size limit exceeded");
+    expect(existsSync(join(workDir, "out.bin"))).toBe(false);
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("keeps a lower GchatClient limit through file mode", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
+    const configDir = mkdtempSync(join(tmpdir(), "chat-mcp-gchat-"));
+    writeFileSync(
+      join(configDir, "client.json"),
+      JSON.stringify({ installed: { client_id: "client", client_secret: "secret" } })
+    );
+    writeFileSync(join(configDir, "token.json"), JSON.stringify({ refresh_token: "refresh" }));
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), { status: 200 })
+      )
+      .mockResolvedValueOnce(new Response(new Uint8Array(100), { status: 200 }));
+    const client = await connect(
+      createChatReadMcpServer(new GchatClient(configDir, 80), {
+        workDir,
+        fileToolsAvailable: true,
+      })
+    );
+
+    const res = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName: "media/spaces/A/attachments/ATT1", destinationPath: "out.bin" },
+    })) as CallToolResult;
+    fetchSpy.mockRestore();
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("attachment is larger than 80 bytes");
+    expect(existsSync(join(workDir, "out.bin"))).toBe(false);
+    rmSync(workDir, { recursive: true, force: true });
+    rmSync(configDir, { recursive: true, force: true });
+  });
+
+  it("streams synthetic payload > 50 MiB through destinationPath and computes hash without full buffering", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
+    const fake = new FakeChatClient();
+    const chunkSize = 1024 * 1024; // 1 MiB
+    const chunkCount = 55; // 55 MiB total (> 50 MiB inline limit)
+    const singleChunk = Buffer.alloc(chunkSize, "x");
+    const expectedHash = createHash("sha256");
+    for (let i = 0; i < chunkCount; i++) {
+      expectedHash.update(singleChunk);
+    }
+    const expectedSha256 = expectedHash.digest("hex");
+
+    fake.downloadAttachmentStream = async () => {
+      async function* generateChunks() {
+        for (let i = 0; i < chunkCount; i++) {
+          yield singleChunk;
+        }
+      }
+      const stream = new ReadableStream({
+        async start(controller) {
+          for await (const chunk of generateChunks()) {
+            controller.enqueue(chunk);
+          }
+          controller.close();
+        },
+      });
+      const resp = new Response(stream, {
+        status: 200,
+        headers: {
+          "content-length": String(chunkSize * chunkCount),
+          "content-type": "application/octet-stream",
+        },
+      });
+      return { resp, name: "large.bin", contentType: "application/octet-stream" };
+    };
+
+    const client = await connect(
+      createChatReadMcpServer(fake, { workDir, fileToolsAvailable: true })
+    );
+
+    const result = (await client.callTool({
+      name: "download_attachment",
+      arguments: {
+        resourceName: "media/spaces/A/attachments/ATT1",
+        destinationPath: "streamed.bin",
+      },
+    })) as CallToolResult;
+
+    expect(result.isError).toBeFalsy();
+    const data = JSON.parse(textOf(result));
+    expect(data.path).toBe(join(workDir, "streamed.bin"));
+    expect(data.bytes).toBe(chunkSize * chunkCount);
+    expect(data.sha256).toBe(expectedSha256);
+    expect(data.name).toBe("large.bin");
+    expect(data.contentType).toBe("application/octet-stream");
+
+    const stat = statSync(join(workDir, "streamed.bin"));
+    expect(stat.size).toBe(chunkSize * chunkCount);
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("rejects destinationPath for follower-hosted actors", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
+    const fake = new FakeChatClient();
+    const client = await connect(
+      createChatReadMcpServer(fake, { workDir, fileToolsAvailable: false })
+    );
+
+    const res = (await client.callTool({
+      name: "download_attachment",
+      arguments: {
+        resourceName: "media/spaces/A/attachments/ATT1",
+        destinationPath: "out.bin",
+      },
+    })) as CallToolResult;
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("Chat file tools are unavailable for follower-hosted actors");
+    rmSync(workDir, { recursive: true, force: true });
   });
 
   it("supports inline contentBase64 uploads in send_message", async () => {
@@ -901,6 +1134,7 @@ describe("chat MCP server", () => {
 
   it("restricts chat-read MCP tools to allowedSpaces when specified", async () => {
     const fake = new FakeChatClient();
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
     fake.spaces.push(
       { name: "spaces/A", spaceType: "SPACE", displayName: "Allowed Space" },
       { name: "spaces/B", spaceType: "SPACE", displayName: "Forbidden Space" }
@@ -947,7 +1181,13 @@ describe("chat MCP server", () => {
       data: sampleBytes,
     });
 
-    const client = await connect(createChatReadMcpServer(fake, { allowedSpaces: ["spaces/A"] }));
+    const client = await connect(
+      createChatReadMcpServer(fake, {
+        allowedSpaces: ["spaces/A"],
+        workDir,
+        fileToolsAvailable: true,
+      })
+    );
 
     // list_spaces only returns allowed spaces
     const listSpacesRes = (await client.callTool({
@@ -989,14 +1229,23 @@ describe("chat MCP server", () => {
     // download_attachment in allowed space vs forbidden space
     const dlAttAllowed = (await client.callTool({
       name: "download_attachment",
-      arguments: { resourceName: "spaces/A/messages/M1/attachments/ATT1" },
+      arguments: {
+        resourceName: "spaces/A/messages/M1/attachments/ATT1",
+        destinationPath: "allowed.txt",
+      },
     })) as CallToolResult;
     expect(dlAttAllowed.isError).toBeFalsy();
-    expect(textOf(dlAttAllowed)).toBe(sampleBytes.toString("base64"));
+    expect(JSON.parse(textOf(dlAttAllowed))).toMatchObject({
+      path: join(workDir, "allowed.txt"),
+      bytes: sampleBytes.length,
+    });
 
     const dlAttForbidden = (await client.callTool({
       name: "download_attachment",
-      arguments: { resourceName: "spaces/B/messages/M2/attachments/ATT2" },
+      arguments: {
+        resourceName: "spaces/B/messages/M2/attachments/ATT2",
+        destinationPath: "forbidden.txt",
+      },
     })) as CallToolResult;
     expect(dlAttForbidden.isError).toBeTruthy();
     expect(textOf(dlAttForbidden)).toContain("access denied");
@@ -1004,7 +1253,7 @@ describe("chat MCP server", () => {
     // raw media tokens are rejected on scoped servers
     const dlMediaTokenForbidden = (await client.callTool({
       name: "download_attachment",
-      arguments: { resourceName: "media/TOKEN_A" },
+      arguments: { resourceName: "media/TOKEN_A", destinationPath: "token.bin" },
     })) as CallToolResult;
     expect(dlMediaTokenForbidden.isError).toBeTruthy();
     expect(textOf(dlMediaTokenForbidden)).toContain("raw media/ tokens are not permitted");
@@ -1022,10 +1271,12 @@ describe("chat MCP server", () => {
     })) as CallToolResult;
     expect(listMsgForbidden.isError).toBeTruthy();
     expect(textOf(listMsgForbidden)).toContain("access denied");
+    rmSync(workDir, { recursive: true, force: true });
   });
 
   it("downloads attachment using raw dataRef token or media format on unscoped server", async () => {
     const fake = new FakeChatClient();
+    const workDir = mkdtempSync(join(tmpdir(), "chat-mcp-download-"));
     const sampleBytes = Buffer.from("opaque token bytes");
     fake.attachments.set("media/OPAQUE_TOKEN_123", {
       metadata: {
@@ -1034,14 +1285,20 @@ describe("chat MCP server", () => {
       },
       data: sampleBytes,
     });
-    const client = await connect(createChatReadMcpServer(fake));
+    const client = await connect(
+      createChatReadMcpServer(fake, { workDir, fileToolsAvailable: true })
+    );
 
     const res = (await client.callTool({
       name: "download_attachment",
-      arguments: { resourceName: "media/OPAQUE_TOKEN_123" },
+      arguments: { resourceName: "media/OPAQUE_TOKEN_123", destinationPath: "opaque.bin" },
     })) as CallToolResult;
     expect(res.isError).toBeFalsy();
-    expect(textOf(res)).toBe(sampleBytes.toString("base64"));
+    expect(JSON.parse(textOf(res))).toMatchObject({
+      path: join(workDir, "opaque.bin"),
+      bytes: sampleBytes.length,
+    });
+    rmSync(workDir, { recursive: true, force: true });
   });
 
   it("auto-paginates list_spaces for scoped actors to locate allowed spaces across pages", async () => {

@@ -16,7 +16,9 @@ import {
   seedConfiguredActorGrants,
 } from "./administrative-capabilities.js";
 import { InMemoryCapabilityGrantStore } from "./capability-grants.js";
-import { STRICT_OBLIGATION_HANDLING_EXPERIMENT } from "./experiments.js";
+
+/** A fixture rollout: the production experiment registry is empty between rollouts. */
+const FIXTURE_EXPERIMENT = "fixture_rollout";
 
 /**
  * Authority over other actors is grant-derived (#549). These characterizations
@@ -56,6 +58,7 @@ function setup() {
   const mesh = new ActorMesh({
     actors,
     rootId: "configured",
+    experimentRegistry: { [FIXTURE_EXPERIMENT]: { intent: "Exercise the rollout seam." } },
     capabilityGrants: grants,
     secretsDir,
     grantableCapabilities: new Set([
@@ -210,40 +213,24 @@ describe("experiment administration is grant-derived", () => {
       grantedAt: "2026-01-01T00:00:00Z",
     });
     expect(
-      mesh.enrollActorInExperiment(
-        "steward-child",
-        STRICT_OBLIGATION_HANDLING_EXPERIMENT,
-        "0b2c3d4e-steward"
-      )
+      mesh.enrollActorInExperiment("steward-child", FIXTURE_EXPERIMENT, "0b2c3d4e-steward")
     ).toEqual({ actorId: "steward-child", changed: true });
     expect(() =>
-      mesh.enrollActorInExperiment(
-        "sibling",
-        STRICT_OBLIGATION_HANDLING_EXPERIMENT,
-        "0b2c3d4e-steward"
-      )
+      mesh.enrollActorInExperiment("sibling", FIXTURE_EXPERIMENT, "0b2c3d4e-steward")
     ).toThrow(/own subtree/);
     expect(
-      mesh.unenrollActorFromExperiment(
-        "steward-child",
-        STRICT_OBLIGATION_HANDLING_EXPERIMENT,
-        "0b2c3d4e-steward"
-      )
+      mesh.unenrollActorFromExperiment("steward-child", FIXTURE_EXPERIMENT, "0b2c3d4e-steward")
     ).toEqual({ actorId: "steward-child", changed: true });
   });
 
   it("refuses an ungranted parentless isRoot record", () => {
     const { mesh } = setup();
     expect(() =>
-      mesh.enrollActorInExperiment(
-        "other-child",
-        STRICT_OBLIGATION_HANDLING_EXPERIMENT,
-        "other-parentless"
-      )
+      mesh.enrollActorInExperiment("other-child", FIXTURE_EXPERIMENT, "other-parentless")
     ).toThrow(/experiment-admin/);
-    expect(() =>
-      mesh.enrollActorInExperiment("sibling", STRICT_OBLIGATION_HANDLING_EXPERIMENT, "configured")
-    ).toThrow(/experiment-admin/);
+    expect(() => mesh.enrollActorInExperiment("sibling", FIXTURE_EXPERIMENT, "configured")).toThrow(
+      /experiment-admin/
+    );
   });
 });
 
@@ -286,9 +273,10 @@ describe("the configured actor's seeded access", () => {
     await expect(
       mesh.revokeCapability("sibling", "understanding-write", "root")
     ).resolves.toBeUndefined();
-    expect(
-      mesh.enrollActorInExperiment("steward-child", STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root")
-    ).toEqual({ actorId: "steward-child", changed: true });
+    expect(mesh.enrollActorInExperiment("steward-child", FIXTURE_EXPERIMENT, "root")).toEqual({
+      actorId: "steward-child",
+      changed: true,
+    });
     expect(() =>
       mesh.setActorModel(
         "configured",

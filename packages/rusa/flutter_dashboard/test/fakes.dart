@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:rusa_dashboard/actor_hierarchy_cache.dart';
 import 'package:rusa_dashboard/api.dart';
+import 'package:rusa_dashboard/dashboard_timing.dart';
 import 'package:rusa_dashboard/avatar_platform.dart';
 import 'package:rusa_dashboard/mesh_stream.dart';
 import 'package:rusa_dashboard/models.dart';
@@ -210,11 +211,14 @@ class FakeApi extends DashboardApi {
   DashboardConfigDto? dashboardConfigResult;
   Completer<DashboardConfigDto>? dashboardConfigGate;
   bool halted = false;
+  HaltStatusDto? halt;
   List<String>? schedulerWarning;
   RuntimeCursor? runtimeCursor;
   int threadsCallCount = 0;
   final threadSnapshotGates = <Completer<ThreadsSnapshot>>[];
   Object? threadsError;
+  final timingInteractions =
+      <({DashboardInteraction interaction, String outcome})>[];
   List<EventPage> eventPages = [];
   List<ChatPage> chatPages = [];
   int chatCall = 0;
@@ -242,6 +246,21 @@ class FakeApi extends DashboardApi {
   Completer<EventPage>? eventsGate;
 
   @override
+  Future<T> trackInteraction<T>(
+    DashboardInteraction interaction,
+    Future<T> Function() action,
+  ) async {
+    try {
+      final result = await action();
+      timingInteractions.add((interaction: interaction, outcome: 'success'));
+      return result;
+    } catch (_) {
+      timingInteractions.add((interaction: interaction, outcome: 'failure'));
+      rethrow;
+    }
+  }
+
+  @override
   Future<ThreadsSnapshot> fetchThreads() async {
     threadsCallCount++;
     final error = threadsError;
@@ -251,6 +270,7 @@ class FakeApi extends DashboardApi {
     }
     return ThreadsSnapshot(
       halted: halted,
+      halt: halt,
       schedulerWarning: schedulerWarning,
       threads: threadsResult,
       runtimeCursor: runtimeCursor,

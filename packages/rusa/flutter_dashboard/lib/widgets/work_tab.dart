@@ -3,6 +3,7 @@ import 'package:flutter_svg/flutter_svg.dart';
 import 'package:flutter/material.dart';
 
 import '../breakpoints.dart';
+import '../dashboard_timing.dart';
 import '../link_opener.dart';
 import '../models.dart';
 import '../store.dart';
@@ -61,7 +62,10 @@ class _WorkTabState extends State<WorkTab> {
   /// [forceIncludeTerminal] widens a single load beyond the current "Show
   /// Done" setting — used when a focus link names an obligation the default
   /// (terminal-excluding) load didn't fetch at all.
-  Future<void> _loadRoots({bool forceIncludeTerminal = false}) async {
+  Future<void> _loadRoots({
+    bool forceIncludeTerminal = false,
+    bool trackNavigation = false,
+  }) async {
     final includeTerminal = forceIncludeTerminal || _showDone;
     final generation = ++_loadGeneration;
     try {
@@ -70,23 +74,36 @@ class _WorkTabState extends State<WorkTab> {
         _isBackgroundRefreshing = _rootTrees.isNotEmpty;
         _error = null;
       });
-      final forest = await widget.store.api.fetchObligationForest(
-        includeTerminalRoots: includeTerminal,
-      );
-      if (!mounted || generation != _loadGeneration) return;
-      setState(() {
-        _rootTrees = forest.trees;
-        _fetchedTerminalRoots = includeTerminal;
-        _loading = false;
-        _isBackgroundRefreshing = false;
-      });
-      // Focus-link and Show Done requests include terminal roots. Persist only
-      // the default terminal-excluding forest so a later default view cannot
-      // paint rows it believes it did not fetch.
-      if (!includeTerminal) {
-        widget.store.saveObligationsSnapshot(forest.trees);
+      Future<void> runLoad() async {
+        final forest = await widget.store.api.fetchObligationForest(
+          includeTerminalRoots: includeTerminal,
+        );
+        if (!mounted || generation != _loadGeneration) {
+          throw StateError('Work queue load superseded or unmounted');
+        }
+        setState(() {
+          _rootTrees = forest.trees;
+          _fetchedTerminalRoots = includeTerminal;
+          _loading = false;
+          _isBackgroundRefreshing = false;
+        });
+        // Focus-link and Show Done requests include terminal roots. Persist only
+        // the default terminal-excluding forest so a later default view cannot
+        // paint rows it believes it did not fetch.
+        if (!includeTerminal) {
+          widget.store.saveObligationsSnapshot(forest.trees);
+        }
+        _checkFocusLink();
       }
-      _checkFocusLink();
+
+      if (trackNavigation) {
+        await widget.store.api.trackInteraction(
+          DashboardInteraction.primaryNavigation,
+          runLoad,
+        );
+      } else {
+        await runLoad();
+      }
     } catch (e) {
       if (!mounted || generation != _loadGeneration) return;
       setState(() {
@@ -267,7 +284,7 @@ class _WorkTabState extends State<WorkTab> {
       _loading = true;
       _isBackgroundRefreshing = false;
     }
-    _loadRoots();
+    _loadRoots(trackNavigation: true);
     _focusSub = widget.store.focusedObligationId.listen((focusedId) {
       if (focusedId != null && !_loading) {
         _expandAncestors(focusedId);
@@ -840,7 +857,7 @@ class _DetailViewState extends State<_DetailView> {
   @override
   void initState() {
     super.initState();
-    _fetch();
+    _fetch(trackDetail: true);
     _checkpointSub = widget.store.obligationRefreshes.listen(_onRefresh);
   }
 
@@ -865,7 +882,7 @@ class _DetailViewState extends State<_DetailView> {
       _pendingAttempts = 0;
       _pendingSeen = const {};
       _pendingGaveUp = const {};
-      _fetch();
+      _fetch(trackDetail: true);
     }
   }
 
@@ -952,24 +969,33 @@ class _DetailViewState extends State<_DetailView> {
         )
       : reference;
 
-  void _fetch() {
+  void _fetch({bool trackDetail = false}) {
     final gen = _beginFetch();
-    final future = store.api.fetchObligationDetail(widget.obligationId);
+    Future<ObligationDetailSnapshot> runFetch() async {
+      final data = await store.api.fetchObligationDetail(widget.obligationId);
+      if (!mounted || gen != _fetchGeneration) {
+        throw StateError('Obligation detail fetch superseded or unmounted');
+      }
+      _shownIds = _idsOf(data);
+      setState(() {
+        _history = data.history;
+        _historyNextBefore = data.historyNextBefore;
+        _completions = data.completions;
+        _completionsTotal = data.completionsTotal;
+        _completionsHasMore = data.completionsHasMore;
+        _schedulePendingRetry(data);
+      });
+      return data;
+    }
+
+    final future = trackDetail
+        ? store.api.trackInteraction(
+            DashboardInteraction.obligationDetail,
+            runFetch,
+          )
+        : runFetch();
     _future = future;
-    future
-        .then((data) {
-          if (!mounted || gen != _fetchGeneration) return;
-          _shownIds = _idsOf(data);
-          setState(() {
-            _history = data.history;
-            _historyNextBefore = data.historyNextBefore;
-            _completions = data.completions;
-            _completionsTotal = data.completionsTotal;
-            _completionsHasMore = data.completionsHasMore;
-            _schedulePendingRetry(data);
-          });
-        })
-        .catchError((_) {});
+    future.then((_) {}).catchError((_) {});
   }
 
   void _loadMoreCompletions() {
@@ -1198,6 +1224,11 @@ class _DetailViewState extends State<_DetailView> {
       const Divider(height: 32, color: MeshColors.border),
       _SectionHeader('EXTERNAL LINK'),
       _externalRefPanel(context, data),
+      if (data.obligation.completionMatcher != null) ...[
+        const Divider(height: 32, color: MeshColors.border),
+        _SectionHeader('COMPLETION MATCHER'),
+        _completionMatcherPanel(data.obligation.completionMatcher!),
+      ],
       if (data.artifacts.isNotEmpty) ...[
         const Divider(height: 32, color: MeshColors.border),
         _SectionHeader('ARTIFACTS'),
@@ -1838,6 +1869,46 @@ class _DetailViewState extends State<_DetailView> {
     return _referenceLine(reference, action: edit);
   }
 
+  Widget _completionMatcherPanel(CompletionMatcherDto matcher) {
+    final label = matcher.kind == 'pr_merged'
+        ? 'Complete when this pull request merges'
+        : 'Complete when this instance deploys a descendant build';
+    final state = matcher.satisfiedAt != null
+        ? 'Satisfied ${formatTs(matcher.satisfiedAt!)}'
+        // Recorded once and not cleared by a reopen, so it is stated as a past
+        // observation; a later merge of the reopened PR still satisfies it.
+        : matcher.closedUnmergedAt != null
+        ? 'PR was closed without merging at ${formatTs(matcher.closedUnmergedAt!)}'
+        : 'Pending';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(color: MeshColors.textPrimary, fontSize: 12.5),
+        ),
+        const SizedBox(height: 6),
+        SelectableText(
+          matcher.target,
+          style: const TextStyle(color: MeshColors.accent, fontSize: 12),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          '$state · set by ${store.actorDisplay(matcher.setBy)}',
+          style: const TextStyle(color: MeshColors.textMuted, fontSize: 11.5),
+        ),
+        // A merged PR's resolution is its own target, already shown above.
+        if (matcher.kind == 'deployed' && matcher.satisfiedRef != null) ...[
+          const SizedBox(height: 4),
+          SelectableText(
+            'Resolution: ${matcher.satisfiedRef}',
+            style: const TextStyle(color: MeshColors.textMuted, fontSize: 11.5),
+          ),
+        ],
+      ],
+    );
+  }
+
   Widget _childrenPanel(BuildContext context, ObligationDetailSnapshot data) {
     final all = data.children;
     // Only `done` is hidden: that is what #396 asks for, and a cancelled child
@@ -2155,10 +2226,7 @@ class _DetailViewState extends State<_DetailView> {
           crossAxisAlignment: WrapCrossAlignment.center,
           runSpacing: 4,
           spacing: 8,
-          children: [
-            status,
-            if (!o.isTerminal) ...actions,
-          ],
+          children: [status, if (!o.isTerminal) ...actions],
         ),
       ],
     );

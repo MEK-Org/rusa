@@ -8,6 +8,7 @@ import {
   type ChatClient,
   type ChatSpace,
   MAX_CHAT_ATTACHMENT_BYTES,
+  MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
   MEDIA_TOKEN_RE,
   MESSAGE_ATTACHMENT_NAME_RE,
 } from "../chat/types.js";
@@ -17,7 +18,12 @@ import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { formatVisibleActorSignature } from "./actor-signature.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
-import { readBoundedRegularFile, resolveAttachmentPath } from "./workdir-path.js";
+import {
+  readBoundedRegularFile,
+  resolveAttachmentPath,
+  resolveDownloadPath,
+  streamNewFileInWorkdir,
+} from "./workdir-path.js";
 
 export const CHAT_WRITE_MCP_NAME = "chat-write";
 export const CHAT_READ_MCP_NAME = "chat-read";
@@ -28,7 +34,28 @@ export function inferChatMimeType(filename: string): string {
 
 export interface ChatReadMcpOptions {
   allowedSpaces?: string[];
+  /**
+   * Optional policy ceiling. It can lower, but never raise, the 1 GiB
+   * downloaded-attachment maximum.
+   */
   maxAttachmentBytes?: number;
+  workDir?: string;
+  fileToolsAvailable?: boolean | (() => boolean);
+}
+
+function requireWorkDir(options: ChatReadMcpOptions): string {
+  if (!options.workDir) throw new Error("Chat file tools need an actor workdir");
+  return options.workDir;
+}
+
+function requireFileToolsAvailable(options: ChatReadMcpOptions): void {
+  const available =
+    typeof options.fileToolsAvailable === "function"
+      ? options.fileToolsAvailable()
+      : options.fileToolsAvailable;
+  if (available === false) {
+    throw new Error("Chat file tools are unavailable for follower-hosted actors (see #812)");
+  }
 }
 
 /** Read-only Google Chat tools, mounted for root or granted to space-scoped actors. */
@@ -107,16 +134,21 @@ export function createChatReadMcpServer(
     {
       title: "Download a Google Chat attachment's binary content",
       description:
-        "Download an attachment's raw bytes and return them as a base64-encoded string. For space-scoped actors, requires the attachment resource name (spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT); unscoped servers also accept opaque media tokens (media/...).",
+        "Stream an attachment to destinationPath inside your working directory (up to 1 GiB) and return its path, byte count, SHA-256, content type, and name. For space-scoped actors, requires the attachment resource name (spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT); unscoped servers also accept opaque media tokens (media/...).",
       inputSchema: {
         resourceName: z
           .string()
           .describe(
             "Attachment resource name in format spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT (or media/... token for unscoped servers)"
           ),
+        destinationPath: z
+          .string()
+          .describe(
+            "New file path inside your working directory for the streamed attachment. Unavailable for follower-hosted actors (see #812)."
+          ),
       },
     },
-    async ({ resourceName }) => {
+    async ({ resourceName, destinationPath }) => {
       try {
         if (!MESSAGE_ATTACHMENT_NAME_RE.test(resourceName) && !MEDIA_TOKEN_RE.test(resourceName)) {
           throw new Error(
@@ -137,14 +169,21 @@ export function createChatReadMcpServer(
         if (spaceName && !isAllowed(spaceName)) {
           throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
         }
-        const result = await chatClient.downloadAttachment(resourceName);
-        const maxBytes = options?.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
-        if (result.length > maxBytes) {
-          throw new Error(
-            `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
-          );
-        }
-        return toolOk(result.toString("base64"));
+
+        const fileLimit = Math.min(
+          options?.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
+          MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES
+        );
+
+        requireFileToolsAvailable(options ?? {});
+        const workDir = requireWorkDir(options ?? {});
+        const target = await resolveDownloadPath(workDir, destinationPath);
+        const { resp, name, contentType } = await chatClient.downloadAttachmentStream(
+          resourceName,
+          fileLimit
+        );
+        const { bytes, sha256 } = await streamNewFileInWorkdir(workDir, target, resp.body);
+        return toolOk({ path: target, bytes, sha256, contentType, name });
       } catch (err) {
         return toolError(err);
       }

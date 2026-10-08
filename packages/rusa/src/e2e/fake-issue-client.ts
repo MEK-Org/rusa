@@ -119,6 +119,7 @@ export class FakeIssueClient implements IssueClient {
       baseRef: pr.base ?? "",
       headSha: `fake-head-${prNumber}`,
       state: pr.state,
+      merged: false,
     };
   }
 

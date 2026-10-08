@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GchatClient } from "./gchat-client.js";
+import { MAX_CHAT_ATTACHMENT_BYTES, MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES } from "./types.js";
 
 const dirs: string[] = [];
 
@@ -255,7 +256,7 @@ describe("GchatClient reads", () => {
     ).rejects.toThrow("is not present on message spaces/A/messages/M1");
   });
 
-  it("downloads binary attachment contents via direct media token", async () => {
+  it("opens a bounded binary attachment stream via direct media token", async () => {
     const fileBytes = Buffer.from("fake binary content");
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
@@ -266,19 +267,19 @@ describe("GchatClient reads", () => {
       )
       .mockResolvedValueOnce(new Response(fileBytes, { status: 200 }));
 
-    const downloaded = await new GchatClient(credentialsDir()).downloadAttachment(
+    const { resp } = await new GchatClient(credentialsDir()).downloadAttachmentStream(
       "media/spaces/A/attachments/DATAREF_123"
     );
 
-    expect(downloaded).toEqual(fileBytes);
+    expect(Buffer.from(await resp.arrayBuffer())).toEqual(fileBytes);
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
       "https://chat.googleapis.com/v1/media/spaces%2FA%2Fattachments%2FDATAREF_123?alt=media"
     );
   });
 
-  it("rejects downloadAttachment if resource name is neither spaces/... nor media/...", async () => {
+  it("rejects downloadAttachmentStream if resource name is neither spaces/... nor media/...", async () => {
     await expect(
-      new GchatClient(credentialsDir()).downloadAttachment("invalid-resource-name")
+      new GchatClient(credentialsDir()).downloadAttachmentStream("invalid-resource-name")
     ).rejects.toThrow("invalid attachment resource name");
   });
 
@@ -308,11 +309,11 @@ describe("GchatClient reads", () => {
       )
       .mockResolvedValueOnce(new Response(fileBytes, { status: 200 }));
 
-    const downloaded = await new GchatClient(credentialsDir()).downloadAttachment(
+    const { resp } = await new GchatClient(credentialsDir()).downloadAttachmentStream(
       "spaces/A/messages/M1/attachments/ATT1"
     );
 
-    expect(downloaded).toEqual(fileBytes);
+    expect(Buffer.from(await resp.arrayBuffer())).toEqual(fileBytes);
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
       "https://chat.googleapis.com/v1/spaces/A/messages/M1"
     );
@@ -321,7 +322,7 @@ describe("GchatClient reads", () => {
     );
   });
 
-  it("rejects downloadAttachment if attachment is a Drive file", async () => {
+  it("rejects downloadAttachmentStream if attachment is a Drive file", async () => {
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
@@ -339,11 +340,13 @@ describe("GchatClient reads", () => {
       );
 
     await expect(
-      new GchatClient(credentialsDir()).downloadAttachment("spaces/A/messages/M1/attachments/ATT1")
+      new GchatClient(credentialsDir()).downloadAttachmentStream(
+        "spaces/A/messages/M1/attachments/ATT1"
+      )
     ).rejects.toThrow("is a Drive file");
   });
 
-  it("rejects downloadAttachment if message attachment lacks attachmentDataRef", async () => {
+  it("rejects downloadAttachmentStream if message attachment lacks attachmentDataRef", async () => {
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
@@ -363,7 +366,9 @@ describe("GchatClient reads", () => {
       );
 
     await expect(
-      new GchatClient(credentialsDir()).downloadAttachment("spaces/A/messages/M1/attachments/ATT1")
+      new GchatClient(credentialsDir()).downloadAttachmentStream(
+        "spaces/A/messages/M1/attachments/ATT1"
+      )
     ).rejects.toThrow("does not contain an attachmentDataRef");
   });
 
@@ -403,7 +408,7 @@ describe("GchatClient reads", () => {
     expect(headers["content-type"]).toContain("multipart/related; boundary=");
   });
 
-  it("rejects downloadAttachment if Content-Length exceeds maxSizeBytes", async () => {
+  it("rejects downloadAttachmentStream if Content-Length exceeds maxSizeBytes", async () => {
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
@@ -418,16 +423,71 @@ describe("GchatClient reads", () => {
       );
 
     await expect(
-      new GchatClient(credentialsDir(), 500).downloadAttachment("media/spaces/A/attachments/ATT1")
+      new GchatClient(credentialsDir(), 500).downloadAttachmentStream(
+        "media/spaces/A/attachments/ATT1"
+      )
     ).rejects.toThrow("attachment size limit exceeded");
   });
 
-  it("rejects downloadAttachment if streaming body exceeds maxSizeBytes", async () => {
+  it("declared-size guard: accepts a declared 1 GiB without reading a body", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
+          status: 200,
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response("", {
+          status: 200,
+          headers: { "content-length": String(MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES) },
+        })
+      );
+
+    const { resp } = await new GchatClient(credentialsDir()).downloadAttachmentStream(
+      "media/spaces/A/attachments/ATT1"
+    );
+    expect(resp.headers.get("content-length")).toBe(String(MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES));
+  });
+
+  it("declared-size guard: rejects a declared 1 GiB + 1 before reading and cancels the body", async () => {
+    let cancelled = false;
+    const stream = new ReadableStream({
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
+          status: 200,
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(stream, {
+          status: 200,
+          headers: { "content-length": String(MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES + 1) },
+        })
+      );
+
+    await expect(
+      new GchatClient(
+        credentialsDir(),
+        MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES + 1
+      ).downloadAttachmentStream("media/spaces/A/attachments/ATT1")
+    ).rejects.toThrow("attachment size limit exceeded");
+    expect(cancelled).toBe(true);
+  });
+
+  it("exposes a bounded stream that cancels if its body exceeds maxSizeBytes", async () => {
+    let cancelled = false;
     const stream = new ReadableStream({
       start(controller) {
         controller.enqueue(new Uint8Array(50));
         controller.enqueue(new Uint8Array(60));
-        controller.close();
+      },
+      cancel() {
+        cancelled = true;
       },
     });
 
@@ -439,9 +499,28 @@ describe("GchatClient reads", () => {
       )
       .mockResolvedValueOnce(new Response(stream, { status: 200 }));
 
-    await expect(
-      new GchatClient(credentialsDir(), 80).downloadAttachment("media/spaces/A/attachments/ATT1")
-    ).rejects.toThrow("attachment size limit exceeded");
+    const { resp } = await new GchatClient(credentialsDir(), 80).downloadAttachmentStream(
+      "media/spaces/A/attachments/ATT1"
+    );
+    await expect(resp.arrayBuffer()).rejects.toThrow("attachment size limit exceeded");
+    expect(cancelled).toBe(true);
+  });
+
+  it("keeps a lower configured limit when a stream call asks for more", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
+          status: 200,
+        })
+      )
+      .mockResolvedValueOnce(new Response(new Uint8Array(100), { status: 200 }));
+
+    const client = new GchatClient(credentialsDir(), 80);
+    const { resp } = await client.downloadAttachmentStream(
+      "media/spaces/A/attachments/ATT1",
+      MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES
+    );
+    await expect(resp.arrayBuffer()).rejects.toThrow("attachment is larger than 80 bytes");
   });
 
   it("rejects uploadAttachment if payload size exceeds maxSizeBytes", async () => {
@@ -452,6 +531,21 @@ describe("GchatClient reads", () => {
         "spaces/A",
         "doc.txt",
         largeBytes,
+        "text/plain"
+      )
+    ).rejects.toThrow("attachment size limit exceeded");
+  });
+
+  it("keeps the default upload ceiling at 50 MiB without allocating a large buffer", async () => {
+    const syntheticOversize = {
+      byteLength: MAX_CHAT_ATTACHMENT_BYTES + 1,
+    } as unknown as Uint8Array;
+
+    await expect(
+      new GchatClient(credentialsDir()).uploadAttachment(
+        "spaces/A",
+        "doc.txt",
+        syntheticOversize,
         "text/plain"
       )
     ).rejects.toThrow("attachment size limit exceeded");

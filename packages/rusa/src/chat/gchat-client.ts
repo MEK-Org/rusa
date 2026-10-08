@@ -1,3 +1,5 @@
+import { basename } from "node:path";
+import { boundedResponse } from "./bounded-response.js";
 import { defaultGchatConfigDir, GchatOAuth } from "./gchat-oauth.js";
 import {
   type ChatAttachment,
@@ -14,6 +16,7 @@ import {
   type ListChatSpaceMembersOptions,
   type ListChatSpacesOptions,
   MAX_CHAT_ATTACHMENT_BYTES,
+  MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
   MESSAGE_ATTACHMENT_NAME_RE,
 } from "./types.js";
 
@@ -30,11 +33,21 @@ const EYES = "\u{1F440}"; // 👀
  */
 export class GchatClient implements ChatClient {
   private readonly oauth: GchatOAuth;
-  private readonly maxSizeBytes: number;
+  private readonly maxDownloadSizeBytes: number;
+  private readonly maxUploadSizeBytes: number;
 
-  constructor(configDir = defaultGchatConfigDir(), maxSizeBytes = MAX_CHAT_ATTACHMENT_BYTES) {
+  /**
+   * An explicit size continues to constrain both directions for callers that
+   * intentionally set a lower cap. Defaults distinguish the 1 GiB read limit
+   * from the unchanged 50 MiB send limit.
+   */
+  constructor(configDir = defaultGchatConfigDir(), maxSizeBytes?: number) {
     this.oauth = new GchatOAuth(configDir);
-    this.maxSizeBytes = maxSizeBytes;
+    this.maxDownloadSizeBytes = Math.min(
+      maxSizeBytes ?? MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES,
+      MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES
+    );
+    this.maxUploadSizeBytes = maxSizeBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
   }
 
   private token(): Promise<string> {
@@ -191,71 +204,17 @@ export class GchatClient implements ChatClient {
     return attachment;
   }
 
-  private async readBodyWithLimit(resp: Response, maxBytes: number): Promise<Buffer> {
-    const body = resp.body;
-    if (!body) {
-      return Buffer.alloc(0);
-    }
-
-    if (typeof (body as unknown as ReadableStream).getReader === "function") {
-      const reader = (body as unknown as ReadableStream).getReader();
-      const chunks: Uint8Array[] = [];
-      let totalSize = 0;
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) {
-            totalSize += value.byteLength;
-            if (totalSize > maxBytes) {
-              throw new Error(
-                `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
-              );
-            }
-            chunks.push(value);
-          }
-        }
-      } catch (err) {
-        try {
-          await reader.cancel(err instanceof Error ? err.message : String(err));
-        } catch (_) {}
-        throw err;
-      } finally {
-        reader.releaseLock();
-      }
-      return Buffer.concat(chunks.map((c) => Buffer.from(c)));
-    }
-
-    if (
-      body &&
-      typeof (body as unknown as AsyncIterable<unknown>)[Symbol.asyncIterator] === "function"
-    ) {
-      const chunks: Buffer[] = [];
-      let totalSize = 0;
-      for await (const chunk of body as unknown as AsyncIterable<Uint8Array | string>) {
-        const buf = Buffer.from(chunk);
-        totalSize += buf.length;
-        if (totalSize > maxBytes) {
-          throw new Error(
-            `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
-          );
-        }
-        chunks.push(buf);
-      }
-      return Buffer.concat(chunks);
-    }
-
-    const arrayBuffer = await resp.arrayBuffer();
-    if (arrayBuffer.byteLength > maxBytes) {
-      throw new Error(
-        `attachment size limit exceeded: attachment is larger than ${maxBytes} bytes`
-      );
-    }
-    return Buffer.from(arrayBuffer);
-  }
-
-  async downloadAttachment(resourceName: string): Promise<Buffer> {
+  async downloadAttachmentStream(
+    resourceName: string,
+    maxBytes?: number
+  ): Promise<{
+    resp: Response;
+    name: string;
+    contentType: string;
+  }> {
     let dataRef: string;
+    let name = basename(resourceName);
+    let contentType = "application/octet-stream";
     if (resourceName.startsWith("spaces/")) {
       const attachment = await this.getAttachment(resourceName);
       if (attachment.source === "DRIVE_FILE") {
@@ -263,6 +222,8 @@ export class GchatClient implements ChatClient {
           `attachment ${resourceName} is a Drive file; access it using the Drive API instead of downloadAttachment`
         );
       }
+      if (attachment.contentName) name = attachment.contentName;
+      if (attachment.contentType) contentType = attachment.contentType;
       const ref = attachment.attachmentDataRef?.resourceName;
       if (!ref) {
         throw new Error(`attachment ${resourceName} does not contain an attachmentDataRef`);
@@ -287,13 +248,17 @@ export class GchatClient implements ChatClient {
         `gchat download attachment ${resourceName} -> HTTP ${resp.status} ${(await resp.text()).slice(0, 300)}`
       );
     }
-    const contentLength = resp.headers.get("content-length");
-    if (contentLength && parseInt(contentLength, 10) > this.maxSizeBytes) {
-      throw new Error(
-        `attachment size limit exceeded: attachment is larger than ${this.maxSizeBytes} bytes`
-      );
+    const headerType = resp.headers.get("content-type");
+    if (headerType && contentType === "application/octet-stream") {
+      contentType = headerType;
     }
-    return this.readBodyWithLimit(resp, this.maxSizeBytes);
+    const bounded = await boundedResponse(resp, this.downloadLimit(maxBytes), "attachment");
+    return { resp: bounded, name, contentType };
+  }
+
+  /** A per-call limit can lower the configured limit, never raise it. */
+  private downloadLimit(maxBytes?: number): number {
+    return Math.min(this.maxDownloadSizeBytes, maxBytes ?? this.maxDownloadSizeBytes);
   }
 
   async uploadAttachment(
@@ -303,9 +268,9 @@ export class GchatClient implements ChatClient {
     mimeType = "application/octet-stream"
   ): Promise<ChatUploadAttachmentResult> {
     const size = Buffer.isBuffer(content) ? content.length : content.byteLength;
-    if (size > this.maxSizeBytes) {
+    if (size > this.maxUploadSizeBytes) {
       throw new Error(
-        `attachment size limit exceeded: attachment is larger than ${this.maxSizeBytes} bytes`
+        `attachment size limit exceeded: attachment is larger than ${this.maxUploadSizeBytes} bytes`
       );
     }
     const token = await this.token();

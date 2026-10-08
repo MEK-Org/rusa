@@ -1,0 +1,58 @@
+{
+  "issue": 190,
+  "pullRequest": 926,
+  "capture": {
+    "kind": "synthetic_widget_test",
+    "flutterCommand": "/tmp/flutter-sdk/bin/flutter",
+    "pixelRatio": 2,
+    "fixture": "appearance_test.dart.fixture",
+    "beforeSource": {
+      "commit": "39cfeb0c86f707195dfab6c5bdeeac30f87d9179",
+      "modelsBlob": "6cc2c5944ff0642506ff1cb15ed889fda6060f41",
+      "workTabBlob": "029aad2ef7da1d0771c3f5d5ce6b92e237d72430"
+    },
+    "afterSource": {
+      "commit": "85d2cc4b4b53a0a850c6e97bccc2532efb2a5f99",
+      "modelsBlob": "bfa1cc0b5a2181b06a1b8cdae4c9af9be5321499",
+      "workTabBlob": "a5640ecabfa81311eee27eb1bf23098ffe06cbf1"
+    },
+    "observed": {
+      "beforeTest": "2 passed",
+      "afterTest": "2 passed"
+    }
+  },
+  "images": [
+    {
+      "path": "completion_matcher_wide_before.png",
+      "phase": "before",
+      "viewport": [1400, 900],
+      "pixels": [2800, 1800],
+      "bytes": 200131,
+      "sha256": "02524280f74c94ab056c751272c44b7609cc612493fa2f3365d171aec3991b8e"
+    },
+    {
+      "path": "completion_matcher_narrow_before.png",
+      "phase": "before",
+      "viewport": [390, 844],
+      "pixels": [780, 1688],
+      "bytes": 137594,
+      "sha256": "6102dbbe614da13295b97a2f701fb4c26ffe97e6c7565f85d0cca29882dcdb7e"
+    },
+    {
+      "path": "completion_matcher_wide_after.png",
+      "phase": "after",
+      "viewport": [1400, 900],
+      "pixels": [2800, 1800],
+      "bytes": 237030,
+      "sha256": "b8cc7e133240ddc4259ec43bebce6d7854df78434a0de04c3777e18dc99db203"
+    },
+    {
+      "path": "completion_matcher_narrow_after.png",
+      "phase": "after",
+      "viewport": [390, 844],
+      "pixels": [780, 1688],
+      "bytes": 149776,
+      "sha256": "f4ba44136ff3bbe119bb338ba735aba6329e99894e0d68c98228120966e21a76"
+    }
+  ]
+}

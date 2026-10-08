@@ -94,6 +94,30 @@ void main() {
       expect(dto.externalRef, null);
     });
 
+    test('deserializes an optional completion matcher and preserves its facts', () {
+      final dto = ObligationDto.fromJson({
+        'id': 'matched',
+        'ownerId': 'test-actor',
+        'status': 'waiting',
+        'effectivePriority': 50.0,
+        'completionMatcher': {
+          'kind': 'pr_merged',
+          'target': 'github:MEK-Org/rusa/pulls/190',
+          'setBy': 'actor-a',
+          'setAt': '2026-10-05T00:00:00.000Z',
+          'satisfiedAt': null,
+          'satisfiedRef': null,
+          'closedUnmergedAt': '2026-10-05T01:00:00.000Z',
+        },
+      });
+
+      expect(dto.completionMatcher, isNotNull);
+      expect(dto.completionMatcher!.kind, 'pr_merged');
+      expect(dto.completionMatcher!.target, 'github:MEK-Org/rusa/pulls/190');
+      expect(dto.completionMatcher!.closedUnmergedAt, '2026-10-05T01:00:00.000Z');
+      expect(dto.toJson()['completionMatcher'], isA<Map<String, dynamic>>());
+    });
+
     test('deserializes recurrence fields and derives isScheduled/isRecurring', () {
       final json = {
         'id': 'ob-cron',
