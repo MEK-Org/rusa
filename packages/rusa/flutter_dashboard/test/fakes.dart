@@ -344,9 +344,16 @@ class FakeApi extends DashboardApi {
   List<RecentActivityItem> recentActivityResult = [];
   int recentActivityCallCount = 0;
 
+  /// Per-call feed answers, taken ahead of [recentActivityResult].
+  final scriptedRecentActivity =
+      <Future<List<RecentActivityItem>> Function()>[];
+
   @override
   Future<List<RecentActivityItem>> fetchRecentActivity({int limit = 50}) async {
     recentActivityCallCount++;
+    if (scriptedRecentActivity.isNotEmpty) {
+      return scriptedRecentActivity.removeAt(0)();
+    }
     return recentActivityResult;
   }
 

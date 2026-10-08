@@ -229,72 +229,43 @@ void main() {
     },
   );
 
-  test(
-    'refreshRecentActivity generation check guards against out-of-order responses',
-    () async {
-      final completer1 = Completer<List<RecentActivityItem>>();
-      final completer2 = Completer<List<RecentActivityItem>>();
-      var callCount = 0;
-      final client = MockClient((req) async {
-        if (req.url.path == '/api/mesh/recent-activity') {
-          callCount++;
-          final items = callCount == 1
-              ? await completer1.future
-              : await completer2.future;
-          return http.Response(
-            jsonEncode({
-              'items': items
-                  .map(
-                    (i) => {
-                      'id': i.id,
-                      'kind': i.kind,
-                      'time': i.time,
-                      'actorId': i.actorId,
-                      'referenceKey': i.referenceKey,
-                    },
-                  )
-                  .toList(),
-            }),
-            200,
-          );
-        }
-        return http.Response(jsonEncode({'references': {}}), 200);
+  testWidgets(
+    'Recent Activity asks for a frame and resolves once for refreshes made '
+    'while Overview is not mounted',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..recentActivityResult = const [
+            RecentActivityItem(
+              id: 'inbox_1',
+              kind: 'handled_inbox',
+              time: '2026-09-23T14:21:37.000Z',
+              actorId: 'actor-1',
+              referenceKey: _cited,
+            ),
+          ]
+          ..referencesResult = {_cited: _issue(_cited, 'The cited bug')};
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await tester.pumpWidget(const SizedBox());
+
+        await store.refreshRecentActivity();
+        await store.refreshRecentActivity();
+        // Nothing on screen listens to the feed, so only the store's own
+        // request schedules the frame its fill waits for.
+        expect(tester.binding.hasScheduledFrame, isTrue);
+        expect(api.referenceRequests, isEmpty);
+
+        await tester.pump();
+        await Future<void>.delayed(Duration.zero);
+        expect(api.referenceRequests, [
+          [_cited],
+        ]);
+        expect(
+          store.recentActivity.value.single.reference?.title,
+          'The cited bug',
+        );
+        await store.dispose();
       });
-      final api = DashboardApi(
-        client: client,
-        base: Uri.parse('http://localhost:3000'),
-      );
-      final store = DashboardStore(api: api, stream: FakeStream());
-      await store.init();
-
-      final f1 = store.refreshRecentActivity(deferUntilPostFrame: false);
-      final f2 = store.refreshRecentActivity(deferUntilPostFrame: false);
-
-      completer2.complete([
-        const RecentActivityItem(
-          id: 'inbox_2',
-          kind: 'handled_inbox',
-          time: '2026-09-23T14:22:00.000Z',
-          actorId: 'actor-2',
-          referenceKey: 'github:o/r/issues/2',
-        ),
-      ]);
-      await f2;
-
-      completer1.complete([
-        const RecentActivityItem(
-          id: 'inbox_1',
-          kind: 'handled_inbox',
-          time: '2026-09-23T14:21:00.000Z',
-          actorId: 'actor-1',
-          referenceKey: 'github:o/r/issues/1',
-        ),
-      ]);
-      await f1;
-
-      final items = await store.recentActivity.first;
-      expect(items.map((i) => i.id), ['inbox_2']);
-      await store.dispose();
     },
   );
 
@@ -331,29 +302,45 @@ void main() {
   );
 
   test(
-    'a stale partial failure cannot replace a newer activity reference',
+    'a stale feed, reference answer or failure never replaces a newer refresh',
     () async {
-      final firstAnswer = Completer<void>();
-      final refreshAnswer = Completer<void>();
+      const current = RecentActivityItem(
+        id: 'inbox_1',
+        kind: 'handled_inbox',
+        time: '2026-09-23T14:21:37.000Z',
+        actorId: 'actor-1',
+        referenceKey: _cited,
+      );
+      const obsolete = ReferenceDto(
+        ref: _cited,
+        scheme: 'github',
+        title: 'Obsolete title',
+        cacheState: 'fresh',
+      );
+      final staleFeed = Completer<void>();
+      final staleAnswer = Completer<void>();
+      final staleFailure = Completer<void>();
+      final revalidation = Completer<void>();
       final api = FakeApi()
-        ..recentActivityResult = const [
-          RecentActivityItem(
-            id: 'inbox_1',
-            kind: 'handled_inbox',
-            time: '2026-09-23T14:21:37.000Z',
-            actorId: 'actor-1',
-            referenceKey: _cited,
-          ),
-        ]
+        ..recentActivityResult = const [current]
+        ..scriptedRecentActivity.add(() async {
+          await staleFeed.future;
+          return const [
+            RecentActivityItem(
+              id: 'inbox_old',
+              kind: 'handled_inbox',
+              time: '2026-09-23T14:20:00.000Z',
+              actorId: 'actor-1',
+            ),
+          ];
+        })
         ..scriptedReferenceResponses.addAll([
           (_) async {
-            const obsolete = ReferenceDto(
-              ref: _cited,
-              scheme: 'github',
-              title: 'Obsolete title',
-              cacheState: 'fresh',
-            );
-            await firstAnswer.future;
+            await staleAnswer.future;
+            return {_cited: obsolete};
+          },
+          (_) async {
+            await staleFailure.future;
             throw const PartialReferenceFetchException(
               resolved: {_cited: obsolete},
               unresolved: {},
@@ -361,36 +348,38 @@ void main() {
           },
           (_) => {_cited: _issue(_cited, 'Current title')},
           (_) async {
-            await refreshAnswer.future;
+            await revalidation.future;
             return {_cited: _issue(_cited, 'Revalidated title')};
           },
         ]);
       final store = DashboardStore(api: api, stream: FakeStream());
 
-      final first = store.refreshRecentActivity(deferUntilPostFrame: false);
+      // Each refresh reaches its own scripted answer before the next starts.
+      final pending = <Future<void>>[];
+      for (var i = 0; i < 3; i++) {
+        pending.add(store.refreshRecentActivity(deferUntilPostFrame: false));
+        await Future<void>.delayed(Duration.zero);
+      }
+      await store.refreshRecentActivity(deferUntilPostFrame: false);
+      staleFeed.complete();
+      staleAnswer.complete();
+      staleFailure.complete();
+      await Future.wait(pending);
+
+      final item = store.recentActivity.value.single;
+      expect(item.id, 'inbox_1');
+      expect(item.reference?.title, 'Current title');
+
+      // A later refresh paints from the cache while it revalidates, so a
+      // stale answer that reached the cache would show here.
+      final refresh = store.refreshRecentActivity(deferUntilPostFrame: false);
       await Future<void>.delayed(Duration.zero);
-      final newer = store.refreshRecentActivity(deferUntilPostFrame: false);
-      await newer;
       expect(
         store.recentActivity.value.single.reference?.title,
         'Current title',
       );
-
-      firstAnswer.complete();
-      await first;
-
-      final revalidation =
-          store.refreshRecentActivity(deferUntilPostFrame: false);
-      await Future<void>.delayed(Duration.zero);
-      // The new generation paints from its cache while enrichment is held.
-      // Without the catch-side generation guard, the stale partial failure
-      // above overwrites this with "Obsolete title".
-      expect(
-        store.recentActivity.value.single.reference?.title,
-        'Current title',
-      );
-      refreshAnswer.complete();
-      await revalidation;
+      revalidation.complete();
+      await refresh;
       expect(
         store.recentActivity.value.single.reference?.title,
         'Revalidated title',

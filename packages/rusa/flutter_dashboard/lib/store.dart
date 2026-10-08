@@ -677,6 +677,7 @@ class DashboardStore {
   /// so a card does not fall back to loading each time the feed reloads.
   final _activityReferences = <String, ReferenceDto>{};
   int _recentActivityGeneration = 0;
+  Future<void> Function()? _pendingActivityResolve;
 
   /// Paints the feed from its ref keys, then fills each card's reference in
   /// as `/api/mesh/references` answers (#940). Known cards keep their shown
@@ -711,6 +712,7 @@ class DashboardStore {
     if (keys.isEmpty) return;
 
     Future<void> resolve() async {
+      if (generation != _recentActivityGeneration) return;
       try {
         final fetched = await _api.fetchReferences(keys);
         if (generation != _recentActivityGeneration) return;
@@ -742,16 +744,22 @@ class DashboardStore {
     }
 
     if (deferUntilPostFrame) {
-      try {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (generation == _recentActivityGeneration) {
-            unawaited(resolve());
-          }
-        });
-        return;
-      } catch (_) {
-        // Fall back to immediate resolution when no WidgetsBinding is bound.
+      // Resolve after the frame that paints this feed. One callback serves
+      // every refresh until that frame, and only the newest generation's
+      // resolve runs. Asking for the frame keeps the fill from waiting on
+      // unrelated input while Overview is not mounted (#940).
+      final scheduled = _pendingActivityResolve != null;
+      _pendingActivityResolve = resolve;
+      if (!scheduled) {
+        WidgetsBinding.instance
+          ..addPostFrameCallback((_) {
+            final pending = _pendingActivityResolve;
+            _pendingActivityResolve = null;
+            if (pending != null) unawaited(pending());
+          })
+          ..ensureVisualUpdate();
       }
+      return;
     }
     await resolve();
   }

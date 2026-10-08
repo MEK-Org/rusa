@@ -127,9 +127,12 @@ void main() {
     await tester.runAsync(() async {
       final ids = ['coder', 'steward'];
       HttpOverrides.global = FakeImageHttpOverrides(await portraits(ids));
+      // The operator card's avatar settles too, so captures differ only in
+      // what they label.
+      final shown = [...ids, 'human:operator'];
       addTearDown(() => HttpOverrides.global = null);
       addTearDown(() => tester.binding.setSurfaceSize(null));
-      await tester.binding.setSurfaceSize(const Size(1500, 1000));
+      await tester.binding.setSurfaceSize(const Size(1500, 1250));
       final gate = Completer<void>();
       final api = FakeApi()
         // Both actors carry the model the staging baseline labelled them
@@ -160,6 +163,20 @@ void main() {
             handledTime: '2026-10-03T12:10:00.000Z',
             addressedNote: 'Answered both review questions',
           ),
+          // Closed by the operator: staging labelled this card with the raw
+          // principal id; it now reads as the operator (#940 review).
+          RecentActivityItem(
+            id: 'obligation_history_7',
+            kind: 'terminal_obligation',
+            time: '2026-10-03T11:30:00.000Z',
+            actorId: 'human:operator',
+            sourceKind: 'OBLIGATION',
+            sourceRef: 'obligation:export',
+            summary: 'Export run history as CSV',
+            obligationId: 'export',
+            terminalStatus: 'done',
+            terminalNote: 'Merged after review',
+          ),
           RecentActivityItem(
             id: 'inbox_1',
             kind: 'handled_inbox',
@@ -188,9 +205,9 @@ void main() {
           ),
         ),
       );
-      await _settle(tester, ids);
+      await _settle(tester, shown);
       await tester.ensureVisible(find.text('Recent Activity'));
-      await _settle(tester, ids);
+      await _settle(tester, shown);
       // A card shows no body, so a loading reference reads as its kind alone.
       expect(find.text('Pull request #431'), findsNothing);
       await captureBoundary(
