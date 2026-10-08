@@ -61,8 +61,9 @@ describe("parsePortableContextState", () => {
         model: "gemini-3.8-flash",
         updatedAt: "2026-10-07T00:01:00.000Z",
         consecutiveFailures: 1,
-        frozen: false,
-        freezeAttentionId: null,
+        frozen: true,
+        freezeAttentionId: "attention-entry-1",
+        freezeAttentionOwnerId: "parent-actor",
         resolvedRefs: ["mesh:actors/actor-a/charter", "mesh:messages/message-1"],
       },
     };

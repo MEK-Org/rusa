@@ -106,6 +106,7 @@ import {
 import {
   classifyBriefSender,
   GeminiBriefRewriter,
+  isBriefAttentionHandled,
   runPortableContextBriefCycle,
   seedPortableBriefState,
 } from "../actor/portable-context-brief.js";
@@ -2674,24 +2675,20 @@ async function composeStart(
               reason,
             });
           }
-          return (
-            repositories.inbox.append([
-              {
-                actorId: parentId,
-                source: `portable_context_brief:${childId}`,
-                payload: {
-                  type: "portable_context_brief.needs_attention",
-                  actorId: childId,
-                  reason,
-                },
+          const entryId = repositories.inbox.append([
+            {
+              actorId: parentId,
+              source: `portable_context_brief:${childId}`,
+              payload: {
+                type: "portable_context_brief.needs_attention",
+                actorId: childId,
+                reason,
               },
-            ])[0]?.id ?? null
-          );
+            },
+          ])[0]?.id;
+          return entryId ? { ownerId: parentId, entryId } : null;
         },
-        isAttentionHandled: (entryId) => {
-          const attentionOwner = repositories.actors.parentOf(actorId) ?? actorId;
-          return repositories.inbox.read(attentionOwner, entryId)?.handledAt !== null;
-        },
+        isAttentionHandled: isBriefAttentionHandled(repositories.inbox),
         log: (message) => log.warn("portable_context_brief_warning", { message }),
       });
     } catch (err) {

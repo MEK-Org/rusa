@@ -1,5 +1,10 @@
+import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
+import { actorInbox } from "../db/migrations/0003_actor_inbox.js";
+import { actorInboxSeen } from "../db/migrations/0012_actor_inbox_seen.js";
+import { actorInboxHandledNote } from "../db/migrations/0015_actor_inbox_handled_note.js";
 import type { PortableLedgerSource } from "../db/repositories/actor-run-repository.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import * as geminiUtils from "../understanding/gemini-utils.js";
 import { assemblePortableContextV2 } from "./portable-context.js";
 import {
@@ -13,6 +18,7 @@ import {
   classifyBriefSender,
   findBriefStateExclusion,
   GeminiBriefRewriter,
+  isBriefAttentionHandled,
   PORTABLE_CONTEXT_BRIEF_MAX_BYTES,
   PORTABLE_CONTEXT_BRIEF_MAX_CONSECUTIVE_FAILURES,
   parseBriefDocument,
@@ -144,9 +150,9 @@ function cycleHarness(options: CycleHarnessOptions) {
     raiseAttention: (input) => {
       const id = `attention-${attention.length + 1}`;
       attention.push({ id, ...input });
-      return id;
+      return { ownerId: "parent-of-actor", entryId: id };
     },
-    isAttentionHandled: (id) => handledAttention.has(id),
+    isAttentionHandled: ({ entryId }) => handledAttention.has(entryId),
   };
   const resolveRefTracked = async (ref: string): Promise<BriefReferenceResolution> => {
     resolveCalls.push(ref);
@@ -272,9 +278,28 @@ describe("parseBriefDocument", () => {
     expect(parseBriefDocument(onlyCitation).errors.join("\n")).toContain("only a citation");
 
     const trailingProse = `## WHAT\nStatement here. [mesh:messages/m-1] and more prose\n\n## HOW\n\n## DOMAIN\n`;
-    // "and more prose" is not a bracketed citation, so the line keeps it in the
-    // statement — which is fine for the parser; validation catches state text.
-    expect(parseBriefDocument(trailingProse).errors).toEqual([]);
+    expect(parseBriefDocument(trailingProse).errors.join("\n")).toContain(
+      "must end with its citations"
+    );
+    const embedded = `## WHAT\nStatement [mesh:messages/m-1] continues here. [mesh:messages/m-2]\n\n## HOW\n\n## DOMAIN\n`;
+    expect(parseBriefDocument(embedded).errors.join("\n")).toContain("must end with its citations");
+    const nonRefInTail = `## WHAT\nStatement here. [mesh:messages/m-1] [see above]\n\n## HOW\n\n## DOMAIN\n`;
+    expect(parseBriefDocument(nonRefInTail).errors.join("\n")).toContain(
+      "must end with its citations"
+    );
+  });
+
+  it("splits at the first citation and keeps a non-reference bracket in the statement", () => {
+    const text = `## WHAT\nKeep the quoted [sic] wording. [mesh:messages/m-1]  [mesh:messages/m-2]\n\n## HOW\n\n## DOMAIN\n`;
+    const { parsed, errors } = parseBriefDocument(text);
+    expect(errors).toEqual([]);
+    expect(parsed?.lines).toEqual([
+      expect.objectContaining({
+        section: "WHAT",
+        statement: "Keep the quoted [sic] wording.",
+        refs: ["mesh:messages/m-1", "mesh:messages/m-2"],
+      }),
+    ]);
   });
 });
 
@@ -343,18 +368,119 @@ describe("validateBriefText", () => {
     expect(errors.join("\n")).toContain("previous HOW line(s) dropped");
   });
 
-  it("allows at most one changed DOMAIN line for a milestone delta", () => {
+  it("a milestone yields no new lines and at most one refined DOMAIN line", () => {
     const previous = `${seed}Existing domain principle. [mesh:messages/old]\n`;
-    const candidate =
-      `${previous}First new principle. [mesh:messages/milestone]\n` +
-      `Second new principle. [mesh:messages/milestone]\n`;
+    const milestoneCitations = new Set(["mesh:messages/milestone"]);
+    const check = (text: string, milestoneOnly = true) =>
+      validateBriefText({
+        text,
+        previousText: previous,
+        authorityCitations: new Set(),
+        milestoneCitations,
+        milestoneOnly,
+      }).errors.join("\n");
+
+    // One appended line, every old line retained: a new line, rejected.
+    expect(check(`${previous}A new principle. [mesh:messages/milestone]\n`)).toContain(
+      "added a new DOMAIN line"
+    );
+    // Same, but citing only a carried ref: the milestone-only bound still catches it.
+    expect(check(`${previous}A new principle. [mesh:messages/old]\n`)).toContain(
+      "milestone-only delta added 1 new DOMAIN line"
+    );
+    // Two refinements.
+    const twoPrevious = `${previous}Second principle. [mesh:messages/old]\n`;
+    expect(
+      validateBriefText({
+        text:
+          `${seed}Refined one. [mesh:messages/milestone]\n` +
+          `Refined two. [mesh:messages/milestone]\n`,
+        previousText: twoPrevious,
+        authorityCitations: new Set(),
+        milestoneCitations,
+        milestoneOnly: true,
+      }).errors.join("\n")
+    ).toContain("changed 2 DOMAIN lines");
+    // Exactly one refinement of an existing DOMAIN line is accepted.
+    expect(
+      check(
+        previous.replace(
+          "Existing domain principle. [mesh:messages/old]",
+          "Existing domain principle, refined. [mesh:messages/old] [mesh:messages/milestone]"
+        )
+      )
+    ).toBe("");
+  });
+
+  it("an ancestor milestone cannot add WHAT/HOW, even in a mixed delta", () => {
+    const candidate = seed.replace(
+      "## HOW\n\n",
+      "## HOW\nShip only through staging. [mesh:messages/milestone]\n\n"
+    );
     const errors = validateBriefText({
       text: candidate,
+      previousText: seed,
+      // The cycle excludes milestone refs from authority; a mixed delta still
+      // carries a genuine human authority ref alongside.
+      authorityCitations: new Set(["mesh:messages/human-rule"]),
+      milestoneCitations: new Set(["mesh:messages/milestone"]),
+      milestoneOnly: false,
+    }).errors.join("\n");
+    expect(errors).toContain("milestone message cannot add or change a HOW line");
+    expect(errors).toContain("changed without a cited human/ancestor supersession");
+  });
+
+  it("a mixed delta keeps non-milestone DOMAIN additions legal", () => {
+    const candidate = `${seed}Humans set direction. [mesh:messages/human-rule]\n`;
+    expect(
+      validateBriefText({
+        text: candidate,
+        previousText: seed,
+        authorityCitations: new Set(["mesh:messages/human-rule"]),
+        milestoneCitations: new Set(["mesh:messages/milestone"]),
+        milestoneOnly: false,
+      }).errors
+    ).toEqual([]);
+  });
+
+  it("same-section supersession: a dropped HOW line needs a same-section authority-cited replacement", () => {
+    const previous = seed.replace(
+      "## HOW\n\n",
+      "## HOW\nKeep validation deterministic. [mesh:messages/old-rule]\n\n"
+    );
+    const replaced = (ref: string) =>
+      seed.replace("## HOW\n\n", `## HOW\nPrefer reproducible checks. [${ref}]\n\n`);
+    // Descendant/peer-cited same-section replacement: rejected twice over.
+    const descendant = validateBriefText({
+      text: replaced("mesh:messages/child-note"),
       previousText: previous,
-      authorityCitations: new Set(),
-      milestone: true,
-    }).errors;
-    expect(errors.join("\n")).toContain("milestone delta changed 2 DOMAIN lines");
+      authorityCitations: new Set(["mesh:messages/new-authority"]),
+    }).errors.join("\n");
+    expect(descendant).toContain("HOW line changed without a cited human/ancestor supersession");
+    expect(descendant).toContain("1 previous HOW line(s) dropped");
+    // Human/ancestor-cited same-section replacement from this delta: accepted.
+    // Which old line it supersedes is the model's judgment under the normative
+    // instruction; the deterministic guard proves only the cited, one-for-one,
+    // same-section authority shape.
+    expect(
+      validateBriefText({
+        text: replaced("mesh:messages/new-authority"),
+        previousText: previous,
+        authorityCitations: new Set(["mesh:messages/new-authority"]),
+      }).errors
+    ).toEqual([]);
+    // One authority line cannot pay for two dropped lines.
+    const twoPrevious = previous.replace(
+      "Keep validation deterministic. [mesh:messages/old-rule]\n",
+      "Keep validation deterministic. [mesh:messages/old-rule]\nPin every tool. [mesh:messages/old-rule]\n"
+    );
+    expect(
+      validateBriefText({
+        text: replaced("mesh:messages/new-authority"),
+        previousText: twoPrevious,
+        authorityCitations: new Set(["mesh:messages/new-authority"]),
+      }).errors.join("\n")
+    ).toContain("2 previous HOW line(s) dropped");
   });
 
   it("rejects state material in DOMAIN while the citation tail stays valid", () => {
@@ -553,6 +679,44 @@ describe("runPortableContextBriefCycle", () => {
     expect(h.attempts[0].reason).toContain("human/ancestor supersession");
   });
 
+  it("an ancestor milestone cannot authorize HOW; a human message about reviews still can", async () => {
+    const withHow = (ref: string) =>
+      SEED_TEXT.replace("## HOW\n\n", `## HOW\nShip only through staging. [${ref}]\n\n`);
+    const milestone = chatSource(
+      "m-ms",
+      "2026-10-07T00:00:01Z",
+      "steward",
+      "PR merged to staging; checks green."
+    );
+    const blocked = cycleHarness({
+      sources: [milestone],
+      rewriterText: [withHow("mesh:messages/m-ms"), withHow("mesh:messages/m-ms")],
+    });
+    await runPortableContextBriefCycle(blocked.deps); // seed
+    expect(await runPortableContextBriefCycle(blocked.deps)).toMatchObject({
+      outcome: "rejected",
+    });
+    expect(blocked.attempts[0].reason).toContain(
+      "milestone message cannot add or change a HOW line"
+    );
+    expect(blocked.attempts[0].reason).toContain("human/ancestor supersession");
+
+    const human = chatSource(
+      "m-hu",
+      "2026-10-07T00:00:01Z",
+      "human:operator",
+      "Before any merge, ship only through staging after review."
+    );
+    const allowed = cycleHarness({
+      sources: [human],
+      rewriterText: [withHow("mesh:messages/m-hu")],
+    });
+    await runPortableContextBriefCycle(allowed.deps); // seed
+    expect(await runPortableContextBriefCycle(allowed.deps)).toMatchObject({
+      outcome: "accepted",
+    });
+  });
+
   it("rejects unresolvable citations and resolves a ref only on its first appearance", async () => {
     const withNewRef =
       `## WHAT\nThe charter is in force; it is rendered in the prompt. [mesh:actors/${ACTOR}/charter]\n` +
@@ -713,6 +877,56 @@ describe("runPortableContextBriefCycle", () => {
     expect(h.store.load(ACTOR).brief?.consecutiveFailures).toBe(0);
   });
 
+  it("handled-state predicate distinguishes absent, unhandled and handled exact entries", () => {
+    const db = new Database(":memory:");
+    actorInbox.up(db);
+    actorInboxSeen.up(db);
+    actorInboxHandledNote.up(db);
+    const inbox = new SqliteInboxRepository(db);
+    const [entry] = inbox.append([
+      {
+        actorId: "parent-a",
+        source: `portable_context_brief:${ACTOR}`,
+        payload: { type: "portable_context_brief.needs_attention", actorId: ACTOR, reason: "r" },
+      },
+    ]);
+    const handled = isBriefAttentionHandled(inbox);
+    // Absent: unknown id, and the right id looked up under another (e.g. new) parent.
+    expect(handled({ ownerId: "parent-a", entryId: "no-such-entry" })).toBe(false);
+    expect(handled({ ownerId: "parent-b", entryId: entry.id })).toBe(false);
+    // Present but unhandled.
+    expect(handled({ ownerId: "parent-a", entryId: entry.id })).toBe(false);
+    inbox.markHandled("parent-a", [entry.id], undefined, "looked at the brief freeze");
+    expect(handled({ ownerId: "parent-a", entryId: entry.id })).toBe(true);
+    db.close();
+  });
+
+  it("keeps the freeze when its attention entry is absent, and looks it up under the raising owner", async () => {
+    const msg = chatSource("m-1", "2026-10-07T00:00:01Z", "root", "ancestor note");
+    const h = cycleHarness({ sources: [msg], rewriterText: Array(7).fill("bad") });
+    const lookups: Array<{ ownerId: string; entryId: string }> = [];
+    const deps: BriefCycleDeps = {
+      ...h.deps,
+      isAttentionHandled: (attention) => {
+        lookups.push(attention);
+        return false; // the inbox has no handled row for it
+      },
+    };
+    await runPortableContextBriefCycle(deps); // seed
+    const seeded = h.store.load(ACTOR);
+    if (!seeded.brief) throw new Error("expected seeded brief");
+    h.store.save({ ...seeded, brief: { ...seeded.brief, cursor: null } });
+    for (let i = 0; i < 3; i++) await runPortableContextBriefCycle(deps);
+    const frozen = h.store.load(ACTOR).brief;
+    expect(frozen).toMatchObject({
+      frozen: true,
+      freezeAttentionId: "attention-1",
+      freezeAttentionOwnerId: "parent-of-actor",
+    });
+    expect(await runPortableContextBriefCycle(deps)).toEqual({ outcome: "frozen" });
+    expect(lookups).toEqual([{ ownerId: "parent-of-actor", entryId: "attention-1" }]);
+  });
+
   it("a failed streak does not grow the input: identical slice, identical input bytes", async () => {
     const sources = [
       chatSource("m-1", "2026-10-07T00:00:01Z", "root", "one"),
@@ -771,6 +985,7 @@ describe("brief render", () => {
         consecutiveFailures: 0,
         frozen: false,
         freezeAttentionId: null,
+        freezeAttentionOwnerId: null,
         resolvedRefs: [`mesh:actors/${ACTOR}/charter`],
       },
     };

@@ -151,6 +151,15 @@ export function findBriefStateExclusion(statement: string): string | null {
 
 // ── Document shape: three fixed sections, one cited statement per line ──
 
+function isStructuredRef(candidate: string): boolean {
+  try {
+    parseReference(candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export const BRIEF_SECTIONS = ["WHAT", "HOW", "DOMAIN"] as const;
 export type BriefSection = (typeof BRIEF_SECTIONS)[number];
 
@@ -213,28 +222,27 @@ export function parseBriefDocument(text: string): { parsed?: ParsedBrief; errors
     sections[current].push(raw);
     if (raw.trim() === "") continue;
 
-    // Citations are bracketed `[ref]` groups; each inner text must parse as a
-    // reference. The statement is the line with the bracketed citations removed.
-    const refs: string[] = [];
-    const validMatches: Array<{ full: string; ref: string }> = [];
-    const matches = Array.from(raw.matchAll(/\[([^\]]+)\]/g));
-    for (const match of matches) {
-      const candidate = match[1].trim();
-      try {
-        parseReference(candidate);
-        validMatches.push({ full: match[0], ref: candidate });
-      } catch {
-        // Not a structured reference; leave in statement
-      }
-    }
-    let statement = raw;
-    for (const valid of validMatches) {
-      refs.push(valid.ref);
-      statement = statement.replace(valid.full, "");
-    }
-    statement = statement.trim();
-    if (refs.length === 0) {
+    // Citations are bracketed `[ref]` groups whose inner text parses as a
+    // reference. The line splits at its first citation: the statement is
+    // everything before it (a non-reference bracket such as `[sic]` stays
+    // statement text), and everything from it on must be citations only.
+    const groups = Array.from(raw.matchAll(/\[([^\]]+)\]/g));
+    const first = groups.find((group) => isStructuredRef(group[1].trim()));
+    if (first?.index === undefined) {
       errors.push(`${current} line has no structured citation: ${JSON.stringify(raw)}`);
+      continue;
+    }
+    const statement = raw.slice(0, first.index).trim();
+    const tail = raw.slice(first.index);
+    const tailGroups = groups.filter((group) => (group.index ?? -1) >= first.index);
+    const refs = tailGroups.map((group) => group[1].trim());
+    if (
+      tail.replace(/\[[^\]]+\]/g, "").trim() !== "" ||
+      !refs.every((ref) => isStructuredRef(ref))
+    ) {
+      errors.push(
+        `${current} line must end with its citations, with nothing after the first one but citations: ${JSON.stringify(raw)}`
+      );
       continue;
     }
     if (statement === "") {
@@ -265,8 +273,18 @@ export interface BriefValidationInput {
   authorityCitations: ReadonlySet<string>;
   /** Refs the model may copy this cycle: current delta, charter, or carried lines. */
   allowedCitations?: ReadonlySet<string>;
-  /** A status/milestone delta may refine at most one existing DOMAIN line. */
-  milestone?: boolean;
+  /**
+   * Citations of this cycle's non-human milestone messages (PR/check/review/
+   * merge status). A changed line citing one may only refine one existing
+   * DOMAIN line: never a WHAT/HOW line, never a net-new line, never two.
+   */
+  milestoneCitations?: ReadonlySet<string>;
+  /**
+   * Every delta message is a milestone, so no line in the output has any other
+   * delta source: the whole document may change by at most one refined DOMAIN
+   * line and gain no new lines.
+   */
+  milestoneOnly?: boolean;
 }
 
 /**
@@ -355,16 +373,43 @@ export function validateBriefText(input: BriefValidationInput): {
         );
       }
     }
-    if (input.milestone) {
-      const previousDomain = new Set(
-        previous.lines.filter((line) => line.section === "DOMAIN").map((line) => line.raw)
-      );
-      const newOrChangedDomain = parsed.lines.filter(
-        (line) => line.section === "DOMAIN" && !previousDomain.has(line.raw)
-      );
-      if (newOrChangedDomain.length > 1) {
+    const previousDomain = previousWhatHowBySection.get("DOMAIN") ?? new Set<string>();
+    const nextDomain = new Set((newWhatHowBySection.get("DOMAIN") ?? []).map((line) => line.raw));
+    const addedDomain = [...nextDomain].filter((raw) => !previousDomain.has(raw));
+    const droppedDomain = [...previousDomain].filter((raw) => !nextDomain.has(raw));
+
+    const milestoneCitations = input.milestoneCitations ?? new Set<string>();
+    const milestoneLines = parsed.lines.filter(
+      (line) =>
+        !previousWhatHowBySection.get(line.section)?.has(line.raw) &&
+        line.refs.some((ref) => milestoneCitations.has(ref))
+    );
+    for (const line of milestoneLines) {
+      if (line.section !== "DOMAIN") {
         errors.push(
-          `milestone delta changed ${newOrChangedDomain.length} DOMAIN lines; at most one is allowed`
+          `milestone message cannot add or change a ${line.section} line: ${JSON.stringify(line.raw)}`
+        );
+      }
+    }
+    const milestoneDomain = milestoneLines.filter((line) => line.section === "DOMAIN");
+    if (milestoneDomain.length > 1) {
+      errors.push(
+        `milestone messages changed ${milestoneDomain.length} DOMAIN lines; at most one is allowed`
+      );
+    } else if (milestoneDomain.length === 1 && droppedDomain.length === 0) {
+      errors.push(
+        `milestone message added a new DOMAIN line instead of refining an existing one: ${JSON.stringify(milestoneDomain[0].raw)}`
+      );
+    }
+    if (input.milestoneOnly) {
+      if (addedDomain.length > droppedDomain.length) {
+        errors.push(
+          `milestone-only delta added ${addedDomain.length - droppedDomain.length} new DOMAIN line(s); none are allowed`
+        );
+      }
+      if (Math.max(addedDomain.length, droppedDomain.length) > 1) {
+        errors.push(
+          `milestone-only delta changed ${Math.max(addedDomain.length, droppedDomain.length)} DOMAIN lines; at most one is allowed`
         );
       }
     }
@@ -471,7 +516,13 @@ export function seedBriefText(actorId: string): string {
   );
 }
 
+/**
+ * A steward/peer/descendant status message about PR, check, review or merge
+ * progress. Human messages are never milestones: their wording about reviews
+ * or merges is direction, and they keep full WHAT/HOW authority.
+ */
 function isBriefMilestone(message: BriefDeltaMessage): boolean {
+  if (message.sourceClass === "human") return false;
   return /\b(?:pull request|PR\s*#?\d+|checks?|review(?:ed|ing)?|merge[sd]?|staging|gate)\b/i.test(
     message.body
   );
@@ -496,6 +547,7 @@ export function seedPortableBriefState(
       consecutiveFailures: 0,
       frozen: false,
       freezeAttentionId: null,
+      freezeAttentionOwnerId: null,
       resolvedRefs: [charterRef],
     },
   };
@@ -539,13 +591,35 @@ export interface BriefCycleDeps {
   recordAttempt: (attempt: BriefAttemptTelemetry) => void;
   /**
    * Raise the durable needs-attention item for the actor's parent through the
-   * existing inbox path, exactly once at freeze time. Returns the entry id so
-   * handling can release precisely this freeze.
+   * existing inbox path, exactly once at freeze time. Returns the owning inbox
+   * and entry id so handling can release precisely this freeze.
    */
-  raiseAttention: (input: { actorId: string; reason: string }) => string | null;
-  /** Whether the durable attention item for the current freeze was handled. */
-  isAttentionHandled: (entryId: string) => boolean;
+  raiseAttention: (input: { actorId: string; reason: string }) => BriefAttentionRef | null;
+  /**
+   * Whether that exact attention item is present in its owner's inbox AND
+   * handled. Absent and unhandled both keep the freeze.
+   */
+  isAttentionHandled: (attention: BriefAttentionRef) => boolean;
   log?: (message: string) => void;
+}
+
+export interface BriefAttentionRef {
+  ownerId: string;
+  entryId: string;
+}
+
+/**
+ * The production handled-state predicate over the existing inbox boundary. An
+ * absent entry (wrong owner, deleted, never written) and an unhandled one both
+ * keep the freeze; only a present entry with a handled timestamp releases it.
+ */
+export function isBriefAttentionHandled(inbox: {
+  read: (actorId: string, entryId: string) => { handledAt: Date | null } | null;
+}): (attention: BriefAttentionRef) => boolean {
+  return ({ ownerId, entryId }) => {
+    const entry = inbox.read(ownerId, entryId);
+    return entry !== null && entry.handledAt !== null;
+  };
 }
 
 export type BriefCycleOutcome =
@@ -603,9 +677,9 @@ function positionOf(source: PortableLedgerSource): BriefCursor {
  * Seed on first sight (cursor captured at the switch-time newest source, so
  * the delta is post-switch only). Skip when nothing new arrived. Freeze after
  * {@link PORTABLE_CONTEXT_BRIEF_MAX_CONSECUTIVE_FAILURES} consecutive failed
- * cycles, alerting the actor's parent through the existing inbox path; any
- * inbound human/ancestor message after the frozen cursor is the parent's
- * handling reply reaching the actor and releases the freeze. On acceptance
+ * cycles, alerting the actor's parent through the existing inbox path; only
+ * that exact entry, present in the inbox that received it and marked handled,
+ * releases the freeze. On acceptance
  * the cursor advances only past the processed slice, so the backlog drains
  * across runs and a failed cycle never enlarges the next one's input.
  *
@@ -628,13 +702,21 @@ export async function runPortableContextBriefCycle(
   let released = false;
   let brief: PortableBrief = state.brief;
   if (brief.frozen) {
-    if (!brief.freezeAttentionId || !deps.isAttentionHandled(brief.freezeAttentionId)) {
+    if (
+      !brief.freezeAttentionId ||
+      !brief.freezeAttentionOwnerId ||
+      !deps.isAttentionHandled({
+        ownerId: brief.freezeAttentionOwnerId,
+        entryId: brief.freezeAttentionId,
+      })
+    ) {
       return { outcome: "frozen" };
     }
     brief = {
       ...brief,
       frozen: false,
       freezeAttentionId: null,
+      freezeAttentionOwnerId: null,
       consecutiveFailures: 0,
     };
     released = true;
@@ -659,10 +741,12 @@ export async function runPortableContextBriefCycle(
     const failures = brief.consecutiveFailures + 1;
     const frozen = failures >= PORTABLE_CONTEXT_BRIEF_MAX_CONSECUTIVE_FAILURES;
     const freezeReason = `portable-context brief rewrite failed ${failures} consecutive cycles for ${deps.actorId}: ${reason}`;
-    const freezeAttentionId =
+    const attention =
       frozen && !brief.frozen
         ? deps.raiseAttention({ actorId: deps.actorId, reason: freezeReason })
-        : brief.freezeAttentionId;
+        : brief.freezeAttentionId && brief.freezeAttentionOwnerId
+          ? { ownerId: brief.freezeAttentionOwnerId, entryId: brief.freezeAttentionId }
+          : null;
     deps.recordAttempt({
       attempt: "initial",
       outcome: "rejected",
@@ -679,7 +763,8 @@ export async function runPortableContextBriefCycle(
         ...brief,
         consecutiveFailures: failures,
         frozen,
-        freezeAttentionId,
+        freezeAttentionId: attention?.entryId ?? null,
+        freezeAttentionOwnerId: attention?.ownerId ?? null,
         updatedAt: now(),
       },
     });
@@ -707,9 +792,14 @@ export async function runPortableContextBriefCycle(
       body: source.body ?? "",
     };
   });
+  const milestones = delta.filter(isBriefMilestone);
+  const milestoneCitations = new Set(milestones.map((m) => m.citation));
+  const milestoneOnly = milestones.length === delta.length;
+  // An ancestor milestone is status, not supersession: it never authorizes WHAT/HOW.
   const authorityCitations = new Set(
     delta
       .filter((m) => m.sourceClass === "human" || m.sourceClass === "ancestor")
+      .filter((m) => !milestoneCitations.has(m.citation))
       .map((m) => m.citation)
   );
 
@@ -768,7 +858,8 @@ export async function runPortableContextBriefCycle(
       previousText: brief.text,
       authorityCitations,
       allowedCitations,
-      milestone: delta.some(isBriefMilestone),
+      milestoneCitations,
+      milestoneOnly,
     });
     if (structural.errors.length > 0) {
       deps.recordAttempt({
@@ -861,9 +952,12 @@ export async function runPortableContextBriefCycle(
     failures += 1;
     const frozen = failures >= PORTABLE_CONTEXT_BRIEF_MAX_CONSECUTIVE_FAILURES;
     let freezeAttentionId = brief.freezeAttentionId;
+    let freezeAttentionOwnerId = brief.freezeAttentionOwnerId;
     if (frozen && !brief.frozen) {
       const reason = `portable-context brief rewrite failed ${failures} consecutive cycles for ${deps.actorId}: ${lastErrors.join("; ")}`;
-      freezeAttentionId = deps.raiseAttention({ actorId: deps.actorId, reason });
+      const attention = deps.raiseAttention({ actorId: deps.actorId, reason });
+      freezeAttentionId = attention?.entryId ?? null;
+      freezeAttentionOwnerId = attention?.ownerId ?? null;
       log(`[portable-context] ${reason}`);
     } else {
       log(
@@ -877,6 +971,7 @@ export async function runPortableContextBriefCycle(
         consecutiveFailures: failures,
         frozen,
         freezeAttentionId,
+        freezeAttentionOwnerId,
         updatedAt: now(),
       },
     });
@@ -894,6 +989,7 @@ export async function runPortableContextBriefCycle(
       consecutiveFailures: 0,
       frozen: false,
       freezeAttentionId: null,
+      freezeAttentionOwnerId: null,
       resolvedRefs: [...resolvedRefs],
     },
   });

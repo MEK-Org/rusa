@@ -52,7 +52,7 @@ export function resolveContextSelection(
 
   if (raw === undefined || raw === null || raw === "") {
     if (compactionModel) {
-      throw new Error("compactionModel requires a portable context selection (ledger or brief)");
+      throw new Error("compactionModel requires a portable context selection (ledger)");
     }
     return undefined;
   }
@@ -75,7 +75,17 @@ export function resolveContextSelection(
     }
     return { type: "portable", mode: "tail" };
   }
-  return { type: "portable", mode: raw, compactionModel };
+  if (raw === "brief") {
+    if (compactionModel) {
+      // The brief rewriter is fixed to bare gemini-3.8-flash by the #954 spec;
+      // a stored model here would read as configured and never be consulted.
+      throw new Error(
+        "compactionModel is meaningless for brief mode, whose rewrite model is fixed"
+      );
+    }
+    return { type: "portable", mode: "brief" };
+  }
+  return { type: "portable", mode: "ledger", compactionModel };
 }
 
 /**

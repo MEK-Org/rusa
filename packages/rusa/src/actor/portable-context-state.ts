@@ -123,6 +123,11 @@ export const portableBriefSchema = z.object({
   /** Inbox entry raised for the current freeze; null before a freeze or after its handling. */
   freezeAttentionId: z.string().min(1).nullable().default(null),
   /**
+   * The actor whose inbox holds {@link freezeAttentionId}, captured when it was
+   * raised, so a later reparent cannot redirect the handled-state lookup.
+   */
+  freezeAttentionOwnerId: z.string().min(1).nullable().default(null),
+  /**
    * Per-actor resolved-ref cache, keyed by the canonical ref string: every ref
    * that has been successfully resolved at least once. A ref is resolved only
    * on its first appearance for the actor; a rewrite that introduces no new
