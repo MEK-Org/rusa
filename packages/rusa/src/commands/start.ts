@@ -1569,7 +1569,10 @@ async function composeStart(
         ? (text: string) => slackClient.send(errorSink.target, text).then(() => {})
         : null;
   if (chatClient) {
-    servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
+    const workDir = join(mcHome, "root-agent");
+    // This root-owned server runs on the local leader; follower placement is
+    // checked dynamically on the per-actor server below.
+    servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient, { workDir });
   }
   if (slackClient) {
     // Only root mounts the shared server, so its downloads land in root's workdir.
@@ -3308,7 +3311,10 @@ async function composeStart(
         ];
         if (chatClient) {
           const chatReadUrl = mcpHttp.addServer(`${id}:${CHAT_READ_MCP_NAME}`, () =>
-            createChatReadMcpServer(chatClient)
+            createChatReadMcpServer(chatClient, {
+              workDir: join(workersDir, id),
+              fileToolsAvailable: () => actors.get(id)?.executionTarget === undefined,
+            })
           );
           perActorShared.push({ name: CHAT_READ_MCP_NAME, url: chatReadUrl });
         }

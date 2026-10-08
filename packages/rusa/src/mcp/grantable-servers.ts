@@ -185,9 +185,14 @@ export function buildGrantableServers(
     [
       DRIVE_READ_MCP_NAME,
       (selfId, params) => {
+        const workDir = deps.actorRootFor?.(selfId);
         return createDriveReadMcpServer(selfId, deps.driveClients, {
           allowedFolders: params,
           onRead: deps.onDriveRead,
+          ...(workDir ? { workDir } : {}),
+          ...(deps.fileToolsAvailableForActor
+            ? { fileToolsAvailable: () => deps.fileToolsAvailableForActor?.(selfId) ?? false }
+            : {}),
         });
       },
     ],
