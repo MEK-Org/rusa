@@ -427,7 +427,9 @@ void main() {
     await tester.runAsync(store.dispose);
   });
 
-  testWidgets('navigating A -> B -> A drops slow response from first A load', (tester) async {
+  testWidgets('navigating A -> B -> A drops slow response from first A load', (
+    tester,
+  ) async {
     final gateA1 = Completer<void>();
     api.obligationDetailByOffset = (id, _) {
       detailCalls.add(id);
@@ -435,19 +437,32 @@ void main() {
         obligation: id == obA.id ? obA : obB,
         children: const [],
         blockingChildren: const [],
-        artifacts: id == obA.id ? const [ObligationArtifactDto(ref: _ref)] : const [],
+        artifacts: id == obA.id
+            ? const [ObligationArtifactDto(ref: _ref)]
+            : const [],
       );
     };
-    api.referencesGate = gateA1;
-    api.referencesResult = {_ref: const ReferenceDto(ref: _ref, scheme: 'gchat', title: 'Obsolete title')};
+    api.scriptedReferenceResponses.addAll([
+      (_) async {
+        // Capture A1's stale answer before its wait.  A later request must
+        // not be able to alter this result through shared fake state.
+        const obsolete = ReferenceDto(
+          ref: _ref,
+          scheme: 'gchat',
+          title: 'Obsolete title',
+          cacheState: 'fresh',
+        );
+        await gateA1.future;
+        return {_ref: obsolete};
+      },
+      (_) => {_ref: _resolved()},
+    ]);
 
     await mount(tester);
     await open(tester, 'Cites a chat');
     expect(find.text('loading context'), findsOneWidget);
 
     await open(tester, 'Other work');
-    api.referencesGate = null;
-    api.referencesResult = {_ref: _resolved()};
     await open(tester, 'Cites a chat');
     await tester.pump();
     expect(find.text('Chat message'), findsOneWidget);
