@@ -2,6 +2,8 @@ import { chmodSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { dirname } from "node:path";
+import { type Logger, nullLogger } from "../observability/logger.js";
+import { getProviderModelCatalog, type ModelEntry } from "../providers/model-catalog.js";
 import { normalizeProviderThrottleKey, QUOTA_THROTTLE_PROVIDERS } from "../providers/registry.js";
 import type { QuotaCollectionStats } from "./coordinator-collection.js";
 import {
@@ -102,6 +104,13 @@ export interface QuotaCoordinatorServiceOptions {
    * it can persist a scrape row leaves nothing in the database to report.
    */
   collectionStats?: () => Record<string, Readonly<QuotaCollectionStats>>;
+  /**
+   * The model catalog a manual reading's model-scoped windows are resolved
+   * against. Defaults to the runtime catalog, the one the scrape parser is
+   * given, so both paths accept the same lanes.
+   */
+  modelCatalogFor?: (provider: string) => readonly ModelEntry[];
+  logger?: Logger;
 }
 
 export class QuotaCoordinatorService {
@@ -113,9 +122,11 @@ export class QuotaCoordinatorService {
   private readonly hardStaleAfterMs: number;
   private readonly manualHardStaleAfterMs: number;
   private readonly metrics: QuotaMetrics;
+  private readonly log: Logger;
 
   constructor(readonly options: QuotaCoordinatorServiceOptions) {
     this.metrics = options.metrics ?? nullQuotaMetrics;
+    this.log = options.logger ?? nullLogger;
     this.configuredProviders = options.configuredProviders ?? DEFAULT_COORDINATOR_PROVIDERS;
     this.maxIntervalSeconds = options.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
@@ -791,8 +802,18 @@ export class QuotaCoordinatorService {
         idempotencyKey: (idempotencyKey as string).trim(),
         acceptedAt: new Date(nowMs).toISOString(),
       },
-      { maxIntervalSeconds: this.maxIntervalSeconds }
+      { maxIntervalSeconds: this.maxIntervalSeconds },
+      {
+        configuredModels: this.options.modelCatalogFor
+          ? this.options.modelCatalogFor(provider)
+          : (getProviderModelCatalog(provider) ?? []),
+      }
     );
+    if (result.result === "accepted") {
+      for (const dropped of result.droppedWindows) {
+        this.log.warn("quota_manual_model_window_dropped", { provider, ...dropped });
+      }
+    }
     if (result.result === "accepted" || result.result === "duplicate") {
       this.sendJson<ManualQuotaObservationResponse>(res, 200, {
         service: serviceInfo,
