@@ -330,7 +330,10 @@ What to know when reading it:
   not aggregate CPU or I/O accounting for processes missed by those snapshots.
 - Two instances on one host each run their own watchdog; `RandomizedDelaySec=20s`
   reduces synchronized starts but does not guarantee non-overlap or prevent
-  mutual sampling.
+  mutual sampling. That jitter can make the time between log lines irregular;
+  read each line's observed `t` and `win_ms`, rather than assuming a 60-second
+  inter-record interval. All sampled CPU, I/O, disk, and swap values belong
+  only to that line's window.
 
 The log's bounds are fixed: `scripts/host-watchdog.mjs` self-rotates the log
 at 2 MiB before appending, keeping two generations (`.1` and `.2`), so it stays

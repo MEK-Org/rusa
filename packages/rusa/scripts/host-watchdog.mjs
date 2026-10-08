@@ -125,11 +125,11 @@ function diskBytes() {
 
 /** comm is chosen by the process itself; keep it printable, within the kernel's 15 bytes, and redact token-shaped patterns. */
 function cleanComm(comm) {
-  const sanitized = comm.replace(/[^\x20-\x7e]/g, "?").slice(0, 15);
+  const sanitized = comm.replace(/[^\x20-\x7e]/g, "?");
   if (/(ghp_|github_pat_|sk-[A-Za-z0-9]|AIza|xox[abprs]-)/.test(sanitized)) {
     return "[redacted]";
   }
-  return sanitized;
+  return sanitized.slice(0, 15);
 }
 
 function processSnapshot() {
