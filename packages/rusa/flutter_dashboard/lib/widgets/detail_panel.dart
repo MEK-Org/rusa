@@ -686,6 +686,17 @@ class _InfoViewState extends State<_InfoView> {
   /// fetch degrades to less text, not to "No charter."
   String get charter => _charter ?? widget.actor.charterPreview;
 
+  Widget _documentBox(Widget child) => Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(
+      color: MeshColors.bgTertiary,
+      border: Border.all(color: MeshColors.border),
+      borderRadius: BorderRadius.circular(6),
+    ),
+    child: child,
+  );
+
   Widget _meta(String label, String value) => Text.rich(
     TextSpan(
       children: [
@@ -855,15 +866,17 @@ class _InfoViewState extends State<_InfoView> {
               ),
             ),
             const SizedBox(height: 12),
-            _brief == null || _brief!.isEmpty
-                ? const Text(
-                    'No brief yet.',
-                    style: TextStyle(
-                      color: MeshColors.textSecondary,
-                      fontSize: 13,
-                    ),
-                  )
-                : SelectionArea(child: SimpleMarkdown(_brief!)),
+            _documentBox(
+              _brief == null || _brief!.isEmpty
+                  ? const Text(
+                      'No brief yet.',
+                      style: TextStyle(
+                        color: MeshColors.textSecondary,
+                        fontSize: 13,
+                      ),
+                    )
+                  : SelectionArea(child: SimpleMarkdown(_brief!)),
+            ),
           ],
           const SizedBox(height: 24),
           const Text(
@@ -875,19 +888,14 @@ class _InfoViewState extends State<_InfoView> {
             ),
           ),
           const SizedBox(height: 12),
-          charter.isEmpty
-              ? const Text(
-                  'No charter.',
-                  style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
-                )
-              : SelectableText(
-                  charter,
-                  style: const TextStyle(
-                    color: MeshColors.textSecondary,
-                    fontSize: 13,
-                    height: 1.5,
-                  ),
-                ),
+          _documentBox(
+            charter.isEmpty
+                ? const Text(
+                    'No charter.',
+                    style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
+                  )
+                : SelectionArea(child: SimpleMarkdown(charter)),
+          ),
         ],
       ),
     );
