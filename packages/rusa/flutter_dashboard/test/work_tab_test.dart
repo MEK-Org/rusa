@@ -1209,6 +1209,8 @@ void main() {
         await tester.tap(find.text('Task with external link'));
         await tester.pump();
         await tester.pump();
+        // Reference enrichment starts after the raw detail frame.
+        await tester.pump();
 
         expect(find.text('EXTERNAL LINK'), findsOneWidget);
         expect(find.byTooltip('View reference context'), findsOneWidget);
@@ -1331,6 +1333,8 @@ void main() {
         await tester.pump();
         await tester.tap(find.text('Unresolved external reference task'));
         await tester.pump();
+        await tester.pump();
+        // Reference enrichment starts after the raw detail frame.
         await tester.pump();
 
         expect(find.text('EXTERNAL LINK'), findsOneWidget);
