@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -118,11 +118,12 @@ describe("host-watchdog (#955)", () => {
       ].join("\n")
     );
     writeFileSync(join(proc, "meminfo"), "MemTotal: 100 kB\nMemAvailable: 42 kB\nSwapFree: 7 kB\n");
-    // One readable process and one whose io file is missing, as for another
-    // user's process; a comm with a ")" and a space must not shift the fields.
+    // One readable process with ")" and space in comm, one unreadable process,
+    // and one process with a token-shaped comm name.
     for (const [pid, comm, io] of [
       [101, "worker (x) y", "rchar: 5\nwchar: 6\nread_bytes: 7\nwrite_bytes: 8\n"],
       [102, "other", undefined],
+      [103, "ghp_credential", undefined],
     ] as const) {
       mkdirSync(join(proc, String(pid)));
       writeFileSync(
@@ -132,9 +133,30 @@ describe("host-watchdog (#955)", () => {
       if (io) writeFileSync(join(proc, String(pid), "io"), io);
     }
     const logPath = join(proc, "out", "host-watchdog.log");
+    const stat101 = join(proc, "101", "stat");
+    const stat103 = join(proc, "103", "stat");
+    const io101 = join(proc, "101", "io");
+    const updater = spawn(
+      process.execPath,
+      [
+        "-e",
+        `setTimeout(() => {
+          const fs = require("node:fs");
+          fs.writeFileSync(process.argv[1], "101 (worker (x) y) S 1 101 101 0 -1 0 0 0 0 0 25 15 0 0 20 0 1 0 0 0 0\\n");
+          fs.writeFileSync(process.argv[2], "103 (ghp_credential) S 1 103 103 0 -1 0 0 0 0 0 20 10 0 0 20 0 1 0 0 0 0\\n");
+          fs.writeFileSync(process.argv[3], "rchar: 105\\nwchar: 106\\nread_bytes: 107\\nwrite_bytes: 108\\n");
+        }, 30);`,
+        stat101,
+        stat103,
+        io101,
+      ],
+      { stdio: "ignore" }
+    );
+    children.push(updater);
+
     const result = sample(logPath, {
       RUSA_HOST_WATCHDOG_PROC: proc,
-      RUSA_HOST_WATCHDOG_WINDOW_MS: "50",
+      RUSA_HOST_WATCHDOG_WINDOW_MS: "100",
     });
     expect(result.status).toBe(0);
     const [s] = samples(logPath);
@@ -142,10 +164,42 @@ describe("host-watchdog (#955)", () => {
     expect(s.psi.cpu).toBeNull();
     expect(s.mem.avail_kb).toBe(42);
     expect(s.mem.swap_free_kb).toBe(7);
-    expect(s.procs).toBe(2);
-    expect(s.io_denied).toBe(1);
-    // A static procfs has no interval activity to rank.
-    expect(s.cpu).toEqual([]);
-    expect(s.io).toEqual([]);
+    expect(s.procs).toBe(3);
+    expect(s.io_denied).toBe(2);
+
+    // comm with ")" and spaces parsed accurately without field offset:
+    const row101 = s.cpu.find(([pid]) => pid === 101);
+    expect(row101?.slice(0, 4)).toEqual([101, 1, "worker (x) y", "S"]);
+    const ioRow101 = s.io.find(([pid]) => pid === 101);
+    expect(ioRow101?.slice(0, 4)).toEqual([101, 1, "worker (x) y", "S"]);
+    expect(ioRow101?.slice(5)).toEqual([100, 100, 100, 100]);
+
+    // token-shaped comm redacted:
+    const row103 = s.cpu.find(([pid]) => pid === 103);
+    expect(row103?.slice(0, 4)).toEqual([103, 1, "[redacted]", "S"]);
+
+    const text = readFileSync(logPath, "utf8");
+    expect(text).not.toContain("ghp_");
+    expect(text).not.toMatch(/ghp_|github_pat_|sk-[A-Za-z0-9]|AIza|xox[abprs]-/);
+  });
+
+  it("self-rotates watchdog log when size exceeds 2 MB", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rusa-watchdog-rotate-"));
+    const logPath = join(dir, "host-watchdog.log");
+    mkdirSync(dir, { recursive: true });
+    // Write 2.1 MB of existing log
+    writeFileSync(logPath, "x".repeat(Math.round(2.1 * 1024 * 1024)));
+
+    const result = sample(logPath, {
+      RUSA_HOST_WATCHDOG_WINDOW_MS: "50",
+    });
+    expect(result.status).toBe(0);
+
+    expect(existsSync(`${logPath}.1`)).toBe(true);
+    expect(statSync(`${logPath}.1`).size).toBeGreaterThanOrEqual(2 * 1024 * 1024);
+    // Active log holds just the new JSON line
+    const activeSize = statSync(logPath).size;
+    expect(activeSize).toBeGreaterThan(0);
+    expect(activeSize).toBeLessThan(1024 * 1024);
   });
 });

@@ -35,7 +35,17 @@
 //   RUSA_HOST_WATCHDOG_PROBES     "off" skips the network probes
 //   RUSA_HOST_WATCHDOG_PROC       procfs root (default /proc)
 
-import { appendFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import {
+  appendFileSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  truncateSync,
+} from "node:fs";
 import { connect } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -113,9 +123,13 @@ function diskBytes() {
   return { rd, wr };
 }
 
-/** comm is chosen by the process itself; keep it printable and within the kernel's 15 bytes. */
+/** comm is chosen by the process itself; keep it printable, within the kernel's 15 bytes, and redact token-shaped prefixes. */
 function cleanComm(comm) {
-  return comm.replace(/[^\x20-\x7e]/g, "?").slice(0, 15);
+  const sanitized = comm.replace(/[^\x20-\x7e]/g, "?").slice(0, 15);
+  if (/^(ghp_|github_pat_|sk-[A-Za-z0-9]|AIza|xox[abprs]-)/.test(sanitized)) {
+    return "[redacted]";
+  }
+  return sanitized;
 }
 
 function processSnapshot() {
@@ -275,5 +289,23 @@ record.self = {
   wall_ms: Date.now() - startedAt,
 };
 
+function rotateWatchdogLog(targetPath, maxBytes = 2 * 1024 * 1024, keep = 2) {
+  try {
+    if (!existsSync(targetPath)) return;
+    const size = statSync(targetPath).size;
+    if (size < maxBytes) return;
+    for (let n = keep - 1; n >= 1; n--) {
+      const curr = `${targetPath}.${n}`;
+      const next = `${targetPath}.${n + 1}`;
+      if (existsSync(curr)) renameSync(curr, next);
+    }
+    if (keep >= 1) copyFileSync(targetPath, `${targetPath}.1`);
+    truncateSync(targetPath, 0);
+  } catch {
+    // Self-rotation is best-effort and must never abort the watchdog sample.
+  }
+}
+
 mkdirSync(dirname(logPath), { recursive: true });
+rotateWatchdogLog(logPath);
 appendFileSync(logPath, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
