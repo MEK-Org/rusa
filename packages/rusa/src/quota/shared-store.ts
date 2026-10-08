@@ -349,17 +349,15 @@ export function parseModelScopeKey(key: string): string[] | null {
 /**
  * The durable scope of one parsed window, or `null` when it must be rejected.
  * Provider-scoped windows map to {@link PROVIDER_SCOPE_KEY}. A model-scoped
- * window is accepted only from a catalog-validated source, only in the
- * explicit `{ provider, models }` form, and only for this provider; the bare
- * legacy `"model"` scope names no models and so cannot identify a lane.
+ * window is accepted only in the explicit `{ provider, models }` form and only
+ * for this provider; the bare legacy `"model"` scope names no models and so
+ * cannot identify a lane. Both callers resolve model names against the catalog
+ * before they get here (the scrape parser's `resolveWindowModels`, and
+ * {@link resolveManualModelScopes} for a manual reading).
  */
-function observationScopeKey(
-  limit: Pick<QuotaLimit, "scope">,
-  provider: string,
-  acceptModelScope: boolean
-): string | null {
+function observationScopeKey(limit: Pick<QuotaLimit, "scope">, provider: string): string | null {
   if (isProviderScopedWindow(limit)) return PROVIDER_SCOPE_KEY;
-  if (!acceptModelScope || typeof limit.scope !== "object" || limit.scope === null) return null;
+  if (typeof limit.scope !== "object" || limit.scope === null) return null;
   const { provider: scopedProvider, models } = limit.scope;
   if (
     typeof scopedProvider !== "string" ||
@@ -771,11 +769,7 @@ export class SharedQuotaStore {
       this.db
         .prepare("UPDATE quota_scrapes SET parsed_state = ?, parse_error = NULL WHERE id = ?")
         .run(serializeParsedState(inferredState), id);
-      // The scrape path's model scopes already passed the catalog-aware trust
-      // boundary in the parser (`resolveWindowModels`).
-      this.insertObservations(inferredParsed, scrape?.scraped_at, scrape?.provider, {
-        acceptModelScope: true,
-      });
+      this.insertObservations(inferredParsed, scrape?.scraped_at, scrape?.provider);
     })();
     // Judge the parser's own read: a failed read that carried an earlier
     // reading forward is not a clean parse (#775).
@@ -911,9 +905,7 @@ export class SharedQuotaStore {
         idempotencyKey: input.idempotencyKey,
         generation: input.generation,
       };
-      // Model scopes were resolved against the catalog above, the trust
-      // boundary the scrape path crosses in its parser.
-      this.insertObservations(state, observedAt, provider, { acceptModelScope: true });
+      this.insertObservations(state, observedAt, provider);
       this.db
         .prepare(
           `INSERT INTO quota_scrapes (id, provider, scraped_at, raw_output, parsed_state)
@@ -1073,7 +1065,7 @@ export class SharedQuotaStore {
        LIMIT 1`
     );
     const limits = snapshot.limits.map((limit) => {
-      const scopeKey = observationScopeKey(limit, provider, true);
+      const scopeKey = observationScopeKey(limit, provider);
       if (scopeKey === null) {
         return {
           ...limit,
@@ -1568,8 +1560,7 @@ export class SharedQuotaStore {
   private insertObservations(
     state: ProviderQuotaSnapshot,
     storedObservedAt: string | undefined,
-    storedProvider: string | undefined,
-    opts: { acceptModelScope: boolean }
+    storedProvider: string | undefined
   ): void {
     const fallbackObservedAt = state.scrapedAt ?? storedObservedAt;
     if (!fallbackObservedAt || !Number.isFinite(Date.parse(fallbackObservedAt))) return;
@@ -1579,12 +1570,12 @@ export class SharedQuotaStore {
     };
     const seenLanes = new Set<string>();
     for (const limit of state.limits ?? []) {
-      // A window this store will not reason about — a model scope from an
-      // unvalidated source or naming no models, or a percent outside 0..100 —
+      // A window this store will not reason about — a model scope naming no
+      // models or another provider, or a percent outside 0..100 —
       // is counted as rejected rather than dropped silently, because a parser
       // regression shows up here as reads that produce observations no
       // controller ever sees.
-      const modelScope = observationScopeKey(limit, provider, opts.acceptModelScope);
+      const modelScope = observationScopeKey(limit, provider);
       if (modelScope === null || !Number.isFinite(limit.percentLeft)) {
         observed("rejected");
         continue;

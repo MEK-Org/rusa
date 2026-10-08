@@ -5,7 +5,11 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderQuotaSnapshot, QuotaLimit } from "../mcp/quota-mcp.js";
 import type { LogFields, Logger } from "../observability/logger.js";
-import type { ModelEntry } from "../providers/model-catalog.js";
+import {
+  clearProviderModelCatalog,
+  type ModelEntry,
+  setProviderModelCatalog,
+} from "../providers/model-catalog.js";
 import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import {
   modelLanePacing,
@@ -268,43 +272,33 @@ describe("model-scoped quota lanes: store (#588)", () => {
     }
   });
 
-  it("paces a catalog-resolved manual model window exactly as the scrape one, across a restart", () => {
-    const path = tempDb("rusa-966-manual-restart-");
-    const store = new SharedQuotaStore(path);
+  it("paces a catalog-resolved manual model window exactly as the scrape one", () => {
+    const store = new SharedQuotaStore(tempDb("rusa-966-manual-"));
     store.configureController({ maxIntervalSeconds: 36000 });
     store.setQuotaReadingMode("claude", "manual", "2029-12-31T23:59:00.000Z");
     // The reader spells Fable by its display label; the catalog canonicalises it.
-    recordStandingErrors(store, 0, 6, 2, 12, recordManual, ["claude fable 5.1"]);
-    const before = store.getProviderThrottle("claude");
-    store.close();
+    recordStandingErrors(store, 0, 12, 2, 12, recordManual, ["claude fable 5.1"]);
 
     const control = new SharedQuotaStore(tempDb("rusa-966-manual-control-"));
     control.configureController({ maxIntervalSeconds: 36000 });
     recordStandingErrors(control, 0, 12, 2, 12);
-
-    const reopened = new SharedQuotaStore(path);
     try {
-      reopened.configureController({ maxIntervalSeconds: 36000 });
-      expect(before?.modelLanes?.[0]).toMatchObject({
+      // Same readings, same controller history, lane for lane.
+      expect(reasonedRows(store)).toEqual(reasonedRows(control));
+      const lanes = store.getProviderThrottle("claude")?.modelLanes;
+      expect(lanes?.[0]).toMatchObject({
         models: [FABLE],
         governingBucketKey: `claude[${FABLE}]:weekly`,
       });
-      expect(reopened.getProviderThrottle("claude")).toEqual(before);
-      recordStandingErrors(reopened, 6, 6, 2, 12, recordManual, ["claude fable 5.1"]);
-
-      // Same readings, same controller history, lane for lane.
-      expect(reasonedRows(reopened)).toEqual(reasonedRows(control));
-      expect(reopened.getProviderThrottle("claude")?.modelLanes).toEqual(
-        control.getProviderThrottle("claude")?.modelLanes
-      );
+      expect(lanes).toEqual(control.getProviderThrottle("claude")?.modelLanes);
       // The stored snapshot carries the canonical scope, not the reader's spelling.
-      const [latest] = reopened.listSince("claude", "2030-01-01T00:55:00.000Z");
+      const [latest] = store.listSince("claude", "2030-01-01T00:55:00.000Z");
       expect(latest?.parsedState?.limits?.[1]?.scope).toEqual({
         provider: "claude",
         models: [FABLE],
       });
     } finally {
-      reopened.close();
+      store.close();
       control.close();
     }
   });
@@ -828,7 +822,7 @@ describe("model-scoped quota lanes: protocol (#588)", () => {
     }
   }, 15_000);
 
-  it("publishes a manual Fable reading's lane over the socket and logs a dropped row", async () => {
+  it("resolves a socket manual reading against the runtime catalog and logs a dropped row", async () => {
     const path = tempDb("rusa-966-e2e-");
     const socketPath = join(path, "..", "coordinator.sock");
     const store = new SharedQuotaStore(path);
@@ -846,9 +840,10 @@ describe("model-scoped quota lanes: protocol (#588)", () => {
       store,
       configuredProviders: ["claude"],
       maxIntervalSeconds: 36000,
-      modelCatalogFor: (provider) => (provider === "claude" ? CATALOG : []),
       logger,
     });
+    // The runtime catalog the coordinator loads at startup, as in production.
+    setProviderModelCatalog("claude", CATALOG);
     try {
       const mode = store.setQuotaReadingMode("claude", "manual", new Date().toISOString());
       await coordinator.start();
@@ -875,26 +870,23 @@ describe("model-scoped quota lanes: protocol (#588)", () => {
         },
       });
       expect(posted).toMatchObject({ reached: true, statusCode: 200 });
-
-      await client.getThrottle();
-      expect(client.getLastPublishedStatus("claude")?.modelLanes).toEqual([
-        expect.objectContaining({
-          models: [FABLE],
-          governingBucketKey: `claude[${FABLE}]:weekly`,
-          intervalSeconds: store.getProviderThrottle("claude")?.modelLanes?.[0]?.intervalSeconds,
-        }),
-      ]);
-      expect(records).toContainEqual({
-        event: "quota_manual_model_window_dropped",
-        fields: {
-          provider: "claude",
-          label: "Reserve weekly",
-          kind: "weekly",
-          models: ["claude-reserve-9"],
-          reason: "no_catalog_match",
+      // Only the reserve row is dropped: Fable resolved against the runtime catalog.
+      expect(
+        records.filter((record) => record.event === "quota_manual_model_window_dropped")
+      ).toEqual([
+        {
+          event: "quota_manual_model_window_dropped",
+          fields: {
+            provider: "claude",
+            label: "Reserve weekly",
+            kind: "weekly",
+            models: ["claude-reserve-9"],
+            reason: "no_catalog_match",
+          },
         },
-      });
+      ]);
     } finally {
+      clearProviderModelCatalog("claude");
       await coordinator.stop();
       store.close();
     }

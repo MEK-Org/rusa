@@ -3,7 +3,7 @@ import http from "node:http";
 import net from "node:net";
 import { dirname } from "node:path";
 import { type Logger, nullLogger } from "../observability/logger.js";
-import { getProviderModelCatalog, type ModelEntry } from "../providers/model-catalog.js";
+import { getProviderModelCatalog } from "../providers/model-catalog.js";
 import { normalizeProviderThrottleKey, QUOTA_THROTTLE_PROVIDERS } from "../providers/registry.js";
 import type { QuotaCollectionStats } from "./coordinator-collection.js";
 import {
@@ -104,12 +104,6 @@ export interface QuotaCoordinatorServiceOptions {
    * it can persist a scrape row leaves nothing in the database to report.
    */
   collectionStats?: () => Record<string, Readonly<QuotaCollectionStats>>;
-  /**
-   * The model catalog a manual reading's model-scoped windows are resolved
-   * against. Defaults to the runtime catalog, the one the scrape parser is
-   * given, so both paths accept the same lanes.
-   */
-  modelCatalogFor?: (provider: string) => readonly ModelEntry[];
   logger?: Logger;
 }
 
@@ -804,9 +798,9 @@ export class QuotaCoordinatorService {
       },
       { maxIntervalSeconds: this.maxIntervalSeconds },
       {
-        configuredModels: this.options.modelCatalogFor
-          ? this.options.modelCatalogFor(provider)
-          : (getProviderModelCatalog(provider) ?? []),
+        // The runtime catalog the scrape parser is given, so both paths
+        // accept the same lanes.
+        configuredModels: getProviderModelCatalog(provider) ?? [],
       }
     );
     if (result.result === "accepted") {
