@@ -645,27 +645,28 @@ function storedWindowMs(point: QuotaHistorySource): number {
     : windowMsFor(point.kind);
 }
 
+/**
+ * Give each live window its lane's latest stored duration, the same length the
+ * pacer reads, so the dashboard and pacer agree even when the live read has
+ * not been stored under that exact timestamp.
+ */
 function withStoredWindowMs(
   dto: ProviderQuotaDto,
   history: readonly QuotaHistorySource[]
 ): ProviderQuotaDto {
-  const byLaneAndRead = new Map<string, number>();
+  const latestByLane = new Map<string, QuotaHistorySource>();
   for (const point of history) {
     if (typeof point.windowMs !== "number" || point.windowMs <= 0) continue;
-    byLaneAndRead.set(
-      `${quotaLaneKey(point.scope, point.models ?? [], point.kind)}\u0000${point.observedAt}`,
-      point.windowMs
-    );
+    const lane = quotaLaneKey(point.scope, point.models ?? [], point.kind);
+    const current = latestByLane.get(lane);
+    if (!current || point.observedAt >= current.observedAt) latestByLane.set(lane, point);
   }
   const replace = <W extends QuotaWindowDto>(
     window: W,
     scope: "provider" | "model",
     models: readonly string[]
   ): W => {
-    if (!window.scrapedAt) return window;
-    const windowMs = byLaneAndRead.get(
-      `${quotaLaneKey(scope, models, window.id)}\u0000${window.scrapedAt}`
-    );
+    const windowMs = latestByLane.get(quotaLaneKey(scope, models, window.id))?.windowMs;
     return windowMs === undefined ? window : { ...window, windowMs };
   };
   return {

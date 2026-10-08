@@ -701,9 +701,11 @@ describe("SharedQuotaStore persisted controller", () => {
         75,
         new Date(firstEnd + 30 * 60 * 1000).toISOString()
       );
-      // Once the prior end has passed, the next end defines the actual 24h window.
-      const nextObserved = firstEnd + 5 * 60 * 1000;
-      const nextEnd = firstEnd + 24 * hour;
+      // Once the corrected prior end has passed, the next end defines the
+      // actual 24h window.
+      const correctedEnd = firstEnd + 30 * 60 * 1000;
+      const nextObserved = correctedEnd + 5 * 60 * 1000;
+      const nextEnd = correctedEnd + 24 * hour;
       recordObservation(
         store,
         "claude",
@@ -809,6 +811,63 @@ describe("SharedQuotaStore persisted controller", () => {
       expect(
         store.listCanonicalSince("claude", "2030-01-01T00:00:00.000Z").map((row) => row.windowMs)
       ).toEqual([6 * 24 * hour, 24 * hour]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps five-hour lanes at 5h across an idle gap between sessions", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-session-gap-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      const hour = 60 * 60 * 1000;
+      const firstObserved = Date.parse("2030-01-01T05:00:00.000Z");
+      const firstEnd = firstObserved + 5 * hour;
+      const iso = (ms: number) => new Date(ms).toISOString();
+      recordObservation(store, "agy", iso(firstObserved), 90, iso(firstEnd), "session");
+      // The account idles for 8h after that reset; the next session starts on
+      // first use, so its end is 13h after the previous one.
+      const nextObserved = firstEnd + 8 * hour;
+      recordObservation(
+        store,
+        "agy",
+        iso(nextObserved),
+        99,
+        iso(nextObserved + 5 * hour),
+        "session"
+      );
+      expect(
+        store.listCanonicalSince("agy", "2030-01-01T00:00:00.000Z").map((row) => row.windowMs)
+      ).toEqual([5 * hour, 5 * hour]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("ends the previous window no later than the reading that shows a new one", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-early-reset-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      const hour = 60 * 60 * 1000;
+      const day = 24 * hour;
+      const iso = (ms: number) => new Date(ms).toISOString();
+      const start = Date.parse("2030-01-01T00:00:00.000Z");
+      const firstEnd = start + 7 * day;
+      recordObservation(store, "codex", iso(start), 90, iso(firstEnd));
+      // The provider resets two days early: the new end is seven days from
+      // the reading, not fourteen days from the last end that had passed.
+      const earlyObserved = firstEnd - 2 * day;
+      const earlyEnd = earlyObserved + 7 * day;
+      recordObservation(store, "codex", iso(earlyObserved), 100, iso(earlyEnd));
+      // A reading whose clock trails the stored end by 20s still measures from
+      // that end's neighbourhood rather than an older cycle.
+      const skewedObserved = earlyEnd - 20 * 1000;
+      recordObservation(store, "codex", iso(skewedObserved), 100, iso(earlyEnd + day));
+      expect(
+        store.listCanonicalSince("codex", "2030-01-01T00:00:00.000Z").map((row) => row.windowMs)
+      ).toEqual([7 * day, 7 * day, day + 20 * 1000]);
     } finally {
       store.close();
     }
