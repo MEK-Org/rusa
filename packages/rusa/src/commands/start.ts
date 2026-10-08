@@ -4433,6 +4433,7 @@ async function composeStart(
           inbox: getRepositories().inbox,
           actorRuns: getRepositories().actorRuns,
           runPrompts: getRepositories().runPrompts,
+          portableContext: getRepositories().portableContext,
           inboxFocus: getRepositories().inboxFocus,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,

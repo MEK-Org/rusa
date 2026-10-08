@@ -636,6 +636,54 @@ void main() {
     });
   });
 
+  testWidgets(
+    'Info shows and refreshes a brief, then clears it on actor switch',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', created: 't0'),
+            makeThread('a', parent: 'root', created: 't1'),
+            makeThread('b', parent: 'root', created: 't2'),
+          ]
+          ..briefs['a'] =
+              '## WHAT\nFixture purpose\n## HOW\nFixture rules\n## DOMAIN\nFixture knowledge';
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.pumpWidget(_harness(store));
+        await tester.pump(const Duration(milliseconds: 50));
+        await tester.tap(find.text('a-handle'));
+        await tester.pump(const Duration(milliseconds: 50));
+        await tester.ensureVisible(find.text('Info'));
+        await tester.tap(find.text('Info'));
+        for (var i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        expect(find.text('Brief'), findsOneWidget);
+        expect(find.text(api.briefs['a']!), findsOneWidget);
+        api.briefs['a'] = '## WHAT\nUpdated purpose';
+        await store.refreshThreads();
+        for (var i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        expect(find.text('## WHAT\nUpdated purpose'), findsOneWidget);
+        api.briefs['a'] = null;
+        await store.refreshThreads();
+        for (var i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        expect(find.text('No brief yet.'), findsOneWidget);
+        await tester.tap(find.text('b-handle'));
+        for (var i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        expect(find.text('Brief'), findsNothing);
+        expect(find.text('## WHAT\nUpdated purpose'), findsNothing);
+        await store.dispose();
+      });
+    },
+  );
+
   testWidgets('the Info tab keeps the preview when the charter fetch fails', (
     tester,
   ) async {
@@ -1422,10 +1470,7 @@ void main() {
         expect(codexMsg, contains('5h: window reset at '));
         expect(codexMsg, contains('no fresh read since'));
         expect(codexMsg, isNot(contains('5h: 53% remaining')));
-        expect(
-          codexMsg,
-          isNot(contains('5h: 47% quota remaining')),
-        );
+        expect(codexMsg, isNot(contains('5h: 47% quota remaining')));
 
         await store.dispose();
       });

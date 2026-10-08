@@ -152,6 +152,7 @@ export interface DashboardMeshRefs {
   /** Completed selection intervals used to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
   runPrompts?: RunPromptRepository;
+  portableContext?: DashboardDataDeps["portableContext"];
   /** Durable per-entry obligation associations for activity correlation. */
   inboxFocus?: InboxFocusRepository;
   emitter: MeshEventEmitter;
@@ -652,6 +653,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           inbox: options.mesh.inbox,
           actorRuns: options.mesh.actorRuns,
           runPrompts: options.mesh.runPrompts,
+          portableContext: options.mesh.portableContext,
           inboxFocus: options.mesh.inboxFocus,
           sseHub,
           mesh: options.mesh.mesh,

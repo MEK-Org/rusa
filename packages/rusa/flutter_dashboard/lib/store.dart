@@ -1359,11 +1359,13 @@ class DashboardStore {
   /// rest when the operator opens an actor. Not cached here: the panel holds
   /// the result for as long as it shows it, and a charter can be edited, so a
   /// store-level cache would go stale with nothing to invalidate it.
-  Future<String> fetchCharter(String threadId) async {
+  Future<({String charter, bool briefMode, String? brief})> fetchActorInfo(
+    String threadId,
+  ) async {
     try {
-      final charter = await _api.fetchCharter(threadId);
+      final info = await _api.fetchActorInfo(threadId);
       _error.add(null);
-      return charter;
+      return info;
     } catch (e) {
       _error.add('$e');
       rethrow;

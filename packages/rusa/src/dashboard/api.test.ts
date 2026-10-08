@@ -10,6 +10,7 @@ import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
+import { emptyPortableContextState } from "../actor/portable-context-state.js";
 import type { RootChildRequest, RootControlService } from "../actor/root-control.js";
 import {
   AvatarGenerationCoordinator,
@@ -1810,6 +1811,31 @@ describe("handleMeshApiRequest", () => {
     const { res } = await call(deps, "GET", `/api/mesh/threads/charter?id=${UUID_A}`);
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ id: UUID_A, charter: long });
+  });
+
+  it("serves only the selected brief actor's current stored brief", async () => {
+    actors.upsert({ ...rec(UUID_A, null, "active"), context: { type: "portable", mode: "brief" } });
+    let text: string | null =
+      "## WHAT\nFixture purpose\n\n## HOW\nFixture rules\n\n## DOMAIN\nFixture knowledge";
+    const load = vi.fn(() => ({
+      ...emptyPortableContextState(UUID_A),
+      brief: text === null ? null : { text },
+    }));
+    deps.portableContext = { load } as unknown as DashboardDataDeps["portableContext"];
+    const read = async () =>
+      JSON.parse((await call(deps, "GET", `/api/mesh/threads/charter?id=${UUID_A}`)).res.body);
+    expect(await read()).toMatchObject({ briefMode: true, brief: text });
+    text = "## WHAT\nUpdated purpose";
+    expect(await read()).toMatchObject({ brief: text });
+    text = null;
+    expect(await read()).toMatchObject({ briefMode: true, brief: null });
+    expect(load.mock.calls).toEqual([[UUID_A], [UUID_A], [UUID_A]]);
+    actors.upsert({
+      ...rec(UUID_A, null, "active"),
+      context: { type: "portable", mode: "ledger" },
+    });
+    expect(await read()).not.toHaveProperty("brief");
+    expect(load).toHaveBeenCalledTimes(3);
   });
 
   it("GET /api/mesh/threads/charter 404s for an unknown or missing id", async () => {
