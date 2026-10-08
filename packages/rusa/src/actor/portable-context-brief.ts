@@ -45,6 +45,15 @@ export const PORTABLE_CONTEXT_BRIEF_MAX_VALIDATION_ERROR_BYTES = 4 * 1024;
 
 const byteLen = (s: string): number => Buffer.byteLength(s, "utf8");
 
+/** Keep a diagnostic within its byte budget without cutting a UTF-8 code point. */
+function truncateUtf8(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.length <= maxBytes) return value;
+  let end = maxBytes;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString("utf8");
+}
+
 /** Who authored a delta message, weighted per the spec's authority rule. */
 export type BriefSourceClass = "human" | "ancestor" | "descendant" | "peer";
 
@@ -254,6 +263,10 @@ export interface BriefValidationInput {
    * human/ancestor supersession.
    */
   authorityCitations: ReadonlySet<string>;
+  /** Refs the model may copy this cycle: current delta, charter, or carried lines. */
+  allowedCitations?: ReadonlySet<string>;
+  /** A status/milestone delta may refine at most one existing DOMAIN line. */
+  milestone?: boolean;
 }
 
 /**
@@ -283,14 +296,31 @@ export function validateBriefText(input: BriefValidationInput): {
 
   const previous =
     input.previousText === null ? null : parseBriefDocument(input.previousText).parsed;
-  const previousWhatHow = new Set(
-    previous ? previous.lines.filter((l) => l.section !== "DOMAIN").map((l) => l.raw) : []
+  const previousWhatHowBySection = new Map<BriefSection, Set<string>>(
+    BRIEF_SECTIONS.map((section) => [
+      section,
+      new Set(
+        previous?.lines.filter((line) => line.section === section).map((line) => line.raw) ?? []
+      ),
+    ])
   );
-  const newWhatHow = parsed.lines.filter((l) => l.section !== "DOMAIN");
+  const newWhatHowBySection = new Map<BriefSection, ParsedBriefLine[]>(
+    BRIEF_SECTIONS.map((section) => [
+      section,
+      parsed.lines.filter((line) => line.section === section),
+    ])
+  );
   const authority = input.authorityCitations;
 
   for (const line of parsed.lines) {
     for (const ref of line.refs) refs.push(ref);
+    if (input.allowedCitations) {
+      for (const ref of line.refs) {
+        if (!input.allowedCitations.has(ref)) {
+          errors.push(`citation was not supplied for this rewrite: ${ref}`);
+        }
+      }
+    }
 
     const exclusion = findBriefStateExclusion(line.statement);
     if (exclusion) {
@@ -299,7 +329,7 @@ export function validateBriefText(input: BriefValidationInput): {
 
     if (line.section === "DOMAIN") continue;
 
-    if (previousWhatHow.has(line.raw)) continue; // byte-identical carry; refs already resolved
+    if (previousWhatHowBySection.get(line.section)?.has(line.raw)) continue;
 
     const citedAuthority = line.refs.some((ref) => authority.has(ref));
     if (!citedAuthority) {
@@ -310,14 +340,33 @@ export function validateBriefText(input: BriefValidationInput): {
   }
 
   if (previous) {
-    const newWhatHowRaw = new Set(newWhatHow.map((l) => l.raw));
-    const dropped = previous.lines.filter(
-      (l) => l.section !== "DOMAIN" && !newWhatHowRaw.has(l.raw)
-    );
-    if (dropped.length > 0 && authority.size === 0) {
-      errors.push(
-        `${dropped.length} previous WHAT/HOW line(s) dropped without any human/ancestor message in the delta`
+    for (const section of ["WHAT", "HOW"] as const) {
+      const before = previousWhatHowBySection.get(section) ?? new Set<string>();
+      const after = newWhatHowBySection.get(section) ?? [];
+      const afterRaw = new Set(after.map((line) => line.raw));
+      const dropped = [...before].filter((raw) => !afterRaw.has(raw));
+      if (dropped.length === 0) continue;
+      const citedReplacements = after.filter(
+        (line) => !before.has(line.raw) && line.refs.some((ref) => authority.has(ref))
+      ).length;
+      if (citedReplacements < dropped.length) {
+        errors.push(
+          `${dropped.length} previous ${section} line(s) dropped without equally cited human/ancestor supersession(s)`
+        );
+      }
+    }
+    if (input.milestone) {
+      const previousDomain = new Set(
+        previous.lines.filter((line) => line.section === "DOMAIN").map((line) => line.raw)
       );
+      const newOrChangedDomain = parsed.lines.filter(
+        (line) => line.section === "DOMAIN" && !previousDomain.has(line.raw)
+      );
+      if (newOrChangedDomain.length > 1) {
+        errors.push(
+          `milestone delta changed ${newOrChangedDomain.length} DOMAIN lines; at most one is allowed`
+        );
+      }
     }
   }
 
@@ -401,7 +450,7 @@ export function buildBriefRewritePrompt(input: {
     const bounded = input.validatorErrors.join("\n");
     const errors =
       byteLen(bounded) > PORTABLE_CONTEXT_BRIEF_MAX_VALIDATION_ERROR_BYTES
-        ? `${bounded.slice(0, PORTABLE_CONTEXT_BRIEF_MAX_VALIDATION_ERROR_BYTES)}…`
+        ? `${truncateUtf8(bounded, PORTABLE_CONTEXT_BRIEF_MAX_VALIDATION_ERROR_BYTES)}…`
         : bounded;
     prompt += `\n\nValidator errors to correct (repair retry; use the same sources):\n${errors}`;
   }
@@ -422,11 +471,41 @@ export function seedBriefText(actorId: string): string {
   );
 }
 
+function isBriefMilestone(message: BriefDeltaMessage): boolean {
+  return /\b(?:pull request|PR\s*#?\d+|checks?|review(?:ed|ing)?|merge[sd]?|staging|gate)\b/i.test(
+    message.body
+  );
+}
+
+/** Seed the durable brief at the exact switch boundary without touching ledger fields. */
+export function seedPortableBriefState(
+  state: PortableContextState,
+  actorId: string,
+  cursor: BriefCursor | null,
+  now: string
+): PortableContextState {
+  const charterRef = `mesh:actors/${actorId}/charter`;
+  return {
+    ...state,
+    brief: {
+      text: seedBriefText(actorId),
+      cursor,
+      generation: 0,
+      model: null,
+      updatedAt: now,
+      consecutiveFailures: 0,
+      frozen: false,
+      freezeAttentionId: null,
+      resolvedRefs: [charterRef],
+    },
+  };
+}
+
 // ── The rewrite cycle ──
 
 export interface BriefAttemptTelemetry {
   attempt: "initial" | "repair";
-  outcome: "accepted" | "rejected";
+  outcome: "accepted" | "rejected" | "unavailable";
   /** The generation this attempt would produce (current + 1). */
   generation: number;
   inputBytes: number;
@@ -445,8 +524,8 @@ export interface BriefCycleDeps {
   };
   /** One bare-LLM rewrite call (Gemini in production; a stub in tests). */
   rewriter: { model: string; rewrite(contents: string): Promise<string> };
-  /** Resolve a citation ref against the actor's own stores/tracker; true when it resolves. */
-  resolveRef: (ref: string) => Promise<boolean>;
+  /** Resolve a citation ref; temporary unavailability is not a validation failure. */
+  resolveRef: (ref: string) => Promise<BriefReferenceResolution>;
   /** Classify a delta sender (compose with the actor's parent chain). */
   classify: (senderId: string) => BriefSourceClass;
   /** Page the durable stream strictly after a position; null position = from the start. */
@@ -460,12 +539,12 @@ export interface BriefCycleDeps {
   recordAttempt: (attempt: BriefAttemptTelemetry) => void;
   /**
    * Raise the durable needs-attention item for the actor's parent through the
-   * existing inbox path, exactly once at freeze time. Handling releases the
-   * freeze: the parent's handling reply reaches the actor as a durable chat
-   * message, and the cycle that sees a human/ancestor-class message after the
-   * frozen cursor unfreezes before rewriting.
+   * existing inbox path, exactly once at freeze time. Returns the entry id so
+   * handling can release precisely this freeze.
    */
-  raiseAttention: (input: { actorId: string; reason: string }) => void;
+  raiseAttention: (input: { actorId: string; reason: string }) => string | null;
+  /** Whether the durable attention item for the current freeze was handled. */
+  isAttentionHandled: (entryId: string) => boolean;
   log?: (message: string) => void;
 }
 
@@ -473,6 +552,7 @@ export type BriefCycleOutcome =
   | { outcome: "seeded" }
   | { outcome: "skipped" }
   | { outcome: "frozen" }
+  | { outcome: "unavailable"; attempts: number; reason: string }
   | { outcome: "accepted"; released: boolean; attempts: number }
   | { outcome: "rejected"; attempts: number; reason: string };
 
@@ -481,10 +561,16 @@ interface BriefSourceSlice {
   hasMore: boolean;
 }
 
+export type BriefReferenceResolution =
+  | { outcome: "resolved" }
+  | { outcome: "unresolved"; reason: string }
+  | { outcome: "unavailable"; reason: string };
+
 /**
  * Select the bounded oldest-first delta slice: walk sources after the cursor
- * until the count or byte bound is reached. A single source larger than the
- * byte bound is taken alone — it is processed, never silently dropped.
+ * until the count or byte bound is reached. An oversized first source does not
+ * enter the request; the cycle retains it and raises explicit attention after
+ * bounded failures rather than silently dropping or truncating it.
  */
 export function selectBriefSlice(
   page: BriefSourceSlice,
@@ -495,7 +581,7 @@ export function selectBriefSlice(
   let used = 0;
   for (const source of page.sources) {
     const cost = byteLen(source.body ?? "");
-    if (selected.length > 0 && (selected.length >= maxSources || used + cost > maxBytes)) break;
+    if (selected.length >= maxSources || used + cost > maxBytes) break;
     selected.push(source);
     used += cost;
     if (selected.length >= maxSources) break;
@@ -534,32 +620,71 @@ export async function runPortableContextBriefCycle(
   const state = deps.store.load(deps.actorId);
 
   if (state.brief === null) {
-    const charterRef = `mesh:actors/${deps.actorId}/charter`;
-    deps.store.save({
-      ...state,
-      brief: {
-        text: seedBriefText(deps.actorId),
-        cursor: deps.latestPosition(),
-        generation: 0,
-        model: null,
-        updatedAt: now(),
-        consecutiveFailures: 0,
-        frozen: false,
-        resolvedRefs: [charterRef],
-      },
-    });
+    deps.store.save(seedPortableBriefState(state, deps.actorId, deps.latestPosition(), now()));
     log(`[portable-context] brief seeded for ${deps.actorId}`);
     return { outcome: "seeded" };
   }
 
-  const page = deps.listSources(state.brief.cursor, PORTABLE_CONTEXT_BRIEF_MAX_SLICE_SOURCES);
+  let released = false;
+  let brief: PortableBrief = state.brief;
+  if (brief.frozen) {
+    if (!brief.freezeAttentionId || !deps.isAttentionHandled(brief.freezeAttentionId)) {
+      return { outcome: "frozen" };
+    }
+    brief = {
+      ...brief,
+      frozen: false,
+      freezeAttentionId: null,
+      consecutiveFailures: 0,
+    };
+    released = true;
+    log(`[portable-context] brief freeze released for ${deps.actorId} by handled attention`);
+  }
+
+  const page = deps.listSources(brief.cursor, PORTABLE_CONTEXT_BRIEF_MAX_SLICE_SOURCES);
   const slice = selectBriefSlice(
     page,
     PORTABLE_CONTEXT_BRIEF_MAX_SLICE_SOURCES,
     PORTABLE_CONTEXT_BRIEF_MAX_SLICE_BYTES
   );
   if (slice.length === 0) {
-    return { outcome: state.brief.frozen ? "frozen" : "skipped" };
+    const oversized = page.sources[0];
+    if (!oversized || byteLen(oversized.body ?? "") <= PORTABLE_CONTEXT_BRIEF_MAX_SLICE_BYTES) {
+      if (released) deps.store.save({ ...state, brief: { ...brief, updatedAt: now() } });
+      return { outcome: "skipped" };
+    }
+    const reason =
+      `source ${oversized.id} is ${byteLen(oversized.body ?? "")} bytes, over the ` +
+      `${PORTABLE_CONTEXT_BRIEF_MAX_SLICE_BYTES}-byte rewrite-input bound`;
+    const failures = brief.consecutiveFailures + 1;
+    const frozen = failures >= PORTABLE_CONTEXT_BRIEF_MAX_CONSECUTIVE_FAILURES;
+    const freezeReason = `portable-context brief rewrite failed ${failures} consecutive cycles for ${deps.actorId}: ${reason}`;
+    const freezeAttentionId =
+      frozen && !brief.frozen
+        ? deps.raiseAttention({ actorId: deps.actorId, reason: freezeReason })
+        : brief.freezeAttentionId;
+    deps.recordAttempt({
+      attempt: "initial",
+      outcome: "rejected",
+      generation: brief.generation + 1,
+      inputBytes: 0,
+      outputBytes: 0,
+      latencyMs: 0,
+      model: deps.rewriter.model,
+      reason,
+    });
+    deps.store.save({
+      ...state,
+      brief: {
+        ...brief,
+        consecutiveFailures: failures,
+        frozen,
+        freezeAttentionId,
+        updatedAt: now(),
+      },
+    });
+    log(`[portable-context] ${frozen ? freezeReason : reason}`);
+    return { outcome: "rejected", attempts: 1, reason };
   }
 
   const delta: BriefDeltaMessage[] = slice.map((source) => {
@@ -588,19 +713,6 @@ export async function runPortableContextBriefCycle(
       .map((m) => m.citation)
   );
 
-  let released = false;
-  let brief: PortableBrief = state.brief;
-  if (brief.frozen) {
-    if (authorityCitations.size === 0) {
-      return { outcome: "frozen" };
-    }
-    // The parent's handling reply (or a human message) reached the actor:
-    // release the freeze and spend this cycle's delta on the rewrite.
-    brief = { ...brief, frozen: false, consecutiveFailures: 0 };
-    released = true;
-    log(`[portable-context] brief freeze released for ${deps.actorId} by human/ancestor message`);
-  }
-
   const resolvedRefs = new Set(brief.resolvedRefs);
   const failedRefsThisCycle = new Set<string>();
   let failures = brief.consecutiveFailures;
@@ -610,7 +722,11 @@ export async function runPortableContextBriefCycle(
   const tryAttempt = async (
     attempt: "initial" | "repair",
     validatorErrors?: string[]
-  ): Promise<{ text: string; errors: string[]; inputBytes: number; latencyMs: number } | null> => {
+  ): Promise<
+    | { outcome: "accepted"; text: string; inputBytes: number; latencyMs: number }
+    | { outcome: "unavailable"; reason: string }
+    | null
+  > => {
     attempts += 1;
     const contents = buildBriefRewritePrompt({
       currentText: brief.text,
@@ -640,14 +756,36 @@ export async function runPortableContextBriefCycle(
     const latencyMs = Date.now() - started;
 
     const candidateRefs = new Set<string>();
+    const carriedParsed = parseBriefDocument(brief.text).parsed;
+    const carried = new Set(carriedParsed?.lines.map((line) => line.raw) ?? []);
+    const allowedCitations = new Set<string>([
+      `mesh:actors/${deps.actorId}/charter`,
+      ...delta.map((message) => message.citation),
+      ...(carriedParsed?.lines.flatMap((line) => line.refs) ?? []),
+    ]);
     const structural = validateBriefText({
       text,
       previousText: brief.text,
       authorityCitations,
+      allowedCitations,
+      milestone: delta.some(isBriefMilestone),
     });
-    // Resolve only refs not already cached; carried lines were never re-parsed
-    // for this (their refs sit in the cache from when they first appeared).
-    const carried = new Set(parseBriefDocument(brief.text).parsed?.lines.map((l) => l.raw) ?? []);
+    if (structural.errors.length > 0) {
+      deps.recordAttempt({
+        attempt,
+        outcome: "rejected",
+        generation: brief.generation + 1,
+        inputBytes,
+        outputBytes: byteLen(text),
+        latencyMs,
+        model: deps.rewriter.model,
+        reason: structural.errors.join("; ").slice(0, 500),
+      });
+      lastErrors = structural.errors;
+      return null;
+    }
+    // Resolve only refs not already cached; carried lines were already resolved
+    // when they first appeared, and an unallowed invented ref never reaches a resolver.
     const { parsed } = parseBriefDocument(text);
     const toResolve = new Set<string>();
     for (const line of parsed?.lines ?? []) {
@@ -661,17 +799,33 @@ export async function runPortableContextBriefCycle(
         structural.errors.push(`citation does not resolve: ${ref}`);
         continue;
       }
-      let ok = false;
+      let resolution: BriefReferenceResolution;
       try {
-        ok = await deps.resolveRef(ref);
-      } catch {
-        ok = false;
+        resolution = await deps.resolveRef(ref);
+      } catch (err) {
+        resolution = {
+          outcome: "unavailable",
+          reason: err instanceof Error ? err.message : String(err),
+        };
       }
-      if (ok) {
+      if (resolution.outcome === "resolved") {
         candidateRefs.add(ref);
-      } else {
+      } else if (resolution.outcome === "unresolved") {
         failedRefsThisCycle.add(ref);
-        structural.errors.push(`citation does not resolve: ${ref}`);
+        structural.errors.push(`citation does not resolve: ${ref} (${resolution.reason})`);
+      } else {
+        const reason = `citation resolution temporarily unavailable: ${ref} (${resolution.reason})`;
+        deps.recordAttempt({
+          attempt,
+          outcome: "unavailable",
+          generation: brief.generation + 1,
+          inputBytes,
+          outputBytes: byteLen(text),
+          latencyMs,
+          model: deps.rewriter.model,
+          reason,
+        });
+        return { outcome: "unavailable", reason };
       }
     }
 
@@ -691,28 +845,41 @@ export async function runPortableContextBriefCycle(
       return null;
     }
     for (const ref of candidateRefs) resolvedRefs.add(ref);
-    return { text, errors: [], inputBytes, latencyMs };
+    return { outcome: "accepted", text, inputBytes, latencyMs };
   };
 
   const initial = await tryAttempt("initial");
+  if (initial?.outcome === "unavailable") {
+    return { outcome: "unavailable", attempts, reason: initial.reason };
+  }
   const accepted = initial ?? (await tryAttempt("repair", lastErrors));
+  if (accepted?.outcome === "unavailable") {
+    return { outcome: "unavailable", attempts, reason: accepted.reason };
+  }
 
   if (accepted === null) {
     failures += 1;
     const frozen = failures >= PORTABLE_CONTEXT_BRIEF_MAX_CONSECUTIVE_FAILURES;
-    deps.store.save({
-      ...state,
-      brief: { ...brief, consecutiveFailures: failures, frozen, updatedAt: now() },
-    });
+    let freezeAttentionId = brief.freezeAttentionId;
     if (frozen && !brief.frozen) {
       const reason = `portable-context brief rewrite failed ${failures} consecutive cycles for ${deps.actorId}: ${lastErrors.join("; ")}`;
-      deps.raiseAttention({ actorId: deps.actorId, reason });
+      freezeAttentionId = deps.raiseAttention({ actorId: deps.actorId, reason });
       log(`[portable-context] ${reason}`);
     } else {
       log(
         `[portable-context] brief rewrite rejected for ${deps.actorId} (failure ${failures}): ${lastErrors.join("; ")}`
       );
     }
+    deps.store.save({
+      ...state,
+      brief: {
+        ...brief,
+        consecutiveFailures: failures,
+        frozen,
+        freezeAttentionId,
+        updatedAt: now(),
+      },
+    });
     return { outcome: "rejected", attempts, reason: lastErrors.join("; ") };
   }
 
@@ -726,6 +893,7 @@ export async function runPortableContextBriefCycle(
       updatedAt: now(),
       consecutiveFailures: 0,
       frozen: false,
+      freezeAttentionId: null,
       resolvedRefs: [...resolvedRefs],
     },
   });
@@ -755,7 +923,11 @@ export class GeminiBriefRewriter {
       client.models.generateContent({
         model: this.model,
         contents,
-        config: { temperature: 0, httpOptions: { timeout: 60_000 } },
+        config: {
+          temperature: 0,
+          systemInstruction: BRIEF_REWRITE_SYSTEM_INSTRUCTION,
+          httpOptions: { timeout: 60_000 },
+        },
       })
     );
     return extractGeminiText(response);

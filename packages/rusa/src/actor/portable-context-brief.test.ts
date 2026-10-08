@@ -1,15 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
 import type { PortableLedgerSource } from "../db/repositories/actor-run-repository.js";
+import * as geminiUtils from "../understanding/gemini-utils.js";
 import { assemblePortableContextV2 } from "./portable-context.js";
 import {
   BRIEF_ACCEPTED_CITATION_FORMS,
   BRIEF_REWRITE_SYSTEM_INSTRUCTION,
   type BriefAttemptTelemetry,
   type BriefCycleDeps,
+  type BriefReferenceResolution,
   buildBriefRewritePrompt,
   citationForLedgerSource,
   classifyBriefSender,
   findBriefStateExclusion,
+  GeminiBriefRewriter,
   PORTABLE_CONTEXT_BRIEF_MAX_BYTES,
   PORTABLE_CONTEXT_BRIEF_MAX_CONSECUTIVE_FAILURES,
   parseBriefDocument,
@@ -64,7 +67,7 @@ const SEED_TEXT = seedBriefText(ACTOR);
 interface CycleHarnessOptions {
   sources: PortableLedgerSource[];
   rewriterText: string | string[];
-  resolveRef?: (ref: string) => Promise<boolean>;
+  resolveRef?: (ref: string) => Promise<BriefReferenceResolution>;
   classify?: BriefCycleDeps["classify"];
   now?: string;
   seedPosition?: BriefCursor | null;
@@ -90,7 +93,8 @@ function cycleHarness(options: CycleHarnessOptions) {
   store.save(state);
 
   const attempts: BriefAttemptTelemetry[] = [];
-  const attention: Array<{ actorId: string; reason: string }> = [];
+  const attention: Array<{ id: string; actorId: string; reason: string }> = [];
+  const handledAttention = new Set<string>();
   const resolveCalls: string[] = [];
   const outputs = Array.isArray(options.rewriterText)
     ? [...options.rewriterText]
@@ -108,7 +112,7 @@ function cycleHarness(options: CycleHarnessOptions) {
     actorId: ACTOR,
     store,
     rewriter,
-    resolveRef: options.resolveRef ?? (async () => true),
+    resolveRef: options.resolveRef ?? (async () => ({ outcome: "resolved" })),
     classify:
       options.classify ??
       ((senderId: string) =>
@@ -137,9 +141,14 @@ function cycleHarness(options: CycleHarnessOptions) {
           : null,
     now: () => options.now ?? "2026-10-07T20:00:00.000Z",
     recordAttempt: (attempt) => attempts.push(attempt),
-    raiseAttention: (input) => attention.push(input),
+    raiseAttention: (input) => {
+      const id = `attention-${attention.length + 1}`;
+      attention.push({ id, ...input });
+      return id;
+    },
+    isAttentionHandled: (id) => handledAttention.has(id),
   };
-  const resolveRefTracked = async (ref: string): Promise<boolean> => {
+  const resolveRefTracked = async (ref: string): Promise<BriefReferenceResolution> => {
     resolveCalls.push(ref);
     return deps.resolveRef(ref);
   };
@@ -147,6 +156,7 @@ function cycleHarness(options: CycleHarnessOptions) {
     store,
     attempts,
     attention,
+    markAttentionHandled: (id: string) => handledAttention.add(id),
     resolveCalls,
     rewriter,
     deps: { ...deps, resolveRef: resolveRefTracked },
@@ -316,7 +326,35 @@ describe("validateBriefText", () => {
       previousText: seed,
       authorityCitations: new Set(),
     }).errors;
-    expect(errors.join("\n")).toContain("dropped without any human/ancestor");
+    expect(errors.join("\n")).toContain("dropped without equally cited human/ancestor");
+  });
+
+  it("rejects a WHAT/HOW deletion when an unrelated authority message is present", () => {
+    const previous = seed.replace(
+      "## HOW\n\n",
+      "## HOW\nKeep validation deterministic. [mesh:messages/old-rule]\n\n"
+    );
+    const candidate = `${seed}A status note. [mesh:messages/new-authority]\n`;
+    const errors = validateBriefText({
+      text: candidate,
+      previousText: previous,
+      authorityCitations: new Set(["mesh:messages/new-authority"]),
+    }).errors;
+    expect(errors.join("\n")).toContain("previous HOW line(s) dropped");
+  });
+
+  it("allows at most one changed DOMAIN line for a milestone delta", () => {
+    const previous = `${seed}Existing domain principle. [mesh:messages/old]\n`;
+    const candidate =
+      `${previous}First new principle. [mesh:messages/milestone]\n` +
+      `Second new principle. [mesh:messages/milestone]\n`;
+    const errors = validateBriefText({
+      text: candidate,
+      previousText: previous,
+      authorityCitations: new Set(),
+      milestone: true,
+    }).errors;
+    expect(errors.join("\n")).toContain("milestone delta changed 2 DOMAIN lines");
   });
 
   it("rejects state material in DOMAIN while the citation tail stays valid", () => {
@@ -374,10 +412,39 @@ describe("buildBriefRewritePrompt", () => {
     expect(repair).toContain("repair retry");
   });
 
+  it("bounds repair diagnostics in UTF-8 bytes", () => {
+    const repair = buildBriefRewritePrompt({
+      currentText: SEED_TEXT,
+      delta: [],
+      validatorErrors: ["界".repeat(2_000)],
+    });
+    const diagnostics = repair.split("Validator errors to correct")[1];
+    expect(Buffer.byteLength(diagnostics, "utf8")).toBeLessThanOrEqual(4_300);
+  });
+
   it("system instruction carries the normative rules", () => {
     expect(BRIEF_REWRITE_SYSTEM_INSTRUCTION).toContain("WHAT (purpose and standing commitments)");
     expect(BRIEF_REWRITE_SYSTEM_INSTRUCTION).toContain("never per-resource state");
     expect(BRIEF_REWRITE_SYSTEM_INSTRUCTION).toContain("mesh:actors/<id>/charter");
+  });
+
+  it("sends the normative instruction through the Gemini request boundary", async () => {
+    const generateContent = vi.fn().mockResolvedValue({ text: "rewritten" });
+    const client = { models: { generateContent } };
+    const clientSpy = vi
+      .spyOn(geminiUtils, "getGeminiClient")
+      .mockReturnValue(client as unknown as ReturnType<typeof geminiUtils.getGeminiClient>);
+    try {
+      await new GeminiBriefRewriter("test-key").rewrite("dynamic prompt");
+    } finally {
+      clientSpy.mockRestore();
+    }
+    expect(generateContent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contents: "dynamic prompt",
+        config: expect.objectContaining({ systemInstruction: BRIEF_REWRITE_SYSTEM_INSTRUCTION }),
+      })
+    );
   });
 });
 
@@ -392,10 +459,10 @@ describe("selectBriefSlice", () => {
     expect(selectBriefSlice({ sources, hasMore: true }, 2, 1_000_000)).toHaveLength(2);
   });
 
-  it("stops at the byte bound but never drops an oversized first message", () => {
+  it("stops at the byte bound and leaves an oversized first message for explicit attention", () => {
     expect(selectBriefSlice({ sources, hasMore: true }, 50, 250)).toHaveLength(2);
     const alone = selectBriefSlice({ sources, hasMore: true }, 50, 50);
-    expect(alone).toHaveLength(1);
+    expect(alone).toHaveLength(0);
   });
 });
 
@@ -491,17 +558,73 @@ describe("runPortableContextBriefCycle", () => {
       `## WHAT\nThe charter is in force; it is rendered in the prompt. [mesh:actors/${ACTOR}/charter]\n` +
       `\n## HOW\n\n## DOMAIN\n` +
       `A durable fact from chat. [mesh:messages/m-new]\n`;
-    const msg = chatSource("m-auth", "2026-10-07T00:00:01Z", "human:operator", "Rule from Matt.");
+    const msg = chatSource("m-new", "2026-10-07T00:00:01Z", "human:operator", "Rule from Matt.");
     const h = cycleHarness({
       sources: [msg],
       rewriterText: [withNewRef, withNewRef],
-      resolveRef: async (ref) => ref === `mesh:actors/${ACTOR}/charter`,
+      resolveRef: async (ref) =>
+        ref === `mesh:actors/${ACTOR}/charter`
+          ? { outcome: "resolved" }
+          : { outcome: "unresolved", reason: "missing" },
     });
     await runPortableContextBriefCycle(h.deps); // seed
     const outcome = await runPortableContextBriefCycle(h.deps);
     expect(outcome).toMatchObject({ outcome: "rejected" });
     expect(h.attempts[0].reason).toContain("citation does not resolve");
     expect(h.resolveCalls).toEqual(["mesh:messages/m-new"]); // charter ref came from the cache
+  });
+
+  it("rejects an invented ref before resolving it, even when that ref would resolve", async () => {
+    const invented =
+      `## WHAT\nThe charter is in force; it is rendered in the prompt. [mesh:actors/${ACTOR}/charter]\n` +
+      `\n## HOW\n\n## DOMAIN\n` +
+      `Invented outside resource. [mesh:messages/not-in-delta]\n`;
+    const h = cycleHarness({ sources: [humanMsg], rewriterText: [invented, invented] });
+    await runPortableContextBriefCycle(h.deps);
+    const outcome = await runPortableContextBriefCycle(h.deps);
+    expect(outcome).toMatchObject({ outcome: "rejected" });
+    expect(h.attempts[0].reason).toContain("citation was not supplied");
+    expect(h.resolveCalls).toEqual([]);
+  });
+
+  it("keeps an accepted carried ref in the persistent cache without another resolver call", async () => {
+    const first = chatSource("m-1", "2026-10-07T00:00:01Z", "human:operator", "First rule.");
+    const second = chatSource("m-2", "2026-10-07T00:00:02Z", "root", "PR milestone status.");
+    const firstText =
+      `## WHAT\nThe charter is in force; it is rendered in the prompt. [mesh:actors/${ACTOR}/charter]\n` +
+      `\n## HOW\n\n## DOMAIN\n` +
+      `A durable fact. [mesh:messages/m-1]\n`;
+    const secondText =
+      `## WHAT\nThe charter is in force; it is rendered in the prompt. [mesh:actors/${ACTOR}/charter]\n` +
+      `\n## HOW\n\n## DOMAIN\n` +
+      `A clarified durable fact. [mesh:messages/m-1]\n`;
+    const h = cycleHarness({ sources: [first], rewriterText: [firstText] });
+    await runPortableContextBriefCycle(h.deps);
+    await runPortableContextBriefCycle(h.deps);
+    h.deps.listSources = (position) => ({
+      sources: position ? [second] : [first, second],
+      hasMore: false,
+    });
+    h.rewriter.rewrite.mockResolvedValueOnce(secondText);
+    expect(await runPortableContextBriefCycle(h.deps)).toMatchObject({ outcome: "accepted" });
+    expect(h.resolveCalls).toEqual(["mesh:messages/m-1"]);
+  });
+
+  it("does not count transient citation resolution against the freeze budget", async () => {
+    const h = cycleHarness({
+      sources: [humanMsg],
+      rewriterText:
+        `## WHAT\nThe charter is in force; it is rendered in the prompt. [mesh:actors/${ACTOR}/charter]\n` +
+        `\n## HOW\n\n## DOMAIN\nA durable fact. [mesh:messages/m-auth]\n`,
+      resolveRef: async (ref) =>
+        ref === "mesh:messages/m-auth"
+          ? { outcome: "unavailable", reason: "GitHub 429 rate limit" }
+          : { outcome: "resolved" },
+    });
+    await runPortableContextBriefCycle(h.deps);
+    expect(await runPortableContextBriefCycle(h.deps)).toMatchObject({ outcome: "unavailable" });
+    expect(h.store.load(ACTOR).brief?.consecutiveFailures).toBe(0);
+    expect(h.attempts[0]).toMatchObject({ outcome: "unavailable" });
   });
 
   it("accepts on the repair retry after a malformed first output and records one event per attempt", async () => {
@@ -527,7 +650,7 @@ describe("runPortableContextBriefCycle", () => {
     const h = cycleHarness({
       sources: [msg],
       rewriterText: [bad, bad, bad, bad, bad, bad],
-      resolveRef: async () => false,
+      resolveRef: async () => ({ outcome: "unresolved", reason: "missing" }),
       classify: () => "descendant",
     });
     await runPortableContextBriefCycle(h.deps); // seed
@@ -547,7 +670,7 @@ describe("runPortableContextBriefCycle", () => {
     expect(h.attention).toHaveLength(1); // no repeat alerts
   });
 
-  it("releases the freeze when a human message reaches the actor and rewrites with it", async () => {
+  it("releases the freeze only after its durable attention item is handled", async () => {
     const first = chatSource("m-1", "2026-10-07T00:00:01Z", "root", "ancestor note");
     const humanReply = chatSource(
       "m-2",
@@ -562,7 +685,10 @@ describe("runPortableContextBriefCycle", () => {
     const h = cycleHarness({
       sources: [first, humanReply],
       rewriterText: ["bad", "bad", "bad", "bad", "bad", "bad", valid],
-      resolveRef: async (ref) => ref.endsWith("/charter") || ref === "mesh:messages/m-2",
+      resolveRef: async (ref) =>
+        ref.endsWith("/charter") || ref === "mesh:messages/m-2"
+          ? { outcome: "resolved" }
+          : { outcome: "unresolved", reason: "missing" },
     });
     await runPortableContextBriefCycle(h.deps); // seed at m-2's position (latestPosition)
     // Seed captured the newest position, so move the cursor back to before m-1
@@ -578,7 +704,9 @@ describe("runPortableContextBriefCycle", () => {
     }
     expect(h.store.load(ACTOR).brief?.frozen).toBe(true);
 
-    // The parent's handling reply is the human message m-2, already in the stream.
+    // An ancestor reply already present in the failed slice cannot release it.
+    expect(await runPortableContextBriefCycle(h.deps)).toEqual({ outcome: "frozen" });
+    h.markAttentionHandled(h.attention[0].id);
     const outcome = await runPortableContextBriefCycle(h.deps);
     expect(outcome).toMatchObject({ outcome: "accepted", released: true });
     expect(h.store.load(ACTOR).brief?.frozen).toBe(false);
@@ -600,22 +728,22 @@ describe("runPortableContextBriefCycle", () => {
     expect(thirdInputs).toEqual(secondInputs);
   });
 
-  it("advances the cursor only past a byte-bounded slice so the backlog drains", async () => {
+  it("retains an oversized source outside the model request and freezes through explicit attention", async () => {
     const big = "x".repeat(100 * 1024);
     const sources = [
       chatSource("m-1", "2026-10-07T00:00:01Z", "root", big),
       chatSource("m-2", "2026-10-07T00:00:02Z", "human:operator", "small"),
     ];
-    const valid =
-      `## WHAT\nThe charter is in force; it is rendered in the prompt. [mesh:actors/${ACTOR}/charter]\n` +
-      `\n## HOW\n\n## DOMAIN\n` +
-      `Big message drained. [mesh:messages/m-1]\n`;
-    const h = cycleHarness({ sources, rewriterText: [valid] });
+    const h = cycleHarness({ sources, rewriterText: [], seedPosition: null });
     await runPortableContextBriefCycle(h.deps); // seed
-    const outcome = await runPortableContextBriefCycle(h.deps);
-    expect(outcome).toMatchObject({ outcome: "accepted" });
-    // Only the oversized m-1 fit the byte bound; m-2 waits for the next cycle.
-    expect(h.store.load(ACTOR).brief?.cursor).toEqual(cursorOf(sources[0]));
+    for (let i = 0; i < 3; i++) {
+      expect(await runPortableContextBriefCycle(h.deps)).toMatchObject({ outcome: "rejected" });
+    }
+    expect(h.rewriter.rewrite).not.toHaveBeenCalled();
+    expect(h.attempts.every((attempt) => attempt.inputBytes === 0)).toBe(true);
+    expect(h.store.load(ACTOR).brief?.cursor).toBeNull();
+    expect(h.store.load(ACTOR).brief?.frozen).toBe(true);
+    expect(h.attention).toHaveLength(1);
   });
 });
 
@@ -642,6 +770,7 @@ describe("brief render", () => {
         updatedAt: "2026-10-07T01:00:00Z",
         consecutiveFailures: 0,
         frozen: false,
+        freezeAttentionId: null,
         resolvedRefs: [`mesh:actors/${ACTOR}/charter`],
       },
     };

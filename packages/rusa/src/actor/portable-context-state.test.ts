@@ -62,6 +62,7 @@ describe("parsePortableContextState", () => {
         updatedAt: "2026-10-07T00:01:00.000Z",
         consecutiveFailures: 1,
         frozen: false,
+        freezeAttentionId: null,
         resolvedRefs: ["mesh:actors/actor-a/charter", "mesh:messages/message-1"],
       },
     };

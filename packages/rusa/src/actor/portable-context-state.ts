@@ -116,13 +116,12 @@ export const portableBriefSchema = z.object({
   consecutiveFailures: z.number().int().nonnegative(),
   /**
    * Rewrites are frozen after three consecutive failed cycles until the
-   * raised needs-attention item is handled. Handling releases the freeze: any
-   * inbound human or ancestor message after the frozen cursor is the parent's
-   * handling reply reaching the actor, and the cycle that sees it clears
-   * `frozen` and resets the failure budget before rewriting (see
-   * portable-context-brief.ts).
+   * specific durable needs-attention item is handled. The item id is retained
+   * below so unrelated messages cannot accidentally release the freeze.
    */
   frozen: z.boolean(),
+  /** Inbox entry raised for the current freeze; null before a freeze or after its handling. */
+  freezeAttentionId: z.string().min(1).nullable().default(null),
   /**
    * Per-actor resolved-ref cache, keyed by the canonical ref string: every ref
    * that has been successfully resolved at least once. A ref is resolved only

@@ -25,6 +25,11 @@ describe("resolveContextSelection", () => {
       compactionModel: undefined,
     });
     expect(resolveContextSelection("tail")).toEqual({ type: "portable", mode: "tail" });
+    expect(resolveContextSelection("brief")).toEqual({
+      type: "portable",
+      mode: "brief",
+      compactionModel: undefined,
+    });
   });
 
   it("has no bare portable selection", () => {
@@ -56,7 +61,7 @@ describe("resolveContextSelection", () => {
 
   it("names the valid values when the selection is unknown", () => {
     expect(() => resolveContextSelection("portible")).toThrow("portible");
-    expect(() => resolveContextSelection("portible")).toThrow("native, ledger, tail");
+    expect(() => resolveContextSelection("portible")).toThrow("native, ledger, tail, brief");
     expect(() => resolveContextSelection(7)).toThrow("unknown context selection");
   });
 
@@ -105,10 +110,16 @@ describe("assertSpawnContextSupported", () => {
     ).toThrow("geminiApiKey");
   });
 
-  it("allows ledger when compaction is available, and tail either way", () => {
+  it("allows Gemini-backed modes when available, and tail either way", () => {
     expect(() =>
       assertSpawnContextSupported({ context: { type: "portable", mode: "ledger" } }, available)
     ).not.toThrow();
+    expect(() =>
+      assertSpawnContextSupported({ context: { type: "portable", mode: "brief" } }, available)
+    ).not.toThrow();
+    expect(() =>
+      assertSpawnContextSupported({ context: { type: "portable", mode: "brief" } }, unavailable)
+    ).toThrow("geminiApiKey");
     // Tail never calls the compactor, so a missing key must NOT block it —
     // otherwise the guard would be refusing a configuration that works.
     expect(() =>

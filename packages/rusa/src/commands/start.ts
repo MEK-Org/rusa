@@ -107,6 +107,7 @@ import {
   classifyBriefSender,
   GeminiBriefRewriter,
   runPortableContextBriefCycle,
+  seedPortableBriefState,
 } from "../actor/portable-context-brief.js";
 import {
   describeCompaction,
@@ -837,6 +838,27 @@ function assemblePortableInjection(
   const runs = repositories.actorRuns
     .listRecentCompleted(id, portableContextMaxRuns())
     .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
+  // Tail remains a run-only renderer. Do not load a snapshot or query messages
+  // and obligations before selecting this established path.
+  if (mode === "tail") {
+    const portable = assemblePortableContext(runs);
+    return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
+  }
+
+  let state = store.load(id);
+  // Seed before the first brief-mode prompt, not after its first run. The
+  // switch position is durable before prompt assembly, so this run renders the
+  // charter seed rather than the old ledger and later rewrites see only sources
+  // arriving after this boundary.
+  if (mode === "brief" && state.brief === null) {
+    state = seedPortableBriefState(
+      state,
+      id,
+      repositories.actorRuns.latestLedgerSourcePosition(id),
+      new Date().toISOString()
+    );
+    store.save(state);
+  }
   const shared = {
     messages: repositories.meshChat
       .listReceivedForActor(id, { limit: portableContextMaxMessages() })
@@ -851,17 +873,11 @@ function assemblePortableInjection(
     // — the obligation store stays the sole lifecycle authority .
     obligations: getRepositories().obligations.listOwned(id),
   };
-  const state = store.load(id);
-  const portable =
-    mode === "ledger" || mode === "brief"
-      ? assemblePortableContextV2({
-          state,
-          ...shared,
-          // Brief mode swaps the durable-intent section for the rendered brief;
-          // null before the first post-run cycle seeds it.
-          ...(mode === "brief" ? { brief: state.brief } : {}),
-        })
-      : assemblePortableContext(runs);
+  const portable = assemblePortableContextV2({
+    state,
+    ...shared,
+    ...(mode === "brief" ? { brief: state.brief } : {}),
+  });
   return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
 }
 
@@ -2619,7 +2635,19 @@ async function composeStart(
             ...(chatClient ? { chatClient } : {}),
             ...(slackClient ? { slackClient } : {}),
           });
-          return resolved.unavailable === null;
+          if (resolved.unavailable === null) return { outcome: "resolved" as const };
+          // `resolveReference` deliberately returns a displayable result rather
+          // than throwing. Preserve that distinction here: a 429/5xx/timeout is
+          // a retry-later condition, not evidence that the model fabricated a
+          // citation and therefore not a failure that can freeze this actor.
+          if (
+            /(?:\b429\b|\b5\d\d\b|rate limit|timed? out|timeout|temporar|network|econn|enotfound)/i.test(
+              resolved.unavailable
+            )
+          ) {
+            return { outcome: "unavailable" as const, reason: resolved.unavailable };
+          }
+          return { outcome: "unresolved" as const, reason: resolved.unavailable };
         },
         classify: (senderId) =>
           classifyBriefSender(senderId, actorId, {
@@ -2638,29 +2666,31 @@ async function composeStart(
             body: JSON.stringify(attempt),
           });
         },
-        // The freeze is released by handling: the parent's handling reply (or
-        // any human/ancestor message) reaches the actor as durable chat, and
-        // the cycle that sees it after the frozen cursor unfreezes and rewrites.
         raiseAttention: ({ actorId: childId, reason }) => {
-          const parentId = repositories.actors.parentOf(childId);
-          if (parentId === null || parentId === undefined) {
+          const parentId = repositories.actors.parentOf(childId) ?? childId;
+          if (parentId === childId) {
             log.warn("portable_context_brief_freeze_no_parent", {
               actorId: childId,
               reason,
             });
-            return;
           }
-          repositories.inbox.append([
-            {
-              actorId: parentId,
-              source: `portable_context_brief:${childId}`,
-              payload: {
-                type: "portable_context_brief.needs_attention",
-                actorId: childId,
-                reason,
+          return (
+            repositories.inbox.append([
+              {
+                actorId: parentId,
+                source: `portable_context_brief:${childId}`,
+                payload: {
+                  type: "portable_context_brief.needs_attention",
+                  actorId: childId,
+                  reason,
+                },
               },
-            },
-          ]);
+            ])[0]?.id ?? null
+          );
+        },
+        isAttentionHandled: (entryId) => {
+          const attentionOwner = repositories.actors.parentOf(actorId) ?? actorId;
+          return repositories.inbox.read(attentionOwner, entryId)?.handledAt !== null;
         },
         log: (message) => log.warn("portable_context_brief_warning", { message }),
       });

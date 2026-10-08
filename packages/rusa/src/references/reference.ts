@@ -160,6 +160,14 @@ export function parseReference(value: string): Reference {
     segments.length === 3 &&
     segments[0] === "actors" &&
     segments[2] === "charter";
+  if (
+    scheme === "mesh" &&
+    segments[0] === "actors" &&
+    segments[2] === "charter" &&
+    !isActorCharter
+  ) {
+    throw new InvalidReferenceError("an actor charter is a terminal property, not a collection");
+  }
   if (segments.length < 1) {
     throw new InvalidReferenceError(`a ${scheme} reference needs at least one path segment`);
   }
