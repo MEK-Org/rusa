@@ -64,6 +64,7 @@ describe("parsePortableContextState", () => {
         frozen: true,
         freezeAttentionId: "attention-entry-1",
         freezeAttentionOwnerId: "parent-actor",
+        oversizedBlock: null,
         resolvedRefs: ["mesh:actors/actor-a/charter", "mesh:messages/message-1"],
         supersessions: [],
         citationAuthorities: {},
@@ -71,6 +72,58 @@ describe("parsePortableContextState", () => {
     };
 
     expect(parsePortableContextState(JSON.parse(JSON.stringify(state)))).toEqual(state);
+  });
+
+  it("round-trips a v4 document with an active oversizedBlock", () => {
+    const state = {
+      ...emptyPortableContextState("actor-a"),
+      brief: {
+        text: "## WHAT\nThe charter is in force. [mesh:actors/actor-a/charter]\n\n## HOW\n\n## DOMAIN",
+        cursor: { ts: "2026-10-07T00:00:00.000Z", sourceOrder: 0, id: "message-1" },
+        generation: 3,
+        model: "gemini-3.8-flash",
+        updatedAt: "2026-10-07T00:01:00.000Z",
+        consecutiveFailures: 3,
+        frozen: true,
+        freezeAttentionId: "attention-entry-1",
+        freezeAttentionOwnerId: "parent-actor",
+        oversizedBlock: {
+          sourceRef: "mesh:messages/m-oversized",
+          sourcePosition: { ts: "2026-10-07T00:00:01.000Z", sourceOrder: 0, id: "m-oversized" },
+          byteSize: 120 * 1024,
+          byteLimit: 96 * 1024,
+          observedAt: "2026-10-07T00:01:00.000Z",
+        },
+        resolvedRefs: ["mesh:actors/actor-a/charter", "mesh:messages/message-1"],
+        supersessions: [],
+        citationAuthorities: {},
+      },
+    };
+
+    expect(parsePortableContextState(JSON.parse(JSON.stringify(state)))).toEqual(state);
+  });
+
+  it("reads forward a v4 document missing oversizedBlock with default null", () => {
+    const stored = {
+      ...emptyPortableContextState("actor-a"),
+      brief: {
+        text: "## WHAT\nThe charter is in force. [mesh:actors/actor-a/charter]\n\n## HOW\n\n## DOMAIN",
+        cursor: { ts: "2026-10-07T00:00:00.000Z", sourceOrder: 0, id: "message-1" },
+        generation: 3,
+        model: "gemini-3.8-flash",
+        updatedAt: "2026-10-07T00:01:00.000Z",
+        consecutiveFailures: 1,
+        frozen: false,
+        freezeAttentionId: null,
+        freezeAttentionOwnerId: null,
+        resolvedRefs: ["mesh:actors/actor-a/charter"],
+        supersessions: [],
+        citationAuthorities: {},
+      },
+    };
+
+    const parsed = parsePortableContextState(JSON.parse(JSON.stringify(stored)));
+    expect(parsed.brief?.oversizedBlock).toBeNull();
   });
 
   it("still accepts a document holding retired kinds (ISSUE_NUM leg 3)", () => {

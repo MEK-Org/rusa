@@ -31,6 +31,7 @@ import {
   type BriefCursor,
   emptyPortableContextState,
   InMemoryPortableContextStore,
+  type PortableBrief,
   type PortableBriefSupersession,
   type PortableContextState,
 } from "./portable-context-state.js";
@@ -78,26 +79,29 @@ interface CycleHarnessOptions {
   classify?: BriefCycleDeps["classify"];
   now?: string;
   seedPosition?: BriefCursor | null;
+  store?: InMemoryPortableContextStore;
 }
 
 function cycleHarness(options: CycleHarnessOptions) {
-  const store = new InMemoryPortableContextStore();
-  const state = emptyPortableContextState(ACTOR);
-  // The pre-brief ledger content proves the cycle never touches ledger fields.
-  state.items = [
-    {
-      id: "mem-legacy",
-      kind: "decision",
-      priority: "must",
-      status: "active",
-      statement: "Legacy ledger item that brief mode must keep intact",
-      evidence: [{ eventId: "evt-1", sender: "root", ts: "2026-01-01T00:00:00Z", quote: "q" }],
-      updatedAt: "2026-01-01T00:00:00Z",
-    },
-  ];
-  state.generation = 41;
-  state.lastFoldedSourceId = "legacy-source";
-  store.save(state);
+  const store = options.store ?? new InMemoryPortableContextStore();
+  if (!options.store) {
+    const state = emptyPortableContextState(ACTOR);
+    // The pre-brief ledger content proves the cycle never touches ledger fields.
+    state.items = [
+      {
+        id: "mem-legacy",
+        kind: "decision",
+        priority: "must",
+        status: "active",
+        statement: "Legacy ledger item that brief mode must keep intact",
+        evidence: [{ eventId: "evt-1", sender: "root", ts: "2026-01-01T00:00:00Z", quote: "q" }],
+        updatedAt: "2026-01-01T00:00:00Z",
+      },
+    ];
+    state.generation = 41;
+    state.lastFoldedSourceId = "legacy-source";
+    store.save(state);
+  }
 
   const attempts: BriefAttemptTelemetry[] = [];
   const attention: Array<{ id: string; actorId: string; reason: string }> = [];
@@ -1171,9 +1175,187 @@ describe("runPortableContextBriefCycle", () => {
     }
     expect(h.rewriter.rewrite).not.toHaveBeenCalled();
     expect(h.attempts.every((attempt) => attempt.inputBytes === 0)).toBe(true);
-    expect(h.store.load(ACTOR).brief?.cursor).toBeNull();
-    expect(h.store.load(ACTOR).brief?.frozen).toBe(true);
+    const brief = h.store.load(ACTOR).brief;
+    expect(brief?.cursor).toBeNull();
+    expect(brief?.generation).toBe(0);
+    expect(brief?.text).toBe(SEED_TEXT);
+    expect(brief?.frozen).toBe(true);
+    expect(brief?.oversizedBlock).toMatchObject({
+      sourceRef: "mesh:messages/m-1",
+      sourcePosition: { ts: "2026-10-07T00:00:01Z", sourceOrder: 0, id: "m-1" },
+      byteSize: 100 * 1024,
+      byteLimit: 96 * 1024,
+    });
     expect(h.attention).toHaveLength(1);
+  });
+
+  it("handled attention acknowledges an oversized block without releasing it, making zero model calls and no duplicate attention", async () => {
+    const big = "x".repeat(100 * 1024);
+    const sources = [chatSource("m-1", "2026-10-07T00:00:01Z", "root", big)];
+    let handled = false;
+    const h = cycleHarness({ sources, rewriterText: [], seedPosition: null });
+    const deps: BriefCycleDeps = {
+      ...h.deps,
+      isAttentionHandled: () => handled,
+    };
+    await runPortableContextBriefCycle(deps); // seed
+    for (let i = 0; i < 3; i++) {
+      await runPortableContextBriefCycle(deps);
+    }
+    const stateBefore = h.store.load(ACTOR);
+    expect(stateBefore.brief?.frozen).toBe(true);
+    expect(stateBefore.brief?.oversizedBlock).not.toBeNull();
+    expect(h.attention).toHaveLength(1);
+
+    // Operator/parent handles the attention entry
+    handled = true;
+    const outcome = await runPortableContextBriefCycle(deps);
+    expect(outcome).toEqual({ outcome: "frozen" });
+
+    // Zero model calls made
+    expect(h.rewriter.rewrite).not.toHaveBeenCalled();
+    // No duplicate attention raised
+    expect(h.attention).toHaveLength(1);
+
+    // State preserved: text, cursor, generation, oversizedBlock remain exact
+    const stateAfter = h.store.load(ACTOR);
+    expect(stateAfter.brief?.frozen).toBe(true);
+    expect(stateAfter.brief?.text).toBe(stateBefore.brief?.text);
+    expect(stateAfter.brief?.cursor).toEqual(stateBefore.brief?.cursor);
+    expect(stateAfter.brief?.generation).toBe(stateBefore.brief?.generation);
+    expect(stateAfter.brief?.oversizedBlock).toEqual(stateBefore.brief?.oversizedBlock);
+  });
+
+  it("process restart retains the exact oversized block across runs with zero model calls", async () => {
+    const big = "x".repeat(100 * 1024);
+    const sources = [chatSource("m-1", "2026-10-07T00:00:01Z", "root", big)];
+    const h = cycleHarness({ sources, rewriterText: [], seedPosition: null });
+    await runPortableContextBriefCycle(h.deps); // seed
+    for (let i = 0; i < 3; i++) {
+      await runPortableContextBriefCycle(h.deps);
+    }
+    const savedState = h.store.load(ACTOR);
+    expect(savedState.brief?.oversizedBlock).not.toBeNull();
+
+    // Fresh process / cycle deps reusing only the persistent store
+    const restartedH = cycleHarness({
+      sources,
+      rewriterText: [],
+      store: h.store,
+      seedPosition: null,
+    });
+    const restartedOutcome = await runPortableContextBriefCycle(restartedH.deps);
+    expect(restartedOutcome).toEqual({ outcome: "frozen" });
+    expect(restartedH.rewriter.rewrite).not.toHaveBeenCalled();
+    expect(restartedH.attention).toHaveLength(0); // no duplicate attention in fresh process
+
+    const loadedAfterRestart = h.store.load(ACTOR);
+    expect(loadedAfterRestart.brief).toEqual(savedState.brief);
+  });
+
+  it("ordinary retry recovery still releases on handled attention when oversizedBlock is null", async () => {
+    const msg = chatSource("m-1", "2026-10-07T00:00:01Z", "root", "ancestor note");
+    let handled = false;
+    const validReplacement =
+      `## WHAT\nThe charter is in force; it is rendered in the prompt. [mesh:actors/${ACTOR}/charter]\n` +
+      `Updated purpose. [mesh:messages/m-1]\n\n## HOW\n\n## DOMAIN\n`;
+    const h = cycleHarness({
+      sources: [msg],
+      rewriterText: ["bad", "bad", "bad", "bad", "bad", "bad", validReplacement],
+      seedPosition: null,
+    });
+    const deps: BriefCycleDeps = {
+      ...h.deps,
+      isAttentionHandled: () => handled,
+    };
+    await runPortableContextBriefCycle(deps); // seed
+    for (let i = 0; i < 3; i++) {
+      await runPortableContextBriefCycle(deps);
+    }
+    const frozenState = h.store.load(ACTOR).brief;
+    expect(frozenState?.frozen).toBe(true);
+    expect(frozenState?.oversizedBlock).toBeNull();
+    expect(frozenState?.consecutiveFailures).toBe(3);
+
+    // Unhandled: stays frozen
+    expect(await runPortableContextBriefCycle(deps)).toEqual({ outcome: "frozen" });
+
+    // Handled: releases freeze and retries, accepting the valid rewrite
+    handled = true;
+    const acceptedOutcome = await runPortableContextBriefCycle(deps);
+    expect(acceptedOutcome).toMatchObject({ outcome: "accepted", released: true });
+    const recoveredBrief = h.store.load(ACTOR).brief;
+    expect(recoveredBrief?.frozen).toBe(false);
+    expect(recoveredBrief?.consecutiveFailures).toBe(0);
+    expect(recoveredBrief?.oversizedBlock).toBeNull();
+  });
+
+  it("switching to ledger mode and back preserves the blocked brief snapshot byte-identically", () => {
+    const blockedBrief: PortableBrief = {
+      text: SEED_TEXT,
+      cursor: null,
+      generation: 2,
+      model: "gemini-3.8-flash",
+      updatedAt: "2026-10-08T09:00:00Z",
+      consecutiveFailures: 3,
+      frozen: true,
+      freezeAttentionId: "attention-oversized-1",
+      freezeAttentionOwnerId: "parent-actor",
+      oversizedBlock: {
+        sourceRef: "mesh:messages/m-blocked",
+        sourcePosition: { ts: "2026-10-08T09:00:01Z", sourceOrder: 0, id: "m-blocked" },
+        byteSize: 150 * 1024,
+        byteLimit: 96 * 1024,
+        observedAt: "2026-10-08T09:00:00Z",
+      },
+      resolvedRefs: [`mesh:actors/${ACTOR}/charter`],
+      supersessions: [],
+      citationAuthorities: {},
+    };
+
+    const state: PortableContextState = {
+      ...emptyPortableContextState(ACTOR),
+      items: [
+        {
+          id: "mem-ledger-1",
+          kind: "decision",
+          priority: "must",
+          status: "active",
+          statement: "Active ledger decision",
+          evidence: [{ eventId: "e1", sender: "root", ts: "2026-10-01T00:00:00Z", quote: "q" }],
+          updatedAt: "2026-10-01T00:00:00Z",
+        },
+      ],
+      brief: blockedBrief,
+    };
+
+    // Mode switched to ledger: brief is omitted from assembly
+    const ledgerContext = assemblePortableContextV2({
+      state,
+      messages: [{ id: "m-1", ts: "2026-10-08T09:00:00Z", sender: "root", body: "hello" }],
+      runs: [],
+      brief: null,
+    });
+    expect(ledgerContext).not.toBeNull();
+    expect(ledgerContext?.section).toContain("Active ledger decision");
+    expect(ledgerContext?.section).not.toContain("Durable brief (mode: brief");
+
+    // The snapshot document still retains the blocked brief completely untouched
+    expect(state.brief).toEqual(blockedBrief);
+
+    // Mode switched back to brief: brief is passed to assembly
+    const briefContext = assemblePortableContextV2({
+      state,
+      messages: [{ id: "m-1", ts: "2026-10-08T09:00:00Z", sender: "root", body: "hello" }],
+      runs: [],
+      brief: state.brief,
+    });
+    expect(briefContext).not.toBeNull();
+    expect(briefContext?.section).toContain("### Durable brief (mode: brief, generation 2");
+    expect(briefContext?.section).not.toContain("Active ledger decision");
+
+    // State brief object remains byte-identical
+    expect(state.brief).toEqual(blockedBrief);
   });
 });
 
@@ -1202,6 +1384,7 @@ describe("brief render", () => {
         frozen: false,
         freezeAttentionId: null,
         freezeAttentionOwnerId: null,
+        oversizedBlock: null,
         resolvedRefs: [`mesh:actors/${ACTOR}/charter`],
         supersessions: [],
         citationAuthorities: {},

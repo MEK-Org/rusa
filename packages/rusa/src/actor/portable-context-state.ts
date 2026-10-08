@@ -117,6 +117,26 @@ export const portableBriefAuthoritySchema = z.object({
 export type PortableBriefAuthority = z.infer<typeof portableBriefAuthoritySchema>;
 
 /**
+ * A persistent acknowledge-and-retain block for an oversized source (#954
+ * settled oversized-source architecture: root 6056878951, spec 6057170505).
+ * Recorded after bounded failure escalation when a durable source exceeds the
+ * fixed slice byte bound.
+ */
+export const portableBriefOversizedBlockSchema = z.object({
+  /** Ready-made citation for the oversized source (e.g. mesh:messages/<id>). */
+  sourceRef: z.string().min(1),
+  /** Monotonic store position of the oversized source. */
+  sourcePosition: briefCursorSchema,
+  /** Measured UTF-8 byte size of the oversized source body. */
+  byteSize: z.number().int().positive(),
+  /** The slice byte limit that was exceeded. */
+  byteLimit: z.number().int().positive(),
+  /** ISO timestamp when the obstruction was first observed and recorded. */
+  observedAt: z.string().min(1),
+});
+export type PortableBriefOversizedBlock = z.infer<typeof portableBriefOversizedBlockSchema>;
+
+/**
  * The per-actor `brief` portable-context mode document (#954 iteration 1).
  *
  * Stored INSIDE the versioned snapshot document (schemaVersion v4) rather than
@@ -158,6 +178,15 @@ export const portableBriefSchema = z.object({
    * raised, so a later reparent cannot redirect the handled-state lookup.
    */
   freezeAttentionOwnerId: z.string().min(1).nullable().default(null),
+  /**
+   * Persistent acknowledge-and-retain block (#954 settled oversized-source
+   * architecture: root 6056878951, spec 6057170505). When an oversized source
+   * exceeds the slice byte bound and escalates through bounded failures, this
+   * distinguishable block persists in the snapshot. Handling the attention item
+   * acknowledges the obstruction but does not release it; subsequent runs and
+   * restarts stay blocked with zero model calls and no duplicate attention.
+   */
+  oversizedBlock: portableBriefOversizedBlockSchema.nullable().default(null),
   /**
    * Per-actor resolved-ref cache, keyed by the canonical ref string: every ref
    * that has been successfully resolved at least once. A ref is resolved only

@@ -9,6 +9,7 @@ import type {
   BriefCursor,
   PortableBrief,
   PortableBriefAuthority,
+  PortableBriefOversizedBlock,
   PortableBriefSupersession,
   PortableContextState,
 } from "./portable-context-state.js";
@@ -38,10 +39,12 @@ export const PORTABLE_CONTEXT_BRIEF_MODEL = "gemini-3.8-flash";
 export const PORTABLE_CONTEXT_BRIEF_MAX_BYTES = 16 * 1024;
 /**
  * The bounded oldest-first delta slice: at most this many sources, and at most
- * this many UTF-8 bytes of source body, go to one rewrite call. A single source
- * larger than the byte bound is processed alone rather than silently lost; the
- * backlog drains across accepted cycles because the cursor advances only past
- * the processed slice (#954 amendment 1b).
+ * this many UTF-8 bytes of source body, go to one rewrite call. If an individual
+ * source exceeds this byte bound, it is not processed alone; brief rewriting
+ * fails-closed by recording a persistent `oversizedBlock` in the snapshot after
+ * bounded failure escalation. The block is retained across attention handling
+ * and process restarts with zero model calls and no duplicate alerts (#954 amendments
+ * 6056878951, 6057170505, 6057219192).
  */
 export const PORTABLE_CONTEXT_BRIEF_MAX_SLICE_SOURCES = 50;
 export const PORTABLE_CONTEXT_BRIEF_MAX_SLICE_BYTES = 96 * 1024;
@@ -711,6 +714,7 @@ export function seedPortableBriefState(
       frozen: false,
       freezeAttentionId: null,
       freezeAttentionOwnerId: null,
+      oversizedBlock: null,
       resolvedRefs: [charterRef],
       supersessions: [],
       citationAuthorities: {
@@ -869,6 +873,14 @@ export async function runPortableContextBriefCycle(
   let released = false;
   let brief: PortableBrief = state.brief;
   if (brief.frozen) {
+    if (brief.oversizedBlock !== null) {
+      // Settled oversized-source architecture (#954, root 6056878951, spec 6057170505):
+      // An oversized-source obstruction is acknowledged and retained. Handling
+      // the attention item acknowledges the obstruction but does not authorize
+      // skipping, truncating, or advancing the cursor. Subsequent runs and restarts
+      // with the same obstruction remain blocked without model calls or duplicate attention.
+      return { outcome: "frozen" };
+    }
     if (
       !brief.freezeAttentionId ||
       !brief.freezeAttentionOwnerId ||
@@ -902,9 +914,13 @@ export async function runPortableContextBriefCycle(
       if (released) deps.store.save({ ...state, brief: { ...brief, updatedAt: now() } });
       return { outcome: "skipped" };
     }
+    const sourcePosition = positionOf(oversized);
+    const sourceRef = citationForLedgerSource(oversized);
+    const byteSize = byteLen(oversized.body ?? "");
+    const byteLimit = PORTABLE_CONTEXT_BRIEF_MAX_SLICE_BYTES;
     const reason =
-      `source ${oversized.id} is ${byteLen(oversized.body ?? "")} bytes, over the ` +
-      `${PORTABLE_CONTEXT_BRIEF_MAX_SLICE_BYTES}-byte rewrite-input bound`;
+      `source ${oversized.id} is ${byteSize} bytes, over the ` +
+      `${byteLimit}-byte rewrite-input bound`;
     const failures = brief.consecutiveFailures + 1;
     const frozen = failures >= PORTABLE_CONTEXT_BRIEF_MAX_CONSECUTIVE_FAILURES;
     const freezeReason = `portable-context brief rewrite failed ${failures} consecutive cycles for ${deps.actorId}: ${reason}`;
@@ -914,6 +930,15 @@ export async function runPortableContextBriefCycle(
         : brief.freezeAttentionId && brief.freezeAttentionOwnerId
           ? { ownerId: brief.freezeAttentionOwnerId, entryId: brief.freezeAttentionId }
           : null;
+    const oversizedBlock: PortableBriefOversizedBlock | null = frozen
+      ? (brief.oversizedBlock ?? {
+          sourceRef,
+          sourcePosition,
+          byteSize,
+          byteLimit,
+          observedAt: now(),
+        })
+      : null;
     deps.recordAttempt({
       attempt: "initial",
       outcome: "rejected",
@@ -932,6 +957,7 @@ export async function runPortableContextBriefCycle(
         frozen,
         freezeAttentionId: attention?.entryId ?? null,
         freezeAttentionOwnerId: attention?.ownerId ?? null,
+        oversizedBlock,
         updatedAt: now(),
       },
     });
@@ -1174,6 +1200,7 @@ export async function runPortableContextBriefCycle(
         frozen,
         freezeAttentionId,
         freezeAttentionOwnerId,
+        oversizedBlock: null,
         updatedAt: now(),
       },
     });
@@ -1192,6 +1219,7 @@ export async function runPortableContextBriefCycle(
       frozen: false,
       freezeAttentionId: null,
       freezeAttentionOwnerId: null,
+      oversizedBlock: null,
       resolvedRefs: [...resolvedRefs],
       supersessions: accepted.supersessions,
       citationAuthorities: Object.fromEntries(citationAuthorities),
