@@ -166,17 +166,43 @@ describe("streamNewFileInWorkdir", () => {
     expect(readFileSync(destination, "utf-8")).toBe("hello world");
   });
 
-  it("syncs the completed file before reporting its digest", async () => {
+  it("reports its digest only after sync completes, and unlinks output when sync fails", async () => {
     const dir = workdir();
     const probe = await openFile(join(dir, "probe"), "w");
-    const sync = vi.spyOn(Object.getPrototypeOf(probe), "sync");
+    const proto = Object.getPrototypeOf(probe);
     await probe.close();
-    const destination = await resolveDownloadPath(dir, "synced.bin");
+    let finishSync: (err?: Error) => void = () => {};
+    const sync = vi.spyOn(proto, "sync").mockImplementation(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          finishSync = (err) => (err ? reject(err) : resolve());
+        })
+    );
+    try {
+      const destination = await resolveDownloadPath(dir, "synced.bin");
+      let settled = false;
+      const receipt = streamNewFileInWorkdir(
+        dir,
+        destination,
+        streamFrom([Buffer.from("complete")])
+      ).finally(() => {
+        settled = true;
+      });
+      await vi.waitFor(() => expect(sync).toHaveBeenCalledTimes(1));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(settled).toBe(false);
+      finishSync();
+      await expect(receipt).resolves.toMatchObject({ bytes: 8 });
 
-    await streamNewFileInWorkdir(dir, destination, streamFrom([Buffer.from("complete")]));
-
-    expect(sync).toHaveBeenCalledTimes(1);
-    sync.mockRestore();
+      const failed = await resolveDownloadPath(dir, "sync-failed.bin");
+      const rejected = streamNewFileInWorkdir(dir, failed, streamFrom([Buffer.from("partial")]));
+      await vi.waitFor(() => expect(sync).toHaveBeenCalledTimes(2));
+      finishSync(new Error("disk full"));
+      await expect(rejected).rejects.toThrow("disk full");
+      expect(existsSync(failed)).toBe(false);
+    } finally {
+      sync.mockRestore();
+    }
   });
 
   it("unlinks partial output when the source stream fails", async () => {

@@ -150,7 +150,7 @@ export class GoogleDriveClient implements DriveClient {
       } finally {
         reader.releaseLock();
       }
-      return Buffer.concat(chunks);
+      return Buffer.concat(chunks.map((c) => Buffer.from(c)));
     }
 
     // Node.js Readable stream or async iterator
@@ -160,15 +160,12 @@ export class GoogleDriveClient implements DriveClient {
       body &&
       typeof (body as unknown as AsyncIterable<unknown>)[Symbol.asyncIterator] === "function"
     ) {
-      const chunks: Uint8Array[] = [];
+      const chunks: Buffer[] = [];
       let totalSize = 0;
       for await (const chunk of body as unknown as AsyncIterable<Uint8Array | string>) {
-        const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-        totalSize += buf.byteLength;
+        const buf = Buffer.from(chunk);
+        totalSize += buf.length;
         if (totalSize > maxBytes) {
-          try {
-            await resp.body?.cancel();
-          } catch (_) {}
           throw new Error(`file size limit exceeded: file is larger than ${maxBytes} bytes`);
         }
         chunks.push(buf);
