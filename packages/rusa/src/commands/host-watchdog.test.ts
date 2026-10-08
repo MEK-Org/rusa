@@ -120,8 +120,10 @@ describe("host-watchdog (#955)", () => {
     writeFileSync(join(proc, "meminfo"), "MemTotal: 100 kB\nMemAvailable: 42 kB\nSwapFree: 7 kB\n");
     // One readable process with ")" and space in comm, one unreadable process,
     // an embedded token-shaped comm name, an overlong synthetic comm whose
-    // sensitive prefix would otherwise begin after the emitted 15-byte limit,
-    // and an asymmetric block reader to prove ioScore ranking over rchar+wchar.
+    // token pattern straddles the 15-byte display boundary (verifying defensive
+    // regex testing on full raw input before truncation, rather than an observed
+    // kernel name), and an asymmetric block reader to prove ioScore ranking over
+    // rchar+wchar.
     for (const [pid, comm, io] of [
       [101, "worker (x) y", "rchar: 5\nwchar: 0\nread_bytes: 0\nwrite_bytes: 0\n"],
       [102, "other", undefined],

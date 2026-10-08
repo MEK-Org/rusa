@@ -37,14 +37,12 @@
 
 import {
   appendFileSync,
-  copyFileSync,
   existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
   renameSync,
   statSync,
-  truncateSync,
 } from "node:fs";
 import { connect } from "node:net";
 import { homedir } from "node:os";
@@ -176,7 +174,12 @@ function probe([label, host, port]) {
   return new Promise((resolve) => {
     const begun = Date.now();
     const socket = connect({ host, port });
+    let settled = false;
     const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      socket.removeAllListeners();
+      socket.on("error", () => {});
       socket.destroy();
       resolve([label, value]);
     };
@@ -302,8 +305,7 @@ function rotateWatchdogLog(targetPath, maxBytes = 2 * 1024 * 1024, keep = 2) {
       const next = `${targetPath}.${n + 1}`;
       if (existsSync(curr)) renameSync(curr, next);
     }
-    if (keep >= 1) copyFileSync(targetPath, `${targetPath}.1`);
-    truncateSync(targetPath, 0);
+    if (keep >= 1) renameSync(targetPath, `${targetPath}.1`);
     return true;
   } catch (err) {
     console.error(
