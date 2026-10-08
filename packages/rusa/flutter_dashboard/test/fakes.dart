@@ -302,6 +302,11 @@ class FakeApi extends DashboardApi {
   Completer<void>? referencesGate;
   Object? referencesError;
 
+  /// Per-call answers for tests that need independent concurrent responses.
+  /// Each callback receives its request's immutable batch before any wait.
+  final scriptedReferenceResponses =
+      <FutureOr<Map<String, ReferenceDto>> Function(List<String>)>[];
+
   /// When set, answers each ref ahead of [referencesResult]; null defers.
   ReferenceDto? Function(String ref)? referenceFor;
 
@@ -311,6 +316,9 @@ class FakeApi extends DashboardApi {
   ) async {
     final batch = refs.toSet().toList();
     referenceRequests.add(batch);
+    if (scriptedReferenceResponses.isNotEmpty) {
+      return scriptedReferenceResponses.removeAt(0)(batch);
+    }
     await referencesGate?.future;
     final error = referencesError;
     if (error != null) throw error;

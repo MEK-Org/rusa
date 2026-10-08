@@ -714,6 +714,7 @@ class DashboardStore {
       _activityReferences.addAll(fetched);
       emit();
     } catch (error) {
+      if (generation != _recentActivityGeneration) return;
       final partial = error is PartialReferenceFetchException ? error : null;
       if (partial != null) _activityReferences.addAll(partial.resolved);
       final unresolved = partial?.unresolved ?? keys;

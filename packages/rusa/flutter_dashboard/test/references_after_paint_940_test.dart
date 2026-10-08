@@ -322,4 +322,72 @@ void main() {
       await store.dispose();
     },
   );
+
+  test(
+    'a stale partial failure cannot replace a newer activity reference',
+    () async {
+      final firstAnswer = Completer<void>();
+      final refreshAnswer = Completer<void>();
+      final api = FakeApi()
+        ..recentActivityResult = const [
+          RecentActivityItem(
+            id: 'inbox_1',
+            kind: 'handled_inbox',
+            time: '2026-09-23T14:21:37.000Z',
+            actorId: 'actor-1',
+            referenceKey: _cited,
+          ),
+        ]
+        ..scriptedReferenceResponses.addAll([
+          (_) async {
+            const obsolete = ReferenceDto(
+              ref: _cited,
+              scheme: 'github',
+              title: 'Obsolete title',
+              cacheState: 'fresh',
+            );
+            await firstAnswer.future;
+            throw const PartialReferenceFetchException(
+              resolved: {_cited: obsolete},
+              unresolved: {},
+            );
+          },
+          (_) => {_cited: _issue(_cited, 'Current title')},
+          (_) async {
+            await refreshAnswer.future;
+            return {_cited: _issue(_cited, 'Revalidated title')};
+          },
+        ]);
+      final store = DashboardStore(api: api, stream: FakeStream());
+
+      final first = store.refreshRecentActivity();
+      await Future<void>.delayed(Duration.zero);
+      final newer = store.refreshRecentActivity();
+      await newer;
+      expect(
+        store.recentActivity.value.single.reference?.title,
+        'Current title',
+      );
+
+      firstAnswer.complete();
+      await first;
+
+      final revalidation = store.refreshRecentActivity();
+      await Future<void>.delayed(Duration.zero);
+      // The new generation paints from its cache while enrichment is held.
+      // Without the catch-side generation guard, the stale partial failure
+      // above overwrites this with "Obsolete title".
+      expect(
+        store.recentActivity.value.single.reference?.title,
+        'Current title',
+      );
+      refreshAnswer.complete();
+      await revalidation;
+      expect(
+        store.recentActivity.value.single.reference?.title,
+        'Revalidated title',
+      );
+      await store.dispose();
+    },
+  );
 }

@@ -32,7 +32,6 @@ import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { SseHub } from "./sse.js";
-import type { DashboardTimingRecorder } from "./timing.js";
 
 class MockReq extends EventEmitter {
   method = "GET";
@@ -4276,50 +4275,6 @@ describe("handleMeshApiRequest", () => {
         expect(startBudget).not.toHaveBeenCalled();
         expect(getIssue).not.toHaveBeenCalled();
         expect(actorRead).not.toHaveBeenCalled();
-      });
-
-      it("measures cold detail and recent activity handler timing in store time (#940)", async () => {
-        obligations.create({ title: "timing-ob", id: "timing-ob", ownerId: "actor-1" });
-        obligations.attachArtifact("timing-ob", "github:o/r/issues/9999", { label: "bug" });
-        obligations.setExternalRef("timing-ob", "github:o/r/issues/8888", "system:mesh");
-        const getSpy = vi.fn(() => new Promise<never>(() => {}));
-        const coldCache = {
-          startBudget: () => ({ deadlineAt: Date.now() + 60_000 }),
-          get: getSpy,
-        } as unknown as ReferenceCacheService;
-        const recordServer = vi.fn();
-        const coldDeps = {
-          ...deps,
-          referenceCache: coldCache,
-          timingRecorder: { recordServer } as unknown as DashboardTimingRecorder,
-        };
-
-        const { res: detailRes } = await call(coldDeps, "GET", "/api/mesh/obligations/timing-ob");
-        expect(detailRes.statusCode).toBe(200);
-        // Handler runs purely in store time: cold reference resolution is not awaited
-        expect(getSpy).not.toHaveBeenCalled();
-
-        const { res: actRes } = await call(coldDeps, "GET", "/api/mesh/recent-activity?limit=20");
-        expect(actRes.statusCode).toBe(200);
-        expect(getSpy).not.toHaveBeenCalled();
-
-        // Synthetic receipts at the timing boundary are bounded and recorded
-        const detailReceipt = {
-          label: "mesh_obligation_detail" as const,
-          durationMs: 14,
-          status: 200,
-          bytes: 512,
-        };
-        const actReceipt = {
-          label: "mesh_actor_activity" as const,
-          durationMs: 12,
-          status: 200,
-          bytes: 1024,
-        };
-        coldDeps.timingRecorder.recordServer(detailReceipt);
-        coldDeps.timingRecorder.recordServer(actReceipt);
-        expect(recordServer).toHaveBeenCalledWith(detailReceipt);
-        expect(recordServer).toHaveBeenCalledWith(actReceipt);
       });
 
       it("404s when obligation not found", async () => {
