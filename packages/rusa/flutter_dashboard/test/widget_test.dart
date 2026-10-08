@@ -647,7 +647,7 @@ void main() {
             makeThread('b', parent: 'root', created: 't2'),
           ]
           ..briefs['a'] =
-              '## WHAT\nFixture purpose\n## HOW\nFixture rules\n## DOMAIN\nFixture knowledge';
+              '## WHAT\n**Fixture purpose**\n## HOW\n- Fixture rules\n## DOMAIN\nFixture knowledge';
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
         await tester.pumpWidget(_harness(store));
@@ -660,13 +660,17 @@ void main() {
           await tester.pump(const Duration(milliseconds: 100));
         }
         expect(find.text('Brief'), findsOneWidget);
-        expect(find.text(api.briefs['a']!), findsOneWidget);
+        expect(find.text('WHAT'), findsOneWidget);
+        expect(find.text('Fixture purpose'), findsOneWidget);
+        expect(find.text('Fixture rules'), findsOneWidget);
+        expect(find.text(api.briefs['a']!), findsNothing);
         api.briefs['a'] = '## WHAT\nUpdated purpose';
         await store.refreshThreads();
         for (var i = 0; i < 10; i++) {
           await tester.pump(const Duration(milliseconds: 100));
         }
-        expect(find.text('## WHAT\nUpdated purpose'), findsOneWidget);
+        expect(find.text('Updated purpose'), findsOneWidget);
+        expect(find.text('Fixture purpose'), findsNothing);
         api.briefs['a'] = null;
         await store.refreshThreads();
         for (var i = 0; i < 10; i++) {
@@ -678,7 +682,7 @@ void main() {
           await tester.pump(const Duration(milliseconds: 100));
         }
         expect(find.text('Brief'), findsNothing);
-        expect(find.text('## WHAT\nUpdated purpose'), findsNothing);
+        expect(find.text('Updated purpose'), findsNothing);
         await store.dispose();
       });
     },

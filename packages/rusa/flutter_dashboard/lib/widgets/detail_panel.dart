@@ -5,6 +5,7 @@ import 'package:rxdart/rxdart.dart';
 
 import '../breakpoints.dart';
 import '../dashboard_timing.dart';
+import '../iu/simple_markdown.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -854,14 +855,15 @@ class _InfoViewState extends State<_InfoView> {
               ),
             ),
             const SizedBox(height: 12),
-            SelectableText(
-              _brief == null || _brief!.isEmpty ? 'No brief yet.' : _brief!,
-              style: const TextStyle(
-                color: MeshColors.textSecondary,
-                fontSize: 13,
-                height: 1.5,
-              ),
-            ),
+            _brief == null || _brief!.isEmpty
+                ? const Text(
+                    'No brief yet.',
+                    style: TextStyle(
+                      color: MeshColors.textSecondary,
+                      fontSize: 13,
+                    ),
+                  )
+                : SelectionArea(child: SimpleMarkdown(_brief!)),
           ],
           const SizedBox(height: 24),
           const Text(
