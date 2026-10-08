@@ -362,6 +362,11 @@ import {
   WebhookSilenceDetector,
 } from "../webhook/silence-detector.js";
 import { resolveRepoRoot } from "./service-instance.js";
+import {
+  appendServiceBootWakes,
+  recordAndAnnounceRequestedRestart,
+  ServiceLifecycleStore,
+} from "./service-lifecycle.js";
 
 // `update` tool bounds . Per-step HARD timeouts so a hung build can't wedge
 // root; a bounded drain so a stuck worker can't block the restart forever.
@@ -733,6 +738,15 @@ export interface RunStartOptions {
  * the runner is not driving events in-process (e2e mode).
  */
 export function shouldBindWebhookServer(params: { e2eMode: boolean }): boolean {
+  return !params.e2eMode;
+}
+
+/**
+ * Every production boot wakes root with its transition evidence. The e2e
+ * launcher boots disposable scratch compositions in-process, so it owns its
+ * root inbox the same way it omits system:events.
+ */
+export function shouldAppendServiceBootWake(params: { e2eMode: boolean }): boolean {
   return !params.e2eMode;
 }
 
@@ -2248,6 +2262,10 @@ async function composeStart(
   const followerTriggerStore = new FollowerUpdateTriggerStore(
     join(mcHome, "data", "follower-update-trigger.json")
   );
+  const serviceLifecycleStore = new ServiceLifecycleStore(
+    join(mcHome, "data", "service-lifecycle.json")
+  );
+  let requestedRestartTransitionId: string | undefined;
   let updateToolDepsFor: ((selfId: string) => UpdateToolDeps) | undefined;
   try {
     const repoRoot = resolveRepoRoot();
@@ -2274,6 +2292,18 @@ async function composeStart(
           log: (m) => log.info("update_coordinator", { detail: m }),
         }),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
+        onRestarting: async (newSha, branch, subject) => {
+          requestedRestartTransitionId = undefined;
+          requestedRestartTransitionId = await recordAndAnnounceRequestedRestart({
+            lifecycle: serviceLifecycleStore,
+            entries: selectedInboxEntriesForActor(selfId),
+            chatClient: chatClient ?? undefined,
+            targetSha: newSha,
+            branch,
+            subject,
+            onWarning: (event, fields) => log.warn(event, fields),
+          });
+        },
         onCommitted: (newSha, branch) => {
           try {
             followerTriggerStore.createTrigger({
@@ -4700,7 +4730,25 @@ async function composeStart(
     e2eInstance.stopForMeshShutdown();
     running = false;
     console.log("\n🛑 Shutting down...");
-    await resources.close();
+    const disposeFailures = await resources.close();
+    if (disposeFailures.length === 0) {
+      try {
+        serviceLifecycleStore.recordCleanShutdown(
+          reason === "deploy" ? "deploy" : "signal",
+          reason === "deploy" ? requestedRestartTransitionId : undefined
+        );
+      } catch (error) {
+        log.warn("service_shutdown_evidence_persist_failed", {
+          reason: reason ?? "signal",
+          err: error,
+        });
+      }
+    } else {
+      log.warn("service_shutdown_incomplete", {
+        reason: reason ?? "signal",
+        failures: disposeFailures.map((failure) => failure.resource),
+      });
+    }
     log.info("service_stopped", { reason });
     process.exit(exitCode ?? getShutdownExitCode(reason));
   };
@@ -4977,6 +5025,23 @@ async function composeStart(
   });
 
   console.log("\n✓ Root actor live. Waiting for events...\n");
+
+  // Every successful boot creates durable root work. The file records the boot
+  // before this append; if this process dies between them, the next boot retries
+  // the same deterministic inbox id before adding its own distinct wake. A
+  // corrupt evidence file is retained and produces its own unknown-evidence wake.
+  if (shouldAppendServiceBootWake({ e2eMode })) {
+    try {
+      appendServiceBootWakes({
+        lifecycle: serviceLifecycleStore,
+        inboxStore,
+        rootId,
+        onLifecycleError: (event, fields) => log.warn(event, fields),
+      });
+    } catch (error) {
+      log.warn("service_boot_wake_failed", { err: error });
+    }
+  }
 
   // Mechanical lifecycle ping : emitted by startup once the mesh is up.
   // A lone "back online" with no preceding "updating" ping is the restart/crash signal.
