@@ -42,7 +42,6 @@ import {
 import {
   type DeploymentMode,
   type ExecutableSource,
-  HOST_WATCHDOG_LOG_BOUNDS,
   hostWatchdogUnitNames,
   logRotationUnitNames,
   type ProbePathEnv,
@@ -273,17 +272,7 @@ export function buildLogRotateUnit(opts: {
   rotateScript: string;
   mcHome: string;
   logPath: string;
-  /**
-   * Further logs rotated by the same oneshot with bounds fixed in the unit
-   * (#955's host watchdog log). The arguments override the `.env` bounds and
-   * opt-out, so an instance-wide setting cannot unbound a log whose budget is
-   * part of its design.
-   */
-  pinnedLogs?: { path: string; maxBytes: number; keep: number }[];
 }): string {
-  const rotate = (args: string[]) =>
-    `ExecStart=${[opts.nodePath, opts.rotateScript, ...args].map(quoteExecArg).join(" ")}`;
-  const unitPath = (path: string) => path.replaceAll("$", () => "$$");
   return [
     "[Unit]",
     `Description=${opts.description}`,
@@ -291,10 +280,7 @@ export function buildLogRotateUnit(opts: {
     "[Service]",
     "Type=oneshot",
     `EnvironmentFile=-${join(opts.mcHome, ".env")}`,
-    rotate([unitPath(opts.logPath)]),
-    ...(opts.pinnedLogs ?? []).map((log) =>
-      rotate([unitPath(log.path), String(log.maxBytes), String(log.keep)])
-    ),
+    `ExecStart=${quoteExecArg(opts.nodePath)} ${quoteExecArg(opts.rotateScript)} ${quoteExecArg(opts.logPath.replaceAll("$", () => "$$"))}`,
     "",
   ].join("\n");
 }
@@ -328,7 +314,6 @@ export function writeLogRotationUnits(opts: {
   rotateScript: string;
   mcHome: string;
   logPath: string;
-  pinnedLogs?: { path: string; maxBytes: number; keep: number }[];
 }): { service: string; timer: string } {
   const names = logRotationUnitNames(opts.serviceBasename);
   installUnit(
@@ -340,7 +325,6 @@ export function writeLogRotationUnits(opts: {
       rotateScript: opts.rotateScript,
       mcHome: opts.mcHome,
       logPath: opts.logPath,
-      pinnedLogs: opts.pinnedLogs,
     })
   );
   installUnit(
@@ -397,6 +381,7 @@ export function buildHostWatchdogTimer(opts: {
     "[Timer]",
     "OnCalendar=minutely",
     "AccuracySec=1s",
+    "RandomizedDelaySec=20s",
     `Unit=${opts.watchdogUnit}`,
     "",
     "[Install]",
@@ -826,7 +811,6 @@ function installSingleRusaService(opts: {
     rotateScript: join(scriptsDir, "rotate-log.mjs"),
     mcHome: instance.mcHome,
     logPath: instance.logPath,
-    pinnedLogs: [{ path: hostWatchdogLog, ...HOST_WATCHDOG_LOG_BOUNDS }],
   });
 
   runOrThrow("systemctl", ["--user", "daemon-reload"]);

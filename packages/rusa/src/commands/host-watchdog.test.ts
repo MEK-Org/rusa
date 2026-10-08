@@ -119,11 +119,11 @@ describe("host-watchdog (#955)", () => {
     );
     writeFileSync(join(proc, "meminfo"), "MemTotal: 100 kB\nMemAvailable: 42 kB\nSwapFree: 7 kB\n");
     // One readable process with ")" and space in comm, one unreadable process,
-    // and one process with a token-shaped comm name.
+    // and one process with an embedded token-shaped comm name.
     for (const [pid, comm, io] of [
       [101, "worker (x) y", "rchar: 5\nwchar: 6\nread_bytes: 7\nwrite_bytes: 8\n"],
       [102, "other", undefined],
-      [103, "ghp_credential", undefined],
+      [103, "xghp_credential", undefined],
     ] as const) {
       mkdirSync(join(proc, String(pid)));
       writeFileSync(
@@ -136,27 +136,27 @@ describe("host-watchdog (#955)", () => {
     const stat101 = join(proc, "101", "stat");
     const stat103 = join(proc, "103", "stat");
     const io101 = join(proc, "101", "io");
-    const updater = spawn(
-      process.execPath,
-      [
-        "-e",
-        `setTimeout(() => {
-          const fs = require("node:fs");
-          fs.writeFileSync(process.argv[1], "101 (worker (x) y) S 1 101 101 0 -1 0 0 0 0 0 25 15 0 0 20 0 1 0 0 0 0\\n");
-          fs.writeFileSync(process.argv[2], "103 (ghp_credential) S 1 103 103 0 -1 0 0 0 0 0 20 10 0 0 20 0 1 0 0 0 0\\n");
-          fs.writeFileSync(process.argv[3], "rchar: 105\\nwchar: 106\\nread_bytes: 107\\nwrite_bytes: 108\\n");
-        }, 30);`,
-        stat101,
-        stat103,
-        io101,
-      ],
-      { stdio: "ignore" }
+    const hookPath = join(proc, "updater-hook.cjs");
+    writeFileSync(
+      hookPath,
+      `const fs = require("node:fs");
+let readdirs = 0;
+const origReaddir = fs.readdirSync;
+fs.readdirSync = function(...args) {
+  readdirs++;
+  if (readdirs === 2) {
+    fs.writeFileSync(${JSON.stringify(stat101)}, "101 (worker (x) y) S 1 101 101 0 -1 0 0 0 0 0 25 15 0 0 20 0 1 0 0 0 0\\n");
+    fs.writeFileSync(${JSON.stringify(stat103)}, "103 (xghp_credential) S 1 103 103 0 -1 0 0 0 0 0 20 10 0 0 20 0 1 0 0 0 0\\n");
+    fs.writeFileSync(${JSON.stringify(io101)}, "rchar: 105\\nwchar: 106\\nread_bytes: 107\\nwrite_bytes: 108\\n");
+  }
+  return origReaddir.apply(this, args);
+};`
     );
-    children.push(updater);
 
     const result = sample(logPath, {
+      NODE_OPTIONS: `--require ${hookPath}`,
       RUSA_HOST_WATCHDOG_PROC: proc,
-      RUSA_HOST_WATCHDOG_WINDOW_MS: "100",
+      RUSA_HOST_WATCHDOG_WINDOW_MS: "50",
     });
     expect(result.status).toBe(0);
     const [s] = samples(logPath);
@@ -170,11 +170,13 @@ describe("host-watchdog (#955)", () => {
     // comm with ")" and spaces parsed accurately without field offset:
     const row101 = s.cpu.find(([pid]) => pid === 101);
     expect(row101?.slice(0, 4)).toEqual([101, 1, "worker (x) y", "S"]);
+    const expectedCpuPct = Math.round((25 / 100 / (s.win_ms / 1000)) * 1000) / 10;
+    expect(row101?.[5]).toBe(expectedCpuPct);
     const ioRow101 = s.io.find(([pid]) => pid === 101);
     expect(ioRow101?.slice(0, 4)).toEqual([101, 1, "worker (x) y", "S"]);
     expect(ioRow101?.slice(5)).toEqual([100, 100, 100, 100]);
 
-    // token-shaped comm redacted:
+    // embedded token-shaped comm redacted:
     const row103 = s.cpu.find(([pid]) => pid === 103);
     expect(row103?.slice(0, 4)).toEqual([103, 1, "[redacted]", "S"]);
 
@@ -201,5 +203,24 @@ describe("host-watchdog (#955)", () => {
     const activeSize = statSync(logPath).size;
     expect(activeSize).toBeGreaterThan(0);
     expect(activeSize).toBeLessThan(1024 * 1024);
+  });
+
+  it("surfaces rotation failure and halts appending to an over-cap log when rotation is obstructed", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rusa-watchdog-rotate-fail-"));
+    const logPath = join(dir, "host-watchdog.log");
+    const initialContent = "x".repeat(Math.round(2.1 * 1024 * 1024));
+    writeFileSync(logPath, initialContent);
+    // Obstruct rotation by having generation 2 be a non-empty directory, so renameSync(curr, next) throws ENOTEMPTY
+    mkdirSync(`${logPath}.2`);
+    writeFileSync(join(`${logPath}.2`, "block"), "x");
+    mkdirSync(`${logPath}.1`);
+
+    const result = sample(logPath, {
+      RUSA_HOST_WATCHDOG_WINDOW_MS: "50",
+    });
+    // Stderr reports the rotation failure
+    expect(result.stderr).toContain("host-watchdog: log rotation failed");
+    // Active log size remained strictly bounded at initial size, no further lines appended
+    expect(statSync(logPath).size).toBe(initialContent.length);
   });
 });

@@ -320,14 +320,19 @@ What to know when reading it:
   open and close a connection; nothing is sent.
 - A sample costs about 40 ms of CPU and a little over a second of wall time.
   The `self` field records this in every line.
-- Two instances on one host each run their own watchdog, so the host is
-  sampled twice a minute.
+- Processes that spawn, consume resources, and terminate between samples or
+  during the window without spanning both snapshots do not appear in the
+  interval `cpu` or `io` tables. Their aggregate resource consumption is
+  captured in system PSI (`psi.cpu`, `psi.io`, `psi.mem`) and disk counters
+  (`disk.rd`, `disk.wr`).
+- Two instances on one host each run their own watchdog; `RandomizedDelaySec=20s`
+  jitters their timer triggers to prevent concurrent execution and mutual sampling.
 
-The log's bounds are fixed: the instance's log-rotation oneshot rotates it
-hourly at 2 MiB, keeping two generations, so it stays under about 6 MiB and
-holds several days of samples. These bounds are arguments in the rotation unit.
-The `RUSA_LOG_ROTATE*` variables in `.env` do not apply to it, and
-`RUSA_LOG_ROTATE=off` does not leave it unbounded.
+The log's bounds are fixed: `scripts/host-watchdog.mjs` self-rotates the log
+at 2 MiB before appending, keeping two generations (`.1` and `.2`), so it stays
+under about 6 MiB and holds several days of samples. If rotation fails on an
+over-capacity log, appending is aborted to guarantee bounded file growth. The
+`RUSA_LOG_ROTATE*` variables in `.env` do not apply to it.
 
 To stop sampling until the next install, run
 `systemctl --user disable --now rusa-host-watchdog.timer`.

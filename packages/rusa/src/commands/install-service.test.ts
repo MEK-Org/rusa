@@ -24,11 +24,7 @@ import {
   writeHostWatchdogUnits,
   writeLogRotationUnits,
 } from "./install-service.js";
-import {
-  HOST_WATCHDOG_LOG_BOUNDS,
-  hostWatchdogUnitNames,
-  logRotationUnitNames,
-} from "./service-instance.js";
+import { hostWatchdogUnitNames, logRotationUnitNames } from "./service-instance.js";
 
 const base = {
   description: "Rusa",
@@ -496,6 +492,7 @@ describe("host watchdog units (#955)", () => {
     });
     expect(timer).toContain("OnCalendar=minutely");
     expect(timer).toContain("AccuracySec=1s");
+    expect(timer).toContain("RandomizedDelaySec=20s");
     expect(timer).not.toContain("Persistent=");
     expect(timer).toContain("Unit=rusa-staging-host-watchdog.service");
     expect(timer).toContain("WantedBy=timers.target");
@@ -515,58 +512,6 @@ describe("host watchdog units (#955)", () => {
       "rusa-staging-host-watchdog.service",
       "rusa-staging-host-watchdog.timer",
     ]);
-  });
-
-  it("rotates the watchdog log from the rotation oneshot with bounds pinned in the unit", () => {
-    const unit = buildLogRotateUnit({
-      description: "Rusa log rotation (rusa-staging)",
-      nodePath: "/usr/bin/node",
-      rotateScript: "/deploy/rusa/packages/rusa/scripts/rotate-log.mjs",
-      mcHome: "/home/x/.rusa-staging",
-      logPath: "/home/x/.rusa-staging/logs/rusa.log",
-      pinnedLogs: [{ path: watchdog.logPath, ...HOST_WATCHDOG_LOG_BOUNDS }],
-    });
-    const execStarts = unit.split("\n").filter((line) => line.startsWith("ExecStart="));
-    expect(execStarts).toEqual([
-      'ExecStart="/usr/bin/node" "/deploy/rusa/packages/rusa/scripts/rotate-log.mjs" "/home/x/.rusa-staging/logs/rusa.log"',
-      'ExecStart="/usr/bin/node" "/deploy/rusa/packages/rusa/scripts/rotate-log.mjs" "/home/x/.rusa-staging/logs/host-watchdog.log" "2097152" "2"',
-    ]);
-  });
-
-  it("keeps the watchdog log bounded when the instance .env opts out of rotation", () => {
-    const mcHome = mkdtempSync(join(tmpdir(), "rusa-watchdog-rotate-"));
-    mkdirSync(join(mcHome, "logs"));
-    const serviceLog = join(mcHome, "logs", "rusa.log");
-    const watchdogLog = join(mcHome, "logs", "host-watchdog.log");
-    writeFileSync(serviceLog, "service log, over the bound\n");
-    writeFileSync(watchdogLog, "watchdog log, over the pinned bound\n");
-    writeFileSync(
-      join(mcHome, ".env"),
-      ["RUSA_LOG_ROTATE=off", "RUSA_LOG_ROTATE_MAX_BYTES=10", ""].join("\n")
-    );
-    const unit = buildLogRotateUnit({
-      description: "Rusa log rotation",
-      nodePath: process.execPath,
-      rotateScript: resolve("scripts/rotate-log.mjs"),
-      mcHome,
-      logPath: serviceLog,
-      pinnedLogs: [{ path: watchdogLog, maxBytes: 10, keep: 2 }],
-    });
-    // Run each ExecStart the way systemd runs a oneshot's commands: in order.
-    for (const line of unit.split("\n").filter((l) => l.startsWith("ExecStart="))) {
-      const single = unit
-        .split("\n")
-        .filter((l) => !l.startsWith("ExecStart="))
-        .concat(line)
-        .join("\n");
-      expect(runOneshotAsSystemd(single).status).toBe(0);
-    }
-    // The operator's opt-out holds for the service log…
-    expect(readFileSync(serviceLog, "utf8")).toBe("service log, over the bound\n");
-    expect(existsSync(`${serviceLog}.1`)).toBe(false);
-    // …but not for the watchdog log, whose bound is part of its design.
-    expect(readFileSync(`${watchdogLog}.1`, "utf8")).toBe("watchdog log, over the pinned bound\n");
-    expect(readFileSync(watchdogLog, "utf8")).toBe("");
   });
 
   it("ships the watchdog in the package, beside the rotator", () => {

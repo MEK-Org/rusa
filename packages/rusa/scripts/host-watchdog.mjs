@@ -123,10 +123,10 @@ function diskBytes() {
   return { rd, wr };
 }
 
-/** comm is chosen by the process itself; keep it printable, within the kernel's 15 bytes, and redact token-shaped prefixes. */
+/** comm is chosen by the process itself; keep it printable, within the kernel's 15 bytes, and redact token-shaped patterns. */
 function cleanComm(comm) {
   const sanitized = comm.replace(/[^\x20-\x7e]/g, "?").slice(0, 15);
-  if (/^(ghp_|github_pat_|sk-[A-Za-z0-9]|AIza|xox[abprs]-)/.test(sanitized)) {
+  if (/(ghp_|github_pat_|sk-[A-Za-z0-9]|AIza|xox[abprs]-)/.test(sanitized)) {
     return "[redacted]";
   }
   return sanitized;
@@ -291,9 +291,9 @@ record.self = {
 
 function rotateWatchdogLog(targetPath, maxBytes = 2 * 1024 * 1024, keep = 2) {
   try {
-    if (!existsSync(targetPath)) return;
+    if (!existsSync(targetPath)) return true;
     const size = statSync(targetPath).size;
-    if (size < maxBytes) return;
+    if (size < maxBytes) return true;
     for (let n = keep - 1; n >= 1; n--) {
       const curr = `${targetPath}.${n}`;
       const next = `${targetPath}.${n + 1}`;
@@ -301,11 +301,17 @@ function rotateWatchdogLog(targetPath, maxBytes = 2 * 1024 * 1024, keep = 2) {
     }
     if (keep >= 1) copyFileSync(targetPath, `${targetPath}.1`);
     truncateSync(targetPath, 0);
-  } catch {
-    // Self-rotation is best-effort and must never abort the watchdog sample.
+    return true;
+  } catch (err) {
+    console.error(
+      `host-watchdog: log rotation failed: ${err instanceof Error ? err.message : String(err)}`
+    );
+    return false;
   }
 }
 
 mkdirSync(dirname(logPath), { recursive: true });
-rotateWatchdogLog(logPath);
-appendFileSync(logPath, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+const rotated = rotateWatchdogLog(logPath);
+if (rotated) {
+  appendFileSync(logPath, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+}

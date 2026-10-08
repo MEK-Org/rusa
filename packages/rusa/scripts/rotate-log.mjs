@@ -17,7 +17,7 @@
 // Only `<log>` and `<log>.<n>` are ever touched, so one instance's rotation
 // cannot delete another instance's files.
 //
-// Usage: node rotate-log.mjs [log [maxBytes keep]]
+// Usage: node rotate-log.mjs [log]
 //   log:      the argument, else $RUSA_LOG_PATH, else $RUSA_HOME/logs/rusa.log
 //             (RUSA_HOME default ~/.rusa). The installed unit always passes the
 //             argument, so nothing in the instance .env can retarget it.
@@ -25,10 +25,6 @@
 //   keep:     $RUSA_LOG_ROTATE_KEEP rotated generations (default 5; 0 = truncate
 //             only; at most 100)
 //   opt-out:  $RUSA_LOG_ROTATE=off
-//   pinned:   explicit `maxBytes keep` arguments fix the bounds for a log whose
-//             budget is part of its design (the #955 host watchdog log). The
-//             .env bound, keep and opt-out variables are then ignored, so an
-//             instance-wide setting cannot unbound it.
 
 import {
   copyFileSync,
@@ -54,7 +50,8 @@ const MAX_KEEP = 100;
 // hole. Digit-only is not enough on its own, since a long enough run of digits
 // parses to Infinity (or an imprecise unsafe integer), which would never reach
 // the bound or never finish shifting generations.
-function intInRange(name, fallback, min, max, raw = process.env[name]) {
+function intInRange(name, fallback, min, max) {
+  const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
   const value = /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : Number.NaN;
   if (Number.isSafeInteger(value) && value >= min && value <= max) return value;
@@ -62,27 +59,19 @@ function intInRange(name, fallback, min, max, raw = process.env[name]) {
   return fallback;
 }
 
-const pinned = process.argv.length >= 5;
-if (!pinned && (process.env.RUSA_LOG_ROTATE ?? "").trim().toLowerCase() === "off") {
+if ((process.env.RUSA_LOG_ROTATE ?? "").trim().toLowerCase() === "off") {
   process.exit(0);
 }
 
 const home = process.env.RUSA_HOME || join(homedir(), ".rusa");
 const logPath = process.argv[2] || process.env.RUSA_LOG_PATH || join(home, "logs", "rusa.log");
 const maxBytes = intInRange(
-  pinned ? "maxBytes argument" : "RUSA_LOG_ROTATE_MAX_BYTES",
+  "RUSA_LOG_ROTATE_MAX_BYTES",
   DEFAULT_MAX_BYTES,
   1,
-  Number.MAX_SAFE_INTEGER,
-  pinned ? process.argv[3] : undefined
+  Number.MAX_SAFE_INTEGER
 );
-const keep = intInRange(
-  pinned ? "keep argument" : "RUSA_LOG_ROTATE_KEEP",
-  DEFAULT_KEEP,
-  0,
-  MAX_KEEP,
-  pinned ? process.argv[4] : undefined
-);
+const keep = intInRange("RUSA_LOG_ROTATE_KEEP", DEFAULT_KEEP, 0, MAX_KEEP);
 
 if (!existsSync(logPath)) process.exit(0);
 const size = statSync(logPath).size;
