@@ -791,7 +791,7 @@ function installSingleRusaService(opts: {
   );
 
   // #955: per-minute host telemetry, so a host lockup can be attributed to a
-  // process. Its log rides the rotation oneshot below with pinned bounds.
+  // process. The sampler self-rotates its own fixed-budget log.
   const scriptsDir = join(dirname(dirname(executableSource.cliPath)), "scripts");
   const hostWatchdogLog = join(instance.mcHome, "logs", "host-watchdog.log");
   const hostWatchdog = writeHostWatchdogUnits({

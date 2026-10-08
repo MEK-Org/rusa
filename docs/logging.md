@@ -302,7 +302,7 @@ Each line covers one sampling window of about a second:
 | `cpu` | Top three processes by CPU during the window: `[pid, ppid, comm, state, rss_kb, cpu_pct]`, where 100 is one full core |
 | `io` | Top three processes by I/O during the window: `[pid, ppid, comm, state, rss_kb, rchar, read_bytes, wchar, write_bytes]` |
 | `probe` | Milliseconds to open a TCP connection to the metadata server, the MagicDNS resolver and a public resolver, or the failure (`timeout`, `ECONNREFUSED`, ...) |
-| `self` | The run's own CPU and wall time in milliseconds, Node startup included |
+| `self` | Sampling-phase CPU and wall time in milliseconds through record construction; later log rotation, serialization and append work are excluded |
 
 What to know when reading it:
 
@@ -318,15 +318,19 @@ What to know when reading it:
   15-byte executable name. The watchdog never reads `/proc/<pid>/cmdline` or
   `environ`, so no arguments or environment reach the log. The probes only
   open and close a connection; nothing is sent.
-- A sample costs about 40 ms of CPU and a little over a second of wall time.
-  The `self` field records this in every line.
-- Processes that spawn, consume resources, and terminate between samples or
-  during the window without spanning both snapshots do not appear in the
-  interval `cpu` or `io` tables. Their aggregate resource consumption is
-  captured in system PSI (`psi.cpu`, `psi.io`, `psi.mem`) and disk counters
-  (`disk.rd`, `disk.wr`).
+- The `self` field is a sampling-phase measurement, not a complete per-process
+  overhead benchmark: it starts after module loading and ends before log
+  rotation, serialization, and append. Use a whole-process measurement for a
+  deployment overhead estimate; staging measurement remains a prerequisite to
+  any production rollout.
+- Processes that spawn and exit between snapshots, or during the roughly
+  one-second window without spanning both snapshots, do not appear in the
+  interval `cpu` or `io` tables. Disk deltas also cover only that window; the
+  rest of the one-minute cadence is a blind interval. PSI is pressure evidence,
+  not aggregate CPU or I/O accounting for processes missed by those snapshots.
 - Two instances on one host each run their own watchdog; `RandomizedDelaySec=20s`
-  jitters their timer triggers to prevent concurrent execution and mutual sampling.
+  reduces synchronized starts but does not guarantee non-overlap or prevent
+  mutual sampling.
 
 The log's bounds are fixed: `scripts/host-watchdog.mjs` self-rotates the log
 at 2 MiB before appending, keeping two generations (`.1` and `.2`), so it stays

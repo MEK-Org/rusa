@@ -65,13 +65,6 @@ export function hostWatchdogUnitNames(serviceBasename: string): { service: strin
   };
 }
 
-/**
- * #955's on-disk budget for the watchdog log: at 500-800 B/min (0.7-1.15 MB/day) a
- * 2 MiB active file plus two rotated generations stays under 6 MiB and keeps
- * five to eight days of samples.
- */
-export const HOST_WATCHDOG_LOG_BOUNDS = { maxBytes: 2 * 1024 * 1024, keep: 2 } as const;
-
 export function resolveServiceInstance(
   environment: ServiceEnvironment,
   homeOverride?: string

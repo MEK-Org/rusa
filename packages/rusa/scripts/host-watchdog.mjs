@@ -14,9 +14,9 @@
 //   - three TCP-connect probes, each across a different isolation boundary:
 //     the GCE metadata server (local vNIC), the MagicDNS resolver (local
 //     tailscaled), and a public resolver (upstream);
-//   - this run's own CPU time (kernel-accounted, Node startup included) and
-//     its wall time from script start, so its overhead is measured in the
-//     same log it writes.
+//   - this run's own CPU time and wall time through record construction. They
+//     are sampling-phase measurements, not a complete invocation benchmark:
+//     later log rotation, serialization, and append work are excluded.
 //
 // Per process it records only pid, ppid, comm (the kernel's ≤15-byte
 // executable name), state, and rss_kb. It never reads /proc/[pid]/cmdline or
@@ -274,7 +274,10 @@ const record = {
   // ms to connect, or the failure ("timeout", "ECONNREFUSED", ...)
   probe: Object.fromEntries(probeResults),
 };
-// From the kernel's own accounting, so Node's startup cost is included.
+// cpu_ms is process CPU through record construction when /proc permits it.
+// wall_ms starts after module loading and ends here; it deliberately excludes
+// the later log-maintenance and write path, so neither field is a complete
+// invocation-cost measurement.
 const self = after.get(process.pid);
 const selfStat = read(join(proc, "self", "stat"));
 const selfTicks = selfStat
