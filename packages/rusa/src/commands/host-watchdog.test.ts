@@ -119,13 +119,15 @@ describe("host-watchdog (#955)", () => {
     );
     writeFileSync(join(proc, "meminfo"), "MemTotal: 100 kB\nMemAvailable: 42 kB\nSwapFree: 7 kB\n");
     // One readable process with ")" and space in comm, one unreadable process,
-    // an embedded token-shaped comm name, and an overlong synthetic comm whose
-    // sensitive prefix would otherwise begin after the emitted 15-byte limit.
+    // an embedded token-shaped comm name, an overlong synthetic comm whose
+    // sensitive prefix would otherwise begin after the emitted 15-byte limit,
+    // and an asymmetric block reader to prove ioScore ranking over rchar+wchar.
     for (const [pid, comm, io] of [
-      [101, "worker (x) y", "rchar: 5\nwchar: 6\nread_bytes: 7\nwrite_bytes: 8\n"],
+      [101, "worker (x) y", "rchar: 5\nwchar: 0\nread_bytes: 0\nwrite_bytes: 0\n"],
       [102, "other", undefined],
       [103, "xghp_credential", undefined],
       [104, "abcdefghijkgithub_pat_synthetic", undefined],
+      [105, "block_reader", "rchar: 10\nwchar: 0\nread_bytes: 10\nwrite_bytes: 0\n"],
     ] as const) {
       mkdirSync(join(proc, String(pid)));
       writeFileSync(
@@ -138,7 +140,9 @@ describe("host-watchdog (#955)", () => {
     const stat101 = join(proc, "101", "stat");
     const stat103 = join(proc, "103", "stat");
     const stat104 = join(proc, "104", "stat");
+    const stat105 = join(proc, "105", "stat");
     const io101 = join(proc, "101", "io");
+    const io105 = join(proc, "105", "io");
     const hookPath = join(proc, "updater-hook.cjs");
     writeFileSync(
       hookPath,
@@ -153,7 +157,9 @@ fs.readdirSync = function(...args) {
     fs.writeFileSync(${JSON.stringify(stat101)}, "101 (worker (x) y) S 1 101 101 0 -1 0 0 0 0 0 25 15 0 0 20 0 1 0 0 0 0\\n");
     fs.writeFileSync(${JSON.stringify(stat103)}, "103 (xghp_credential) S 1 103 103 0 -1 0 0 0 0 0 20 10 0 0 20 0 1 0 0 0 0\\n");
     fs.writeFileSync(${JSON.stringify(stat104)}, "104 (abcdefghijkgithub_pat_synthetic) S 1 104 104 0 -1 0 0 0 0 0 20 10 0 0 20 0 1 0 0 0 0\\n");
-    fs.writeFileSync(${JSON.stringify(io101)}, "rchar: 105\\nwchar: 106\\nread_bytes: 107\\nwrite_bytes: 108\\n");
+    fs.writeFileSync(${JSON.stringify(stat105)}, "105 (block_reader) S 1 105 105 0 -1 0 0 0 0 0 10 5 0 0 20 0 1 0 0 0 0\\n");
+    fs.writeFileSync(${JSON.stringify(io101)}, "rchar: 105\\nwchar: 0\\nread_bytes: 0\\nwrite_bytes: 0\\n");
+    fs.writeFileSync(${JSON.stringify(io105)}, "rchar: 20\\nwchar: 0\\nread_bytes: 210\\nwrite_bytes: 0\\n");
   }
   return origReaddir.apply(this, args);
 };`
@@ -170,7 +176,7 @@ fs.readdirSync = function(...args) {
     expect(s.psi.cpu).toBeNull();
     expect(s.mem.avail_kb).toBe(42);
     expect(s.mem.swap_free_kb).toBe(7);
-    expect(s.procs).toBe(4);
+    expect(s.procs).toBe(5);
     expect(s.io_denied).toBe(3);
     // The preload pause makes the real denominator longer than the configured
     // window; CPU percentages must use this recorded denominator instead.
@@ -181,9 +187,17 @@ fs.readdirSync = function(...args) {
     expect(row101?.slice(0, 4)).toEqual([101, 1, "worker (x) y", "S"]);
     const expectedCpuPct = Math.round((25 / 100 / (s.win_ms / 1000)) * 1000) / 10;
     expect(row101?.[5]).toBe(expectedCpuPct);
+
+    // Asymmetric I/O ranking: block-reading process 105 ranks ahead of process 101,
+    // exercising max(rchar, rb) and distinguishing ioScore from naive rchar+wchar summation.
+    expect(s.io).toHaveLength(2);
+    expect(s.io[0][0]).toBe(105);
+    expect(s.io[0].slice(0, 4)).toEqual([105, 1, "block_reader", "S"]);
+    expect(s.io[0].slice(5)).toEqual([10, 200, 0, 0]);
+
     const ioRow101 = s.io.find(([pid]) => pid === 101);
     expect(ioRow101?.slice(0, 4)).toEqual([101, 1, "worker (x) y", "S"]);
-    expect(ioRow101?.slice(5)).toEqual([100, 100, 100, 100]);
+    expect(ioRow101?.slice(5)).toEqual([100, 0, 0, 0]);
 
     // embedded token-shaped comm redacted:
     const row103 = s.cpu.find(([pid]) => pid === 103);
