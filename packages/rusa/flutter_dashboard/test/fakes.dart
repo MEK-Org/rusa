@@ -12,6 +12,8 @@ import 'package:rusa_dashboard/quota_cache.dart';
 import 'package:rusa_dashboard/tree_preferences_cache.dart';
 import 'package:rusa_dashboard/voice_platform.dart';
 
+const testUserPrincipalId = '00000000-0000-4000-8000-000000000001';
+
 ThreadDto makeThread(
   String id, {
   String? parent,
@@ -133,7 +135,7 @@ MeshEvent makeEvent(
 MeshChat makeChat(
   String id, {
   String sender = 'a',
-  String recipient = 'human:operator',
+  String recipient = '00000000-0000-4000-8000-000000000001',
   String body = '',
 }) => MeshChat(
   id: id,
@@ -410,7 +412,10 @@ class FakeApi extends DashboardApi {
       return gate.future;
     }
     return dashboardConfigResult ??
-        const DashboardConfigDto(quotaProviders: {});
+        const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: testUserPrincipalId,
+        );
   }
 
   @override

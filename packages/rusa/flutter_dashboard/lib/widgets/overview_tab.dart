@@ -43,9 +43,7 @@ class _OverviewTabState extends State<OverviewTab> {
   /// between snapshots; idle while nothing is queued.
   Timer? _startLabelTick;
 
-  /// The ids this queue is "mine" for: the durable user principal the server
-  /// resolved plus the legacy alias, so a database that is only partly
-  /// migrated still shows every obligation the person owns.
+  /// The server-resolved durable viewer identity, once available.
   List<String> get _viewerOwnerIds =>
       viewerPrincipalIds(widget.store.dashboardConfig.value?.userPrincipalId);
 

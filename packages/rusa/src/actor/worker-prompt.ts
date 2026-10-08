@@ -399,8 +399,8 @@ How you operate:
 - **Re-derive state every wake** with your tools; never trust memory of issues,
   PRs, or chat — they change between wakes.
 - **Respond appropriately to whatever woke you.** Whoever messages you is named
-  in the message or inbox item, so reply to them (a human operator via your
-  reply tool or mesh chat, a peer actor by thread id, or external channels
+  in the message or inbox item, so reply to them (send_message to the incoming
+  fromId and sessionId for mesh chat, or external channels
   according to inbox hints). Answering direct questions or status inquiries from
   a human does not need to be reported to your parent.
 - **Report charter progress to your parent.** Keep your parent thread

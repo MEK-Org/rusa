@@ -21,7 +21,6 @@ export default defineConfig({
     "quota/coordinator-client": "src/quota/coordinator-client.ts",
     "quota/coordinator-metrics": "src/quota/coordinator-metrics.ts",
     "quota/shared-store": "src/quota/shared-store.ts",
-    "principals/legacy-migration": "src/principals/legacy-migration.ts",
     "commands/coordinator-path-check": "src/commands/coordinator-path-check.ts",
   },
   format: ["esm"],

@@ -37,61 +37,58 @@ Widget _dialogHost(
 
 void main() {
   group('durable principal attribution (#460)', () {
-    testWidgets(
-      'My Queue lists work owned by the durable user principal and by unmigrated alias rows',
-      (tester) async {
-        await tester.runAsync(() async {
-          final api = FakeApi()
-            ..threadsResult = [makeThread('root')]
-            ..dashboardConfigResult = _configWithUser(kDurableUser)
-            ..obligationsResult = [
-              makeObligation(
-                'ob-migrated',
-                ownerId: kDurableUser,
-                intent: 'Migrated decision',
-                status: 'ready',
-              ),
-              makeObligation(
-                'ob-legacy',
-                ownerId: kLegacyOperatorPrincipalId,
-                intent: 'Unmigrated decision',
-                status: 'ready',
-              ),
-              makeObligation(
-                'ob-actor',
-                ownerId: 'worker-1',
-                intent: 'Actor job',
-                status: 'ready',
-              ),
-            ];
-          final store = DashboardStore(api: api, stream: FakeStream());
-          await store.init();
-          addTearDown(store.dispose);
-
-          await tester.pumpWidget(
-            MaterialApp(
-              home: Scaffold(body: OverviewTab(store: store)),
+    testWidgets('My Queue lists only work owned by the durable viewer', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..dashboardConfigResult = _configWithUser(kDurableUser)
+          ..obligationsResult = [
+            makeObligation(
+              'ob-viewer',
+              ownerId: kDurableUser,
+              intent: 'My decision',
+              status: 'ready',
             ),
-          );
-          await tester.pump();
-          await tester.pump();
+            makeObligation(
+              'ob-other-user',
+              ownerId: testUserPrincipalId,
+              intent: 'Another user decision',
+              status: 'ready',
+            ),
+            makeObligation(
+              'ob-actor',
+              ownerId: 'worker-1',
+              intent: 'Actor job',
+              status: 'ready',
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
 
-          // The durable owner is queried at all — the pre-#460 build asked
-          // only for the alias, so a migrated row never appeared here.
-          expect(
-            api.fetchObligationsCalls.map((c) => c.ownerId).toSet(),
-            containsAll(<String>{kDurableUser, kLegacyOperatorPrincipalId}),
-          );
-          expect(find.text('Migrated decision'), findsOneWidget);
-          expect(find.text('Unmigrated decision'), findsOneWidget);
-          expect(find.text('Actor job'), findsNothing);
-          expect(find.text('2 obligations'), findsOneWidget);
-        });
-      },
-    );
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(body: OverviewTab(store: store)),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(
+          api.fetchObligationsCalls.map((c) => c.ownerId).toSet(),
+          <String>{kDurableUser},
+        );
+        expect(find.text('My decision'), findsOneWidget);
+        expect(find.text('Another user decision'), findsNothing);
+        expect(find.text('Actor job'), findsNothing);
+        expect(find.text('1 obligation'), findsOneWidget);
+      });
+    });
 
     testWidgets(
-      'creating from My Queue attributes the obligation to the durable principal, not the alias',
+      'creating from My Queue attributes the obligation to the durable principal',
       (tester) async {
         await tester.runAsync(() async {
           final api = FakeApi()
@@ -169,7 +166,7 @@ void main() {
     );
 
     testWidgets(
-      'without a durable user the dialogs still fall back to the alias the server accepts',
+      'without a durable user the dialog cannot infer an operator owner',
       (tester) async {
         await tester.runAsync(() async {
           final api = FakeApi()
@@ -202,7 +199,7 @@ void main() {
           await tester.tap(find.widgetWithText(ElevatedButton, 'Reassign'));
           await tester.pumpAndSettle();
 
-          expect(api.reassignCalls.single.ownerId, kLegacyOperatorPrincipalId);
+          expect(api.reassignCalls, isEmpty);
         });
       },
     );
@@ -221,28 +218,19 @@ void main() {
 
       await api.interruptActor('actor-1');
 
-      // The server binds the acting principal; a `by` here could only be the
-      // legacy alias or a guess.
+      // The server binds the acting principal.
       expect(sentBody, isEmpty);
     });
   });
 
   group('viewer principal helpers', () {
-    test('reads under both ids, writes under the durable one', () {
-      expect(viewerPrincipalIds(kDurableUser), [
-        kDurableUser,
-        kLegacyOperatorPrincipalId,
-      ]);
-      expect(viewerPrincipalIds(null), [kLegacyOperatorPrincipalId]);
-      expect(viewerPrincipalIds(kLegacyOperatorPrincipalId), [
-        kLegacyOperatorPrincipalId,
-      ]);
+    test('reads and writes only under the durable id', () {
+      expect(viewerPrincipalIds(kDurableUser), [kDurableUser]);
+      expect(viewerPrincipalIds(null), isEmpty);
+      expect(viewerPrincipalIds(testUserPrincipalId), [testUserPrincipalId]);
       expect(viewerOwnerId(kDurableUser), kDurableUser);
-      expect(viewerOwnerId(null), kLegacyOperatorPrincipalId);
-      expect(
-        isViewerPrincipal(kLegacyOperatorPrincipalId, kDurableUser),
-        isTrue,
-      );
+      expect(viewerOwnerId(null), isEmpty);
+      expect(isViewerPrincipal(testUserPrincipalId, kDurableUser), isFalse);
       expect(isViewerPrincipal('worker-1', kDurableUser), isFalse);
       expect(isOperatorOwnerText(' operator ', kDurableUser), isTrue);
       expect(isOperatorOwnerText(kDurableUser, kDurableUser), isTrue);
@@ -252,7 +240,7 @@ void main() {
       expect(isOperatorOwnerText('Ada Lovelace', kDurableUser), isFalse);
     });
 
-    test('the viewer profile label covers both of their ids', () async {
+    test('the viewer profile label covers only their durable id', () async {
       final api = FakeApi()
         ..dashboardConfigResult = _configWithUser(kDurableUser);
       final store = DashboardStore(
@@ -265,11 +253,11 @@ void main() {
       addTearDown(store.dispose);
 
       expect(store.actorDisplay(kDurableUser), 'Ada Lovelace');
-      expect(store.actorDisplay(kLegacyOperatorPrincipalId), 'Ada Lovelace');
-      expect(store.actorDisplay('human:another-user'), 'Operator');
+      expect(store.actorDisplay(testUserPrincipalId), 'Unknown actor');
+      expect(store.actorDisplay('human:another-user'), 'Unknown actor');
       expect(store.ownerLabel(kDurableUser), 'Ada Lovelace');
-      expect(store.ownerLabel(kLegacyOperatorPrincipalId), 'Ada Lovelace');
-      expect(store.ownerLabel('human:another-user'), 'Operator');
+      expect(store.ownerLabel(testUserPrincipalId), testUserPrincipalId);
+      expect(store.ownerLabel('human:another-user'), 'human:another-user');
     });
   });
 }

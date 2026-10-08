@@ -40,14 +40,13 @@ import {
   InMemoryExperimentEnrollmentStore,
 } from "../actor/experiments.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
-import type { RootControlService } from "../actor/root-control.js";
+import { RootControlService } from "../actor/root-control.js";
 import type { RusaConfig } from "../config/types.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import type { ChatRoomMember } from "../db/repositories/chat-room-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
-import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import {
@@ -190,6 +189,7 @@ function setup(
   runMigrations(eventDb);
   const inboxStore = new SqliteInboxRepository(eventDb);
   const chatStore = new MeshChatRepository(eventDb);
+  const principals = new PrincipalRepository(eventDb);
   const eventManager = new EventManager({
     inboxStore,
     resolver: eventSourceResolver,
@@ -197,6 +197,7 @@ function setup(
   mesh = new ActorMesh({
     recordChat: (entry) => chatStore.record(entry),
     actors: registry,
+    principals,
     rootId: opts.rootId,
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
@@ -269,7 +270,17 @@ function setup(
   if (opts.seedRootGrants !== false) {
     seedConfiguredActorGrants(capabilityGrants, rootId, () => "2026-01-01T00:00:00Z");
   }
-  return { registry, mesh, events, inboxStore, rootId, capabilityGrants, root };
+  return {
+    registry,
+    mesh,
+    events,
+    inboxStore,
+    rootId,
+    capabilityGrants,
+    root,
+    chatStore,
+    principals,
+  };
 }
 
 /** Tools that exist only for a holder of an administrative capability. */
@@ -803,15 +814,117 @@ describe("agent-execution MCP server", () => {
     );
   });
 
+  it.each([
+    "worker",
+    "root",
+  ])("%s addresses interleaved humans with the same send_message tool", async (role) => {
+    const { mesh, rootId, principals, chatStore, inboxStore, events } = setup();
+    const selfId =
+      role === "root"
+        ? rootId
+        : mesh.spawn({
+            charter: "worker",
+            parentId: rootId,
+            modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+          });
+    const alice = principals.createUser({ email: "alice@example.test", createdAt: "t" });
+    const bob = principals.createUser({ email: "bob@example.test", createdAt: "t" });
+    const rootControl = new RootControlService({ mesh, rootId, providers: ["claude"] });
+    const client = await connect(
+      createAgentExecMcpServer(mesh, selfId, rootId, undefined, { rootControl })
+    );
+    try {
+      expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain("reply");
+      mesh.sendMessage(selfId, "alice asks first", alice.id, "alice-session");
+      mesh.sendMessage(selfId, "bob asks later", bob.id, "bob-session");
+      expect(inboxStore.list(selfId).entries).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            payload: expect.objectContaining({
+              type: "mesh.message",
+              fromId: alice.id,
+              sessionId: "alice-session",
+              priority: "responsive",
+            }),
+          }),
+          expect.objectContaining({
+            payload: expect.objectContaining({
+              type: "mesh.message",
+              fromId: bob.id,
+              sessionId: "bob-session",
+              priority: "responsive",
+            }),
+          }),
+        ])
+      );
+      for (const [recipient, session, body] of [
+        [alice.id, "alice-session", "answer alice"],
+        [bob.id, "bob-session", "answer bob"],
+      ]) {
+        const result = await client.callTool({
+          name: "send_message",
+          arguments: { thread_id: recipient, body, session_id: session },
+        });
+        expect(result.isError).not.toBe(true);
+        expect(
+          chatStore.listForActor(recipient).find((message) => message.body === body)
+        ).toMatchObject({ senderId: selfId, recipientId: recipient, sessionId: session });
+        expect(events).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ kind: "message_sent", actorId: selfId, detail: session }),
+            expect.objectContaining({
+              kind: "message_received",
+              actorId: recipient,
+              detail: session,
+            }),
+          ])
+        );
+      }
+      principals.setDisabled(bob.id, "2026-10-01T00:00:00Z");
+      expect(
+        (
+          await client.callTool({
+            name: "send_message",
+            arguments: { thread_id: bob.id, body: "disabled" },
+          })
+        ).isError
+      ).toBe(true);
+      expect(chatStore.listForActor(bob.id).some((message) => message.body === "disabled")).toBe(
+        false
+      );
+      expect(
+        (
+          await client.callTool({
+            name: "send_message",
+            arguments: { thread_id: "unknown", body: "unknown" },
+          })
+        ).isError
+      ).toBe(true);
+    } finally {
+      await client.close();
+      mesh.shutdownAll();
+    }
+  });
+
+  it("cannot report successful human delivery without a durable chat write", async () => {
+    const { mesh, principals } = setup();
+    const user = principals.createUser({ email: "user@example.test", createdAt: "t" });
+    const record = vi.spyOn(mesh, "recordMessageEmitted").mockReturnValue(undefined);
+    expect(() => mesh.sendMessage(user.id, "reply", "root")).toThrow("durable chat storage");
+    record.mockRestore();
+    mesh.shutdownAll();
+  });
+
   it("transfers only the caller's active voice session through a held target", async () => {
     let holder = "";
+    let principalId = "";
     const controls: Array<[string, string]> = [];
-    const { inboxStore, mesh } = setup({
+    const { inboxStore, mesh, principals, chatStore } = setup({
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceSessionTransfer: {
-        activeSessionIdFor: (actorId) => {
+        activeSessionFor: (actorId) => {
           if (actorId !== holder) throw new Error("caller does not hold an active voice session");
-          return "session-a";
+          return { sessionId: "session-a", principalId };
         },
         transferActiveSession: (fromActorId, targetActorId) => {
           if (fromActorId !== holder)
@@ -829,6 +942,7 @@ describe("agent-execution MCP server", () => {
       },
       listVoiceSessionChat: () => [],
     });
+    principalId = principals.createUser({ email: "caller@example.test", createdAt: "t" }).id;
     const source = mesh.spawn({
       charter: "source",
       parentId: "root",
@@ -855,180 +969,30 @@ describe("agent-execution MCP server", () => {
       type: "voice.transfer",
       priority: "responsive",
       sessionId: "session-a",
+      principalId,
     });
-  });
-
-  it("gives a SQLite-backed transfer recipient a lease-scoped reply tool and session", async () => {
-    const db = new Database(":memory:");
-    runMigrations(db);
-    const actors = new SqliteActorRepository(db);
-    const inboxStore = new SqliteInboxRepository(db);
-    const chat = new MeshChatRepository(db);
-    let holder = "";
-    const mesh = new ActorMesh({
-      actors,
-      inboxStore,
-      recordChat: (entry) => chat.record(entry),
-      voiceSessionTransfer: {
-        activeSessionIdFor: (actorId) => {
-          if (actorId !== holder) throw new Error("caller does not hold an active voice session");
-          return "transferred-session";
-        },
-        transferActiveSession: (fromActorId, targetActorId) => {
-          if (fromActorId !== holder)
-            throw new Error("caller does not hold an active voice session");
-          holder = targetActorId;
-          return "transferred-session";
-        },
-        revertActiveSessionTransfer: (sessionId, fromActorId, targetActorId) => {
-          expect(sessionId).toBe("transferred-session");
-          expect(holder).toBe(targetActorId);
-          holder = fromActorId;
-        },
-        notifySessionTransferred: () => {},
-      },
-      createActor: () => ({}) as unknown as Actor,
-    });
-    const liveActor = (id: string) =>
-      ({
-        id,
-        requestRun: () => {},
-        markUnkillable: () => {},
-        close: () => {},
-        isRunning: false,
-        preemptForResponsive: () => ({ preempted: false as const }),
-      }) as unknown as Actor;
-    const root: ActorRecord = {
-      id: "root",
-      charter: "root",
-      parentId: null,
-      isRoot: true,
-      status: "active",
-      createdAt: "2026-01-01T00:00:00.000Z",
-    };
-    const source: ActorRecord = {
-      id: "source",
-      charter: "source",
-      parentId: "root",
-      status: "active",
-      createdAt: "2026-01-01T00:00:01.000Z",
-    };
-    const target: ActorRecord = {
-      id: "target",
-      charter: "target",
-      parentId: "source",
-      status: "active",
-      createdAt: "2026-01-01T00:00:02.000Z",
-    };
-    mesh.adopt(root, liveActor(root.id));
-    mesh.adopt(source, liveActor(source.id));
-    mesh.adopt(target, liveActor(target.id));
-    actors.patch(source.id, { handles: [{ id: target.id }] });
-    holder = source.id;
-
-    mesh.transferVoiceSession(source.id, target.id);
-    expect(actors.lastHumanChat(target.id)).toBeUndefined();
-
-    const client = await connect(createAgentExecMcpServer(mesh, target.id, root.id));
-    const { tools } = await client.listTools();
-    expect(tools.map((tool) => tool.name)).toContain("reply");
-
-    const reply = (await client.callTool({
-      name: "reply",
-      arguments: { message: "I have the call." },
-    })) as CallToolResult;
-    expect(reply.isError).not.toBe(true);
-    expect(
-      chat
-        .listForSession("transferred-session", { limit: 10 })
-        .find((entry) => entry.senderId === target.id)
-    ).toMatchObject({ recipientId: "human:operator", sessionId: "transferred-session" });
-  });
-
-  it("replies to the human chat that arrived after the reply tool was registered (#691)", async () => {
-    const db = new Database(":memory:");
-    runMigrations(db);
-    const actors = new SqliteActorRepository(db);
-    const chat = new MeshChatRepository(db);
-    // Distinct, increasing timestamps so the newest-by-(ts, id) order is fixed.
-    let tick = 0;
-    const mesh = new ActorMesh({
-      actors,
-      inboxStore: new SqliteInboxRepository(db),
-      recordChat: (entry) =>
-        chat.record({ ...entry, ts: new Date(Date.UTC(2026, 0, 1, 0, 0, ++tick)).toISOString() }),
-      createActor: () => ({}) as unknown as Actor,
-    });
-    const liveActor = (id: string) =>
-      ({
-        id,
-        requestRun: () => {},
-        markUnkillable: () => {},
-        close: () => {},
-        isRunning: true,
-        preemptForResponsive: () => ({ preempted: false as const }),
-      }) as unknown as Actor;
-    mesh.adopt(
-      {
-        id: "root",
-        charter: "root",
-        parentId: null,
-        isRoot: true,
-        status: "active",
-        createdAt: "2026-01-01T00:00:00.000Z",
-      },
-      liveActor("root")
-    );
-    mesh.adopt(
-      {
-        id: "worker",
-        charter: "worker",
-        parentId: "root",
-        status: "active",
-        createdAt: "2026-01-01T00:00:01.000Z",
-      },
-      liveActor("worker")
-    );
-    const user = new PrincipalRepository(db).createUser({
-      email: "second@example.com",
-      createdAt: "2026-01-01T00:00:02.000Z",
-      identity: { issuer: "https://accounts.google.com", subject: "second" },
-    });
-
-    // The run's endpoint is built while the newest human message has no
-    // session: that unlocks reply, but a send has no conversation to go to.
-    chat.record({
-      senderId: "human:operator",
-      recipientId: "worker",
-      body: "sessionless",
-      sessionId: null,
-      ts: new Date(Date.UTC(2026, 0, 1, 0, 0, ++tick)).toISOString(),
-    });
-    const client = await connect(createAgentExecMcpServer(mesh, "worker", "root"));
-    expect((await client.listTools()).tools.map((tool) => tool.name)).toContain("reply");
-    const rejected = (await client.callTool({
-      name: "reply",
-      arguments: { message: "Nowhere to send." },
-    })) as CallToolResult;
-    expect(rejected.isError).toBe(true);
-    expect(JSON.stringify(rejected.content)).toContain("requires an active human conversation");
-
-    mesh.sendHumanMessage("worker", "first", "session-a");
-
-    // A second human writes mid-run; the next reply must follow them.
-    mesh.sendHumanMessage("worker", "second", "session-b", { fromId: user.id });
-    const reply = (await client.callTool({
-      name: "reply",
-      arguments: { message: "On it." },
-    })) as CallToolResult;
-
-    expect(reply.isError).not.toBe(true);
-    const sent = (sessionId: string) =>
-      chat.listForSession(sessionId, { limit: 10 }).filter((entry) => entry.senderId === "worker");
-    expect(sent("session-b")).toEqual([
-      expect.objectContaining({ recipientId: user.id, body: "On it." }),
-    ]);
-    expect(sent("session-a")).toEqual([]);
+    const recipient = await connect(createAgentExecMcpServer(mesh, target, "root"));
+    try {
+      // No prior human chat or inferred reply recipient is needed after handoff.
+      expect((await recipient.listTools()).tools.map((tool) => tool.name)).not.toContain("reply");
+      const answer = await recipient.callTool({
+        name: "send_message",
+        arguments: { thread_id: principalId, body: "I have the call.", session_id: "session-a" },
+      });
+      expect(answer.isError).not.toBe(true);
+      expect(chatStore.listForActor(principalId)).toEqual([
+        expect.objectContaining({
+          senderId: target,
+          recipientId: principalId,
+          sessionId: "session-a",
+          body: "I have the call.",
+        }),
+      ]);
+    } finally {
+      await recipient.close();
+      await client.close();
+      mesh.shutdownAll();
+    }
   });
 
   it("describes live capability grants as effective on the next run", async () => {

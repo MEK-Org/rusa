@@ -7,9 +7,9 @@ void main() {
     () {
       expect(
         actorDisplayLabel(
-          'human:operator',
+          '00000000-0000-4000-8000-000000000001',
           null,
-          (id) => id == 'human:operator',
+          (id) => id == '00000000-0000-4000-8000-000000000001',
           'Ada Lovelace',
         ),
         'Ada Lovelace',
@@ -27,23 +27,26 @@ void main() {
   );
 
   test(
-    'keeps Operator for another human principal and as the safe fallback',
+    'does not infer human identity from ids and uses Operator for an unnamed viewer',
     () {
       expect(
         actorDisplayLabel(
           'human:another-person',
           null,
-          (id) => id == 'human:operator',
+          (id) => id == '00000000-0000-4000-8000-000000000001',
           'Ada Lovelace',
         ),
-        'Operator',
+        'Unknown actor',
       );
-      expect(actorDisplayLabel('human:operator'), 'Operator');
+      expect(
+        actorDisplayLabel('00000000-0000-4000-8000-000000000001'),
+        'Unknown actor',
+      );
       expect(
         actorDisplayLabel(
-          'human:operator',
+          '00000000-0000-4000-8000-000000000001',
           null,
-          (id) => id == 'human:operator',
+          (id) => id == '00000000-0000-4000-8000-000000000001',
           '   ',
         ),
         'Operator',

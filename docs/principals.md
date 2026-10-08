@@ -1,141 +1,63 @@
 # Principals
 
-Durable identity storage for actors, admitted users, and the mesh's own writes.
-This document states what is stored, what deliberately has **not** changed yet,
-and the exact list of code that still decides identity by reading a string —
-the work the next slice has to do.
+`principals` stores one identity per row, with kind `actor`, `user`, or `system`.
+Identity is an opaque id; principal storage determines its kind. No human alias,
+prefix recognition, automatic historical rewrite, or migration command exists.
+Already-applied database migrations remain immutable historical artifacts.
 
-## What exists
+`PrincipalRepository` is the identity writer. `SqliteActorRepository.upsert`
+records an actor principal in the same transaction as the actor row. An actor's
+principal id is its actor id. Retirement preserves its principal and history.
+Disabling a user likewise preserves their identity, root association, and history.
 
-`principals` is the supertype: one row per identity, carrying its `kind`
-(`actor`, `user`, `system`). An actor's principal id **is** its actor id, so
-every id already written into an attribution column keeps resolving as itself.
-`users` is the subtype for admitted people, keyed by verified Firebase issuer +
-subject, with email as mutable admission metadata. A user's nullable, unique
-`google_account_id` (#890) is copied at each dashboard sign-in from the
-verified ID token's `firebase.identities["google.com"][0]`, and is the only link
-from a Google Chat sender (`users/{id}`) to a user. Nothing else writes it, and
-an id another user already holds is logged and left with its holder.
+## Human identity
 
-`PrincipalRepository` (`src/db/repositories/principal-repository.ts`) is the
-only writer. `SqliteActorRepository.upsert` records an actor's principal inside
-the same transaction as the actor row, so spawn and legacy import both get it
-without either having to remember. `PrincipalRef`
-(`src/principals/principal-ref.ts`) is the typed value a caller gets back — it
-exists only because a row does.
+Users are keyed by verified Firebase issuer and subject. Email is mutable
+admission metadata, not identity. After verification, both ID tokens and session
+cookies use the canonical project issuer. The nullable unique `google_account_id`
+is recorded from verified Google sign-in claims and links Google Chat senders to
+users; display names and email do not provide that link.
 
-Lifecycle, against the actor lifecycle as it actually is:
+Auth-disabled startup with no users creates one implicit durable user with a
+reserved internal email (`local-operator@rusa.invalid`). Repeated startup does not
+create another user, and disabled users prevent bootstrap. The first admitted,
+verified sign-in atomically binds and enriches the sole unbound implicit user,
+preserving its id and attributed history. That internal email cannot be admitted.
+A matching explicitly provisioned unbound user can also be claimed by verified
+email. Bound identities are never reassigned by email.
 
-- **Retirement** is a `retired_at` timestamp on `actors`. The principal is
-  untouched: a retired actor's attributed history stays attributable.
-- **Deletion** of an actor is refused (`ON DELETE RESTRICT`) while any user
-  holds it as their root. Nothing deletes actors today; actor lifecycles treat
-  retirement as a `retired_at` timestamp mutation.
-- **Disabling a user** is a `disabled_at` timestamp. The root actor, the bound
-  identity and all history are preserved.
+Local mutations require exactly one active durable user. Missing or ambiguous
+identity is an ordinary error, not an inferred sender. Authenticated requests
+always use the verified request principal. Interrupt callers explicitly supply
+their principal; obligation owners must resolve to a durable user or live actor.
 
-## The boundary this slice stops at
+The runtime's single-root invariant is unchanged. Users may share the installation
+without having individual roots; claiming an identity does not change topology.
 
-Nothing here changes who anything is attributed to, and nothing here
-authenticates. Specifically:
+## Mesh messages
 
-- **`human:operator` gets no principal row, and no alias table exists.** The
-  historical references to it are migrated by hand, as a deployment operation,
-  before an upgraded instance serves traffic. This slice must not decide who
-  they belong to, and there is no runtime reinterpretation of the literal.
-- **No attribution column has a foreign key to `principals`.** One would refuse
-  every legacy row still holding `human:operator`. Those keys are added after
-  the manual cutover, not before.
-- **No user is created by interpreting an owner string.** `createUser` mints its
-  own opaque id and offers no way to choose one, so an arbitrary string found in
-  an attribution column cannot become a user.
-- **The single-root invariant stands.** `actors_single_root_idx` still permits
-  one parentless actor, so at most one user can hold a root until the multi-root
-  runtime slice lifts it. `PrincipalRepository` accepts only a parentless actor
-  for `root_actor_id` and refuses to silently repoint an already-rooted user;
-  the future cutover owns any deliberate reassignment. The column is nullable
-  for explicit pre-binding provisioning.
-- **No Firebase, session, network or route authorization code lands here.**
-  `last_authenticated_at` has a storage-level writer and no caller yet.
+`send_message` is the single actor messaging tool. The tool binds the sender to
+the calling actor; the caller names the recipient in `thread_id` and optionally
+copies `session_id` from the incoming inbox payload. To answer a message, use its
+`fromId` and `sessionId`. No tool infers the recipient from the latest human chat.
 
-## Consumers the next slice must switch
+The same mesh delivery path stores human and agent messages in `mesh_chat` and
+emits sent/received events. Actor recipients receive inbox attention; durable
+user recipients receive chat/events. Human-origin actor messages are responsive.
+Voice memos use this path with their existing voice marker and payload type.
+Scheduled messages retain the existing agent-only scheduler.
 
-Each of these decides identity today by reading a string, and each has to move
-onto `PrincipalRef`. This is the reason the storage exists. The list was derived
-by grepping for `HUMAN_OPERATOR`, `MESH_SYSTEM`, `isHumanOperator`,
-`isSystemActor`, and the bare `human:operator` and `system:` literals across `packages/rusa/src`
-and dropping the hits that are prose — a prompt string, JSDoc, and comments in
-`worker-prompt.ts`, `providers/types.ts`, `voice/wiring.ts` and
-`webhook/server.ts`. Re-run that grep before trusting it; it is accurate as of
-this branch, not permanently.
+Each dashboard viewer reads their own human conversations plus traffic between
+known actors/system principals. Unknown participants and other users remain
+private in chat, event history, live streams, and cited message bodies.
 
-**The id space itself**
+Voice sessions bind a principal and actor. Transfers preserve the principal and
+include it directly in the handoff inbox payload. Voice presence, announcements,
+audio retrieval, backlog, and acknowledgements are recipient-scoped; leased SSE
+streams also match the explicit message session. No accepted-input proof or
+recursive handoff chain is needed to name a message recipient.
 
-- `src/obligations/obligation.ts` — `EntityId` is documented as "an actor UUID,
-  `root`, `human:*`, or `system:*`", deliberately an id without a kind. That
-  decision is what the principal supertype supersedes.
-- `src/mcp/stamp.ts` — `HUMAN_OPERATOR`, `MESH_SYSTEM`, `isHumanOperator` and
-  `isSystemActor` are the prefix tests every other consumer calls.
+## System resources
 
-**Prefix tests on a caller's identity**
-
-- `src/actor/actor-mesh.ts` — human-origin message handling.
-- `src/runtime/event-manager.ts` — the system-author suppression rule in
-  `applyAuthorSuppression`.
-- `src/mcp/agent-exec-mcp.ts` — the human-operator branch on `selfId`.
-- `src/actor/inbox-hints.ts` — human-origin hinting on `fromId`.
-- `src/actor/failure-sink.ts` — `isHumanOperatorCancelled`.
-
-**Writers of the literal**
-
-- `src/dashboard/api.ts` and `src/commands/e2e-actor-mesh.ts` — `creatorId:
-  HUMAN_OPERATOR` on obligation creation.
-- `src/actor/actor-mesh.ts` — `fromId = HUMAN_OPERATOR` for operator-originated
-  messages, and `MESH_SYSTEM` for dropped-delivery notices.
-- `src/actor/actor.ts` — `interrupt(by = "human:operator")` defaults the
-  interrupt's attribution to the literal, so an unattributed interrupt silently
-  becomes an operator-attributed one. A `PrincipalRef` parameter with no default
-  would make the caller say who it was.
-
-**A parallel principal vocabulary**
-
-- `src/actor/root-control.ts` — `RootControlPrincipal` is
-  `"root-llm" | "human:operator" | "e2e-controller"`, a hand-rolled union naming
-  who may drive the root. It is the closest thing in the tree to a typed
-  principal and it overlaps this one only at `human:operator`; the other two are
-  control-plane callers, not identities. Worth folding in deliberately rather
-  than by coincidence of a shared string.
-
-**Readers that compare against it**
-
-- `src/obligations/owner.ts` — `resolveObligationOwner` admits the single
-  canonical operator id or a live actor; this is the one write boundary every
-  owner passes through, and the natural place to accept a `PrincipalRef`.
-- `src/db/repositories/sqlite-actor-repository.ts` — `lastHumanChat` finds the
-  newest chat row whose sender is the operator literal or a user principal; the
-  reply tool reads it on demand, never during record hydration.
-- `src/voice/voice-service.ts` — announcements are gated on the recipient being
-  the operator.
-- `src/commands/chat.ts` — its own local copy of the literal, for the CLI
-  transcript's "you" label.
-
-**Attribution columns holding these ids**
-
-`obligations.owner_id` and `obligations.creator_id`; `mesh_chat.sender_id` and
-`recipient_id`; `mesh_events.actor_id`; `actor_inbox_entries.actor_id`;
-`capability_grants.granted_by`.
-
-**`system:` resource strings that are not principals**
-
-`system:events` is a canonical event-source resource, not an actor or a mesh
-writer identity: `actor/event-subscriptions.ts` normalizes it,
-`commands/start.ts` delivers disk alerts to it, and `mcp/agent-exec-mcp.ts`
-constructs it for system subscriptions. It is persisted as an event-source or
-inbox `source`, never in an attribution column, so it deliberately has no
-`principals` row and `PrincipalRepository.get("system:events")` returns nothing.
-The actual infrastructure attribution identity is `MESH_SYSTEM` (`system:mesh`),
-which the migration seeds. A future source must not become a principal merely
-because its resource key shares the `system:` prefix.
-
-Completing this list is what completes the identity half of authenticated
-multi-user mode. Finishing the storage does not finish it.
+`system:mesh` is the infrastructure attribution principal. `system:events` is an
+event-source resource, not a principal. Resource prefixes do not create identity.

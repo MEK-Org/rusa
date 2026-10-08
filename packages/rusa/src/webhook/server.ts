@@ -393,7 +393,7 @@ export function createDashboardRequestHandler(
         });
         // The viewing user: the authenticated identity, else local mode's
         // sole active durable user, so the client personalizes "my" surfaces
-        // (obligation queue, chat) without assuming the legacy alias (#460).
+        // (obligation queue, chat) with the verified durable identity.
         const userPrincipalId = viewingUserPrincipalId(req, dataDeps?.principals);
         res.end(
           JSON.stringify({
@@ -694,7 +694,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
         }
       : null;
   // Reply-TTS hook: observe the mesh-event emitter for replies to
-  // human:operator and push rendered audio on the `voice` channel.
+  // durable users and push recipient-scoped audio on the `voice` channel.
   const detachVoiceOutbound =
     options.voice && options.mesh && sseHub
       ? attachVoiceOutbound(

@@ -360,14 +360,14 @@ void main() {
       final mockClient = MockClient((req) async {
         expect(req.url.path, '/api/mesh/obligations/ob-owner/reassign');
         expect(req.method, 'POST');
-        expect(jsonDecode(req.body), {'ownerId': 'human:operator'});
+        expect(jsonDecode(req.body), {'ownerId': '00000000-0000-4000-8000-000000000001'});
         return http.Response(
           jsonEncode({
             'ok': true,
             'obligation': {
               'id': 'ob-owner',
               'parentId': null,
-              'ownerId': 'human:operator',
+              'ownerId': '00000000-0000-4000-8000-000000000001',
               'intent': 'Reassigned task',
               'externalRef': null,
               'status': 'ready',
@@ -385,9 +385,9 @@ void main() {
       );
       final result = await api.reassignObligation(
         'ob-owner',
-        ownerId: 'human:operator',
+        ownerId: '00000000-0000-4000-8000-000000000001',
       );
-      expect(result.ownerId, 'human:operator');
+      expect(result.ownerId, '00000000-0000-4000-8000-000000000001');
     });
   });
 
@@ -784,7 +784,7 @@ void main() {
       final done = makeObligation(
         'ob-done-1',
         intent: 'Pick a stack',
-        ownerId: 'human:operator',
+        ownerId: '00000000-0000-4000-8000-000000000001',
         status: 'done',
         terminalNote: 'Flutter — the tooling is already wired here.',
       );
@@ -829,6 +829,7 @@ void main() {
     testWidgets('owner panel labels the category instead of repeating the id', (
       tester,
     ) async {
+      await store.refreshDashboardConfig();
       tester.view.physicalSize = const Size(1280, 900);
       tester.view.devicePixelRatio = 1.0;
       addTearDown(tester.view.resetDevicePixelRatio);
@@ -839,7 +840,7 @@ void main() {
       // says nothing and drops the cue the old `Kind: ACTOR` line carried.
       final operatorOwned = makeObligation(
         'ob-op',
-        ownerId: 'human:operator',
+        ownerId: '00000000-0000-4000-8000-000000000001',
         intent: 'Operator Work',
       );
       final ghostOwned = makeObligation(

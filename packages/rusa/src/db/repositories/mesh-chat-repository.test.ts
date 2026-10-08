@@ -90,7 +90,7 @@ describe("MeshChatRepository.listForSession", () => {
     repo.record({
       id: "a",
       ts: "2026-01-01T00:00:00Z",
-      senderId: "human:operator",
+      senderId: "00000000-0000-4000-8000-000000000001",
       recipientId: "one",
       body: "first",
       sessionId: "walkie",
@@ -98,7 +98,7 @@ describe("MeshChatRepository.listForSession", () => {
     repo.record({
       id: "other",
       ts: "2026-01-01T00:00:01Z",
-      senderId: "human:operator",
+      senderId: "00000000-0000-4000-8000-000000000001",
       recipientId: "other",
       body: "other",
       sessionId: "other",
@@ -107,14 +107,14 @@ describe("MeshChatRepository.listForSession", () => {
       id: "b",
       ts: "2026-01-01T00:00:02Z",
       senderId: "one",
-      recipientId: "human:operator",
+      recipientId: "00000000-0000-4000-8000-000000000001",
       body: "second",
       sessionId: "walkie",
     });
     repo.record({
       id: "c",
       ts: "2026-01-01T00:00:03Z",
-      senderId: "human:operator",
+      senderId: "00000000-0000-4000-8000-000000000001",
       recipientId: "one",
       body: "third",
       sessionId: "walkie",

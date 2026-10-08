@@ -11,7 +11,7 @@ import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { SseHub } from "../dashboard/sse.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+
 import type { Logger } from "../observability/logger.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { createElevenLabsSpeechClient } from "./elevenlabs-speech.js";
@@ -109,7 +109,7 @@ function replyEvent(overrides: Partial<MeshEvent> = {}): MeshEvent {
     actorId: UUID_A,
     detail: "sess",
     body: "short reply",
-    payload: JSON.stringify({ to: HUMAN_OPERATOR }),
+    payload: JSON.stringify({ to: TEST_USER_ID }),
     success: null,
     ...overrides,
   };
@@ -134,6 +134,7 @@ function makeStreamingService(home: string, startNow: number) {
   const listeners = new Set<{ onData: (c: Buffer) => void; onEnd: () => void }>();
 
   const service = new VoiceService({
+    isHumanRecipient: (id) => id === TEST_USER_ID,
     home,
     speech: fakeStreamSpeech(),
     now: () => now,
@@ -201,12 +202,12 @@ describe("handleVoiceApiRequest", () => {
   let service: VoiceService;
   let hub: SseHub;
   let emitter: MeshEventEmitter;
-  let sendHumanMessage: ReturnType<typeof vi.fn>;
+  let sendMessage: ReturnType<typeof vi.fn>;
   let deps: VoiceApiDeps;
   let transcribe: Mock<(audio: Buffer, mimeType: string) => Promise<string>>;
   let now: number;
   /** Local mode's sole active durable user; every memo is attributed to it (#460). */
-  const LOCAL_USER = "11111111-0000-4000-8000-000000000001";
+  const LOCAL_USER = TEST_USER_ID;
   const principals = {
     listUsers: () => [
       { kind: "user", id: LOCAL_USER, email: "op@example.com", createdAt: "2026-01-01T00:00:00Z" },
@@ -231,6 +232,7 @@ describe("handleVoiceApiRequest", () => {
     };
     now = 1_752_700_000_000;
     service = new VoiceService({
+      isHumanRecipient: (id) => id === TEST_USER_ID,
       home,
       speech,
       now: () => now,
@@ -249,11 +251,11 @@ describe("handleVoiceApiRequest", () => {
     });
     emitter = new MeshEventEmitter();
     hub = new SseHub(emitter);
-    sendHumanMessage = vi.fn(() => ({ delivered: true }));
+    sendMessage = vi.fn(() => ({ delivered: true }));
     deps = {
       actors: actors,
       sseHub: hub,
-      mesh: { sendHumanMessage } as unknown as ActorMesh,
+      mesh: { sendMessage } as unknown as ActorMesh,
       service,
       principals,
     };
@@ -296,11 +298,13 @@ describe("handleVoiceApiRequest", () => {
         transcript: "pick up milk on the way home",
         delivered: true,
       });
-      expect(sendHumanMessage).toHaveBeenCalledWith(
+      expect(sendMessage).toHaveBeenCalledWith(
         UUID_A,
         `${VOICE_MEMO_PREFIX}pick up milk on the way home`,
+        LOCAL_USER,
         "sess-9",
-        { fromId: LOCAL_USER }
+        undefined,
+        { voice: true }
       );
       expect(transcribe).toHaveBeenCalledWith(audio, "audio/webm");
       const inbox = readdirSync(join(home, "voice", "inbox"));
@@ -315,7 +319,7 @@ describe("handleVoiceApiRequest", () => {
       });
       await settled(res);
       expect(res.statusCode).toBe(200);
-      const sessionId = sendHumanMessage.mock.calls[0][2];
+      const sessionId = sendMessage.mock.calls[0][3];
       expect(sessionId).toMatch(/^[0-9a-f-]{36}$/);
     });
 
@@ -330,12 +334,12 @@ describe("handleVoiceApiRequest", () => {
       await settled(first.res);
 
       expect(first.res.statusCode).toBe(200);
-      expect(sendHumanMessage.mock.calls[0]?.[2]).toMatch(/^[0-9a-f-]{36}$/);
-      expect(sendHumanMessage.mock.calls[0]?.[2]).not.toBe(sessionId);
+      expect(sendMessage.mock.calls[0]?.[3]).toMatch(/^[0-9a-f-]{36}$/);
+      expect(sendMessage.mock.calls[0]?.[3]).not.toBe(sessionId);
       expect(service.hasActiveSession(UUID_A)).toBe(false);
 
       call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`);
-      expect(service.hasSession(sessionId, UUID_A)).toBe(true);
+      expect(service.hasSession(sessionId, UUID_A, TEST_USER_ID)).toBe(true);
 
       const second = call(
         deps,
@@ -345,16 +349,18 @@ describe("handleVoiceApiRequest", () => {
       );
       await settled(second.res);
       expect(second.res.statusCode).toBe(200);
-      expect(sendHumanMessage.mock.calls[1]).toEqual([
+      expect(sendMessage.mock.calls[1]).toEqual([
         UUID_A,
         `${VOICE_MEMO_PREFIX}pick up milk on the way home`,
+        LOCAL_USER,
         sessionId,
-        { fromId: LOCAL_USER },
+        undefined,
+        { voice: true },
       ]);
     });
 
     it("reports delivered: false for a non-live actor (memo still transcribed)", async () => {
-      sendHumanMessage.mockReturnValue({ delivered: false, status: "active" });
+      sendMessage.mockReturnValue({ delivered: false, status: "active" });
       const { res } = call(deps, "POST", `/api/mesh/actors/${UUID_A}/voice-memo`, {
         body: Buffer.from("x"),
         contentType: "audio/webm",
@@ -389,7 +395,7 @@ describe("handleVoiceApiRequest", () => {
       });
       await settled(res);
       expect(res.statusCode).toBe(400);
-      expect(sendHumanMessage).not.toHaveBeenCalled();
+      expect(sendMessage).not.toHaveBeenCalled();
     });
 
     it("502s a transcription failure — with the audio already saved", async () => {
@@ -405,7 +411,7 @@ describe("handleVoiceApiRequest", () => {
       expect(body.audioSaved).toBe(true);
       expect(body.error).toContain("model unavailable");
       expect(readdirSync(join(home, "voice", "inbox"))).toHaveLength(1);
-      expect(sendHumanMessage).not.toHaveBeenCalled();
+      expect(sendMessage).not.toHaveBeenCalled();
     });
 
     it("502s when ElevenLabs transcription returns empty or whitespace-only text", async () => {
@@ -414,9 +420,9 @@ describe("handleVoiceApiRequest", () => {
         .mockResolvedValue(Response.json({ text: "   \n\t " }));
       const elevenlabsClient = createElevenLabsSpeechClient({ apiKey: "test-key", fetchImpl });
       const voiceService = new VoiceService({
+        isHumanRecipient: (id) => id === TEST_USER_ID,
         home,
         speech: elevenlabsClient,
-        isHumanRecipient: () => true,
       });
       const depsWithEleven = {
         ...deps,
@@ -433,7 +439,7 @@ describe("handleVoiceApiRequest", () => {
       const body = JSON.parse(res.body);
       expect(body.audioSaved).toBe(true);
       expect(body.error).toContain("ElevenLabs STT returned no transcript text");
-      expect(sendHumanMessage).not.toHaveBeenCalled();
+      expect(sendMessage).not.toHaveBeenCalled();
     });
   });
 
@@ -445,20 +451,20 @@ describe("handleVoiceApiRequest", () => {
 
     it("keeps an explicit session through an SSE drop and ends it only on disable", async () => {
       const first = call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-1`);
-      expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
+      expect(service.hasSession("walkie-1", UUID_A, TEST_USER_ID)).toBe(true);
 
       // A healthy EventSource holds authority beyond the reconnect allowance.
       now += VOICE_SESSION_LEASE_MS * 2;
       service.expireSessions();
-      expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
+      expect(service.hasSession("walkie-1", UUID_A, TEST_USER_ID)).toBe(true);
 
       // An EventSource error/reconnect does not release background work.
       first.res.req.emit("close");
       now += VOICE_SESSION_LEASE_MS - 1;
       service.expireSessions();
-      expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
+      expect(service.hasSession("walkie-1", UUID_A, TEST_USER_ID)).toBe(true);
       call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-1`);
-      expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
+      expect(service.hasSession("walkie-1", UUID_A, TEST_USER_ID)).toBe(true);
 
       const { res } = call(deps, "POST", "/api/mesh/voice/session/disable", {
         body: JSON.stringify({ sessionId: "walkie-1" }),
@@ -488,7 +494,7 @@ describe("handleVoiceApiRequest", () => {
       const { res } = call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}`);
       expect(res.statusCode).toBe(200);
       expect(res.headers["Content-Type"]).toContain("text/event-stream");
-      expect(service.hasPresence(UUID_A)).toBe(true);
+      expect(service.hasPresence(UUID_A, TEST_USER_ID)).toBe(true);
 
       emitter.emitMeshEvent(replyEvent());
       await vi.waitFor(() => expect(res.frames()).toHaveLength(1));
@@ -506,7 +512,7 @@ describe("handleVoiceApiRequest", () => {
       actors.upsert(rec("cccccccc-0000-4000-8000-000000000003", "active"));
       const detach = attachVoiceOutbound(emitter, service, hub);
       const { res } = call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}`);
-      service.presenceConnect(["cccccccc-0000-4000-8000-000000000003"]);
+      service.presenceConnect(["cccccccc-0000-4000-8000-000000000003"], TEST_USER_ID);
 
       emitter.emitMeshEvent(replyEvent({ actorId: "cccccccc-0000-4000-8000-000000000003" }));
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -516,18 +522,18 @@ describe("handleVoiceApiRequest", () => {
 
     it("disconnect starts the grace window; replies still render into the backlog", async () => {
       const { res } = call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}`);
-      expect(service.hasPresence(UUID_A)).toBe(true);
+      expect(service.hasPresence(UUID_A, TEST_USER_ID)).toBe(true);
       res.req.emit("close");
 
       // Within grace: still present, reply renders (queued for reconnect).
       now += 60_000;
-      expect(service.hasPresence(UUID_A)).toBe(true);
+      expect(service.hasPresence(UUID_A, TEST_USER_ID)).toBe(true);
       expect(await service.handleMeshEvent(replyEvent())).not.toBeNull();
-      expect(service.backlog(UUID_A)).toHaveLength(1);
+      expect(service.backlog(UUID_A, TEST_USER_ID)).toHaveLength(1);
 
       // Beyond grace: presence expired, nothing renders.
       now += 120_000;
-      expect(service.hasPresence(UUID_A)).toBe(false);
+      expect(service.hasPresence(UUID_A, TEST_USER_ID)).toBe(false);
       expect(await service.handleMeshEvent(replyEvent())).toBeNull();
     });
 
@@ -550,7 +556,7 @@ describe("handleVoiceApiRequest", () => {
 
   describe("audio / backlog / ack", () => {
     async function seedAnnouncement(body = "short reply") {
-      service.presenceConnect([UUID_A]);
+      service.presenceConnect([UUID_A], TEST_USER_ID);
       const announcement = await service.handleMeshEvent(replyEvent({ body }));
       if (!announcement) throw new Error("seed failed");
       return announcement;
@@ -591,6 +597,7 @@ describe("handleVoiceApiRequest", () => {
       };
 
       const testService = new VoiceService({
+        isHumanRecipient: (id) => id === TEST_USER_ID,
         home,
         speech,
         now: () => now,
@@ -626,7 +633,7 @@ describe("handleVoiceApiRequest", () => {
 
       deps.service = testService;
 
-      testService.presenceConnect([UUID_A]);
+      testService.presenceConnect([UUID_A], TEST_USER_ID);
       const announcementPromise = testService.handleMeshEvent(replyEvent({ body: "stream test" }));
       await firstChunkPromise;
 
@@ -651,7 +658,7 @@ describe("handleVoiceApiRequest", () => {
     it("measures first-byte latency from the stream request baseline", async () => {
       const { service: testService, advance } = makeStreamingService(home, 1_000);
       deps.service = testService;
-      testService.presenceConnect([UUID_A]);
+      testService.presenceConnect([UUID_A], TEST_USER_ID);
 
       const announcement = await testService.handleMeshEvent(replyEvent({ body: "latency test" }));
       expect(announcement).not.toBeNull();
@@ -674,7 +681,7 @@ describe("handleVoiceApiRequest", () => {
     it("warns with latencySuspect and null latencyMs when the request baseline is missing", async () => {
       const { service: testService, advance } = makeStreamingService(home, 1_000);
       deps.service = testService;
-      testService.presenceConnect([UUID_A]);
+      testService.presenceConnect([UUID_A], TEST_USER_ID);
 
       const announcement = await testService.handleMeshEvent(replyEvent({ body: "missing base" }));
       expect(announcement).not.toBeNull();
@@ -697,7 +704,7 @@ describe("handleVoiceApiRequest", () => {
     it("warns with latencySuspect when first-byte latency exceeds 60 seconds", async () => {
       const { service: testService, advance } = makeStreamingService(home, 1_000);
       deps.service = testService;
-      testService.presenceConnect([UUID_A]);
+      testService.presenceConnect([UUID_A], TEST_USER_ID);
 
       const announcement = await testService.handleMeshEvent(replyEvent({ body: "slow flush" }));
       expect(announcement).not.toBeNull();
@@ -719,7 +726,7 @@ describe("handleVoiceApiRequest", () => {
     it("re-fetch of the same announcement logs a latency tied to its own flush time", async () => {
       const { service: testService, advance } = makeStreamingService(home, 1_000);
       deps.service = testService;
-      testService.presenceConnect([UUID_A]);
+      testService.presenceConnect([UUID_A], TEST_USER_ID);
 
       const announcement = await testService.handleMeshEvent(replyEvent({ body: "re-fetch test" }));
       expect(announcement).not.toBeNull();
@@ -748,7 +755,7 @@ describe("handleVoiceApiRequest", () => {
       const { service: testService, advance } = makeStreamingService(home, 1_000);
       deps.service = testService;
       delete deps.logger;
-      testService.presenceConnect([UUID_A]);
+      testService.presenceConnect([UUID_A], TEST_USER_ID);
 
       const announcement = await testService.handleMeshEvent(replyEvent({ body: "silent test" }));
       expect(announcement).not.toBeNull();
@@ -773,6 +780,7 @@ describe("handleVoiceApiRequest", () => {
       };
 
       const testService = new VoiceService({
+        isHumanRecipient: (id) => id === TEST_USER_ID,
         home,
         speech,
         now: () => now,
@@ -788,7 +796,7 @@ describe("handleVoiceApiRequest", () => {
       });
 
       deps.service = testService;
-      testService.presenceConnect([UUID_A]);
+      testService.presenceConnect([UUID_A], TEST_USER_ID);
       const announcement = await testService.handleMeshEvent(replyEvent({ body: "fallback" }));
       expect(announcement).not.toBeNull();
 
@@ -897,3 +905,5 @@ describe("handleVoiceApiRequest", () => {
     expect(transcribe).toHaveBeenCalledWith(expect.any(Buffer), "audio/webm");
   });
 });
+
+const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";

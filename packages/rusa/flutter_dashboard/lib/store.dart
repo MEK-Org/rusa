@@ -502,11 +502,10 @@ class DashboardStore {
   /// carries the field, but reading it there too would let the two disagree.
   String? get userPrincipalId => _dashboardConfig.value?.userPrincipalId;
 
-  /// Whether [id] names a human operator — either the legacy alias, any
-  /// `human:*` prefix, or the server-resolved durable user principal.
+  /// Whether [id] is the server-resolved viewing user principal.
   bool isHuman(String? id) => isHumanPrincipal(id, userPrincipalId);
 
-  /// Whether [id] names the viewing person under either of their ids.
+  /// Whether [id] names the viewing person.
   bool isViewer(String? id) => isViewerPrincipal(id, userPrincipalId);
 
   /// Resolves an actor/thread/principal id to a display label.
@@ -521,11 +520,8 @@ class DashboardStore {
   /// dialog), which keep showing the raw id for an actor the mesh view does
   /// not know rather than "Unknown actor" — that fallback predates #538 and
   /// is what the overview's blocker line is pinned to.
-  String ownerLabel(String id) => isViewer(id)
-      ? operatorDisplayLabel
-      : isHuman(id)
-      ? 'Operator'
-      : (actor(id)?.handle ?? id);
+  String ownerLabel(String id) =>
+      isViewer(id) ? operatorDisplayLabel : (actor(id)?.handle ?? id);
 
   void setWalkieActive(bool active) {
     if (!_walkieActive.isClosed) {
@@ -1211,12 +1207,7 @@ class DashboardStore {
     try {
       final selectedId = actors.first;
       final userPrincipalId = _dashboardConfig.value?.userPrincipalId;
-      final chatActors = [
-        selectedId,
-        'human:operator',
-        if (userPrincipalId != null && userPrincipalId != 'human:operator')
-          userPrincipalId,
-      ];
+      final chatActors = [selectedId, ?userPrincipalId];
       final page = await _api.fetchChat(
         actors: chatActors,
         before: reset ? null : cur.cursor,
@@ -1550,10 +1541,8 @@ class DashboardStore {
           final selectedId = sel.first;
           final userPrincipalId = _dashboardConfig.value?.userPrincipalId;
           final isHumanSender =
-              actorId == 'human:operator' ||
               (userPrincipalId != null && actorId == userPrincipalId);
           final isHumanRecipient =
-              recipientId == 'human:operator' ||
               (userPrincipalId != null && recipientId == userPrincipalId);
           if ((actorId == selectedId && isHumanRecipient) ||
               (isHumanSender && recipientId == selectedId)) {

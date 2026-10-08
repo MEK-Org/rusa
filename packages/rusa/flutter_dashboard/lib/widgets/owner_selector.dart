@@ -27,16 +27,14 @@ class OwnerSelector extends StatelessWidget {
         final actors = store.actorStates.value.actors.values
             .where((a) => !a.isRetired)
             .map((a) => OwnerOption(kind: 'actor', id: a.id, handle: a.handle));
-        // The durable user principal when the server resolved one, so a pick
-        // from this list never writes the legacy alias back into a migrated
-        // database; the alias only remains as the id on an instance that has
-        // no durable user yet.
+        // Offer the viewer only once the server has resolved their identity.
         final humans = [
-          OwnerOption(
-            kind: 'human',
-            id: viewerOwnerId(store.dashboardConfig.value?.userPrincipalId),
-            handle: kOperatorDisplayHandle,
-          ),
+          if (store.userPrincipalId != null)
+            OwnerOption(
+              kind: 'human',
+              id: viewerOwnerId(store.dashboardConfig.value?.userPrincipalId),
+              handle: kOperatorDisplayHandle,
+            ),
         ];
         final all = [...humans, ...actors];
         if (text.isEmpty) return all;

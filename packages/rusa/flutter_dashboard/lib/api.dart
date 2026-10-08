@@ -286,7 +286,7 @@ class DashboardApi {
   ///
   /// Sends no `by`: the server binds the acting principal from the request
   /// (authenticated identity, or the sole durable user in local mode), so a
-  /// client-supplied attribution could only be a guess or the legacy alias.
+  /// client-supplied attribution would be an unverified guess.
   Future<void> interruptActor(String actorId) =>
       trackInteraction(DashboardInteraction.actorInterrupt, () async {
         final uri = _u('/api/mesh/actors/$actorId/interrupt');

@@ -214,6 +214,9 @@ Future<void> showCreateObligationDialog(
                               .map((a) => a.id);
                           resolvedId = matches.isNotEmpty ? matches.first : typedText;
                         }
+                        if (resolvedId.isEmpty) {
+                          throw StateError('Viewer identity is not available');
+                        }
 
                         final bodyText = intentCtrl.text.trim();
                         await store.mutateObligations(
@@ -482,6 +485,9 @@ Future<void> showReassignObligationDialog(
                             .where((a) => a.handle == typedText || a.id == typedText)
                             .map((a) => a.id);
                         resolvedId = matches.isNotEmpty ? matches.first : typedText;
+                      }
+                      if (resolvedId.isEmpty) {
+                        throw StateError('Viewer identity is not available');
                       }
 
                       await store.api.reassignObligation(

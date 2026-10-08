@@ -7,7 +7,7 @@ import {
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
-import { HUMAN_OPERATOR, isHumanOperator, MESH_SYSTEM } from "../mcp/stamp.js";
+import { MESH_SYSTEM } from "../mcp/stamp.js";
 import {
   isBlockingObligationStatus,
   isReadyForAttention,
@@ -235,7 +235,7 @@ export interface RetireOptions {
 /** Host-owned live-session operations used by the actor transfer primitive. */
 export interface VoiceSessionTransferPort {
   /** Read the caller's unambiguous active session before any authority moves. */
-  activeSessionIdFor(actorId: string): string;
+  activeSessionFor(actorId: string): { sessionId: string; principalId: string };
   /** Atomically rebind the caller's active session and return its same UUID. */
   transferActiveSession(fromActorId: string, targetActorId: string): string;
   /** Restore a just-rebound session before its durable handoff was accepted. */
@@ -511,8 +511,6 @@ function isTrustedControlPrincipal(
 ): boolean {
   return (
     by === "root-llm" ||
-    by === "human:operator" ||
-    by.startsWith("human:") ||
     by === "e2e-controller" ||
     (principals !== undefined && principals.getUser(by) !== undefined)
   );
@@ -1447,7 +1445,7 @@ export class ActorMesh {
     if (!this.inboxStore) return;
     try {
       for (const { ownerId, headId, responsive } of obligations.readyHeadRecords()) {
-        if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
+        if (ownerId.startsWith("system:")) continue;
         const actorId = this.resolveThreadId(ownerId);
         const record = this.actors.get(actorId);
         if (!record || record.status !== "active") continue;
@@ -2043,7 +2041,7 @@ export class ActorMesh {
    * non-restart state that record cannot show (see {@link isActiveActor}).
    */
   private isWakeableRecipient(ownerId: string): boolean {
-    if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) return false;
+    if (ownerId.startsWith("system:")) return false;
     return this.isActiveActor(this.resolveThreadId(ownerId));
   }
 
@@ -2701,7 +2699,7 @@ export class ActorMesh {
     if (!this.inboxStore) return;
     try {
       for (const obligation of obligations.listResponsiveReadyAttention()) {
-        if (obligation.ownerId.startsWith("human:") || obligation.ownerId.startsWith("system:")) {
+        if (obligation.ownerId.startsWith("system:")) {
           continue;
         }
         const actorId = this.resolveThreadId(obligation.ownerId);
@@ -2773,7 +2771,7 @@ export class ActorMesh {
         dependentOwnerId,
         prerequisiteId,
       } of obligations.listPrerequisiteCancellationAttention()) {
-        if (dependentOwnerId.startsWith("human:") || dependentOwnerId.startsWith("system:")) {
+        if (dependentOwnerId.startsWith("system:")) {
           continue;
         }
         const actorId = this.resolveThreadId(dependentOwnerId);
@@ -2801,7 +2799,7 @@ export class ActorMesh {
     matcherSetAt: string
   ): boolean {
     if (!this.inboxStore) return false;
-    if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) return false;
+    if (ownerId.startsWith("system:")) return false;
     const actorId = this.resolveThreadId(ownerId);
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
@@ -2897,7 +2895,7 @@ export class ActorMesh {
 
     // Read and render before rebinding. If the durable context projection is
     // unavailable, no live authority moves and the caller can retry safely.
-    const sessionId = transfer.activeSessionIdFor(fromActorId);
+    const { sessionId, principalId } = transfer.activeSessionFor(fromActorId);
     const context = renderVoiceTransferContext(
       this.listVoiceSessionChat?.(sessionId) ?? [],
       handoffNote
@@ -2913,6 +2911,7 @@ export class ActorMesh {
             type: "voice.transfer",
             priority: "responsive",
             fromId: fromActorId,
+            principalId,
             sessionId,
             context,
           },
@@ -2976,22 +2975,6 @@ export class ActorMesh {
       });
     }
     return { sessionId, targetActorId: target.id };
-  }
-
-  /**
-   * The currently leased voice session for an actor, if this host has one.
-   * This is intentionally lease-scoped rather than an actor-row capability:
-   * a recipient of a transfer may reply during the live handoff without
-   * permanently gaining direct-human authority.
-   */
-  activeVoiceSessionIdFor(actorId: string): string | undefined {
-    const transfer = this.voiceSessionTransfer;
-    if (!transfer) return undefined;
-    try {
-      return transfer.activeSessionIdFor(this.resolveThreadId(actorId));
-    } catch {
-      return undefined;
-    }
   }
 
   /** Resolve an active live actor from the caller's own handle set. */
@@ -3175,10 +3158,7 @@ export class ActorMesh {
    * that it is no longer live.
    */
   private introduceMessageSender(toId: string, fromId: string): void {
-    if (
-      isHumanOperator(fromId) ||
-      (this.principals !== undefined && this.principals.getUser(fromId) !== undefined)
-    ) {
+    if (this.principals !== undefined && this.principals.getUser(fromId) !== undefined) {
       return;
     }
     const recipient = this.actors.get(toId);
@@ -4023,25 +4003,31 @@ export class ActorMesh {
   }
 
   /**
-   * Deliver a message to a thread's inbox. Actor→actor only; the human↔root edge
-   * is handled by the wiring (chat/webhook), not here. Async by design.
+   * One delivery path for every mesh principal. Authentication binds human
+   * senders at ingress; actor tools bind their sender to the calling actor.
+   * Agents receive durable inbox attention; users receive durable chat/events.
    */
   sendMessage(
     toId: string,
     body: string,
     fromId: string,
     sessionId?: string,
-    deliverAt?: string
+    deliverAt?: string,
+    options: { voice?: boolean } = {}
   ): MessageDeliveryResult {
     toId = this.resolveThreadId(toId);
     fromId = this.resolveThreadId(fromId);
-    if (
-      isHumanOperator(fromId) ||
-      (this.principals !== undefined && this.principals.getUser(fromId) !== undefined)
-    ) {
-      throw new Error(
-        "Invalid sender ID: actor-facing send path structurally cannot claim human origin"
-      );
+    const humanSender = this.principals?.getUser(fromId);
+    if (humanSender?.disabledAt) throw new Error("Message sender is disabled");
+
+    const humanRecipient = this.principals?.getUser(toId);
+    if (humanRecipient) {
+      if (humanRecipient.disabledAt) throw new Error("Message recipient is disabled");
+      if (deliverAt) throw new Error("Scheduled delivery requires an agent recipient");
+      if (!this.recordMessageEmitted({ fromId, toId, body, sessionId, isDrop: false })) {
+        throw new Error("User message delivery requires durable chat storage");
+      }
+      return { delivered: true };
     }
 
     if (fromId === toId && !deliverAt) {
@@ -4128,7 +4114,13 @@ export class ActorMesh {
         {
           actorId: toId,
           source: `mesh:${fromId}`,
-          payload: { type: "mesh.message", messageId, fromId, sessionId },
+          payload: {
+            type: options.voice ? VOICE_INBOX_PAYLOAD_TYPE : "mesh.message",
+            ...(humanSender ? { priority: "responsive" as const } : {}),
+            messageId,
+            fromId,
+            sessionId,
+          },
         },
       ]);
       this.introduceMessageSender(toId, fromId);
@@ -4184,57 +4176,6 @@ export class ActorMesh {
     if (inserted.length === 0) return { delivered: true };
     if (delivery.responsive) this.dispatchJoiningActiveRun(toId);
     else this.dispatch(toId);
-    return { delivered: true };
-  }
-
-  /**
-   * Deliver a message to a thread's inbox originating from a human operator.
-   * Stamped only at the dashboard API ingress.
-   */
-  sendHumanMessage(
-    toId: string,
-    body: string,
-    sessionId: string,
-    opts?: { voice?: boolean; fromId?: string }
-  ): MessageDeliveryResult {
-    toId = this.resolveThreadId(toId);
-    const fromId = opts?.fromId ?? HUMAN_OPERATOR;
-    const rec = this.actors.get(toId);
-    if (!rec || rec.status !== "active") {
-      this.log(`message to ${toId} from ${fromId} dropped — recipient not active`);
-      return { delivered: false, status: rec?.status };
-    }
-    this.actors.noteHumanChat(toId, { sessionId, principalId: fromId });
-    const target = this.runs.liveActor(toId);
-    const messageId = this.recordMessageEmitted({
-      fromId,
-      toId,
-      body,
-      sessionId,
-      isDrop: !target,
-    });
-    if (!target) {
-      this.log(`message to ${toId} from ${fromId} dropped — no live actor`);
-      return { delivered: false, status: this.actors.get(toId)?.status };
-    }
-    const isVoice = opts?.voice || body.startsWith("🎙️ [voice memo");
-    if (this.inboxStore) {
-      if (!messageId) throw new Error("Human message delivery requires durable chat storage");
-      this.inboxStore.append([
-        {
-          actorId: toId,
-          source: `mesh:${fromId}`,
-          payload: {
-            type: isVoice ? VOICE_INBOX_PAYLOAD_TYPE : "human.message",
-            priority: "responsive",
-            messageId,
-            fromId,
-            sessionId,
-          },
-        },
-      ]);
-    }
-    this.dispatch(toId);
     return { delivered: true };
   }
 
@@ -4418,10 +4359,7 @@ export class ActorMesh {
    * interrupted run's start time, and only schedules a re-run if newer unhandled inbox
    * items have arrived after the interrupted run started.
    */
-  interrupt(
-    targetId: string,
-    by: string = "human:operator"
-  ): { interrupted: boolean; status?: string } {
+  interrupt(targetId: string, by: string): { interrupted: boolean; status?: string } {
     targetId = this.resolveThreadId(targetId);
     by = this.resolveThreadId(by);
     const target = this.runs.liveActor(targetId);

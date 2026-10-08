@@ -27,7 +27,6 @@ import {
 } from "../db/repositories/obligation-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import type { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import {
   type Obligation,
   type ObligationStatus,
@@ -35,10 +34,7 @@ import {
 } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
-import {
-  resolveLegacyOperatorAlias,
-  resolveSoleActiveUser,
-} from "../principals/operator-principal.js";
+import { resolveSoleActiveUser } from "../principals/operator-principal.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import {
   type ResolvedReference,
@@ -765,9 +761,8 @@ function parseKinds(url: URL): string[] | undefined {
  * The durable principal a dashboard mutation is attributed to. An
  * authenticated session carries its verified identity. In auth-disabled local
  * mode the process boundary is the trust boundary. A sole active durable user
- * remains attributable after #460; when no active durable user exists, local
- * actions retain the legacy `human:operator` identity rather than becoming
- * unusable. Several active users are still refused rather than guessed at.
+ * is required. Local startup bootstraps one when no user exists. Missing or
+ * ambiguous identities are refused rather than guessed at.
  */
 export function resolveOperatorPrincipalId(
   req: IncomingMessage,
@@ -777,7 +772,6 @@ export function resolveOperatorPrincipalId(
   if (reqPrincipal) return { ok: true, principalId: reqPrincipal.id as RootControlPrincipal };
   const sole = resolveSoleActiveUser(deps?.principals);
   if (sole.ok) return { ok: true, principalId: sole.user.id as RootControlPrincipal };
-  if (sole.reason === "none") return { ok: true, principalId: HUMAN_OPERATOR };
   return { ok: false, error: sole.error };
 }
 
@@ -798,33 +792,20 @@ export function requireOperatorPrincipal(
 
 /**
  * The participant set a `/api/mesh/chat` query may read (#590). The viewer's
- * own ids (durable principal plus the legacy alias while it still names them)
- * are always part of the set, as #469 did for an authenticated viewer, so a
- * two-actor query still reads the viewer's side with each of them. A human id
- * in the request is the client asking for "the human side", and the only
- * human side a viewer may read is their own: the request's human ids are
- * replaced by the viewer's, so the same query reads correctly whether the
- * client sent `human:operator`, the viewer's id, or both. Naming another
- * human principal is refused rather than silently narrowed — a direct API
- * caller asking for someone else's conversation gets told no, not an answer
- * that looks complete. The legacy `human:operator` alias is never "another
- * human": the shipped client always sends it, so it stands for the viewer
- * while it still resolves to them and is simply dropped once several durable
- * users make it nobody's. A viewer who cannot be identified (auth-disabled
- * local mode with several users) has no human side at all and reads only
- * actor↔actor rows, the same silent narrowing the events feed and the live
- * stream apply; the write path is where that misconfiguration is reported.
+ * durable id is always included, so an actor selection reads the viewer's
+ * conversation with each actor. Other users and unknown participants are
+ * refused. An unidentified viewer reads only known actor↔actor traffic.
  */
 export function resolveChatQueryActors(
   actors: string[],
   scope: HumanChatScope
 ): { ok: true; actors: string[] } | { ok: false; error: string } {
-  const other = actors.find((id) => id !== HUMAN_OPERATOR && !scope.canSee(id));
+  const other = actors.find((id) => !scope.canSee(id));
   if (other !== undefined) {
     return { ok: false, error: "cannot read another human principal's conversation" };
   }
   const mine = scope.viewerIds;
-  const result = new Set(actors.filter((id) => id !== HUMAN_OPERATOR && !mine.has(id)));
+  const result = new Set(actors.filter((id) => !mine.has(id)));
   for (const id of mine) result.add(id);
   return { ok: true, actors: [...result] };
 }
@@ -1121,7 +1102,9 @@ export async function handleMeshApiRequest(
 
           const fromId = requireOperatorPrincipal(req, res, deps);
           if (!fromId) return;
-          const result = deps.mesh.sendHumanMessage(actorId, body, sessionId, { voice, fromId });
+          const result = deps.mesh.sendMessage(actorId, body, fromId, sessionId, undefined, {
+            voice,
+          });
           if (result.delivered) {
             sendJson(res, 200, { ok: true });
           } else {
@@ -1561,13 +1544,7 @@ export async function handleMeshApiRequest(
           }
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
-          // A row still owned by the legacy operator alias belongs to whoever
-          // that alias resolves to now, the same reading every owner write uses.
-          const owner = resolveLegacyOperatorAlias(existing.ownerId, deps?.principals);
-          if (
-            existing.ownerId !== actingPrincipal &&
-            !(owner.ok && owner.ownerId === actingPrincipal)
-          ) {
+          if (existing.ownerId !== actingPrincipal) {
             sendJson(res, 403, {
               error: "only the obligation's current owner may snooze or unsnooze it",
             });

@@ -75,8 +75,16 @@ describe("CompletionMatcherEvaluator", () => {
     });
 
   it("completes a late-set merged PR matcher through the shared evaluator", async () => {
-    repository.create({ id: "matched", title: "matched", ownerId: "human:operator" });
-    repository.setCompletionMatcher("matched", { kind: "pr_merged", pr }, "human:operator");
+    repository.create({
+      id: "matched",
+      title: "matched",
+      ownerId: "00000000-0000-4000-8000-000000000001",
+    });
+    repository.setCompletionMatcher(
+      "matched",
+      { kind: "pr_merged", pr },
+      "00000000-0000-4000-8000-000000000001"
+    );
 
     await expect(evaluator({ state: "closed", merged: true }).evaluate("matched")).resolves.toBe(
       "satisfied"

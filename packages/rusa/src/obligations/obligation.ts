@@ -12,14 +12,7 @@ export const OBLIGATION_STATUSES = ["ready", "waiting", "done", "cancelled", "sc
 export type ObligationStatus = (typeof OBLIGATION_STATUSES)[number];
 
 /**
- * One entity in the mesh's single id space: an actor UUID, `root`, `human:*`,
- * or `system:*`.
- *
- * Deliberately an id alone, not an id plus a `kind`. `mcp/stamp.ts` already
- * mints `human:operator` / `system:mesh` into the
- * same space actor ids live in, and `isHumanOperator(actorId)` reads the
- * category off the prefix — so a stored kind would restate what the id already
- * says, and could drift from it.
+ * A principal's id. Its kind comes from principal storage, not its spelling.
  */
 export type EntityId = string;
 

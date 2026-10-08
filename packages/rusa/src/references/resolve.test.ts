@@ -194,7 +194,7 @@ describe("resolveReference — mesh", () => {
     const getById = vi.fn().mockReturnValue({
       id: "m1",
       senderId: "actor-1",
-      recipientId: "human:operator",
+      recipientId: "00000000-0000-4000-8000-000000000001",
       body: "hello",
       ts: "2026-09-01T00:00:00Z",
     });
@@ -203,7 +203,7 @@ describe("resolveReference — mesh", () => {
     expect(resolved.entity).toEqual({
       type: "mesh_message",
       senderId: "actor-1",
-      recipientId: "human:operator",
+      recipientId: "00000000-0000-4000-8000-000000000001",
     });
     // author still carries the raw id — callers resolve it to a handle themselves.
     expect(resolved.author).toBe("actor-1");
