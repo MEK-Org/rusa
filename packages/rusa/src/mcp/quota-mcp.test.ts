@@ -2874,9 +2874,115 @@ describe("quota MCP server", () => {
             extracted: c.extracted,
           }))
         );
+        // Every case but the clean read extracted no quota value, so its scrape
+        // outcome is failed (#982); only the capture failure has a parse_error.
         expect(store.listScrapeOutcomesSince("claude", baselineAt).map((s) => s.outcome)).toEqual([
           "parsed",
-          ...cases.map((c) => (c.parseError ? "failed" : "parsed")),
+          ...cases.map((c) => (c.name === "clean read" ? "parsed" : "failed")),
+        ]);
+      });
+    });
+
+    describe("agy read with no quota values (#982)", () => {
+      // A good read, then two scheduled scrapes that each captured only the
+      // startup screen behind the model-announcement banner.
+      const goodAt = "2026-10-09T16:25:00.000Z";
+      const firstBadAt = "2026-10-09T17:25:00.000Z";
+      const secondBadAt = "2026-10-09T17:55:00.000Z";
+      const good: ProviderQuotaSnapshot = {
+        provider: "agy",
+        status: "available",
+        scrapedAt: goodAt,
+        limits: [
+          {
+            label: "Weekly Limit",
+            kind: "weekly",
+            percentLeft: 71.18,
+            resetAtIso: "2026-10-12T00:00:00.000Z",
+          },
+          {
+            label: "Five Hour Limit",
+            kind: "five_hour",
+            percentLeft: 40,
+            // Expires between the two bad reads.
+            resetAtIso: "2026-10-09T17:37:59.000Z",
+          },
+        ],
+      };
+      const bannerCapture = readFileSync(
+        join(__dirname, "..", "providers", "fixtures", "agy-usage-banner.txt"),
+        "utf-8"
+      );
+
+      let root: string;
+      let store: SharedQuotaStore;
+      beforeEach(() => {
+        mockGenerateContent.mockReset();
+        root = mkdtempSync(join(tmpdir(), "rusa-982-"));
+        store = new SharedQuotaStore(join(root, "shared.db"));
+        store.recordParsed(
+          store.recordRaw({ provider: "agy", scrapedAt: goodAt, rawOutput: "" }),
+          good,
+          good
+        );
+      });
+      afterEach(() => {
+        store.close();
+        rmSync(root, { recursive: true, force: true });
+      });
+
+      it("reports the missed window as a failed scrape while carry-forward is unchanged", async () => {
+        mockGenerateContent.mockResolvedValue({
+          text: () => JSON.stringify({ status: "unknown", windows: [] }),
+        });
+        let nowIso = firstBadAt;
+        const service = new QuotaService({
+          config: { ...mockConfig, geminiApiKey: "test-gemini-key" } as RusaConfig,
+          workersDir: root,
+          scrapeAgyUsage: vi.fn().mockResolvedValue(bannerCapture),
+          scrapeStore: store,
+          now: () => Date.parse(nowIso),
+          ttlMs: 0,
+        });
+        service.hydrate("agy", good);
+        const detector = new MissedQuotaWindowDetector();
+        const observe = () =>
+          detector.observe(
+            "agy",
+            store.listHistorySince("agy", goodAt),
+            store.listScrapeOutcomesSince("agy", goodAt)
+          );
+        expect(observe()).toEqual([]);
+
+        // Both windows are carried over the first bad read, so nothing is missed.
+        const first = await service.getQuotaProbeOutcome("agy");
+        expect(first.readFailed).toBe(true);
+        expect(first.state?.limits?.map((l) => [l.label, l.percentLeft])).toEqual([
+          ["Weekly Limit", 71.18],
+          ["Five Hour Limit", 40],
+        ]);
+        expect(first.state?.explanations?.map((e) => e.rule)).toEqual([
+          "carried_forward_bad_read",
+          "carried_forward_bad_read",
+        ]);
+        expect(observe()).toEqual([]);
+
+        // The five-hour window has expired by the second bad read: only the
+        // weekly is carried, and the alert names the read as failed.
+        nowIso = secondBadAt;
+        const second = await service.getQuotaProbeOutcome("agy");
+        expect(second.state?.limits?.map((l) => l.label)).toEqual(["Weekly Limit"]);
+        expect(observe()).toEqual([
+          expect.objectContaining({
+            lane: "provider:five_hour",
+            missedAt: secondBadAt,
+            scrapeFailed: true,
+          }),
+        ]);
+        expect(store.listScrapeOutcomesSince("agy", goodAt)).toEqual([
+          { observedAt: goodAt, outcome: "parsed" },
+          { observedAt: firstBadAt, outcome: "failed" },
+          { observedAt: secondBadAt, outcome: "failed" },
         ]);
       });
     });

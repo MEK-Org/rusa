@@ -40,9 +40,53 @@ export interface ScrapeAgyUsageOptions {
   cliCommand?: string;
 }
 
+/** Poll budgets for the script's two waits (test seam; the defaults suit a real agy boot). */
+export interface AgyTmuxScriptTiming {
+  /** Polls for the input-ready prompt. */
+  readyTries: number;
+  /** Polls for the quota panel after `/usage`. */
+  panelTries: number;
+  /** Seconds between polls. */
+  pollSecs: number;
+}
+
+const DEFAULT_TIMING: AgyTmuxScriptTiming = { readyTries: 80, panelTries: 60, pollSecs: 0.6 };
+
+// Readiness terms for the Models & Quota view, shared by the shell wait below
+// and the TypeScript predicate so the two cannot drift. Each is a POSIX ERE
+// that reads the same as a JavaScript RegExp. The view's header alone is not
+// evidence: the "New Models Available" banner and the loading placeholder both
+// render before any figure does, and the old case-insensitive match on the
+// header words fired on the banner and captured a frame with no quota in it.
+/** A row naming one of the view's quota windows (case-sensitive). */
+const QUOTA_ROW = "Weekly Limit|Five Hour Limit|Limit Remaining";
+/** A value printed for a window: a percentage, or the view's full/exhausted wording. */
+const QUOTA_VALUE = "[0-9]%|Quota available|hit your weekly limit";
+/** The view's placeholder while it fetches (case-insensitive). */
+const QUOTA_LOADING = "loading quota";
+/** agy's model-announcement banner, which can sit over the prompt at startup. */
+const MODELS_BANNER = "New Models Available";
+
+/**
+ * Whether a captured pane shows quota data: a window row and a value, and no
+ * loading placeholder. Only then is the pane worth capturing.
+ */
+export function isAgyQuotaPanelReady(screen: string): boolean {
+  return (
+    new RegExp(QUOTA_ROW).test(screen) &&
+    new RegExp(QUOTA_VALUE).test(screen) &&
+    !new RegExp(QUOTA_LOADING, "i").test(screen)
+  );
+}
+
 /** tmux orchestration: launch agy, open /usage, capture the Models & Quota view. */
-function buildTmuxScript(cliCommand: string, sockPath: string): string {
+export function buildTmuxScript(
+  cliCommand: string,
+  sockPath: string,
+  timing: AgyTmuxScriptTiming = DEFAULT_TIMING
+): string {
   const q = JSON.stringify;
+  const t = timing;
   return [
     "set -u",
     `SOCK=${q(sockPath)}`,
@@ -66,12 +110,12 @@ function buildTmuxScript(cliCommand: string, sockPath: string): string {
     // ~/.gemini, NOT auth — within the auth-safety bound. The probe reuses a
     // stable actorDir, so the gate typically appears only on the very first scrape.
     "consec=0",
-    "for i in $(seq 1 80); do",
+    `for i in $(seq 1 ${t.readyTries}); do`,
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
     '  if printf "%s" "$scr" | grep -qiE "do you trust|trust this folder|trust the contents"; then',
     '    tmux -S "$SOCK" send-keys -t "$S" Enter',
     "    consec=0",
-    "    sleep 0.6",
+    `    sleep ${t.pollSecs}`,
     "    continue",
     "  fi",
     '  if printf "%s" "$scr" | grep -qiE "signing in|not signed in|welcome to the antigravity"; then',
@@ -82,17 +126,29 @@ function buildTmuxScript(cliCommand: string, sockPath: string): string {
     "  else",
     "    consec=0",
     "  fi",
-    "  sleep 0.6",
+    `  sleep ${t.pollSecs}`,
     "done",
+    // The model-announcement banner says "esc to dismiss"; clear it first so
+    // it can't sit over the prompt. Grep-gated like the trust gate: Escape is
+    // sent only when the banner is actually up.
+    'scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
+    `if printf "%s" "$scr" | grep -qF ${q(MODELS_BANNER)}; then`,
+    '  tmux -S "$SOCK" send-keys -t "$S" Escape',
+    `  sleep ${t.pollSecs}`,
+    "fi",
     // Open the read-only usage view now that the prompt is settled.
     'tmux -S "$SOCK" send-keys -t "$S" "/usage"',
     "sleep 1",
     'tmux -S "$SOCK" send-keys -t "$S" Enter',
-    // Wait up to ~36s for the Models & Quota view to render.
-    "for i in $(seq 1 60); do",
+    // Wait up to ~36s for quota data to render (isAgyQuotaPanelReady). On a
+    // timeout the last frame is still captured; with no figure in it the read
+    // is reported as failed downstream.
+    `for i in $(seq 1 ${t.panelTries}); do`,
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
-    '  printf "%s" "$scr" | grep -qiE "Models & Quota|Weekly Limit|Quota available|MODELS" && break',
-    "  sleep 0.6",
+    `  printf "%s" "$scr" | grep -qE ${q(QUOTA_ROW)} \\`,
+    `    && printf "%s" "$scr" | grep -qE ${q(QUOTA_VALUE)} \\`,
+    `    && ! printf "%s" "$scr" | grep -qiE ${q(QUOTA_LOADING)} && break`,
+    `  sleep ${t.pollSecs}`,
     "done",
     'tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true',
     // Close the view (Escape) then tear the session down.
