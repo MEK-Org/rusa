@@ -28,6 +28,34 @@ const VALID_INFERENCE_RULES = new Set([
   "carried_forward_bad_read",
 ]);
 
+/**
+ * The `carried_forward_bad_read` detail on a window carried over a read that
+ * extracted no window at all, as opposed to one that only lacked a reset.
+ */
+export const WHOLE_BAD_READ_CARRY_DETAIL =
+  "carried forward previous unexpired window assessment after bad read";
+
+/**
+ * Whether a parsed snapshot came from a read where every window was carried
+ * over from an earlier read after a bad read (#982). Its scrape counts as
+ * failed, so an expired carried window is reported as a failed scrape rather
+ * than a window that stopped showing.
+ */
+export function extractedNoQuotaValues(snapshot: ProviderQuotaSnapshot): boolean {
+  const limits = snapshot.limits ?? [];
+  return (
+    limits.length > 0 &&
+    limits.every((limit) =>
+      snapshot.explanations?.some(
+        (e) =>
+          e.window === limit.label &&
+          e.rule === "carried_forward_bad_read" &&
+          e.detail === WHOLE_BAD_READ_CARRY_DETAIL
+      )
+    )
+  );
+}
+
 function isValidScope(raw: unknown, provider: string): boolean {
   if (raw === undefined || raw === null) return true;
   if (typeof raw !== "object" || Array.isArray(raw)) return false;
