@@ -248,8 +248,10 @@ void main() {
     'at short viewport height, toggling walkie ON preserves the controller '
     'and switches to full-screen layout and stays',
     (tester) async {
-      await tester.binding.setSurfaceSize(const Size(800, 400));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+      tester.view.physicalSize = const Size(800, 400);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
 
       await selectActor(tester);
 

@@ -379,6 +379,7 @@ void main() {
     final ready = store.init().then((_) => initialized = true);
     await pumpEventQueue();
     expect(initialized, isFalse);
+    expect(api.threadsCallCount, 0);
 
     config.complete(
       const DashboardConfigDto(

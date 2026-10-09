@@ -44,16 +44,14 @@ class _OverviewTabState extends State<OverviewTab> {
 
   Future<Map<String, dynamic>> _loadHumanQueue() async {
     final api = widget.store.api;
-    final config = await widget.store.dashboardConfig
-        .whereType<DashboardConfigDto>()
-        .first;
+    final ownerId = widget.store.userPrincipalId;
     const queues = ['ready', 'waiting', 'scheduled'];
     // One page per section rather than carving sections out of a shared
     // page: otherwise one section's rows could exhaust the page limit and
     // silently drop another section's rows.
     final results = await Future.wait([
       for (final queue in queues)
-        api.fetchObligations(ownerId: config.userPrincipalId, queue: queue),
+        api.fetchObligations(ownerId: ownerId, queue: queue),
     ]);
     if (!mounted) {
       throw StateError('Overview queue load superseded or unmounted');

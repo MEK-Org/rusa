@@ -114,7 +114,7 @@ class _DashboardPageState extends State<DashboardPage> {
                         ),
                         TextButton(
                           onPressed: () => setState(() {
-                            _ready = _store.refreshDashboardConfig();
+                            _ready = _store.init();
                           }),
                           child: const Text('Retry'),
                         ),

@@ -564,9 +564,10 @@ class DashboardStore {
     }
   }
 
-  /// Open the SSE stream FIRST (so events during the initial fetch are captured
-  /// and de-duped), then load threads and resolve the viewer before returning.
+  /// Resolve the viewer, then open SSE before fetching threads so events during
+  /// the initial snapshot are captured and de-duped.
   Future<void> init() async {
+    await refreshDashboardConfig();
     _subs.add(_stream.meshEvents.listen(_onMeshEvent));
     _subs.add(_stream.liveOutput.listen(_onLiveOutput));
     _subs.add(_stream.elided.listen((_) => _onElided()));
@@ -600,7 +601,6 @@ class DashboardStore {
       _kQuotaPollInterval,
       (_) => unawaited(refreshQuota()),
     );
-    await refreshDashboardConfig();
   }
 
   Future<void> refreshDashboardConfig() async {
@@ -1200,10 +1200,7 @@ class DashboardStore {
     _operatorChat.add(cur.copyWith(loading: true));
     try {
       final selectedId = actors.first;
-      final config = await dashboardConfig
-          .whereType<DashboardConfigDto>()
-          .first;
-      final chatActors = [selectedId, config.userPrincipalId];
+      final chatActors = [selectedId, userPrincipalId];
       final page = await _api.fetchChat(
         actors: chatActors,
         before: reset ? null : cur.cursor,
