@@ -66,6 +66,7 @@ describe("runQuotaMigrations", () => {
       // The baseline is the store's former inline schema code, so running it
       // alone reproduces a database written before `_migrations` existed.
       coordinatorSchemaV3.up(db);
+      db.pragma("user_version = 3");
       db.prepare(
         `INSERT INTO quota_scrapes (id, provider, scraped_at, raw_output, parse_error)
          VALUES ('existing', 'codex', '2030-01-01T00:00:00.000Z', 'synthetic', 'synthetic failure')`

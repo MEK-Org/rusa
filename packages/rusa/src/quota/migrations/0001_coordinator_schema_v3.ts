@@ -3,12 +3,12 @@ import type { Migration } from "../../db/migrations/types.js";
 
 /**
  * The quota coordinator schema as it stood at `user_version` 3, before this
- * migration registry existed (#536). The runner stamps the version. Every quota.db in use was created and
+ * migration registry existed (#536). Every quota.db in use was created and
  * upgraded by the store's inline schema code, so this baseline is that code
  * moved here unchanged. Unlike the mesh.db baseline it is not assumed to be
  * applied when tables already exist: each step is idempotent, so it brings a
  * database at any earlier version up to 3 and leaves a version-3 database
- * exactly as it was.
+ * exactly as it was. The runner stamps the version.
  *
  * Version 2 added the durable per-provider reading-mode fence and the manual
  * observation receipts; version 3 moved `model_scope` into the observation key
