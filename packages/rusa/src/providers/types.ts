@@ -117,6 +117,12 @@ export interface RunResult {
    * Observability only; callers must not use it to choose or mutate providers.
    */
   tokenUsage?: RunTokenUsage;
+  /**
+   * Fixed-text sign-in status read from a failed Antigravity run's own log (#971).
+   * Diagnostic only: it is kept out of `output`, so exhaustion classification never
+   * sees it, and only the failure notice renders it. In memory only, never persisted.
+   */
+  signInDiagnostic?: string;
 }
 
 /**

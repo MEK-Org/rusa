@@ -14,6 +14,7 @@ vi.mock("../understanding/gemini-utils.js", () => ({
 }));
 
 import { classifyRunExhaustion, deterministicExhaustionFallback } from "./exhaustion-classifier.js";
+import type { RunResult } from "./types.js";
 
 describe("exhaustion classifier", () => {
   beforeEach(() => {
@@ -142,6 +143,27 @@ describe("exhaustion classifier", () => {
     expect(sent).toContain("[scrubbed]");
     // ...but the exhaustion signal the classifier needs must survive.
     expect(sent).toContain("session limit");
+  });
+
+  it("sends the same classifier input whether or not a run carries a sign-in diagnostic", async () => {
+    gemini.generateContent.mockResolvedValue({ text: '{"exhausted":false}' });
+    const failed: RunResult = {
+      success: false,
+      output: "Error: invalid model selection: --effort is not supported for model",
+      exitCode: 1,
+    };
+
+    await classifyRunExhaustion(failed, "gemini-key");
+    await classifyRunExhaustion(
+      { ...failed, signInDiagnostic: "[agy run log: silent sign-in failed]" },
+      "gemini-key"
+    );
+
+    const [without, withDiagnostic] = gemini.generateContent.mock.calls.map(
+      ([request]) => request.contents as string
+    );
+    expect(withDiagnostic).toBe(without);
+    expect(withDiagnostic).not.toContain("agy run log");
   });
 
   it("degrades to the deterministic exhaustion matcher when the LLM classifier fails", async () => {

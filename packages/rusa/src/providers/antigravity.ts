@@ -816,12 +816,12 @@ export class AntigravityProvider implements CodingProvider {
         }
         return withTokenUsage({
           success: exitCode === 0,
-          output:
-            exitCode !== 0 && logFile
-              ? `${effectiveOutput}\n${describeAgyAuthOutcome(runLog)}`
-              : effectiveOutput,
+          output: effectiveOutput,
           exitCode,
           sessionId,
+          ...(exitCode !== 0 && logFile
+            ? { signInDiagnostic: describeAgyAuthOutcome(runLog) }
+            : {}),
         });
       },
       buildSpawnErrorResult: (err) =>

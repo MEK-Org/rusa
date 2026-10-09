@@ -3,7 +3,7 @@
   "issue": 971,
   "sources": {
     "before": "2105acfb366b85e254ffd33ebcc7820613926bdf (staging) packages/rusa/src/providers/antigravity.ts",
-    "after": "a92d5e9f2446b89e2ef0f2dde2a9396bbb4bd07f packages/rusa/src/providers/antigravity.ts",
+    "after": "a92d5e9f2446b89e2ef0f2dde2a9396bbb4bd07f packages/rusa/src/providers/antigravity.ts; re-rendered after the line moved from output to the signInDiagnostic result field, with byte-identical notices and PNG hashes",
     "route": "routeRunFailure (packages/rusa/src/actor/failure-sink.ts) with the deterministic exhaustion classifier",
     "renderer": "unchanged InboxTab at a92d5e9f"
   },

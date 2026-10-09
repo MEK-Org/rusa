@@ -231,7 +231,10 @@ export async function routeRunFailure(
   const exitDesc = result.abortReason
     ? `exit ${result.exitCode}, ${result.abortReason}`
     : `exit ${result.exitCode}`;
-  const summary = `(${exitDesc})${tail ? `\n\n${tail}` : ""}`;
+  // A provider's fixed diagnostic is appended after the output tail and outside its
+  // length budget, so it never displaces the cause and never reaches the classifier.
+  const details = [tail, result.signInDiagnostic].filter(Boolean).join("\n");
+  const summary = `(${exitDesc})${details ? `\n\n${details}` : ""}`;
 
   let leadLine: string | undefined;
   if (deps.classify) {

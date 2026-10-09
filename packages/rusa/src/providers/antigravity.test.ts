@@ -25,6 +25,7 @@ import {
   RUN_CEILING_ABORT_REASON,
   STALL_WATCHDOG_ABORT_REASON,
 } from "./termination-attribution.js";
+import type { RunResult } from "./types.js";
 
 // Synthetic agy run-log lines. Healthy runs log the first two at startup and then
 // sign in silently, so they cannot distinguish a failed launch on their own.
@@ -881,7 +882,7 @@ describe("AntigravityProvider", () => {
     async function runFailedLaunch(
       logLines: string[] | "missing" | "unreadable",
       decoyLogLines?: string[]
-    ): Promise<{ output: string; success: boolean; exitCode: number | null }> {
+    ): Promise<Pick<RunResult, "output" | "success" | "exitCode" | "signInDiagnostic">> {
       const config: ProviderConfig = { cliCommand: "agy" };
       const cwd = mkdtempSync(join(tmpdir(), "mc-agy-auth-"));
       const provider = new AntigravityProvider("antigravity", config, "Gemini 3.1 Pro (High)");
@@ -900,13 +901,18 @@ describe("AntigravityProvider", () => {
         child.stdout.emit("data", `${AGY_UNSUPPORTED_EFFORT}\n`);
         child.emit("close", 1);
         const result = await runPromise;
-        return { output: result.output, success: result.success, exitCode: result.exitCode };
+        return {
+          output: result.output,
+          success: result.success,
+          exitCode: result.exitCode,
+          signInDiagnostic: result.signInDiagnostic,
+        };
       } finally {
         rmSync(cwd, { recursive: true, force: true });
       }
     }
 
-    it("appends a failed silent sign-in from the run's own log and keeps the cause", async () => {
+    it("reports a failed silent sign-in from the run's own log beside an unchanged output", async () => {
       const result = await runFailedLaunch(
         [
           ...AGY_STARTUP_NOT_LOGGED_IN,
@@ -920,7 +926,9 @@ describe("AntigravityProvider", () => {
       expect(result).toEqual({
         success: false,
         exitCode: 1,
-        output: `${AGY_UNSUPPORTED_EFFORT}\n[agy run log: silent sign-in failed]`,
+        // The output, which exhaustion classification reads, is exactly the CLI's cause.
+        output: AGY_UNSUPPORTED_EFFORT,
+        signInDiagnostic: "[agy run log: silent sign-in failed]",
       });
     });
 
@@ -938,19 +946,22 @@ describe("AntigravityProvider", () => {
       expect(result).toEqual({
         success: false,
         exitCode: 1,
-        output: `${AGY_UNSUPPORTED_EFFORT}\n[agy run log: silent sign-in succeeded]`,
+        output: AGY_UNSUPPORTED_EFFORT,
+        signInDiagnostic: "[agy run log: silent sign-in succeeded]",
       });
       expect(deterministicExhaustionFallback(result.output)).toBe("unknown");
     });
 
     it("tells a never-written run log from an unreadable one without dropping the cause", async () => {
       const missing = await runFailedLaunch("missing");
-      expect(missing.output).toBe(`${AGY_UNSUPPORTED_EFFORT}\n[agy run log: no run log written]`);
+      expect(missing.output).toBe(AGY_UNSUPPORTED_EFFORT);
+      expect(missing.signInDiagnostic).toBe("[agy run log: no run log written]");
       expect(missing.success).toBe(false);
 
       // A directory at the log path makes the read fail with EISDIR, not ENOENT.
       const unreadable = await runFailedLaunch("unreadable");
-      expect(unreadable.output).toBe(`${AGY_UNSUPPORTED_EFFORT}\n[agy run log: unreadable]`);
+      expect(unreadable.output).toBe(AGY_UNSUPPORTED_EFFORT);
+      expect(unreadable.signInDiagnostic).toBe("[agy run log: unreadable]");
       expect(unreadable.success).toBe(false);
     });
 
