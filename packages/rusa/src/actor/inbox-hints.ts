@@ -1,4 +1,5 @@
 import { isHumanOperator } from "../mcp/stamp.js";
+import { ROOM_HUMAN_ENTRY_PAYLOAD_TYPE } from "../repositories/inbox-interruption.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import type { ChatContextWindow } from "./inbox-chat-context.js";
 import type { InboxOpenQuestions } from "./inbox-open-questions.js";
@@ -50,6 +51,12 @@ export function isGchatThreadHead(messageName?: string, threadName?: string): bo
 export function resolveInboxHint(entry: InboxEntry): string | undefined {
   const { source, payload } = entry;
   const fromId = typeof payload.fromId === "string" ? payload.fromId : undefined;
+
+  if (payload.type === ROOM_HUMAN_ENTRY_PAYLOAD_TYPE) {
+    const principal = typeof payload.principalId === "string" ? payload.principalId : "a human";
+    const enteredAt = typeof payload.enteredAt === "string" ? ` at ${payload.enteredAt}` : "";
+    return `A Room entry notice records that the human ${principal} entered the Chat Room${enteredAt}. This is a notice, not a message from them: it asks nothing and completes no obligation. Do not greet them or send an entry reply: your reply tool answers your most recent human conversation, which may not be this Room. When nothing useful remains, mark this entry handled with an honest note; staying silent is fine.`;
+  }
 
   // Voice needs its own contract before the general human-message branch:
   // speech is lossy and silence reads as a dropped conversation.
