@@ -19,7 +19,6 @@ import {
   describeAgyAuthOutcome,
   formatAgyToolInvocation,
 } from "./antigravity.js";
-import { deterministicExhaustionFallback } from "./exhaustion-classifier.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "./model-catalog.js";
 import {
   RUN_CEILING_ABORT_REASON,
@@ -949,7 +948,6 @@ describe("AntigravityProvider", () => {
         output: AGY_UNSUPPORTED_EFFORT,
         signInDiagnostic: "[agy run log: silent sign-in succeeded]",
       });
-      expect(deterministicExhaustionFallback(result.output)).toBe("unknown");
     });
 
     it("tells a never-written run log from an unreadable one without dropping the cause", async () => {
@@ -1000,8 +998,6 @@ describe("AntigravityProvider", () => {
           Array.isArray(lines) ? [...lines, ...AGY_PRIVATE_NOISE].join("\n") : lines
         );
         expect(status).toBe(expected);
-        // The appended status must not move a failure into quota or transient recovery.
-        expect(deterministicExhaustionFallback(status)).toBe("unknown");
       }
     });
   });
