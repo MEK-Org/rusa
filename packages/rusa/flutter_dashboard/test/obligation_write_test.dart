@@ -12,11 +12,127 @@ import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/inbox_tab.dart';
 import 'package:rusa_dashboard/widgets/obligation_card.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
+import 'package:rusa_dashboard/widgets/overview_tab.dart';
+import 'package:rusa_dashboard/widgets/obligation_dialogs.dart';
 
 import 'fakes.dart';
 
 void main() {
+  testWidgets(
+    'creating from My Queue attributes the obligation to the durable principal',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: 'viewer-user',
+            users: [
+              UserPrincipalDto(id: 'viewer-user', email: 'viewer@example.test'),
+            ],
+          );
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
+
+        await tester.binding.setSurfaceSize(const Size(1200, 900));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(body: OverviewTab(store: store)),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        await tester.tap(find.text('New Obligation'));
+        await tester.pumpAndSettle();
+
+        // Default ownership uses the authenticated principal directly.
+        expect(find.text('viewer-user'), findsOneWidget);
+        await tester.enterText(
+          find.widgetWithText(TextFormField, 'e.g. Game Type'),
+          'Decide the cutover date',
+        );
+        await tester.tap(find.widgetWithText(ElevatedButton, 'Create'));
+        await tester.pumpAndSettle();
+
+        expect(api.createObligationCalls.single.ownerId, 'viewer-user');
+      });
+    },
+  );
+
+  testWidgets('reassigns work to another selected human principal', (
+    tester,
+  ) async {
+    final api = FakeApi()
+      ..dashboardConfigResult = const DashboardConfigDto(
+        quotaProviders: {},
+        userPrincipalId: 'viewer-user',
+        users: [
+          UserPrincipalDto(id: 'viewer-user', email: 'viewer@example.test'),
+          UserPrincipalDto(
+            id: 'colleague-user',
+            email: 'colleague@example.test',
+          ),
+        ],
+      );
+    final store = DashboardStore(
+      api: api,
+      stream: FakeStream(),
+      operatorDisplayName: 'Ada',
+    );
+    await store.refreshDashboardConfig();
+    addTearDown(store.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Builder(
+            builder: (context) => TextButton(
+              onPressed: () => showReassignObligationDialog(
+                context,
+                store,
+                makeObligation('ob-1'),
+              ),
+              child: const Text('open'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.arrow_drop_down));
+    await tester.pumpAndSettle();
+    expect(find.text('Ada'), findsOneWidget);
+    await tester.tap(find.text('colleague@example.test'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Reassign'));
+    await tester.pumpAndSettle();
+
+    expect(api.reassignCalls.single.ownerId, 'colleague-user');
+    expect(store.ownerLabel('colleague-user'), 'colleague@example.test');
+    expect(store.isHuman('colleague-user'), isTrue);
+  });
+
   group('DashboardApi Obligation Write Methods', () {
+    test('interruptActor sends no client-chosen acting principal', () async {
+      Map<String, dynamic>? sentBody;
+      final client = MockClient((req) async {
+        expect(req.url.path, '/api/mesh/actors/actor-1/interrupt');
+        sentBody = jsonDecode(req.body) as Map<String, dynamic>;
+        return http.Response(jsonEncode({'ok': true}), 200);
+      });
+      final api = DashboardApi(
+        client: client,
+        base: Uri.parse('http://localhost:3000'),
+      );
+
+      await api.interruptActor('actor-1');
+
+      // The server binds the acting principal.
+      expect(sentBody, isEmpty);
+    });
     test('reparentActor sends the root-control request', () async {
       final mockClient = MockClient((req) async {
         expect(req.url.path, '/api/mesh/actors/worker/reparent');
@@ -395,7 +511,7 @@ void main() {
     late FakeApi api;
     late DashboardStore store;
 
-    setUp(() {
+    setUp(() async {
       api = FakeApi();
       final stream = FakeStream();
       store = DashboardStore(
@@ -404,6 +520,7 @@ void main() {
         quotaCache: FakeQuotaCache(),
         treePreferencesCache: FakeTreePreferencesCache(),
       );
+      await store.refreshDashboardConfig();
     });
 
     testWidgets(
@@ -1348,7 +1465,7 @@ void main() {
     late FakeApi api;
     late DashboardStore store;
 
-    setUp(() {
+    setUp(() async {
       api = FakeApi();
       final stream = FakeStream();
       store = DashboardStore(
@@ -1357,6 +1474,7 @@ void main() {
         quotaCache: FakeQuotaCache(),
         treePreferencesCache: FakeTreePreferencesCache(),
       );
+      await store.refreshDashboardConfig();
     });
 
     testWidgets('renders ready obligations with reorder controls and actions', (

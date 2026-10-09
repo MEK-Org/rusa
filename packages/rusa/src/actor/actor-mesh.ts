@@ -134,7 +134,7 @@ export interface MeshActor {
   rescheduleQueuedRun?(): boolean;
   resumeCancelledRun?(): boolean;
   preemptForResponsive(): { preempted: false } | { preempted: true; phase: "running" | "queued" };
-  interrupt?(by?: string): { interrupted: boolean; runStartTime?: Date; wasQueued?: boolean };
+  interrupt?(by: string): { interrupted: boolean; runStartTime?: Date; wasQueued?: boolean };
   getInterruptedWatermark?(): Date | null;
   clearInterruptWatermark?(): void;
   setModelConfig?(modelConfig: ProviderModelConfig[]): void;

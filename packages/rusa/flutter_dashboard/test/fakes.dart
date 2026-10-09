@@ -415,6 +415,12 @@ class FakeApi extends DashboardApi {
         const DashboardConfigDto(
           quotaProviders: {},
           userPrincipalId: testUserPrincipalId,
+          users: [
+            UserPrincipalDto(
+              id: testUserPrincipalId,
+              email: 'viewer@example.test',
+            ),
+          ],
         );
   }
 

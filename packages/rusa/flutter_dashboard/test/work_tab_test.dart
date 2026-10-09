@@ -1784,7 +1784,7 @@ void main() {
           stream: FakeStream(),
           obligationsCache: cache,
         );
-        await store.init();
+        final ready = store.init();
 
         await tester.pumpWidget(
           MaterialApp(
@@ -1802,6 +1802,7 @@ void main() {
             userPrincipalId: 'user-bob',
           ),
         );
+        await ready;
         await pumpEventQueue();
         await tester.pump();
 

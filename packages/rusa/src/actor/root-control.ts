@@ -49,7 +49,7 @@ export interface RootControlMesh {
   grantHandle(holderId: string, handle: ActorHandle): void;
   isAncestorOf(ancestorId: string, id: string): boolean;
   retire(id: string, opts?: { force?: boolean; forceQueued?: boolean }): void;
-  interrupt(id: string, by?: string): { interrupted: boolean; status?: string };
+  interrupt(id: string, by: string): { interrupted: boolean; status?: string };
   runNow(id: string, source?: string): { queued: boolean };
   reparentThread(id: string, newParentId: string): void;
   recordEvent(event: {

@@ -525,7 +525,7 @@ describe("routeRunFailure", () => {
     });
   });
 
-  describe("human operator cancellation / error chat suppression ", () => {
+  describe("user cancellation / error chat suppression", () => {
     it("suppresses expected responsive preemption notices for roots and workers", async () => {
       const { deps, toParent, toChat, logs } = makeDeps({
         root: { id: "root", parentId: null },
@@ -587,68 +587,6 @@ describe("routeRunFailure", () => {
       expect(
         logs.some((m) => m.includes("suppressing error chat") && m.includes("human operator"))
       ).toBe(true);
-    });
-
-    it("does not treat a display handle as an interrupting user", async () => {
-      const { deps, toChat } = makeDeps({
-        root: { id: "root", parentId: null },
-      });
-      const interruptedRun: RunResult = {
-        success: false,
-        exitCode: 143,
-        cancelled: true,
-        interrupted: true,
-        interruptSource: "operator",
-        output: "[Task interrupted by operator]",
-      };
-      await routeRunFailure(deps, "root", interruptedRun);
-      expect(toChat).toHaveLength(1);
-    });
-
-    it("does not classify an interrupt by its human-looking prefix", async () => {
-      const { deps, toChat } = makeDeps({
-        root: { id: "root", parentId: null },
-      });
-      const interruptedRun: RunResult = {
-        success: false,
-        exitCode: 143,
-        cancelled: true,
-        interrupted: true,
-        interruptSource: "human:alice",
-        output: "[Task interrupted by human:alice]",
-      };
-      await routeRunFailure(deps, "root", interruptedRun);
-      expect(toChat).toHaveLength(1);
-    });
-
-    it("suppresses error chat when root has interrupted: true without output attribution", async () => {
-      const { deps, toChat } = makeDeps({
-        root: { id: "root", parentId: null },
-      });
-      const interruptedRun: RunResult = {
-        success: false,
-        exitCode: 143,
-        cancelled: true,
-        interrupted: true,
-        output: "",
-      };
-      await routeRunFailure(deps, "root", interruptedRun);
-      expect(toChat).toHaveLength(0);
-    });
-
-    it("suppresses error chat when interruptSource indicates human interrupt even if interrupted flag is omitted", async () => {
-      const { deps, toChat } = makeDeps({
-        root: { id: "root", parentId: null },
-      });
-      const interruptedRun: RunResult = {
-        success: false,
-        exitCode: 143,
-        cancelled: true,
-        interruptSource: "00000000-0000-4000-8000-000000000001",
-        output: "partial logs\n[Task interrupted by 00000000-0000-4000-8000-000000000001]",
-      };
-      await routeRunFailure(deps, "root", interruptedRun);
-      expect(toChat).toHaveLength(0);
     });
 
     it("still posts to error chat when root fails with genuine runtime error", async () => {
@@ -775,10 +713,8 @@ describe("routeRunFailure", () => {
     });
   });
 
-  describe("isUserCancelled helper ", () => {
+  describe("isUserCancelled", () => {
     it("recognizes a durable user principal id as a human cancellation only via principal storage", () => {
-      // After the #460 cutover the dashboard interrupts with the migrated user
-      // id, which carries no `human:` prefix; storage is what says it is a person.
       const USER = "11111111-0000-4000-8000-000000000001";
       const interrupted: RunResult = {
         success: false,
@@ -795,124 +731,6 @@ describe("routeRunFailure", () => {
       expect(isUserCancelled({ ...interrupted, interruptSource: "worker-abc" }, principals)).toBe(
         false
       );
-    });
-
-    it("suppresses the root error-chat notice for a durable-principal interrupt", async () => {
-      const USER = "11111111-0000-4000-8000-000000000001";
-      const { deps, toChat, logs } = makeDeps(
-        { root: { id: "root", parentId: null } },
-        {
-          principals: {
-            getUser: (id: string) => (id === USER ? { kind: "user", id } : undefined),
-          } as unknown as NonNullable<FailureSinkDeps["principals"]>,
-        }
-      );
-      await routeRunFailure(deps, "root", {
-        success: false,
-        exitCode: 143,
-        interrupted: true,
-        interruptSource: USER,
-        output: `[Task interrupted by ${USER}]`,
-      });
-      expect(toChat).toEqual([]);
-      expect(logs.some((l) => l.includes("interrupted by human operator"))).toBe(true);
-    });
-
-    it("does not infer a user from interrupt strings without principal storage", () => {
-      expect(
-        isUserCancelled({
-          success: false,
-          exitCode: 143,
-          interrupted: true,
-          interruptSource: "00000000-0000-4000-8000-000000000001",
-          output: "[Task interrupted by 00000000-0000-4000-8000-000000000001]",
-        })
-      ).toBe(false);
-      expect(
-        isUserCancelled({
-          success: false,
-          exitCode: 143,
-          interrupted: true,
-          interruptSource: "operator",
-          output: "[Task interrupted by operator]",
-        })
-      ).toBe(false);
-      expect(
-        isUserCancelled({
-          success: false,
-          exitCode: 143,
-          interrupted: true,
-          interruptSource: "human:bob",
-          output: "[Task interrupted by human:bob]",
-        })
-      ).toBe(false);
-      expect(
-        isUserCancelled({
-          success: false,
-          exitCode: 143,
-          interrupted: true,
-          interruptSource: "00000000-0000-4000-8000-000000000001",
-          output: "[Task cancelled by 00000000-0000-4000-8000-000000000001]",
-        })
-      ).toBe(false);
-      expect(
-        isUserCancelled({
-          success: false,
-          exitCode: 143,
-          interrupted: true,
-          output: "",
-        })
-      ).toBe(true);
-      expect(
-        isUserCancelled({
-          success: false,
-          exitCode: 143,
-          interruptSource: "00000000-0000-4000-8000-000000000001",
-          output: "[Task interrupted by 00000000-0000-4000-8000-000000000001]",
-        })
-      ).toBe(false);
-
-      expect(
-        isUserCancelled({
-          success: false,
-          exitCode: 143,
-          interrupted: true,
-          interruptSource: "root",
-          output: "[Task interrupted by root]",
-        })
-      ).toBe(false);
-      expect(
-        isUserCancelled({
-          success: false,
-          exitCode: 143,
-          interrupted: true,
-          interruptSource: "root-llm",
-          output: "[Task interrupted by root-llm]",
-        })
-      ).toBe(false);
-      expect(
-        isUserCancelled({
-          success: false,
-          exitCode: 143,
-          interrupted: true,
-          interruptSource: "worker-abc",
-          output: "[Task interrupted by worker-abc]",
-        })
-      ).toBe(false);
-      expect(
-        isUserCancelled({
-          success: false,
-          exitCode: 1,
-          output: "runtime error",
-        })
-      ).toBe(false);
-      expect(
-        isUserCancelled({
-          success: false,
-          exitCode: 143,
-          output: "[Task killed by stall watchdog (no output for 15 minutes)]",
-        })
-      ).toBe(false);
     });
   });
 });

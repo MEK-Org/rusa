@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import '../principals.dart';
 import '../store.dart';
 import '../theme.dart';
 import 'avatar.dart';
@@ -21,21 +20,15 @@ class OwnerSelector extends StatelessWidget {
   Widget build(BuildContext context) {
     return Autocomplete<OwnerOption>(
       initialValue: TextEditingValue(text: ownerIdCtrl.text),
-      displayStringForOption: (option) => option.display,
+      displayStringForOption: (option) => option.id,
       optionsBuilder: (textEditingValue) {
         final text = textEditingValue.text.toLowerCase();
         final actors = store.actorStates.value.actors.values
             .where((a) => !a.isRetired)
             .map((a) => OwnerOption(kind: 'actor', id: a.id, handle: a.handle));
-        // Offer the viewer only once the server has resolved their identity.
-        final humans = [
-          if (store.userPrincipalId != null)
-            OwnerOption(
-              kind: 'human',
-              id: viewerOwnerId(store.dashboardConfig.value?.userPrincipalId),
-              handle: kOperatorDisplayHandle,
-            ),
-        ];
+        final humans = store.dashboardConfig.value!.users.map((user) =>
+          OwnerOption(kind: 'human', id: user.id, handle: store.ownerLabel(user.id)),
+        );
         final all = [...humans, ...actors];
         if (text.isEmpty) return all;
         return all.where((opt) => opt.handle.toLowerCase().contains(text) || opt.id.toLowerCase().contains(text));
@@ -91,6 +84,7 @@ class OwnerSelector extends StatelessWidget {
                         ? const Icon(Icons.person, color: MeshColors.textSecondary, size: 24)
                         : ActorAvatar(id: option.id, size: 24, store: store),
                     title: Text(option.handle, style: const TextStyle(color: MeshColors.textPrimary)),
+                    subtitle: Text(option.id, style: const TextStyle(color: MeshColors.textMuted, fontSize: 11)),
                     onTap: () => onSelected(option),
                   );
                 },

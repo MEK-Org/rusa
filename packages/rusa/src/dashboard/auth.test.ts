@@ -173,6 +173,35 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     return cookie.split(";")[0];
   }
 
+  it("returns the session's viewer and active user choices without private identity metadata", async () => {
+    const cookie = await login();
+    const viewer = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });
+    const colleague = principals.createUser({
+      email: "colleague@example.com",
+      createdAt: new Date(now).toISOString(),
+    });
+    const disabled = principals.createUser({
+      email: "disabled@example.com",
+      createdAt: new Date(now).toISOString(),
+    });
+    principals.setDisabled(disabled.id, new Date(now).toISOString());
+
+    const response = await fetch(`${origin}/api/dashboard/config`, { headers: { Cookie: cookie } });
+    expect(response.status).toBe(200);
+    const data = (await response.json()) as {
+      userPrincipalId: string;
+      users: { id: string; email: string }[];
+    };
+    expect(data.userPrincipalId).toBe(viewer?.id);
+    expect(data.users).toHaveLength(2);
+    expect(data.users).toEqual(
+      expect.arrayContaining([
+        { id: viewer?.id, email: "owner@example.com" },
+        { id: colleague.id, email: colleague.email },
+      ])
+    );
+  });
+
   it("requires a verified durable principal for authenticated dashboard mutations (#509)", async () => {
     const missingPrincipal = await post("/api/mesh/actors/actor/interrupt");
     expect(missingPrincipal.status).toBe(401);
@@ -867,7 +896,10 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
   });
 
   it("preserves unauthenticated mode when auth is absent", async () => {
-    const local = createServer(createDashboardRequestHandler({ port: 0 }));
+    principals.ensureImplicitUser(new Date(now).toISOString());
+    const local = createServer(
+      createDashboardRequestHandler({ port: 0 }, { principals } as DashboardDataDeps)
+    );
     await new Promise<void>((resolve) => local.listen(0, "127.0.0.1", resolve));
     try {
       const base = `http://127.0.0.1:${(local.address() as AddressInfo).port}`;

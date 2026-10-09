@@ -24,6 +24,61 @@ Widget _app(
 );
 
 void main() {
+  testWidgets('My Queue lists only work owned by the durable viewer', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..threadsResult = [makeThread('root')]
+        ..dashboardConfigResult = const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: 'viewer-user',
+          users: [
+            UserPrincipalDto(id: 'viewer-user', email: 'viewer@example.test'),
+          ],
+        )
+        ..obligationsResult = [
+          makeObligation(
+            'ob-viewer',
+            ownerId: 'viewer-user',
+            intent: 'My decision',
+            status: 'ready',
+          ),
+          makeObligation(
+            'ob-other-user',
+            ownerId: testUserPrincipalId,
+            intent: 'Another user decision',
+            status: 'ready',
+          ),
+          makeObligation(
+            'ob-actor',
+            ownerId: 'worker-1',
+            intent: 'Actor job',
+            status: 'ready',
+          ),
+        ];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      addTearDown(store.dispose);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: OverviewTab(store: store)),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+
+      expect(api.fetchObligationsCalls.map((c) => c.ownerId).toSet(), <String>{
+        'viewer-user',
+      });
+      expect(find.text('My decision'), findsOneWidget);
+      expect(find.text('Another user decision'), findsNothing);
+      expect(find.text('Actor job'), findsNothing);
+      expect(find.text('1 obligation'), findsOneWidget);
+    });
+  });
+
   testWidgets(
     'Overview uses columns wide and stacks My Queue above quota pacing narrow',
     (tester) async {

@@ -12,6 +12,7 @@ void main() {
     final walkie = FakeWalkie(api);
     final store = DashboardStore(api: api, stream: stream, walkie: walkie.deps);
 
+    await store.refreshDashboardConfig();
     await store.refreshThreads();
     store.clickActor('a');
     

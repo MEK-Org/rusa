@@ -369,15 +369,27 @@ void main() {
     });
   });
 
-  test('init loads dashboard quota provider config', () async {
+  test('init waits for the verified viewer and dashboard choices', () async {
+    final config = Completer<DashboardConfigDto>();
     final api = FakeApi()
       ..threadsResult = [makeThread('root', created: 't0')]
-      ..dashboardConfigResult = const DashboardConfigDto(
+      ..dashboardConfigGate = config;
+    final store = DashboardStore(api: api, stream: FakeStream());
+    var initialized = false;
+    final ready = store.init().then((_) => initialized = true);
+    await pumpEventQueue();
+    expect(initialized, isFalse);
+
+    config.complete(
+      const DashboardConfigDto(
+        userPrincipalId: testUserPrincipalId,
         quotaProviders: {
           'claude': QuotaProviderConfigDto(primaryWindow: 'session'),
         },
-      );
-    final store = await _booted(api, FakeStream());
+      ),
+    );
+    await ready;
+    expect(store.userPrincipalId, testUserPrincipalId);
 
     expect(
       store.dashboardConfig.value?.quotaProviders['claude']?.primaryWindow,

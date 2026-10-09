@@ -344,13 +344,7 @@ export function isUserCancelled(
   result: RunResult,
   principals?: Pick<PrincipalRepository, "getUser">
 ): boolean {
-  if (result.interruptSource) {
-    return principals?.getUser(result.interruptSource) !== undefined;
-  }
-  if (result.interrupted) {
-    return true;
-  }
-  return false;
+  return Boolean(result.interruptSource && principals?.getUser(result.interruptSource));
 }
 
 function routeMechanicalFailureNotice(

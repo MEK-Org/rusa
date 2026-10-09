@@ -5,7 +5,6 @@ import 'package:rxdart/rxdart.dart';
 import '../breakpoints.dart';
 import '../dashboard_timing.dart';
 import '../models.dart';
-import '../principals.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../util.dart';
@@ -43,45 +42,25 @@ class _OverviewTabState extends State<OverviewTab> {
   /// between snapshots; idle while nothing is queued.
   Timer? _startLabelTick;
 
-  /// The server-resolved durable viewer identity, once available.
-  List<String> get _viewerOwnerIds =>
-      viewerPrincipalIds(widget.store.dashboardConfig.value?.userPrincipalId);
-
-  String get _newObligationOwnerId =>
-      viewerOwnerId(widget.store.dashboardConfig.value?.userPrincipalId);
-
   Future<Map<String, dynamic>> _loadHumanQueue() async {
     final api = widget.store.api;
-    final ownerIds = _viewerOwnerIds;
+    final config = await widget.store.dashboardConfig
+        .whereType<DashboardConfigDto>()
+        .first;
     const queues = ['ready', 'waiting', 'scheduled'];
     // One page per section rather than carving sections out of a shared
     // page: otherwise one section's rows could exhaust the page limit and
     // silently drop another section's rows.
     final results = await Future.wait([
       for (final queue in queues)
-        for (final ownerId in ownerIds)
-          api.fetchObligations(ownerId: ownerId, queue: queue),
+        api.fetchObligations(ownerId: config.userPrincipalId, queue: queue),
     ]);
     if (!mounted) {
       throw StateError('Overview queue load superseded or unmounted');
     }
-    // One obligation has one owner, but the two ids are queried separately,
-    // so dedupe by id rather than trusting the pages to be disjoint.
-    List<ObligationDto> merge(Iterable<ObligationPage> pages) {
-      final byId = <String, ObligationDto>{};
-      for (final page in pages) {
-        for (final o in page.obligations) {
-          byId.putIfAbsent(o.id, () => o);
-        }
-      }
-      return byId.values.toList();
-    }
-
-    List<ObligationDto> section(int i) =>
-        merge(results.skip(i * ownerIds.length).take(ownerIds.length));
-    final ready = section(0);
-    final waiting = section(1);
-    final scheduled = section(2)
+    final ready = results[0].obligations;
+    final waiting = results[1].obligations;
+    final scheduled = results[2].obligations
       ..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
     final blockers = await Future.wait(
       waiting.map((o) => api.fetchObligationDetail(o.id)),
@@ -117,10 +96,7 @@ class _OverviewTabState extends State<OverviewTab> {
             _loadHumanQueue,
           )
         : _loadHumanQueue();
-    // The dashboard config — and with it the durable user principal — is
-    // fetched after init returns, so this first load can only have asked for
-    // the alias. Re-ask once the server names the viewing principal, or a
-    // migrated instance would show an empty queue until a manual refresh.
+    // Refresh if the server-resolved viewing principal changes.
     _viewerPrincipalSub = widget.store.dashboardConfig
         .map((c) => c?.userPrincipalId)
         .distinct()
@@ -313,7 +289,7 @@ class _OverviewTabState extends State<OverviewTab> {
                     onPressed: () => showCreateObligationDialog(
                       context,
                       widget.store,
-                      defaultOwnerId: _newObligationOwnerId,
+                      defaultOwnerId: widget.store.userPrincipalId,
                       onCreated: _refreshHumanQueue,
                     ),
                     icon: const Icon(Icons.add, size: 14),
@@ -347,7 +323,7 @@ class _OverviewTabState extends State<OverviewTab> {
                     onPressed: () => showCreateObligationDialog(
                       context,
                       widget.store,
-                      defaultOwnerId: _newObligationOwnerId,
+                      defaultOwnerId: widget.store.userPrincipalId,
                       onCreated: _refreshHumanQueue,
                     ),
                   ),
@@ -457,7 +433,8 @@ class _OverviewTabState extends State<OverviewTab> {
                                   onPressed: () => showCreateObligationDialog(
                                     context,
                                     widget.store,
-                                    defaultOwnerId: _newObligationOwnerId,
+                                    defaultOwnerId:
+                                        widget.store.userPrincipalId,
                                     onCreated: _refreshHumanQueue,
                                   ),
                                   icon: const Icon(Icons.add, size: 14),
@@ -495,7 +472,8 @@ class _OverviewTabState extends State<OverviewTab> {
                                   onPressed: () => showCreateObligationDialog(
                                     context,
                                     widget.store,
-                                    defaultOwnerId: _newObligationOwnerId,
+                                    defaultOwnerId:
+                                        widget.store.userPrincipalId,
                                     onCreated: _refreshHumanQueue,
                                   ),
                                   icon: const Icon(Icons.add, size: 14),

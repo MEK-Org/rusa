@@ -55,6 +55,7 @@ class DashboardPage extends StatefulWidget {
 class _DashboardPageState extends State<DashboardPage> {
   late final DashboardApi _api;
   late final DashboardStore _store;
+  late Future<void> _ready;
 
   @override
   void initState() {
@@ -72,7 +73,7 @@ class _DashboardPageState extends State<DashboardPage> {
       avatarFilePicker: WebAvatarFilePicker(),
     );
     // Opens the SSE stream before the initial /threads fetch (seam-safe).
-    _store.init();
+    _ready = _store.init();
   }
 
   @override
@@ -94,15 +95,45 @@ class _DashboardPageState extends State<DashboardPage> {
           // web-only glass-goals imports and renders headlessly in the
           // screenshot harness.
           Expanded(
-            child: DashboardBody(
-              onLogout: widget.session.authenticationEnabled
-                  ? () => unawaited(widget.session.signOut())
-                  : null,
-              onNavigation: widget.session.visit,
-              profilePhotoUrl: widget.session.profilePhotoUrl,
-              store: _store,
-              understandingBuilder: (_) => IuTreeBody(session: widget.session),
-              reportsBuilder: (_) => IuReportsBody(store: _store),
+            child: FutureBuilder<void>(
+              future: _ready,
+              builder: (context, snapshot) {
+                if (snapshot.connectionState != ConnectionState.done) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                if (snapshot.hasError) {
+                  return Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          '${snapshot.error}',
+                          style: const TextStyle(
+                            color: MeshColors.textSecondary,
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () => setState(() {
+                            _ready = _store.refreshDashboardConfig();
+                          }),
+                          child: const Text('Retry'),
+                        ),
+                      ],
+                    ),
+                  );
+                }
+                return DashboardBody(
+                  onLogout: widget.session.authenticationEnabled
+                      ? () => unawaited(widget.session.signOut())
+                      : null,
+                  onNavigation: widget.session.visit,
+                  profilePhotoUrl: widget.session.profilePhotoUrl,
+                  store: _store,
+                  understandingBuilder: (_) =>
+                      IuTreeBody(session: widget.session),
+                  reportsBuilder: (_) => IuReportsBody(store: _store),
+                );
+              },
             ),
           ),
           AnimatedBuilder(

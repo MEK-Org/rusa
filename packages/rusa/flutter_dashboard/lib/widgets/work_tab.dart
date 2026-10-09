@@ -295,10 +295,8 @@ class _WorkTabState extends State<WorkTab> {
     _checkpointSub = widget.store.obligationRefreshes.listen((_) {
       _handleMutation();
     });
-    // Owner/creator labels read the viewing principal off the dashboard
-    // config, which lands after init returns; a tree drawn before then would
-    // name the person "Unknown actor" until something else rebuilt it (#538).
-    // When the principal switches, re-seed or clear the tree accordingly (#505).
+    // When the viewing principal changes, refresh labels and re-seed or clear
+    // the cached tree for that principal.
     _principalSub = widget.store.dashboardConfig
         .map((c) => c?.userPrincipalId)
         .distinct()
