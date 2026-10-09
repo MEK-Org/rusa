@@ -19,8 +19,9 @@ class OwnerSelector extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Autocomplete<OwnerOption>(
-      initialValue: TextEditingValue(text: ownerIdCtrl.text),
-      displayStringForOption: (option) => option.id,
+      initialValue: TextEditingValue(text: store.ownerLabel(ownerIdCtrl.text)),
+      displayStringForOption: (option) => option.handle,
+      onSelected: (option) => ownerIdCtrl.text = option.id,
       optionsBuilder: (textEditingValue) {
         final text = textEditingValue.text.toLowerCase();
         final actors = store.actorStates.value.actors.values
@@ -34,18 +35,10 @@ class OwnerSelector extends StatelessWidget {
         return all.where((opt) => opt.handle.toLowerCase().contains(text) || opt.id.toLowerCase().contains(text));
       },
       fieldViewBuilder: (context, textEditingController, focusNode, onFieldSubmitted) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (ownerIdCtrl.text != textEditingController.text) {
-            ownerIdCtrl.text = textEditingController.text;
-          }
-        });
-        textEditingController.addListener(() {
-          ownerIdCtrl.text = textEditingController.text;
-        });
-        
         return TextFormField(
           controller: textEditingController,
           focusNode: focusNode,
+          onChanged: (text) => ownerIdCtrl.text = text,
           style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13, fontFamily: kMonoFontFamily),
           decoration: decoration.copyWith(
             suffixIcon: IconButton(

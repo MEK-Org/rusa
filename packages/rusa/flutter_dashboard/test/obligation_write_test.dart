@@ -48,8 +48,8 @@ void main() {
         await tester.tap(find.text('New Obligation'));
         await tester.pumpAndSettle();
 
-        // Default ownership uses the authenticated principal directly.
-        expect(find.text('viewer-user'), findsOneWidget);
+        // Show the viewer's label while retaining their principal for submission.
+        expect(find.text('Operator'), findsOneWidget);
         await tester.enterText(
           find.widgetWithText(TextFormField, 'e.g. Game Type'),
           'Decide the cutover date',
@@ -107,6 +107,10 @@ void main() {
     expect(find.text('Ada'), findsOneWidget);
     await tester.tap(find.text('colleague@example.test'));
     await tester.pumpAndSettle();
+    expect(
+      tester.widget<TextFormField>(find.byType(TextFormField).first).controller!.text,
+      'colleague@example.test',
+    );
     await tester.tap(find.widgetWithText(ElevatedButton, 'Reassign'));
     await tester.pumpAndSettle();
 
