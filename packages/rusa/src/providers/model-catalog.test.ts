@@ -1162,29 +1162,32 @@ describe("codex catalog identifier case across refreshes", () => {
     }
   });
 
-  it("resolves case variants to each provider's native launch value", () => {
+  // Each provider restores its own recorded row so one red does not hide the
+  // others.
+  const restore = (provider: string, entries: ModelEntry[]) =>
     populateModelCatalogsFromDb({
-      listLatestForEachProvider: () =>
-        new Map<string, ModelEntry[]>([
-          ["claude", [{ displayLabel: "Opus", identifier: "Claude-Opus-5", passable: true }]],
-          [
-            "agy",
-            [
-              { displayLabel: "Gemini Flash", identifier: "gemini-flash", passable: false },
-              {
-                displayLabel: "Gemini 3.5 Flash (High)",
-                identifier: "Gemini-3.5-Flash-High",
-                passable: true,
-              },
-            ],
-          ],
-          // A Kimi identifier is the operator's own config key, launched verbatim.
-          ["kimi", [{ displayLabel: "K3", identifier: "Kimi-Code/K3", passable: true }]],
-        ]),
+      listLatestForEachProvider: () => new Map([[provider, entries]]),
     });
+
+  it("resolves claude case variants and display labels to the claude-* identifier", () => {
+    restore("claude", [{ displayLabel: "Opus", identifier: "Claude-Opus-5", passable: true }]);
 
     expect(getProviderModelCatalog("claude")?.[0].identifier).toBe("claude-opus-5");
     expect(validateModelPin("claude", "CLAUDE-OPUS-5")).toMatchObject({ model: "claude-opus-5" });
+    // A display label is not a passable claude value; it launches the identifier.
+    expect(validateModelPin("claude", "Opus")).toMatchObject({ model: "claude-opus-5" });
+    expect(() => validateModelPin("claude", "claude-opus-9")).toThrow(/rejected/);
+  });
+
+  it("resolves agy case variants to the lowercase slug", () => {
+    restore("agy", [
+      { displayLabel: "Gemini Flash", identifier: "gemini-flash", passable: false },
+      {
+        displayLabel: "Gemini 3.5 Flash (High)",
+        identifier: "Gemini-3.5-Flash-High",
+        passable: true,
+      },
+    ]);
 
     expect(getProviderModelCatalog("agy")?.map((e) => e.identifier)).toEqual([
       "gemini-flash",
@@ -1201,9 +1204,41 @@ describe("codex catalog identifier case across refreshes", () => {
     expect(() => resolveAntigravitySelection("GEMINI FLASH", "high")).toThrow(/impassable/);
     expect(() => validateModelPin("agy", "gemini flash")).toThrow(/rejected "gemini flash"/);
     expect(() => resolveAntigravitySelection("Gemini 3.5 Flash", "max")).toThrow(/max/);
+  });
 
-    expect(validateModelPin("kimi", "kimi-code/k3")).toMatchObject({ model: "Kimi-Code/K3" });
+  it("keeps the spelling of a restored agy identifier that is a display label", () => {
+    // `agy models` rows carry a slug, but a recorded row whose identifier is a
+    // display label launches that label, so lowercasing it would change argv.
+    restore("agy", [
+      {
+        displayLabel: "Gemini 3.1 Pro (High)",
+        identifier: "Gemini 3.1 Pro (High)",
+        passable: true,
+      },
+    ]);
+
+    expect(getProviderModelCatalog("agy")?.map((e) => e.identifier)).toEqual([
+      "Gemini 3.1 Pro (High)",
+    ]);
+    expect(resolveAntigravitySelection("gemini 3.1 pro (high)", "high")).toEqual({
+      model: "Gemini 3.1 Pro (High)",
+      effort: "high",
+    });
+  });
+
+  it("matches kimi config keys ignoring case and launches the key as written", () => {
+    // TOML keys are case-sensitive, so two keys may differ only in case. An
+    // exactly spelled pin selects its own key; a case variant takes the first.
+    restore("kimi", [
+      { displayLabel: "K3", identifier: "Kimi-Code/K3", passable: true },
+      { displayLabel: "K3 lower", identifier: "kimi-code/k3", passable: true },
+    ]);
+
+    expect(validateModelPin("kimi", "Kimi-Code/K3")).toMatchObject({ model: "Kimi-Code/K3" });
+    expect(validateModelPin("kimi", "kimi-code/k3")).toMatchObject({ model: "kimi-code/k3" });
+    expect(validateModelPin("kimi", "KIMI-CODE/K3")).toMatchObject({ model: "Kimi-Code/K3" });
     expect(() => validateModelPin("kimi", "k3")).toThrow();
+    expect(() => validateModelPin("kimi", "kimi-code/k9")).toThrow();
   });
 });
 
