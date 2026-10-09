@@ -38,7 +38,7 @@ describe("RootControlService", () => {
         charter: "  Investigate the failure  ",
         modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium" },
       },
-      "human:operator"
+      "00000000-0000-4000-8000-000000000001"
     );
 
     expect(id).toBe("child-1");
@@ -54,10 +54,10 @@ describe("RootControlService", () => {
     expect(events[0]).toMatchObject({
       kind: "root_control_action",
       actorId: "root",
-      detail: "human:operator spawn_child",
+      detail: "00000000-0000-4000-8000-000000000001 spawn_child",
     });
     expect(JSON.parse(events[0].payload ?? "{}")).toMatchObject({
-      principal: "human:operator",
+      principal: "00000000-0000-4000-8000-000000000001",
       action: "spawn_child",
       targetId: "child-1",
     });
@@ -145,7 +145,7 @@ describe("RootControlService", () => {
     expect(() =>
       service.spawnChild(
         { charter: "work", modelConfig: { provider: "missing", model: "claude-sonnet-4-6" } },
-        "human:operator"
+        "00000000-0000-4000-8000-000000000001"
       )
     ).toThrow(/unknown provider/);
     expect(mesh.spawn).not.toHaveBeenCalled();
@@ -154,7 +154,10 @@ describe("RootControlService", () => {
   it("rejects spawnChild when modelConfig is an empty pool", () => {
     const { mesh, service } = setup();
     expect(() =>
-      service.spawnChild({ charter: "work", modelConfig: [] }, "human:operator")
+      service.spawnChild(
+        { charter: "work", modelConfig: [] },
+        "00000000-0000-4000-8000-000000000001"
+      )
     ).toThrow(/modelConfig is required/);
     expect(mesh.spawn).not.toHaveBeenCalled();
   });
@@ -193,16 +196,20 @@ describe("RootControlService", () => {
 
   it("refuses to retire root or a thread outside root's subtree", () => {
     const { mesh, service } = setup();
-    expect(() => service.retireChild("root", "human:operator")).toThrow(/descendants/);
+    expect(() => service.retireChild("root", "00000000-0000-4000-8000-000000000001")).toThrow(
+      /descendants/
+    );
     vi.mocked(mesh.isAncestorOf).mockReturnValue(false);
-    expect(() => service.retireChild("peer", "human:operator")).toThrow(/descendants/);
+    expect(() => service.retireChild("peer", "00000000-0000-4000-8000-000000000001")).toThrow(
+      /descendants/
+    );
     expect(mesh.retire).not.toHaveBeenCalled();
   });
 
   it("retires a child under the mid-run guard by default, and audits the force override", () => {
     const { mesh, events, service } = setup();
 
-    service.retireChild("child-1", "human:operator");
+    service.retireChild("child-1", "00000000-0000-4000-8000-000000000001");
     expect(mesh.retire).toHaveBeenLastCalledWith("child-1", { force: undefined });
     expect(JSON.parse(events[0]?.payload ?? "{}")).toMatchObject({
       action: "retire_child",
@@ -212,14 +219,14 @@ describe("RootControlService", () => {
 
     // The operator keeps an override the actor-facing tool does not have — a wedged
     // thread must stay retirable — and it lands in the audit record.
-    service.retireChild("child-1", "human:operator", { force: true });
+    service.retireChild("child-1", "00000000-0000-4000-8000-000000000001", { force: true });
     expect(mesh.retire).toHaveBeenLastCalledWith("child-1", {
       force: true,
       forceQueued: undefined,
     });
     expect(JSON.parse(events[1]?.payload ?? "{}")).toMatchObject({ force: true });
 
-    service.retireChild("child-1", "human:operator", { forceQueued: true });
+    service.retireChild("child-1", "00000000-0000-4000-8000-000000000001", { forceQueued: true });
     expect(mesh.retire).toHaveBeenLastCalledWith("child-1", {
       force: undefined,
       forceQueued: true,
@@ -237,7 +244,7 @@ describe("RootControlService", () => {
 
     const id = service.spawnChild(
       { charter: "work", modelConfig: { class: "fast" } },
-      "human:operator"
+      "00000000-0000-4000-8000-000000000001"
     );
 
     expect(id).toBe("child-1");
@@ -261,7 +268,10 @@ describe("RootControlService", () => {
     });
 
     expect(() =>
-      service.spawnChild({ charter: "work", modelConfig: { class: "fast" } }, "human:operator")
+      service.spawnChild(
+        { charter: "work", modelConfig: { class: "fast" } },
+        "00000000-0000-4000-8000-000000000001"
+      )
     ).toThrow(/unknown provider: missing/);
     expect(mesh.spawn).not.toHaveBeenCalled();
   });
@@ -270,7 +280,10 @@ describe("RootControlService", () => {
     const { mesh, service } = setup();
 
     expect(() =>
-      service.spawnChild({ charter: "work", modelConfig: { class: "fast" } }, "human:operator")
+      service.spawnChild(
+        { charter: "work", modelConfig: { class: "fast" } },
+        "00000000-0000-4000-8000-000000000001"
+      )
     ).toThrow(/model class reference/);
     expect(mesh.spawn).not.toHaveBeenCalled();
   });
@@ -299,7 +312,7 @@ describe("RootControlService", () => {
 
     const id = service.spawnChild(
       { charter: "work", modelConfig: { class: "fast" } },
-      "human:operator"
+      "00000000-0000-4000-8000-000000000001"
     );
 
     const record = actors.get(id);
@@ -312,9 +325,9 @@ describe("RootControlService", () => {
   it("interrupts a child in the root subtree and audits the action", () => {
     const { mesh, events, service } = setup();
 
-    const res = service.interruptChild("child-1", "human:operator");
+    const res = service.interruptChild("child-1", "00000000-0000-4000-8000-000000000001");
     expect(res.interrupted).toBe(true);
-    expect(mesh.interrupt).toHaveBeenCalledWith("child-1", "human:operator");
+    expect(mesh.interrupt).toHaveBeenCalledWith("child-1", "00000000-0000-4000-8000-000000000001");
     expect(JSON.parse(events[0]?.payload ?? "{}")).toMatchObject({
       action: "interrupt_child",
       targetId: "child-1",
@@ -325,9 +338,9 @@ describe("RootControlService", () => {
   it("runs a child immediately and audits the action", () => {
     const { mesh, events, service } = setup();
 
-    const res = service.runNowChild("child-1", "human:operator");
+    const res = service.runNowChild("child-1", "00000000-0000-4000-8000-000000000001");
     expect(res.queued).toBe(true);
-    expect(mesh.runNow).toHaveBeenCalledWith("child-1", "human:operator");
+    expect(mesh.runNow).toHaveBeenCalledWith("child-1", "00000000-0000-4000-8000-000000000001");
     expect(JSON.parse(events[0]?.payload ?? "{}")).toMatchObject({
       action: "run_now_child",
       targetId: "child-1",
@@ -337,14 +350,14 @@ describe("RootControlService", () => {
   it("reparents a root descendant and audits the new parent", () => {
     const { mesh, events, service } = setup();
 
-    service.reparentChild("worker-1", "steward-2", "human:operator");
+    service.reparentChild("worker-1", "steward-2", "00000000-0000-4000-8000-000000000001");
 
     expect(mesh.reparentThread).toHaveBeenCalledWith("worker-1", "steward-2");
     expect(JSON.parse(events[0]?.payload ?? "{}")).toMatchObject({
       action: "reparent_child",
       targetId: "worker-1",
       newParentId: "steward-2",
-      principal: "human:operator",
+      principal: "00000000-0000-4000-8000-000000000001",
     });
   });
 
@@ -352,15 +365,15 @@ describe("RootControlService", () => {
     const { mesh, service } = setup();
     vi.mocked(mesh.isAncestorOf).mockImplementation((_, id) => id !== "foreign");
 
-    expect(() => service.reparentChild("root", "worker-2", "human:operator")).toThrow(
-      /root descendants/
-    );
-    expect(() => service.reparentChild("foreign", "worker-2", "human:operator")).toThrow(
-      /root descendants/
-    );
-    expect(() => service.reparentChild("worker-1", "foreign", "human:operator")).toThrow(
-      /root descendants/
-    );
+    expect(() =>
+      service.reparentChild("root", "worker-2", "00000000-0000-4000-8000-000000000001")
+    ).toThrow(/root descendants/);
+    expect(() =>
+      service.reparentChild("foreign", "worker-2", "00000000-0000-4000-8000-000000000001")
+    ).toThrow(/root descendants/);
+    expect(() =>
+      service.reparentChild("worker-1", "foreign", "00000000-0000-4000-8000-000000000001")
+    ).toThrow(/root descendants/);
     expect(mesh.reparentThread).not.toHaveBeenCalled();
   });
 });

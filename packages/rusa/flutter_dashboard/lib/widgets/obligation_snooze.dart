@@ -17,8 +17,7 @@ final DateFormat _previewFormat = DateFormat('EEE yyyy-MM-dd HH:mm');
 /// Whether the viewer may snooze [obligation] from the dashboard (#893).
 ///
 /// Snoozing is owner-only on the server (#722), unlike Done/Cancel, so the
-/// action is offered only on the viewer's own non-terminal rows — under either
-/// of their ids, since the server resolves the legacy alias the same way. An
+/// action is offered only on the durable viewer's own non-terminal rows. An
 /// actor-owned row offers no snooze. The server still decides; this only
 /// avoids offering a write it would refuse.
 bool canSnoozeObligation(DashboardStore store, ObligationDto obligation) =>

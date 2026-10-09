@@ -387,18 +387,27 @@ export function createDashboardRequestHandler(
       if (await handleDashboardTimingTelemetry(req, res, pathname, timings)) return;
 
       if (req.method === "GET" && pathname === "/api/dashboard/config") {
+        // Identity is request-scoped, not an application config setting.
+        const userPrincipalId = viewingUserPrincipalId(req, dataDeps?.principals);
+        if (!userPrincipalId) {
+          res.writeHead(503, {
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+          });
+          res.end(JSON.stringify({ error: "Dashboard viewing principal is unavailable" }));
+          return;
+        }
         res.writeHead(200, {
           "Content-Type": "application/json; charset=utf-8",
           "Cache-Control": "no-store",
         });
-        // The viewing user: the authenticated identity, else local mode's
-        // sole active durable user, so the client personalizes "my" surfaces
-        // (obligation queue, chat) without assuming the legacy alias (#460).
-        const userPrincipalId = viewingUserPrincipalId(req, dataDeps?.principals);
         res.end(
           JSON.stringify({
             quotaProviders: options.dashboardConfig?.quotaProviders ?? {},
-            ...(userPrincipalId ? { userPrincipalId } : {}),
+            userPrincipalId,
+            users: (dataDeps?.principals?.listUsers() ?? [])
+              .filter((user) => !user.disabledAt)
+              .map(({ id, email }) => ({ id, email })),
           })
         );
         return;
@@ -694,7 +703,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
         }
       : null;
   // Reply-TTS hook: observe the mesh-event emitter for replies to
-  // human:operator and push rendered audio on the `voice` channel.
+  // durable users and push recipient-scoped audio on the `voice` channel.
   const detachVoiceOutbound =
     options.voice && options.mesh && sseHub
       ? attachVoiceOutbound(

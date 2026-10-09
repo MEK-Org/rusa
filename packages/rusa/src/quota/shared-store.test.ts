@@ -183,6 +183,7 @@ describe("SharedQuotaStore canonical observations", () => {
         result: "accepted",
         observedAt: "2030-01-01T00:05:00.000Z",
         generation: 1,
+        droppedWindows: [],
       });
 
       // The reading is one quota_scrapes row like any scrape (#572 precedent),

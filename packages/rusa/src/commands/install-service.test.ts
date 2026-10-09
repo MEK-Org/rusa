@@ -13,15 +13,18 @@ import { describe, expect, it } from "vitest";
 import { POOL_COORDINATOR_UNIT } from "./coordinator-provisioning.js";
 import {
   buildAlertUnit,
+  buildHostWatchdogTimer,
+  buildHostWatchdogUnit,
   buildLogRotateTimer,
   buildLogRotateUnit,
   buildQuotaCoordinatorUnit,
   buildServiceUnit,
   unitOrdersAfter,
   withCoordinatorOrdering,
+  writeHostWatchdogUnits,
   writeLogRotationUnits,
 } from "./install-service.js";
-import { logRotationUnitNames } from "./service-instance.js";
+import { hostWatchdogUnitNames, logRotationUnitNames } from "./service-instance.js";
 
 const base = {
   description: "Rusa",
@@ -443,5 +446,76 @@ describe("service log rotation units (#580)", () => {
   it("ships the rotator in the package, beside the notifier", () => {
     const packageJson = JSON.parse(readFileSync(resolve("package.json"), "utf8"));
     expect(packageJson.files).toContain("scripts/rotate-log.mjs");
+  });
+});
+
+describe("host watchdog units (#955)", () => {
+  const watchdog = {
+    nodePath: "/usr/bin/node",
+    watchdogScript: "/deploy/rusa/packages/rusa/scripts/host-watchdog.mjs",
+    logPath: "/home/x/.rusa-staging/logs/host-watchdog.log",
+  };
+
+  it("names the watchdog units after the instance they belong to", () => {
+    expect(hostWatchdogUnitNames("rusa-staging")).toEqual({
+      service: "rusa-staging-host-watchdog.service",
+      timer: "rusa-staging-host-watchdog.timer",
+    });
+  });
+
+  it("is a bounded oneshot that runs the standalone sampler against this instance's log", () => {
+    const unit = buildHostWatchdogUnit({ description: "Rusa host watchdog", ...watchdog });
+    expect(unit).toContain("Type=oneshot");
+    expect(unit).toContain("TimeoutStartSec=30");
+    expect(unit).toContain(
+      'ExecStart="/usr/bin/node" "/deploy/rusa/packages/rusa/scripts/host-watchdog.mjs" "/home/x/.rusa-staging/logs/host-watchdog.log"'
+    );
+    // Nothing in the instance .env can retarget or reshape the sampler.
+    expect(unit).not.toContain("EnvironmentFile");
+    expect(unit).not.toContain("Environment=");
+    expect(unit).not.toContain("[Install]");
+  });
+
+  it("doubles a `$` in the log path", () => {
+    const unit = buildHostWatchdogUnit({
+      description: "Rusa host watchdog",
+      ...watchdog,
+      logPath: "/home/x/odd$HOME/logs/host-watchdog.log",
+    });
+    expect(unit).toContain('"/home/x/odd$$HOME/logs/host-watchdog.log"');
+  });
+
+  it("samples every minute and does not replay samples missed while the host was down", () => {
+    const timer = buildHostWatchdogTimer({
+      description: "Rusa host watchdog timer",
+      watchdogUnit: "rusa-staging-host-watchdog.service",
+    });
+    expect(timer).toContain("OnCalendar=minutely");
+    expect(timer).toContain("AccuracySec=1s");
+    expect(timer).toContain("RandomizedDelaySec=20s");
+    expect(timer).not.toContain("Persistent=");
+    expect(timer).toContain("Unit=rusa-staging-host-watchdog.service");
+    expect(timer).toContain("WantedBy=timers.target");
+  });
+
+  it("writes both units, and rewriting them is a no-op", () => {
+    const systemdUserDir = mkdtempSync(join(tmpdir(), "rusa-units-"));
+    const write = () =>
+      writeHostWatchdogUnits({ systemdUserDir, serviceBasename: "rusa-staging", ...watchdog });
+    expect(write()).toEqual(hostWatchdogUnitNames("rusa-staging"));
+    const snapshot = () =>
+      readdirSync(systemdUserDir).map((f) => [f, readFileSync(join(systemdUserDir, f), "utf8")]);
+    const first = snapshot();
+    write();
+    expect(snapshot()).toEqual(first);
+    expect(first.map(([f]) => f).sort()).toEqual([
+      "rusa-staging-host-watchdog.service",
+      "rusa-staging-host-watchdog.timer",
+    ]);
+  });
+
+  it("ships the watchdog in the package, beside the rotator", () => {
+    const packageJson = JSON.parse(readFileSync(resolve("package.json"), "utf8"));
+    expect(packageJson.files).toContain("scripts/host-watchdog.mjs");
   });
 });

@@ -340,24 +340,11 @@ function scrubJson(value: unknown): unknown {
  * Check if a run failure was caused by a human operator interrupt or cancellation .
  * Top-level error chat reporting suppresses notices for operator-initiated interrupts.
  */
-export function isHumanOperatorCancelled(
+export function isUserCancelled(
   result: RunResult,
   principals?: Pick<PrincipalRepository, "getUser">
 ): boolean {
-  if (result.interruptSource) {
-    const by = result.interruptSource.toLowerCase();
-    return (
-      by === "human:operator" ||
-      by === "operator" ||
-      by === "human" ||
-      by.startsWith("human:") ||
-      principals?.getUser(result.interruptSource) !== undefined
-    );
-  }
-  if (result.interrupted) {
-    return true;
-  }
-  return false;
+  return Boolean(result.interruptSource && principals?.getUser(result.interruptSource));
 }
 
 function routeMechanicalFailureNotice(
@@ -397,7 +384,7 @@ function routeMechanicalFailureNotice(
   }
 
   if (actorId === deps.rootId) {
-    if (result && isHumanOperatorCancelled(result, deps.principals)) {
+    if (result && isUserCancelled(result, deps.principals)) {
       deps.log(`suppressing error chat for root ${label} — interrupted by human operator`);
       return;
     }

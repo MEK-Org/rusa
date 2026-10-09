@@ -60,7 +60,7 @@ void main() {
       ..obligationsResult = [
         makeObligation(
           'ob-898',
-          ownerId: 'human:operator',
+          ownerId: '00000000-0000-4000-8000-000000000001',
           title: 'Open external link from obligation card',
           intent:
               'Deliver MEK-Org/rusa#898 as Matt wrote it:\n'

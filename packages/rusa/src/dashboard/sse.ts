@@ -125,7 +125,8 @@ class SseClient {
     private readonly onClose?: () => void,
     /** Stable leased-session id for targeted voice handoff controls. */
     readonly voiceSessionId?: string,
-    readonly chatViewer?: HumanChatViewer
+    readonly chatViewer?: HumanChatViewer,
+    readonly voicePrincipalId?: string
   ) {}
 
   wantsLiveOutput(actorId: string): boolean {
@@ -347,17 +348,24 @@ export class SseHub {
     res: ServerResponse,
     actors: Set<string>,
     onClose?: () => void,
-    sessionId?: string
+    sessionId?: string,
+    principalId?: string
   ): boolean {
-    return this.attach(res, actors, "voice", onClose, sessionId);
+    return this.attach(res, actors, "voice", onClose, sessionId, undefined, principalId);
   }
 
   /** Push a reply-TTS announcement to every voice client watching its actor. */
-  pushVoice(announcement: { actorId: string }): void {
+  pushVoice(announcement: {
+    actorId: string;
+    recipientId: string;
+    sessionId?: string | null;
+  }): void {
     const text = frame("voice", announcement);
     for (const client of this.clients) {
       if (client.channel !== "voice") continue;
       if (!client.actors?.has(announcement.actorId)) continue;
+      if (client.voicePrincipalId !== announcement.recipientId) continue;
+      if (client.voiceSessionId && client.voiceSessionId !== announcement.sessionId) continue;
       try {
         client.send(text);
       } catch {
@@ -389,7 +397,8 @@ export class SseHub {
     channel: "mesh" | "voice",
     onClose?: () => void,
     voiceSessionId?: string,
-    chatViewer?: HumanChatViewer
+    chatViewer?: HumanChatViewer,
+    voicePrincipalId?: string
   ): boolean {
     if (this.clients.size >= this.maxClients) {
       res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" });
@@ -420,7 +429,8 @@ export class SseHub {
         onClose?.();
       },
       voiceSessionId,
-      chatViewer
+      chatViewer,
+      voicePrincipalId
     );
     if (channel === "mesh" && this.runtimeState) {
       client.send(frame("hello", { streamId: this.runtimeState.runtimeStateSnapshot().streamId }));

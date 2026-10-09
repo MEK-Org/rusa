@@ -10,8 +10,8 @@ function message(index: number, body = `body ${index}`): MeshChat {
   return {
     id: `m-${index}`,
     ts: `2026-09-10T00:00:${String(index).padStart(2, "0")}.000Z`,
-    senderId: index % 2 === 0 ? "human:operator" : "actor-a",
-    recipientId: index % 2 === 0 ? "actor-a" : "human:operator",
+    senderId: index % 2 === 0 ? "00000000-0000-4000-8000-000000000001" : "actor-a",
+    recipientId: index % 2 === 0 ? "actor-a" : "00000000-0000-4000-8000-000000000001",
     body,
     sessionId: "session-a",
   };

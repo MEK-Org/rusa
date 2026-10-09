@@ -1,4 +1,4 @@
-import type { ActorRecord, HumanChat } from "../actor/actor-record.js";
+import type { ActorRecord } from "../actor/actor-record.js";
 
 /**
  * The fields an explicit model-configuration change may set: the selection
@@ -35,16 +35,4 @@ export interface ActorRepository {
    * Efficient path for tree and ancestry traversal without loading full records or chat history.
    */
   parentOf(id: string): string | null | undefined;
-  /**
-   * The newest human chat addressed to an actor, or undefined if no human has
-   * messaged it. Kept off {@link get} and the other record reads because only
-   * the reply tool needs it and SQLite answers it from `mesh_chat` (#691).
-   */
-  lastHumanChat(id: string): HumanChat | undefined;
-  /**
-   * Note a human message just delivered to an actor. Repositories that derive
-   * {@link lastHumanChat} from durable chat ignore it; the in-memory adapter has
-   * no chat table and keeps it here.
-   */
-  noteHumanChat(id: string, chat: HumanChat): void;
 }

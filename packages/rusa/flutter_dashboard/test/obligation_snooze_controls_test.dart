@@ -174,7 +174,7 @@ void main() {
       return labels;
     }
 
-    testWidgets('the viewer\'s own rows, under either id, beside Done/Cancel', (
+    testWidgets('Snooze is offered only on the viewer\'s non-terminal rows', (
       tester,
     ) async {
       api.dashboardConfigResult = const DashboardConfigDto(
@@ -185,16 +185,18 @@ void main() {
 
       expect(
         await menuLabels(tester, makeObligation('mine', ownerId: 'user-1')),
-        ['Mark Done', 'Cancel', 'Snooze...', 'Reparent...', 'Add Child...'],
+        containsAll(['Mark Done', 'Cancel', 'Snooze...']),
       );
-      // A row still owned by the legacy alias is the viewer's; the server
-      // resolves the alias the same way.
+      // Another durable id never stands for the viewer.
       expect(
         await menuLabels(
           tester,
-          makeObligation('legacy', ownerId: 'human:operator'),
+          makeObligation(
+            'colleague',
+            ownerId: '00000000-0000-4000-8000-000000000001',
+          ),
         ),
-        contains('Snooze...'),
+        isNot(contains('Snooze...')),
       );
       expect(
         await menuLabels(
@@ -207,28 +209,10 @@ void main() {
         ),
         contains('Change Snooze...'),
       );
-    });
-
-    testWidgets('never on an actor-owned or another human\'s row', (
-      tester,
-    ) async {
-      api.dashboardConfigResult = const DashboardConfigDto(
-        quotaProviders: {},
-        userPrincipalId: 'user-1',
+      expect(
+        await menuLabels(tester, makeObligation('actor', ownerId: 'worker')),
+        isNot(contains('Snooze...')),
       );
-      await store.refreshDashboardConfig();
-
-      final actorRow = await menuLabels(
-        tester,
-        makeObligation('theirs', ownerId: 'worker'),
-      );
-      expect(actorRow, containsAll(['Cancel', 'Reparent...']));
-      expect(actorRow.where((l) => l.contains('Snooze')), isEmpty);
-      final otherHuman = await menuLabels(
-        tester,
-        makeObligation('other', ownerId: 'human:someone'),
-      );
-      expect(otherHuman.where((l) => l.contains('Snooze')), isEmpty);
       expect(
         canSnoozeObligation(
           store,
@@ -254,6 +238,7 @@ void main() {
     });
 
     Future<void> openDetail(WidgetTester tester, String title) async {
+      await store.refreshDashboardConfig();
       tester.view.physicalSize = const Size(1280, 900);
       tester.view.devicePixelRatio = 1.0;
       addTearDown(tester.view.resetDevicePixelRatio);
@@ -276,7 +261,7 @@ void main() {
         api.obligationsResult = [
           makeObligation(
             'ob-mine',
-            ownerId: 'human:operator',
+            ownerId: '00000000-0000-4000-8000-000000000001',
             intent: 'My Task',
           ),
         ];
@@ -369,7 +354,7 @@ void main() {
 
     final mine = makeObligation(
       'ob-1',
-      ownerId: 'human:operator',
+      ownerId: '00000000-0000-4000-8000-000000000001',
       intent: 'Mine',
     );
 
@@ -413,7 +398,7 @@ void main() {
       // on that date rather than asserting it is past lastDate.
       final far = makeObligation(
         'ob-1',
-        ownerId: 'human:operator',
+        ownerId: '00000000-0000-4000-8000-000000000001',
         intent: 'Mine',
         snoozedUntil: '2036-06-15T09:00:00.000Z',
       );
@@ -488,7 +473,7 @@ void main() {
     ) async {
       final snoozed = makeObligation(
         'ob-1',
-        ownerId: 'human:operator',
+        ownerId: '00000000-0000-4000-8000-000000000001',
         intent: 'Mine',
         snoozedUntil: '2026-10-05T09:00:00.000Z',
       );
