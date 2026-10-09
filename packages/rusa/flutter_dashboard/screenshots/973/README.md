@@ -14,6 +14,11 @@ source; the after phase runs #973's provider.
 - `signin_failed_*`: the run log records a failed silent sign-in.
 - `healthy_control_*`: the run log records the startup "not logged in" lines
   followed by a successful silent sign-in, the shape every healthy run has.
+- `long_tail_phone_*`: the worst case for the phone card. A synthetic one-line
+  cause of 1,002 characters fills the sink's full 800-character tail, and the
+  run log records only the startup "not logged in" lines, which gives the
+  longest fixed status (65 characters). The status wraps to a second line
+  under the tail, and the whole card stays inside the 844-point viewport.
 
 Both scenarios fail with the same unsupported-effort stdout, so the before
 notices are identical and their PNGs share one hash. After #973, the notice
@@ -22,7 +27,8 @@ that line in its own `signInDiagnostic` result field, and `routeRunFailure`
 renders it after the output tail. The run output, which exhaustion
 classification reads, is unchanged. The captures were first taken when the line
 was appended to the output, then re-rendered after the move to the separate
-field: the notice text and all eight PNG hashes are identical. No raw log line, URL,
+field: the notice text and all eight PNG hashes are identical. The long-tail
+pair was added later, in the same run that reproduced those eight hashes again. No raw log line, URL,
 identifier or token reaches the notice. `manifest.json` records the source
 revisions, synthetic inputs, exact notice text, dimensions, byte counts and
 SHA-256 values.
