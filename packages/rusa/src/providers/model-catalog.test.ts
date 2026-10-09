@@ -1169,13 +1169,14 @@ describe("codex catalog identifier case across refreshes", () => {
       listLatestForEachProvider: () => new Map([[provider, entries]]),
     });
 
-  it("resolves claude case variants and display labels to the claude-* identifier", () => {
+  it("resolves claude case variants in the catalog's spelling of the matched field", () => {
     restore("claude", [{ displayLabel: "Opus", identifier: "Claude-Opus-5", passable: true }]);
 
     expect(getProviderModelCatalog("claude")?.[0].identifier).toBe("claude-opus-5");
     expect(validateModelPin("claude", "CLAUDE-OPUS-5")).toMatchObject({ model: "claude-opus-5" });
-    // A display label is not a passable claude value; it launches the identifier.
-    expect(validateModelPin("claude", "Opus")).toMatchObject({ model: "claude-opus-5" });
+    // A display-label pin still launches the display label, as before #974.
+    expect(validateModelPin("claude", "Opus")).toMatchObject({ model: "Opus" });
+    expect(validateModelPin("claude", "OPUS")).toMatchObject({ model: "Opus" });
     expect(() => validateModelPin("claude", "claude-opus-9")).toThrow(/rejected/);
   });
 

@@ -452,7 +452,7 @@ export function acceptableModelPins(provider: string): readonly string[] | undef
 }
 
 export type ModelPinValidation =
-  /** `model` is the catalog's spelling of the provider's launch value for the pin. */
+  /** `model` is the catalog's spelling of the field the pin matched. */
   | { status: "accepted"; model: string; efforts?: string[] }
   | { status: "unknown"; warning: string };
 
@@ -460,10 +460,10 @@ export type ModelPinValidation =
  * Validate locally before constructing a provider. Absent and empty catalogs
  * are unknown and remain permissive until live enumeration lands.
  * Accepts both slug identifiers (e.g. gemini-3.1-pro-high) and display labels (e.g. Gemini 3.1 Pro (High)) .
- * Matching ignores case (#974). For a provider whose CLI takes the identifier,
- * the accepted `model` is the matched entry's identifier, whichever field or
- * spelling the pin matched, so a pin launches the same value however it was
- * written. For agy it is the matched field in the catalog's spelling.
+ * Matching ignores case (#974). The accepted `model` is the field the pin
+ * matched, in the catalog's spelling, so a case variant launches what the exact
+ * spelling would. Which field launches is unchanged: an identifier pin launches
+ * the identifier and a display-label pin launches the display label.
  *
  * The `/halt provider:<p> model:<m>` gate shares this function's vocabulary via
  * {@link acceptableModelPins} but deliberately *refuses* on an absent or empty
@@ -522,11 +522,7 @@ export function validateModelPin(provider: string, pin: string): ModelPinValidat
       `model pin validation failed for provider "${provider}": rejected "${pin}"; acceptable values: ${acceptable.length > 0 ? acceptable.map((value) => `"${value}"`).join(", ") : "(none)"}`
     );
   }
-  // Where the CLI takes the identifier, any matching spelling launches it. agy
-  // takes its display label and re-resolves the selection at launch, so it
-  // keeps the matched field in the catalog's spelling.
-  const model = descriptor.commandLineField === "identifier" ? match.entry.identifier : match.value;
-  return { status: "accepted", model, efforts: match.entry.efforts };
+  return { status: "accepted", model: match.value, efforts: match.entry.efforts };
 }
 
 /**
