@@ -48,7 +48,9 @@ const limitSchema = z.object({
   scope: z
     .object({ provider: z.string(), models: z.array(z.string()).optional() })
     .optional()
-    .describe("Omit for a provider-wide window."),
+    .describe(
+      "Omit for a provider-wide window. For a window that applies only to some models (e.g. a Fable-only weekly), give the provider and the models it names; the coordinator paces it as its own lane when those models are in the provider's catalog and drops the row otherwise."
+    ),
 });
 
 /**
@@ -71,7 +73,7 @@ export function createQuotaManualServer(deps: QuotaManualMcpDeps): McpServer {
     {
       title: "Submit a manual quota reading",
       description:
-        "Submit one quota reading you took yourself to the quota coordinator, for a provider the operator has put in manual reading mode. Call it in the same run that took the reading. observedAt is when you read the source, never when you call this. Returns the coordinator's response unchanged: an accepted reading, a duplicate replay, or a refusal such as stale_observation, manual_mode_required or mode_generation_mismatch.",
+        "Submit one quota reading you took yourself to the quota coordinator, for a provider the operator has put in manual reading mode. Call it in the same run that took the reading. observedAt is when you read the source, never when you call this. Include model-scoped rows (scope.models) as the source shows them: they are honoured as separate pacing lanes when their models resolve against the provider's catalog. Returns the coordinator's response unchanged: an accepted reading, a duplicate replay, or a refusal such as stale_observation, manual_mode_required or mode_generation_mismatch.",
       inputSchema: {
         provider: z.string().min(1).describe('Provider id, e.g. "kimi".'),
         generation: z
