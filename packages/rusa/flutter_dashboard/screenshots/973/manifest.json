@@ -1,0 +1,125 @@
+{
+  "pr": 973,
+  "issue": 971,
+  "sources": {
+    "before": "2105acfb366b85e254ffd33ebcc7820613926bdf (staging) packages/rusa/src/providers/antigravity.ts",
+    "after": "a92d5e9f2446b89e2ef0f2dde2a9396bbb4bd07f packages/rusa/src/providers/antigravity.ts",
+    "route": "routeRunFailure (packages/rusa/src/actor/failure-sink.ts) with the deterministic exhaustion classifier",
+    "renderer": "unchanged InboxTab at a92d5e9f"
+  },
+  "viewports": {
+    "wide": "1100x800 logical",
+    "phone": "390x844 logical",
+    "pixelRatio": 2
+  },
+  "inputs": {
+    "stdout": "Error: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model",
+    "runLogs": {
+      "signin_failed": [
+        "I1009 10:00:00.000001 1 cache.go:1] Singleflight refresh failed: error getting token source: You are not logged into Antigravity.",
+        "I1009 10:00:00.000002 1 model_configs.go:226] Auth mode is unspecified, skipping fetchAvailableModels and returning empty response",
+        "I1009 10:00:00.100000 1 printmode.go:372] Print mode: not authenticated, trying silent auth",
+        "I1009 10:00:00.500000 1 printmode.go:376] Print mode: silent auth failed",
+        "I1009 10:00:01.000000 1 trace.go:1] trace https://example.invalid/v1/trace?id=0123abcd",
+        "I1009 10:00:01.000002 1 auth.go:1] token=synthetic-secret-token"
+      ],
+      "healthy_control": [
+        "I1009 10:00:00.000001 1 cache.go:1] Singleflight refresh failed: error getting token source: You are not logged into Antigravity.",
+        "I1009 10:00:00.000002 1 model_configs.go:226] Auth mode is unspecified, skipping fetchAvailableModels and returning empty response",
+        "I1009 10:00:00.100000 1 printmode.go:372] Print mode: not authenticated, trying silent auth",
+        "I1009 10:00:00.500000 1 printmode.go:374] Print mode: silent auth succeeded",
+        "I1009 10:00:01.000000 1 trace.go:1] trace https://example.invalid/v1/trace?id=0123abcd",
+        "I1009 10:00:01.000002 1 auth.go:1] token=synthetic-secret-token"
+      ]
+    },
+    "note": "Synthetic. The same failing stdout drives every run; only the per-run --log-file content differs by scenario."
+  },
+  "notices": {
+    "signin_failed_before": "[run failed] provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nError: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model",
+    "signin_failed_after": "[run failed] provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nError: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model\n[agy run log: silent sign-in failed]",
+    "healthy_control_before": "[run failed] provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nError: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model",
+    "healthy_control_after": "[run failed] provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nError: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model\n[agy run log: silent sign-in succeeded]"
+  },
+  "screenshots": [
+    {
+      "file": "signin_failed_wide_before.png",
+      "scenario": "signin_failed",
+      "viewport": "wide",
+      "state": "before",
+      "width": 2200,
+      "height": 1600,
+      "bytes": 89128,
+      "sha256": "f84bf9ea562b0076e5e568443ffcc296853fbdbb038690555420e4b573b884b2"
+    },
+    {
+      "file": "signin_failed_wide_after.png",
+      "scenario": "signin_failed",
+      "viewport": "wide",
+      "state": "after",
+      "width": 2200,
+      "height": 1600,
+      "bytes": 95693,
+      "sha256": "4998ebd743aeb42ac7d3b83550469a2d018b3a796163555d1ddff368751238e7"
+    },
+    {
+      "file": "signin_failed_phone_before.png",
+      "scenario": "signin_failed",
+      "viewport": "phone",
+      "state": "before",
+      "width": 780,
+      "height": 1688,
+      "bytes": 82779,
+      "sha256": "dd2162f404fba5ca0afd5d67ecf9d8624a9e66263b3cd2e7aa661906ff430f9f"
+    },
+    {
+      "file": "signin_failed_phone_after.png",
+      "scenario": "signin_failed",
+      "viewport": "phone",
+      "state": "after",
+      "width": 780,
+      "height": 1688,
+      "bytes": 88868,
+      "sha256": "98a7fe18a73f5599beab26eb44d98cc679914e49ef1f977a8db8db5746e559e2"
+    },
+    {
+      "file": "healthy_control_wide_before.png",
+      "scenario": "healthy_control",
+      "viewport": "wide",
+      "state": "before",
+      "width": 2200,
+      "height": 1600,
+      "bytes": 89128,
+      "sha256": "f84bf9ea562b0076e5e568443ffcc296853fbdbb038690555420e4b573b884b2"
+    },
+    {
+      "file": "healthy_control_wide_after.png",
+      "scenario": "healthy_control",
+      "viewport": "wide",
+      "state": "after",
+      "width": 2200,
+      "height": 1600,
+      "bytes": 96968,
+      "sha256": "b16ab8b8cb4678e2073805c9ef5743b07a351462e66bcc52c6c771a3b55f60ca"
+    },
+    {
+      "file": "healthy_control_phone_before.png",
+      "scenario": "healthy_control",
+      "viewport": "phone",
+      "state": "before",
+      "width": 780,
+      "height": 1688,
+      "bytes": 82779,
+      "sha256": "dd2162f404fba5ca0afd5d67ecf9d8624a9e66263b3cd2e7aa661906ff430f9f"
+    },
+    {
+      "file": "healthy_control_phone_after.png",
+      "scenario": "healthy_control",
+      "viewport": "phone",
+      "state": "after",
+      "width": 780,
+      "height": 1688,
+      "bytes": 89991,
+      "sha256": "3d4eff582365ff8ea4b612dcc4619e43ad6ca5671d80ec557cb1a1dbb257ce32"
+    }
+  ]
+}
