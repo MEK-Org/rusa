@@ -40,7 +40,7 @@ export interface InboxOpenQuestionSources {
   listArtifacts: (obligationId: string) => ObligationArtifact[];
 }
 
-const MESH_HUMAN_PAYLOAD_TYPES = new Set(["human.message", VOICE_INBOX_PAYLOAD_TYPE]);
+const MESH_HUMAN_PAYLOAD_TYPES = new Set(["mesh.message", VOICE_INBOX_PAYLOAD_TYPE]);
 
 /** What the sender seam reads: principals by id, and users by Google account id. */
 export interface InboxSenderPrincipals {
@@ -56,8 +56,7 @@ export interface InboxSenderPrincipals {
  *   `fromId` on a `mesh:<fromId>` source, and that id must name a user row;
  * - a Google Chat message names its sender `users/{id}`, and that id must equal
  *   the Google account id a user's verified dashboard sign-in recorded.
- * The legacy `human:operator` alias (which has no principal row), a disabled
- * user, and any other source stay unmatched rather than falling back to a user.
+ * Unknown ids, disabled users, and other sources stay unmatched.
  */
 export function resolveInboxSenderPrincipal(
   entry: Pick<InboxEntry, "source" | "payload">,

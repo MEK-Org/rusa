@@ -31,13 +31,13 @@ describe("formatSigtermResult", () => {
 
   it("attributes interrupt aborts with the source prefix", () => {
     const controller = new AbortController();
-    controller.abort("interrupt:human:operator");
+    controller.abort("interrupt:00000000-0000-4000-8000-000000000001");
     const result = formatSigtermResult("partial log", controller.signal);
     expect(result.exitCode).toBe(143);
     expect(result.cancelled).toBe(true);
     expect(result.interrupted).toBe(true);
-    expect(result.interruptSource).toBe("human:operator");
-    expect(result.abortReason).toBe("interrupt:human:operator");
+    expect(result.interruptSource).toBe("00000000-0000-4000-8000-000000000001");
+    expect(result.abortReason).toBe("interrupt:00000000-0000-4000-8000-000000000001");
   });
 
   it("attributes unattributed SIGTERM as unknown", () => {
@@ -65,8 +65,10 @@ describe("extractAbortReason", () => {
 
   it("extracts interrupt abort reason with prefix", () => {
     const controller = new AbortController();
-    controller.abort("interrupt:human:operator");
-    expect(extractAbortReason(controller.signal)).toBe("interrupt:human:operator");
+    controller.abort("interrupt:00000000-0000-4000-8000-000000000001");
+    expect(extractAbortReason(controller.signal)).toBe(
+      "interrupt:00000000-0000-4000-8000-000000000001"
+    );
   });
 
   it("extracts unknown for unattributed abort", () => {

@@ -1,4 +1,5 @@
 import { normalizeEmail } from "../db/repositories/principal-repository.js";
+import { IMPLICIT_USER_EMAIL } from "../principals/operator-principal.js";
 import type { DashboardAuthConfig } from "./types.js";
 
 /** Reject malformed auth rather than silently starting an unprotected dashboard. */
@@ -23,7 +24,10 @@ export function validateDashboardAuth(
     if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
       throw new Error("config.yaml: auth admission entries must be email addresses");
     }
-    return normalizeEmail(email);
+    const normalized = normalizeEmail(email);
+    if (normalized === IMPLICIT_USER_EMAIL)
+      throw new Error("config.yaml: reserved admission email");
+    return normalized;
   };
   if (value.email !== undefined) value.email = normalize(value.email);
   else {

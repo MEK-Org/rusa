@@ -68,6 +68,7 @@ class FakeObligationScheduler implements ObligationActivationScheduler {
 }
 
 const T0 = Date.parse("2026-09-27T12:10:00.000Z");
+const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -99,6 +100,15 @@ describe("ObligationRepository", () => {
       db,
       (id) => ["actor-a", "actor-b", "actor-c"].includes(id),
       () => now++
+    );
+    repository.setPrincipalKind((id) =>
+      id === "system:mesh"
+        ? "system"
+        : id === TEST_USER_ID
+          ? "user"
+          : ["actor-a", "actor-b", "actor-c"].includes(id)
+            ? "actor"
+            : undefined
     );
   });
 
@@ -507,7 +517,13 @@ describe("ObligationRepository", () => {
 
       it("does not announce responsive obligations owned by humans", () => {
         const userId = "fb394608-d6d6-4f2e-aebe-51a59bd01374";
-        repository.setPrincipalKind((id) => (id === userId ? "user" : undefined));
+        repository.setPrincipalKind((id) =>
+          id === userId || id === TEST_USER_ID
+            ? "user"
+            : ["actor-a", "actor-b", "actor-c"].includes(id)
+              ? "actor"
+              : undefined
+        );
         repository.create({ title: "decision", id: "decision", ownerId: userId, responsive: true });
         expect(announced).toEqual([]);
       });
@@ -1230,7 +1246,13 @@ describe("ObligationRepository", () => {
 
     it("keeps durable user owners out of actor validation and ready-head tracking", () => {
       const userId = "fb394608-d6d6-4f2e-aebe-51a59bd01374";
-      repository.setPrincipalKind((id) => (id === userId ? "user" : undefined));
+      repository.setPrincipalKind((id) =>
+        id === userId || id === TEST_USER_ID
+          ? "user"
+          : ["actor-a", "actor-b", "actor-c"].includes(id)
+            ? "actor"
+            : undefined
+      );
 
       repository.create({ title: "human root", id: "human-root", ownerId: userId, priority: 10 });
       repository.create({
@@ -1564,7 +1586,7 @@ describe("ObligationRepository", () => {
       repository.create({
         title: "operator-work",
         id: "operator-work",
-        ownerId: "human:operator",
+        ownerId: "00000000-0000-4000-8000-000000000001",
         priority: 10,
       });
       expect(heads).toEqual([]);
@@ -1622,7 +1644,7 @@ describe("ObligationRepository", () => {
     repository.create({
       title: "answered",
       id: "answered",
-      ownerId: "human:operator",
+      ownerId: "00000000-0000-4000-8000-000000000001",
       intent: "pick a stack",
     });
     repository.create({
@@ -1720,7 +1742,7 @@ describe("ObligationRepository", () => {
   it("keeps the heading and the body as separate fields", () => {
     const created = repository.create({
       title: "Game Type",
-      ownerId: "human:operator",
+      ownerId: "00000000-0000-4000-8000-000000000001",
       intent: "What kind of game Delve is, settled well enough to build against.",
     });
     expect(created.title).toBe("Game Type");
@@ -1731,7 +1753,11 @@ describe("ObligationRepository", () => {
 
   describe("artifacts", () => {
     it("cites artifacts, and citing the same one twice is not an error", () => {
-      repository.create({ title: "Game Type", id: "q", ownerId: "human:operator" });
+      repository.create({
+        title: "Game Type",
+        id: "q",
+        ownerId: "00000000-0000-4000-8000-000000000001",
+      });
 
       const first = repository.attachArtifact("q", "mesh:messages/msg-1", {
         label: "the ask",
@@ -1767,7 +1793,11 @@ describe("ObligationRepository", () => {
     });
 
     it("attaches the resolving artifact as part of the transition", () => {
-      repository.create({ title: "Game Type", id: "q", ownerId: "human:operator" });
+      repository.create({
+        title: "Game Type",
+        id: "q",
+        ownerId: "00000000-0000-4000-8000-000000000001",
+      });
 
       const resolved = repository.setTerminalStatus(
         "q",
@@ -1931,22 +1961,27 @@ describe("ObligationRepository", () => {
       title: "owned-elsewhere",
       id: "owned-elsewhere",
       ownerId: "actor-b",
-      creatorId: "human:operator",
+      creatorId: "00000000-0000-4000-8000-000000000001",
       intent: "raised by one entity, owned by another",
     });
 
-    expect(created.creatorId).toBe("human:operator");
+    expect(created.creatorId).toBe("00000000-0000-4000-8000-000000000001");
     expect(created.ownerId).toEqual("actor-b");
 
     repository.reassign("owned-elsewhere", "actor-c", "system:mesh");
     const moved = repository.require("owned-elsewhere");
     expect(moved.ownerId).toEqual("actor-c");
-    expect(moved.creatorId).toBe("human:operator");
+    expect(moved.creatorId).toBe("00000000-0000-4000-8000-000000000001");
   });
 
   it("accepts any id in the mesh's one id space and rejects a blank one", () => {
-    // Actor UUID, root, human:*, system:* — all the same space, no `kind`.
-    for (const creator of ["actor-a", "root", "human:operator", "system:service"]) {
+    // Actor, user, and system ids share one space; storage determines kind.
+    for (const creator of [
+      "actor-a",
+      "root",
+      "00000000-0000-4000-8000-000000000001",
+      "system:service",
+    ]) {
       const o = repository.create({
         title: `by-${creator}`,
         id: `by-${creator}`,
@@ -2007,18 +2042,18 @@ describe("ObligationRepository", () => {
     const humanOwned = repository.create({
       title: "human-work",
       id: "human-work",
-      ownerId: "human:operator",
+      ownerId: "00000000-0000-4000-8000-000000000001",
     });
 
     expect(actorOwned.ownerId).toEqual("actor-a");
-    expect(humanOwned.ownerId).toEqual("human:operator");
+    expect(humanOwned.ownerId).toEqual("00000000-0000-4000-8000-000000000001");
     expect(() =>
       repository.create({
         title: "missing-actor",
         id: "missing-actor",
         ownerId: "unknown",
       })
-    ).toThrow("actor owner does not exist");
+    ).toThrow("unknown obligation owner");
     expect(() =>
       repository.create({
         title: "blank-owner",
@@ -2026,15 +2061,14 @@ describe("ObligationRepository", () => {
         ownerId: "   ",
       })
     ).toThrow("entity id is required");
-    // `human:*` and `system:*` are not in the actor repository, so they must NOT
-    // be run through the actor-existence check that rejects "unknown".
+    // A system-looking string is still unknown without a principal row.
     expect(() =>
       repository.create({
         title: "system-owned",
         id: "system-owned",
         ownerId: "system:service",
       })
-    ).not.toThrow();
+    ).toThrow("unknown obligation owner");
   });
 
   it("validates one supported external ref, enforces live uniqueness, and permits terminal reuse", () => {
@@ -2737,7 +2771,7 @@ describe("ObligationRepository", () => {
       title: "child-b",
       id: "child-b",
       parentId: "parent",
-      ownerId: "human:operator",
+      ownerId: "00000000-0000-4000-8000-000000000001",
     });
 
     repository.setTerminalStatus("child-a", "done", null, null, "system:mesh");
@@ -2827,7 +2861,7 @@ describe("ObligationRepository", () => {
       title: "review",
       id: "review",
       parentId: "root",
-      ownerId: "human:operator",
+      ownerId: "00000000-0000-4000-8000-000000000001",
     });
     repository.create({
       title: "check",
@@ -3443,7 +3477,7 @@ describe("ObligationRepository", () => {
       repository.create({
         title: "root-2",
         id: "root-2",
-        ownerId: "human:operator",
+        ownerId: "00000000-0000-4000-8000-000000000001",
       });
       repository.create({
         title: "child-1",
@@ -3515,11 +3549,17 @@ describe("ObligationRepository", () => {
       // timestamp tests. Comparing the rest pins that nothing ELSE moved.
       const identity = ({ ownerId: _ownerId, updatedAt: _updatedAt, ...rest }: Obligation) => rest;
 
-      const humanOwned = repository.reassign("parent", "human:operator", "system:mesh");
+      const humanOwned = repository.reassign(
+        "parent",
+        "00000000-0000-4000-8000-000000000001",
+        "system:mesh"
+      );
       expect(identity(humanOwned)).toEqual(identity(before));
-      expect(humanOwned.ownerId).toEqual("human:operator");
+      expect(humanOwned.ownerId).toEqual("00000000-0000-4000-8000-000000000001");
       expect(repository.listOwned("actor-a")).toEqual([]);
-      expect(repository.listOwned("human:operator").map((o) => o.id)).toEqual(["parent"]);
+      expect(repository.listOwned("00000000-0000-4000-8000-000000000001").map((o) => o.id)).toEqual(
+        ["parent"]
+      );
 
       const actorOwned = repository.reassign("parent", "actor-c", "system:mesh");
       expect(identity(actorOwned)).toEqual(identity(before));
@@ -3535,12 +3575,12 @@ describe("ObligationRepository", () => {
       });
       expect(repository.reassign("task", task.ownerId, "system:mesh")).toEqual(task);
       expect(() => repository.reassign("task", "missing", "system:mesh")).toThrow(
-        "actor owner does not exist"
+        "unknown obligation owner"
       );
       repository.setTerminalStatus("task", "done", null, null, "system:mesh");
-      expect(() => repository.reassign("task", "human:operator", "system:mesh")).toThrow(
-        "terminal obligations cannot be reassigned"
-      );
+      expect(() =>
+        repository.reassign("task", "00000000-0000-4000-8000-000000000001", "system:mesh")
+      ).toThrow("terminal obligations cannot be reassigned");
     });
   });
 

@@ -52,7 +52,7 @@ void main() {
           ..obligationsResult = [
             makeObligation(
               'overview-ready',
-              ownerId: 'human:operator',
+              ownerId: '00000000-0000-4000-8000-000000000001',
               intent: 'Review deployment checklist',
             ),
           ]
@@ -259,12 +259,12 @@ void main() {
           ..obligationsResult = [
             makeObligation(
               'ob-shortcut-done',
-              ownerId: 'human:operator',
+              ownerId: '00000000-0000-4000-8000-000000000001',
               intent: 'Publish the release notes',
             ),
             makeObligation(
               'ob-shortcut-cancel',
-              ownerId: 'human:operator',
+              ownerId: '00000000-0000-4000-8000-000000000001',
               intent: 'Draft the migration guide',
             ),
           ];
@@ -1130,7 +1130,7 @@ List<ObligationDto> _seedInboxObligations(String owner) => [
   ),
   makeObligation(
     'ob-poller-check',
-    ownerId: 'human:operator',
+    ownerId: '00000000-0000-4000-8000-000000000001',
     parentId: 'ob-poller',
     title: 'Confirm no instance still depends on polling',
     intent: 'Confirm no instance still depends on polling',

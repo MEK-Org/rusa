@@ -2489,7 +2489,7 @@ describe("Actor", () => {
       const actor = makeActor({}, provider);
 
       expect(actor.isRunning).toBe(false);
-      const res = actor.interrupt("human:operator");
+      const res = actor.interrupt("00000000-0000-4000-8000-000000000001");
       expect(res.interrupted).toBe(false);
     });
 

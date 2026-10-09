@@ -1715,14 +1715,27 @@ class QuotaProviderConfigDto {
       );
 }
 
+class UserPrincipalDto {
+  const UserPrincipalDto({required this.id, required this.email});
+
+  final String id;
+  final String email;
+
+  factory UserPrincipalDto.fromJson(Map<String, dynamic> j) =>
+      UserPrincipalDto(id: j['id'] as String, email: j['email'] as String);
+}
+
+/// Per-request dashboard data, including the server-verified viewing principal.
 class DashboardConfigDto {
   const DashboardConfigDto({
     required this.quotaProviders,
-    this.userPrincipalId,
+    required this.userPrincipalId,
+    this.users = const [],
   });
 
   final Map<String, QuotaProviderConfigDto> quotaProviders;
-  final String? userPrincipalId;
+  final String userPrincipalId;
+  final List<UserPrincipalDto> users;
 
   factory DashboardConfigDto.fromJson(Map<String, dynamic> j) {
     final rawProviders =
@@ -1734,7 +1747,10 @@ class DashboardConfigDto {
           QuotaProviderConfigDto.fromJson(value as Map<String, dynamic>),
         ),
       ),
-      userPrincipalId: j['userPrincipalId'] as String?,
+      userPrincipalId: j['userPrincipalId'] as String,
+      users: (j['users'] as List<dynamic>)
+          .map((u) => UserPrincipalDto.fromJson(u as Map<String, dynamic>))
+          .toList(),
     );
   }
 }
@@ -1754,7 +1770,7 @@ class VoiceAnnouncement {
 
   final String id;
 
-  /// The actor whose reply this is (the walkie peer, not `human:operator`).
+  /// The actor whose message is being spoken.
   final String actorId;
 
   /// The speakable text that was synthesized — shown large while playing.
@@ -1954,9 +1970,8 @@ class ObligationDto {
   final String id;
   final String? parentId;
 
-  /// One entity id in the mesh's single id space: an actor UUID, `root`,
-  /// `human:*`, or `system:*`. The category is read off the prefix — there is
-  /// no separate owner "kind".
+  /// An opaque actor or durable user principal id in the mesh's single id space.
+  /// Principal storage determines its kind.
   final String ownerId;
 
   /// The heading — short, and what a queue shows. Null only for rows that

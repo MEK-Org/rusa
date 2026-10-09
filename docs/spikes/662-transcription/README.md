@@ -133,7 +133,7 @@ recognizer-first acquisition. Per-trial order/start-call timestamps make the
 comparison explicit; neither order is chosen for the eventual feature. It is a separate page, so success
 here still requires verification in the actual Room before feature acceptance.
 [voice-api.ts](../../../packages/rusa/src/voice/voice-api.ts) saves the clip, calls
-`service.transcribeMemo` and then `mesh.sendHumanMessage` (baseline lines 199–222).
+`service.transcribeMemo` and then shared mesh message delivery.
 [voice-service.ts](../../../packages/rusa/src/voice/voice-service.ts) delegates the
 batch to its selected speech adapter (lines 480–481). Browser preview and server
 batch are two sessions; even equal samples cannot guarantee their text always matches.

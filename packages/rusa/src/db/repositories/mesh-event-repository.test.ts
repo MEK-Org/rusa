@@ -390,6 +390,8 @@ describe("MeshEventRepository", () => {
         email: "bob@example.com",
         createdAt: "2026-06-17T00:00:00.000Z",
       }).id;
+      principals.ensureActorPrincipal("actor-1", "2026-06-17T00:00:00.000Z");
+      principals.ensureActorPrincipal("actor-2", "2026-06-17T00:00:00.000Z");
       // One actor answering two humans, plus actor↔actor traffic and a
       // non-message event, all inside one `since` window.
       const message = (from: string, to: string, body: string, ts: string) => {
@@ -404,6 +406,7 @@ describe("MeshEventRepository", () => {
       message("actor-1", alice, "to alice", "2026-06-18T00:00:00.000Z");
       message("actor-1", bob, "to bob", "2026-06-18T00:00:01.000Z");
       message("actor-1", "actor-2", "to peer", "2026-06-18T00:00:02.000Z");
+      message("actor-1", "unknown", "to unknown", "2026-06-18T00:00:02.500Z");
       repo.record({
         kind: "run_start",
         actorId: "actor-1",
@@ -420,7 +423,7 @@ describe("MeshEventRepository", () => {
       // A viewer who cannot be identified reads actor↔actor traffic alone.
       expect(window([])).toEqual(["to peer", "shared"]);
       // Omitting the scope is the unscoped read the distiller-style callers use.
-      expect(repo.listEventsSince("2026-06-17T00:00:00.000Z", 50).events).toHaveLength(4);
+      expect(repo.listEventsSince("2026-06-17T00:00:00.000Z", 50).events).toHaveLength(5);
     });
   });
 
