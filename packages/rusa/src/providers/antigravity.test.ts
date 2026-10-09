@@ -16,13 +16,35 @@ import type { ProviderConfig } from "../config/types.js";
 import {
   ANTIGRAVITY_COMMAND_DISCIPLINE,
   AntigravityProvider,
+  describeAgyAuthOutcome,
   formatAgyToolInvocation,
 } from "./antigravity.js";
+import { deterministicExhaustionFallback } from "./exhaustion-classifier.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "./model-catalog.js";
 import {
   RUN_CEILING_ABORT_REASON,
   STALL_WATCHDOG_ABORT_REASON,
 } from "./termination-attribution.js";
+
+// Synthetic agy run-log lines. Healthy runs log the first two at startup and then
+// sign in silently, so they cannot distinguish a failed launch on their own.
+const AGY_STARTUP_NOT_LOGGED_IN = [
+  "I1009 10:00:00.000001 1 cache.go:1] Singleflight refresh failed: error getting token source: You are not logged into Antigravity.",
+  "I1009 10:00:00.000002 1 model_configs.go:226] Auth mode is unspecified, skipping fetchAvailableModels and returning empty response",
+];
+const AGY_SILENT_AUTH_ATTEMPT =
+  "I1009 10:00:00.100000 1 printmode.go:372] Print mode: not authenticated, trying silent auth";
+const AGY_SILENT_AUTH_SUCCEEDED =
+  "I1009 10:00:00.500000 1 printmode.go:374] Print mode: silent auth succeeded";
+const AGY_SILENT_AUTH_FAILED =
+  "I1009 10:00:00.500000 1 printmode.go:376] Print mode: silent auth failed";
+const AGY_PRIVATE_NOISE = [
+  "I1009 10:00:01.000000 1 trace.go:1] trace https://example.invalid/v1/trace?id=0123abcd",
+  "I1009 10:00:01.000001 1 session.go:1] Print mode: conversation=99999999-8888-4777-8666-555555555555, sending message",
+  "I1009 10:00:01.000002 1 auth.go:1] token=synthetic-secret-token",
+];
+const AGY_UNSUPPORTED_EFFORT =
+  "Error: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model";
 
 const { spawnFn, execSyncFn, execFileSyncFn } = vi.hoisted(() => {
   const spawnFn = vi.fn();
@@ -853,6 +875,115 @@ describe("AntigravityProvider", () => {
       rmSync(cwd, { recursive: true, force: true });
       rmSync(conversationsDir, { recursive: true, force: true });
     }
+  });
+
+  describe("failed-exit run-log sign-in diagnostic", () => {
+    async function runFailedLaunch(
+      logLines: string[] | null,
+      decoyLogLines?: string[]
+    ): Promise<{ output: string; success: boolean; exitCode: number | null }> {
+      const config: ProviderConfig = { cliCommand: "agy" };
+      const cwd = mkdtempSync(join(tmpdir(), "mc-agy-auth-"));
+      const provider = new AntigravityProvider("antigravity", config, "Gemini 3.1 Pro (High)");
+      try {
+        if (decoyLogLines) {
+          // Another run's log in the same cwd must never be attributed to this run.
+          writeFileSync(join(cwd, ".rusa-agy-decoy.log"), decoyLogLines.join("\n"));
+        }
+        const child = mockChildProcess();
+        vi.mocked(spawn).mockReturnValue(child as ChildProcessWithoutNullStreams);
+        const runPromise = provider.run({ prompt: "test prompt", cwd, session: {} });
+        const args = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+        const logFile = args[args.indexOf("--log-file") + 1];
+        if (logLines) writeFileSync(logFile, logLines.join("\n"));
+        child.stdout.emit("data", `${AGY_UNSUPPORTED_EFFORT}\n`);
+        child.emit("close", 1);
+        const result = await runPromise;
+        return { output: result.output, success: result.success, exitCode: result.exitCode };
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    }
+
+    it("appends a failed silent sign-in from the run's own log and keeps the cause", async () => {
+      const result = await runFailedLaunch(
+        [
+          ...AGY_STARTUP_NOT_LOGGED_IN,
+          AGY_SILENT_AUTH_ATTEMPT,
+          AGY_SILENT_AUTH_FAILED,
+          ...AGY_PRIVATE_NOISE,
+        ],
+        [...AGY_STARTUP_NOT_LOGGED_IN, AGY_SILENT_AUTH_ATTEMPT, AGY_SILENT_AUTH_SUCCEEDED]
+      );
+
+      expect(result).toEqual({
+        success: false,
+        exitCode: 1,
+        output: `${AGY_UNSUPPORTED_EFFORT}\n[agy run log: silent sign-in failed]`,
+      });
+    });
+
+    it("keeps a healthy-startup unsupported-effort failure an ordinary failure", async () => {
+      const result = await runFailedLaunch(
+        [
+          ...AGY_STARTUP_NOT_LOGGED_IN,
+          AGY_SILENT_AUTH_ATTEMPT,
+          AGY_SILENT_AUTH_SUCCEEDED,
+          ...AGY_PRIVATE_NOISE,
+        ],
+        [...AGY_STARTUP_NOT_LOGGED_IN, AGY_SILENT_AUTH_ATTEMPT, AGY_SILENT_AUTH_FAILED]
+      );
+
+      expect(result).toEqual({
+        success: false,
+        exitCode: 1,
+        output: `${AGY_UNSUPPORTED_EFFORT}\n[agy run log: silent sign-in succeeded]`,
+      });
+      expect(deterministicExhaustionFallback(result.output)).toBe("unknown");
+    });
+
+    it("reports a missing run log without dropping the cause", async () => {
+      const result = await runFailedLaunch(null);
+
+      expect(result.output).toBe(`${AGY_UNSUPPORTED_EFFORT}\n[agy run log: unreadable]`);
+      expect(result.success).toBe(false);
+    });
+
+    it("maps run-log sign-in lines to fixed status text only", () => {
+      const cases: Array<[string[] | undefined, string]> = [
+        [undefined, "[agy run log: unreadable]"],
+        [[], "[agy run log: no sign-in status logged]"],
+        [
+          AGY_STARTUP_NOT_LOGGED_IN,
+          "[agy run log: not signed in at startup, no silent sign-in logged]",
+        ],
+        [
+          [...AGY_STARTUP_NOT_LOGGED_IN, AGY_SILENT_AUTH_ATTEMPT],
+          "[agy run log: silent sign-in started, no outcome logged]",
+        ],
+        [
+          [...AGY_STARTUP_NOT_LOGGED_IN, AGY_SILENT_AUTH_ATTEMPT, AGY_SILENT_AUTH_SUCCEEDED],
+          "[agy run log: silent sign-in succeeded]",
+        ],
+        [
+          [AGY_SILENT_AUTH_ATTEMPT, AGY_SILENT_AUTH_SUCCEEDED, AGY_SILENT_AUTH_FAILED],
+          "[agy run log: silent sign-in failed]",
+        ],
+        [
+          [AGY_SILENT_AUTH_ATTEMPT, AGY_SILENT_AUTH_FAILED, AGY_SILENT_AUTH_SUCCEEDED],
+          "[agy run log: silent sign-in succeeded]",
+        ],
+      ];
+      for (const [lines, expected] of cases) {
+        const status = describeAgyAuthOutcome(
+          lines ? [...lines, ...AGY_PRIVATE_NOISE].join("\n") : undefined
+        );
+        expect(status).toBe(expected);
+        expect(status).not.toMatch(/https?:|conversation=|token|[0-9a-f]{8}-/i);
+        // The appended status must not move a failure into quota or transient recovery.
+        expect(deterministicExhaustionFallback(status)).toBe("unknown");
+      }
+    });
   });
 
   it("parses stream-json lines and emits incremental tool and text chunks", async () => {
