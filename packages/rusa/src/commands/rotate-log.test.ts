@@ -8,6 +8,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  rmSync,
   statSync,
   truncateSync,
   writeFileSync,
@@ -15,15 +16,24 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 // #580: the standalone service-log rotator the per-instance logrotate timer runs.
 
+// Each fixture root is recorded and removed after its test, pass or fail; the
+// sweep is by exact path so it never touches another run's rusa-rotate-* roots.
+const tempRoots: string[] = [];
 function logDir(): string {
-  const dir = join(mkdtempSync(join(tmpdir(), "rusa-rotate-")), "logs");
+  const root = mkdtempSync(join(tmpdir(), "rusa-rotate-"));
+  tempRoots.push(root);
+  const dir = join(root, "logs");
   mkdirSync(dir, { recursive: true });
   return dir;
 }
+
+afterEach(() => {
+  while (tempRoots.length > 0) rmSync(tempRoots.pop() as string, { recursive: true, force: true });
+});
 
 function rotate(logPath: string, env: Record<string, string> = {}, timeout?: number) {
   return spawnSync(process.execPath, [resolve("scripts/rotate-log.mjs")], {
