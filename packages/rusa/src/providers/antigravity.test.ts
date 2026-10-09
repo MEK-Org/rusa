@@ -879,7 +879,7 @@ describe("AntigravityProvider", () => {
 
   describe("failed-exit run-log sign-in diagnostic", () => {
     async function runFailedLaunch(
-      logLines: string[] | null,
+      logLines: string[] | "missing" | "unreadable",
       decoyLogLines?: string[]
     ): Promise<{ output: string; success: boolean; exitCode: number | null }> {
       const config: ProviderConfig = { cliCommand: "agy" };
@@ -893,9 +893,10 @@ describe("AntigravityProvider", () => {
         const child = mockChildProcess();
         vi.mocked(spawn).mockReturnValue(child as ChildProcessWithoutNullStreams);
         const runPromise = provider.run({ prompt: "test prompt", cwd, session: {} });
-        const args = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+        const args = vi.mocked(spawn).mock.lastCall?.[1] as string[];
         const logFile = args[args.indexOf("--log-file") + 1];
-        if (logLines) writeFileSync(logFile, logLines.join("\n"));
+        if (logLines === "unreadable") mkdirSync(logFile);
+        else if (logLines !== "missing") writeFileSync(logFile, logLines.join("\n"));
         child.stdout.emit("data", `${AGY_UNSUPPORTED_EFFORT}\n`);
         child.emit("close", 1);
         const result = await runPromise;
@@ -942,16 +943,21 @@ describe("AntigravityProvider", () => {
       expect(deterministicExhaustionFallback(result.output)).toBe("unknown");
     });
 
-    it("reports a missing run log without dropping the cause", async () => {
-      const result = await runFailedLaunch(null);
+    it("tells a never-written run log from an unreadable one without dropping the cause", async () => {
+      const missing = await runFailedLaunch("missing");
+      expect(missing.output).toBe(`${AGY_UNSUPPORTED_EFFORT}\n[agy run log: no run log written]`);
+      expect(missing.success).toBe(false);
 
-      expect(result.output).toBe(`${AGY_UNSUPPORTED_EFFORT}\n[agy run log: unreadable]`);
-      expect(result.success).toBe(false);
+      // A directory at the log path makes the read fail with EISDIR, not ENOENT.
+      const unreadable = await runFailedLaunch("unreadable");
+      expect(unreadable.output).toBe(`${AGY_UNSUPPORTED_EFFORT}\n[agy run log: unreadable]`);
+      expect(unreadable.success).toBe(false);
     });
 
     it("maps run-log sign-in lines to fixed status text only", () => {
-      const cases: Array<[string[] | undefined, string]> = [
-        [undefined, "[agy run log: unreadable]"],
+      const cases: Array<[string[] | { readErrorCode: string }, string]> = [
+        [{ readErrorCode: "ENOENT" }, "[agy run log: no run log written]"],
+        [{ readErrorCode: "EACCES" }, "[agy run log: unreadable]"],
         [[], "[agy run log: no sign-in status logged]"],
         [
           AGY_STARTUP_NOT_LOGGED_IN,
@@ -973,13 +979,16 @@ describe("AntigravityProvider", () => {
           [AGY_SILENT_AUTH_ATTEMPT, AGY_SILENT_AUTH_FAILED, AGY_SILENT_AUTH_SUCCEEDED],
           "[agy run log: silent sign-in succeeded]",
         ],
+        [
+          [AGY_SILENT_AUTH_ATTEMPT, AGY_SILENT_AUTH_SUCCEEDED, AGY_SILENT_AUTH_ATTEMPT],
+          "[agy run log: silent sign-in started, no outcome logged]",
+        ],
       ];
       for (const [lines, expected] of cases) {
         const status = describeAgyAuthOutcome(
-          lines ? [...lines, ...AGY_PRIVATE_NOISE].join("\n") : undefined
+          Array.isArray(lines) ? [...lines, ...AGY_PRIVATE_NOISE].join("\n") : lines
         );
         expect(status).toBe(expected);
-        expect(status).not.toMatch(/https?:|conversation=|token|[0-9a-f]{8}-/i);
         // The appended status must not move a failure into quota or transient recovery.
         expect(deterministicExhaustionFallback(status)).toBe("unknown");
       }

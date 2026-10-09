@@ -164,6 +164,8 @@ export function parseConversationId(log: string): string | undefined {
 const AUTH_OUTCOME_SCAN_CHARS = 256 * 1024;
 
 const AUTH_OUTCOME_LINES = {
+  // Taken from the agy 1.3.1/1.3.2 binary's string table; not yet seen in a run log.
+  // The other three lines have been seen in real per-run logs.
   failed: "Print mode: silent auth failed",
   succeeded: "Print mode: silent auth succeeded",
   attempted: "Print mode: not authenticated, trying silent auth",
@@ -177,17 +179,26 @@ const AUTH_OUTCOME_LINES = {
  * then sign in silently, so it is reported, never acted on. Only fixed text
  * leaves this function: no raw log lines, URLs, identifiers or tokens.
  */
-export function describeAgyAuthOutcome(log: string | undefined): string {
+export function describeAgyAuthOutcome(
+  log: string | { readErrorCode: string } | undefined
+): string {
   const prefix = "[agy run log: ";
-  if (log === undefined) return `${prefix}unreadable]`;
+  if (typeof log !== "string") {
+    // Only ENOENT from the read itself means agy never wrote the log.
+    return log?.readErrorCode === "ENOENT"
+      ? `${prefix}no run log written]`
+      : `${prefix}unreadable]`;
+  }
   const head = log.slice(0, AUTH_OUTCOME_SCAN_CHARS);
   const failedAt = head.lastIndexOf(AUTH_OUTCOME_LINES.failed);
   const succeededAt = head.lastIndexOf(AUTH_OUTCOME_LINES.succeeded);
-  if (failedAt >= 0 || succeededAt >= 0) {
-    return `${prefix}silent sign-in ${failedAt > succeededAt ? "failed" : "succeeded"}]`;
-  }
-  if (head.includes(AUTH_OUTCOME_LINES.attempted)) {
+  const outcomeAt = Math.max(failedAt, succeededAt);
+  // A later attempt supersedes an earlier outcome: report the attempt, not the stale outcome.
+  if (head.lastIndexOf(AUTH_OUTCOME_LINES.attempted) > outcomeAt) {
     return `${prefix}silent sign-in started, no outcome logged]`;
+  }
+  if (outcomeAt >= 0) {
+    return `${prefix}silent sign-in ${failedAt > succeededAt ? "failed" : "succeeded"}]`;
   }
   if (head.includes(AUTH_OUTCOME_LINES.notLoggedIn)) {
     return `${prefix}not signed in at startup, no silent sign-in logged]`;
@@ -700,7 +711,7 @@ export class AntigravityProvider implements CodingProvider {
       }
     };
 
-    let runLog: string | undefined;
+    let runLog: string | { readErrorCode: string } | undefined;
     const captureSessionFromLog = (): string | undefined => {
       let sessionId = capturedSessionId ?? opts.session?.id;
       if (logFile) {
@@ -708,8 +719,8 @@ export class AntigravityProvider implements CodingProvider {
         try {
           runLog = readFileSync(logFile, "utf8");
           sessionId = parseConversationId(runLog) ?? sessionId;
-        } catch {
-          /* log unreadable */
+        } catch (error) {
+          runLog = { readErrorCode: (error as NodeJS.ErrnoException).code ?? "UNKNOWN" };
         }
         try {
           unlinkSync(logFile);
