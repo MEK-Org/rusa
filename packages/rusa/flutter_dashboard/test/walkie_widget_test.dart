@@ -35,6 +35,7 @@ void main() {
   );
 
   Future<void> selectActor(WidgetTester tester) async {
+    await store.refreshDashboardConfig();
     await store.refreshThreads();
     store.clickActor('a');
     await tester.pumpWidget(harness());
@@ -52,6 +53,7 @@ void main() {
   ) async {
     final bare = DashboardStore(api: api, stream: FakeStream());
     addTearDown(bare.dispose);
+    await bare.refreshDashboardConfig();
     await bare.refreshThreads();
     bare.clickActor('a');
     await tester.pumpWidget(
