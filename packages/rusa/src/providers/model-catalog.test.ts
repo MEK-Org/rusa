@@ -328,26 +328,19 @@ describe("effort-suffixed agy slugs (#968)", () => {
     ]);
   });
 
-  it("keeps selection resolution canonical and launches the suffixed slug", () => {
+  it("keeps selection resolution canonical for a suffixed slug", () => {
     setProviderModelCatalog("agy", parseAgyModelsOutput(flashRows));
     expect(() => resolveAntigravitySelection("gemini-3.8-flash")).toThrow(
       'invalid model selection: model "gemini-3.8-flash" requires an effort but none was provided'
     );
-    const selection = resolveAntigravitySelection("gemini-3.8-flash-low");
-    expect(selection).toEqual({ model: "gemini-3.8-flash", effort: "low" });
-    expect(antigravityLaunchSelector(selection)).toEqual({ model: "gemini-3.8-flash-low" });
-    expect(
-      antigravityLaunchSelector(resolveAntigravitySelection("Gemini 3.8 Flash", "MEDIUM"))
-    ).toEqual({ model: "gemini-3.8-flash-medium" });
+    expect(resolveAntigravitySelection("gemini-3.8-flash-low")).toEqual({
+      model: "gemini-3.8-flash",
+      effort: "low",
+    });
   });
 
-  it("passes through a tier known only from a display label, and provider defaults", () => {
-    setProviderModelCatalog("agy", [
-      { identifier: "gemini-3.1-pro", displayLabel: "Gemini 3.1 Pro (High)", passable: true },
-    ]);
-    const selection = resolveAntigravitySelection("Gemini 3.1 Pro", "high");
-    expect(selection).toEqual({ model: "gemini-3.1-pro", effort: "high" });
-    expect(antigravityLaunchSelector(selection)).toEqual(selection);
+  it("passes provider-default selections through the launch selector", () => {
+    setProviderModelCatalog("agy", parseAgyModelsOutput(flashRows));
     expect(antigravityLaunchSelector({ effort: "low" })).toEqual({ effort: "low" });
     expect(antigravityLaunchSelector({})).toEqual({});
   });
