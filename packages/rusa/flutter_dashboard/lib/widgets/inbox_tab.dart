@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../link_opener.dart';
+import '../dashboard_timing.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -65,9 +66,10 @@ class _InboxTabState extends State<InboxTab> {
 
     final readyObligations = (results[2] as ObligationPage).obligations;
     final waitingObligations = (results[3] as ObligationPage).obligations;
-    final scheduledObligations = (results[4] as ObligationPage).obligations
-        .toList()
-      ..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
+    final scheduledObligations =
+        (results[4] as ObligationPage).obligations.toList()..sort(
+          (a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''),
+        );
 
     // Fetch blockers for waiting obligations
     final blockers = await Future.wait(
@@ -98,7 +100,10 @@ class _InboxTabState extends State<InboxTab> {
   @override
   void initState() {
     super.initState();
-    _page = _loadInbox();
+    _page = widget.store.api.trackInteraction(
+      DashboardInteraction.primaryNavigation,
+      _loadInbox,
+    );
   }
 
   @override
@@ -344,6 +349,7 @@ class _InboxTabState extends State<InboxTab> {
       store: widget.store,
       blockers: blockers,
       onSelectView: widget.onSelectView,
+      openLink: widget.openLink,
       onMutated: _refresh,
       showKindChip: false,
       showReorder: isReadyList && items.length > 1,

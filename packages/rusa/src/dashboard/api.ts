@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { brotliCompress, gzip, constants as zlibConstants } from "node:zlib";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
+import type { HaltState } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { inboxEntryObligationRefs } from "../actor/inbox-focus.js";
 import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
@@ -25,7 +26,7 @@ import {
   type ObligationRepository,
 } from "../db/repositories/obligation-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import type { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import {
   type Obligation,
   type ObligationStatus,
@@ -33,10 +34,7 @@ import {
 } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
-import {
-  resolveLegacyOperatorAlias,
-  resolveSoleActiveUser,
-} from "../principals/operator-principal.js";
+import { resolveSoleActiveUser } from "../principals/operator-principal.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import {
   type ResolvedReference,
@@ -67,6 +65,8 @@ import {
 } from "./human-chat-scope.js";
 import { selectPrioritizedInboxItem } from "./inbox-selection.js";
 import type { SseHub } from "./sse.js";
+import type { DashboardTimingRecorder } from "./timing.js";
+import { measureDashboardPhase, startDashboardPhase } from "./timing-phases.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {
@@ -75,6 +75,8 @@ export interface DashboardDataDeps {
   /** Application logger for route diagnostics. Absent → nothing is logged. */
   logger?: Logger;
   meshEvents: MeshEventRepository;
+  /** Bounded, content-free dashboard timing recorder; absent in UI-only tests. */
+  timings?: DashboardTimingRecorder;
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
   obligations?: ObligationRepository;
@@ -85,6 +87,7 @@ export interface DashboardDataDeps {
   inbox?: InboxRepository;
   /** Completed selection intervals used only to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
+  runPrompts?: RunPromptRepository;
   /** Durable per-entry obligation associations for activity correlation. */
   inboxFocus?: InboxFocusRepository;
   sseHub: SseHub;
@@ -103,6 +106,15 @@ export interface DashboardDataDeps {
    * when absent (e.g. a UI-only server) the response reports `halted: false`.
    */
   isHalted?: () => boolean;
+  /**
+   * Read-only structured view of the active halt — global versus the held
+   * provider(s)/model(s), plus the requested expiry — from the same
+   * authoritative sentinel as `isHalted`. Surfaced as the top-level `halt`
+   * field on `/api/mesh/threads` so the header chip can explain its scope;
+   * `null` (or absent, for a UI-only server) means no active halt, never an
+   * expired one: the sentinel layer already retires `until` past its time.
+   */
+  haltSnapshot?: () => HaltState | null;
   /**
    * Read-only snapshot of both host-scheduler preflights: crontab/crond and
    * `at`/`atrm`/`atd`/`atq`. Surfaced as the top-level `schedulerWarning`
@@ -410,6 +422,31 @@ function operatorHandledNote(reason: string): string {
 }
 
 /**
+ * The smallest projection of the authoritative halt sentinel the header chip
+ * needs to explain itself: whether the hold is global or names provider(s)
+ * and/or model(s), and the requested expiry when one was set. The sentinel
+ * layer already retires expired `until`s, so a returned `until` is in the
+ * future when this snapshot is built; an idle client may present it after its
+ * local clock passes that expiry. Its absence means indefinite. Reason text
+ * stays server-side: the chip explains scope and effect, not the operator's
+ * note.
+ */
+function haltSnapshotJson(state: HaltState | null | undefined): {
+  scope: "global" | "providers" | "models";
+  providers?: string[];
+  models?: string[];
+  until?: string;
+} | null {
+  if (!state) return null;
+  return {
+    scope: state.models?.length ? "models" : state.providers?.length ? "providers" : "global",
+    ...(state.providers?.length ? { providers: state.providers } : {}),
+    ...(state.models?.length ? { models: state.models } : {}),
+    ...(state.until ? { until: state.until } : {}),
+  };
+}
+
+/**
  * Below this, compression costs more than it saves: a round trip through the
  * threadpool to shave a few hundred bytes off a response that already fits in
  * one segment. Most of this file's replies are small errors and acks.
@@ -499,7 +536,13 @@ function compress(encoding: Encoding, payload: Buffer): Promise<Buffer> {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const payload = Buffer.from(JSON.stringify(body), "utf-8");
+  const endSerialization = startDashboardPhase("serialization");
+  let payload: Buffer;
+  try {
+    payload = Buffer.from(JSON.stringify(body), "utf-8");
+  } finally {
+    endSerialization();
+  }
   // `Vary` regardless of what this particular response did: the header
   // describes the endpoint's behaviour, and omitting it on the uncompressed
   // branch is how an intermediary caches a br body for a client that can't read it.
@@ -519,13 +562,16 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 
   // Off the event loop: zlib's async form runs on the threadpool, so a 2 MB
   // body costs this request latency and not every concurrent one.
+  const endCompression = startDashboardPhase("compression");
   compress(encoding, payload).then(
     (compressed) => {
+      endCompression();
       if (res.writableEnded) return;
       res.writeHead(status, { ...headers, "Content-Encoding": encoding });
       res.end(compressed);
     },
     () => {
+      endCompression();
       // Compression is an optimisation; failing it must not fail the response.
       if (res.writableEnded) return;
       res.writeHead(status, headers);
@@ -581,16 +627,18 @@ function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
 async function resolveInboxPage(
   page: InboxPage,
   deps: DashboardDataDeps,
-  chatScope: HumanChatScope
+  chatScope: HumanChatScope,
+  budget?: import("../references/cache-service.js").ReferenceBudget
 ): Promise<ResolvedInboxPage> {
   // Same cache/resolver an obligation's cited artifacts use, so an external
   // inbox entry gets the identical rich preview and "open in new tab" link
   // rather than a second rendering path.
+  const { referenceCache } = deps;
   const resolve = (ref: string) =>
-    deps.referenceCache
-      ? deps.referenceCache
-          .get(ref, deps)
-          .catch(() => resolveReferenceSync(ref, { meshChat: deps.meshChat }))
+    referenceCache
+      ? measureDashboardPhase("enrichment", () => referenceCache.get(ref, deps, budget)).catch(() =>
+          resolveReferenceSync(ref, { meshChat: deps.meshChat })
+        )
       : resolveReferenceSync(ref, { meshChat: deps.meshChat });
   const entries: Array<ResolvedInboxEntry | null> = await Promise.all(
     page.entries.map(async (entry): Promise<ResolvedInboxEntry | null> => {
@@ -713,9 +761,8 @@ function parseKinds(url: URL): string[] | undefined {
  * The durable principal a dashboard mutation is attributed to. An
  * authenticated session carries its verified identity. In auth-disabled local
  * mode the process boundary is the trust boundary. A sole active durable user
- * remains attributable after #460; when no active durable user exists, local
- * actions retain the legacy `human:operator` identity rather than becoming
- * unusable. Several active users are still refused rather than guessed at.
+ * is required. Local startup bootstraps one when no user exists. Missing or
+ * ambiguous identities are refused rather than guessed at.
  */
 export function resolveOperatorPrincipalId(
   req: IncomingMessage,
@@ -725,7 +772,6 @@ export function resolveOperatorPrincipalId(
   if (reqPrincipal) return { ok: true, principalId: reqPrincipal.id as RootControlPrincipal };
   const sole = resolveSoleActiveUser(deps?.principals);
   if (sole.ok) return { ok: true, principalId: sole.user.id as RootControlPrincipal };
-  if (sole.reason === "none") return { ok: true, principalId: HUMAN_OPERATOR };
   return { ok: false, error: sole.error };
 }
 
@@ -746,33 +792,20 @@ export function requireOperatorPrincipal(
 
 /**
  * The participant set a `/api/mesh/chat` query may read (#590). The viewer's
- * own ids (durable principal plus the legacy alias while it still names them)
- * are always part of the set, as #469 did for an authenticated viewer, so a
- * two-actor query still reads the viewer's side with each of them. A human id
- * in the request is the client asking for "the human side", and the only
- * human side a viewer may read is their own: the request's human ids are
- * replaced by the viewer's, so the same query reads correctly whether the
- * client sent `human:operator`, the viewer's id, or both. Naming another
- * human principal is refused rather than silently narrowed — a direct API
- * caller asking for someone else's conversation gets told no, not an answer
- * that looks complete. The legacy `human:operator` alias is never "another
- * human": the shipped client always sends it, so it stands for the viewer
- * while it still resolves to them and is simply dropped once several durable
- * users make it nobody's. A viewer who cannot be identified (auth-disabled
- * local mode with several users) has no human side at all and reads only
- * actor↔actor rows, the same silent narrowing the events feed and the live
- * stream apply; the write path is where that misconfiguration is reported.
+ * durable id is always included, so an actor selection reads the viewer's
+ * conversation with each actor. Other users and unknown participants are
+ * refused. An unidentified viewer reads only known actor↔actor traffic.
  */
 export function resolveChatQueryActors(
   actors: string[],
   scope: HumanChatScope
 ): { ok: true; actors: string[] } | { ok: false; error: string } {
-  const other = actors.find((id) => id !== HUMAN_OPERATOR && !scope.canSee(id));
+  const other = actors.find((id) => !scope.canSee(id));
   if (other !== undefined) {
     return { ok: false, error: "cannot read another human principal's conversation" };
   }
   const mine = scope.viewerIds;
-  const result = new Set(actors.filter((id) => id !== HUMAN_OPERATOR && !mine.has(id)));
+  const result = new Set(actors.filter((id) => !mine.has(id)));
   for (const id of mine) result.add(id);
   return { ok: true, actors: [...result] };
 }
@@ -1069,7 +1102,9 @@ export async function handleMeshApiRequest(
 
           const fromId = requireOperatorPrincipal(req, res, deps);
           if (!fromId) return;
-          const result = deps.mesh.sendHumanMessage(actorId, body, sessionId, { voice, fromId });
+          const result = deps.mesh.sendMessage(actorId, body, fromId, sessionId, undefined, {
+            voice,
+          });
           if (result.delivered) {
             sendJson(res, 200, { ok: true });
           } else {
@@ -1509,13 +1544,7 @@ export async function handleMeshApiRequest(
           }
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
-          // A row still owned by the legacy operator alias belongs to whoever
-          // that alias resolves to now, the same reading every owner write uses.
-          const owner = resolveLegacyOperatorAlias(existing.ownerId, deps?.principals);
-          if (
-            existing.ownerId !== actingPrincipal &&
-            !(owner.ok && owner.ownerId === actingPrincipal)
-          ) {
+          if (existing.ownerId !== actingPrincipal) {
             sendJson(res, 403, {
               error: "only the obligation's current owner may snooze or unsnooze it",
             });
@@ -1949,12 +1978,13 @@ export async function handleMeshApiRequest(
     );
     const rootHandle = deps.rootIdentity?.handle ?? generateHandle("root");
     const chatScope = viewerScope();
-    // Aggregate last activity once for all actors; the covering index on
-    // mesh_events(actor_id, ts) makes this cheap .
-    const lastActiveByActor = meshEvents.latestActivityByActor();
+    // Aggregate last activity once for all displayed actors; bounded indexed
+    // seeks on idx_mesh_events_actor_ts scale with actor count rather than event history (#934).
+    const actorList = actors.list();
+    const lastActiveByActor = meshEvents.latestActivityByActor(actorList.map((a) => a.id));
 
     const threads: ThreadDto[] = await Promise.all(
-      actors.list().map(async (r) => {
+      actorList.map(async (r) => {
         let runState: "running" | "queued" | "idle" = "idle";
         if (runtime) {
           runState = runtime.states.get(r.id) ?? "idle";
@@ -2080,6 +2110,7 @@ export async function handleMeshApiRequest(
     const userPrincipalId = viewingUserPrincipalId(req, deps.principals);
     sendJson(res, 200, {
       halted: deps.isHalted?.() ?? false,
+      halt: haltSnapshotJson(deps.haltSnapshot?.()),
       schedulerWarning: schedulerHealth && !schedulerHealth.ok ? schedulerHealth.issues : null,
       runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
       threads,
@@ -2125,6 +2156,18 @@ export async function handleMeshApiRequest(
       humanViewerIds,
     });
     sendJson(res, 200, page);
+    return true;
+  }
+
+  // Complete launch text is fetched on demand through the existing dashboard access path.
+  const runPromptMatch = /^\/api\/mesh\/runs\/([^/]+)\/prompt$/.exec(pathname);
+  if (runPromptMatch && req.method === "GET") {
+    const retained = deps.runPrompts?.getById(decodeURIComponent(runPromptMatch[1]));
+    if (!retained) {
+      sendJson(res, 404, { error: "prompt not retained" });
+      return true;
+    }
+    sendJson(res, 200, { prompt: retained.prompt });
     return true;
   }
 
@@ -2335,10 +2378,16 @@ export async function handleMeshApiRequest(
     // another human's conversation is projected without its content or ends
     // (#590). Mesh refs are resolved locally by the cache service rather than
     // stored, so the scope applies to the cached and uncached paths alike.
+    // Citations and the external reference start together and share one
+    // deadline, so two cold references wait one window, not two (#933).
+    const { referenceCache } = deps;
+    const referenceBudget = referenceCache?.startBudget();
     const resolveCited = async (ref: string): Promise<ResolvedReferenceWithEntity> =>
       scopeMeshMessageReference(
-        deps.referenceCache
-          ? await deps.referenceCache.get(ref, deps).catch(() => ({
+        referenceCache
+          ? await measureDashboardPhase("enrichment", () =>
+              referenceCache.get(ref, deps, referenceBudget)
+            ).catch(() => ({
               ...resolveReferenceSync(ref, { meshChat: deps.meshChat }),
               unavailable: "could not load context",
               cacheState: "unavailable" as const,
@@ -2346,14 +2395,16 @@ export async function handleMeshApiRequest(
           : resolveReferenceSync(ref, { meshChat: deps.meshChat }),
         viewerScope()
       );
-    const artifacts = await Promise.all(
-      deps.obligations.listArtifacts(id).map(async (artifact) => ({
-        artifact,
-        reference: await resolveCited(artifact.ref),
-      }))
-    );
     const externalRefKey = obligation.externalRef?.key;
-    const externalReference = externalRefKey ? await resolveCited(externalRefKey) : null;
+    const [artifacts, externalReference] = await Promise.all([
+      Promise.all(
+        deps.obligations.listArtifacts(id).map(async (artifact) => ({
+          artifact,
+          reference: await resolveCited(artifact.ref),
+        }))
+      ),
+      externalRefKey ? resolveCited(externalRefKey) : null,
+    ]);
     sendJson(res, 200, {
       obligation,
       parent,
@@ -2400,14 +2451,27 @@ export async function handleMeshApiRequest(
     const completedFocuses = deps.actorRuns?.listRecentCompletedFocuses(limit * 2) ?? [];
     const handledItems: Array<Record<string, unknown>> = [];
 
-    for (const entry of handledEntries) {
+    // Resolve the whole page at once against one reference deadline (#933);
+    // the loop below then assembles cards in the store's order.
+    const referenceBudget = deps.referenceCache?.startBudget();
+    const resolvedEntries = await Promise.all(
+      handledEntries.map(async (entry) =>
+        entry.handledAt
+          ? (
+              await resolveInboxPage(
+                { entries: [entry], unhandledCount: 1, nextCursor: null },
+                deps,
+                chatScope,
+                referenceBudget
+              )
+            ).entries[0]
+          : undefined
+      )
+    );
+
+    for (const [index, entry] of handledEntries.entries()) {
       if (!entry.handledAt) continue;
-      const page = await resolveInboxPage(
-        { entries: [entry], unhandledCount: 1, nextCursor: null },
-        deps,
-        chatScope
-      );
-      const resolved = page.entries[0];
+      const resolved = resolvedEntries[index];
       if (!resolved) continue;
 
       const { handle, model } = actorDisplayInfo(entry.actorId);
@@ -2556,8 +2620,40 @@ export async function handleMeshApiRequest(
 
   // GET /api/mesh/stream?actors= — SSE: all mesh_event, live_output for `actors`.
   if (pathname === "/api/mesh/stream") {
+    const started = performance.now();
     const actors = parseActors(url);
-    sseHub.addConnection(res, actors.length > 0 ? new Set(actors) : null, humanChatViewer(req));
+    const connected = sseHub.addConnection(
+      res,
+      actors.length > 0 ? new Set(actors) : null,
+      humanChatViewer(req)
+    );
+    // `handleMeshApiRequest` also supports lightweight response doubles in
+    // API-only callers. The live HTTP wrapper always supplies this header.
+    const requestId = deps.timings
+      ? (res as unknown as { getHeader?: (name: string) => unknown }).getHeader?.(
+          "X-Rusa-Request-Id"
+        )
+      : undefined;
+    const requestIdString = typeof requestId === "string" ? requestId : undefined;
+    deps.timings?.recordServer({
+      label: "mesh_stream_open",
+      requestId: requestIdString,
+      durationMs: Math.round(performance.now() - started),
+      status: res.statusCode || (connected ? 200 : 503),
+      bytes: null,
+    });
+    if (connected) {
+      // A close is its own lifecycle observation, never a request-latency sample.
+      res.once("close", () =>
+        deps.timings?.recordServer({
+          label: "mesh_stream_close",
+          requestId: requestIdString,
+          durationMs: null,
+          status: res.statusCode || 200,
+          bytes: null,
+        })
+      );
+    }
     return true;
   }
 

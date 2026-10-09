@@ -20,7 +20,7 @@ import {
   carryForwardAntigravityConversation,
   ensureAntigravityPrivateState,
 } from "./antigravity-paths.js";
-import { getProviderModelCatalog } from "./model-catalog.js";
+import { getProviderModelCatalog, type ModelEntry } from "./model-catalog.js";
 import {
   type ModelEffortSelection,
   normalizeModelEffortSelection,
@@ -105,9 +105,13 @@ export function resolveAntigravitySelection(
 
   // A catalog-exact base name wins before legacy suffix parsing. This keeps a
   // legitimate future base identifier/display label ending in "-high" intact.
-  const exactMatch = catalog.find(
-    (entry) => entry.identifier === model || entry.displayLabel === model
-  );
+  // Model names are case-insensitive (#974); the identifier returned below is
+  // the catalog's spelling either way.
+  const names = (name: string | undefined) => (entry: ModelEntry) =>
+    name !== undefined &&
+    (entry.identifier.toLowerCase() === name.toLowerCase() ||
+      entry.displayLabel.toLowerCase() === name.toLowerCase());
+  const exactMatch = catalog.find(names(model));
   const selection = exactMatch
     ? {
         model,
@@ -115,11 +119,7 @@ export function resolveAntigravitySelection(
       }
     : normalizeModelEffortSelection("agy", model, rawEffort);
 
-  const catalogMatch =
-    exactMatch ??
-    catalog.find(
-      (entry) => entry.identifier === selection.model || entry.displayLabel === selection.model
-    );
+  const catalogMatch = exactMatch ?? catalog.find(names(selection.model));
   if (!catalogMatch) {
     throw new Error(`invalid model selection: model "${rawModel}" not found in catalog`);
   }
@@ -522,8 +522,9 @@ export class AntigravityProvider implements CodingProvider {
     }
     const logFile = opts.session ? join(logDir, `.rusa-agy-${randomUUID()}.log`) : undefined;
 
+    const launchPrompt = sanitizeArgvText(appendAntigravityCommandDiscipline(opts.prompt));
     const args = buildAntigravityArgs({
-      prompt: appendAntigravityCommandDiscipline(opts.prompt),
+      prompt: launchPrompt,
       model: selection.model,
       effort: selection.effort,
       conversationId: opts.session?.id,
@@ -702,6 +703,7 @@ export class AntigravityProvider implements CodingProvider {
       : undefined;
 
     return runSubprocess({
+      onSpawn: () => opts.onPromptLaunched?.(launchPrompt),
       command: spawnCommand,
       args: spawnArgs,
       cwd: spawnCwd,

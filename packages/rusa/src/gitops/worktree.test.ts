@@ -171,8 +171,6 @@ describe("addWorktree", () => {
       "rev-parse --verify refs/remotes/origin/mc/issue-123": makeGitError("not found"),
       "worktree list --porcelain": "worktree /tmp/mc/workspaces/abc123/repo.git\nbare\n\n",
       "worktree add -b mc/issue-123 /tmp/mc/workspaces/abc123/worktrees/wt-001 main": "",
-      "config user.email rusa@localhost": "",
-      "config user.name Meta Coder": "",
       "config --local safe.directory *": "",
     });
 
@@ -196,8 +194,6 @@ describe("addWorktree", () => {
       "rev-parse --verify refs/heads/mc/issue-123": "def456",
       "worktree list --porcelain": "worktree /tmp/mc/workspaces/abc123/repo.git\nbare\n\n",
       "worktree add --checkout /tmp/mc/workspaces/abc123/worktrees/wt-001 mc/issue-123": "",
-      "config user.email rusa@localhost": "",
-      "config user.name Meta Coder": "",
       "config --local safe.directory *": "",
     });
 
@@ -400,8 +396,6 @@ describe("addWorktree", () => {
       "rev-parse --verify refs/remotes/origin/mc/issue-123": makeGitError("not found"),
       "worktree list --porcelain": "worktree /tmp/mc/workspaces/abc123/repo.git\nbare\n\n",
       "worktree add -b mc/issue-123 /tmp/mc/workspaces/abc123/worktrees/wt-001 main": "",
-      "config user.email rusa@localhost": "",
-      "config user.name Meta Coder": "",
       "config --local safe.directory *": "",
     });
 
@@ -439,8 +433,6 @@ describe("addWorktree", () => {
       "rev-parse --verify refs/heads/mc/issue-123": makeGitError("not found"),
       "worktree list --porcelain": "worktree /tmp/mc/workspaces/abc123/repo.git\nbare\n\n",
       "worktree add -b mc/issue-123 /tmp/mc/workspaces/abc123/worktrees/wt-001 main": "",
-      "config user.email rusa@localhost": "",
-      "config user.name Meta Coder": "",
       "config --local safe.directory *": "",
     });
 
@@ -493,8 +485,6 @@ describe("addWorktree", () => {
       "rev-parse --verify refs/heads/mc/issue-123": makeGitError("not found"),
       "worktree list --porcelain": "worktree /tmp/mc/workspaces/abc123/repo.git\nbare\n\n",
       "worktree add -b mc/issue-123 /tmp/mc/workspaces/abc123/worktrees/wt-001 main": "",
-      "config user.email rusa@localhost": "",
-      "config user.name Meta Coder": "",
       "config --local safe.directory *": "",
     });
 

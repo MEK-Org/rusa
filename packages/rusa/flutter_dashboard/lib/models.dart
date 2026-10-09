@@ -689,6 +689,7 @@ class ThreadsSnapshot {
     this.runtimeCursor,
     this.schedulerWarning,
     this.supportedVoices = const [],
+    this.halt,
   });
 
   final bool halted;
@@ -706,6 +707,12 @@ class ThreadsSnapshot {
   /// working); this is the health-visible surface for that non-fatal state.
   final List<String>? schedulerWarning;
 
+  /// Structured view of the active halt (scope/providers/models/until), null
+  /// when no halt is active — what the header chip's tooltip explains. Absent
+  /// against an older server that predates the field (the bool above still
+  /// carries the badge).
+  final HaltStatusDto? halt;
+
   factory ThreadsSnapshot.fromJson(Map<String, dynamic> j) => ThreadsSnapshot(
     halted: j['halted'] as bool? ?? false,
     runtimeCursor: j['runtimeCursor'] == null
@@ -720,6 +727,43 @@ class ThreadsSnapshot {
     supportedVoices: (j['supportedVoices'] as List<dynamic>? ?? const [])
         .map(SupportedVoiceDto.fromJson)
         .toList(),
+    halt: j['halt'] == null
+        ? null
+        : HaltStatusDto.fromJson(j['halt'] as Map<String, dynamic>),
+  );
+}
+
+/// The authoritative halt sentinel's own shape, projected without its reason
+/// text: the chip explains scope and effect, not the operator's note.
+class HaltStatusDto {
+  const HaltStatusDto({
+    required this.scope,
+    this.providers = const [],
+    this.models = const [],
+    this.until,
+  });
+
+  /// `global` = every provider; `providers` = the named providers; `models` =
+  /// the named models on the named provider(s).
+  final String scope;
+  final List<String> providers;
+  final List<String> models;
+
+  /// Requested expiry, ISO-8601. It is in the future when the server builds
+  /// the snapshot — the sentinel retires expired halts; a client may present
+  /// that snapshot after its local clock has passed the expiry. Absence means
+  /// indefinite.
+  final String? until;
+
+  factory HaltStatusDto.fromJson(Map<String, dynamic> j) => HaltStatusDto(
+    scope: j['scope'] as String? ?? 'global',
+    providers: (j['providers'] as List<dynamic>? ?? const [])
+        .map((e) => e as String)
+        .toList(),
+    models: (j['models'] as List<dynamic>? ?? const [])
+        .map((e) => e as String)
+        .toList(),
+    until: j['until'] as String?,
   );
 }
 
@@ -1116,6 +1160,17 @@ class MeshEvent {
       } catch (_) {}
     }
     return null;
+  }
+
+  /// The immutable run id from this run-start receipt.
+  String? get runId {
+    if (kind != 'run_start' || payload == null) return null;
+    try {
+      final id = (jsonDecode(payload!) as Map<String, dynamic>)['runId'];
+      return id is String && id.isNotEmpty ? id : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   /// The concrete model that actually started this run. Older run_start rows
@@ -1660,14 +1715,27 @@ class QuotaProviderConfigDto {
       );
 }
 
+class UserPrincipalDto {
+  const UserPrincipalDto({required this.id, required this.email});
+
+  final String id;
+  final String email;
+
+  factory UserPrincipalDto.fromJson(Map<String, dynamic> j) =>
+      UserPrincipalDto(id: j['id'] as String, email: j['email'] as String);
+}
+
+/// Per-request dashboard data, including the server-verified viewing principal.
 class DashboardConfigDto {
   const DashboardConfigDto({
     required this.quotaProviders,
-    this.userPrincipalId,
+    required this.userPrincipalId,
+    this.users = const [],
   });
 
   final Map<String, QuotaProviderConfigDto> quotaProviders;
-  final String? userPrincipalId;
+  final String userPrincipalId;
+  final List<UserPrincipalDto> users;
 
   factory DashboardConfigDto.fromJson(Map<String, dynamic> j) {
     final rawProviders =
@@ -1679,7 +1747,10 @@ class DashboardConfigDto {
           QuotaProviderConfigDto.fromJson(value as Map<String, dynamic>),
         ),
       ),
-      userPrincipalId: j['userPrincipalId'] as String?,
+      userPrincipalId: j['userPrincipalId'] as String,
+      users: (j['users'] as List<dynamic>)
+          .map((u) => UserPrincipalDto.fromJson(u as Map<String, dynamic>))
+          .toList(),
     );
   }
 }
@@ -1699,7 +1770,7 @@ class VoiceAnnouncement {
 
   final String id;
 
-  /// The actor whose reply this is (the walkie peer, not `human:operator`).
+  /// The actor whose message is being spoken.
   final String actorId;
 
   /// The speakable text that was synthesized — shown large while playing.
@@ -1876,6 +1947,7 @@ class ObligationDto {
     this.updatedAt,
     this.intent,
     this.externalRef,
+    this.completionMatcher,
     required this.status,
     this.priority,
     required this.effectivePriority,
@@ -1898,9 +1970,8 @@ class ObligationDto {
   final String id;
   final String? parentId;
 
-  /// One entity id in the mesh's single id space: an actor UUID, `root`,
-  /// `human:*`, or `system:*`. The category is read off the prefix — there is
-  /// no separate owner "kind".
+  /// An opaque actor or durable user principal id in the mesh's single id space.
+  /// Principal storage determines its kind.
   final String ownerId;
 
   /// The heading — short, and what a queue shows. Null only for rows that
@@ -1914,6 +1985,9 @@ class ObligationDto {
   final String? updatedAt;
   final String? intent;
   final String? externalRef;
+
+  /// Read-only event predicate, set through the obligations MCP server.
+  final CompletionMatcherDto? completionMatcher;
   final String
   status; // "ready" | "waiting" | "done" | "cancelled" | "scheduled"
   final double? priority;
@@ -2052,6 +2126,11 @@ class ObligationDto {
       updatedAt: j['updatedAt'] as String?,
       intent: j['intent'] as String?,
       externalRef: extRef,
+      completionMatcher: j['completionMatcher'] is Map
+          ? CompletionMatcherDto.fromJson(
+              (j['completionMatcher'] as Map).cast<String, dynamic>(),
+            )
+          : null,
       status: j['status'] as String? ?? 'ready',
       priority: (j['priority'] as num?)?.toDouble(),
       effectivePriority: (j['effectivePriority'] as num?)?.toDouble() ?? 0.0,
@@ -2082,6 +2161,8 @@ class ObligationDto {
     if (updatedAt != null) 'updatedAt': updatedAt,
     if (intent != null) 'intent': intent,
     if (externalRef != null) 'externalRef': externalRef,
+    if (completionMatcher != null)
+      'completionMatcher': completionMatcher!.toJson(),
     'status': status,
     if (priority != null) 'priority': priority,
     'effectivePriority': effectivePriority,
@@ -2098,6 +2179,48 @@ class ObligationDto {
     if (checkpointAt != null) 'checkpointAt': checkpointAt,
     if (checkpointBy != null) 'checkpointBy': checkpointBy,
     if (hasCompletionHistory) 'hasCompletionHistory': hasCompletionHistory,
+  };
+}
+
+/// The immutable dashboard projection of an obligation completion matcher.
+class CompletionMatcherDto {
+  const CompletionMatcherDto({
+    required this.kind,
+    required this.target,
+    required this.setBy,
+    required this.setAt,
+    this.satisfiedAt,
+    this.satisfiedRef,
+    this.closedUnmergedAt,
+  });
+
+  final String kind;
+  final String target;
+  final String setBy;
+  final String setAt;
+  final String? satisfiedAt;
+  final String? satisfiedRef;
+  final String? closedUnmergedAt;
+
+  factory CompletionMatcherDto.fromJson(Map<String, dynamic> j) =>
+      CompletionMatcherDto(
+        kind: j['kind'] as String? ?? '',
+        target: j['target'] as String? ?? '',
+        setBy: j['setBy'] as String? ?? '',
+        setAt: j['setAt'] as String? ?? '',
+        satisfiedAt: j['satisfiedAt'] as String?,
+        satisfiedRef: j['satisfiedRef'] as String?,
+        closedUnmergedAt: j['closedUnmergedAt'] as String?,
+      );
+
+  Map<String, dynamic> toJson() => {
+    'kind': kind,
+    'target': target,
+    'setBy': setBy,
+    'setAt': setAt,
+    if (satisfiedAt != null) 'satisfiedAt': satisfiedAt,
+    if (satisfiedRef != null) 'satisfiedRef': satisfiedRef,
+    if (closedUnmergedAt != null) 'closedUnmergedAt': closedUnmergedAt,
   };
 }
 

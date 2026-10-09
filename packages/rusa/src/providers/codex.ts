@@ -1,4 +1,3 @@
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -371,56 +370,6 @@ export const CODEX_DENIED_DESKTOP_PLUGIN_OVERRIDES = [
   "plugins.computer-use@openai-bundled.enabled=false",
 ];
 
-export interface ListEffectiveCodexMcpServersOptions {
-  command: string;
-  args: string[];
-  cwd: string;
-  env?: NodeJS.ProcessEnv;
-  timeoutMs?: number;
-  signal?: AbortSignal;
-}
-
-/**
- * Discover configured MCP servers in the effective configuration using `codex mcp list --json`.
- * Runs with the actual invocation's effective config/context (including bwrap/overrides/signal).
- * Throws if the discovery command fails, is cancelled, or output cannot be parsed.
- */
-export async function listEffectiveCodexMcpServers(
-  options: ListEffectiveCodexMcpServersOptions
-): Promise<Array<{ name: string; enabled?: boolean; transport?: unknown }>> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      options.command,
-      options.args,
-      {
-        cwd: options.cwd,
-        env: options.env ?? process.env,
-        encoding: "utf-8",
-        timeout: options.timeoutMs ?? 5_000,
-        signal: options.signal,
-        maxBuffer: 10 * 1024 * 1024,
-      },
-      (error, stdout) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        try {
-          resolve(
-            JSON.parse(stdout) as Array<{
-              name: string;
-              enabled?: boolean;
-              transport?: unknown;
-            }>
-          );
-        } catch (err) {
-          reject(err);
-        }
-      }
-    );
-  });
-}
-
 /**
  * OpenAI Codex CLI provider.
  * Spawns `codex exec "<prompt>"` in non-interactive mode with --full-auto and --yolo.
@@ -517,6 +466,7 @@ export class CodexProvider implements CodingProvider {
 
     // Spawn codex once with the given CLI args and resolve a RunResult. Does NOT
     // clean up temp files — run() does that once in `finally`, after any retry.
+    const launchPrompt = sanitizeArgvText(opts.prompt);
     const spawnCodex = (codexArgs: string[]): Promise<RunResult> => {
       const spawnArgs = bwrapResult
         ? buildActorBwrapCommand(bwrapResult, command, codexArgs)
@@ -730,6 +680,7 @@ export class CodexProvider implements CodingProvider {
         assistantTexts.length > 0 ? assistantTexts.join("\n") : rawOutput;
 
       return runSubprocess({
+        onSpawn: () => opts.onPromptLaunched?.(launchPrompt),
         command: spawnCommand,
         args: spawnArgs,
         cwd: spawnCwd,
@@ -888,48 +839,7 @@ export class CodexProvider implements CodingProvider {
       }
 
       if (opts.computerUse !== true) {
-        const computerUseOverrides: string[] = [...CODEX_DENIED_DESKTOP_PLUGIN_OVERRIDES];
-        try {
-          const discoveryTimeoutMs = Math.min(5_000, opts.timeoutMs ?? 5_000);
-          const mcpListArgs = [
-            "mcp",
-            "list",
-            "--json",
-            ...configOverrides.flatMap((c) => ["-c", c]),
-          ];
-          const discoveryArgs = bwrapResult
-            ? buildActorBwrapCommand(bwrapResult, command, mcpListArgs)
-            : mcpListArgs;
-
-          const effectiveServers = await listEffectiveCodexMcpServers({
-            command: spawnCommand,
-            args: discoveryArgs,
-            cwd: spawnCwd,
-            env: spawnEnv,
-            timeoutMs: discoveryTimeoutMs,
-            signal: opts.signal,
-          });
-          for (const server of effectiveServers) {
-            if (server.name === "computer-use" && server.transport) {
-              computerUseOverrides.push(`mcp_servers.${server.name}.enabled=false`);
-            }
-          }
-        } catch (err) {
-          if (opts.signal?.aborted) {
-            return {
-              success: false,
-              cancelled: true,
-              output: "Codex run cancelled during MCP configuration discovery",
-              exitCode: 1,
-            };
-          }
-          return {
-            success: false,
-            output: `Failed to determine effective MCP configuration for computer-use denial: ${err instanceof Error ? err.message : String(err)}`,
-            exitCode: 1,
-          };
-        }
-        configOverrides.push(...computerUseOverrides);
+        configOverrides.push(...CODEX_DENIED_DESKTOP_PLUGIN_OVERRIDES);
       }
 
       // Attempt resume when the pre-check cleared it. Fall back to a fresh run on
@@ -943,7 +853,7 @@ export class CodexProvider implements CodingProvider {
       if (resumeSessionId) {
         const resumeResult = await spawnCodex(
           buildCodexArgs({
-            prompt: opts.prompt,
+            prompt: launchPrompt,
             model: this.model,
             effort: this.effort,
             cwd: codexCwd,
@@ -965,7 +875,7 @@ export class CodexProvider implements CodingProvider {
 
       return await spawnCodex(
         buildCodexArgs({
-          prompt: opts.prompt,
+          prompt: launchPrompt,
           model: this.model,
           effort: this.effort,
           cwd: codexCwd,

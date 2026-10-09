@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { nullLogger } from "../observability/logger.js";
+import { IMPLICIT_USER_EMAIL } from "../principals/operator-principal.js";
 import { DashboardIdentityClaimError, DashboardIdentityResolver } from "./identity.js";
 
 let db: Database.Database;
@@ -33,7 +34,7 @@ it("keeps one stable user across repeated verified logins and admission email ch
   expect(resolver.resolve(token({ email: "new@example.com" })).id).toBe(user.id);
   expect(repo.getUser(user.id)?.email).toBe("new@example.com");
   expect(user.rootActorId).toBeUndefined();
-  expect(repo.get("human:operator")).toBeUndefined();
+  expect(repo.get("00000000-0000-4000-8000-000000000001")).toBeUndefined();
   expect(db.prepare("SELECT COUNT(*) AS n FROM users").get()).toEqual({ n: 1 });
 });
 
@@ -44,6 +45,26 @@ it("claims the explicitly provisioned unbound user matching a verified email", (
   });
   expect(resolver.resolve(token()).id).toBe(pending.id);
   expect(repo.getUser(pending.id)?.identity).toEqual({ issuer: ISSUER, subject: "uid" });
+});
+
+it("claims the local implicit user once, then provisions distinct verified users", () => {
+  const local = repo.ensureImplicitUser("2026-10-01T00:00:00Z");
+  if (!local) throw new Error("Expected durable user fixture");
+  expect(resolver.resolve(token()).id).toBe(local.id);
+  expect(resolver.resolve(token()).id).toBe(local.id);
+  expect(
+    resolver.resolve(token({ uid: "other", sub: "other", email: "other@example.com" })).id
+  ).not.toBe(local.id);
+  expect(repo.listUsers()).toHaveLength(2);
+});
+
+it("does not resolve reserved bootstrap email as a verified login", () => {
+  const local = repo.ensureImplicitUser("2026-10-01T00:00:00Z");
+  if (!local) throw new Error("Expected durable user fixture");
+  expect(() => resolver.resolve(token({ email: IMPLICIT_USER_EMAIL }))).toThrow(
+    "Reserved admission email"
+  );
+  expect(repo.getUser(local.id)?.identity).toBeUndefined();
 });
 
 it("never rebinds a user already held by another identity", () => {
@@ -149,4 +170,75 @@ it.each([
 ])("refuses incomplete verified identity %j", (extra) => {
   expect(() => resolver.resolve(token(extra))).toThrow();
   expect(db.prepare("SELECT COUNT(*) AS n FROM users").get()).toEqual({ n: 0 });
+});
+
+it("records the Google account id from the verified sign-in token, never moving one another user holds", () => {
+  const warn = vi.fn();
+  const logged = new DashboardIdentityResolver(() => repo, "project", { ...nullLogger, warn });
+  // Synthetic Google account ids; never a real person's.
+  const google = (id: string) =>
+    token({
+      firebase: { identities: { "google.com": [id] }, sign_in_provider: "google.com" },
+    } as Partial<DecodedIdToken>);
+  const at = new Date().toISOString();
+
+  const owner = logged.resolve(google("100000000000000000001"));
+  logged.recordAuthentication(owner, at, google("100000000000000000001"));
+  expect(repo.getUser(owner.id)?.googleAccountId).toBe("100000000000000000001");
+  expect(repo.findUserByGoogleAccountId("100000000000000000001")?.id).toBe(owner.id);
+
+  // A token without a Google identity leaves the recorded id alone.
+  logged.recordAuthentication(owner, at, token());
+  expect(repo.getUser(owner.id)?.googleAccountId).toBe("100000000000000000001");
+
+  // Another user presenting the same Google id is logged by id and not rebound.
+  const other = repo.createUser({
+    email: "other@example.com",
+    identity: { issuer: ISSUER, subject: "other" },
+    createdAt: at,
+  });
+  logged.recordAuthentication(other, at, google("100000000000000000001"));
+  expect(repo.getUser(other.id)?.googleAccountId).toBeUndefined();
+  expect(repo.getUser(owner.id)?.googleAccountId).toBe("100000000000000000001");
+  expect(warn).toHaveBeenCalledWith("dashboard_google_account_conflict", {
+    userId: other.id,
+    holderId: owner.id,
+  });
+  expect(repo.getUser(other.id)?.lastAuthenticatedAt).toBe(at);
+});
+
+it("treats a Google id taken by a concurrent sign-in as the same logged conflict", () => {
+  const warn = vi.fn();
+  const logged = new DashboardIdentityResolver(() => repo, "project", { ...nullLogger, warn });
+  const at = new Date().toISOString();
+  // Synthetic Google account id; never a real person's.
+  const googleId = "100000000000000000002";
+  const owner = repo.createUser({
+    email: "owner@example.com",
+    identity: { issuer: ISSUER, subject: "owner" },
+    createdAt: at,
+  });
+  repo.setGoogleAccountId(owner.id, googleId);
+  const other = repo.createUser({
+    email: "other@example.com",
+    identity: { issuer: ISSUER, subject: "other" },
+    createdAt: at,
+  });
+  // The other sign-in read the id as free just before the owner's write landed.
+  vi.spyOn(repo, "findUserByGoogleAccountId").mockReturnValueOnce(undefined);
+
+  logged.recordAuthentication(
+    other,
+    at,
+    token({
+      firebase: { identities: { "google.com": [googleId] }, sign_in_provider: "google.com" },
+    } as Partial<DecodedIdToken>)
+  );
+  expect(repo.getUser(other.id)?.googleAccountId).toBeUndefined();
+  expect(repo.getUser(owner.id)?.googleAccountId).toBe(googleId);
+  expect(repo.getUser(other.id)?.lastAuthenticatedAt).toBe(at);
+  expect(warn).toHaveBeenCalledWith("dashboard_google_account_conflict", {
+    userId: other.id,
+    holderId: owner.id,
+  });
 });

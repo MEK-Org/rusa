@@ -48,6 +48,9 @@ import { dropObligationReadyHeads } from "./0050_drop_obligation_ready_heads.js"
 import { eventSourceConfig } from "./0051_event_source_config.js";
 import { obligationSnooze } from "./0052_obligation_snooze.js";
 import { chatRoomParticipants } from "./0053_chat_room_participants.js";
+import { runPrompts } from "./0055_run_prompts.js";
+import { userGoogleAccountId } from "./0058_user_google_account_id.js";
+import { obligationCompletionMatchers } from "./0059_obligation_completion_matchers.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -108,4 +111,7 @@ export const migrations: Migration[] = [
   eventSourceConfig,
   obligationSnooze,
   chatRoomParticipants,
+  runPrompts,
+  userGoogleAccountId,
+  obligationCompletionMatchers,
 ];

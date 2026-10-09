@@ -8,6 +8,7 @@ import { actorInbox } from "../db/migrations/0003_actor_inbox.js";
 import { actorInboxSeen } from "../db/migrations/0012_actor_inbox_seen.js";
 import { actorInboxHandledNote } from "../db/migrations/0015_actor_inbox_handled_note.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
+import type { Obligation } from "../obligations/obligation.js";
 import { createInboxMcpServer } from "./inbox-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -119,8 +120,8 @@ describe("inbox MCP server", () => {
       {
         id: "human-msg",
         actorId: "actor-a",
-        source: "mesh:human:operator",
-        payload: { type: "human.message", fromId: "human:operator" },
+        source: "mesh:00000000-0000-4000-8000-000000000001",
+        payload: { type: "mesh.message", fromId: "00000000-0000-4000-8000-000000000001" },
       },
       {
         id: "gchat-reply-msg",
@@ -158,8 +159,8 @@ describe("inbox MCP server", () => {
     expect(data.entries).toHaveLength(4);
 
     const humanEntry = data.entries.find((e) => e.id === "human-msg");
-    expect(humanEntry?.hint).toContain("human operator");
-    expect(humanEntry?.hint).toContain("reply tool");
+    expect(humanEntry?.hint).toContain("send_message");
+    expect(humanEntry?.hint).toContain("fromId");
 
     const gchatReplyEntry = data.entries.find((e) => e.id === "gchat-reply-msg");
     expect(gchatReplyEntry?.hint).toContain("in thread 'spaces/AAA/threads/BBB'");
@@ -178,8 +179,12 @@ describe("inbox MCP server", () => {
       {
         id: "voice",
         actorId: "actor-a",
-        source: "mesh:human:operator",
-        payload: { type: "human.voice", priority: "responsive", fromId: "human:operator" },
+        source: "mesh:00000000-0000-4000-8000-000000000001",
+        payload: {
+          type: "human.voice",
+          priority: "responsive",
+          fromId: "00000000-0000-4000-8000-000000000001",
+        },
       },
     ]);
     const client = await connect(
@@ -338,5 +343,60 @@ describe("inbox MCP server", () => {
       },
     });
     expect(entries[1]).not.toHaveProperty("chatContext");
+  });
+
+  it("returns a human sender's open questions on selection when the run scope supplies them", async () => {
+    store.append([
+      {
+        id: "human-msg",
+        actorId: "actor-a",
+        source: "mesh:user-1",
+        payload: { type: "mesh.message", messageId: "m9", fromId: "user-1" },
+      },
+    ]);
+    const readEntries = (ids: string[]) =>
+      ids.map((id) => {
+        const entry = store.read("actor-a", id);
+        if (!entry) throw new Error("missing test entry");
+        return entry;
+      });
+    const client = await connect(
+      createInboxMcpServer(store, "actor-a", {
+        select: readEntries,
+        selected: () => ["human-msg", "own"],
+        openQuestions: {
+          resolveSenderPrincipal: (entry) =>
+            entry.payload.fromId === "user-1" ? "user-1" : undefined,
+          listOpenQuestions: (ownerId, creatorId) => ({
+            obligations:
+              ownerId === "user-1" && creatorId === "actor-a"
+                ? [{ id: "ob-q", title: "Which region?" } as Obligation]
+                : [],
+            total: 1,
+            hasMore: false,
+          }),
+          listArtifacts: () => [],
+        },
+      })
+    );
+
+    const result = (await client.callTool({
+      name: "select",
+      arguments: { entry_ids: ["human-msg", "own"] },
+    })) as CallToolResult;
+
+    expect(result.isError).not.toBe(true);
+    const entries = (dataOf(result) as { entries: Array<Record<string, unknown>> }).entries;
+    expect(entries[0]).toMatchObject({
+      id: "human-msg",
+      openQuestions: {
+        principalId: "user-1",
+        resolutionRef: "mesh:messages/m9",
+        questions: [{ id: "ob-q", title: "Which region?" }],
+        total: 1,
+        truncated: false,
+      },
+    });
+    expect(entries[1]).not.toHaveProperty("openQuestions");
   });
 });

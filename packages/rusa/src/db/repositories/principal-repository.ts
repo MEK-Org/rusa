@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import { IMPLICIT_USER_EMAIL } from "../../principals/operator-principal.js";
 import type {
   ExternalIdentity,
   PrincipalRef,
@@ -20,6 +21,7 @@ type UserRow = {
   root_actor_id: string | null;
   disabled_at: string | null;
   last_authenticated_at: string | null;
+  google_account_id: string | null;
 };
 
 export interface CreateUserInput {
@@ -51,6 +53,7 @@ function toUser(row: UserRow, createdAt: string): UserPrincipal {
     ...(row.last_authenticated_at !== null
       ? { lastAuthenticatedAt: row.last_authenticated_at }
       : {}),
+    ...(row.google_account_id !== null ? { googleAccountId: row.google_account_id } : {}),
   };
 }
 
@@ -120,17 +123,17 @@ export class PrincipalRepository {
     return row ? this.getUser(row.principal_id) : undefined;
   }
 
-  /** Lookup by admission metadata — for provisioning decisions, not for auth. */
-  findUserByEmail(email: string): UserPrincipal | undefined {
-    const row = this.db.prepare("SELECT * FROM users WHERE email = ?").get(normalizeEmail(email)) as
-      | UserRow
-      | undefined;
+  /** Lookup by the Google account id recorded at a verified sign-in (#890). */
+  findUserByGoogleAccountId(googleAccountId: string): UserPrincipal | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM users WHERE google_account_id = ?")
+      .get(googleAccountId) as UserRow | undefined;
     return row ? this.getUser(row.principal_id) : undefined;
   }
 
-  /** First user row in storage, if any exists — for local-mode single-user fallback. */
-  findFirstUser(): UserPrincipal | undefined {
-    const row = this.db.prepare("SELECT * FROM users ORDER BY rowid ASC LIMIT 1").get() as
+  /** Lookup by admission metadata — for provisioning decisions, not for auth. */
+  findUserByEmail(email: string): UserPrincipal | undefined {
+    const row = this.db.prepare("SELECT * FROM users WHERE email = ?").get(normalizeEmail(email)) as
       | UserRow
       | undefined;
     return row ? this.getUser(row.principal_id) : undefined;
@@ -175,6 +178,16 @@ export class PrincipalRepository {
     return created;
   }
 
+  /** Bootstrap once, only when no users exist, including disabled users. */
+  ensureImplicitUser(createdAt: string): UserPrincipal | undefined {
+    return this.db
+      .transaction(() => {
+        if (this.listUsers().length !== 0) return undefined;
+        return this.createUser({ email: IMPLICIT_USER_EMAIL, createdAt });
+      })
+      .immediate();
+  }
+
   /**
    * Bind a verified external identity to a user provisioned without one.
    *
@@ -209,11 +222,8 @@ export class PrincipalRepository {
   /**
    * Atomically confirm the identity of an explicitly provisioned unbound user.
    *
-   * The maintenance migration is the production path that creates an unbound
-   * row; dashboard sign-in never creates one. Looking up the admission email
-   * and writing the external identity in the same transaction therefore lets a
-   * verified login confirm that prior provisioning without making email a
-   * general identity lookup or redirecting an existing principal.
+   * A matching provisioned email or the sole local bootstrap user can be
+   * enriched by a verified admitted login, preserving its ID and history.
    *
    * Returns undefined when no user was provisioned for the email, so a normal
    * first sign-in can create its own bound user. A row that was concurrently
@@ -226,39 +236,56 @@ export class PrincipalRepository {
     authenticatedAt: string
   ): UserPrincipal | undefined {
     const normalizedEmail = normalizeEmail(email);
-    return this.db.transaction(() => {
-      const user = this.findUserByEmail(normalizedEmail);
-      if (!user) return undefined;
-      // Let the resolver apply the same disabled-user refusal as an already
-      // bound identity. Nothing has been written, and this must not become an
-      // account-linking hint to an otherwise unauthorized caller.
-      if (user.disabledAt) return user;
-      if (user.identity) {
-        if (
-          user.identity.issuer === identity.issuer &&
-          user.identity.subject === identity.subject
-        ) {
-          return user;
+    if (normalizedEmail === IMPLICIT_USER_EMAIL) throw new Error("Reserved admission email");
+    return this.db
+      .transaction(() => {
+        const users = this.listUsers();
+        const user =
+          this.findUserByEmail(normalizedEmail) ??
+          (users.length === 1 && users[0].email === IMPLICIT_USER_EMAIL && !users[0].identity
+            ? users[0]
+            : undefined);
+        if (!user) return undefined;
+        // Let the resolver apply the same disabled-user refusal as an already
+        // bound identity. Nothing has been written, and this must not become an
+        // account-linking hint to an otherwise unauthorized caller.
+        if (user.disabledAt) return user;
+        if (user.identity) {
+          if (
+            user.identity.issuer === identity.issuer &&
+            user.identity.subject === identity.subject
+          ) {
+            return user;
+          }
+          throw new Error(
+            `PrincipalRepository: provisioned user '${user.id}' is already bound to another external identity`
+          );
         }
-        throw new Error(
-          `PrincipalRepository: provisioned user '${user.id}' is already bound to another external identity`
-        );
-      }
 
-      this.assertIdentityAvailable(identity);
-      const result = this.db
-        .prepare(
-          `UPDATE users
-           SET firebase_issuer = ?, firebase_subject = ?, last_authenticated_at = ?
+        this.assertIdentityAvailable(identity);
+        const result = this.db
+          .prepare(
+            `UPDATE users
+           SET firebase_issuer = ?, firebase_subject = ?, last_authenticated_at = ?, email = ?
            WHERE principal_id = ? AND email = ?
              AND firebase_issuer IS NULL AND firebase_subject IS NULL`
-        )
-        .run(identity.issuer, identity.subject, authenticatedAt, user.id, normalizedEmail);
-      if (result.changes !== 1) {
-        throw new Error(`PrincipalRepository: provisioned user '${user.id}' could not be claimed`);
-      }
-      return this.requireUser(user.id);
-    })();
+          )
+          .run(
+            identity.issuer,
+            identity.subject,
+            authenticatedAt,
+            normalizedEmail,
+            user.id,
+            user.email
+          );
+        if (result.changes !== 1) {
+          throw new Error(
+            `PrincipalRepository: provisioned user '${user.id}' could not be claimed`
+          );
+        }
+        return this.requireUser(user.id);
+      })
+      .immediate();
   }
 
   /** Update admission metadata. The principal id and root are untouched. */
@@ -314,6 +341,20 @@ export class PrincipalRepository {
       this.db
         .prepare("UPDATE users SET last_authenticated_at = ? WHERE principal_id = ?")
         .run(authenticatedAt, principalId);
+      return this.requireUser(principalId);
+    })();
+  }
+
+  /**
+   * Record the Google account id from a verified sign-in token (#890). Throws
+   * when another user already holds it; the unique index is the guard.
+   */
+  setGoogleAccountId(principalId: string, googleAccountId: string): UserPrincipal {
+    return this.db.transaction(() => {
+      this.requireUser(principalId);
+      this.db
+        .prepare("UPDATE users SET google_account_id = ? WHERE principal_id = ?")
+        .run(googleAccountId, principalId);
       return this.requireUser(principalId);
     })();
   }

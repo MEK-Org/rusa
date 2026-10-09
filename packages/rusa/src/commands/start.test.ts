@@ -235,6 +235,7 @@ import {
   type RunStartOptions,
   reactToQueuedInboxEntries,
   runStart,
+  shouldAppendServiceBootWake,
   shouldBindDashboardServer,
   shouldBindWebhookServer,
   warnMissingConfiguredEventSubscriptionsAtBoot,
@@ -449,6 +450,11 @@ describe("start command tests", () => {
   it("binds the webhook server whenever the runner is not driving events in-process", () => {
     expect(shouldBindWebhookServer({ e2eMode: false })).toBe(true);
     expect(shouldBindWebhookServer({ e2eMode: true })).toBe(false);
+  });
+
+  it("wakes root on every production boot but leaves e2e root inboxes to the launcher", () => {
+    expect(shouldAppendServiceBootWake({ e2eMode: false })).toBe(true);
+    expect(shouldAppendServiceBootWake({ e2eMode: true })).toBe(false);
   });
 
   it("binds the dashboard in e2e only when explicitly enabled", () => {
@@ -1534,6 +1540,200 @@ describe("runStart webhook event routing (Phase 4)", () => {
         }
       });
     });
+
+    it("raises one root alarm per provider-wide governing window closing with no newer reading (#794)", async () => {
+      // A whole-lane reading as the coordinator publishes it: its governing
+      // window comes from that same reading.
+      const reading = (
+        resetMs: number,
+        intervalSeconds: number,
+        freshnessState: { stale: boolean; hardStale: boolean },
+        observedMs = resetMs - 60_000,
+        windowKey = "claude:weekly"
+      ) => {
+        const updatedAt = new Date(observedMs).toISOString();
+        const status = throttleStatus("claude", { intervalSeconds, updatedAt });
+        return {
+          ...status,
+          governingBucketKey: windowKey,
+          buckets: [
+            {
+              key: windowKey,
+              percentLeft: 50,
+              timeRemainingPct: 50,
+              error: 0,
+              derivative: 0,
+              requiredIntervalSeconds: intervalSeconds,
+              observedAt: updatedAt,
+              resetAtIso: new Date(resetMs).toISOString(),
+            },
+          ],
+          freshness: {
+            ...status.freshness,
+            stale: freshnessState.stale,
+            hardStale: freshnessState.hardStale,
+            staleAfterMs: 45 * 60_000,
+            hardStaleAfterMs: 60 * 60_000,
+          },
+        };
+      };
+
+      const now = Date.now();
+      let published = reading(now + 60 * 60_000, 300, { stale: false, hardStale: false }, now);
+      const { close, triggerQuotaThrottleTick, getThrottle } = await bootWithCoordinator(() => ({
+        claude: published,
+      }));
+      const closedAlarms = () =>
+        getRepositories()
+          .inbox.list("root")
+          .entries.filter(
+            (entry) =>
+              (entry.payload as { type?: string }).type === "system.quota_governing_window_closed"
+          );
+      try {
+        // 1. Window still open and reading is fresh: ordinary throttle applied, no alarm.
+        await triggerQuotaThrottleTick();
+        expect(getThrottle("claude")?.intervalSeconds).toBe(300);
+        expect(closedAlarms()).toEqual([]);
+
+        // 2. Healthy reset/recovery without an alert:
+        // A fresh reading at reset (reset has passed, but reading is still fresh < staleAfterMs).
+        // It stays quiet per the soft-stale timing amendment (#794).
+        const window1ResetMs = now - 60_000;
+        published = reading(
+          window1ResetMs,
+          300,
+          { stale: false, hardStale: false },
+          window1ResetMs - 10 * 60_000
+        );
+        await triggerQuotaThrottleTick();
+        expect(getThrottle("claude")?.intervalSeconds).toBe(300);
+        expect(closedAlarms()).toEqual([]);
+
+        // 3. Soft-stale crossing after reset:
+        // That same window reaches the soft-stale threshold without a newer reading.
+        // The first applied status after crossing soft-stale raises one responsive alarm.
+        published = reading(
+          window1ResetMs,
+          300,
+          { stale: true, hardStale: false },
+          window1ResetMs - 50 * 60_000
+        );
+        await triggerQuotaThrottleTick();
+        await vi.waitFor(() => expect(closedAlarms()).toHaveLength(1));
+        const alarm1 = closedAlarms()[0];
+        expect(alarm1).toMatchObject({
+          actorId: "root",
+          source: "system:events",
+          payload: expect.objectContaining({
+            provider: "claude",
+            window: "claude:weekly",
+            resetAt: new Date(window1ResetMs).toISOString(),
+            priority: "responsive",
+            message: expect.stringContaining("Check the scrapes to inspect collection"),
+          }),
+        });
+        const alarm1Msg = (alarm1.payload as unknown as { message: string }).message;
+        expect(alarm1Msg).toContain("no newer accepted quota reading has arrived since");
+        expect(alarm1Msg).not.toContain("conservative ceiling");
+        // Pin unchanged published/applied throttle value around the alert:
+        expect(getThrottle("claude")?.intervalSeconds).toBe(300);
+
+        // 4. Repeated applies of the same closed window are deduplicated:
+        await triggerQuotaThrottleTick();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(closedAlarms()).toHaveLength(1);
+        expect(getThrottle("claude")?.intervalSeconds).toBe(300);
+
+        // 5. A new reset for the same governing key arrives fresh, so it does
+        // not alert. When that same accepted reading later becomes stale, the
+        // second reset closes without an intermediate open apply. Keeping the
+        // key at claude:weekly proves resetAtIso is part of the dedup key.
+        const window2ResetMs = now - 30_000;
+        published = reading(
+          window2ResetMs,
+          300,
+          { stale: false, hardStale: false },
+          window2ResetMs - 10 * 60_000,
+          "claude:weekly"
+        );
+        await triggerQuotaThrottleTick();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(closedAlarms()).toHaveLength(1);
+
+        published = reading(
+          window2ResetMs,
+          300,
+          { stale: true, hardStale: true },
+          window2ResetMs - 10 * 60_000,
+          "claude:weekly"
+        );
+        await triggerQuotaThrottleTick();
+        await vi.waitFor(() => expect(closedAlarms()).toHaveLength(2));
+        const alarm2 = closedAlarms().find(
+          (entry) =>
+            (entry.payload as { window?: string; resetAt?: string }).resetAt ===
+            new Date(window2ResetMs).toISOString()
+        );
+        expect(alarm2).toMatchObject({
+          actorId: "root",
+          source: "system:events",
+          payload: expect.objectContaining({
+            provider: "claude",
+            window: "claude:weekly",
+            resetAt: new Date(window2ResetMs).toISOString(),
+            priority: "responsive",
+          }),
+        });
+        // The alert observes the published throttle; it does not select one.
+        expect(getThrottle("claude")?.intervalSeconds).toBe(published.intervalSeconds);
+
+        // Repeated apply of window 2 is also deduplicated:
+        await triggerQuotaThrottleTick();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(closedAlarms()).toHaveLength(2);
+        expect(getThrottle("claude")?.intervalSeconds).toBe(published.intervalSeconds);
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
+
+    it("raises the window-close alarm for a provider already closed when the instance boots (#794)", async () => {
+      const updatedAt = new Date(Date.now() - 2 * 60 * 60_000).toISOString();
+      const status = throttleStatus("claude", { intervalSeconds: 3600, updatedAt });
+      const { close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => ({
+        claude: {
+          ...status,
+          buckets: status.buckets.map((bucket) => ({
+            ...bucket,
+            observedAt: updatedAt,
+            resetAtIso: new Date(Date.now() - 60_000).toISOString(),
+          })),
+          freshness: { ...status.freshness, stale: true, hardStale: true },
+        },
+      }));
+      try {
+        // The boot apply runs before the alarm is bound; the next one raises it.
+        await triggerQuotaThrottleTick();
+        await vi.waitFor(() =>
+          expect(
+            getRepositories()
+              .inbox.list("root")
+              .entries.filter(
+                (entry) =>
+                  (entry.payload as { type?: string }).type ===
+                  "system.quota_governing_window_closed"
+              )
+          ).toHaveLength(1)
+        );
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
   });
 
   it("keeps an in-progress coordinator history warmup from reading as authoritative empty history at readiness (#527)", async () => {
@@ -1743,7 +1943,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   });
 
-  it("tells a root-enrolled worker its closure rule across the live MCP boundary while an unenrolled control is untouched", async () => {
+  it("tells every worker its closure rule across the live MCP boundary, with no enrollment (#917)", async () => {
     let mesh: ActorMesh | undefined;
     let root: Actor | undefined;
     await new Promise<void>((resolve) => {
@@ -1790,27 +1990,34 @@ describe("runStart webhook event routing (Phase 4)", () => {
         parentId: "root",
         modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
       });
-    const optedIn = spawnWorker("live opted-in worker");
-    const control = spawnWorker("live unenrolled control");
+    const first = spawnWorker("live first worker");
+    const second = spawnWorker("live second worker");
     const actorOf = (id: string) => {
       const actor = liveMesh.get(id) as Actor | undefined;
       if (!actor) throw new Error(`worker MCP endpoints missing: ${id}`);
       return actor;
     };
 
-    // Root-only enrollment, through root's own live mesh endpoint.
-    const enrolled = await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
-      actor_id: optedIn,
-      experiment: "strict_obligation_handling",
-    });
-    expect(enrolled.isError).toBeFalsy();
+    // The retired experiment is gone from the live surface: nothing is listed,
+    // and its name can no longer be enrolled. Strict closure needs neither.
+    expect(
+      payloadOf(await call(urlOf(root, "mesh"), "list_actor_experiments", {})).experiments
+    ).toEqual([]);
+    expect(
+      (
+        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
+          actor_id: first,
+          experiment: "strict_obligation_handling",
+        })
+      ).isError
+    ).toBe(true);
 
     // Attention arrives the way production delivers it: creating the obligation
     // moves each worker's ready head, and runStart's ready-head listener routes
     // that transition into the worker's durable inbox. Nothing is injected.
     for (const [actorId, title] of [
-      [optedIn, "live strict head"],
-      [control, "live control head"],
+      [first, "live strict head"],
+      [second, "live second head"],
     ]) {
       getRepositories().obligations.create({ title, ownerId: actorId });
     }
@@ -1855,51 +2062,40 @@ describe("runStart webhook event routing (Phase 4)", () => {
         runId,
       };
     };
-    const strict = await selectHeadOverMcp(optedIn);
+    const strict = await selectHeadOverMcp(first);
     const strictHeadId = strict.obligationId;
-    const controlSelection = await selectHeadOverMcp(control);
+    const secondRun = await selectHeadOverMcp(second);
 
-    // The selection that arms the experiment is also what states the rule, so the
+    // The selection that arms closure is also what states the rule, so the
     // worker learns it before its run returns.
-    // The rule is stated directly without mentioning the experiment itself.
-    expect(String(strict.selection.discipline)).not.toContain("strict_obligation_handling");
     expect(String(strict.selection.discipline)).not.toMatch(/experiment/i);
     expect(String(strict.selection.discipline)).toContain(strictHeadId);
     expect(String(strict.selection.discipline)).toMatch(/every selected head/);
     expect(String(strict.selection.discipline)).toContain(
       "complete it, cancel it, schedule it, snooze it until a future time with `set_snooze`, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor"
     );
-    // The unenrolled control's selection carries no trace of the experiment.
-    expect(controlSelection.selection).not.toHaveProperty("discipline");
-    expect(JSON.stringify(controlSelection.selection)).not.toContain("strict_obligation_handling");
+    // Every worker is held to it; none is a control.
+    expect(String(secondRun.selection.discipline)).toContain(secondRun.obligationId);
 
-    // The rule is held, not only stated: the strict head's attention cannot be
-    // marked handled while the head is as it was found, and the control's can.
+    // The rule is held, not only stated: neither head's attention can be
+    // marked handled while the head is as it was found.
     const markHandled = (actorId: string, entryId: string) =>
       call(urlOf(actorOf(actorId), "inbox"), "mark_handled", {
         entry_id: entryId,
         note: "handled in this run",
       });
-    const refused = await markHandled(optedIn, strict.entryId);
+    const refused = await markHandled(first, strict.entryId);
     expect(refused.isError).toBe(true);
     expect(JSON.stringify(refused)).toContain(
       `Cannot mark handled: selected head obligation ${strictHeadId}`
     );
-    expect((await markHandled(control, controlSelection.entryId)).isError).toBeFalsy();
+    expect((await markHandled(second, secondRun.entryId)).isError).toBe(true);
 
     // Direct focus takes the separate production path: an ordinary mesh
     // message plus an explicit owned obligation, selected through the same
     // live inbox MCP endpoint. It must arm independently of ready-head
     // delivery and describe that commitment.
     const direct = spawnWorker("live direct-focus worker");
-    expect(
-      (
-        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
-          actor_id: direct,
-          experiment: "strict_obligation_handling",
-        })
-      ).isError
-    ).toBeFalsy();
     const directId = getRepositories().obligations.create({
       title: "live direct focus",
       ownerId: direct,
@@ -1928,13 +2124,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await endLifecycleRun(actorOf(direct), directRunId, { success: true, output: "", exitCode: 0 });
 
     // Decomposing it through the worker's own obligations MCP is a legal exit.
-    const child = await call(urlOf(actorOf(optedIn), "obligations"), "create_obligation", {
-      owner_id: optedIn,
+    const child = await call(urlOf(actorOf(first), "obligations"), "create_obligation", {
+      owner_id: first,
       parent_id: strictHeadId,
       title: "Review the strict head",
     });
     expect(child.isError).toBeFalsy();
-    expect((await markHandled(optedIn, strict.entryId)).isError).toBeFalsy();
+    expect((await markHandled(first, strict.entryId)).isError).toBeFalsy();
 
     // Handing the head to a sibling is a legal exit too (#420), through the
     // worker's own obligations MCP under the production owner-or-ancestor
@@ -1943,14 +2139,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // sink in this process — no restart, no injection.
     const handoffSource = spawnWorker("live handoff source");
     const recipient = spawnWorker("live handoff recipient");
-    expect(
-      (
-        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
-          actor_id: handoffSource,
-          experiment: "strict_obligation_handling",
-        })
-      ).isError
-    ).toBeFalsy();
     const handoffHeadId = getRepositories().obligations.create({
       title: "live handoff head",
       ownerId: handoffSource,
@@ -1997,58 +2185,24 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
     expect((await markHandled(handoffSource, handoffRun.entryId)).isError).toBeFalsy();
 
-    // A root enrollment change lands at the next selection across the same
-    // live boundary.
-    const switched = spawnWorker("live enrollment-change worker");
-    expect(
-      (
-        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
-          actor_id: switched,
-          experiment: "strict_obligation_handling",
-        })
-      ).isError
-    ).toBeFalsy();
-    getRepositories().obligations.create({ title: "live enrolled head", ownerId: switched });
-    const enrolledRun = await selectHeadOverMcp(switched);
-    expect(String(enrolledRun.selection.discipline)).toContain(enrolledRun.obligationId);
-    expect(String(enrolledRun.selection.discipline)).not.toContain("strict_obligation_handling");
-    expect(String(enrolledRun.selection.discipline)).not.toMatch(/experiment/i);
-
-    expect(
-      (
-        await call(urlOf(root, "mesh"), "unenroll_actor_experiment", {
-          actor_id: switched,
-          experiment: "strict_obligation_handling",
-        })
-      ).isError
-    ).toBeFalsy();
-    // End the run the way production ends it, then move this worker's head
-    // with a higher-priority obligation so the next run selects fresh.
-    await endLifecycleRun(actorOf(switched), enrolledRun.runId, {
+    // End the second run the way production ends it, with its armed head as
+    // found: the return is recorded as rejected and the attention stays
+    // unhandled. The direct-focus run above closed its head first and
+    // returned clean.
+    await endLifecycleRun(actorOf(second), secondRun.runId, {
       success: true,
       output: "",
       exitCode: 0,
     });
-    // That run returned with its armed head as found, so the return is
-    // recorded as rejected and the attention stays unhandled. The direct-focus
-    // run above closed its head first and returned clean.
     const returnRejections = (actorId: string) =>
       getRepositories().meshEvents.listEventsByActors([actorId], {
         limit: 20,
         kinds: ["run_return_rejected"],
       }).events;
-    expect(returnRejections(switched).map((event) => JSON.parse(event.payload ?? "{}"))).toEqual([
-      expect.objectContaining({ obligationId: enrolledRun.obligationId }),
+    expect(returnRejections(second).map((event) => JSON.parse(event.payload ?? "{}"))).toEqual([
+      expect.objectContaining({ obligationId: secondRun.obligationId }),
     ]);
     expect(returnRejections(direct)).toEqual([]);
-    getRepositories().obligations.create({
-      title: "live released head",
-      ownerId: switched,
-      priority: 100,
-    });
-    const releasedRun = await selectHeadOverMcp(switched);
-    expect(releasedRun.obligationId).not.toBe(enrolledRun.obligationId);
-    expect(releasedRun.selection).not.toHaveProperty("discipline");
   }, 10_000);
 
   describe("root pool fallback is root-only ", () => {
@@ -2180,12 +2334,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect(
           () => obligations.create({ title: "drift", ownerId, intent: "drift" }),
           ownerId
-        ).toThrow(/actor owner does not exist/);
+        ).toThrow(/unknown obligation owner|actor owner does not exist/);
       }
       // The operator is not an actor and must still be ownable — the whole
       // human-decision contract depends on it.
       expect(() =>
-        obligations.create({ title: "decide", ownerId: "human:operator", intent: "decide" })
+        obligations.create({
+          title: "decide",
+          ownerId: getRepositories().principals.listUsers()[0].id,
+          intent: "decide",
+        })
       ).not.toThrow();
     });
   });
@@ -3169,7 +3327,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(issueClient.commentReactionsAdded).toHaveLength(1);
   });
 
-  it("delivers exact-resource issue and PR follow-up events to mechanically subscribed creator with no-obligation fan-out and under human:operator obligation", async () => {
+  it("delivers exact-resource issue and PR follow-up events to mechanically subscribed creator with no-obligation fan-out and under a user-owned obligation", async () => {
     let emitGitHubEvent:
       | ((event: string, payload: Record<string, unknown>, deliveryId?: string) => Promise<void>)
       | undefined;
@@ -3401,29 +3559,29 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(getRepositories().inbox.list(updaterId).entries).toHaveLength(0);
 
     // 5. Human-obligation coexistence proof:
-    //    Both resources receive a human:operator-owned decision obligation.
+    //    Both resources receive a user-owned decision obligation.
     getRepositories().obligations.create({
       title: "Human issue triage decision",
       intent: "Human operator must review and triage",
-      ownerId: "human:operator",
+      ownerId: getRepositories().principals.listUsers()[0].id,
       externalRef: issueRef,
     });
     getRepositories().obligations.create({
       title: "Human PR merge decision",
       intent: "Human operator must approve merge",
-      ownerId: "human:operator",
+      ownerId: getRepositories().principals.listUsers()[0].id,
       externalRef: prRef,
     });
 
-    // Verify route projection: human:operator obligation governs authority
+    // Verify route projection: the human obligation governs authority.
     const issueRouteAfter = mesh.resolveEffectiveRoute(issueRef);
     expect(issueRouteAfter.governingSource).toBe("obligation");
-    expect(issueRouteAfter.principal).toBe("human:operator");
+    expect(issueRouteAfter.principal).toBe(getRepositories().principals.listUsers()[0].id);
     expect(issueRouteAfter.isLive).toBe(false);
 
     const prRouteAfter = mesh.resolveEffectiveRoute(prRef);
     expect(prRouteAfter.governingSource).toBe("obligation");
-    expect(prRouteAfter.principal).toBe("human:operator");
+    expect(prRouteAfter.principal).toBe(getRepositories().principals.listUsers()[0].id);
     expect(prRouteAfter.isLive).toBe(false);
 
     // Emit subsequent follow-up events under the human obligation
@@ -5070,6 +5228,108 @@ describe("runStart webhook event routing (Phase 4)", () => {
         sender: { login: "mock-bot" },
       });
 
+      expect(requestRunCalls).toEqual([{ actorId: "root", reason: "{}" }]);
+    });
+
+    it("satisfies a bot-sender merged-PR matcher before routing, with no subscriber", async () => {
+      let emitGitHubEvent:
+        | ((event: string, payload: Record<string, unknown>) => Promise<void>)
+        | undefined;
+      let mesh: ActorMesh | undefined;
+
+      const issueClient = new MockIssueClient();
+      setIssueClient(issueClient as unknown as IssueClient);
+
+      const readyPromise = new Promise<void>((resolve) => {
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              emitGitHubEvent = handles.emitGitHubEvent;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+
+      await readyPromise;
+      if (!mesh || !emitGitHubEvent) {
+        throw new Error("Mesh or emitGitHubEvent not ready");
+      }
+      getRepositories().obligations.create({
+        id: "bot-merged-matcher",
+        title: "bot merge gate",
+        ownerId: getRepositories().principals.listUsers()[0].id,
+      });
+      getRepositories().obligations.setCompletionMatcher(
+        "bot-merged-matcher",
+        { kind: "pr_merged", pr: "github:dummy-org/dummy-repo/pulls/456" },
+        getRepositories().principals.listUsers()[0].id
+      );
+
+      // No event subscription is installed. The matcher hook must still see a
+      // bot-made merge before normal ownership/subscription delivery decides
+      // that nobody should receive this webhook.
+      await emitGitHubEvent("pull_request", {
+        action: "closed",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        pull_request: { number: 456, merged: true, body: "pr body" },
+        sender: { login: "mock-bot" },
+      });
+
+      expect(getRepositories().obligations.require("bot-merged-matcher")).toMatchObject({
+        status: "done",
+        resolutionRef: "github:dummy-org/dummy-repo/pulls/456",
+      });
+      expect(requestRunCalls).toEqual([]);
+    });
+
+    it("still routes a merged-PR event when completion matching throws", async () => {
+      let emitGitHubEvent:
+        | ((event: string, payload: Record<string, unknown>) => Promise<void>)
+        | undefined;
+      let mesh: ActorMesh | undefined;
+
+      const issueClient = new MockIssueClient();
+      setIssueClient(issueClient as unknown as IssueClient);
+
+      const readyPromise = new Promise<void>((resolve) => {
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              emitGitHubEvent = handles.emitGitHubEvent;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+
+      await readyPromise;
+      if (!mesh || !emitGitHubEvent) {
+        throw new Error("Mesh or emitGitHubEvent not ready");
+      }
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
+      const failing = vi
+        .spyOn(getRepositories().obligations, "listLiveCompletionMatchers")
+        .mockImplementation(() => {
+          throw new Error("SQLITE_BUSY");
+        });
+
+      // A matcher failure is logged and left to boot reconciliation; it must
+      // not turn the webhook into a 500 or cost the subscriber its delivery.
+      await emitGitHubEvent("pull_request", {
+        action: "closed",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        pull_request: { number: 456, merged: true, body: "pr body" },
+        sender: { login: "mock-bot" },
+      });
+      const matcherCalls = failing.mock.calls.length;
+      failing.mockRestore();
+
+      expect(matcherCalls).toBeGreaterThan(0);
       expect(requestRunCalls).toEqual([{ actorId: "root", reason: "{}" }]);
     });
   });
@@ -8256,6 +8516,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     const exitMock = () => process.exit as unknown as ReturnType<typeof vi.fn>;
 
+    // Clean-completion evidence the next boot reads; absent means "not clean".
+    const cleanShutdownEvidence = (): unknown => {
+      const path = join(homeDir, "data", "service-lifecycle.json");
+      if (!existsSync(path)) return undefined;
+      return (JSON.parse(readFileSync(path, "utf8")) as { cleanShutdown?: unknown }).cleanShutdown;
+    };
+
     beforeEach(() => {
       logCapture.lines.length = 0;
     });
@@ -8276,6 +8543,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "dashboard-timing",
         "pnpm-hardlinks",
         "update",
       ]);
@@ -8284,6 +8552,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "repo",
         "understanding",
         "quota",
+        "dashboard-timing",
         "mesh",
         "inbox",
         "obligations",
@@ -8293,6 +8562,20 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // Every worker endpoint is the worker's own; none is shared with root.
       const rootUrls = new Set(rootServers.map((server) => server.url));
       expect(workerServers.filter((server) => rootUrls.has(server.url))).toEqual([]);
+    });
+
+    it("unmounts a retired worker's dashboard timing endpoint", async () => {
+      withWorker("timing-retire-worker");
+      const { mesh } = await boot();
+      const dashboardTimingUrl = mcpServersOf(workerOf(mesh, "timing-retire-worker")).find(
+        (server) => server.name === "dashboard-timing"
+      )?.url;
+      expect(dashboardTimingUrl).toBeDefined();
+
+      mesh.retire("timing-retire-worker");
+      await vi.waitFor(async () => {
+        expect((await fetch(dashboardTimingUrl as string)).status).toBe(404);
+      });
     });
 
     it("adds chat read to both sets and chat write to the root only when chat is configured", async () => {
@@ -8314,6 +8597,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "dashboard-timing",
         "chat-write",
         "pnpm-hardlinks",
         "update",
@@ -8323,6 +8607,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "repo",
         "understanding",
         "quota",
+        "dashboard-timing",
         "chat-read",
         "mesh",
         "inbox",
@@ -8621,7 +8906,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!gitBridge) throw new Error("git bridge not started");
       dbMock.closeDb.mockClear();
       try {
+        let evidenceDuringCleanup: unknown = "unobserved";
         vi.spyOn(mesh, "shutdownAll").mockImplementation(() => {
+          evidenceDuringCleanup = cleanShutdownEvidence();
           throw new Error("actor refused to stop");
         });
 
@@ -8629,6 +8916,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
         expect(records("shutdown_disposer_failed")).toEqual([
           expect.objectContaining({ resource: "actor mesh" }),
+        ]);
+        // #950: a failed disposer is an incomplete shutdown, so no clean
+        // evidence exists while cleanup runs or after it fails.
+        expect(evidenceDuringCleanup).toBeUndefined();
+        expect(cleanShutdownEvidence()).toBeUndefined();
+        expect(records("service_shutdown_incomplete")).toEqual([
+          expect.objectContaining({ failures: ["actor mesh"] }),
         ]);
         // #389 requires attempting every later disposer even after a failure:
         // the release must run past the mesh all the way to the database and
@@ -8640,6 +8934,23 @@ describe("runStart webhook event routing (Phase 4)", () => {
       } finally {
         mcpClose.mockRestore();
       }
+    });
+
+    it("records clean shutdown evidence only after every disposer has finished", async () => {
+      const { mesh, shutdown } = await boot();
+      shutdownFn = undefined;
+      let evidenceDuringCleanup: unknown = "unobserved";
+      const meshShutdown = mesh.shutdownAll.bind(mesh);
+      vi.spyOn(mesh, "shutdownAll").mockImplementation(() => {
+        evidenceDuringCleanup = cleanShutdownEvidence();
+        meshShutdown();
+      });
+
+      await shutdown();
+
+      expect(evidenceDuringCleanup).toBeUndefined();
+      expect(cleanShutdownEvidence()).toMatchObject({ reason: "signal" });
+      expect(exitMock()).toHaveBeenCalledWith(0);
     });
 
     // Distinguishes post-handler boot failure from earlier pre-handler partial-boot tests.

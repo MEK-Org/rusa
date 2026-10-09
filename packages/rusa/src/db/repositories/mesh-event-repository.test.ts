@@ -82,6 +82,76 @@ describe("MeshEventRepository", () => {
     expect(stored).toContain("truncated");
   });
 
+  describe("kind-scoped bounded diagnostic storage", () => {
+    it("reads only one event family since a timestamp without materializing bodies", () => {
+      repo.record({
+        id: "timing-old",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T09:59:59.000Z",
+        body: "must not be read",
+      });
+      repo.record({
+        id: "ordinary-event",
+        kind: "run_end",
+        ts: "2026-10-05T10:00:00.000Z",
+        body: "ordinary history",
+      });
+      repo.record({
+        id: "timing-first",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T10:00:00.000Z",
+        body: "must not be read",
+      });
+      repo.record({
+        id: "timing-second",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T10:00:00.000Z",
+        body: "must not be read",
+      });
+
+      repo.record({
+        id: "timing-newest",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T10:00:01.000Z",
+      });
+
+      const rows = repo.listByKindSince("dashboard_timing", "2026-10-05T10:00:00.000Z", 10);
+      expect(rows.map((row) => row.id)).toEqual(["timing-first", "timing-second", "timing-newest"]);
+      expect(rows.map((row) => row.body)).toEqual([null, null, null]);
+      // A cap between prunes keeps the newest observations, still oldest-first.
+      const capped = repo.listByKindSince("dashboard_timing", "2026-10-05T10:00:00.000Z", 2);
+      expect(capped.map((row) => row.id)).toEqual(["timing-second", "timing-newest"]);
+    });
+
+    it("prunes only the requested event family by age and newest-record bound", () => {
+      repo.record({ id: "old-timing", kind: "dashboard_timing", ts: "2026-10-01T00:00:00.000Z" });
+      repo.record({
+        id: "current-timing-1",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T10:00:00.000Z",
+      });
+      repo.record({
+        id: "current-timing-2",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T10:01:00.000Z",
+      });
+      repo.record({
+        id: "current-timing-3",
+        kind: "dashboard_timing",
+        ts: "2026-10-05T10:02:00.000Z",
+      });
+      repo.record({ id: "ordinary-history", kind: "run_end", ts: "2026-10-01T00:00:00.000Z" });
+
+      repo.pruneKind("dashboard_timing", "2026-10-05T00:00:00.000Z", 2);
+
+      expect(repo.list().map((row) => row.id)).toEqual([
+        "current-timing-2",
+        "current-timing-3",
+        "ordinary-history",
+      ]);
+    });
+  });
+
   describe("listEventsByActors", () => {
     it("conversation filter excludes self-sends and keeps only the A↔B pair ", () => {
       const a = "actor-a";
@@ -320,6 +390,8 @@ describe("MeshEventRepository", () => {
         email: "bob@example.com",
         createdAt: "2026-06-17T00:00:00.000Z",
       }).id;
+      principals.ensureActorPrincipal("actor-1", "2026-06-17T00:00:00.000Z");
+      principals.ensureActorPrincipal("actor-2", "2026-06-17T00:00:00.000Z");
       // One actor answering two humans, plus actor↔actor traffic and a
       // non-message event, all inside one `since` window.
       const message = (from: string, to: string, body: string, ts: string) => {
@@ -334,6 +406,7 @@ describe("MeshEventRepository", () => {
       message("actor-1", alice, "to alice", "2026-06-18T00:00:00.000Z");
       message("actor-1", bob, "to bob", "2026-06-18T00:00:01.000Z");
       message("actor-1", "actor-2", "to peer", "2026-06-18T00:00:02.000Z");
+      message("actor-1", "unknown", "to unknown", "2026-06-18T00:00:02.500Z");
       repo.record({
         kind: "run_start",
         actorId: "actor-1",
@@ -350,7 +423,7 @@ describe("MeshEventRepository", () => {
       // A viewer who cannot be identified reads actor↔actor traffic alone.
       expect(window([])).toEqual(["to peer", "shared"]);
       // Omitting the scope is the unscoped read the distiller-style callers use.
-      expect(repo.listEventsSince("2026-06-17T00:00:00.000Z", 50).events).toHaveLength(4);
+      expect(repo.listEventsSince("2026-06-17T00:00:00.000Z", 50).events).toHaveLength(5);
     });
   });
 
@@ -372,20 +445,24 @@ describe("MeshEventRepository", () => {
   });
 
   describe("latestActivityByActor", () => {
-    it("returns the latest ts per actor, ignoring null actor_ids", () => {
+    it("returns latest ts only for requested actor ids with one JSON input (#934)", () => {
+      expect(repo.latestActivityByActor([])).toEqual(new Map());
+
+      repo.record({ kind: "run_start", actorId: "first", ts: "2026-06-19T00:00:00.000Z" });
       repo.record({ kind: "run_start", actorId: "a", ts: "2026-06-20T00:00:00.000Z" });
       repo.record({ kind: "run_end", actorId: "a", success: true, ts: "2026-06-21T00:00:00.000Z" });
-      repo.record({ kind: "run_start", actorId: "b", ts: "2026-06-22T00:00:00.000Z" });
-      repo.record({ kind: "actor_retired", actorId: null, ts: "2026-06-23T00:00:00.000Z" });
+      repo.record({ kind: "run_start", actorId: "outside", ts: "2026-06-22T00:00:00.000Z" });
 
-      const latest = repo.latestActivityByActor();
-      expect(latest.get("a")).toBe("2026-06-21T00:00:00.000Z");
-      expect(latest.get("b")).toBe("2026-06-22T00:00:00.000Z");
-      expect(latest.has("c")).toBe(false);
-    });
-
-    it("returns an empty map when no events exist", () => {
-      expect(repo.latestActivityByActor()).toEqual(new Map());
+      const result = repo.latestActivityByActor([
+        "first",
+        ...Array.from({ length: 600 }, (_, i) => `absent-${i}`),
+        "a",
+        "unknown_actor",
+      ]);
+      expect(result.get("first")).toBe("2026-06-19T00:00:00.000Z");
+      expect(result.get("a")).toBe("2026-06-21T00:00:00.000Z");
+      expect(result.has("unknown_actor")).toBe(false);
+      expect(result.has("outside")).toBe(false);
     });
   });
 
@@ -409,6 +486,20 @@ describe("MeshEventRepository", () => {
 
       const page = repo.listEventsWindow({ since: stamp(0), limit: 50 });
       expect(page.events.map((e) => e.detail)).toEqual(["early", "late"]);
+    });
+
+    it("excludes dashboard timing diagnostics from the distiller replay window", () => {
+      repo.record({ kind: "run_start", actorId: "a", detail: "substantive", ts: stamp(1) });
+      repo.record({
+        kind: "dashboard_timing",
+        actorId: null,
+        detail: "server:mesh_threads",
+        payload: "{}",
+        ts: stamp(2),
+      });
+
+      const page = repo.listEventsWindow({ since: stamp(0), limit: 50 });
+      expect(page.events.map((event) => event.detail)).toEqual(["substantive"]);
     });
 
     it("pages with a cursor that resumes exactly after the last served event", () => {

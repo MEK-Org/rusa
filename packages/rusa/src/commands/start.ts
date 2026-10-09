@@ -81,6 +81,10 @@ import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
 import type { InboxChatContextSources } from "../actor/inbox-chat-context.js";
 import { InboxFocusResolver, type ResolvedInboxFocus } from "../actor/inbox-focus.js";
+import {
+  type InboxOpenQuestionSources,
+  resolveInboxSenderPrincipal,
+} from "../actor/inbox-open-questions.js";
 import { HttpJevDecisionClient } from "../actor/jev-decision-client.js";
 import { createJevInboxTextResolver } from "../actor/jev-inbox-text-resolver.js";
 import {
@@ -155,6 +159,7 @@ import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
 import type { DashboardAuth } from "../dashboard/auth.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
+import { DashboardTimingRecorder } from "../dashboard/timing.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import {
   finishDeferredRootSessionImport,
@@ -174,7 +179,7 @@ import { GoogleGmailClient } from "../email/gmail-client.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitops/issue-client.js";
 import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
-import { initEmptyBareRepo } from "../gitops/worktree.js";
+import { getRemoteUrl, initEmptyBareRepo } from "../gitops/worktree.js";
 import { AGENT_EXEC_MCP_NAME, createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
 import {
   CHAT_READ_MCP_NAME,
@@ -182,6 +187,10 @@ import {
   createChatReadMcpServer,
   createChatWriteMcpServer,
 } from "../mcp/chat-mcp.js";
+import {
+  createDashboardTimingMcpServer,
+  DASHBOARD_TIMING_MCP_NAME,
+} from "../mcp/dashboard-timing-mcp.js";
 import type { DistillerMcpStore } from "../mcp/distiller-mcp.js";
 import {
   buildGrantableServers,
@@ -211,6 +220,12 @@ import {
 } from "../mcp/understanding-mcp.js";
 import type { UpdateToolDeps } from "../mcp/update-mcp.js";
 import {
+  CompletionMatcherEvaluator,
+  githubRepositoryFromRemote,
+  validateDeployedCompletionMatcher,
+} from "../obligations/completion-matcher-evaluator.js";
+import {
+  type CompletionMatcherInput,
   type EntityId,
   isTerminalObligationStatus,
   type Obligation,
@@ -272,6 +287,7 @@ import {
 } from "../quota/coordinator-client.js";
 import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
 import {
+  closedGoverningWindow,
   HISTORY_WINDOW_MS,
   isPublishedModelLane,
   type ModelLanePacing,
@@ -337,6 +353,7 @@ import {
 } from "../webhook/directed-delivery.js";
 import {
   createDashboardRequestHandler,
+  deployedSha,
   startDashboardServer,
   startWebhookServer,
 } from "../webhook/server.js";
@@ -345,6 +362,11 @@ import {
   WebhookSilenceDetector,
 } from "../webhook/silence-detector.js";
 import { resolveRepoRoot } from "./service-instance.js";
+import {
+  appendServiceBootWakes,
+  recordAndAnnounceRequestedRestart,
+  ServiceLifecycleStore,
+} from "./service-lifecycle.js";
 
 // `update` tool bounds . Per-step HARD timeouts so a hung build can't wedge
 // root; a bounded drain so a stuck worker can't block the restart forever.
@@ -716,6 +738,15 @@ export interface RunStartOptions {
  * the runner is not driving events in-process (e2e mode).
  */
 export function shouldBindWebhookServer(params: { e2eMode: boolean }): boolean {
+  return !params.e2eMode;
+}
+
+/**
+ * Every production boot wakes root with its transition evidence. The e2e
+ * launcher boots disposable scratch compositions in-process, so it owns its
+ * root inbox the same way it omits system:events.
+ */
+export function shouldAppendServiceBootWake(params: { e2eMode: boolean }): boolean {
   return !params.e2eMode;
 }
 
@@ -1104,6 +1135,7 @@ async function composeStart(
   const database = initDb(mcHome);
   resources.acquire("database", () => closeDb());
   log.info("database_ready", { home: mcHome });
+  if (!config.auth) getRepositories().principals.ensureImplicitUser(new Date().toISOString());
 
   const modelClasses = getRepositories().modelClasses;
 
@@ -1282,13 +1314,13 @@ async function composeStart(
 
   log.info("github_identity_resolved", { account: config.github.account });
 
-  // Read once from the mesh host's global Git config and handed to every actor
-  // prompt, which tells actors to apply it per command (#894).
-  const meshGitIdentity = resolveMeshGitIdentity();
-  if (meshGitIdentity) {
-    log.info("mesh_git_identity_resolved", { name: meshGitIdentity.name });
+  // Resolved once from config.yaml's explicit gitIdentity and handed to every
+  // actor prompt, which applies it per command or reports the gap (#894, #909).
+  const meshGitIdentity = resolveMeshGitIdentity(config.gitIdentity);
+  if (meshGitIdentity.identity) {
+    log.info("mesh_git_identity_resolved", { name: meshGitIdentity.identity.name });
   } else {
-    log.warn("mesh_git_identity_missing", {});
+    log.warn("mesh_git_identity_missing", { gap: meshGitIdentity.gap });
   }
 
   // The root's configured identity : the display handle every
@@ -1538,7 +1570,10 @@ async function composeStart(
         ? (text: string) => slackClient.send(errorSink.target, text).then(() => {})
         : null;
   if (chatClient) {
-    servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
+    const workDir = join(mcHome, "root-agent");
+    // This root-owned server runs on the local leader; follower placement is
+    // checked dynamically on the per-actor server below.
+    servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient, { workDir });
   }
   if (slackClient) {
     // Only root mounts the shared server, so its downloads land in root's workdir.
@@ -1552,6 +1587,15 @@ async function composeStart(
     ...(slackClient ? { slackClient } : {}),
     meshChat: getRepositories().meshChat,
   });
+  const inboxOpenQuestionSources = (): InboxOpenQuestionSources => {
+    const { obligations, principals } = getRepositories();
+    return {
+      resolveSenderPrincipal: (entry) => resolveInboxSenderPrincipal(entry, principals),
+      listOpenQuestions: (ownerId, creatorId, limit) =>
+        obligations.listOwnedPage(ownerId, { creatorId, openOnly: true, limit }),
+      listArtifacts: (obligationId) => obligations.listArtifacts(obligationId),
+    };
+  };
   const responsiveInterruption =
     config.jevApiKeyFile === undefined
       ? undefined
@@ -1598,11 +1642,64 @@ async function composeStart(
     }
   })();
   const addDirs: string[] = repoRoot ? [repoRoot] : [];
+  const excludedGitHubRepos = new Set(
+    (config.github.orgs ?? [])
+      .flatMap((entry) => entry.excludedRepos ?? [])
+      .map((repo) => repo.toLowerCase())
+  );
+  const completionMatcherGit = repoRoot ? new GitRunner(repoRoot) : null;
+  // The repository this build's own checkout came from: `deployed` ancestry
+  // runs in that checkout, so its satisfaction cites that repository. The
+  // configured subscription list is unrelated and may name several repos.
+  const completionMatcherRepository = repoRoot
+    ? githubRepositoryFromRemote(getRemoteUrl(repoRoot))
+    : null;
+  // Same deferred-sink shape as the obligation listeners above: the mesh does
+  // not exist yet, and boot reconciliation re-derives anything missed.
+  let completionMatcherClosedUnmergedSink:
+    | ((ownerId: string, obligationId: string, matcherSetAt: string) => void)
+    | undefined;
+  const completionMatcherEvaluator = new CompletionMatcherEvaluator({
+    obligations: getRepositories().obligations,
+    issueClient,
+    deployedSha: () => deployedSha,
+    isAncestor: (ancestor, descendant) =>
+      completionMatcherGit
+        ? completionMatcherGit.isAncestor(ancestor, descendant)
+        : Promise.reject(new Error("local checkout unavailable")),
+    repository: completionMatcherRepository,
+    instanceName: rootHandle,
+    onClosedUnmerged: (obligation, matcher) =>
+      completionMatcherClosedUnmergedSink?.(obligation.ownerId, obligation.id, matcher.setAt),
+    log: (message) => log.warn("completion_matcher_warning", { message }),
+  });
+  const validateCompletionMatcher = async (matcher: CompletionMatcherInput): Promise<void> => {
+    if (matcher.kind === "deployed") {
+      await validateDeployedCompletionMatcher(matcher.commit, {
+        repository: completionMatcherRepository,
+        git: completionMatcherGit,
+        log: (message) => log.warn("completion_matcher_warning", { message }),
+      });
+      return;
+    }
+    const target = asGitHubIssue(parseReference(matcher.pr));
+    if (target && excludedGitHubRepos.has(`${target.owner}/${target.repo}`.toLowerCase())) {
+      throw new Error(
+        `completion matcher refuses configured excluded repository: ${target.owner}/${target.repo}`
+      );
+    }
+  };
   // Append-only observability log: every message, wake, spawn, and retire lands
   // in `mesh_events` so a run can be replayed as a timeline by `rusa report`.
   // After persisting, broadcast the stored row to any live dashboard SSE clients
   // (best-effort — fan-out must never break the recording or the mesh).
   const meshEmitter = new MeshEventEmitter();
+  // Dashboard timings write only fixed, content-free metadata to mesh_events
+  // after each response has finished. The recorder prunes this one event kind
+  // at boot and in bounded batches; it never changes the SQLite schema.
+  const dashboardTimings = new DashboardTimingRecorder(getRepositories().meshEvents);
+  dashboardTimings.start();
+  resources.acquire("dashboard timing recorder", () => dashboardTimings.stop());
   // One child logger per actor run: `actorId` and `runId` ride every record the
   // run boundary writes, so a run reads back by field instead of by matching
   // prose across interleaved actors. The run's *output* never lands here — it is
@@ -1813,6 +1910,38 @@ async function composeStart(
       }
     }
   };
+  // Deduplicate governing window closure alerts by distinct window transition
+  // (${lane}:${window.key}:${window.resetAtIso}) (#794). Each distinct closed
+  // window alerts once, even across successive distinct closes without an
+  // intermediate open apply. Nothing is recorded before the alarm is bound,
+  // so a window already closed at boot still reaches root.
+  const closedGoverningWindows = new Set<string>();
+  let raiseGoverningWindowClosedAlarm:
+    | ((closed: {
+        provider: string;
+        window: string;
+        resetAt: string | null;
+        lastReadingAt: string;
+      }) => void)
+    | null = null;
+  const noteGoverningWindowClosure = (
+    lane: string,
+    status: PublishedThrottleProviderStatus
+  ): void => {
+    const window = closedGoverningWindow(status, Date.now());
+    if (!window) return;
+    const dedupKey = `${lane}:${window.key}:${window.resetAtIso ?? ""}`;
+    if (!raiseGoverningWindowClosedAlarm || closedGoverningWindows.has(dedupKey)) return;
+    closedGoverningWindows.add(dedupKey);
+    const closed = {
+      provider: lane,
+      window: window.key,
+      resetAt: window.resetAtIso,
+      lastReadingAt: status.updatedAt,
+    };
+    log.info("quota_governing_window_closed", closed);
+    raiseGoverningWindowClosedAlarm(closed);
+  };
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
     tick: QuotaThrottleTick,
@@ -1878,6 +2007,7 @@ async function composeStart(
     // Update the lanes before asking the shared admission list to re-scan them.
     applyThrottleStatusToPacer(pacer, status);
     applyModelLaneStatuses(providerName, status);
+    noteGoverningWindowClosure(providerName, status);
     const validModelLanes = Array.isArray(status.modelLanes)
       ? status.modelLanes.filter(isPublishedModelLane).map((lane) => ({
           models: [...lane.models],
@@ -2136,6 +2266,10 @@ async function composeStart(
   const followerTriggerStore = new FollowerUpdateTriggerStore(
     join(mcHome, "data", "follower-update-trigger.json")
   );
+  const serviceLifecycleStore = new ServiceLifecycleStore(
+    join(mcHome, "data", "service-lifecycle.json")
+  );
+  let requestedRestartTransitionId: string | undefined;
   let updateToolDepsFor: ((selfId: string) => UpdateToolDeps) | undefined;
   try {
     const repoRoot = resolveRepoRoot();
@@ -2162,6 +2296,18 @@ async function composeStart(
           log: (m) => log.info("update_coordinator", { detail: m }),
         }),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
+        onRestarting: async (newSha, branch, subject) => {
+          requestedRestartTransitionId = undefined;
+          requestedRestartTransitionId = await recordAndAnnounceRequestedRestart({
+            lifecycle: serviceLifecycleStore,
+            entries: selectedInboxEntriesForActor(selfId),
+            chatClient: chatClient ?? undefined,
+            targetSha: newSha,
+            branch,
+            subject,
+            onWarning: (event, fields) => log.warn(event, fields),
+          });
+        },
         onCommitted: (newSha, branch) => {
           try {
             followerTriggerStore.createTrigger({
@@ -2389,6 +2535,7 @@ async function composeStart(
     void mcpHttp.removeServer(`${actorId}:${QUOTA_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${CHAT_READ_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${SLACK_READ_MCP_NAME}`);
+    void mcpHttp.removeServer(`${actorId}:${DASHBOARD_TIMING_MCP_NAME}`);
     // Tear down EVERY granted-capability endpoint this actor could have mounted
     //  — iterate the full grantable set, not the current grants, so an
     // endpoint can't leak past retire even after a revoke cleared the grant.
@@ -2584,6 +2731,9 @@ async function composeStart(
       },
     });
     lifecycle.add({
+      onPrompt: (event) => {
+        getRepositories().runPrompts.recordForActor(id, event.runId, event.prompt);
+      },
       onQueued: (event) => {
         mesh.recordEvent({
           kind: "run_queued",
@@ -2778,9 +2928,8 @@ async function composeStart(
     // here rather than at routing time hangs boot.
     obligations: {
       findLiveByExternalRef: (ref) => getRepositories().obligations.findLiveByExternalRef(ref),
-      // Strict-obligation handling snapshots these unbounded edge reads at
-      // selection. Keep the production wiring on the same durable repository
-      // seam as the experiment registry.
+      // Strict head closure (#917) snapshots these unbounded edge reads at
+      // every head selection, so they read the same durable repository.
       get: (id) => getRepositories().obligations.get(id),
       listDirectChildEdges: (parentId) =>
         getRepositories().obligations.listDirectChildEdges(parentId),
@@ -2812,10 +2961,10 @@ async function composeStart(
     // this host-owned port closes over it. ActorMesh keeps authorization and
     // durable handoff delivery; VoiceService keeps the one live-session map.
     voiceSessionTransfer: {
-      activeSessionIdFor: (actorId) => {
+      activeSessionFor: (actorId) => {
         if (!voiceService)
           throw new Error("voice session transfer is unavailable on this instance");
-        return voiceService.activeSessionIdFor(actorId);
+        return voiceService.activeSessionFor(actorId);
       },
       transferActiveSession: (fromActorId, targetActorId) => {
         if (!voiceService)
@@ -3091,6 +3240,7 @@ async function composeStart(
             assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(id, entryIds),
             isVoiceSessionActive: () => voiceService?.hasActiveSession(id) ?? false,
             chatContext: inboxChatContextSources(),
+            openQuestions: inboxOpenQuestionSources(),
           })
         );
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
@@ -3100,6 +3250,9 @@ async function composeStart(
             canManage: (callerId, obligation) =>
               canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
             recordEvent: (event) => mesh.recordEvent(event),
+            validateCompletionMatcher,
+            evaluateCompletionMatcher: (obligationId) =>
+              completionMatcherEvaluator.evaluate(obligationId),
           })
         );
         const meshChatUrl = mcpHttp.addServer(`${id}:${MESH_CHAT_MCP_NAME}`, () =>
@@ -3146,16 +3299,23 @@ async function composeStart(
             quotaService
           )
         );
+        const dashboardTimingUrl = mcpHttp.addServer(`${id}:${DASHBOARD_TIMING_MCP_NAME}`, () =>
+          createDashboardTimingMcpServer(dashboardTimings)
+        );
 
         const perActorShared: McpServerSpec[] = [
           { name: TRACKER_MCP_NAME, url: trackerUrl },
           { name: REPO_MCP_NAME, url: repoUrl },
           { name: UNDERSTANDING_READ_MCP_NAME, url: understandingUrl },
           { name: QUOTA_MCP_NAME, url: quotaUrl },
+          { name: DASHBOARD_TIMING_MCP_NAME, url: dashboardTimingUrl },
         ];
         if (chatClient) {
           const chatReadUrl = mcpHttp.addServer(`${id}:${CHAT_READ_MCP_NAME}`, () =>
-            createChatReadMcpServer(chatClient)
+            createChatReadMcpServer(chatClient, {
+              workDir: join(workersDir, id),
+              fileToolsAvailable: () => actors.get(id)?.executionTarget === undefined,
+            })
           );
           perActorShared.push({ name: CHAT_READ_MCP_NAME, url: chatReadUrl });
         }
@@ -3409,6 +3569,9 @@ async function composeStart(
   prerequisiteCancellationSink = ({ dependentId, dependentOwnerId, prerequisiteId }) => {
     mesh.deliverPrerequisiteCancelledAttention(dependentOwnerId, dependentId, prerequisiteId);
   };
+  completionMatcherClosedUnmergedSink = (ownerId, obligationId, matcherSetAt) => {
+    mesh.deliverCompletionMatcherClosedUnmergedAttention(ownerId, obligationId, matcherSetAt);
+  };
   statusChangeSink = (change) => mesh.recordEvent(obligationStatusChangedEvent(change));
   responsiveReadySink = (obligation, actingPrincipal) => {
     mesh.deliverResponsiveReadyAttention(
@@ -3531,6 +3694,7 @@ async function composeStart(
       assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(rootId, entryIds),
       isVoiceSessionActive: () => voiceService?.hasActiveSession(rootId) ?? false,
       chatContext: inboxChatContextSources(),
+      openQuestions: inboxOpenQuestionSources(),
     })
   );
   const rootMeshChatUrl = mcpHttp.addServer(`${rootId}:${MESH_CHAT_MCP_NAME}`, () =>
@@ -3542,6 +3706,9 @@ async function composeStart(
       canManage: () => true,
       resolveOwner: (raw) => resolveObligationOwner(actors, raw, getRepositories().principals),
       recordEvent: (event) => mesh.recordEvent(event),
+      validateCompletionMatcher,
+      evaluateCompletionMatcher: (obligationId) =>
+        completionMatcherEvaluator.evaluate(obligationId),
     })
   );
   const rootPnpmInstallUrl = mcpHttp.addServer(`${rootId}:${PNPM_INSTALL_MCP_NAME}`, () =>
@@ -3571,6 +3738,9 @@ async function composeStart(
         mechanicallySubscribeCreatedResource(mesh, configuredRoots, resource, rootId);
       },
     })
+  );
+  const rootDashboardTimingUrl = mcpHttp.addServer(`${rootId}:${DASHBOARD_TIMING_MCP_NAME}`, () =>
+    createDashboardTimingMcpServer(dashboardTimings)
   );
 
   const cc = chatClient;
@@ -3620,7 +3790,8 @@ async function composeStart(
     { name: INBOX_MCP_NAME, url: rootInboxUrl },
     { name: OBLIGATIONS_MCP_NAME, url: rootObligationsUrl },
     { name: MESH_CHAT_MCP_NAME, url: rootMeshChatUrl },
-    { name: PNPM_INSTALL_MCP_NAME, url: rootPnpmInstallUrl }
+    { name: PNPM_INSTALL_MCP_NAME, url: rootPnpmInstallUrl },
+    { name: DASHBOARD_TIMING_MCP_NAME, url: rootDashboardTimingUrl }
   );
   if (rootChatUrl) {
     rootMcp.push({ name: CHAT_WRITE_MCP_NAME, url: rootChatUrl });
@@ -3878,6 +4049,19 @@ async function composeStart(
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
   }
+  try {
+    mesh.reconcileCompletionMatcherClosedUnmergedAttention(getRepositories().obligations);
+  } catch (_err) {
+    // Database may be closed during test shutdown/teardown races
+  }
+  // One GitHub read per live `pr_merged` matcher: run it after startup rather
+  // than in front of it. Each row is isolated inside the evaluator; this catch
+  // only covers the listing itself (e.g. a teardown race).
+  void completionMatcherEvaluator.reconcileAtBoot().catch((err: unknown) => {
+    log.warn("completion_matcher_boot_reconcile_failed", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  });
   const restored = actors.list().filter((r) => r.status === "active" && r.id !== rootId);
   if (restored.length > 0) {
     console.log(`[mesh] rehydrated ${restored.length} active actor(s) from the repository`);
@@ -3902,12 +4086,6 @@ async function composeStart(
   const dashboardPort = config.dashboard?.port ?? 8080;
   const dashboardBindHost = config.dashboard?.bindHost ?? "127.0.0.1";
   const botLogin = config.github.account?.toLowerCase();
-  const excludedGitHubRepos = new Set(
-    (config.github.orgs ?? [])
-      .flatMap((entry) => entry.excludedRepos ?? [])
-      .map((repo) => repo.toLowerCase())
-  );
-
   const onEvent = async (
     event: string,
     payload: Record<string, unknown>,
@@ -3926,6 +4104,29 @@ async function composeStart(
         `[github] configured excluded repository event dropped: ${event} on ${repoFullName}`
       );
       return;
+    }
+    // Completion matching deliberately runs before every authorship, bot, and
+    // subscription delivery filter. A staging merge made by the bot must close
+    // its explicitly-matched obligation even when no actor subscribed to the
+    // repository and even when no routable owner exists for this webhook.
+    if (event === "pull_request" && action === "closed" && repoFullName) {
+      const pull = payload.pull_request as { number?: number; merged?: boolean } | undefined;
+      const number = pull?.number ?? (payload.number as number | undefined);
+      if (typeof number === "number") {
+        // Matching must never cost the delivery its ordinary routing; boot
+        // reconciliation re-reads the PR for anything this misses.
+        try {
+          await completionMatcherEvaluator.handlePullRequestClosed({
+            repo: repoFullName,
+            number,
+            merged: pull?.merged === true,
+          });
+        } catch (err) {
+          log.warn("completion_matcher_event_failed", {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
     }
     // Directive-only: this walks a parent fallback chain and must never feed authorship.
     // See authorStampBodyForWebhookPayload.
@@ -4055,10 +4256,10 @@ async function composeStart(
           elevenlabsApiKey: config.elevenlabsApiKey,
           voiceConfigFor: (actorId) => actors.get(actorId)?.voiceConfig,
           voice: config.voice,
-          // Post-#460 replies target the durable user principal, not the legacy
-          // alias; principal storage is what says a recipient is a person.
-          isHumanRecipient: (principalId) =>
-            getRepositories().principals.getUser(principalId) !== undefined,
+          isHumanRecipient: (principalId) => {
+            const user = getRepositories().principals.getUser(principalId);
+            return user !== undefined && !user.disabledAt;
+          },
           onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
           logger: log.child({ component: "voice-session" }),
         })
@@ -4092,10 +4293,12 @@ async function composeStart(
           mesh,
           actors,
           meshEvents: getRepositories().meshEvents,
+          timings: dashboardTimings,
           meshChat: getRepositories().meshChat,
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,
           actorRuns: getRepositories().actorRuns,
+          runPrompts: getRepositories().runPrompts,
           inboxFocus: getRepositories().inboxFocus,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,
@@ -4109,6 +4312,7 @@ async function composeStart(
           // which actors are executing a run right now — for the header HALTED
           // indicator and per-thread run-state dots. No new mesh behavior.
           isHalted: () => haltSwitch.hasActiveHalt(),
+          haltSnapshot: () => haltSwitch.state(),
           // Surfaces the boot-time `at`/`atrm`/`atd`/`atq` AND `crontab`/crond/
           // cron.allow-cron.deny preflights so a missing one-shot facility or an
           // unusable crontab is dashboard/health-visible, not just a startup
@@ -4533,7 +4737,25 @@ async function composeStart(
     e2eInstance.stopForMeshShutdown();
     running = false;
     console.log("\n🛑 Shutting down...");
-    await resources.close();
+    const disposeFailures = await resources.close();
+    if (disposeFailures.length === 0) {
+      try {
+        serviceLifecycleStore.recordCleanShutdown(
+          reason === "deploy" ? "deploy" : "signal",
+          reason === "deploy" ? requestedRestartTransitionId : undefined
+        );
+      } catch (error) {
+        log.warn("service_shutdown_evidence_persist_failed", {
+          reason: reason ?? "signal",
+          err: error,
+        });
+      }
+    } else {
+      log.warn("service_shutdown_incomplete", {
+        reason: reason ?? "signal",
+        failures: disposeFailures.map((failure) => failure.resource),
+      });
+    }
     log.info("service_stopped", { reason });
     process.exit(exitCode ?? getShutdownExitCode(reason));
   };
@@ -4554,6 +4776,11 @@ async function composeStart(
     handle.unref?.();
     resources.acquire(resource, () => clearInterval(handle));
   };
+  const pruneRunPrompts = () => {
+    getRepositories().runPrompts.prune();
+  };
+  pruneRunPrompts();
+  everyInterval("run prompt retention", pruneRunPrompts, 60 * 60 * 1000);
   // The interval handle says nothing about a probe already in flight, so keep
   // both a way to stop one (the signal) and a way to wait for it (the promise).
   // Acquired before the probe interval, so the interval stops first and no new
@@ -4671,6 +4898,35 @@ async function composeStart(
     });
   };
 
+  raiseGoverningWindowClosedAlarm = (closed) => {
+    const message =
+      `Quota window closed without a reading: ${closed.provider}'s governing window ` +
+      `"${closed.window}" reset at ${closed.resetAt}, and no newer accepted quota reading has arrived since ` +
+      `${closed.lastReadingAt}. Check the scrapes to inspect collection.`;
+    void deliverHostAlarm({
+      deliver: () =>
+        mesh.deliverExternalEvent({
+          sourceType: "timer",
+          rawResource: "system:events",
+          rawPayload: { type: "system.quota_governing_window_closed", ...closed, message },
+          priority: "responsive",
+          eventSummary: message,
+        }),
+      message,
+      sendToErrorChat,
+      log,
+      alarmName: "quota_governing_window_closed",
+    }).then((outcome) => {
+      if (outcome !== "delivered") {
+        log.warn("quota_governing_window_closed_not_delivered_to_mesh", {
+          fallback: outcome,
+          provider: closed.provider,
+          window: closed.window,
+        });
+      }
+    });
+  };
+
   const diskAlertConfig = config.observability?.diskAlert;
   const diskAlertSettings = resolveDiskAlertConfig(diskAlertConfig);
   let diskAlert: DiskUsageAlert | null = null;
@@ -4776,6 +5032,23 @@ async function composeStart(
   });
 
   console.log("\n✓ Root actor live. Waiting for events...\n");
+
+  // Every successful boot creates durable root work. The file records the boot
+  // before this append; if this process dies between them, the next boot retries
+  // the same deterministic inbox id before adding its own distinct wake. A
+  // corrupt evidence file is retained and produces its own unknown-evidence wake.
+  if (shouldAppendServiceBootWake({ e2eMode })) {
+    try {
+      appendServiceBootWakes({
+        lifecycle: serviceLifecycleStore,
+        inboxStore,
+        rootId,
+        onLifecycleError: (event, fields) => log.warn(event, fields),
+      });
+    } catch (error) {
+      log.warn("service_boot_wake_failed", { err: error });
+    }
+  }
 
   // Mechanical lifecycle ping : emitted by startup once the mesh is up.
   // A lone "back online" with no preceding "updating" ping is the restart/crash signal.

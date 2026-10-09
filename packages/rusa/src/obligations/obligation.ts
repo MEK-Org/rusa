@@ -12,14 +12,7 @@ export const OBLIGATION_STATUSES = ["ready", "waiting", "done", "cancelled", "sc
 export type ObligationStatus = (typeof OBLIGATION_STATUSES)[number];
 
 /**
- * One entity in the mesh's single id space: an actor UUID, `root`, `human:*`,
- * or `system:*`.
- *
- * Deliberately an id alone, not an id plus a `kind`. `mcp/stamp.ts` already
- * mints `human:operator` / `system:mesh` into the
- * same space actor ids live in, and `isHumanOperator(actorId)` reads the
- * category off the prefix — so a stored kind would restate what the id already
- * says, and could drift from it.
+ * A principal's id. Its kind comes from principal storage, not its spelling.
  */
 export type EntityId = string;
 
@@ -30,6 +23,52 @@ export type EntityId = string;
  * an attached artifact, where many obligations may cite one thing.
  */
 export type ObligationExternalRef = Reference;
+
+/** The event predicates v1 can use to finish an obligation. */
+export type CompletionMatcherKind = "pr_merged" | "deployed";
+
+/**
+ * Versioned, application-validated data stored in a matcher's `spec_json`:
+ * the matcher's specification plus, once satisfied, the observation recorded
+ * at satisfaction.
+ */
+export interface CompletionMatcherSpec {
+  schemaVersion: 1;
+  /**
+   * The terminal note observed at satisfaction (e.g. which instance saw the
+   * deployed revision). Present exactly when the matcher's `satisfied_at` is
+   * set; replacing or clearing the matcher drops it with the other
+   * satisfaction columns.
+   */
+  satisfiedNote?: string;
+}
+
+/** The one opt-in matcher currently attached to an obligation, if any. */
+export interface CompletionMatcher {
+  kind: CompletionMatcherKind;
+  /** A canonical PR reference for `pr_merged`, or a 40-hex commit for `deployed`. */
+  target: string;
+  spec: CompletionMatcherSpec;
+  setBy: EntityId;
+  setAt: string;
+  satisfiedAt: string | null;
+  satisfiedRef: string | null;
+  closedUnmergedAt: string | null;
+}
+
+/**
+ * The stored `pr_merged` target. GitHub owner and repository names are
+ * case-insensitive, so the canonical form is lowercase and the webhook lookup
+ * can use the `(kind, target)` index with an exact comparison.
+ */
+export function canonicalPullRequestTarget(repo: string, number: number): string {
+  return `github:${repo.toLowerCase()}/pulls/${number}`;
+}
+
+/** Model-facing shape accepted by the create/set matcher boundary. */
+export type CompletionMatcherInput =
+  | { kind: "pr_merged"; pr: string }
+  | { kind: "deployed"; commit: string };
 
 export interface Obligation {
   id: string;
@@ -48,6 +87,8 @@ export interface Obligation {
   /** The fuller statement of what should become true. The body, not the heading. */
   intent: string | null;
   externalRef: ObligationExternalRef | null;
+  /** An explicit event→done predicate. It never changes `externalRef`. */
+  completionMatcher: CompletionMatcher | null;
   status: ObligationStatus;
   /** Explicit override; null means inherit from the nearest prioritized ancestor. */
   priority: number | null;

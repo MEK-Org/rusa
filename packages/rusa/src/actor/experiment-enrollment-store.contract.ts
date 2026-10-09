@@ -5,8 +5,8 @@ export const ROOT = "root";
 export const WORKER = "worker-thread-1";
 export const OTHER = "worker-thread-2";
 
-/** The one registered experiment; the store itself holds no registry opinion. */
-export const EXPERIMENT = "strict_obligation_handling";
+/** Any experiment name; the store itself holds no registry opinion. */
+export const EXPERIMENT = "fixture_rollout";
 
 export const enrollment = (over: Partial<ExperimentEnrollment> = {}): ExperimentEnrollment => ({
   actorId: WORKER,

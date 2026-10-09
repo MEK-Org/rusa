@@ -1,7 +1,13 @@
+import { boundedResponse } from "../chat/bounded-response.js";
 import { defaultGchatConfigDir } from "../chat/gchat-oauth.js";
 import { DriveOAuth } from "./drive-oauth.js";
 
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
+
+/** Default ceiling for downloaded Drive files. */
+export const MAX_DRIVE_FILE_DOWNLOAD_BYTES = 1024 * 1024 * 1024; // 1 GiB
+
+const MAX_DRIVE_EXPORT_BYTES = 50 * 1024 * 1024; // 50 MiB
 
 export interface DriveFileMetadata {
   id: string;
@@ -15,23 +21,30 @@ export interface DriveFileMetadata {
 export interface DriveClient {
   listChildren(folderId: string, recursive?: boolean): Promise<DriveFileMetadata[]>;
   getFileMetadata(fileId: string): Promise<DriveFileMetadata>;
-  downloadFile(fileId: string): Promise<Buffer>;
+  /** Stream a file's response bounded at the client's configured ceiling. */
+  downloadFileStream(fileId: string): Promise<Response>;
   exportDoc(fileId: string, mimeType: string): Promise<Buffer>;
 }
 
 export class GoogleDriveClient implements DriveClient {
   private readonly oauth: DriveOAuth;
 
-  private readonly maxSizeBytes: number;
+  private readonly maxDownloadSizeBytes: number;
+
+  private readonly maxExportSizeBytes: number;
 
   constructor(
     configDir = defaultGchatConfigDir(),
     private readonly fetchImpl: typeof fetch = fetch,
     tokenFilename = "drive-token.json",
-    maxSizeBytes = 50 * 1024 * 1024 // 50MB default
+    maxSizeBytes?: number
   ) {
     this.oauth = new DriveOAuth(configDir, fetchImpl, tokenFilename);
-    this.maxSizeBytes = maxSizeBytes;
+    this.maxDownloadSizeBytes = Math.min(
+      maxSizeBytes ?? MAX_DRIVE_FILE_DOWNLOAD_BYTES,
+      MAX_DRIVE_FILE_DOWNLOAD_BYTES
+    );
+    this.maxExportSizeBytes = maxSizeBytes ?? MAX_DRIVE_EXPORT_BYTES;
   }
 
   private async get(path: string, query?: Record<string, string>): Promise<unknown> {
@@ -164,7 +177,7 @@ export class GoogleDriveClient implements DriveClient {
     throw new Error("cannot enforce size limit: response body is not streamable");
   }
 
-  async downloadFile(fileId: string): Promise<Buffer> {
+  async downloadFileStream(fileId: string): Promise<Response> {
     const token = await this.oauth.token();
     const resp = await this.fetchImpl(
       `${DRIVE_API}/files/${encodeURIComponent(fileId)}?alt=media`,
@@ -177,7 +190,7 @@ export class GoogleDriveClient implements DriveClient {
         `drive download ${fileId} -> HTTP ${resp.status} ${(await resp.text()).slice(0, 300)}`
       );
     }
-    return this.readBodyWithLimit(resp, this.maxSizeBytes);
+    return boundedResponse(resp, this.maxDownloadSizeBytes, "file");
   }
 
   async exportDoc(fileId: string, mimeType: string): Promise<Buffer> {
@@ -193,6 +206,6 @@ export class GoogleDriveClient implements DriveClient {
         `drive export ${fileId} -> HTTP ${resp.status} ${(await resp.text()).slice(0, 300)}`
       );
     }
-    return this.readBodyWithLimit(resp, this.maxSizeBytes);
+    return this.readBodyWithLimit(resp, this.maxExportSizeBytes);
   }
 }

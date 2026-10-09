@@ -1,8 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   authorStampBodyForWebhookPayload,
-  HUMAN_OPERATOR,
-  isHumanOperator,
   isSystemActor,
   MESH_SYSTEM,
   parseAuthor,
@@ -119,17 +117,14 @@ describe("Author Identity Stamp Security & HMAC Verification", () => {
   });
 
   describe("Unified Stamp Module Identity Parity (Soft-v1)", () => {
-    it("should produce and parse unversioned plaintext stamp for human:operator and actor id", () => {
-      const humanStamp = stampAuthor(HUMAN_OPERATOR);
-      expect(humanStamp).toBe(`<!-- mesh:author ${HUMAN_OPERATOR} -->`);
-      expect(parseAuthor(humanStamp)).toBe(HUMAN_OPERATOR);
-      expect(isHumanOperator(HUMAN_OPERATOR)).toBe(true);
-      expect(isHumanOperator("human:evil")).toBe(true);
+    it("should produce and parse unversioned plaintext stamps for user and actor ids", () => {
+      const humanStamp = stampAuthor(TEST_USER_ID);
+      expect(humanStamp).toBe(`<!-- mesh:author ${TEST_USER_ID} -->`);
+      expect(parseAuthor(humanStamp)).toBe(TEST_USER_ID);
 
       const actorStamp = stampAuthor("some-actor");
       expect(actorStamp).toBe("<!-- mesh:author some-actor -->");
       expect(parseAuthor(actorStamp)).toBe("some-actor");
-      expect(isHumanOperator("some-actor")).toBe(false);
     });
   });
 
@@ -141,7 +136,7 @@ describe("Author Identity Stamp Security & HMAC Verification", () => {
     });
 
     it("rejects non-system actor ids, including human: and plain actor ids", () => {
-      expect(isSystemActor(HUMAN_OPERATOR)).toBe(false);
+      expect(isSystemActor(TEST_USER_ID)).toBe(false);
       expect(isSystemActor("some-actor")).toBe(false);
       expect(isSystemActor("systemic-actor")).toBe(false);
       expect(isSystemActor("")).toBe(false);
@@ -593,3 +588,5 @@ describe("resolveStampedAuthor ", () => {
     expect(allDetails).not.toContain("forgery");
   });
 });
+
+const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";

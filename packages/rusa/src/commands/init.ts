@@ -8,6 +8,7 @@ import { parse as parseYaml, stringify as toYaml } from "yaml";
 import { GLASS_GOALS_PASSWORD_SECRET_FILENAME, writeHostSecret } from "../config/secrets.js";
 import type { RusaConfig } from "../config/types.js";
 import { initDb } from "../db/index.js";
+import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
 
 export interface InitOptions {
   nonInteractive?: boolean;
@@ -80,6 +81,7 @@ function buildDefaultConfig(existing?: RusaConfig | null): RusaConfig {
     // No silent provider default — `validateConfig` fails if none are configured.
     providers: existing?.providers ?? {},
     geminiApiKey,
+    ...(existing?.gitIdentity ? { gitIdentity: existing.gitIdentity } : {}),
     webhook: {
       port: existing?.webhook?.port ?? 9742,
       secret: existing?.webhook?.secret ?? randomBytes(32).toString("hex"),
@@ -242,42 +244,30 @@ export async function runInit(opts?: InitOptions): Promise<void> {
     default: existing?.github?.account ?? "quickstart-user",
   });
 
-  // 2b. Git identity
-  console.log("\nGit identity (for commits made by rusa):\n");
+  // 2b. Git identity for mesh-owned commits, kept in rusa's own config (#909).
+  // No Git config file is read or written: its identity may belong to a person.
+  console.log("\nGit identity for commits made by rusa (leave blank to set later):\n");
 
-  let existingGitName = "";
-  let existingGitEmail = "";
-  try {
-    existingGitName = execSync("git config --global user.name", {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
-  } catch {
-    // not set
+  const gitName = (
+    await input({
+      message: "Git author name for rusa's commits:",
+      default: existing?.gitIdentity?.name ?? "",
+    })
+  ).trim();
+
+  const gitEmail = (
+    await input({
+      message: "Git author email for rusa's commits:",
+      default: existing?.gitIdentity?.email ?? "",
+    })
+  ).trim();
+
+  const gitIdentity = resolveMeshGitIdentity({ name: gitName, email: gitEmail });
+  if (gitIdentity.identity) {
+    console.log(`  ✓ Git identity: ${gitIdentity.identity.name} <${gitIdentity.identity.email}>`);
+  } else {
+    console.log(`  ⚠️  ${gitIdentity.gap}; actors will report this instead of committing.`);
   }
-  try {
-    existingGitEmail = execSync("git config --global user.email", {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
-  } catch {
-    // not set
-  }
-
-  const gitName = await input({
-    message: "Git user.name for commits:",
-    default: existingGitName || ghAccount,
-  });
-
-  const gitEmail = await input({
-    message: "Git user.email for commits:",
-    default: existingGitEmail || "",
-  });
-
-  // Apply git config globally
-  execSync(`git config --global user.name "${gitName}"`, { stdio: "pipe" });
-  execSync(`git config --global user.email "${gitEmail}"`, { stdio: "pipe" });
-  console.log(`  ✓ Git identity set: ${gitName} <${gitEmail}>`);
 
   // 5. Detect CLI providers and configure API keys
   console.log("\nDetecting LLM providers...\n");
@@ -435,6 +425,14 @@ export async function runInit(opts?: InitOptions): Promise<void> {
     },
     providers,
     ...(geminiApiKey.trim() ? { geminiApiKey: geminiApiKey.trim() } : {}),
+    ...(gitName || gitEmail
+      ? {
+          gitIdentity: {
+            ...(gitName ? { name: gitName } : {}),
+            ...(gitEmail ? { email: gitEmail } : {}),
+          },
+        }
+      : {}),
     webhook: {
       port: parseInt(webhookPort, 10) || 9742,
       secret: webhookSecret,

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 
 import '../breakpoints.dart';
 import '../models.dart';
@@ -161,6 +162,7 @@ class MeshHeader extends StatelessWidget {
     this.onLogout,
     this.profilePhotoUrl,
     this.profileDisplayName,
+    this.haltTooltipNow,
   });
 
   final DashboardStore store;
@@ -168,6 +170,10 @@ class MeshHeader extends StatelessWidget {
   final VoidCallback? onLogout;
   final String? profilePhotoUrl;
   final String? profileDisplayName;
+
+  /// Test clock for the lazily built halt tooltip. Production callers leave
+  /// this null, so each presentation reads the wall clock.
+  final DateTime Function()? haltTooltipNow;
 
   /// Which top-level view is active (drives the nav highlight).
   final DashboardView selected;
@@ -293,9 +299,24 @@ class MeshHeader extends StatelessWidget {
                               StreamBuilder<bool>(
                                 stream: store.halted,
                                 initialData: store.halted.valueOrNull ?? false,
-                                builder: (_, snap) => (snap.data ?? false)
-                                    ? _HaltedBadge(compact: compact)
-                                    : const SizedBox.shrink(),
+                                builder: (_, haltSnap) =>
+                                    StreamBuilder<HaltStatusDto?>(
+                                      stream: store.haltStatus,
+                                      initialData: store.haltStatus.valueOrNull,
+                                      builder: (_, statusSnap) {
+                                        if (!(haltSnap.data ?? false)) {
+                                          return const SizedBox.shrink();
+                                        }
+                                        // The structured status rides the same
+                                        // snapshot as the bool; a null here only
+                                        // means an older server without the field.
+                                        return _HaltedBadge(
+                                          halt: statusSnap.data,
+                                          compact: compact,
+                                          now: haltTooltipNow,
+                                        );
+                                      },
+                                    ),
                               ),
                               StreamBuilder<List<String>?>(
                                 stream: store.schedulerWarning,
@@ -1073,45 +1094,149 @@ Color _legacyColorForRemaining(double remainingPercent) {
   return MeshColors.statusActive;
 }
 
+/// Plain-text summary of the active halt for the header chip's tooltip
+/// (#906): the authoritative scope and the expiry (if timed).
+/// The server retires an expired sentinel, but an idle mesh may not refresh
+/// the snapshot at `until`, so a past expiry is worded as passed rather than
+/// pending; an indefinite halt displays no expiry line.
+String haltTooltipText(HaltStatusDto? halt, {DateTime? now}) {
+  final untilString = halt?.until;
+  final until = untilString == null
+      ? null
+      : DateTime.tryParse(untilString)?.toLocal();
+  final local = (now ?? DateTime.now()).toLocal();
+  final String? expiry;
+  if (until == null) {
+    expiry = null;
+  } else if (until.isAfter(local)) {
+    expiry = 'Expires ${_haltExpiryFormat(until, local)}.';
+  } else {
+    expiry = 'Expiry passed ${_haltExpiryFormat(until, local)}.';
+  }
+  return _haltDescription(
+    halt,
+    expiry,
+    reported: until != null && !until.isAfter(local),
+  );
+}
+
+/// The accessible label uses a clock-stable expiry fact. A screen reader may
+/// reach the badge after local time passes `until` but before a new snapshot
+/// rebuilds it, so it must not retain a stale future-tense expiry claim.
+String haltSemanticsText(HaltStatusDto? halt) {
+  final untilString = halt?.until;
+  final until = untilString == null
+      ? null
+      : DateTime.tryParse(untilString)?.toUtc();
+  final expiry = until == null
+      ? null
+      : 'Reported expiry: '
+            "${DateFormat('EEE MMM d, y, h:mm a').format(until)} UTC.";
+  return _haltDescription(halt, expiry, reported: true);
+}
+
+String _haltDescription(
+  HaltStatusDto? halt,
+  String? expiry, {
+  bool reported = false,
+}) {
+  if (halt == null) {
+    // Older server without the structured halt field: the chip is right,
+    // the scope is unknown.
+    return 'Mesh halted — scope not reported by this server.';
+  }
+  final providers = halt.providers.isEmpty
+      ? 'any provider'
+      : halt.providers.join(', ');
+  final String scope;
+  switch (halt.scope) {
+    case 'models':
+      scope = '${halt.models.join(', ')} on $providers';
+    case 'providers':
+      scope = providers;
+    default:
+      scope = 'all providers';
+  }
+  final label = reported ? 'Reported halt scope' : 'Halt scope';
+  if (expiry == null || expiry.isEmpty) {
+    return '$label: $scope.';
+  }
+  return '$label: $scope.\n$expiry';
+}
+
+/// Same-day expiries read as a time; later ones carry the weekday and date.
+String _haltExpiryFormat(DateTime until, DateTime now) {
+  final sameDay =
+      until.year == now.year &&
+      until.month == now.month &&
+      until.day == now.day;
+  return sameDay
+      ? 'today ${DateFormat('h:mm a').format(until)}'
+      : DateFormat('EEE MMM d, h:mm a').format(until);
+}
+
 /// The engaged-emergency-brake indicator: a solid red pause icon and a bold
 /// "Halted" label — the only status the header surfaces (issue #412), shown
-/// solely while an active halt exists.
+/// solely while an active halt exists. The tooltip names the authoritative
+/// scope and expiry from the same snapshot that raised the badge (#906).
 class _HaltedBadge extends StatelessWidget {
-  const _HaltedBadge({this.compact = false});
+  const _HaltedBadge({this.halt, this.compact = false, this.now});
 
+  final HaltStatusDto? halt;
   final bool compact;
+  final DateTime Function()? now;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: EdgeInsets.symmetric(horizontal: compact ? 6 : 10, vertical: 4),
-      decoration: BoxDecoration(
-        color: MeshColors.statusHalted.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(4),
-        border: Border.all(
-          color: MeshColors.statusHalted.withValues(alpha: 0.5),
+    return Tooltip(
+      ignorePointer: true,
+      richMessage: WidgetSpan(
+        // Evaluated when the tooltip opens, so a passed expiry reads as passed
+        // on an idle page; the overlay's DefaultTextStyle supplies the style.
+        child: Builder(
+          builder: (context) => Text(haltTooltipText(halt, now: now?.call())),
         ),
       ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(
-            Icons.pause_circle_filled,
-            color: MeshColors.statusHalted,
-            size: 14,
+      excludeFromSemantics: true,
+      child: Semantics(
+        // Announce the status first, and use this explicit label instead of
+        // merging the visible child text at an implementation-defined suffix.
+        excludeSemantics: true,
+        label: 'Halted. ${haltSemanticsText(halt)}',
+        child: Container(
+          padding: EdgeInsets.symmetric(
+            horizontal: compact ? 6 : 10,
+            vertical: 4,
           ),
-          if (!compact) ...[
-            const SizedBox(width: 8),
-            Text(
-              'Halted',
-              style: kMonoStyle.copyWith(
-                color: MeshColors.statusHalted,
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-              ),
+          decoration: BoxDecoration(
+            color: MeshColors.statusHalted.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(
+              color: MeshColors.statusHalted.withValues(alpha: 0.5),
             ),
-          ],
-        ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.pause_circle_filled,
+                color: MeshColors.statusHalted,
+                size: 14,
+              ),
+              if (!compact) ...[
+                const SizedBox(width: 8),
+                Text(
+                  'Halted',
+                  style: kMonoStyle.copyWith(
+                    color: MeshColors.statusHalted,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
       ),
     );
   }

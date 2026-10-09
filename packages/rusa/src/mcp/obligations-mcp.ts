@@ -3,7 +3,12 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { MeshEventSink } from "../actor/mesh-events.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
-import { OBLIGATION_TITLE_MAX, type ObligationStatus } from "../obligations/obligation.js";
+import type { CompletionMatcherEvaluation } from "../obligations/completion-matcher-evaluator.js";
+import {
+  type CompletionMatcherInput,
+  OBLIGATION_TITLE_MAX,
+  type ObligationStatus,
+} from "../obligations/obligation.js";
 import { REFERENCE_SCHEMES } from "../references/reference.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
@@ -18,6 +23,7 @@ type ObligationServerRepository = Pick<
   | "create"
   | "setTerminalStatus"
   | "setExternalRef"
+  | "setCompletionMatcher"
   | "setCheckpoint"
   | "setSnooze"
   | "attachArtifact"
@@ -68,12 +74,30 @@ export interface ObligationsMcpOptions {
    * authoritative durable result.
    */
   recordEvent?: MeshEventSink;
+  /** Reject a matcher that this runtime can prove is outside its v1 scope before persisting it. */
+  validateCompletionMatcher?: (matcher: CompletionMatcherInput) => Promise<void>;
+  /** Evaluate a durably-written matcher at create/set time. Read failures are reported, not rolled back. */
+  evaluateCompletionMatcher?: (id: string) => Promise<CompletionMatcherEvaluation>;
 }
 
 /** The one field {@link ObligationsMcpOptions.canManage} needs to decide. */
 type ManageableObligation = Pick<ReturnType<ObligationRepository["require"]>, "ownerId">;
 
 const DEFAULT_PAGE_LIMIT = 50;
+
+const COMPLETION_MATCHER_INPUT_SCHEMA = z.union([
+  z.object({
+    kind: z.literal("pr_merged"),
+    pr: z.string().trim().min(1),
+  }),
+  z.object({
+    kind: z.literal("deployed"),
+    commit: z
+      .string()
+      .trim()
+      .regex(/^[0-9a-fA-F]{40}$/, "must be a 40-hex SHA"),
+  }),
+]);
 
 type PageCursor =
   | {
@@ -344,6 +368,7 @@ export function createObligationsMcpServer(
           ])
           .nullable()
           .optional(),
+        completion_matcher: COMPLETION_MATCHER_INPUT_SCHEMA.nullable().optional(),
         blocked_by: z.array(z.string().trim().min(1)).max(50).optional(),
       },
     },
@@ -356,6 +381,7 @@ export function createObligationsMcpServer(
       priority,
       responsive,
       recurrence,
+      completion_matcher,
       blocked_by,
     }) => {
       try {
@@ -376,7 +402,10 @@ export function createObligationsMcpServer(
         ) {
           throw new Error("only root may create newly responsive obligations");
         }
-        const obligation = repository.create({
+        if (completion_matcher !== undefined && completion_matcher !== null) {
+          await options?.validateCompletionMatcher?.(completion_matcher);
+        }
+        const created = repository.create({
           ownerId: owner.ownerId,
           title,
           parentId: parent_id ?? null,
@@ -385,6 +414,7 @@ export function createObligationsMcpServer(
           priority: priority ?? null,
           responsive: responsive ?? null,
           recurrence: recurrence ?? null,
+          completionMatcher: completion_matcher ?? null,
           blockedBy: blocked_by,
           // Bound by the server from this server's actor identity, exactly like
           // `owner` on list_owned. There is deliberately no `created_by` field
@@ -393,9 +423,46 @@ export function createObligationsMcpServer(
           // to be anyone else — including when it creates work owned by another.
           creatorId: actorId,
         });
-        return toolOk({ obligation });
+        const evaluation =
+          created.completionMatcher === null ? null : await evaluateCommitted(created.id);
+        return toolOk({ obligation: repository.get(created.id) ?? created, evaluation });
       } catch (err) {
         return toolError(err);
+      }
+    }
+  );
+
+  // The matcher is already committed when this runs, so an evaluation failure
+  // must not read as a failed (and retryable) write: it reports `unchecked`.
+  const evaluateCommitted = async (id: string): Promise<CompletionMatcherEvaluation> => {
+    try {
+      return (await options?.evaluateCompletionMatcher?.(id)) ?? "unchecked";
+    } catch {
+      return "unchecked";
+    }
+  };
+
+  server.registerTool(
+    "set_completion_matcher",
+    {
+      title: "Set one completion matcher",
+      description:
+        "Set an opt-in, done-only event predicate, or clear it with null. A pull-request matcher completes on a merge; a deployed matcher completes once this instance runs a descendant build. Replacing or clearing a matcher discards any satisfaction or unmerged-close record from the old predicate.",
+      inputSchema: {
+        id: z.string().trim().min(1),
+        matcher: COMPLETION_MATCHER_INPUT_SCHEMA.nullable(),
+      },
+    },
+    async ({ id, matcher }) => {
+      try {
+        const existing = repository.require(id);
+        if (!canManage(existing)) throw new Error("not authorized to manage this obligation");
+        if (matcher !== null) await options?.validateCompletionMatcher?.(matcher);
+        const written = repository.setCompletionMatcher(id, matcher, actorId);
+        const evaluation = matcher === null ? null : await evaluateCommitted(written.id);
+        return toolOk({ obligation: repository.get(written.id) ?? written, evaluation });
+      } catch (error) {
+        return toolError(error);
       }
     }
   );

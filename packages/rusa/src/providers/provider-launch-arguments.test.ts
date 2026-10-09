@@ -36,6 +36,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildWorkerPrompt } from "../actor/worker-prompt.js";
 import type { ProviderConfig } from "../config/types.js";
+import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
 import { AntigravityProvider } from "./antigravity.js";
 import { buildClaudeArgs, ClaudeProvider } from "./claude.js";
 import { CodexProvider } from "./codex.js";
@@ -69,7 +70,7 @@ function assembledActorContext(): string {
     parentId: "00000000-0000-4000-8000-00000000beef",
     handles: [],
     understandingMountEnabled: false,
-    gitIdentity: null,
+    gitIdentity: resolveMeshGitIdentity(undefined),
   });
 }
 
@@ -204,10 +205,14 @@ describe("provider launch boundary — a NUL in assembled actor context", () => 
       const cli = fakeCliRecordingArgv();
       const provider = adapter.create({ cliCommand: cli.command });
 
+      let retained: string | undefined;
       const result = await provider.run({
         prompt: assembledActorContext(),
         cwd: cli.cwd,
         timeoutMs: 30_000,
+        onPromptLaunched: (prompt) => {
+          retained = prompt;
+        },
       });
 
       // The launch happened at all — the pre-fix behavior was a spawn failure,
@@ -219,6 +224,14 @@ describe("provider launch boundary — a NUL in assembled actor context", () => 
       // Replacement, not truncation: the surrounding charter arrives intact.
       expect(joined).toContain(`stray byte here: [${ARGV_NUL_REPLACEMENT}]`);
       expect(joined).toContain("leave the rest of the file alone");
+      const argv = cli.readArgv() ?? [];
+      const promptArg =
+        adapter.name === "codex"
+          ? argv.at(-1)
+          : argv[argv.indexOf(adapter.name === "copilot" ? "--prompt" : "-p") + 1];
+      expect(retained).toBe(promptArg);
+      if (adapter.name === "antigravity")
+        expect(retained).toContain("## Antigravity command discipline");
     });
   }
 
@@ -383,5 +396,20 @@ describe("provider launch boundary — synchronous spawn rejection", () => {
     // '<the element, up to 128 inspected characters>'`.
     expect(result.output).not.toContain(NEVER_DISCLOSE);
     expect(result.output).toContain("TypeError [ERR_INVALID_ARG_VALUE]");
+  });
+});
+
+describe("#866 retained prompt equals the actual launched argv", () => {
+  it("does not observe a failed spawn as a launched attempt", async () => {
+    const cli = fakeCliRecordingArgv();
+    let observed = false;
+    await new ClaudeProvider("claude", { cliCommand: `${cli.command}\u0000` }).run({
+      prompt: "fixture",
+      cwd: cli.cwd,
+      onPromptLaunched: () => {
+        observed = true;
+      },
+    });
+    expect(observed).toBe(false);
   });
 });

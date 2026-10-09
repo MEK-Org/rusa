@@ -474,7 +474,8 @@ function renderLedger(state: PortableContextState): {
 const OBLIGATIONS_HEADING =
   "\n### Your obligations (system of record)\n\n" +
   "Work state lives in the obligation store, not here. This is a read-through:\n" +
-  "use your obligation tools to change any of it.\n\n";
+  "use your obligation tools to change any of it. If your charter turns\n" +
+  "obligation practice off, your charter governs how you treat this list.\n\n";
 
 /**
  * A snoozed obligation keeps its status and its place in the section (#722);

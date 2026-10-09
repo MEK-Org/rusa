@@ -6,7 +6,9 @@ import '../event_coalesce.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../util.dart';
+import 'event_disclosure.dart';
 import 'kind_chip.dart';
+import 'run_start_details.dart';
 
 /// All mesh event kinds, for the filter dropdown (mirrors MeshEventKind).
 const _kKinds = [
@@ -25,8 +27,8 @@ const _kKinds = [
 ];
 
 /// Events Log tab: kind filter + a merged, newest-first, paginated list. Each row
-/// is timestamp + inline kind chip + detail (+ a handle badge when multiple
-/// actors are selected). No multi-column table (cut).
+/// is timestamp + inline kind chip (+ a handle badge when multiple actors are
+/// selected), with any detail behind a chevron. No multi-column table (cut).
 class EventsTab extends StatelessWidget {
   const EventsTab({super.key, required this.store});
 
@@ -117,7 +119,6 @@ class EventsTab extends StatelessWidget {
     final detail = row.isCoalesced
         ? (row.yielded!.body ?? e.detail)
         : (isMessage ? (e.body ?? e.detail) : e.detail);
-    final resolvedRunModel = e.resolvedRunModel;
 
     Widget? peerLabel;
     String? directionPeer;
@@ -171,6 +172,35 @@ class EventsTab extends StatelessWidget {
       );
     }
 
+    // Wrap (not Row) so the chip/pill/peer cluster reflows onto a second line
+    // instead of overflowing on narrow (mobile) widths. An expandable row's
+    // toggle follows the chip, ahead of the other labels.
+    Widget firstLine(Widget? toggle) => Wrap(
+      spacing: 6,
+      runSpacing: 4,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        KindChip(kind: e.kind),
+        ?toggle,
+        // The merged yield surfaced as a compact status pill, so the single
+        // row still shows the run both ended and yielded.
+        if (row.isCoalesced) _yieldPill(row.yieldStatus ?? ''),
+        if (multi && e.actorId != null)
+          _actorBadge(handles[e.actorId] ?? e.actorId!),
+        ?peerLabel,
+      ],
+    );
+
+    final secondLine = (detail ?? '').isEmpty
+        ? null
+        : Text(
+            detail!,
+            style: const TextStyle(
+              color: MeshColors.textSecondary,
+              fontSize: 13,
+            ),
+          );
+
     return Container(
       decoration: const BoxDecoration(
         border: Border(
@@ -196,42 +226,41 @@ class EventsTab extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Wrap (not Row) so the chip/pill/peer cluster reflows onto a
-                // second line instead of overflowing on narrow (mobile) widths.
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 4,
-                  crossAxisAlignment: WrapCrossAlignment.center,
-                  children: [
-                    KindChip(kind: e.kind),
-                    // The merged yield surfaced as a compact status pill, so the
-                    // single row still shows the run both ended and yielded.
-                    if (row.isCoalesced) _yieldPill(row.yieldStatus ?? ''),
-                    if (multi && e.actorId != null)
-                      _actorBadge(handles[e.actorId] ?? e.actorId!),
-                    ?peerLabel,
-                  ],
-                ),
-                if (resolvedRunModel != null) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    'resolved model: $resolvedRunModel',
-                    style: kMonoStyle.copyWith(
-                      color: MeshColors.textSecondary,
-                      fontSize: 12,
+                if (e.kind == 'run_start')
+                  // The run's resolved model and launch prompt sit behind a
+                  // chevron right after the chip, fetched only when opened.
+                  EventDisclosure(
+                    key: ValueKey('run_start:${e.id}'),
+                    label: 'run details',
+                    header: firstLine,
+                    content: (_) => Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (secondLine != null) ...[
+                          secondLine,
+                          const SizedBox(height: 6),
+                        ],
+                        RunStartDetails(
+                          runId: e.runId,
+                          model: e.resolvedRunModel,
+                          api: store.api,
+                        ),
+                      ],
                     ),
-                  ),
-                ],
-                if ((detail ?? '').isNotEmpty) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    detail!,
-                    style: const TextStyle(
-                      color: MeshColors.textSecondary,
-                      fontSize: 13,
-                    ),
-                  ),
-                ],
+                  )
+                else if (secondLine != null)
+                  // Anything below the first line (message, yield or detail
+                  // body) waits behind the same chevron (#922).
+                  EventDisclosure(
+                    key: ValueKey('event:${e.id}'),
+                    label: isMessage
+                        ? 'message'
+                        : (row.isCoalesced ? 'yield' : 'details'),
+                    header: firstLine,
+                    content: (_) => secondLine,
+                  )
+                else
+                  firstLine(null),
               ],
             ),
           ),

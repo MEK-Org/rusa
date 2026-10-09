@@ -446,7 +446,7 @@ export class ActorHandle implements MeshActor {
    * The follower's answer is asynchronous, so a run that finishes before the
    * command lands simply completes.
    */
-  interrupt(by = "human:operator"): {
+  interrupt(by: string): {
     interrupted: boolean;
     runStartTime?: Date;
     wasQueued?: boolean;
@@ -1087,6 +1087,13 @@ export class ActorHandle implements MeshActor {
           mode: this.queuedMode ?? "ordinary",
           injectRecord: message.injectRecord,
           selected: message.selected,
+        });
+      case "runPrompt":
+        if (message.runId !== this.startedRunId) return;
+        return ctx.lifecycle.emit("onPrompt", {
+          actorId: this.id,
+          runId: message.runId,
+          prompt: message.prompt,
         });
       case "firstChunk":
         hooks?.onFirstChunk?.();

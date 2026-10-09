@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:rusa_dashboard/actor_hierarchy_cache.dart';
 import 'package:rusa_dashboard/api.dart';
+import 'package:rusa_dashboard/dashboard_timing.dart';
 import 'package:rusa_dashboard/avatar_platform.dart';
 import 'package:rusa_dashboard/mesh_stream.dart';
 import 'package:rusa_dashboard/models.dart';
@@ -10,6 +11,8 @@ import 'package:rusa_dashboard/obligations_cache.dart';
 import 'package:rusa_dashboard/quota_cache.dart';
 import 'package:rusa_dashboard/tree_preferences_cache.dart';
 import 'package:rusa_dashboard/voice_platform.dart';
+
+const testUserPrincipalId = '00000000-0000-4000-8000-000000000001';
 
 ThreadDto makeThread(
   String id, {
@@ -132,7 +135,7 @@ MeshEvent makeEvent(
 MeshChat makeChat(
   String id, {
   String sender = 'a',
-  String recipient = 'human:operator',
+  String recipient = '00000000-0000-4000-8000-000000000001',
   String body = '',
 }) => MeshChat(
   id: id,
@@ -210,11 +213,14 @@ class FakeApi extends DashboardApi {
   DashboardConfigDto? dashboardConfigResult;
   Completer<DashboardConfigDto>? dashboardConfigGate;
   bool halted = false;
+  HaltStatusDto? halt;
   List<String>? schedulerWarning;
   RuntimeCursor? runtimeCursor;
   int threadsCallCount = 0;
   final threadSnapshotGates = <Completer<ThreadsSnapshot>>[];
   Object? threadsError;
+  final timingInteractions =
+      <({DashboardInteraction interaction, String outcome})>[];
   List<EventPage> eventPages = [];
   List<ChatPage> chatPages = [];
   int chatCall = 0;
@@ -242,6 +248,21 @@ class FakeApi extends DashboardApi {
   Completer<EventPage>? eventsGate;
 
   @override
+  Future<T> trackInteraction<T>(
+    DashboardInteraction interaction,
+    Future<T> Function() action,
+  ) async {
+    try {
+      final result = await action();
+      timingInteractions.add((interaction: interaction, outcome: 'success'));
+      return result;
+    } catch (_) {
+      timingInteractions.add((interaction: interaction, outcome: 'failure'));
+      rethrow;
+    }
+  }
+
+  @override
   Future<ThreadsSnapshot> fetchThreads() async {
     threadsCallCount++;
     final error = threadsError;
@@ -251,6 +272,7 @@ class FakeApi extends DashboardApi {
     }
     return ThreadsSnapshot(
       halted: halted,
+      halt: halt,
       schedulerWarning: schedulerWarning,
       threads: threadsResult,
       runtimeCursor: runtimeCursor,
@@ -390,7 +412,16 @@ class FakeApi extends DashboardApi {
       return gate.future;
     }
     return dashboardConfigResult ??
-        const DashboardConfigDto(quotaProviders: {});
+        const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: testUserPrincipalId,
+          users: [
+            UserPrincipalDto(
+              id: testUserPrincipalId,
+              email: 'viewer@example.test',
+            ),
+          ],
+        );
   }
 
   @override

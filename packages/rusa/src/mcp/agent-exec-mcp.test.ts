@@ -38,17 +38,15 @@ import {
 import {
   type ExperimentEnrollmentStore,
   InMemoryExperimentEnrollmentStore,
-  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
 } from "../actor/experiments.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
-import type { RootControlService } from "../actor/root-control.js";
+import { RootControlService } from "../actor/root-control.js";
 import type { RusaConfig } from "../config/types.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import type { ChatRoomMember } from "../db/repositories/chat-room-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
-import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import {
@@ -72,6 +70,9 @@ async function connect(server: McpServer): Promise<Client> {
   await client.connect(clientTransport);
   return client;
 }
+
+/** A fixture rollout: the production experiment registry is empty between rollouts. */
+const FIXTURE_EXPERIMENT = "fixture_rollout";
 
 function dataOf(result: CallToolResult): unknown {
   const first = result.content[0];
@@ -188,6 +189,7 @@ function setup(
   runMigrations(eventDb);
   const inboxStore = new SqliteInboxRepository(eventDb);
   const chatStore = new MeshChatRepository(eventDb);
+  const principals = new PrincipalRepository(eventDb);
   const eventManager = new EventManager({
     inboxStore,
     resolver: eventSourceResolver,
@@ -195,6 +197,7 @@ function setup(
   mesh = new ActorMesh({
     recordChat: (entry) => chatStore.record(entry),
     actors: registry,
+    principals,
     rootId: opts.rootId,
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
@@ -207,6 +210,9 @@ function setup(
     inboxStore,
     completedFocusEntryCounts: opts.completedFocusEntryCounts,
     experimentEnrollments: opts.experimentEnrollments,
+    // The production registry is empty between rollouts; the tools are
+    // exercised against a fixture rollout instead.
+    experimentRegistry: { [FIXTURE_EXPERIMENT]: { intent: "Exercise the rollout seam." } },
     isVoiceSessionActive: opts.isVoiceSessionActive,
     voiceSessionTransfer: opts.voiceSessionTransfer,
     listVoiceSessionChat: opts.listVoiceSessionChat,
@@ -264,7 +270,17 @@ function setup(
   if (opts.seedRootGrants !== false) {
     seedConfiguredActorGrants(capabilityGrants, rootId, () => "2026-01-01T00:00:00Z");
   }
-  return { registry, mesh, events, inboxStore, rootId, capabilityGrants, root };
+  return {
+    registry,
+    mesh,
+    events,
+    inboxStore,
+    rootId,
+    capabilityGrants,
+    root,
+    chatStore,
+    principals,
+  };
 }
 
 /** Tools that exist only for a holder of an administrative capability. */
@@ -624,7 +640,7 @@ describe("administrative capability gating of management tools (#549)", () => {
       });
       experiments.enroll({
         actorId,
-        experiment: STRICT_OBLIGATION_HANDLING_EXPERIMENT,
+        experiment: FIXTURE_EXPERIMENT,
         enrolledBy: "test",
         enrolledAt: "2026-01-01T00:00:00Z",
       });
@@ -798,15 +814,117 @@ describe("agent-execution MCP server", () => {
     );
   });
 
+  it.each([
+    "worker",
+    "root",
+  ])("%s addresses interleaved humans with the same send_message tool", async (role) => {
+    const { mesh, rootId, principals, chatStore, inboxStore, events } = setup();
+    const selfId =
+      role === "root"
+        ? rootId
+        : mesh.spawn({
+            charter: "worker",
+            parentId: rootId,
+            modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+          });
+    const alice = principals.createUser({ email: "alice@example.test", createdAt: "t" });
+    const bob = principals.createUser({ email: "bob@example.test", createdAt: "t" });
+    const rootControl = new RootControlService({ mesh, rootId, providers: ["claude"] });
+    const client = await connect(
+      createAgentExecMcpServer(mesh, selfId, rootId, undefined, { rootControl })
+    );
+    try {
+      expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain("reply");
+      mesh.sendMessage(selfId, "alice asks first", alice.id, "alice-session");
+      mesh.sendMessage(selfId, "bob asks later", bob.id, "bob-session");
+      expect(inboxStore.list(selfId).entries).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            payload: expect.objectContaining({
+              type: "mesh.message",
+              fromId: alice.id,
+              sessionId: "alice-session",
+              priority: "responsive",
+            }),
+          }),
+          expect.objectContaining({
+            payload: expect.objectContaining({
+              type: "mesh.message",
+              fromId: bob.id,
+              sessionId: "bob-session",
+              priority: "responsive",
+            }),
+          }),
+        ])
+      );
+      for (const [recipient, session, body] of [
+        [alice.id, "alice-session", "answer alice"],
+        [bob.id, "bob-session", "answer bob"],
+      ]) {
+        const result = await client.callTool({
+          name: "send_message",
+          arguments: { thread_id: recipient, body, session_id: session },
+        });
+        expect(result.isError).not.toBe(true);
+        expect(
+          chatStore.listForActor(recipient).find((message) => message.body === body)
+        ).toMatchObject({ senderId: selfId, recipientId: recipient, sessionId: session });
+        expect(events).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ kind: "message_sent", actorId: selfId, detail: session }),
+            expect.objectContaining({
+              kind: "message_received",
+              actorId: recipient,
+              detail: session,
+            }),
+          ])
+        );
+      }
+      principals.setDisabled(bob.id, "2026-10-01T00:00:00Z");
+      expect(
+        (
+          await client.callTool({
+            name: "send_message",
+            arguments: { thread_id: bob.id, body: "disabled" },
+          })
+        ).isError
+      ).toBe(true);
+      expect(chatStore.listForActor(bob.id).some((message) => message.body === "disabled")).toBe(
+        false
+      );
+      expect(
+        (
+          await client.callTool({
+            name: "send_message",
+            arguments: { thread_id: "unknown", body: "unknown" },
+          })
+        ).isError
+      ).toBe(true);
+    } finally {
+      await client.close();
+      mesh.shutdownAll();
+    }
+  });
+
+  it("cannot report successful human delivery without a durable chat write", async () => {
+    const { mesh, principals } = setup();
+    const user = principals.createUser({ email: "user@example.test", createdAt: "t" });
+    const record = vi.spyOn(mesh, "recordMessageEmitted").mockReturnValue(undefined);
+    expect(() => mesh.sendMessage(user.id, "reply", "root")).toThrow("durable chat storage");
+    record.mockRestore();
+    mesh.shutdownAll();
+  });
+
   it("transfers only the caller's active voice session through a held target", async () => {
     let holder = "";
+    let principalId = "";
     const controls: Array<[string, string]> = [];
-    const { inboxStore, mesh } = setup({
+    const { inboxStore, mesh, principals, chatStore } = setup({
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceSessionTransfer: {
-        activeSessionIdFor: (actorId) => {
+        activeSessionFor: (actorId) => {
           if (actorId !== holder) throw new Error("caller does not hold an active voice session");
-          return "session-a";
+          return { sessionId: "session-a", principalId };
         },
         transferActiveSession: (fromActorId, targetActorId) => {
           if (fromActorId !== holder)
@@ -824,6 +942,7 @@ describe("agent-execution MCP server", () => {
       },
       listVoiceSessionChat: () => [],
     });
+    principalId = principals.createUser({ email: "caller@example.test", createdAt: "t" }).id;
     const source = mesh.spawn({
       charter: "source",
       parentId: "root",
@@ -850,180 +969,30 @@ describe("agent-execution MCP server", () => {
       type: "voice.transfer",
       priority: "responsive",
       sessionId: "session-a",
+      principalId,
     });
-  });
-
-  it("gives a SQLite-backed transfer recipient a lease-scoped reply tool and session", async () => {
-    const db = new Database(":memory:");
-    runMigrations(db);
-    const actors = new SqliteActorRepository(db);
-    const inboxStore = new SqliteInboxRepository(db);
-    const chat = new MeshChatRepository(db);
-    let holder = "";
-    const mesh = new ActorMesh({
-      actors,
-      inboxStore,
-      recordChat: (entry) => chat.record(entry),
-      voiceSessionTransfer: {
-        activeSessionIdFor: (actorId) => {
-          if (actorId !== holder) throw new Error("caller does not hold an active voice session");
-          return "transferred-session";
-        },
-        transferActiveSession: (fromActorId, targetActorId) => {
-          if (fromActorId !== holder)
-            throw new Error("caller does not hold an active voice session");
-          holder = targetActorId;
-          return "transferred-session";
-        },
-        revertActiveSessionTransfer: (sessionId, fromActorId, targetActorId) => {
-          expect(sessionId).toBe("transferred-session");
-          expect(holder).toBe(targetActorId);
-          holder = fromActorId;
-        },
-        notifySessionTransferred: () => {},
-      },
-      createActor: () => ({}) as unknown as Actor,
-    });
-    const liveActor = (id: string) =>
-      ({
-        id,
-        requestRun: () => {},
-        markUnkillable: () => {},
-        close: () => {},
-        isRunning: false,
-        preemptForResponsive: () => ({ preempted: false as const }),
-      }) as unknown as Actor;
-    const root: ActorRecord = {
-      id: "root",
-      charter: "root",
-      parentId: null,
-      isRoot: true,
-      status: "active",
-      createdAt: "2026-01-01T00:00:00.000Z",
-    };
-    const source: ActorRecord = {
-      id: "source",
-      charter: "source",
-      parentId: "root",
-      status: "active",
-      createdAt: "2026-01-01T00:00:01.000Z",
-    };
-    const target: ActorRecord = {
-      id: "target",
-      charter: "target",
-      parentId: "source",
-      status: "active",
-      createdAt: "2026-01-01T00:00:02.000Z",
-    };
-    mesh.adopt(root, liveActor(root.id));
-    mesh.adopt(source, liveActor(source.id));
-    mesh.adopt(target, liveActor(target.id));
-    actors.patch(source.id, { handles: [{ id: target.id }] });
-    holder = source.id;
-
-    mesh.transferVoiceSession(source.id, target.id);
-    expect(actors.lastHumanChat(target.id)).toBeUndefined();
-
-    const client = await connect(createAgentExecMcpServer(mesh, target.id, root.id));
-    const { tools } = await client.listTools();
-    expect(tools.map((tool) => tool.name)).toContain("reply");
-
-    const reply = (await client.callTool({
-      name: "reply",
-      arguments: { message: "I have the call." },
-    })) as CallToolResult;
-    expect(reply.isError).not.toBe(true);
-    expect(
-      chat
-        .listForSession("transferred-session", { limit: 10 })
-        .find((entry) => entry.senderId === target.id)
-    ).toMatchObject({ recipientId: "human:operator", sessionId: "transferred-session" });
-  });
-
-  it("replies to the human chat that arrived after the reply tool was registered (#691)", async () => {
-    const db = new Database(":memory:");
-    runMigrations(db);
-    const actors = new SqliteActorRepository(db);
-    const chat = new MeshChatRepository(db);
-    // Distinct, increasing timestamps so the newest-by-(ts, id) order is fixed.
-    let tick = 0;
-    const mesh = new ActorMesh({
-      actors,
-      inboxStore: new SqliteInboxRepository(db),
-      recordChat: (entry) =>
-        chat.record({ ...entry, ts: new Date(Date.UTC(2026, 0, 1, 0, 0, ++tick)).toISOString() }),
-      createActor: () => ({}) as unknown as Actor,
-    });
-    const liveActor = (id: string) =>
-      ({
-        id,
-        requestRun: () => {},
-        markUnkillable: () => {},
-        close: () => {},
-        isRunning: true,
-        preemptForResponsive: () => ({ preempted: false as const }),
-      }) as unknown as Actor;
-    mesh.adopt(
-      {
-        id: "root",
-        charter: "root",
-        parentId: null,
-        isRoot: true,
-        status: "active",
-        createdAt: "2026-01-01T00:00:00.000Z",
-      },
-      liveActor("root")
-    );
-    mesh.adopt(
-      {
-        id: "worker",
-        charter: "worker",
-        parentId: "root",
-        status: "active",
-        createdAt: "2026-01-01T00:00:01.000Z",
-      },
-      liveActor("worker")
-    );
-    const user = new PrincipalRepository(db).createUser({
-      email: "second@example.com",
-      createdAt: "2026-01-01T00:00:02.000Z",
-      identity: { issuer: "https://accounts.google.com", subject: "second" },
-    });
-
-    // The run's endpoint is built while the newest human message has no
-    // session: that unlocks reply, but a send has no conversation to go to.
-    chat.record({
-      senderId: "human:operator",
-      recipientId: "worker",
-      body: "sessionless",
-      sessionId: null,
-      ts: new Date(Date.UTC(2026, 0, 1, 0, 0, ++tick)).toISOString(),
-    });
-    const client = await connect(createAgentExecMcpServer(mesh, "worker", "root"));
-    expect((await client.listTools()).tools.map((tool) => tool.name)).toContain("reply");
-    const rejected = (await client.callTool({
-      name: "reply",
-      arguments: { message: "Nowhere to send." },
-    })) as CallToolResult;
-    expect(rejected.isError).toBe(true);
-    expect(JSON.stringify(rejected.content)).toContain("requires an active human conversation");
-
-    mesh.sendHumanMessage("worker", "first", "session-a");
-
-    // A second human writes mid-run; the next reply must follow them.
-    mesh.sendHumanMessage("worker", "second", "session-b", { fromId: user.id });
-    const reply = (await client.callTool({
-      name: "reply",
-      arguments: { message: "On it." },
-    })) as CallToolResult;
-
-    expect(reply.isError).not.toBe(true);
-    const sent = (sessionId: string) =>
-      chat.listForSession(sessionId, { limit: 10 }).filter((entry) => entry.senderId === "worker");
-    expect(sent("session-b")).toEqual([
-      expect.objectContaining({ recipientId: user.id, body: "On it." }),
-    ]);
-    expect(sent("session-a")).toEqual([]);
+    const recipient = await connect(createAgentExecMcpServer(mesh, target, "root"));
+    try {
+      // No prior human chat or inferred reply recipient is needed after handoff.
+      expect((await recipient.listTools()).tools.map((tool) => tool.name)).not.toContain("reply");
+      const answer = await recipient.callTool({
+        name: "send_message",
+        arguments: { thread_id: principalId, body: "I have the call.", session_id: "session-a" },
+      });
+      expect(answer.isError).not.toBe(true);
+      expect(chatStore.listForActor(principalId)).toEqual([
+        expect.objectContaining({
+          senderId: target,
+          recipientId: principalId,
+          sessionId: "session-a",
+          body: "I have the call.",
+        }),
+      ]);
+    } finally {
+      await recipient.close();
+      await client.close();
+      mesh.shutdownAll();
+    }
   });
 
   it("describes live capability grants as effective on the next run", async () => {
@@ -4556,31 +4525,31 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
     })) as CallToolResult;
     const threadId = (dataOf(spawned) as { thread_id: string }).thread_id;
     // Enrollment is strictly post-spawn: the actor exists first, unenrolled.
-    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(false);
+    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(false);
 
     const enrolled = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(enrolled.isError).toBeFalsy();
     expect(changeOf(enrolled)).toMatchObject({
       actor_id: threadId,
-      experiment: "strict_obligation_handling",
+      experiment: FIXTURE_EXPERIMENT,
       enrolled: true,
       changed: true,
     });
-    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(true);
+    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(true);
 
     const listed = (await root.callTool({
       name: "list_actor_experiments",
       arguments: { actor_id: threadId },
     })) as CallToolResult;
     expect(dataOf(listed)).toMatchObject({
-      experiments: [{ name: "strict_obligation_handling" }],
+      experiments: [{ name: FIXTURE_EXPERIMENT }],
       enrollments: [
         {
           actor_id: threadId,
-          experiment: "strict_obligation_handling",
+          experiment: FIXTURE_EXPERIMENT,
           enrolled_by: "root",
         },
       ],
@@ -4588,11 +4557,11 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     const unenrolled = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(unenrolled.isError).toBeFalsy();
     expect(changeOf(unenrolled)).toMatchObject({ enrolled: false, changed: true });
-    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(false);
+    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(false);
     const afterList = (await root.callTool({
       name: "list_actor_experiments",
       arguments: {},
@@ -4611,11 +4580,11 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     const first = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     const second = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(second.isError).toBeFalsy();
     expect(changeOf(first)).toMatchObject({ enrolled: true, changed: true });
@@ -4623,11 +4592,11 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     });
     const repeatOff = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(repeatOff.isError).toBeFalsy();
     expect(changeOf(repeatOff)).toMatchObject({ enrolled: false, changed: false });
@@ -4651,7 +4620,7 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     const unknownActor = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: "no-such-thread", experiment: "strict_obligation_handling" },
+      arguments: { actor_id: "no-such-thread", experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(unknownActor.isError).toBe(true);
     expect(mesh.listExperimentEnrollments()).toEqual([]);
@@ -4667,24 +4636,24 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
     });
     await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     });
     mesh.retire(threadId);
 
-    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(true);
+    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(true);
     const reEnroll = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(reEnroll.isError).toBe(true);
     expect(String(dataOf(reEnroll))).toContain("retired");
 
     const withdraw = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
+      arguments: { actor_id: threadId, experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(withdraw.isError).toBeFalsy();
-    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(false);
+    expect(mesh.isEnrolledInExperiment(threadId, FIXTURE_EXPERIMENT)).toBe(false);
   });
 
   it("is not a grantable capability, so no grant can hand it to a worker", async () => {
@@ -4715,13 +4684,13 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     const enrolled = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: "root", experiment: "strict_obligation_handling" },
+      arguments: { actor_id: "root", experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(enrolled.isError).toBeFalsy();
     // The response names the thread the row was written under, not the
     // legacy address the caller typed, so it correlates with the readback.
     expect(changeOf(enrolled)).toMatchObject({ actor_id: configuredRootId, changed: true });
-    expect(mesh.isEnrolledInExperiment(configuredRootId, "strict_obligation_handling")).toBe(true);
+    expect(mesh.isEnrolledInExperiment(configuredRootId, FIXTURE_EXPERIMENT)).toBe(true);
 
     const listed = (await root.callTool({
       name: "list_actor_experiments",
@@ -4731,18 +4700,18 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       enrollments: [
         {
           actor_id: configuredRootId,
-          experiment: "strict_obligation_handling",
+          experiment: FIXTURE_EXPERIMENT,
         },
       ],
     });
 
     const unenrolled = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: "root", experiment: "strict_obligation_handling" },
+      arguments: { actor_id: "root", experiment: FIXTURE_EXPERIMENT },
     })) as CallToolResult;
     expect(unenrolled.isError).toBeFalsy();
     expect(changeOf(unenrolled)).toMatchObject({ actor_id: configuredRootId, changed: true });
-    expect(mesh.isEnrolledInExperiment(configuredRootId, "strict_obligation_handling")).toBe(false);
+    expect(mesh.isEnrolledInExperiment(configuredRootId, FIXTURE_EXPERIMENT)).toBe(false);
   });
 
   it("deletes a stale row for an experiment no longer in the registry via the tool", async () => {
@@ -4754,18 +4723,19 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       parentId: "root",
       modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
-    // A row left behind by an experiment since deleted from `EXPERIMENTS`:
-    // nothing at the mesh or tool layer can write this name any more.
+    // A row left behind by an experiment since deleted from `EXPERIMENTS` —
+    // strict obligation handling, now every actor's behavior (#917): nothing at
+    // the mesh or tool layer can write this name any more.
     experimentEnrollments.enroll({
       actorId: threadId,
-      experiment: "retired_experiment",
+      experiment: "strict_obligation_handling",
       enrolledBy: "root",
       enrolledAt: "2026-01-01T00:00:00Z",
     });
 
     const unenrollStale = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "retired_experiment" },
+      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     expect(unenrollStale.isError).toBeFalsy();
     expect(changeOf(unenrollStale)).toMatchObject({ enrolled: false, changed: true });
@@ -4774,7 +4744,7 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
     // Enrolling under that name is still refused — cleanup is one-way.
     const reEnroll = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "retired_experiment" },
+      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     expect(reEnroll.isError).toBe(true);
   });

@@ -18,10 +18,13 @@ import { obligationHistory } from "../db/migrations/0045_obligation_history.js";
 import { obligationResponsive } from "../db/migrations/0049_obligation_responsive.js";
 import { dropObligationReadyHeads } from "../db/migrations/0050_drop_obligation_ready_heads.js";
 import { obligationSnooze } from "../db/migrations/0052_obligation_snooze.js";
+import { obligationCompletionMatchers } from "../db/migrations/0059_obligation_completion_matchers.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { OBLIGATION_CHECKPOINT_MAX } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import { createObligationsMcpServer } from "./obligations-mcp.js";
+
+const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";
 
 async function connect(server: McpServer): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -57,10 +60,11 @@ describe("obligations MCP", () => {
     obligationResponsive.up(db);
     obligationSnooze.up(db);
     dropObligationReadyHeads.up(db);
+    obligationCompletionMatchers.up(db);
     repository = new ObligationRepository(db);
   });
 
-  it("exposes all 15 obligation tools", async () => {
+  it("exposes all 16 obligation tools", async () => {
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual([
@@ -75,6 +79,7 @@ describe("obligations MCP", () => {
       "reorder_obligation",
       "reparent_obligation",
       "set_checkpoint",
+      "set_completion_matcher",
       "set_external_ref",
       "set_obligation_recurrence",
       "set_obligation_status",
@@ -300,7 +305,7 @@ describe("obligations MCP", () => {
     expect(obligation.creatorId).toBe("actor-a");
 
     // And it survives the reassignment that destroys owner attribution.
-    repository.reassign(obligation.id, "human:operator", "system:mesh");
+    repository.reassign(obligation.id, "00000000-0000-4000-8000-000000000001", "system:mesh");
     expect(repository.require(obligation.id).creatorId).toBe("actor-a");
   });
 
@@ -312,7 +317,7 @@ describe("obligations MCP", () => {
         title: "attempted attribution laundering",
         owner_id: "actor-a",
         intent: "attempted attribution laundering",
-        created_by: "human:operator",
+        created_by: "00000000-0000-4000-8000-000000000001",
       },
     })) as CallToolResult;
 
@@ -392,7 +397,12 @@ describe("obligations MCP", () => {
     const client = await connect(
       createObligationsMcpServer(repository, "actor-a", {
         resolveOwner: (raw) =>
-          resolveObligationOwner({ get: (id: string) => registry.get(id) as never }, raw),
+          resolveObligationOwner({ get: (id: string) => registry.get(id) as never }, raw, {
+            get: (id) =>
+              id === TEST_USER_ID
+                ? { kind: "user", id, email: "user@example.test", createdAt: "t" }
+                : undefined,
+          }),
       })
     );
 
@@ -408,7 +418,7 @@ describe("obligations MCP", () => {
     // A live actor and the canonical operator id are both legitimate: owning
     // work to another actor is why `creator_id` exists, and owning it to the
     // operator is the human-decision contract.
-    for (const ownerId of ["actor-a", "human:operator"]) {
+    for (const ownerId of ["actor-a", "00000000-0000-4000-8000-000000000001"]) {
       const res = (await client.callTool({
         name: "create_obligation",
         arguments: { title: "fine", owner_id: ownerId, intent: "fine" },
@@ -417,7 +427,7 @@ describe("obligations MCP", () => {
     }
   });
 
-  it("creates human-owned work by durable id and legacy alias without actor attention", async () => {
+  it("creates human-owned work by explicit durable id without actor attention", async () => {
     const user = {
       kind: "user" as const,
       id: "fb394608-d6d6-4f2e-aebe-51a59bd01374",
@@ -442,7 +452,7 @@ describe("obligations MCP", () => {
       })
     );
 
-    for (const ownerId of [user.id, "human:operator"]) {
+    for (const ownerId of [user.id]) {
       const result = (await client.callTool({
         name: "create_obligation",
         arguments: { title: `owned through ${ownerId}`, owner_id: ownerId },
@@ -580,6 +590,57 @@ describe("obligations MCP", () => {
     expect(repository.require("rec-owned").recurrencePolicy).toBe("cron");
   });
 
+  it("sets and clears an owner-managed completion matcher", async () => {
+    repository.create({ title: "matched", id: "matched", ownerId: "actor-a" });
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+
+    const set = (await client.callTool({
+      name: "set_completion_matcher",
+      arguments: {
+        id: "matched",
+        matcher: { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      },
+    })) as CallToolResult;
+    expect(set.isError).toBeFalsy();
+    expect(repository.require("matched").completionMatcher).toMatchObject({
+      kind: "pr_merged",
+      target: "github:mek-org/rusa/pulls/190",
+    });
+
+    const cleared = (await client.callTool({
+      name: "set_completion_matcher",
+      arguments: { id: "matched", matcher: null },
+    })) as CallToolResult;
+    expect(cleared.isError).toBeFalsy();
+    expect(repository.require("matched").completionMatcher).toBeNull();
+  });
+
+  it("reports a committed matcher as unchecked when its evaluation throws", async () => {
+    repository.create({ title: "matched", id: "matched", ownerId: "actor-a" });
+    const client = await connect(
+      createObligationsMcpServer(repository, "actor-a", {
+        evaluateCompletionMatcher: async () => {
+          throw new Error("SQLITE_BUSY");
+        },
+      })
+    );
+
+    const set = (await client.callTool({
+      name: "set_completion_matcher",
+      arguments: {
+        id: "matched",
+        matcher: { kind: "pr_merged", pr: "github:MEK-Org/rusa/pulls/190" },
+      },
+    })) as CallToolResult;
+
+    // The write committed, so the tool must not read as a failed write.
+    expect(set.isError).toBeFalsy();
+    expect(dataOf(set)).toMatchObject({
+      evaluation: "unchecked",
+    });
+    expect(repository.require("matched").completionMatcher).not.toBeNull();
+  });
+
   it("rejects set_obligation_recurrence for a non-owner, and honors the owner-ancestor policy", async () => {
     repository.create({ title: "foreign recurring", id: "rec-foreign", ownerId: "actor-b" });
 
@@ -675,12 +736,12 @@ describe("obligations MCP", () => {
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const result = (await client.callTool({
       name: "reassign_obligation",
-      arguments: { id: "task", owner_id: "human:operator" },
+      arguments: { id: "task", owner_id: "00000000-0000-4000-8000-000000000001" },
     })) as CallToolResult;
 
     expect(result.isError).toBeFalsy();
     expect(dataOf(result)).toMatchObject({
-      obligation: { id: "task", ownerId: "human:operator" },
+      obligation: { id: "task", ownerId: "00000000-0000-4000-8000-000000000001" },
       previousOwnerId: "actor-a",
     });
   });

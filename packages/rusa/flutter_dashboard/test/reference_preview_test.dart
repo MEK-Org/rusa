@@ -11,7 +11,7 @@ Widget _host(Widget child) => MaterialApp(
 
 /// Every string actually rendered by a `Text`/`SelectableText` in the tree,
 /// joined with a separator. Substring checks against this catch a raw id
-/// hiding inside a composite string (e.g. "human:operator → root"), which
+/// hiding inside a composite string (e.g. "00000000-0000-4000-8000-000000000001 → root"), which
 /// `find.text(rawId)` — an exact-match finder — cannot.
 String _allRenderedText(WidgetTester tester) {
   final texts = tester
@@ -29,9 +29,9 @@ void main() {
       final dto = ReferenceDto.fromJson(const {
         'ref': 'mesh:messages/abc',
         'scheme': 'mesh',
-        'title': 'human:operator → root',
+        'title': '00000000-0000-4000-8000-000000000001 → root',
         'body': 'A monster-catching JRPG in a cave.',
-        'author': 'human:operator',
+        'author': '00000000-0000-4000-8000-000000000001',
         'timestamp': '2026-08-30T12:00:00.000Z',
         'url': null,
         'unavailable': null,
@@ -66,7 +66,7 @@ void main() {
         'reference': {
           'ref': 'mesh:messages/abc',
           'scheme': 'mesh',
-          'title': 'human:operator → root',
+          'title': '00000000-0000-4000-8000-000000000001 → root',
           'body': 'the answer',
         },
       });
@@ -233,11 +233,11 @@ void main() {
               reference: ReferenceDto(
                 ref: 'mesh:messages/abc',
                 scheme: 'mesh',
-                title: 'human:operator → root',
+                title: '00000000-0000-4000-8000-000000000001 → root',
                 body: 'A monster-catching JRPG in a cave.',
                 entity: {
                   'type': 'mesh_message',
-                  'senderId': 'human:operator',
+                  'senderId': '00000000-0000-4000-8000-000000000001',
                   'recipientId': 'root',
                 },
               ),
@@ -245,10 +245,10 @@ void main() {
           ),
         );
 
-        expect(find.text('Operator → Unknown actor'), findsWidgets);
+        expect(find.text('Unknown actor → Unknown actor'), findsWidgets);
         expect(find.textContaining('by Operator'), findsNothing);
         final rendered = _allRenderedText(tester);
-        expect(rendered.contains('human:operator'), false);
+        expect(rendered.contains('00000000-0000-4000-8000-000000000001'), false);
         expect(rendered.contains('root'), false);
       },
     );

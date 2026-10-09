@@ -173,6 +173,8 @@ export interface PullRequestDetails {
   baseRef: string;
   headSha: string;
   state: string;
+  /** GitHub's authoritative merge state; closed alone is not sufficient. */
+  merged?: boolean;
 }
 
 export interface PullRequestChecksStatus {
@@ -1223,6 +1225,7 @@ export class GitHubIssueClient implements IssueClient {
       head: { ref: string; sha: string };
       base?: { ref?: string } | null;
       state: string;
+      merged: boolean;
     }>("GET", `/repos/${repo}/pulls/${prNumber}`);
 
     return {
@@ -1234,6 +1237,7 @@ export class GitHubIssueClient implements IssueClient {
       baseRef: pr.base?.ref ?? "",
       headSha: pr.head.sha,
       state: pr.state,
+      merged: pr.merged,
     };
   }
 

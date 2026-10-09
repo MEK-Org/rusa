@@ -9,7 +9,9 @@ String legacyConversationSender(MeshEvent event, Set<String> selection) =>
 
 String legacyOperatorSender(MeshEvent event, String selectedId) =>
     event.messageRecipient ??
-    (event.actorId == 'human:operator' ? selectedId : 'human:operator');
+    (event.actorId == '00000000-0000-4000-8000-000000000001'
+        ? selectedId
+        : '00000000-0000-4000-8000-000000000001');
 
 void main() {
   test('messageSender resolves payload-backed and legacy message rows', () {
@@ -23,7 +25,7 @@ void main() {
       'actor-reply',
       'message_sent',
       actor: 'actor-a',
-      payload: '{"messageId":"m2","to":"human:operator"}',
+      payload: '{"messageId":"m2","to":"00000000-0000-4000-8000-000000000001"}',
     );
     final receivedFromPeer = makeEvent(
       'b-received',
@@ -41,7 +43,10 @@ void main() {
     expect(actorToPeer.messageSender, 'actor-a');
     expect(actorToPeer.messageRecipient, 'actor-b');
     expect(actorReplyToOperator.messageSender, 'actor-a');
-    expect(actorReplyToOperator.messageRecipient, 'human:operator');
+    expect(
+      actorReplyToOperator.messageRecipient,
+      '00000000-0000-4000-8000-000000000001',
+    );
     expect(receivedFromPeer.messageSender, 'actor-a');
     expect(receivedFromPeer.messageRecipient, 'actor-b');
     expect(legacyPeerRow.messageSender, 'actor-a');
@@ -53,7 +58,7 @@ void main() {
     );
     expect(
       legacyOperatorSender(actorReplyToOperator, 'actor-a'),
-      'human:operator',
+      '00000000-0000-4000-8000-000000000001',
     );
   });
 }

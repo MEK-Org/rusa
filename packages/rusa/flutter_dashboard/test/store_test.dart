@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/api.dart';
+import 'package:rusa_dashboard/dashboard_timing.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/obligations_cache.dart';
 import 'package:rusa_dashboard/store.dart';
@@ -368,15 +369,28 @@ void main() {
     });
   });
 
-  test('init loads dashboard quota provider config', () async {
+  test('init waits for the verified viewer and dashboard choices', () async {
+    final config = Completer<DashboardConfigDto>();
     final api = FakeApi()
       ..threadsResult = [makeThread('root', created: 't0')]
-      ..dashboardConfigResult = const DashboardConfigDto(
+      ..dashboardConfigGate = config;
+    final store = DashboardStore(api: api, stream: FakeStream());
+    var initialized = false;
+    final ready = store.init().then((_) => initialized = true);
+    await pumpEventQueue();
+    expect(initialized, isFalse);
+    expect(api.threadsCallCount, 0);
+
+    config.complete(
+      const DashboardConfigDto(
+        userPrincipalId: testUserPrincipalId,
         quotaProviders: {
           'claude': QuotaProviderConfigDto(primaryWindow: 'session'),
         },
-      );
-    final store = await _booted(api, FakeStream());
+      ),
+    );
+    await ready;
+    expect(store.userPrincipalId, testUserPrincipalId);
 
     expect(
       store.dashboardConfig.value?.quotaProviders['claude']?.primaryWindow,
@@ -1420,6 +1434,13 @@ void main() {
         async.flushMicrotasks();
         expect(store.actor('a'), isNull);
         expect(store.error.value, contains('offline'));
+        expect(
+          api.timingInteractions,
+          contains((
+            interaction: DashboardInteraction.initialLoad,
+            outcome: 'failure',
+          )),
+        );
 
         api.threadsError = null;
         async.elapse(const Duration(milliseconds: 250));
@@ -1639,7 +1660,7 @@ void main() {
       store.clickActor('a');
       await pumpEventQueue();
       expect(store.operatorChat.value.chat.map((e) => e.id), ['e1']);
-      expect(api.chatActorCalls.last, containsAll(['a', 'human:operator']));
+      expect(api.chatActorCalls.last, containsAll(['a', '00000000-0000-4000-8000-000000000001']));
 
       // Live incoming messages
       // 1. human operator to actor
@@ -1648,7 +1669,7 @@ void main() {
           'e2-event',
           'message_sent',
           actor: 'a',
-          payload: '{"messageId":"e2","to":"human:operator"}',
+          payload: '{"messageId":"e2","to":"00000000-0000-4000-8000-000000000001"}',
         ),
       );
       // 2. actor to human operator (reply)
@@ -1656,13 +1677,13 @@ void main() {
         makeEvent(
           'e3-event',
           'message_sent',
-          actor: 'human:operator',
+          actor: '00000000-0000-4000-8000-000000000001',
           payload: '{"messageId":"e3","to":"a"}',
         ),
       );
       // 3. non-matching message
       stream.meshCtrl.add(
-        makeEvent('e4', 'message_sent', actor: 'b', peer: 'human:operator'),
+        makeEvent('e4', 'message_sent', actor: 'b', peer: '00000000-0000-4000-8000-000000000001'),
       );
       await pumpEventQueue();
 
@@ -1697,7 +1718,7 @@ void main() {
         makeEvent(
           'sent-event',
           'message_sent',
-          actor: 'human:operator',
+          actor: '00000000-0000-4000-8000-000000000001',
           body: 'hello actor',
           payload: '{"messageId":"chat-1","to":"a"}',
         ),
@@ -1708,7 +1729,7 @@ void main() {
           'message_received',
           actor: 'a',
           body: 'hello actor',
-          payload: '{"messageId":"chat-1","from":"human:operator"}',
+          payload: '{"messageId":"chat-1","from":"00000000-0000-4000-8000-000000000001"}',
         ),
       );
       await pumpEventQueue();
@@ -1734,7 +1755,7 @@ void main() {
         makeEvent(
           'evt$i',
           'message_sent',
-          actor: 'human:operator',
+          actor: '00000000-0000-4000-8000-000000000001',
           payload: '{"messageId":"m$i","to":"a"}',
         ),
       );

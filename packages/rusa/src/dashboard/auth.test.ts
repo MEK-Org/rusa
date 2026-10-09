@@ -11,8 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
-import { executeLegacyPrincipalMigration } from "../principals/legacy-migration.js";
+
 import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
 import {
@@ -132,6 +131,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
             ],
           },
           meshEvents,
+          principals,
           mesh: { interrupt },
         } as unknown as DashboardDataDeps,
         null,
@@ -173,6 +173,35 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     return cookie.split(";")[0];
   }
 
+  it("returns the session's viewer and active user choices without private identity metadata", async () => {
+    const cookie = await login();
+    const viewer = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });
+    const colleague = principals.createUser({
+      email: "colleague@example.com",
+      createdAt: new Date(now).toISOString(),
+    });
+    const disabled = principals.createUser({
+      email: "disabled@example.com",
+      createdAt: new Date(now).toISOString(),
+    });
+    principals.setDisabled(disabled.id, new Date(now).toISOString());
+
+    const response = await fetch(`${origin}/api/dashboard/config`, { headers: { Cookie: cookie } });
+    expect(response.status).toBe(200);
+    const data = (await response.json()) as {
+      userPrincipalId: string;
+      users: { id: string; email: string }[];
+    };
+    expect(data.userPrincipalId).toBe(viewer?.id);
+    expect(data.users).toHaveLength(2);
+    expect(data.users).toEqual(
+      expect.arrayContaining([
+        { id: viewer?.id, email: "owner@example.com" },
+        { id: colleague.id, email: colleague.email },
+      ])
+    );
+  });
+
   it("requires a verified durable principal for authenticated dashboard mutations (#509)", async () => {
     const missingPrincipal = await post("/api/mesh/actors/actor/interrupt");
     expect(missingPrincipal.status).toBe(401);
@@ -200,8 +229,19 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
 
     const selected = "selected-actor";
     const unrelated = "unrelated-actor";
-    meshEvents.record({ kind: "message_sent", actorId: selected, detail: "selected sent" });
-    meshEvents.record({ kind: "message_received", actorId: selected, detail: "selected received" });
+    principals.ensureActorPrincipal(selected, "2026-06-21T00:00:00.000Z");
+    meshEvents.record({
+      kind: "message_sent",
+      actorId: selected,
+      detail: "selected sent",
+      payload: JSON.stringify({ to: viewer.id }),
+    });
+    meshEvents.record({
+      kind: "message_received",
+      actorId: selected,
+      detail: "selected received",
+      payload: JSON.stringify({ from: viewer.id }),
+    });
     meshEvents.record({
       kind: "message_sent",
       actorId: viewer.id,
@@ -232,7 +272,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect(page.events.map((event) => event.detail)).not.toContain("unrelated sent");
   });
 
-  it("keeps legacy human:operator event queries scoped to the legacy actor id", async () => {
+  it("does not reinterpret an unknown participant as the authenticated viewer", async () => {
     const cookie = await login();
     const viewer = principals.findUserByExternalIdentity({
       issuer: `https://securetoken.google.com/${config.firebase.projectId}`,
@@ -242,12 +282,12 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
 
     meshEvents.record({
       kind: "message_sent",
-      actorId: HUMAN_OPERATOR,
-      detail: "legacy operator event",
+      actorId: TEST_USER_ID,
+      detail: "unknown participant event",
     });
     meshEvents.record({ kind: "message_sent", actorId: viewer.id, detail: "durable user event" });
 
-    const response = await fetch(`${origin}/api/mesh/events?actors=${HUMAN_OPERATOR}`, {
+    const response = await fetch(`${origin}/api/mesh/events?actors=${TEST_USER_ID}`, {
       headers: { Cookie: cookie },
     });
 
@@ -255,8 +295,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     const page = (await response.json()) as {
       events: Array<{ actorId: string; detail: string | null }>;
     };
-    expect(page.events.map((event) => event.detail)).toEqual(["legacy operator event"]);
-    expect(page.events.map((event) => event.actorId)).toEqual([HUMAN_OPERATOR]);
+    expect(page.events).toEqual([]);
   });
 
   it.skipIf(mode !== "shared")(
@@ -370,6 +409,36 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect((await post("/api/auth/session", cookie)).status).toBe(401);
     expect((await post("/api/auth/refresh", cookie)).status).toBe(401);
     expect(principals.getUser(user.id)?.identity).toEqual(user.identity);
+  });
+
+  it("records the Google account id only from the verified ID token at sign-in", async () => {
+    // Synthetic Google account ids; never a real person's.
+    token = claim({
+      firebase: {
+        identities: { "google.com": ["100000000000000000001"] },
+        sign_in_provider: "google.com",
+      },
+    });
+    const cookie = await login();
+    const identity = { issuer: token.iss, subject: token.sub };
+    expect(principals.findUserByExternalIdentity(identity)?.googleAccountId).toBe(
+      "100000000000000000001"
+    );
+    // A later request authorized by the session cookie does not rewrite it.
+    cookies.set(
+      cookie,
+      claim({
+        ...cookies.get(cookie),
+        firebase: {
+          identities: { "google.com": ["100000000000000000002"] },
+          sign_in_provider: "google.com",
+        },
+      })
+    );
+    expect(await auth.authorize(authRequest(cookie), authResponse())).toBe(true);
+    expect(principals.findUserByExternalIdentity(identity)?.googleAccountId).toBe(
+      "100000000000000000001"
+    );
   });
 
   it("resolves existing cookies across resolver restarts without claiming roots or changing history", async () => {
@@ -560,12 +629,10 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect(firebase.verifySessionCookie).toHaveBeenCalledWith("cookie-1", true);
   });
 
-  it("keeps repeated first sign-in requests bound to the migrated principal", async () => {
-    const migrated = executeLegacyPrincipalMigration(db, {
-      email: "owner@example.com",
-      apply: true,
-    });
-    const before = principals.getUser(migrated.principalId);
+  it("keeps concurrent first sign-ins bound to the local bootstrap principal", async () => {
+    const provisioned = principals.ensureImplicitUser(new Date(now).toISOString());
+    if (!provisioned) throw new Error("expected bootstrap user");
+    const before = principals.getUser(provisioned.id);
 
     const [first, second] = await Promise.all([
       post("/api/auth/session"),
@@ -574,39 +641,40 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
 
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
-    expect(principals.getUser(migrated.principalId)).toMatchObject({
-      id: migrated.principalId,
+    expect(principals.getUser(provisioned.id)).toMatchObject({
+      id: provisioned.id,
+      email: "owner@example.com",
       identity: { issuer: token.iss, subject: token.sub },
     });
-    expect(before?.id).toBe(migrated.principalId);
+    expect(before?.id).toBe(provisioned.id);
     expect(principals.listUsers()).toHaveLength(1);
     expect(
       principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub })?.id
-    ).toBe(migrated.principalId);
+    ).toBe(provisioned.id);
   });
 
   it("does not bind a disabled or non-allowlisted provisioned principal", async () => {
-    const migrated = executeLegacyPrincipalMigration(db, {
+    const provisioned = principals.createUser({
       email: "owner@example.com",
-      apply: true,
+      createdAt: new Date(now).toISOString(),
     });
     token = claim({ email: "other@example.com" });
     expect((await post("/api/auth/session")).status).toBe(401);
-    expect(principals.getUser(migrated.principalId)?.identity).toBeUndefined();
+    expect(principals.getUser(provisioned.id)?.identity).toBeUndefined();
 
     token = claim();
-    principals.setDisabled(migrated.principalId, new Date(now).toISOString());
+    principals.setDisabled(provisioned.id, new Date(now).toISOString());
     expect((await post("/api/auth/session")).status).toBe(401);
-    expect(principals.getUser(migrated.principalId)?.identity).toBeUndefined();
+    expect(principals.getUser(provisioned.id)?.identity).toBeUndefined();
   });
 
   it("returns a safe actionable error when an admitted account cannot claim its provisioned principal", async () => {
-    const migrated = executeLegacyPrincipalMigration(db, {
+    const provisioned = principals.createUser({
       email: "owner@example.com",
-      apply: true,
+      createdAt: new Date(now).toISOString(),
     });
     principals.bindExternalIdentity(
-      migrated.principalId,
+      provisioned.id,
       { issuer: token.iss, subject: "other-google-user" },
       new Date(now).toISOString()
     );
@@ -618,7 +686,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect(JSON.parse(body)).toEqual({ error: DASHBOARD_IDENTITY_CLAIM_ERROR });
     expect(body).not.toContain("owner@example.com");
     expect(firebase.createSessionCookie).not.toHaveBeenCalled();
-    expect(principals.getUser(migrated.principalId)?.identity?.subject).toBe("other-google-user");
+    expect(principals.getUser(provisioned.id)?.identity?.subject).toBe("other-google-user");
   });
 
   it.each([
@@ -828,7 +896,10 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
   });
 
   it("preserves unauthenticated mode when auth is absent", async () => {
-    const local = createServer(createDashboardRequestHandler({ port: 0 }));
+    principals.ensureImplicitUser(new Date(now).toISOString());
+    const local = createServer(
+      createDashboardRequestHandler({ port: 0 }, { principals } as DashboardDataDeps)
+    );
     await new Promise<void>((resolve) => local.listen(0, "127.0.0.1", resolve));
     try {
       const base = `http://127.0.0.1:${(local.address() as AddressInfo).port}`;
@@ -896,3 +967,5 @@ describe("production boundary startup", () => {
     );
   });
 });
+
+const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";

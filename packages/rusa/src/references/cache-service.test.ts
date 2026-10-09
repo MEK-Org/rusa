@@ -742,5 +742,29 @@ describe("ReferenceCacheService", () => {
       expect(res.cacheState).toBe("fresh");
       expect(getMessage).toHaveBeenCalledTimes(2);
     });
+
+    describe("request budget (#933)", () => {
+      const issue = (n: number) => `github:a/b/issues/${n}`;
+
+      it("answers every get sharing a budget at the budget's one deadline", async () => {
+        const { repo } = memoryRepo();
+        const getIssue = vi.fn(() => new Promise<IssueDetails>(() => {}));
+        const deps = { issueClient: { getIssue } };
+        const svc = new ReferenceCacheService({ repo, deadlineMs: 60_000 });
+        vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
+        try {
+          const budget = svc.startBudget();
+          const first = svc.get(issue(1), deps, budget);
+          // A get joining the request later waits only what is left of it.
+          await vi.advanceTimersByTimeAsync(40_000);
+          const second = svc.get(issue(2), deps, budget);
+          await vi.advanceTimersByTimeAsync(20_000);
+          expect((await first).cacheState).toBe("pending");
+          expect((await second).cacheState).toBe("pending");
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+    });
   });
 });

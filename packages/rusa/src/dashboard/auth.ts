@@ -10,6 +10,7 @@ import {
   type PrincipalRepository,
 } from "../db/repositories/principal-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import { IMPLICIT_USER_EMAIL } from "../principals/operator-principal.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
 import { DashboardCsrf } from "./csrf.js";
 import {
@@ -35,8 +36,7 @@ const isTransient = (error: unknown): boolean =>
   typeof error.code === "string" &&
   TRANSIENT_CODES.has(error.code);
 const authenticatedRequests = new WeakMap<IncomingMessage, UserPrincipal>();
-/** The durable identity behind an authorized request. Actions still carry
- * `human:operator` authority; this is identity, not yet tenant-scoped authorization. */
+/** The durable identity behind an authorized request in the shared mesh. */
 export const getDashboardRequestPrincipal = (req: IncomingMessage): UserPrincipal | undefined =>
   authenticatedRequests.get(req);
 export const isAuthenticatedOperatorRequest = (req: IncomingMessage): boolean =>
@@ -108,7 +108,7 @@ async function readToken(req: IncomingMessage): Promise<string> {
   return body.idToken;
 }
 
-/** Durable verified human identities with shared human:operator authority. */
+/** Durable verified human identities with shared mesh control authority. */
 export class DashboardAuth {
   private readonly csrf = new DashboardCsrf();
   private readonly revocations = new Map<string, number>();
@@ -151,6 +151,7 @@ export class DashboardAuth {
   private admitted(token: DecodedIdToken): void {
     if (
       token.email_verified !== true ||
+      normalizeEmail(token.email ?? "") === IMPLICIT_USER_EMAIL ||
       !this.allowedEmails.has(normalizeEmail(token.email ?? "")) ||
       token.firebase?.sign_in_provider !== "google.com" ||
       !token.uid ||
@@ -278,7 +279,7 @@ export class DashboardAuth {
       }
       const principal = this.identities.resolve(token);
       const cookie = await this.firebase.createSessionCookie(idToken, { expiresIn: SESSION_MS });
-      this.identities.recordAuthentication(principal, new Date(this.now()).toISOString());
+      this.identities.recordAuthentication(principal, new Date(this.now()).toISOString(), token);
       setCookie(res, cookie, SESSION_MS / 1000);
       this.csrf.issue(req, res, cookie, SESSION_MS / 1000);
       json(res, 200, { authenticated: true });

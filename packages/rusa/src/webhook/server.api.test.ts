@@ -11,12 +11,15 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import Database from "better-sqlite3";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 import { describe, expect, it, vi } from "vitest";
 import type { DashboardDataDeps } from "../dashboard/api.js";
+import { runMigrations } from "../db/migrations/runner.js";
+import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { QuotaCoordinatorClientHealth } from "../quota/coordinator-client.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";
@@ -56,9 +59,14 @@ class MockServerResponse extends EventEmitter {
   headersSent = false;
   writableEnded = false;
 
+  setHeader(name: string, value: string): this {
+    this.headers[name] = value;
+    return this;
+  }
+
   writeHead(statusCode: number, headers?: Record<string, string>): this {
     this.statusCode = statusCode;
-    this.headers = headers ?? {};
+    this.headers = { ...this.headers, ...headers };
     this.headersSent = true;
     return this;
   }
@@ -193,11 +201,21 @@ describe("static dashboard request handler", () => {
     expect([200, 404]).toContain(res.statusCode);
   });
 
-  it("serves dashboard config for frontend-only quota choices", async () => {
-    const handler = createDashboardRequestHandler({
-      port: 8787,
-      dashboardConfig: { quotaProviders: { claude: { primaryWindow: "session" } } },
+  it("serves dashboard choices with the resolved local viewer, or refuses without one", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const principals = new PrincipalRepository(db);
+    const user = principals.createUser({
+      email: "local@example.test",
+      createdAt: new Date().toISOString(),
     });
+    const handler = createDashboardRequestHandler(
+      {
+        port: 8787,
+        dashboardConfig: { quotaProviders: { claude: { primaryWindow: "session" } } },
+      },
+      { principals } as DashboardDataDeps
+    );
     const req = new MockIncomingMessage({ method: "GET", url: "/api/dashboard/config" });
     const res = new MockServerResponse();
     const done = once(res, "finish");
@@ -208,7 +226,15 @@ describe("static dashboard request handler", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({
       quotaProviders: { claude: { primaryWindow: "session" } },
+      userPrincipalId: user.id,
+      users: [{ id: user.id, email: user.email }],
     });
+    principals.setDisabled(user.id, new Date().toISOString());
+    const unavailable = new MockServerResponse();
+    await handler(req as unknown as IncomingMessage, unavailable as unknown as ServerResponse);
+    expect(unavailable.statusCode).toBe(503);
+    expect(JSON.parse(unavailable.body).userPrincipalId).toBeUndefined();
+    db.close();
   });
 });
 

@@ -43,6 +43,8 @@ export interface SessionSpec {
 export interface RunOptions {
   /** The prompt/task description to send to the agent */
   prompt: string;
+  /** Observes the exact post-adapter argv prompt after a subprocess launches. */
+  onPromptLaunched?: (prompt: string) => void;
   /** Working directory for the agent subprocess */
   cwd: string;
   /** Timeout in milliseconds (default: 10 minutes) */
@@ -86,7 +88,7 @@ export interface RunResult {
   exitCode: number;
   cancelled?: boolean;
   interrupted?: boolean;
-  /** The typed source of the interrupt, if applicable (e.g. 'human:operator', 'responsive-notification'). */
+  /** The explicit principal or mechanical source of the interrupt. */
   interruptSource?: string;
   /** The typed reason for termination/abort (e.g. 'stall-watchdog', 'run-ceiling', 'interrupt:<by>', 'unknown'). */
   abortReason?: AbortReason;

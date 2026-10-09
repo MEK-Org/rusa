@@ -6,11 +6,11 @@ import 'package:rxdart/rxdart.dart';
 import 'actor_display.dart';
 import 'actor_hierarchy_cache.dart';
 import 'api.dart';
+import 'dashboard_timing.dart';
 import 'avatar_platform.dart';
 import 'mesh_stream.dart';
 import 'models.dart';
 import 'obligations_cache.dart';
-import 'principals.dart';
 import 'quota_cache.dart';
 import 'tree_preferences_cache.dart';
 import 'voice_platform.dart';
@@ -346,6 +346,7 @@ class DashboardStore {
     const ActorStateSnapshot.empty(),
   );
   final _halted = BehaviorSubject<bool>.seeded(false);
+  final _haltStatus = BehaviorSubject<HaltStatusDto?>.seeded(null);
   final _schedulerWarning = BehaviorSubject<List<String>?>.seeded(null);
   final _supportedVoices = BehaviorSubject<List<SupportedVoiceDto>>.seeded(
     const [],
@@ -434,12 +435,14 @@ class DashboardStore {
   RuntimeCursor? _runtimeCursor;
   final List<ActorRuntimeStateDelta> _runtimeBuffer = [];
   Future<void>? _runtimeSyncTask;
+  int _authoritativeThreadSnapshots = 0;
   bool _runtimeSyncAgain = false;
   Duration _runtimeRetryDelay = _kRuntimeRetryInitial;
 
   // ── Exposed streams ──
   ValueStream<ActorStateSnapshot> get actorStates => _actorStates.stream;
   ValueStream<bool> get halted => _halted.stream;
+  ValueStream<HaltStatusDto?> get haltStatus => _haltStatus.stream;
   ValueStream<List<String>?> get schedulerWarning => _schedulerWarning.stream;
   ValueStream<List<SupportedVoiceDto>> get supportedVoices =>
       _supportedVoices.stream;
@@ -493,35 +496,35 @@ class DashboardStore {
   List<ActorViewState> get runningActors => _actorStates.value.runningActors;
   List<ActorViewState> get queuedActors => _actorStates.value.queuedActors;
 
-  /// The viewing person's durable principal id, as `/api/dashboard/config`
-  /// resolved it. That route is the single source: the threads snapshot also
-  /// carries the field, but reading it there too would let the two disagree.
-  String? get userPrincipalId => _dashboardConfig.value?.userPrincipalId;
+  /// The server-verified viewer. The dashboard mounts after this is resolved.
+  String get userPrincipalId => _dashboardConfig.value!.userPrincipalId;
 
-  /// Whether [id] names a human operator — either the legacy alias, any
-  /// `human:*` prefix, or the server-resolved durable user principal.
-  bool isHuman(String? id) => isHumanPrincipal(id, userPrincipalId);
+  /// Whether [id] names a known user principal.
+  bool isHuman(String? id) =>
+      isViewer(id) ||
+      (_dashboardConfig.value?.users.any((u) => u.id == id) ?? false);
 
-  /// Whether [id] names the viewing person under either of their ids.
-  bool isViewer(String? id) => isViewerPrincipal(id, userPrincipalId);
+  /// Whether [id] names the viewing person.
+  bool isViewer(String? id) =>
+      id != null && id == _dashboardConfig.value?.userPrincipalId;
 
   /// Resolves an actor/thread/principal id to a display label.
-  String actorDisplay(String id) => actorDisplayLabel(
-    id,
-    (i) => actor(i)?.handle,
-    isViewer,
-    operatorDisplayName,
-  );
+  String actorDisplay(String id) =>
+      actorDisplayLabel(id, _principalLabel, isViewer, operatorDisplayName);
 
   /// [actorDisplay] for the compact owner lines (row owner, blocker, reassign
   /// dialog), which keep showing the raw id for an actor the mesh view does
   /// not know rather than "Unknown actor" — that fallback predates #538 and
   /// is what the overview's blocker line is pinned to.
-  String ownerLabel(String id) => isViewer(id)
-      ? operatorDisplayLabel
-      : isHuman(id)
-      ? 'Operator'
-      : (actor(id)?.handle ?? id);
+  String ownerLabel(String id) =>
+      isViewer(id) ? operatorDisplayLabel : (_principalLabel(id) ?? id);
+
+  String? _principalLabel(String id) {
+    for (final user in _dashboardConfig.value?.users ?? <UserPrincipalDto>[]) {
+      if (user.id == id) return user.email;
+    }
+    return actor(id)?.handle;
+  }
 
   void setWalkieActive(bool active) {
     if (!_walkieActive.isClosed) {
@@ -561,9 +564,10 @@ class DashboardStore {
     }
   }
 
-  /// Open the SSE stream FIRST (so events during the initial fetch are captured
-  /// and de-duped), then load the thread list.
+  /// Resolve the viewer, then open SSE before fetching threads so events during
+  /// the initial snapshot are captured and de-duped.
   Future<void> init() async {
+    await refreshDashboardConfig();
     _subs.add(_stream.meshEvents.listen(_onMeshEvent));
     _subs.add(_stream.liveOutput.listen(_onLiveOutput));
     _subs.add(_stream.elided.listen((_) => _onElided()));
@@ -572,8 +576,22 @@ class DashboardStore {
     _subs.add(_stream.avatarUpdates.listen(_onAvatarUpdate));
     _subs.add(_actorStates.listen(_syncRunSelections));
     _stream.connect(const []); // mesh_event flows for all actors regardless
-    await refreshThreads();
-    unawaited(refreshDashboardConfig());
+    try {
+      await _api.trackInteraction(DashboardInteraction.initialLoad, () async {
+        final snapshotsBefore = _authoritativeThreadSnapshots;
+        await refreshThreads();
+        // `_requestRuntimeSync` deliberately catches and retries a transient
+        // failure for the dashboard. The initial interaction is not usable
+        // until that first authoritative thread snapshot has actually landed.
+        if (_authoritativeThreadSnapshots == snapshotsBefore) {
+          throw StateError('initial thread snapshot unavailable');
+        }
+      });
+    } on StateError catch (_) {
+      // `_runRuntimeSync` already exposed the original failure and scheduled
+      // its existing retry. Keep the UI's resilient startup behaviour while
+      // the timing receipt truthfully reports this first attempt as a failure.
+    }
     unawaited(refreshRecentActivity());
     unawaited(refreshQuota());
     // Background SWR revalidation (ISSUE_NUM ask 4) — the ring/tooltip keep
@@ -586,32 +604,22 @@ class DashboardStore {
   }
 
   Future<void> refreshDashboardConfig() async {
-    try {
-      final config = await _api.fetchDashboardConfig();
-      _onPrincipalResolved(config.userPrincipalId);
-      // WorkTab listens to this subject. Publish only after the cache is
-      // reconciled, so no listener can render a previous principal's trees.
-      _dashboardConfig.add(config);
-    } on DashboardApiException catch (e) {
-      // Older/static dashboard hosts may not expose this endpoint; the header
-      // keeps its weekly per-provider defaults.
-      if (e.status == 404 || e.status == 503) return;
-      _error.add('$e');
-    } catch (e) {
-      _error.add('$e');
-    }
+    final config = await _api.fetchDashboardConfig();
+    _onPrincipalResolved(config.userPrincipalId);
+    // Publish after reconciling caches so listeners cannot render another
+    // principal's trees. Startup errors are handled by the page's ready future.
+    _dashboardConfig.add(config);
   }
 
-  void _onPrincipalResolved(String? resolvedPrincipal) {
+  void _onPrincipalResolved(String resolvedPrincipal) {
     _cachedObligationTrees = null;
     _cachedObligationPrincipal = resolvedPrincipal;
-    if (resolvedPrincipal == null || resolvedPrincipal.isEmpty) return;
     _seedObligationsFromCache(resolvedPrincipal);
   }
 
   /// Persists [trees] as the new last-known successful obligations snapshot (#505).
   void saveObligationsSnapshot(List<ObligationTreeDto> trees) {
-    final principal = userPrincipalId;
+    final principal = _dashboardConfig.value?.userPrincipalId;
     // A capture without an authenticated principal is unsafe to replay later.
     if (principal == null || principal.isEmpty) return;
     _cachedObligationTrees = trees;
@@ -629,7 +637,8 @@ class DashboardStore {
   /// Invalidates the cached obligations snapshot so navigation return or reload
   /// does not regress to known-old state after a mutation (#505).
   void invalidateObligationsCache() {
-    final principal = _cachedObligationPrincipal ?? userPrincipalId;
+    final principal =
+        _cachedObligationPrincipal ?? _dashboardConfig.value?.userPrincipalId;
     _cachedObligationTrees = null;
     _cachedObligationPrincipal = principal;
     if (principal == null || principal.isEmpty) return;
@@ -911,6 +920,23 @@ class DashboardStore {
     _treePreferencesCache.saveWorkExpanded(_workExpanded);
   }
 
+  // ── Sidebar widths (#897) ──────────────────────────────────────────────
+  //
+  // The width the user dragged each resizable sidebar to, kept so it survives
+  // a view switch (which rebuilds the view from scratch). In memory only: a
+  // reload starts from the defaults again.
+
+  final Map<String, double> _sidebarWidths = {};
+
+  /// The width the user last left the sidebar named [id] at this session, or
+  /// null if it is still at its default.
+  double? sidebarWidth(String id) => _sidebarWidths[id];
+
+  /// Records [width] as the sidebar named [id]'s width for this session.
+  void setSidebarWidth(String id, double width) {
+    _sidebarWidths[id] = width;
+  }
+
   /// Reorders a child actor among its siblings under the same parent.
   /// [draggedId] is moved relative to [targetId] (before it if [before] is true, else after).
   /// Reordering is strictly scoped to siblings with the exact same [parentId] (v1 constraint).
@@ -1174,13 +1200,7 @@ class DashboardStore {
     _operatorChat.add(cur.copyWith(loading: true));
     try {
       final selectedId = actors.first;
-      final userPrincipalId = _dashboardConfig.value?.userPrincipalId;
-      final chatActors = [
-        selectedId,
-        'human:operator',
-        if (userPrincipalId != null && userPrincipalId != 'human:operator')
-          userPrincipalId,
-      ];
+      final chatActors = [selectedId, userPrincipalId];
       final page = await _api.fetchChat(
         actors: chatActors,
         before: reset ? null : cur.cursor,
@@ -1200,6 +1220,7 @@ class DashboardStore {
       );
       _error.add(null);
     } catch (e) {
+      if (_operatorChat.isClosed) return;
       _operatorChat.add(_operatorChat.value.copyWith(loading: false));
       _error.add('$e');
     }
@@ -1512,13 +1533,8 @@ class DashboardStore {
 
         if (sel.length == 1) {
           final selectedId = sel.first;
-          final userPrincipalId = _dashboardConfig.value?.userPrincipalId;
-          final isHumanSender =
-              actorId == 'human:operator' ||
-              (userPrincipalId != null && actorId == userPrincipalId);
-          final isHumanRecipient =
-              recipientId == 'human:operator' ||
-              (userPrincipalId != null && recipientId == userPrincipalId);
+          final isHumanSender = isViewer(actorId);
+          final isHumanRecipient = isViewer(recipientId);
           if ((actorId == selectedId && isHumanRecipient) ||
               (isHumanSender && recipientId == selectedId)) {
             if (_seenOperatorChatMessageIds.add(c.id)) {
@@ -1759,6 +1775,7 @@ class DashboardStore {
       _runtimeRetry = null;
       _runtimeRetryDelay = _kRuntimeRetryInitial;
       _halted.add(snap.halted);
+      _haltStatus.add(snap.halt);
       _schedulerWarning.add(snap.schedulerWarning);
       _supportedVoices.add(snap.supportedVoices);
       _updateActorStatesFromThreads(snap.threads);
@@ -1771,6 +1788,7 @@ class DashboardStore {
       _actorsStale.add(false);
       _persistActorHierarchy(snap.threads);
       _runtimeCursor = snap.runtimeCursor;
+      _authoritativeThreadSnapshots += 1;
       _error.add(null);
       if (!_drainRuntimeBuffer()) _runtimeSyncAgain = true;
     }
@@ -1946,6 +1964,7 @@ class DashboardStore {
       _actorStates.close(),
       _runSelections.close(),
       _halted.close(),
+      _haltStatus.close(),
       _schedulerWarning.close(),
       _supportedVoices.close(),
       _showRetired.close(),

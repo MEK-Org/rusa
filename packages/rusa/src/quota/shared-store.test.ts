@@ -375,6 +375,7 @@ describe("SharedQuotaStore canonical observations", () => {
         result: "accepted",
         observedAt: "2030-01-01T00:05:00.000Z",
         generation: 1,
+        droppedWindows: [],
       });
 
       // The reading is one quota_scrapes row like any scrape (#572 precedent),
@@ -870,6 +871,214 @@ describe("SharedQuotaStore canonical observations", () => {
 });
 
 describe("SharedQuotaStore persisted controller", () => {
+  it("derives stored window lengths from reset ends, cold-start evidence, and jitter", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-window-length-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      const hour = 60 * 60 * 1000;
+      const firstObserved = Date.parse("2030-01-01T00:00:00.000Z");
+      const firstEnd = firstObserved + 6 * 24 * hour;
+      // No prior end: use the lane's earliest reading, not the old 7d default.
+      recordObservation(
+        store,
+        "claude",
+        new Date(firstObserved).toISOString(),
+        80,
+        new Date(firstEnd).toISOString()
+      );
+      // A sub-hour reset correction is one cycle, so it preserves the stored 6d length.
+      recordObservation(
+        store,
+        "claude",
+        new Date(firstObserved + hour).toISOString(),
+        75,
+        new Date(firstEnd + 30 * 60 * 1000).toISOString()
+      );
+      // Once the corrected prior end has passed, the next end defines the
+      // actual 24h window.
+      const correctedEnd = firstEnd + 30 * 60 * 1000;
+      const nextObserved = correctedEnd + 5 * 60 * 1000;
+      const nextEnd = correctedEnd + 24 * hour;
+      recordObservation(
+        store,
+        "claude",
+        new Date(nextObserved).toISOString(),
+        99,
+        new Date(nextEnd).toISOString()
+      );
+
+      const windows = store
+        .listCanonicalSince("claude", "2030-01-01T00:00:00.000Z")
+        .map((row) => row.windowMs);
+      expect(windows).toEqual([6 * 24 * hour, 6 * 24 * hour, 24 * hour]);
+
+      // The established seven-day and five-hour shapes are unchanged when
+      // their own reset evidence says so.
+      const weekEnd = firstObserved + 7 * 24 * hour;
+      recordObservation(
+        store,
+        "codex",
+        new Date(firstObserved).toISOString(),
+        90,
+        new Date(weekEnd).toISOString()
+      );
+      recordObservation(
+        store,
+        "codex",
+        new Date(firstObserved + hour).toISOString(),
+        80,
+        new Date(weekEnd).toISOString()
+      );
+      const fiveHourEnd = firstObserved + 5 * hour;
+      recordObservation(
+        store,
+        "agy",
+        new Date(firstObserved).toISOString(),
+        90,
+        new Date(fiveHourEnd).toISOString(),
+        "session"
+      );
+      recordObservation(
+        store,
+        "agy",
+        new Date(firstObserved + hour).toISOString(),
+        80,
+        new Date(fiveHourEnd).toISOString(),
+        "session"
+      );
+      expect(
+        store.listCanonicalSince("codex", "2030-01-01T00:00:00.000Z").map((row) => row.windowMs)
+      ).toEqual([7 * 24 * hour, 7 * 24 * hour]);
+      expect(
+        store.listCanonicalSince("agy", "2030-01-01T00:00:00.000Z").map((row) => row.windowMs)
+      ).toEqual([5 * hour, 5 * hour]);
+
+      store.advancePendingController({ maxIntervalSeconds: 3600 }, "claude");
+      expect(store.getProviderThrottle("claude")?.buckets[0]?.timeRemainingPct).toBeCloseTo(
+        ((nextEnd - nextObserved) / (24 * hour)) * 100,
+        8
+      );
+    } finally {
+      store.close();
+    }
+  });
+
+  it("derives manual readings at the same insertion seam", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-manual-window-length-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      const hour = 60 * 60 * 1000;
+      const firstObserved = Date.parse("2030-01-01T00:00:00.000Z");
+      const firstEnd = firstObserved + 6 * 24 * hour;
+      const mode = store.setQuotaReadingMode(
+        "claude",
+        "manual",
+        new Date(firstObserved).toISOString()
+      );
+      const submit = (observedMs: number, resetMs: number, idempotencyKey: string) =>
+        store.recordManualObservation({
+          snapshot: {
+            provider: "claude",
+            status: "available",
+            scrapedAt: new Date(observedMs).toISOString(),
+            limits: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                scope: "provider",
+                percentLeft: 90,
+                resetAtIso: new Date(resetMs).toISOString(),
+              },
+            ],
+          },
+          generation: mode.generation,
+          idempotencyKey,
+          acceptedAt: new Date(observedMs).toISOString(),
+        });
+      expect(submit(firstObserved, firstEnd, "first")).toMatchObject({ result: "accepted" });
+      const nextObserved = firstEnd + 5 * 60 * 1000;
+      expect(submit(nextObserved, firstEnd + 24 * hour, "next")).toMatchObject({
+        result: "accepted",
+      });
+      expect(
+        store.listCanonicalSince("claude", "2030-01-01T00:00:00.000Z").map((row) => row.windowMs)
+      ).toEqual([6 * 24 * hour, 24 * hour]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps five-hour lanes at 5h across an idle gap between sessions", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-session-gap-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      const hour = 60 * 60 * 1000;
+      const firstObserved = Date.parse("2030-01-01T05:00:00.000Z");
+      const firstEnd = firstObserved + 5 * hour;
+      const iso = (ms: number) => new Date(ms).toISOString();
+      recordObservation(store, "agy", iso(firstObserved), 90, iso(firstEnd), "session");
+      // The account idles for 8h after that reset; the next session starts on
+      // first use, so its end is 13h after the previous one.
+      const nextObserved = firstEnd + 8 * hour;
+      recordObservation(
+        store,
+        "agy",
+        iso(nextObserved),
+        99,
+        iso(nextObserved + 5 * hour),
+        "session"
+      );
+      expect(
+        store.listCanonicalSince("agy", "2030-01-01T00:00:00.000Z").map((row) => row.windowMs)
+      ).toEqual([5 * hour, 5 * hour]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("ends the previous window no later than the reading that shows a new one", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-early-reset-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      const hour = 60 * 60 * 1000;
+      const day = 24 * hour;
+      const iso = (ms: number) => new Date(ms).toISOString();
+      const start = Date.parse("2030-01-01T00:00:00.000Z");
+      const firstEnd = start + 7 * day;
+      recordObservation(store, "codex", iso(start), 90, iso(firstEnd));
+      // The provider resets two days early: the new end is seven days from
+      // the reading, not fourteen days from the last end that had passed.
+      const earlyObserved = firstEnd - 2 * day;
+      const earlyEnd = earlyObserved + 7 * day;
+      recordObservation(store, "codex", iso(earlyObserved), 100, iso(earlyEnd));
+      // A reading whose clock trails the stored end by 20s still measures from
+      // that end's neighbourhood rather than an older cycle.
+      const skewedObserved = earlyEnd - 20 * 1000;
+      recordObservation(store, "codex", iso(skewedObserved), 100, iso(earlyEnd + day));
+      expect(
+        store.listCanonicalSince("codex", "2030-01-01T00:00:00.000Z").map((row) => row.windowMs)
+      ).toEqual([7 * day, 7 * day, day + 20 * 1000]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("does not fabricate pacing for a lane with no usable reading", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-no-reading-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 3600 });
+      expect(store.getProviderThrottle("claude")).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
   it("keeps exhaustion out of throttle decisions and resumes from the prior period", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-controller-"));
     roots.push(root);
@@ -1426,11 +1635,35 @@ describe("SharedQuotaStore PID integral term", () => {
     const maxIntervalSeconds = 1450;
     try {
       store.configureController({ maxIntervalSeconds });
-      const reset = "2030-01-08T00:00:00.000Z";
       const startedMs = Date.parse("2030-01-04T12:00:00.000Z");
+      const reset = new Date(startedMs + 4 * 24 * 60 * 60 * 1000).toISOString();
       const resetMs = Date.parse(reset);
       const percentLeftForError = (observedMs: number, error: number) =>
         ((resetMs - observedMs) / (7 * 24 * 60 * 60 * 1000)) * 100 - error;
+
+      // The window began three days before this fixture's first controller
+      // sample, so the lane has explicit 7d evidence instead of relying on a
+      // nominal fallback.
+      const windowStartMs = resetMs - 7 * 24 * 60 * 60 * 1000;
+      recordObservation(
+        store,
+        "claude",
+        new Date(windowStartMs).toISOString(),
+        percentLeftForError(windowStartMs, 10),
+        reset
+      );
+      // The seed supplies only the persisted cycle boundary. The controller
+      // series under test begins at `startedMs`, as it did before this fixture
+      // made that boundary explicit.
+      store.db
+        .prepare(
+          `UPDATE quota_observations
+           SET controller_error = NULL, controller_derivative = NULL,
+               controller_integral = NULL, uncapped_interval_seconds = NULL,
+               interval_seconds = NULL
+           WHERE provider = 'claude' AND observed_at = ?`
+        )
+        .run(new Date(windowStartMs).toISOString());
 
       for (let slot = 0; slot <= 3; slot += 1) {
         const observedMs = startedMs + slot * 5 * 60 * 1000;
@@ -1465,6 +1698,16 @@ describe("SharedQuotaStore PID integral term", () => {
       expect(released.integral).toBeLessThan(atBound.integral);
       expect(released.interval).toBeLessThan(maxIntervalSeconds);
 
+      recordObservation(store, "codex", new Date(windowStartMs).toISOString(), 100, reset);
+      store.db
+        .prepare(
+          `UPDATE quota_observations
+           SET controller_error = NULL, controller_derivative = NULL,
+               controller_integral = NULL, uncapped_interval_seconds = NULL,
+               interval_seconds = NULL
+           WHERE provider = 'codex' AND observed_at = ?`
+        )
+        .run(new Date(windowStartMs).toISOString());
       recordObservation(
         store,
         "codex",
@@ -2211,7 +2454,7 @@ describe("SharedQuotaStore operator pacing reset", () => {
         store.configureController({ maxIntervalSeconds: 36000 });
         const nowMs = Date.parse("2030-01-01T12:00:00.000Z");
         const scrapedAt = new Date(nowMs).toISOString();
-        const resetAtIso = new Date(nowMs + 6 * 24 * 3600 * 1000).toISOString();
+        const resetAtIso = new Date(nowMs + 7 * 24 * 3600 * 1000).toISOString();
 
         recordObservation(store, "claude", scrapedAt, 10, resetAtIso);
         store.advancePendingController({ maxIntervalSeconds: 36000 }, "claude");
@@ -2273,7 +2516,7 @@ describe("SharedQuotaStore operator pacing reset", () => {
         store.configureController({ maxIntervalSeconds: 36000 });
 
         // 2. Throttled lane (burning faster than linear pace -> positive pace error, interval_seconds > 0)
-        // Remaining time is ~85.7%, percentLeft is 10% -> error is ~+75.7% (throttled)
+        // Remaining time is 100%, percentLeft is 10% -> error is +90% (throttled)
         recordObservation(store, "claude", scrapedAt, 10, resetAtIso);
         store.advancePendingController({ maxIntervalSeconds: 36000 }, "claude");
 
@@ -2290,7 +2533,16 @@ describe("SharedQuotaStore operator pacing reset", () => {
         // 3. Unthrottled lane (plenty of quota -> negative pace error, interval_seconds = 0)
         const unthrottledScrapedAt = new Date(nowMs).toISOString();
         const unthrottledReset = new Date(nowMs + 1 * 24 * 3600 * 1000).toISOString();
-        // Remaining time is ~14.3%, percentLeft is 90% -> error is -75.7% (unthrottled)
+        // Its prior observation establishes this as a 7d window; the current
+        // read is therefore at ~14.3% remaining, not a new one-day window.
+        recordObservation(
+          store,
+          "codex",
+          new Date(nowMs - 6 * 24 * 3600 * 1000).toISOString(),
+          100,
+          unthrottledReset
+        );
+        // Remaining time is ~14.3%, percentLeft is 90% -> error is ~-75.7% (unthrottled)
         recordObservation(store, "codex", unthrottledScrapedAt, 90, unthrottledReset);
         store.advancePendingController({ maxIntervalSeconds: 36000 }, "codex");
 
@@ -2318,6 +2570,28 @@ describe("SharedQuotaStore operator pacing reset", () => {
         const scrapedAt = new Date(nowMs).toISOString();
         const resetAtIso = new Date(nowMs + 6 * 24 * 3600 * 1000).toISOString();
 
+        const prior: ProviderQuotaSnapshot = {
+          provider: "claude",
+          status: "available",
+          scrapedAt: new Date(nowMs - 24 * 3600 * 1000).toISOString(),
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 100,
+              resetAtIso,
+              scope: { provider: "claude" },
+            },
+            {
+              label: "Current week (Fable)",
+              kind: "weekly",
+              percentLeft: 100,
+              resetAtIso,
+              scope: { provider: "claude", models: ["fable"] },
+            },
+          ],
+        };
+
         const multiLimitSnapshot: ProviderQuotaSnapshot = {
           provider: "claude",
           status: "available",
@@ -2326,19 +2600,25 @@ describe("SharedQuotaStore operator pacing reset", () => {
             {
               label: "Weekly",
               kind: "weekly",
-              percentLeft: 95, // provider lane: timeRemaining is 85.7% -> error is -9.3% -> unthrottled (0)
+              percentLeft: 95, // provider lane: timeRemaining is ~85.7% -> error is ~-9.3% -> unthrottled (0)
               resetAtIso,
               scope: { provider: "claude" },
             },
             {
               label: "Current week (Fable)",
               kind: "weekly",
-              percentLeft: 10, // model lane: timeRemaining is 85.7% -> error is +75.7% -> throttled (>0)
+              percentLeft: 10, // model lane: timeRemaining is ~85.7% -> error is ~+75.7% -> throttled (>0)
               resetAtIso,
               scope: { provider: "claude", models: ["fable"] },
             },
           ],
         };
+        const priorId = store.recordRaw({
+          provider: "claude",
+          scrapedAt: prior.scrapedAt as string,
+          rawOutput: "prior",
+        });
+        store.recordParsed(priorId, prior, prior);
         const id = store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "raw" });
         store.recordParsed(id, multiLimitSnapshot, multiLimitSnapshot);
         store.advancePendingController({ maxIntervalSeconds: 36000 }, "claude");

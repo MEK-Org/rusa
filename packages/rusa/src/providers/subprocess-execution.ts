@@ -50,6 +50,8 @@ export interface SubprocessRunConfig {
   /** Optional stdout end hook (e.g. flushing a line buffer). */
   onStdoutEnd?: (chunks: string[]) => void;
   cleanup?: () => void;
+  /** Best-effort observation; called only after Node reports a successful spawn. */
+  onSpawn?: () => void;
   buildKilledResult: (sigtermResult: TerminationAttribution) => RunResult;
   buildSignalResult: (sigtermResult: TerminationAttribution, signal: NodeJS.Signals) => RunResult;
   buildExitResult: (output: string, exitCode: number) => RunResult;
@@ -93,6 +95,14 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
       resolve(config.buildSpawnErrorResult(describeSpawnRejection(err)));
       return;
     }
+
+    child.once("spawn", () => {
+      try {
+        config.onSpawn?.();
+      } catch {
+        // Observability must never prevent or fail a provider run.
+      }
+    });
 
     const killGroup = () => {
       if (child.pid) {

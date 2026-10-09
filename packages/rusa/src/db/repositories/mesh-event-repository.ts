@@ -8,7 +8,6 @@ import type Database from "better-sqlite3";
 // *forwarding* is the failure-sink's job). This is a type-only import: no
 // runtime coupling from db → actor.
 import type { MeshEventKind } from "../../actor/mesh-events.js";
-import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 export type { MeshEventKind };
 
 /** An appended mesh event (camelCase domain object). */
@@ -246,6 +245,51 @@ export class MeshEventRepository {
   }
 
   /**
+   * Read one bounded, content-free event family without materialising unrelated
+   * transcript bodies. A capped read keeps the newest `limit` rows, returned
+   * oldest-first. Callers own the meaning of `kind`; this repository only
+   * supplies the append-only storage primitive.
+   */
+  listByKindSince(kind: string, sinceISO: string, limit: number): MeshEvent[] {
+    if (limit <= 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT id, ts, kind, actor_id, detail, body, payload, success
+         FROM (
+           SELECT rowid AS seq, id, ts, kind, actor_id, detail, NULL AS body, payload, success
+           FROM mesh_events
+           WHERE kind = ? AND ts >= ?
+           ORDER BY ts DESC, rowid DESC
+           LIMIT ?
+         )
+         ORDER BY ts ASC, seq ASC`
+      )
+      .all(kind, sinceISO, limit) as MeshEventRow[];
+    return rows.map(toMeshEvent);
+  }
+
+  /**
+   * Enforce both an age and a newest-record bound for one append-only event
+   * family. The predicates are deliberately scoped by `kind`: pruning a
+   * bounded diagnostic must never touch the ordinary mesh history.
+   */
+  pruneKind(kind: string, olderThanISO: string, maxRecords: number): void {
+    this.db.prepare(`DELETE FROM mesh_events WHERE kind = ? AND ts < ?`).run(kind, olderThanISO);
+    this.db
+      .prepare(`
+        DELETE FROM mesh_events
+        WHERE kind = ?
+          AND rowid IN (
+            SELECT rowid FROM mesh_events
+            WHERE kind = ?
+            ORDER BY ts DESC, rowid DESC
+            LIMIT -1 OFFSET ?
+          )
+      `)
+      .run(kind, kind, Math.max(0, maxRecords));
+  }
+
+  /**
    * The distiller's replay read of a bounded window (#537): every actor's
    * events in the half-open `[since, until)`, oldest-first, in pages that
    * resume exactly where the previous one stopped. The order is `ts, rowid`
@@ -266,7 +310,7 @@ export class MeshEventRepository {
       SELECT e.rowid AS rowid, e.*, c.body AS chat_body
       FROM mesh_events e
       LEFT JOIN mesh_chat c ON json_extract(e.payload, '$.messageId') = c.id
-      WHERE e.ts >= ?
+      WHERE e.ts >= ? AND e.kind != 'dashboard_timing'
     `;
     if (opts.until != null) {
       sql += ` AND e.ts < ?`;
@@ -367,14 +411,11 @@ export class MeshEventRepository {
    * across a multi-selection. Pass the previous page's `nextCursor` as
    * `before` to page backward in time. `kinds`, if given, restricts to those
    * event kinds. `humanViewerIds`, if given, keeps only the message events a
-   * human viewer may read (#590): those whose every human participant — the
-   * legacy `human:operator` alias or any durable user — is one of these ids,
-   * i.e. the viewer's own conversations plus actor↔actor traffic; an empty
-   * list reads actor↔actor traffic alone. A participant is read from the
-   * mesh_chat row when the event has one (the authoritative, migrated pairing)
-   * and otherwise from the event's own subject and payload peer, so a legacy
-   * row that pre-dates mesh_chat cannot surface another human's conversation
-   * either. Non-message events are unaffected. Returns an empty page for an
+   * human viewer may read (#590): each participant must be the viewer or a
+   * known actor/system principal. An empty list reads only shared traffic.
+   * Participants come from the authoritative mesh_chat row when present,
+   * otherwise from the event's subject and payload peer. Unknown or malformed
+   * participants are withheld. Non-message events are unaffected. Returns an empty page for an
    * empty `actorIds`.
    */
   listEventsByActors(
@@ -436,19 +477,29 @@ export class MeshEventRepository {
 
   /**
    * Returns the most recent event timestamp (`MAX(ts)`) for every actor that has
-   * at least one mesh event. One grouped query, not N+1; the `idx_mesh_events_actor_ts`
-   * covering index supplies the answer without touching the table rows.
+   * at least one mesh event.
+   *
+   * Retrieves last activity only for the requested actors using bounded indexed
+   * seeks on `idx_mesh_events_actor_ts` (#934).
    */
-  latestActivityByActor(): Map<string, string> {
+  latestActivityByActor(actorIds: Iterable<string>): Map<string, string> {
+    const ids = Array.from(actorIds);
+    if (ids.length === 0) {
+      return new Map();
+    }
+
     const rows = this.db
       .prepare(
-        `SELECT actor_id AS actorId, MAX(ts) AS ts
-         FROM mesh_events
-         WHERE actor_id IS NOT NULL
-         GROUP BY actor_id`
+        `WITH actor_ids(id) AS (SELECT value FROM json_each(?))
+         SELECT id, (SELECT MAX(ts) FROM mesh_events WHERE actor_id = actor_ids.id) AS ts
+         FROM actor_ids`
       )
-      .all() as { actorId: string; ts: string }[];
-    return new Map(rows.map((r) => [r.actorId, r.ts]));
+      .all(JSON.stringify(ids)) as { id: string; ts: string | null }[];
+    return new Map(
+      rows
+        .filter((row): row is { id: string; ts: string } => row.ts !== null)
+        .map((row) => [row.id, row.ts])
+    );
   }
 }
 
@@ -462,8 +513,8 @@ export class MeshEventRepository {
  * the returned SQL binds them, so callers must splice it into the statement at
  * the point they call it.
  *
- * Bounded by construction: the viewer's own ids (at most a durable id and the
- * legacy alias) per participant column, never one parameter per known human.
+ * Bounded by construction: the viewer's durable id per participant column,
+ * never one parameter per known human.
  * An empty `viewerIds` — a viewer who cannot be identified — reads actor↔actor
  * traffic alone.
  */
@@ -474,12 +525,12 @@ function humanReadableMessageSql(
   const readable = (participant: string): string => {
     const mine =
       viewerIds.length > 0 ? ` OR ${participant} IN (${viewerIds.map(() => "?").join(", ")})` : "";
-    params.push(...viewerIds, HUMAN_OPERATOR);
-    return `(${participant} IS NULL${mine} OR (${participant} != ? AND ${participant} NOT IN (SELECT id FROM principals WHERE kind = 'user')))`;
+    params.push(...viewerIds);
+    return `(${participant} IN (SELECT id FROM principals WHERE kind IN ('actor', 'system'))${mine})`;
   };
   return `(e.kind NOT IN ('message_sent', 'message_received')
         OR (c.id IS NOT NULL AND ${readable("c.sender_id")} AND ${readable("c.recipient_id")})
-        OR (c.id IS NULL AND ${readable("e.actor_id")} AND ${readable("json_extract(e.payload, '$.to')")} AND ${readable("json_extract(e.payload, '$.from')")})
+        OR (c.id IS NULL AND ${readable("e.actor_id")} AND ${readable("CASE WHEN json_valid(e.payload) THEN CASE e.kind WHEN 'message_sent' THEN json_extract(e.payload, '$.to') ELSE json_extract(e.payload, '$.from') END END")})
       )`;
 }
 

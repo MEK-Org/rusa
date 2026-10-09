@@ -1,19 +1,31 @@
 // @vitest-environment node
+
+import { mkdtempSync, rmSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import type { DecodedIdToken } from "firebase-admin/auth";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { createActorRunModelConfig } from "../db/repositories/actor-run-model-config.js";
+import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { ReferenceCacheRepository } from "../db/repositories/reference-cache-repository.js";
+import { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+
+import { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import { VoiceService } from "../voice/voice-service.js";
+import { attachVoiceOutbound } from "../voice/wiring.js";
 import { createDashboardRequestHandler } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
 import { DashboardAuth, SESSION_MS } from "./auth.js";
@@ -89,8 +101,10 @@ describe("human chat isolation (#590)", () => {
   let auth: DashboardAuth;
   let server: ReturnType<typeof createServer>;
   let origin: string;
+  let deps: DashboardDataDeps;
   let alice: Person;
   let bob: Person;
+  let firebase: ConstructorParameters<typeof DashboardAuth>[1];
   /** Session cookie → the person it authenticates. */
   const cookies = new Map<string, Person>();
 
@@ -138,12 +152,13 @@ describe("human chat isolation (#590)", () => {
     const actors = new InMemoryActorRepository();
     actors.upsert(rec(ACTOR, null));
     actors.upsert(rec(PEER, ACTOR));
+    for (const actor of actors.list()) principals.ensureActorPrincipal(actor.id, actor.createdAt);
 
     const byIdToken = new Map<string, Person>([
       ["alice-token", alice],
       ["bob-token", bob],
     ]);
-    const firebase = {
+    firebase = {
       verifyIdToken: async (value: string) => {
         const who = byIdToken.get(value);
         if (!who) throw new Error("unknown id token");
@@ -172,20 +187,14 @@ describe("human chat isolation (#590)", () => {
       () => now
     );
     const mesh = {
-      sendHumanMessage: (
-        toId: string,
-        body: string,
-        sessionId: string,
-        opts?: { fromId?: string }
-      ) => {
-        const fromId = opts?.fromId ?? HUMAN_OPERATOR;
+      sendMessage: (toId: string, body: string, fromId: string, sessionId: string) => {
         const messageId = record(fromId, toId, body, sessionId);
         inbox.append([
           {
             actorId: toId,
             source: `mesh:${fromId}`,
             payload: {
-              type: "human.message",
+              type: "mesh.message",
               priority: "responsive",
               messageId,
               fromId,
@@ -197,8 +206,9 @@ describe("human chat isolation (#590)", () => {
       },
       getSelection: () => undefined,
     };
-    const deps: DashboardDataDeps = {
+    deps = {
       actors,
+      runPrompts: new RunPromptRepository(db),
       principals,
       meshEvents,
       meshChat,
@@ -301,6 +311,100 @@ describe("human chat isolation (#590)", () => {
     }>;
   };
 
+  it("#866 withholds complete launch prompts from both allowedEmails viewers", async () => {
+    const a = await login(alice);
+    const b = await login(bob);
+    const runs = new ActorRunRepository(db);
+    const prompts = new RunPromptRepository(db);
+    const runId = runs.start({
+      actorId: ACTOR,
+      modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
+    });
+    const prompt = `# Synthetic charter\n\n  Preserve whitespace ✓\r\n${"x".repeat(300_000)}`;
+    prompts.recordForActor(ACTOR, runId, prompt);
+    meshEvents.record({ kind: "run_start", actorId: ACTOR, payload: JSON.stringify({ runId }) });
+    const path = `/api/mesh/runs/${runId}/prompt`;
+    const anonymous = await fetch(origin + path);
+    expect(anonymous.status).toBe(401);
+    expect(await anonymous.text()).not.toContain("Synthetic charter");
+    for (const cookie of [a.cookie, b.cookie]) {
+      const response = await fetch(origin + path, { headers: { Cookie: cookie } });
+      expect(response.status).toBe(404);
+      const unavailable = await response.text();
+      expect(unavailable).toBe(JSON.stringify({ error: "prompt not retained" }));
+      expect(unavailable).not.toContain(prompt);
+      expect(unavailable).not.toContain("provider");
+      expect(unavailable).not.toContain("createdAt");
+      const missing = await fetch(`${origin}/api/mesh/runs/pre-feature/prompt`, {
+        headers: { Cookie: cookie },
+      });
+      expect(missing.status).toBe(404);
+      expect(await missing.text()).toBe(unavailable);
+    }
+    expect(prompts.getById(runId)?.prompt).toBe(prompt);
+    const feed = await fetch(`${origin}/api/mesh/events?actors=${ACTOR}`, {
+      headers: { Cookie: a.cookie },
+    });
+    expect(JSON.stringify(await feed.json())).not.toContain("Synthetic charter");
+  });
+
+  it("#866 serves exact bytes through sole-email auth and the supported auth-disabled local path", async () => {
+    // Engineering boundary: #866 comment5972967230; no multi-human exception to #590.
+    // Rebuild this fixture as a real sole-email instance: authenticator and options agree.
+    await auth.close();
+    const soleEmail = { firebase: firebaseConfig, email: alice.email };
+    auth = new DashboardAuth(
+      soleEmail,
+      firebase,
+      new DashboardIdentityResolver(() => principals, PROJECT),
+      () => now
+    );
+    server.removeAllListeners("request");
+    server.on(
+      "request",
+      createDashboardRequestHandler({ port: 0, auth: soleEmail }, deps, null, auth)
+    );
+    const a = await login(alice);
+    expect((await post("/api/auth/session", { idToken: "bob-token" })).status).toBe(401);
+    const runId = new ActorRunRepository(db).start({
+      actorId: ACTOR,
+      modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
+    });
+    const prompt = `# Synthetic charter\n\n  Preserve whitespace ✓\r\n${"x".repeat(300_000)}`;
+    const prompts = new RunPromptRepository(db);
+    prompts.recordForActor(ACTOR, runId, prompt);
+    const path = `/api/mesh/runs/${runId}/prompt`;
+    expect((await fetch(origin + path)).status).toBe(401);
+    const authenticated = await fetch(origin + path, { headers: { Cookie: a.cookie } });
+    expect(authenticated.status).toBe(200);
+    expect(await authenticated.json()).toEqual({ prompt });
+    // Incomplete authenticated adapters refuse before touching retained prompt storage.
+    const config = Object.getOwnPropertyDescriptor(auth, "config");
+    const readPrompt = vi.spyOn(prompts, "getById");
+    Object.defineProperty(auth, "config", { value: undefined, configurable: true });
+    try {
+      expect((await fetch(origin + path, { headers: { Cookie: a.cookie } })).status).toBe(404);
+      expect(readPrompt).not.toHaveBeenCalled();
+    } finally {
+      if (config) Object.defineProperty(auth, "config", config);
+      readPrompt.mockRestore();
+    }
+    // Replace only this isolated fixture's request handler; Alice is its sole durable user.
+    server.removeAllListeners("request");
+    server.on("request", createDashboardRequestHandler({ port: 0 }, deps));
+    const local = await fetch(origin + path);
+    expect(local.status).toBe(200);
+    expect(await local.json()).toEqual({ prompt });
+    // A second active user leaves auth-disabled mode unable to identify its viewer.
+    principals.createUser({ email: "second@example.com", createdAt: new Date(now).toISOString() });
+    const ambiguous = await fetch(origin + path);
+    expect(ambiguous.status).toBe(404);
+    const unavailable = await ambiguous.text();
+    expect(unavailable).toBe(JSON.stringify({ error: "prompt not retained" }));
+    expect(unavailable).not.toContain("Synthetic charter");
+    expect(prompts.getById(runId)?.prompt).toBe(prompt);
+  });
+
   /** Two humans each talk to the actor and the actor answers each of them. */
   async function seedBothConversations(a: { cookie: string; id: string }, b: typeof a) {
     expect(
@@ -319,19 +423,12 @@ describe("human chat isolation (#590)", () => {
     expect(a.id).not.toBe(b.id);
     await seedBothConversations(a, b);
 
-    // The dashboard's query as shipped: selected actor, the legacy alias, and
-    // the viewer's own id.
+    // The dashboard names the selected actor and its authenticated viewer.
     const bodies = (page: ChatPage) => page.chat.map((m) => m.body).sort();
-    const aliceView = await getJson<ChatPage>(
-      `/api/mesh/chat?actors=${ACTOR},${HUMAN_OPERATOR},${a.id}`,
-      a.cookie
-    );
+    const aliceView = await getJson<ChatPage>(`/api/mesh/chat?actors=${ACTOR},${a.id}`, a.cookie);
     expect(aliceView.status).toBe(200);
     expect(bodies(aliceView.body)).toEqual(["alice asks", "reply to alice"]);
-    const bobView = await getJson<ChatPage>(
-      `/api/mesh/chat?actors=${ACTOR},${HUMAN_OPERATOR},${b.id}`,
-      b.cookie
-    );
+    const bobView = await getJson<ChatPage>(`/api/mesh/chat?actors=${ACTOR},${b.id}`, b.cookie);
     expect(bodies(bobView.body)).toEqual(["bob asks", "reply to bob"]);
   });
 
@@ -340,11 +437,8 @@ describe("human chat isolation (#590)", () => {
     const b = await login(bob);
     await seedBothConversations(a, b);
 
-    // Before `/api/dashboard/config` answers, the client only knows the alias.
-    const view = await getJson<ChatPage>(
-      `/api/mesh/chat?actors=${ACTOR},${HUMAN_OPERATOR}`,
-      a.cookie
-    );
+    // Before config answers, the actor-only query is scoped by authentication.
+    const view = await getJson<ChatPage>(`/api/mesh/chat?actors=${ACTOR}`, a.cookie);
     expect(view.status).toBe(200);
     expect(view.body.chat.map((m) => m.body).sort()).toEqual(["alice asks", "reply to alice"]);
     for (const m of view.body.chat) {
@@ -475,19 +569,11 @@ describe("human chat isolation (#590)", () => {
     });
 
     const aliceFeed = await getJson<EventPage>(`/api/mesh/events?actors=${ACTOR}`, a.cookie);
-    expect(aliceFeed.body.events.map((e) => e.body).sort()).toEqual([
-      "legacy from peer",
-      "legacy to alice",
-      null,
-    ]);
+    expect(aliceFeed.body.events.map((e) => e.body).sort()).toEqual(["legacy to alice"]);
     expect(JSON.stringify(aliceFeed.body)).not.toContain(b.id);
     expect(JSON.stringify(aliceFeed.body)).not.toContain("legacy unpaired");
     const bobFeed = await getJson<EventPage>(`/api/mesh/events?actors=${ACTOR}`, b.cookie);
-    expect(bobFeed.body.events.map((e) => e.body).sort()).toEqual([
-      "legacy from bob",
-      "legacy from peer",
-      null,
-    ]);
+    expect(bobFeed.body.events.map((e) => e.body).sort()).toEqual(["legacy from bob"]);
     expect(JSON.stringify(bobFeed.body)).not.toContain(a.id);
   });
 
@@ -570,6 +656,161 @@ describe("human chat isolation (#590)", () => {
     expect(bobCard?.moreInboxItemsCount).toBeUndefined();
     expect(JSON.stringify(bobThreads.body)).not.toContain(a.id);
     expect(JSON.stringify(bobThreads.body)).not.toContain("alice asks");
+  });
+
+  it("omits another human's message from recent activity resolved alongside cold references (#933)", async () => {
+    const a = await login(alice);
+    const b = await login(bob);
+    await seedBothConversations(a, b);
+    inbox.append([
+      {
+        id: "cold-issue",
+        actorId: ACTOR,
+        source: "github:o/r/issues/1",
+        payload: { type: "issues.opened" },
+      },
+    ]);
+    const handled = inbox.list(ACTOR, { status: "unhandled", limit: 100 }).entries;
+    inbox.markHandled(
+      ACTOR,
+      handled.map((entry) => entry.id),
+      new Date(),
+      "Addressed"
+    );
+    // A provider that never answers keeps the GitHub card pending while the
+    // mesh messages resolve in the same pass.
+    deps.referenceCache = new ReferenceCacheService({
+      repo: new ReferenceCacheRepository(db),
+      deadlineMs: 20,
+    });
+    deps.issueClient = {
+      getIssue: () => new Promise<never>(() => {}),
+    } as unknown as DashboardDataDeps["issueClient"];
+
+    const activity = await getJson<{
+      items: Array<{ sourceRef: string; reference?: { body: string | null; cacheState?: string } }>;
+    }>("/api/mesh/recent-activity?limit=10", a.cookie);
+    expect(activity.status).toBe(200);
+    expect(activity.body.items.map((item) => item.reference?.body ?? null)).toContain("alice asks");
+    expect(
+      activity.body.items.find((item) => item.sourceRef === "github:o/r/issues/1")?.reference
+        ?.cacheState
+    ).toBe("pending");
+    const serialized = JSON.stringify(activity.body);
+    expect(serialized).not.toContain("bob asks");
+    expect(serialized).not.toContain(b.id);
+  });
+
+  it("scopes voice streams, audio, backlog, acknowledgements, and sessions to the authenticated user", async () => {
+    const a = await login(alice);
+    const b = await login(bob);
+    const home = mkdtempSync(join(tmpdir(), "rusa-voice-isolation-"));
+    const service = new VoiceService({
+      home,
+      isHumanRecipient: (id) => principals.getUser(id) !== undefined,
+      speech: {
+        transcribe: async () => "bob memo",
+        synthesize: async () => ({ pcm: Buffer.from("audio"), sampleRate: 24_000 }),
+        streamSynthesize: async () => ({
+          sampleRate: 24_000,
+          pcmStream: (async function* () {
+            yield Buffer.from("audio");
+          })(),
+        }),
+      },
+      encodeStream: async (stream, _rate, path) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of stream) chunks.push(chunk);
+        await writeFile(path, Buffer.concat(chunks));
+        return { path, mime: "audio/mpeg", subscribe: () => false };
+      },
+    });
+    const hub = deps.sseHub;
+    if (!hub) throw new Error("Expected SSE hub fixture");
+    const detach = attachVoiceOutbound(emitter, service, hub);
+    server.removeAllListeners("request");
+    server.on(
+      "request",
+      createDashboardRequestHandler(
+        { port: 0, auth: { firebase: firebaseConfig, allowedEmails: [alice.email, bob.email] } },
+        deps,
+        { actors: deps.actors, mesh: deps.mesh, principals, sseHub: hub, service },
+        auth
+      )
+    );
+    const streams: Array<{ controller: AbortController; pump: Promise<unknown>; frames: string }> =
+      [];
+    async function openVoice(cookie: string, session: string) {
+      const controller = new AbortController();
+      const response = await fetch(
+        `${origin}/api/mesh/voice/stream?actors=${ACTOR}&sessionId=${session}`,
+        { headers: { Cookie: cookie }, signal: controller.signal }
+      );
+      expect(response.status).toBe(200);
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("Expected SSE response body");
+      const stream = { controller, frames: "", pump: Promise.resolve() as Promise<unknown> };
+      stream.pump = (async () => {
+        const decoder = new TextDecoder();
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) return;
+          stream.frames += decoder.decode(value, { stream: true });
+        }
+      })().catch(() => undefined);
+      streams.push(stream);
+      return stream;
+    }
+    try {
+      const asAlice = await openVoice(a.cookie, "alice-session");
+      const wrongSession = await openVoice(a.cookie, "other-alice-session");
+      const asBob = await openVoice(b.cookie, "bob-session");
+      const stolen = await fetch(
+        `${origin}/api/mesh/voice/stream?actors=${ACTOR}&sessionId=alice-session`,
+        { headers: { Cookie: b.cookie } }
+      );
+      expect(stolen.status).toBe(409);
+      await stolen.text();
+      await post("/api/mesh/voice/session/disable", { sessionId: "alice-session" }, b.cookie);
+      expect(service.hasSession("alice-session", ACTOR, a.id)).toBe(true);
+
+      record(ACTOR, a.id, "alice voice answer", "alice-session");
+      record(ACTOR, b.id, "bob voice answer", "bob-session");
+      await vi.waitFor(() => {
+        expect(asAlice.frames).toContain("alice voice answer");
+        expect(asBob.frames).toContain("bob voice answer");
+      });
+      expect(asAlice.frames).not.toContain("bob voice answer");
+      expect(asBob.frames).not.toContain("alice voice answer");
+      expect(wrongSession.frames).not.toContain("voice answer");
+      const aliceAudio = service.backlog(ACTOR, a.id)[0];
+      expect(service.backlog(ACTOR, b.id).map((item) => item.text)).toEqual(["bob voice answer"]);
+      expect(
+        (
+          await getJson<{ announcements: Array<{ text: string }> }>(
+            `/api/mesh/actors/${ACTOR}/voice/backlog`,
+            b.cookie
+          )
+        ).body.announcements.map((item) => item.text)
+      ).toEqual(["bob voice answer"]);
+      expect((await getJson(`/api/mesh/voice/audio/${aliceAudio.id}`, b.cookie)).status).toBe(404);
+      expect((await post("/api/mesh/voice/ack", { id: aliceAudio.id }, b.cookie)).status).toBe(404);
+      expect(service.get(aliceAudio.id)?.playedAt).toBeNull();
+      const audio = await fetch(`${origin}/api/mesh/voice/audio/${aliceAudio.id}`, {
+        headers: { Cookie: a.cookie },
+      });
+      expect(audio.status).toBe(200);
+      expect(await audio.text()).toBe("audio");
+      expect((await post("/api/mesh/voice/ack", { id: aliceAudio.id }, a.cookie)).status).toBe(200);
+      expect(service.backlog(ACTOR, a.id)).toEqual([]);
+    } finally {
+      for (const stream of streams) stream.controller.abort();
+      await Promise.all(streams.map((stream) => stream.pump));
+      for (const session of ["alice-session", "other-alice-session", "bob-session"])
+        service.closeSession(session);
+      detach();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("streams live message frames only to the human they belong to", async () => {

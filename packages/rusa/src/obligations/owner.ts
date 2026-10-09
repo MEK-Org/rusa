@@ -1,34 +1,23 @@
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
-import { resolveLegacyOperatorAlias } from "../principals/operator-principal.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { Obligation } from "./obligation.js";
 
 /**
  * Resolve a requested obligation owner to one this mesh can actually route to.
  *
- * Shared rather than reimplemented per surface. `0025` collapsed owner into one
- * entity id specifically because a `kind` column removed the pressure to have a
- * canonical id per principal — live data held three ids for one operator. That
- * pressure only exists if every write boundary applies the same rule, so this
- * is the rule, in one place.
+ * Shared by every owner write boundary; identities are explicit and opaque.
  *
- * Accepts a live actor, a durable user principal, or the legacy operator alias
- * — which, once a sole active user exists, resolves to that user rather than
- * minting a fresh `human:operator` row (#460). Everything else is refused: a
- * retired actor, an id that names nothing, and any `system:*` id, since nothing
+ * Accepts a live actor or a durable user principal. Everything else is refused: a
+ * retired actor, an id that names nothing, and system principals, since nothing
  * mints a system owner today and admitting one would create work that appears
  * in no queue and wakes nobody.
  */
 export function resolveObligationOwner(
   actors: Pick<ActorRepository, "get">,
   rawOwnerId: string,
-  principals?: Pick<PrincipalRepository, "get" | "listUsers">
+  principals?: Pick<PrincipalRepository, "get">
 ): { ok: true; ownerId: string } | { ok: false; error: string } {
-  const alias = resolveLegacyOperatorAlias(rawOwnerId.trim(), principals);
-  if (!alias.ok) return alias;
-  const ownerId = alias.ownerId;
-  if (ownerId === HUMAN_OPERATOR) return { ok: true, ownerId };
+  const ownerId = rawOwnerId.trim();
   if (principals) {
     const p = principals.get(ownerId);
     if (p && p.kind === "user") return { ok: true, ownerId };

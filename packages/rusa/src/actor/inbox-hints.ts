@@ -1,16 +1,19 @@
-import { isHumanOperator } from "../mcp/stamp.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import type { ChatContextWindow } from "./inbox-chat-context.js";
+import type { InboxOpenQuestions } from "./inbox-open-questions.js";
 
 /**
  * An inbox entry enriched with an optional run-scoped handling hint and, for
- * chat entries, the recent conversation around it.
+ * chat entries, the recent conversation around it and the open questions this
+ * actor filed for a human sender.
  * Returned to actors at selection time by the inbox MCP server.
  */
 export interface SelectedInboxEntry extends InboxEntry {
   hint?: string;
   chatContext?: ChatContextWindow | { sameAsEntryId: string };
   chatContextError?: string;
+  openQuestions?: InboxOpenQuestions;
+  openQuestionsError?: string;
 }
 
 function extractThreadId(threadName: string): string | undefined {
@@ -45,28 +48,21 @@ export function isGchatThreadHead(messageName?: string, threadName?: string): bo
  */
 export function resolveInboxHint(entry: InboxEntry): string | undefined {
   const { source, payload } = entry;
-  const fromId = typeof payload.fromId === "string" ? payload.fromId : undefined;
 
-  // Voice needs its own contract before the general human-message branch:
+  // Voice needs its own contract before the general mesh-message branch:
   // speech is lossy and silence reads as a dropped conversation.
   if (payload.type === "human.voice") {
-    return "This is a live voice memo from the human operator. You must acknowledge immediately with a short, ear-first reply; keep progress updates short, assume speech is lossy, and reconfirm understanding more often than in text. Reply directly to the human operator using your reply tool or mesh chat.";
+    return "This is a live voice memo. Acknowledge immediately with a short, ear-first message; keep progress updates short, assume speech is lossy, and reconfirm understanding more often than in text. Use send_message to this message's fromId with its sessionId.";
   }
 
   if (payload.type === "voice.transfer") {
     const context =
       typeof payload.context === "string" ? payload.context : "(session context unavailable)";
-    return `A live voice session was transferred to you. Acknowledge the human operator immediately with a short, ear-first reply; keep progress updates short, assume speech is lossy, and reconfirm understanding more often than in text. The following is mechanically rendered bounded context from existing durable mesh-chat rows, not a model summary:\n${context}`;
+    return `A live voice session was transferred to you. Acknowledge immediately with a short, ear-first message using send_message to this handoff's principalId with its sessionId. Keep progress updates short, assume speech is lossy, and reconfirm understanding more often than in text. The following is mechanically rendered bounded context from existing durable mesh-chat rows, not a model summary:\n${context}`;
   }
 
-  // an issue: Human operator message cue
-  if (
-    payload.type === "human.message" ||
-    (fromId !== undefined && isHumanOperator(fromId)) ||
-    source === "mesh:human" ||
-    source.startsWith("mesh:human:")
-  ) {
-    return "This is a message from the human operator. Reply directly to the human operator using your reply tool or mesh chat.";
+  if (payload.type === "mesh.message") {
+    return "Reply with send_message to this message's fromId; copy its sessionId when present.";
   }
 
   if (payload.type === "slack.message") {

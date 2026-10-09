@@ -13,7 +13,6 @@ import 'package:rusa_dashboard/widgets/obligation_card.dart';
 import 'package:rusa_dashboard/widgets/obligation_status.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 
-
 import 'fakes.dart';
 
 void main() {
@@ -151,7 +150,7 @@ void main() {
       final ob = makeObligation(
         'ob-human-creator',
         ownerId: 'root',
-        creatorId: 'human:operator',
+        creatorId: '00000000-0000-4000-8000-000000000001',
         intent: 'Filed by the operator',
       );
       final api = FakeApi()
@@ -175,7 +174,7 @@ void main() {
 
       expect(find.text('Creator'), findsOneWidget);
       expect(find.text('Operator'), findsOneWidget);
-      expect(find.text('human:operator'), findsNothing);
+      expect(find.text('00000000-0000-4000-8000-000000000001'), findsNothing);
 
       await store.dispose();
     });
@@ -456,9 +455,18 @@ void main() {
 
         expect(wideActionsRect.left, closeTo(wideTitleRect.right + 8, 1));
         // The title and adjacent controls share the same visual axis (#508).
-        expect(wideActionsRect.center.dy, closeTo(wideTitleRect.center.dy, 1.0));
-        final status = find.descendant(of: actions, matching: find.byType(ObligationStatusChip));
-        expect(tester.getRect(status).center.dy, closeTo(wideTitleRect.center.dy, 1.0));
+        expect(
+          wideActionsRect.center.dy,
+          closeTo(wideTitleRect.center.dy, 1.0),
+        );
+        final status = find.descendant(
+          of: actions,
+          matching: find.byType(ObligationStatusChip),
+        );
+        expect(
+          tester.getRect(status).center.dy,
+          closeTo(wideTitleRect.center.dy, 1.0),
+        );
         for (final tooltip in [
           'Mark Done',
           'Cancel Obligation',
@@ -611,7 +619,9 @@ void main() {
           await tester.pump();
 
           final title = find.byKey(const ValueKey('obligation-detail-title'));
-          final actions = find.byKey(const ValueKey('obligation-detail-actions'));
+          final actions = find.byKey(
+            const ValueKey('obligation-detail-actions'),
+          );
           final titleRect = tester.getRect(title);
           final actionsRect = tester.getRect(actions);
 
@@ -626,7 +636,10 @@ void main() {
           );
 
           // Status chip on the same visual axis
-          final status = find.descendant(of: actions, matching: find.byType(ObligationStatusChip));
+          final status = find.descendant(
+            of: actions,
+            matching: find.byType(ObligationStatusChip),
+          );
           expect(
             tester.getRect(status).center.dy,
             closeTo(titleRect.center.dy, 1.0),
@@ -654,14 +667,24 @@ void main() {
         await tester.pump();
         await tester.pump();
 
-        final narrowTitle = find.byKey(const ValueKey('obligation-detail-title'));
-        final narrowActions = find.byKey(const ValueKey('obligation-detail-actions'));
+        final narrowTitle = find.byKey(
+          const ValueKey('obligation-detail-title'),
+        );
+        final narrowActions = find.byKey(
+          const ValueKey('obligation-detail-actions'),
+        );
         final narrowTitleRect = tester.getRect(narrowTitle);
         final narrowActionsRect = tester.getRect(narrowActions);
 
-        expect(narrowActionsRect.top, greaterThanOrEqualTo(narrowTitleRect.bottom));
+        expect(
+          narrowActionsRect.top,
+          greaterThanOrEqualTo(narrowTitleRect.bottom),
+        );
         // Inside the wrapped actions, controls remain aligned on the same visual axis
-        final narrowStatus = find.descendant(of: narrowActions, matching: find.byType(ObligationStatusChip));
+        final narrowStatus = find.descendant(
+          of: narrowActions,
+          matching: find.byType(ObligationStatusChip),
+        );
         final narrowStatusRect = tester.getRect(narrowStatus);
         final doneBtnRect = tester.getRect(find.byTooltip('Mark Done'));
         expect(
@@ -699,7 +722,6 @@ void main() {
   );
 
   testWidgets(
-
     'excludes quiet terminal roots from the default load, fetches them on '
     'Show Done (#241)',
     (tester) async {
@@ -808,6 +830,7 @@ void main() {
 
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
+        await pumpEventQueue();
         store.setFocusedObligationId('child-under-quiet-root');
 
         await tester.pumpWidget(
@@ -862,6 +885,7 @@ void main() {
 
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
+        await pumpEventQueue();
         await tester.pumpWidget(
           MaterialApp(
             home: Scaffold(
@@ -942,6 +966,7 @@ void main() {
 
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
+        await pumpEventQueue();
         store.setFocusedObligationId('child-under-quiet-root');
 
         // Gate the initial load so the widget mounts with an empty forest
@@ -1187,11 +1212,17 @@ void main() {
 
         expect(find.text('EXTERNAL LINK'), findsOneWidget);
         expect(find.byTooltip('View reference context'), findsOneWidget);
-        expect(find.text('Make external link a reference card'), findsOneWidget);
+        expect(
+          find.text('Make external link a reference card'),
+          findsOneWidget,
+        );
         await tester.tap(find.byTooltip('View reference context'));
         await tester.pumpAndSettle();
         expect(find.text('GITHUB'), findsOneWidget);
-        expect(find.text('Make external link a reference card'), findsNWidgets(2));
+        expect(
+          find.text('Make external link a reference card'),
+          findsNWidgets(2),
+        );
         expect(find.text('root-handle'), findsOneWidget);
         expect(
           find.text('Reference card in obligation view preview snippet'),
@@ -1258,7 +1289,10 @@ void main() {
 
         expect(find.text('EXTERNAL LINK'), findsOneWidget);
         expect(find.byTooltip('View reference context'), findsOneWidget);
-        expect(find.text('Done obligation with reference card'), findsOneWidget);
+        expect(
+          find.text('Done obligation with reference card'),
+          findsOneWidget,
+        );
         await tester.tap(find.byTooltip('View reference context'));
         await tester.pumpAndSettle();
         expect(find.byTooltip('Open in new tab'), findsOneWidget);
@@ -1305,7 +1339,13 @@ void main() {
         await tester.pumpAndSettle();
         expect(find.text('GITHUB'), findsOneWidget);
         expect(find.text('GitHub reference'), findsNWidgets(2));
-        expect(find.descendant(of: find.byType(AlertDialog), matching: find.text('Not resolvable yet.')), findsOneWidget);
+        expect(
+          find.descendant(
+            of: find.byType(AlertDialog),
+            matching: find.text('Not resolvable yet.'),
+          ),
+          findsOneWidget,
+        );
         expect(find.byTooltip('Change or unlink'), findsOneWidget);
 
         await store.dispose();
@@ -1481,13 +1521,16 @@ void main() {
         expect(find.text('BLOCKED BY'), findsOneWidget);
         expect(find.text('Prerequisite Non-GitHub Title'), findsNWidgets(2));
         expect(find.text('Prerequisite with GitHub Issue'), findsNWidgets(2));
-        expect(find.text('github:MEK-Org/rusa/issues/101'), findsOneWidget);
+        expect(find.text('github:MEK-Org/rusa/issues/101'), findsNothing);
 
         // Check BLOCKS section
         expect(find.text('BLOCKS'), findsOneWidget);
         expect(find.text('Dependent with GitHub PR'), findsNWidgets(2));
-        expect(find.text('github:MEK-Org/rusa/pulls/202'), findsOneWidget);
+        expect(find.text('github:MEK-Org/rusa/pulls/202'), findsNothing);
         expect(find.text('Dependent Non-GitHub Title'), findsNWidgets(2));
+
+        // The external references render as icon buttons next to the status chip.
+        expect(find.byIcon(Icons.open_in_new), findsAtLeastNWidgets(2));
 
         // Tapping a GitHub-backed obligation opens its detail view, whose
         // existing reference card owns the resolved external link.
@@ -1502,66 +1545,57 @@ void main() {
     },
   );
 
-  testWidgets(
-    'shows bounded dependency page remainder without paging state',
-    (tester) async {
-      await tester.runAsync(() async {
-        await tester.binding.setSurfaceSize(const Size(1200, 1600));
-        addTearDown(() => tester.binding.setSurfaceSize(null));
+  testWidgets('shows bounded dependency page remainder without paging state', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      await tester.binding.setSurfaceSize(const Size(1200, 1600));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
 
-        final targetOb = makeObligation(
-          'ob-target',
-          ownerId: 'root',
-          intent: 'Paged obligation',
-        );
-        final item1 = makeObligation('item-1', ownerId: 'root', title: 'Item 1');
-        final item2 = makeObligation('item-2', ownerId: 'root', title: 'Item 2');
+      final targetOb = makeObligation(
+        'ob-target',
+        ownerId: 'root',
+        intent: 'Paged obligation',
+      );
+      final item1 = makeObligation('item-1', ownerId: 'root', title: 'Item 1');
+      final item2 = makeObligation('item-2', ownerId: 'root', title: 'Item 2');
 
-        final api = FakeApi()
-          ..threadsResult = [makeThread('root')]
-          ..obligationsResult = [targetOb, item1, item2]
-          ..obBlockedBy = {
-            'ob-target': [item1],
-          }
-          ..obBlockedByTotal = {
-            'ob-target': 3,
-          }
-          ..obBlockedByHasMore = {
-            'ob-target': true,
-          }
-          ..obBlocks = {
-            'ob-target': [item2],
-          }
-          ..obBlocksTotal = {
-            'ob-target': 5,
-          }
-          ..obBlocksHasMore = {
-            'ob-target': true,
-          };
+      final api = FakeApi()
+        ..threadsResult = [makeThread('root')]
+        ..obligationsResult = [targetOb, item1, item2]
+        ..obBlockedBy = {
+          'ob-target': [item1],
+        }
+        ..obBlockedByTotal = {'ob-target': 3}
+        ..obBlockedByHasMore = {'ob-target': true}
+        ..obBlocks = {
+          'ob-target': [item2],
+        }
+        ..obBlocksTotal = {'ob-target': 5}
+        ..obBlocksHasMore = {'ob-target': true};
 
-        final store = DashboardStore(api: api, stream: FakeStream());
-        await store.init();
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
 
-        await tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: WorkTab(store: store, onSelectView: (_) {}),
-            ),
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: WorkTab(store: store, onSelectView: (_) {}),
           ),
-        );
-        await tester.pump();
-        await tester.pump();
-        await tester.tap(find.text('Paged obligation'));
-        await tester.pump();
-        await tester.pump();
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.tap(find.text('Paged obligation'));
+      await tester.pump();
+      await tester.pump();
 
-        expect(find.text('and 2 more'), findsOneWidget);
-        expect(find.text('and 4 more'), findsOneWidget);
+      expect(find.text('and 2 more'), findsOneWidget);
+      expect(find.text('and 4 more'), findsOneWidget);
 
-        await store.dispose();
-      });
-    },
-  );
+      await store.dispose();
+    });
+  });
 
   testWidgets(
     'measures cached and cold first useful content against the same delayed forest response (#505)',
@@ -1704,12 +1738,18 @@ void main() {
     (tester) async {
       await tester.runAsync(() async {
         final aliceTree = ObligationTreeDto(
-          obligation: makeObligation('alice-obligation', title: 'Alice private obligation'),
+          obligation: makeObligation(
+            'alice-obligation',
+            title: 'Alice private obligation',
+          ),
           children: const [],
           blockingChildren: const [],
         );
         final bobTree = ObligationTreeDto(
-          obligation: makeObligation('bob-obligation', title: 'Bob cached obligation'),
+          obligation: makeObligation(
+            'bob-obligation',
+            title: 'Bob cached obligation',
+          ),
           children: const [],
           blockingChildren: const [],
         );
@@ -1718,41 +1758,51 @@ void main() {
         final secondForestGate = Completer<void>();
         final api = FakeApi(base: Uri.parse('http://localhost:4040'))
           ..threadsResult = [makeThread('root')]
-          ..obligationsResult = [makeObligation('fresh-bob', title: 'Bob authoritative obligation')]
+          ..obligationsResult = [
+            makeObligation('fresh-bob', title: 'Bob authoritative obligation'),
+          ]
           ..dashboardConfigGate = configGate
           ..forestGates.addAll([firstForestGate, secondForestGate]);
-        final cache = FakeObligationsCache(
-          PersistedObligationsSnapshot.capture(
-            scope: 'http://localhost:4040',
-            principalId: 'user-alice',
-            trees: [aliceTree],
-            now: DateTime.timestamp(),
-          ),
-        )..save(
-          PersistedObligationsSnapshot.capture(
-            scope: 'http://localhost:4040',
-            principalId: 'user-bob',
-            trees: [bobTree],
-            now: DateTime.timestamp(),
-          ),
-        );
+        final cache =
+            FakeObligationsCache(
+              PersistedObligationsSnapshot.capture(
+                scope: 'http://localhost:4040',
+                principalId: 'user-alice',
+                trees: [aliceTree],
+                now: DateTime.timestamp(),
+              ),
+            )..save(
+              PersistedObligationsSnapshot.capture(
+                scope: 'http://localhost:4040',
+                principalId: 'user-bob',
+                trees: [bobTree],
+                now: DateTime.timestamp(),
+              ),
+            );
         final store = DashboardStore(
           api: api,
           stream: FakeStream(),
           obligationsCache: cache,
         );
-        await store.init();
+        final ready = store.init();
 
         await tester.pumpWidget(
-          MaterialApp(home: Scaffold(body: WorkTab(store: store, onSelectView: (_) {}))),
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
         );
         await tester.pump();
         expect(find.text('Alice private obligation'), findsNothing);
 
-        configGate.complete(const DashboardConfigDto(
-          quotaProviders: {},
-          userPrincipalId: 'user-bob',
-        ));
+        configGate.complete(
+          const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: 'user-bob',
+          ),
+        );
+        await ready;
         await pumpEventQueue();
         await tester.pump();
 
@@ -1824,16 +1874,24 @@ void main() {
         await tester.pump();
 
         // Even though fetch failed, the cached obligation MUST remain visible (no full-page error!)
-        expect(find.text('Cached Obligation Preserved On Error'), findsOneWidget);
+        expect(
+          find.text('Cached Obligation Preserved On Error'),
+          findsOneWidget,
+        );
 
         // At narrow width the banner uses the one actionable sentence rather
         // than a duplicated failure prefix that can clip its guidance.
         expect(
-          find.text('We could not refresh the work queue. Check your connection and retry.'),
+          find.text(
+            'We could not refresh the work queue. Check your connection and retry.',
+          ),
           findsOneWidget,
         );
         expect(find.textContaining('Failed to refresh:'), findsNothing);
-        expect(find.textContaining('Network error during background sync'), findsNothing);
+        expect(
+          find.textContaining('Network error during background sync'),
+          findsNothing,
+        );
         expect(find.text('Retry'), findsOneWidget);
 
         // Clear error on API and tap Retry
@@ -1845,7 +1903,10 @@ void main() {
 
         // Error banner is dismissed after successful retry
         expect(find.textContaining('Failed to refresh:'), findsNothing);
-        expect(find.text('Cached Obligation Preserved On Error'), findsOneWidget);
+        expect(
+          find.text('Cached Obligation Preserved On Error'),
+          findsOneWidget,
+        );
 
         await store.dispose();
       });
@@ -1883,7 +1944,9 @@ void main() {
         await tester.pump();
 
         expect(
-          find.text('We could not refresh the work queue. Check your connection and retry.'),
+          find.text(
+            'We could not refresh the work queue. Check your connection and retry.',
+          ),
           findsOneWidget,
         );
         expect(find.textContaining('Failed to load work queue:'), findsNothing);
@@ -1945,7 +2008,10 @@ void main() {
 
         // The shared store mutation seam covers callbacks outside WorkTab too.
         final created = await store.mutateObligations(
-          () => api.createObligation(ownerId: 'root', title: 'Newly Created Child'),
+          () => api.createObligation(
+            ownerId: 'root',
+            title: 'Newly Created Child',
+          ),
         );
         expect(created.id, isNotNull);
 

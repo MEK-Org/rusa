@@ -1,5 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
+import type { ActorLifecyclePromptEvent } from "../actor/actor-lifecycle.js";
 import { ActorMesh, type ActorMeshOptions } from "../actor/actor-mesh.js";
 import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
 import { COMPUTER_USE_CAPABILITY } from "../actor/computer-use-lock.js";
@@ -11,6 +12,7 @@ import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import type { MeshEventInput } from "../actor/mesh-events.js";
 import { type ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { LogFields, Logger } from "../observability/logger.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
@@ -46,10 +48,10 @@ export function createHarness(options: {
   isHalted?: (provider?: string, model?: string) => boolean;
   /** Leader-side observer, called as each follower event is received, for race-window tests. */
   onEvent?: (actorId: string, event: ActorEvent) => void;
-  /** Obligation reads and experiment membership, for tests about strict head closure. */
+  /** Obligation reads, for tests about strict head closure. */
   obligations?: ActorMeshOptions["obligations"];
-  experimentEnrollments?: ActorMeshOptions["experimentEnrollments"];
 }) {
+  const promptEvents: ActorLifecyclePromptEvent[] = [];
   const actors = new InMemoryActorRepository();
   const runtimes = new Map<string, ActorHandle>();
   let remote = new RemoteInstance("test-follower", process.platform, process.pid);
@@ -115,10 +117,13 @@ export function createHarness(options: {
   const inboxDb = new Database(":memory:");
   runMigrations(inboxDb);
   const inboxStore = new SqliteInboxRepository(inboxDb);
+  const principals = new PrincipalRepository(inboxDb);
+  const user = principals.createUser({ email: "operator@example.test", createdAt: "t" });
   // No event seam: these follower tests never route or deliver events, and a
   // mesh without one simply refuses those paths rather than inventing a ladder.
   const mesh = new ActorMesh({
     actors,
+    principals,
     rootId: "root",
     inboxStore,
     eventSourceOwners,
@@ -130,7 +135,6 @@ export function createHarness(options: {
     events: (event) => meshEvents.push(event),
     idgen: () => `instance-worker-${++sequence}`,
     obligations: options.obligations,
-    experimentEnrollments: options.experimentEnrollments,
     ...(pacer
       ? {
           // Every declared candidate is a lane, and a halted one is skipped as
@@ -162,6 +166,9 @@ export function createHarness(options: {
       let cursor = 0;
       let admittedCursor = 0;
       context.lifecycle.add({
+        onPrompt: (event) => {
+          promptEvents.push(event);
+        },
         onEnd: (event) => {
           if (event.terminal.kind === "abandoned") {
             mesh.recordEvent({
@@ -260,6 +267,7 @@ export function createHarness(options: {
   };
 
   return {
+    user,
     mesh,
     inboxStore,
     dispatchResponsive,
@@ -268,6 +276,7 @@ export function createHarness(options: {
     actors,
     runtimes,
     messages,
+    promptEvents,
     events,
     meshEvents,
     logs,

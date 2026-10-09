@@ -11,9 +11,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Actor } from "../actor/actor.js";
+import { createActorLifecycle } from "../actor/actor-lifecycle.js";
 import { waitUntil } from "../remote-instances/harness.js";
-import { CodexProvider, listEffectiveCodexMcpServers } from "./codex.js";
-import { classifyRunExhaustion } from "./exhaustion-classifier.js";
+import { CodexProvider } from "./codex.js";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -42,8 +42,6 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { parse } = require(${JSON.stringify(parser)});
 const args = process.argv.slice(2);
-if (process.env.FAKE_NO_JSON && args.includes("--json")) { console.error("unsupported --json"); process.exit(2); }
-if (process.env.FAKE_DISCOVERY_HANG && args.includes("mcp")) { setTimeout(() => {}, 60000); return; }
 const home = process.env.CODEX_HOME;
 function load(file) { return fs.existsSync(file) ? parse(fs.readFileSync(file, "utf8")) : {}; }
 function merge(a, b) { for (const [k, v] of Object.entries(b)) {
@@ -69,7 +67,8 @@ const servers = Object.entries(config.mcp_servers || {}).map(([name, c]) => {
 const plugins = Object.entries(config.plugins || {}).filter(([, c]) => c.enabled !== false).map(([id]) => id);
 const inventory = { servers, plugins };
 if (process.env.FAKE_RECEIPT_PATH) fs.appendFileSync(process.env.FAKE_RECEIPT_PATH, JSON.stringify({ args, inventory }) + "\\n");
-if (args.includes("mcp")) { console.log(JSON.stringify(servers)); process.exit(0); }
+// The observed failure: \`mcp list --json\` exits 0 with blank stdout.
+if (args.includes("mcp")) process.exit(0);
 if (args.includes("resume") && process.env.FAKE_RESUME_FAIL) process.exit(1);
 if (args.includes("exec")) {
   console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(inventory) } }));
@@ -98,50 +97,7 @@ function inventory(output: string) {
 }
 
 describe("Codex computer-use fake inventories (#885)", () => {
-  it("selects a profile, then observes project and invocation override precedence with preserved transport", async () => {
-    const f = fixture();
-    writeFileSync(
-      join(f.codexHome, "desktop.config.toml"),
-      '[mcp_servers.computer-use]\ncommand="fake-profile-never-launched"\nargs=["profile"]\nenabled=false\n'
-    );
-    const read = (configOverrides?: string[]) =>
-      listEffectiveCodexMcpServers({
-        command: f.command,
-        cwd: f.project,
-        args: [
-          "--profile",
-          "desktop",
-          "mcp",
-          "list",
-          "--json",
-          ...(configOverrides ?? []).flatMap((c) => ["-c", c]),
-        ],
-      });
-    expect(await read()).toMatchObject([
-      {
-        name: "computer-use",
-        enabled: false,
-        transport: { command: "fake-profile-never-launched", args: ["profile"] },
-      },
-    ]);
-    writeFileSync(
-      join(f.project, ".codex", "config.toml"),
-      '[mcp_servers.computer-use]\ncommand="fake-project-never-launched"\nargs=["project"]\nenabled=true\n[mcp_servers.docs]\nurl="https://example.invalid/docs"\n'
-    );
-    const project = await read();
-    expect(project.find((s) => s.name === "computer-use")).toMatchObject({
-      enabled: true,
-      transport: { command: "fake-project-never-launched", args: ["project"] },
-    });
-    const denied = await read(["mcp_servers.computer-use.enabled=false"]);
-    expect(denied.find((s) => s.name === "computer-use")).toMatchObject({
-      enabled: false,
-      transport: { command: "fake-project-never-launched", args: ["project"] },
-    });
-    expect(denied.find((s) => s.name === "docs")).toEqual(project.find((s) => s.name === "docs"));
-  });
-
-  it("filters only known plugin and direct inventories for denied, allowed, revoked and allowed-after-denied invocations without modifying settings", async () => {
+  it("filters only known plugins for denied, allowed, revoked and allowed-after-denied invocations without modifying settings", async () => {
     const f = fixture();
     appendFileSync(
       f.configPath,
@@ -161,8 +117,9 @@ describe("Codex computer-use fake inventories (#885)", () => {
             ]
           : ["unrelated@fixture"]
       );
+      // No startup discovery: an unsandboxed run inherits a direct binding unchanged.
       expect(observed.servers.find((s) => s.name === "computer-use")).toMatchObject({
-        enabled: computerUse === true,
+        enabled: true,
         transport: { command: "fake-desktop-never-launched" },
       });
       expect(observed.servers.find((s) => s.name === "docs")).toMatchObject({ enabled: true });
@@ -171,7 +128,7 @@ describe("Codex computer-use fake inventories (#885)", () => {
     }
   });
 
-  it("discovers inside the sandbox merged configuration, excluding the stripped host-only binding", async () => {
+  it("strips the host-only direct binding from the sandbox merged configuration", async () => {
     const f = fixture();
     appendFileSync(
       f.configPath,
@@ -190,87 +147,53 @@ describe("Codex computer-use fake inventories (#885)", () => {
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line));
-    expect(receipts).toHaveLength(2);
-    expect(receipts[0].inventory.servers.map((s: { name: string }) => s.name)).toEqual(["docs"]);
-    expect(receipts[1].args).not.toContain("mcp_servers.computer-use.enabled=false");
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0].args).toContain("exec");
+    expect(receipts[0].args).not.toContain("mcp_servers.computer-use.enabled=false");
   });
 
-  for (const problem of ["unsupported-json", "invalid-transport"] as const) {
-    it(`fails closed before exec on ${problem}`, async () => {
-      const f = fixture();
-      if (problem === "unsupported-json") vi.stubEnv("FAKE_NO_JSON", "1");
-      else appendFileSync(f.configPath, "[mcp_servers.computer-use]\nenabled=false\n");
-      const result = await f.provider.run({
-        prompt: "synthetic",
-        cwd: f.project,
-        computerUse: false,
-      });
-      expect(result.success).toBe(false);
-      expect(result.output).toContain("Failed to determine effective MCP configuration");
-      expect(() => readFileSync(f.receipt)).toThrow();
-      const attempts: string[] = [];
-      const failures: string[] = [];
-      const actor = new Actor({
-        id: "discovery-failure",
-        cwd: f.project,
-        modelConfig: [{ provider: "codex" }, { provider: "fallback" }],
-        mcpServers: [],
-        resolveProvider: (entry) => {
-          attempts.push(entry.provider);
-          return f.provider;
-        },
-        classifyExhaustion: async (result) => {
-          failures.push(result.output);
-          return classifyRunExhaustion(result); // Actual deterministic path, no remote request.
-        },
-        loadSessionId: () => undefined,
-        saveSessionId: () => {},
-        buildPrompt: () => ({ prompt: "synthetic" }),
-      });
-      try {
-        actor.requestRun();
-        await waitUntil(() => failures.length === 1 && !actor.isBusy);
-        expect(attempts).toEqual(["codex"]);
-        expect(failures[0]).toContain("Failed to determine effective MCP configuration");
-        expect(() => readFileSync(f.receipt)).toThrow();
-      } finally {
-        actor.close();
-      }
-    });
-  }
-
-  it("bounds a hung discovery by a shorter run timeout without launching exec", async () => {
+  it("starts the actor's run without a discovery subprocess when MCP listing would return blank success", async () => {
     const f = fixture();
-    vi.stubEnv("FAKE_DISCOVERY_HANG", "1");
-    const result = await f.provider.run({
-      prompt: "synthetic",
+    appendFileSync(
+      f.configPath,
+      '[plugins."computer-use@openai-bundled"]\nenabled=true\n[plugins."unrelated@fixture"]\nenabled=true\n'
+    );
+    const attempts: string[] = [];
+    const outputs: string[] = [];
+    const actor = new Actor({
+      id: "no-discovery",
       cwd: f.project,
-      computerUse: false,
-      timeoutMs: 25,
+      modelConfig: [{ provider: "codex" }, { provider: "fallback" }],
+      mcpServers: [],
+      resolveProvider: (entry) => {
+        attempts.push(entry.provider);
+        return f.provider;
+      },
+      lifecycle: createActorLifecycle([
+        {
+          onEnd: ({ terminal }) => {
+            if (terminal.kind === "result") outputs.push(terminal.result.output);
+          },
+        },
+      ]),
+      loadSessionId: () => undefined,
+      saveSessionId: () => {},
+      buildPrompt: () => ({ prompt: "synthetic" }),
     });
-    expect(result.success).toBe(false);
-    expect(result.cancelled).not.toBe(true);
-    expect(result.output).toContain("Failed to determine effective MCP configuration");
-    expect(() => readFileSync(f.receipt)).toThrow();
-  });
-
-  it("honors cancellation during configuration discovery without launching exec", async () => {
-    const f = fixture();
-    vi.stubEnv("FAKE_DISCOVERY_HANG", "1");
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 50);
     try {
-      const result = await f.provider.run({
-        prompt: "synthetic",
-        cwd: f.project,
-        computerUse: false,
-        signal: controller.signal,
-      });
-      expect(result.cancelled).toBe(true);
-      expect(result.success).toBe(false);
-      expect(() => readFileSync(f.receipt)).toThrow();
+      actor.requestRun();
+      await waitUntil(() => outputs.length === 1 && !actor.isBusy);
+      expect(attempts).toEqual(["codex"]);
+      expect(inventory(outputs[0]).plugins).toEqual(["unrelated@fixture"]);
+      const invocations = readFileSync(f.receipt, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line).args as string[]);
+      expect(invocations).toHaveLength(1);
+      expect(invocations[0]).toContain("exec");
+      expect(invocations[0]).not.toContain("mcp");
     } finally {
-      clearTimeout(timer);
+      actor.close();
     }
   });
 });

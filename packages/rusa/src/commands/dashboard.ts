@@ -40,6 +40,7 @@ ${"━".repeat(26)}
   const dashboardBindHost = config.dashboard?.bindHost ?? "127.0.0.1";
   // Open the persisted database so the Data API serves real mesh data.
   initDb(mcHome);
+  if (!config.auth) getRepositories().principals.ensureImplicitUser(new Date().toISOString());
   // The banner above and the URL below are this command's contract with the
   // person who ran it and stay on the console. Everything the server has to say
   // about itself is a diagnostic and goes to the application logger.
@@ -77,6 +78,7 @@ ${"━".repeat(26)}
       // Read-only: stat the shared HALT sentinel. No live actors here, so
       // `runningThreadIds` is intentionally omitted → every thread reads idle.
       isHalted: () => haltSwitch.hasActiveHalt(),
+      haltSnapshot: () => haltSwitch.state(),
       geminiApiKey: config.geminiApiKey,
       rootIdentity: {
         id: rootRecord?.id,

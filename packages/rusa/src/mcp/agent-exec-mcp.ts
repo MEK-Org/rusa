@@ -14,7 +14,6 @@ import {
   normalizeEventResource,
   resourceKey,
 } from "../actor/event-subscriptions.js";
-import { EXPERIMENT_NAMES, EXPERIMENTS } from "../actor/experiments.js";
 import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
@@ -31,7 +30,6 @@ import {
 import type { VoiceConfigDocument } from "../voice/voice-config.js";
 import { MAX_VOICE_TRANSFER_NOTE_CHARS } from "../voice/voice-transfer-context.js";
 import { toolError, toolOk } from "./result.js";
-import { HUMAN_OPERATOR, isHumanOperator } from "./stamp.js";
 import { createMcpServer } from "./strict-server.js";
 
 class ModelClassInUseError extends Error {
@@ -247,39 +245,6 @@ export function createAgentExecMcpServer(
     return `github:${repo}/${kind === "github_pr" ? "pulls" : "issues"}/${number}`;
   };
 
-  const voiceSessionId = mesh.activeVoiceSessionIdFor(selfId);
-  if (voiceSessionId || mesh.actors.lastHumanChat(selfId)) {
-    server.registerTool(
-      "reply",
-      {
-        title: "Reply to the human operator",
-        description: "Reply to the human operator in your conversation thread.",
-        inputSchema: {
-          message: z.string().describe("The message to send back to the human operator."),
-        },
-      },
-      async ({ message }) => {
-        try {
-          const chat = mesh.actors.lastHumanChat(selfId);
-          const sessionId = mesh.activeVoiceSessionIdFor(selfId) ?? chat?.sessionId;
-          if (!sessionId) throw new Error("reply requires an active human conversation");
-          const toId = chat?.principalId ?? HUMAN_OPERATOR;
-          mesh.recordMessageEmitted({
-            fromId: selfId,
-            toId,
-            body: message,
-            sessionId,
-            isDrop: false,
-          });
-          options?.onWrite?.();
-          return toolOk("sent");
-        } catch (err) {
-          return toolError(err);
-        }
-      }
-    );
-  }
-
   server.registerTool(
     "spawn_thread",
     {
@@ -376,14 +341,17 @@ export function createAgentExecMcpServer(
   server.registerTool(
     "send_message",
     {
-      title: "Send a message to a thread",
+      title: "Send a mesh message",
       description:
-        "Deliver a message to another actor's inbox (your parent, a child, or a peer you've been introduced to). The recipient wakes and sees that the message came from you, and may reply later as a new message — this is async, never a blocking call.",
+        "Send a message to a human or agent principal. Answer the explicit fromId in the message you are responding to; copy its sessionId when present. An agent receives the message in its inbox and wakes; a human receives it in dashboard chat, with voice rendered for a matching voice session. Delivery is asynchronous.",
       inputSchema: {
-        thread_id: z
-          .string()
-          .describe("The recipient thread id (must be one you hold a handle to)."),
+        thread_id: z.string().describe("The recipient principal id, or an agent handle you hold."),
         body: z.string().describe("The message."),
+        session_id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Conversation sessionId from the incoming message or voice handoff."),
         deliver_at: z
           .string()
           .optional()
@@ -392,19 +360,19 @@ export function createAgentExecMcpServer(
           ),
       },
     },
-    async ({ thread_id, body, deliver_at }) => {
+    async ({ thread_id, body, session_id, deliver_at }) => {
       try {
-        if (isHumanOperator(selfId)) {
+        if (mesh.principals?.getUser(selfId)) {
           return toolError(
             new Error("actor-facing send path structurally cannot claim human origin")
           );
         }
         if (selfId === rootId && options?.rootControl) {
-          options.rootControl.sendMessage(thread_id, body, "root-llm", deliver_at);
+          options.rootControl.sendMessage(thread_id, body, "root-llm", deliver_at, session_id);
           options?.onWrite?.();
           return toolOk(deliver_at ? `scheduled for ${deliver_at}` : "sent");
         }
-        const result = mesh.sendMessage(thread_id, body, selfId, undefined, deliver_at);
+        const result = mesh.sendMessage(thread_id, body, selfId, session_id, deliver_at);
         if (!result.delivered) {
           if (!result.status) {
             return toolError(new Error(`unknown thread id: ${thread_id}`));
@@ -1215,7 +1183,7 @@ export function createAgentExecMcpServer(
           actor_id: z.string().describe("The thread id of the actor to enroll."),
           experiment: z
             .string()
-            .describe("A registered experiment name, e.g. 'strict_obligation_handling'."),
+            .describe("A registered experiment name (see list_actor_experiments)."),
         },
       },
       async ({ actor_id, experiment }) => {
@@ -1293,10 +1261,9 @@ export function createAgentExecMcpServer(
               enrolled_at: enrollment.enrolledAt,
             }));
           return toolOk({
-            experiments: EXPERIMENT_NAMES.map((name) => ({
-              name,
-              intent: EXPERIMENTS[name].intent,
-            })),
+            experiments: mesh
+              .listRegisteredExperiments()
+              .map(({ name, intent }) => ({ name, intent })),
             enrollments,
           });
         } catch (err) {

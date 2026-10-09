@@ -4,6 +4,7 @@ import {
   type PrincipalRepository,
 } from "../db/repositories/principal-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import { IMPLICIT_USER_EMAIL } from "../principals/operator-principal.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
 
 /** Safe response text for an admitted, verified account that cannot claim its
@@ -16,6 +17,16 @@ export class DashboardIdentityClaimError extends Error {
     super(DASHBOARD_IDENTITY_CLAIM_ERROR, { cause });
     this.name = "DashboardIdentityClaimError";
   }
+}
+
+/**
+ * The Google account id a verified token was signed in with (#890): the first
+ * `firebase.identities["google.com"]` entry, which Google Chat names as
+ * `users/{id}`. Undefined when the token carries no Google identity.
+ */
+export function googleAccountIdOf(token: DecodedIdToken): string | undefined {
+  const id = token.firebase?.identities?.["google.com"]?.[0];
+  return typeof id === "string" && id.length > 0 ? id : undefined;
 }
 
 /** Called only after Firebase verification and the configured admission check.
@@ -40,6 +51,7 @@ export class DashboardIdentityResolver {
       subject: token.sub,
     };
     const email = normalizeEmail(token.email);
+    if (email === IMPLICIT_USER_EMAIL) throw new Error("Reserved admission email");
     let user = repo.findUserByExternalIdentity(identity);
     if (!user) {
       try {
@@ -68,8 +80,34 @@ export class DashboardIdentityResolver {
     return user;
   }
 
-  recordAuthentication(user: UserPrincipal, at: string): void {
-    this.repository().recordAuthentication(user.id, at);
+  /**
+   * Stamp a sign-in and record the Google account id from its verified ID
+   * token, which is the only source for that column. A Google id already held
+   * by another user is logged by holder id and left alone: sign-in still
+   * succeeds, and this user's Chat messages stay unmatched until an operator
+   * resolves the duplicate.
+   */
+  recordAuthentication(user: UserPrincipal, at: string, token?: DecodedIdToken): void {
+    const repo = this.repository();
+    repo.recordAuthentication(user.id, at);
+    const googleAccountId = token === undefined ? undefined : googleAccountIdOf(token);
+    if (googleAccountId === undefined || googleAccountId === user.googleAccountId) return;
+    let holder = repo.findUserByGoogleAccountId(googleAccountId);
+    if (holder === undefined || holder.id === user.id) {
+      try {
+        repo.setGoogleAccountId(user.id, googleAccountId);
+        return;
+      } catch (error) {
+        // A concurrent sign-in can take the id between that read and this
+        // write; the unique index refuses this one, which is the same conflict.
+        holder = repo.findUserByGoogleAccountId(googleAccountId);
+        if (holder === undefined || holder.id === user.id) throw error;
+      }
+    }
+    this.logger.warn("dashboard_google_account_conflict", {
+      userId: user.id,
+      holderId: holder.id,
+    });
   }
 
   /** A verified identity whose email another row already holds fails closed.

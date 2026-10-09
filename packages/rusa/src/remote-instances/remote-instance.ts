@@ -5,6 +5,7 @@ import type { ActorChannel } from "./actor-channel.js";
 import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
 import type {
   ActorEvent,
+  FollowerParkedEvent,
   FollowerUpdateCommand,
   FollowerUpdateStatus,
   FollowerUpdateStatusEvent,
@@ -92,6 +93,8 @@ export class RemoteInstance {
   poll?: ServerResponse;
   pollTimer?: ReturnType<typeof setTimeout>;
   updateStatus?: FollowerUpdateStatus;
+  /** Latest parked-head report; undefined until a follower that reports one polls (#880). */
+  parkedEvent?: FollowerParkedEvent | null;
 
   constructor(
     readonly id: string,

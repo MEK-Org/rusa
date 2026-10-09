@@ -43,6 +43,8 @@ export interface UserPrincipal {
   /** Set to deny further access while the root and history are preserved. */
   disabledAt?: string;
   lastAuthenticatedAt?: string;
+  /** The Google account id from the user's last verified sign-in; Chat names it `users/{id}`. */
+  googleAccountId?: string;
 }
 
 /**

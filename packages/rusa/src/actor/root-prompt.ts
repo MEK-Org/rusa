@@ -8,7 +8,10 @@
  * It deliberately doesn't enumerate exact tool names: the agent discovers them
  * from the MCP servers it's connected to at runtime.
  */
-import type { MeshGitIdentity } from "../gitops/mesh-git-identity.js";
+import {
+  type MeshGitIdentityResolution,
+  resolveMeshGitIdentity,
+} from "../gitops/mesh-git-identity.js";
 import {
   DELEGATION_DISCIPLINE,
   EXTERNAL_CONDUCT_POLICY,
@@ -60,15 +63,15 @@ export function buildRootPrompt(
   charter: string = ROOT_ACTOR_CHARTER,
   priorContext?: string,
   actorHandle?: string,
-  gitIdentity: MeshGitIdentity | null = null
+  gitIdentity: MeshGitIdentityResolution = resolveMeshGitIdentity(undefined)
 ): string {
-  return `${charter}
+  return `${trackerWritingGuidance(actorHandle ?? "rusa")}
+
+${charter}
 
 ${DELEGATION_DISCIPLINE}
 
 ${GROUNDING_DISCIPLINE}
-
-${trackerWritingGuidance(actorHandle ?? "rusa")}
 
 ${gitIdentityGuidance(gitIdentity)}
 

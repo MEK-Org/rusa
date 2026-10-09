@@ -1,19 +1,15 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ActorFactoryContext, ActorMeshOptions } from "../actor/actor-mesh.js";
-import { EXPERIMENT_ADMIN_CAPABILITY } from "../actor/administrative-capabilities.js";
 import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../actor/computer-use-lock.js";
-import {
-  InMemoryExperimentEnrollmentStore,
-  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
-} from "../actor/experiments.js";
 import { ProviderPacer } from "../actor/provider-pacer.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import { ClaudeProvider } from "../providers/claude.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { createHarness, waitUntil } from "./harness.js";
 import type { ActorEvent, LeaderCommand, ProviderFactory } from "./protocol.js";
@@ -32,7 +28,6 @@ function setup(
     onEvent?: (actorId: string, event: ActorEvent) => void;
     maxConcurrent?: number;
     obligations?: ActorMeshOptions["obligations"];
-    experimentEnrollments?: ActorMeshOptions["experimentEnrollments"];
   } = {}
 ) {
   const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-unit-"));
@@ -47,7 +42,6 @@ function setup(
     onEvent: options.onEvent,
     maxConcurrent: options.maxConcurrent,
     obligations: options.obligations,
-    experimentEnrollments: options.experimentEnrollments,
     providerFactory: options.failInit
       ? () => {
           throw new Error("test provider initialization failed");
@@ -173,6 +167,40 @@ function abandonedRuns(h: Harness, id: string) {
 }
 
 describe("monolithic follower instance", () => {
+  it("#866 forwards exact real follower argv to leader and rejects stale receipts", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-prompt-"));
+    dirs.push(cwd);
+    const dump = join(cwd, "argv.json");
+    const cli = join(cwd, "synthetic-cli");
+    writeFileSync(
+      cli,
+      `#!/usr/bin/env node
+require("node:fs").writeFileSync(${JSON.stringify(dump)}, JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic result"}));
+`
+    );
+    chmodSync(cli, 0o755);
+    const h = setup({
+      providerFactory: () => new ClaudeProvider("fixture", { cliCommand: cli }),
+    });
+    const id = h.spawn("Synthetic charter ✓\n  indentation");
+    await waitUntil(() => h.promptEvents.length === 1 && existsSync(dump));
+    const event = h.promptEvents[0];
+    const argv = JSON.parse(readFileSync(dump, "utf8")) as string[];
+    expect(event).toMatchObject({ actorId: id, runId: runStarts(h, id)[0] });
+    expect(event?.prompt).toBe(argv[argv.indexOf("-p") + 1]);
+    expect(event?.prompt).toContain("Synthetic charter");
+    expect(
+      JSON.stringify(h.meshEvents.filter((entry) => entry.kind === "run_start"))
+    ).not.toContain(JSON.stringify(event?.prompt));
+    h.remote.receive({
+      actorId: id,
+      message: { type: "runPrompt", runId: "stale-run", prompt: "stale" },
+    });
+    await delay(0);
+    expect(h.promptEvents).toHaveLength(1);
+  });
+
   it("serializes three computer-capable actors without holding unrelated actors", async () => {
     // Provider admission happens before the per-instance lock. Give all four
     // runs capacity here so the unrelated control proves the lock — rather
@@ -2074,7 +2102,9 @@ describe("monolithic follower instance", () => {
       const runId = queuedRunId(h, second);
       expect(runId).toBeTruthy();
 
-      expect(h.mesh.interrupt(second, "human:operator")).toEqual({ interrupted: true });
+      expect(h.mesh.interrupt(second, h.user.id)).toEqual({
+        interrupted: true,
+      });
       expect(h.runtime(second).isQueued).toBe(false);
       expect(h.runtime(second).getInterruptedWatermark()).not.toBeNull();
       expect(h.meshEvents).toContainEqual(
@@ -2101,7 +2131,9 @@ describe("monolithic follower instance", () => {
       await waitUntil(() => h.runtime(id).isRunning);
       const before = Date.now();
 
-      expect(h.mesh.interrupt(id, "human:operator")).toEqual({ interrupted: true });
+      expect(h.mesh.interrupt(id, h.user.id)).toEqual({
+        interrupted: true,
+      });
       expect(h.meshEvents).toContainEqual(
         expect.objectContaining({ kind: "root_control_action", actorId: id })
       );
@@ -2238,7 +2270,7 @@ describe("monolithic follower instance", () => {
           // The queued report precedes the admission request on the same channel.
           if (event.type === "queued" && !interrupted) {
             expect(h.runtime(actorId).isQueued).toBe(true);
-            interrupted = h.mesh.interrupt(actorId, "human:operator");
+            interrupted = h.mesh.interrupt(actorId, h.user.id);
           }
         },
       });
@@ -2302,7 +2334,7 @@ describe("monolithic follower instance", () => {
           typeof message.value === "object" &&
           "selected" in message.value
         ) {
-          interrupted = h.mesh.interrupt(id, "human:operator");
+          interrupted = h.mesh.interrupt(id, h.user.id);
         }
         return sent;
       }) as typeof runtime.channel.send;
@@ -2323,7 +2355,7 @@ describe("monolithic follower instance", () => {
         onEvent: (actorId, event) => {
           // The follower reports running before its runStart, so this lands in between.
           if (event.type === "state" && event.state === "running" && !interrupted) {
-            interrupted = h.mesh.interrupt(actorId, "human:operator");
+            interrupted = h.mesh.interrupt(actorId, h.user.id);
           }
         },
       });
@@ -2369,7 +2401,9 @@ describe("monolithic follower instance", () => {
       }) as typeof runtime.channel.send;
 
       await waitUntil(() => started(h, id).length === 1);
-      expect(h.mesh.interrupt(id, "human:operator")).toEqual({ interrupted: true });
+      expect(h.mesh.interrupt(id, h.user.id)).toEqual({
+        interrupted: true,
+      });
       await waitUntil(() => started(h, id).length === 2);
       expect(h.runtime(id).getInterruptedWatermark()).toBeNull();
     });
@@ -2384,7 +2418,7 @@ describe("monolithic follower instance", () => {
             const until = Date.now() + 5;
             while (Date.now() < until) {}
             h.dispatchNormal(actorId, "test:after-start");
-            interrupted = h.mesh.interrupt(actorId, "human:operator");
+            interrupted = h.mesh.interrupt(actorId, h.user.id);
           }
         },
       });
@@ -2407,10 +2441,8 @@ describe("monolithic follower instance", () => {
     });
     runMigrations(db);
     const repo = new ObligationRepository(db);
-    const enrollments = new InMemoryExperimentEnrollmentStore();
     const h = setup({
       delayMs: 300,
-      experimentEnrollments: enrollments,
       obligations: {
         findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
         get: (id) => repo.get(id),
@@ -2419,18 +2451,11 @@ describe("monolithic follower instance", () => {
         expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
       },
     });
-    h.capabilityGrants.grant({
-      actorId: "root",
-      capability: EXPERIMENT_ADMIN_CAPABILITY,
-      grantedBy: "root",
-      grantedAt: "2026-10-01T00:00:00Z",
-    });
     const id = h.mesh.spawn({
       charter: "strict follower",
       parentId: "root",
       modelConfig: { provider: "instance-fixture", model: "scripted" },
     });
-    h.mesh.enrollActorInExperiment(id, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
     repo.create({ id: "remote-head", title: "Remote head", ownerId: id });
     h.mesh.deliverReadyHeadAttention(id, { id: "remote-head", intent: "handle it" }, null);
     await waitUntil(() => h.runtime(id).isRunning);

@@ -7,7 +7,7 @@ import {
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
-import { HUMAN_OPERATOR, isHumanOperator, MESH_SYSTEM } from "../mcp/stamp.js";
+import { MESH_SYSTEM } from "../mcp/stamp.js";
 import {
   isBlockingObligationStatus,
   isReadyForAttention,
@@ -90,12 +90,15 @@ import {
 } from "./event-subscriptions.js";
 import {
   assertKnownExperiment,
+  EXPERIMENTS,
+  type ExperimentDefinition,
   type ExperimentEnrollment,
   type ExperimentEnrollmentChange,
   type ExperimentEnrollmentStore,
+  type ExperimentRegistry,
+  experimentNames,
   InMemoryExperimentEnrollmentStore,
   isKnownExperiment,
-  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
 } from "./experiments.js";
 import { generateHandle } from "./handle-generator.js";
 import {
@@ -131,7 +134,7 @@ export interface MeshActor {
   rescheduleQueuedRun?(): boolean;
   resumeCancelledRun?(): boolean;
   preemptForResponsive(): { preempted: false } | { preempted: true; phase: "running" | "queued" };
-  interrupt?(by?: string): { interrupted: boolean; runStartTime?: Date; wasQueued?: boolean };
+  interrupt?(by: string): { interrupted: boolean; runStartTime?: Date; wasQueued?: boolean };
   getInterruptedWatermark?(): Date | null;
   clearInterruptWatermark?(): void;
   setModelConfig?(modelConfig: ProviderModelConfig[]): void;
@@ -232,7 +235,7 @@ export interface RetireOptions {
 /** Host-owned live-session operations used by the actor transfer primitive. */
 export interface VoiceSessionTransferPort {
   /** Read the caller's unambiguous active session before any authority moves. */
-  activeSessionIdFor(actorId: string): string;
+  activeSessionFor(actorId: string): { sessionId: string; principalId: string };
   /** Atomically rebind the caller's active session and return its same UUID. */
   transferActiveSession(fromActorId: string, targetActorId: string): string;
   /** Restore a just-rebound session before its durable handoff was accepted. */
@@ -276,11 +279,12 @@ export interface MeshObligationPort {
 /**
  * The narrower contract strict obligation handling (#382) actually requires.
  *
- * These reads stay optional on {@link MeshObligationPort} so an embedder built
- * before #382 keeps working, but they are not optional for an *enrolled* actor:
- * enrollment without this contract is a misconfiguration, not a soft mode.
+ * These reads stay optional on {@link MeshObligationPort} so an embedder that
+ * never selects obligation attention keeps working, but they are not optional
+ * for head selection: every actor is held to head closure (#917), so selecting
+ * a head without this contract is a misconfiguration, not a soft mode.
  * {@link ActorMesh.selectInboxEntries} refuses head attention in that state
- * rather than arming an enrolled run whose heads it could not read.
+ * rather than arming a run whose heads it could not read.
  */
 export type MeshObligationClosurePort = MeshObligationPort &
   Required<
@@ -507,8 +511,6 @@ function isTrustedControlPrincipal(
 ): boolean {
   return (
     by === "root-llm" ||
-    by === "human:operator" ||
-    by.startsWith("human:") ||
     by === "e2e-controller" ||
     (principals !== undefined && principals.getUser(by) !== undefined)
   );
@@ -731,6 +733,12 @@ export interface ActorMeshOptions {
    * — both enforced here in the mesh, never in the store.
    */
   experimentEnrollments?: ExperimentEnrollmentStore;
+  /**
+   * The experiment registry enrollments are checked against. Defaults to the
+   * hard-coded {@link EXPERIMENTS}; tests of the rollout seam supply their own
+   * so it stays exercised while the production registry is empty.
+   */
+  experimentRegistry?: ExperimentRegistry;
   eventSourceOwners?: EventSourceOwnerStore;
   eventSourceSubscriptions?: EventSourceSubscriptionStore;
   /**
@@ -801,8 +809,8 @@ export interface ActorMeshOptions {
 }
 
 /**
- * The exits a strict head-obligation run has, worded once: the discipline an
- * enrolled run is told when its selection arms it.
+ * The exits a strict head-obligation run has, worded once: the discipline a
+ * run is told when its selection arms it.
  */
 const STRICT_HEAD_CLOSURE_EXITS =
   "complete it, cancel it, schedule it, snooze it until a future time with `set_snooze`, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
@@ -924,6 +932,7 @@ export class ActorMesh {
   readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
   private readonly experiments: ExperimentEnrollmentStore;
+  private readonly experimentRegistry: ExperimentRegistry;
   private readonly eventSourceOwners: EventSourceOwnerStore;
   private readonly eventSourceSubscriptions: EventSourceSubscriptionStore;
   private readonly configuredEventSources: readonly EventResource[] | undefined;
@@ -1031,6 +1040,7 @@ export class ActorMesh {
     this.validateModel = opts.validateModel;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
     this.experiments = opts.experimentEnrollments ?? new InMemoryExperimentEnrollmentStore();
+    this.experimentRegistry = opts.experimentRegistry ?? EXPERIMENTS;
     this.eventSourceOwners = opts.eventSourceOwners ?? new InMemoryEventSourceOwnerStore();
     this.eventSourceSubscriptions =
       opts.eventSourceSubscriptions ?? new InMemoryEventSourceSubscriptionStore();
@@ -1435,7 +1445,7 @@ export class ActorMesh {
     if (!this.inboxStore) return;
     try {
       for (const { ownerId, headId, responsive } of obligations.readyHeadRecords()) {
-        if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
+        if (ownerId.startsWith("system:")) continue;
         const actorId = this.resolveThreadId(ownerId);
         const record = this.actors.get(actorId);
         if (!record || record.status !== "active") continue;
@@ -1724,46 +1734,35 @@ export class ActorMesh {
       }
       return entry;
     });
-    // Capture experiment membership now. Root can revise enrollment later, but
-    // that governs a future selection rather than retroactively releasing or
-    // constraining this already-running actor.
     // Snapshot the selected focus now. A direct focus and selected ready-head
     // attention both contribute: supplying an explicit id must not let an
     // actor bypass a ready head included in the same selection. Direct focus
     // only arms its owning actor; the resolver may record another live row as
     // context, but strict head closure is a commitment of its owner.
-    const strictEnrolled = this.isEnrolledInExperiment(
-      actorId,
-      STRICT_OBLIGATION_HANDLING_EXPERIMENT
+    const readyHeadObligationIds = entries.flatMap((entry) =>
+      entry.payload.type === "obligation.ready_head" &&
+      typeof entry.payload.obligationId === "string"
+        ? [entry.payload.obligationId]
+        : []
     );
-    const readyHeadObligationIds = strictEnrolled
-      ? entries.flatMap((entry) =>
-          entry.payload.type === "obligation.ready_head" &&
-          typeof entry.payload.obligationId === "string"
-            ? [entry.payload.obligationId]
-            : []
-        )
-      : [];
-    const focusedObligationIds = strictEnrolled
-      ? [
-          ...(focusedObligationId !== undefined ? [focusedObligationId] : []),
-          ...readyHeadObligationIds,
-        ]
-      : [];
+    const focusedObligationIds = [
+      ...(focusedObligationId !== undefined ? [focusedObligationId] : []),
+      ...readyHeadObligationIds,
+    ];
     // Fail closed, and fail here — before the selection commits, so nothing has
-    // run yet on heads the mesh cannot read. An enrolled actor in a mesh
-    // without closure reads is a misconfiguration the root must fix by wiring
-    // the port or unenrolling, not a run that silently opts out.
+    // run yet on heads the mesh cannot read. Every actor is held to head
+    // closure (#917), so a mesh without closure reads is a misconfiguration to
+    // fix by wiring the port, not a run that silently opts out.
     const closure = this.obligations;
     if (focusedObligationIds.length > 0 && !supportsObligationClosureReads(closure)) {
       throw new Error(
-        `Cannot select head attention: ${actorId} is enrolled in ${STRICT_OBLIGATION_HANDLING_EXPERIMENT}, but this mesh has no obligation closure port (get, listDirectChildEdges, listPrerequisiteEdges, expireDueSnoozes) wired. Wire the closure port or unenroll the actor.`
+        `Cannot select head attention for ${actorId}: this mesh has no obligation closure port (get, listDirectChildEdges, listPrerequisiteEdges, expireDueSnoozes) wired, and every head selection is held to strict closure. Wire the closure port.`
       );
     }
-    // Membership and status are both selection-time facts. Keeping only ready
-    // focuses in the run state makes a later waiting -> ready transition stay
-    // unarmed, while a ready -> waiting transition retains the existing legal
-    // exit checks for the run that selected it. A transiently unreadable row
+    // Status is a selection-time fact. Keeping only ready focuses in the run
+    // state makes a later waiting -> ready transition stay unarmed, while a
+    // ready -> waiting transition retains the existing legal exit checks for
+    // the run that selected it. A transiently unreadable row
     // remains fail-closed, as it did before status-aware selection: silently
     // releasing a strict run on a failed closure read would be less safe.
     const headObligationIds = supportsObligationClosureReads(closure)
@@ -1853,16 +1852,13 @@ export class ActorMesh {
   }
 
   /**
-   * The experiment-specific discipline in force for this actor's current run,
-   * or undefined when none is — the text an enrolled actor is told at
+   * The head-closure discipline in force for this actor's current run, or
+   * undefined when its selections armed no head — the text an actor is told at
    * selection.
    *
-   * This reads the armed run state rather than re-evaluating enrollment, so a
-   * root enrollment change lands at the next selection and not in between.
-   *
-   * States the obligation rule directly without experiment framing, and per
-   * head: a selection of several is told that each one must take a legal exit,
-   * not just the first.
+   * This reads the armed run state, so it states exactly the heads selection
+   * armed. It is per head: a selection of several is told that each one must
+   * take a legal exit, not just the first.
    */
   runDisciplineNotice(actorId: string): string | undefined {
     actorId = this.resolveThreadId(actorId);
@@ -2045,7 +2041,7 @@ export class ActorMesh {
    * non-restart state that record cannot show (see {@link isActiveActor}).
    */
   private isWakeableRecipient(ownerId: string): boolean {
-    if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) return false;
+    if (ownerId.startsWith("system:")) return false;
     return this.isActiveActor(this.resolveThreadId(ownerId));
   }
 
@@ -2703,7 +2699,7 @@ export class ActorMesh {
     if (!this.inboxStore) return;
     try {
       for (const obligation of obligations.listResponsiveReadyAttention()) {
-        if (obligation.ownerId.startsWith("human:") || obligation.ownerId.startsWith("system:")) {
+        if (obligation.ownerId.startsWith("system:")) {
           continue;
         }
         const actorId = this.resolveThreadId(obligation.ownerId);
@@ -2775,7 +2771,7 @@ export class ActorMesh {
         dependentOwnerId,
         prerequisiteId,
       } of obligations.listPrerequisiteCancellationAttention()) {
-        if (dependentOwnerId.startsWith("human:") || dependentOwnerId.startsWith("system:")) {
+        if (dependentOwnerId.startsWith("system:")) {
           continue;
         }
         const actorId = this.resolveThreadId(dependentOwnerId);
@@ -2786,6 +2782,66 @@ export class ActorMesh {
     } catch (err) {
       this.log(
         `prerequisite-cancellation reconciliation failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  /**
+   * Durable owner attention for a completion matcher whose PR closed without
+   * merging (#190). One notice per matcher installation: the key carries the
+   * matcher's `set_at`, so replays and boot reconciliation are silent no-ops
+   * while a replaced matcher that closes unmerged again is announced again.
+   * Human owners see the recorded state on the dashboard instead.
+   */
+  deliverCompletionMatcherClosedUnmergedAttention(
+    ownerId: string,
+    obligationId: string,
+    matcherSetAt: string
+  ): boolean {
+    if (!this.inboxStore) return false;
+    if (ownerId.startsWith("system:")) return false;
+    const actorId = this.resolveThreadId(ownerId);
+    const record = this.actors.get(actorId);
+    if (!record || record.status !== "active") return false;
+    const entries = this.inboxStore.append([
+      {
+        id: deduplicatedInboxEntryId(
+          `obligation-matcher-closed-unmerged:${obligationId}:${matcherSetAt}`,
+          actorId
+        ),
+        actorId,
+        source: `obligation:${obligationId}`,
+        payload: {
+          type: "obligation.completion_matcher_closed_unmerged",
+          obligationId,
+        } as unknown as InboxPayload,
+      },
+    ]);
+    if (entries.length === 0) return false;
+    this.dispatch(actorId);
+    return true;
+  }
+
+  /** Boot recovery for {@link deliverCompletionMatcherClosedUnmergedAttention}. */
+  reconcileCompletionMatcherClosedUnmergedAttention(obligations: {
+    listCompletionMatcherClosedUnmergedAttention(): Iterable<{
+      obligationId: string;
+      ownerId: string;
+      matcherSetAt: string;
+    }>;
+  }): void {
+    if (!this.inboxStore) return;
+    try {
+      for (const attention of obligations.listCompletionMatcherClosedUnmergedAttention()) {
+        this.deliverCompletionMatcherClosedUnmergedAttention(
+          attention.ownerId,
+          attention.obligationId,
+          attention.matcherSetAt
+        );
+      }
+    } catch (err) {
+      this.log(
+        `completion-matcher attention reconciliation failed: ${err instanceof Error ? err.message : String(err)}`
       );
     }
   }
@@ -2839,7 +2895,7 @@ export class ActorMesh {
 
     // Read and render before rebinding. If the durable context projection is
     // unavailable, no live authority moves and the caller can retry safely.
-    const sessionId = transfer.activeSessionIdFor(fromActorId);
+    const { sessionId, principalId } = transfer.activeSessionFor(fromActorId);
     const context = renderVoiceTransferContext(
       this.listVoiceSessionChat?.(sessionId) ?? [],
       handoffNote
@@ -2855,6 +2911,7 @@ export class ActorMesh {
             type: "voice.transfer",
             priority: "responsive",
             fromId: fromActorId,
+            principalId,
             sessionId,
             context,
           },
@@ -2918,22 +2975,6 @@ export class ActorMesh {
       });
     }
     return { sessionId, targetActorId: target.id };
-  }
-
-  /**
-   * The currently leased voice session for an actor, if this host has one.
-   * This is intentionally lease-scoped rather than an actor-row capability:
-   * a recipient of a transfer may reply during the live handoff without
-   * permanently gaining direct-human authority.
-   */
-  activeVoiceSessionIdFor(actorId: string): string | undefined {
-    const transfer = this.voiceSessionTransfer;
-    if (!transfer) return undefined;
-    try {
-      return transfer.activeSessionIdFor(this.resolveThreadId(actorId));
-    } catch {
-      return undefined;
-    }
   }
 
   /** Resolve an active live actor from the caller's own handle set. */
@@ -3117,10 +3158,7 @@ export class ActorMesh {
    * that it is no longer live.
    */
   private introduceMessageSender(toId: string, fromId: string): void {
-    if (
-      isHumanOperator(fromId) ||
-      (this.principals !== undefined && this.principals.getUser(fromId) !== undefined)
-    ) {
+    if (this.principals !== undefined && this.principals.getUser(fromId) !== undefined) {
       return;
     }
     const recipient = this.actors.get(toId);
@@ -3370,7 +3408,7 @@ export class ActorMesh {
   ): ExperimentEnrollmentChange {
     actorId = this.resolveThreadId(actorId);
     enrolledBy = this.resolveThreadId(enrolledBy);
-    const name = assertKnownExperiment(experiment);
+    const name = assertKnownExperiment(experiment, this.experimentRegistry);
     const record = this.assertExperimentAuthority(enrolledBy, actorId, "enroll");
     if (record.status === "retired") {
       throw new Error(`Cannot enroll a retired thread: ${actorId}`);
@@ -3437,8 +3475,16 @@ export class ActorMesh {
    * not have to guard against its own registry constant.
    */
   isEnrolledInExperiment(actorId: string, experiment: string): boolean {
-    if (!isKnownExperiment(experiment)) return false;
+    if (!isKnownExperiment(experiment, this.experimentRegistry)) return false;
     return this.experiments.isEnrolled(this.resolveThreadId(actorId), experiment);
+  }
+
+  /** The registered experiments in name order — the registry half of the readback view. */
+  listRegisteredExperiments(): Array<{ name: string } & ExperimentDefinition> {
+    return experimentNames(this.experimentRegistry).map((name) => ({
+      name,
+      ...this.experimentRegistry[name],
+    }));
   }
 
   /** Every current enrollment in (actorId, experiment) order — the administrator's readback view. */
@@ -3957,25 +4003,31 @@ export class ActorMesh {
   }
 
   /**
-   * Deliver a message to a thread's inbox. Actor→actor only; the human↔root edge
-   * is handled by the wiring (chat/webhook), not here. Async by design.
+   * One delivery path for every mesh principal. Authentication binds human
+   * senders at ingress; actor tools bind their sender to the calling actor.
+   * Agents receive durable inbox attention; users receive durable chat/events.
    */
   sendMessage(
     toId: string,
     body: string,
     fromId: string,
     sessionId?: string,
-    deliverAt?: string
+    deliverAt?: string,
+    options: { voice?: boolean } = {}
   ): MessageDeliveryResult {
     toId = this.resolveThreadId(toId);
     fromId = this.resolveThreadId(fromId);
-    if (
-      isHumanOperator(fromId) ||
-      (this.principals !== undefined && this.principals.getUser(fromId) !== undefined)
-    ) {
-      throw new Error(
-        "Invalid sender ID: actor-facing send path structurally cannot claim human origin"
-      );
+    const humanSender = this.principals?.getUser(fromId);
+    if (humanSender?.disabledAt) throw new Error("Message sender is disabled");
+
+    const humanRecipient = this.principals?.getUser(toId);
+    if (humanRecipient) {
+      if (humanRecipient.disabledAt) throw new Error("Message recipient is disabled");
+      if (deliverAt) throw new Error("Scheduled delivery requires an agent recipient");
+      if (!this.recordMessageEmitted({ fromId, toId, body, sessionId, isDrop: false })) {
+        throw new Error("User message delivery requires durable chat storage");
+      }
+      return { delivered: true };
     }
 
     if (fromId === toId && !deliverAt) {
@@ -4062,7 +4114,13 @@ export class ActorMesh {
         {
           actorId: toId,
           source: `mesh:${fromId}`,
-          payload: { type: "mesh.message", messageId, fromId, sessionId },
+          payload: {
+            type: options.voice ? VOICE_INBOX_PAYLOAD_TYPE : "mesh.message",
+            ...(humanSender ? { priority: "responsive" as const } : {}),
+            messageId,
+            fromId,
+            sessionId,
+          },
         },
       ]);
       this.introduceMessageSender(toId, fromId);
@@ -4118,57 +4176,6 @@ export class ActorMesh {
     if (inserted.length === 0) return { delivered: true };
     if (delivery.responsive) this.dispatchJoiningActiveRun(toId);
     else this.dispatch(toId);
-    return { delivered: true };
-  }
-
-  /**
-   * Deliver a message to a thread's inbox originating from a human operator.
-   * Stamped only at the dashboard API ingress.
-   */
-  sendHumanMessage(
-    toId: string,
-    body: string,
-    sessionId: string,
-    opts?: { voice?: boolean; fromId?: string }
-  ): MessageDeliveryResult {
-    toId = this.resolveThreadId(toId);
-    const fromId = opts?.fromId ?? HUMAN_OPERATOR;
-    const rec = this.actors.get(toId);
-    if (!rec || rec.status !== "active") {
-      this.log(`message to ${toId} from ${fromId} dropped — recipient not active`);
-      return { delivered: false, status: rec?.status };
-    }
-    this.actors.noteHumanChat(toId, { sessionId, principalId: fromId });
-    const target = this.runs.liveActor(toId);
-    const messageId = this.recordMessageEmitted({
-      fromId,
-      toId,
-      body,
-      sessionId,
-      isDrop: !target,
-    });
-    if (!target) {
-      this.log(`message to ${toId} from ${fromId} dropped — no live actor`);
-      return { delivered: false, status: this.actors.get(toId)?.status };
-    }
-    const isVoice = opts?.voice || body.startsWith("🎙️ [voice memo");
-    if (this.inboxStore) {
-      if (!messageId) throw new Error("Human message delivery requires durable chat storage");
-      this.inboxStore.append([
-        {
-          actorId: toId,
-          source: `mesh:${fromId}`,
-          payload: {
-            type: isVoice ? VOICE_INBOX_PAYLOAD_TYPE : "human.message",
-            priority: "responsive",
-            messageId,
-            fromId,
-            sessionId,
-          },
-        },
-      ]);
-    }
-    this.dispatch(toId);
     return { delivered: true };
   }
 
@@ -4352,10 +4359,7 @@ export class ActorMesh {
    * interrupted run's start time, and only schedules a re-run if newer unhandled inbox
    * items have arrived after the interrupted run started.
    */
-  interrupt(
-    targetId: string,
-    by: string = "human:operator"
-  ): { interrupted: boolean; status?: string } {
+  interrupt(targetId: string, by: string): { interrupted: boolean; status?: string } {
     targetId = this.resolveThreadId(targetId);
     by = this.resolveThreadId(by);
     const target = this.runs.liveActor(targetId);
