@@ -36,13 +36,12 @@ export const WHOLE_BAD_READ_CARRY_DETAIL =
   "carried forward previous unexpired window assessment after bad read";
 
 /**
- * Whether a parsed snapshot came from a read that extracted no quota value
- * (#982): the parser answered `unknown`, or every window in it was carried
- * over from an earlier read. Its scrape counts as failed, not as a read that
- * stopped showing a window.
+ * Whether a parsed snapshot came from a read where every window was carried
+ * over from an earlier read after a bad read (#982). Its scrape counts as
+ * failed, so an expired carried window is reported as a failed scrape rather
+ * than a window that stopped showing.
  */
 export function extractedNoQuotaValues(snapshot: ProviderQuotaSnapshot): boolean {
-  if (snapshot.status === "unknown") return true;
   const limits = snapshot.limits ?? [];
   return (
     limits.length > 0 &&

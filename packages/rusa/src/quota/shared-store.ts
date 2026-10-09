@@ -1053,7 +1053,7 @@ export class SharedQuotaStore {
       }>
     ).map(({ observedAt, parsedState, threw }) => {
       const parsed = threw ? null : parseParsedState(parsedState);
-      const failed = threw || (parsed !== null && extractedNoQuotaValues(parsed));
+      const failed = Boolean(threw || parsed === null || extractedNoQuotaValues(parsed));
       return { observedAt, outcome: failed ? "failed" : "parsed" };
     });
   }

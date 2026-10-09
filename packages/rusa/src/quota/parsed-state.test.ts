@@ -171,8 +171,19 @@ describe("extractedNoQuotaValues (#982)", () => {
     expect(judge({ provider: "agy", status: "unknown", scrapedAt, limits: [] })).toBe(true);
   });
 
-  it("fails an unknown read with nothing to carry", () => {
-    expect(extractedNoQuotaValues({ provider: "agy", status: "unknown", scrapedAt })).toBe(true);
+  it("does not flag an unknown read with nothing to carry as a carried bad read", () => {
+    expect(extractedNoQuotaValues({ provider: "agy", status: "unknown", scrapedAt })).toBe(false);
+  });
+
+  it("keeps a read that extracted model-only limits with status unknown", () => {
+    expect(
+      extractedNoQuotaValues({
+        provider: "claude",
+        status: "unknown",
+        scrapedAt,
+        limits: [{ label: "Fable", kind: "five_hour", percentLeft: 50 }],
+      })
+    ).toBe(false);
   });
 
   it("keeps a read that extracted values but carried a missing reset", () => {

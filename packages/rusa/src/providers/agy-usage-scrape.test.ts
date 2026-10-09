@@ -13,6 +13,7 @@ const fixture = (path: string) => readFileSync(new URL(path, import.meta.url), "
 const FRAMES = {
   banner: fixture("./fixtures/agy-usage-banner.txt"),
   loading: fixture("./fixtures/agy-usage-loading.txt"),
+  partial: fixture("./fixtures/agy-usage-partial.txt"),
   panel: fixture("../mcp/fixtures/agy-usage.txt"),
 };
 
@@ -36,7 +37,12 @@ const FAKE_TMUX = [
   "  capture-pane)",
   '    if [ -e "$STATE/opened" ]; then',
   '      printf "x" >> "$STATE/panel_captures"',
-  '      cat "$FAKE_PANEL"',
+  '      if [ -n "${' + 'FAKE_PARTIAL:-}" ] && ! [ -e "$STATE/partial_served" ]; then',
+  '        : > "$STATE/partial_served"',
+  '        cat "$FAKE_PARTIAL"',
+  "      else",
+  '        cat "$FAKE_PANEL"',
+  "      fi",
   "    else",
   '      cat "$FAKE_PROMPT"',
   "    fi",
@@ -79,6 +85,7 @@ describe("agy /usage panel readiness (#982)", () => {
   it.each([
     ["banner", false],
     ["loading", false],
+    ["partial", false],
     ["panel", true],
   ] as const)("treats the %s frame as ready=%s", (frame, ready) => {
     expect(isAgyQuotaPanelReady(FRAMES[frame])).toBe(ready);
@@ -87,14 +94,46 @@ describe("agy /usage panel readiness (#982)", () => {
   it.each([
     ["banner", false],
     ["loading", false],
+    ["partial", false],
     ["panel", true],
   ] as const)("the script's panel wait agrees with the predicate on the %s frame", (frame, ready) => {
     const r = runScript(PROMPT, FRAMES[frame]);
     expect(r.code).toBe(0);
     expect(r.stdout).toContain(FRAMES[frame].trim());
-    // A ready frame ends the wait on its first poll; anything else polls
-    // out the bounded budget. One more capture is the final read.
-    expect(r.panelCaptures).toBe((ready ? 1 : TIMING.panelTries) + 1);
+    // A ready frame ends the wait on its second consecutive poll; anything
+    // else polls out the bounded budget. One more capture is the final read.
+    expect(r.panelCaptures).toBe((ready ? 2 : TIMING.panelTries) + 1);
+  });
+
+  it("waits past a partial frame (window row present, value absent) until the full panel stabilizes", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agy-scrape-partial-"));
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+    const state = join(dir, "state");
+    mkdirSync(state);
+    writeFileSync(join(dir, "tmux"), FAKE_TMUX, { mode: 0o755 });
+    writeFileSync(join(dir, "prompt.txt"), PROMPT);
+    writeFileSync(join(dir, "partial.txt"), FRAMES.partial);
+    writeFileSync(join(dir, "panel.txt"), FRAMES.panel);
+
+    const res = spawnSync("bash", ["-c", buildTmuxScript("agy", join(dir, "probe.sock"), TIMING)], {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        PATH: `${dir}:${process.env.PATH ?? ""}`,
+        FAKE_TMUX_STATE: state,
+        FAKE_PROMPT: join(dir, "prompt.txt"),
+        FAKE_PARTIAL: join(dir, "partial.txt"),
+        FAKE_PANEL: join(dir, "panel.txt"),
+      },
+    });
+
+    const read = (name: string) =>
+      existsSync(join(state, name)) ? readFileSync(join(state, name), "utf-8") : "";
+
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain("Quota available");
+    // Poll 1 (partial, not ready) + Poll 2 (panel, ready 1) + Poll 3 (panel, ready 2 -> break) + 1 final read = 4 captures
+    expect(read("panel_captures").length).toBe(4);
   });
 
   it("dismisses the model-announcement banner before typing /usage, only when it is on screen", () => {

@@ -2874,11 +2874,24 @@ describe("quota MCP server", () => {
             extracted: c.extracted,
           }))
         );
-        // Every case but the clean read extracted no quota value, so its scrape
-        // outcome is failed (#982); only the capture failure has a parse_error.
         expect(store.listScrapeOutcomesSince("claude", baselineAt).map((s) => s.outcome)).toEqual([
           "parsed",
-          ...cases.map((c) => (c.name === "clean read" ? "parsed" : "failed")),
+          ...cases.map((c) => (c.parseError ? "failed" : "parsed")),
+        ]);
+      });
+
+      it("publishes failed for a scrape whose stored parsed state cannot be decoded", () => {
+        const at = "2026-10-09T18:00:00.000Z";
+        const id = store.recordRaw({ provider: "claude", scrapedAt: at, rawOutput: "" });
+        (
+          store as unknown as {
+            db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } };
+          }
+        ).db
+          .prepare("UPDATE quota_scrapes SET parsed_state = ? WHERE id = ?")
+          .run("invalid json", id);
+        expect(store.listScrapeOutcomesSince("claude", at)).toEqual([
+          { observedAt: at, outcome: "failed" },
         ]);
       });
     });

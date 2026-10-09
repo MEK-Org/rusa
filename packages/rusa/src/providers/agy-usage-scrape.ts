@@ -140,14 +140,21 @@ export function buildTmuxScript(
     'tmux -S "$SOCK" send-keys -t "$S" "/usage"',
     "sleep 1",
     'tmux -S "$SOCK" send-keys -t "$S" Enter',
-    // Wait up to ~36s for quota data to render (isAgyQuotaPanelReady). On a
-    // timeout the last frame is still captured; with no figure in it the read
-    // is reported as failed downstream.
+    "consec=0",
+    // Wait up to ~36s for quota data to render (isAgyQuotaPanelReady). Stable
+    // across 2 consecutive captures to guard against progressive repaints or
+    // transient partial frames. On a timeout the last frame is still captured;
+    // with no figure in it the read is reported as failed downstream.
     `for i in $(seq 1 ${t.panelTries}); do`,
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
-    `  printf "%s" "$scr" | grep -qE ${q(QUOTA_ROW)} \\`,
+    `  if printf "%s" "$scr" | grep -qE ${q(QUOTA_ROW)} \\`,
     `    && printf "%s" "$scr" | grep -qE ${q(QUOTA_VALUE)} \\`,
-    `    && ! printf "%s" "$scr" | grep -qiE ${q(QUOTA_LOADING)} && break`,
+    `    && ! printf "%s" "$scr" | grep -qiE ${q(QUOTA_LOADING)}; then`,
+    "    consec=$((consec + 1))",
+    '    [ "$consec" -ge 2 ] && break',
+    "  else",
+    "    consec=0",
+    "  fi",
     `  sleep ${t.pollSecs}`,
     "done",
     'tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true',
