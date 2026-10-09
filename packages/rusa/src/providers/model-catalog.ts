@@ -25,6 +25,13 @@ export interface ModelEntry {
    * set of supported effort levels.
    */
   efforts?: string[];
+  /**
+   * Antigravity only: the exact `agy models` slug each effort was folded from,
+   * keyed by that effort. The CLI rejects `--effort` for models it lists only
+   * as effort-suffixed slugs (#968), so these tiers launch as the slug itself.
+   * An effort absent here was learned from a display label and keeps `--effort`.
+   */
+  effortIdentifiers?: Record<string, string>;
 }
 
 export type ModelCommandLineField = keyof ModelEntry;
@@ -348,6 +355,12 @@ export function normalizeModelEntries(
 
       if (parsedEffort && existing.efforts && !existing.efforts.includes(parsedEffort)) {
         existing.efforts.push(parsedEffort);
+      }
+      if (match && parsedEffort) {
+        existing.effortIdentifiers = {
+          ...existing.effortIdentifiers,
+          [parsedEffort]: entry.identifier,
+        };
       }
     }
     return Array.from(baseModels.values());

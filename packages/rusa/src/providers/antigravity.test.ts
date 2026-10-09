@@ -18,7 +18,11 @@ import {
   AntigravityProvider,
   formatAgyToolInvocation,
 } from "./antigravity.js";
-import { clearProviderModelCatalog, setProviderModelCatalog } from "./model-catalog.js";
+import {
+  clearProviderModelCatalog,
+  parseAgyModelsOutput,
+  setProviderModelCatalog,
+} from "./model-catalog.js";
 import {
   RUN_CEILING_ABORT_REASON,
   STALL_WATCHDOG_ABORT_REASON,
@@ -104,12 +108,11 @@ describe("AntigravityProvider", () => {
         expect.stringContaining("test prompt"),
         "--dangerously-skip-permissions",
         "--model",
-        "gemini-3.1-pro",
-        "--effort",
-        "high",
+        "gemini-3.1-pro-high",
       ]),
       expect.objectContaining({ cwd: "/tmp" })
     );
+    expect(vi.mocked(spawn).mock.calls[0][1]).not.toContain("--effort");
   });
 
   it("rejects a required-effort model before launching agy when effort is missing", async () => {
@@ -135,7 +138,7 @@ describe("AntigravityProvider", () => {
   it.each([
     "Gemini 3.5 Flash (High)",
     "gemini-3.5-flash-high",
-  ])("canonicalizes matching tiered selector %s and mixed-case effort before launching agy", async (model) => {
+  ])("canonicalizes matching tiered selector %s and mixed-case effort to its listed slug", async (model) => {
     const provider = new AntigravityProvider(
       "antigravity",
       { cliCommand: "agy" },
@@ -153,12 +156,71 @@ describe("AntigravityProvider", () => {
     const args = vi.mocked(spawn).mock.calls[0][1];
     expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
       "--model",
-      "gemini-3.5-flash",
+      "gemini-3.5-flash-high",
     ]);
-    expect(args.slice(args.indexOf("--effort"), args.indexOf("--effort") + 2)).toEqual([
+    expect(args).not.toContain("--effort");
+  });
+
+  it("keeps --effort for a tier known only from a display label", async () => {
+    // The banked agy-model-entry.json shape: an unsuffixed slug whose label names the tier.
+    setProviderModelCatalog("agy", [
+      { identifier: "gemini-3.1-pro", displayLabel: "Gemini 3.1 Pro (High)", passable: true },
+    ]);
+    const provider = new AntigravityProvider(
+      "antigravity",
+      { cliCommand: "agy" },
+      "Gemini 3.1 Pro",
+      undefined,
+      "high"
+    );
+    const child = mockChildProcess();
+    vi.mocked(spawn).mockReturnValue(child as ChildProcessWithoutNullStreams);
+
+    const runPromise = provider.run({ prompt: "test prompt", cwd: "/tmp" });
+    setTimeout(() => child.emit("close", 0), 10);
+    await runPromise;
+
+    const args = vi.mocked(spawn).mock.calls[0][1];
+    expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 4)).toEqual([
+      "--model",
+      "gemini-3.1-pro",
       "--effort",
       "high",
     ]);
+  });
+
+  it("launches a tier listed only as an effort-suffixed slug as that slug, without --effort (#968)", async () => {
+    // Synthetic `agy models` rows in the shape the issue reports for this tier.
+    setProviderModelCatalog(
+      "agy",
+      parseAgyModelsOutput(
+        [
+          "gemini-3.8-flash-low\tGemini 3.8 Flash (Low)",
+          "gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)",
+          "gemini-3.8-flash-high\tGemini 3.8 Flash (High)",
+        ].join("\n")
+      )
+    );
+    const provider = new AntigravityProvider(
+      "antigravity",
+      { cliCommand: "agy" },
+      "gemini-3.8-flash",
+      undefined,
+      "low"
+    );
+    const child = mockChildProcess();
+    vi.mocked(spawn).mockReturnValue(child as ChildProcessWithoutNullStreams);
+
+    const runPromise = provider.run({ prompt: "test prompt", cwd: "/tmp" });
+    setTimeout(() => child.emit("close", 0), 10);
+    await runPromise;
+
+    const args = vi.mocked(spawn).mock.calls[0][1];
+    expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
+      "--model",
+      "gemini-3.8-flash-low",
+    ]);
+    expect(args).not.toContain("--effort");
   });
 
   it("rejects mismatched tiered display and explicit effort before launching agy", async () => {

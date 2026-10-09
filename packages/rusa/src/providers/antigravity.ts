@@ -149,6 +149,20 @@ export function resolveAntigravitySelection(
 }
 
 /**
+ * The argv selector for a canonical agy selection. A tier the catalog learned
+ * from an effort-suffixed slug launches as that slug without `--effort`, which
+ * current agy rejects for such models (#968); other selections pass through.
+ */
+export function antigravityLaunchSelector(selection: ModelEffortSelection): ModelEffortSelection {
+  if (!selection.model || !selection.effort) return selection;
+  const entry = getProviderModelCatalog("agy")?.find(
+    (candidate) => candidate.identifier === selection.model
+  );
+  const slug = entry?.effortIdentifiers?.[selection.effort];
+  return slug ? { model: slug } : selection;
+}
+
+/**
  * Extract agy's conversation id from a run's `--log-file`. agy logs it
  * deterministically at the *start* of every run (e.g.
  * `Print mode: conversation=<uuid>, sending message`), so this is race-free and
@@ -453,7 +467,9 @@ export class AntigravityProvider implements CodingProvider {
   async run(opts: RunOptions): Promise<RunResult> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const command = this.config.cliCommand ?? "agy";
-    const selection = resolveAntigravitySelection(this.model, this.effort);
+    const selection = antigravityLaunchSelector(
+      resolveAntigravitySelection(this.model, this.effort)
+    );
     // The sandbox overlays the CLI's shared conversations path with this
     // actor-owned directory. Read it from the same host path so resume, quota
     // classification, and token accounting observe the sandboxed invocation.

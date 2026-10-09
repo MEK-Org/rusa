@@ -3,7 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
-import { buildAntigravityArgs, resolveAntigravitySelection } from "./antigravity.js";
+import {
+  antigravityLaunchSelector,
+  buildAntigravityArgs,
+  resolveAntigravitySelection,
+} from "./antigravity.js";
 import {
   CODEX_MODELS_CACHE_MAX_AGE_MS,
   CODEX_MODELS_CACHE_MAX_FUTURE_SKEW_MS,
@@ -254,7 +258,7 @@ describe("populateModelCatalogsFromDb", () => {
     expect(() => validateModelPin("codex", "bad-model")).toThrow();
   });
 
-  it("restores a raw tiered agy entry and emits the exact canonical argv selector pair", () => {
+  it("restores a raw tiered agy entry, keeps the canonical pair, and launches its listed slug", () => {
     const mockRepo = {
       listLatestForEachProvider: () =>
         new Map([
@@ -278,24 +282,74 @@ describe("populateModelCatalogsFromDb", () => {
         identifier: "gemini-3.5-flash",
         passable: true,
         efforts: ["high"],
+        effortIdentifiers: { high: "gemini-3.5-flash-high" },
       },
     ]);
 
     const selection = resolveAntigravitySelection("Gemini 3.5 Flash", "high");
+    expect(selection).toEqual({ model: "gemini-3.5-flash", effort: "high" });
+    const launch = antigravityLaunchSelector(selection);
     const args = buildAntigravityArgs({
       prompt: "hi",
-      model: selection.model,
-      effort: selection.effort,
+      model: launch.model,
+      effort: launch.effort,
       timeoutMs: 60_000,
     });
-    const iModel = args.indexOf("--model");
-    const iEffort = args.indexOf("--effort");
-    expect(args.slice(iModel, iEffort + 2)).toEqual([
+    expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
       "--model",
-      "gemini-3.5-flash",
-      "--effort",
-      "high",
+      "gemini-3.5-flash-high",
     ]);
+    expect(args).not.toContain("--effort");
+  });
+});
+
+describe("effort-suffixed agy slugs (#968)", () => {
+  // Synthetic `agy models` rows in the shape the issue reports.
+  const flashRows = [
+    "gemini-3.8-flash-low\tGemini 3.8 Flash (Low)",
+    "gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)",
+    "gemini-3.8-flash-high\tGemini 3.8 Flash (High)",
+  ].join("\n");
+
+  it("records the listed slug for each folded effort without changing the canonical entry", () => {
+    setProviderModelCatalog("agy", parseAgyModelsOutput(flashRows));
+    expect(getProviderModelCatalog("agy")).toEqual([
+      {
+        identifier: "gemini-3.8-flash",
+        displayLabel: "Gemini 3.8 Flash",
+        passable: true,
+        efforts: ["low", "medium", "high"],
+        effortIdentifiers: {
+          low: "gemini-3.8-flash-low",
+          medium: "gemini-3.8-flash-medium",
+          high: "gemini-3.8-flash-high",
+        },
+      },
+    ]);
+  });
+
+  it("keeps selection resolution canonical and launches the suffixed slug", () => {
+    setProviderModelCatalog("agy", parseAgyModelsOutput(flashRows));
+    expect(() => resolveAntigravitySelection("gemini-3.8-flash")).toThrow(
+      'invalid model selection: model "gemini-3.8-flash" requires an effort but none was provided'
+    );
+    const selection = resolveAntigravitySelection("gemini-3.8-flash-low");
+    expect(selection).toEqual({ model: "gemini-3.8-flash", effort: "low" });
+    expect(antigravityLaunchSelector(selection)).toEqual({ model: "gemini-3.8-flash-low" });
+    expect(
+      antigravityLaunchSelector(resolveAntigravitySelection("Gemini 3.8 Flash", "MEDIUM"))
+    ).toEqual({ model: "gemini-3.8-flash-medium" });
+  });
+
+  it("passes through a tier known only from a display label, and provider defaults", () => {
+    setProviderModelCatalog("agy", [
+      { identifier: "gemini-3.1-pro", displayLabel: "Gemini 3.1 Pro (High)", passable: true },
+    ]);
+    const selection = resolveAntigravitySelection("Gemini 3.1 Pro", "high");
+    expect(selection).toEqual({ model: "gemini-3.1-pro", effort: "high" });
+    expect(antigravityLaunchSelector(selection)).toEqual(selection);
+    expect(antigravityLaunchSelector({ effort: "low" })).toEqual({ effort: "low" });
+    expect(antigravityLaunchSelector({})).toEqual({});
   });
 });
 
@@ -373,6 +427,7 @@ describe("validateModelPin", () => {
         identifier: "gemini-3.1-pro",
         passable: true,
         efforts: ["high"],
+        effortIdentifiers: { high: "gemini-3.1-pro-high" },
       },
     ]);
     // clear resolves the reverse
@@ -435,6 +490,7 @@ describe("validateModelPin", () => {
         displayLabel: "Custom Flash 3.7",
         passable: true,
         efforts: ["high"],
+        effortIdentifiers: { high: "gemini-3.7-flash-high" },
       },
     ]);
   });
