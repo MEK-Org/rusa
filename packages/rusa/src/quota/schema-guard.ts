@@ -6,11 +6,11 @@ import type Database from "better-sqlite3";
  * adds `quota_observations.model_scope` to the observation and controller
  * identity (#588), so a model-scoped window keeps its own PID history.
  *
- * Purely additive changes do not bump it. The #536 parser-wording revision
- * tables and the nullable `quota_scrapes.parser_wording_revision_id` column are
- * ignored by a pre-change binary, which refuses any newer version outright, so
- * leaving the version alone is what lets that binary keep reading and writing
- * an upgraded database.
+ * Schema changes are applied by the migrations in `./migrations/`. Purely
+ * additive ones do not bump this version: a pre-change binary refuses any newer
+ * version outright but ignores tables and columns it does not know, so leaving
+ * the version alone is what lets it keep reading and writing an upgraded
+ * database. `0002_parser_wording_revisions` (#536) is one such change.
  */
 export const QUOTA_SCHEMA_VERSION = 3;
 

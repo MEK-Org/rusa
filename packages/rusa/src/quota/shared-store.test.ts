@@ -80,6 +80,7 @@ describe("SharedQuotaStore schema v2 migration", () => {
             .all() as Array<{ name: string }>
         ).map((row) => row.name)
       ).toEqual([
+        "_migrations",
         "quota_manual_observation_receipts",
         "quota_observations",
         "quota_parser_wording_revisions",
@@ -624,6 +625,7 @@ describe("SharedQuotaStore canonical observations", () => {
             .all() as Array<{ name: string }>
         ).map((row) => row.name)
       ).toEqual([
+        "_migrations",
         "quota_manual_observation_receipts",
         "quota_observations",
         "quota_parser_wording_revisions",
@@ -1150,6 +1152,7 @@ describe("SharedQuotaStore persisted controller", () => {
             .all() as Array<{ name: string }>
         ).map((row) => row.name)
       ).toEqual([
+        "_migrations",
         "quota_manual_observation_receipts",
         "quota_observations",
         "quota_parser_wording_revisions",

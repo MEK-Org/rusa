@@ -21,6 +21,7 @@ import {
   type QuotaObservationResult,
 } from "./coordinator-metrics.js";
 import type { PublishedScrapeOutcome } from "./coordinator-protocol.js";
+import { runQuotaMigrations } from "./migrations/runner.js";
 import { configuredModelRefs, resolveWindowModels } from "./model-window-scope.js";
 import { parseParsedState, serializeParsedState } from "./parsed-state.js";
 import {
@@ -580,154 +581,8 @@ export class SharedQuotaStore {
   }
 
   private ensureSchema(): void {
-    const migrate = this.db.transaction(() => {
-      const rawVersion = this.db.pragma("user_version", { simple: true });
-      const currentVersion = typeof rawVersion === "number" ? rawVersion : Number(rawVersion ?? 0);
-      this.addModelScopeInTransaction();
-      this.db.exec(`
-      CREATE TABLE IF NOT EXISTS quota_scrapes (
-        id TEXT PRIMARY KEY,
-        provider TEXT NOT NULL,
-        scraped_at TEXT NOT NULL,
-        raw_output TEXT NOT NULL,
-        parsed_state TEXT,
-        parse_error TEXT,
-        parser_wording_revision_id TEXT
-      );
-      CREATE INDEX IF NOT EXISTS idx_shared_quota_scrapes_provider_time
-        ON quota_scrapes(provider, scraped_at);
-      CREATE INDEX IF NOT EXISTS idx_shared_quota_scrapes_time
-        ON quota_scrapes(scraped_at);
-
-      CREATE TABLE IF NOT EXISTS quota_observations (
-        provider TEXT NOT NULL,
-        model_scope TEXT NOT NULL DEFAULT '',
-        kind TEXT NOT NULL,
-        observed_slot INTEGER NOT NULL,
-        label TEXT NOT NULL,
-        observed_at TEXT NOT NULL,
-        percent_left REAL NOT NULL,
-        reset_at_iso TEXT,
-        window_ms INTEGER NOT NULL,
-        processed INTEGER NOT NULL DEFAULT 0,
-        controller_error REAL,
-        controller_derivative REAL,
-        controller_integral REAL,
-        uncapped_interval_seconds REAL,
-        interval_seconds REAL,
-        PRIMARY KEY(provider, model_scope, kind, observed_slot)
-      );
-      CREATE INDEX IF NOT EXISTS idx_quota_observations_provider_time
-        ON quota_observations(provider, observed_at);
-      CREATE INDEX IF NOT EXISTS idx_quota_observations_observed_at
-        ON quota_observations(observed_at);
-      CREATE INDEX IF NOT EXISTS idx_quota_observations_scope_kind_time
-        ON quota_observations(provider, model_scope, kind, observed_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_quota_observations_scope_reasoned
-        ON quota_observations(provider, model_scope, kind, observed_at DESC)
-        WHERE interval_seconds IS NOT NULL;
-      CREATE TABLE IF NOT EXISTS quota_provider_reading_modes (
-        provider TEXT PRIMARY KEY,
-        mode TEXT NOT NULL CHECK (mode IN ('manual', 'scrape')),
-        generation INTEGER NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS quota_manual_observation_receipts (
-        provider TEXT NOT NULL,
-        idempotency_key TEXT NOT NULL,
-        generation INTEGER NOT NULL,
-        request_fingerprint TEXT NOT NULL,
-        observed_at TEXT NOT NULL,
-        accepted_at TEXT NOT NULL,
-        PRIMARY KEY(provider, idempotency_key)
-      );
-      CREATE TABLE IF NOT EXISTS quota_parser_wording_revisions (
-        id TEXT PRIMARY KEY,
-        provider TEXT NOT NULL,
-        wording TEXT NOT NULL
-      );
-    `);
-      this.ensureColumnsInTransaction();
-      if (currentVersion < QUOTA_SCHEMA_VERSION) {
-        this.db.pragma(`user_version = ${QUOTA_SCHEMA_VERSION}`);
-      }
-    });
-    migrate.immediate();
+    runQuotaMigrations(this.db);
     this.registerBuiltInParserWording();
-  }
-
-  /**
-   * Schema version 3 (#588): move `model_scope` into the observation key. A
-   * primary key cannot be altered in place, so a pre-v3 table is rebuilt with
-   * every row copied as provider-wide (`''`) — before v3 the store rejected
-   * every model-scoped window, so that is exactly what each row was. The old
-   * table's `(provider, kind)` indexes go with it and the schema block below
-   * recreates the scope-aware ones. A database already carrying the column,
-   * or with no observation table yet, is left alone.
-   */
-  private addModelScopeInTransaction(): void {
-    const columns = (
-      this.db.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>
-    ).map((column) => column.name);
-    if (columns.length === 0 || columns.includes("model_scope")) return;
-    if (!columns.includes("controller_integral")) {
-      this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
-    }
-    this.db.exec(`
-      CREATE TABLE quota_observations_v3 (
-        provider TEXT NOT NULL,
-        model_scope TEXT NOT NULL DEFAULT '',
-        kind TEXT NOT NULL,
-        observed_slot INTEGER NOT NULL,
-        label TEXT NOT NULL,
-        observed_at TEXT NOT NULL,
-        percent_left REAL NOT NULL,
-        reset_at_iso TEXT,
-        window_ms INTEGER NOT NULL,
-        processed INTEGER NOT NULL DEFAULT 0,
-        controller_error REAL,
-        controller_derivative REAL,
-        controller_integral REAL,
-        uncapped_interval_seconds REAL,
-        interval_seconds REAL,
-        PRIMARY KEY(provider, model_scope, kind, observed_slot)
-      );
-      INSERT INTO quota_observations_v3
-        (provider, model_scope, kind, observed_slot, label, observed_at, percent_left,
-         reset_at_iso, window_ms, processed, controller_error, controller_derivative,
-         controller_integral, uncapped_interval_seconds, interval_seconds)
-      SELECT provider, '', kind, observed_slot, label, observed_at, percent_left,
-             reset_at_iso, window_ms, processed, controller_error, controller_derivative,
-             controller_integral, uncapped_interval_seconds, interval_seconds
-      FROM quota_observations ORDER BY rowid;
-      DROP TABLE quota_observations;
-      ALTER TABLE quota_observations_v3 RENAME TO quota_observations;
-    `);
-  }
-
-  /**
-   * `CREATE TABLE IF NOT EXISTS` is a no-op against a database created before a
-   * column existed, so widen those tables in place. The shared quota database is
-   * opened directly by every instance rather than through the instance migration
-   * runner, so its schema has to evolve here.
-   */
-  private ensureColumnsInTransaction(): void {
-    const columns = new Set(
-      (
-        this.db.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>
-      ).map((column) => column.name)
-    );
-    if (!columns.has("controller_integral")) {
-      this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
-    }
-    const scrapeColumns = new Set(
-      (this.db.prepare("PRAGMA table_info(quota_scrapes)").all() as Array<{ name: string }>).map(
-        (column) => column.name
-      )
-    );
-    if (!scrapeColumns.has("parser_wording_revision_id")) {
-      this.db.exec("ALTER TABLE quota_scrapes ADD COLUMN parser_wording_revision_id TEXT");
-    }
   }
 
   /**
