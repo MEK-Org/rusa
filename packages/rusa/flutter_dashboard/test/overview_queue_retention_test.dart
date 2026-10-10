@@ -487,6 +487,99 @@ void main() {
         expect(api.fetchObligationForestCalls, hasLength(forestRequests));
       });
     });
+
+    testWidgets('a row an Overview refresh no longer finds shows its current '
+        'copy in Work and its detail, never the old forest row', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(2400, 1600);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.runAsync(() async {
+        final api = _populatedApi()
+          ..obligationsResult = [
+            for (final o in _populatedApi().obligationsResult)
+              _stamped(o, '2026-10-10T12:00:00.000Z'),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Row(
+                children: [
+                  Expanded(child: OverviewTab(store: store)),
+                  Expanded(
+                    child: WorkTab(store: store, onSelectView: (_) {}),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        Finder inWork(String text) => find.descendant(
+          of: find.byType(WorkTab),
+          matching: find.text(text),
+        );
+        Finder inOverview(String text) => find.descendant(
+          of: find.byType(OverviewTab),
+          matching: find.text(text),
+        );
+        await tester.tap(inWork('Ready decision'));
+        await tester.pump();
+        await tester.pump();
+        // The row and its open detail.
+        expect(inWork('Ready decision'), findsNWidgets(2));
+        expect(inOverview('Ready decision'), findsOneWidget);
+        expect(inWork('Waiting decision'), findsOneWidget);
+        final forestRequests = api.fetchObligationForestCalls.length;
+
+        // Reassigned elsewhere and reworded: no viewer queue page returns it,
+        // so only its detail can say where it went.
+        api.obligationsResult = _replacingReady(
+          api,
+          _stamped(
+            makeObligation(
+              'ob-ready',
+              ownerId: 'worker-9',
+              intent: 'Handed off decision',
+            ),
+            '2026-10-10T12:00:05.000Z',
+          ),
+        );
+        // And the waiting row was deleted outright.
+        api
+          ..obligationsResult = [
+            for (final o in api.obligationsResult)
+              if (o.id != 'ob-waiting') o,
+          ]
+          ..deletedObligationIds = {'ob-waiting'};
+        await tester.tap(
+          find.descendant(
+            of: find.byType(OverviewTab),
+            matching: find.byTooltip('Refresh Queue'),
+          ),
+        );
+        for (var i = 0; i < 3; i++) {
+          await Future<void>.delayed(Duration.zero);
+          await tester.pump();
+        }
+        expect(inOverview('Ready decision'), findsNothing);
+        expect(inOverview('Handed off decision'), findsNothing);
+        expect(inWork('Ready decision'), findsNothing);
+        expect(inWork('Handed off decision'), findsNWidgets(2));
+        expect(store.obligations['ob-ready']!.ownerId, 'worker-9');
+        // Only the server's "not found" takes a row out of Work.
+        expect(inWork('Waiting decision'), findsNothing);
+        expect(inOverview('Waiting decision'), findsNothing);
+        // The rest of Work's forest is untouched.
+        expect(store.obligations['ob-blocker'], isNotNull);
+        expect(api.fetchObligationForestCalls, hasLength(forestRequests));
+      });
+    });
   });
 
   group('DashboardStore', () {
@@ -765,8 +858,8 @@ void main() {
       },
     );
 
-    test('a response an event overtook shows its rows but neither evicts nor '
-        'persists', () async {
+    test('a response an event overtook shows its rows but neither marks rows '
+        'absent nor persists', () async {
       final cache = FakeObligationsCache();
       final api = _populatedApi();
       final stream = FakeStream();
@@ -805,7 +898,7 @@ void main() {
       held.complete();
       await pumpEventQueue();
       // The held page lacks `ob-late`, but the event may be why: it stays.
-      expect(store.obligations['ob-late'], isNotNull);
+      expect(_readyIntents(store), contains('Late arrival'));
       expect(store.obligationSync.freshnessOf(ready).stale, isTrue);
       expect(
         cache.loadEntities(scope: _scope, principalId: testUserPrincipalId),
@@ -903,90 +996,154 @@ void main() {
       },
     );
 
-    test('a partial page evicts only rows ordered before its last', () {
+    test('a page marks what it left out absent from its query alone, and '
+        'keeps the obligation for every other view', () {
       final store = ObligationStore();
       addTearDown(store.close);
+      final a = readyRow('a', 1);
+      final c = readyRow('c', 3);
       final waiting = makeObligation('w', ownerId: owner, status: 'waiting');
-      final elsewhere = readyRow('x', 0);
-      store.upsert([
-        readyRow('a', 1),
-        readyRow('b', 2),
-        readyRow('c', 3),
-        waiting,
-        ObligationDto.fromJson({...elsewhere.toJson(), 'ownerId': 'someone'}),
-      ]);
+      final elsewhere = ObligationDto.fromJson({
+        ...readyRow('x', 0).toJson(),
+        'ownerId': 'someone',
+      });
+      store.upsert([a, readyRow('b', 2), c, waiting, elsewhere]);
 
-      store.applyPage(
+      final missing = store.applyPage(
         ready,
         ObligationPage(
           obligations: [readyRow('b', 2)],
           total: 3,
           hasMore: true,
         ),
-        evict: true,
+        reconcile: true,
       );
       // `a` sorts before the page's last row, so the server would have
       // returned it; `c` lies past the page and is left alone.
-      expect(store['a'], isNull);
+      expect(missing, ['a']);
       expect(store.current.select(ready).map((o) => o.id), ['b', 'c']);
+      expect(store['a'], same(a));
       expect(store['w'], same(waiting));
-      expect(store['x'], isNotNull);
+      expect(store['x'], same(elsewhere));
 
-      store.applyPage(
-        ready,
-        ObligationPage(
-          obligations: [readyRow('b', 2)],
-          total: 1,
-          hasMore: false,
+      expect(
+        store.applyPage(
+          ready,
+          ObligationPage(
+            obligations: [readyRow('b', 2)],
+            total: 1,
+            hasMore: false,
+          ),
+          reconcile: false,
         ),
-        evict: false,
+        isEmpty,
       );
-      expect(store['c'], isNotNull);
+      expect(store.current.select(ready).map((o) => o.id), ['b', 'c']);
 
-      store.applyPage(
-        ready,
-        ObligationPage(
-          obligations: [readyRow('b', 2)],
-          total: 1,
-          hasMore: false,
+      expect(
+        store.applyPage(
+          ready,
+          ObligationPage(
+            obligations: [readyRow('b', 2)],
+            total: 1,
+            hasMore: false,
+          ),
+          reconcile: true,
         ),
-        evict: true,
+        unorderedEquals(['a', 'c']),
       );
       expect(store.current.select(ready).map((o) => o.id), ['b']);
-      expect(store['w'], same(waiting));
-      expect(store['x'], isNotNull);
+      expect(store['a'], same(a));
+      expect(store['c'], same(c));
+      expect(store.current.deleted, isEmpty);
     });
 
-    test('an empty partial page evicts nothing', () {
+    test('an empty partial page marks nothing absent', () {
       final store = ObligationStore();
       addTearDown(store.close);
       store.upsert([readyRow('a', 1)]);
-      store.applyPage(
-        ready,
-        const ObligationPage(obligations: [], total: 4, hasMore: true),
-        evict: true,
+      expect(
+        store.applyPage(
+          ready,
+          const ObligationPage(obligations: [], total: 4, hasMore: true),
+          reconcile: true,
+        ),
+        isEmpty,
       );
-      expect(store['a'], isNotNull);
+      expect(store.current.select(ready).single.id, 'a');
     });
 
-    test('a strictly older row never overwrites a newer one', () {
+    test('absence lifts only for a newer copy, a detail read, or a page of '
+        'the query that shows the obligation again', () {
       final store = ObligationStore();
       addTearDown(store.close);
-      final newer = _stamped(readyRow('a', 1), '2026-10-10T12:00:01.000Z');
-      store.upsert([newer]);
-      store.upsert([_stamped(readyRow('a', 9), '2026-10-10T12:00:00.000Z')]);
-      expect(store['a'], same(newer));
+      final old = _stamped(readyRow('a', 1), '2026-10-10T12:00:00.000Z');
+      store.upsert([old]);
+      void markAbsent() => store.applyPage(
+        ready,
+        const ObligationPage(obligations: [], total: 0, hasMore: false),
+        reconcile: true,
+      );
+      List<String> shown() => [
+        for (final o in store.current.select(ready)) o.id,
+      ];
 
-      final sameStamp = _stamped(readyRow('a', 5), '2026-10-10T12:00:01.000Z');
-      store.upsert([sameStamp]);
-      expect(store['a'], same(sameStamp));
+      markAbsent();
+      expect(shown(), isEmpty);
+      // A re-read of the same write, as a later forest load returns, does not
+      // contradict the page.
+      store.upsert([_stamped(readyRow('a', 1), '2026-10-10T12:00:00.000Z')]);
+      expect(shown(), isEmpty);
+      store.upsert([_stamped(readyRow('a', 1), '2026-10-10T12:00:05.000Z')]);
+      expect(shown(), ['a']);
 
-      final unstamped = readyRow('a', 7);
-      store.upsert([unstamped]);
-      expect(store['a'], same(unstamped));
+      markAbsent();
+      store.applyDetail(store['a']!);
+      expect(shown(), ['a']);
+
+      markAbsent();
+      store.applyPage(
+        ready,
+        ObligationPage(obligations: [store['a']!], total: 1, hasMore: false),
+        reconcile: true,
+      );
+      expect(shown(), ['a']);
     });
 
-    test('blockers are recorded and dropped with their evicted row', () {
+    test('a detail read moves the obligation to the queries its current '
+        'fields name', () {
+      final store = ObligationStore();
+      addTearDown(store.close);
+      final waitingQuery = _query(owner, ObligationQueue.waiting);
+      final elsewhere = _query('someone', ObligationQueue.ready);
+      store.upsert([
+        _stamped(readyRow('a', 1), '2026-10-10T12:00:00.000Z'),
+        _stamped(readyRow('b', 2), '2026-10-10T12:00:00.000Z'),
+      ]);
+      store.applyPage(
+        ready,
+        const ObligationPage(obligations: [], total: 0, hasMore: false),
+        reconcile: true,
+      );
+
+      store.applyDetail(
+        _stamped(
+          makeObligation('a', ownerId: owner, status: 'waiting'),
+          '2026-10-10T12:00:03.000Z',
+        ),
+      );
+      store.applyDetail(
+        _stamped(
+          makeObligation('b', ownerId: 'someone', effectivePriority: 9),
+          '2026-10-10T12:00:03.000Z',
+        ),
+      );
+      expect(store.current.select(ready), isEmpty);
+      expect(store.current.select(waitingQuery).single.id, 'a');
+      expect(store.current.select(elsewhere).single.effectivePriority, 9);
+    });
+
+    test('only a deletion removes an obligation, with its blockers', () {
       final store = ObligationStore();
       addTearDown(store.close);
       final waitingQuery = _query(owner, ObligationQueue.waiting);
@@ -998,10 +1155,36 @@ void main() {
       store.applyPage(
         waitingQuery,
         const ObligationPage(obligations: [], total: 0, hasMore: false),
-        evict: true,
+        reconcile: true,
       );
+      expect(store['w'], isNotNull);
+      expect(store.current.blockersOf('w')!.single.id, 'b1');
+
+      store.delete('w');
       expect(store['w'], isNull);
       expect(store.current.blockers, isEmpty);
+      expect(store.current.absent, isEmpty);
+      expect(store.current.deleted, {'w'});
+      expect(store['b1'], isNotNull);
+    });
+
+    test('a strictly older row never overwrites a newer one', () {
+      final store = ObligationStore();
+      addTearDown(store.close);
+      final newer = _stamped(readyRow('a', 1), '2026-10-10T12:00:01.000Z');
+      store.upsert([newer]);
+      store.upsert([_stamped(readyRow('a', 9), '2026-10-10T12:00:00.000Z')]);
+      expect(store['a'], same(newer));
+      store.applyDetail(_stamped(readyRow('a', 9), '2026-10-10T12:00:00.000Z'));
+      expect(store['a'], same(newer));
+
+      final sameStamp = _stamped(readyRow('a', 5), '2026-10-10T12:00:01.000Z');
+      store.upsert([sameStamp]);
+      expect(store['a'], same(sameStamp));
+
+      final unstamped = readyRow('a', 7);
+      store.upsert([unstamped]);
+      expect(store['a'], same(unstamped));
     });
   });
 
@@ -1073,6 +1256,114 @@ void main() {
       sync.statusesChanged(const {});
       expect(sync.freshnessOf(query).stale, isTrue);
       expect(dropped, 1);
+    });
+
+    test('a row a settled page left out is read in detail: its current copy '
+        'replaces it, not found deletes it, a failure keeps it', () async {
+      const viewer = testUserPrincipalId;
+      const before = '2026-10-10T12:00:00.000Z';
+      const after = '2026-10-10T12:00:05.000Z';
+      ObligationDto row(String id, {String owner = viewer, String? intent}) =>
+          _stamped(makeObligation(id, ownerId: owner, intent: intent), before);
+      final api = FakeApi(base: Uri.parse(_scope))
+        ..obligationsResult = [
+          row('handed-off'),
+          row('closed'),
+          row('deleted'),
+          row('unreadable'),
+          row('kept'),
+          row('unrelated', owner: 'worker-1'),
+        ];
+      final store = ObligationStore();
+      final sync = ObligationSync(api: api, store: store);
+      addTearDown(store.close);
+      addTearDown(sync.close);
+      // Work's forest load put every row in the store; Overview's first page
+      // showed the viewer's.
+      store.upsert(api.obligationsResult);
+      await sync.refresh([query]);
+      expect(store.current.select(query), hasLength(5));
+      final unreadable = store['unreadable'];
+      final unrelated = store['unrelated'];
+
+      api
+        ..obligationsResult = [
+          _stamped(
+            makeObligation(
+              'handed-off',
+              ownerId: 'worker-9',
+              intent: 'Handed off',
+            ),
+            after,
+          ),
+          _stamped(
+            makeObligation('closed', ownerId: viewer, status: 'done'),
+            after,
+          ),
+          _stamped(
+            makeObligation('unreadable', ownerId: viewer, status: 'done'),
+            after,
+          ),
+          row('kept'),
+          row('unrelated', owner: 'worker-1'),
+        ]
+        ..deletedObligationIds = {'deleted'}
+        ..obligationDetailErrors = {'unreadable': StateError('offline')};
+      final detailsBefore = api.obligationDetailCallCount;
+      await sync.refresh([query]);
+
+      expect(store.current.select(query).map((o) => o.id), ['kept']);
+      // Reads were for the four rows the page left out, nothing else.
+      expect(api.obligationDetailCallCount - detailsBefore, 4);
+      expect(store['handed-off']!.ownerId, 'worker-9');
+      expect(store['handed-off']!.intent, 'Handed off');
+      expect(store['closed']!.status, 'done');
+      expect(store['deleted'], isNull);
+      expect(store.current.deleted, {'deleted'});
+      // A failed read proves nothing: the copy stays for every other view,
+      // and only the page's query leaves it out.
+      expect(store['unreadable'], same(unreadable));
+      expect(store['unrelated'], same(unrelated));
+
+      api.obligationDetailErrors = {};
+      await sync.refresh([query]);
+      expect(store['unreadable']!.status, 'done');
+      expect(store.current.select(query).map((o) => o.id), ['kept']);
+    });
+
+    test('a row whose new priority put it past the first page comes back in '
+        'its new place', () async {
+      const viewer = testUserPrincipalId;
+      ObligationDto row(String id, double priority, String at) => _stamped(
+        makeObligation(id, ownerId: viewer, effectivePriority: priority),
+        at,
+      );
+      const before = '2026-10-10T12:00:00.000Z';
+      final api = FakeApi(base: Uri.parse(_scope))
+        ..obligationPageLimit = 2
+        ..obligationsResult = [
+          row('a', 1, before),
+          row('b', 2, before),
+          row('c', 3, before),
+        ];
+      final store = ObligationStore();
+      final sync = ObligationSync(api: api, store: store);
+      addTearDown(store.close);
+      addTearDown(sync.close);
+      store.upsert(api.obligationsResult);
+      await sync.refresh([query]);
+      expect(store.current.select(query).map((o) => o.id), ['a', 'b', 'c']);
+
+      // `a` was reprioritised: its cached priority still sorts it first, so
+      // the first page's absence is all the client sees.
+      api.obligationsResult = [
+        row('b', 2, before),
+        row('c', 3, before),
+        row('a', 9, '2026-10-10T12:00:05.000Z'),
+      ];
+      await sync.refresh([query]);
+      expect(store.current.select(query).map((o) => o.id), ['b', 'c', 'a']);
+      expect(store['a']!.effectivePriority, 9);
     });
   });
 

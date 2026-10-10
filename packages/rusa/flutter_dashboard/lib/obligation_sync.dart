@@ -237,17 +237,46 @@ class ObligationSync {
     }
     if (!current()) return;
     // A response a change overtook still shows what it found, but only the
-    // follow-up may drop rows or be persisted: the change may be what it
-    // is missing.
+    // follow-up may mark rows absent or be persisted: the change may be what
+    // it is missing.
     final settled = startedAt == (_versions[q] ?? 0);
-    _store.applyPage(q, page, evict: settled);
+    final missing = _store.applyPage(q, page, reconcile: settled);
     _set(q, QueryFreshness(known: true, stale: !settled, fetchedAt: _now()));
     if (settled) onSettled?.call();
-    if (q.queue == ObligationQueue.waiting) {
-      await _readBlockers(page.obligations, current);
-      if (current() && startedAt == (_versions[q] ?? 0)) onSettled?.call();
+    await Future.wait([
+      _readMissing(missing, current),
+      if (q.queue == ObligationQueue.waiting)
+        _readBlockers(page.obligations, current),
+    ]);
+    final readMore = missing.isNotEmpty || q.queue == ObligationQueue.waiting;
+    if (readMore && current() && startedAt == (_versions[q] ?? 0)) {
+      onSettled?.call();
     }
   }
+
+  /// Reads the detail of each obligation a page left out, since absence from
+  /// one query says neither that it is gone nor where it went: the detail's
+  /// copy replaces the stored one, and only "not found" removes it. Any other
+  /// failure keeps the stored copy, still absent from the page's query.
+  Future<void> _readMissing(List<String> ids, bool Function() current) =>
+      Future.wait(
+        ids.map(
+          (id) => _api
+              .fetchObligationDetail(id)
+              .then(
+                (d) {
+                  if (current()) _store.applyDetail(d.obligation);
+                },
+                onError: (Object e) {
+                  if (current() &&
+                      e is DashboardApiException &&
+                      e.status == 404) {
+                    _store.delete(id);
+                  }
+                },
+              ),
+        ),
+      );
 
   /// Reads each waiting row's blocking children after the rows are shown; a
   /// failed detail leaves that row as it was for the next refresh.

@@ -352,14 +352,25 @@ class _WorkTabState extends State<WorkTab> {
   }
 
   /// The tree's shape comes from the last forest load; each row shows the
-  /// shared store's copy of its obligation when it holds one, so a refresh
-  /// behind another view updates the row (#992).
-  ObligationDto _latest(ObligationDto loaded) =>
-      widget.store.obligations[loaded.id] ?? loaded;
+  /// shared store's copy of its obligation, so a refresh behind another view
+  /// updates the row (#992). Every load writes its rows to the store first,
+  /// so the loaded copy only shows where it is the later write, as a forest
+  /// replayed from its own capture can be.
+  ObligationDto _latest(ObligationDto loaded) {
+    final shared = widget.store.obligations[loaded.id];
+    return shared != null && ObligationStore.isCurrent(shared, than: loaded)
+        ? shared
+        : loaded;
+  }
+
+  /// The server said this obligation no longer exists.
+  bool _deleted(ObligationDto loaded) =>
+      widget.store.obligations.current.deleted.contains(loaded.id);
 
   List<_FlatNode> _flattenTree(List<ObligationTreeDto> nodes, int depth) {
     final result = <_FlatNode>[];
     for (final node in nodes) {
+      if (_deleted(node.obligation)) continue;
       final obligation = _latest(node.obligation);
       // A terminal obligation still shows if it retains completion history —
       // the same "recurring, or ledger rows survived recurrence being turned
@@ -375,6 +386,7 @@ class _WorkTabState extends State<WorkTab> {
       final hasVisibleChildren = _showDone
           ? node.children.isNotEmpty
           : node.children
+                .where((c) => !_deleted(c.obligation))
                 .map((c) => _latest(c.obligation))
                 .any(
                   (c) =>
@@ -870,6 +882,8 @@ class _DetailViewState extends State<_DetailView> {
   /// children and dependency edges (#773).
   Set<String> _shownIds = const {};
 
+  StreamSubscription<ObligationDto?>? _sharedSub;
+
   DashboardStore get store => widget.store;
   ValueChanged<DashboardView> get onSelectView => widget.onSelectView;
 
@@ -887,6 +901,31 @@ class _DetailViewState extends State<_DetailView> {
     super.initState();
     _fetch(trackDetail: true);
     _checkpointSub = widget.store.obligationRefreshes.listen(_onRefresh);
+    _listenToShared();
+  }
+
+  /// Repaints when the shared store's copy of this obligation changes, so a
+  /// refresh behind another view updates the header (#992).
+  void _listenToShared() {
+    _sharedSub?.cancel();
+    _sharedSub = widget.store.obligations.entities
+        .map((e) => e.byId[widget.obligationId])
+        .distinct(identical)
+        .skip(1)
+        .listen((_) {
+          if (mounted) setState(() {});
+        });
+  }
+
+  /// [data] showing the shared store's copy of its obligation where that is
+  /// not an earlier write than the one the detail read.
+  ObligationDetailSnapshot _withShared(ObligationDetailSnapshot data) {
+    final shared = store.obligations[data.obligation.id];
+    return shared == null ||
+            identical(shared, data.obligation) ||
+            !ObligationStore.isCurrent(shared, than: data.obligation)
+        ? data
+        : data.withObligation(shared);
   }
 
   @override
@@ -895,6 +934,10 @@ class _DetailViewState extends State<_DetailView> {
     if (oldWidget.store != widget.store) {
       _checkpointSub?.cancel();
       _checkpointSub = widget.store.obligationRefreshes.listen(_onRefresh);
+    }
+    if (oldWidget.store != widget.store ||
+        oldWidget.obligationId != widget.obligationId) {
+      _listenToShared();
     }
     if (oldWidget.obligationId != widget.obligationId) {
       _shownIds = const {};
@@ -919,6 +962,7 @@ class _DetailViewState extends State<_DetailView> {
   @override
   void dispose() {
     _checkpointSub?.cancel();
+    _sharedSub?.cancel();
     _pendingRetry?.cancel();
     super.dispose();
   }
@@ -1057,6 +1101,7 @@ class _DetailViewState extends State<_DetailView> {
       if (!mounted || gen != _fetchGeneration) {
         throw StateError('Obligation detail fetch superseded or unmounted');
       }
+      store.obligations.applyDetail(data.obligation);
       _shownIds = _idsOf(data);
       setState(() {
         _history = data.history;
@@ -1134,6 +1179,7 @@ class _DetailViewState extends State<_DetailView> {
     future
         .then((data) {
           if (!mounted || gen != _fetchGeneration) return;
+          store.obligations.applyDetail(data.obligation);
           _shownIds = _idsOf(data);
           setState(() => _applyRefreshed(data));
         })
@@ -1183,7 +1229,7 @@ class _DetailViewState extends State<_DetailView> {
           return const Center(child: CircularProgressIndicator());
         }
 
-        final data = snapshot.data!;
+        final data = _withShared(snapshot.data!);
         final o = data.obligation;
 
         final description = Column(

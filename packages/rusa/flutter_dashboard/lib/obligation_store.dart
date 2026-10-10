@@ -51,10 +51,16 @@ class ObligationQuery {
   String toString() => 'ObligationQuery($key)';
 }
 
-/// What the store knows at one instant: every obligation it holds by id, and
-/// the blocking children of the obligations whose detail it has read.
+/// What the store knows at one instant: every obligation it holds by id, the
+/// blocking children of the obligations whose detail it has read, and what
+/// the server has said about membership and deletion.
 class ObligationEntities {
-  const ObligationEntities({this.byId = const {}, this.blockers = const {}});
+  const ObligationEntities({
+    this.byId = const {},
+    this.blockers = const {},
+    this.absent = const {},
+    this.deleted = const {},
+  });
 
   final Map<String, ObligationDto> byId;
 
@@ -62,9 +68,25 @@ class ObligationEntities {
   /// obligation without an entry has not had its blockers read.
   final Map<String, List<String>> blockers;
 
+  /// Per query, the obligations a settled page of it left out although the
+  /// store's copy still matches it. The page is the server's word that they
+  /// are not in the query, so [select] leaves them out; it says nothing about
+  /// what did change, so their content stays until a newer copy or a detail
+  /// read replaces it.
+  final Map<ObligationQuery, Set<String>> absent;
+
+  /// Obligations the server answered "not found" for. Only these are removed
+  /// from [byId].
+  final Set<String> deleted;
+
   /// The obligations [query] holds, in its order.
-  List<ObligationDto> select(ObligationQuery query) =>
-      byId.values.where(query.matches).toList()..sort(query.compare);
+  List<ObligationDto> select(ObligationQuery query) {
+    final left = absent[query] ?? const {};
+    return byId.values
+        .where((o) => query.matches(o) && !left.contains(o.id))
+        .toList()
+      ..sort(query.compare);
+  }
 
   /// The blocking children recorded for [id], or null if none were read.
   /// A child the store no longer holds is left out.
@@ -161,45 +183,68 @@ class ObligationStore {
   /// `updatedAt` is strictly later than the incoming one is kept, so a
   /// response that left the server before a change cannot undo it.
   void upsert(Iterable<ObligationDto> obligations) =>
-      _write((byId, _) => _upsertInto(byId, obligations));
+      _write((e) => _upsertInto(e, obligations));
 
-  /// Applies one page of [query] in server order. Its rows are upserted.
-  /// When [evict] is set, an obligation the store has under [query] that the
-  /// page left out is dropped, as long as the server would have ordered it
-  /// within the page: every one when the page is the whole query, and only
-  /// those ordered before its last row when more follow. Its current state is
-  /// unknown, so the store forgets it rather than keep it where it is not;
-  /// whatever sits past a partial page is left alone.
-  void applyPage(
+  /// Applies one page of [query] in server order and returns the obligations
+  /// it showed absent. Its rows are upserted, and are members of [query]
+  /// again. When [reconcile] is set, an obligation whose stored copy matches
+  /// [query] but which the page left out is marked absent from [query], as
+  /// long as the server would have ordered it within the page: every one
+  /// when the page is the whole query, and only those ordered before its last
+  /// row when more follow. Absence is no evidence of what changed, so the
+  /// store keeps the obligation for every other view and query; the caller
+  /// reads its detail to learn its current state ([applyDetail], [delete]).
+  /// Whatever sits past a partial page is left alone.
+  List<String> applyPage(
     ObligationQuery query,
     ObligationPage page, {
-    required bool evict,
-  }) => _write((byId, blockers) {
-    final rows = page.obligations;
-    if (evict) {
+    required bool reconcile,
+  }) {
+    final missing = <String>[];
+    _write((e) {
+      final rows = page.obligations;
       final returned = {for (final o in rows) o.id};
-      final last = page.hasMore && rows.isNotEmpty ? rows.last : null;
-      final stale = [
-        for (final o in byId.values)
+      final absent = {...?e.absent[query]}..removeAll(returned);
+      if (reconcile) {
+        // Matched against the stored copy, absent or not, so a detail read
+        // that failed last time is tried again.
+        final last = page.hasMore && rows.isNotEmpty ? rows.last : null;
+        for (final o in e.byId.values) {
           if (query.matches(o) &&
               !returned.contains(o.id) &&
-              (!page.hasMore || (last != null && query.compare(o, last) < 0)))
-            o.id,
-      ];
-      for (final id in stale) {
-        byId.remove(id);
-        blockers.remove(id);
+              (!page.hasMore || (last != null && query.compare(o, last) < 0))) {
+            missing.add(o.id);
+          }
+        }
+        absent.addAll(missing);
       }
-    }
-    _upsertInto(byId, rows);
+      e.absent[query] = absent;
+      _upsertInto(e, rows);
+    });
+    return missing;
+  }
+
+  /// Writes a detail read's copy of an obligation. It was read after any
+  /// page that marked it absent, so its own fields now decide which queries
+  /// hold it.
+  void applyDetail(ObligationDto obligation) => _write((e) {
+    _upsertInto(e, [obligation]);
+    _forgetAbsence(e, obligation.id);
+  });
+
+  /// The server answered "not found" for [id]: it is gone for every view.
+  void delete(String id) => _write((e) {
+    e.byId.remove(id);
+    e.blockers.remove(id);
+    _forgetAbsence(e, id);
+    e.deleted.add(id);
   });
 
   /// Records [children] as [id]'s blocking children and upserts them.
-  void setBlockers(String id, List<ObligationDto> children) =>
-      _write((byId, blockers) {
-        _upsertInto(byId, children);
-        blockers[id] = [for (final c in children) c.id];
-      });
+  void setBlockers(String id, List<ObligationDto> children) => _write((e) {
+    _upsertInto(e, children);
+    e.blockers[id] = [for (final c in children) c.id];
+  });
 
   /// Replaces everything the store holds, as on a change of viewer.
   void reset([ObligationEntities seed = const ObligationEntities()]) {
@@ -208,28 +253,47 @@ class ObligationStore {
 
   Future<void> close() => _entities.close();
 
-  void _write(
-    void Function(
-      Map<String, ObligationDto> byId,
-      Map<String, List<String>> blockers,
-    )
-    change,
-  ) {
+  void _write(void Function(_MutableEntities e) change) {
     if (_entities.isClosed) return;
     final before = _entities.value;
-    final byId = Map.of(before.byId);
-    final blockers = Map.of(before.blockers);
-    change(byId, blockers);
-    _entities.add(ObligationEntities(byId: byId, blockers: blockers));
+    final e = _MutableEntities(
+      Map.of(before.byId),
+      Map.of(before.blockers),
+      Map.of(before.absent),
+      Set.of(before.deleted),
+    );
+    change(e);
+    _entities.add(
+      ObligationEntities(
+        byId: e.byId,
+        blockers: e.blockers,
+        absent: {
+          for (final MapEntry(:key, :value) in e.absent.entries)
+            if (value.isNotEmpty) key: value,
+        },
+        deleted: e.deleted,
+      ),
+    );
   }
 
+  /// A strictly newer copy changed the obligation since any page marked it
+  /// absent, so its fields decide membership again.
   static void _upsertInto(
-    Map<String, ObligationDto> byId,
+    _MutableEntities e,
     Iterable<ObligationDto> obligations,
   ) {
     for (final o in obligations) {
-      final held = byId[o.id];
-      if (held == null || !_isNewer(held, than: o)) byId[o.id] = o;
+      final held = e.byId[o.id];
+      if (held != null && _isNewer(held, than: o)) continue;
+      e.byId[o.id] = o;
+      e.deleted.remove(o.id);
+      if (held == null || _isNewer(o, than: held)) _forgetAbsence(e, o.id);
+    }
+  }
+
+  static void _forgetAbsence(_MutableEntities e, String id) {
+    for (final MapEntry(key: q, value: ids) in e.absent.entries.toList()) {
+      if (ids.contains(id)) e.absent[q] = {...ids}..remove(id);
     }
   }
 
@@ -240,4 +304,17 @@ class ObligationStore {
     final other = DateTime.tryParse(than.updatedAt ?? '');
     return at != null && other != null && at.isAfter(other);
   }
+
+  /// Whether [a] was not written before [than]: the copy to show of two.
+  static bool isCurrent(ObligationDto a, {required ObligationDto than}) =>
+      !_isNewer(than, than: a);
+}
+
+class _MutableEntities {
+  _MutableEntities(this.byId, this.blockers, this.absent, this.deleted);
+
+  final Map<String, ObligationDto> byId;
+  final Map<String, List<String>> blockers;
+  final Map<ObligationQuery, Set<String>> absent;
+  final Set<String> deleted;
 }
