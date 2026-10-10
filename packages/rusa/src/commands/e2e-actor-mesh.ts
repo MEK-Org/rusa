@@ -1,12 +1,4 @@
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -129,40 +121,36 @@ interface ResolvedE2EInstance {
 }
 
 /**
- * Resolves an E2E instance: if `--resume` is explicitly set, or if an existing
- * `--root` is already complete and structurally resumable (as during watcher
- * restarts), reopens the existing instance without rewriting state; otherwise
- * provisions a fresh instance. If a non-empty directory is supplied that is
- * incomplete, fails fast with missing-requirement diagnostics rather than
- * silently attempting to re-provision in place.
+ * Resolves an E2E instance: reopens the existing root without rewriting state
+ * when `--resume` is set or when `--root` already holds a complete instance (as
+ * on an `am-up --watch` rerun); otherwise provisions a fresh one.
  */
 export function resolveE2EInstance(opts: ResolveE2EInstanceOptions): ResolvedE2EInstance {
-  // Provision OUTSIDE /tmp. Sandboxed workers run under bwrap with `--tmpfs /tmp`,
-  // which replaces /tmp with a fresh empty mount — so anything the instance puts
-  // under /tmp (the bare remote backing the loopback endpoint, the gitconfig with
-  // the clone `insteadOf`) would be invisible to a worker's own process, and the
-  // instance's own git-http-backend child processes need the bare remote to keep
-  // existing across the run. Rooting under $HOME keeps it ro-bound and visible, so
-  // a worker can clone the synthetic repo via the rewritten URL.
-  const runsDir = join(homedir(), E2E_RUNS_DIR_NAME);
-  mkdirSync(runsDir, { recursive: true });
   if (opts.resume && !opts.root) {
     throw new Error("--resume requires --root");
   }
-  const instanceRoot = opts.root ?? mkdtempSync(join(runsDir, "run-"));
-  const exists = existsSync(instanceRoot);
-  const isNonEmpty = exists && readdirSync(instanceRoot).length > 0;
-
-  if (isNonEmpty || opts.resume) {
-    const missing = missingResumeRequirements(instanceRoot);
-    if (missing.length > 0) {
-      throw new Error(`cannot resume E2E instance; missing: ${missing.join(", ")}`);
-    }
+  let instanceRoot = opts.root;
+  if (!instanceRoot) {
+    // Provision OUTSIDE /tmp. Sandboxed workers run under bwrap with `--tmpfs /tmp`,
+    // which replaces /tmp with a fresh empty mount — so anything the instance puts
+    // under /tmp (the bare remote backing the loopback endpoint, the gitconfig with
+    // the clone `insteadOf`) would be invisible to a worker's own process, and the
+    // instance's own git-http-backend child processes need the bare remote to keep
+    // existing across the run. Rooting under $HOME keeps it ro-bound and visible, so
+    // a worker can clone the synthetic repo via the rewritten URL.
+    const runsDir = join(homedir(), E2E_RUNS_DIR_NAME);
+    mkdirSync(runsDir, { recursive: true });
+    instanceRoot = mkdtempSync(join(runsDir, "run-"));
   }
-  const shouldResume = isNonEmpty || Boolean(opts.resume);
+  const resumed =
+    opts.resume === true ||
+    (opts.root !== undefined && missingResumeRequirements(instanceRoot).length === 0);
 
+  // Provision with the actor-mesh edges enabled: a root actor (agy, built-in
+  // charter) and a chat config (the real fields are unused — fakes are injected
+  // below — but their presence activates the chat MCP server + inbound path).
   const offset = opts.portOffset ?? 0;
-  const instance = shouldResume
+  const instance = resumed
     ? resumeE2EInstance(instanceRoot)
     : provisionE2EInstance({
         dashboardPort: 8083 + offset,
@@ -184,7 +172,30 @@ export function resolveE2EInstance(opts: ResolveE2EInstanceOptions): ResolvedE2E
         slack: opts.slack,
       });
 
-  return { instance, resumed: Boolean(shouldResume) };
+  return { instance, resumed };
+}
+
+/**
+ * The gitconfig stanza routing clones of `repo` to the loopback remote at `url`,
+ * or `null` when `gitconfig` already carries it. Keyed on the exact URL so a
+ * reused root gains the stanza when it was provisioned elsewhere (ab-context
+ * writes a filesystem-path rewrite) or under a different `--port-offset`.
+ */
+export function loopbackRewriteToAppend(
+  gitconfig: string,
+  url: string,
+  repo: string
+): string | null {
+  const header = `[url "${url}"]`;
+  if (gitconfig.split("\n").some((line) => line.trim() === header)) return null;
+  const separator = gitconfig === "" || gitconfig.endsWith("\n") ? "" : "\n";
+  return [
+    `${separator}${header}`,
+    `\tinsteadOf = https://github.com/${repo}`,
+    `\tinsteadOf = https://github.com/${repo}.git`,
+    `\tinsteadOf = git@github.com:${repo}.git`,
+    "",
+  ].join("\n");
 }
 
 /**
@@ -237,7 +248,7 @@ export async function runActorMeshE2EUp(opts: {
     process.exit(1);
   }
 
-  const { instance, resumed } = resolveE2EInstance({
+  const { instance } = resolveE2EInstance({
     root: opts.root,
     resume: opts.resume,
     portOffset: offset,
@@ -280,19 +291,13 @@ export async function runActorMeshE2EUp(opts: {
   try {
     // Resolve clones of the synthetic repo to the loopback endpoint, so a worker
     // that `git clone`s the GitHub URL transparently hits our throwaway origin.
-    if (!resumed) {
-      appendFileSync(
-        join(rootDir, "gitconfig"),
-        [
-          `[url "${gitRemoteServer.url}"]`,
-          `\tinsteadOf = https://github.com/${repo}`,
-          `\tinsteadOf = https://github.com/${repo}.git`,
-          `\tinsteadOf = git@github.com:${repo}.git`,
-          "",
-        ].join("\n"),
-        "utf8"
-      );
-    }
+    const gitconfigPath = join(rootDir, "gitconfig");
+    const rewrite = loopbackRewriteToAppend(
+      readFileSync(gitconfigPath, "utf8"),
+      gitRemoteServer.url,
+      repo
+    );
+    if (rewrite) appendFileSync(gitconfigPath, rewrite, "utf8");
     writeFileSync(join(rootDir, PID_FILE), String(process.pid), "utf8");
   } catch (err) {
     process.removeListener("exit", closeGitOnExit);

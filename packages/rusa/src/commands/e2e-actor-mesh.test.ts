@@ -7,6 +7,7 @@ import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import {
   createDashboardE2EQuotaApi,
+  loopbackRewriteToAppend,
   resolveE2EInstance,
   startChatControlServer,
   startRootControlServer,
@@ -320,13 +321,37 @@ describe("resolveE2EInstance", () => {
       "preserve across watcher restart\n"
     );
   });
+});
 
-  it("fails fast with missing-requirement diagnostics when given a nonempty incomplete root", () => {
-    root = mkdtempSync(join(TEST_TMPDIR, "e2e-resolve-incomplete-"));
-    writeFileSync(join(root, "scratch.txt"), "incomplete", "utf8");
+describe("loopbackRewriteToAppend", () => {
+  const repo = "acme/widgets";
+  const url = "http://127.0.0.1:8087/git/repo.git";
 
-    expect(() => resolveE2EInstance({ root, rootDriver: "external" })).toThrow(
-      /cannot resume E2E instance; missing:/
+  it("appends nothing when the gitconfig already routes to this loopback URL", () => {
+    const gitconfig = `[user]\n\tname = e2e\n${loopbackRewriteToAppend("", url, repo) ?? ""}`;
+    expect(loopbackRewriteToAppend(gitconfig, url, repo)).toBeNull();
+  });
+
+  it("appends the stanza for a root provisioned by ab-context or under another port offset", () => {
+    const abContext = `[url "/runs/run-1/remote/repo.git"]\n\tinsteadOf = https://github.com/${repo}\n`;
+    const otherOffset =
+      loopbackRewriteToAppend("", "http://127.0.0.1:8088/git/repo.git", repo) ?? "";
+    for (const gitconfig of [abContext, otherOffset]) {
+      expect(loopbackRewriteToAppend(gitconfig, url, repo)).toBe(
+        [
+          `[url "${url}"]`,
+          `\tinsteadOf = https://github.com/${repo}`,
+          `\tinsteadOf = https://github.com/${repo}.git`,
+          `\tinsteadOf = git@github.com:${repo}.git`,
+          "",
+        ].join("\n")
+      );
+    }
+  });
+
+  it("starts the stanza on its own line when the gitconfig lacks a trailing newline", () => {
+    expect(loopbackRewriteToAppend("[user]\n\tname = e2e", url, repo)).toMatch(
+      /^\n\[url "http:\/\/127\.0\.0\.1:8087\/git\/repo\.git"\]\n/
     );
   });
 });
