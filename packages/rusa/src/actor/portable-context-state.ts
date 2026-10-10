@@ -155,6 +155,19 @@ export type PortableBriefOversizedBlock = z.infer<typeof portableBriefOversizedB
  * survive restarts; their shape is enforced here, at the point of
  * consumption, exactly like the rest of the document.
  */
+/**
+ * Inspectable revision history record for an actor brief (#954, Matt jMZhErvvUEY).
+ * Retains accepted updates with timestamp, generation, optional actor explanation,
+ * and text without requiring database DDL migrations.
+ */
+export const portableBriefRevisionSchema = z.object({
+  generation: z.number().int().nonnegative(),
+  updatedAt: z.string().min(1),
+  explanation: z.string().optional(),
+  text: z.string(),
+});
+export type PortableBriefRevision = z.infer<typeof portableBriefRevisionSchema>;
+
 export const portableBriefSchema = z.object({
   /** The rendered three-section brief text (WHAT/HOW/DOMAIN), verbatim. */
   text: z.string(),
@@ -206,6 +219,8 @@ export const portableBriefSchema = z.object({
    * re-resolving historical citations.
    */
   citationAuthorities: z.record(z.string(), portableBriefAuthoritySchema).default({}),
+  /** Inspectable history of accepted brief updates (capped, e.g. 10 most recent). */
+  revisions: z.array(portableBriefRevisionSchema).optional(),
 });
 export type PortableBrief = z.infer<typeof portableBriefSchema>;
 

@@ -1,0 +1,191 @@
+# Actor-Owned Portable Brief Specification
+
+**Status:** Approved Architecture Draft  
+**Scope:** Rusa portable context (`brief` mode)  
+**Tracking Issue:** [#954](https://github.com/MEK-Org/rusa/issues/954)  
+**PR:** [#961](https://github.com/MEK-Org/rusa/pull/961)  
+**Governing Authority:** Mesh Root Architecture Ruling (`mesh:messages/4e8bf997-061d-4754-a4c4-53ddfbe96a30`), Parent Steward Charter (`mesh:messages/dd33fde2-dd4f-498b-8981-7b817f8cf454`)
+
+---
+
+## 1. Overview and Rationale
+
+The portable context `brief` mode enables an actor to maintain a compact, persistent synthesis of its identity, responsibilities, domain models, and operational principles across stateless run boundaries.
+
+Previously, brief updates were performed by an automated background Gemini LLM rewriter after each run (`GeminiBriefRewriter`). While automated, this model introduced several structural drawbacks:
+1. **External Dependency:** Required an active `geminiApiKey` even for non-Gemini actors and offline test setups.
+2. **Artificial Supersession Constraints:** Post-run diffing struggled to distinguish consolidation or rotation from unauthorized deletion of prior guidance.
+3. **Complex Failure Accounting:** Post-run rewrite errors triggered retry loops, frozen brief states, and parent attention notifications that cluttered queues without giving the actor itself actionable feedback.
+
+Under this specification, brief updates are **actor-owned**. The actor itself inspects and refines its brief during active runs using dedicated MCP tools (`brief:read`, `brief:replace`). Updates are validated strictly and synchronously at write time.
+
+---
+
+## 2. Security, Caller Identity, and Scoping
+
+To prevent lateral tampering across actor boundaries:
+- **No Spoofable Actor ID:** Neither `brief:read` nor `brief:replace` accepts an `actor_id` or `thread_id` argument in its tool schema.
+- **Strict Caller Binding:** The MCP server instance is bound immutably to the caller actor's ID (`BriefMcpDeps.actorId`) upon server construction. All operations read from and write to the caller's own slot in `PortableContextStore`.
+- **Worker and Root Support:** Both worker actors and the root actor mount the brief MCP server when configured with `context: { type: "portable", mode: "brief" }`.
+
+---
+
+## 3. Tool Specifications
+
+### 3.1 `brief:read`
+
+Reads the caller actor's current brief state and governing charter.
+
+- **Parameters:** None (`{}`).
+- **Return Type:**
+  ```json
+  {
+    "text": "string (markdown content of current brief)",
+    "generation": 1,
+    "updatedAt": "2026-10-10T13:30:00.000Z",
+    "charter": "string (the actor's active governing charter)",
+    "revisions": [
+      {
+        "generation": 0,
+        "text": "...",
+        "updatedAt": "2026-10-10T13:00:00.000Z",
+        "reason": "Initial seed"
+      }
+    ]
+  }
+  ```
+
+### 3.2 `brief:replace`
+
+Validates and replaces the caller actor's entire brief text.
+
+- **Parameters:**
+  - `brief` (string, required): The complete replacement brief in Markdown format.
+  - `reason` (string, optional): An explanatory note describing why the brief was updated (recorded in revision history).
+- **Return Type:**
+  - **Success:**
+    ```json
+    {
+      "generation": 2,
+      "updatedAt": "2026-10-10T13:35:00.000Z",
+      "bytes": 4120
+    }
+    ```
+  - **No-Op (Unchanged Text):**
+    ```json
+    {
+      "generation": 1,
+      "updatedAt": "2026-10-10T13:30:00.000Z",
+      "bytes": 4120,
+      "noop": true
+    }
+    ```
+  - **Validation Error:** Returns a formatted MCP tool error with a descriptive error message explaining why the write was rejected.
+
+---
+
+## 4. Content Invariants & Write-Time Validation
+
+Every proposed update submitted to `brief:replace` is subjected to strict synchronous validation before being written to persistent storage.
+
+### 4.1 Maximum Size Cap
+The total text length of the brief must not exceed **16 KiB** (16,384 bytes UTF-8). Rejection occurs immediately if the size exceeds this threshold.
+
+### 4.2 Structural Headings
+The brief must follow a structured Markdown layout with the following required sections:
+- `## WHAT`: High-level responsibilities and deliverables.
+- `## HOW`: Operational workflows, tools, and practices.
+- `## DOMAIN`: Domain-specific invariants, architecture constraints, and data definitions.
+
+Alternatively, the equivalent document-level headings (`# WHO I AM`, `# WHAT I DO`, `# HOW I WORK`, `# PRINCIPLES`) are recognized and accepted.
+
+### 4.3 Exclusion of Transient State
+Briefs must capture durable principles, not transient task progress. Updates containing ephemeral status markers are rejected:
+- References to specific unhandled inbox items (`inbox entry`, `selected item`, `unhandled item`).
+- Intermediate task loops or progress tallies (`task 1/4`, `in-progress test run`).
+- Scratchpad dumps or ephemeral command outputs.
+
+### 4.4 Citation Requirements
+Operational principles and prescriptive behavioral rules declared under `WHAT` and `HOW` must carry concrete citations referencing their authoritative origin:
+- Citations must reference verifiable artifacts: Git commits (`commit <sha>`), GitHub issues/PRs (`#123`, `pulls/123`), mesh messages (`mesh:messages/<uuid>`), or human directions (`Matt <id>`, `chat:<space>/<msg>`).
+- Synthesized, unattributed, or vague rules are rejected.
+
+### 4.5 Consolidation, Citation Rotation, and No-Ops
+- **Consolidation:** An actor may synthesize multiple related rules into a more concise principle, provided the synthesized rule retains valid citation backing.
+- **Citation Rotation:** When newer commits, issues, or parent directives supersede older examples, the actor may freely rotate or refresh citations.
+- **No-Op Detection:** Submitting identical text is detected as a no-op; it succeeds safely without bumping the `generation` counter or mutating `updatedAt`.
+
+---
+
+## 5. Failure Semantics: Atomic Last-Good
+
+Write-time validation enforces **atomic last-good preservation**:
+- If validation fails for any reason (size cap, missing section, missing citation, transient state), the storage layer is **not touched**.
+- The existing, previously validated brief remains active and unaltered.
+- The failure reason is returned directly to the calling actor via the tool error response, enabling the actor to correct and retry within the same turn.
+
+---
+
+## 6. Authority Accounting & The Two Parent Pathways
+
+The brief captures the actor's working memory, but the actor's scope of authority is governed strictly by its parent steward and the mesh root. The architecture establishes two distinct pathways:
+
+```
++-------------------------------------------------------------------------+
+|                              Mesh Parent                                |
++-------------------------------------------------------------------------+
+       |                                                 |
+       | Path 1: Charter Update                          | Path 2: Exclusion Message
+       v                                                 v
++-------------------------------+             +---------------------------+
+| New Charter Bound to Actor    |             | Mesh Message with         |
+| Authorizes action immediately |             | Intentional Exclusions    |
+| No brief rewrite required     |             | & Refined Principles      |
++-------------------------------+             +---------------------------+
+       |                                                 |
+       v                                                 v
++-------------------------------------------------------------------------+
+|                             Calling Actor                               |
+|          Reads charter via brief:read; refines brief:replace            |
++-------------------------------------------------------------------------+
+```
+
+### Path 1: Charter Governance (Scope Evolution)
+The actor's charter is its foundational legal authority. When a parent updates an actor's charter to assign new repos, PRs, or goals:
+- The actor is immediately authorized to act on that charter.
+- A brief rewrite is **not required** as a prerequisite for executing charter-authorized work.
+- `brief:read` provides the latest charter string alongside the brief so the actor can check for scope updates on wake.
+
+### Path 2: Intentional Exclusion & Refinement Directives
+When a parent or root architect communicates design boundaries, intentional exclusions, or principle changes via mesh messages:
+- The actor incorporates those decisions into its brief under `## PRINCIPLES` or `## HOW`.
+- The actor cites the parent message (`mesh:messages/<id>`) as the authoritative origin of the exclusion.
+
+---
+
+## 7. Storage, Revision History, and DDL Invariants
+
+### 7.1 No New DDL
+All brief state, timestamps, generation counters, and revision histories are stored within the existing SQLite table / JSON document structure managed by `PortableContextStore`. No database schema migrations or DDL changes are introduced.
+
+### 7.2 Revision History Ring Buffer
+Every successful mutation appends a revision record to a bounded ring buffer (retaining the last **10 revisions**):
+```typescript
+interface PortableBriefRevision {
+  generation: number;
+  text: string;
+  updatedAt: string;
+  reason?: string;
+}
+```
+This enables full inspectability of brief evolution over time, allowing operators and steward actors to audit what changed, when, and why.
+
+---
+
+## 8. Removal of Background Gemini Rewriter
+
+With actor-owned brief updates:
+- `GeminiBriefRewriter`, `runPortableContextBriefCycle`, `classifyBriefSender`, and `isBriefAttentionHandled` are completely removed.
+- Post-run lifecycle hooks no longer perform background LLM calls.
+- Brief mode no longer requires a `geminiApiKey`.
+- Background retry loops, freeze states, and parent attention inbox alerts for brief rewrites are deprecated and eliminated.

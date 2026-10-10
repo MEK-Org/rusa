@@ -369,6 +369,81 @@ export interface BriefValidationInput {
   milestoneOnly?: boolean;
 }
 
+export interface ActorBriefValidationInput {
+  actorId: string;
+  charter: string;
+  text: string;
+  previousText?: string | null;
+}
+
+export interface ActorBriefValidationResult {
+  valid: boolean;
+  errors: string[];
+  refs: string[];
+  isNoop: boolean;
+}
+
+/**
+ * Validate an actor-authored brief update (#954, Matt ri18gmk-BNk / jMZhErvvUEY).
+ *
+ * Invariants:
+ * 1. 16 KiB size cap (PORTABLE_CONTEXT_BRIEF_MAX_BYTES).
+ * 2. Markdown sections: ## WHAT, ## HOW, ## DOMAIN.
+ * 3. Transient state exclusion: no operational / check run status on statements.
+ * 4. Structured citations on WHAT and HOW lines (citing charter, ancestor/human messages, etc.).
+ * 5. Consolidation and citation rotation permitted: actor distills principles without 1:1 supersession bookkeeping.
+ * 6. No-op detection: identical text is detected and marked isNoop: true.
+ * 7. Charter governs action: the charter is the authoritative foundation.
+ */
+export function validateActorBriefUpdate(
+  input: ActorBriefValidationInput
+): ActorBriefValidationResult {
+  const errors: string[] = [];
+  const refs: string[] = [];
+
+  if (input.previousText !== undefined && input.previousText !== null) {
+    if (input.text.trim() === input.previousText.trim()) {
+      return { valid: true, errors: [], refs: [], isNoop: true };
+    }
+  }
+
+  if (byteLen(input.text) > PORTABLE_CONTEXT_BRIEF_MAX_BYTES) {
+    errors.push(
+      `brief is ${byteLen(input.text)} bytes, over the ${PORTABLE_CONTEXT_BRIEF_MAX_BYTES}-byte cap`
+    );
+  }
+
+  const { parsed, errors: parseErrors } = parseBriefDocument(input.text);
+  errors.push(...parseErrors);
+  if (!parsed) {
+    return { valid: false, errors, refs, isNoop: false };
+  }
+
+  for (const line of parsed.lines) {
+    for (const ref of line.refs) {
+      refs.push(ref);
+    }
+
+    const exclusion = findBriefStateExclusion(line.statement);
+    if (exclusion) {
+      errors.push(`${line.section} line ${exclusion}: ${JSON.stringify(line.statement)}`);
+    }
+
+    if (line.section === "WHAT" || line.section === "HOW") {
+      if (line.refs.length === 0) {
+        errors.push(`${line.section} line has no structured citation: ${JSON.stringify(line.raw)}`);
+      }
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    refs,
+    isNoop: false,
+  };
+}
+
 /**
  * Deterministically validate a candidate brief's SHAPE: sections, the 16 KB
  * cap, the state exclusions on the statement part only, citation syntax, and

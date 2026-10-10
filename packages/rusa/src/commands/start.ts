@@ -103,13 +103,7 @@ import {
   portableContextMaxMessages,
   portableContextMaxRuns,
 } from "../actor/portable-context.js";
-import {
-  classifyBriefSender,
-  GeminiBriefRewriter,
-  isBriefAttentionHandled,
-  runPortableContextBriefCycle,
-  seedPortableBriefState,
-} from "../actor/portable-context-brief.js";
+import { seedPortableBriefState } from "../actor/portable-context-brief.js";
 import {
   describeCompaction,
   GeminiPortableContextCompactor,
@@ -188,6 +182,7 @@ import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitop
 import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
 import { getRemoteUrl, initEmptyBareRepo } from "../gitops/worktree.js";
 import { AGENT_EXEC_MCP_NAME, createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
+import { BRIEF_MCP_NAME, createBriefMcpServer } from "../mcp/brief-mcp.js";
 import {
   CHAT_READ_MCP_NAME,
   CHAT_WRITE_MCP_NAME,
@@ -305,7 +300,6 @@ import {
 import { type MissedQuotaWindow, MissedQuotaWindowDetector } from "../quota/missed-windows.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
-import { resolveReference } from "../references/resolve.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
@@ -888,7 +882,7 @@ function assembleConfiguredPortableInjection(
   store: PortableContextStore
 ): { priorContext: string; injectRecord: InjectRecord } | undefined {
   if (record.context?.type !== "portable") return undefined;
-  if ((record.context.mode === "ledger" || record.context.mode === "brief") && !apiKey) {
+  if (record.context.mode === "ledger" && !apiKey) {
     throw new Error(`portable context ${record.context.mode} mode requires geminiApiKey`);
   }
   return assemblePortableInjection(record.id, record.context.mode, store);
@@ -1140,7 +1134,6 @@ async function composeStart(
   }
   const portableContextApiKey = config.geminiApiKey?.trim() || null;
   const portableContextCompactors = new Map<string, PortableContextCompactor>();
-  let briefRewriter: GeminiBriefRewriter | null = null;
   const compactorFor = (context: PortableContextConfig): PortableContextCompactor | null => {
     if (!portableContextApiKey) return null;
     const model = resolvePortableContextCompactorModel(context.compactionModel);
@@ -2599,109 +2592,6 @@ async function composeStart(
     }
   };
 
-  /**
-   * The `brief` mode post-run rewrite cycle (#954). Runs on the same hook as
-   * ledger compaction — after the run, never before prompt assembly — so the
-   * LLM latency stays off responsive wakes. One telemetry event per rewrite
-   * attempt is recorded inside the cycle; a third consecutive failure freezes
-   * rewrites and raises a durable needs-attention entry for the actor's parent
-   * through the existing inbox path. No-op for every other context mode.
-   */
-  const rewriteBriefActorAfterRun = async (actorId: string): Promise<void> => {
-    const current = actors.get(actorId);
-    const context = current?.context?.type === "portable" ? current.context : undefined;
-    if (!current || context?.mode !== "brief") return;
-    if (!portableContextApiKey) {
-      // Assembly already refuses to start a brief-mode actor without a key;
-      // this guard only keeps the post-run hook total.
-      return;
-    }
-    briefRewriter ??= new GeminiBriefRewriter(portableContextApiKey);
-    const repositories = getRepositories();
-    try {
-      await runPortableContextBriefCycle({
-        actorId,
-        charter: current.charter,
-        store: portableContextStore,
-        rewriter: briefRewriter,
-        // Citations resolve against the actor's own stores and the tracker,
-        // but only on a ref's first appearance for the actor — the persisted
-        // resolvedRefs cache and byte-identical carried lines keep a run with
-        // no new GitHub ref at zero tracker calls.
-        resolveRef: async (ref) => {
-          const resolved = await resolveReference(ref, {
-            meshChat: repositories.meshChat,
-            inbox: repositories.inbox,
-            actors: repositories.actors,
-            actorRuns: repositories.actorRuns,
-            issueClient: baseIssueClient,
-            ...(chatClient ? { chatClient } : {}),
-            ...(slackClient ? { slackClient } : {}),
-          });
-          if (resolved.unavailable === null) return { outcome: "resolved" as const };
-          // `resolveReference` deliberately returns a displayable result rather
-          // than throwing. Preserve that distinction here: a 429/5xx/timeout is
-          // a retry-later condition, not evidence that the model fabricated a
-          // citation and therefore not a failure that can freeze this actor.
-          if (
-            /(?:\b429\b|\b5\d\d\b|rate limit|timed? out|timeout|temporar|network|econn|enotfound)/i.test(
-              resolved.unavailable
-            )
-          ) {
-            return { outcome: "unavailable" as const, reason: resolved.unavailable };
-          }
-          return { outcome: "unresolved" as const, reason: resolved.unavailable };
-        },
-        classify: (senderId) =>
-          classifyBriefSender(senderId, actorId, {
-            parentOf: (id) => repositories.actors.parentOf(id),
-            isHumanPrincipal: (id) => repositories.principals.getUser(id) !== undefined,
-          }),
-        listSources: (position, limit) =>
-          repositories.actorRuns.listLedgerSourcesAfterPosition(actorId, position, limit),
-        latestPosition: () => repositories.actorRuns.latestLedgerSourcePosition(actorId),
-        recordAttempt: (attempt) => {
-          repositories.meshEvents.record({
-            kind: "portable_context_brief_rewrite",
-            actorId,
-            detail: `${attempt.attempt} ${attempt.outcome} gen ${attempt.generation}`,
-            body: JSON.stringify(attempt),
-          });
-        },
-        raiseAttention: ({ actorId: childId, reason }) => {
-          const parentId = repositories.actors.parentOf(childId) ?? childId;
-          if (parentId === childId) {
-            log.warn("portable_context_brief_freeze_no_parent", {
-              actorId: childId,
-              reason,
-            });
-          }
-          const entryId = repositories.inbox.append([
-            {
-              actorId: parentId,
-              source: `portable_context_brief:${childId}`,
-              payload: {
-                type: "portable_context_brief.needs_attention",
-                actorId: childId,
-                reason,
-              },
-            },
-          ])[0]?.id;
-          return entryId ? { ownerId: parentId, entryId } : null;
-        },
-        isAttentionHandled: isBriefAttentionHandled(repositories.inbox),
-        log: (message) => log.warn("portable_context_brief_warning", { message }),
-      });
-    } catch (err) {
-      // Keep the previous brief and cursor; the next run retries. The rejection
-      // reason also rides the per-attempt telemetry row whenever the cycle ran.
-      log.warn("portable_context_brief_rewrite_failed", {
-        actorId,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    }
-  };
-
   // ── Follower gateway: persistent remote execution nodes ──
   let followerHub: FollowerHub | undefined;
   if (config.followers) {
@@ -2946,7 +2836,6 @@ async function composeStart(
             body: JSON.stringify(compacted),
           });
         }
-        await rewriteBriefActorAfterRun(id);
         if (!result.success) {
           await routeRunFailure(
             failureSink,
@@ -3474,6 +3363,17 @@ async function composeStart(
           { name: PNPM_INSTALL_MCP_NAME, url: pnpmInstallUrl },
         ];
 
+        if (rec.context?.type === "portable" && rec.context.mode === "brief") {
+          const briefUrl = mcpHttp.addServer(`${id}:${BRIEF_MCP_NAME}`, () =>
+            createBriefMcpServer({
+              actorId: id,
+              store: portableContextStore,
+              charter: () => actors.get(id)?.charter ?? rec.charter,
+            })
+          );
+          workerMcp.push({ name: BRIEF_MCP_NAME, url: briefUrl });
+        }
+
         // Mount any capabilities granted to this actor (by id) on top of the default
         // worker set (ISSUE_NUM, phase 1a). A granted-but-not-mountable capability (none
         // registered) is skipped safely. Parameterized capabilities (e.g. chat-write:spaces/AAAA)
@@ -3932,6 +3832,16 @@ async function composeStart(
     rootMcp.push({ name: CHAT_WRITE_MCP_NAME, url: rootChatUrl });
   }
   if (rootSlackUrl) rootMcp.push({ name: SLACK_WRITE_MCP_NAME, url: rootSlackUrl });
+  if (rootActor.context?.type === "portable" && rootActor.context.mode === "brief") {
+    const rootBriefUrl = mcpHttp.addServer(`${rootId}:${BRIEF_MCP_NAME}`, () =>
+      createBriefMcpServer({
+        actorId: rootId,
+        store: portableContextStore,
+        charter: () => actors.get(rootId)?.charter ?? rootActor.charter ?? DEFAULT_ROOT_CHARTER,
+      })
+    );
+    rootMcp.push({ name: BRIEF_MCP_NAME, url: rootBriefUrl });
+  }
   refreshLiveActorMcp(rootId);
 
   const externalRoot =
