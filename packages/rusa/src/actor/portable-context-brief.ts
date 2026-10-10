@@ -585,6 +585,13 @@ export const BRIEF_REWRITE_SYSTEM_INSTRUCTION =
   "ownership and recurring failure shapes). One statement per line. Every line ends with one or " +
   "more structured citations, each in square brackets and adjacent with no punctuation between them.\n" +
   "\n" +
+  "The charter governs the brief: it defines the actor's purpose, scope and authority. " +
+  "The brief may retain cited evolving guidance even when carrying it out requires charter " +
+  "clarification. Recording it does not expand or override the charter. The actor carries out " +
+  "the work its charter permits and reports the remainder to its parent. A parent's charter " +
+  "clarification informs subsequent rewrites under the existing citation and supersession rules. " +
+  "The charter is supplied separately as governing context, not as a new delta message.\n" +
+  "\n" +
   "Input is the current brief and a bounded delta. Each new message has a verified class and a " +
   "ready-made citation. Human outranks ancestor, which outranks descendant; peer and the actor's " +
   "own messages have descendant weight. Copy only refs supplied with messages, the charter, or " +
@@ -632,10 +639,11 @@ export interface BriefDeltaMessage {
  * Assemble one rewrite call's user content: current brief, the bounded delta
  * oldest-first with ready-made citations and class labels, the accepted
  * citation-form list, and — on the repair retry — the bounded validator
- * errors. Input bytes stay O(brief + bounded delta + errors) regardless of how
+ * errors. Input bytes stay O(charter + brief + bounded delta + errors) regardless of how
  * much durable history lies behind the cursor.
  */
 export function buildBriefRewritePrompt(input: {
+  charter: string;
   currentText: string;
   delta: BriefDeltaMessage[];
   validatorErrors?: string[];
@@ -648,6 +656,8 @@ export function buildBriefRewritePrompt(input: {
     )
     .join("\n\n");
   let prompt =
+    `Governing charter (defines the actor's purpose, scope and authority):\n` +
+    `${input.charter}\n\n` +
     `Current brief:\n${input.currentText}\n\n` +
     `New messages (oldest first; each carries its ready-made citation and source class):\n` +
     `${rendered}\n\n` +
@@ -741,6 +751,8 @@ export interface BriefAttemptTelemetry {
 
 export interface BriefCycleDeps {
   actorId: string;
+  /** The actor's current parent-approved charter, supplied to both rewrite attempts. */
+  charter: string;
   store: {
     load(actorId: string): PortableContextState;
     save(state: PortableContextState): void;
@@ -1028,6 +1040,7 @@ export async function runPortableContextBriefCycle(
   > => {
     attempts += 1;
     const contents = buildBriefRewritePrompt({
+      charter: deps.charter,
       currentText: brief.text,
       delta,
       validatorErrors,

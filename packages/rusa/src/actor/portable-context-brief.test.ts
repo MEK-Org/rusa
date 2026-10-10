@@ -121,6 +121,7 @@ function cycleHarness(options: CycleHarnessOptions) {
   };
   const deps: BriefCycleDeps = {
     actorId: ACTOR,
+    charter: "Create abstract SVG art within the assigned project.",
     store,
     rewriter,
     resolveRef: options.resolveRef ?? (async () => ({ outcome: "resolved" })),
@@ -660,6 +661,7 @@ describe("validateBriefText", () => {
 describe("buildBriefRewritePrompt", () => {
   it("carries the delta with ready-made citations, class labels, and the accepted forms", () => {
     const prompt = buildBriefRewritePrompt({
+      charter: "Create abstract SVG art within the assigned project.",
       currentText: SEED_TEXT,
       delta: [
         {
@@ -679,6 +681,7 @@ describe("buildBriefRewritePrompt", () => {
 
   it("adds bounded validator errors only on the repair retry", () => {
     const repair = buildBriefRewritePrompt({
+      charter: "Create abstract SVG art within the assigned project.",
       currentText: SEED_TEXT,
       delta: [],
       validatorErrors: ["WHAT line changed without a cited human/ancestor supersession"],
@@ -689,6 +692,7 @@ describe("buildBriefRewritePrompt", () => {
 
   it("bounds repair diagnostics in UTF-8 bytes", () => {
     const repair = buildBriefRewritePrompt({
+      charter: "Create abstract SVG art within the assigned project.",
       currentText: SEED_TEXT,
       delta: [],
       validatorErrors: ["界".repeat(2_000)],
@@ -771,6 +775,41 @@ describe("runPortableContextBriefCycle", () => {
     const outcome = await runPortableContextBriefCycle(h.deps);
     expect(outcome).toEqual({ outcome: "skipped" });
     expect(h.rewriter.rewrite).not.toHaveBeenCalled();
+  });
+
+  it("supplies the current charter to both attempts and retains guidance requiring clarification", async () => {
+    const source = chatSource(
+      "m-charter-clarification",
+      "2026-10-07T00:00:01Z",
+      "human:operator",
+      "Make abstract SVG art and administer the external project account."
+    );
+    const rewritten = SEED_TEXT.replace(
+      "## HOW\n",
+      "## HOW\n" +
+        "Make abstract SVG art and administer the external project account. " +
+        "[mesh:messages/m-charter-clarification]\n"
+    );
+    const h = cycleHarness({
+      sources: [source],
+      rewriterText: ["invalid brief", rewritten],
+    });
+    await runPortableContextBriefCycle(h.deps);
+    h.deps.charter =
+      "Create abstract SVG art. External account administration is outside the remit.";
+    expect(await runPortableContextBriefCycle(h.deps)).toMatchObject({
+      outcome: "accepted",
+      attempts: 2,
+    });
+    for (const [index, [contents]] of h.rewriter.rewrite.mock.calls.entries()) {
+      expect(contents.indexOf(h.deps.charter)).toBeLessThan(contents.indexOf("Current brief:"));
+      expect(contents).not.toContain("Create abstract SVG art within the assigned project.");
+      expect(contents).toContain("[class: human] [mesh:messages/m-charter-clarification]");
+      expect(contents.includes("Validator errors to correct")).toBe(index === 1);
+      expect(h.attempts[index].inputBytes).toBe(Buffer.byteLength(contents, "utf8"));
+    }
+    expect(h.store.load(ACTOR).brief?.text).toBe(rewritten);
+    expect(h.store.load(ACTOR).brief?.cursor).toEqual(cursorOf(source));
   });
 
   it("accepts a valid rewrite: cursor advances past the slice, generation bumps, ledger fields untouched", async () => {

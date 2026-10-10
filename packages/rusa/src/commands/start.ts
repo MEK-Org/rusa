@@ -2609,7 +2609,7 @@ async function composeStart(
   const rewriteBriefActorAfterRun = async (actorId: string): Promise<void> => {
     const current = actors.get(actorId);
     const context = current?.context?.type === "portable" ? current.context : undefined;
-    if (context?.mode !== "brief") return;
+    if (!current || context?.mode !== "brief") return;
     if (!portableContextApiKey) {
       // Assembly already refuses to start a brief-mode actor without a key;
       // this guard only keeps the post-run hook total.
@@ -2620,6 +2620,7 @@ async function composeStart(
     try {
       await runPortableContextBriefCycle({
         actorId,
+        charter: current.charter,
         store: portableContextStore,
         rewriter: briefRewriter,
         // Citations resolve against the actor's own stores and the tracker,
