@@ -746,6 +746,29 @@ describe("obligations MCP", () => {
     });
   });
 
+  it("returns the latest reassignment message from get_obligation, and no field without one (#947)", async () => {
+    repository.create({ title: "task", id: "task", ownerId: "actor-a" });
+    repository.create({ title: "other", id: "other", ownerId: "actor-a" });
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    await client.callTool({
+      name: "reassign_obligation",
+      arguments: { id: "task", owner_id: "human:operator", message: "Ready for your review." },
+    });
+    const read = async (id: string) =>
+      dataOf(
+        (await client.callTool({ name: "get_obligation", arguments: { id } })) as CallToolResult
+      );
+
+    expect(await read("task")).toHaveProperty("latestReassignment", {
+      previousOwnerId: "actor-a",
+      newOwnerId: "human:operator",
+      message: "Ready for your review.",
+      actingPrincipal: "actor-a",
+      timestamp: expect.any(String),
+    });
+    expect(await read("other")).not.toHaveProperty("latestReassignment");
+  });
+
   it("records an optional reassignment message in history (#941)", async () => {
     repository.create({ title: "task", id: "task", ownerId: "actor-a" });
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));

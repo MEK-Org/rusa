@@ -2957,6 +2957,8 @@ async function composeStart(
       // Snooze expiry during a closure check is the mesh's own normalization,
       // not the actor's write, so it is attributed to the system principal.
       expireDueSnoozes: (ids) => getRepositories().obligations.expireDueSnoozes(ids, "system:mesh"),
+      // Ready-head attention carries the head's latest reassignment message (#947).
+      latestReassignment: (id) => getRepositories().obligations.latestReassignment(id),
       // Retirement's fail-closed preflight (#191): every non-terminal obligation
       // owned in the subtree is a blocker, so `scheduled` counts alongside
       // `ready` and `waiting` — a recurrence that has not fired yet is still

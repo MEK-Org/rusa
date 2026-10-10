@@ -552,6 +552,19 @@ export interface ObligationHistoryEntry {
 }
 
 /**
+ * An obligation's latest reassignment, when that reassignment carried a
+ * message (#947): who moved it, from whom to whom, when, and why. Read from the
+ * owner-change history row the message is recorded on (#941).
+ */
+export interface ObligationReassignment {
+  previousOwnerId: string;
+  newOwnerId: string;
+  message: string;
+  actingPrincipal: EntityId;
+  timestamp: string;
+}
+
+/**
  * Original payload version. Detail history fields use version 2; readers accept both.
  * The schema carries no SQLite json_* validator; consuming code validates
  * and owns schema evolution at this boundary.

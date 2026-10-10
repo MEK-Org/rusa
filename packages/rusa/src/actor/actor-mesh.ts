@@ -13,6 +13,7 @@ import {
   isReadyForAttention,
   isTerminalObligationStatus,
   type Obligation,
+  type ObligationReassignment,
   type ObligationStatus,
   prerequisiteEdgeKey,
 } from "../obligations/obligation.js";
@@ -275,6 +276,8 @@ export interface MeshObligationPort {
    * so strict closure judges an expired snooze by the ordinary rules.
    */
   expireDueSnoozes?(ids: readonly string[]): readonly string[];
+  /** The latest reassignment's message (#947), carried on ready-head attention. */
+  latestReassignment?(id: string): ObligationReassignment | null;
 }
 
 /**
@@ -2767,6 +2770,7 @@ export class ActorMesh {
       actorId
     );
     const responsive = head.responsive === true;
+    const latestReassignment = this.readLatestReassignment(head.id);
     const entries = this.inboxStore.append([
       {
         id: entryId,
@@ -2776,6 +2780,9 @@ export class ActorMesh {
           type: "obligation.ready_head",
           obligationId: head.id,
           intent: head.intent ?? undefined,
+          // Why the obligation was handed here (#947), so the owner can act on
+          // it without a further read. Absent when there is no such message.
+          ...(latestReassignment ? { latestReassignment } : {}),
           // A responsive head's attention is immediately responsive work:
           // it preempts where the inbox model admits preemption. The priority
           // written here is the only thing that makes the dispatch below
@@ -2789,6 +2796,22 @@ export class ActorMesh {
     }
     this.dispatch(actorId);
     return true;
+  }
+
+  /**
+   * The head's latest reassignment message, read when its attention is
+   * appended. The message only enriches the entry, so a failed read omits it
+   * rather than costing the owner their attention.
+   */
+  private readLatestReassignment(obligationId: string): ObligationReassignment | null {
+    try {
+      return this.obligations?.latestReassignment?.(obligationId) ?? null;
+    } catch (err) {
+      this.log(
+        `latest reassignment read failed for ${obligationId}: ${err instanceof Error ? err.message : String(err)}`
+      );
+      return null;
+    }
   }
 
   /**
