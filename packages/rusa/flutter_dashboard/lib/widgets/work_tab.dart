@@ -1608,6 +1608,11 @@ class _DetailViewState extends State<_DetailView> {
     if (h.kind == 'status') {
       return 'changed status ${h.before['status']} → ${h.after['status']}';
     }
+    if (h.kind == 'responsive') {
+      return h.after['responsive'] == true
+          ? 'marked responsive'
+          : 'cleared responsive';
+    }
     if (h.after.containsKey('checkpoint')) {
       return h.after['checkpoint'] == null
           ? 'cleared standing'

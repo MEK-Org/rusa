@@ -504,6 +504,7 @@ export const OBLIGATION_MUTATION_KINDS = [
   "external_ref",
   "snooze",
   "checkpoint",
+  "responsive",
 ] as const;
 
 export type ObligationMutationKind = (typeof OBLIGATION_MUTATION_KINDS)[number];
@@ -527,6 +528,8 @@ export interface ObligationHistoryState {
   resolutionRef?: string | null;
   /** Snooze deadline (#722); null when not snoozed. */
   snoozedUntil?: string | null;
+  /** Explicit responsiveness (#903); true when marked responsive, null when not explicitly marked. */
+  responsive?: boolean | null;
   /**
    * Why a reassignment was made (#941), given by the acting principal. Not a
    * tracked column: it exists only on the `after` side of the owner change it
@@ -608,6 +611,7 @@ export const obligationHistoryStateSchema = z
     terminalNote: z.string().nullable().optional(),
     resolutionRef: validatedBy(parseObligationReference).nullable().optional(),
     snoozedUntil: z.iso.datetime().nullable().optional(),
+    responsive: z.boolean().nullable().optional(),
     message: z.string().optional(),
   })
   .strict();

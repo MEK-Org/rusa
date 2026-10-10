@@ -108,4 +108,55 @@ void main() {
       });
     },
   );
+
+  testWidgets('history labels explicit responsive marks and removals (#903)', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      await tester.binding.setSurfaceSize(const Size(1600, 1600));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final ob = makeObligation('detail', ownerId: 'root', title: 'Responsive');
+      final api = FakeApi()
+        ..threadsResult = [makeThread('root')]
+        ..obligationsResult = [ob]
+        ..obligationDetailByHistory = (id, before) => ObligationDetailSnapshot(
+          obligation: ob,
+          children: const [],
+          blockingChildren: const [],
+          history: const [
+            ObligationHistoryDto(
+              id: 'history:0002',
+              kind: 'responsive',
+              by: 'root',
+              timestamp: '2026-10-03T12:00:00Z',
+              before: {'responsive': true},
+              after: {'responsive': null},
+            ),
+            ObligationHistoryDto(
+              id: 'history:0001',
+              kind: 'responsive',
+              by: 'root',
+              timestamp: '2026-10-03T11:00:00Z',
+              before: {'responsive': null},
+              after: {'responsive': true},
+            ),
+          ],
+        );
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      addTearDown(store.dispose);
+      store.setFocusedObligationId('detail');
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: WorkTab(store: store, onSelectView: (_) {}),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.textContaining(' marked responsive · '), findsOneWidget);
+      expect(find.textContaining(' cleared responsive · '), findsOneWidget);
+      expect(find.textContaining('updated obligation'), findsNothing);
+    });
+  });
 }
