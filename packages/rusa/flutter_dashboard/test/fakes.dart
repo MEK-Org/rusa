@@ -290,12 +290,70 @@ class FakeApi extends DashboardApi {
     return chatRoomParticipants;
   }
 
+  /// What `/api/mesh/references` answers (#940); a ref missing here comes
+  /// back unavailable, as the server answers a ref it cannot resolve.
+  Map<String, ReferenceDto> referencesResult = {};
+
+  /// Each batch asked for, in order.
+  final referenceRequests = <List<String>>[];
+
+  /// Optional observer for assertions about when enrichment starts.
+  void Function()? onFetchReferences;
+
+  /// When set, each references answer waits on this, so a test can see the
+  /// pane painted before its references arrive.
+  Completer<void>? referencesGate;
+  Object? referencesError;
+
+  /// Per-call answers for tests that need independent concurrent responses.
+  /// Each callback receives its request's immutable batch before any wait.
+  final scriptedReferenceResponses =
+      <FutureOr<Map<String, ReferenceDto>> Function(List<String>)>[];
+
+  /// When set, answers each ref ahead of [referencesResult]; null defers.
+  ReferenceDto? Function(String ref)? referenceFor;
+
+  @override
+  Future<Map<String, ReferenceDto>> fetchReferences(
+    Iterable<String> refs,
+  ) async {
+    final batch = refs.toSet().toList();
+    referenceRequests.add(batch);
+    onFetchReferences?.call();
+    if (scriptedReferenceResponses.isNotEmpty) {
+      return scriptedReferenceResponses.removeAt(0)(batch);
+    }
+    await referencesGate?.future;
+    final error = referencesError;
+    if (error != null) throw error;
+    return {
+      for (final ref in batch)
+        ref:
+            referenceFor?.call(ref) ??
+            referencesResult[ref] ??
+            ReferenceDto(
+              ref: ref,
+              scheme: ref.split(':').first,
+              title: ref,
+              unavailable: 'could not load context',
+              cacheState: 'unavailable',
+            ),
+    };
+  }
+
   List<RecentActivityItem> recentActivityResult = [];
   int recentActivityCallCount = 0;
+
+  /// Per-call feed answers, taken ahead of [recentActivityResult].
+  final scriptedRecentActivity =
+      <Future<List<RecentActivityItem>> Function()>[];
 
   @override
   Future<List<RecentActivityItem>> fetchRecentActivity({int limit = 50}) async {
     recentActivityCallCount++;
+    if (scriptedRecentActivity.isNotEmpty) {
+      return scriptedRecentActivity.removeAt(0)();
+    }
     return recentActivityResult;
   }
 
@@ -676,7 +734,6 @@ class FakeApi extends DashboardApi {
   // ── Obligations routes ──
   List<ObligationDto> obligationsResult = [];
   Map<String, ObligationDetailSnapshot> obligationDetails = {};
-  Map<String, ReferenceDto?> obExternalReferences = {};
   Map<String, List<ObligationDto>> obBlockedBy = {};
   Map<String, int> obBlockedByTotal = {};
   Map<String, bool> obBlockedByHasMore = {};
@@ -814,7 +871,6 @@ class FakeApi extends DashboardApi {
       blocks: blocks,
       blocksTotal: obBlocksTotal[id] ?? blocks.length,
       blocksHasMore: obBlocksHasMore[id] ?? false,
-      externalReference: obExternalReferences[id],
     );
   }
 

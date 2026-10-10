@@ -256,6 +256,13 @@ function parseAvatarId(raw: string): string | null {
 const MAX_LIMIT = 200;
 const MAX_ACTORS = 200;
 const DEFAULT_LIMIT = 50;
+/**
+ * Bounds on one /api/mesh/references batch (#940): distinct keys per request,
+ * and characters per key — far above any canonical GitHub, Chat, Slack or mesh
+ * ref, so only a request that is not a ref is refused.
+ */
+const MAX_REFERENCE_BATCH = 20;
+const MAX_REFERENCE_LENGTH = 512;
 /** Cap on a manually-uploaded avatar's decoded byte size (5 MB). */
 const MAX_AVATAR_UPLOAD_BYTES = 5 * 1024 * 1024;
 /**
@@ -747,6 +754,41 @@ function scopeMeshMessageReference(
   };
 }
 
+/**
+ * A fill-in request may only name a reference the dashboard already projects
+ * from durable state.  The client has those keys after its first-paint route;
+ * accepting an arbitrary key here would turn this read endpoint into a
+ * provider-credential oracle and cache warmer.
+ *
+ * The activity feed is capped at 100 rows, so its current projection and this
+ * allowlist use the same bounded source.  Obligation references come from the
+ * durable external-ref and artifact records, not from a client assertion, and
+ * are looked up only for the requested batch rather than scanned in full.
+ */
+function dashboardReferenceKeys(deps: DashboardDataDeps, refs: readonly string[]): Set<string> {
+  const keys = deps.obligations?.citedReferences(refs) ?? new Set<string>();
+  for (const entry of deps.inbox?.listRecentHandledEntries(100) ?? []) {
+    const { messageId } = entry.payload as { messageId?: unknown };
+    if (typeof messageId === "string") {
+      keys.add(`mesh:messages/${messageId}`);
+    } else if (entry.source.startsWith("github:") || entry.source.startsWith("slack:")) {
+      keys.add(entry.source);
+    } else {
+      const ref = gchatInboxMessageReference(entry.source, entry.payload);
+      if (ref) keys.add(ref);
+    }
+  }
+  return keys;
+}
+
+function unavailableReference(ref: string): ResolvedReferenceWithEntity {
+  return {
+    ...resolveReferenceSync(ref, {}),
+    unavailable: "could not load context",
+    cacheState: "unavailable",
+  };
+}
+
 function parseKinds(url: URL): string[] | undefined {
   const raw = url.searchParams.get("kinds");
   if (!raw) return undefined;
@@ -811,6 +853,65 @@ export function resolveChatQueryActors(
 }
 
 /**
+ * Resolves a bounded batch of references through the cache with phase measurement,
+ * viewer scoping, and per-reference error isolation (#940).
+ */
+async function resolveReferenceBatch(
+  res: ServerResponse,
+  refs: string[],
+  deps: DashboardDataDeps,
+  scope: HumanChatScope
+): Promise<boolean> {
+  if (
+    refs.length === 0 ||
+    refs.length > MAX_REFERENCE_BATCH ||
+    refs.some((ref) => ref.length === 0 || ref.length > MAX_REFERENCE_LENGTH)
+  ) {
+    sendJson(res, 400, {
+      error: `ref takes 1 to ${MAX_REFERENCE_BATCH} keys of at most ${MAX_REFERENCE_LENGTH} characters`,
+    });
+    return true;
+  }
+
+  // Every ref resolves through one scoped resolution: a `mesh:messages/<id>`
+  // naming another human's conversation is projected without its content or
+  // ends (#590), whatever else shares its batch. Mesh refs are resolved
+  // locally by the cache service rather than stored, so the scope applies to
+  // the cached and uncached paths alike. The batch starts together and
+  // shares one deadline, so cold references wait one window, not one each
+  // (#933).
+  const { referenceCache } = deps;
+  const referenceBudget = referenceCache?.startBudget();
+  const available = dashboardReferenceKeys(deps, refs);
+  const resolved = await Promise.all(
+    refs.map(async (ref) => {
+      // Do not permit an authenticated browser to use this endpoint to query
+      // a provider object it was never shown by a first-paint projection.
+      // In particular, never call ReferenceCacheService for an unknown key.
+      if (!available.has(ref)) return unavailableReference(ref);
+      try {
+        const res = referenceCache
+          ? await measureDashboardPhase("enrichment", () =>
+              referenceCache.get(ref, deps, referenceBudget)
+            ).catch(() => ({
+              ...resolveReferenceSync(ref, { meshChat: deps.meshChat }),
+              unavailable: "could not load context",
+              cacheState: "unavailable" as const,
+            }))
+          : resolveReferenceSync(ref, { meshChat: deps.meshChat });
+        return scopeMeshMessageReference(res, scope);
+      } catch {
+        return unavailableReference(ref);
+      }
+    })
+  );
+  sendJson(res, 200, {
+    references: Object.fromEntries(refs.map((ref, index) => [ref, resolved[index]])),
+  });
+  return true;
+}
+
+/**
  * Dispatch a `/api/mesh/*` request. Returns true if it owned the request
  * (responded or took over the socket for SSE), false to let the caller fall
  * through to static asset serving. When `deps` is null (e.g. the e2e UI-only
@@ -824,6 +925,10 @@ export async function handleMeshApiRequest(
 ): Promise<boolean> {
   const { pathname } = url;
   if (!pathname.startsWith("/api/mesh/")) return false;
+
+  let resolvedScope: HumanChatScope | undefined;
+  const viewerScope = (): HumanChatScope =>
+    (resolvedScope ??= resolveHumanChatScope(req, deps?.principals));
 
   if (req.method === "POST") {
     if (pathname === "/api/mesh/actors") {
@@ -1779,6 +1884,40 @@ export async function handleMeshApiRequest(
         .catch((err) => sendJson(res, 500, { error: String(err) }));
       return true;
     }
+
+    if (pathname === "/api/mesh/references") {
+      if (!deps) {
+        sendJson(res, 503, { error: "mesh data API unavailable (no live mesh bound)" });
+        return true;
+      }
+      const bodyStr = await readBody(req);
+      if (Buffer.byteLength(bodyStr, "utf8") > 64 * 1024) {
+        sendJson(res, 413, { error: "request body too large" });
+        return true;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(bodyStr);
+      } catch {
+        sendJson(res, 400, { error: "Invalid JSON body" });
+        return true;
+      }
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        !Array.isArray((parsed as Record<string, unknown>).refs)
+      ) {
+        sendJson(res, 400, { error: "Missing or invalid refs array" });
+        return true;
+      }
+      const rawRefs = (parsed as { refs: unknown[] }).refs;
+      if (!rawRefs.every((ref): ref is string => typeof ref === "string")) {
+        sendJson(res, 400, { error: "refs must contain only strings" });
+        return true;
+      }
+      const refs = [...new Set(rawRefs)];
+      return resolveReferenceBatch(res, refs, deps, viewerScope());
+    }
   }
 
   if (req.method === "PATCH") {
@@ -1903,14 +2042,6 @@ export async function handleMeshApiRequest(
   }
 
   const { actors, meshEvents, sseHub } = deps;
-
-  // One viewer resolution per request (#590). A request takes exactly one of
-  // the read branches below, and each asks the same question of the same
-  // principal list, so the scope is resolved on first use and reused — a route
-  // that reads nothing human-involving still costs no principal read.
-  let resolvedScope: HumanChatScope | undefined;
-  const viewerScope = (): HumanChatScope =>
-    (resolvedScope ??= resolveHumanChatScope(req, deps.principals));
 
   if (pathname === "/api/mesh/control/options") {
     if (!deps.rootControl) {
@@ -2378,38 +2509,10 @@ export async function handleMeshApiRequest(
       before: url.searchParams.get("history_before") ?? undefined,
       limit: Math.min(parsePositiveInt(url, "history_limit") ?? 10, 100),
     });
-    // The obligation's own citations and the reference it claims resolve the
-    // same way, through one scoped resolution: a `mesh:messages/<id>` naming
-    // another human's conversation is projected without its content or ends
-    // (#590). Mesh refs are resolved locally by the cache service rather than
-    // stored, so the scope applies to the cached and uncached paths alike.
-    // Citations and the external reference start together and share one
-    // deadline, so two cold references wait one window, not two (#933).
-    const { referenceCache } = deps;
-    const referenceBudget = referenceCache?.startBudget();
-    const resolveCited = async (ref: string): Promise<ResolvedReferenceWithEntity> =>
-      scopeMeshMessageReference(
-        referenceCache
-          ? await measureDashboardPhase("enrichment", () =>
-              referenceCache.get(ref, deps, referenceBudget)
-            ).catch(() => ({
-              ...resolveReferenceSync(ref, { meshChat: deps.meshChat }),
-              unavailable: "could not load context",
-              cacheState: "unavailable" as const,
-            }))
-          : resolveReferenceSync(ref, { meshChat: deps.meshChat }),
-        viewerScope()
-      );
-    const externalRefKey = obligation.externalRef?.key;
-    const [artifacts, externalReference] = await Promise.all([
-      Promise.all(
-        deps.obligations.listArtifacts(id).map(async (artifact) => ({
-          artifact,
-          reference: await resolveCited(artifact.ref),
-        }))
-      ),
-      externalRefKey ? resolveCited(externalRefKey) : null,
-    ]);
+    // Citations and the external reference go out as their keys alone: the
+    // client resolves them through /api/mesh/references after the pane has
+    // painted, so a cold GitHub or Chat read never holds the response (#940).
+    const artifacts = deps.obligations.listArtifacts(id).map((artifact) => ({ artifact }));
     sendJson(res, 200, {
       obligation,
       parent,
@@ -2428,7 +2531,6 @@ export async function handleMeshApiRequest(
       blocksTotal: blocks.total,
       blocksHasMore: blocks.hasMore,
       artifacts,
-      externalReference,
     });
     return true;
   }
@@ -2438,16 +2540,6 @@ export async function handleMeshApiRequest(
     const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
     const limit = Number.isNaN(rawLimit) || rawLimit <= 0 ? 50 : Math.min(rawLimit, 100);
     const chatScope = viewerScope();
-    const rootHandle = deps.rootIdentity?.handle ?? generateHandle("root");
-
-    const actorDisplayInfo = (actorId: string) => {
-      const actor = actors.get(actorId);
-      const handle = actor?.isRoot ? rootHandle : generateHandle(actorId);
-      const model = actor?.modelConfig?.[0]
-        ? `${actor.modelConfig[0].model}${actor.modelConfig[0].effort ? `, ${actor.modelConfig[0].effort}` : ""}`
-        : "default";
-      return { handle, model };
-    };
 
     const handledEntries = deps.inbox?.listRecentHandledEntries(limit) ?? [];
     const terminalHistory = deps.obligations?.listTerminalHistory?.(limit) ?? [];
@@ -2456,32 +2548,45 @@ export async function handleMeshApiRequest(
     const completedFocuses = deps.actorRuns?.listRecentCompletedFocuses(limit * 2) ?? [];
     const handledItems: Array<Record<string, unknown>> = [];
 
-    // Resolve the whole page at once against one reference deadline (#933);
-    // the loop below then assembles cards in the store's order.
-    const referenceBudget = deps.referenceCache?.startBudget();
-    const resolvedEntries = await Promise.all(
-      handledEntries.map(async (entry) =>
-        entry.handledAt
-          ? (
-              await resolveInboxPage(
-                { entries: [entry], unhandledCount: 1, nextCursor: null },
-                deps,
-                chatScope,
-                referenceBudget
-              )
-            ).entries[0]
-          : undefined
-      )
-    );
-
-    for (const [index, entry] of handledEntries.entries()) {
+    // Each card carries the key of the reference it stands for and its
+    // actor's id, never the reference or the actor themselves: the client
+    // resolves the keys after first paint and labels actors from its threads
+    // snapshot, so this answers in store time however cold the page (#940).
+    for (const entry of handledEntries) {
       if (!entry.handledAt) continue;
-      const resolved = resolvedEntries[index];
-      if (!resolved) continue;
-
-      const { handle, model } = actorDisplayInfo(entry.actorId);
 
       const source = entry.source;
+      const { messageId, fromId } = entry.payload as { messageId?: unknown; fromId?: unknown };
+      let referenceKey: string | undefined;
+      if (typeof messageId === "string") {
+        // A human's message is that human's conversation with the actor.
+        // Another viewer is shown nothing of it — not that it exists — and a
+        // legacy pointer gets its sender from the canonical mesh source. The
+        // inbox row is always the recipient's. Payload/source are hints only:
+        // the local canonical record remains the #590 visibility authority.
+        const sourceSender =
+          source.startsWith("mesh:") && source !== "mesh:unknown"
+            ? source.slice("mesh:".length)
+            : undefined;
+        const senderId = typeof fromId === "string" ? fromId : sourceSender;
+        if (senderId && !chatScope.canSee(senderId, entry.actorId)) continue;
+        const reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
+          meshChat: deps.meshChat,
+        });
+        if (
+          reference.entity?.type === "mesh_message" &&
+          !chatScope.canSee(reference.entity.senderId, reference.entity.recipientId)
+        ) {
+          continue;
+        }
+        referenceKey = `mesh:messages/${messageId}`;
+      } else if (source.startsWith("github:") || source.startsWith("slack:")) {
+        // Canonical external reference: resolve key after first paint.
+        referenceKey = source;
+      } else {
+        referenceKey = gchatInboxMessageReference(source, entry.payload);
+      }
+
       let sourceKind = "UNKNOWN";
       if (source.startsWith("github:")) {
         let collection: string | undefined;
@@ -2504,8 +2609,6 @@ export async function handleMeshApiRequest(
         sourceKind = "SLACK MESSAGE";
       } else if (source.startsWith("obligation:")) {
         sourceKind = "OBLIGATION";
-      } else if (resolved.reference?.scheme) {
-        sourceKind = String(resolved.reference.scheme).toUpperCase();
       }
 
       const handledAt = entry.handledAt.toISOString();
@@ -2565,20 +2668,16 @@ export async function handleMeshApiRequest(
         }
       }
 
-      const summary =
-        resolved.reference?.title ??
-        (typeof entry.payload?.type === "string" ? entry.payload.type : source);
+      const summary = typeof entry.payload?.type === "string" ? entry.payload.type : source;
 
       handledItems.push({
         id: `inbox_${entry.id}`,
         kind: "handled_inbox",
         time: handledAt,
         actorId: entry.actorId,
-        actorHandle: handle,
-        actorModel: model,
         sourceKind,
         sourceRef: source,
-        ...(resolved.reference ? { reference: resolved.reference } : {}),
+        ...(referenceKey ? { referenceKey } : {}),
         summary,
         handledTime: handledAt,
         addressedNote: entry.handledNote ?? "Handled without comment",
@@ -2593,15 +2692,11 @@ export async function handleMeshApiRequest(
       }
       const ob = deps.obligations ? deps.obligations.get(h.obligationId) : null;
       const status = (h.after.status ?? ob?.status ?? "done") as "done" | "cancelled";
-      const { handle, model } = actorDisplayInfo(h.actingPrincipal ?? ob?.ownerId ?? "root");
-
       obligationItems.push({
         id: `obligation_history_${h.id}`,
         kind: "terminal_obligation",
         time: h.timestamp,
         actorId: h.actingPrincipal ?? ob?.ownerId ?? "root",
-        actorHandle: handle,
-        actorModel: model,
         sourceKind: "OBLIGATION",
         sourceRef: ob?.externalRef?.key ?? `obligation:${h.obligationId}`,
         summary: ob?.title ?? `Obligation ${h.obligationId}`,

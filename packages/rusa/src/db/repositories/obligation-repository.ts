@@ -3215,6 +3215,27 @@ export class ObligationRepository {
     return rows.map(parseHistoryRow);
   }
 
+  /**
+   * Which of `refs` some obligation names, as its external ref or an artifact.
+   *
+   * Asks only about the given keys, so a caller checking a bounded batch pays
+   * for that batch rather than for every obligation and its artifacts. Both
+   * columns hold canonical reference keys, so exact matching agrees with
+   * {@link Obligation.externalRef}`.key` and {@link ObligationArtifact.ref}.
+   */
+  citedReferences(refs: readonly string[]): Set<string> {
+    if (refs.length === 0) return new Set();
+    const placeholders = refs.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT external_ref AS ref FROM obligations WHERE external_ref IN (${placeholders})
+         UNION
+         SELECT ref FROM obligation_artifacts WHERE ref IN (${placeholders})`
+      )
+      .all(...refs, ...refs) as { ref: string }[];
+    return new Set(rows.map((row) => row.ref));
+  }
+
   listArtifacts(obligationId: string): ObligationArtifact[] {
     const rows = this.db
       .prepare(

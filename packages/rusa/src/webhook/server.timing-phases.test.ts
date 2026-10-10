@@ -126,6 +126,16 @@ describe("dashboard server phase timing", () => {
     return response;
   };
 
+  const post = async (path: string, body: unknown) => {
+    const response = await fetch(`${origin}${path}`, {
+      method: "POST",
+      headers: { "Accept-Encoding": "br", "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    await response.arrayBuffer();
+    return response;
+  };
+
   const phaseGroups = async (expectedRecordCount: number): Promise<DashboardServerPhaseGroup[]> => {
     await vi.waitFor(() => {
       expect(
@@ -135,28 +145,39 @@ describe("dashboard server phase timing", () => {
     return timings.summary({ since: new Date(Date.now() - 60_000) }).serverPhases;
   };
 
-  it("separates a cold quota history read from a slow authenticated obligation request", async () => {
+  it("separates a cold quota history read, first paint, and after-paint references", async () => {
     // A cold history read: fast auth, slow store read-through.
     delays.history = 80;
     expect((await get("/api/quota/history")).status).toBe(200);
     delays.history = 0;
 
-    // A slow authenticated obligation request with parallel enrichment and compression.
+    // First paint stays a slow authenticated request, but does not wait for
+    // cold reference enrichment now that #940 moves it to its own request.
     delays.auth = 80;
-    delays.enrichment = 50;
     delays.compression = 40;
     const detail = await get("/api/mesh/obligations/phase-fixture");
     expect(detail.status).toBe(200);
     expect(detail.headers.get("content-encoding")).toBe("br");
-    Object.assign(delays, { auth: 0, compression: 0, enrichment: 0 });
+    Object.assign(delays, { auth: 0, compression: 0 });
+
+    // This is a real host-local HTTP handler request, not a structural mock:
+    // the cache's fixed synthetic delay lets the timing recorder prove that
+    // reference enrichment is attributed to the after-paint route alone.
+    delays.enrichment = 50;
+    const references = await post("/api/mesh/references", {
+      refs: ["github:example-org/example/issues/1", "github:example-org/example/issues/2"],
+    });
+    expect(references.status).toBe(200);
+    delays.enrichment = 0;
 
     // The snapshot route is a separate operation of the same fixed label.
     await get("/api/quota");
 
-    const groups = await phaseGroups(3);
+    const groups = await phaseGroups(4);
     const history = groups.find((group) => group.operation === "quota_history");
     const snapshot = groups.find((group) => group.operation === "quota_snapshot");
     const obligation = groups.find((group) => group.label === "mesh_obligation_detail");
+    const referenceFill = groups.find((group) => group.label === "mesh_references");
     expect(history?.label).toBe("mesh_quota");
     expect(snapshot?.label).toBe("mesh_quota");
     expect(obligation?.operation).toBeUndefined();
@@ -171,15 +192,23 @@ describe("dashboard server phase timing", () => {
     // Quota responses are never enriched or compressed: those phases are absent, not zero.
     expect(Object.keys(history?.phases ?? {}).sort()).toEqual(["auth", "route", "serialization"]);
 
-    // The slow obligation request is dominated by auth, and its two parallel
-    // enrichments are one ~50 ms union rather than a 100 ms sum.
+    // First paint is dominated by auth and has no enrichment phase: refs are
+    // raw keys in this response.
     expect(obligation?.phases.auth?.p50Ms).toBeGreaterThanOrEqual(75);
-    expect(obligation?.phases.enrichment?.p50Ms).toBeGreaterThanOrEqual(45);
-    expect(obligation?.phases.route?.p50Ms).toBeGreaterThanOrEqual(
-      obligation?.phases.enrichment?.p50Ms ?? Number.POSITIVE_INFINITY
-    );
+    expect(obligation?.phases.enrichment).toBeUndefined();
     expect(obligation?.phases.compression?.p50Ms).toBeGreaterThanOrEqual(35);
     expect(obligation?.phases.serialization).toBeDefined();
+
+    // The controlled 50 ms cache delay is measured at the live handler's
+    // timing boundary on the separate fill-in route. This checks a bounded
+    // receipt rather than a host-specific first-paint wall-clock target.
+    expect(referenceFill?.phases.enrichment?.p50Ms).toBeGreaterThanOrEqual(45);
+    expect(referenceFill?.phases.route?.p50Ms).toBeGreaterThanOrEqual(
+      referenceFill?.phases.enrichment?.p50Ms ?? Number.POSITIVE_INFINITY
+    );
+    expect(referenceFill?.durationMs.p50Ms).toBeGreaterThanOrEqual(
+      referenceFill?.phases.enrichment?.p50Ms ?? Number.POSITIVE_INFINITY
+    );
 
     // The request-wide duration is kept, and the phases are not a partition of it.
     expect(obligation?.durationMs.p50Ms).toBeGreaterThanOrEqual(

@@ -1188,7 +1188,7 @@ class _OverviewTabState extends State<OverviewTab> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        item.actorHandle,
+                        widget.store.actorDisplay(item.actorId),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: kMonoStyle.copyWith(
@@ -1199,7 +1199,7 @@ class _OverviewTabState extends State<OverviewTab> {
                       ),
                       const SizedBox(height: 1),
                       Text(
-                        item.actorModel,
+                        widget.store.actorModelLabel(item.actorId),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
@@ -1374,7 +1374,7 @@ class _OverviewTabState extends State<OverviewTab> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        item.actorHandle,
+                        widget.store.actorDisplay(item.actorId),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: kMonoStyle.copyWith(
@@ -1385,7 +1385,7 @@ class _OverviewTabState extends State<OverviewTab> {
                       ),
                       const SizedBox(height: 1),
                       Text(
-                        item.actorModel,
+                        widget.store.actorModelLabel(item.actorId),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(

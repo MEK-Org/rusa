@@ -1187,7 +1187,7 @@ void main() {
         final api = FakeApi()
           ..threadsResult = [makeThread('root')]
           ..obligationsResult = [ob]
-          ..obExternalReferences['ob-with-ref'] = refDto;
+          ..referencesResult[refDto.ref] = refDto;
 
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
@@ -1208,6 +1208,8 @@ void main() {
         await tester.pump();
         await tester.tap(find.text('Task with external link'));
         await tester.pump();
+        await tester.pump();
+        // Reference enrichment starts after the raw detail frame.
         await tester.pump();
 
         expect(find.text('EXTERNAL LINK'), findsOneWidget);
@@ -1269,7 +1271,7 @@ void main() {
         final api = FakeApi()
           ..threadsResult = [makeThread('root')]
           ..obligationsResult = [ob]
-          ..obExternalReferences['ob-terminal-with-ref'] = refDto;
+          ..referencesResult[refDto.ref] = refDto;
 
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
@@ -1304,7 +1306,7 @@ void main() {
   );
 
   testWidgets(
-    'renders fallback reference card when externalReference is not yet resolved',
+    'renders fallback reference card when the external reference cannot be resolved',
     (tester) async {
       await tester.runAsync(() async {
         final ob = makeObligation(
@@ -1332,6 +1334,8 @@ void main() {
         await tester.tap(find.text('Unresolved external reference task'));
         await tester.pump();
         await tester.pump();
+        // Reference enrichment starts after the raw detail frame.
+        await tester.pump();
 
         expect(find.text('EXTERNAL LINK'), findsOneWidget);
         expect(find.byTooltip('View reference context'), findsOneWidget);
@@ -1342,7 +1346,7 @@ void main() {
         expect(
           find.descendant(
             of: find.byType(AlertDialog),
-            matching: find.text('Not resolvable yet.'),
+            matching: find.text('could not load context'),
           ),
           findsOneWidget,
         );

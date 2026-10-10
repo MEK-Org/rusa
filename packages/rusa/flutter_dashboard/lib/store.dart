@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/widgets.dart';
 import 'package:rxdart/rxdart.dart';
 
 import 'actor_display.dart';
@@ -526,6 +527,18 @@ class DashboardStore {
     return actor(id)?.handle;
   }
 
+  /// The model an actor runs on, from the threads snapshot, as the Recent
+  /// Activity cards label it: its first configured model and effort, or
+  /// 'default' when it has none.
+  String actorModelLabel(String id) {
+    final configs = actor(id)?.thread.modelConfig ?? const [];
+    if (configs.isEmpty) return 'default';
+    final effort = configs.first.effort;
+    return effort == null
+        ? configs.first.model
+        : '${configs.first.model}, $effort';
+  }
+
   void setWalkieActive(bool active) {
     if (!_walkieActive.isClosed) {
       _walkieActive.add(active);
@@ -660,13 +673,95 @@ class DashboardStore {
     await _requestRuntimeSync();
   }
 
-  Future<void> refreshRecentActivity() async {
+  /// References already resolved for Recent Activity, kept across refreshes
+  /// so a card does not fall back to loading each time the feed reloads.
+  final _activityReferences = <String, ReferenceDto>{};
+  int _recentActivityGeneration = 0;
+  Future<void> Function()? _pendingActivityResolve;
+
+  /// Paints the feed from its ref keys, then fills each card's reference in
+  /// as `/api/mesh/references` answers (#940). Known cards keep their shown
+  /// previews on reload while revalidation refreshes them in the background.
+  Future<void> refreshRecentActivity({bool deferUntilPostFrame = true}) async {
+    final generation = ++_recentActivityGeneration;
+    final List<RecentActivityItem> items;
     try {
-      final items = await _api.fetchRecentActivity(limit: 50);
-      if (!_recentActivity.isClosed) {
-        _recentActivity.add(items);
+      items = await _api.fetchRecentActivity(limit: 50);
+    } catch (_) {
+      return;
+    }
+    if (generation != _recentActivityGeneration) return;
+    final keys = {for (final item in items) ?item.referenceKey};
+    _activityReferences.removeWhere((ref, _) => !keys.contains(ref));
+    void emit() {
+      if (generation != _recentActivityGeneration || _recentActivity.isClosed) {
+        return;
       }
-    } catch (_) {}
+      _recentActivity.add([
+        for (final item in items)
+          item.referenceKey == null
+              ? item
+              : item.withReference(
+                  _activityReferences[item.referenceKey] ??
+                      ReferenceDto.loading(item.referenceKey!),
+                ),
+      ]);
+    }
+
+    emit();
+    if (keys.isEmpty) return;
+
+    Future<void> resolve() async {
+      if (generation != _recentActivityGeneration) return;
+      try {
+        final fetched = await _api.fetchReferences(keys);
+        if (generation != _recentActivityGeneration) return;
+        _activityReferences.addAll(fetched);
+        emit();
+      } catch (error) {
+        if (generation != _recentActivityGeneration) return;
+        final partial = error is PartialReferenceFetchException ? error : null;
+        if (partial != null) _activityReferences.addAll(partial.resolved);
+        final unresolved = partial?.unresolved ?? keys;
+        // Keep an already-filled preview, but settle a new card rather than
+        // leaving its placeholder pending until a later feed refresh. A pending
+        // cache answer is a placeholder, not a filled preview. That refresh
+        // still asks the failed key again and can replace the fallback.
+        _activityReferences.addAll({
+          for (final key in unresolved)
+            if (_activityReferences[key]?.cacheState == null ||
+                _activityReferences[key]?.cacheState == 'pending')
+              key: ReferenceDto(
+                ref: key,
+                scheme: key.split(':').first,
+                title: key,
+                unavailable: 'could not load context',
+                cacheState: 'unavailable',
+              ),
+        });
+        emit();
+      }
+    }
+
+    if (deferUntilPostFrame) {
+      // Resolve after the frame that paints this feed. One callback serves
+      // every refresh until that frame, and only the newest generation's
+      // resolve runs. Asking for the frame keeps the fill from waiting on
+      // unrelated input while Overview is not mounted (#940).
+      final scheduled = _pendingActivityResolve != null;
+      _pendingActivityResolve = resolve;
+      if (!scheduled) {
+        WidgetsBinding.instance
+          ..addPostFrameCallback((_) {
+            final pending = _pendingActivityResolve;
+            _pendingActivityResolve = null;
+            if (pending != null) unawaited(pending());
+          })
+          ..ensureVisualUpdate();
+      }
+      return;
+    }
+    await resolve();
   }
 
   Future<List<String>> fetchRootControlProviders() =>
