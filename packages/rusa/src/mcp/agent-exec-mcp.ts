@@ -491,7 +491,7 @@ export function createAgentExecMcpServer(
     {
       title: "Introduce one thread to another",
       description:
-        "Give `holder_thread_id` a handle to `target_thread_id` so it can message it directly (e.g. let a coder reach a reviewer). The holder sees the target described by its own title, or its charter's first line when it has none.",
+        "Give `holder_thread_id` a handle to `target_thread_id` so it can message it directly (e.g. let a coder reach a reviewer). You must already hold handles to both. The holder sees the target described by its own title, or its charter's first line when it has none.",
       inputSchema: {
         holder_thread_id: z.string().describe("The actor that should gain the new handle."),
         target_thread_id: z.string().describe("The actor the handle points at."),
@@ -499,13 +499,23 @@ export function createAgentExecMcpServer(
     },
     async ({ holder_thread_id, target_thread_id }) => {
       try {
-        if (!mesh.actors.get(holder_thread_id)) {
+        const holder = mesh.actors.get(holder_thread_id);
+        if (!holder) {
           return toolError(new Error(`unknown thread id: ${holder_thread_id}`));
         }
-        if (!mesh.actors.get(target_thread_id)) {
+        const target = mesh.actors.get(target_thread_id);
+        if (!target) {
           return toolError(new Error(`unknown thread id: ${target_thread_id}`));
         }
-        mesh.grantHandle(holder_thread_id, { id: target_thread_id });
+        // Holding handles to both actors is sufficient authority to introduce
+        // them; how each handle was obtained does not matter (#814).
+        const held = new Set((mesh.actors.get(selfId)?.handles ?? []).map((h) => h.id));
+        for (const actor of [holder, target]) {
+          if (!held.has(actor.id)) {
+            return toolError(new Error(`you do not hold a handle to ${actor.id}`));
+          }
+        }
+        mesh.grantHandle(holder.id, { id: target.id });
         return toolOk("introduced");
       } catch (err) {
         return toolError(err);

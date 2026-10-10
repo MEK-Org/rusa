@@ -84,7 +84,7 @@ The core primitives:
 | --- | --- |
 | `spawn_thread(charter, model_config, …)` | Create a child actor with its own charter and session. You become its parent. Non-blocking: the child runs asynchronously. `model_config` is required; there is no default model. |
 | `send_message(thread_id, body)` | Deliver a message to another actor's inbox (parent, child, or an introduced peer). The recipient wakes on its own schedule and replies later as a new message. |
-| `introduce(holder, target)` | Grant one actor a handle to another so they can message directly (for example, let a coder reach a reviewer). The id is the capability; the holder sees the target's own title, or its charter's first line when untitled. |
+| `introduce(holder, target)` | Grant one actor a handle to another so they can message directly (for example, let a coder reach a reviewer). The caller must already hold handles to both. The id is the capability; the holder sees the target's own title, or its charter's first line when untitled. |
 | `list_threads()` | List the actors you have spawned, with charter summaries and status. |
 | `retire_thread(thread_id)` | Mark a descendant (and its subtree) done and stop it. Only a parent can retire its descendants. |
 | `set_actor_model(actor_id, model_config)` | Replace a child's provider/model pool in place (parent or root only). Provider changes and multi-entry pools are only allowed for portable-context actors. |
