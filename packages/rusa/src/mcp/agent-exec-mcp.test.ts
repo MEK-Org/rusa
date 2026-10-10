@@ -1265,6 +1265,77 @@ describe("agent-execution MCP server", () => {
     expect(registry.get(a.thread_id)?.handles).toEqual([{ id: b.thread_id }]);
   });
 
+  describe("introduce requires the caller to hold both handles (#814)", () => {
+    const modelConfig = { provider: "claude", model: "claude-sonnet-4-6" };
+
+    function peers() {
+      const env = setup();
+      const spawn = (charter: string) => env.mesh.spawn({ charter, parentId: "root", modelConfig });
+      return { ...env, caller: spawn("caller"), b: spawn("holder"), c: spawn("target") };
+    }
+
+    it("lets a caller holding both handles introduce them, whatever each handle's origin", async () => {
+      const { mesh, registry, caller, b, c } = peers();
+      mesh.grantHandle(caller, { id: b });
+      // A reply address minted by message delivery (#796) counts as held.
+      mesh.sendMessage(caller, "hello", c);
+      expect(registry.get(caller)?.handles).toEqual([{ id: b }, { id: c, origin: "message" }]);
+
+      const client = await connect(createAgentExecMcpServer(mesh, caller, "root"));
+      const introduce = async (holder: string, target: string) =>
+        (await client.callTool({
+          name: "introduce",
+          arguments: { holder_thread_id: holder, target_thread_id: target },
+        })) as CallToolResult;
+      expect((await introduce(b, c)).isError).toBeFalsy();
+      // The minted handle keeps the caller's message origin, so it cannot
+      // carry voice transfer.
+      expect(registry.get(b)?.handles).toEqual([{ id: c, origin: "message" }]);
+      expect(() => mesh.transferVoiceSession(b, c)).toThrow("not a handle held");
+
+      // Nor does it downgrade a handle the holder already has.
+      const d = mesh.spawn({ charter: "prior holder", parentId: "root", modelConfig });
+      mesh.grantHandle(d, { id: c });
+      mesh.grantHandle(caller, { id: d });
+      expect((await introduce(d, c)).isError).toBeFalsy();
+      expect(registry.get(d)?.handles).toEqual([{ id: c }]);
+    });
+
+    it("does not count the caller's parent alias as a held handle", async () => {
+      const { mesh, registry, caller, b } = peers();
+      mesh.grantHandle(caller, { id: b });
+      const before = registry.list().map((r) => ({ id: r.id, handles: r.handles }));
+      const client = await connect(createAgentExecMcpServer(mesh, caller, "root"));
+      const res = (await client.callTool({
+        name: "introduce",
+        arguments: { holder_thread_id: b, target_thread_id: "root" },
+      })) as CallToolResult;
+      expect(dataOf(res)).toBe("you do not hold a handle to root");
+      expect(registry.list().map((r) => ({ id: r.id, handles: r.handles }))).toEqual(before);
+    });
+
+    it.each([
+      ["holder", "c", "b"],
+      ["target", "b", "c"],
+    ] as const)("refuses a caller missing the %s handle and changes nothing", async (_, held, missing) => {
+      const env = peers();
+      const { mesh, registry, events, caller, b, c } = env;
+      mesh.grantHandle(caller, { id: env[held] });
+      const before = registry.list().map((r) => ({ id: r.id, handles: r.handles }));
+      const grantsBefore = events.filter((e) => e.kind === "handle_granted").length;
+
+      const client = await connect(createAgentExecMcpServer(mesh, caller, "root"));
+      const res = (await client.callTool({
+        name: "introduce",
+        arguments: { holder_thread_id: b, target_thread_id: c },
+      })) as CallToolResult;
+      expect(res.isError).toBe(true);
+      expect(dataOf(res)).toBe(`you do not hold a handle to ${env[missing]}`);
+      expect(registry.list().map((r) => ({ id: r.id, handles: r.handles }))).toEqual(before);
+      expect(events.filter((e) => e.kind === "handle_granted")).toHaveLength(grantsBefore);
+    });
+  });
+
   it("list_threads returns the caller's direct reports", async () => {
     const { mesh } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
