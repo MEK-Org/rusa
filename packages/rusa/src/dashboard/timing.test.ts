@@ -556,9 +556,55 @@ describe("dashboard timing recorder", () => {
         closedBeforeFinish: empty,
       },
     ]);
-    // The pre-#990 per-label group is unchanged: every method and status together.
+    // The pre-#990 aggregates keep their finished-only population: every
+    // method and status together, but never the premature close.
     expect(summary.groups).toEqual([
-      expect.objectContaining({ source: "server", label: "mesh_obligations", count: 6 }),
+      expect.objectContaining({
+        source: "server",
+        label: "mesh_obligations",
+        count: 5,
+        maxMs: 900,
+        statusBuckets: { "2xx": 3, "3xx": 1, "5xx": 1 },
+      }),
+    ]);
+    expect(summary.serverPhases).toEqual([
+      expect.objectContaining({ label: "mesh_obligations", sampleCount: 5 }),
+    ]);
+  });
+
+  it("keeps a premature close out of client/server pairing and coverage (#990)", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    const closedId = randomUUID();
+    recorder.recordServer({
+      label: "mesh_threads",
+      requestId: closedId,
+      durationMs: 5000,
+      status: null,
+      bytes: 0,
+      request: { method: "GET", terminal: "closed_before_finish" },
+    });
+    recorder.recordClient({
+      interaction: "initial_load",
+      durationMs: 5100,
+      requestIds: [closedId],
+      requestTimings: [{ requestId: closedId, requestMs: 5050 }],
+      outcome: "failure",
+    });
+    while (timingRows().length < 2) recorder.flush();
+
+    const summary = recorder.summary({ since: new Date(Date.now() - 60_000) });
+    expect(summary.clientServerCoverage).toEqual({
+      clientRequestIds: 1,
+      serverRequestIds: 0,
+      matchedRequestIds: 0,
+    });
+    expect(summary.pairedRequestDurations).toEqual([]);
+    expect(summary.serverPopulations).toEqual([
+      expect.objectContaining({
+        label: "mesh_threads",
+        method: "GET",
+        closedBeforeFinish: expect.objectContaining({ count: 1, maxMs: 5000 }),
+      }),
     ]);
   });
 

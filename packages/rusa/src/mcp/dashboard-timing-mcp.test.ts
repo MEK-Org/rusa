@@ -2,7 +2,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { describe, expect, it, vi } from "vitest";
+import Database from "better-sqlite3";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { DashboardTimingRecorder } from "../dashboard/timing.js";
+import { runMigrations } from "../db/migrations/runner.js";
+import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { createDashboardTimingMcpServer } from "./dashboard-timing-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -58,6 +62,39 @@ describe("dashboard timing MCP", () => {
     expect(result.content[0]).toMatchObject({
       type: "text",
       text: expect.stringContaining("sampleCount"),
+    });
+  });
+
+  describe("retention boundary (#990)", () => {
+    afterEach(() => vi.useRealTimers());
+
+    const retentionLimited = async (hours: number, readLagMs: number) => {
+      vi.useFakeTimers({ now: new Date("2026-10-10T12:00:00.000Z"), toFake: ["Date"] });
+      const db = new Database(":memory:");
+      runMigrations(db);
+      // The recorder reads its clock a moment after the tool computes `since`.
+      const recorder = new DashboardTimingRecorder(
+        new MeshEventRepository(db),
+        () => new Date(Date.now() + readLagMs)
+      );
+      const client = await connect(createDashboardTimingMcpServer(recorder));
+      const result = (await client.callTool({
+        name: "dashboard_timing_summary",
+        arguments: { hours },
+      })) as CallToolResult;
+      db.close();
+      const text = (result.content[0] as { text: string }).text;
+      return JSON.parse(text).window.retentionLimited as boolean;
+    };
+
+    it("flags a full-retention request whether or not the clock moved between reads", async () => {
+      expect(await retentionLimited(168, 0)).toBe(true);
+      expect(await retentionLimited(168, 5)).toBe(true);
+    });
+
+    it("does not flag a request an hour inside retention", async () => {
+      expect(await retentionLimited(167, 0)).toBe(false);
+      expect(await retentionLimited(167, 5)).toBe(false);
     });
   });
 

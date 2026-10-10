@@ -10,6 +10,7 @@ import {
 export const DASHBOARD_TIMING_EVENT_KIND = "dashboard_timing";
 export const DASHBOARD_TIMING_MAX_RECORDS = 20_000;
 export const DASHBOARD_TIMING_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const RETENTION_BOUNDARY_SLACK_MS = 60_000;
 export const DASHBOARD_TIMING_MAX_QUEUE = 512;
 export const DASHBOARD_TIMING_MAX_CLIENT_IDS = 32;
 export const DASHBOARD_TIMING_MAX_CLIENT_BODY_BYTES = 8 * 1024;
@@ -543,8 +544,11 @@ export class DashboardTimingRecorder {
         // rows may exist (or may have been count-pruned) and are not counted.
         capReached: events.length >= DASHBOARD_TIMING_MAX_RECORDS,
         retentionMs: DASHBOARD_TIMING_RETENTION_MS,
+        // Inclusive with a minute of slack: a caller's `since` is computed a
+        // moment before this read, and a full-retention request must not flip.
         retentionLimited:
-          opts.since.getTime() < this.now().getTime() - DASHBOARD_TIMING_RETENTION_MS,
+          opts.since.getTime() <=
+          this.now().getTime() - DASHBOARD_TIMING_RETENTION_MS + RETENTION_BOUNDARY_SLACK_MS,
         unreadableRecords: events.length - allRows.length,
       },
     };
@@ -646,7 +650,7 @@ export interface DashboardTimingWindow {
   /** True when the read hit its cap; older rows in the window are not counted. */
   capReached: boolean;
   retentionMs: number;
-  /** True when the requested window starts before the retention horizon. */
+  /** True when the requested window reaches the retention horizon, so its earliest rows may be pruned. */
   retentionLimited: boolean;
   /** Rows read that failed validation and are excluded from every figure. */
   unreadableRecords: number;
@@ -677,7 +681,7 @@ export interface DashboardTimingSummary {
   serverPhases: DashboardServerPhaseGroup[];
   /** Server request populations by label, operation and method (#990). */
   serverPopulations: DashboardServerPopulationGroup[];
-  /** Per-label groups as before #990: every method and status in one distribution. */
+  /** Per-label groups as before #990: finished responses of every method and status in one distribution. */
   groups: DashboardTimingGroup[];
 }
 
@@ -874,6 +878,9 @@ function summarize(
   since: string,
   droppedSinceStart: number
 ): Omit<DashboardTimingSummary, "window"> {
+  // The pre-#990 aggregates describe finished responses only, as every row
+  // did before closes were recorded; closes appear only in serverPopulations.
+  const finishedRows = rows.filter(({ payload }) => payload.terminal !== "closed_before_finish");
   const groups = new Map<
     string,
     {
@@ -891,7 +898,7 @@ function summarize(
     string,
     Array<{ interaction: (typeof CLIENT_LABELS)[number]; requestMs: number }>
   >();
-  for (const { payload } of rows) {
+  for (const { payload } of finishedRows) {
     const key = `${payload.source}:${payload.label}`;
     const group = groups.get(key) ?? {
       payload,
@@ -912,6 +919,7 @@ function summarize(
     groups.set(key, group);
   }
   for (const { payload } of correlationRows) {
+    if (payload.terminal === "closed_before_finish") continue;
     if (payload.source === "server" && payload.requestId) {
       serverRequestIds.add(payload.requestId);
       const serverRows = serverRowsByRequestId.get(payload.requestId) ?? [];
@@ -987,7 +995,7 @@ function summarize(
           a.serverLabel.localeCompare(b.serverLabel) ||
           (a.serverOperation ?? "").localeCompare(b.serverOperation ?? "")
       ),
-    serverPhases: serverPhaseGroups(rows),
+    serverPhases: serverPhaseGroups(finishedRows),
     serverPopulations: serverPopulationGroups(rows),
     groups: [...groups.values()]
       .map((group) => {
