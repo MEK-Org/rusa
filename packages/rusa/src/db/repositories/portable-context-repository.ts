@@ -1,6 +1,11 @@
 import type Database from "better-sqlite3";
+import { z } from "zod";
 import {
+  applyBriefCommit,
   emptyPortableContextState,
+  type PortableBriefCommit,
+  type PortableBriefRevision,
+  type PortableBriefStore,
   type PortableContextState,
   type PortableContextStore,
   parsePortableContextState,
@@ -8,6 +13,21 @@ import {
 } from "../../actor/portable-context-state.js";
 
 type SnapshotRow = { snapshot: string };
+
+type BriefRevisionRow = {
+  generation: number;
+  acting_principal: string;
+  timestamp: string;
+  payload: string;
+};
+
+/** `portable_brief_revisions.payload` (0060), validated here at the point of consumption. */
+const briefRevisionPayloadSchema = z.object({
+  schemaVersion: z.literal(1),
+  before: z.string(),
+  after: z.string(),
+  explanation: z.string().optional(),
+});
 
 /**
  * SQLite implementation of {@link PortableContextStore} — every call reads
@@ -25,7 +45,7 @@ type SnapshotRow = { snapshot: string };
  * cannot be written and an unreadable one is named rather than silently
  * treated as absent.
  */
-export class DbPortableContextStore implements PortableContextStore {
+export class DbPortableContextStore implements PortableContextStore, PortableBriefStore {
   constructor(private readonly db: Database.Database) {}
 
   /**
@@ -73,6 +93,65 @@ export class DbPortableContextStore implements PortableContextStore {
          ON CONFLICT(actor_id) DO UPDATE SET snapshot = excluded.snapshot`
       )
       .run(state.actorId, JSON.stringify(state));
+  }
+
+  /**
+   * Accept one brief write. The reread, the generation check, the snapshot
+   * replace and the history append run in one immediate transaction, so a
+   * writer that read an older generation gets a `StaleBriefWriteError`
+   * and nothing changes, and the snapshot never shows a brief the history
+   * lacks. `UNIQUE(actor_id, generation)` backs the check in the database.
+   */
+  commitBrief(input: PortableBriefCommit): PortableBriefRevision {
+    return this.db
+      .transaction(() => {
+        const { state, revision } = applyBriefCommit(this.load(input.actorId), input);
+        this.save(state);
+        const payload: z.infer<typeof briefRevisionPayloadSchema> = {
+          schemaVersion: 1,
+          before: revision.before,
+          after: revision.after,
+          ...(revision.explanation === undefined ? {} : { explanation: revision.explanation }),
+        };
+        this.db
+          .prepare(
+            `INSERT INTO portable_brief_revisions
+               (actor_id, generation, acting_principal, timestamp, payload)
+             VALUES (?, ?, ?, ?, ?)`
+          )
+          .run(
+            input.actorId,
+            revision.generation,
+            revision.actingPrincipal,
+            revision.updatedAt,
+            JSON.stringify(payload)
+          );
+        return revision;
+      })
+      .immediate();
+  }
+
+  listBriefRevisions(actorId: string, limit: number): PortableBriefRevision[] {
+    const rows = this.db
+      .prepare(
+        `SELECT generation, acting_principal, timestamp, payload
+         FROM portable_brief_revisions
+         WHERE actor_id = ?
+         ORDER BY generation DESC
+         LIMIT ?`
+      )
+      .all(actorId, limit) as BriefRevisionRow[];
+    return rows.map((row) => {
+      const payload = briefRevisionPayloadSchema.parse(JSON.parse(row.payload));
+      return {
+        generation: row.generation,
+        updatedAt: row.timestamp,
+        actingPrincipal: row.acting_principal,
+        before: payload.before,
+        after: payload.after,
+        ...(payload.explanation === undefined ? {} : { explanation: payload.explanation }),
+      };
+    });
   }
 
   /**

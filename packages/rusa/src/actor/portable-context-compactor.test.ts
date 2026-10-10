@@ -10,12 +10,14 @@ import {
 } from "../db/repositories/actor-run-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import * as geminiUtils from "../understanding/gemini-utils.js";
+import { seedPortableBriefState } from "./portable-context-brief.js";
 import {
   applyCompactionOperations,
   DEFAULT_PORTABLE_CONTEXT_COMPACTOR_MODEL,
   describeCompaction,
   GeminiPortableContextCompactor,
   type PortableContextCompactionSummary,
+  type PortableContextCompactor,
   QUARANTINE_CLASSES,
   QUARANTINE_QUOTE_MAX_BYTES,
   type QuarantineClass,
@@ -1576,6 +1578,39 @@ describe("compactPortableContext integration (spec 6b)", () => {
     // Should NOT re-fetch the first message because watermark advanced
     expect(result2).toBeNull(); // No new messages to fold
     expect(mockClient.models.generateContent).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a brief committed while the fold awaited the model", async () => {
+    recordInbound("a durable decision");
+    const store = new InMemoryPortableContextStore();
+    store.save(
+      seedPortableBriefState(
+        emptyPortableContextState("actor-a"),
+        "actor-a",
+        "2026-10-10T12:00:00Z"
+      )
+    );
+    const brief = "## WHAT\nDraw. [mesh:messages/m-1]\n\n## HOW\n\n## DOMAIN\n";
+    const commit = (expectedGeneration: number, text: string) =>
+      store.commitBrief({
+        actorId: "actor-a",
+        expectedGeneration,
+        text,
+        actingPrincipal: "actor-a",
+        at: "2026-10-10T12:05:00Z",
+      });
+    const compactor: PortableContextCompactor = {
+      compact: async ({ state }) => {
+        // The actor writes its brief while the fold is in flight.
+        commit(0, brief);
+        return { state, quarantined: [], operations: 0 };
+      },
+    };
+
+    await compactPortableContext({ actorId: "actor-a", store, compactor });
+    expect(store.load("actor-a").brief).toMatchObject({ text: brief, generation: 1 });
+    // The snapshot and the history still agree, so the next write lands.
+    expect(commit(1, brief.replace("Draw.", "Paint.")).generation).toBe(2);
   });
 
   it("distinguishes a degraded fold from an empty one in a single event ", async () => {

@@ -72,155 +72,27 @@ const portableMemoryItemSchema = z.object({
 export type PortableMemoryItem = z.infer<typeof portableMemoryItemSchema>;
 
 /**
- * The brief's own monotonic position in the durable source stream, mirroring
- * the ledger source ordering (`ts`, then the message/yield discriminator,
- * then id as the tiebreak — never a UUID comparison on its own). `null` means
- * "before every source": either the actor was switched to brief mode before
- * any durable source existed, or no source has been incorporated yet.
- */
-export const briefCursorSchema = z.object({
-  ts: z.string().min(1),
-  sourceOrder: z.number().int().min(0),
-  id: z.string().min(1),
-});
-export type BriefCursor = z.infer<typeof briefCursorSchema>;
-
-/**
- * Auditable accounting for one WHAT/HOW line changed or retired by a brief
- * rewrite. It is rewrite bookkeeping, never rendered as part of the brief.
- */
-export const portableBriefSupersessionSchema = z.object({
-  previous: z.object({
-    section: z.enum(["WHAT", "HOW"]),
-    /** The exact raw prior line, including its citation tail. */
-    line: z.string().min(1),
-    /** One-based occurrence of that raw line within its previous section. */
-    occurrence: z.number().int().positive(),
-  }),
-  /** Newer eligible human/ancestor citation authorizing this one change. */
-  source: z.string().min(1),
-  /** Omitted only for a deletion; otherwise an exact candidate line in the same section. */
-  replacement: z
-    .object({
-      section: z.enum(["WHAT", "HOW"]),
-      line: z.string().min(1),
-    })
-    .optional(),
-});
-export type PortableBriefSupersession = z.infer<typeof portableBriefSupersessionSchema>;
-
-/** Verified authority facts retained for cited WHAT/HOW instructions. */
-export const portableBriefAuthoritySchema = z.object({
-  sourceClass: z.enum(["human", "ancestor"]),
-  observedAt: z.string().min(1),
-});
-export type PortableBriefAuthority = z.infer<typeof portableBriefAuthoritySchema>;
-
-/**
- * A persistent acknowledge-and-retain block for an oversized source (#954
- * settled oversized-source architecture: root 6056878951, spec 6057170505).
- * Recorded after bounded failure escalation when a durable source exceeds the
- * fixed slice byte bound.
- */
-export const portableBriefOversizedBlockSchema = z.object({
-  /** Ready-made citation for the oversized source (e.g. mesh:messages/<id>). */
-  sourceRef: z.string().min(1),
-  /** Monotonic store position of the oversized source. */
-  sourcePosition: briefCursorSchema,
-  /** Measured UTF-8 byte size of the oversized source body. */
-  byteSize: z.number().int().positive(),
-  /** The slice byte limit that was exceeded. */
-  byteLimit: z.number().int().positive(),
-  /** ISO timestamp when the obstruction was first observed and recorded. */
-  observedAt: z.string().min(1),
-});
-export type PortableBriefOversizedBlock = z.infer<typeof portableBriefOversizedBlockSchema>;
-
-/**
- * The per-actor `brief` portable-context mode document (#954 iteration 1).
+ * The per-actor `brief` portable-context mode document (#954).
  *
  * Stored INSIDE the versioned snapshot document (schemaVersion v4) rather than
  * in its own table: `portable_context_snapshots` is already one versioned JSON
  * document per actor with no database-level shape constraint, and keeping the
  * brief beside the ledger is what makes switch-back free — the ledger `items`,
  * ledger generation and `lastFoldedSourceId` stay in the same document,
- * untouched by brief rewrites.
+ * untouched by brief writes.
  *
- * The brief cursor and generation are the brief's OWN sequence position and
- * counter, fully independent of the ledger watermark and ledger generation:
- * a brief rewrite must never advance or otherwise touch the ledger fields.
- *
- * `consecutiveFailures`, `frozen` and `resolvedRefs` are the minimal
- * retry/freeze/resolved-ref-cache bookkeeping the rewrite cycle needs to
- * survive restarts; their shape is enforced here, at the point of
- * consumption, exactly like the rest of the document.
+ * The actor writes its own brief through the brief MCP server; nothing rewrites
+ * it after a run. The snapshot holds only the CURRENT brief. Its accepted-write
+ * history lives in `portable_brief_revisions` (0060), the one authoritative
+ * history, appended in the same transaction that replaces this document.
  */
-/**
- * Inspectable revision history record for an actor brief (#954, Matt jMZhErvvUEY).
- * Retains accepted updates with timestamp, generation, optional actor explanation,
- * and text without requiring database DDL migrations.
- */
-export const portableBriefRevisionSchema = z.object({
-  generation: z.number().int().nonnegative(),
-  updatedAt: z.string().min(1),
-  explanation: z.string().optional(),
-  text: z.string(),
-});
-export type PortableBriefRevision = z.infer<typeof portableBriefRevisionSchema>;
-
 export const portableBriefSchema = z.object({
-  /** The rendered three-section brief text (WHAT/HOW/DOMAIN), verbatim. */
+  /** The three-section brief text (WHAT/HOW/DOMAIN), verbatim. */
   text: z.string(),
-  cursor: briefCursorSchema.nullable(),
+  /** Accepted-write counter: 0 for the seed, +1 per accepted change, unchanged by a no-op. */
   generation: z.number().int().nonnegative(),
-  /** The Gemini model that produced the current text; null on the seed. */
-  model: z.string().nullable(),
+  /** Time of the last accepted write (the seed time before the first one). */
   updatedAt: z.string().min(1),
-  /** Failed rewrite cycles since the last accepted rewrite (repair retries inside one cycle count once). */
-  consecutiveFailures: z.number().int().nonnegative(),
-  /**
-   * Rewrites are frozen after three consecutive failed cycles until the
-   * specific durable needs-attention item is handled. The item id is retained
-   * below so unrelated messages cannot accidentally release the freeze.
-   */
-  frozen: z.boolean(),
-  /** Inbox entry raised for the current freeze; null before a freeze or after its handling. */
-  freezeAttentionId: z.string().min(1).nullable().default(null),
-  /**
-   * The actor whose inbox holds {@link freezeAttentionId}, captured when it was
-   * raised, so a later reparent cannot redirect the handled-state lookup.
-   */
-  freezeAttentionOwnerId: z.string().min(1).nullable().default(null),
-  /**
-   * Persistent acknowledge-and-retain block (#954 settled oversized-source
-   * architecture: root 6056878951, spec 6057170505). When an oversized source
-   * exceeds the slice byte bound and escalates through bounded failures, this
-   * distinguishable block persists in the snapshot. Handling the attention item
-   * acknowledges the obstruction but does not release it; subsequent runs and
-   * restarts stay blocked with zero model calls and no duplicate attention.
-   */
-  oversizedBlock: portableBriefOversizedBlockSchema.nullable().default(null),
-  /**
-   * Per-actor resolved-ref cache, keyed by the canonical ref string: every ref
-   * that has been successfully resolved at least once. A ref is resolved only
-   * on its first appearance for the actor; a rewrite that introduces no new
-   * ref makes zero resolution calls (for GitHub refs: zero tracker calls).
-   */
-  resolvedRefs: z.array(z.string().min(1)),
-  /**
-   * The most recent accepted rewrite's per-line change ledger.  It is bounded
-   * by the rewrite validator and remains with the snapshot for audit while the
-   * rendered prompt receives only {@link text}.
-   */
-  supersessions: z.array(portableBriefSupersessionSchema).default([]),
-  /**
-   * Source classes observed at acceptance time.  They let a later rewrite
-   * prove it is not lowering the authority of the line it replaces without
-   * re-resolving historical citations.
-   */
-  citationAuthorities: z.record(z.string(), portableBriefAuthoritySchema).default({}),
-  /** Inspectable history of accepted brief updates (capped, e.g. 10 most recent). */
-  revisions: z.array(portableBriefRevisionSchema).optional(),
 });
 export type PortableBrief = z.infer<typeof portableBriefSchema>;
 
@@ -324,8 +196,90 @@ export interface PortableContextStore {
   save(state: PortableContextState): void;
 }
 
-export class InMemoryPortableContextStore implements PortableContextStore {
+/** One accepted brief write, read back from the append-only brief history. */
+export interface PortableBriefRevision {
+  generation: number;
+  updatedAt: string;
+  /** Server-bound writer identity; never taken from tool input. */
+  actingPrincipal: string;
+  /** The brief text this write replaced. */
+  before: string;
+  after: string;
+  /** The writer's optional account of why it changed the brief. */
+  explanation?: string;
+}
+
+export interface PortableBriefCommit {
+  actorId: string;
+  /** The generation the writer read; a write against any other generation is refused. */
+  expectedGeneration: number;
+  text: string;
+  explanation?: string;
+  actingPrincipal: string;
+  at: string;
+}
+
+/** A write whose expected generation is no longer the stored one. Nothing was written. */
+export class StaleBriefWriteError extends Error {
+  constructor(
+    readonly actorId: string,
+    readonly expectedGeneration: number,
+    readonly currentGeneration: number | null
+  ) {
+    super(
+      currentGeneration === null
+        ? `actor ${actorId} has no brief to replace`
+        : `stale brief write for actor ${actorId}: expected generation ${expectedGeneration}, current is ${currentGeneration}; read the brief again before replacing it`
+    );
+    this.name = "StaleBriefWriteError";
+  }
+}
+
+/**
+ * Brief writes and their history. {@link commitBrief} is the only accepted-write
+ * path: it rereads the stored brief, refuses a stale `expectedGeneration`, and
+ * replaces the snapshot and appends the revision as one unit, so the current
+ * brief and its history cannot disagree.
+ */
+export interface PortableBriefStore {
+  commitBrief(input: PortableBriefCommit): PortableBriefRevision;
+  /** Newest first, at most `limit`. */
+  listBriefRevisions(actorId: string, limit: number): PortableBriefRevision[];
+}
+
+/** The snapshot an accepted brief write leaves behind; shared by both stores. */
+export function applyBriefCommit(
+  state: PortableContextState,
+  input: PortableBriefCommit
+): { state: PortableContextState; revision: PortableBriefRevision } {
+  const current = state.brief;
+  if (current === null || current.generation !== input.expectedGeneration) {
+    throw new StaleBriefWriteError(
+      input.actorId,
+      input.expectedGeneration,
+      current?.generation ?? null
+    );
+  }
+  const revision: PortableBriefRevision = {
+    generation: current.generation + 1,
+    updatedAt: input.at,
+    actingPrincipal: input.actingPrincipal,
+    before: current.text,
+    after: input.text,
+    ...(input.explanation === undefined ? {} : { explanation: input.explanation }),
+  };
+  return {
+    state: {
+      ...state,
+      brief: { text: input.text, generation: revision.generation, updatedAt: input.at },
+    },
+    revision,
+  };
+}
+
+export class InMemoryPortableContextStore implements PortableContextStore, PortableBriefStore {
   private readonly states = new Map<string, PortableContextState>();
+  private readonly revisions = new Map<string, PortableBriefRevision[]>();
 
   load(actorId: string): PortableContextState {
     return structuredClone(this.states.get(actorId) ?? emptyPortableContextState(actorId));
@@ -334,5 +288,16 @@ export class InMemoryPortableContextStore implements PortableContextStore {
   save(state: PortableContextState): void {
     portableContextStateSchema.parse(state);
     this.states.set(state.actorId, structuredClone(state));
+  }
+
+  commitBrief(input: PortableBriefCommit): PortableBriefRevision {
+    const { state, revision } = applyBriefCommit(this.load(input.actorId), input);
+    this.save(state);
+    this.revisions.set(input.actorId, [...(this.revisions.get(input.actorId) ?? []), revision]);
+    return structuredClone(revision);
+  }
+
+  listBriefRevisions(actorId: string, limit: number): PortableBriefRevision[] {
+    return structuredClone((this.revisions.get(actorId) ?? []).slice(-limit).reverse());
   }
 }

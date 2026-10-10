@@ -87,7 +87,7 @@ interface PortableLedgerSourceRow {
 interface SourceCursor {
   id: string;
   ts: string;
-  sourceOrder: number;
+  source_order: number;
 }
 
 /** Match the historical run_end capture bound while moving authority off the event log. */
@@ -356,54 +356,7 @@ export class ActorRunRepository {
     if (afterSourceId && !cursor) {
       throw new Error(`portable-context durable source not found: ${afterSourceId}`);
     }
-    return this.pageLedgerSources(actorId, cursor, limit);
-  }
 
-  /**
-   * The same durable stream paged by ordered POSITION (`ts`, `source_order`,
-   * `id`) rather than by resolving a source id first. The brief's cursor is a
-   * position of exactly this shape (#954 amendment 2: a monotonic store
-   * position, never a UUID comparison), so the brief rewrite pages its bounded
-   * delta with this method and can resume mid-stream without re-resolving ids.
-   */
-  listLedgerSourcesAfterPosition(
-    actorId: string,
-    position: { ts: string; sourceOrder: number; id: string } | null,
-    limit = 50
-  ): { sources: PortableLedgerSource[]; hasMore: boolean } {
-    if (limit <= 0) return { sources: [], hasMore: false };
-    assertLimit(limit);
-    return this.pageLedgerSources(actorId, position, limit);
-  }
-
-  /** The position of the newest durable source for an actor, or null when none. */
-  latestLedgerSourcePosition(
-    actorId: string
-  ): { ts: string; sourceOrder: number; id: string } | null {
-    const row = this.db
-      .prepare(
-        `WITH durable_sources AS (
-           SELECT id, ts, 0 AS source_order
-           FROM mesh_chat
-           WHERE recipient_id = ?
-           UNION ALL
-           SELECT id, yielded_at AS ts, 1 AS source_order
-           FROM actor_runs
-           WHERE actor_id = ? AND yielded_at IS NOT NULL AND yield_note IS NOT NULL
-         )
-         SELECT ts, source_order, id FROM durable_sources
-         ORDER BY ts DESC, source_order DESC, id DESC
-         LIMIT 1`
-      )
-      .get(actorId, actorId) as { ts: string; source_order: number; id: string } | undefined;
-    return row ? { ts: row.ts, sourceOrder: row.source_order, id: row.id } : null;
-  }
-
-  private pageLedgerSources(
-    actorId: string,
-    cursor: { ts: string; sourceOrder: number; id: string } | null,
-    limit: number
-  ): { sources: PortableLedgerSource[]; hasMore: boolean } {
     const params: Array<string | number> = [actorId, actorId];
     let after = "";
     if (cursor) {
@@ -415,9 +368,9 @@ export class ActorRunRepository {
       params.push(
         cursor.ts,
         cursor.ts,
-        cursor.sourceOrder,
+        cursor.source_order,
         cursor.ts,
-        cursor.sourceOrder,
+        cursor.source_order,
         cursor.id
       );
     }
@@ -453,7 +406,7 @@ export class ActorRunRepository {
   private resolveSourceCursor(actorId: string, sourceId: string): SourceCursor | null {
     const row = this.db
       .prepare(
-        `SELECT id, ts, source_order AS sourceOrder
+        `SELECT id, ts, source_order
          FROM (
            SELECT id, ts, 0 AS source_order
            FROM mesh_chat
@@ -467,9 +420,7 @@ export class ActorRunRepository {
          ORDER BY source_order ASC
          LIMIT 1`
       )
-      .get(actorId, sourceId, sourceId, actorId, sourceId, sourceId) as
-      | { id: string; ts: string; sourceOrder: number }
-      | undefined;
+      .get(actorId, sourceId, sourceId, actorId, sourceId, sourceId) as SourceCursor | undefined;
     return row ?? null;
   }
 }

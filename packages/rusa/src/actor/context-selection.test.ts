@@ -54,7 +54,7 @@ describe("resolveContextSelection", () => {
     expect(() => resolveContextSelection(undefined, { compactionModel: "gemini-x" })).toThrow(
       "requires a portable context selection"
     );
-    // Brief rewrites always use the spec-fixed model, so a configured one would be inert.
+    // Nothing compacts a brief, so a configured model would be inert.
     expect(() => resolveContextSelection("brief", { compactionModel: "gemini-x" })).toThrow(
       "meaningless for brief mode"
     );
@@ -114,16 +114,17 @@ describe("assertSpawnContextSupported", () => {
     ).toThrow("geminiApiKey");
   });
 
-  it("allows Gemini-backed modes when available, and tail either way", () => {
+  it("allows ledger when compaction is available, and tail and brief either way", () => {
     expect(() =>
       assertSpawnContextSupported({ context: { type: "portable", mode: "ledger" } }, available)
     ).not.toThrow();
     expect(() =>
       assertSpawnContextSupported({ context: { type: "portable", mode: "brief" } }, available)
     ).not.toThrow();
+    // The actor writes its own brief; no Gemini call is involved.
     expect(() =>
       assertSpawnContextSupported({ context: { type: "portable", mode: "brief" } }, unavailable)
-    ).toThrow("geminiApiKey");
+    ).not.toThrow();
     // Tail never calls the compactor, so a missing key must NOT block it —
     // otherwise the guard would be refusing a configuration that works.
     expect(() =>

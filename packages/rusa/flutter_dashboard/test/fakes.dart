@@ -332,16 +332,17 @@ class FakeApi extends DashboardApi {
   final briefRevisions = <String, List<BriefRevision>>{};
 
   @override
-  Future<({
-    String charter,
-    bool briefMode,
-    String? brief,
-    int? briefGeneration,
-    String? briefUpdatedAt,
-    List<BriefRevision> briefRevisions,
-  })> fetchActorInfo(
-    String threadId,
-  ) async => (
+  Future<
+    ({
+      String charter,
+      bool briefMode,
+      String? brief,
+      int? briefGeneration,
+      String? briefUpdatedAt,
+      List<BriefRevision> briefRevisions,
+    })
+  >
+  fetchActorInfo(String threadId) async => (
     charter: await fetchCharter(threadId),
     briefMode: briefs.containsKey(threadId),
     brief: briefs[threadId],

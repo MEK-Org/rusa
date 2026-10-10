@@ -5,6 +5,7 @@ import 'package:rxdart/rxdart.dart';
 
 import '../api.dart' show BriefRevision;
 import '../breakpoints.dart';
+import '../brief_diff.dart';
 import '../dashboard_timing.dart';
 import '../iu/simple_markdown.dart';
 import '../models.dart';
@@ -635,8 +636,8 @@ class _InfoViewState extends State<_InfoView> {
 
   Future<void> _loadCharter({bool trackDetail = false}) async {
     final id = widget.actor.id;
-    // Brief actors refresh with the existing detail rebuilds, so post-run
-    // rewrites reach an open Info tab without loading every actor's context.
+    // Brief actors refresh with the existing detail rebuilds, so the actor's
+    // own writes reach an open Info tab without loading every actor's context.
     if (_loadedFor == id && (!_briefMode || _loadingInfo)) return;
     final isNewActor = _loadedFor != id;
     _loadedFor = id;
@@ -697,45 +698,31 @@ class _InfoViewState extends State<_InfoView> {
   /// fetch degrades to less text, not to "No charter."
   String get charter => _charter ?? widget.actor.charterPreview;
 
+  /// Option B: the latest ten writes, then one write's change and
+  /// explanation. A centred dialog on wide screens, fullscreen on narrow ones.
   void _showBriefHistory(BuildContext context) {
     final isNarrow = MediaQuery.sizeOf(context).width < kNarrowBreakpoint;
-    final content = _BriefHistoryDialog(
+    final content = _BriefHistory(
       actorHandle: widget.actor.handle,
       currentGeneration: _briefGeneration,
       revisions: _briefRevisions,
-      isNarrow: isNarrow,
     );
-
-    if (isNarrow) {
-      showModalBottomSheet<void>(
-        context: context,
-        isScrollControlled: true,
-        backgroundColor: MeshColors.bgSecondary,
-        shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-        ),
-        builder: (ctx) => SizedBox(
-          height: MediaQuery.sizeOf(ctx).height * 0.9,
-          child: content,
-        ),
-      );
-    } else {
-      showDialog<void>(
-        context: context,
-        builder: (ctx) => Dialog(
-          backgroundColor: MeshColors.bgSecondary,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-            side: const BorderSide(color: MeshColors.border),
-          ),
-          child: SizedBox(
-            width: 620,
-            height: 640,
-            child: content,
-          ),
-        ),
-      );
-    }
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => isNarrow
+          ? Dialog.fullscreen(
+              backgroundColor: MeshColors.bgSecondary,
+              child: SafeArea(child: content),
+            )
+          : Dialog(
+              backgroundColor: MeshColors.bgSecondary,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+                side: const BorderSide(color: MeshColors.border),
+              ),
+              child: SizedBox(width: 680, height: 640, child: content),
+            ),
+    );
   }
 
   Widget _documentBox(Widget child) => Container(
@@ -922,7 +909,10 @@ class _InfoViewState extends State<_InfoView> {
                 if (_briefGeneration != null && _briefGeneration! > 0) ...[
                   const SizedBox(width: 8),
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2,
+                    ),
                     decoration: BoxDecoration(
                       color: MeshColors.bgSecondary,
                       borderRadius: BorderRadius.circular(4),
@@ -941,13 +931,24 @@ class _InfoViewState extends State<_InfoView> {
                 if (_briefUpdatedAt != null && _briefUpdatedAt!.isNotEmpty) ...[
                   const SizedBox(width: 8),
                   Expanded(
-                    child: Text(
-                      formatTs(_briefUpdatedAt!),
-                      style: const TextStyle(
-                        color: MeshColors.textMuted,
-                        fontSize: 11,
+                    // The update time is the accepted-write time, and the
+                    // way into its history alongside the icon.
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: InkWell(
+                        key: const ValueKey('brief-history-time'),
+                        onTap: _briefRevisions.isEmpty
+                            ? null
+                            : () => _showBriefHistory(context),
+                        child: Text(
+                          'updated ${formatTs(_briefUpdatedAt!)}',
+                          style: const TextStyle(
+                            color: MeshColors.textMuted,
+                            fontSize: 11,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
                       ),
-                      overflow: TextOverflow.ellipsis,
                     ),
                   ),
                 ] else ...[
@@ -958,7 +959,7 @@ class _InfoViewState extends State<_InfoView> {
                   IconButton(
                     key: const ValueKey('brief-history-button'),
                     icon: const Icon(Icons.history, size: 16),
-                    tooltip: 'Brief revision history',
+                    tooltip: 'Brief history',
                     visualDensity: VisualDensity.compact,
                     splashRadius: 16,
                     padding: EdgeInsets.zero,
@@ -1106,230 +1107,318 @@ class _VoicePicker extends StatelessWidget {
   }
 }
 
-class _BriefHistoryDialog extends StatefulWidget {
-  const _BriefHistoryDialog({
+/// The brief's history: the latest ten accepted writes, newest first, and on
+/// selecting one, what it changed (a line diff from the text it replaced) and
+/// the actor's explanation for it.
+class _BriefHistory extends StatefulWidget {
+  const _BriefHistory({
     required this.actorHandle,
     required this.currentGeneration,
     required this.revisions,
-    required this.isNarrow,
   });
 
   final String actorHandle;
   final int? currentGeneration;
+
+  /// Newest first, as the API pages them.
   final List<BriefRevision> revisions;
-  final bool isNarrow;
 
   @override
-  State<_BriefHistoryDialog> createState() => _BriefHistoryDialogState();
+  State<_BriefHistory> createState() => _BriefHistoryState();
 }
 
-class _BriefHistoryDialogState extends State<_BriefHistoryDialog> {
-  late final Set<int> _expandedGenerations;
+class _BriefHistoryState extends State<_BriefHistory> {
+  BriefRevision? _selected;
 
-  @override
-  void initState() {
-    super.initState();
-    _expandedGenerations = <int>{
-      if (widget.revisions.isNotEmpty) widget.revisions.last.generation,
-    };
+  static Widget _chip(String label, {bool current = false}) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+    decoration: BoxDecoration(
+      color: current
+          ? MeshColors.accent.withValues(alpha: 0.15)
+          : MeshColors.bgSecondary,
+      borderRadius: BorderRadius.circular(4),
+      border: Border.all(
+        color: current ? MeshColors.accent : MeshColors.border,
+      ),
+    ),
+    child: Text(
+      label,
+      style: TextStyle(
+        color: current ? MeshColors.accent : MeshColors.textSecondary,
+        fontSize: 11,
+        fontWeight: FontWeight.w600,
+      ),
+    ),
+  );
+
+  static Widget _label(String text) => Text(
+    text,
+    style: const TextStyle(
+      color: MeshColors.textPrimary,
+      fontSize: 13,
+      fontWeight: FontWeight.w600,
+    ),
+  );
+
+  static Widget _explanation(BriefRevision rev, {int? maxLines}) {
+    final given = rev.explanation;
+    return given == null || given.isEmpty
+        ? const Text(
+            'No explanation given.',
+            style: TextStyle(
+              color: MeshColors.textMuted,
+              fontSize: 12,
+              fontStyle: FontStyle.italic,
+            ),
+          )
+        : Text(
+            given,
+            maxLines: maxLines,
+            overflow: maxLines == null ? null : TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: MeshColors.textSecondary,
+              fontSize: 12,
+              height: 1.4,
+            ),
+          );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final reversed = widget.revisions.reversed.toList();
+  static String _tally(List<BriefDiffLine> diff) {
+    final added = diff.where((l) => l.op == BriefDiffOp.added).length;
+    final removed = diff.where((l) => l.op == BriefDiffOp.removed).length;
+    return '+$added −$removed';
+  }
 
-    return Column(
-      children: [
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          decoration: const BoxDecoration(
-            border: Border(bottom: BorderSide(color: MeshColors.border)),
+  bool _isCurrent(BriefRevision rev) =>
+      rev.generation == widget.currentGeneration;
+
+  Widget _header(BuildContext context) {
+    final selected = _selected;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: const BoxDecoration(
+        border: Border(bottom: BorderSide(color: MeshColors.border)),
+      ),
+      child: Row(
+        children: [
+          if (selected != null)
+            IconButton(
+              key: const ValueKey('brief-history-back'),
+              icon: const Icon(Icons.arrow_back, size: 18),
+              tooltip: 'All changes',
+              color: MeshColors.textSecondary,
+              visualDensity: VisualDensity.compact,
+              onPressed: () => setState(() => _selected = null),
+            )
+          else
+            const Padding(
+              padding: EdgeInsets.all(8),
+              child: Icon(Icons.history, size: 18, color: MeshColors.accent),
+            ),
+          const SizedBox(width: 4),
+          Expanded(
+            child: Text(
+              selected == null
+                  ? 'Brief history — ${widget.actorHandle}'
+                  : 'Generation ${selected.generation} change',
+              style: const TextStyle(
+                color: MeshColors.textPrimary,
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+              ),
+              overflow: TextOverflow.ellipsis,
+            ),
           ),
-          child: Row(
-            children: [
-              const Icon(Icons.history, size: 18, color: MeshColors.accent),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  'Brief Revision History — ${widget.actorHandle}',
-                  style: const TextStyle(
-                    color: MeshColors.textPrimary,
-                    fontSize: 15,
-                    fontWeight: FontWeight.w600,
-                  ),
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                  color: MeshColors.bgTertiary,
-                  borderRadius: BorderRadius.circular(4),
-                  border: Border.all(color: MeshColors.border),
-                ),
-                child: Text(
-                  '${widget.revisions.length} revision${widget.revisions.length == 1 ? '' : 's'}',
-                  style: const TextStyle(
-                    color: MeshColors.textSecondary,
-                    fontSize: 11,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 8),
-              IconButton(
-                icon: const Icon(Icons.close, size: 18),
-                color: MeshColors.textMuted,
-                visualDensity: VisualDensity.compact,
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
-                onPressed: () => Navigator.of(context).pop(),
-              ),
-            ],
+          if (selected == null)
+            _chip(
+              'Latest ${widget.revisions.length} '
+              'change${widget.revisions.length == 1 ? '' : 's'}',
+            ),
+          IconButton(
+            icon: const Icon(Icons.close, size: 18),
+            tooltip: 'Close',
+            color: MeshColors.textMuted,
+            visualDensity: VisualDensity.compact,
+            onPressed: () => Navigator.of(context).pop(),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _list() {
+    if (widget.revisions.isEmpty) {
+      return const Center(
+        child: Text(
+          'No brief changes recorded.',
+          style: TextStyle(color: MeshColors.textSecondary),
         ),
-        Expanded(
-          child: widget.revisions.isEmpty
-              ? const Center(
-                  child: Text(
-                    'No brief revisions recorded.',
-                    style: TextStyle(color: MeshColors.textSecondary),
-                  ),
-                )
-              : ListView.builder(
-                  padding: const EdgeInsets.all(16),
-                  itemCount: reversed.length,
-                  itemBuilder: (context, index) {
-                    final rev = reversed[index];
-                    final isExpanded = _expandedGenerations.contains(rev.generation);
-                    final isCurrent = rev.generation == widget.currentGeneration;
-
-                    return Container(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      decoration: BoxDecoration(
-                        color: MeshColors.bgTertiary,
-                        border: Border.all(
-                          color: isCurrent
-                              ? MeshColors.accent.withValues(alpha: 0.5)
-                              : MeshColors.border,
-                        ),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          InkWell(
-                            borderRadius: BorderRadius.circular(8),
-                            onTap: () {
-                              setState(() {
-                                if (isExpanded) {
-                                  _expandedGenerations.remove(rev.generation);
-                                } else {
-                                  _expandedGenerations.add(rev.generation);
-                                }
-                              });
-                            },
-                            child: Padding(
-                              padding: const EdgeInsets.all(12),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Row(
-                                    children: [
-                                      Container(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 6,
-                                          vertical: 2,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: isCurrent
-                                              ? MeshColors.accent.withValues(alpha: 0.15)
-                                              : MeshColors.bgSecondary,
-                                          borderRadius: BorderRadius.circular(4),
-                                          border: Border.all(
-                                            color: isCurrent ? MeshColors.accent : MeshColors.border,
-                                          ),
-                                        ),
-                                        child: Text(
-                                          'Gen ${rev.generation}',
-                                          style: TextStyle(
-                                            color: isCurrent ? MeshColors.accent : MeshColors.textSecondary,
-                                            fontSize: 11,
-                                            fontWeight: FontWeight.w600,
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      if (isCurrent) ...[
-                                        Container(
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 5,
-                                            vertical: 1.5,
-                                          ),
-                                          decoration: BoxDecoration(
-                                            color: const Color(0x3310B981),
-                                            borderRadius: BorderRadius.circular(4),
-                                          ),
-                                          child: const Text(
-                                            'Current',
-                                            style: TextStyle(
-                                              color: Color(0xFF10B981),
-                                              fontSize: 10,
-                                              fontWeight: FontWeight.w600,
-                                            ),
-                                          ),
-                                        ),
-                                        const SizedBox(width: 8),
-                                      ],
-                                      Expanded(
-                                        child: Text(
-                                          formatTs(rev.updatedAt),
-                                          style: const TextStyle(
-                                            color: MeshColors.textMuted,
-                                            fontSize: 12,
-                                          ),
-                                        ),
-                                      ),
-                                      Icon(
-                                        isExpanded ? Icons.expand_less : Icons.expand_more,
-                                        size: 18,
-                                        color: MeshColors.textMuted,
-                                      ),
-                                    ],
-                                  ),
-                                  if (rev.explanation != null && rev.explanation!.isNotEmpty) ...[
-                                    const SizedBox(height: 6),
-                                    Text(
-                                      'Explanation: ${rev.explanation}',
-                                      style: const TextStyle(
-                                        color: MeshColors.textSecondary,
-                                        fontSize: 12,
-                                        fontStyle: FontStyle.italic,
-                                      ),
-                                    ),
-                                  ],
-                                ],
-                              ),
-                            ),
-                          ),
-                          if (isExpanded) ...[
-                            const Divider(height: 1, color: MeshColors.border),
-                            Container(
-                              width: double.infinity,
-                              padding: const EdgeInsets.all(12),
-                              color: MeshColors.bgPrimary,
-                              child: SelectionArea(
-                                child: SimpleMarkdown(rev.text),
-                              ),
-                            ),
-                          ],
+      );
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.all(12),
+      itemCount: widget.revisions.length,
+      itemBuilder: (context, index) {
+        final rev = widget.revisions[index];
+        final current = _isCurrent(rev);
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Material(
+            color: MeshColors.bgTertiary,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+              side: BorderSide(
+                color: current
+                    ? MeshColors.accent.withValues(alpha: 0.5)
+                    : MeshColors.border,
+              ),
+            ),
+            child: InkWell(
+              key: ValueKey('brief-revision-${rev.generation}'),
+              borderRadius: BorderRadius.circular(8),
+              onTap: () => setState(() => _selected = rev),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        _chip('Gen ${rev.generation}', current: current),
+                        if (current) ...[
+                          const SizedBox(width: 6),
+                          _chip('Current', current: true),
                         ],
-                      ),
-                    );
-                  },
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            formatTs(rev.updatedAt),
+                            style: const TextStyle(
+                              color: MeshColors.textMuted,
+                              fontSize: 12,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        Text(
+                          _tally(diffBriefLines(rev.before, rev.after)),
+                          style: const TextStyle(
+                            color: MeshColors.textSecondary,
+                            fontSize: 11,
+                            fontFamily: kMonoFontFamily,
+                          ),
+                        ),
+                        const Icon(
+                          Icons.chevron_right,
+                          size: 18,
+                          color: MeshColors.textMuted,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    _explanation(rev, maxLines: 2),
+                  ],
                 ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _diffLine(BriefDiffLine line) {
+    final (prefix, color, background) = switch (line.op) {
+      BriefDiffOp.added => (
+        '+ ',
+        MeshColors.statusActive,
+        MeshColors.statusActive.withValues(alpha: 0.12),
+      ),
+      BriefDiffOp.removed => (
+        '− ',
+        MeshColors.statusHalted,
+        MeshColors.statusHalted.withValues(alpha: 0.12),
+      ),
+      BriefDiffOp.same => ('  ', MeshColors.textSecondary, Colors.transparent),
+    };
+    return Container(
+      width: double.infinity,
+      color: background,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+      child: Text(
+        '$prefix${line.text}',
+        style: TextStyle(
+          color: color,
+          fontSize: 12,
+          height: 1.45,
+          fontFamily: kMonoFontFamily,
+        ),
+      ),
+    );
+  }
+
+  Widget _detail(BriefRevision rev) {
+    final diff = diffBriefLines(rev.before, rev.after);
+    return ListView(
+      key: const ValueKey('brief-revision-detail'),
+      padding: const EdgeInsets.all(16),
+      children: [
+        Wrap(
+          spacing: 8,
+          runSpacing: 6,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            _chip('Gen ${rev.generation}', current: _isCurrent(rev)),
+            if (_isCurrent(rev)) _chip('Current', current: true),
+            Text(
+              formatTs(rev.updatedAt),
+              style: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        _label('Explanation'),
+        const SizedBox(height: 6),
+        SelectionArea(child: _explanation(rev)),
+        const SizedBox(height: 16),
+        Row(
+          children: [
+            _label('Change'),
+            const SizedBox(width: 8),
+            Text(
+              _tally(diff),
+              style: const TextStyle(
+                color: MeshColors.textSecondary,
+                fontSize: 11,
+                fontFamily: kMonoFontFamily,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Container(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          decoration: BoxDecoration(
+            color: MeshColors.bgPrimary,
+            border: Border.all(color: MeshColors.border),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: SelectionArea(
+            child: Column(children: [for (final line in diff) _diffLine(line)]),
+          ),
         ),
       ],
     );
   }
-}
 
+  @override
+  Widget build(BuildContext context) {
+    final selected = _selected;
+    return Column(
+      children: [
+        _header(context),
+        Expanded(child: selected == null ? _list() : _detail(selected)),
+      ],
+    );
+  }
+}

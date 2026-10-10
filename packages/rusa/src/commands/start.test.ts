@@ -4505,7 +4505,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(built.injectRecord?.runCount).toBe(1);
   });
 
-  it("seeds brief mode before its first prompt and never renders the old ledger", async () => {
+  it("seeds brief mode before its first prompt, without a Gemini key, and never renders the old ledger", async () => {
     let mesh: ActorMesh | undefined;
     writeFileSync(
       join(homeDir, "config.yaml"),
@@ -4518,7 +4518,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           effort: "high",
           context: { type: "portable", mode: "brief" },
         },
-        geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
     );
@@ -4562,7 +4561,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ).opts.buildPrompt().prompt;
     expect(prompt).toContain("The charter is in force; it is rendered in the prompt.");
     expect(prompt).not.toContain("This old ledger line must not leak into brief mode.");
-    expect(getRepositories().portableContext.load("root").brief?.cursor).toBeNull();
+    expect(getRepositories().portableContext.load("root").brief?.generation).toBe(0);
   });
 
   it("applies the existing ledger API-key requirement to a portable root", async () => {

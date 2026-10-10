@@ -6,25 +6,39 @@ import 'dashboard_timing.dart';
 import 'models.dart';
 import 'session_client.dart';
 
+/// One accepted write to an actor's brief, as `GET /api/mesh/threads/charter`
+/// lists it: newest first, at most ten. An unchanged write records nothing.
 class BriefRevision {
   final int generation;
   final String updatedAt;
+
+  /// The actor that made the write; the server binds it, the writer cannot.
+  final String actingPrincipal;
+
+  /// The brief text this write replaced.
+  final String before;
+  final String after;
+
+  /// The writer's own account of the change, when it gave one.
   final String? explanation;
-  final String text;
 
   const BriefRevision({
     required this.generation,
     required this.updatedAt,
+    required this.actingPrincipal,
+    required this.before,
+    required this.after,
     this.explanation,
-    required this.text,
   });
 
   factory BriefRevision.fromJson(Map<String, dynamic> json) {
     return BriefRevision(
       generation: json['generation'] as int? ?? 0,
       updatedAt: json['updatedAt'] as String? ?? '',
+      actingPrincipal: json['actingPrincipal'] as String? ?? '',
+      before: json['before'] as String? ?? '',
+      after: json['after'] as String? ?? '',
       explanation: json['explanation'] as String?,
-      text: json['text'] as String? ?? '',
     );
   }
 }
@@ -97,18 +111,21 @@ class DashboardApi {
 
   /// `GET /api/mesh/threads/charter` → one actor's full charter.
   ///
-  /// Fetch full charter and current stored brief for the actor whose Info tab
-  /// is open. The thread list continues to carry only the charter preview.
-  Future<({
-    String charter,
-    bool briefMode,
-    String? brief,
-    int? briefGeneration,
-    String? briefUpdatedAt,
-    List<BriefRevision> briefRevisions,
-  })> fetchActorInfo(
-    String threadId,
-  ) async {
+  /// The thread list carries only a clipped preview, since it is the same field
+  /// for every actor on every poll. The whole text is fetched here, for the one
+  /// actor whose detail panel is open, together with a brief-mode actor's
+  /// current brief and its latest ten accepted writes.
+  Future<
+    ({
+      String charter,
+      bool briefMode,
+      String? brief,
+      int? briefGeneration,
+      String? briefUpdatedAt,
+      List<BriefRevision> briefRevisions,
+    })
+  >
+  fetchActorInfo(String threadId) async {
     final json = await _getJson(
       _u('/api/mesh/threads/charter', {'id': threadId}),
     );

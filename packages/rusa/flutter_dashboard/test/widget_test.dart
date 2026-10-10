@@ -689,29 +689,38 @@ void main() {
   );
 
   testWidgets(
-    'Info displays brief generation badge and opens revision history dialog (Option B)',
+    'Info opens the latest brief changes, then one change with its explanation (Option B)',
     (tester) async {
       await tester.runAsync(() async {
+        const seed =
+            '## WHAT\nSeed purpose [mesh:messages/m-0]\n\n## HOW\n\n## DOMAIN';
+        const gen1 =
+            '## WHAT\nSeed purpose [mesh:messages/m-0]\n\n## HOW\nThree colours [mesh:messages/m-1]\n\n## DOMAIN';
+        const gen2 =
+            '## WHAT\nSeed purpose [mesh:messages/m-0]\n\n## HOW\nTwo colours [mesh:messages/m-2]\n\n## DOMAIN';
         final api = FakeApi()
           ..threadsResult = [
             makeThread('root', created: 't0'),
             makeThread('a', parent: 'root', created: 't1'),
           ]
-          ..briefs['a'] = '## WHAT\nActive brief text'
+          ..briefs['a'] = gen2
           ..briefGenerations['a'] = 2
           ..briefUpdatedAts['a'] = '2026-10-10T13:30:00Z'
           ..briefRevisions['a'] = [
             const BriefRevision(
-              generation: 1,
-              updatedAt: '2026-10-10T13:00:00Z',
-              explanation: 'Initial seed',
-              text: '## WHAT\nInitial brief',
-            ),
-            const BriefRevision(
               generation: 2,
               updatedAt: '2026-10-10T13:30:00Z',
-              explanation: 'Consolidated domain guidelines',
-              text: '## WHAT\nActive brief text',
+              actingPrincipal: 'a',
+              before: gen1,
+              after: gen2,
+              explanation: 'The parent narrowed the palette.',
+            ),
+            const BriefRevision(
+              generation: 1,
+              updatedAt: '2026-10-10T13:00:00Z',
+              actingPrincipal: 'a',
+              before: seed,
+              after: gen1,
             ),
           ];
 
@@ -729,25 +738,112 @@ void main() {
 
         expect(find.text('Brief'), findsOneWidget);
         expect(find.text('Gen 2'), findsOneWidget);
-        expect(find.byKey(const ValueKey('brief-history-button')), findsOneWidget);
+        expect(
+          find.byKey(const ValueKey('brief-history-button')),
+          findsOneWidget,
+        );
 
-        // Tap history button to open popover/dialog
-        await tester.tap(find.byKey(const ValueKey('brief-history-button')));
+        // The update time opens the history as well as the icon does.
+        await tester.tap(find.byKey(const ValueKey('brief-history-time')));
         for (var i = 0; i < 5; i++) {
           await tester.pump(const Duration(milliseconds: 100));
         }
-
-        expect(find.text('Brief Revision History — a-handle'), findsOneWidget);
-        expect(find.text('2 revisions'), findsOneWidget);
-        expect(find.text('Gen 2'), findsWidgets);
-        expect(find.text('Gen 1'), findsOneWidget);
+        expect(find.text('Brief history — a-handle'), findsOneWidget);
+        expect(find.text('Latest 2 changes'), findsOneWidget);
         expect(find.text('Current'), findsOneWidget);
-        expect(find.text('Explanation: Consolidated domain guidelines'), findsOneWidget);
+        expect(find.text('The parent narrowed the palette.'), findsOneWidget);
+        expect(find.text('No explanation given.'), findsOneWidget);
+        expect(find.text('+1 −1'), findsOneWidget);
+        expect(find.text('+1 −0'), findsOneWidget);
+
+        await tester.tap(find.byKey(const ValueKey('brief-revision-2')));
+        for (var i = 0; i < 3; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        expect(
+          find.byKey(const ValueKey('brief-revision-detail')),
+          findsOneWidget,
+        );
+        expect(find.text('Generation 2 change'), findsOneWidget);
+        expect(find.text('Explanation'), findsOneWidget);
+        expect(find.text('The parent narrowed the palette.'), findsOneWidget);
+        expect(
+          find.text('− Three colours [mesh:messages/m-1]'),
+          findsOneWidget,
+        );
+        expect(find.text('+ Two colours [mesh:messages/m-2]'), findsOneWidget);
+        expect(find.text('  Seed purpose [mesh:messages/m-0]'), findsOneWidget);
+
+        await tester.tap(find.byKey(const ValueKey('brief-history-back')));
+        for (var i = 0; i < 3; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        await tester.tap(find.byKey(const ValueKey('brief-revision-1')));
+        for (var i = 0; i < 3; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        expect(find.text('Generation 1 change'), findsOneWidget);
+        expect(find.text('No explanation given.'), findsOneWidget);
+        expect(
+          find.text('+ Three colours [mesh:messages/m-1]'),
+          findsOneWidget,
+        );
 
         await store.dispose();
       });
     },
   );
+
+  testWidgets('the brief history is fullscreen on a narrow screen', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      tester.view
+        ..physicalSize = const Size(390, 844)
+        ..devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread('a', parent: 'root', created: 't1'),
+        ]
+        ..briefs['a'] = '## WHAT\nB [mesh:messages/m-1]\n\n## HOW\n\n## DOMAIN'
+        ..briefGenerations['a'] = 1
+        ..briefUpdatedAts['a'] = '2026-10-10T13:00:00Z'
+        ..briefRevisions['a'] = [
+          const BriefRevision(
+            generation: 1,
+            updatedAt: '2026-10-10T13:00:00Z',
+            actingPrincipal: 'a',
+            before: '## WHAT\nA [mesh:messages/m-0]\n\n## HOW\n\n## DOMAIN',
+            after: '## WHAT\nB [mesh:messages/m-1]\n\n## HOW\n\n## DOMAIN',
+          ),
+        ];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      store.clickActor('a');
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: DetailPanel(store: store, narrow: true)),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.tap(find.text('Info'));
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      await tester.tap(find.byKey(const ValueKey('brief-history-button')));
+      for (var i = 0; i < 5; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      final dialog = find.ancestor(
+        of: find.text('Brief history — a-handle'),
+        matching: find.byType(Dialog),
+      );
+      expect(tester.getSize(dialog), const Size(390, 844));
+      await store.dispose();
+    });
+  });
 
   testWidgets('the Info tab keeps the preview when the charter fetch fails', (
     tester,

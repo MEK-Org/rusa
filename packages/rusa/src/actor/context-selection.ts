@@ -12,8 +12,9 @@ import type { ContextConfig } from "./actor-record.js";
  * - `tail` — the mesh owns the context as a bounded raw window with no
  *   compaction and no LLM in the loop; useful for experiments that want the
  *   aging boundary without a compactor.
- * - `brief` — the mesh owns a cited three-section durable brief, rewritten
- *   after runs with the configured Gemini key.
+ * - `brief` — the actor keeps one cited three-section durable brief, which
+ *   it reads and replaces itself through the brief MCP tools; no LLM rewrites
+ *   it, so it needs no Gemini key.
  *
  * There is deliberately no bare `portable` selection. `ledger` and `tail` ARE
  * the portable modes, so a fourth word naming their family would sit at a
@@ -77,10 +78,10 @@ export function resolveContextSelection(
   }
   if (raw === "brief") {
     if (compactionModel) {
-      // The brief rewriter is fixed to bare gemini-3.8-flash by the #954 spec;
-      // a stored model here would read as configured and never be consulted.
+      // The actor writes its own brief and nothing compacts it, so a model
+      // here would be accepted, stored, and never consulted.
       throw new Error(
-        "compactionModel is meaningless for brief mode, whose rewrite model is fixed"
+        "compactionModel is meaningless for brief mode, which the actor writes itself"
       );
     }
     return { type: "portable", mode: "brief" };
@@ -141,9 +142,9 @@ export function assertSpawnContextSupported(
         "drop conversationId or spawn it with native context"
     );
   }
-  if ((context.mode === "ledger" || context.mode === "brief") && !caps.ledgerCompactionAvailable) {
+  if (context.mode === "ledger" && !caps.ledgerCompactionAvailable) {
     throw new Error(
-      `portable ${context.mode} mode needs a Gemini API key for rewriting (config geminiApiKey); ` +
+      "portable ledger mode needs a Gemini API key for compaction (config geminiApiKey); " +
         "set it, or spawn with tail mode which never compacts"
     );
   }

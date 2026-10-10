@@ -10,7 +10,11 @@ import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
-import { emptyPortableContextState } from "../actor/portable-context-state.js";
+import { seedPortableBriefState } from "../actor/portable-context-brief.js";
+import {
+  emptyPortableContextState,
+  InMemoryPortableContextStore,
+} from "../actor/portable-context-state.js";
 import type { RootChildRequest, RootControlService } from "../actor/root-control.js";
 import {
   AvatarGenerationCoordinator,
@@ -1777,38 +1781,68 @@ describe("handleMeshApiRequest", () => {
     expect(JSON.parse(res.body)).toEqual({ id: UUID_A, charter: long });
   });
 
-  it("serves only the selected brief actor's current stored brief", async () => {
+  it("serves only the selected brief actor's current brief and its latest ten writes", async () => {
     actors.upsert({ ...rec(UUID_A, null, "active"), context: { type: "portable", mode: "brief" } });
-    let text: string | null =
-      "## WHAT\nFixture purpose\n\n## HOW\nFixture rules\n\n## DOMAIN\nFixture knowledge";
-    const load = vi.fn(() => ({
-      ...emptyPortableContextState(UUID_A),
-      brief: text === null ? null : {
-        text,
-        generation: 2,
-        updatedAt: "2026-10-10T13:30:00.000Z",
-        revisions: [
-          { generation: 1, updatedAt: "2026-10-10T13:00:00.000Z", text: "## WHAT\nInit", explanation: "Seed" },
-          { generation: 2, updatedAt: "2026-10-10T13:30:00.000Z", text, explanation: "Update" },
-        ],
-      },
-    }));
-    deps.portableContext = { load } as unknown as DashboardDataDeps["portableContext"];
+    const store = new InMemoryPortableContextStore();
+    const brief = (n: number) =>
+      `## WHAT\nPurpose ${n}. [mesh:messages/m-${n}]\n\n## HOW\n\n## DOMAIN\n`;
+    for (const actorId of [UUID_A, UUID_B]) {
+      store.save(
+        seedPortableBriefState(
+          emptyPortableContextState(actorId),
+          actorId,
+          "2026-10-10T12:00:00.000Z"
+        )
+      );
+    }
+    store.commitBrief({
+      actorId: UUID_B,
+      expectedGeneration: 0,
+      text: brief(99),
+      actingPrincipal: UUID_B,
+      at: "2026-10-10T12:30:00.000Z",
+    });
+    for (let n = 1; n <= 12; n += 1) {
+      store.commitBrief({
+        actorId: UUID_A,
+        expectedGeneration: n - 1,
+        text: brief(n),
+        ...(n === 12 ? { explanation: "Narrowed the purpose." } : {}),
+        actingPrincipal: UUID_A,
+        at: `2026-10-10T13:${String(n).padStart(2, "0")}:00.000Z`,
+      });
+    }
+    const load = vi.spyOn(store, "load");
+    const listBriefRevisions = vi.spyOn(store, "listBriefRevisions");
+    deps.portableContext = store;
     const read = async () =>
       JSON.parse((await call(deps, "GET", `/api/mesh/threads/charter?id=${UUID_A}`)).res.body);
-    expect(await read()).toMatchObject({
+
+    const body = await read();
+    expect(body).toMatchObject({
       briefMode: true,
-      brief: text,
-      briefGeneration: 2,
-      briefUpdatedAt: "2026-10-10T13:30:00.000Z",
-      briefRevisions: [
-        { generation: 1, updatedAt: "2026-10-10T13:00:00.000Z", text: "## WHAT\nInit", explanation: "Seed" },
-        { generation: 2, updatedAt: "2026-10-10T13:30:00.000Z", text, explanation: "Update" },
-      ],
+      brief: brief(12),
+      briefGeneration: 12,
+      briefUpdatedAt: "2026-10-10T13:12:00.000Z",
     });
-    text = "## WHAT\nUpdated purpose";
-    expect(await read()).toMatchObject({ brief: text });
-    text = null;
+    expect(body.briefRevisions.map((r: { generation: number }) => r.generation)).toEqual([
+      12, 11, 10, 9, 8, 7, 6, 5, 4, 3,
+    ]);
+    expect(body.briefRevisions[0]).toEqual({
+      generation: 12,
+      updatedAt: "2026-10-10T13:12:00.000Z",
+      actingPrincipal: UUID_A,
+      before: brief(11),
+      after: brief(12),
+      explanation: "Narrowed the purpose.",
+    });
+    expect(body.briefRevisions[1]).not.toHaveProperty("explanation");
+    expect(load.mock.calls).toEqual([[UUID_A]]);
+    expect(listBriefRevisions.mock.calls).toEqual([[UUID_A, 10]]);
+
+    store.save({ ...store.load(UUID_A), brief: null });
+    load.mockClear();
+    listBriefRevisions.mockClear();
     expect(await read()).toMatchObject({
       briefMode: true,
       brief: null,
@@ -1816,13 +1850,17 @@ describe("handleMeshApiRequest", () => {
       briefUpdatedAt: null,
       briefRevisions: [],
     });
-    expect(load.mock.calls).toEqual([[UUID_A], [UUID_A], [UUID_A]]);
+    expect(listBriefRevisions).not.toHaveBeenCalled();
+
     actors.upsert({
       ...rec(UUID_A, null, "active"),
       context: { type: "portable", mode: "ledger" },
     });
-    expect(await read()).not.toHaveProperty("brief");
-    expect(load).toHaveBeenCalledTimes(3);
+    load.mockClear();
+    const ledger = await read();
+    expect(ledger).not.toHaveProperty("brief");
+    expect(ledger).not.toHaveProperty("briefRevisions");
+    expect(load).not.toHaveBeenCalled();
   });
 
   it("GET /api/mesh/threads/charter 404s for an unknown or missing id", async () => {

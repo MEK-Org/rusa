@@ -635,17 +635,16 @@ function boundedMessages(messages: PriorMessage[]): { section: string; selected:
 
 /**
  * Render the brief-mode durable-intent section: the three sections verbatim
- * under a heading naming the mode, the brief's own generation and its cursor.
- * The 16 KB cap is enforced at rewrite time, so unlike the ledger render this
- * can never emit an "omitted due to budget" line — the property the prompt
- * header can state flatly.
+ * under a heading naming the mode, the brief's generation and its last update,
+ * and the one line that tells the actor the brief is its own to keep. The
+ * 16 KB cap is enforced when a write is accepted, so unlike the ledger render
+ * this can never emit an "omitted due to budget" line.
  */
 function renderBrief(brief: PortableBrief): string {
-  const cursor = brief.cursor
-    ? `${brief.cursor.ts}#${brief.cursor.sourceOrder}/${brief.cursor.id}`
-    : "start";
   return (
-    `\n### Durable brief (mode: brief, generation ${brief.generation}, cursor ${cursor})\n\n` +
+    `\n### Durable brief (mode: brief, generation ${brief.generation}, updated ${brief.updatedAt})\n\n` +
+    "This brief is yours to keep current: when durable guidance changes, read it and replace it " +
+    "with the `brief` MCP tools. The charter governs where the two disagree.\n\n" +
     `${brief.text.trim()}\n`
   );
 }
@@ -656,7 +655,7 @@ function renderBrief(brief: PortableBrief): string {
  *
  * In `brief` mode (`input.brief` set) the durable-intent ledger section is
  * replaced by the rendered brief: the three sections verbatim under a heading
- * naming the mode, generation and cursor. Everything else — obligations
+ * naming the mode, generation and last update. Everything else — obligations
  * projection, verbatim recent-message journal, run tail — renders unchanged,
  * and the ledger stays untouched in the snapshot so switching back is free.
  */

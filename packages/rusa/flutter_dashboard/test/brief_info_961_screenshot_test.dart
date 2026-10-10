@@ -16,376 +16,197 @@ final String _outDir = '${Directory.current.path}/screenshots';
 const _actorId = '11111111-1111-4111-8111-111111111111';
 const _parentId = '00000000-0000-4000-8000-000000000000';
 
-const _briefContent = '''## WHAT
-- Maintain portable brief continuity across actor lifecycle boundaries.
-- Render active brief sections in dashboard actor Info tab with markdown formatting.
-- Preserve supersession accounting and source citations without DDL migrations.
+// Synthetic fixtures: each statement line ends in a structured citation, as the
+// brief grammar requires of an accepted write.
+const _seed =
+    '''## WHAT
+The charter is in force; it is rendered in the prompt. [mesh:actors/$_actorId/charter]
 
 ## HOW
-- Execute bounded single-delta rewrites using `gemini-3.8-flash`.
-- Format WHAT/HOW/DOMAIN sections inside styled panels.
-- Retain audit records for human and ancestor direction.
+
+## DOMAIN''';
+
+const _gen1 =
+    '''## WHAT
+Draw abstract SVG art for the assigned gallery. [mesh:actors/$_actorId/charter]
+
+## HOW
+Keep each piece to three colours. [mesh:messages/m-palette]
+Report each finished piece to the parent. [mesh:messages/m-report]
 
 ## DOMAIN
-- Actor portable context protocol (mode: `brief`).
-- Dashboard inspection panels and responsive mobile layouts.''';
+The gallery renders at 1:1 pixel density. [github:MEK-Org/rusa/issues/954]''';
 
-const _charterContent = '''# Standing Coder Charter
-You are an autonomous mesh worker actor responsible for portable context maintenance, regression verification, and dashboard appearance compliance.''';
+const _gen2 =
+    '''## WHAT
+Draw abstract SVG art for the assigned gallery. [mesh:actors/$_actorId/charter]
 
+## HOW
+Keep each piece to two colours and one accent. [mesh:messages/m-palette-2]
+Report each finished piece to the parent. [mesh:messages/m-report]
+
+## DOMAIN
+The gallery renders at 1:1 pixel density. [github:MEK-Org/rusa/issues/954]
+Pieces over 200 KB are rejected by the gallery. [mesh:messages/m-size]''';
+
+const _charterContent = '''# Gallery Worker Charter
+You draw abstract SVG art for the assigned gallery and report each finished piece to your parent.''';
+
+// Newest first, as the API pages them.
 final _revisions = [
-  const BriefRevision(
-    generation: 1,
-    updatedAt: '2026-10-10T13:00:00Z',
-    explanation: 'Initial brief seed from parent charter and intent',
-    text: '''## WHAT
-- Seed portable brief for autonomous worker.
-
-## HOW
-- Execute commands and report milestones to parent steward.
-
-## DOMAIN
-- Standalone actor context.''',
-  ),
   const BriefRevision(
     generation: 2,
     updatedAt: '2026-10-10T13:30:00Z',
-    explanation: 'Consolidated domain guidelines and added Option B revision history inspectability',
-    text: _briefContent,
+    actingPrincipal: _actorId,
+    before: _gen1,
+    after: _gen2,
+    explanation:
+        'The parent narrowed the palette, and the gallery size limit is now known.',
+  ),
+  const BriefRevision(
+    generation: 1,
+    updatedAt: '2026-10-10T13:00:00Z',
+    actingPrincipal: _actorId,
+    before: _seed,
+    after: _gen1,
   ),
 ];
 
-Widget _desktopApp(DashboardStore store, Key boundaryKey) => RepaintBoundary(
-  key: boundaryKey,
-  child: MaterialApp(
-    debugShowCheckedModeBanner: false,
-    theme: buildMeshTheme(),
-    home: Scaffold(
-      backgroundColor: MeshColors.bgPrimary,
-      body: SizedBox(
-        width: 1180,
-        height: 820,
-        child: Row(
-          children: [
-            ActorTree(store: store),
-            Expanded(child: DetailPanel(store: store)),
-          ],
+Widget _app(DashboardStore store, Key boundaryKey, {required bool mobile}) =>
+    RepaintBoundary(
+      key: boundaryKey,
+      child: MaterialApp(
+        debugShowCheckedModeBanner: false,
+        theme: buildMeshTheme(),
+        home: Scaffold(
+          backgroundColor: MeshColors.bgPrimary,
+          body: mobile
+              ? SizedBox(
+                  width: 390,
+                  height: 844,
+                  child: DetailPanel(store: store, narrow: true),
+                )
+              : SizedBox(
+                  width: 1180,
+                  height: 820,
+                  child: Row(
+                    children: [
+                      ActorTree(store: store),
+                      Expanded(child: DetailPanel(store: store)),
+                    ],
+                  ),
+                ),
         ),
       ),
-    ),
-  ),
-);
+    );
 
-Widget _mobileApp(DashboardStore store, Key boundaryKey) => RepaintBoundary(
-  key: boundaryKey,
-  child: MaterialApp(
-    debugShowCheckedModeBanner: false,
-    theme: buildMeshTheme(),
-    home: Scaffold(
-      backgroundColor: MeshColors.bgPrimary,
-      body: SizedBox(
-        width: 390,
-        height: 844,
-        child: DetailPanel(store: store, narrow: true),
-      ),
-    ),
-  ),
-);
+enum _Step { before, after, history, detail }
+
+Future<void> _capture(
+  WidgetTester tester, {
+  required bool mobile,
+  required _Step step,
+}) async {
+  await tester.runAsync(() async {
+    HttpOverrides.global = FakeImageHttpOverrides(
+      await portraits([_parentId, _actorId]),
+    );
+    addTearDown(() => HttpOverrides.global = null);
+
+    final key = GlobalKey();
+    tester.view
+      ..physicalSize = mobile ? const Size(390, 844) : const Size(1180, 820)
+      ..devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    final api = FakeApi()
+      ..threadsResult = [
+        makeThread(_parentId, created: 't0'),
+        makeThread(
+          _actorId,
+          parent: _parentId,
+          commitmentKind: 'running',
+          created: 't1',
+        ),
+      ]
+      ..charters[_actorId] = _charterContent;
+    if (step != _Step.before) {
+      api
+        ..briefs[_actorId] = _gen2
+        ..briefGenerations[_actorId] = 2
+        ..briefUpdatedAts[_actorId] = '2026-10-10T13:30:00Z'
+        ..briefRevisions[_actorId] = _revisions;
+    }
+
+    final store = DashboardStore(api: api, stream: FakeStream());
+    addTearDown(store.dispose);
+    await store.init();
+    store.clickActor(_actorId);
+
+    await tester.pumpWidget(_app(store, key, mobile: mobile));
+    await settleImages(tester, portraitUrls([_parentId, _actorId]));
+    await tester.tap(find.text('Info'));
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    expect(find.text('Charter'), findsOneWidget);
+
+    switch (step) {
+      case _Step.before:
+        expect(find.text('Brief'), findsNothing);
+      case _Step.after:
+        expect(find.text('Brief'), findsOneWidget);
+        expect(find.text('Gen 2'), findsOneWidget);
+        expect(
+          find.byKey(const ValueKey('brief-history-time')),
+          findsOneWidget,
+        );
+      case _Step.history || _Step.detail:
+        await tester.tap(find.byKey(const ValueKey('brief-history-time')));
+        for (var i = 0; i < 8; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        expect(find.text('Brief history — $_actorId-handle'), findsOneWidget);
+        expect(find.text('Latest 2 changes'), findsOneWidget);
+        expect(find.text('No explanation given.'), findsOneWidget);
+        if (step == _Step.detail) {
+          await tester.tap(find.byKey(const ValueKey('brief-revision-2')));
+          for (var i = 0; i < 4; i++) {
+            await tester.pump(const Duration(milliseconds: 100));
+          }
+          expect(find.text('Generation 2 change'), findsOneWidget);
+          expect(
+            find.text(
+              '− Keep each piece to three colours. [mesh:messages/m-palette]',
+            ),
+            findsOneWidget,
+          );
+          expect(
+            find.text(
+              '+ Keep each piece to two colours and one accent. [mesh:messages/m-palette-2]',
+            ),
+            findsOneWidget,
+          );
+        }
+    }
+
+    final device = mobile ? 'mobile' : 'desktop';
+    await captureBoundary(
+      key,
+      '$_outDir/961_brief_info_${device}_${step.name}.png',
+    );
+  });
+}
 
 void main() {
   setUpAll(loadFonts);
 
-  testWidgets('961 brief info desktop before', (tester) async {
-    await tester.runAsync(() async {
-      HttpOverrides.global = FakeImageHttpOverrides(await portraits([_parentId, _actorId]));
-      addTearDown(() => HttpOverrides.global = null);
-
-      final key = GlobalKey();
-      tester.view
-        ..physicalSize = const Size(1180, 820)
-        ..devicePixelRatio = 1.0;
-      addTearDown(tester.view.reset);
-
-      final api = FakeApi()
-        ..threadsResult = [
-          makeThread(_parentId, created: 't0'),
-          makeThread(
-            _actorId,
-            parent: _parentId,
-            provider: 'agy',
-            model: 'gemini-3.8-flash',
-            commitmentKind: 'running',
-            created: 't1',
-          ),
-        ]
-        ..charters[_actorId] = _charterContent;
-
-      final store = DashboardStore(api: api, stream: FakeStream());
-      addTearDown(store.dispose);
-      await store.init();
-      store.clickActor(_actorId);
-
-      await tester.pumpWidget(_desktopApp(store, key));
-      await settleImages(tester, portraitUrls([_parentId, _actorId]));
-      await tester.tap(find.text('Info'));
-      for (var i = 0; i < 10; i++) {
-        await tester.pump(const Duration(milliseconds: 100));
-      }
-
-      expect(find.text('Charter'), findsOneWidget);
-      expect(find.text('Brief'), findsNothing);
-
-      await captureBoundary(key, '$_outDir/961_brief_info_desktop_before.png');
-    });
-  });
-
-  testWidgets('961 brief info desktop after', (tester) async {
-    await tester.runAsync(() async {
-      HttpOverrides.global = FakeImageHttpOverrides(await portraits([_parentId, _actorId]));
-      addTearDown(() => HttpOverrides.global = null);
-
-      final key = GlobalKey();
-      tester.view
-        ..physicalSize = const Size(1180, 820)
-        ..devicePixelRatio = 1.0;
-      addTearDown(tester.view.reset);
-
-      final api = FakeApi()
-        ..threadsResult = [
-          makeThread(_parentId, created: 't0'),
-          makeThread(
-            _actorId,
-            parent: _parentId,
-            provider: 'agy',
-            model: 'gemini-3.8-flash',
-            commitmentKind: 'running',
-            created: 't1',
-          ),
-        ]
-        ..charters[_actorId] = _charterContent
-        ..briefs[_actorId] = _briefContent
-        ..briefGenerations[_actorId] = 2
-        ..briefUpdatedAts[_actorId] = '2026-10-10T13:30:00Z'
-        ..briefRevisions[_actorId] = _revisions;
-
-      final store = DashboardStore(api: api, stream: FakeStream());
-      addTearDown(store.dispose);
-      await store.init();
-      store.clickActor(_actorId);
-
-      await tester.pumpWidget(_desktopApp(store, key));
-      await settleImages(tester, portraitUrls([_parentId, _actorId]));
-      await tester.tap(find.text('Info'));
-      for (var i = 0; i < 10; i++) {
-        await tester.pump(const Duration(milliseconds: 100));
-      }
-
-      expect(find.text('Charter'), findsOneWidget);
-      expect(find.text('Brief'), findsOneWidget);
-      expect(find.text('Gen 2'), findsOneWidget);
-      expect(find.byKey(const ValueKey('brief-history-button')), findsOneWidget);
-
-      await captureBoundary(key, '$_outDir/961_brief_info_desktop_after.png');
-    });
-  });
-
-  testWidgets('961 brief info desktop history', (tester) async {
-    await tester.runAsync(() async {
-      HttpOverrides.global = FakeImageHttpOverrides(await portraits([_parentId, _actorId]));
-      addTearDown(() => HttpOverrides.global = null);
-
-      final key = GlobalKey();
-      tester.view
-        ..physicalSize = const Size(1180, 820)
-        ..devicePixelRatio = 1.0;
-      addTearDown(tester.view.reset);
-
-      final api = FakeApi()
-        ..threadsResult = [
-          makeThread(_parentId, created: 't0'),
-          makeThread(
-            _actorId,
-            parent: _parentId,
-            provider: 'agy',
-            model: 'gemini-3.8-flash',
-            commitmentKind: 'running',
-            created: 't1',
-          ),
-        ]
-        ..charters[_actorId] = _charterContent
-        ..briefs[_actorId] = _briefContent
-        ..briefGenerations[_actorId] = 2
-        ..briefUpdatedAts[_actorId] = '2026-10-10T13:30:00Z'
-        ..briefRevisions[_actorId] = _revisions;
-
-      final store = DashboardStore(api: api, stream: FakeStream());
-      addTearDown(store.dispose);
-      await store.init();
-      store.clickActor(_actorId);
-
-      await tester.pumpWidget(_desktopApp(store, key));
-      await settleImages(tester, portraitUrls([_parentId, _actorId]));
-      await tester.tap(find.text('Info'));
-      for (var i = 0; i < 10; i++) {
-        await tester.pump(const Duration(milliseconds: 100));
-      }
-
-      await tester.tap(find.byKey(const ValueKey('brief-history-button')));
-      for (var i = 0; i < 8; i++) {
-        await tester.pump(const Duration(milliseconds: 100));
-      }
-
-      expect(find.text('Brief Revision History — $_actorId-handle'), findsOneWidget);
-      expect(find.text('2 revisions'), findsOneWidget);
-      expect(find.text('Current'), findsOneWidget);
-
-      await captureBoundary(key, '$_outDir/961_brief_info_desktop_history.png');
-    });
-  });
-
-  testWidgets('961 brief info mobile before', (tester) async {
-    await tester.runAsync(() async {
-      HttpOverrides.global = FakeImageHttpOverrides(await portraits([_parentId, _actorId]));
-      addTearDown(() => HttpOverrides.global = null);
-
-      final key = GlobalKey();
-      tester.view
-        ..physicalSize = const Size(390, 844)
-        ..devicePixelRatio = 1.0;
-      addTearDown(tester.view.reset);
-
-      final api = FakeApi()
-        ..threadsResult = [
-          makeThread(_parentId, created: 't0'),
-          makeThread(
-            _actorId,
-            parent: _parentId,
-            provider: 'agy',
-            model: 'gemini-3.8-flash',
-            commitmentKind: 'running',
-            created: 't1',
-          ),
-        ]
-        ..charters[_actorId] = _charterContent;
-
-      final store = DashboardStore(api: api, stream: FakeStream());
-      addTearDown(store.dispose);
-      await store.init();
-      store.clickActor(_actorId);
-
-      await tester.pumpWidget(_mobileApp(store, key));
-      await settleImages(tester, portraitUrls([_parentId, _actorId]));
-      await tester.tap(find.text('Info'));
-      for (var i = 0; i < 10; i++) {
-        await tester.pump(const Duration(milliseconds: 100));
-      }
-
-      expect(find.text('Charter'), findsOneWidget);
-      expect(find.text('Brief'), findsNothing);
-
-      await captureBoundary(key, '$_outDir/961_brief_info_mobile_before.png');
-    });
-  });
-
-  testWidgets('961 brief info mobile after', (tester) async {
-    await tester.runAsync(() async {
-      HttpOverrides.global = FakeImageHttpOverrides(await portraits([_parentId, _actorId]));
-      addTearDown(() => HttpOverrides.global = null);
-
-      final key = GlobalKey();
-      tester.view
-        ..physicalSize = const Size(390, 844)
-        ..devicePixelRatio = 1.0;
-      addTearDown(tester.view.reset);
-
-      final api = FakeApi()
-        ..threadsResult = [
-          makeThread(_parentId, created: 't0'),
-          makeThread(
-            _actorId,
-            parent: _parentId,
-            provider: 'agy',
-            model: 'gemini-3.8-flash',
-            commitmentKind: 'running',
-            created: 't1',
-          ),
-        ]
-        ..charters[_actorId] = _charterContent
-        ..briefs[_actorId] = _briefContent
-        ..briefGenerations[_actorId] = 2
-        ..briefUpdatedAts[_actorId] = '2026-10-10T13:30:00Z'
-        ..briefRevisions[_actorId] = _revisions;
-
-      final store = DashboardStore(api: api, stream: FakeStream());
-      addTearDown(store.dispose);
-      await store.init();
-      store.clickActor(_actorId);
-
-      await tester.pumpWidget(_mobileApp(store, key));
-      await settleImages(tester, portraitUrls([_parentId, _actorId]));
-      await tester.tap(find.text('Info'));
-      for (var i = 0; i < 10; i++) {
-        await tester.pump(const Duration(milliseconds: 100));
-      }
-
-      expect(find.text('Charter'), findsOneWidget);
-      expect(find.text('Brief'), findsOneWidget);
-      expect(find.text('Gen 2'), findsOneWidget);
-
-      await captureBoundary(key, '$_outDir/961_brief_info_mobile_after.png');
-    });
-  });
-
-  testWidgets('961 brief info mobile history', (tester) async {
-    await tester.runAsync(() async {
-      HttpOverrides.global = FakeImageHttpOverrides(await portraits([_parentId, _actorId]));
-      addTearDown(() => HttpOverrides.global = null);
-
-      final key = GlobalKey();
-      tester.view
-        ..physicalSize = const Size(390, 844)
-        ..devicePixelRatio = 1.0;
-      addTearDown(tester.view.reset);
-
-      final api = FakeApi()
-        ..threadsResult = [
-          makeThread(_parentId, created: 't0'),
-          makeThread(
-            _actorId,
-            parent: _parentId,
-            provider: 'agy',
-            model: 'gemini-3.8-flash',
-            commitmentKind: 'running',
-            created: 't1',
-          ),
-        ]
-        ..charters[_actorId] = _charterContent
-        ..briefs[_actorId] = _briefContent
-        ..briefGenerations[_actorId] = 2
-        ..briefUpdatedAts[_actorId] = '2026-10-10T13:30:00Z'
-        ..briefRevisions[_actorId] = _revisions;
-
-      final store = DashboardStore(api: api, stream: FakeStream());
-      addTearDown(store.dispose);
-      await store.init();
-      store.clickActor(_actorId);
-
-      await tester.pumpWidget(_mobileApp(store, key));
-      await settleImages(tester, portraitUrls([_parentId, _actorId]));
-      await tester.tap(find.text('Info'));
-      for (var i = 0; i < 10; i++) {
-        await tester.pump(const Duration(milliseconds: 100));
-      }
-
-      await tester.tap(find.byKey(const ValueKey('brief-history-button')));
-      for (var i = 0; i < 8; i++) {
-        await tester.pump(const Duration(milliseconds: 100));
-      }
-
-      expect(find.text('Brief Revision History — $_actorId-handle'), findsOneWidget);
-      expect(find.text('2 revisions'), findsOneWidget);
-
-      await captureBoundary(key, '$_outDir/961_brief_info_mobile_history.png');
-    });
-  });
+  for (final mobile in [false, true]) {
+    for (final step in _Step.values) {
+      testWidgets(
+        '961 brief info ${mobile ? 'mobile' : 'desktop'} ${step.name}',
+        (tester) => _capture(tester, mobile: mobile, step: step),
+      );
+    }
+  }
 }

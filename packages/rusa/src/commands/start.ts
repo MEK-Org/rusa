@@ -841,17 +841,10 @@ function assemblePortableInjection(
   }
 
   let state = store.load(id);
-  // Seed before the first brief-mode prompt, not after its first run. The
-  // switch position is durable before prompt assembly, so this run renders the
-  // charter seed rather than the old ledger and later rewrites see only sources
-  // arriving after this boundary.
+  // Seed before the first brief-mode prompt, so the first brief-mode run
+  // renders the charter seed rather than the old ledger.
   if (mode === "brief" && state.brief === null) {
-    state = seedPortableBriefState(
-      state,
-      id,
-      repositories.actorRuns.latestLedgerSourcePosition(id),
-      new Date().toISOString()
-    );
+    state = seedPortableBriefState(state, id, new Date().toISOString());
     store.save(state);
   }
   const shared = {
@@ -883,7 +876,7 @@ function assembleConfiguredPortableInjection(
 ): { priorContext: string; injectRecord: InjectRecord } | undefined {
   if (record.context?.type !== "portable") return undefined;
   if (record.context.mode === "ledger" && !apiKey) {
-    throw new Error(`portable context ${record.context.mode} mode requires geminiApiKey`);
+    throw new Error("portable context ledger mode requires geminiApiKey");
   }
   return assemblePortableInjection(record.id, record.context.mode, store);
 }
@@ -916,7 +909,12 @@ export async function compactPortableContext(input: {
       messages: page.sources,
       now: (input.now ?? (() => new Date().toISOString()))(),
     });
-    state = result.state;
+    // The fold read `state` before awaiting the model. The brief is not the
+    // fold's to write: if the actor's mode switched and it committed a brief
+    // meanwhile, saving the stale copy would roll the snapshot back under
+    // brief history that is already ahead of it. Take the stored brief as it
+    // is now; the reread and the save run with no await between them.
+    state = { ...result.state, brief: input.store.load(input.actorId).brief };
     quarantinedOperations.push(...result.quarantined);
     operations += result.operations;
     input.store.save(state);
@@ -2233,7 +2231,7 @@ async function composeStart(
       backups: legacyPortableContextImport.backupFiles,
     });
   }
-  const portableContextStore: PortableContextStore = getRepositories().portableContext;
+  const portableContextStore = getRepositories().portableContext;
   const e2eInstance = new E2EInstanceManager({
     mcHome,
     workersDir,
@@ -3368,7 +3366,6 @@ async function composeStart(
             createBriefMcpServer({
               actorId: id,
               store: portableContextStore,
-              charter: () => actors.get(id)?.charter ?? rec.charter,
             })
           );
           workerMcp.push({ name: BRIEF_MCP_NAME, url: briefUrl });
@@ -3837,7 +3834,6 @@ async function composeStart(
       createBriefMcpServer({
         actorId: rootId,
         store: portableContextStore,
-        charter: () => actors.get(rootId)?.charter ?? rootActor.charter ?? DEFAULT_ROOT_CHARTER,
       })
     );
     rootMcp.push({ name: BRIEF_MCP_NAME, url: rootBriefUrl });
