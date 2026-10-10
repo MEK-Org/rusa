@@ -48,6 +48,7 @@ import {
   type MeshProviderGate,
   type QueuedSelection,
   type ResponsiveArrival,
+  type ResponsiveArrivalDisposition,
   RunManager,
   VOICE_INBOX_PAYLOAD_TYPE,
 } from "../runtime/run-manager.js";
@@ -783,8 +784,10 @@ export interface ActorMeshOptions {
   onQueued?: (actorId: string, context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Best-effort receipts for entries first accepted into an execution opportunity. */
   onInboxEntriesSeen?: (actorId: string, entries: readonly InboxEntry[]) => void;
-  /** Optional, shadow-only JEV policy; it never changes the v1 dispatch result. */
+  /** Optional JEV policy. In shadow mode (default), it never changes dispatch. In active mode, it conditionally suppresses preemption. */
   responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
+  /** Explicit active or shadow mode for JEV responsive interruption. Defaults to "shadow" (or classifier.mode). */
+  responsiveInterruptionMode?: "shadow" | "active";
   /**
    * Posts a shadow verdict as a reaction on the chat message that arrived.
    * Only ever called when `responsiveInterruption` is also supplied, so an
@@ -880,6 +883,15 @@ interface SelectedHeadSnapshot {
   checkpointBy: string | null;
 }
 
+interface ActiveInterruptionSuppression {
+  actorId: string;
+  runEpoch: number;
+  selectionEpoch: number;
+  selectedEntryIds: readonly string[];
+  pendingEvaluations: Set<string>;
+  suppressedEntries: Set<string>;
+}
+
 export class ActorMesh {
   readonly actors: ActorRepository;
   readonly principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
@@ -955,6 +967,10 @@ export class ActorMesh {
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
+  private readonly responsiveInterruptionMode: "shadow" | "active";
+  private readonly selectionEpochs = new Map<string, number>();
+  private readonly runEpochs = new Map<string, number>();
+  private readonly activeSuppressions = new Map<string, ActiveInterruptionSuppression>();
   private readonly reactToChatMessage?: ActorMeshOptions["reactToChatMessage"];
   private readonly grantable: ReadonlySet<string>;
   private readonly secretsDir: string;
@@ -1055,6 +1071,8 @@ export class ActorMesh {
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
     this.responsiveInterruption = opts.responsiveInterruption;
+    this.responsiveInterruptionMode =
+      opts.responsiveInterruptionMode ?? opts.responsiveInterruption?.mode ?? "shadow";
     this.reactToChatMessage = opts.reactToChatMessage;
     // A host-global capability is never grantable through the mesh (#549), so
     // a wiring that lists one — the maintenance servers are registered like
@@ -1098,8 +1116,9 @@ export class ActorMesh {
               arrivals: readonly ResponsiveArrival[],
               isRunning: boolean
             ) => {
-              this.shadowResponsiveInterruptions(actorId, arrivals, isRunning);
+              return this.handleResponsiveArrivals(actorId, arrivals, isRunning);
             },
+            isPreemptionSuppressed: (actorId: string) => this.isPreemptionSuppressed(actorId),
           }
         : {}),
       onInternalPort: (port) => {
@@ -1135,8 +1154,9 @@ export class ActorMesh {
       this.unsubscribeInboxAppends = opts.inboxStore.onItemsAppended((items) => {
         this.scheduleAppendedWork(items);
       });
-      this.unsubscribeInboxHandled = opts.inboxStore.onItemsHandled((actorId) => {
+      this.unsubscribeInboxHandled = opts.inboxStore.onItemsHandled((actorId, results) => {
         this.cancelEmptyQueuedRun(actorId);
+        this.onItemsMarkedHandled(actorId, results);
       });
     }
   }
@@ -1488,6 +1508,176 @@ export class ActorMesh {
     return this.runs.dispatch(resolved);
   }
 
+  isPreemptionSuppressed(actorId: string): boolean {
+    actorId = this.resolveThreadId(actorId);
+    const active = this.activeSuppressions.get(actorId);
+    if (!active) return false;
+    return active.pendingEvaluations.size > 0 || active.suppressedEntries.size > 0;
+  }
+
+  // biome-ignore lint/suspicious/noConfusingVoidType: hook may return void or disposition
+  private handleResponsiveArrivals(
+    actorId: string,
+    incoming: readonly ResponsiveArrival[],
+    wasRunning: boolean
+  ): ResponsiveArrivalDisposition | void {
+    if (this.responsiveInterruptionMode === "active") {
+      return this.handleActiveResponsiveArrivals(actorId, incoming, wasRunning);
+    }
+    this.shadowResponsiveInterruptions(actorId, incoming, wasRunning);
+  }
+
+  private hasLiveUnhandledSelection(actorId: string, selectedEntryIds: readonly string[]): boolean {
+    if (selectedEntryIds.length === 0) return false;
+    const inbox = this.inboxStore;
+    if (!inbox) return false;
+    for (const id of selectedEntryIds) {
+      const entry = inbox.read(actorId, id);
+      if (entry && !entry.handledAt) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private invalidateActiveInterruption(actorId: string, _reason: string): void {
+    const resolved = this.resolveThreadId(actorId);
+    const active = this.activeSuppressions.get(resolved);
+    if (!active) return;
+    this.activeSuppressions.delete(resolved);
+    const live = this.runs.liveActor(resolved);
+    if (live?.isRunning) {
+      this.runs.preemptLiveActor(resolved);
+    }
+  }
+
+  private clearActiveInterruption(actorId: string): void {
+    const resolved = this.resolveThreadId(actorId);
+    this.activeSuppressions.delete(resolved);
+  }
+
+  private onItemsMarkedHandled(actorId: string, results?: readonly MarkHandledResult[]): void {
+    const resolved = this.resolveThreadId(actorId);
+    if (!this.activeSuppressions.has(resolved)) return;
+    const selected = new Set(this.selectedInboxEntries(resolved));
+    if (selected.size === 0) {
+      this.invalidateActiveInterruption(resolved, "no_selection");
+      return;
+    }
+    if (results && results.length > 0) {
+      const handledSelected = results.some((r) => selected.has(r.id));
+      if (handledSelected) {
+        this.invalidateActiveInterruption(resolved, "selected_work_handled");
+      }
+    } else {
+      if (!this.hasLiveUnhandledSelection(resolved, [...selected])) {
+        this.invalidateActiveInterruption(resolved, "selected_work_handled");
+      }
+    }
+  }
+
+  // biome-ignore lint/suspicious/noConfusingVoidType: hook may return void or disposition
+  private handleActiveResponsiveArrivals(
+    actorId: string,
+    incoming: readonly ResponsiveArrival[],
+    wasRunning: boolean
+  ): ResponsiveArrivalDisposition | void {
+    const classifier = this.responsiveInterruption;
+    if (!classifier || incoming.length === 0 || !wasRunning) return;
+
+    // Explicit Run Now always interrupts immediately without JEV call.
+    // Any interrupting batchrow wins: if any row is operator.run_now, preemption cannot be suppressed.
+    if (incoming.some(({ entry }) => entry.payload.type === "operator.run_now")) {
+      this.invalidateActiveInterruption(actorId, "operator_run_now");
+      return { suppressPreemption: false };
+    }
+
+    const interrupting = incoming.filter(({ baseline }) => baseline === "interrupt");
+    if (interrupting.length === 0) return;
+
+    const selectedEntryIds = [...this.selectedInboxEntries(actorId)];
+    const hasLiveSelection = this.hasLiveUnhandledSelection(actorId, selectedEntryIds);
+    if (!hasLiveSelection) {
+      // No live unhandled selection: baseline interrupts without JEV call
+      this.invalidateActiveInterruption(actorId, "no_live_selection");
+      return { suppressPreemption: false };
+    }
+
+    const runEpoch = this.runEpochs.get(actorId) ?? 0;
+    const selectionEpoch = this.selectionEpochs.get(actorId) ?? 0;
+
+    let active = this.activeSuppressions.get(actorId);
+    if (!active || active.runEpoch !== runEpoch || active.selectionEpoch !== selectionEpoch) {
+      active = {
+        actorId,
+        runEpoch,
+        selectionEpoch,
+        selectedEntryIds,
+        pendingEvaluations: new Set<string>(),
+        suppressedEntries: new Set<string>(),
+      };
+      this.activeSuppressions.set(actorId, active);
+    }
+
+    for (const { entry, baseline } of interrupting) {
+      const incomingEntryId = entry.id;
+      const evaluationId = this.idgen();
+      active.pendingEvaluations.add(evaluationId);
+
+      void classifier
+        .evaluate({
+          evaluationId,
+          actorId,
+          incomingEntryId,
+          selectedEntryIds,
+          pendingEntryIds: [],
+        })
+        .then((decision) => {
+          this.recordEvent({
+            kind: "responsive_interruption_shadow",
+            actorId,
+            detail: "active",
+            payload: JSON.stringify({ evaluationId, baseline, decision }),
+          });
+          const prediction = shadowPrediction(decision);
+          if (prediction) this.postShadowReaction(entry.payload, prediction, incomingEntryId);
+
+          const current = this.activeSuppressions.get(actorId);
+          if (
+            !current ||
+            current.runEpoch !== runEpoch ||
+            current.selectionEpoch !== selectionEpoch ||
+            !current.pendingEvaluations.has(evaluationId)
+          ) {
+            return;
+          }
+
+          current.pendingEvaluations.delete(evaluationId);
+
+          if (decision.outcome === "interrupt") {
+            this.activeSuppressions.delete(actorId);
+            this.runs.preemptLiveActor(actorId);
+          } else {
+            current.suppressedEntries.add(incomingEntryId);
+          }
+        })
+        .catch(() => {
+          this.log(`responsive interruption active observation failed for ${incomingEntryId}`);
+          const current = this.activeSuppressions.get(actorId);
+          if (
+            current &&
+            current.runEpoch === runEpoch &&
+            current.selectionEpoch === selectionEpoch
+          ) {
+            this.activeSuppressions.delete(actorId);
+            this.runs.preemptLiveActor(actorId);
+          }
+        });
+    }
+
+    return { suppressPreemption: true };
+  }
+
   /**
    * Fire-and-forget shadow decisions over the exact rows the durable inbox
    * identified as newly arrived, before its normal preemption path runs. Only
@@ -1671,6 +1861,8 @@ export class ActorMesh {
   actorQueued(actorId: string, context: { responsive: boolean; mode: ActorRunMode }): InboxEntry[] {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
+    this.runEpochs.set(actorId, (this.runEpochs.get(actorId) ?? 0) + 1);
+    this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
     // Open the run-scoped head window. An actor absent from this set delivers
     // head attention immediately, which is what every non-run producer wants.
@@ -1779,6 +1971,8 @@ export class ActorMesh {
       : [];
     beforeCommit?.(entries);
     this.selectedInboxEntryIds.set(actorId, unique);
+    this.selectionEpochs.set(actorId, (this.selectionEpochs.get(actorId) ?? 0) + 1);
+    this.invalidateActiveInterruption(actorId, "selection_changed");
     if (headObligationIds.length > 0 && supportsObligationClosureReads(closure)) {
       const run: HeadClosureRunState = this.headClosureRuns.get(actorId) ?? {
         headObligationIds: new Set<string>(),
@@ -2101,6 +2295,8 @@ export class ActorMesh {
       );
     }
     this.selectedInboxEntryIds.delete(actorId);
+    this.runEpochs.set(actorId, (this.runEpochs.get(actorId) ?? 0) + 1);
+    this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
     this.flushRunResponsiveReadyAttention(actorId);
@@ -2424,6 +2620,8 @@ export class ActorMesh {
   abandonInboxRun(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
+    this.runEpochs.set(actorId, (this.runEpochs.get(actorId) ?? 0) + 1);
+    this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
     this.flushRunResponsiveReadyAttention(actorId);
@@ -4362,6 +4560,7 @@ export class ActorMesh {
   interrupt(targetId: string, by: string): { interrupted: boolean; status?: string } {
     targetId = this.resolveThreadId(targetId);
     by = this.resolveThreadId(by);
+    this.clearActiveInterruption(targetId);
     const target = this.runs.liveActor(targetId);
     if (!target) {
       return { interrupted: false, status: "not_live" };
@@ -5295,6 +5494,9 @@ export class ActorMesh {
     this.unsubscribeInboxHandled = undefined;
     this.appendWakesOwed.clear();
     this.runResponsiveReadyAttention.clear();
+    this.activeSuppressions.clear();
+    this.selectionEpochs.clear();
+    this.runEpochs.clear();
     this.runs.closeAll();
   }
 

@@ -160,18 +160,28 @@ export interface RunManagerOptions {
   /** Report that responsive work replaced an in-flight or queued run. */
   onPreempted?: (actorId: string, phase: string) => void;
   /**
-   * Observe each newly arrived responsive inbox row before normal preemption.
-   * This is a narrow policy hook, not a second dispatch path: the durable
-   * inbox still decides priority and this callback cannot delay its dispatch.
+   * Observe or evaluate each newly arrived responsive inbox row before normal preemption.
+   * Under active queue policy, returning `{ suppressPreemption: true }` suppresses
+   * immediate preemption for running actors.
    */
+  // biome-ignore lint/suspicious/noConfusingVoidType: allow void-returning callback handlers
   onResponsiveArrived?: (
     actorId: string,
     arrivals: readonly ResponsiveArrival[],
     isRunning: boolean
-  ) => void;
+  ) => ResponsiveArrivalDisposition | void;
+  /**
+   * Query whether active responsive interruption policy currently suppresses preemption
+   * for an actor in flight.
+   */
+  isPreemptionSuppressed?: (actorId: string) => boolean;
   /** Internal construction-only port receiver. */
   onInternalPort?: (port: RunManagerInternalPort) => void;
   log?: (msg: string) => void;
+}
+
+export interface ResponsiveArrivalDisposition {
+  suppressPreemption?: boolean;
 }
 
 /**
@@ -211,6 +221,7 @@ export class RunManager {
   private readonly markInboxSeen: (actorId: string) => void;
   private readonly onPreempted: (actorId: string, phase: string) => void;
   private readonly onResponsiveArrived?: RunManagerOptions["onResponsiveArrived"];
+  private readonly isPreemptionSuppressed?: RunManagerOptions["isPreemptionSuppressed"];
   /**
    * Entry ids already handed to `onResponsiveArrived`. A row stays unseen
    * until a run admits it, so without this a second delivery poke re-reports
@@ -259,6 +270,7 @@ export class RunManager {
     this.markInboxSeen = opts.markInboxSeen ?? (() => {});
     this.onPreempted = opts.onPreempted ?? (() => {});
     this.onResponsiveArrived = opts.onResponsiveArrived;
+    this.isPreemptionSuppressed = opts.isPreemptionSuppressed;
     this.log = opts.log ?? (() => {});
   }
 
@@ -384,12 +396,13 @@ export class RunManager {
    * baseline: it would interrupt only if this dispatch may preempt and the
    * row's durable policy allows it.
    */
+  // biome-ignore lint/suspicious/noConfusingVoidType: allow void-returning callback handlers
   private observeResponsiveArrival(
     actorId: string,
     work: DurableDispatchWork,
     mayPreempt: boolean,
     isRunning: boolean
-  ): void {
+  ): ResponsiveArrivalDisposition | void {
     const observe = this.onResponsiveArrived;
     if (!observe) return;
     const entries = work.unseenResponsiveEntries ?? [];
@@ -405,7 +418,7 @@ export class RunManager {
     if (observed.size > 0) this.observedResponsive.set(actorId, observed);
     else this.observedResponsive.delete(actorId);
     if (arrived.length === 0) return;
-    observe(
+    return observe(
       actorId,
       arrived.map((entry) => ({
         entry,
@@ -452,13 +465,22 @@ export class RunManager {
       return false;
     }
     const wasRunning = target.isRunning;
+    let suppressPreemption = this.isPreemptionSuppressed?.(actorId) ?? false;
     if (responsiveArrived) {
-      this.observeResponsiveArrival(actorId, work, opts.preempt, wasRunning);
+      const disposition = this.observeResponsiveArrival(actorId, work, opts.preempt, wasRunning);
+      if (disposition !== undefined && disposition.suppressPreemption !== undefined) {
+        suppressPreemption = disposition.suppressPreemption;
+      }
     }
     // Arrival decides admission; only a row whose own durable policy permits
     // it may replace the run in flight (#829). Joining rows reach that run's
     // successor through the trigger runner's one responsive follow-up.
-    if (responsiveArrived && opts.preempt && work.unseenInterrupting !== false) {
+    if (
+      responsiveArrived &&
+      opts.preempt &&
+      work.unseenInterrupting !== false &&
+      !suppressPreemption
+    ) {
       const preemption = target.preemptForResponsive();
       if (preemption.preempted) this.onPreempted(actorId, preemption.phase);
     }
@@ -572,6 +594,20 @@ export class RunManager {
   /** Clear a reservation at start/cancel/end so it never outlives itself. */
   clearSelection(actorId: string): void {
     this.selections.delete(actorId);
+  }
+
+  /**
+   * Preempt an active running actor, invoking onPreempted if preemption took effect.
+   */
+  preemptLiveActor(actorId: string): boolean {
+    const target = this.live.get(actorId);
+    if (!target) return false;
+    const preemption = target.preemptForResponsive();
+    if (preemption.preempted) {
+      this.onPreempted(actorId, preemption.phase);
+      return true;
+    }
+    return true;
   }
 }
 

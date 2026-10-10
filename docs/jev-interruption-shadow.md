@@ -78,14 +78,50 @@ null text. A GitHub comment or review event without a usable id counts as
 unreadable rather than falling back to the issue or PR body. If the arriving
 item's own text cannot be read, the observation is
 recorded as `input_unavailable` and nothing is sent. If transport, response
-parsing, or the timeout fails, that observation safely queues and posts no
-prediction reaction. No
-retry is attempted, because a retry would resend inbox text. The existing
-responsive scheduler still runs exactly as before in every case.
+parsing, or the timeout fails, that observation records `outcome: "interrupt"`
+with the corresponding fallback reason (`timeout`, `client_error`, `invalid_probability`)
+and posts no prediction reaction. No retry is attempted, because a retry would
+resend inbox text. The baseline interruption stands.
+
+## Active mode
+
+By default, JEV runs in shadow mode (`jevMode: shadow`), observing arrivals without
+altering scheduler dispatch. Setting `jevMode: active` enables active interruption
+suppression:
+
+```yaml
+jevApiKeyFile: your-jev-credential-file
+jevMode: active
+```
+
+### Active queue policy behavior
+
+- **Eligibility:** Active JEV is called *only* when an otherwise-interrupting
+  responsive arrival reaches an actor that is actively running and currently
+  holds a live, unhandled selection (`inbox.select`) in that run.
+- **Immediate baseline interrupt (no JEV call):** If the actor is idle or queued,
+  if the actor has no selected work (empty selection or pending-only), or if all
+  selected entries have already been marked handled, JEV is not evaluated and
+  the baseline interrupt proceeds immediately.
+- **Hard operator controls:** `operator.run_now` and direct `interrupt` (Stop)
+  are hard control paths that bypass JEV evaluation and immediately preempt.
+  In a concurrent batch of arriving rows, any interrupting row wins.
+- **Threshold & suppression:** A timely valid decision strictly below the 0.5
+  threshold (`outcome: "queue"`, `reason: "below_threshold"`) suppresses
+  preemption of the active turn. The arrival remains durable in the inbox and
+  is scheduled as a responsive follow-up when the current turn finishes.
+- **Invalidation:** Suppression is strictly tied to the originating run and its
+  selection. If the actor changes its selection (including re-selecting the same
+  entries — ABA), marks its selected work handled, or if the run ends or Stop is
+  called, suppression is invalidated and preemption occurs immediately if the actor
+  is still running.
+- **Failures & deadlines:** Timeouts (5-second decision deadline), transport
+  errors, or unreadable inputs preserve baseline preemption.
 
 ## Roll back
 
-Remove `jevApiKeyFile` from `config.yaml` and restart `rusa`. This removes the
-observer and its chat reactions; it does not require a database or schema
-migration, and it leaves the normal scheduler unchanged. The credential file
-may be removed separately once the service has restarted without the setting.
+- To revert from active mode to shadow observation: change `jevMode: shadow` (or
+  remove `jevMode`) and restart `rusa`.
+- To disable JEV entirely: remove `jevApiKeyFile` from `config.yaml` and restart
+  `rusa`. This removes the classifier and its chat reactions; it does not require
+  a database or schema migration. The credential file may be removed separately.

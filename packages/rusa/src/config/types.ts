@@ -447,6 +447,12 @@ export interface RusaConfig {
    * interruption observations; absence preserves today's scheduler exactly.
    */
   jevApiKeyFile?: string;
+  /**
+   * Mode for the optional JEV responsive-interruption classifier.
+   * "shadow" (default): logs predictions and posts chat reactions without changing scheduler behavior.
+   * "active": conditionally suppresses interruption for eligible responsive arrivals under threshold.
+   */
+  jevMode?: "shadow" | "active";
   webhook: WebhookConfig;
   /** Explicit provider/model selection for the root actor. */
   rootActor?: RootActorConfig;
