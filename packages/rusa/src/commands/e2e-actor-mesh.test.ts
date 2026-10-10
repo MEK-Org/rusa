@@ -349,6 +349,25 @@ describe("loopbackRewriteToAppend", () => {
     }
   });
 
+  it("appends the missing mappings when the loopback header carries wrong or partial values", () => {
+    const wrongRepo = `[url "${url}"]\n\tinsteadOf = https://github.com/acme/other\n`;
+    expect(loopbackRewriteToAppend(wrongRepo, url, repo)).toBe(
+      loopbackRewriteToAppend("", url, repo)
+    );
+    const partial = `[url "${url}"]\n\tinsteadOf = https://github.com/${repo}\n`;
+    expect(loopbackRewriteToAppend(partial, url, repo)).toBe(
+      [
+        `[url "${url}"]`,
+        `\tinsteadOf = https://github.com/${repo}.git`,
+        `\tinsteadOf = git@github.com:${repo}.git`,
+        "",
+      ].join("\n")
+    );
+    expect(
+      loopbackRewriteToAppend(`${partial}${loopbackRewriteToAppend(partial, url, repo)}`, url, repo)
+    ).toBeNull();
+  });
+
   it("starts the stanza on its own line when the gitconfig lacks a trailing newline", () => {
     expect(loopbackRewriteToAppend("[user]\n\tname = e2e", url, repo)).toMatch(
       /^\n\[url "http:\/\/127\.0\.0\.1:8087\/git\/repo\.git"\]\n/

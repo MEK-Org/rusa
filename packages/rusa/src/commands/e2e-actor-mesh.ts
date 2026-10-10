@@ -177,9 +177,10 @@ export function resolveE2EInstance(opts: ResolveE2EInstanceOptions): ResolvedE2E
 
 /**
  * The gitconfig stanza routing clones of `repo` to the loopback remote at `url`,
- * or `null` when `gitconfig` already carries it. Keyed on the exact URL so a
- * reused root gains the stanza when it was provisioned elsewhere (ab-context
- * writes a filesystem-path rewrite) or under a different `--port-offset`.
+ * or `null` when `gitconfig` already maps every clone form there. Keyed on the
+ * exact URL and its `insteadOf` values, so a reused root gains the mapping when
+ * it was provisioned elsewhere (ab-context writes a filesystem-path rewrite),
+ * under a different `--port-offset`, or with the header but not the values.
  */
 export function loopbackRewriteToAppend(
   gitconfig: string,
@@ -187,15 +188,24 @@ export function loopbackRewriteToAppend(
   repo: string
 ): string | null {
   const header = `[url "${url}"]`;
-  if (gitconfig.split("\n").some((line) => line.trim() === header)) return null;
+  const mapped = new Set<string>();
+  let inStanza = false;
+  for (const raw of gitconfig.split("\n")) {
+    const line = raw.trim();
+    if (line.startsWith("[")) inStanza = line === header;
+    const value = inStanza ? /^insteadOf\s*=\s*(.*)$/i.exec(line)?.[1] : undefined;
+    if (value !== undefined) mapped.add(value.trim());
+  }
+  const missing = [
+    `https://github.com/${repo}`,
+    `https://github.com/${repo}.git`,
+    `git@github.com:${repo}.git`,
+  ].filter((form) => !mapped.has(form));
+  if (missing.length === 0) return null;
   const separator = gitconfig === "" || gitconfig.endsWith("\n") ? "" : "\n";
-  return [
-    `${separator}${header}`,
-    `\tinsteadOf = https://github.com/${repo}`,
-    `\tinsteadOf = https://github.com/${repo}.git`,
-    `\tinsteadOf = git@github.com:${repo}.git`,
-    "",
-  ].join("\n");
+  return [`${separator}${header}`, ...missing.map((form) => `\tinsteadOf = ${form}`), ""].join(
+    "\n"
+  );
 }
 
 /**
