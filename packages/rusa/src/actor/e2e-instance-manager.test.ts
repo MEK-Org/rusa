@@ -48,16 +48,6 @@ describe("E2EInstanceManager", () => {
   let stopFails = false;
   let calls: Array<{ file: string; args: string[] }> = [];
 
-  const writeResumableRootAt = (resumeRoot: string): void => {
-    mkdirSync(join(resumeRoot, "home", "data"), { recursive: true });
-    writeFileSync(join(resumeRoot, "home", "config.yaml"), "providers: {}\n");
-    writeFileSync(join(resumeRoot, "home", "data", "mesh.db"), "");
-    mkdirSync(join(resumeRoot, "remote", "repo.git"), { recursive: true });
-    writeFileSync(join(resumeRoot, "remote", "repo.git", "HEAD"), "ref: refs/heads/main\n");
-    mkdirSync(join(resumeRoot, "scratch", ".git"), { recursive: true });
-    writeFileSync(join(resumeRoot, "gitconfig"), "[user]\n");
-  };
-
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "e2e-instance-manager-"));
     workersDir = join(root, "workers");
@@ -683,44 +673,15 @@ describe("E2EInstanceManager", () => {
     expect(existsSync(runRoot)).toBe(false);
   });
 
-  it("preserves holder record and root on deliberate down() and allows subsequent resume()", async () => {
+  it("reclaims the holder's run root on a deliberate down(), leaving nothing unresumable", async () => {
     const subject = manager();
     await subject.up("actor-a", actorWorktree);
     const runRoot = subject.status().holder?.resumableRoot;
     if (!runRoot) throw new Error("expected a persisted resumableRoot");
-    writeResumableRootAt(runRoot);
+    mkdirSync(join(runRoot, "home", "data"), { recursive: true });
+    writeFileSync(join(runRoot, "home", "data", "mesh.db"), "");
 
-    const downStatus = subject.down("actor-a");
-    expect(downStatus.state).toBe("down");
-    expect(existsSync(runRoot)).toBe(true);
-    expect(existsSync(join(mcHome, "e2e-instance.json"))).toBe(true);
-
-    const resumeStatus = await subject.resume("actor-a", runRoot);
-    expect(resumeStatus.state).toBe("up");
-    expect(resumeStatus.holder?.resumableRoot).toBe(runRoot);
-  });
-
-  it("reclaims the holder's run root on an explicit down({ destroy: true })", async () => {
-    const subject = manager();
-    await subject.up("actor-a", actorWorktree);
-    const runRoot = subject.status().holder?.resumableRoot;
-    if (!runRoot) throw new Error("expected a persisted resumableRoot");
-    writeResumableRootAt(runRoot);
-
-    subject.down("actor-a", { destroy: true });
-
-    expect(existsSync(runRoot)).toBe(false);
-    expect(existsSync(join(mcHome, "e2e-instance.json"))).toBe(false);
-  });
-
-  it("reclaims the holder's run root on stopForMeshShutdown()", async () => {
-    const subject = manager();
-    await subject.up("actor-a", actorWorktree);
-    const runRoot = subject.status().holder?.resumableRoot;
-    if (!runRoot) throw new Error("expected a persisted resumableRoot");
-    writeResumableRootAt(runRoot);
-
-    subject.stopForMeshShutdown();
+    subject.down("actor-a");
 
     expect(existsSync(runRoot)).toBe(false);
     expect(existsSync(join(mcHome, "e2e-instance.json"))).toBe(false);
@@ -815,7 +776,7 @@ describe("E2EInstanceManager", () => {
 
     // Only the holder can bring the dead unit state down.
     subject.down("actor-a");
-    expect(existsSync(stateFile)).toBe(true);
+    expect(existsSync(stateFile)).toBe(false);
     expect(existsSync(runtimeDir)).toBe(false);
 
     // The host's Claude state is now a differently-shaped path (a directory
@@ -847,13 +808,26 @@ describe("E2EInstanceManager", () => {
   });
 
   describe("resume", () => {
+    // Populates the structural files a resumable e2e root must have, at a
+    // caller-supplied path — never invents its own path, since the whole
+    // point of exact-root binding is that only `up()` gets to choose it.
+    const writeResumableRootAt = (resumeRoot: string): void => {
+      mkdirSync(join(resumeRoot, "home", "data"), { recursive: true });
+      writeFileSync(join(resumeRoot, "home", "config.yaml"), "providers: {}\n");
+      writeFileSync(join(resumeRoot, "home", "data", "mesh.db"), "");
+      mkdirSync(join(resumeRoot, "remote", "repo.git"), { recursive: true });
+      writeFileSync(join(resumeRoot, "remote", "repo.git", "HEAD"), "ref: refs/heads/main\n");
+      mkdirSync(join(resumeRoot, "scratch", ".git"), { recursive: true });
+      writeFileSync(join(resumeRoot, "gitconfig"), "[user]\n");
+    };
+
     it("resumes the exact root established by up(), with --root/--resume, and reuses its worktree unmodified", async () => {
       const subject = manager();
       await subject.up("actor-a", actorWorktree);
       const upLaunch = calls.find((call) => call.file === "systemd-run");
       const upRootIndex = upLaunch?.args.indexOf("--root") ?? -1;
       const upRoot = upLaunch?.args[upRootIndex + 1];
-      await subject.down("actor-a");
+      active = false; // externally stopped: the holder record survives, unlike down()
       const resumeRoot = subject.status().holder?.resumableRoot;
       expect(resumeRoot).toBe(upRoot); // the fresh launch root IS the one later resumed
       if (!resumeRoot) throw new Error("expected a persisted resumableRoot");

@@ -725,15 +725,10 @@ export class E2EInstanceManager {
     // worktree or runtime so a stopped-but-still-held instance can only be
     // reclaimed by that actor's own down/stop (or, separately, resumed).
     if (existing) {
-      if (this.isLive(existingStatus) || existing.actorId !== actorId) {
-        throw new Error(
-          `e2e-instance: already held by ${existing.actorHandle} (${existing.actorId}) serving ${existing.worktree}; ` +
-            "it comes down only when that actor calls down/stop, that actor is retired, or the mesh shuts down"
-        );
-      }
-      // Held by the same actor and currently stopped: caller explicitly requested a
-      // fresh instance via up(), so discard the prior inactive instance root first.
-      this.discardRunRoot(existing.resumableRoot);
+      throw new Error(
+        `e2e-instance: already held by ${existing.actorHandle} (${existing.actorId}) serving ${existing.worktree}; ` +
+          "it comes down only when that actor calls down/stop, that actor is retired, or the mesh shuts down"
+      );
     }
     if (this.isLive(existingStatus)) {
       throw new Error(
@@ -894,7 +889,7 @@ export class E2EInstanceManager {
       : { state: "down", port: E2E_INSTANCE_PORT, ...(holder ? { holder } : {}), liveStatus };
   }
 
-  down(actorId: string, opts?: { destroy?: boolean }): E2EInstanceStatus {
+  down(actorId: string): E2EInstanceStatus {
     const holder = this.readRecord();
     if (!holder) return this.status();
     if (holder.actorId !== actorId) {
@@ -902,20 +897,16 @@ export class E2EInstanceManager {
         `e2e-instance: held by ${holder.actorHandle} (${holder.actorId}); only the holder may call down/stop`
       );
     }
-    if (opts?.destroy) {
-      this.teardownUnit();
-    } else {
-      this.stopService();
-    }
+    this.stopUnit();
     return this.status();
   }
 
   stopForActorRetirement(actorId: string): void {
-    if (this.readRecord()?.actorId === actorId) this.teardownUnit();
+    if (this.readRecord()?.actorId === actorId) this.stopUnit();
   }
 
   stopForMeshShutdown(): void {
-    if (this.readRecord() || this.isLive(this.liveStatus())) this.teardownUnit();
+    if (this.readRecord() || this.isLive(this.liveStatus())) this.stopUnit();
   }
 
   /**
@@ -923,7 +914,7 @@ export class E2EInstanceManager {
    * no owning holder record and no live unit — orphaned state, distinct from a
    * preserved holder's runtime and root (which `up()` never reaches while a
    * record exists) or a live singleton's runtime (torn down only via
-   * teardownUnit/cleanupFailedStart). Only the holder record makes a run root
+   * stopUnit/cleanupFailedStart). Only the holder record makes a run root
    * resumable, so without one every root under the runs area is dead weight.
    */
   private clearOrphanState(): void {
@@ -954,12 +945,8 @@ export class E2EInstanceManager {
     rmSync(realRoot, { recursive: true, force: true });
   }
 
-  /**
-   * Stops the running systemd unit and clears transient runtime directories,
-   * while preserving the holder record and resumable root so that the holding
-   * actor can resume authentic state via resume().
-   */
-  private stopService(): void {
+  private stopUnit(): void {
+    const holder = this.readRecord();
     // Keep the holder record if systemctl fails: losing attribution while an
     // active unit survives would permit a silent singleton takeover. The run
     // root stays with it, since a surviving record can still resume it.
@@ -967,18 +954,10 @@ export class E2EInstanceManager {
       this.exec("systemctl", ["--user", "stop", E2E_INSTANCE_UNIT_NAME]);
     }
     teardownFlutterOverlay(this.runtimeDir);
-    rmSync(this.runtimeDir, { recursive: true, force: true });
-  }
-
-  /**
-   * Destructive teardown: stops the unit, clears runtime state, deletes the
-   * holder record, and discards the preserved run root. Invoked on actor
-   * retirement, mesh shutdown, or explicit down({ destroy: true }).
-   */
-  private teardownUnit(): void {
-    const holder = this.readRecord();
-    this.stopService();
     rmSync(this.stateFile, { force: true });
+    rmSync(this.runtimeDir, { recursive: true, force: true });
+    // Deliberate teardown (down, retirement, mesh shutdown) discards the
+    // record, so the root it named is no longer resumable by anyone.
     this.discardRunRoot(holder?.resumableRoot);
   }
 

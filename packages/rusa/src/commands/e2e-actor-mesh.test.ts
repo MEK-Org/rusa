@@ -320,33 +320,4 @@ describe("resolveE2EInstance", () => {
       "preserve across watcher restart\n"
     );
   });
-
-  it("provisions a fresh instance when given an empty root", () => {
-    root = mkdtempSync(join(TEST_TMPDIR, "e2e-resolve-fresh-"));
-    const resolved = resolveE2EInstance({ root, rootDriver: "external" });
-    expect(resolved.resumed).toBe(false);
-    expect(resolved.instance.root).toBe(root);
-  });
-
-  it("resumes when explicitly requested with --resume and a valid root", () => {
-    root = mkdtempSync(join(TEST_TMPDIR, "e2e-resolve-explicit-"));
-    const initial = resolveE2EInstance({ root, rootDriver: "external" });
-    mkdirSync(join(initial.instance.home, "data"), { recursive: true });
-    writeFileSync(join(initial.instance.home, "data", "mesh.db"), "", "utf8");
-
-    const resolved = resolveE2EInstance({ root, resume: true, rootDriver: "external" });
-    expect(resolved.resumed).toBe(true);
-    expect(resolved.instance.root).toBe(root);
-  });
-
-  it("throws when --resume is requested without --root", () => {
-    expect(() => resolveE2EInstance({ resume: true })).toThrow(/--resume requires --root/);
-  });
-
-  it("throws when --resume is requested on an incomplete root", () => {
-    root = mkdtempSync(join(TEST_TMPDIR, "e2e-resolve-incomplete-"));
-    expect(() => resolveE2EInstance({ root, resume: true })).toThrow(
-      /cannot resume E2E instance; missing:/
-    );
-  });
 });

@@ -9,7 +9,7 @@ export const E2E_INSTANCE_MCP_NAME = "e2e-instance";
 export interface E2EInstanceController {
   up(actorId: string, worktree: string): E2EInstanceStatus | Promise<E2EInstanceStatus>;
   resume(actorId: string, root: string): E2EInstanceStatus | Promise<E2EInstanceStatus>;
-  down(actorId: string, opts?: { destroy?: boolean }): E2EInstanceStatus;
+  down(actorId: string): E2EInstanceStatus;
   status(): E2EInstanceStatus;
 }
 
@@ -34,11 +34,9 @@ export function createE2EInstanceServer(deps: E2EInstanceMcpDeps, selfId: string
       return toolError(err);
     }
   };
-  const down = async ({ destroy }: { destroy?: boolean } = {}) => {
+  const down = async () => {
     try {
-      return toolOk(
-        destroy !== undefined ? deps.manager.down(selfId, { destroy }) : deps.manager.down(selfId)
-      );
+      return toolOk(deps.manager.down(selfId));
     } catch (err) {
       return toolError(err);
     }
@@ -98,16 +96,8 @@ export function createE2EInstanceServer(deps: E2EInstanceMcpDeps, selfId: string
     "down",
     {
       title: "Stop my live e2e instance",
-      description:
-        "Stop the singleton when this actor is its current holder. Preserves holder record and root for resume unless destroy is set.",
-      inputSchema: {
-        destroy: z
-          .boolean()
-          .optional()
-          .describe(
-            "Permanently discard the preserved root and holder record instead of retaining them for resume."
-          ),
-      },
+      description: "Stop the singleton when this actor is its current holder.",
+      inputSchema: {},
     },
     down
   );
@@ -116,14 +106,7 @@ export function createE2EInstanceServer(deps: E2EInstanceMcpDeps, selfId: string
     {
       title: "Stop my live e2e instance (alias)",
       description: "Alias of down.",
-      inputSchema: {
-        destroy: z
-          .boolean()
-          .optional()
-          .describe(
-            "Permanently discard the preserved root and holder record instead of retaining them for resume."
-          ),
-      },
+      inputSchema: {},
     },
     down
   );

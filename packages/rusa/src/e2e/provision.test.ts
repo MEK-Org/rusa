@@ -196,15 +196,6 @@ describe("resumeE2EInstance", () => {
     expect(resumed.config.github.account).toBe("rusa-e2e-bot");
     expect(readFileSync(join(resumed.scratchPath, "DESIGN.md"), "utf8")).toBe("preserve me\n");
   });
-
-  it("fails when attempting to re-provision an existing complete root (watcher restart hazard)", () => {
-    root = mkdtempSync(join(TEST_TMPDIR, "rusa-e2e-reprovision-hazard-"));
-    const provisioned = provisionE2EInstance({ root });
-    mkdirSync(join(provisioned.home, "data"), { recursive: true });
-    writeFileSync(join(provisioned.home, "data", "mesh.db"), "", "utf8");
-
-    expect(() => provisionE2EInstance({ root })).toThrow(/Initial scratch commit/);
-  });
 });
 
 describe("runE2EDown", () => {

@@ -35,16 +35,13 @@ describe("e2e-instance MCP", () => {
     await client.callTool({ name: "resume", arguments: { root: "/owned/preserved-run" } });
     await client.callTool({ name: "down", arguments: {} });
     await client.callTool({ name: "stop", arguments: {} });
-    await client.callTool({ name: "down", arguments: { destroy: true } });
     await client.callTool({ name: "status", arguments: {} });
 
     expect(manager.up).toHaveBeenNthCalledWith(1, "actor-a", "/owned/repo");
     expect(manager.up).toHaveBeenNthCalledWith(2, "actor-a", "/owned/other");
     expect(manager.resume).toHaveBeenCalledWith("actor-a", "/owned/preserved-run");
-    expect(manager.down).toHaveBeenCalledTimes(3);
-    expect(manager.down).toHaveBeenNthCalledWith(1, "actor-a");
-    expect(manager.down).toHaveBeenNthCalledWith(2, "actor-a");
-    expect(manager.down).toHaveBeenNthCalledWith(3, "actor-a", { destroy: true });
+    expect(manager.down).toHaveBeenCalledTimes(2);
+    expect(manager.down).toHaveBeenCalledWith("actor-a");
     expect(manager.status).toHaveBeenCalledOnce();
   });
 
