@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -7,10 +8,10 @@ import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import {
   createDashboardE2EQuotaApi,
-  loopbackRewriteToAppend,
   resolveE2EInstance,
   startChatControlServer,
   startRootControlServer,
+  withLoopbackRewrite,
 } from "./e2e-actor-mesh.js";
 import type { RunStartE2EHandles } from "./start.js";
 
@@ -323,54 +324,65 @@ describe("resolveE2EInstance", () => {
   });
 });
 
-describe("loopbackRewriteToAppend", () => {
+describe("withLoopbackRewrite", () => {
   const repo = "acme/widgets";
   const url = "http://127.0.0.1:8087/git/repo.git";
+  const forms = [
+    `https://github.com/${repo}`,
+    `https://github.com/${repo}.git`,
+    `git@github.com:${repo}.git`,
+  ];
+  let dir = "";
 
-  it("appends nothing when the gitconfig already routes to this loopback URL", () => {
-    const gitconfig = `[user]\n\tname = e2e\n${loopbackRewriteToAppend("", url, repo) ?? ""}`;
-    expect(loopbackRewriteToAppend(gitconfig, url, repo)).toBeNull();
-  });
-
-  it("appends the stanza for a root provisioned by ab-context or under another port offset", () => {
-    const abContext = `[url "/runs/run-1/remote/repo.git"]\n\tinsteadOf = https://github.com/${repo}\n`;
-    const otherOffset =
-      loopbackRewriteToAppend("", "http://127.0.0.1:8088/git/repo.git", repo) ?? "";
-    for (const gitconfig of [abContext, otherOffset]) {
-      expect(loopbackRewriteToAppend(gitconfig, url, repo)).toBe(
-        [
-          `[url "${url}"]`,
-          `\tinsteadOf = https://github.com/${repo}`,
-          `\tinsteadOf = https://github.com/${repo}.git`,
-          `\tinsteadOf = git@github.com:${repo}.git`,
-          "",
-        ].join("\n")
-      );
+  afterEach(() => {
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true });
+      dir = "";
     }
   });
 
-  it("appends the missing mappings when the loopback header carries wrong or partial values", () => {
-    const wrongRepo = `[url "${url}"]\n\tinsteadOf = https://github.com/acme/other\n`;
-    expect(loopbackRewriteToAppend(wrongRepo, url, repo)).toBe(
-      loopbackRewriteToAppend("", url, repo)
+  /** What real Git resolves each clone form to under `gitconfig` (no network). */
+  function resolveWithGit(gitconfig: string): string[] {
+    dir = dir || mkdtempSync(join(TEST_TMPDIR, "e2e-rewrite-"));
+    const path = join(dir, "gitconfig");
+    writeFileSync(path, gitconfig, "utf8");
+    const env = { ...process.env, GIT_CONFIG_GLOBAL: path, GIT_CONFIG_NOSYSTEM: "1" };
+    return forms.map((form) =>
+      execFileSync("git", ["ls-remote", "--get-url", form], {
+        cwd: dir,
+        env,
+        encoding: "utf8",
+      }).trim()
     );
-    const partial = `[url "${url}"]\n\tinsteadOf = https://github.com/${repo}\n`;
-    expect(loopbackRewriteToAppend(partial, url, repo)).toBe(
-      [
-        `[url "${url}"]`,
-        `\tinsteadOf = https://github.com/${repo}.git`,
-        `\tinsteadOf = git@github.com:${repo}.git`,
-        "",
-      ].join("\n")
-    );
-    expect(
-      loopbackRewriteToAppend(`${partial}${loopbackRewriteToAppend(partial, url, repo)}`, url, repo)
-    ).toBeNull();
+  }
+
+  function rewrite(gitconfig: string): string {
+    return withLoopbackRewrite(gitconfig, url, repo) ?? gitconfig;
+  }
+
+  it("routes every clone form to the loopback and is then a no-op", () => {
+    const gitconfig = rewrite("[user]\n\tname = e2e");
+    expect(gitconfig).toMatch(/^\[user\]\n\tname = e2e\n\[url "/);
+    expect(resolveWithGit(gitconfig)).toEqual([url, url, url]);
+    expect(withLoopbackRewrite(gitconfig, url, repo)).toBeNull();
   });
 
-  it("starts the stanza on its own line when the gitconfig lacks a trailing newline", () => {
-    expect(loopbackRewriteToAppend("[user]\n\tname = e2e", url, repo)).toMatch(
-      /^\n\[url "http:\/\/127\.0\.0\.1:8087\/git\/repo\.git"\]\n/
-    );
+  it("takes precedence over a mapping from another port offset or ab-context", () => {
+    const otherOffset = withLoopbackRewrite("", "http://127.0.0.1:8088/git/repo.git", repo) ?? "";
+    const abContext = `[url "/runs/run-1/remote/repo.git"]\n\tinsteadOf = https://github.com/${repo}\n`;
+    for (const gitconfig of [otherOffset, abContext]) {
+      expect(resolveWithGit(rewrite(gitconfig))).toEqual([url, url, url]);
+    }
+  });
+
+  it("completes a loopback section with missing or partial values", () => {
+    for (const values of [[], [forms[0]]]) {
+      const gitconfig = [`[url "${url}"]`, ...values.map((f) => `\tinsteadOf = ${f}`), ""].join(
+        "\n"
+      );
+      const rewritten = rewrite(gitconfig);
+      expect(resolveWithGit(rewritten)).toEqual([url, url, url]);
+      expect(withLoopbackRewrite(rewritten, url, repo)).toBeNull();
+    }
   });
 });

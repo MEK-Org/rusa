@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -176,34 +176,38 @@ export function resolveE2EInstance(opts: ResolveE2EInstanceOptions): ResolvedE2E
 }
 
 /**
- * The gitconfig stanza routing clones of `repo` to the loopback remote at `url`,
- * or `null` when `gitconfig` already maps every clone form there. Keyed on the
- * exact URL and its `insteadOf` values, so a reused root gains the mapping when
- * it was provisioned elsewhere (ab-context writes a filesystem-path rewrite),
- * under a different `--port-offset`, or with the header but not the values.
+ * `gitconfig` rewritten so every clone form of `repo` resolves to the loopback
+ * remote at `url`, or `null` when it already does. Git takes the first of
+ * equal-length `insteadOf` matches, so a mapping left by ab-context (filesystem
+ * path) or an earlier `--port-offset` would shadow an appended stanza: those
+ * values are removed before the current stanza is appended.
  */
-export function loopbackRewriteToAppend(
-  gitconfig: string,
-  url: string,
-  repo: string
-): string | null {
-  const header = `[url "${url}"]`;
-  const mapped = new Set<string>();
-  let inStanza = false;
-  for (const raw of gitconfig.split("\n")) {
-    const line = raw.trim();
-    if (line.startsWith("[")) inStanza = line === header;
-    const value = inStanza ? /^insteadOf\s*=\s*(.*)$/i.exec(line)?.[1] : undefined;
-    if (value !== undefined) mapped.add(value.trim());
-  }
-  const missing = [
+export function withLoopbackRewrite(gitconfig: string, url: string, repo: string): string | null {
+  const forms = [
     `https://github.com/${repo}`,
     `https://github.com/${repo}.git`,
     `git@github.com:${repo}.git`,
-  ].filter((form) => !mapped.has(form));
-  if (missing.length === 0) return null;
-  const separator = gitconfig === "" || gitconfig.endsWith("\n") ? "" : "\n";
-  return [`${separator}${header}`, ...missing.map((form) => `\tinsteadOf = ${form}`), ""].join(
+  ];
+  const kept: string[] = [];
+  const mappedHere = new Set<string>();
+  let shadowed = false;
+  let section: string | undefined;
+  for (const raw of gitconfig.split("\n")) {
+    const line = raw.trim();
+    if (line.startsWith("[")) section = /^\[url\s+"(.*)"\]$/.exec(line)?.[1];
+    const value = section === undefined ? undefined : /^insteadOf\s*=\s*(.*)$/i.exec(line)?.[1];
+    const form = value?.trim().replace(/^"(.*)"$/, "$1");
+    if (form !== undefined && forms.includes(form)) {
+      if (section === url) mappedHere.add(form);
+      else shadowed = true;
+      continue;
+    }
+    kept.push(raw);
+  }
+  if (!shadowed && mappedHere.size === forms.length) return null;
+  const rest = kept.join("\n");
+  const separator = rest === "" || rest.endsWith("\n") ? "" : "\n";
+  return [`${rest}${separator}[url "${url}"]`, ...forms.map((f) => `\tinsteadOf = ${f}`), ""].join(
     "\n"
   );
 }
@@ -302,12 +306,12 @@ export async function runActorMeshE2EUp(opts: {
     // Resolve clones of the synthetic repo to the loopback endpoint, so a worker
     // that `git clone`s the GitHub URL transparently hits our throwaway origin.
     const gitconfigPath = join(rootDir, "gitconfig");
-    const rewrite = loopbackRewriteToAppend(
+    const rewritten = withLoopbackRewrite(
       readFileSync(gitconfigPath, "utf8"),
       gitRemoteServer.url,
       repo
     );
-    if (rewrite) appendFileSync(gitconfigPath, rewrite, "utf8");
+    if (rewritten !== null) writeFileSync(gitconfigPath, rewritten, "utf8");
     writeFileSync(join(rootDir, PID_FILE), String(process.pid), "utf8");
   } catch (err) {
     process.removeListener("exit", closeGitOnExit);
