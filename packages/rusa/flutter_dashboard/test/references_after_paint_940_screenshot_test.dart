@@ -129,7 +129,7 @@ void main() {
       HttpOverrides.global = FakeImageHttpOverrides(await portraits(ids));
       // The operator card's avatar settles too, so captures differ only in
       // what they label.
-      final shown = [...ids, 'human:operator'];
+      final shown = [...ids, testUserPrincipalId];
       addTearDown(() => HttpOverrides.global = null);
       addTearDown(() => tester.binding.setSurfaceSize(null));
       await tester.binding.setSurfaceSize(const Size(1500, 1250));
@@ -163,13 +163,13 @@ void main() {
             handledTime: '2026-10-03T12:10:00.000Z',
             addressedNote: 'Answered both review questions',
           ),
-          // Closed by the operator: staging labelled this card with the raw
-          // principal id; it now reads as the operator (#940 review).
+          // Closed by the operator: staging labelled this card with the
+          // server-generated handle; it now reads as the operator (#940 review).
           RecentActivityItem(
             id: 'obligation_history_7',
             kind: 'terminal_obligation',
             time: '2026-10-03T11:30:00.000Z',
-            actorId: 'human:operator',
+            actorId: testUserPrincipalId,
             sourceKind: 'OBLIGATION',
             sourceRef: 'obligation:export',
             summary: 'Export run history as CSV',
