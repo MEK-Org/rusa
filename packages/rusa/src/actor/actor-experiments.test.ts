@@ -38,7 +38,7 @@ function setup(
     id: rootId,
     charter: "root",
     parentId: null,
-    isRoot: true,
+    executionConfig: { unsandboxed: true },
     status: "active",
     createdAt: "2026-09-10T00:00:00Z",
   });
@@ -254,7 +254,7 @@ describe("actor experiment enrollment", () => {
       id: "account-b-root",
       charter: "another account root",
       parentId: null,
-      isRoot: true,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-09-10T00:00:00Z",
     });
@@ -270,7 +270,7 @@ describe("actor experiment enrollment", () => {
     );
     expect(enrollments.list()).toEqual([]);
     // The other tree's root is refused until it holds the grant itself (#549):
-    // parentless/isRoot is topology, not authority.
+    // being parentless is topology, not authority.
     expect(() =>
       mesh.enrollActorInExperiment("account-b-child", EXPERIMENT, "account-b-root")
     ).toThrow(/experiment-admin/);
@@ -336,7 +336,7 @@ describe("actor experiment enrollment", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      isRoot: true,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-09-10T00:00:00Z",
     });

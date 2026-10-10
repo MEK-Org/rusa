@@ -7,8 +7,8 @@ import type { CapabilityGrantStore } from "./capability-grants.js";
  * grant-derived capabilities (#549) — not a property of the distinguished root
  * actor. Each name covers exactly one existing administrative surface; none of
  * them is a catch-all "root" marker, and holding one confers nothing about the
- * others. Topology (`parentId === null`), the `isRoot` record flag, and the
- * literal `root` address grant none of these.
+ * others. Topology (`parentId === null`) and the literal `root` address grant
+ * none of these.
  *
  * Every operation that names a target actor is scoped to the holder's own
  * subtree (itself included); the mesh enforces that boundary, not the tool

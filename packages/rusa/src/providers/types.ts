@@ -123,6 +123,24 @@ export interface RunResult {
    * sees it, and only the failure notice renders it. In memory only, never persisted.
    */
   signInDiagnostic?: string;
+  /**
+   * What a caught exception said, kept apart from the stack that `output`
+   * records. Optional on the wire: a result from an older follower has none, and
+   * an older reader ignores it.
+   */
+  failure?: RunFailure;
+}
+
+/** The failure a run caught, as its source established it (#980). */
+export interface RunFailure {
+  /**
+   * Set only where the boundary itself is known, never inferred from text.
+   * `provider-selection`: the primary entry could not be prepared, so no
+   * provider was invoked.
+   */
+  stage?: "provider-selection";
+  /** The exception's own message, without its stack. May be blank. */
+  message: string;
 }
 
 /**

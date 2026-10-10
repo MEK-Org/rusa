@@ -2,11 +2,11 @@
   "pr": 973,
   "issue": 971,
   "sources": {
-    "before": "2105acfb366b85e254ffd33ebcc7820613926bdf (staging) packages/rusa/src/providers/antigravity.ts",
-    "after": "a92d5e9f2446b89e2ef0f2dde2a9396bbb4bd07f packages/rusa/src/providers/antigravity.ts; re-rendered after the line moved from output to the signInDiagnostic result field, with byte-identical notices and PNG hashes",
-    "route": "routeRunFailure (packages/rusa/src/actor/failure-sink.ts) with the deterministic exhaustion classifier",
-    "renderer": "unchanged InboxTab at a92d5e9f",
-    "longTail": "re-rendered at 4cd9f76c (the c8ced2ba implementation plus test-only deletions); the eight earlier notices and PNG hashes reproduced byte-identically in the same run"
+    "before": "d641ff11bd0f4445f6e08666ed5848814b942d10 (staging, includes #980's head-and-tail clip and run-id lead line) packages/rusa/src/providers/antigravity.ts",
+    "after": "this branch after merging staging d641ff11: packages/rusa/src/providers/antigravity.ts with the signInDiagnostic result field",
+    "route": "routeRunFailure (packages/rusa/src/actor/failure-sink.ts) at the same merge, with the deterministic exhaustion classifier; the fixed line is appended after clipFailureDiagnostic's output, outside its budget",
+    "renderer": "unchanged InboxTab at staging d641ff11",
+    "regenerated": "all ten captures re-rendered after the staging merge: staging's #980 adds 'Run <id>:' to the lead line and clips long causes head and tail, so before and after both changed; the before/after difference is still the one fixed line"
   },
   "viewports": {
     "wide": "1100x800 logical",
@@ -44,16 +44,16 @@
         "I1009 10:00:01.000000 1 trace.go:1] trace https://example.invalid/v1/trace?id=0123abcd",
         "I1009 10:00:01.000002 1 auth.go:1] token=synthetic-secret-token"
       ],
-      "note": "Synthetic. A one-line cause over 900 characters, so the notice renders the sink's full 800-character tail, plus a run log that yields the longest fixed status (65 characters). Phone viewport only, the narrowest card."
+      "note": "Synthetic. A one-line cause over 900 characters, so the sink clips it to its 800-character budget (head and tail, with an omitted-characters marker), plus a run log that yields the longest fixed status (65 characters). Phone viewport only, the narrowest card."
     }
   },
   "notices": {
-    "signin_failed_before": "[run failed] provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nError: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model",
-    "signin_failed_after": "[run failed] provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nError: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model\n[agy run log: silent sign-in failed]",
-    "healthy_control_before": "[run failed] provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nError: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model",
-    "healthy_control_after": "[run failed] provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nError: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model\n[agy run log: silent sign-in succeeded]",
-    "long_tail_before": "[run failed] provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nattempt 04: model catalog lookup returned no entries; synthetic attempt 05: model catalog lookup returned no entries; synthetic attempt 06: model catalog lookup returned no entries; synthetic attempt 07: model catalog lookup returned no entries; synthetic attempt 08: model catalog lookup returned no entries; synthetic attempt 09: model catalog lookup returned no entries; synthetic attempt 10: model catalog lookup returned no entries; synthetic attempt 11: model catalog lookup returned no entries; synthetic attempt 12: model catalog lookup returned no entries; synthetic attempt 13: model catalog lookup returned no entries; synthetic attempt 14: model catalog lookup returned no entries; Error: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model",
-    "long_tail_after": "[run failed] provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nattempt 04: model catalog lookup returned no entries; synthetic attempt 05: model catalog lookup returned no entries; synthetic attempt 06: model catalog lookup returned no entries; synthetic attempt 07: model catalog lookup returned no entries; synthetic attempt 08: model catalog lookup returned no entries; synthetic attempt 09: model catalog lookup returned no entries; synthetic attempt 10: model catalog lookup returned no entries; synthetic attempt 11: model catalog lookup returned no entries; synthetic attempt 12: model catalog lookup returned no entries; synthetic attempt 13: model catalog lookup returned no entries; synthetic attempt 14: model catalog lookup returned no entries; Error: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model\n[agy run log: not signed in at startup, no silent sign-in logged]"
+    "signin_failed_before": "[run failed] Run fixture-run: provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nError: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model",
+    "signin_failed_after": "[run failed] Run fixture-run: provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nError: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model\n[agy run log: silent sign-in failed]",
+    "healthy_control_before": "[run failed] Run fixture-run: provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nError: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model",
+    "healthy_control_after": "[run failed] Run fixture-run: provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nError: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model\n[agy run log: silent sign-in succeeded]",
+    "long_tail_before": "[run failed] Run fixture-run: provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nsynthetic attempt 01: model catalog lookup returned no entries; synthetic attempt 02: model catalog lookup returned no entries; synthetic attempt 03: model catalog lookup returned no entries; synthetic attempt 04: model catalog lookup returned no entries; synthetic attempt 05: model catalog lookup returned no entries; synthetic attempt 06: model catalog lookup returned no entries; sy… [230 characters omitted] …up returned no entries; synthetic attempt 11: model catalog lookup returned no entries; synthetic attempt 12: model catalog lookup returned no entries; synthetic attempt 13: model catalog lookup returned no entries; synthetic attempt 14: model catalog lookup returned no entries; Error: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model",
+    "long_tail_after": "[run failed] Run fixture-run: provider run antigravity/Gemini 3.1 Pro (High) failed.\n\n(exit 1)\n\nsynthetic attempt 01: model catalog lookup returned no entries; synthetic attempt 02: model catalog lookup returned no entries; synthetic attempt 03: model catalog lookup returned no entries; synthetic attempt 04: model catalog lookup returned no entries; synthetic attempt 05: model catalog lookup returned no entries; synthetic attempt 06: model catalog lookup returned no entries; sy… [230 characters omitted] …up returned no entries; synthetic attempt 11: model catalog lookup returned no entries; synthetic attempt 12: model catalog lookup returned no entries; synthetic attempt 13: model catalog lookup returned no entries; synthetic attempt 14: model catalog lookup returned no entries; Error: invalid model selection (--model gemini-3.1-pro --effort high): --effort is not supported for model\n[agy run log: not signed in at startup, no silent sign-in logged]"
   },
   "screenshots": [
     {
@@ -63,8 +63,8 @@
       "state": "before",
       "width": 2200,
       "height": 1600,
-      "bytes": 89128,
-      "sha256": "f84bf9ea562b0076e5e568443ffcc296853fbdbb038690555420e4b573b884b2"
+      "bytes": 90497,
+      "sha256": "e464a1f524fff55d25b91e11059d0af00efd1168a59b412b3c3ffbd47f2a8a2a"
     },
     {
       "file": "signin_failed_wide_after.png",
@@ -73,8 +73,8 @@
       "state": "after",
       "width": 2200,
       "height": 1600,
-      "bytes": 95693,
-      "sha256": "4998ebd743aeb42ac7d3b83550469a2d018b3a796163555d1ddff368751238e7"
+      "bytes": 97068,
+      "sha256": "8fb45f80bb3ec132d524e2c494d2fce8bf2b733e89f80361529cdb08defe0224"
     },
     {
       "file": "signin_failed_phone_before.png",
@@ -83,8 +83,8 @@
       "state": "before",
       "width": 780,
       "height": 1688,
-      "bytes": 82779,
-      "sha256": "dd2162f404fba5ca0afd5d67ecf9d8624a9e66263b3cd2e7aa661906ff430f9f"
+      "bytes": 84733,
+      "sha256": "aea4c50c675843d0d78a2cbf807aacb452e4411ff1706750ef46b66d3e77c4bd"
     },
     {
       "file": "signin_failed_phone_after.png",
@@ -93,8 +93,8 @@
       "state": "after",
       "width": 780,
       "height": 1688,
-      "bytes": 88868,
-      "sha256": "98a7fe18a73f5599beab26eb44d98cc679914e49ef1f977a8db8db5746e559e2"
+      "bytes": 90475,
+      "sha256": "28537ed2d60b2acd834ad1dcc27f99d504e75af145b5e81b59405d0823207f21"
     },
     {
       "file": "healthy_control_wide_before.png",
@@ -103,8 +103,8 @@
       "state": "before",
       "width": 2200,
       "height": 1600,
-      "bytes": 89128,
-      "sha256": "f84bf9ea562b0076e5e568443ffcc296853fbdbb038690555420e4b573b884b2"
+      "bytes": 90497,
+      "sha256": "e464a1f524fff55d25b91e11059d0af00efd1168a59b412b3c3ffbd47f2a8a2a"
     },
     {
       "file": "healthy_control_wide_after.png",
@@ -113,8 +113,8 @@
       "state": "after",
       "width": 2200,
       "height": 1600,
-      "bytes": 96968,
-      "sha256": "b16ab8b8cb4678e2073805c9ef5743b07a351462e66bcc52c6c771a3b55f60ca"
+      "bytes": 98520,
+      "sha256": "9e93942e5df9573f9a6120c9416fb1e82d74e5796d436b6bee9783f06b2631b0"
     },
     {
       "file": "healthy_control_phone_before.png",
@@ -123,8 +123,8 @@
       "state": "before",
       "width": 780,
       "height": 1688,
-      "bytes": 82779,
-      "sha256": "dd2162f404fba5ca0afd5d67ecf9d8624a9e66263b3cd2e7aa661906ff430f9f"
+      "bytes": 84733,
+      "sha256": "aea4c50c675843d0d78a2cbf807aacb452e4411ff1706750ef46b66d3e77c4bd"
     },
     {
       "file": "healthy_control_phone_after.png",
@@ -133,8 +133,8 @@
       "state": "after",
       "width": 780,
       "height": 1688,
-      "bytes": 89991,
-      "sha256": "3d4eff582365ff8ea4b612dcc4619e43ad6ca5671d80ec557cb1a1dbb257ce32"
+      "bytes": 91565,
+      "sha256": "52583ec1bb106498be2f79c4c73181c23305d1ad5228ee466aa03728dfd9c4a1"
     },
     {
       "file": "long_tail_phone_before.png",
@@ -143,8 +143,8 @@
       "state": "before",
       "width": 780,
       "height": 1688,
-      "bytes": 212233,
-      "sha256": "cec00a6f04dc6ed61336e727d203ff29598280776af799e549e3433a82e48a6a"
+      "bytes": 214942,
+      "sha256": "5e5f49c39bfa5b57c8005da25cfd31ad563223c826d7c6e9c423aea919fe2206"
     },
     {
       "file": "long_tail_phone_after.png",
@@ -153,8 +153,8 @@
       "state": "after",
       "width": 780,
       "height": 1688,
-      "bytes": 221858,
-      "sha256": "2cee078067b672634803a48f61bbe7cb427a565957d87443ea5e52ebe8b9005f"
+      "bytes": 225289,
+      "sha256": "f9bb8bebd4440765616d55d4dd402769bc87ccf35a7141d8ecb974aaf0f579f2"
     }
   ]
 }

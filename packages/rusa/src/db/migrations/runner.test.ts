@@ -110,6 +110,7 @@ describe("Database Migration System", () => {
       "0052_obligation_snooze",
       "0053_chat_room_participants",
       "0055_run_prompts",
+      "0056_actor_execution_config",
       "0058_user_google_account_id",
       "0059_obligation_completion_matchers",
     ]);

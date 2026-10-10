@@ -50,6 +50,8 @@ export function createHarness(options: {
   onEvent?: (actorId: string, event: ActorEvent) => void;
   /** Obligation reads, for tests about strict head closure. */
   obligations?: ActorMeshOptions["obligations"];
+  responsiveInterruption?: ActorMeshOptions["responsiveInterruption"];
+  responsiveInterruptionMode?: ActorMeshOptions["responsiveInterruptionMode"];
 }) {
   const promptEvents: ActorLifecyclePromptEvent[] = [];
   const actors = new InMemoryActorRepository();
@@ -135,6 +137,8 @@ export function createHarness(options: {
     events: (event) => meshEvents.push(event),
     idgen: () => `instance-worker-${++sequence}`,
     obligations: options.obligations,
+    responsiveInterruption: options.responsiveInterruption,
+    responsiveInterruptionMode: options.responsiveInterruptionMode,
     ...(pacer
       ? {
           // Every declared candidate is a lane, and a halted one is skipped as
@@ -230,6 +234,7 @@ export function createHarness(options: {
     {
       id: "root",
       parentId: null,
+      executionConfig: { unsandboxed: true },
       charter: "Coordinate the followers",
       status: "active",
       createdAt: new Date().toISOString(),

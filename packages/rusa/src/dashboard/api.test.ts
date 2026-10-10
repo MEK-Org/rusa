@@ -117,7 +117,14 @@ async function settled(res: MockRes): Promise<void> {
 }
 
 function rec(id: string, parentId: string | null, status: "active" | "retired"): ActorRecord {
-  return { id, charter: `charter ${id}`, parentId, status, createdAt: "2026-06-21T00:00:00.000Z" };
+  return {
+    id,
+    charter: `charter ${id}`,
+    parentId,
+    ...(parentId === null ? { executionConfig: { unsandboxed: true } } : {}),
+    status,
+    createdAt: "2026-06-21T00:00:00.000Z",
+  };
 }
 
 const googleVoiceConfig = (voiceName: string) => ({
@@ -520,27 +527,57 @@ describe("handleMeshApiRequest", () => {
       });
     });
 
-    it("resolves a page of cold references against one deadline, bounded and in store order (#933)", async () => {
+    it("answers from the store alone, with ref keys and actor ids but no reference or actor read (#940)", async () => {
       actors.upsert(rec(UUID_A, "root", "active"));
+      obligations.create({ id: "finished", ownerId: UUID_A, title: "Finished work" });
+      obligations.setTerminalStatus("finished", "done", "Done", null, UUID_A);
+      const fromViewer = meshChat.record({
+        senderId: LOCAL_USER,
+        recipientId: UUID_A,
+        body: "please look",
+      });
       const ids = Array.from({ length: 12 }, (_, i) => `cold-${String(i).padStart(2, "0")}`);
-      inbox.append(
-        ids.map((id, i) => ({
+      inbox.append([
+        ...ids.map((id, i) => ({
           id,
           actorId: UUID_A,
           source: `github:o/r/issues/${i + 1}`,
           payload: { type: "issues.opened" },
-        }))
+        })),
+        {
+          id: "chat",
+          actorId: UUID_A,
+          source: "gchat:spaces/AAAA",
+          payload: { type: "gchat.message", messageName: "spaces/AAAA/messages/BBBB.CCCC" },
+        },
+        {
+          id: "slack",
+          actorId: UUID_A,
+          source: "slack:channels/C123/messages/123.456",
+          payload: { type: "slack.message" },
+        },
+        {
+          id: "asked",
+          actorId: UUID_A,
+          source: `mesh:${LOCAL_USER}`,
+          payload: { type: "human.message", messageId: fromViewer, fromId: LOCAL_USER },
+        },
+      ]);
+      inbox.markHandled(
+        UUID_A,
+        [...ids, "chat", "slack", "asked"],
+        new Date("2026-09-26T03:15:00.000Z"),
+        "Addressed"
       );
-      inbox.markHandled(UUID_A, ids, new Date("2026-09-26T03:15:00.000Z"), "Addressed");
       const getIssue = vi.fn(() => new Promise<never>(() => {}));
-      const coldDeps = {
-        ...deps,
-        referenceCache: new ReferenceCacheService({
-          repo: new ReferenceCacheRepository(db),
-          deadlineMs: 60_000,
-        }),
-        issueClient: { getIssue },
-      } as unknown as DashboardDataDeps;
+      const referenceCache = new ReferenceCacheService({
+        repo: new ReferenceCacheRepository(db),
+        deadlineMs: 60_000,
+      });
+      const get = vi.spyOn(referenceCache, "get");
+      const startBudget = vi.spyOn(referenceCache, "startBudget");
+      const actorRead = vi.spyOn(actors, "get");
+      const coldDeps = { ...deps, referenceCache, issueClient: { getIssue } } as DashboardDataDeps;
 
       vi.useFakeTimers({ toFake: ["setTimeout"] });
       try {
@@ -549,22 +586,113 @@ describe("handleMeshApiRequest", () => {
           answered = true;
           return r;
         });
-        // One deadline answers the whole page; resolving entry by entry
-        // waited one deadline per entry.
-        await vi.advanceTimersByTimeAsync(60_000);
+        // No deadline elapses: a page of cold references costs the response
+        // nothing, because the client resolves them after first paint.
+        await vi.advanceTimersByTimeAsync(0);
         expect(answered).toBe(true);
-        const items = JSON.parse((await response).res.body).items as Array<{
-          id: string;
-          reference?: { cacheState?: string };
-        }>;
-        expect(items.map((item) => item.id)).toEqual(
-          inbox.listRecentHandledEntries(20).map((entry) => `inbox_${entry.id}`)
-        );
-        expect(items.every((item) => item.reference?.cacheState === "pending")).toBe(true);
-        expect(getIssue).toHaveBeenCalledTimes(12);
+        const items = JSON.parse((await response).res.body).items as Array<Record<string, unknown>>;
+        // The terminal transition is newer than the handled entries.
+        expect(items.map((item) => item.id)).toEqual([
+          expect.stringMatching(/^obligation_history_/),
+          ...inbox.listRecentHandledEntries(20).map((entry) => `inbox_${entry.id}`),
+        ]);
+        const byId = new Map(items.map((item) => [item.id, item]));
+        expect(byId.get("inbox_cold-00")).toMatchObject({
+          actorId: UUID_A,
+          sourceKind: "GITHUB ISSUE",
+          sourceRef: "github:o/r/issues/1",
+          referenceKey: "github:o/r/issues/1",
+          summary: "issues.opened",
+        });
+        expect(byId.get("inbox_chat")).toMatchObject({
+          sourceKind: "GCHAT MESSAGE",
+          referenceKey: "gchat:spaces/AAAA/messages/BBBB.CCCC",
+        });
+        expect(byId.get("inbox_slack")).toMatchObject({
+          sourceKind: "SLACK MESSAGE",
+          referenceKey: "slack:channels/C123/messages/123.456",
+        });
+        expect(byId.get("inbox_asked")).toMatchObject({
+          sourceKind: "MESH CHAT",
+          referenceKey: `mesh:messages/${fromViewer}`,
+        });
+        expect(items.find((item) => item.kind === "terminal_obligation")).toMatchObject({
+          actorId: UUID_A,
+          summary: "Finished work",
+        });
+        for (const item of items) {
+          expect(item).not.toHaveProperty("reference");
+          expect(item).not.toHaveProperty("actorHandle");
+          expect(item).not.toHaveProperty("actorModel");
+        }
       } finally {
         vi.useRealTimers();
       }
+      expect(get).not.toHaveBeenCalled();
+      expect(startBudget).not.toHaveBeenCalled();
+      expect(getIssue).not.toHaveBeenCalled();
+      expect(actorRead).not.toHaveBeenCalled();
+    });
+
+    it("scopes legacy mesh pointers by their canonical record (#590, #940)", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      const other = principals.createUser({
+        email: "second@example.com",
+        createdAt: "2026-06-22T00:00:00.000Z",
+      }).id;
+      const hiddenMessageId = meshChat.record({
+        senderId: other,
+        recipientId: UUID_A,
+        body: "not this viewer's conversation",
+      });
+      inbox.append([
+        {
+          id: "theirs",
+          actorId: UUID_A,
+          source: `mesh:${other}`,
+          payload: { type: "human.message", messageId: "m-theirs", fromId: other },
+        },
+        {
+          id: "unsigned",
+          actorId: UUID_A,
+          source: "mesh:unknown",
+          payload: { type: "human.message", messageId: "m-unsigned" },
+        },
+        {
+          id: "hidden-canonical",
+          actorId: UUID_A,
+          source: "mesh:unknown",
+          payload: { type: "human.message", messageId: hiddenMessageId },
+        },
+        {
+          id: "peer",
+          actorId: UUID_A,
+          source: `mesh:${UUID_B}`,
+          payload: { type: "mesh.message", messageId: "m-peer", fromId: UUID_B },
+        },
+      ]);
+      inbox.markHandled(
+        UUID_A,
+        ["theirs", "unsigned", "hidden-canonical", "peer"],
+        new Date("2026-09-26T03:15:00.000Z"),
+        "Addressed"
+      );
+      const chatRead = vi.spyOn(meshChat, "getById");
+
+      const { res } = await call(deps, "GET", "/api/mesh/recent-activity?limit=10");
+      expect(res.statusCode).toBe(200);
+      const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
+      // The second local user is not the viewer, so their conversation with
+      // the actor is not in the feed at all. Even a legacy entry that omits
+      // sender/source is omitted when its canonical mesh record says that;
+      // an unresolvable legacy pointer remains visible as it did at staging.
+      // Actor↔actor chat stays shared.
+      expect(items.map((item) => item.id)).toEqual(["inbox_unsigned", "inbox_peer"]);
+      expect(items.find((item) => item.id === "inbox_unsigned")).toMatchObject({
+        referenceKey: "mesh:messages/m-unsigned",
+      });
+      expect(res.body).not.toContain(other);
+      expect(chatRead).toHaveBeenCalledWith(hiddenMessageId);
     });
   });
 
@@ -1636,14 +1764,14 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads shows the default root handle when no identity is configured", async () => {
-    actors.upsert({ ...rec("root", null, "active"), isRoot: true });
+    actors.upsert(rec("root", null, "active"));
     const { res } = await call(deps, "GET", "/api/mesh/threads");
     const { threads } = JSON.parse(res.body);
     expect(threads.find((t: { id: string }) => t.id === "root").handle).toBe("root-actor");
   });
 
   it("GET /api/mesh/threads shows the configured root handle, leaving worker handles alone ", async () => {
-    actors.upsert({ ...rec("root", null, "active"), isRoot: true });
+    actors.upsert(rec("root", null, "active"));
     actors.upsert(rec(UUID_A, "root", "active"));
     const configuredDeps: DashboardDataDeps = {
       ...deps,
@@ -1658,8 +1786,8 @@ describe("handleMeshApiRequest", () => {
     );
   });
 
-  it("GET /api/mesh/threads identifies a generated-id root from isRoot", async () => {
-    actors.upsert({ ...rec(UUID_A, null, "active"), isRoot: true });
+  it("GET /api/mesh/threads identifies a generated-id root by its null parent", async () => {
+    actors.upsert(rec(UUID_A, null, "active"));
     const configuredDeps: DashboardDataDeps = {
       ...deps,
       rootIdentity: { id: UUID_A, handle: "ember-familiar" },
@@ -1675,6 +1803,7 @@ describe("handleMeshApiRequest", () => {
       id: "root",
       charter: "root charter\nline 2",
       parentId: null,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1705,6 +1834,7 @@ describe("handleMeshApiRequest", () => {
       id: UUID_A,
       charter: long,
       parentId: null,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1726,6 +1856,7 @@ describe("handleMeshApiRequest", () => {
       id: UUID_A,
       charter: "short charter\nline 2",
       parentId: null,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1746,6 +1877,7 @@ describe("handleMeshApiRequest", () => {
       id: UUID_A,
       charter: "\u{1F9ED}".repeat(400),
       parentId: null,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1767,6 +1899,7 @@ describe("handleMeshApiRequest", () => {
       id: UUID_A,
       charter: long,
       parentId: null,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -3990,6 +4123,26 @@ describe("handleMeshApiRequest", () => {
         expect(page.historyNextBefore).not.toBeNull(); // creation remains in the tail
       });
 
+      it("returns responsive history entries through GET /api/mesh/obligations/:id (#903)", async () => {
+        obligations.create({ id: "hot-task", title: "Hot", ownerId: "actor-1" });
+        obligations.markResponsive("hot-task", "actor-2");
+
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/hot-task");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+        const responsiveEntries = data.history.filter(
+          (h: { mutationKind: string }) => h.mutationKind === "responsive"
+        );
+        expect(responsiveEntries).toEqual([
+          expect.objectContaining({
+            mutationKind: "responsive",
+            actingPrincipal: "actor-2",
+            before: { responsive: null },
+            after: { responsive: true },
+          }),
+        ]);
+      });
+
       it("returns obligation with parent, children, and blockingChildren", async () => {
         obligations.create({
           title: "root-task",
@@ -4111,298 +4264,49 @@ describe("handleMeshApiRequest", () => {
         expect(limitData.blocksHasMore).toBe(true);
       });
 
-      it("returns obligation with referenceCache embeddings and isolates faults", async () => {
-        obligations.create({
-          title: "with-cache",
-          id: "with-cache",
-          ownerId: "actor-1",
-        });
-        obligations.attachArtifact("with-cache", "github:MEK-Org/rusa/issues/1");
-        obligations.attachArtifact("with-cache", "github:MEK-Org/rusa/issues/2");
-
-        const depsWithCache = {
-          ...deps,
-          referenceCache: {
-            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
-            get: async (ref: string) => {
-              if (ref.includes("issues/1")) {
-                return {
-                  ref,
-                  scheme: "github",
-                  title: "Issue 1",
-                  body: "The body",
-                  cacheState: "fresh",
-                  entity: { type: "github_issue", title: "Issue 1", description: "The body" },
-                  unavailable: null,
-                };
-              }
-              throw new Error("cache fault on issue 2");
-            },
-          } as unknown as ReferenceCacheService,
-        };
-
-        const { res } = await call(depsWithCache, "GET", "/api/mesh/obligations/with-cache");
-        await new Promise((resolve) => process.nextTick(resolve));
-        expect(res.statusCode).toBe(200);
-
-        const artifacts = JSON.parse(res.body).artifacts as Array<{
-          artifact: { ref: string };
-          reference: { cacheState: string; entity?: unknown; unavailable?: string } | null;
-        }>;
-
-        expect(artifacts).toHaveLength(2);
-        const success = artifacts.find((a) => a.artifact.ref.includes("issues/1"));
-        expect(success?.reference?.cacheState).toBe("fresh");
-        expect(success?.reference?.entity).toEqual({
-          type: "github_issue",
-          title: "Issue 1",
-          description: "The body",
-        });
-
-        const failure = artifacts.find((a) => a.artifact.ref.includes("issues/2"));
-        // Since cacheService threw, Promise.all would reject in api.ts if we don't catch it!
-        expect(failure?.reference?.cacheState).toBe("unavailable");
-        expect(failure?.reference?.unavailable).toBe("could not load context");
-      });
-
-      it("returns obligation with externalReference resolved and isolates cache faults", async () => {
-        obligations.create({
-          title: "with-ext-ref",
-          id: "with-ext-ref",
-          ownerId: "actor-1",
-          externalRef: "github:MEK-Org/rusa/issues/345",
-        });
-        obligations.create({
-          title: "with-ext-ref-fault",
-          id: "with-ext-ref-fault",
-          ownerId: "actor-1",
-          externalRef: "github:MEK-Org/rusa/issues/999",
-        });
-        obligations.create({
-          title: "without-ext-ref",
-          id: "without-ext-ref",
-          ownerId: "actor-1",
-        });
-
-        const depsWithCache = {
-          ...deps,
-          referenceCache: {
-            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
-            get: async (ref: string) => {
-              if (ref.includes("issues/345")) {
-                return {
-                  ref,
-                  scheme: "github",
-                  title: "Issue 345 Title",
-                  body: "Issue 345 description",
-                  cacheState: "fresh",
-                  entity: {
-                    type: "github_issue",
-                    title: "Issue 345 Title",
-                    description: "Issue 345 description",
-                  },
-                  url: "https://github.com/MEK-Org/rusa/issues/345",
-                  unavailable: null,
-                };
-              }
-              throw new Error("cache fault on issue 999");
-            },
-          } as unknown as ReferenceCacheService,
-        };
-
-        const resSuccess = await call(depsWithCache, "GET", "/api/mesh/obligations/with-ext-ref");
-        expect(resSuccess.res.statusCode).toBe(200);
-        const dataSuccess = JSON.parse(resSuccess.res.body);
-        expect(dataSuccess.externalReference).toEqual({
-          ref: "github:MEK-Org/rusa/issues/345",
-          scheme: "github",
-          title: "Issue 345 Title",
-          body: "Issue 345 description",
-          cacheState: "fresh",
-          entity: {
-            type: "github_issue",
-            title: "Issue 345 Title",
-            description: "Issue 345 description",
-          },
-          url: "https://github.com/MEK-Org/rusa/issues/345",
-          unavailable: null,
-        });
-
-        const resFault = await call(
-          depsWithCache,
-          "GET",
-          "/api/mesh/obligations/with-ext-ref-fault"
-        );
-        expect(resFault.res.statusCode).toBe(200);
-        const dataFault = JSON.parse(resFault.res.body);
-        expect(dataFault.externalReference?.cacheState).toBe("unavailable");
-        expect(dataFault.externalReference?.unavailable).toBe("could not load context");
-        expect(dataFault.externalReference?.url).toBe("https://github.com/MEK-Org/rusa/issues/999");
-
-        const resNone = await call(depsWithCache, "GET", "/api/mesh/obligations/without-ext-ref");
-        expect(resNone.res.statusCode).toBe(200);
-        const dataNone = JSON.parse(resNone.res.body);
-        expect(dataNone.externalReference).toBeNull();
-      });
-
-      it("returns obligation with a PR comment and a PR review embedded, not just a plain issue", async () => {
-        obligations.create({
-          title: "with-comment-and-review",
-          id: "with-comment-and-review",
-          ownerId: "actor-1",
-        });
-        obligations.attachArtifact(
-          "with-comment-and-review",
-          "github:MEK-Org/rusa/pulls/76/comments/12345"
-        );
-        obligations.attachArtifact(
-          "with-comment-and-review",
-          "github:MEK-Org/rusa/pulls/76/reviews/9001"
-        );
-
-        const depsWithCache = {
-          ...deps,
-          referenceCache: {
-            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
-            get: async (ref: string) => {
-              if (ref.includes("comments")) {
-                return {
-                  ref,
-                  scheme: "github",
-                  title: "MEK-Org/rusa pulls/76 — comment",
-                  body: "nit: rename this",
-                  cacheState: "fresh",
-                  entity: { type: "github_comment", body: "nit: rename this" },
-                  unavailable: null,
-                };
-              }
-              return {
-                ref,
-                scheme: "github",
-                title: "MEK-Org/rusa pulls/76 — review",
-                body: null,
-                cacheState: "fresh",
-                entity: { type: "github_review", body: "", state: "APPROVED" },
-                unavailable: null,
-              };
-            },
-          } as unknown as ReferenceCacheService,
-        };
-
-        const { res } = await call(
-          depsWithCache,
-          "GET",
-          "/api/mesh/obligations/with-comment-and-review"
-        );
-        await new Promise((resolve) => process.nextTick(resolve));
-        expect(res.statusCode).toBe(200);
-
-        const artifacts = JSON.parse(res.body).artifacts as Array<{
-          artifact: { ref: string };
-          reference: { entity?: unknown } | null;
-        }>;
-
-        expect(artifacts).toHaveLength(2);
-        const comment = artifacts.find((a) => a.artifact.ref.includes("comments"));
-        expect(comment?.reference?.entity).toEqual({
-          type: "github_comment",
-          body: "nit: rename this",
-        });
-        const review = artifacts.find((a) => a.artifact.ref.includes("reviews"));
-        expect(review?.reference?.entity).toEqual({
-          type: "github_review",
-          body: "",
-          state: "APPROVED",
-        });
-      });
-
-      it("converges a pending Google Chat citation on re-fetch with one provider read (#595)", async () => {
-        const ref = "gchat:spaces/AAAA123/messages/BBBB.CCCC";
-        obligations.create({
-          title: "pending-gchat",
-          id: "pending-gchat",
-          ownerId: "actor-1",
-        });
-        obligations.attachArtifact("pending-gchat", ref);
-
-        let finishRead!: () => void;
-        const readGate = new Promise<void>((resolve) => {
-          finishRead = resolve;
-        });
-        const getMessage = vi.fn(async (name: string) => {
-          await readGate;
-          return { name, text: "Arrived after the deadline" };
-        });
-        const depsWithCache = {
-          ...deps,
-          referenceCache: new ReferenceCacheService({
-            repo: new ReferenceCacheRepository(db),
-            deadlineMs: 20,
-          }),
-          chatClient: {
-            getMessage,
-            getSpace: vi.fn(),
-          } as unknown as DashboardDataDeps["chatClient"],
-        };
-        const detail = async () => {
-          const { res } = await call(depsWithCache, "GET", "/api/mesh/obligations/pending-gchat");
-          expect(res.statusCode).toBe(200);
-          const data = JSON.parse(res.body);
-          return data.artifacts[0].reference;
-        };
-
-        // The first render and an overlapping client retry both meet the
-        // deadline while the single provider read is still out.
-        const [first, retry] = await Promise.all([detail(), detail()]);
-        for (const reference of [first, retry]) {
-          expect(reference.cacheState).toBe("pending");
-          expect(reference.unavailable).toBe("loading context");
-        }
-        expect(getMessage).toHaveBeenCalledTimes(1);
-
-        finishRead();
-        for (let i = 0; i < 5; i += 1) await new Promise((r) => setTimeout(r, 0));
-
-        const converged = await detail();
-        expect(converged.cacheState).toBe("fresh");
-        expect(converged.unavailable).toBeNull();
-        expect(converged.entity).toEqual({
-          type: "gchat_message",
-          contents: "Arrived after the deadline",
-        });
-        expect(getMessage).toHaveBeenCalledTimes(1);
-      });
-
-      it("waits one deadline for a cold artifact and a different cold external reference (#933)", async () => {
-        obligations.create({ title: "two-cold", id: "two-cold", ownerId: "actor-1" });
-        obligations.attachArtifact("two-cold", "github:o/r/issues/1");
-        obligations.setExternalRef("two-cold", "github:o/r/issues/2", "system:mesh");
+      it("answers from the store alone, with cited ref keys but no reference read (#940)", async () => {
+        obligations.create({ title: "cold-detail", id: "cold-detail", ownerId: "actor-1" });
+        obligations.attachArtifact("cold-detail", "github:o/r/issues/1", { label: "the bug" });
+        obligations.setExternalRef("cold-detail", "github:o/r/issues/2", "system:mesh");
         const getIssue = vi.fn(() => new Promise<never>(() => {}));
+        const referenceCache = new ReferenceCacheService({
+          repo: new ReferenceCacheRepository(db),
+          deadlineMs: 60_000,
+        });
+        const get = vi.spyOn(referenceCache, "get");
+        const startBudget = vi.spyOn(referenceCache, "startBudget");
+        const actorRead = vi.spyOn(actors, "get");
         const coldDeps = {
           ...deps,
-          referenceCache: new ReferenceCacheService({
-            repo: new ReferenceCacheRepository(db),
-            deadlineMs: 60_000,
-          }),
+          referenceCache,
           issueClient: { getIssue },
-        } as unknown as DashboardDataDeps;
+        } as DashboardDataDeps;
 
         vi.useFakeTimers({ toFake: ["setTimeout"] });
         try {
           let answered = false;
-          const response = call(coldDeps, "GET", "/api/mesh/obligations/two-cold").then((r) => {
+          const response = call(coldDeps, "GET", "/api/mesh/obligations/cold-detail").then((r) => {
             answered = true;
             return r;
           });
-          await vi.advanceTimersByTimeAsync(60_000);
+          // No deadline elapses: two cold references cost the response nothing.
+          await vi.advanceTimersByTimeAsync(0);
           expect(answered).toBe(true);
           const data = JSON.parse((await response).res.body);
-          expect(data.artifacts[0].reference.cacheState).toBe("pending");
-          expect(data.externalReference.cacheState).toBe("pending");
-          expect(getIssue).toHaveBeenCalledTimes(2);
+          expect(data.artifacts).toEqual([
+            {
+              artifact: expect.objectContaining({ ref: "github:o/r/issues/1", label: "the bug" }),
+            },
+          ]);
+          expect(data.obligation.externalRef.key).toBe("github:o/r/issues/2");
+          expect(data).not.toHaveProperty("externalReference");
         } finally {
           vi.useRealTimers();
         }
+        expect(get).not.toHaveBeenCalled();
+        expect(startBudget).not.toHaveBeenCalled();
+        expect(getIssue).not.toHaveBeenCalled();
+        expect(actorRead).not.toHaveBeenCalled();
       });
 
       it("404s when obligation not found", async () => {
@@ -4450,6 +4354,328 @@ describe("handleMeshApiRequest", () => {
         obligations.create({ title: "root-task", id: "root-task", ownerId: "actor-1" });
         const { res } = await call(deps, "GET", "/api/mesh/obligations/root-task?limit=150");
         expect(res.statusCode).toBe(200);
+      });
+    });
+
+    describe("POST /api/mesh/references (#940)", () => {
+      type ReferencesBody = {
+        references: Record<
+          string,
+          {
+            ref: string;
+            title: string;
+            body: string | null;
+            url?: string | null;
+            cacheState?: string;
+            entity?: unknown;
+            unavailable: string | null;
+          }
+        >;
+      };
+      const references = async (d: DashboardDataDeps, refs: string[]) => {
+        const { res } = await call(d, "POST", "/api/mesh/references", JSON.stringify({ refs }));
+        expect(res.statusCode).toBe(200);
+        return (JSON.parse(res.body) as ReferencesBody).references;
+      };
+      let citation = 0;
+      const cite = (...refs: string[]) => {
+        const obligation = obligations.create({
+          id: `reference-citation-${citation}`,
+          ownerId: UUID_A,
+          title: "Reference citation",
+          externalRef: `github:MEK-Org/rusa/issues/${10_000 + citation++}`,
+        });
+        for (const ref of refs) obligations.attachArtifact(obligation.id, ref);
+      };
+
+      it("resolves each requested ref through the cache and isolates faults", async () => {
+        cite("github:MEK-Org/rusa/issues/345", "github:MEK-Org/rusa/issues/999");
+        const depsWithCache = {
+          ...deps,
+          referenceCache: {
+            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
+            get: async (ref: string) => {
+              if (ref.includes("issues/345")) {
+                return {
+                  ref,
+                  scheme: "github",
+                  title: "Issue 345 Title",
+                  body: "Issue 345 description",
+                  cacheState: "fresh",
+                  entity: {
+                    type: "github_issue",
+                    title: "Issue 345 Title",
+                    description: "Issue 345 description",
+                  },
+                  url: "https://github.com/MEK-Org/rusa/issues/345",
+                  unavailable: null,
+                };
+              }
+              throw new Error("cache fault on issue 999");
+            },
+          } as unknown as ReferenceCacheService,
+        };
+
+        const resolved = await references(depsWithCache, [
+          "github:MEK-Org/rusa/issues/345",
+          "github:MEK-Org/rusa/issues/999",
+        ]);
+        expect(resolved["github:MEK-Org/rusa/issues/345"]).toEqual({
+          ref: "github:MEK-Org/rusa/issues/345",
+          scheme: "github",
+          title: "Issue 345 Title",
+          body: "Issue 345 description",
+          cacheState: "fresh",
+          entity: {
+            type: "github_issue",
+            title: "Issue 345 Title",
+            description: "Issue 345 description",
+          },
+          url: "https://github.com/MEK-Org/rusa/issues/345",
+          unavailable: null,
+        });
+        // One ref's fault answers that ref as unavailable, not the batch.
+        const fault = resolved["github:MEK-Org/rusa/issues/999"];
+        expect(fault.cacheState).toBe("unavailable");
+        expect(fault.unavailable).toBe("could not load context");
+        expect(fault.url).toBe("https://github.com/MEK-Org/rusa/issues/999");
+      });
+
+      it("resolves a PR comment and a PR review, not just a plain issue", async () => {
+        cite(
+          "github:MEK-Org/rusa/pulls/76/comments/12345",
+          "github:MEK-Org/rusa/pulls/76/reviews/9001"
+        );
+        const depsWithCache = {
+          ...deps,
+          referenceCache: {
+            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
+            get: async (ref: string) => {
+              if (ref.includes("comments")) {
+                return {
+                  ref,
+                  scheme: "github",
+                  title: "MEK-Org/rusa pulls/76 — comment",
+                  body: "nit: rename this",
+                  cacheState: "fresh",
+                  entity: { type: "github_comment", body: "nit: rename this" },
+                  unavailable: null,
+                };
+              }
+              return {
+                ref,
+                scheme: "github",
+                title: "MEK-Org/rusa pulls/76 — review",
+                body: null,
+                cacheState: "fresh",
+                entity: { type: "github_review", body: "", state: "APPROVED" },
+                unavailable: null,
+              };
+            },
+          } as unknown as ReferenceCacheService,
+        };
+
+        const resolved = await references(depsWithCache, [
+          "github:MEK-Org/rusa/pulls/76/comments/12345",
+          "github:MEK-Org/rusa/pulls/76/reviews/9001",
+        ]);
+        expect(resolved["github:MEK-Org/rusa/pulls/76/comments/12345"].entity).toEqual({
+          type: "github_comment",
+          body: "nit: rename this",
+        });
+        expect(resolved["github:MEK-Org/rusa/pulls/76/reviews/9001"].entity).toEqual({
+          type: "github_review",
+          body: "",
+          state: "APPROVED",
+        });
+      });
+
+      it("resolves mesh chat locally and names other schemes without a cache", async () => {
+        actors.upsert(rec(UUID_A, "root", "active"));
+        const messageId = meshChat.record({
+          senderId: LOCAL_USER,
+          recipientId: UUID_A,
+          body: "A monster-catching JRPG in a cave.",
+        });
+        const chatRef = `mesh:messages/${messageId}`;
+        cite("github:MEK-Org/rusa/issues/33", chatRef);
+        const resolved = await references(deps, [chatRef, "github:MEK-Org/rusa/issues/33"]);
+        expect(resolved[chatRef].body).toBe("A monster-catching JRPG in a cave.");
+        // Without a cache the GitHub ref still comes back with an explicit
+        // reason — an unresolvable reference is not an absent one.
+        expect(resolved["github:MEK-Org/rusa/issues/33"]).toMatchObject({
+          scheme: "github",
+          unavailable: "not resolved by the synchronous dashboard path",
+        });
+      });
+
+      it("converges a pending Google Chat reference on re-fetch with one provider read (#595)", async () => {
+        const ref = "gchat:spaces/AAAA123/messages/BBBB.CCCC";
+        cite(ref);
+        let finishRead!: () => void;
+        const readGate = new Promise<void>((resolve) => {
+          finishRead = resolve;
+        });
+        const getMessage = vi.fn(async (name: string) => {
+          await readGate;
+          return { name, text: "Arrived after the deadline" };
+        });
+        const depsWithCache = {
+          ...deps,
+          referenceCache: new ReferenceCacheService({
+            repo: new ReferenceCacheRepository(db),
+            deadlineMs: 20,
+          }),
+          chatClient: {
+            getMessage,
+            getSpace: vi.fn(),
+          } as unknown as DashboardDataDeps["chatClient"],
+        };
+        const fetchOne = async () => (await references(depsWithCache, [ref]))[ref];
+
+        // The first fill-in and an overlapping client retry both meet the
+        // deadline while the single provider read is still out.
+        const [first, retry] = await Promise.all([fetchOne(), fetchOne()]);
+        for (const reference of [first, retry]) {
+          expect(reference.cacheState).toBe("pending");
+          expect(reference.unavailable).toBe("loading context");
+        }
+        expect(getMessage).toHaveBeenCalledTimes(1);
+
+        finishRead();
+        for (let i = 0; i < 5; i += 1) await new Promise((r) => setTimeout(r, 0));
+
+        const converged = await fetchOne();
+        expect(converged.cacheState).toBe("fresh");
+        expect(converged.unavailable).toBeNull();
+        expect(converged.entity).toEqual({
+          type: "gchat_message",
+          contents: "Arrived after the deadline",
+        });
+        expect(getMessage).toHaveBeenCalledTimes(1);
+      });
+
+      it("waits one deadline for a whole batch of cold references (#933)", async () => {
+        const refs = Array.from({ length: 12 }, (_, i) => `github:o/r/issues/${i + 1}`);
+        cite(...refs);
+        const getIssue = vi.fn(() => new Promise<never>(() => {}));
+        const coldDeps = {
+          ...deps,
+          referenceCache: new ReferenceCacheService({
+            repo: new ReferenceCacheRepository(db),
+            deadlineMs: 60_000,
+          }),
+          issueClient: { getIssue },
+        } as unknown as DashboardDataDeps;
+
+        vi.useFakeTimers({ toFake: ["setTimeout"] });
+        try {
+          let answered = false;
+          const response = call(
+            coldDeps,
+            "POST",
+            "/api/mesh/references",
+            JSON.stringify({ refs })
+          ).then((r) => {
+            answered = true;
+            return r;
+          });
+          // One deadline answers the batch; resolving ref by ref waited one
+          // deadline per ref.
+          await vi.advanceTimersByTimeAsync(60_000);
+          expect(answered).toBe(true);
+          const resolved = (JSON.parse((await response).res.body) as ReferencesBody).references;
+          expect(Object.keys(resolved)).toEqual(refs);
+          expect(Object.values(resolved).every((r) => r.cacheState === "pending")).toBe(true);
+          expect(getIssue).toHaveBeenCalledTimes(12);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("bounds the batch and the body, and resolves a repeated ref once", async () => {
+        const get = vi.fn(async (ref: string) => ({
+          ref,
+          scheme: "github",
+          title: ref,
+          body: null,
+          cacheState: "fresh",
+          unavailable: null,
+        }));
+        const counted = {
+          ...deps,
+          referenceCache: {
+            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
+            get,
+          } as unknown as ReferenceCacheService,
+        };
+        // A full batch of maximum-length keys is accepted.
+        const refs = Array.from({ length: 20 }, (_, i) =>
+          `github:o/r/issues/${i}_`.padEnd(512, "x")
+        );
+        cite(...refs);
+
+        const full = await references(counted, [...refs, refs[0], refs[1]]);
+        expect(Object.keys(full)).toEqual(refs);
+        expect(get).toHaveBeenCalledTimes(20);
+
+        get.mockClear();
+        for (const body of [
+          { refs: [...refs, "github:o/r/issues/21"] },
+          { refs: [`github:o/r/issues/${"9".repeat(600)}`] },
+          { refs: [] },
+          { refs: [refs[0], 42] },
+        ]) {
+          const { res } = await call(counted, "POST", "/api/mesh/references", JSON.stringify(body));
+          expect(res.statusCode).toBe(400);
+        }
+        // This route validates a post-buffer UTF-8 byte limit; it
+        // deliberately makes no transport-memory claim shared `readBody` does
+        // not provide.
+        for (const body of ["x".repeat(70_000), "\ud83d\ude00".repeat(20_000)]) {
+          const { res } = await call(counted, "POST", "/api/mesh/references", body);
+          expect(res.statusCode).toBe(413);
+        }
+        expect(get).not.toHaveBeenCalled();
+      });
+
+      it("does not resolve a client-invented reference", async () => {
+        const allowed = "github:MEK-Org/rusa/issues/345";
+        const invented = "github:private/repo/issues/999";
+        cite(allowed);
+        const get = vi.fn(async (ref: string) => ({
+          ref,
+          scheme: "github",
+          title: ref,
+          body: null,
+          cacheState: "fresh" as const,
+          unavailable: null,
+        }));
+        const counted = {
+          ...deps,
+          referenceCache: {
+            startBudget: () => ({ deadlineAt: Date.now() + 250 }),
+            get,
+          } as unknown as ReferenceCacheService,
+        };
+
+        // The allowlist asks the store about the requested keys only; it
+        // does not walk every obligation and its artifacts per batch.
+        const list = vi.spyOn(obligations, "list");
+        const listArtifacts = vi.spyOn(obligations, "listArtifacts");
+        const claimed = obligations.get(`reference-citation-${citation - 1}`)?.externalRef?.key;
+        expect(claimed).toBeDefined();
+
+        const resolved = await references(counted, [allowed, claimed as string, invented]);
+        expect(list).not.toHaveBeenCalled();
+        expect(listArtifacts).not.toHaveBeenCalled();
+        expect(get.mock.calls.map(([ref]) => ref)).toEqual([allowed, claimed]);
+        expect(resolved[allowed].cacheState).toBe("fresh");
+        expect(resolved[claimed as string].cacheState).toBe("fresh");
+        expect(resolved[invented]).toMatchObject({
+          cacheState: "unavailable",
+          unavailable: "could not load context",
+        });
       });
     });
 
@@ -4518,41 +4744,6 @@ describe("handleMeshApiRequest", () => {
         expect(created.creatorId).toBe(LOCAL_USER);
         // Attribution is the explicit durable owner, not client-chosen creator metadata.
         expect(created.ownerId).toBe(LOCAL_USER);
-      });
-
-      it("returns cited artifacts with mesh chat resolved and other schemes named", async () => {
-        actors.upsert(rec(UUID_A, "root", "active"));
-        obligations.create({ id: "cited", ownerId: UUID_A, title: "Game Type" });
-        const messageId = meshChat.record({
-          senderId: LOCAL_USER,
-          recipientId: UUID_A,
-          body: "A monster-catching JRPG in a cave.",
-        });
-        obligations.attachArtifact("cited", `mesh:messages/${messageId}`, {
-          label: "the answer",
-          attachedBy: UUID_A,
-        });
-        obligations.attachArtifact("cited", "github:MEK-Org/rusa/issues/33");
-
-        const { res } = await call(deps, "GET", "/api/mesh/obligations/cited");
-        await new Promise((resolve) => process.nextTick(resolve));
-        const artifacts = JSON.parse(res.body).artifacts as Array<{
-          artifact: { ref: string; label: string | null };
-          reference: { body: string } | null;
-        }>;
-
-        expect(artifacts).toHaveLength(2);
-        const chat = artifacts.find((a) => a.artifact.ref.startsWith("mesh:"));
-        expect(chat?.reference?.body).toBe("A monster-catching JRPG in a cave.");
-        expect(chat?.artifact.label).toBe("the answer");
-        // v1 resolves mesh chat only. The GitHub citation still comes back with
-        // an explicit reason — an unresolvable citation is not an absent one.
-        const gh = artifacts.find((a) => a.artifact.ref.startsWith("github:"));
-        expect(gh).toBeDefined();
-        expect(gh?.reference).toMatchObject({
-          scheme: "github",
-          unavailable: "not resolved by the synchronous dashboard path",
-        });
       });
 
       it("rejects a create with no title", async () => {
@@ -5020,6 +5211,41 @@ describe("handleMeshApiRequest", () => {
         await new Promise((resolve) => process.nextTick(resolve));
         expect(res.statusCode).toBe(200);
         expect(JSON.parse(res.body).obligation.ownerId).toBe(LOCAL_USER);
+      });
+
+      it("records an optional message in the obligation's history (#941)", async () => {
+        actors.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({ title: "review", id: "review", ownerId: LOCAL_USER });
+        const { res } = await call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/review/reassign",
+          JSON.stringify({ ownerId: UUID_A, message: "Please answer seat 2 first." })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(res.statusCode).toBe(200);
+
+        const detail = await call(deps, "GET", "/api/mesh/obligations/review?history_limit=1");
+        expect(JSON.parse(detail.res.body).history[0]).toMatchObject({
+          mutationKind: "reassign",
+          actingPrincipal: LOCAL_USER,
+          after: { ownerId: UUID_A, message: "Please answer seat 2 first." },
+        });
+      });
+
+      it("rejects a non-string message without reassigning (#941)", async () => {
+        actors.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({ title: "review", id: "review", ownerId: LOCAL_USER });
+        const { res } = await call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/review/reassign",
+          JSON.stringify({ ownerId: UUID_A, message: 42 })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(res.statusCode).toBe(400);
+        expect(JSON.parse(res.body).error).toMatch(/message/);
+        expect(obligations.get("review")?.ownerId).toBe(LOCAL_USER);
       });
 
       it("validates the new owner and returns 404 for missing work", async () => {

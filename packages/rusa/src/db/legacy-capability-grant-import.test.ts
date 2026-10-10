@@ -17,10 +17,12 @@ import { Repositories } from "./repositories/index.js";
 const ROOT = "root";
 const CHILD = "worker";
 const OTHER = "some-other-actor";
-
 function seedActors(db: Database.Database, ...ids: string[]): void {
   const insert = db.prepare(
-    "INSERT INTO actors (id, charter, parent_id, created_at) VALUES (?, 'test actor', ?, '2026-06-27T00:00:00Z')"
+    `INSERT INTO actors (id, charter, parent_id, created_at, execution_config)
+       SELECT id, 'test actor', parent, '2026-06-27T00:00:00Z',
+         CASE WHEN parent IS NULL THEN '{"schemaVersion":1,"unsandboxed":true}' ELSE '{"schemaVersion":1,"unsandboxed":false}' END
+       FROM (SELECT ? AS id, ? AS parent)`
   );
   const [rootId, ...rest] = ids;
   if (rootId === undefined) return;

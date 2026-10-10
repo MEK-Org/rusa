@@ -150,4 +150,23 @@ describe("dashboard timing server wrapper", () => {
     // Route stops at writeHead; the post-header sleep is outside it.
     expect(record.durationMs - record.phases.route).toBeGreaterThanOrEqual(55);
   });
+
+  it("times the after-paint reference fill-in apart from the pages it fills (#940)", () => {
+    const recordServer = vi.fn();
+    const recorder = { recordServer } as unknown as DashboardTimingRecorder;
+    for (const path of ["/api/mesh/references", "/api/mesh/obligations/ob-1"]) {
+      const response = new TestResponse();
+      beginDashboardRequestTiming(response as unknown as ServerResponse, path, "GET", recorder);
+      response.end("{}");
+    }
+
+    expect(recordServer).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ label: "mesh_references" })
+    );
+    expect(recordServer).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ label: "mesh_obligation_detail" })
+    );
+  });
 });

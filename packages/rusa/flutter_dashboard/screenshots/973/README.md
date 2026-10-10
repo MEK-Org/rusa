@@ -15,20 +15,21 @@ source; the after phase runs #973's provider.
 - `healthy_control_*`: the run log records the startup "not logged in" lines
   followed by a successful silent sign-in, the shape every healthy run has.
 - `long_tail_phone_*`: the worst case for the phone card. A synthetic one-line
-  cause of 1,002 characters fills the sink's full 800-character tail, and the
+  cause of 1,002 characters fills the sink's 800-character budget, which clips
+  it head and tail around an omitted-characters marker, and the
   run log records only the startup "not logged in" lines, which gives the
   longest fixed status (65 characters). The status wraps to a second line
-  under the tail, and the whole card stays inside the 844-point viewport.
+  under the clipped cause, and the whole card stays inside the 844-point viewport.
 
 Both scenarios fail with the same unsupported-effort stdout, so the before
 notices are identical and their PNGs share one hash. After #973, the notice
 gains one fixed status line under the unchanged cause. The provider carries
 that line in its own `signInDiagnostic` result field, and `routeRunFailure`
-renders it after the output tail. The run output, which exhaustion
-classification reads, is unchanged. The captures were first taken when the line
-was appended to the output, then re-rendered after the move to the separate
-field: the notice text and all eight PNG hashes are identical. The long-tail
-pair was added later, in the same run that reproduced those eight hashes again. No raw log line, URL,
+renders it after the clipped cause, outside its budget. The run output, which
+exhaustion classification reads, is unchanged. All ten captures were re-rendered
+after merging staging d641ff11, whose #980 change adds the run id to the lead
+line and clips long causes head and tail; that changes before and after alike,
+and the difference between them is still the one fixed line. No raw log line, URL,
 identifier or token reaches the notice. `manifest.json` records the source
 revisions, synthetic inputs, exact notice text, dimensions, byte counts and
 SHA-256 values.

@@ -400,6 +400,9 @@ Future<void> showReparentObligationDialog(
   );
 }
 
+/// The server's bound on a reassignment message (OBLIGATION_REASSIGN_MESSAGE_MAX).
+const _reassignMessageMax = 500;
+
 Future<void> showReassignObligationDialog(
   BuildContext context,
   DashboardStore store,
@@ -408,6 +411,7 @@ Future<void> showReassignObligationDialog(
 }) async {
   final formKey = GlobalKey<FormState>();
   final ownerIdCtrl = TextEditingController(text: '');
+  final messageCtrl = TextEditingController(text: '');
   var isSubmitting = false;
 
   await showDialog<void>(
@@ -443,6 +447,30 @@ Future<void> showReassignObligationDialog(
                     contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                   ),
                 ),
+                const SizedBox(height: 12),
+                // Recorded in the obligation's history with the owner change
+                // (#941). Counted as the server counts it: UTF-16 code units
+                // after trimming, which is what Dart's String.length is. The
+                // field's maxLength would count characters instead.
+                TextFormField(
+                  controller: messageCtrl,
+                  minLines: 2,
+                  maxLines: 4,
+                  onChanged: (_) => setState(() {}),
+                  validator: (value) => (value ?? '').trim().length > _reassignMessageMax
+                      ? 'Message must be at most $_reassignMessageMax characters'
+                      : null,
+                  style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
+                  decoration: InputDecoration(
+                    labelText: 'Message (optional)',
+                    hintText: 'Why is this coming to them?',
+                    counterText: '${messageCtrl.text.trim().length}/$_reassignMessageMax',
+                    filled: true,
+                    fillColor: MeshColors.bgPrimary,
+                    border: const OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  ),
+                ),
               ],
             ),
           ),
@@ -468,6 +496,7 @@ Future<void> showReassignObligationDialog(
                       await store.api.reassignObligation(
                         obligation.id,
                         ownerId: resolvedId,
+                        message: messageCtrl.text.trim(),
                       );
                       store.invalidateObligationsCache();
                       if (context.mounted) {

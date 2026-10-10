@@ -174,7 +174,9 @@ export interface PublishedHistoryRecord {
 /**
  * One finished scrape (#759): its stamp, which every window row it wrote
  * shares, and whether its output parsed. A scrape that parsed to no window, or
- * failed to parse, has no row in `records`; this is how a reader sees it.
+ * failed to parse, has no row in `records`; this is how a reader sees it. A
+ * scrape that extracted no quota value is `failed` even when it carried
+ * earlier windows forward (#982).
  */
 export interface PublishedScrapeOutcome {
   observedAt: string;

@@ -278,6 +278,18 @@ export function formatPoolRecoveryFailure(input: {
 }
 
 /**
+ * The primary entry's resolver refused it, so no provider was invoked (#980).
+ * Raised only at that boundary: a recovery entry that cannot be prepared is
+ * reported as context to the exhaustion that caused the run to fail.
+ */
+class ProviderSelectionError extends Error {
+  constructor(override readonly cause: unknown) {
+    super("provider selection failed");
+    this.name = "ProviderSelectionError";
+  }
+}
+
+/**
  * The unit of the actor mesh: an inbox (the {@link TriggerRunner} loop), its own
  * working memory (a provider session), access to MCP tools, and a
  * charter. The root and every worker are the same class — they differ only in
@@ -846,12 +858,13 @@ export class Actor {
       // same run's outcome twice, here it is claiming a start nobody saw.)
       this.runStartReported = true;
       startWatchdogTimers();
-      return this.runWithPoolFallback(
-        runId,
-        selected,
-        this.opts.resolveProvider(selected),
-        runProvider
-      );
+      let primary: CodingProvider;
+      try {
+        primary = this.opts.resolveProvider(selected);
+      } catch (err) {
+        throw new ProviderSelectionError(err);
+      }
+      return this.runWithPoolFallback(runId, selected, primary, runProvider);
     };
 
     // The post-run hook is the single choke point for failure forwarding, so it
@@ -937,20 +950,28 @@ export class Actor {
         return;
       }
       if (this.coalesceAborted) return;
+      const selection = err instanceof ProviderSelectionError;
+      const cause = err instanceof ProviderSelectionError ? err.cause : err;
       const runId = this.currentRunId;
-      if (runId) await this.lifecycle.emit("onError", { actorId: this.id, runId, error: err });
+      if (runId) await this.lifecycle.emit("onError", { actorId: this.id, runId, error: cause });
       result = {
         success: false,
         // A PoolExhaustedError carries the operator-facing pool summary as its
         // message; pasting a stack here would bury it (#655).
         output:
-          err instanceof PoolExhaustedError
-            ? err.message
-            : err instanceof Error
-              ? (err.stack ?? err.message)
-              : String(err),
+          cause instanceof PoolExhaustedError
+            ? cause.message
+            : cause instanceof Error
+              ? (cause.stack ?? cause.message)
+              : String(cause),
         exitCode: 1,
         sessionId,
+        // The run record keeps the stack above; the notice uses this message
+        // (#980).
+        failure: {
+          ...(selection ? { stage: "provider-selection" as const } : {}),
+          message: cause instanceof Error ? cause.message : String(cause),
+        },
       };
     } finally {
       this.pendingStart = undefined;

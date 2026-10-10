@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { z } from "zod";
-import type { ActorRecord } from "../../actor/actor-record.js";
+import type { ActorRecord, ExecutionConfig } from "../../actor/actor-record.js";
 import {
   lookupModelClassPool,
   type ModelClassStore,
@@ -26,16 +26,19 @@ type ActorRow = {
   title: string | null;
   retired_at: string | null;
   created_at: string;
+  execution_config: string | null;
 };
 
 /**
- * `context_config` version emitted by this build. Version 2 adds the durable
- * execution-placement field; the version must identify the exact strict
- * document shape rather than merely its broad category.
+ * `context_config` version emitted by this build: the portable/native context
+ * selection and the native provider session, and nothing else. Version 2 also
+ * carried `executionTarget`; migration 0056 moved that to `execution_config`
+ * and rewrote every v2 document as v1, so v2 is no longer read.
  */
-export const ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION = 2 as const;
-/** `context_config` shape emitted before durable remote placement (#301). */
-const LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION = 1 as const;
+export const ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION = 1 as const;
+
+/** `execution_config` version emitted by this build (#550). */
+export const ACTOR_EXECUTION_CONFIG_SCHEMA_VERSION = 1 as const;
 
 /** schemaVersion for a `model_config` document written before #169's pool contract. */
 const LEGACY_MODEL_CONFIG_SCHEMA_VERSION = 1 as const;
@@ -110,55 +113,43 @@ const modelConfigDocumentSchema = z.union([
   legacyModelConfigSchema,
 ]);
 
-const legacyContextConfigSchema = z.discriminatedUnion("type", [
+const contextConfigSchema = z.discriminatedUnion("type", [
   z
     .object({
-      schemaVersion: z.literal(LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
+      schemaVersion: z.literal(ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
       type: z.literal("native"),
       sessionId: z.string().optional(),
     })
     .strict(),
   z
     .object({
-      schemaVersion: z.literal(LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
+      schemaVersion: z.literal(ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
       type: z.literal("portable"),
       mode: z.enum(["tail", "ledger"]),
       compactionModel: z.string().optional(),
     })
     .strict(),
 ]);
+type ContextConfigDocument = z.infer<typeof contextConfigSchema>;
 
-const currentContextConfigSchema = z.discriminatedUnion("type", [
-  z
-    .object({
-      schemaVersion: z.literal(ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
-      type: z.literal("native"),
-      sessionId: z.string().optional(),
-      executionTarget: z.string().optional(),
-    })
-    .strict(),
-  z
-    .object({
-      schemaVersion: z.literal(ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
-      type: z.literal("portable"),
-      mode: z.enum(["tail", "ledger"]),
-      compactionModel: z.string().optional(),
-      executionTarget: z.string().optional(),
-    })
-    .strict(),
-]);
 /**
- * Read both strict shapes. We write v2 only when executionTarget is set,
- * keeping unplaced actors on v1 so rollback blast radius is strictly bounded
- * to remotely-placed actors.
+ * The stored {@link ExecutionConfig} (#550): whether the actor runs outside
+ * managed sandboxing and, for a remotely placed actor, its follower. Every
+ * actor row has one, and it always states `unsandboxed` explicitly. The shape
+ * is enforced here, by its version, rather than by the database.
  */
-const contextConfigSchema = z.union([legacyContextConfigSchema, currentContextConfigSchema]);
-type LegacyContextConfigDocument = z.infer<typeof legacyContextConfigSchema>;
-type CurrentContextConfigDocument = z.infer<typeof currentContextConfigSchema>;
+const executionConfigSchema = z
+  .object({
+    schemaVersion: z.literal(ACTOR_EXECUTION_CONFIG_SCHEMA_VERSION),
+    unsandboxed: z.boolean(),
+    executionTarget: z.string().optional(),
+  })
+  .strict();
+type ExecutionConfigDocument = z.infer<typeof executionConfigSchema>;
 
 function parseDocument<T>(
   actorId: string,
-  column: "model_config" | "context_config" | "voice_config",
+  column: "model_config" | "context_config" | "voice_config" | "execution_config",
   json: string,
   schema: z.ZodType<T>
 ): T {
@@ -285,20 +276,8 @@ function parseModelConfig(
  */
 function buildContextConfig(record: ActorRecord): string | null {
   if (record.context?.type === "portable") {
-    if (record.executionTarget !== undefined) {
-      const config: CurrentContextConfigDocument = {
-        schemaVersion: ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
-        type: "portable",
-        mode: record.context.mode,
-        ...(record.context.compactionModel !== undefined
-          ? { compactionModel: record.context.compactionModel }
-          : {}),
-        executionTarget: record.executionTarget,
-      };
-      return JSON.stringify(config);
-    }
-    const config: LegacyContextConfigDocument = {
-      schemaVersion: LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
+    const config: ContextConfigDocument = {
+      schemaVersion: ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
       type: "portable",
       mode: record.context.mode,
       ...(record.context.compactionModel !== undefined
@@ -307,22 +286,9 @@ function buildContextConfig(record: ActorRecord): string | null {
     };
     return JSON.stringify(config);
   }
-  if (
-    record.context?.type === "native" ||
-    record.sessionId !== undefined ||
-    record.executionTarget !== undefined
-  ) {
-    if (record.executionTarget !== undefined) {
-      const config: CurrentContextConfigDocument = {
-        schemaVersion: ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
-        type: "native",
-        ...(record.sessionId !== undefined ? { sessionId: record.sessionId } : {}),
-        executionTarget: record.executionTarget,
-      };
-      return JSON.stringify(config);
-    }
-    const config: LegacyContextConfigDocument = {
-      schemaVersion: LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
+  if (record.context?.type === "native" || record.sessionId !== undefined) {
+    const config: ContextConfigDocument = {
+      schemaVersion: ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
       type: "native",
       ...(record.sessionId !== undefined ? { sessionId: record.sessionId } : {}),
     };
@@ -334,13 +300,9 @@ function buildContextConfig(record: ActorRecord): string | null {
 function parseContextConfig(
   actorId: string,
   json: string | null
-): Pick<ActorRecord, "context" | "sessionId" | "executionTarget"> {
+): Pick<ActorRecord, "context" | "sessionId"> {
   if (!json) return {};
   const parsed = parseDocument(actorId, "context_config", json, contextConfigSchema);
-  const executionTarget =
-    "executionTarget" in parsed && parsed.executionTarget !== undefined
-      ? { executionTarget: parsed.executionTarget }
-      : {};
   if (parsed.type === "portable") {
     return {
       context: {
@@ -350,14 +312,55 @@ function parseContextConfig(
           ? { compactionModel: parsed.compactionModel }
           : {}),
       },
-      ...executionTarget,
     };
   }
   return {
     context: { type: "native" },
     ...(parsed.sessionId !== undefined ? { sessionId: parsed.sessionId } : {}),
-    ...executionTarget,
   };
+}
+
+/**
+ * Builds the execution-config document every actor row carries. An actor is
+ * sandboxed unless its record affirmatively says `unsandboxed: true`; the
+ * stored document states that resolved value.
+ */
+function buildExecutionConfig(record: ActorRecord): string {
+  const { unsandboxed, executionTarget } = record.executionConfig ?? {};
+  const config: ExecutionConfigDocument = {
+    schemaVersion: ACTOR_EXECUTION_CONFIG_SCHEMA_VERSION,
+    // Only an absent value takes the default; anything else that is not a
+    // boolean fails validation below.
+    unsandboxed: unsandboxed === undefined ? false : unsandboxed,
+    ...(executionTarget !== undefined ? { executionTarget } : {}),
+  };
+  const parsed = executionConfigSchema.safeParse(config);
+  if (!parsed.success) {
+    throw new Error(`SqliteActorRepository: invalid execution_config for actor '${record.id}'`, {
+      cause: parsed.error,
+    });
+  }
+  return JSON.stringify(parsed.data);
+}
+
+/**
+ * A missing or unknown document fails the read: an actor's execution is never
+ * guessed. The record omits default values, so a sandboxed leader-local actor
+ * reads back without an `executionConfig`.
+ */
+function parseExecutionConfig(
+  actorId: string,
+  json: string | null
+): Pick<ActorRecord, "executionConfig"> {
+  if (json === null) {
+    throw new Error(`SqliteActorRepository: missing execution_config for actor '${actorId}'`);
+  }
+  const parsed = parseDocument(actorId, "execution_config", json, executionConfigSchema);
+  const executionConfig: ExecutionConfig = {
+    ...(parsed.unsandboxed ? { unsandboxed: true } : {}),
+    ...(parsed.executionTarget !== undefined ? { executionTarget: parsed.executionTarget } : {}),
+  };
+  return Object.keys(executionConfig).length > 0 ? { executionConfig } : {};
 }
 
 /** Builds the versioned voice-config document, or null when the actor follows the instance default. */
@@ -467,18 +470,7 @@ export class SqliteActorRepository implements ActorRepository {
   }
 
   private write(record: ActorRecord, opts?: { restateModelConfig?: boolean }): void {
-    const isRoot = record.isRoot === true;
-    if (record.parentId === null && !isRoot) {
-      throw new Error(
-        `SqliteActorRepository: refusing to store parentless actor '${record.id}' without isRoot — ` +
-          "root topology is derived from parent_id IS NULL in this schema"
-      );
-    }
-    if (record.parentId !== null && isRoot) {
-      throw new Error(
-        `SqliteActorRepository: root actor '${record.id}' must have a null parentId (got '${record.parentId}')`
-      );
-    }
+    const executionConfigJson = buildExecutionConfig(record);
 
     this.db.transaction(() => {
       // One read of the prior row serves both the retirement timestamp and the
@@ -496,12 +488,14 @@ export class SqliteActorRepository implements ActorRepository {
 
       this.db
         .prepare(`INSERT INTO actors (
-        id, charter, parent_id, model_config, context_config, voice_config, title, retired_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        id, charter, parent_id, model_config, context_config, voice_config, title, retired_at, created_at,
+        execution_config
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET charter=excluded.charter, parent_id=excluded.parent_id,
         model_config=excluded.model_config, context_config=excluded.context_config,
         voice_config=excluded.voice_config,
-        title=excluded.title, retired_at=excluded.retired_at, created_at=excluded.created_at`)
+        title=excluded.title, retired_at=excluded.retired_at, created_at=excluded.created_at,
+        execution_config=excluded.execution_config`)
         .run(
           record.id,
           record.charter,
@@ -511,7 +505,8 @@ export class SqliteActorRepository implements ActorRepository {
           buildVoiceConfig(record),
           record.title ?? null,
           retiredAt,
-          record.createdAt
+          record.createdAt,
+          executionConfigJson
         );
       this.principals.ensureActorPrincipal(record.id, record.createdAt);
       this.db.prepare("DELETE FROM actor_handles WHERE actor_id = ?").run(record.id);
@@ -585,13 +580,13 @@ export class SqliteActorRepository implements ActorRepository {
       id: row.id,
       charter: row.charter,
       parentId: row.parent_id,
+      ...parseExecutionConfig(row.id, row.execution_config),
       status: row.retired_at === null ? "active" : "retired",
       createdAt: row.created_at,
       ...parseModelConfig(row.id, row.model_config, this.modelClasses),
       ...parseContextConfig(row.id, row.context_config),
       ...parseVoiceConfig(row.id, row.voice_config),
       ...(row.title === null ? {} : { title: row.title }),
-      ...(row.parent_id === null ? { isRoot: true } : {}),
       ...(handles.length
         ? {
             handles: handles.map((handle) => {

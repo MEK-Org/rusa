@@ -168,7 +168,7 @@ describe("db-check", () => {
       id: "root",
       charter: "root charter",
       parentId: null,
-      isRoot: true,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-01-01T00:00:00.000Z",
     });
@@ -480,7 +480,7 @@ describe("db-check", () => {
         id: "root",
         charter: "root charter",
         parentId: null,
-        isRoot: true,
+        executionConfig: { unsandboxed: true },
         status: "active",
         createdAt: "2026-01-01T00:00:00.000Z",
       });
@@ -517,7 +517,7 @@ describe("db-check", () => {
         id: "root",
         charter: "root charter",
         parentId: null,
-        isRoot: true,
+        executionConfig: { unsandboxed: true },
         status: "active",
         createdAt: "2026-01-01T00:00:00.000Z",
       });
@@ -561,7 +561,7 @@ describe("db-check", () => {
         id: "root",
         charter: "root charter",
         parentId: null,
-        isRoot: true,
+        executionConfig: { unsandboxed: true },
         status: "active",
         createdAt: "2026-01-01T00:00:00.000Z",
       });

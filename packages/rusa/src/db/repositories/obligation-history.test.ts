@@ -1,6 +1,9 @@
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
-import { ObligationValidationError } from "../../obligations/obligation.js";
+import {
+  OBLIGATION_REASSIGN_MESSAGE_MAX,
+  ObligationValidationError,
+} from "../../obligations/obligation.js";
 import { obligations } from "../migrations/0016_obligations.js";
 import { obligationPriority } from "../migrations/0017_obligation_priority.js";
 import { obligationTimestamps } from "../migrations/0025_obligation_timestamps.js";
@@ -80,6 +83,8 @@ function instrumentObligationReads(db: Database.Database): {
   return { db: proxy, tally };
 }
 
+const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";
+
 describe("Obligation mutation history", () => {
   let db: Database.Database;
   let repository: ObligationRepository;
@@ -93,6 +98,13 @@ describe("Obligation mutation history", () => {
       db,
       (id) => ["actor-a", "actor-b", "actor-c"].includes(id),
       () => now
+    );
+    repository.setPrincipalKind((id) =>
+      id === TEST_USER_ID
+        ? "user"
+        : ["actor-a", "actor-b", "actor-c"].includes(id)
+          ? "actor"
+          : undefined
     );
   });
 
@@ -332,6 +344,162 @@ describe("Obligation mutation history", () => {
       const page = repository.listHistory(child.id);
       expect(page.length).toBe(0);
     });
+
+    it("does not record history on no-op markResponsive when already responsive", () => {
+      const ob = repository.create({
+        title: "Test Obligation",
+        ownerId: "actor-a",
+      });
+
+      repository.markResponsive(ob.id, "actor-b");
+      const historyAfterFirst = repository.listHistory(ob.id);
+      expect(historyAfterFirst.length).toBe(1);
+
+      repository.markResponsive(ob.id, "actor-b");
+      const historyAfterSecond = repository.listHistory(ob.id);
+      expect(historyAfterSecond.length).toBe(1);
+    });
+  });
+
+  describe("reassign message (#941)", () => {
+    it("records the message with the owner change, attributed to the acting principal", () => {
+      const ob = repository.create({ title: "Review", ownerId: TEST_USER_ID });
+      now += 1000;
+      repository.reassign(ob.id, "actor-a", TEST_USER_ID, "  Please address the round-2 note.  ");
+
+      expect(repository.listHistory(ob.id)).toEqual([
+        expect.objectContaining({
+          mutationKind: "reassign",
+          actingPrincipal: TEST_USER_ID,
+          before: { ownerId: TEST_USER_ID },
+          after: { ownerId: "actor-a", message: "Please address the round-2 note." },
+        }),
+      ]);
+      expect(repository.listHistoryPage(ob.id).entries[0].after.message).toBe(
+        "Please address the round-2 note."
+      );
+    });
+
+    it("records no message key for an absent or blank message", () => {
+      const ob = repository.create({ title: "Review", ownerId: "actor-a" });
+      repository.reassign(ob.id, "actor-b", "actor-a");
+      repository.reassign(ob.id, "actor-c", "actor-a", "   ");
+
+      const history = repository.listHistory(ob.id);
+      expect(history.map((h) => h.after)).toEqual([{ ownerId: "actor-c" }, { ownerId: "actor-b" }]);
+      const payloads = db
+        .prepare("SELECT payload FROM obligation_history WHERE obligation_id = ? ORDER BY id")
+        .all(ob.id) as Array<{ payload: string }>;
+      expect(payloads.map((row) => JSON.parse(row.payload).schemaVersion)).toEqual([1, 1]);
+    });
+
+    it("rejects an over-long message without changing the owner", () => {
+      const ob = repository.create({ title: "Review", ownerId: "actor-a" });
+      expect(() =>
+        repository.reassign(
+          ob.id,
+          "actor-b",
+          "actor-a",
+          "x".repeat(OBLIGATION_REASSIGN_MESSAGE_MAX + 1)
+        )
+      ).toThrow(ObligationValidationError);
+      expect(repository.get(ob.id)?.ownerId).toBe("actor-a");
+      expect(repository.listHistory(ob.id)).toEqual([]);
+    });
+
+    it("leaves ready-head delivery exactly as a reassign without a message", () => {
+      const deliveries = (message?: string) => {
+        const changes: Array<{ ownerId: string; headId: string | null }> = [];
+        const local = new ObligationRepository(
+          migratedDb(),
+          (id) => ["actor-a", "actor-b"].includes(id),
+          () => now
+        );
+        local.setPrincipalKind((id) =>
+          id === TEST_USER_ID ? "user" : ["actor-a", "actor-b"].includes(id) ? "actor" : undefined
+        );
+        const ob = local.create({ id: "review", title: "Review", ownerId: TEST_USER_ID });
+        local.setReadyHeadListener((change) =>
+          changes.push({ ownerId: change.ownerId, headId: change.head?.id ?? null })
+        );
+        local.reassign(ob.id, "actor-a", TEST_USER_ID, message);
+        return changes;
+      };
+      expect(deliveries("Back to you.")).toEqual(deliveries());
+      expect(deliveries()).toContainEqual({ ownerId: "actor-a", headId: "review" });
+    });
+
+    it("returns a human -> actor -> human round trip to its place in the human's queue", () => {
+      const ids = ["first", "review", "last"];
+      for (const id of ids) {
+        now += 1000;
+        repository.create({ id, title: id, ownerId: TEST_USER_ID });
+      }
+      const queue = () => repository.listOwned(TEST_USER_ID).map((o) => o.id);
+      expect(queue()).toEqual(ids);
+
+      repository.reassign("review", "actor-a", TEST_USER_ID, "Please answer seat 2.");
+      expect(queue()).toEqual(["first", "last"]);
+      repository.reassign("review", TEST_USER_ID, "actor-a", "Answered; back to you.");
+
+      expect(queue()).toEqual(ids);
+      expect(repository.listHistory("review").map((h) => h.after)).toEqual([
+        { ownerId: TEST_USER_ID, message: "Answered; back to you." },
+        { ownerId: "actor-a", message: "Please answer seat 2." },
+      ]);
+    });
+  });
+
+  describe("latest reassignment (#947)", () => {
+    it("returns the latest reassignment's message with its owners, principal and time", () => {
+      const ob = repository.create({ title: "Review", ownerId: TEST_USER_ID });
+      now += 1000;
+      repository.reassign(ob.id, "actor-a", TEST_USER_ID, "Please address the round-2 note.");
+
+      expect(repository.latestReassignment(ob.id)).toEqual({
+        previousOwnerId: TEST_USER_ID,
+        newOwnerId: "actor-a",
+        message: "Please address the round-2 note.",
+        actingPrincipal: TEST_USER_ID,
+        timestamp: new Date(now).toISOString(),
+      });
+    });
+
+    it("returns only the latest of two reassignments", () => {
+      const ob = repository.create({ title: "Review", ownerId: TEST_USER_ID });
+      repository.reassign(ob.id, "actor-a", TEST_USER_ID, "First pass.");
+      now += 1000;
+      repository.reassign(ob.id, "actor-b", "actor-a", "Second pass.");
+
+      expect(repository.latestReassignment(ob.id)).toMatchObject({
+        previousOwnerId: "actor-a",
+        newOwnerId: "actor-b",
+        message: "Second pass.",
+        actingPrincipal: "actor-a",
+      });
+    });
+
+    it("returns null when never reassigned, or when the latest reassignment had no message", () => {
+      const never = repository.create({ title: "Never", ownerId: "actor-a" });
+      repository.setCheckpoint(never.id, "Some progress.", "actor-a");
+      expect(repository.latestReassignment(never.id)).toBeNull();
+
+      const superseded = repository.create({ title: "Superseded", ownerId: TEST_USER_ID });
+      repository.reassign(superseded.id, "actor-a", TEST_USER_ID, "An older hand-off.");
+      repository.reassign(superseded.id, "actor-b", "actor-a");
+      expect(repository.latestReassignment(superseded.id)).toBeNull();
+    });
+
+    it("throws on a reassign row missing an owner id, like listHistory", () => {
+      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
+
+      db.prepare(
+        `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
+         VALUES (?, 'reassign', 'actor-a', '2026-09-09T12:00:00.000Z', '{"schemaVersion":2,"before":{},"after":{"ownerId":"actor-b","message":"Why."}}')`
+      ).run(ob.id);
+
+      expect(() => repository.latestReassignment(ob.id)).toThrow(ObligationValidationError);
+    });
   });
 
   describe("direct mutation coverage", () => {
@@ -441,6 +609,25 @@ describe("Obligation mutation history", () => {
         actingPrincipal: "actor-a",
         before: { externalRef: "github:MEK-Org/rusa/issues/185" },
         after: { externalRef: null },
+      });
+    });
+
+    it("records a responsive mark with actor, target, timestamp, and old/new explicit values", () => {
+      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
+
+      now += 1000;
+      const tMark = new Date(now).toISOString();
+      repository.markResponsive(ob.id, "actor-b");
+
+      const history = repository.listHistory(ob.id);
+      expect(history).toHaveLength(1);
+      expect(history[0]).toMatchObject({
+        obligationId: ob.id,
+        mutationKind: "responsive",
+        actingPrincipal: "actor-b",
+        timestamp: tMark,
+        before: { responsive: null },
+        after: { responsive: true },
       });
     });
   });
@@ -617,6 +804,32 @@ describe("Obligation mutation history", () => {
         before: { ownerId: "actor-a" },
         after: { ownerId: "actor-b" },
       });
+    });
+
+    it("records no history rows for derived responsiveness on descendants when an ancestor is marked", () => {
+      const parent = repository.create({ title: "Parent", ownerId: "actor-a" });
+      const child = repository.create({ title: "Child", ownerId: "actor-b", parentId: parent.id });
+      const grandchild = repository.create({
+        title: "Grandchild",
+        ownerId: "actor-c",
+        parentId: child.id,
+      });
+
+      now += 1000;
+      repository.markResponsive(parent.id, "actor-a");
+
+      expect(repository.require(parent.id).effectiveResponsive).toBe(true);
+      expect(repository.require(child.id).effectiveResponsive).toBe(true);
+      expect(repository.require(grandchild.id).effectiveResponsive).toBe(true);
+
+      const parentHistory = repository.listHistory(parent.id);
+      expect(parentHistory.map((h) => h.mutationKind)).toContain("responsive");
+
+      const childHistory = repository.listHistory(child.id);
+      expect(childHistory.filter((h) => h.mutationKind === "responsive")).toHaveLength(0);
+
+      const grandchildHistory = repository.listHistory(grandchild.id);
+      expect(grandchildHistory.filter((h) => h.mutationKind === "responsive")).toHaveLength(0);
     });
   });
 
@@ -843,6 +1056,17 @@ describe("Obligation mutation history", () => {
       db.prepare(
         `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
          VALUES (?, 'reassign', 'actor-a', '2026-09-09T12:00:00.000Z', '{"schemaVersion":1,"before":{},"after":{"ownerId":""}}')`
+      ).run(ob.id);
+
+      expect(() => repository.listHistory(ob.id)).toThrow(ObligationValidationError);
+    });
+
+    it("throws on malformed responsive value in history payload when reading history", () => {
+      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
+
+      db.prepare(
+        `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
+         VALUES (?, 'responsive', 'actor-a', '2026-09-09T12:00:00.000Z', '{"schemaVersion":1,"before":{},"after":{"responsive":"invalid-not-boolean"}}')`
       ).run(ob.id);
 
       expect(() => repository.listHistory(ob.id)).toThrow(ObligationValidationError);

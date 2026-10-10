@@ -59,7 +59,7 @@ function seed(
       id: `actor-${actor}`,
       charter: "Synthetic actor-load benchmark fixture; not production data.",
       parentId: actor === 0 ? null : "actor-0",
-      ...(actor === 0 ? { isRoot: true } : {}),
+      ...(actor === 0 ? { executionConfig: { unsandboxed: true } } : {}),
       status: "active",
       createdAt: new Date(actor * 1000).toISOString(),
     };

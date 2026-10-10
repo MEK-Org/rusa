@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { RusaConfig } from "../config/types.js";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
 import { buildAntigravityArgs, resolveAntigravitySelection } from "./antigravity.js";
 import {
@@ -15,6 +16,7 @@ import {
   getProviderModelCatalog,
   ingestCodexHostModels,
   ingestKimiHostModels,
+  type ModelEntry,
   PROVIDER_MODEL_DESCRIPTORS,
   parseAgyModelsOutput,
   populateModelCatalogsFromDb,
@@ -23,6 +25,7 @@ import {
   setProviderModelCatalog,
   validateModelPin,
 } from "./model-catalog.js";
+import { validateProviderSelection } from "./provider-selection.js";
 
 vi.mock("../understanding/gemini-utils.js", () => ({
   getGeminiClient: vi.fn(),
@@ -168,7 +171,10 @@ describe("recordAndExtractModelCatalog", () => {
     expect(getProviderModelCatalog("codex")).toEqual([
       { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol" },
     ]);
-    expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({ status: "accepted" });
+    expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({
+      status: "accepted",
+      model: "gpt-5.6-sol",
+    });
   });
 
   it("records parse error when LLM parsing returns unknown or errors", async () => {
@@ -219,7 +225,10 @@ describe("recordAndExtractModelCatalog", () => {
     expect(getProviderModelCatalog("codex")).toEqual([
       { displayLabel: "good-model", identifier: "good-model", passable: true },
     ]);
-    expect(validateModelPin("codex", "good-model")).toEqual({ status: "accepted" });
+    expect(validateModelPin("codex", "good-model")).toEqual({
+      status: "accepted",
+      model: "good-model",
+    });
   });
 });
 
@@ -250,7 +259,10 @@ describe("populateModelCatalogsFromDb", () => {
     ]);
     expect(getAllProviderModelCatalogs().size).toBe(2);
 
-    expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({ status: "accepted" });
+    expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({
+      status: "accepted",
+      model: "gpt-5.6-sol",
+    });
     expect(() => validateModelPin("codex", "bad-model")).toThrow();
   });
 
@@ -332,8 +344,14 @@ describe("validateModelPin", () => {
       { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol" },
       { displayLabel: "gpt-5.6-terra", identifier: "gpt-5.6-terra" },
     ]);
-    expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({ status: "accepted" });
-    expect(validateModelPin("codex", "gpt-5.6-sol medium")).toEqual({ status: "accepted" });
+    expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({
+      status: "accepted",
+      model: "gpt-5.6-sol",
+    });
+    expect(validateModelPin("codex", "gpt-5.6-sol medium")).toEqual({
+      status: "accepted",
+      model: "gpt-5.6-sol",
+    });
     expect(() => validateModelPin("codex", "bad-pin")).toThrow(
       'provider "codex": rejected "bad-pin"; acceptable values: "gpt-5.6-sol", "gpt-5.6-terra"'
     );
@@ -346,8 +364,14 @@ describe("validateModelPin", () => {
     expect(getProviderModelCatalog("codex")).toEqual([
       { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol" },
     ]);
-    expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({ status: "accepted" });
-    expect(validateModelPin("codex", "gpt-5.6-sol medium")).toEqual({ status: "accepted" });
+    expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({
+      status: "accepted",
+      model: "gpt-5.6-sol",
+    });
+    expect(validateModelPin("codex", "gpt-5.6-sol medium")).toEqual({
+      status: "accepted",
+      model: "gpt-5.6-sol",
+    });
   });
 
   it("accepts both agy display labels and slug identifiers ", () => {
@@ -650,7 +674,10 @@ display_name = "K3"
     expect(getProviderModelCatalog("kimi")).toEqual([
       { displayLabel: "K3", identifier: "kimi-code/k3", passable: true },
     ]);
-    expect(validateModelPin("kimi", "kimi-code/k3")).toEqual({ status: "accepted" });
+    expect(validateModelPin("kimi", "kimi-code/k3")).toEqual({
+      status: "accepted",
+      model: "kimi-code/k3",
+    });
     expect(() => validateModelPin("kimi", "k3")).toThrow();
     expect(() => validateModelPin("kimi", "K3")).toThrow();
     expect(() => validateModelPin("kimi", "unsupported-model")).toThrow();
@@ -1005,10 +1032,16 @@ describe("codex models cache", () => {
     ]);
     expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({
       status: "accepted",
+      model: "gpt-5.6-sol",
       efforts: undefined,
     });
-    // The display name the cache carried is prose, and prose is not a pin.
-    expect(() => validateModelPin("codex", "GPT-5.6-Sol")).toThrow();
+    // Model names are case-insensitive (#974): the cache's capitalized display
+    // name is the same model, and it launches as the slug.
+    expect(validateModelPin("codex", "GPT-5.6-Sol")).toEqual({
+      status: "accepted",
+      model: "gpt-5.6-sol",
+      efforts: undefined,
+    });
   });
 
   it("leaves the last-known-good catalog alone when the cache is unusable", () => {
@@ -1031,6 +1064,182 @@ describe("codex models cache", () => {
     expect(getProviderModelCatalog("codex")).toEqual([
       { displayLabel: "gpt-5.4", identifier: "gpt-5.4", passable: true },
     ]);
+  });
+});
+
+describe("codex catalog identifier case across refreshes", () => {
+  let tmpDir: string | undefined;
+
+  afterEach(() => {
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  const config = { providers: { codex: { cliCommand: "codex" } } } as unknown as RusaConfig;
+
+  // A /model picker that renders display names hands the TUI fallback
+  // `GPT-6.1-Sol`, while the models cache lists the slug `gpt-6.1-sol` for the
+  // same model. Refreshes alternate between the two sources, and a restart
+  // restores whichever one was recorded last.
+  const tuiRefresh = async () => {
+    vi.mocked(getGeminiClient).mockReturnValue({
+      models: { generateContent: vi.fn().mockResolvedValue({}) },
+    } as never);
+    vi.mocked(extractGeminiText).mockResolvedValue(
+      JSON.stringify({
+        entries: [
+          { displayLabel: "GPT-6.1-Sol", identifier: "GPT-6.1-Sol", passable: true },
+          { displayLabel: "GPT-6.1-Terra", identifier: "GPT-6.1-Terra", passable: true },
+        ],
+      })
+    );
+    await recordAndExtractModelCatalog({
+      provider: "codex",
+      rawOutput: "Select Model and Effort\n› 1. GPT-6.1-Sol (current)\n  2. GPT-6.1-Terra",
+      geminiApiKey: "key",
+    });
+  };
+  const cacheRefresh = () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "codex-case-test-"));
+    const cachePath = join(tmpDir, "models_cache.json");
+    writeFileSync(
+      cachePath,
+      JSON.stringify({
+        fetched_at: "2026-09-05T12:00:00.000Z",
+        models: [
+          { slug: "gpt-6.1-sol", display_name: "GPT-6.1-Sol", visibility: "list" },
+          { slug: "gpt-6.1-terra", display_name: "GPT-6.1-Terra", visibility: "list" },
+        ],
+      })
+    );
+    expect(
+      ingestCodexHostModels({ cachePath, now: Date.parse("2026-09-05T12:30:00.000Z") }).status
+    ).toBe("usable");
+  };
+  const restart = () => {
+    clearProviderModelCatalog();
+    populateModelCatalogsFromDb({
+      listLatestForEachProvider: () =>
+        new Map([
+          ["codex", [{ displayLabel: "GPT-6.1-Sol", identifier: "GPT-6.1-Sol", passable: true }]],
+        ]),
+    });
+  };
+
+  it("keeps accepting the same configured slug whichever source refreshed last", async () => {
+    const steps: Array<[string, () => unknown]> = [
+      ["tui", tuiRefresh],
+      ["cache", cacheRefresh],
+      ["tui again", tuiRefresh],
+      ["restart from a recorded tui row", restart],
+    ];
+    for (const [step, refresh] of steps) {
+      await refresh();
+      const identifiers = (getProviderModelCatalog("codex") ?? []).map((e) => e.identifier);
+      expect(identifiers, step).toContain("gpt-6.1-sol");
+      expect(
+        identifiers.filter((id) => id !== id.toLowerCase()),
+        step
+      ).toEqual([]);
+      expect(validateProviderSelection(config, "codex", "gpt-6.1-sol", "high"), step).toEqual({
+        model: "gpt-6.1-sol",
+        effort: "high",
+      });
+      // A case variant resolves to the native slug, and a legacy effort
+      // qualifier still splits off as a separate effort.
+      expect(validateProviderSelection(config, "codex", "GPT-6.1-Sol medium"), step).toEqual({
+        model: "gpt-6.1-sol",
+        effort: "medium",
+      });
+      expect(
+        () => validateProviderSelection(config, "codex", "gpt-9-unlisted", "high"),
+        step
+      ).toThrow(/rejected "gpt-9-unlisted"/);
+      expect(
+        () => validateProviderSelection(config, "codex", "gpt-6.1-sol", "turbo"),
+        step
+      ).toThrow(/turbo/);
+    }
+  });
+
+  // Each provider restores its own recorded row so one red does not hide the
+  // others.
+  const restore = (provider: string, entries: ModelEntry[]) =>
+    populateModelCatalogsFromDb({
+      listLatestForEachProvider: () => new Map([[provider, entries]]),
+    });
+
+  it("resolves claude case variants in the catalog's spelling of the matched field", () => {
+    restore("claude", [{ displayLabel: "Opus", identifier: "Claude-Opus-5", passable: true }]);
+
+    expect(getProviderModelCatalog("claude")?.[0].identifier).toBe("claude-opus-5");
+    expect(validateModelPin("claude", "CLAUDE-OPUS-5")).toMatchObject({ model: "claude-opus-5" });
+    // A display-label pin still launches the display label, as before #974.
+    expect(validateModelPin("claude", "Opus")).toMatchObject({ model: "Opus" });
+    expect(validateModelPin("claude", "OPUS")).toMatchObject({ model: "Opus" });
+    expect(() => validateModelPin("claude", "claude-opus-9")).toThrow(/rejected/);
+  });
+
+  it("resolves agy case variants to the lowercase slug", () => {
+    restore("agy", [
+      { displayLabel: "Gemini Flash", identifier: "gemini-flash", passable: false },
+      {
+        displayLabel: "Gemini 3.5 Flash (High)",
+        identifier: "Gemini-3.5-Flash-High",
+        passable: true,
+      },
+    ]);
+
+    expect(getProviderModelCatalog("agy")?.map((e) => e.identifier)).toEqual([
+      "gemini-flash",
+      "gemini-3.5-flash",
+    ]);
+    expect(resolveAntigravitySelection("GEMINI 3.5 FLASH", "high")).toEqual({
+      model: "gemini-3.5-flash",
+      effort: "high",
+    });
+    expect(resolveAntigravitySelection("Gemini-3.5-Flash-HIGH")).toEqual({
+      model: "gemini-3.5-flash",
+      effort: "high",
+    });
+    expect(() => resolveAntigravitySelection("GEMINI FLASH", "high")).toThrow(/impassable/);
+    expect(() => validateModelPin("agy", "gemini flash")).toThrow(/rejected "gemini flash"/);
+    expect(() => resolveAntigravitySelection("Gemini 3.5 Flash", "max")).toThrow(/max/);
+  });
+
+  it("keeps the spelling of a restored agy identifier that is a display label", () => {
+    // `agy models` rows carry a slug, but a recorded row whose identifier is a
+    // display label launches that label, so lowercasing it would change argv.
+    restore("agy", [
+      {
+        displayLabel: "Gemini 3.1 Pro (High)",
+        identifier: "Gemini 3.1 Pro (High)",
+        passable: true,
+      },
+    ]);
+
+    expect(getProviderModelCatalog("agy")?.map((e) => e.identifier)).toEqual([
+      "Gemini 3.1 Pro (High)",
+    ]);
+    expect(resolveAntigravitySelection("gemini 3.1 pro (high)", "high")).toEqual({
+      model: "Gemini 3.1 Pro (High)",
+      effort: "high",
+    });
+  });
+
+  it("matches kimi config keys ignoring case and launches the key as written", () => {
+    // TOML keys are case-sensitive, so two keys may differ only in case. An
+    // exactly spelled pin selects its own key; a case variant takes the first.
+    restore("kimi", [
+      { displayLabel: "K3", identifier: "Kimi-Code/K3", passable: true },
+      { displayLabel: "K3 lower", identifier: "kimi-code/k3", passable: true },
+    ]);
+
+    expect(validateModelPin("kimi", "Kimi-Code/K3")).toMatchObject({ model: "Kimi-Code/K3" });
+    expect(validateModelPin("kimi", "kimi-code/k3")).toMatchObject({ model: "kimi-code/k3" });
+    expect(validateModelPin("kimi", "KIMI-CODE/K3")).toMatchObject({ model: "Kimi-Code/K3" });
+    expect(() => validateModelPin("kimi", "k3")).toThrow();
+    expect(() => validateModelPin("kimi", "kimi-code/k9")).toThrow();
   });
 });
 

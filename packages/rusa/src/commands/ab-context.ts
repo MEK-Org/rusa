@@ -133,9 +133,9 @@ import { type RunStartE2EHandles, runStart } from "./start.js";
  * own dev tooling and not a second identically-chartered sibling. Only the list_threads
  * STIMULUS removal is load-bearing here, not an authority trick.
  *
- * Root authority decoupling : `isRoot` is explicitly `false`, so the holder has no
- * capability grant/revoke authority. It is also inert in practice — no provider, no MCP
- * surface and no run loop.
+ * Root authority decoupling : the holder holds no capability grant, so it has no
+ * grant/revoke authority. It is also inert in practice — no provider, no MCP surface and
+ * no run loop. Like every other child of root, it is sandboxed by default.
  */
 export const RIG_HOLDER_ID = "ab-rig-holder";
 
@@ -184,7 +184,6 @@ export function adoptRigHolder(mesh: ActorMesh, rootId: string): string {
       id: RIG_HOLDER_ID,
       charter: RIG_HOLDER_CHARTER,
       parentId: rootId,
-      isRoot: false,
       status: "active",
       title: "A/B rig (driver-owned)",
       createdAt: new Date().toISOString(),
