@@ -1,15 +1,19 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
   realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { open as openFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -17,6 +21,7 @@ import {
   readBoundedRegularFile,
   resolveAttachmentPath,
   resolveDownloadPath,
+  streamNewFileInWorkdir,
   writeNewFileInWorkdir,
 } from "./workdir-path.js";
 
@@ -37,6 +42,15 @@ vi.mock("node:fs/promises", async () => {
 
 function workdir(): string {
   return mkdtempSync(join(tmpdir(), "rusa-workdir-path-"));
+}
+
+function streamFrom(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
 }
 
 describe("readBoundedRegularFile", () => {
@@ -138,5 +152,113 @@ describe("workdir root acquisition", () => {
       "access denied"
     );
     expect(existsSync(join(outside, "root", "new.txt"))).toBe(false);
+  });
+});
+
+describe("streamNewFileInWorkdir", () => {
+  it("streams chunks into a new file, computing sha256 and byte length", async () => {
+    const dir = workdir();
+    const destination = await resolveDownloadPath(dir, "streamed.bin");
+    const chunks = [Buffer.from("hello "), Buffer.from("world")];
+    const result = await streamNewFileInWorkdir(dir, destination, streamFrom(chunks));
+    expect(result.bytes).toBe(11);
+    expect(result.sha256).toBe(createHash("sha256").update("hello world").digest("hex"));
+    expect(readFileSync(destination, "utf-8")).toBe("hello world");
+  });
+
+  it("reports its digest only after sync completes, and unlinks output when sync fails", async () => {
+    const dir = workdir();
+    const probe = await openFile(join(dir, "probe"), "w");
+    const proto = Object.getPrototypeOf(probe);
+    await probe.close();
+    let finishSync: (err?: Error) => void = () => {};
+    const sync = vi.spyOn(proto, "sync").mockImplementation(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          finishSync = (err) => (err ? reject(err) : resolve());
+        })
+    );
+    try {
+      const destination = await resolveDownloadPath(dir, "synced.bin");
+      let settled = false;
+      const receipt = streamNewFileInWorkdir(
+        dir,
+        destination,
+        streamFrom([Buffer.from("complete")])
+      ).finally(() => {
+        settled = true;
+      });
+      await vi.waitFor(() => expect(sync).toHaveBeenCalledTimes(1));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(settled).toBe(false);
+      finishSync();
+      await expect(receipt).resolves.toMatchObject({ bytes: 8 });
+
+      const failed = await resolveDownloadPath(dir, "sync-failed.bin");
+      const rejected = streamNewFileInWorkdir(dir, failed, streamFrom([Buffer.from("partial")]));
+      await vi.waitFor(() => expect(sync).toHaveBeenCalledTimes(2));
+      finishSync(new Error("disk full"));
+      await expect(rejected).rejects.toThrow("disk full");
+      expect(existsSync(failed)).toBe(false);
+    } finally {
+      sync.mockRestore();
+    }
+  });
+
+  it("unlinks partial output when the source stream fails", async () => {
+    const dir = workdir();
+    const destination = await resolveDownloadPath(dir, "oversized.bin");
+    let first = true;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (first) {
+          first = false;
+          controller.enqueue(Buffer.from("partial"));
+          return;
+        }
+        controller.error(new Error("source failed"));
+      },
+    });
+    await expect(streamNewFileInWorkdir(dir, destination, stream)).rejects.toThrow("source failed");
+    expect(existsSync(destination)).toBe(false);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it("cancels the source and keeps an existing destination it refuses to overwrite", async () => {
+    const dir = workdir();
+    writeFileSync(join(dir, "existing.bin"), "original");
+    const destination = await resolveDownloadPath(dir, "existing.bin");
+    const cancel = vi.fn();
+    const stream = new ReadableStream<Uint8Array>({ cancel });
+    await expect(streamNewFileInWorkdir(dir, destination, stream)).rejects.toMatchObject({
+      code: "EEXIST",
+    });
+    expect(cancel).toHaveBeenCalled();
+    expect(readFileSync(destination, "utf-8")).toBe("original");
+  });
+
+  it("removes partial output from the directory it opened after an ancestor swap", async () => {
+    const dir = workdir();
+    const outside = workdir();
+    writeFileSync(join(outside, "partial.bin"), "unrelated");
+    mkdirSync(join(dir, "sub"));
+    const destination = await resolveDownloadPath(dir, "sub/partial.bin");
+    let first = true;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (first) {
+          first = false;
+          controller.enqueue(Buffer.from("first"));
+          return;
+        }
+        renameSync(join(dir, "sub"), join(dir, "sub-moved"));
+        symlinkSync(outside, join(dir, "sub"));
+        controller.error(new Error("source failed"));
+      },
+    });
+    await expect(streamNewFileInWorkdir(dir, destination, stream)).rejects.toThrow("source failed");
+    expect(existsSync(join(dir, "sub-moved", "partial.bin"))).toBe(false);
+    expect(readdirSync(join(dir, "sub-moved"))).toEqual([]);
+    expect(readFileSync(join(outside, "partial.bin"), "utf-8")).toBe("unrelated");
   });
 });

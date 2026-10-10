@@ -281,10 +281,30 @@ export async function recordAndExtractModelCatalog(opts: {
 
 const catalogs = new Map<string, readonly ModelEntry[]>();
 
+/** Lowercases a slug; an identifier containing whitespace is a display label. */
+function slugCase(identifier: string): string {
+  return /\s/.test(identifier) ? identifier : identifier.toLowerCase();
+}
+
 /**
  * Normalizes model entries for a provider if necessary.
  * For Codex, entries that include reasoning effort suffixes (e.g. 'gpt-5.6-sol medium')
  * are normalized to their base model identifier and display label ('gpt-5.6-sol').
+ *
+ * Model names are case-insensitive (#974). Identifiers are stored lowercase
+ * where the provider's native launch value is lowercase by construction:
+ * Codex slugs, `agy models` slugs and claude-* ids. That gives one spelling per
+ * model, whichever source or presentation produced it. The Codex models cache
+ * shows why: its `slug` ('gpt-5.6-sol') is the `--model` value and
+ * `display_name` ('GPT-5.6-Sol') is presentation, and a /model picker that
+ * renders display names hands the TUI fallback the capitalized form. Recorded
+ * rows pass through here on restore, so earlier capitalized scrapes are
+ * canonicalized without rewriting them.
+ *
+ * Spelling is kept where the launch value is not a slug: a Kimi identifier is
+ * a key the operator chose in config.toml, and an agy or Claude identifier
+ * containing whitespace is a display label, which launches as written. Display
+ * labels keep their casing.
  */
 export function normalizeModelEntries(
   provider: string,
@@ -295,7 +315,7 @@ export function normalizeModelEntries(
     const normalized: ModelEntry[] = [];
     for (const entry of entries) {
       const { model } = parseCodexModel(entry.identifier);
-      const slug = model || entry.identifier;
+      const slug = (model || entry.identifier).toLowerCase();
       if (!seen.has(slug)) {
         seen.add(slug);
         normalized.push({
@@ -324,6 +344,7 @@ export function normalizeModelEntries(
         parsedBase = entry.identifier.replace(slugRe, "").trim();
         parsedEffort = match[1].toLowerCase();
       }
+      parsedBase = slugCase(parsedBase);
 
       let parsedDisplay = entry.displayLabel;
       const displayRe = new RegExp(`\\s*\\((${AGY_EFFORTS.join("|")})\\)$`, "i");
@@ -351,6 +372,9 @@ export function normalizeModelEntries(
       }
     }
     return Array.from(baseModels.values());
+  }
+  if (provider === "claude") {
+    return entries.map((entry) => ({ ...entry, identifier: slugCase(entry.identifier) }));
   }
   return [...entries];
 }
@@ -428,13 +452,18 @@ export function acceptableModelPins(provider: string): readonly string[] | undef
 }
 
 export type ModelPinValidation =
-  | { status: "accepted"; efforts?: string[] }
+  /** `model` is the catalog's spelling of the field the pin matched. */
+  | { status: "accepted"; model: string; efforts?: string[] }
   | { status: "unknown"; warning: string };
 
 /**
  * Validate locally before constructing a provider. Absent and empty catalogs
  * are unknown and remain permissive until live enumeration lands.
  * Accepts both slug identifiers (e.g. gemini-3.1-pro-high) and display labels (e.g. Gemini 3.1 Pro (High)) .
+ * Matching ignores case (#974). The accepted `model` is the field the pin
+ * matched, in the catalog's spelling, so a case variant launches what the exact
+ * spelling would. Which field launches is unchanged: an identifier pin launches
+ * the identifier and a display-label pin launches the display label.
  *
  * The `/halt provider:<p> model:<m>` gate shares this function's vocabulary via
  * {@link acceptableModelPins} but deliberately *refuses* on an absent or empty
@@ -456,33 +485,44 @@ export function validateModelPin(provider: string, pin: string): ModelPinValidat
   // Kimi's CLI takes only the config key (identifier), never the friendly
   // display_name, so a display-label match here would accept a pin that
   // fails to launch. Every other provider keeps matching either field.
-  let matchedEntry = passableEntries.find((entry) =>
-    provider === "kimi"
-      ? entry.identifier === pin
-      : entry.identifier === pin || entry.displayLabel === pin
-  );
-  let isMatch = !!matchedEntry;
+  const fields: readonly ModelCommandLineField[] =
+    provider === "kimi" ? ["identifier"] : ["identifier", "displayLabel"];
+  const sameName = (a: string | undefined, b: string) =>
+    a !== undefined && a.toLowerCase() === b.toLowerCase();
+  const resolve = (name: string, equal: (a: string, b: string) => boolean) => {
+    for (const entry of passableEntries) {
+      for (const field of fields) {
+        const value = entry[field];
+        if (typeof value === "string" && equal(value, name)) return { entry, value };
+      }
+    }
+    return undefined;
+  };
 
-  if (!isMatch && provider === "codex") {
+  // Exact spelling is tried first because Kimi config.toml keys are
+  // case-sensitive and may differ only in case; a case variant then takes the
+  // first entry it matches.
+  let match = resolve(pin, (a, b) => a === b) ?? resolve(pin, sameName);
+  if (!match && provider === "codex") {
     const { model: pinModel } = parseCodexModel(pin);
     if (pinModel) {
-      matchedEntry = passableEntries.find(
-        (entry) =>
-          entry.identifier === pinModel ||
-          entry.displayLabel === pinModel ||
-          parseCodexModel(entry.identifier).model === pinModel ||
-          parseCodexModel(entry.displayLabel).model === pinModel
+      const entry = passableEntries.find(
+        (candidate) =>
+          sameName(candidate.identifier, pinModel) ||
+          sameName(candidate.displayLabel, pinModel) ||
+          sameName(parseCodexModel(candidate.identifier).model, pinModel) ||
+          sameName(parseCodexModel(candidate.displayLabel).model, pinModel)
       );
-      isMatch = !!matchedEntry;
+      if (entry) match = { entry, value: entry.identifier };
     }
   }
-  if (!isMatch) {
+  if (!match) {
     const acceptable = acceptableModelPins(provider) ?? [];
     throw new Error(
       `model pin validation failed for provider "${provider}": rejected "${pin}"; acceptable values: ${acceptable.length > 0 ? acceptable.map((value) => `"${value}"`).join(", ") : "(none)"}`
     );
   }
-  return { status: "accepted", efforts: matchedEntry?.efforts };
+  return { status: "accepted", model: match.value, efforts: match.entry.efforts };
 }
 
 /**

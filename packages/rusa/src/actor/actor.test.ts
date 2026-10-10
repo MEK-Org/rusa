@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { RusaConfig } from "../config/types.js";
 import { deterministicExhaustionFallback } from "../providers/exhaustion-classifier.js";
 import { FakeProvider } from "../providers/fake-provider.js";
+import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
+import { validateProviderSelection } from "../providers/provider-selection.js";
 import * as sandboxModule from "../providers/sandbox.js";
 import type { CodingProvider, RunOptions, RunResult } from "../providers/types.js";
 import {
@@ -21,7 +24,7 @@ import {
   RunStartCancelledError,
   type RunStartHandle,
 } from "./concurrency-limiter.js";
-import { routeRunFailure } from "./failure-sink.js";
+import { formatProviderLabel, routeRunFailure } from "./failure-sink.js";
 
 /** Let the timer-less corrective-run microtasks drain. */
 const flush = async () => {
@@ -2489,7 +2492,7 @@ describe("Actor", () => {
       const actor = makeActor({}, provider);
 
       expect(actor.isRunning).toBe(false);
-      const res = actor.interrupt("human:operator");
+      const res = actor.interrupt("00000000-0000-4000-8000-000000000001");
       expect(res.interrupted).toBe(false);
     });
 
@@ -2649,5 +2652,178 @@ describe("Actor", () => {
 
       expect(teardownSpy).not.toHaveBeenCalledWith("/tmp/test-actor-no-sandbox");
     });
+  });
+});
+
+describe("failure reasons reach the supervisor (#980)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    setProviderModelCatalog("codex", [
+      { identifier: "gpt-fixture-valid", displayLabel: "gpt-fixture-valid", passable: true },
+    ]);
+  });
+  afterEach(() => {
+    clearProviderModelCatalog("codex");
+    vi.useRealTimers();
+  });
+
+  const config = { providers: { codex: {} } } as unknown as RusaConfig;
+  /** Enough synthetic frames that the old tail-only notice loses the message. */
+  const FRAMES = Array.from(
+    { length: 30 },
+    (_, i) => `    at fixtureFrame${i} (/fixture/frames.ts:${i + 1}:1)`
+  ).join("\n");
+  const withLongStack = (err: unknown): never => {
+    if (err instanceof Error) err.stack = `${err.stack}\n${FRAMES}`;
+    throw err;
+  };
+
+  /**
+   * The lifecycle composition `start.ts` registers: remember the launched
+   * selection at start, route the terminal result with that label and the run id.
+   */
+  async function deliver(
+    records: Record<string, Partial<ActorRecord>>,
+    actorId: string,
+    over: Partial<ActorOptions>,
+    provider = new FakeProvider(() => ({ success: true, output: "ran", exitCode: 0 }), "codex")
+  ) {
+    const toParent: string[] = [];
+    const toChat: string[] = [];
+    const runIds: string[] = [];
+    const ended: RunResult[] = [];
+    const deps = {
+      actors: { get: (id: string) => records[id] as ActorRecord | undefined },
+      sendToParent: (_toId: string, body: string) => toParent.push(body),
+      postToErrorChat: (text: string) => toChat.push(text),
+      rootId: "root",
+      log: () => {},
+    };
+    // start.ts seeds the label with the first configured entry: a run can fail
+    // before lifecycle start announces the launched one.
+    let selected = over.modelConfig?.[0];
+    const lifecycle = createActorLifecycle([
+      {
+        onStart: (event) => {
+          selected = event.selected;
+          runIds.push(event.runId);
+        },
+        onEnd: async (event) => {
+          if (event.terminal.kind !== "result") return;
+          const { result } = event.terminal;
+          ended.push(result);
+          if (!result.success && selected) {
+            await routeRunFailure(
+              deps,
+              actorId,
+              result,
+              formatProviderLabel(
+                { providerName: selected.provider, model: selected.model, effort: selected.effort },
+                result.model
+              ),
+              event.runId
+            );
+          }
+        },
+      },
+    ]);
+    const actor = makeActor({ id: actorId, lifecycle, ...over }, provider);
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    await flush();
+    return { toParent, toChat, runIds, ended, provider };
+  }
+
+  const missingPin = {
+    modelConfig: [{ provider: "codex", model: "gpt-fixture-missing", effort: "medium" }],
+    resolveProvider: (entry: RawProviderModelConfig): CodingProvider => {
+      try {
+        validateProviderSelection(config, entry.provider, entry.model, entry.effort);
+      } catch (err) {
+        withLongStack(err);
+      }
+      throw new Error("fixture expected the pin to be rejected");
+    },
+  } satisfies Partial<ActorOptions>;
+
+  it.each([
+    ["child", { w1: { id: "w1", parentId: "root" } }, "w1"],
+    ["root", { root: { id: "root" } }, "root"],
+  ] as const)("reports a refused primary selection to the %s supervisor without a stack", async (_kind, records, actorId) => {
+    const { toParent, toChat, runIds, ended, provider } = await deliver(
+      records,
+      actorId,
+      missingPin
+    );
+    expect(provider.calls).toHaveLength(0);
+    const notices = [...toParent, ...toChat];
+    expect(notices).toHaveLength(1);
+    const notice = notices[0] ?? "";
+    expect(notice).toContain(
+      `Run ${runIds[0]}: could not prepare codex/gpt-fixture-missing @ medium.\nProvider was not invoked.`
+    );
+    expect(notice).toContain('rejected "gpt-fixture-missing"');
+    expect(notice).toContain('acceptable values: "gpt-fixture-valid"');
+    expect(notice).not.toContain("provider run");
+    expect(notice).not.toMatch(/^\s+at /m);
+    // The run record keeps the full original stack.
+    expect(ended[0]?.output).toContain("model pin validation failed");
+    expect(ended[0]?.output).toContain("fixtureFrame29");
+  });
+
+  it("carries another caught error's message without its stack", async () => {
+    const { toParent, ended } = await deliver({ w1: { id: "w1", parentId: "root" } }, "w1", {
+      modelConfig: [{ provider: "codex", model: "gpt-fixture-valid" }],
+      buildPrompt: () => withLongStack(new Error("assembly blew up")),
+    });
+    expect(ended[0]?.failure).toEqual({ message: "assembly blew up" });
+    expect(toParent[0]).toContain("provider run codex/gpt-fixture-valid failed.");
+    expect(toParent[0]).toContain("assembly blew up");
+    expect(toParent[0]).not.toMatch(/^\s+at /m);
+    expect(ended[0]?.output).toContain("fixtureFrame29");
+  });
+
+  it.each([
+    ["blank", "   "],
+    ["missing", ""],
+  ])("falls back to the actual stack when the message is %s", async (_kind, message) => {
+    const { toParent, ended } = await deliver({ w1: { id: "w1", parentId: "root" } }, "w1", {
+      modelConfig: [{ provider: "codex", model: "gpt-fixture-valid" }],
+      buildPrompt: () => withLongStack(new Error(message)),
+    });
+    const notice = toParent[0] ?? "";
+    expect(notice).toMatch(/^\s+at fixtureFrame/m);
+    expect(notice).toMatch(/… \[\d+ characters omitted\] …/);
+    expect(notice).toContain("fixtureFrame29");
+    expect(ended[0]?.output).toContain("fixtureFrame29");
+  });
+
+  it("keeps the primary's exhaustion as the cause when a recovery entry cannot be prepared", async () => {
+    const primary = new FakeProvider(
+      () => ({ success: false, output: "quota exhausted primary", exitCode: 1 }),
+      "codex"
+    );
+    const { toParent, ended } = await deliver(
+      { w1: { id: "w1", parentId: "root" } },
+      "w1",
+      {
+        modelConfig: [
+          { provider: "codex", model: "gpt-fixture-valid" },
+          { provider: "codex", model: "gpt-fixture-missing" },
+        ],
+        classifyExhaustion: async (r) => ({ exhausted: r.output.includes("exhausted") }),
+        resolveProvider: (entry) => {
+          validateProviderSelection(config, entry.provider, entry.model, entry.effort);
+          return primary;
+        },
+      },
+      primary
+    );
+    expect(primary.calls).toHaveLength(1);
+    expect(ended[0]?.failure).toBeUndefined();
+    const notice = toParent[0] ?? "";
+    expect(notice).not.toContain("could not prepare");
+    expect(notice).toContain("primary codex:gpt-fixture-valid exhausted");
+    expect(notice).toContain('rejected "gpt-fixture-missing"');
   });
 });

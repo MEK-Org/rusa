@@ -12,14 +12,7 @@ export const OBLIGATION_STATUSES = ["ready", "waiting", "done", "cancelled", "sc
 export type ObligationStatus = (typeof OBLIGATION_STATUSES)[number];
 
 /**
- * One entity in the mesh's single id space: an actor UUID, `root`, `human:*`,
- * or `system:*`.
- *
- * Deliberately an id alone, not an id plus a `kind`. `mcp/stamp.ts` already
- * mints `human:operator` / `system:mesh` into the
- * same space actor ids live in, and `isHumanOperator(actorId)` reads the
- * category off the prefix — so a stored kind would restate what the id already
- * says, and could drift from it.
+ * A principal's id. Its kind comes from principal storage, not its spelling.
  */
 export type EntityId = string;
 
@@ -332,6 +325,27 @@ export function normalizeCheckpoint(checkpoint: string | null | undefined): stri
 }
 
 /**
+ * Upper bound on a reassignment message (#941), on the same reasoning as
+ * {@link OBLIGATION_CHECKPOINT_MAX}: it says why the obligation is arriving,
+ * and the detail belongs in an artifact.
+ */
+export const OBLIGATION_REASSIGN_MESSAGE_MAX = 500;
+
+/** Normalize a reassignment message: prose, or nothing. */
+export function normalizeReassignMessage(message: string | null | undefined): string | null {
+  if (message == null) return null;
+  const trimmed = message.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > OBLIGATION_REASSIGN_MESSAGE_MAX) {
+    throw new ObligationValidationError(
+      `reassignment message cannot exceed ${OBLIGATION_REASSIGN_MESSAGE_MAX} characters; ` +
+        "cite the detail as an artifact instead"
+    );
+  }
+  return trimmed;
+}
+
+/**
  * Whether a stored deadline (`snoozed_until`, `next_ready_at`) has come due.
  *
  * Due at the start of the deadline's minute, not its exact millisecond: `at`
@@ -516,6 +530,12 @@ export interface ObligationHistoryState {
   snoozedUntil?: string | null;
   /** Explicit responsiveness (#903); true when marked responsive, null when not explicitly marked. */
   responsive?: boolean | null;
+  /**
+   * Why a reassignment was made (#941), given by the acting principal. Not a
+   * tracked column: it exists only on the `after` side of the owner change it
+   * accompanied.
+   */
+  message?: string;
 }
 
 /**
@@ -592,8 +612,14 @@ export const obligationHistoryStateSchema = z
     resolutionRef: validatedBy(parseObligationReference).nullable().optional(),
     snoozedUntil: z.iso.datetime().nullable().optional(),
     responsive: z.boolean().nullable().optional(),
+    message: z.string().optional(),
   })
   .strict();
+
+/** Fields only payload version 2 may carry. */
+function hasDetailField(state: ObligationHistoryState): boolean {
+  return state.checkpoint !== undefined || state.message !== undefined;
+}
 
 export const obligationHistoryPayloadSchema = z
   .object({
@@ -603,10 +629,7 @@ export const obligationHistoryPayloadSchema = z
   })
   .strict()
   .superRefine((payload, ctx) => {
-    if (
-      payload.schemaVersion === 1 &&
-      [payload.before, payload.after].some((state) => state.checkpoint !== undefined)
-    ) {
+    if (payload.schemaVersion === 1 && [payload.before, payload.after].some(hasDetailField)) {
       ctx.addIssue({ code: "custom", message: "detail history fields require schemaVersion 2" });
     }
   });
@@ -622,9 +645,7 @@ export function buildHistoryPayload(
   after: ObligationHistoryState
 ): string {
   return JSON.stringify({
-    schemaVersion: [before, after].some((state) => state.checkpoint !== undefined)
-      ? 2
-      : OBLIGATION_HISTORY_SCHEMA_VERSION,
+    schemaVersion: [before, after].some(hasDetailField) ? 2 : OBLIGATION_HISTORY_SCHEMA_VERSION,
     before,
     after,
   });

@@ -7,6 +7,7 @@ import Database from "better-sqlite3";
 import type { QuotaScrape } from "../db/repositories/quota-scrape-repository.js";
 import { BUSY_TIMEOUT_MS, widenToWal } from "../db/wal.js";
 import type { ProviderQuotaSnapshot, QuotaLimit, QuotaWindowKind } from "../mcp/quota-mcp.js";
+import type { ModelEntry } from "../providers/model-catalog.js";
 import {
   nullQuotaMetrics,
   QUOTA_SERVICE_METRICS,
@@ -14,7 +15,8 @@ import {
   type QuotaObservationResult,
 } from "./coordinator-metrics.js";
 import type { PublishedScrapeOutcome } from "./coordinator-protocol.js";
-import { parseParsedState, serializeParsedState } from "./parsed-state.js";
+import { configuredModelRefs, resolveWindowModels } from "./model-window-scope.js";
+import { extractedNoQuotaValues, parseParsedState, serializeParsedState } from "./parsed-state.js";
 import { QUOTA_OBSERVATION_SLOT_MS, quotaCycleChanged } from "./quota-cycle.js";
 import {
   assertQuotaSchemaVersion,
@@ -141,8 +143,22 @@ export interface ManualQuotaObservation {
   acceptedAt: string;
 }
 
+/** A manual model-scoped window kept out of pacing, and why. */
+export interface DroppedManualWindow {
+  label: string;
+  kind: QuotaWindowKind;
+  /** The models as the reader submitted them. */
+  models: string[];
+  reason: "no_catalog_match";
+}
+
 export type ManualObservationResult =
-  | { result: "accepted"; observedAt: string; generation: number }
+  | {
+      result: "accepted";
+      observedAt: string;
+      generation: number;
+      droppedWindows: DroppedManualWindow[];
+    }
   | { result: "duplicate"; observedAt: string; generation: number }
   | { result: "manual_mode_required" }
   | { result: "generation_mismatch"; generation: number }
@@ -213,6 +229,8 @@ export interface QuotaHistoryRecord {
   observedAt: string;
   percentLeft: number;
   resetAtIso: string | null;
+  /** Duration inferred from the lane's reset evidence when this row was inserted. */
+  windowMs: number;
   /** Positive means quota is being consumed faster than even pacing. */
   controllerError: number | null;
   /** Null when the observation did not produce a reasoned control decision. */
@@ -238,6 +256,7 @@ interface ReasonedObservation {
   controllerIntegral: number | null;
   percentLeft: number;
   observedAt: string;
+  windowMs: number;
 }
 
 interface StoredScrapeRow {
@@ -330,17 +349,15 @@ export function parseModelScopeKey(key: string): string[] | null {
 /**
  * The durable scope of one parsed window, or `null` when it must be rejected.
  * Provider-scoped windows map to {@link PROVIDER_SCOPE_KEY}. A model-scoped
- * window is accepted only from a catalog-validated source, only in the
- * explicit `{ provider, models }` form, and only for this provider; the bare
- * legacy `"model"` scope names no models and so cannot identify a lane.
+ * window is accepted only in the explicit `{ provider, models }` form and only
+ * for this provider; the bare legacy `"model"` scope names no models and so
+ * cannot identify a lane. Both callers resolve model names against the catalog
+ * before they get here (the scrape parser's `resolveWindowModels`, and
+ * {@link resolveManualModelScopes} for a manual reading).
  */
-function observationScopeKey(
-  limit: Pick<QuotaLimit, "scope">,
-  provider: string,
-  acceptModelScope: boolean
-): string | null {
+function observationScopeKey(limit: Pick<QuotaLimit, "scope">, provider: string): string | null {
   if (isProviderScopedWindow(limit)) return PROVIDER_SCOPE_KEY;
-  if (!acceptModelScope || typeof limit.scope !== "object" || limit.scope === null) return null;
+  if (typeof limit.scope !== "object" || limit.scope === null) return null;
   const { provider: scopedProvider, models } = limit.scope;
   if (
     typeof scopedProvider !== "string" ||
@@ -351,6 +368,43 @@ function observationScopeKey(
     return null;
   }
   return modelScopeKey(models.map((model) => model.trim()));
+}
+
+/**
+ * Resolve a manual reading's model-scoped windows against the provider catalog
+ * with the scrape parser's rule (`resolveWindowModels`): a window keeps the
+ * canonical catalog models it names, in catalog order, or is dropped when it
+ * names none — so a manual Fable row becomes the same lane a scraped one does,
+ * and an unknown, reserve, or bare `"model"` row reaches no lane at all.
+ * Provider-scoped windows pass through untouched.
+ */
+function resolveManualModelScopes(
+  limits: readonly QuotaLimit[],
+  catalog: readonly ModelEntry[]
+): { limits: QuotaLimit[]; dropped: DroppedManualWindow[] } {
+  const refs = configuredModelRefs(catalog);
+  const kept: QuotaLimit[] = [];
+  const dropped: DroppedManualWindow[] = [];
+  for (const limit of limits) {
+    if (isProviderScopedWindow(limit)) {
+      kept.push(limit);
+      continue;
+    }
+    const scope = typeof limit.scope === "object" && limit.scope !== null ? limit.scope : null;
+    const models = scope?.models ?? [];
+    const canonical = resolveWindowModels(models, refs);
+    if (scope === null || canonical.length === 0) {
+      dropped.push({
+        label: limit.label,
+        kind: normalizeKind(limit.kind),
+        models: [...models],
+        reason: "no_catalog_match",
+      });
+      continue;
+    }
+    kept.push({ ...limit, scope: { ...scope, models: canonical } });
+  }
+  return { limits: kept, dropped };
 }
 
 function bucketKey(provider: string, models: readonly string[], kind: string): string {
@@ -715,11 +769,7 @@ export class SharedQuotaStore {
       this.db
         .prepare("UPDATE quota_scrapes SET parsed_state = ?, parse_error = NULL WHERE id = ?")
         .run(serializeParsedState(inferredState), id);
-      // The scrape path's model scopes already passed the catalog-aware trust
-      // boundary in the parser (`resolveWindowModels`).
-      this.insertObservations(inferredParsed, scrape?.scraped_at, scrape?.provider, {
-        acceptModelScope: true,
-      });
+      this.insertObservations(inferredParsed, scrape?.scraped_at, scrape?.provider);
     })();
     // Judge the parser's own read: a failed read that carried an earlier
     // reading forward is not a clean parse (#775).
@@ -765,10 +815,17 @@ export class SharedQuotaStore {
    * canonical observation rows. That keeps
    * `/v1/quota`, `/v1/history`, boot hydration and 30-day pruning on their one
    * existing source; the receipt table holds only the idempotency fingerprint.
+   *
+   * Model-scoped windows are resolved against `configuredModels`, the same
+   * catalog the scrape parser is given, before anything is stored: a resolved
+   * window becomes a pacing lane exactly as a scraped one does, and the rest
+   * are returned as `droppedWindows`. The fingerprint covers the submitted
+   * body, so a retry is a replay even if the catalog moved in between.
    */
   recordManualObservation(
     input: ManualQuotaObservation,
-    controller?: QuotaControllerOptions
+    controller?: QuotaControllerOptions,
+    opts: { configuredModels?: readonly ModelEntry[] } = {}
   ): ManualObservationResult {
     const provider = input.snapshot.provider.trim().toLocaleLowerCase("en-US");
     const observedAt = input.snapshot.scrapedAt;
@@ -783,7 +840,12 @@ export class SharedQuotaStore {
       }
     }
     const fingerprint = manualObservationFingerprint(input.snapshot);
-    const candidates = this.manualObservationSlots(input.snapshot, observedMs);
+    const resolved = resolveManualModelScopes(
+      input.snapshot.limits ?? [],
+      opts.configuredModels ?? []
+    );
+    const snapshot: ProviderQuotaSnapshot = { ...input.snapshot, limits: resolved.limits };
+    const candidates = this.manualObservationSlots(snapshot, observedMs);
     if (candidates.length === 0)
       throw new Error("manual observation has no provider-scoped limits");
 
@@ -836,16 +898,14 @@ export class SharedQuotaStore {
 
       this.pruneRawScrapes(acceptedMs);
       this.pruneObservations(acceptedMs);
-      const { raw: _raw, ...state } = input.snapshot;
+      const { raw: _raw, ...state } = snapshot;
       const rawOutput: ManualScrapeRawOutput = {
         version: 1,
         source: "manual",
         idempotencyKey: input.idempotencyKey,
         generation: input.generation,
       };
-      // A manual body is not catalog-validated, so its model-scoped rows stay
-      // snapshot-only evidence and never become a pacing lane.
-      this.insertObservations(state, observedAt, provider, { acceptModelScope: false });
+      this.insertObservations(state, observedAt, provider);
       this.db
         .prepare(
           `INSERT INTO quota_scrapes (id, provider, scraped_at, raw_output, parsed_state)
@@ -872,7 +932,12 @@ export class SharedQuotaStore {
           observedAt,
           input.acceptedAt
         );
-      return { result: "accepted", observedAt, generation: input.generation };
+      return {
+        result: "accepted",
+        observedAt,
+        generation: input.generation,
+        droppedWindows: resolved.dropped,
+      };
     });
 
     const result = record.immediate();
@@ -943,7 +1008,7 @@ export class SharedQuotaStore {
     const rows = this.db
       .prepare(
         `SELECT model_scope AS modelScope, kind, label, observed_at AS observedAt,
-                percent_left AS percentLeft, reset_at_iso AS resetAtIso,
+                percent_left AS percentLeft, reset_at_iso AS resetAtIso, window_ms AS windowMs,
                 controller_error AS controllerError, interval_seconds AS intervalSeconds
          FROM quota_observations
          WHERE provider = ? AND observed_at >= ?
@@ -964,7 +1029,9 @@ export class SharedQuotaStore {
   /**
    * Every finished scrape since `sinceIso`, parsed or failed, by stamp (#759).
    * A scrape that parsed to no window, or failed to parse, writes no
-   * observation, so this is the only record that it happened. A row still
+   * observation, so this is the only record that it happened. A scrape fails
+   * when its capture or parse threw, or when it extracted no quota value
+   * (#982), even though carried windows were written for it. A row still
    * being parsed (neither column set) is left out until it finishes; no raw
    * output leaves the store.
    */
@@ -972,14 +1039,23 @@ export class SharedQuotaStore {
     return (
       this.db
         .prepare(
-          `SELECT scraped_at AS observedAt, parse_error IS NOT NULL AS failed
+          `SELECT scraped_at AS observedAt, parsed_state AS parsedState,
+                  parse_error IS NOT NULL AS threw
            FROM quota_scrapes
            WHERE provider = ? AND scraped_at >= ?
              AND (parsed_state IS NOT NULL OR parse_error IS NOT NULL)
            ORDER BY scraped_at ASC, rowid ASC`
         )
-        .all(provider, sinceIso) as Array<{ observedAt: string; failed: 0 | 1 }>
-    ).map(({ observedAt, failed }) => ({ observedAt, outcome: failed ? "failed" : "parsed" }));
+        .all(provider, sinceIso) as Array<{
+        observedAt: string;
+        parsedState: string | null;
+        threw: 0 | 1;
+      }>
+    ).map(({ observedAt, parsedState, threw }) => {
+      const parsed = threw ? null : parseParsedState(parsedState);
+      const failed = Boolean(threw || parsed === null || extractedNoQuotaValues(parsed));
+      return { observedAt, outcome: failed ? "failed" : "parsed" };
+    });
   }
 
   /**
@@ -1000,7 +1076,7 @@ export class SharedQuotaStore {
        LIMIT 1`
     );
     const limits = snapshot.limits.map((limit) => {
-      const scopeKey = observationScopeKey(limit, provider, true);
+      const scopeKey = observationScopeKey(limit, provider);
       if (scopeKey === null) {
         return {
           ...limit,
@@ -1389,7 +1465,7 @@ export class SharedQuotaStore {
                 controller_error AS controllerError,
                 controller_derivative AS controllerDerivative,
                 controller_integral AS controllerIntegral,
-                percent_left AS percentLeft, observed_at AS observedAt
+                percent_left AS percentLeft, observed_at AS observedAt, window_ms AS windowMs
          FROM quota_observations o
          WHERE provider = ? AND model_scope = ? AND interval_seconds IS NOT NULL
            AND NOT EXISTS (
@@ -1405,7 +1481,7 @@ export class SharedQuotaStore {
     const current = this.db
       .prepare(
         `SELECT kind, label, reset_at_iso AS resetAtIso,
-                percent_left AS percentLeft, observed_at AS observedAt
+                percent_left AS percentLeft, observed_at AS observedAt, window_ms AS windowMs
          FROM quota_observations o
          WHERE provider = ? AND model_scope = ?
            AND NOT EXISTS (
@@ -1422,6 +1498,7 @@ export class SharedQuotaStore {
       resetAtIso: string | null;
       percentLeft: number;
       observedAt: string;
+      windowMs: number;
     }>;
     if (current.length === 0) return null;
     const currentByKind = new Map(current.map((row) => [row.kind, row]));
@@ -1477,7 +1554,7 @@ export class SharedQuotaStore {
                   100,
                   Math.max(
                     0,
-                    ((Date.parse(latest.resetAtIso) - observedMs) / quotaWindowMs(row.kind)) * 100
+                    ((Date.parse(latest.resetAtIso) - observedMs) / latest.windowMs) * 100
                   )
                 )
               : 0,
@@ -1494,8 +1571,7 @@ export class SharedQuotaStore {
   private insertObservations(
     state: ProviderQuotaSnapshot,
     storedObservedAt: string | undefined,
-    storedProvider: string | undefined,
-    opts: { acceptModelScope: boolean }
+    storedProvider: string | undefined
   ): void {
     const fallbackObservedAt = state.scrapedAt ?? storedObservedAt;
     if (!fallbackObservedAt || !Number.isFinite(Date.parse(fallbackObservedAt))) return;
@@ -1505,12 +1581,12 @@ export class SharedQuotaStore {
     };
     const seenLanes = new Set<string>();
     for (const limit of state.limits ?? []) {
-      // A window this store will not reason about — a model scope from an
-      // unvalidated source or naming no models, or a percent outside 0..100 —
+      // A window this store will not reason about — a model scope naming no
+      // models or another provider, or a percent outside 0..100 —
       // is counted as rejected rather than dropped silently, because a parser
       // regression shows up here as reads that produce observations no
       // controller ever sees.
-      const modelScope = observationScopeKey(limit, provider, opts.acceptModelScope);
+      const modelScope = observationScopeKey(limit, provider);
       if (modelScope === null || !Number.isFinite(limit.percentLeft)) {
         observed("rejected");
         continue;
@@ -1545,7 +1621,14 @@ export class SharedQuotaStore {
         slot: Math.floor(observedMs / SLOT_MS),
         percentLeft: limit.percentLeft,
         resetAtIso: limit.resetAtIso ?? null,
-        windowMs: quotaWindowMs(kind),
+        windowMs: this.windowMsForCandidate({
+          provider,
+          modelScope,
+          kind,
+          observedAt,
+          percentLeft: limit.percentLeft,
+          resetAtIso: limit.resetAtIso ?? null,
+        }),
         processed: 0,
       };
       const existing = this.db
@@ -1597,5 +1680,65 @@ export class SharedQuotaStore {
         );
       observed("recorded");
     }
+  }
+
+  /**
+   * Derive one lane's window duration at the persistence seam. A material
+   * reset change starts the next window, so the latest stored cycle is the
+   * previous window and this one's length is the distance between ends. That cycle
+   * ended at its reset, or at the latest by this reading if the provider reset
+   * early. Before the store has seen a prior end, the first reading is the only
+   * honest lower bound for the start. Tiny reset changes are display jitter:
+   * retain the current cycle's stored duration. Five-hour lanes keep their
+   * standard 5h denominator (#924 item 6): a session starts on first use, so
+   * the gap between successive ends includes idle time.
+   */
+  private windowMsForCandidate(
+    candidate: Pick<
+      StoredObservation,
+      "provider" | "modelScope" | "kind" | "observedAt" | "percentLeft" | "resetAtIso"
+    >
+  ): number {
+    if (candidate.kind === "session" || candidate.kind === "five_hour")
+      return quotaWindowMs(candidate.kind);
+    const observedMs = Date.parse(candidate.observedAt);
+    const resetMs = candidate.resetAtIso ? Date.parse(candidate.resetAtIso) : Number.NaN;
+    if (!Number.isFinite(observedMs) || !Number.isFinite(resetMs) || resetMs <= observedMs)
+      return quotaWindowMs(candidate.kind);
+
+    const latest = this.db
+      .prepare(
+        `SELECT reset_at_iso AS resetAtIso, window_ms AS windowMs
+         FROM quota_observations
+         WHERE provider = ? AND model_scope = ? AND kind = ? AND reset_at_iso IS NOT NULL
+         ORDER BY observed_at DESC, rowid DESC LIMIT 1`
+      )
+      .get(candidate.provider, candidate.modelScope, candidate.kind) as
+      | { resetAtIso: string; windowMs: number }
+      | undefined;
+    if (latest) {
+      // Only a moved end starts the next window; a refill under the same end
+      // stays in the current one.
+      const endMoved = quotaCycleChanged(
+        { percentLeft: candidate.percentLeft, resetAtIso: latest.resetAtIso },
+        candidate,
+        latest.windowMs
+      );
+      if (!endMoved) return latest.windowMs;
+      const previousEndMs = Math.min(Date.parse(latest.resetAtIso), observedMs);
+      if (Number.isFinite(previousEndMs)) return resetMs - previousEndMs;
+    }
+
+    const earliest = this.db
+      .prepare(
+        `SELECT observed_at AS observedAt FROM quota_observations
+         WHERE provider = ? AND model_scope = ? AND kind = ?
+         ORDER BY observed_at ASC, rowid ASC LIMIT 1`
+      )
+      .get(candidate.provider, candidate.modelScope, candidate.kind) as
+      | { observedAt: string }
+      | undefined;
+    const firstObservedMs = earliest ? Date.parse(earliest.observedAt) : observedMs;
+    return resetMs - Math.min(observedMs, firstObservedMs);
   }
 }

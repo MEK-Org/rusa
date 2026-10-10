@@ -24,6 +24,61 @@ Widget _app(
 );
 
 void main() {
+  testWidgets('My Queue lists only work owned by the durable viewer', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..threadsResult = [makeThread('root')]
+        ..dashboardConfigResult = const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: 'viewer-user',
+          users: [
+            UserPrincipalDto(id: 'viewer-user', email: 'viewer@example.test'),
+          ],
+        )
+        ..obligationsResult = [
+          makeObligation(
+            'ob-viewer',
+            ownerId: 'viewer-user',
+            intent: 'My decision',
+            status: 'ready',
+          ),
+          makeObligation(
+            'ob-other-user',
+            ownerId: testUserPrincipalId,
+            intent: 'Another user decision',
+            status: 'ready',
+          ),
+          makeObligation(
+            'ob-actor',
+            ownerId: 'worker-1',
+            intent: 'Actor job',
+            status: 'ready',
+          ),
+        ];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      addTearDown(store.dispose);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: OverviewTab(store: store)),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+
+      expect(api.fetchObligationsCalls.map((c) => c.ownerId).toSet(), <String>{
+        'viewer-user',
+      });
+      expect(find.text('My decision'), findsOneWidget);
+      expect(find.text('Another user decision'), findsNothing);
+      expect(find.text('Actor job'), findsNothing);
+      expect(find.text('1 obligation'), findsOneWidget);
+    });
+  });
+
   testWidgets(
     'Overview uses columns wide and stacks My Queue above quota pacing narrow',
     (tester) async {
@@ -185,7 +240,7 @@ void main() {
   });
 
   testWidgets(
-    'OverviewTab renders empty state when human:operator has no obligations ',
+    'OverviewTab renders empty state when 00000000-0000-4000-8000-000000000001 has no obligations ',
     (tester) async {
       await tester.runAsync(() async {
         final api = FakeApi()
@@ -214,12 +269,12 @@ void main() {
   );
 
   testWidgets(
-    'OverviewTab renders ready and waiting obligations for human:operator with focus link ',
+    'OverviewTab renders ready and waiting obligations for 00000000-0000-4000-8000-000000000001 with focus link ',
     (tester) async {
       await tester.runAsync(() async {
         final readyOb = makeObligation(
           'ob-ready',
-          ownerId: 'human:operator',
+          ownerId: '00000000-0000-4000-8000-000000000001',
           intent: 'Approve PR review',
           status: 'ready',
           priority: 50.0,
@@ -228,7 +283,7 @@ void main() {
         );
         final waitingOb = makeObligation(
           'ob-waiting',
-          ownerId: 'human:operator',
+          ownerId: '00000000-0000-4000-8000-000000000001',
           intent: 'Merge deploy release',
           status: 'waiting',
           effectivePriority: 60.0,
@@ -301,14 +356,14 @@ void main() {
     await tester.runAsync(() async {
       final ob1 = makeObligation(
         'ob-1',
-        ownerId: 'human:operator',
+        ownerId: '00000000-0000-4000-8000-000000000001',
         intent: 'Decision 1',
         status: 'ready',
         effectivePriority: 10.0,
       );
       final ob2 = makeObligation(
         'ob-2',
-        ownerId: 'human:operator',
+        ownerId: '00000000-0000-4000-8000-000000000001',
         intent: 'Decision 2',
         status: 'ready',
         effectivePriority: 20.0,
@@ -346,7 +401,7 @@ void main() {
       await tester.runAsync(() async {
         final humanOb = makeObligation(
           'ob-human',
-          ownerId: 'human:operator',
+          ownerId: '00000000-0000-4000-8000-000000000001',
           intent: 'Human obligation',
           status: 'ready',
         );
@@ -529,12 +584,12 @@ void main() {
   );
 
   testWidgets(
-    'OverviewTab renders scheduled obligations for human:operator via their own filtered fetch',
+    'OverviewTab renders scheduled obligations for 00000000-0000-4000-8000-000000000001 via their own filtered fetch',
     (tester) async {
       await tester.runAsync(() async {
         final scheduledOb = makeObligation(
           'ob-scheduled',
-          ownerId: 'human:operator',
+          ownerId: '00000000-0000-4000-8000-000000000001',
           intent: 'Weekly review',
           status: 'scheduled',
           recurrencePolicy: 'cron',
@@ -561,7 +616,9 @@ void main() {
         // all, since it only ever derived ready/waiting from that page.
         expect(
           api.fetchObligationsCalls.any(
-            (c) => c.ownerId == 'human:operator' && c.queue == 'scheduled',
+            (c) =>
+                c.ownerId == '00000000-0000-4000-8000-000000000001' &&
+                c.queue == 'scheduled',
           ),
           isTrue,
         );
@@ -585,19 +642,19 @@ void main() {
             for (var i = 0; i < 50; i++)
               makeObligation(
                 'ob-ready-$i',
-                ownerId: 'human:operator',
+                ownerId: '00000000-0000-4000-8000-000000000001',
                 status: 'ready',
               ),
             for (var i = 0; i < 50; i++)
               makeObligation(
                 'ob-snoozed-$i',
-                ownerId: 'human:operator',
+                ownerId: '00000000-0000-4000-8000-000000000001',
                 status: 'scheduled',
                 snoozedUntil: until,
               ),
             makeObligation(
               'ob-scheduled',
-              ownerId: 'human:operator',
+              ownerId: '00000000-0000-4000-8000-000000000001',
               intent: 'Nightly digest',
               status: 'scheduled',
               nextReadyAt: '2026-10-01T06:00:00.000Z',

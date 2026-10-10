@@ -45,7 +45,7 @@ void main() {
       ..obligationsResult = [
         makeObligation(
           'ob-release',
-          ownerId: 'human:operator',
+          ownerId: '00000000-0000-4000-8000-000000000001',
           title: 'Review the release notes',
           intent:
               'Review the release notes\n'
@@ -54,7 +54,7 @@ void main() {
         makeObligation(
           'ob-changelog',
           parentId: 'ob-release',
-          ownerId: 'human:operator',
+          ownerId: '00000000-0000-4000-8000-000000000001',
           title: 'Confirm changelog wording',
           // Relative to the live clock the views read, as the quota scenes
           // in screenshots_test.dart are, so the snooze is always ahead.
@@ -139,7 +139,10 @@ void main() {
       await harness(
         tester,
         size,
-        (store) => InboxTab(actorId: 'human:operator', store: store),
+        (store) => InboxTab(
+          actorId: '00000000-0000-4000-8000-000000000001',
+          store: store,
+        ),
         (api, key, settle) async {
           final menu = find.byTooltip('Obligation Actions');
           await tester.tap(menu.first);

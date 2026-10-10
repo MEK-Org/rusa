@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../models.dart';
-import '../principals.dart';
 import '../store.dart';
 import '../theme.dart';
 import 'obligation_status.dart';
@@ -19,14 +18,7 @@ Future<void> showCreateObligationDialog(
   final formKey = GlobalKey<FormState>();
   final titleCtrl = TextEditingController();
   final intentCtrl = TextEditingController();
-  final viewerPrincipalId = store.dashboardConfig.value?.userPrincipalId;
-  // Either of the person's ids shows as the readable handle; the id the field
-  // resolves to on submit is the durable one whenever the server knows it.
-  final ownerIdCtrl = TextEditingController(
-    text: isViewerPrincipal(defaultOwnerId, viewerPrincipalId)
-        ? kOperatorDisplayHandle
-        : defaultOwnerId ?? '',
-  );
+  final ownerIdCtrl = TextEditingController(text: defaultOwnerId ?? '');
   final parentIdCtrl = TextEditingController(text: defaultParentId ?? '');
   final externalRefCtrl = TextEditingController();
   final priorityCtrl = TextEditingController();
@@ -205,15 +197,10 @@ Future<void> showCreateObligationDialog(
                         final priority = rawPrio.isEmpty ? null : double.tryParse(rawPrio);
 
                         final typedText = ownerIdCtrl.text.trim();
-                        String resolvedId;
-                        if (isOperatorOwnerText(typedText, viewerPrincipalId)) {
-                          resolvedId = viewerOwnerId(viewerPrincipalId);
-                        } else {
-                          final matches = store.actorStates.value.actors.values
-                              .where((a) => a.handle == typedText || a.id == typedText)
-                              .map((a) => a.id);
-                          resolvedId = matches.isNotEmpty ? matches.first : typedText;
-                        }
+                        final matches = store.actorStates.value.actors.values
+                            .where((a) => a.handle == typedText || a.id == typedText)
+                            .map((a) => a.id);
+                        final resolvedId = matches.isNotEmpty ? matches.first : typedText;
 
                         final bodyText = intentCtrl.text.trim();
                         await store.mutateObligations(
@@ -413,6 +400,9 @@ Future<void> showReparentObligationDialog(
   );
 }
 
+/// The server's bound on a reassignment message (OBLIGATION_REASSIGN_MESSAGE_MAX).
+const _reassignMessageMax = 500;
+
 Future<void> showReassignObligationDialog(
   BuildContext context,
   DashboardStore store,
@@ -420,8 +410,8 @@ Future<void> showReassignObligationDialog(
   VoidCallback? onReassigned,
 }) async {
   final formKey = GlobalKey<FormState>();
-  final viewerPrincipalId = store.dashboardConfig.value?.userPrincipalId;
   final ownerIdCtrl = TextEditingController(text: '');
+  final messageCtrl = TextEditingController(text: '');
   var isSubmitting = false;
 
   await showDialog<void>(
@@ -450,11 +440,35 @@ Future<void> showReassignObligationDialog(
                   ownerIdCtrl: ownerIdCtrl,
                   decoration: const InputDecoration(
                     labelText: 'Owner ID or Handle *',
-                    hintText: 'e.g. cloudy-porpoise, operator, or UUID',
+                    hintText: 'Select a person, or enter an actor handle or UUID',
                     filled: true,
                     fillColor: MeshColors.bgPrimary,
                     border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
                     contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                // Recorded in the obligation's history with the owner change
+                // (#941). Counted as the server counts it: UTF-16 code units
+                // after trimming, which is what Dart's String.length is. The
+                // field's maxLength would count characters instead.
+                TextFormField(
+                  controller: messageCtrl,
+                  minLines: 2,
+                  maxLines: 4,
+                  onChanged: (_) => setState(() {}),
+                  validator: (value) => (value ?? '').trim().length > _reassignMessageMax
+                      ? 'Message must be at most $_reassignMessageMax characters'
+                      : null,
+                  style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
+                  decoration: InputDecoration(
+                    labelText: 'Message (optional)',
+                    hintText: 'Why is this coming to them?',
+                    counterText: '${messageCtrl.text.trim().length}/$_reassignMessageMax',
+                    filled: true,
+                    fillColor: MeshColors.bgPrimary,
+                    border: const OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                   ),
                 ),
               ],
@@ -474,19 +488,15 @@ Future<void> showReassignObligationDialog(
                     setState(() => isSubmitting = true);
                     try {
                       final typedText = ownerIdCtrl.text.trim();
-                      String resolvedId;
-                      if (isOperatorOwnerText(typedText, viewerPrincipalId)) {
-                        resolvedId = viewerOwnerId(viewerPrincipalId);
-                      } else {
-                        final matches = store.actorStates.value.actors.values
-                            .where((a) => a.handle == typedText || a.id == typedText)
-                            .map((a) => a.id);
-                        resolvedId = matches.isNotEmpty ? matches.first : typedText;
-                      }
+                      final matches = store.actorStates.value.actors.values
+                          .where((a) => a.handle == typedText || a.id == typedText)
+                          .map((a) => a.id);
+                      final resolvedId = matches.isNotEmpty ? matches.first : typedText;
 
                       await store.api.reassignObligation(
                         obligation.id,
                         ownerId: resolvedId,
+                        message: messageCtrl.text.trim(),
                       );
                       store.invalidateObligationsCache();
                       if (context.mounted) {
@@ -819,5 +829,4 @@ class OwnerOption {
   final String handle;
 
   OwnerOption({required this.kind, required this.id, required this.handle});
-  String get display => handle;
 }

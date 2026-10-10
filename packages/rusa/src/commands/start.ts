@@ -362,6 +362,11 @@ import {
   WebhookSilenceDetector,
 } from "../webhook/silence-detector.js";
 import { resolveRepoRoot } from "./service-instance.js";
+import {
+  appendServiceBootWakes,
+  recordAndAnnounceRequestedRestart,
+  ServiceLifecycleStore,
+} from "./service-lifecycle.js";
 
 // `update` tool bounds . Per-step HARD timeouts so a hung build can't wedge
 // root; a bounded drain so a stuck worker can't block the restart forever.
@@ -733,6 +738,15 @@ export interface RunStartOptions {
  * the runner is not driving events in-process (e2e mode).
  */
 export function shouldBindWebhookServer(params: { e2eMode: boolean }): boolean {
+  return !params.e2eMode;
+}
+
+/**
+ * Every production boot wakes root with its transition evidence. The e2e
+ * launcher boots disposable scratch compositions in-process, so it owns its
+ * root inbox the same way it omits system:events.
+ */
+export function shouldAppendServiceBootWake(params: { e2eMode: boolean }): boolean {
   return !params.e2eMode;
 }
 
@@ -1121,6 +1135,7 @@ async function composeStart(
   const database = initDb(mcHome);
   resources.acquire("database", () => closeDb());
   log.info("database_ready", { home: mcHome });
+  if (!config.auth) getRepositories().principals.ensureImplicitUser(new Date().toISOString());
 
   const modelClasses = getRepositories().modelClasses;
 
@@ -1555,7 +1570,10 @@ async function composeStart(
         ? (text: string) => slackClient.send(errorSink.target, text).then(() => {})
         : null;
   if (chatClient) {
-    servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
+    const workDir = join(mcHome, "root-agent");
+    // This root-owned server runs on the local leader; follower placement is
+    // checked dynamically on the per-actor server below.
+    servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient, { workDir });
   }
   if (slackClient) {
     // Only root mounts the shared server, so its downloads land in root's workdir.
@@ -2248,6 +2266,10 @@ async function composeStart(
   const followerTriggerStore = new FollowerUpdateTriggerStore(
     join(mcHome, "data", "follower-update-trigger.json")
   );
+  const serviceLifecycleStore = new ServiceLifecycleStore(
+    join(mcHome, "data", "service-lifecycle.json")
+  );
+  let requestedRestartTransitionId: string | undefined;
   let updateToolDepsFor: ((selfId: string) => UpdateToolDeps) | undefined;
   try {
     const repoRoot = resolveRepoRoot();
@@ -2274,6 +2296,18 @@ async function composeStart(
           log: (m) => log.info("update_coordinator", { detail: m }),
         }),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
+        onRestarting: async (newSha, branch, subject) => {
+          requestedRestartTransitionId = undefined;
+          requestedRestartTransitionId = await recordAndAnnounceRequestedRestart({
+            lifecycle: serviceLifecycleStore,
+            entries: selectedInboxEntriesForActor(selfId),
+            chatClient: chatClient ?? undefined,
+            targetSha: newSha,
+            branch,
+            subject,
+            onWarning: (event, fields) => log.warn(event, fields),
+          });
+        },
         onCommitted: (newSha, branch) => {
           try {
             followerTriggerStore.createTrigger({
@@ -2927,10 +2961,10 @@ async function composeStart(
     // this host-owned port closes over it. ActorMesh keeps authorization and
     // durable handoff delivery; VoiceService keeps the one live-session map.
     voiceSessionTransfer: {
-      activeSessionIdFor: (actorId) => {
+      activeSessionFor: (actorId) => {
         if (!voiceService)
           throw new Error("voice session transfer is unavailable on this instance");
-        return voiceService.activeSessionIdFor(actorId);
+        return voiceService.activeSessionFor(actorId);
       },
       transferActiveSession: (fromActorId, targetActorId) => {
         if (!voiceService)
@@ -3278,7 +3312,10 @@ async function composeStart(
         ];
         if (chatClient) {
           const chatReadUrl = mcpHttp.addServer(`${id}:${CHAT_READ_MCP_NAME}`, () =>
-            createChatReadMcpServer(chatClient)
+            createChatReadMcpServer(chatClient, {
+              workDir: join(workersDir, id),
+              fileToolsAvailable: () => actors.get(id)?.executionTarget === undefined,
+            })
           );
           perActorShared.push({ name: CHAT_READ_MCP_NAME, url: chatReadUrl });
         }
@@ -4219,10 +4256,10 @@ async function composeStart(
           elevenlabsApiKey: config.elevenlabsApiKey,
           voiceConfigFor: (actorId) => actors.get(actorId)?.voiceConfig,
           voice: config.voice,
-          // Post-#460 replies target the durable user principal, not the legacy
-          // alias; principal storage is what says a recipient is a person.
-          isHumanRecipient: (principalId) =>
-            getRepositories().principals.getUser(principalId) !== undefined,
+          isHumanRecipient: (principalId) => {
+            const user = getRepositories().principals.getUser(principalId);
+            return user !== undefined && !user.disabledAt;
+          },
           onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
           logger: log.child({ component: "voice-session" }),
         })
@@ -4700,7 +4737,25 @@ async function composeStart(
     e2eInstance.stopForMeshShutdown();
     running = false;
     console.log("\n🛑 Shutting down...");
-    await resources.close();
+    const disposeFailures = await resources.close();
+    if (disposeFailures.length === 0) {
+      try {
+        serviceLifecycleStore.recordCleanShutdown(
+          reason === "deploy" ? "deploy" : "signal",
+          reason === "deploy" ? requestedRestartTransitionId : undefined
+        );
+      } catch (error) {
+        log.warn("service_shutdown_evidence_persist_failed", {
+          reason: reason ?? "signal",
+          err: error,
+        });
+      }
+    } else {
+      log.warn("service_shutdown_incomplete", {
+        reason: reason ?? "signal",
+        failures: disposeFailures.map((failure) => failure.resource),
+      });
+    }
     log.info("service_stopped", { reason });
     process.exit(exitCode ?? getShutdownExitCode(reason));
   };
@@ -4977,6 +5032,23 @@ async function composeStart(
   });
 
   console.log("\n✓ Root actor live. Waiting for events...\n");
+
+  // Every successful boot creates durable root work. The file records the boot
+  // before this append; if this process dies between them, the next boot retries
+  // the same deterministic inbox id before adding its own distinct wake. A
+  // corrupt evidence file is retained and produces its own unknown-evidence wake.
+  if (shouldAppendServiceBootWake({ e2eMode })) {
+    try {
+      appendServiceBootWakes({
+        lifecycle: serviceLifecycleStore,
+        inboxStore,
+        rootId,
+        onLifecycleError: (event, fields) => log.warn(event, fields),
+      });
+    } catch (error) {
+      log.warn("service_boot_wake_failed", { err: error });
+    }
+  }
 
   // Mechanical lifecycle ping : emitted by startup once the mesh is up.
   // A lone "back online" with no preceding "updating" ping is the restart/crash signal.

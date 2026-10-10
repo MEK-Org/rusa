@@ -235,6 +235,7 @@ import {
   type RunStartOptions,
   reactToQueuedInboxEntries,
   runStart,
+  shouldAppendServiceBootWake,
   shouldBindDashboardServer,
   shouldBindWebhookServer,
   warnMissingConfiguredEventSubscriptionsAtBoot,
@@ -449,6 +450,11 @@ describe("start command tests", () => {
   it("binds the webhook server whenever the runner is not driving events in-process", () => {
     expect(shouldBindWebhookServer({ e2eMode: false })).toBe(true);
     expect(shouldBindWebhookServer({ e2eMode: true })).toBe(false);
+  });
+
+  it("wakes root on every production boot but leaves e2e root inboxes to the launcher", () => {
+    expect(shouldAppendServiceBootWake({ e2eMode: false })).toBe(true);
+    expect(shouldAppendServiceBootWake({ e2eMode: true })).toBe(false);
   });
 
   it("binds the dashboard in e2e only when explicitly enabled", () => {
@@ -2328,12 +2334,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect(
           () => obligations.create({ title: "drift", ownerId, intent: "drift" }),
           ownerId
-        ).toThrow(/actor owner does not exist/);
+        ).toThrow(/unknown obligation owner|actor owner does not exist/);
       }
       // The operator is not an actor and must still be ownable — the whole
       // human-decision contract depends on it.
       expect(() =>
-        obligations.create({ title: "decide", ownerId: "human:operator", intent: "decide" })
+        obligations.create({
+          title: "decide",
+          ownerId: getRepositories().principals.listUsers()[0].id,
+          intent: "decide",
+        })
       ).not.toThrow();
     });
   });
@@ -3317,7 +3327,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(issueClient.commentReactionsAdded).toHaveLength(1);
   });
 
-  it("delivers exact-resource issue and PR follow-up events to mechanically subscribed creator with no-obligation fan-out and under human:operator obligation", async () => {
+  it("delivers exact-resource issue and PR follow-up events to mechanically subscribed creator with no-obligation fan-out and under a user-owned obligation", async () => {
     let emitGitHubEvent:
       | ((event: string, payload: Record<string, unknown>, deliveryId?: string) => Promise<void>)
       | undefined;
@@ -3549,29 +3559,29 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(getRepositories().inbox.list(updaterId).entries).toHaveLength(0);
 
     // 5. Human-obligation coexistence proof:
-    //    Both resources receive a human:operator-owned decision obligation.
+    //    Both resources receive a user-owned decision obligation.
     getRepositories().obligations.create({
       title: "Human issue triage decision",
       intent: "Human operator must review and triage",
-      ownerId: "human:operator",
+      ownerId: getRepositories().principals.listUsers()[0].id,
       externalRef: issueRef,
     });
     getRepositories().obligations.create({
       title: "Human PR merge decision",
       intent: "Human operator must approve merge",
-      ownerId: "human:operator",
+      ownerId: getRepositories().principals.listUsers()[0].id,
       externalRef: prRef,
     });
 
-    // Verify route projection: human:operator obligation governs authority
+    // Verify route projection: the human obligation governs authority.
     const issueRouteAfter = mesh.resolveEffectiveRoute(issueRef);
     expect(issueRouteAfter.governingSource).toBe("obligation");
-    expect(issueRouteAfter.principal).toBe("human:operator");
+    expect(issueRouteAfter.principal).toBe(getRepositories().principals.listUsers()[0].id);
     expect(issueRouteAfter.isLive).toBe(false);
 
     const prRouteAfter = mesh.resolveEffectiveRoute(prRef);
     expect(prRouteAfter.governingSource).toBe("obligation");
-    expect(prRouteAfter.principal).toBe("human:operator");
+    expect(prRouteAfter.principal).toBe(getRepositories().principals.listUsers()[0].id);
     expect(prRouteAfter.isLive).toBe(false);
 
     // Emit subsequent follow-up events under the human obligation
@@ -5250,12 +5260,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       getRepositories().obligations.create({
         id: "bot-merged-matcher",
         title: "bot merge gate",
-        ownerId: "human:operator",
+        ownerId: getRepositories().principals.listUsers()[0].id,
       });
       getRepositories().obligations.setCompletionMatcher(
         "bot-merged-matcher",
         { kind: "pr_merged", pr: "github:dummy-org/dummy-repo/pulls/456" },
-        "human:operator"
+        getRepositories().principals.listUsers()[0].id
       );
 
       // No event subscription is installed. The matcher hook must still see a
@@ -8506,6 +8516,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     const exitMock = () => process.exit as unknown as ReturnType<typeof vi.fn>;
 
+    // Clean-completion evidence the next boot reads; absent means "not clean".
+    const cleanShutdownEvidence = (): unknown => {
+      const path = join(homeDir, "data", "service-lifecycle.json");
+      if (!existsSync(path)) return undefined;
+      return (JSON.parse(readFileSync(path, "utf8")) as { cleanShutdown?: unknown }).cleanShutdown;
+    };
+
     beforeEach(() => {
       logCapture.lines.length = 0;
     });
@@ -8889,7 +8906,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!gitBridge) throw new Error("git bridge not started");
       dbMock.closeDb.mockClear();
       try {
+        let evidenceDuringCleanup: unknown = "unobserved";
         vi.spyOn(mesh, "shutdownAll").mockImplementation(() => {
+          evidenceDuringCleanup = cleanShutdownEvidence();
           throw new Error("actor refused to stop");
         });
 
@@ -8897,6 +8916,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
         expect(records("shutdown_disposer_failed")).toEqual([
           expect.objectContaining({ resource: "actor mesh" }),
+        ]);
+        // #950: a failed disposer is an incomplete shutdown, so no clean
+        // evidence exists while cleanup runs or after it fails.
+        expect(evidenceDuringCleanup).toBeUndefined();
+        expect(cleanShutdownEvidence()).toBeUndefined();
+        expect(records("service_shutdown_incomplete")).toEqual([
+          expect.objectContaining({ failures: ["actor mesh"] }),
         ]);
         // #389 requires attempting every later disposer even after a failure:
         // the release must run past the mesh all the way to the database and
@@ -8908,6 +8934,23 @@ describe("runStart webhook event routing (Phase 4)", () => {
       } finally {
         mcpClose.mockRestore();
       }
+    });
+
+    it("records clean shutdown evidence only after every disposer has finished", async () => {
+      const { mesh, shutdown } = await boot();
+      shutdownFn = undefined;
+      let evidenceDuringCleanup: unknown = "unobserved";
+      const meshShutdown = mesh.shutdownAll.bind(mesh);
+      vi.spyOn(mesh, "shutdownAll").mockImplementation(() => {
+        evidenceDuringCleanup = cleanShutdownEvidence();
+        meshShutdown();
+      });
+
+      await shutdown();
+
+      expect(evidenceDuringCleanup).toBeUndefined();
+      expect(cleanShutdownEvidence()).toMatchObject({ reason: "signal" });
+      expect(exitMock()).toHaveBeenCalledWith(0);
     });
 
     // Distinguishes post-handler boot failure from earlier pre-handler partial-boot tests.

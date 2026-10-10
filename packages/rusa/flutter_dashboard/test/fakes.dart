@@ -12,6 +12,8 @@ import 'package:rusa_dashboard/quota_cache.dart';
 import 'package:rusa_dashboard/tree_preferences_cache.dart';
 import 'package:rusa_dashboard/voice_platform.dart';
 
+const testUserPrincipalId = '00000000-0000-4000-8000-000000000001';
+
 ThreadDto makeThread(
   String id, {
   String? parent,
@@ -133,7 +135,7 @@ MeshEvent makeEvent(
 MeshChat makeChat(
   String id, {
   String sender = 'a',
-  String recipient = 'human:operator',
+  String recipient = '00000000-0000-4000-8000-000000000001',
   String body = '',
 }) => MeshChat(
   id: id,
@@ -410,7 +412,16 @@ class FakeApi extends DashboardApi {
       return gate.future;
     }
     return dashboardConfigResult ??
-        const DashboardConfigDto(quotaProviders: {});
+        const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: testUserPrincipalId,
+          users: [
+            UserPrincipalDto(
+              id: testUserPrincipalId,
+              email: 'viewer@example.test',
+            ),
+          ],
+        );
   }
 
   @override
@@ -695,7 +706,7 @@ class FakeApi extends DashboardApi {
   final reorderCalls =
       <({String id, String? previousId, String? nextId, String scope})>[];
   final reparentCalls = <({String id, String? parentId})>[];
-  final reassignCalls = <({String id, String ownerId})>[];
+  final reassignCalls = <({String id, String ownerId, String? message})>[];
   final fetchObligationsCalls =
       <({String? ownerId, String? status, String? queue, bool? rootsOnly})>[];
 
@@ -1069,8 +1080,9 @@ class FakeApi extends DashboardApi {
   Future<ObligationDto> reassignObligation(
     String id, {
     required String ownerId,
+    String? message,
   }) async {
-    reassignCalls.add((id: id, ownerId: ownerId));
+    reassignCalls.add((id: id, ownerId: ownerId, message: message));
     final old = obligationsResult.firstWhere(
       (o) => o.id == id,
       orElse: () => makeObligation(id),

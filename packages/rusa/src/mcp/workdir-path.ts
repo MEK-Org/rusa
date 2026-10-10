@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { type FileHandle, open, realpath, stat } from "node:fs/promises";
+import { type FileHandle, lstat, open, realpath, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 function isContained(parent: string, child: string): boolean {
@@ -53,57 +54,80 @@ export async function resolveDownloadPath(
 }
 
 /**
- * Open a resolved path by walking it from the filesystem root one component at
- * a time, each relative to the previous directory's descriptor and without
- * following symlinks. The path was realpath'd, so it has no legitimate
- * symlinks; one that appears in any component, whether inside the workdir or
- * above the workdir root, was swapped in after resolution and is refused
- * rather than followed out of the root. Node has no openat, so lookups go
- * through Linux's `/proc/self/fd`; without it this fails closed rather than
- * falling back to a pathname open.
+ * Open the parent directory of a resolved path by walking it from the
+ * filesystem root one component at a time, each relative to the previous
+ * directory's descriptor and without following symlinks. The path was
+ * realpath'd, so it has no legitimate symlinks; one that appears in any
+ * component, whether inside the workdir or above the workdir root, was swapped
+ * in after resolution and is refused rather than followed out of the root. Node
+ * has no openat, so lookups go through Linux's `/proc/self/fd`; without it this
+ * fails closed rather than falling back to a pathname open. Returns the parent
+ * handle with the final component's name, for {@link inDir}.
  */
-async function openInWorkdir(
+async function openParentInWorkdir(
   workDir: string,
-  confinedPath: string,
-  flags: number,
-  mode?: number
-): Promise<FileHandle> {
+  confinedPath: string
+): Promise<{ dir: FileHandle; name: string }> {
   const realRoot = await realpath(workDir);
   if (!isContained(realRoot, confinedPath)) {
     throw new Error("access denied: path resolves outside the actor workdir");
   }
   const names = confinedPath.split(sep).filter(Boolean);
-  const dirFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
-  let dir = await open(sep, dirFlags);
+  const name = names.pop();
+  if (name === undefined) throw new Error("access denied: path names no file");
+  let dir = await open(sep, DIR_FLAGS);
   try {
     const anchor = await stat(`/proc/self/fd/${dir.fd}`).catch(() => undefined);
     const fsRoot = await dir.stat();
     if (anchor?.dev !== fsRoot.dev || anchor?.ino !== fsRoot.ino) {
       throw new Error("workdir file I/O needs Linux /proc/self/fd; refusing to open by pathname");
     }
-    for (const [index, name] of names.entries()) {
-      const last = index === names.length - 1;
-      let next: FileHandle;
-      try {
-        next = await open(`/proc/self/fd/${dir.fd}/${name}`, last ? flags : dirFlags, mode);
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code === "ELOOP" || (!last && code === "ENOTDIR")) {
-          throw Object.assign(
-            new Error("access denied: a path component changed to a symlink after resolution"),
-            { code }
-          );
-        }
-        throw err;
-      }
+    for (const component of names) {
+      const next = await open(inDir(dir, component), DIR_FLAGS).catch((err) => {
+        throw refusedSwap(err, false);
+      });
       const parent = dir;
       dir = next;
       await parent.close();
     }
-    return dir;
+    return { dir, name };
   } catch (err) {
     await dir.close();
     throw err;
+  }
+}
+
+const DIR_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+
+/** `name` inside the directory `dir` holds open, independent of its current pathname. */
+function inDir(dir: FileHandle, name: string): string {
+  return `/proc/self/fd/${dir.fd}/${name}`;
+}
+
+function refusedSwap(err: unknown, last: boolean): unknown {
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === "ELOOP" || (!last && code === "ENOTDIR")) {
+    return Object.assign(
+      new Error("access denied: a path component changed to a symlink after resolution"),
+      { code }
+    );
+  }
+  return err;
+}
+
+async function openInWorkdir(
+  workDir: string,
+  confinedPath: string,
+  flags: number,
+  mode?: number
+): Promise<FileHandle> {
+  const { dir, name } = await openParentInWorkdir(workDir, confinedPath);
+  try {
+    return await open(inDir(dir, name), flags, mode).catch((err) => {
+      throw refusedSwap(err, true);
+    });
+  } finally {
+    await dir.close();
   }
 }
 
@@ -128,6 +152,76 @@ export async function writeNewFileInWorkdir(
   } finally {
     await handle.close();
   }
+}
+
+/**
+ * Stream data into a new file at a {@link resolveDownloadPath} target, computing
+ * sha256 without buffering the whole payload. The client supplies a response
+ * already bounded at its download limit; this helper owns only confined,
+ * safe artifact publication. It opens the destination file exclusively (`O_EXCL`)
+ * through the parent directory descriptor. On failure, the source stream is
+ * cancelled and partial output is unlinked via `unlinkIfSame` through the same
+ * directory descriptor. Callers operate within their actor workdir and must
+ * not concurrently replace destination pathnames during an active download.
+ */
+export async function streamNewFileInWorkdir(
+  workDir: string,
+  path: string,
+  stream: ReadableStream<Uint8Array> | null
+): Promise<{ bytes: number; sha256: string }> {
+  let dir: FileHandle | undefined;
+  let handle: FileHandle | undefined;
+  let name = "";
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  try {
+    const parent = await openParentInWorkdir(workDir, path);
+    dir = parent.dir;
+    name = parent.name;
+    handle = await open(
+      inDir(dir, name),
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o666
+    ).catch((err) => {
+      throw refusedSwap(err, true);
+    });
+    const hash = createHash("sha256");
+    let bytesWritten = 0;
+    if (stream) {
+      reader = stream.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        bytesWritten += value.byteLength;
+        hash.update(value);
+        await handle.writeFile(value);
+      }
+    }
+    // A successful file-mode result promises a completed artifact, not merely
+    // bytes queued in the process. Keep the bounded write path, then ask the
+    // filesystem to flush before reporting its path and digest.
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    return { bytes: bytesWritten, sha256: hash.digest("hex") };
+  } catch (err) {
+    await reader?.cancel().catch(() => {});
+    if (!reader) await stream?.cancel().catch(() => {});
+    if (dir && handle) await unlinkIfSame(dir, name, handle);
+    throw err;
+  } finally {
+    reader?.releaseLock();
+    await handle?.close().catch(() => {});
+    await dir?.close().catch(() => {});
+  }
+}
+
+/** Unlink `name` in `dir` only while it is still the file `handle` has open. */
+async function unlinkIfSame(dir: FileHandle, name: string, handle: FileHandle): Promise<void> {
+  try {
+    const [opened, current] = await Promise.all([handle.stat(), lstat(inDir(dir, name))]);
+    if (opened.dev === current.dev && opened.ino === current.ino) await unlink(inDir(dir, name));
+  } catch (_) {}
 }
 
 const READ_CHUNK_BYTES = 64 * 1024;

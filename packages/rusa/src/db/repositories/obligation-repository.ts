@@ -21,6 +21,7 @@ import {
   isReadyForAttention,
   isTerminalObligationStatus,
   normalizeCheckpoint,
+  normalizeReassignMessage,
   normalizeSnoozeUntil,
   OBLIGATION_STATUSES,
   type Obligation,
@@ -47,10 +48,6 @@ let _obligationLogger: Logger | undefined;
 function obligationLogger(): Logger {
   _obligationLogger ??= createLogger({ context: { component: "obligations" } });
   return _obligationLogger;
-}
-
-function isActorEntityId(id: EntityId): boolean {
-  return !id.startsWith("human:") && !id.startsWith("system:");
 }
 
 interface ObligationRow {
@@ -695,7 +692,7 @@ export class ObligationRepository {
 
   private scheduler?: ObligationActivationScheduler;
 
-  /** Resolves durable principal ids whose kind cannot be inferred from a prefix. */
+  /** Resolves the kind of a durable principal. */
   private principalKind?: (principalId: string) => PrincipalKind | undefined;
 
   /** Set once the connection carries the TEMP capture table and trigger. */
@@ -969,8 +966,7 @@ export class ObligationRepository {
 
   /**
    * Supply the authoritative principal-kind lookup used by owner validation
-   * and actor-only ready-head delivery. The prefix check remains only as a
-   * compatibility fallback for repositories constructed without principals.
+   * and actor-only ready-head delivery.
    */
   setPrincipalKind(probe: (principalId: string) => PrincipalKind | undefined): void {
     this.principalKind = probe;
@@ -978,11 +974,15 @@ export class ObligationRepository {
 
   private isActorOwner(ownerId: EntityId): boolean {
     const kind = this.principalKind?.(ownerId);
-    return kind === undefined ? isActorEntityId(ownerId) : kind === "actor";
+    return kind === undefined ? this.actorExists?.(ownerId) === true : kind === "actor";
   }
 
   private assertOwnerExists(ownerId: EntityId): void {
-    if (this.isActorOwner(ownerId) && this.actorExists && !this.actorExists(ownerId)) {
+    const kind = this.principalKind?.(ownerId);
+    if (this.principalKind && !kind) {
+      throw new ObligationValidationError(`unknown obligation owner: ${ownerId}`);
+    }
+    if (kind !== "user" && kind !== "system" && this.actorExists && !this.actorExists(ownerId)) {
       throw new ObligationValidationError(`actor owner does not exist: ${ownerId}`);
     }
   }
@@ -1038,6 +1038,12 @@ export class ObligationRepository {
    * caused it; everything else is recorded as the mutation's principal.
    */
   private historyPrincipalOverrides = new Map<string, EntityId>();
+
+  /**
+   * Reassignment messages (#941) for this transaction, keyed by obligation.
+   * Recorded on that obligation's owner-change history row and nowhere else.
+   */
+  private historyReassignMessages = new Map<string, string>();
 
   /**
    * `(dependentId, prerequisiteId)` keys whose cancellation-attention delivery
@@ -1284,6 +1290,7 @@ export class ObligationRepository {
     this.pendingResponsiveReady = [];
     this.pendingStatusChanges = [];
     this.historyPrincipalOverrides.clear();
+    this.historyReassignMessages.clear();
     const actingPrincipal = validateEntityId(principal);
     this.installHistoryCapture();
     let afterHeads = new Map<string, string>();
@@ -1640,6 +1647,8 @@ export class ObligationRepository {
       if (ownerChanged) {
         beforeState.ownerId = b.owner_id;
         afterState.ownerId = a.owner_id;
+        const message = this.historyReassignMessages.get(id);
+        if (message !== undefined) afterState.message = message;
       }
       if (parentChanged) {
         beforeState.parentId = b.parent_id;
@@ -2759,8 +2768,17 @@ export class ObligationRepository {
   /**
    * Change the owner of one live obligation without changing its identity,
    * position, ancestry, or state. Authorization belongs to the calling surface.
+   *
+   * A `message` (#941) is recorded on the owner-change history row. A
+   * reassignment to the current owner changes nothing and records nothing, so
+   * its message is validated and then dropped.
    */
-  reassign(id: string, newOwnerId: EntityId, principal: EntityId): Obligation {
+  reassign(
+    id: string,
+    newOwnerId: EntityId,
+    principal: EntityId,
+    message?: string | null
+  ): Obligation {
     return this.mutate(principal, () => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
@@ -2768,9 +2786,11 @@ export class ObligationRepository {
       }
       const ownerId = validateEntityId(newOwnerId);
       this.assertOwnerExists(ownerId);
+      const reason = normalizeReassignMessage(message);
       if (ownerId === obligation.ownerId) {
         return obligation;
       }
+      if (reason !== null) this.historyReassignMessages.set(id, reason);
 
       this.db
         .prepare("UPDATE obligations SET owner_id = ?, updated_at = ? WHERE id = ?")

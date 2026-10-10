@@ -120,8 +120,8 @@ describe("inbox MCP server", () => {
       {
         id: "human-msg",
         actorId: "actor-a",
-        source: "mesh:human:operator",
-        payload: { type: "human.message", fromId: "human:operator" },
+        source: "mesh:00000000-0000-4000-8000-000000000001",
+        payload: { type: "mesh.message", fromId: "00000000-0000-4000-8000-000000000001" },
       },
       {
         id: "gchat-reply-msg",
@@ -159,8 +159,8 @@ describe("inbox MCP server", () => {
     expect(data.entries).toHaveLength(4);
 
     const humanEntry = data.entries.find((e) => e.id === "human-msg");
-    expect(humanEntry?.hint).toContain("human operator");
-    expect(humanEntry?.hint).toContain("reply tool");
+    expect(humanEntry?.hint).toContain("send_message");
+    expect(humanEntry?.hint).toContain("fromId");
 
     const gchatReplyEntry = data.entries.find((e) => e.id === "gchat-reply-msg");
     expect(gchatReplyEntry?.hint).toContain("in thread 'spaces/AAA/threads/BBB'");
@@ -179,8 +179,12 @@ describe("inbox MCP server", () => {
       {
         id: "voice",
         actorId: "actor-a",
-        source: "mesh:human:operator",
-        payload: { type: "human.voice", priority: "responsive", fromId: "human:operator" },
+        source: "mesh:00000000-0000-4000-8000-000000000001",
+        payload: {
+          type: "human.voice",
+          priority: "responsive",
+          fromId: "00000000-0000-4000-8000-000000000001",
+        },
       },
     ]);
     const client = await connect(
@@ -347,7 +351,7 @@ describe("inbox MCP server", () => {
         id: "human-msg",
         actorId: "actor-a",
         source: "mesh:user-1",
-        payload: { type: "human.message", messageId: "m9", fromId: "user-1" },
+        payload: { type: "mesh.message", messageId: "m9", fromId: "user-1" },
       },
     ]);
     const readEntries = (ids: string[]) =>

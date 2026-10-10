@@ -7,8 +7,8 @@ import type { CodingProvider, RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { MechanicalInboxForensics } from "./actor-mesh.js";
 
-/** How much of a failed run's output to include in the mechanical notice. */
-const TAIL_LEN = 800;
+/** Code points of failure diagnostic a mechanical notice may carry. */
+export const FAILURE_DIAGNOSTIC_BUDGET = 800;
 
 export interface FailureSinkDeps {
   actors: Pick<ActorRepository, "get">;
@@ -225,16 +225,21 @@ export async function routeRunFailure(
     deps.log(`suppressing expected responsive preemption notice for ${actorId}`);
     return;
   }
-  const tail = sanitizeFailureText(result.output ?? "")
-    .slice(-TAIL_LEN)
-    .trim();
+  // A caught exception's own message says what went wrong; its stack does not,
+  // and a long one would push the message out of the budget. Output (the stack,
+  // or an ordinary CLI exit's own text) is the fallback only without a message.
+  const message = result.failure?.message.trim() ? result.failure.message : undefined;
+  const diagnostic = clipFailureDiagnostic(sanitizeFailureText(message ?? result.output ?? ""));
   const exitDesc = result.abortReason
     ? `exit ${result.exitCode}, ${result.abortReason}`
     : `exit ${result.exitCode}`;
-  const summary = `(${exitDesc})${tail ? `\n\n${tail}` : ""}`;
+  const summary = `(${exitDesc})${diagnostic ? `\n\n${diagnostic}` : ""}`;
 
   let leadLine: string | undefined;
-  if (deps.classify) {
+  if (result.failure?.stage === "provider-selection") {
+    // Established at the resolver boundary: nothing ran, so nothing exhausted.
+    leadLine = `could not prepare ${providerLabel ?? "the configured provider/model"}.\nProvider was not invoked.`;
+  } else if (deps.classify) {
     const classification = await deps.classify(result);
     if (classification.exhausted) {
       leadLine =
@@ -246,6 +251,9 @@ export async function routeRunFailure(
   if (!leadLine && providerLabel) {
     leadLine = `provider run ${providerLabel} failed.`;
   }
+  // The run id, stage and selection sit outside the diagnostic budget, so
+  // clipping can never cost the supervisor the record it needs to inspect.
+  if (runId) leadLine = leadLine ? `Run ${runId}: ${leadLine}` : `Run ${runId} failed.`;
   const body = leadLine ? `${leadLine}\n\n${summary}` : summary;
   // A capped run is a failure too (#189); it keeps its own label so the parent
   // can tell a hit limit from a crash.
@@ -297,6 +305,31 @@ export function isResponsivePreemption(result: RunResult): boolean {
   );
 }
 
+/**
+ * Bound an already-sanitized diagnostic to `budget` Unicode code points by
+ * keeping its beginning and end around a `… [N characters omitted] …` marker
+ * (#980). The head carries what an exception or CLI said first and the tail
+ * what it said last, so neither a long stack nor a late CLI error can crowd the
+ * other out. The marker counts against the budget, N counts omitted code
+ * points, and an odd remainder goes to the beginning. Text within the budget is
+ * returned whole.
+ */
+export function clipFailureDiagnostic(text: string, budget = FAILURE_DIAGNOSTIC_BUDGET): string {
+  const trimmed = text.trim();
+  const points = Array.from(trimmed);
+  if (points.length <= budget) return trimmed;
+  // The marker's width depends on N, which depends on the marker's width;
+  // widening it by a digit omits more, so the first width that fits is exact.
+  for (let digits = 1; ; digits++) {
+    const markerLength = "… [ characters omitted] …".length + digits;
+    const kept = budget - markerLength;
+    const omitted = points.length - kept;
+    if (String(omitted).length > digits) continue;
+    const head = Math.ceil(kept / 2);
+    return `${points.slice(0, head).join("")}… [${omitted} characters omitted] …${points.slice(points.length - (kept - head)).join("")}`;
+  }
+}
+
 export function sanitizeFailureText(text: string): string {
   if (!text) return "";
   const parsed = tryParseJson(text);
@@ -340,24 +373,11 @@ function scrubJson(value: unknown): unknown {
  * Check if a run failure was caused by a human operator interrupt or cancellation .
  * Top-level error chat reporting suppresses notices for operator-initiated interrupts.
  */
-export function isHumanOperatorCancelled(
+export function isUserCancelled(
   result: RunResult,
   principals?: Pick<PrincipalRepository, "getUser">
 ): boolean {
-  if (result.interruptSource) {
-    const by = result.interruptSource.toLowerCase();
-    return (
-      by === "human:operator" ||
-      by === "operator" ||
-      by === "human" ||
-      by.startsWith("human:") ||
-      principals?.getUser(result.interruptSource) !== undefined
-    );
-  }
-  if (result.interrupted) {
-    return true;
-  }
-  return false;
+  return Boolean(result.interruptSource && principals?.getUser(result.interruptSource));
 }
 
 function routeMechanicalFailureNotice(
@@ -397,7 +417,7 @@ function routeMechanicalFailureNotice(
   }
 
   if (actorId === deps.rootId) {
-    if (result && isHumanOperatorCancelled(result, deps.principals)) {
+    if (result && isUserCancelled(result, deps.principals)) {
       deps.log(`suppressing error chat for root ${label} — interrupted by human operator`);
       return;
     }

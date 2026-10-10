@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+
 import type { Logger } from "../observability/logger.js";
 import type { SpeechClient } from "./gemini-speech.js";
 import {
@@ -52,7 +52,7 @@ function makeService(
     maxAnnouncements: opts.max,
     sessionLeaseMs: opts.sessionLeaseMs,
     onSessionEnded: opts.onSessionEnded,
-    isHumanRecipient: opts.isHumanRecipient,
+    isHumanRecipient: opts.isHumanRecipient ?? ((id) => id === TEST_USER_ID),
     speechFor: opts.speechFor,
     logger: opts.logger,
     encode: async (pcm, _rate, basePath) => {
@@ -79,7 +79,7 @@ function replyEvent(overrides: Partial<MeshEvent> = {}): MeshEvent {
     actorId: ACTOR,
     detail: "sess-1",
     body: "On it — ETA five minutes.",
-    payload: JSON.stringify({ to: HUMAN_OPERATOR }),
+    payload: JSON.stringify({ to: TEST_USER_ID }),
     success: null,
     ...overrides,
   };
@@ -88,36 +88,52 @@ function replyEvent(overrides: Partial<MeshEvent> = {}): MeshEvent {
 describe("VoiceService presence & grace", () => {
   it("is inactive with no subscription, active while one is connected", () => {
     const { service } = makeService();
-    expect(service.hasPresence(ACTOR)).toBe(false);
-    service.presenceConnect([ACTOR]);
-    expect(service.hasPresence(ACTOR)).toBe(true);
+    expect(service.hasPresence(ACTOR, TEST_USER_ID)).toBe(false);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
+    expect(service.hasPresence(ACTOR, TEST_USER_ID)).toBe(true);
   });
 
   it("stays active within the grace window after disconnect, then expires", () => {
     let now = 1_000_000;
     const { service } = makeService({ now: () => now });
-    service.presenceConnect([ACTOR]);
-    service.presenceDisconnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
+    service.presenceDisconnect([ACTOR], TEST_USER_ID);
 
     now += VOICE_PRESENCE_GRACE_MS - 1;
-    expect(service.hasPresence(ACTOR)).toBe(true);
+    expect(service.hasPresence(ACTOR, TEST_USER_ID)).toBe(true);
 
     now += 2;
-    expect(service.hasPresence(ACTOR)).toBe(false);
+    expect(service.hasPresence(ACTOR, TEST_USER_ID)).toBe(false);
   });
 
   it("keeps presence while any of several subscriptions remains connected", () => {
     let now = 0;
     const { service } = makeService({ now: () => now });
-    service.presenceConnect([ACTOR]);
-    service.presenceConnect([ACTOR]);
-    service.presenceDisconnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
+    service.presenceDisconnect([ACTOR], TEST_USER_ID);
     now += VOICE_PRESENCE_GRACE_MS * 10; // grace irrelevant: one is still live
-    expect(service.hasPresence(ACTOR)).toBe(true);
+    expect(service.hasPresence(ACTOR, TEST_USER_ID)).toBe(true);
   });
 });
 
 describe("VoiceService leased sessions", () => {
+  it("binds a session to its user and preserves that user across transfers", () => {
+    const { service } = makeService();
+    const other = "11111111-0000-4000-8000-000000000001";
+    service.openSession("session-a", ACTOR, TEST_USER_ID);
+    expect(() => service.openSession("session-a", ACTOR, other)).toThrow("different actor or user");
+    expect(service.hasSession("session-a", ACTOR, other)).toBe(false);
+    expect(service.closeSession("session-a", other)).toBe(false);
+    service.transferActiveSession(ACTOR, TARGET);
+    expect(service.activeSessionFor(TARGET)).toEqual({
+      sessionId: "session-a",
+      principalId: TEST_USER_ID,
+    });
+    expect(service.hasSession("session-a", TARGET, other)).toBe(false);
+    service.closeSession("session-a", TEST_USER_ID);
+  });
+
   it("holds authority while connections remain and expires only after the final drop", () => {
     let now = 1_000_000;
     const ended: string[] = [];
@@ -128,14 +144,14 @@ describe("VoiceService leased sessions", () => {
       onSessionEnded: (actorId) => ended.push(actorId),
     });
     const sessions = service as unknown as {
-      openSession(sessionId: string, actorId: string): void;
+      openSession(sessionId: string, actorId: string, principalId: string): void;
       disconnectSession(sessionId: string): boolean;
       closeSession(sessionId: string): boolean;
       hasActiveSession(actorId: string): boolean;
       expireSessions(): void;
     };
 
-    sessions.openSession("session-a", ACTOR);
+    sessions.openSession("session-a", ACTOR, TEST_USER_ID);
     expect(sessions.hasActiveSession(ACTOR)).toBe(true);
 
     // One open stream holds authority beyond the reconnect allowance.
@@ -144,7 +160,7 @@ describe("VoiceService leased sessions", () => {
     expect(sessions.hasActiveSession(ACTOR)).toBe(true);
 
     // A second connection and one drop still leave the first holding authority.
-    sessions.openSession("session-a", ACTOR);
+    sessions.openSession("session-a", ACTOR, TEST_USER_ID);
     expect(sessions.disconnectSession("session-a")).toBe(true);
     now += leaseMs * 2;
     sessions.expireSessions();
@@ -163,7 +179,7 @@ describe("VoiceService leased sessions", () => {
     expect(ended).toEqual([ACTOR]);
 
     // Explicit disable remains idempotent for a newly opened session.
-    sessions.openSession("session-a", ACTOR);
+    sessions.openSession("session-a", ACTOR, TEST_USER_ID);
     expect(sessions.closeSession("session-a")).toBe(true);
     expect(sessions.closeSession("session-a")).toBe(false);
     expect(ended).toEqual([ACTOR, ACTOR]);
@@ -176,19 +192,19 @@ describe("VoiceService leased sessions", () => {
     service.setSessionTransferNotifier((sessionId, targetActorId) =>
       controls.push([sessionId, targetActorId])
     );
-    service.openSession("session-a", ACTOR);
+    service.openSession("session-a", ACTOR, TEST_USER_ID);
 
-    expect(service.activeSessionIdFor(ACTOR)).toBe("session-a");
+    expect(service.activeSessionFor(ACTOR).sessionId).toBe("session-a");
     expect(service.transferActiveSession(ACTOR, TARGET)).toBe("session-a");
-    expect(service.hasSession("session-a", ACTOR)).toBe(false);
-    expect(service.hasSession("session-a", TARGET)).toBe(true);
+    expect(service.hasSession("session-a", ACTOR, TEST_USER_ID)).toBe(false);
+    expect(service.hasSession("session-a", TARGET, TEST_USER_ID)).toBe(true);
     expect(service.hasActiveSession(ACTOR)).toBe(false);
     expect(service.hasActiveSession(TARGET)).toBe(true);
     expect(ended).toEqual([]);
 
     service.revertActiveSessionTransfer("session-a", ACTOR, TARGET);
-    expect(service.hasSession("session-a", ACTOR)).toBe(true);
-    expect(service.hasSession("session-a", TARGET)).toBe(false);
+    expect(service.hasSession("session-a", ACTOR, TEST_USER_ID)).toBe(true);
+    expect(service.hasSession("session-a", TARGET, TEST_USER_ID)).toBe(false);
 
     expect(service.transferActiveSession(ACTOR, TARGET)).toBe("session-a");
 
@@ -225,8 +241,8 @@ describe("VoiceService leased sessions", () => {
     service.setSessionTransferNotifier((sessionId, targetActorId) =>
       controls.push([sessionId, targetActorId])
     );
-    service.presenceConnect([ACTOR]);
-    service.openSession("session-a", ACTOR);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
+    service.openSession("session-a", ACTOR, TEST_USER_ID);
 
     const reply = service.handleMeshEvent(replyEvent(), (announcement) =>
       frames.push(announcement.id)
@@ -256,9 +272,9 @@ describe("VoiceService leased sessions", () => {
 });
 
 describe("VoiceService outbound reply TTS", () => {
-  it("renders, stores, and registers a reply to human:operator from a present actor", async () => {
+  it("renders, stores, and registers a reply to a durable user from a present actor", async () => {
     const { service, home } = makeService();
-    service.presenceConnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
 
     const announcement = await service.handleMeshEvent(replyEvent());
     expect(announcement).not.toBeNull();
@@ -268,7 +284,7 @@ describe("VoiceService outbound reply TTS", () => {
     expect(announcement?.playedAt).toBeNull();
     expect(announcement?.audioPath.startsWith(join(home, "voice", "outbox"))).toBe(true);
     expect((await readFile(announcement?.audioPath ?? "")).length).toBeGreaterThan(0);
-    expect(service.backlog(ACTOR)).toHaveLength(1);
+    expect(service.backlog(ACTOR, TEST_USER_ID)).toHaveLength(1);
   });
 
   it("renders nothing without presence (reply stays text-only)", async () => {
@@ -281,8 +297,8 @@ describe("VoiceService outbound reply TTS", () => {
   it("still renders within the grace window after disconnect", async () => {
     let now = 0;
     const { service } = makeService({ now: () => now });
-    service.presenceConnect([ACTOR]);
-    service.presenceDisconnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
+    service.presenceDisconnect([ACTOR], TEST_USER_ID);
     now += VOICE_PRESENCE_GRACE_MS - 1;
     expect(await service.handleMeshEvent(replyEvent())).not.toBeNull();
   });
@@ -290,37 +306,35 @@ describe("VoiceService outbound reply TTS", () => {
   it("renders nothing outside the grace window", async () => {
     let now = 0;
     const { service } = makeService({ now: () => now });
-    service.presenceConnect([ACTOR]);
-    service.presenceDisconnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
+    service.presenceDisconnect([ACTOR], TEST_USER_ID);
     now += VOICE_PRESENCE_GRACE_MS + 1;
     expect(await service.handleMeshEvent(replyEvent())).toBeNull();
   });
 
   it("renders a reply to a durable user principal once storage says the recipient is a person", async () => {
-    // After the #460 cutover an actor's reply targets the migrated user id,
-    // not the legacy alias; the walkie must keep speaking those.
     const USER = "11111111-0000-4000-8000-000000000001";
     const spoken = makeService({ isHumanRecipient: (id) => id === USER });
-    spoken.service.presenceConnect([ACTOR]);
+    spoken.service.presenceConnect([ACTOR], USER);
     expect(
       await spoken.service.handleMeshEvent(replyEvent({ payload: JSON.stringify({ to: USER }) }))
     ).not.toBeNull();
 
     // Without principal storage a bare id is just another actor, so it stays silent.
     const silent = makeService();
-    silent.service.presenceConnect([ACTOR]);
+    silent.service.presenceConnect([ACTOR], TEST_USER_ID);
     expect(
       await silent.service.handleMeshEvent(replyEvent({ payload: JSON.stringify({ to: USER }) }))
     ).toBeNull();
   });
 
-  it("ignores events that are not replies to human:operator", async () => {
+  it("ignores events that are not replies to a known user", async () => {
     const { service } = makeService();
-    service.presenceConnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
     // Inbound memo delivery: recipient is the actor, sender is the operator.
     expect(
       await service.handleMeshEvent(
-        replyEvent({ payload: JSON.stringify({ to: ACTOR, from: HUMAN_OPERATOR }) })
+        replyEvent({ payload: JSON.stringify({ to: ACTOR, from: TEST_USER_ID }) })
       )
     ).toBeNull();
     expect(await service.handleMeshEvent(replyEvent({ kind: "run_start" }))).toBeNull();
@@ -330,11 +344,11 @@ describe("VoiceService outbound reply TTS", () => {
 
   it("bounds the announcement registry to a ring of the newest entries", async () => {
     const { service } = makeService({ max: 3 });
-    service.presenceConnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
     for (let i = 0; i < 5; i++) {
       await service.handleMeshEvent(replyEvent({ body: `reply ${i}` }));
     }
-    const backlog = service.backlog(ACTOR);
+    const backlog = service.backlog(ACTOR, TEST_USER_ID);
     expect(backlog.map((a) => a.text)).toEqual(["reply 2", "reply 3", "reply 4"]);
   });
 });
@@ -353,7 +367,7 @@ describe("VoiceService per-actor voice selection", () => {
       speech,
       speechFor,
     });
-    service.presenceConnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
 
     await service.handleMeshEvent(replyEvent());
     expect(streamSynthesize).toHaveBeenCalledWith("On it — ETA five minutes.", "Charon");
@@ -375,7 +389,7 @@ describe("VoiceService per-actor voice selection", () => {
       speech: fakeSpeech({ streamSynthesize }),
       speechFor: () => undefined,
     });
-    service.presenceConnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
 
     await service.handleMeshEvent(replyEvent());
     expect(streamSynthesize).toHaveBeenCalledWith("On it — ETA five minutes.", undefined);
@@ -387,7 +401,7 @@ describe("VoiceService per-actor voice selection", () => {
       pcmStream: (async function* () {})(),
     }));
     const { service } = makeService({ speech: fakeSpeech({ streamSynthesize }) });
-    service.presenceConnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
 
     await service.handleMeshEvent(replyEvent());
     expect(streamSynthesize).toHaveBeenCalledWith("On it — ETA five minutes.", undefined);
@@ -396,7 +410,7 @@ describe("VoiceService per-actor voice selection", () => {
   it("never consults the speech resolver for a non-reply event", async () => {
     const speechFor = vi.fn(() => ({ speech: fakeSpeech(), voiceName: "Charon" }));
     const { service } = makeService({ speechFor });
-    service.presenceConnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
     expect(await service.handleMeshEvent(replyEvent({ kind: "run_start" }))).toBeNull();
     expect(speechFor).not.toHaveBeenCalled();
   });
@@ -405,13 +419,13 @@ describe("VoiceService per-actor voice selection", () => {
 describe("VoiceService backlog & ack", () => {
   it("lists only unplayed announcements oldest first; ack removes from backlog", async () => {
     const { service } = makeService();
-    service.presenceConnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
     const first = await service.handleMeshEvent(replyEvent({ body: "first" }));
     const second = await service.handleMeshEvent(replyEvent({ body: "second" }));
-    expect(service.backlog(ACTOR).map((a) => a.text)).toEqual(["first", "second"]);
+    expect(service.backlog(ACTOR, TEST_USER_ID).map((a) => a.text)).toEqual(["first", "second"]);
 
     expect(service.ack(first?.id ?? "")).toBe(true);
-    expect(service.backlog(ACTOR).map((a) => a.text)).toEqual(["second"]);
+    expect(service.backlog(ACTOR, TEST_USER_ID).map((a) => a.text)).toEqual(["second"]);
     expect(service.get(first?.id ?? "")?.playedAt).not.toBeNull();
     expect(second?.playedAt).toBeNull();
   });
@@ -425,7 +439,7 @@ describe("VoiceService backlog & ack", () => {
 describe("attachVoiceOutbound", () => {
   it("bridges emitter events to a voice push and detaches cleanly", async () => {
     const { service } = makeService();
-    service.presenceConnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
     const emitter = new MeshEventEmitter();
     const pushVoice = vi.fn();
     const detach = attachVoiceOutbound(emitter, service, { pushVoice });
@@ -454,7 +468,7 @@ describe("attachVoiceOutbound", () => {
         },
       }),
     });
-    service.presenceConnect([ACTOR]);
+    service.presenceConnect([ACTOR], TEST_USER_ID);
     const emitter = new MeshEventEmitter();
     const pushVoice = vi.fn();
     attachVoiceOutbound(emitter, service, { pushVoice });
@@ -463,3 +477,5 @@ describe("attachVoiceOutbound", () => {
     expect(pushVoice).not.toHaveBeenCalled();
   });
 });
+
+const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";

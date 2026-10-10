@@ -727,7 +727,10 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
   it("rebuilds a missing-reading interval after coordinator restart, keeps it across reset, and recovers on a fresh reading (#794)", async () => {
     let nowMs = Date.parse("2040-01-01T00:00:00.000Z");
     const resetMs = nowMs + 3 * 24 * 60 * 60_000;
-    const windowMs = 7 * 24 * 60 * 60_000;
+    const firstObservedMs = nowMs - 2 * 60 * 60_000 - 5 * 5 * 60_000;
+    // This synthetic cold lane has no prior reset, so its first observation
+    // is the supported lower bound for the window start.
+    const windowMs = resetMs - firstObservedMs;
     const snapshot = (
       scrapedAt: string,
       providerPercentLeft: number,
@@ -915,7 +918,8 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     const nowMs = Date.now();
     const resetMs = nowMs + 30 * 60_000;
     const resetAtIso = new Date(resetMs).toISOString();
-    const windowMs = 7 * 24 * 60 * 60_000;
+    const firstObservedMs = nowMs - 3 * 60 * 60_000 - 5 * 5 * 60_000;
+    const windowMs = resetMs - firstObservedMs;
     store.configureController({ maxIntervalSeconds: 3600 });
     for (let offset = 5; offset >= 0; offset -= 1) {
       const observedMs = nowMs - 3 * 60 * 60_000 - offset * 5 * 60_000;

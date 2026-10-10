@@ -286,7 +286,7 @@ class DashboardApi {
   ///
   /// Sends no `by`: the server binds the acting principal from the request
   /// (authenticated identity, or the sole durable user in local mode), so a
-  /// client-supplied attribution could only be a guess or the legacy alias.
+  /// client-supplied attribution would be an unverified guess.
   Future<void> interruptActor(String actorId) =>
       trackInteraction(DashboardInteraction.actorInterrupt, () async {
         final uri = _u('/api/mesh/actors/$actorId/interrupt');
@@ -732,6 +732,7 @@ class DashboardApi {
   Future<ObligationDto> reassignObligation(
     String id, {
     required String ownerId,
+    String? message,
   }) => trackInteraction(DashboardInteraction.dashboardMutation, () async {
     final uri = _u('/api/mesh/obligations/$id/reassign');
     final res = await _client.post(
@@ -740,7 +741,10 @@ class DashboardApi {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
       },
-      body: jsonEncode({'ownerId': ownerId}),
+      body: jsonEncode({
+        'ownerId': ownerId,
+        if (message != null && message.trim().isNotEmpty) 'message': message,
+      }),
     );
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);

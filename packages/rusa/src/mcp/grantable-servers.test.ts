@@ -28,7 +28,7 @@ const STUB_DEPS: GrantableServerDeps = {
   driveClients: {
     listChildren: async () => [],
     getFileMetadata: async () => ({ id: "", name: "", mimeType: "" }),
-    downloadFile: async () => Buffer.alloc(0),
+    downloadFileStream: async () => new Response(),
     exportDoc: async () => Buffer.alloc(0),
   },
   calendarClients: {
@@ -362,7 +362,11 @@ describe("grantable capabilities allow-list ", () => {
       getMessage: async () => ({ name: "spaces/A/messages/M1" }),
       getSpace: async () => ({ name: "spaces/A" }),
       getAttachment: async () => ({ name: "spaces/A/attachments/ATT1" }),
-      downloadAttachment: async () => Buffer.alloc(0),
+      downloadAttachmentStream: async () => ({
+        resp: new Response(),
+        name: "attachment.bin",
+        contentType: "application/octet-stream",
+      }),
       uploadAttachment: async () => ({ attachmentDataRef: { resourceName: "ref" } }),
       send: async () => ({ name: "spaces/A/messages/M1" }),
       react: async () => {},
@@ -428,7 +432,11 @@ describe("grantable capabilities allow-list ", () => {
       getMessage: async () => ({ name: "spaces/A/messages/M1" }),
       getSpace: async () => ({ name: "spaces/A" }),
       getAttachment: async () => ({ name: "spaces/A/attachments/ATT1" }),
-      downloadAttachment: async () => Buffer.alloc(0),
+      downloadAttachmentStream: async () => ({
+        resp: new Response(),
+        name: "attachment.bin",
+        contentType: "application/octet-stream",
+      }),
       uploadAttachment: async () => ({ attachmentDataRef: { resourceName: "ref" } }),
       send: async () => ({ name: "spaces/A/messages/M1" }),
       react: async () => {},

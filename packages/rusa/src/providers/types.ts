@@ -88,7 +88,7 @@ export interface RunResult {
   exitCode: number;
   cancelled?: boolean;
   interrupted?: boolean;
-  /** The typed source of the interrupt, if applicable (e.g. 'human:operator', 'responsive-notification'). */
+  /** The explicit principal or mechanical source of the interrupt. */
   interruptSource?: string;
   /** The typed reason for termination/abort (e.g. 'stall-watchdog', 'run-ceiling', 'interrupt:<by>', 'unknown'). */
   abortReason?: AbortReason;
@@ -117,6 +117,24 @@ export interface RunResult {
    * Observability only; callers must not use it to choose or mutate providers.
    */
   tokenUsage?: RunTokenUsage;
+  /**
+   * What a caught exception said, kept apart from the stack that `output`
+   * records. Optional on the wire: a result from an older follower has none, and
+   * an older reader ignores it.
+   */
+  failure?: RunFailure;
+}
+
+/** The failure a run caught, as its source established it (#980). */
+export interface RunFailure {
+  /**
+   * Set only where the boundary itself is known, never inferred from text.
+   * `provider-selection`: the primary entry could not be prepared, so no
+   * provider was invoked.
+   */
+  stage?: "provider-selection";
+  /** The exception's own message, without its stack. May be blank. */
+  message: string;
 }
 
 /**

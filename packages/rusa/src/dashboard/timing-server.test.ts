@@ -3,7 +3,10 @@ import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import type { DashboardTimingRecorder } from "./timing.js";
+import { beginDashboardRoutePhase, runDashboardRequestScope } from "./timing-phases.js";
 import { beginDashboardRequestTiming } from "./timing-server.js";
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 class TestResponse extends EventEmitter {
   statusCode = 200;
@@ -11,6 +14,11 @@ class TestResponse extends EventEmitter {
 
   setHeader(name: string, value: string): this {
     this.headers[name] = value;
+    return this;
+  }
+
+  writeHead(status: number): this {
+    this.statusCode = status;
     return this;
   }
 
@@ -115,5 +123,31 @@ describe("dashboard timing server wrapper", () => {
       3,
       expect.objectContaining({ label: "mesh_actor_mutation" })
     );
+  });
+
+  it("ends the route phase at header write and tags quota operations", async () => {
+    const recordServer = vi.fn();
+    const response = new TestResponse();
+    await runDashboardRequestScope(async () => {
+      beginDashboardRequestTiming(
+        response as unknown as ServerResponse,
+        "/api/quota/history",
+        "GET",
+        { recordServer } as unknown as DashboardTimingRecorder
+      );
+      beginDashboardRoutePhase();
+      await sleep(30);
+      response.writeHead(200);
+      await sleep(60);
+      response.end("{}");
+    });
+
+    const [[record]] = recordServer.mock.calls;
+    expect(record).toMatchObject({ label: "mesh_quota", operation: "quota_history" });
+    // The body write after the header is outside route.
+    expect(Object.keys(record.phases)).toEqual(["route"]);
+    expect(record.phases.route).toBeGreaterThanOrEqual(25);
+    // Route stops at writeHead; the post-header sleep is outside it.
+    expect(record.durationMs - record.phases.route).toBeGreaterThanOrEqual(55);
   });
 });

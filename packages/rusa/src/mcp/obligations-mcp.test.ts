@@ -24,6 +24,8 @@ import { OBLIGATION_CHECKPOINT_MAX } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import { createObligationsMcpServer } from "./obligations-mcp.js";
 
+const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";
+
 async function connect(server: McpServer): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -303,7 +305,7 @@ describe("obligations MCP", () => {
     expect(obligation.creatorId).toBe("actor-a");
 
     // And it survives the reassignment that destroys owner attribution.
-    repository.reassign(obligation.id, "human:operator", "system:mesh");
+    repository.reassign(obligation.id, "00000000-0000-4000-8000-000000000001", "system:mesh");
     expect(repository.require(obligation.id).creatorId).toBe("actor-a");
   });
 
@@ -315,7 +317,7 @@ describe("obligations MCP", () => {
         title: "attempted attribution laundering",
         owner_id: "actor-a",
         intent: "attempted attribution laundering",
-        created_by: "human:operator",
+        created_by: "00000000-0000-4000-8000-000000000001",
       },
     })) as CallToolResult;
 
@@ -395,7 +397,12 @@ describe("obligations MCP", () => {
     const client = await connect(
       createObligationsMcpServer(repository, "actor-a", {
         resolveOwner: (raw) =>
-          resolveObligationOwner({ get: (id: string) => registry.get(id) as never }, raw),
+          resolveObligationOwner({ get: (id: string) => registry.get(id) as never }, raw, {
+            get: (id) =>
+              id === TEST_USER_ID
+                ? { kind: "user", id, email: "user@example.test", createdAt: "t" }
+                : undefined,
+          }),
       })
     );
 
@@ -411,7 +418,7 @@ describe("obligations MCP", () => {
     // A live actor and the canonical operator id are both legitimate: owning
     // work to another actor is why `creator_id` exists, and owning it to the
     // operator is the human-decision contract.
-    for (const ownerId of ["actor-a", "human:operator"]) {
+    for (const ownerId of ["actor-a", "00000000-0000-4000-8000-000000000001"]) {
       const res = (await client.callTool({
         name: "create_obligation",
         arguments: { title: "fine", owner_id: ownerId, intent: "fine" },
@@ -420,7 +427,7 @@ describe("obligations MCP", () => {
     }
   });
 
-  it("creates human-owned work by durable id and legacy alias without actor attention", async () => {
+  it("creates human-owned work by explicit durable id without actor attention", async () => {
     const user = {
       kind: "user" as const,
       id: "fb394608-d6d6-4f2e-aebe-51a59bd01374",
@@ -445,7 +452,7 @@ describe("obligations MCP", () => {
       })
     );
 
-    for (const ownerId of [user.id, "human:operator"]) {
+    for (const ownerId of [user.id]) {
       const result = (await client.callTool({
         name: "create_obligation",
         arguments: { title: `owned through ${ownerId}`, owner_id: ownerId },
@@ -729,13 +736,29 @@ describe("obligations MCP", () => {
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const result = (await client.callTool({
       name: "reassign_obligation",
-      arguments: { id: "task", owner_id: "human:operator" },
+      arguments: { id: "task", owner_id: "00000000-0000-4000-8000-000000000001" },
     })) as CallToolResult;
 
     expect(result.isError).toBeFalsy();
     expect(dataOf(result)).toMatchObject({
-      obligation: { id: "task", ownerId: "human:operator" },
+      obligation: { id: "task", ownerId: "00000000-0000-4000-8000-000000000001" },
       previousOwnerId: "actor-a",
+    });
+  });
+
+  it("records an optional reassignment message in history (#941)", async () => {
+    repository.create({ title: "task", id: "task", ownerId: "actor-a" });
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const result = (await client.callTool({
+      name: "reassign_obligation",
+      arguments: { id: "task", owner_id: "human:operator", message: "Ready for your review." },
+    })) as CallToolResult;
+
+    expect(result.isError).toBeFalsy();
+    expect(repository.listHistory("task")[0]).toMatchObject({
+      mutationKind: "reassign",
+      actingPrincipal: "actor-a",
+      after: { ownerId: "human:operator", message: "Ready for your review." },
     });
   });
 
