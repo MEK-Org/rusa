@@ -771,6 +771,14 @@ class FakeApi extends DashboardApi {
   /// [obligationsResult] order, like the server's default page limit.
   int? obligationPageLimit;
 
+  /// Holds every queue-page request (`queue` set, as Overview's My Queue
+  /// sends) until completed. The page is computed when the call is made, so
+  /// a held request returns the data as it stood then, like a slow response.
+  Completer<void>? obligationQueuePagesGate;
+
+  /// Thrown by queue-page requests (after any gate) while set.
+  Object? obligationQueuePagesError;
+
   @override
   Future<ObligationPage> fetchObligations({
     String? ownerId,
@@ -810,12 +818,21 @@ class FakeApi extends DashboardApi {
     if (pageLimit != null && list.length > pageLimit) {
       list = list.take(pageLimit).toList();
     }
+    if (queue != null) {
+      final gate = obligationQueuePagesGate;
+      if (gate != null) await gate.future;
+      final error = obligationQueuePagesError;
+      if (error != null) throw error;
+    }
     return ObligationPage(
       obligations: list,
       total: total,
       hasMore: list.length < total,
     );
   }
+
+  /// Holds every obligation detail request until completed.
+  Completer<void>? obligationDetailGate;
 
   ObligationDetailSnapshot Function(String id, String? historyBefore)?
   obligationDetailByHistory;
@@ -832,6 +849,8 @@ class FakeApi extends DashboardApi {
     int? limit,
   }) async {
     obligationDetailCallCount++;
+    final detailGate = obligationDetailGate;
+    if (detailGate != null) await detailGate.future;
     if (obligationDetailByHistory != null) {
       return obligationDetailByHistory!(id, historyBefore);
     }
@@ -1350,10 +1369,37 @@ class FakeObligationsCache implements ObligationsCache {
     invalidateCount++;
   }
 
+  /// Overview queue captures (#992), keyed like [_entries].
+  final Map<String, PersistedOverviewQueueSnapshot> overviewEntries = {};
+  int overviewSaveCount = 0;
+  int overviewInvalidateCount = 0;
+
+  @override
+  PersistedOverviewQueueSnapshot? loadOverviewQueue({
+    required String scope,
+    required String principalId,
+  }) => overviewEntries['$scope.$principalId'];
+
+  @override
+  void saveOverviewQueue(PersistedOverviewQueueSnapshot snapshot) {
+    overviewEntries['${snapshot.scope}.${snapshot.principalId}'] = snapshot;
+    overviewSaveCount++;
+  }
+
+  @override
+  void invalidateOverviewQueue({
+    required String scope,
+    required String principalId,
+  }) {
+    overviewEntries.remove('$scope.$principalId');
+    overviewInvalidateCount++;
+  }
+
   @override
   void clear() {
     stored = null;
     _entries.clear();
+    overviewEntries.clear();
     clearCount++;
   }
 }

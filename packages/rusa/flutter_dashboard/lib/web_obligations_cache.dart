@@ -66,6 +66,68 @@ class WebObligationsCache implements ObligationsCache {
     }
   }
 
+  static String _overviewKey(String scope, String principalId) =>
+      'rusa.dashboard.obligations.overview.v${PersistedOverviewQueueSnapshot.schemaVersion}.'
+      '${Uri.encodeComponent(scope)}.${Uri.encodeComponent(principalId)}';
+
+  @override
+  PersistedOverviewQueueSnapshot? loadOverviewQueue({
+    required String scope,
+    required String principalId,
+  }) {
+    try {
+      if (principalId.isEmpty) return null;
+      final raw = web.window.localStorage.getItem(
+        _overviewKey(scope, principalId),
+      );
+      if (raw == null || raw.isEmpty) return null;
+      final rawByteCount = PersistedObligationsSnapshot.encodedSize(raw);
+      if (rawByteCount > PersistedOverviewQueueSnapshot.maxSerializedBytes) {
+        return null;
+      }
+      return PersistedOverviewQueueSnapshot.fromJson(
+        jsonDecode(raw),
+        serializedByteCount: rawByteCount,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  void saveOverviewQueue(PersistedOverviewQueueSnapshot snapshot) {
+    try {
+      final raw = snapshot.encode();
+      final key = _overviewKey(snapshot.scope, snapshot.principalId);
+      if (!PersistedOverviewQueueSnapshot.rawFitsStorageBudget(raw)) {
+        // A queue that outgrew the budget must not leave an older capture
+        // behind to replay.
+        web.window.localStorage.removeItem(key);
+        return;
+      }
+      web.window.localStorage.setItem(key, raw);
+    } catch (_) {
+      // Quota or private browsing: drop the older capture rather than keep it.
+      invalidateOverviewQueue(
+        scope: snapshot.scope,
+        principalId: snapshot.principalId,
+      );
+    }
+  }
+
+  @override
+  void invalidateOverviewQueue({
+    required String scope,
+    required String principalId,
+  }) {
+    try {
+      if (principalId.isEmpty) return;
+      web.window.localStorage.removeItem(_overviewKey(scope, principalId));
+    } catch (_) {
+      // Best-effort.
+    }
+  }
+
   @override
   void clear() {
     try {

@@ -133,6 +133,103 @@ class PersistedObligationsSnapshot {
   static int encodedSize(String value) => utf8.encode(value).length;
 }
 
+/// One persisted capture of Overview's My Queue (#992), written after each
+/// successful queue refresh and replayed after the viewing principal resolves
+/// on the next page load, while the refresh runs. Identity, age and corruption
+/// rules match [PersistedObligationsSnapshot]; only the payload differs,
+/// because the queue's per-section pages are not derivable from the forest.
+class PersistedOverviewQueueSnapshot {
+  const PersistedOverviewQueueSnapshot({
+    required this.scope,
+    required this.principalId,
+    required this.savedAt,
+    required this.queue,
+  });
+
+  final String scope;
+  final String principalId;
+  final String savedAt;
+  final OverviewQueue queue;
+
+  static const int schemaVersion = 1;
+
+  /// Half the forest budget, so both captures together stay well inside an
+  /// origin's localStorage (768 KiB of roughly 5 MiB).
+  static const int maxSerializedBytes = 256 * 1024;
+
+  factory PersistedOverviewQueueSnapshot.capture({
+    required String scope,
+    required String principalId,
+    required OverviewQueue queue,
+    required DateTime now,
+  }) => PersistedOverviewQueueSnapshot(
+    scope: scope,
+    principalId: principalId,
+    savedAt: now.toUtc().toIso8601String(),
+    queue: queue,
+  );
+
+  Map<String, dynamic> toJson() => {
+    'version': schemaVersion,
+    'scope': scope,
+    'principalId': principalId,
+    'savedAt': savedAt,
+    'queue': queue.toJson(),
+  };
+
+  String encode() => jsonEncode(toJson());
+
+  static bool rawFitsStorageBudget(String raw) =>
+      PersistedObligationsSnapshot.encodedSize(raw) <= maxSerializedBytes;
+
+  /// Parses a persisted payload, or returns null for another schema version,
+  /// an oversized payload or an unexpected shape. Never throws.
+  static PersistedOverviewQueueSnapshot? fromJson(
+    Object? decoded, {
+    int? serializedByteCount,
+  }) {
+    try {
+      if (decoded is! Map) return null;
+      if (decoded['version'] != schemaVersion) return null;
+      final byteCount =
+          serializedByteCount ??
+          PersistedObligationsSnapshot.encodedSize(jsonEncode(decoded));
+      if (byteCount < 0 || byteCount > maxSerializedBytes) return null;
+      final scope = decoded['scope'];
+      final principalId = decoded['principalId'];
+      final savedAt = decoded['savedAt'];
+      final queue = decoded['queue'];
+      if (scope is! String ||
+          principalId is! String ||
+          savedAt is! String ||
+          queue is! Map) {
+        return null;
+      }
+      return PersistedOverviewQueueSnapshot(
+        scope: scope,
+        principalId: principalId,
+        savedAt: savedAt,
+        queue: OverviewQueue.fromJson(Map<String, dynamic>.from(queue)),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  bool isUsableAt({
+    required String scope,
+    required String principalId,
+    required DateTime now,
+  }) {
+    if (this.scope != scope || this.principalId != principalId) return false;
+    final written = DateTime.tryParse(savedAt);
+    if (written == null) return false;
+    final age = now.toUtc().difference(written.toUtc());
+    return age >= -PersistedObligationsSnapshot.maxFutureSkew &&
+        age <= PersistedObligationsSnapshot.maxAge;
+  }
+}
+
 /// Persists the last authoritative obligations snapshot across page loads and
 /// navigation returns (#505).
 /// Concrete implementation is `WebObligationsCache` (browser localStorage).
@@ -149,7 +246,21 @@ abstract interface class ObligationsCache {
   /// Invalidate or remove cached obligations for [scope] and [principalId].
   void invalidate({required String scope, required String principalId});
 
-  /// Drop any persisted capture across all scopes and principals.
+  /// The last Overview queue capture for [scope] and [principalId] (#992).
+  PersistedOverviewQueueSnapshot? loadOverviewQueue({
+    required String scope,
+    required String principalId,
+  });
+
+  void saveOverviewQueue(PersistedOverviewQueueSnapshot snapshot);
+
+  void invalidateOverviewQueue({
+    required String scope,
+    required String principalId,
+  });
+
+  /// Drop every persisted capture, forest and Overview queue, across all
+  /// scopes and principals.
   void clear();
 }
 
@@ -169,6 +280,21 @@ class NoopObligationsCache implements ObligationsCache {
 
   @override
   void invalidate({required String scope, required String principalId}) {}
+
+  @override
+  PersistedOverviewQueueSnapshot? loadOverviewQueue({
+    required String scope,
+    required String principalId,
+  }) => null;
+
+  @override
+  void saveOverviewQueue(PersistedOverviewQueueSnapshot snapshot) {}
+
+  @override
+  void invalidateOverviewQueue({
+    required String scope,
+    required String principalId,
+  }) {}
 
   @override
   void clear() {}

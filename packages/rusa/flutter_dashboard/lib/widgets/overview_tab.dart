@@ -35,65 +35,42 @@ class OverviewTab extends StatefulWidget {
 }
 
 class _OverviewTabState extends State<OverviewTab> {
-  late Future<Map<String, dynamic>> _humanQueueFuture;
   StreamSubscription<String?>? _viewerPrincipalSub;
 
   /// Re-renders queued cards' relative "Runs in ~N min" labels as time passes
   /// between snapshots; idle while nothing is queued.
   Timer? _startLabelTick;
 
-  Future<Map<String, dynamic>> _loadHumanQueue() async {
-    final api = widget.store.api;
-    final ownerId = widget.store.userPrincipalId;
-    const queues = ['ready', 'waiting', 'scheduled'];
-    // One page per section rather than carving sections out of a shared
-    // page: otherwise one section's rows could exhaust the page limit and
-    // silently drop another section's rows.
-    final results = await Future.wait([
-      for (final queue in queues)
-        api.fetchObligations(ownerId: ownerId, queue: queue),
-    ]);
-    if (!mounted) {
-      throw StateError('Overview queue load superseded or unmounted');
-    }
-    final ready = results[0].obligations;
-    final waiting = results[1].obligations;
-    final scheduled = results[2].obligations
-      ..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
-    final blockers = await Future.wait(
-      waiting.map((o) => api.fetchObligationDetail(o.id)),
-    );
-    if (!mounted) {
-      throw StateError('Overview queue load superseded or unmounted');
-    }
-    final blockerMap = {
-      for (var i = 0; i < waiting.length; i++)
-        waiting[i].id: blockers[i].blockingChildren,
-    };
-    return {
-      'ready': ready,
-      'waiting': waiting,
-      'scheduled': scheduled,
-      'blockerMap': blockerMap,
-    };
-  }
+  /// The queue lives in the store (#992), so a return paints the rows it last
+  /// showed while this revalidates them.
+  void _refreshHumanQueue() => unawaited(widget.store.refreshOverviewQueue());
 
-  void _refreshHumanQueue() {
-    setState(() {
-      _humanQueueFuture = _loadHumanQueue();
-    });
+  /// Times the mount's revalidation as primary navigation; a failed refresh
+  /// counts as a failed interaction even though its retained rows still show.
+  Future<void> _trackedRefresh() async {
+    try {
+      await widget.store.api.trackInteraction(
+        DashboardInteraction.primaryNavigation,
+        () async {
+          await widget.store.refreshOverviewQueue();
+          final error = widget.store.overviewQueue.value.error;
+          if (error != null) throw error;
+        },
+      );
+    } catch (_) {
+      // The store already exposes the failure to the queue section.
+    }
   }
 
   @override
   void initState() {
     super.initState();
     widget.store.refreshQuotaHistory();
-    _humanQueueFuture = widget.trackNavigation
-        ? widget.store.api.trackInteraction(
-            DashboardInteraction.primaryNavigation,
-            _loadHumanQueue,
-          )
-        : _loadHumanQueue();
+    if (widget.trackNavigation) {
+      unawaited(_trackedRefresh());
+    } else {
+      _refreshHumanQueue();
+    }
     // Refresh if the server-resolved viewing principal changes.
     _viewerPrincipalSub = widget.store.dashboardConfig
         .map((c) => c?.userPrincipalId)
@@ -254,18 +231,17 @@ class _OverviewTabState extends State<OverviewTab> {
 
   /// My obligations queue for the viewing person, under every id they hold.
   Widget _buildMyQueueSection() {
-    return FutureBuilder<Map<String, dynamic>>(
-      future: _humanQueueFuture,
+    return StreamBuilder<OverviewQueueState>(
+      stream: widget.store.overviewQueue,
+      initialData: widget.store.overviewQueue.value,
       builder: (context, snap) {
-        final ready = snap.data?['ready'] as List<ObligationDto>? ?? const [];
-        final waiting =
-            snap.data?['waiting'] as List<ObligationDto>? ?? const [];
-        final scheduled =
-            snap.data?['scheduled'] as List<ObligationDto>? ?? const [];
-        final blockerMap =
-            snap.data?['blockerMap'] as Map<String, List<ObligationDto>>? ??
-            const {};
-        final totalCount = ready.length + waiting.length + scheduled.length;
+        final queue = snap.data?.queue;
+        final error = snap.data?.error;
+        final ready = queue?.ready ?? const <ObligationDto>[];
+        final waiting = queue?.waiting ?? const <ObligationDto>[];
+        final scheduled = queue?.scheduled ?? const <ObligationDto>[];
+        final blockerMap = queue?.blockers ?? const {};
+        final totalCount = queue?.length ?? 0;
 
         return LayoutBuilder(
           builder: (_, constraints) {
@@ -365,51 +341,13 @@ class _OverviewTabState extends State<OverviewTab> {
                     style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
                   ),
                   const SizedBox(height: 14),
-                  if (snap.connectionState != ConnectionState.done &&
-                      snap.data == null)
+                  if (queue == null && error == null)
                     const Padding(
                       padding: EdgeInsets.symmetric(vertical: 20),
                       child: Center(child: CircularProgressIndicator()),
                     )
-                  else if (snap.hasError && snap.data == null)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      child: isNarrow
-                          ? Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  'Queue unavailable: ${snap.error}',
-                                  style: const TextStyle(
-                                    color: MeshColors.textMuted,
-                                    fontSize: 13,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                TextButton(
-                                  onPressed: _refreshHumanQueue,
-                                  child: const Text('Retry'),
-                                ),
-                              ],
-                            )
-                          : Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    'Queue unavailable: ${snap.error}',
-                                    style: const TextStyle(
-                                      color: MeshColors.textMuted,
-                                      fontSize: 13,
-                                    ),
-                                  ),
-                                ),
-                                TextButton(
-                                  onPressed: _refreshHumanQueue,
-                                  child: const Text('Retry'),
-                                ),
-                              ],
-                            ),
-                    )
+                  else if (queue == null)
+                    _queueError(error, isNarrow: isNarrow)
                   else if (ready.isEmpty &&
                       waiting.isEmpty &&
                       scheduled.isEmpty)
@@ -495,6 +433,8 @@ class _OverviewTabState extends State<OverviewTab> {
                             ),
                     )
                   else ...[
+                    // A failed refresh keeps the rows it could not replace.
+                    if (error != null) _queueError(error, isNarrow: isNarrow),
                     if (ready.isNotEmpty) ...[
                       Wrap(
                         spacing: 8,
@@ -624,6 +564,47 @@ class _OverviewTabState extends State<OverviewTab> {
           },
         );
       },
+    );
+  }
+
+  Widget _queueError(Object? error, {required bool isNarrow}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: isNarrow
+          ? Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Queue unavailable: $error',
+                  style: const TextStyle(
+                    color: MeshColors.textMuted,
+                    fontSize: 13,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                TextButton(
+                  onPressed: _refreshHumanQueue,
+                  child: const Text('Retry'),
+                ),
+              ],
+            )
+          : Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Queue unavailable: $error',
+                    style: const TextStyle(
+                      color: MeshColors.textMuted,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+                TextButton(
+                  onPressed: _refreshHumanQueue,
+                  child: const Text('Retry'),
+                ),
+              ],
+            ),
     );
   }
 
