@@ -66,26 +66,27 @@ class WebObligationsCache implements ObligationsCache {
     }
   }
 
-  static String _overviewKey(String scope, String principalId) =>
-      'rusa.dashboard.obligations.overview.v${PersistedOverviewQueueSnapshot.schemaVersion}.'
+  static String _entitiesKey(String scope, String principalId) =>
+      'rusa.dashboard.obligations.entities.v${PersistedObligationEntitiesSnapshot.schemaVersion}.'
       '${Uri.encodeComponent(scope)}.${Uri.encodeComponent(principalId)}';
 
   @override
-  PersistedOverviewQueueSnapshot? loadOverviewQueue({
+  PersistedObligationEntitiesSnapshot? loadEntities({
     required String scope,
     required String principalId,
   }) {
     try {
       if (principalId.isEmpty) return null;
       final raw = web.window.localStorage.getItem(
-        _overviewKey(scope, principalId),
+        _entitiesKey(scope, principalId),
       );
       if (raw == null || raw.isEmpty) return null;
       final rawByteCount = PersistedObligationsSnapshot.encodedSize(raw);
-      if (rawByteCount > PersistedOverviewQueueSnapshot.maxSerializedBytes) {
+      if (rawByteCount >
+          PersistedObligationEntitiesSnapshot.maxSerializedBytes) {
         return null;
       }
-      return PersistedOverviewQueueSnapshot.fromJson(
+      return PersistedObligationEntitiesSnapshot.fromJson(
         jsonDecode(raw),
         serializedByteCount: rawByteCount,
       );
@@ -95,12 +96,12 @@ class WebObligationsCache implements ObligationsCache {
   }
 
   @override
-  void saveOverviewQueue(PersistedOverviewQueueSnapshot snapshot) {
+  void saveEntities(PersistedObligationEntitiesSnapshot snapshot) {
     try {
       final raw = snapshot.encode();
-      final key = _overviewKey(snapshot.scope, snapshot.principalId);
-      if (!PersistedOverviewQueueSnapshot.rawFitsStorageBudget(raw)) {
-        // A queue that outgrew the budget must not leave an older capture
+      final key = _entitiesKey(snapshot.scope, snapshot.principalId);
+      if (!PersistedObligationEntitiesSnapshot.rawFitsStorageBudget(raw)) {
+        // A store that outgrew the budget must not leave an older capture
         // behind to replay.
         web.window.localStorage.removeItem(key);
         return;
@@ -108,7 +109,7 @@ class WebObligationsCache implements ObligationsCache {
       web.window.localStorage.setItem(key, raw);
     } catch (_) {
       // Quota or private browsing: drop the older capture rather than keep it.
-      invalidateOverviewQueue(
+      invalidateEntities(
         scope: snapshot.scope,
         principalId: snapshot.principalId,
       );
@@ -116,13 +117,13 @@ class WebObligationsCache implements ObligationsCache {
   }
 
   @override
-  void invalidateOverviewQueue({
+  void invalidateEntities({
     required String scope,
     required String principalId,
   }) {
     try {
       if (principalId.isEmpty) return;
-      web.window.localStorage.removeItem(_overviewKey(scope, principalId));
+      web.window.localStorage.removeItem(_entitiesKey(scope, principalId));
     } catch (_) {
       // Best-effort.
     }

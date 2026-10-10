@@ -11,6 +11,8 @@ import 'dashboard_timing.dart';
 import 'avatar_platform.dart';
 import 'mesh_stream.dart';
 import 'models.dart';
+import 'obligation_store.dart';
+import 'obligation_sync.dart';
 import 'obligations_cache.dart';
 import 'quota_cache.dart';
 import 'tree_preferences_cache.dart';
@@ -42,17 +44,6 @@ class ObligationRefresh {
   final Set<String> ids;
 
   bool touches(String id) => ids.isEmpty || ids.contains(id);
-}
-
-/// What Overview's My Queue shows (#992). [queue] is the last successful
-/// same-viewer result, or the persisted capture replayed after a reload; it
-/// stays through refreshes and their failures. [error] is the latest refresh's
-/// failure, cleared by the next success.
-class OverviewQueueState {
-  const OverviewQueueState({this.queue, this.error});
-
-  final OverviewQueue? queue;
-  final Object? error;
 }
 
 /// The `{id, status}` pairs of an `obligation_status_changed` payload, in
@@ -430,9 +421,6 @@ class DashboardStore {
   final _focusedObligationId = BehaviorSubject<String?>.seeded(null);
   final _detailPanelIndex = BehaviorSubject<int>.seeded(0);
   final _obligationRefreshes = PublishSubject<ObligationRefresh>();
-  final _overviewQueue = BehaviorSubject<OverviewQueueState>.seeded(
-    const OverviewQueueState(),
-  );
 
   /// Anchor for shift-range selection (set by plain/ctrl clicks).
   String? _anchor;
@@ -505,11 +493,6 @@ class DashboardStore {
   /// the obligations they show.
   Stream<ObligationRefresh> get obligationRefreshes =>
       _obligationRefreshes.stream;
-
-  /// Overview's My Queue for the resolved viewer (#992). It outlives the tab,
-  /// so a return paints the last rows at once while [refreshOverviewQueue]
-  /// revalidates them.
-  ValueStream<OverviewQueueState> get overviewQueue => _overviewQueue.stream;
 
   // ── Normalized actor selectors ──
   ActorViewState? actor(String id) => _actorStates.value.actor(id);
@@ -647,33 +630,45 @@ class DashboardStore {
     _cachedObligationTrees = null;
     _cachedObligationPrincipal = resolvedPrincipal;
     _seedObligationsFromCache(resolvedPrincipal);
-    _seedOverviewQueue(resolvedPrincipal);
+    _seedObligationStore(resolvedPrincipal);
   }
 
-  // ── Overview queue (#992) ──
+  // ── Shared obligation store (#992) ──
 
-  /// The viewer [overviewQueue] belongs to.
-  String? _overviewPrincipal;
+  /// Every obligation a request returned for the resolved viewer, by id.
+  /// Views render projections of it; [obligationSync] fills it.
+  final ObligationStore obligations = ObligationStore();
 
-  /// Bumped when an in-flight queue response must not land: the viewer changed
-  /// or the viewer's own mutation committed after the request was sent.
-  int _overviewEpoch = 0;
+  /// Owns when [obligations] is refreshed and writes the responses into it.
+  late final ObligationSync obligationSync = ObligationSync(
+    api: _api,
+    store: obligations,
+    onSettled: _persistObligationStore,
+    onStale: _dropPersistedObligationStore,
+  );
 
-  /// Bumped whenever the server's queue may have moved past the request in
-  /// flight; the refresh loop runs again until a request starts after the last.
-  int _overviewChanges = 0;
-  Future<void>? _overviewRefresh;
+  /// The viewer [obligations] holds knowledge for.
+  String? _obligationStorePrincipal;
 
-  /// Replays the viewer's persisted queue once dashboard configuration names
-  /// them, mirroring [_seedObligationsFromCache]. A re-resolution of the same
-  /// viewer keeps the rows already shown.
-  void _seedOverviewQueue(String principalId) {
-    if (principalId == _overviewPrincipal) return;
-    _overviewPrincipal = principalId;
-    _overviewEpoch++;
-    _overviewChanges++;
-    OverviewQueue? seed;
-    final cached = _obligationsCache.loadOverviewQueue(
+  /// The viewer's own queue sections, as Overview's My Queue shows them.
+  List<ObligationQuery> viewerQueues() {
+    final principal = _obligationStorePrincipal;
+    if (principal == null || principal.isEmpty) return const [];
+    return [
+      for (final queue in ObligationQueue.values)
+        ObligationQuery(ownerId: principal, queue: queue),
+    ];
+  }
+
+  /// Replaces the store with the new viewer's persisted capture once
+  /// dashboard configuration names them, mirroring [_seedObligationsFromCache].
+  /// A re-resolution of the same viewer keeps what the store holds.
+  void _seedObligationStore(String principalId) {
+    if (principalId == _obligationStorePrincipal) return;
+    _obligationStorePrincipal = principalId;
+    var seed = const ObligationEntities();
+    var replayed = const <ObligationQuery>[];
+    final cached = _obligationsCache.loadEntities(
       scope: _hierarchyScope,
       principalId: principalId,
     );
@@ -683,158 +678,40 @@ class DashboardStore {
         principalId: principalId,
         now: DateTime.timestamp(),
       )) {
-        seed = cached.queue;
+        seed = cached.entities;
+        replayed = cached.queries;
       } else {
-        _obligationsCache.invalidateOverviewQueue(
-          scope: _hierarchyScope,
-          principalId: principalId,
-        );
+        _dropPersistedObligationStore();
       }
     }
-    if (!_overviewQueue.isClosed) {
-      _overviewQueue.add(OverviewQueueState(queue: seed));
-    }
+    obligations.reset(seed);
+    obligationSync.reset(replayed: replayed);
   }
 
-  /// Revalidates [overviewQueue] behind the rows it holds. Concurrent calls
-  /// share one refresh, which repeats while obligation changes keep arriving
-  /// during it. Never throws: a failure keeps the rows and sets the error.
-  Future<void> refreshOverviewQueue() {
-    final running = _overviewRefresh;
-    if (running != null) return running;
-    final run = _runOverviewRefreshes().whenComplete(
-      () => _overviewRefresh = null,
-    );
-    _overviewRefresh = run;
-    return run;
-  }
-
-  Future<void> _runOverviewRefreshes() async {
-    int startedAt;
-    do {
-      startedAt = _overviewChanges;
-      await _refreshOverviewQueueOnce(startedAt);
-    } while (startedAt != _overviewChanges && !_overviewQueue.isClosed);
-  }
-
-  Future<void> _refreshOverviewQueueOnce(int startedAt) async {
-    final principal = _overviewPrincipal;
+  void _persistObligationStore() {
+    final principal = _obligationStorePrincipal;
     if (principal == null || principal.isEmpty) return;
-    final epoch = _overviewEpoch;
-    bool current() => epoch == _overviewEpoch && !_overviewQueue.isClosed;
-    const queues = ['ready', 'waiting', 'scheduled'];
-    // One page per section rather than carving sections out of a shared
-    // page: otherwise one section's rows could exhaust the page limit and
-    // silently drop another section's rows.
-    final List<ObligationPage> pages;
-    try {
-      pages = await Future.wait([
-        for (final queue in queues)
-          _api.fetchObligations(ownerId: principal, queue: queue),
-      ]);
-    } catch (e) {
-      if (current()) {
-        _overviewQueue.add(
-          OverviewQueueState(queue: _overviewQueue.value.queue, error: e),
-        );
-      }
-      return;
-    }
-    if (!current()) return;
-    final waiting = pages[1].obligations;
-    final known = _overviewQueue.value.queue?.blockers ?? const {};
-    var queue = OverviewQueue(
-      ready: pages[0].obligations,
-      waiting: waiting,
-      scheduled: [...pages[2].obligations]
-        ..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? '')),
-      // Blockers already shown stay until their row's detail answers.
-      blockers: {for (final o in waiting) o.id: ?known[o.id]},
-    );
-    _publishOverviewQueue(queue, principal, startedAt);
-    if (waiting.isEmpty) return;
-    // Details only enrich waiting rows, so the queue paints without them and
-    // a failed one leaves that row as it was for the next refresh.
-    final details = await Future.wait(
-      waiting.map(
-        (o) => _api
-            .fetchObligationDetail(o.id)
-            .then<List<ObligationDto>?>(
-              (d) => d.blockingChildren,
-              onError: (Object _) => null,
-            ),
-      ),
-    );
-    if (!current()) return;
-    queue = OverviewQueue(
-      ready: queue.ready,
-      waiting: queue.waiting,
-      scheduled: queue.scheduled,
-      blockers: {
-        ...queue.blockers,
-        for (var i = 0; i < waiting.length; i++) waiting[i].id: ?details[i],
-      },
-    );
-    _publishOverviewQueue(queue, principal, startedAt);
-  }
-
-  void _publishOverviewQueue(
-    OverviewQueue queue,
-    String principal,
-    int startedAt,
-  ) {
-    _overviewQueue.add(OverviewQueueState(queue: queue));
-    // A response an obligation change has overtaken is shown, but only the
-    // follow-up refresh is persisted, so a reload cannot replay known-old rows.
-    if (startedAt != _overviewChanges) return;
-    _obligationsCache.saveOverviewQueue(
-      PersistedOverviewQueueSnapshot.capture(
+    _obligationsCache.saveEntities(
+      PersistedObligationEntitiesSnapshot.capture(
         scope: _hierarchyScope,
         principalId: principal,
-        queue: queue,
+        queries: obligationSync.settledQueries,
+        entities: obligations.current,
         now: DateTime.timestamp(),
       ),
     );
   }
 
-  /// The server's queue may have moved: drop the persisted capture and, while
-  /// Overview shows this viewer's queue, refresh it behind the rows. Off
-  /// screen the next mount refreshes, so nobody pays for a view not shown.
-  /// [dropInFlight] is for the viewer's own mutations, whose pre-mutation
-  /// response would briefly undo what they just did; obligation events let
-  /// it land so a busy mesh cannot starve the queue of updates.
-  void _overviewQueueOutdated({required bool dropInFlight}) {
-    _overviewChanges++;
-    if (dropInFlight) _overviewEpoch++;
-    final principal = _overviewPrincipal;
-    if (principal != null && principal.isNotEmpty) {
-      _obligationsCache.invalidateOverviewQueue(
-        scope: _hierarchyScope,
-        principalId: principal,
-      );
-    }
-    if (_overviewQueue.isClosed ||
-        !_overviewQueue.hasListener ||
-        _overviewQueue.value.queue == null) {
-      return;
-    }
-    unawaited(refreshOverviewQueue());
+  /// A change may have moved what the capture holds, so a reload must not
+  /// replay it; the next settled refresh writes a new one.
+  void _dropPersistedObligationStore() {
+    final principal = _obligationStorePrincipal;
+    if (principal == null || principal.isEmpty) return;
+    _obligationsCache.invalidateEntities(
+      scope: _hierarchyScope,
+      principalId: principal,
+    );
   }
-
-  /// Whether an obligation event naming [ids] can change the queue: any id
-  /// it shows, or an event that does not say which obligations it touched.
-  bool _overviewQueueTouchedBy(Set<String> ids) {
-    final queue = _overviewQueue.value.queue;
-    if (queue == null) return false;
-    return ids.isEmpty || ids.any(queue.mentions);
-  }
-
-  /// Whether a status change can move the queue: it touches a row the queue
-  /// shows, or puts an obligation into a queue section. Status events carry
-  /// no owner, so one entering this viewer's queue looks like any other.
-  bool _overviewQueueMovedBy(Map<String, String> statuses) =>
-      _overviewQueueTouchedBy(statuses.keys.toSet()) ||
-      statuses.values.any(const {'ready', 'waiting', 'scheduled'}.contains);
 
   /// Persists [trees] as the new last-known successful obligations snapshot (#505).
   void saveObligationsSnapshot(List<ObligationTreeDto> trees) {
@@ -868,11 +745,11 @@ class DashboardStore {
   }
 
   /// Runs an obligation-changing API operation and prevents a later Work-tab
-  /// or Overview return from reviving the old persisted forest or queue.
+  /// or Overview return from reviving the old persisted forest or store.
   Future<T> mutateObligations<T>(Future<T> Function() operation) async {
     final result = await operation();
     invalidateObligationsCache();
-    _overviewQueueOutdated(dropInFlight: true);
+    obligationSync.mutated();
     return result;
   }
 
@@ -1762,18 +1639,14 @@ class DashboardStore {
         !_obligationRefreshes.isClosed) {
       final ids = {if (e.detail != null) e.detail!};
       invalidateObligationsCache();
-      if (_overviewQueueTouchedBy(ids)) {
-        _overviewQueueOutdated(dropInFlight: false);
-      }
+      obligationSync.obligationsChanged(ids);
       _obligationRefreshes.add(ObligationRefresh(ids: ids));
     }
     if (e.kind == 'obligation_status_changed' &&
         !_obligationRefreshes.isClosed) {
       final statuses = _statusChanges(e.payload);
       invalidateObligationsCache();
-      if (_overviewQueueMovedBy(statuses)) {
-        _overviewQueueOutdated(dropInFlight: false);
-      }
+      obligationSync.statusesChanged(statuses);
       statuses.keys.forEach(_obligationLookups.remove);
       _obligationRefreshes.add(ObligationRefresh(ids: statuses.keys.toSet()));
       // Recent Activity lists closes only, so a re-ready or block adds no row.
@@ -2296,7 +2169,8 @@ class DashboardStore {
       _walkieActive.close(),
       _chatRoomParticipants.close(),
       _obligationRefreshes.close(),
-      _overviewQueue.close(),
+      obligations.close(),
+      obligationSync.close(),
     ]);
   }
 }

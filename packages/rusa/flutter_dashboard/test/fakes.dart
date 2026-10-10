@@ -1369,37 +1369,37 @@ class FakeObligationsCache implements ObligationsCache {
     invalidateCount++;
   }
 
-  /// Overview queue captures (#992), keyed like [_entries].
-  final Map<String, PersistedOverviewQueueSnapshot> overviewEntries = {};
-  int overviewSaveCount = 0;
-  int overviewInvalidateCount = 0;
+  /// Shared obligation store captures (#992), keyed like [_entries].
+  final Map<String, PersistedObligationEntitiesSnapshot> entityEntries = {};
+  int entitySaveCount = 0;
+  int entityInvalidateCount = 0;
 
   @override
-  PersistedOverviewQueueSnapshot? loadOverviewQueue({
+  PersistedObligationEntitiesSnapshot? loadEntities({
     required String scope,
     required String principalId,
-  }) => overviewEntries['$scope.$principalId'];
+  }) => entityEntries['$scope.$principalId'];
 
   @override
-  void saveOverviewQueue(PersistedOverviewQueueSnapshot snapshot) {
-    overviewEntries['${snapshot.scope}.${snapshot.principalId}'] = snapshot;
-    overviewSaveCount++;
+  void saveEntities(PersistedObligationEntitiesSnapshot snapshot) {
+    entityEntries['${snapshot.scope}.${snapshot.principalId}'] = snapshot;
+    entitySaveCount++;
   }
 
   @override
-  void invalidateOverviewQueue({
+  void invalidateEntities({
     required String scope,
     required String principalId,
   }) {
-    overviewEntries.remove('$scope.$principalId');
-    overviewInvalidateCount++;
+    entityEntries.remove('$scope.$principalId');
+    entityInvalidateCount++;
   }
 
   @override
   void clear() {
     stored = null;
     _entries.clear();
-    overviewEntries.clear();
+    entityEntries.clear();
     clearCount++;
   }
 }

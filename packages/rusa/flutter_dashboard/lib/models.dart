@@ -2271,57 +2271,6 @@ class ObligationPage {
   );
 }
 
-/// The viewer's Overview "My Queue": one page per section, plus the
-/// blocking children of each waiting row once their details answer (#992).
-class OverviewQueue {
-  const OverviewQueue({
-    required this.ready,
-    required this.waiting,
-    required this.scheduled,
-    this.blockers = const {},
-  });
-
-  final List<ObligationDto> ready;
-  final List<ObligationDto> waiting;
-  final List<ObligationDto> scheduled;
-
-  /// Waiting row id -> its blocking children. A row without an entry has not
-  /// been enriched yet, so its card renders without the blocker list.
-  final Map<String, List<ObligationDto>> blockers;
-
-  int get length => ready.length + waiting.length + scheduled.length;
-
-  /// Whether [id] is a row here or a blocker shown under one.
-  bool mentions(String id) =>
-      ready.any((o) => o.id == id) ||
-      waiting.any((o) => o.id == id) ||
-      scheduled.any((o) => o.id == id) ||
-      blockers.values.any((list) => list.any((o) => o.id == id));
-
-  Map<String, dynamic> toJson() => {
-    'ready': ready.map((o) => o.toJson()).toList(),
-    'waiting': waiting.map((o) => o.toJson()).toList(),
-    'scheduled': scheduled.map((o) => o.toJson()).toList(),
-    'blockers': blockers.map(
-      (id, list) => MapEntry(id, list.map((o) => o.toJson()).toList()),
-    ),
-  };
-
-  factory OverviewQueue.fromJson(Map<String, dynamic> j) {
-    List<ObligationDto> rows(Object? raw) => (raw as List<dynamic>)
-        .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
-        .toList();
-    return OverviewQueue(
-      ready: rows(j['ready']),
-      waiting: rows(j['waiting']),
-      scheduled: rows(j['scheduled']),
-      blockers: (j['blockers'] as Map<String, dynamic>? ?? const {}).map(
-        (id, list) => MapEntry(id, rows(list)),
-      ),
-    );
-  }
-}
-
 class ObligationTreeDto {
   const ObligationTreeDto({
     required this.obligation,

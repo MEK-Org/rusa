@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'models.dart';
+import 'obligation_store.dart';
 
 /// One persisted capture of the obligations forest, written after an authoritative
 /// `/api/mesh/obligations/forest` sync and replayed on the next return or reload
@@ -133,23 +134,26 @@ class PersistedObligationsSnapshot {
   static int encodedSize(String value) => utf8.encode(value).length;
 }
 
-/// One persisted capture of Overview's My Queue (#992), written after each
-/// successful queue refresh and replayed after the viewing principal resolves
-/// on the next page load, while the refresh runs. Identity, age and corruption
-/// rules match [PersistedObligationsSnapshot]; only the payload differs,
-/// because the queue's per-section pages are not derivable from the forest.
-class PersistedOverviewQueueSnapshot {
-  const PersistedOverviewQueueSnapshot({
+/// One persisted capture of the shared obligation store (#992), written after
+/// each settled refresh and replayed once the viewing principal resolves on
+/// the next page load, while the refresh runs. It holds the obligations of
+/// the queries the store knew in full, those rows' recorded blockers, and the
+/// queries themselves, so a replayed empty queue still reads as empty.
+/// Identity, age and corruption rules match [PersistedObligationsSnapshot].
+class PersistedObligationEntitiesSnapshot {
+  const PersistedObligationEntitiesSnapshot({
     required this.scope,
     required this.principalId,
     required this.savedAt,
-    required this.queue,
+    required this.queries,
+    required this.entities,
   });
 
   final String scope;
   final String principalId;
   final String savedAt;
-  final OverviewQueue queue;
+  final List<ObligationQuery> queries;
+  final ObligationEntities entities;
 
   static const int schemaVersion = 1;
 
@@ -157,24 +161,47 @@ class PersistedOverviewQueueSnapshot {
   /// origin's localStorage (768 KiB of roughly 5 MiB).
   static const int maxSerializedBytes = 256 * 1024;
 
-  factory PersistedOverviewQueueSnapshot.capture({
+  /// Captures what [entities] holds for [queries]: their rows, and the
+  /// recorded blockers of those rows.
+  factory PersistedObligationEntitiesSnapshot.capture({
     required String scope,
     required String principalId,
-    required OverviewQueue queue,
+    required Iterable<ObligationQuery> queries,
+    required ObligationEntities entities,
     required DateTime now,
-  }) => PersistedOverviewQueueSnapshot(
-    scope: scope,
-    principalId: principalId,
-    savedAt: now.toUtc().toIso8601String(),
-    queue: queue,
-  );
+  }) {
+    final kept = queries.toList();
+    final rows = {
+      for (final q in kept)
+        for (final o in entities.select(q)) o.id: o,
+    };
+    final blockers = {for (final id in rows.keys) id: ?entities.blockers[id]};
+    return PersistedObligationEntitiesSnapshot(
+      scope: scope,
+      principalId: principalId,
+      savedAt: now.toUtc().toIso8601String(),
+      queries: kept,
+      entities: ObligationEntities(
+        byId: {
+          ...rows,
+          for (final children in blockers.values)
+            for (final c in children) c: ?entities.byId[c],
+        },
+        blockers: blockers,
+      ),
+    );
+  }
 
   Map<String, dynamic> toJson() => {
     'version': schemaVersion,
     'scope': scope,
     'principalId': principalId,
     'savedAt': savedAt,
-    'queue': queue.toJson(),
+    'queries': [
+      for (final q in queries) {'ownerId': q.ownerId, 'queue': q.queue.name},
+    ],
+    'obligations': entities.byId.values.map((o) => o.toJson()).toList(),
+    'blockers': entities.blockers,
   };
 
   String encode() => jsonEncode(toJson());
@@ -184,7 +211,7 @@ class PersistedOverviewQueueSnapshot {
 
   /// Parses a persisted payload, or returns null for another schema version,
   /// an oversized payload or an unexpected shape. Never throws.
-  static PersistedOverviewQueueSnapshot? fromJson(
+  static PersistedObligationEntitiesSnapshot? fromJson(
     Object? decoded, {
     int? serializedByteCount,
   }) {
@@ -198,18 +225,41 @@ class PersistedOverviewQueueSnapshot {
       final scope = decoded['scope'];
       final principalId = decoded['principalId'];
       final savedAt = decoded['savedAt'];
-      final queue = decoded['queue'];
+      final queries = decoded['queries'];
+      final obligations = decoded['obligations'];
+      final blockers = decoded['blockers'];
       if (scope is! String ||
           principalId is! String ||
           savedAt is! String ||
-          queue is! Map) {
+          queries is! List ||
+          obligations is! List ||
+          blockers is! Map) {
         return null;
       }
-      return PersistedOverviewQueueSnapshot(
+      return PersistedObligationEntitiesSnapshot(
         scope: scope,
         principalId: principalId,
         savedAt: savedAt,
-        queue: OverviewQueue.fromJson(Map<String, dynamic>.from(queue)),
+        queries: [
+          for (final q in queries.cast<Map<dynamic, dynamic>>())
+            ObligationQuery(
+              ownerId: q['ownerId'] as String,
+              queue: ObligationQueue.values.byName(q['queue'] as String),
+            ),
+        ],
+        entities: ObligationEntities(
+          byId: {
+            for (final o in obligations.map(
+              (raw) =>
+                  ObligationDto.fromJson(Map<String, dynamic>.from(raw as Map)),
+            ))
+              o.id: o,
+          },
+          blockers: {
+            for (final e in blockers.entries)
+              e.key as String: (e.value as List).cast<String>().toList(),
+          },
+        ),
       );
     } catch (_) {
       return null;
@@ -246,21 +296,19 @@ abstract interface class ObligationsCache {
   /// Invalidate or remove cached obligations for [scope] and [principalId].
   void invalidate({required String scope, required String principalId});
 
-  /// The last Overview queue capture for [scope] and [principalId] (#992).
-  PersistedOverviewQueueSnapshot? loadOverviewQueue({
+  /// The last shared obligation store capture for [scope] and [principalId]
+  /// (#992).
+  PersistedObligationEntitiesSnapshot? loadEntities({
     required String scope,
     required String principalId,
   });
 
-  void saveOverviewQueue(PersistedOverviewQueueSnapshot snapshot);
+  void saveEntities(PersistedObligationEntitiesSnapshot snapshot);
 
-  void invalidateOverviewQueue({
-    required String scope,
-    required String principalId,
-  });
+  void invalidateEntities({required String scope, required String principalId});
 
-  /// Drop every persisted capture, forest and Overview queue, across all
-  /// scopes and principals.
+  /// Drop every persisted capture, forest and shared store, across all scopes
+  /// and principals.
   void clear();
 }
 
@@ -282,16 +330,16 @@ class NoopObligationsCache implements ObligationsCache {
   void invalidate({required String scope, required String principalId}) {}
 
   @override
-  PersistedOverviewQueueSnapshot? loadOverviewQueue({
+  PersistedObligationEntitiesSnapshot? loadEntities({
     required String scope,
     required String principalId,
   }) => null;
 
   @override
-  void saveOverviewQueue(PersistedOverviewQueueSnapshot snapshot) {}
+  void saveEntities(PersistedObligationEntitiesSnapshot snapshot) {}
 
   @override
-  void invalidateOverviewQueue({
+  void invalidateEntities({
     required String scope,
     required String principalId,
   }) {}

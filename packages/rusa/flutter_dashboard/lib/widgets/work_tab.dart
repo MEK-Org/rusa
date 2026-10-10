@@ -7,6 +7,7 @@ import '../breakpoints.dart';
 import '../dashboard_timing.dart';
 import '../link_opener.dart';
 import '../models.dart';
+import '../obligation_store.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../util.dart';
@@ -48,6 +49,7 @@ class _WorkTabState extends State<WorkTab> {
   String? _selectedObligationId;
   StreamSubscription<String?>? _focusSub;
   StreamSubscription<ObligationRefresh>? _checkpointSub;
+  StreamSubscription<ObligationEntities>? _storeSub;
   StreamSubscription<String?>? _principalSub;
   bool _showDone = false;
   bool _fetchedTerminalRoots = false;
@@ -88,6 +90,9 @@ class _WorkTabState extends State<WorkTab> {
           _loading = false;
           _isBackgroundRefreshing = false;
         });
+        // Into the shared store too, so the Overview's queue shows what this
+        // load found without a request of its own (#992).
+        widget.store.obligations.upsert(_obligationsIn(forest.trees));
         // Focus-link and Show Done requests include terminal roots. Persist only
         // the default terminal-excluding forest so a later default view cannot
         // paint rows it believes it did not fetch.
@@ -296,6 +301,9 @@ class _WorkTabState extends State<WorkTab> {
     _checkpointSub = widget.store.obligationRefreshes.listen((_) {
       _handleMutation();
     });
+    _storeSub = widget.store.obligations.entities.skip(1).listen((_) {
+      if (mounted) setState(() {});
+    });
     // When the viewing principal changes, refresh labels and re-seed or clear
     // the cached tree for that principal.
     _principalSub = widget.store.dashboardConfig
@@ -329,36 +337,51 @@ class _WorkTabState extends State<WorkTab> {
   void dispose() {
     _focusSub?.cancel();
     _checkpointSub?.cancel();
+    _storeSub?.cancel();
     _principalSub?.cancel();
     super.dispose();
   }
 
+  static Iterable<ObligationDto> _obligationsIn(
+    List<ObligationTreeDto> nodes,
+  ) sync* {
+    for (final node in nodes) {
+      yield node.obligation;
+      yield* _obligationsIn(node.children);
+    }
+  }
+
+  /// The tree's shape comes from the last forest load; each row shows the
+  /// shared store's copy of its obligation when it holds one, so a refresh
+  /// behind another view updates the row (#992).
+  ObligationDto _latest(ObligationDto loaded) =>
+      widget.store.obligations[loaded.id] ?? loaded;
+
   List<_FlatNode> _flattenTree(List<ObligationTreeDto> nodes, int depth) {
     final result = <_FlatNode>[];
     for (final node in nodes) {
+      final obligation = _latest(node.obligation);
       // A terminal obligation still shows if it retains completion history —
       // the same "recurring, or ledger rows survived recurrence being turned
       // off" test the detail panel uses to decide whether to render the
       // COMPLETION HISTORY section at all.
       final visible =
           _showDone ||
-          !node.obligation.isTerminal ||
-          node.obligation.isRecurring ||
-          node.obligation.hasCompletionHistory;
+          !obligation.isTerminal ||
+          obligation.isRecurring ||
+          obligation.hasCompletionHistory;
       if (!visible) continue;
-      final id = node.obligation.id;
+      final id = obligation.id;
       final hasVisibleChildren = _showDone
           ? node.children.isNotEmpty
-          : node.children.any(
-              (c) =>
-                  !c.obligation.isTerminal ||
-                  c.obligation.isRecurring ||
-                  c.obligation.hasCompletionHistory,
-            );
+          : node.children
+                .map((c) => _latest(c.obligation))
+                .any(
+                  (c) =>
+                      !c.isTerminal || c.isRecurring || c.hasCompletionHistory,
+                );
       final isCollapsed = !_expandedIds.contains(id);
-      result.add(
-        _FlatNode(node.obligation, depth, hasVisibleChildren, isCollapsed),
-      );
+      result.add(_FlatNode(obligation, depth, hasVisibleChildren, isCollapsed));
       if (hasVisibleChildren && !isCollapsed) {
         result.addAll(_flattenTree(node.children, depth + 1));
       }

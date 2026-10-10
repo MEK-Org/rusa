@@ -5,6 +5,8 @@ import 'package:rxdart/rxdart.dart';
 import '../breakpoints.dart';
 import '../dashboard_timing.dart';
 import '../models.dart';
+import '../obligation_store.dart';
+import '../obligation_sync.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../util.dart';
@@ -41,9 +43,40 @@ class _OverviewTabState extends State<OverviewTab> {
   /// between snapshots; idle while nothing is queued.
   Timer? _startLabelTick;
 
-  /// The queue lives in the store (#992), so a return paints the rows it last
-  /// showed while this revalidates them.
-  void _refreshHumanQueue() => unawaited(widget.store.refreshOverviewQueue());
+  /// The viewer's queue sections and the projection of the shared obligation
+  /// store this tab subscribes to (#992). The store outlives the tab, so a
+  /// return paints what it holds while [ObligationSync] revalidates it.
+  List<ObligationQuery> _queries = const [];
+  late Stream<_QueueView> _queueView;
+
+  void _watchQueue() {
+    final store = widget.store;
+    _queries = store.viewerQueues();
+    final queries = _queries;
+    // Deferred so each listen gets its own: the layout switch remounts the
+    // StreamBuilder, which listens again.
+    _queueView = Rx.defer(
+      () => Rx.combineLatest2(
+        store.obligations.watch(queries),
+        store.obligationSync.freshness,
+        _QueueView.new,
+      ),
+      reusable: true,
+    );
+  }
+
+  _QueueView get _currentQueueView => _QueueView(
+    ObligationProjection.of(widget.store.obligations.current, _queries),
+    widget.store.obligationSync.freshness.value,
+  );
+
+  /// The operator asked: request the queue now, whatever its freshness.
+  void _refreshHumanQueue() =>
+      unawaited(widget.store.obligationSync.refresh(_queries));
+
+  /// Requests the queue only if the freshness policy says it needs one.
+  Future<void> _ensureFresh() =>
+      widget.store.obligationSync.ensureFresh(_queries);
 
   /// Times the mount's revalidation as primary navigation; a failed refresh
   /// counts as a failed interaction even though its retained rows still show.
@@ -52,13 +85,13 @@ class _OverviewTabState extends State<OverviewTab> {
       await widget.store.api.trackInteraction(
         DashboardInteraction.primaryNavigation,
         () async {
-          await widget.store.refreshOverviewQueue();
-          final error = widget.store.overviewQueue.value.error;
+          await _ensureFresh();
+          final error = _currentQueueView.error;
           if (error != null) throw error;
         },
       );
     } catch (_) {
-      // The store already exposes the failure to the queue section.
+      // The sync already exposes the failure to the queue section.
     }
   }
 
@@ -66,10 +99,11 @@ class _OverviewTabState extends State<OverviewTab> {
   void initState() {
     super.initState();
     widget.store.refreshQuotaHistory();
+    _watchQueue();
     if (widget.trackNavigation) {
       unawaited(_trackedRefresh());
     } else {
-      _refreshHumanQueue();
+      unawaited(_ensureFresh());
     }
     // Refresh if the server-resolved viewing principal changes.
     _viewerPrincipalSub = widget.store.dashboardConfig
@@ -77,7 +111,9 @@ class _OverviewTabState extends State<OverviewTab> {
         .distinct()
         .skip(1)
         .listen((_) {
-          if (mounted) _refreshHumanQueue();
+          if (!mounted) return;
+          setState(_watchQueue);
+          unawaited(_ensureFresh());
         });
     _startLabelTick = Timer.periodic(const Duration(seconds: 30), (_) {
       if (mounted && widget.store.actorStates.value.queuedActors.isNotEmpty) {
@@ -231,17 +267,27 @@ class _OverviewTabState extends State<OverviewTab> {
 
   /// My obligations queue for the viewing person, under every id they hold.
   Widget _buildMyQueueSection() {
-    return StreamBuilder<OverviewQueueState>(
-      stream: widget.store.overviewQueue,
-      initialData: widget.store.overviewQueue.value,
+    return StreamBuilder<_QueueView>(
+      stream: _queueView,
+      initialData: _currentQueueView,
       builder: (context, snap) {
-        final queue = snap.data?.queue;
-        final error = snap.data?.error;
-        final ready = queue?.ready ?? const <ObligationDto>[];
-        final waiting = queue?.waiting ?? const <ObligationDto>[];
-        final scheduled = queue?.scheduled ?? const <ObligationDto>[];
-        final blockerMap = queue?.blockers ?? const {};
-        final totalCount = queue?.length ?? 0;
+        final view = snap.data ?? _currentQueueView;
+        final error = view.error;
+        List<ObligationDto> rows(ObligationQueue queue) => [
+          for (final q in _queries)
+            if (q.queue == queue) ...view.projection.of(q),
+        ];
+        final ready = rows(ObligationQueue.ready);
+        final waiting = rows(ObligationQueue.waiting);
+        final scheduled = rows(
+          ObligationQueue.scheduled,
+        )..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
+        final blockerMap = view.projection.blockers;
+        final totalCount = ready.length + waiting.length + scheduled.length;
+        final isEmpty = totalCount == 0;
+        final known =
+            _queries.isNotEmpty &&
+            _queries.every((q) => view.freshness[q]?.known ?? false);
 
         return LayoutBuilder(
           builder: (_, constraints) {
@@ -341,22 +387,16 @@ class _OverviewTabState extends State<OverviewTab> {
                     style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
                   ),
                   const SizedBox(height: 14),
-                  if (queue == null && error == null)
+                  if (isEmpty && !known && error == null)
                     const Padding(
                       padding: EdgeInsets.symmetric(vertical: 20),
                       child: Center(child: CircularProgressIndicator()),
                     )
                   // An empty queue kept through a failed refresh would claim
                   // the queue is empty when the refresh could not say.
-                  else if (queue == null ||
-                      (error != null &&
-                          ready.isEmpty &&
-                          waiting.isEmpty &&
-                          scheduled.isEmpty))
+                  else if (isEmpty && error != null)
                     _queueError(error, isNarrow: isNarrow)
-                  else if (ready.isEmpty &&
-                      waiting.isEmpty &&
-                      scheduled.isEmpty)
+                  else if (isEmpty)
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 12),
                       child: isNarrow
@@ -1648,3 +1688,16 @@ class _OverviewTabState extends State<OverviewTab> {
 /// The identity takes a quarter and the inbox item three quarters, so this
 /// keeps the identity at least 280px — room for a handle, model, and title.
 const double _kQueuedFocusColumnMinWidth = 1120;
+
+/// What My Queue renders: the store's projection of the viewer's queue
+/// sections and where each section stands with the server.
+class _QueueView {
+  const _QueueView(this.projection, this.freshness);
+
+  final ObligationProjection projection;
+  final Map<ObligationQuery, QueryFreshness> freshness;
+
+  /// The first failure among the sections' latest refreshes.
+  Object? get error =>
+      projection.rows.keys.map((q) => freshness[q]?.error).nonNulls.firstOrNull;
+}
