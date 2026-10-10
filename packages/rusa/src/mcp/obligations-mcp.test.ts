@@ -746,6 +746,22 @@ describe("obligations MCP", () => {
     });
   });
 
+  it("records an optional reassignment message in history (#941)", async () => {
+    repository.create({ title: "task", id: "task", ownerId: "actor-a" });
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const result = (await client.callTool({
+      name: "reassign_obligation",
+      arguments: { id: "task", owner_id: "human:operator", message: "Ready for your review." },
+    })) as CallToolResult;
+
+    expect(result.isError).toBeFalsy();
+    expect(repository.listHistory("task")[0]).toMatchObject({
+      mutationKind: "reassign",
+      actingPrincipal: "actor-a",
+      after: { ownerId: "human:operator", message: "Ready for your review." },
+    });
+  });
+
   it("rejects unauthorized reassignment and honors an injected ancestor policy", async () => {
     repository.create({
       title: "foreign",

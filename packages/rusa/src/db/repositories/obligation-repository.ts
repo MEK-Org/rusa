@@ -21,6 +21,7 @@ import {
   isReadyForAttention,
   isTerminalObligationStatus,
   normalizeCheckpoint,
+  normalizeReassignMessage,
   normalizeSnoozeUntil,
   OBLIGATION_STATUSES,
   type Obligation,
@@ -1029,6 +1030,12 @@ export class ObligationRepository {
   private historyPrincipalOverrides = new Map<string, EntityId>();
 
   /**
+   * Reassignment messages (#941) for this transaction, keyed by obligation.
+   * Recorded on that obligation's owner-change history row and nowhere else.
+   */
+  private historyReassignMessages = new Map<string, string>();
+
+  /**
    * `(dependentId, prerequisiteId)` keys whose cancellation-attention delivery
    * threw on a previous {@link mutate} call (#212) — e.g. a transient inbox
    * append failure. Kept only as keys, not the stale payload: the next
@@ -1273,6 +1280,7 @@ export class ObligationRepository {
     this.pendingResponsiveReady = [];
     this.pendingStatusChanges = [];
     this.historyPrincipalOverrides.clear();
+    this.historyReassignMessages.clear();
     const actingPrincipal = validateEntityId(principal);
     this.installHistoryCapture();
     let afterHeads = new Map<string, string>();
@@ -1623,6 +1631,8 @@ export class ObligationRepository {
       if (ownerChanged) {
         beforeState.ownerId = b.owner_id;
         afterState.ownerId = a.owner_id;
+        const message = this.historyReassignMessages.get(id);
+        if (message !== undefined) afterState.message = message;
       }
       if (parentChanged) {
         beforeState.parentId = b.parent_id;
@@ -2735,8 +2745,17 @@ export class ObligationRepository {
   /**
    * Change the owner of one live obligation without changing its identity,
    * position, ancestry, or state. Authorization belongs to the calling surface.
+   *
+   * A `message` (#941) is recorded on the owner-change history row. A
+   * reassignment to the current owner changes nothing and records nothing, so
+   * its message is validated and then dropped.
    */
-  reassign(id: string, newOwnerId: EntityId, principal: EntityId): Obligation {
+  reassign(
+    id: string,
+    newOwnerId: EntityId,
+    principal: EntityId,
+    message?: string | null
+  ): Obligation {
     return this.mutate(principal, () => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
@@ -2744,9 +2763,11 @@ export class ObligationRepository {
       }
       const ownerId = validateEntityId(newOwnerId);
       this.assertOwnerExists(ownerId);
+      const reason = normalizeReassignMessage(message);
       if (ownerId === obligation.ownerId) {
         return obligation;
       }
+      if (reason !== null) this.historyReassignMessages.set(id, reason);
 
       this.db
         .prepare("UPDATE obligations SET owner_id = ?, updated_at = ? WHERE id = ?")

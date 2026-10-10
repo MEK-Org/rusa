@@ -1,6 +1,9 @@
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
-import { ObligationValidationError } from "../../obligations/obligation.js";
+import {
+  OBLIGATION_REASSIGN_MESSAGE_MAX,
+  ObligationValidationError,
+} from "../../obligations/obligation.js";
 import { obligations } from "../migrations/0016_obligations.js";
 import { obligationPriority } from "../migrations/0017_obligation_priority.js";
 import { obligationTimestamps } from "../migrations/0025_obligation_timestamps.js";
@@ -80,6 +83,8 @@ function instrumentObligationReads(db: Database.Database): {
   return { db: proxy, tally };
 }
 
+const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";
+
 describe("Obligation mutation history", () => {
   let db: Database.Database;
   let repository: ObligationRepository;
@@ -93,6 +98,13 @@ describe("Obligation mutation history", () => {
       db,
       (id) => ["actor-a", "actor-b", "actor-c"].includes(id),
       () => now
+    );
+    repository.setPrincipalKind((id) =>
+      id === TEST_USER_ID
+        ? "user"
+        : ["actor-a", "actor-b", "actor-c"].includes(id)
+          ? "actor"
+          : undefined
     );
   });
 
@@ -331,6 +343,95 @@ describe("Obligation mutation history", () => {
       repository.reparent(child.id, parent.id, "actor-a");
       const page = repository.listHistory(child.id);
       expect(page.length).toBe(0);
+    });
+  });
+
+  describe("reassign message (#941)", () => {
+    it("records the message with the owner change, attributed to the acting principal", () => {
+      const ob = repository.create({ title: "Review", ownerId: TEST_USER_ID });
+      now += 1000;
+      repository.reassign(ob.id, "actor-a", TEST_USER_ID, "  Please address the round-2 note.  ");
+
+      expect(repository.listHistory(ob.id)).toEqual([
+        expect.objectContaining({
+          mutationKind: "reassign",
+          actingPrincipal: TEST_USER_ID,
+          before: { ownerId: TEST_USER_ID },
+          after: { ownerId: "actor-a", message: "Please address the round-2 note." },
+        }),
+      ]);
+      expect(repository.listHistoryPage(ob.id).entries[0].after.message).toBe(
+        "Please address the round-2 note."
+      );
+    });
+
+    it("records no message key for an absent or blank message", () => {
+      const ob = repository.create({ title: "Review", ownerId: "actor-a" });
+      repository.reassign(ob.id, "actor-b", "actor-a");
+      repository.reassign(ob.id, "actor-c", "actor-a", "   ");
+
+      const history = repository.listHistory(ob.id);
+      expect(history.map((h) => h.after)).toEqual([{ ownerId: "actor-c" }, { ownerId: "actor-b" }]);
+      const payloads = db
+        .prepare("SELECT payload FROM obligation_history WHERE obligation_id = ? ORDER BY id")
+        .all(ob.id) as Array<{ payload: string }>;
+      expect(payloads.map((row) => JSON.parse(row.payload).schemaVersion)).toEqual([1, 1]);
+    });
+
+    it("rejects an over-long message without changing the owner", () => {
+      const ob = repository.create({ title: "Review", ownerId: "actor-a" });
+      expect(() =>
+        repository.reassign(
+          ob.id,
+          "actor-b",
+          "actor-a",
+          "x".repeat(OBLIGATION_REASSIGN_MESSAGE_MAX + 1)
+        )
+      ).toThrow(ObligationValidationError);
+      expect(repository.get(ob.id)?.ownerId).toBe("actor-a");
+      expect(repository.listHistory(ob.id)).toEqual([]);
+    });
+
+    it("leaves ready-head delivery exactly as a reassign without a message", () => {
+      const deliveries = (message?: string) => {
+        const changes: Array<{ ownerId: string; headId: string | null }> = [];
+        const local = new ObligationRepository(
+          migratedDb(),
+          (id) => ["actor-a", "actor-b"].includes(id),
+          () => now
+        );
+        local.setPrincipalKind((id) =>
+          id === TEST_USER_ID ? "user" : ["actor-a", "actor-b"].includes(id) ? "actor" : undefined
+        );
+        const ob = local.create({ id: "review", title: "Review", ownerId: TEST_USER_ID });
+        local.setReadyHeadListener((change) =>
+          changes.push({ ownerId: change.ownerId, headId: change.head?.id ?? null })
+        );
+        local.reassign(ob.id, "actor-a", TEST_USER_ID, message);
+        return changes;
+      };
+      expect(deliveries("Back to you.")).toEqual(deliveries());
+      expect(deliveries()).toContainEqual({ ownerId: "actor-a", headId: "review" });
+    });
+
+    it("returns a human -> actor -> human round trip to its place in the human's queue", () => {
+      const ids = ["first", "review", "last"];
+      for (const id of ids) {
+        now += 1000;
+        repository.create({ id, title: id, ownerId: TEST_USER_ID });
+      }
+      const queue = () => repository.listOwned(TEST_USER_ID).map((o) => o.id);
+      expect(queue()).toEqual(ids);
+
+      repository.reassign("review", "actor-a", TEST_USER_ID, "Please answer seat 2.");
+      expect(queue()).toEqual(["first", "last"]);
+      repository.reassign("review", TEST_USER_ID, "actor-a", "Answered; back to you.");
+
+      expect(queue()).toEqual(ids);
+      expect(repository.listHistory("review").map((h) => h.after)).toEqual([
+        { ownerId: TEST_USER_ID, message: "Answered; back to you." },
+        { ownerId: "actor-a", message: "Please answer seat 2." },
+      ]);
     });
   });
 

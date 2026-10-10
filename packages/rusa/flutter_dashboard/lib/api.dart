@@ -732,6 +732,7 @@ class DashboardApi {
   Future<ObligationDto> reassignObligation(
     String id, {
     required String ownerId,
+    String? message,
   }) => trackInteraction(DashboardInteraction.dashboardMutation, () async {
     final uri = _u('/api/mesh/obligations/$id/reassign');
     final res = await _client.post(
@@ -740,7 +741,10 @@ class DashboardApi {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
       },
-      body: jsonEncode({'ownerId': ownerId}),
+      body: jsonEncode({
+        'ownerId': ownerId,
+        if (message != null && message.trim().isNotEmpty) 'message': message,
+      }),
     );
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);

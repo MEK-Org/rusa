@@ -1753,6 +1753,11 @@ export async function handleMeshApiRequest(
             sendJson(res, 400, { error: "ownerId is required" });
             return;
           }
+          const message = body.message;
+          if (message != null && typeof message !== "string") {
+            sendJson(res, 400, { error: "message must be a string" });
+            return;
+          }
           if (!obligations.get(id)) {
             sendJson(res, 404, { error: "obligation not found" });
             return;
@@ -1765,7 +1770,7 @@ export async function handleMeshApiRequest(
           const actingPrincipal = requireOperatorPrincipal(req, res, deps);
           if (!actingPrincipal) return;
           try {
-            const obligation = obligations.reassign(id, owner.ownerId, actingPrincipal);
+            const obligation = obligations.reassign(id, owner.ownerId, actingPrincipal, message);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });

@@ -706,7 +706,7 @@ class FakeApi extends DashboardApi {
   final reorderCalls =
       <({String id, String? previousId, String? nextId, String scope})>[];
   final reparentCalls = <({String id, String? parentId})>[];
-  final reassignCalls = <({String id, String ownerId})>[];
+  final reassignCalls = <({String id, String ownerId, String? message})>[];
   final fetchObligationsCalls =
       <({String? ownerId, String? status, String? queue, bool? rootsOnly})>[];
 
@@ -1080,8 +1080,9 @@ class FakeApi extends DashboardApi {
   Future<ObligationDto> reassignObligation(
     String id, {
     required String ownerId,
+    String? message,
   }) async {
-    reassignCalls.add((id: id, ownerId: ownerId));
+    reassignCalls.add((id: id, ownerId: ownerId, message: message));
     final old = obligationsResult.firstWhere(
       (o) => o.id == id,
       orElse: () => makeObligation(id),
