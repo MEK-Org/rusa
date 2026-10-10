@@ -24,6 +24,8 @@ const BODY = JSON.stringify({ actors: 1000, status: "ok" });
 
 class BenchResponse extends EventEmitter {
   statusCode = 200;
+  headersSent = false;
+  writableFinished = false;
   readonly headers: Record<string, string> = {};
 
   setHeader(name: string, value: string): this {
@@ -40,8 +42,12 @@ class BenchResponse extends EventEmitter {
     return true;
   }
 
+  // A real finished response also emits `close`, which the wrapper must
+  // observe and ignore (#990), so the instrumented arm pays for both.
   end(_chunk?: string | Buffer): this {
+    this.writableFinished = true;
     this.emit("finish");
+    this.emit("close");
     return this;
   }
 }

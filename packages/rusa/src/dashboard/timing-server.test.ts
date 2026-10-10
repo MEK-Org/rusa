@@ -10,6 +10,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 class TestResponse extends EventEmitter {
   statusCode = 200;
+  headersSent = false;
+  writableFinished = false;
   readonly headers: Record<string, string> = {};
 
   setHeader(name: string, value: string): this {
@@ -19,16 +21,27 @@ class TestResponse extends EventEmitter {
 
   writeHead(status: number): this {
     this.statusCode = status;
+    this.headersSent = true;
     return this;
   }
 
   write(_chunk?: string | Buffer): boolean {
+    this.headersSent = true;
     return true;
   }
 
+  // Like a real ServerResponse, a finished response then emits `close`.
   end(_chunk?: string | Buffer): this {
+    this.headersSent = true;
+    this.writableFinished = true;
     this.emit("finish");
+    this.emit("close");
     return this;
+  }
+
+  /** The connection goes away before `end`: abort, client timeout or drop. */
+  closeEarly(): void {
+    this.emit("close");
   }
 }
 
@@ -149,6 +162,93 @@ describe("dashboard timing server wrapper", () => {
     expect(record.phases.route).toBeGreaterThanOrEqual(25);
     // Route stops at writeHead; the post-header sleep is outside it.
     expect(record.durationMs - record.phases.route).toBeGreaterThanOrEqual(55);
+  });
+
+  it("records a finished response exactly once although close follows finish (#990)", () => {
+    const recordServer = vi.fn();
+    const response = new TestResponse();
+    beginDashboardRequestTiming(response as unknown as ServerResponse, "/api/mesh/threads", "GET", {
+      recordServer,
+    } as unknown as DashboardTimingRecorder);
+    response.writeHead(404);
+    response.end("{}");
+    response.closeEarly();
+
+    expect(recordServer).toHaveBeenCalledTimes(1);
+    expect(recordServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        label: "mesh_threads",
+        status: 404,
+        request: { method: "GET", terminal: "finished" },
+      })
+    );
+  });
+
+  it("records a close before finish once, with a status only after headers were sent (#990)", () => {
+    const recordServer = vi.fn();
+    const recorder = { recordServer } as unknown as DashboardTimingRecorder;
+    const beforeHeaders = new TestResponse();
+    beginDashboardRequestTiming(
+      beforeHeaders as unknown as ServerResponse,
+      "/api/mesh/threads",
+      "GET",
+      recorder
+    );
+    beforeHeaders.closeEarly();
+    beforeHeaders.closeEarly();
+    const midBody = new TestResponse();
+    beginDashboardRequestTiming(
+      midBody as unknown as ServerResponse,
+      "/api/mesh/threads",
+      "GET",
+      recorder
+    );
+    midBody.writeHead(200);
+    midBody.write("partial");
+    midBody.closeEarly();
+
+    expect(recordServer).toHaveBeenCalledTimes(2);
+    expect(recordServer).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        status: null,
+        bytes: 0,
+        request: { method: "GET", terminal: "closed_before_finish" },
+      })
+    );
+    expect(recordServer).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        status: 200,
+        bytes: 7,
+        request: { method: "GET", terminal: "closed_before_finish" },
+      })
+    );
+  });
+
+  it("records the fixed request method and never a verbatim unknown one (#990)", () => {
+    const recordServer = vi.fn();
+    const recorder = { recordServer } as unknown as DashboardTimingRecorder;
+    for (const method of ["GET", "HEAD", "OPTIONS", "PROPFIND", undefined]) {
+      const response = new TestResponse();
+      beginDashboardRequestTiming(
+        response as unknown as ServerResponse,
+        "/api/mesh/obligations",
+        method,
+        recorder
+      );
+      response.end("{}");
+    }
+
+    expect(
+      recordServer.mock.calls.map(([record]) => [record.label, record.request.method])
+    ).toEqual([
+      ["mesh_obligations", "GET"],
+      ["mesh_obligations", "HEAD"],
+      ["mesh_obligations", "OPTIONS"],
+      ["mesh_obligation_mutation", "other"],
+      ["mesh_obligations", "GET"],
+    ]);
   });
 
   it("times the after-paint reference fill-in apart from the pages it fills (#940)", () => {
