@@ -12,10 +12,10 @@ export interface MissedQuotaWindow {
   /** When the scrape that dropped it was observed. */
   missedAt: string;
   /**
-   * Whether that scrape failed — its capture did not complete (#847) or its
-   * output threw while parsing — rather than parsing without the window. A
-   * parser that gave up and recorded an `unknown` snapshot counts as parsed
-   * with no windows, so its alarm reads as the window no longer showing.
+   * Whether that scrape failed — its capture did not complete (#847), its
+   * output threw while parsing, or it extracted no quota value at all (#982),
+   * such as a capture taken before the panel rendered — rather than reading
+   * the panel without the window.
    */
   scrapeFailed: boolean;
 }

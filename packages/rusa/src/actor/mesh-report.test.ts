@@ -76,9 +76,9 @@ describe("generateMeshReport", () => {
       repo.record({
         kind: "root_control_action",
         actorId: "root",
-        detail: "human:operator spawn_child",
+        detail: "00000000-0000-4000-8000-000000000001 spawn_child",
         payload: JSON.stringify({
-          principal: "human:operator",
+          principal: "00000000-0000-4000-8000-000000000001",
           action: "spawn_child",
           targetId: "worker-abcdef12",
         }),
@@ -98,7 +98,7 @@ describe("generateMeshReport", () => {
     expect(html).toContain("done, PR opened");
     expect(html).toContain("all green");
     expect(html).toContain("root control");
-    expect(html).toContain("human:operator spawn_child");
+    expect(html).toContain("00000000-0000-4000-8000-000000000001 spawn_child");
     // Cards carry the actor keys for client-side zoom filtering.
     expect(html).toContain('data-actors="root worker-abcdef12"');
   });

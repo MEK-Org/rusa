@@ -60,14 +60,14 @@ void main() {
       expect(label, isNot(contains('actor-a')));
     });
 
-    test('says Operator for a human author', () {
+    test('does not infer a human author from an unknown id', () {
       final ob = makeObligation(
         'arc',
         checkpoint: standing,
-        checkpointBy: 'human:operator',
+        checkpointBy: '00000000-0000-4000-8000-000000000001',
       );
 
-      expect(checkpointStampLabel(ob, (id) => null), startsWith('Operator · '));
+      expect(checkpointStampLabel(ob, (id) => null), startsWith('Unknown actor · '));
     });
   });
 
@@ -201,6 +201,7 @@ void main() {
       await tester.pump();
       await tester.pump();
       expect(find.text(oldStanding), findsOneWidget);
+      final forestLoadsBefore = api.fetchObligationForestCalls.length;
 
       api.obligationsResult = [
         makeObligation(
@@ -227,7 +228,7 @@ void main() {
         await tester.pump(const Duration(milliseconds: 10));
       }
 
-      expect(api.fetchObligationForestCalls, hasLength(2));
+      expect(api.fetchObligationForestCalls, hasLength(forestLoadsBefore + 1));
       expect(find.text(newStanding), findsOneWidget);
       expect(find.text(oldStanding), findsNothing);
 

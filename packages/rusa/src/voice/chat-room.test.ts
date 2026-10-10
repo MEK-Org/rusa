@@ -35,7 +35,7 @@ describe("ChatRoomService", () => {
       rootId: "root",
       voices: () => buildSupportedVoiceCatalog(),
       defaultVoice: DEFAULT,
-      isHumanPrincipal: (id) => id === "user-operator",
+      isHumanPrincipal: (id) => id === "00000000-0000-4000-8000-000000000001",
       now: () => new Date(Date.UTC(2026, 8, 30, 12, 0, clock++)).toISOString(),
     });
 
@@ -131,8 +131,9 @@ describe("ChatRoomService", () => {
 
     expect(() => room.add("root", "root")).toThrow(/always in the Chat Room/);
     expect(() => room.add("parent", "root")).toThrow(/alias/);
-    expect(() => room.add("human:operator", "root")).toThrow(/human principals/);
-    expect(() => room.add("user-operator", "root")).toThrow(/human principals/);
+    expect(() => room.add("00000000-0000-4000-8000-000000000001", "root")).toThrow(
+      /human principals/
+    );
     expect(() => room.add("nobody", "root")).toThrow(/unknown actor/);
     expect(() => room.add("gone", "root")).toThrow(/retired/);
     expect(room.participants()).toHaveLength(1);

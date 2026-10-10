@@ -251,7 +251,7 @@ describe("RunManager", () => {
       const h = setup();
       const actor = live(h, "a1");
       append("a1", { type: "github.issue" });
-      append("a1", { type: "human.message", priority: "responsive" });
+      append("a1", { type: "mesh.message", priority: "responsive" });
 
       // The same promotion `actorsWithUnhandled()` reports for the whole mesh,
       // derived per actor. The caller still said only the actor's name.
@@ -269,7 +269,7 @@ describe("RunManager", () => {
       const h = setup();
       live(h, "a1");
       append("a1", { type: "github.issue" });
-      const urgent = append("a1", { type: "human.message", priority: "responsive" });
+      const urgent = append("a1", { type: "mesh.message", priority: "responsive" });
 
       inbox.markHandled("a1", [urgent.id], new Date(), "read it");
       expect(h.manager.durableWork("a1")).toEqual({ priority: "normal" });
@@ -289,7 +289,7 @@ describe("RunManager", () => {
       const h = setup();
       const actor = live(h, "a1");
       append("a1", { type: "human.voice", priority: "responsive" }, new Date(1_000));
-      append("a1", { type: "human.message", priority: "responsive" }, new Date(2_000));
+      append("a1", { type: "mesh.message", priority: "responsive" }, new Date(2_000));
 
       // Recovery — a reattach, a resume sweep — is exactly where the memo is
       // most likely to sit behind a newer responsive row, so voice timing is
@@ -332,7 +332,7 @@ describe("RunManager", () => {
 
       // 1. Append 100 responsive entries with newer timestamps (t=2000..2099)
       for (let i = 0; i < 100; i++) {
-        append("a1", { type: "human.message", priority: "responsive" }, new Date(2_000 + i));
+        append("a1", { type: "mesh.message", priority: "responsive" }, new Date(2_000 + i));
       }
       // 2. Mark them seen so unseen is false on the first page
       inbox.markSeen("a1");
@@ -340,7 +340,7 @@ describe("RunManager", () => {
       // 3. Append older unseen entries with older timestamps (t=1000..1004)
       append("a1", { type: "human.voice", priority: "responsive" }, new Date(1_000));
       for (let i = 1; i <= 4; i++) {
-        append("a1", { type: "human.message", priority: "responsive" }, new Date(1_000 + i));
+        append("a1", { type: "mesh.message", priority: "responsive" }, new Date(1_000 + i));
       }
 
       // Exact paging must traverse beyond the first 100 rows, discover the unseen work,
@@ -376,7 +376,7 @@ describe("RunManager", () => {
       // An unseen voice memo on the first page, with a second page behind it.
       append("a1", { type: "human.voice", priority: "responsive" }, new Date(9_000));
       for (let i = 0; i < 120; i++) {
-        append("a1", { type: "human.message", priority: "responsive" }, new Date(1_000 + i));
+        append("a1", { type: "mesh.message", priority: "responsive" }, new Date(1_000 + i));
       }
 
       const plain = counted();
@@ -418,7 +418,7 @@ describe("RunManager", () => {
       });
       live(h, "a1");
       // No run is admitted, so the row is never marked seen and stays unabsorbed.
-      const entry = append("a1", { type: "human.message", priority: "responsive" });
+      const entry = append("a1", { type: "mesh.message", priority: "responsive" });
       h.manager.dispatch("a1");
       h.manager.dispatch("a1");
       expect(arrivals).toEqual([[entry.id]]);
@@ -446,7 +446,7 @@ describe("RunManager", () => {
 
       // 1. Idle actor: isRunning should be false at arrival time
       const a1 = live(h, "a1", { hold: true });
-      const e1 = append("a1", { type: "human.message", priority: "responsive" });
+      const e1 = append("a1", { type: "mesh.message", priority: "responsive" });
       expect(a1.isRunning).toBe(false);
       h.manager.dispatch("a1");
       expect(observations).toHaveLength(1);
@@ -461,7 +461,7 @@ describe("RunManager", () => {
       expect(a1.isRunning).toBe(true);
 
       // 2. Running actor: isRunning should be true at arrival time
-      const e2 = append("a1", { type: "human.message", priority: "responsive" });
+      const e2 = append("a1", { type: "mesh.message", priority: "responsive" });
       h.manager.dispatch("a1");
       expect(observations).toHaveLength(2);
       expect(observations[1]).toEqual({
@@ -475,7 +475,7 @@ describe("RunManager", () => {
       a2.queued = true;
       expect(a2.isRunning).toBe(false);
       expect(a2.isQueued).toBe(true);
-      const e3 = append("a2", { type: "human.message", priority: "responsive" });
+      const e3 = append("a2", { type: "mesh.message", priority: "responsive" });
       h.manager.dispatch("a2");
       expect(observations).toHaveLength(3);
       expect(observations[2]).toEqual({
@@ -554,7 +554,7 @@ describe("RunManager", () => {
     it("quick-starts responsive work past the debounce window", async () => {
       const h = setup();
       const actor = live(h, "a1", { debounceMs: 5_000 });
-      append("a1", { type: "human.message", priority: "responsive" });
+      append("a1", { type: "mesh.message", priority: "responsive" });
 
       h.manager.dispatch("a1");
       await vi.advanceTimersByTimeAsync(0);
@@ -601,7 +601,7 @@ describe("RunManager", () => {
       const h = setup();
       const actor = live(h, "a1");
       actor.preemptPhase = "running";
-      append("a1", { type: "human.message", priority: "responsive" });
+      append("a1", { type: "mesh.message", priority: "responsive" });
 
       // The operator's message starts a run, which absorbs it. The row stays
       // unhandled for almost the whole run, because an actor marks its work
@@ -620,7 +620,7 @@ describe("RunManager", () => {
       expect(h.preempted).toEqual([["a1", "running"]]);
 
       // Genuinely new responsive work still replaces the run.
-      append("a1", { type: "human.message", priority: "responsive" });
+      append("a1", { type: "mesh.message", priority: "responsive" });
       expect(h.manager.dispatch("a1")).toBe(true);
       expect(actor.preemptions).toBe(2);
       expect(h.preempted).toEqual([
@@ -696,13 +696,13 @@ describe("RunManager", () => {
       const actor = live(h, "a1");
       actor.preemptPhase = "running";
       append("a1", ROOM_ENTRY);
-      append("a1", { type: "human.message", priority: "responsive" });
+      append("a1", { type: "mesh.message", priority: "responsive" });
 
       h.manager.dispatch("a1");
       expect(actor.preemptions).toBe(1);
       expect(h.preempted).toEqual([["a1", "running"]]);
       expect(observed.sort()).toEqual([
-        ["human.message", "interrupt"],
+        ["mesh.message", "interrupt"],
         ["room.human_entry", "queue"],
       ]);
     });
@@ -755,10 +755,10 @@ describe("RunManager", () => {
       });
       const actor = live(h, "a1");
       actor.preemptPhase = "running";
-      append("a1", { type: "human.message", priority: "responsive" });
+      append("a1", { type: "mesh.message", priority: "responsive" });
       h.manager.dispatch("a1");
       expect(actor.preemptions).toBe(1);
-      expect(observed).toEqual([["human.message", "interrupt"]]);
+      expect(observed).toEqual([["mesh.message", "interrupt"]]);
 
       // A subscriber copy keeps its join only through the after-commit seam. The
       // human row is seen first, so only the copy's own policy can preempt here.
@@ -767,7 +767,7 @@ describe("RunManager", () => {
       h.manager.dispatch("a1");
       expect(actor.preemptions).toBe(2);
       expect(observed).toEqual([
-        ["human.message", "interrupt"],
+        ["mesh.message", "interrupt"],
         ["event.copy", "interrupt"],
       ]);
     });
@@ -790,7 +790,7 @@ describe("RunManager", () => {
     it("admits responsive work through the hold", () => {
       const h = setup({ isVoiceSessionActive: () => true });
       const actor = live(h, "a1");
-      append("a1", { type: "human.message", priority: "responsive" });
+      append("a1", { type: "mesh.message", priority: "responsive" });
 
       expect(h.manager.dispatch("a1")).toBe(true);
       expect(actor.nudges).toEqual([{ priority: "responsive" }]);

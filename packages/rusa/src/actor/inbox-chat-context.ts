@@ -60,11 +60,7 @@ const DEFAULT_BOUNDS: ChatContextBounds = {
   maxBytes: CHAT_CONTEXT_MAX_BYTES,
 };
 
-const MESH_CHAT_PAYLOAD_TYPES = new Set([
-  "mesh.message",
-  "human.message",
-  VOICE_INBOX_PAYLOAD_TYPE,
-]);
+const MESH_CHAT_PAYLOAD_TYPES = new Set(["mesh.message", VOICE_INBOX_PAYLOAD_TYPE]);
 
 interface ChatContextTarget {
   /** Entries sharing a key share one window. */

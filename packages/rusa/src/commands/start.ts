@@ -218,7 +218,7 @@ import {
   SLACK_READ_MCP_NAME,
   SLACK_WRITE_MCP_NAME,
 } from "../mcp/slack-mcp.js";
-import { HUMAN_OPERATOR, resolveStampedAuthor, stampAuthor } from "../mcp/stamp.js";
+import { resolveStampedAuthor, stampAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer, TRACKER_MCP_NAME } from "../mcp/tracker-mcp.js";
 import {
   createUnderstandingReadServer,
@@ -1166,6 +1166,7 @@ async function composeStart(
   const database = initDb(mcHome);
   resources.acquire("database", () => closeDb());
   log.info("database_ready", { home: mcHome });
+  if (!config.auth) getRepositories().principals.ensureImplicitUser(new Date().toISOString());
 
   const modelClasses = getRepositories().modelClasses;
 
@@ -2654,8 +2655,7 @@ async function composeStart(
         classify: (senderId) =>
           classifyBriefSender(senderId, actorId, {
             parentOf: (id) => repositories.actors.parentOf(id),
-            isHumanPrincipal: (id) =>
-              id === HUMAN_OPERATOR || repositories.principals.getUser(id) !== undefined,
+            isHumanPrincipal: (id) => repositories.principals.getUser(id) !== undefined,
           }),
         listSources: (position, limit) =>
           repositories.actorRuns.listLedgerSourcesAfterPosition(actorId, position, limit),
@@ -3096,10 +3096,10 @@ async function composeStart(
     // this host-owned port closes over it. ActorMesh keeps authorization and
     // durable handoff delivery; VoiceService keeps the one live-session map.
     voiceSessionTransfer: {
-      activeSessionIdFor: (actorId) => {
+      activeSessionFor: (actorId) => {
         if (!voiceService)
           throw new Error("voice session transfer is unavailable on this instance");
-        return voiceService.activeSessionIdFor(actorId);
+        return voiceService.activeSessionFor(actorId);
       },
       transferActiveSession: (fromActorId, targetActorId) => {
         if (!voiceService)
@@ -4391,10 +4391,10 @@ async function composeStart(
           elevenlabsApiKey: config.elevenlabsApiKey,
           voiceConfigFor: (actorId) => actors.get(actorId)?.voiceConfig,
           voice: config.voice,
-          // Post-#460 replies target the durable user principal, not the legacy
-          // alias; principal storage is what says a recipient is a person.
-          isHumanRecipient: (principalId) =>
-            getRepositories().principals.getUser(principalId) !== undefined,
+          isHumanRecipient: (principalId) => {
+            const user = getRepositories().principals.getUser(principalId);
+            return user !== undefined && !user.disabledAt;
+          },
           onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
           logger: log.child({ component: "voice-session" }),
         })

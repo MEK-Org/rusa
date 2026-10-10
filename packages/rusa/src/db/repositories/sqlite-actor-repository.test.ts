@@ -5,7 +5,7 @@ import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { resolveHandleLabels } from "../../actor/worker-prompt.js";
-import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
+
 import { runMigrations } from "../migrations/runner.js";
 import { ModelClassRepository } from "./model-class-repository.js";
 import { PrincipalRepository } from "./principal-repository.js";
@@ -529,43 +529,6 @@ describe("SqliteActorRepository", () => {
     expect(secondRetiredAt).toBe(firstRetiredAt);
   });
 
-  it("resolves the newest human chat from durable mesh_chat rows", () => {
-    repository.upsert(root);
-    repository.upsert({
-      id: "worker",
-      charter: "Work",
-      parentId: "root",
-      status: "active",
-      createdAt: "2026-09-03T13:01:00.000Z",
-    });
-    repository.upsert({
-      id: "no-human",
-      charter: "Work without a human message",
-      parentId: "root",
-      status: "active",
-      createdAt: "2026-09-03T13:02:00.000Z",
-    });
-    expect(repository.lastHumanChat("root")).toBeUndefined();
-
-    const insert = db.prepare(
-      "INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id) VALUES (?, ?, ?, ?, ?, ?)"
-    );
-    insert.run("root-old", "2026-09-03T13:05:00.000Z", HUMAN_OPERATOR, "root", "old", "root-1");
-    insert.run("root-new", "2026-09-03T13:10:00.000Z", HUMAN_OPERATOR, "root", "new", "root-2");
-    insert.run("root-z", "2026-09-03T13:10:00.000Z", HUMAN_OPERATOR, "root", "tie", "root-3");
-    insert.run("root-actor", "2026-09-03T13:20:00.000Z", "worker", "root", "actor", "actor-1");
-    insert.run("worker", "2026-09-03T13:15:00.000Z", HUMAN_OPERATOR, "worker", "hello", null);
-    insert.run("no-human", "2026-09-03T13:15:00.000Z", "worker", "no-human", "actor", "s");
-
-    // Newest by (ts, id); a later actor-to-actor message does not displace it.
-    expect(repository.lastHumanChat("root")).toEqual({
-      sessionId: "root-3",
-      principalId: HUMAN_OPERATOR,
-    });
-    expect(repository.lastHumanChat("worker")).toEqual({ principalId: HUMAN_OPERATOR });
-    expect(repository.lastHumanChat("no-human")).toBeUndefined();
-  });
-
   it("hydrates actor records without reading mesh_chat (#691)", () => {
     repository.upsert(root);
     for (let i = 0; i < 5; i++) {
@@ -580,7 +543,7 @@ describe("SqliteActorRepository", () => {
     const insert = db.prepare(
       "INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id) VALUES (?, ?, ?, ?, ?, ?)"
     );
-    insert.run("m-1", "2026-09-03T13:05:00.000Z", HUMAN_OPERATOR, "worker-1", "hello", "s-1");
+    insert.run("m-1", "2026-09-03T13:05:00.000Z", TEST_USER_ID, "worker-1", "hello", "s-1");
 
     const prepare = vi.spyOn(db, "prepare");
     expect(repository.get("worker-1")).toMatchObject({ id: "worker-1", parentId: "root" });
@@ -596,35 +559,6 @@ describe("SqliteActorRepository", () => {
     expect(chatReads).toHaveLength(0);
     expect(renamed).toMatchObject({ title: "Renamed" });
     expect(renamed).not.toHaveProperty("humanUnlocked");
-  });
-
-  it("resolves the newest human chat from user principal mesh_chat rows", () => {
-    repository.upsert(root);
-    const principalRepo = new PrincipalRepository(db);
-    const userPrincipal = principalRepo.createUser({
-      email: "user@example.com",
-      createdAt: "2026-09-03T13:00:00.000Z",
-      identity: {
-        issuer: "https://accounts.google.com",
-        subject: "sub-1",
-      },
-    });
-
-    db.prepare(
-      "INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run(
-      "msg-user",
-      "2026-09-03T13:20:00.000Z",
-      userPrincipal.id,
-      "root",
-      "hello from user",
-      "user-session-1"
-    );
-
-    expect(repository.lastHumanChat("root")).toEqual({
-      sessionId: "user-session-1",
-      principalId: userPrincipal.id,
-    });
   });
 
   it("persists normalized records across a file-backed database reopen", () => {
@@ -1150,3 +1084,5 @@ describe("SqliteActorRepository", () => {
     expect(repository.parentOf("worker")).toBe("root");
   });
 });
+
+const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";

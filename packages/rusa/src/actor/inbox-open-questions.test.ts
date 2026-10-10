@@ -18,7 +18,7 @@ function humanMessage(id: string, fromId: string, messageId = `msg-${id}`): Inbo
     id,
     actorId: "asker",
     source: `mesh:${fromId}`,
-    payload: { type: "human.message", messageId, fromId, sessionId: null },
+    payload: { type: "mesh.message", messageId, fromId, sessionId: null },
     deliveredAt: new Date(AT),
     seenAt: null,
     handledAt: null,
@@ -130,7 +130,7 @@ describe("attachOpenQuestions", () => {
     ask("bobs", bob);
     repos.principals.setDisabled(bob, AT);
     const disabledUser = humanMessage("disabled", bob);
-    const legacyOperator = humanMessage("legacy", "human:operator");
+    const legacyOperator = humanMessage("legacy", "00000000-0000-4000-8000-000000000001");
     const unknownUser = humanMessage("unknown", "00000000-0000-4000-8000-000000000000");
     const actorSent: InboxEntry = {
       ...humanMessage("actor", "other-actor"),
@@ -255,7 +255,7 @@ describe("attachOpenQuestions", () => {
     };
 
     const result = attachOpenQuestions(
-      [humanMessage("e1", alice), humanMessage("e2", "human:operator")],
+      [humanMessage("e1", alice), humanMessage("e2", "00000000-0000-4000-8000-000000000001")],
       "asker",
       failing
     );

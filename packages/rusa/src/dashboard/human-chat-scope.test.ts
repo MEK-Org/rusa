@@ -1,6 +1,6 @@
 import type { IncomingMessage } from "node:http";
 import { describe, expect, it } from "vitest";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+
 import type { UserPrincipal } from "../principals/principal-ref.js";
 import {
   eventAudience,
@@ -11,6 +11,12 @@ import {
 
 const ACTOR = "11111111-1111-4111-8111-111111111111";
 const PEER = "22222222-2222-4222-8222-222222222222";
+const knownActors = {
+  get: (id: string) =>
+    [ACTOR, PEER].includes(id)
+      ? { kind: "actor" as const, id, actorId: id, createdAt: "t" }
+      : undefined,
+};
 
 function user(name: string, disabled = false): UserPrincipal {
   return {
@@ -73,34 +79,34 @@ describe("messageEventParticipants", () => {
 });
 
 describe("humanChatScope", () => {
-  it("reads as the sole active user and the legacy alias that still resolves to them", () => {
+  it("reads only as the sole active durable user", () => {
     const alice = user("alice");
-    const scope = humanChatScope(anonymous, [alice]);
-    expect([...scope.viewerIds].sort()).toEqual([alice.id, HUMAN_OPERATOR].sort());
+    const scope = humanChatScope(anonymous, [alice], knownActors);
+    expect([...scope.viewerIds]).toEqual([alice.id]);
     expect(scope.canSee(ACTOR, alice.id)).toBe(true);
-    expect(scope.canSee(ACTOR, HUMAN_OPERATOR)).toBe(true);
+    expect(scope.canSee(ACTOR, "unknown")).toBe(false);
     expect(scope.canSee(ACTOR, PEER)).toBe(true);
   });
 
   it("treats a disabled colleague as another human, not as an actor", () => {
     const alice = user("alice");
     const bob = user("bob", true);
-    const scope = humanChatScope(anonymous, [alice, bob]);
-    expect([...scope.viewerIds].sort()).toEqual([alice.id, HUMAN_OPERATOR].sort());
+    const scope = humanChatScope(anonymous, [alice, bob], knownActors);
+    expect([...scope.viewerIds]).toEqual([alice.id]);
     expect(scope.canSee(ACTOR, bob.id)).toBe(false);
   });
 
-  it("reads as the alias alone before any durable user exists", () => {
-    const scope = humanChatScope(anonymous, []);
-    expect([...scope.viewerIds]).toEqual([HUMAN_OPERATOR]);
-    expect(scope.canSee(ACTOR, HUMAN_OPERATOR)).toBe(true);
+  it("identifies nobody before any durable user exists", () => {
+    const scope = humanChatScope(anonymous, [], knownActors);
+    expect([...scope.viewerIds]).toEqual([]);
+    expect(scope.canSee(ACTOR, "unknown")).toBe(false);
   });
 
   it("identifies nobody, and so reads no human's side, among several unauthenticated users", () => {
-    const scope = humanChatScope(anonymous, [user("alice"), user("bob")]);
+    const scope = humanChatScope(anonymous, [user("alice"), user("bob")], knownActors);
     expect(scope.viewerIds.size).toBe(0);
     expect(scope.canSee(ACTOR, "alice-id")).toBe(false);
-    expect(scope.canSee(ACTOR, HUMAN_OPERATOR)).toBe(false);
+    expect(scope.canSee(ACTOR, "unknown")).toBe(false);
     expect(scope.canSee(ACTOR, PEER)).toBe(true);
   });
 });
@@ -110,16 +116,17 @@ describe("eventAudience", () => {
   const bob = user("bob");
   const viewerFor =
     (id: string): HumanChatViewer =>
-    (users) => ({
+    (_users, principals) => ({
       viewerIds: new Set([id]),
       canSee: (...participants) =>
-        participants.every((p) => p === id || !users.some((u) => u.id === p)),
+        participants.every((p) => p === id || principals?.get(p)?.kind === "actor"),
     });
 
   function counting(users: UserPrincipal[]) {
     let reads = 0;
     return {
       principals: {
+        ...knownActors,
         listUsers: () => {
           reads += 1;
           return users;
@@ -162,14 +169,14 @@ describe("eventAudience", () => {
 
   it("reads the list fresh for the next event, so a newly admitted colleague counts", () => {
     const users: UserPrincipal[] = [alice];
-    const principals = { listUsers: () => [...users] };
+    const principals = { ...knownActors, listUsers: () => [...users] };
     const later = () =>
       eventAudience(
         message("message_received", ACTOR, JSON.stringify({ from: bob.id })),
         principals
-      )((u) => humanChatScope(anonymous, u));
-    // With alice the sole user, `bob-id` is not a known human and reads as an actor.
-    expect(later()).toBe(true);
+      )((u, p) => humanChatScope(anonymous, u, p));
+    // Unknown participants are private even before they become users.
+    expect(later()).toBe(false);
     users.push(bob);
     expect(later()).toBe(false);
   });

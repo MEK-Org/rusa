@@ -85,16 +85,3 @@ export interface ActorRecord {
   /** Per-actor walkie-talkie voice; absent follows the instance-wide default. */
   voiceConfig?: VoiceConfigDocument;
 }
-
-/**
- * The newest human (operator or user principal) chat addressed to an actor.
- * Its presence is what unlocks the actor's `reply` tool. Derived from durable
- * chat and never stored on the actor row, so record hydration does not read it
- * (#691); only the reply path asks for it.
- */
-export interface HumanChat {
-  /** Session of the newest human message, when it carried one. */
-  sessionId?: string;
-  /** Operator or user principal that sent the newest human message. */
-  principalId?: string;
-}

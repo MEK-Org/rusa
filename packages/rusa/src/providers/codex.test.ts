@@ -31,7 +31,6 @@ const { spawnFn, execSyncFn, execFileSyncFn, execFileFn } = vi.hoisted(() => {
   });
   const execFileSyncFn = vi.fn((command: string, args: string[]) => {
     if (command === "bwrap" && args[0] === "--version") return "bwrap version";
-    if (command === "codex" && args[0] === "mcp" && args[1] === "list") return "[]";
     throw new Error(`Unexpected execFileSync: ${command} ${args.join(" ")}`);
   });
   const execFileFn = vi.fn(
@@ -48,14 +47,6 @@ const { spawnFn, execSyncFn, execFileSyncFn, execFileFn } = vi.hoisted(() => {
       ) => void;
       if (command === "bwrap" && args[0] === "--version") {
         callback(null, "bwrap version", "");
-        return;
-      }
-      if (
-        (command === "codex" || command === "bwrap") &&
-        args.includes("mcp") &&
-        args.includes("list")
-      ) {
-        callback(null, "[]", "");
         return;
       }
       callback(new Error(`Unexpected execFile: ${command} ${args?.join(" ")}`), "", "");
@@ -716,35 +707,20 @@ trust_level = "trusted"
       expect(result.success).toBe(true);
     });
 
-    it("reuses filtered plugin/direct overrides and the sandbox context for resume-to-fresh fallback", async () => {
+    it("reuses the plugin denial overrides for resume-to-fresh fallback without a discovery subprocess", async () => {
       seedRollout(ID);
-      execFileFn.mockImplementationOnce((_command, _args, _options, cb) => {
-        cb?.(
-          null,
-          JSON.stringify([
-            { name: "computer-use", transport: { type: "stdio", command: "fake-desktop" } },
-          ]),
-          ""
-        );
-      });
       const { argvs, result } = await runWithSpawns({ id: ID }, [1, 0]);
       expect(result.success).toBe(true);
       expect(argvs).toHaveLength(2);
-      const discovery = execFileFn.mock.calls.find(([, args]) => args.includes("mcp"));
-      expect(discovery?.[0]).toBe("bwrap");
-      const options = discovery?.[2] as { timeout: number };
-      expect(options.timeout).toBe(5_000);
+      expect(execFileFn.mock.calls.some(([, args]) => args.includes("mcp"))).toBe(false);
       for (const argv of argvs) {
         expect(codexArgsOf(argv)).toEqual(
           expect.arrayContaining([
             "plugins.unified-computer-use@openai-bundled.enabled=false",
             "plugins.computer-use@openai-bundled.enabled=false",
-            "mcp_servers.computer-use.enabled=false",
           ])
         );
-        expect(argv.slice(0, argv.indexOf("--"))).toEqual(
-          discovery?.[1].slice(0, discovery[1].indexOf("--"))
-        );
+        expect(codexArgsOf(argv)).not.toContain("mcp_servers.computer-use.enabled=false");
       }
     });
 

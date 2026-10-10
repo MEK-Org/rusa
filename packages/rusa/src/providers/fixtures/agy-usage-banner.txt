@@ -1,0 +1,11 @@
+ Antigravity CLI
+ Signed in · Google AI Pro
+
+ ✦ New Models Available
+   Example Model A and Example Model B are now available in /model.
+   esc to dismiss
+
+ > /usage
+   /usage    View model quota usage
+
+ ? for shortcuts

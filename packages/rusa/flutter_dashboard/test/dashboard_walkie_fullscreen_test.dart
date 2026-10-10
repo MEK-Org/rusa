@@ -12,14 +12,17 @@ void main() {
     final walkie = FakeWalkie(api);
     final store = DashboardStore(api: api, stream: stream, walkie: walkie.deps);
 
+    await store.refreshDashboardConfig();
     await store.refreshThreads();
     store.clickActor('a');
     
     // Short viewport height (< 500) triggers fullscreen walkie.
     // Use 800 width so normal layout fits before toggling. Height 480 clears header chrome.
-    await tester.binding.setSurfaceSize(const Size(800, 480));
+    tester.view.physicalSize = const Size(800, 480);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
     addTearDown(() async {
-      tester.binding.setSurfaceSize(null);
       await store.dispose();
     });
 

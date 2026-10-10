@@ -57,6 +57,14 @@ export function logRotationUnitNames(serviceBasename: string): { service: string
   };
 }
 
+/** The per-minute host watchdog units for one instance, named after its service (#955). */
+export function hostWatchdogUnitNames(serviceBasename: string): { service: string; timer: string } {
+  return {
+    service: `${serviceBasename}-host-watchdog.service`,
+    timer: `${serviceBasename}-host-watchdog.timer`,
+  };
+}
+
 export function resolveServiceInstance(
   environment: ServiceEnvironment,
   homeOverride?: string

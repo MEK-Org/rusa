@@ -23,7 +23,7 @@ import {
 import { startTrackerServer } from "../e2e/tracker-server.js";
 import { setIssueClient } from "../gitops/issue-client.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import { resolveSoleActiveUser } from "../principals/operator-principal.js";
 import { assertBwrapAvailable } from "../providers/sandbox.js";
 import { ActorHandle } from "../remote-instances/actor-handle.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
@@ -359,6 +359,11 @@ export function startRootControlServer(opts: {
   port: number;
   handles: RunStartE2EHandles;
 }): Server {
+  const operatorId = (): string => {
+    const result = resolveSoleActiveUser(getRepositories().principals);
+    if (!result.ok) throw new Error(result.error);
+    return result.user.id;
+  };
   const send = (res: import("node:http").ServerResponse, code: number, body: unknown) => {
     res.writeHead(code, { "content-type": "application/json" });
     res.end(JSON.stringify(body));
@@ -569,7 +574,7 @@ export function startRootControlServer(opts: {
         }
         if (url.pathname === "/obligations") {
           // The external driver IS the operator, so the creator is the shared
-          // HUMAN_OPERATOR id — the same server-side binding the actor MCP does
+          // durable user id — the same server-side binding the actor MCP does
           // with its own actor id, never a value read off the request.
           const obligation = getRepositories().obligations.create({
             ownerId: String(body.ownerId ?? ""),
@@ -578,7 +583,7 @@ export function startRootControlServer(opts: {
             title: String(body.title ?? ""),
             externalRef: body.externalRef == null ? null : String(body.externalRef),
             priority: typeof body.priority === "number" ? body.priority : null,
-            creatorId: HUMAN_OPERATOR,
+            creatorId: operatorId(),
           });
           send(res, 200, { obligation });
           return;
@@ -590,7 +595,7 @@ export function startRootControlServer(opts: {
             body.status === "cancelled" ? "cancelled" : "done",
             typeof body.note === "string" ? body.note : null,
             typeof body.resolutionRef === "string" ? body.resolutionRef : null,
-            HUMAN_OPERATOR
+            operatorId()
           );
           send(res, 200, { obligation });
           return;
@@ -600,7 +605,7 @@ export function startRootControlServer(opts: {
           const obligation = getRepositories().obligations.reassign(
             decodeURIComponent(reassignMatch[1]),
             String(body.ownerId ?? ""),
-            HUMAN_OPERATOR
+            operatorId()
           );
           send(res, 200, { obligation });
           return;
@@ -610,7 +615,7 @@ export function startRootControlServer(opts: {
           const obligation = getRepositories().obligations.reparent(
             decodeURIComponent(reparentMatch[1]),
             body.parentId == null ? null : String(body.parentId),
-            HUMAN_OPERATOR
+            operatorId()
           );
           send(res, 200, { obligation });
           return;

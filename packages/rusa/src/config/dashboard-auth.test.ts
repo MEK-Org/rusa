@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { IMPLICIT_USER_EMAIL } from "../principals/operator-principal.js";
 import { validateDashboardAuth } from "./dashboard-auth.js";
 
 describe("optional shared-human auth config", () => {
@@ -26,6 +27,14 @@ describe("optional shared-human auth config", () => {
     };
     validateDashboardAuth(config);
     expect(config.allowedEmails).toEqual(["owner@example.com", "other@example.com"]);
+  });
+  it("rejects the reserved bootstrap email in either admission configuration", () => {
+    expect(() => validateDashboardAuth({ ...valid(), email: IMPLICIT_USER_EMAIL })).toThrow(
+      /reserved/i
+    );
+    expect(() =>
+      validateDashboardAuth({ firebase: valid().firebase, allowedEmails: [IMPLICIT_USER_EMAIL] })
+    ).toThrow(/reserved/i);
   });
   it("accepts programmatic configurations with explicit undefined omitted keys", () => {
     const configWithUndefinedEmail = {

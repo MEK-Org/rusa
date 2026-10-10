@@ -130,7 +130,7 @@ export class ChatRoomService {
     if (ALIASES.has(id.toLowerCase())) {
       throw new Error(`'${id}' is an alias, not a participant; pass the actor's thread id`);
     }
-    if (id.startsWith("human:") || this.deps.isHumanPrincipal(id)) {
+    if (this.deps.isHumanPrincipal(id)) {
       throw new Error("human principals listen from the dashboard; only actors can be added");
     }
     const actor = this.deps.actors.get(id);

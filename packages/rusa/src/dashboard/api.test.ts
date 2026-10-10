@@ -24,12 +24,8 @@ import { ObligationRepository } from "../db/repositories/obligation-repository.j
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { ReferenceCacheRepository } from "../db/repositories/reference-cache-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+
 import { createLogger } from "../observability/logger.js";
-import {
-  executeLegacyPrincipalMigration,
-  inventoryLegacyReferences,
-} from "../principals/legacy-migration.js";
 import { assertConcreteModelConfig } from "../providers/model-config.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
@@ -180,6 +176,14 @@ describe("handleMeshApiRequest", () => {
     obligations = new ObligationRepository(db);
     actors = new InMemoryActorRepository();
     principals = new PrincipalRepository(db);
+    for (const id of ["root", UUID_A, UUID_B, UUID_C]) {
+      principals.ensureActorPrincipal(id, "2026-06-21T00:00:00.000Z");
+    }
+    const upsert = actors.upsert.bind(actors);
+    vi.spyOn(actors, "upsert").mockImplementation((record) => {
+      upsert(record);
+      principals.ensureActorPrincipal(record.id, record.createdAt);
+    });
     LOCAL_USER = principals.createUser({
       email: "operator@example.com",
       createdAt: "2026-06-21T00:00:00.000Z",
@@ -188,13 +192,7 @@ describe("handleMeshApiRequest", () => {
     rootReparents = [];
     admissionReorders = [];
     const mockMesh = {
-      sendHumanMessage: (
-        toId: string,
-        body: string,
-        sessionId: string,
-        opts?: { fromId?: string }
-      ) => {
-        const from = opts?.fromId ?? HUMAN_OPERATOR;
+      sendMessage: (toId: string, body: string, from: string, sessionId: string) => {
         meshEvents.record({
           kind: "message_sent",
           actorId: toId,
@@ -599,7 +597,7 @@ describe("handleMeshApiRequest", () => {
       ["POST", "/api/mesh/actors", JSON.stringify({ charter: "c", provider: "agy", model: "m" })],
       ["POST", `/api/mesh/actors/${UUID_B}/reparent`, JSON.stringify({ parentId: UUID_A })],
       ["POST", `/api/mesh/actors/${UUID_A}/chat`, JSON.stringify({ body: "hi" })],
-      ["POST", `/api/mesh/actors/${UUID_A}/interrupt`, JSON.stringify({ by: "human:operator" })],
+      ["POST", `/api/mesh/actors/${UUID_A}/interrupt`, JSON.stringify({ by: LOCAL_USER })],
       ["POST", `/api/mesh/actors/${UUID_A}/run-now`, undefined],
       ["POST", "/api/mesh/obligations", JSON.stringify({ ownerId: UUID_A, title: "t" })],
       ["POST", "/api/mesh/obligations/task/status", JSON.stringify({ status: "done" })],
@@ -657,7 +655,7 @@ describe("handleMeshApiRequest", () => {
       expect(runNowMock).toHaveBeenCalledWith(UUID_A, other);
     });
 
-    it("uses the legacy local identity when no durable user is active", async () => {
+    it("refuses mutation when no durable user is active", async () => {
       principals.setDisabled(LOCAL_USER, "2026-06-22T00:00:00.000Z");
       obligations.create({ id: "task", ownerId: UUID_A, title: "local cancellation" });
 
@@ -669,13 +667,11 @@ describe("handleMeshApiRequest", () => {
       );
       await settled(res);
 
-      expect(res.statusCode).toBe(200);
-      expect(obligations.listHistory("task")).toEqual(
-        expect.arrayContaining([expect.objectContaining({ actingPrincipal: HUMAN_OPERATOR })])
-      );
+      expect(res.statusCode).toBe(403);
+      expect(obligations.get("task")?.status).toBe("ready");
     });
 
-    it("cancels with the legacy local identity when no durable principal is available (#509)", async () => {
+    it("refuses mutation when durable principal storage is unavailable", async () => {
       const { principals: _omitted, ...withoutPrincipals } = deps;
       obligations.create({ id: "task", ownerId: UUID_A, title: "local cancellation" });
 
@@ -687,11 +683,8 @@ describe("handleMeshApiRequest", () => {
       );
       await settled(res);
 
-      expect(res.statusCode).toBe(200);
-      expect(obligations.get("task")?.status).toBe("cancelled");
-      expect(obligations.listHistory("task")).toEqual(
-        expect.arrayContaining([expect.objectContaining({ actingPrincipal: HUMAN_OPERATOR })])
-      );
+      expect(res.statusCode).toBe(403);
+      expect(obligations.get("task")?.status).toBe("ready");
     });
 
     it("rejects every mutation as ambiguous when several users are active, never guessing", async () => {
@@ -708,26 +701,11 @@ describe("handleMeshApiRequest", () => {
       expect(JSON.parse(ambiguous.res.body).userPrincipalId).toBeNull();
     });
 
-    it("mints no new exact human:operator authoritative reference after the migration", async () => {
-      // A representative pre-cutover database: legacy rows in the columns the
-      // migration classifies as authoritative, then the real one-off migration.
+    it("attributes local chat and obligation mutations to the durable user", async () => {
       actors.upsert(rec(UUID_A, null, "active"));
-      meshChat.record({ senderId: HUMAN_OPERATOR, recipientId: UUID_A, body: "before" });
-      obligations.create({ id: "legacy", ownerId: HUMAN_OPERATOR, title: "legacy" });
-      // The migration reuses the sole bootstrapped user by email.
-      const migrated = executeLegacyPrincipalMigration(db, {
-        email: "operator@example.com",
-        apply: true,
-      });
-      expect(migrated.principalId).toBe(LOCAL_USER);
-      expect(inventoryLegacyReferences(db).totalAuthoritative).toBe(0);
-      // The migration is a separate process in production, so its direct
-      // UPDATEs never share this connection's per-connection delta temp table.
-      db.prepare("DELETE FROM obligation_history_delta").run();
+      obligations.create({ id: "task", ownerId: UUID_A, title: "task" });
 
-      // Every supported local-mode mutation, including the ones that used to
-      // default to the alias: chat, an obligation owned "to the operator",
-      // its terminal transition, and a reassignment back to the alias.
+      // Chat, owner writes, and terminal transitions share the durable attribution.
       const chat = await call(
         deps,
         "POST",
@@ -740,7 +718,7 @@ describe("handleMeshApiRequest", () => {
         deps,
         "POST",
         "/api/mesh/obligations",
-        JSON.stringify({ ownerId: HUMAN_OPERATOR, title: "decide" })
+        JSON.stringify({ ownerId: LOCAL_USER, title: "decide" })
       );
       await settled(created.res);
       expect(created.res.statusCode).toBe(201);
@@ -748,8 +726,8 @@ describe("handleMeshApiRequest", () => {
       const reassigned = await call(
         deps,
         "POST",
-        "/api/mesh/obligations/legacy/reassign",
-        JSON.stringify({ ownerId: HUMAN_OPERATOR })
+        "/api/mesh/obligations/task/reassign",
+        JSON.stringify({ ownerId: LOCAL_USER })
       );
       await settled(reassigned.res);
       expect(reassigned.res.statusCode).toBe(200);
@@ -762,37 +740,25 @@ describe("handleMeshApiRequest", () => {
       await settled(done.res);
       expect(done.res.statusCode).toBe(200);
 
-      const after = inventoryLegacyReferences(db);
-      expect(after.authoritative.filter((c) => c.count > 0)).toEqual([]);
-      expect(after.totalAuthoritative).toBe(0);
+      expect(meshChat.listReceivedForActor(UUID_A)[0].senderId).toBe(LOCAL_USER);
       expect(obligations.get(id)?.ownerId).toBe(LOCAL_USER);
       expect(obligations.get(id)?.creatorId).toBe(LOCAL_USER);
-      expect(obligations.get("legacy")?.ownerId).toBe(LOCAL_USER);
-      // A rerun of the migration is a no-op: nothing left to rewrite.
-      const rerun = executeLegacyPrincipalMigration(db, {
-        email: "operator@example.com",
-        apply: true,
-      });
-      expect(rerun.rewritesApplied).toBe(0);
+      expect(obligations.get("task")?.ownerId).toBe(LOCAL_USER);
     });
 
     describe("human chat scope (#590)", () => {
       const chatBodies = (res: MockRes): string[] =>
         (JSON.parse(res.body).chat as Array<{ body: string }>).map((m) => m.body).sort();
 
-      it("pairs the sole local user with their own and the unmigrated alias's rows", async () => {
+      it("pairs the sole local user with their own rows only", async () => {
         actors.upsert(rec(UUID_A, null, "active"));
-        meshChat.record({ senderId: HUMAN_OPERATOR, recipientId: UUID_A, body: "legacy" });
+        meshChat.record({ senderId: "unknown-principal", recipientId: UUID_A, body: "unknown" });
         meshChat.record({ senderId: LOCAL_USER, recipientId: UUID_A, body: "mine" });
         meshChat.record({ senderId: UUID_A, recipientId: LOCAL_USER, body: "reply" });
-        for (const query of [
-          `${UUID_A},${HUMAN_OPERATOR}`,
-          `${UUID_A},${LOCAL_USER}`,
-          `${UUID_A},${HUMAN_OPERATOR},${LOCAL_USER}`,
-        ]) {
+        for (const query of [`${UUID_A}`, `${UUID_A},${LOCAL_USER}`]) {
           const { res } = await call(deps, "GET", `/api/mesh/chat?actors=${query}`);
           expect(res.statusCode).toBe(200);
-          expect(chatBodies(res)).toEqual(["legacy", "mine", "reply"]);
+          expect(chatBodies(res)).toEqual(["mine", "reply"]);
         }
       });
 
@@ -815,12 +781,10 @@ describe("handleMeshApiRequest", () => {
           });
         }
 
-        // The alias names nobody, so — like the event feed and the live
-        // stream — the chat answers with nothing human-involving rather than
-        // erroring on a query the dashboard sends unconditionally.
-        const alias = await call(deps, "GET", `/api/mesh/chat?actors=${UUID_A},${HUMAN_OPERATOR}`);
-        expect(alias.res.statusCode).toBe(200);
-        expect(chatBodies(alias.res)).toEqual([]);
+        // Without a resolved viewer, actor-only queries omit private conversations.
+        const anonymous = await call(deps, "GET", `/api/mesh/chat?actors=${UUID_A}`);
+        expect(anonymous.res.statusCode).toBe(200);
+        expect(chatBodies(anonymous.res)).toEqual([]);
         // Naming a durable user outright is asking for someone's private
         // conversation with no identity to match it against.
         const named = await call(deps, "GET", `/api/mesh/chat?actors=${UUID_A},${other}`);
@@ -3061,7 +3025,12 @@ describe("handleMeshApiRequest", () => {
 
   it("GET /api/mesh/events filters by kind", async () => {
     meshEvents.record({ kind: "run_start", actorId: UUID_A, detail: "s" });
-    meshEvents.record({ kind: "message_sent", actorId: UUID_A, detail: "m" });
+    meshEvents.record({
+      kind: "message_sent",
+      actorId: UUID_A,
+      detail: "m",
+      payload: JSON.stringify({ to: UUID_B }),
+    });
     const { res } = await call(deps, "GET", `/api/mesh/events?actors=${UUID_A}&kinds=message_sent`);
     const page = JSON.parse(res.body);
     expect(page.events.map((e: { kind: string }) => e.kind)).toEqual(["message_sent"]);
@@ -3286,7 +3255,7 @@ describe("handleMeshApiRequest", () => {
       actors.upsert(rec(UUID_B, null, "retired"));
     });
 
-    it("sends human message, returns 200, and records human:operator event", async () => {
+    it("sends human message, returns 200, and records its durable sender", async () => {
       const { res } = await call(
         deps,
         "POST",
@@ -3670,7 +3639,7 @@ describe("handleMeshApiRequest", () => {
       const { res, req } = await call(meshDeps, "POST", `/api/mesh/actors/${UUID_A}/interrupt`);
       // A body-supplied `by` is never an identity claim: the server binds the
       // acting principal itself (#460).
-      req.emit("data", Buffer.from(JSON.stringify({ by: "human:operator" })));
+      req.emit("data", Buffer.from(JSON.stringify({ by: LOCAL_USER })));
       req.emit("end");
       await new Promise((resolve) => process.nextTick(resolve));
 
@@ -3755,7 +3724,7 @@ describe("handleMeshApiRequest", () => {
         obligations.create({
           title: "root-2",
           id: "root-2",
-          ownerId: "human:operator",
+          ownerId: LOCAL_USER,
         });
         obligations.create({
           title: "child-1",
@@ -4564,7 +4533,7 @@ describe("handleMeshApiRequest", () => {
           "POST",
           "/api/mesh/obligations",
           JSON.stringify({
-            ownerId: HUMAN_OPERATOR,
+            ownerId: LOCAL_USER,
             title: "Decide",
             creatorId: "actor-impostor",
           })
@@ -4573,8 +4542,7 @@ describe("handleMeshApiRequest", () => {
         expect(res.statusCode).toBe(201);
         const created = JSON.parse(res.body).obligation;
         expect(created.creatorId).toBe(LOCAL_USER);
-        // The legacy owner alias resolves to the durable user too, so the
-        // request mints no new `human:operator` row (#460).
+        // Attribution is the explicit durable owner, not client-chosen creator metadata.
         expect(created.ownerId).toBe(LOCAL_USER);
       });
 
@@ -4582,7 +4550,7 @@ describe("handleMeshApiRequest", () => {
         actors.upsert(rec(UUID_A, "root", "active"));
         obligations.create({ id: "cited", ownerId: UUID_A, title: "Game Type" });
         const messageId = meshChat.record({
-          senderId: HUMAN_OPERATOR,
+          senderId: LOCAL_USER,
           recipientId: UUID_A,
           body: "A monster-catching JRPG in a cave.",
         });
@@ -4692,7 +4660,7 @@ describe("handleMeshApiRequest", () => {
         obligations.create({
           title: "decide-stack",
           id: "decide-stack",
-          ownerId: HUMAN_OPERATOR,
+          ownerId: LOCAL_USER,
         });
 
         const { res } = await call(
@@ -4772,9 +4740,9 @@ describe("handleMeshApiRequest", () => {
         });
       });
 
-      it("treats a row still owned by the legacy operator alias as the operator's", async () => {
-        obligations.create({ title: "legacy", id: "legacy", ownerId: HUMAN_OPERATOR });
-        expect((await snooze("legacy", { until: future() })).status).toBe(200);
+      it("does not claim work owned by an unknown principal", async () => {
+        obligations.create({ title: "unknown", id: "unknown", ownerId: "unknown-owner" });
+        expect((await snooze("unknown", { until: future() })).status).toBe(403);
       });
 
       it("refuses an obligation the human does not own", async () => {
@@ -5073,7 +5041,7 @@ describe("handleMeshApiRequest", () => {
           deps,
           "POST",
           "/api/mesh/obligations/task-owner/reassign",
-          JSON.stringify({ ownerId: "human:operator" })
+          JSON.stringify({ ownerId: LOCAL_USER })
         );
         await new Promise((resolve) => process.nextTick(resolve));
         expect(res.statusCode).toBe(200);
@@ -5101,7 +5069,7 @@ describe("handleMeshApiRequest", () => {
           deps,
           "POST",
           "/api/mesh/obligations/missing/reassign",
-          JSON.stringify({ ownerId: "human:operator" })
+          JSON.stringify({ ownerId: LOCAL_USER })
         );
         await new Promise((resolve) => process.nextTick(resolve));
         expect(missing.res.statusCode).toBe(404);

@@ -244,7 +244,7 @@ correspond with external entities such as GitHub issues or PRs. Obligations are
 the latest addition to the system so the system is still being refined but the
 intention is that all non-trivial work is tracked in the obligations system.
 
-Each obligation has an owner (an actor, or `human:operator` for questions that
+Each obligation has an owner (an actor, or a durable user principal for questions that
 need a person), an optional parent, prerequisites that gate when it becomes
 ready, an external reference, attached artifacts, and a checkpoint the owner
 keeps current so a fresh run can pick the work back up. Recurring obligations

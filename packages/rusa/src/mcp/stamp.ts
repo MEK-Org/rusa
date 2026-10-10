@@ -445,12 +445,7 @@ export function resolveStampedAuthor(opts: {
   return null;
 }
 
-export const HUMAN_OPERATOR = "human:operator";
 export const MESH_SYSTEM = "system:mesh";
-
-export function isHumanOperator(actorId: string): boolean {
-  return actorId.startsWith("human:");
-}
 
 /**
  * A `system:*` actor id marks a persistence-only write performed by mesh

@@ -65,11 +65,18 @@ function user(name: string): UserPrincipal {
 /** A human who reads their own side and every conversation with no other human in it. */
 const viewerFor =
   (id: string): HumanChatViewer =>
-  (users) => ({
+  (_users, principals) => ({
     viewerIds: new Set([id]),
     canSee: (...participants) =>
-      participants.every((p) => p === id || !users.some((u) => u.id === p)),
+      participants.every((p) => p === id || principals?.get(p)?.kind === "actor"),
   });
+
+const knownActors = {
+  get: (id: string) =>
+    ["a", "b"].includes(id)
+      ? { kind: "actor" as const, id, actorId: id, createdAt: "t" }
+      : undefined,
+};
 
 function messageEvent(actorId: string | null, payload: string | null) {
   return {
@@ -223,6 +230,7 @@ describe("SseHub", () => {
     let reads = 0;
     const hub = new SseHub(emitter, {
       principals: {
+        ...knownActors,
         listUsers: () => {
           reads += 1;
           return [alice, bob];
@@ -251,7 +259,9 @@ describe("SseHub", () => {
 
   it("withholds a message frame whose participants cannot be read from every scoped client", () => {
     const emitter = new MeshEventEmitter();
-    const hub = new SseHub(emitter, { principals: { listUsers: () => [user("alice")] } });
+    const hub = new SseHub(emitter, {
+      principals: { ...knownActors, listUsers: () => [user("alice")] },
+    });
     const scoped = connect(hub, null, viewerFor("alice-id"));
     const unscoped = connect(hub, null);
 
@@ -267,15 +277,17 @@ describe("SseHub", () => {
   it("honours a colleague admitted after a scoped client connected", () => {
     const emitter = new MeshEventEmitter();
     const users: UserPrincipal[] = [user("alice")];
-    const hub = new SseHub(emitter, { principals: { listUsers: () => [...users] } });
+    const hub = new SseHub(emitter, {
+      principals: { ...knownActors, listUsers: () => [...users] },
+    });
     const asAlice = connect(hub, null, viewerFor("alice-id"));
 
     emitter.emitMeshEvent(messageEvent("a", JSON.stringify({ from: "bob-id" })));
-    expect(asAlice.dataFrames()).toHaveLength(1);
+    expect(asAlice.dataFrames()).toHaveLength(0);
 
     users.push(user("bob"));
     emitter.emitMeshEvent({ ...messageEvent("a", JSON.stringify({ from: "bob-id" })), id: "m2" });
-    expect(asAlice.dataFrames()).toHaveLength(1);
+    expect(asAlice.dataFrames()).toHaveLength(0);
     hub.close();
   });
 

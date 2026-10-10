@@ -22,8 +22,13 @@ describe("voice provider routing", () => {
   it("defaults transcription to Google and selects ElevenLabs independently", async () => {
     clients.google.transcribe.mockResolvedValue("google");
     clients.elevenlabs.transcribe.mockResolvedValue("elevenlabs");
-    const google = createVoiceService({ home: "/unused", apiKey: "key" });
+    const google = createVoiceService({
+      isHumanRecipient: (id) => id === TEST_USER_ID,
+      home: "/unused",
+      apiKey: "key",
+    });
     const elevenlabs = createVoiceService({
+      isHumanRecipient: (id) => id === TEST_USER_ID,
       home: "/unused",
       apiKey: "key",
       elevenlabsApiKey: "key",
@@ -42,12 +47,13 @@ describe("voice provider routing", () => {
       config: { voiceId: "my-voice" },
     };
     const service = createVoiceService({
+      isHumanRecipient: (id) => id === TEST_USER_ID,
       home: "/unused",
       apiKey: "key",
       elevenlabsApiKey: "key",
       voiceConfigFor: () => config,
     });
-    service.presenceConnect(["actor"]);
+    service.presenceConnect(["actor"], TEST_USER_ID);
     // Stop at the synthesis boundary, before filesystem/encoder work.
     clients.google.streamSynthesize.mockRejectedValue(new Error("google render"));
     clients.elevenlabs.streamSynthesize.mockRejectedValue(new Error("elevenlabs render"));
@@ -58,7 +64,7 @@ describe("voice provider routing", () => {
       actorId: "actor",
       detail: null,
       body: "Hello",
-      payload: JSON.stringify({ to: "human:operator" }),
+      payload: JSON.stringify({ to: "00000000-0000-4000-8000-000000000001" }),
       success: null,
     };
     await expect(service.handleMeshEvent(event)).rejects.toThrow("elevenlabs render");
@@ -75,6 +81,7 @@ describe("voice provider routing", () => {
       config: { voiceName: "Puck" },
     };
     const service = createVoiceService({
+      isHumanRecipient: (id) => id === TEST_USER_ID,
       home: "/unused",
       apiKey: "",
       elevenlabsApiKey: "eleven-key",
@@ -92,7 +99,7 @@ describe("voice provider routing", () => {
         ],
       },
     });
-    service.presenceConnect(["actor"]);
+    service.presenceConnect(["actor"], TEST_USER_ID);
     const event = {
       id: "event",
       ts: "now",
@@ -100,7 +107,7 @@ describe("voice provider routing", () => {
       actorId: "actor",
       detail: null,
       body: "Hello",
-      payload: JSON.stringify({ to: "human:operator" }),
+      payload: JSON.stringify({ to: "00000000-0000-4000-8000-000000000001" }),
       success: null,
     };
     // Actor with Google voice throws explicitly when Google key is missing
@@ -116,6 +123,7 @@ describe("voice provider routing", () => {
 
     // ElevenLabs actor voice throws explicitly when ElevenLabs key is missing
     const googleOnlyService = createVoiceService({
+      isHumanRecipient: (id) => id === TEST_USER_ID,
       home: "/unused",
       apiKey: "google-key",
       elevenlabsApiKey: "",
@@ -125,7 +133,7 @@ describe("voice provider routing", () => {
         config: { voiceId: "chris-voice-id" },
       }),
     });
-    googleOnlyService.presenceConnect(["actor"]);
+    googleOnlyService.presenceConnect(["actor"], TEST_USER_ID);
     await expect(googleOnlyService.handleMeshEvent(event)).rejects.toThrow(
       "ElevenLabs TTS: elevenlabsApiKey is not configured; select an available actor voice"
     );
@@ -157,12 +165,13 @@ describe("voice provider routing", () => {
     }).add("actor-b", "root");
 
     const service = createVoiceService({
+      isHumanRecipient: (id) => id === TEST_USER_ID,
       home: "/unused",
       apiKey: "key",
       voice: { voiceName: "Laomedeia" },
       voiceConfigFor: (actorId) => actors.get(actorId)?.voiceConfig,
     });
-    service.presenceConnect(["root", "actor-b"]);
+    service.presenceConnect(["root", "actor-b"], TEST_USER_ID);
     // Stop at the synthesis boundary, before filesystem/encoder work.
     clients.google.streamSynthesize.mockRejectedValue(new Error("render"));
     const reply = (id: string, actorId: string, body: string) => ({
@@ -172,7 +181,7 @@ describe("voice provider routing", () => {
       actorId,
       detail: null,
       body,
-      payload: JSON.stringify({ to: "human:operator" }),
+      payload: JSON.stringify({ to: "00000000-0000-4000-8000-000000000001" }),
       success: null,
     });
     await expect(service.handleMeshEvent(reply("a", "root", "Reply A"))).rejects.toThrow();
@@ -184,3 +193,5 @@ describe("voice provider routing", () => {
     ]);
   });
 });
+
+const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";

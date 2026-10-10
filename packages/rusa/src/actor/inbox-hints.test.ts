@@ -56,39 +56,36 @@ describe("inbox hints", () => {
   });
 
   describe("human operator messages ", () => {
-    it("provides a reminder to reply via mesh chat for human.message payload", () => {
+    it("provides an explicit recipient reminder for mesh.message payload", () => {
       const entry = makeEntry({
-        source: "mesh:human:operator",
+        source: "mesh:00000000-0000-4000-8000-000000000001",
         payload: {
-          type: "human.message",
+          type: "mesh.message",
           messageId: "msg-123",
-          fromId: "human:operator",
+          fromId: "00000000-0000-4000-8000-000000000001",
           sessionId: "sess-abc",
         },
       });
       const hint = resolveInboxHint(entry);
-      expect(hint).toContain("This is a message from the human operator");
-      expect(hint).toContain(
-        "Reply directly to the human operator using your reply tool or mesh chat"
-      );
+      expect(hint).toContain("send_message");
+      expect(hint).toContain("fromId");
+      expect(hint).toContain("sessionId");
     });
 
     it("provides a reminder for human.voice payload", () => {
       const entry = makeEntry({
-        source: "mesh:human:operator",
+        source: "mesh:00000000-0000-4000-8000-000000000001",
         payload: {
           type: "human.voice",
           messageId: "msg-456",
-          fromId: "human:operator",
+          fromId: "00000000-0000-4000-8000-000000000001",
         },
       });
       const hint = resolveInboxHint(entry);
-      expect(hint).toContain("acknowledge immediately");
+      expect(hint).toContain("Acknowledge immediately");
       expect(hint).toContain("lossy");
       expect(hint).toContain("reconfirm");
-      expect(hint).toContain(
-        "Reply directly to the human operator using your reply tool or mesh chat"
-      );
+      expect(hint).toContain("send_message");
     });
 
     it("carries the mechanically rendered bounded context for voice.transfer", () => {
@@ -107,7 +104,7 @@ describe("inbox hints", () => {
       expect(hint).toContain("worker-a: status");
     });
 
-    it("provides a reminder when source is mesh:human", () => {
+    it("does not infer message identity from the source spelling", () => {
       const entry = makeEntry({
         source: "mesh:human",
         payload: {
@@ -115,12 +112,10 @@ describe("inbox hints", () => {
         },
       });
       const hint = resolveInboxHint(entry);
-      expect(hint).toContain(
-        "Reply directly to the human operator using your reply tool or mesh chat"
-      );
+      expect(hint).toBeUndefined();
     });
 
-    it("provides a reminder when fromId is human operator", () => {
+    it("does not classify arbitrary payloads by sender prefix", () => {
       const entry = makeEntry({
         source: "mesh:some_source",
         payload: {
@@ -129,9 +124,7 @@ describe("inbox hints", () => {
         },
       });
       const hint = resolveInboxHint(entry);
-      expect(hint).toContain(
-        "Reply directly to the human operator using your reply tool or mesh chat"
-      );
+      expect(hint).toBeUndefined();
     });
   });
 
@@ -277,7 +270,7 @@ describe("inbox hints", () => {
   });
 
   describe("other message types", () => {
-    it("returns undefined for peer mesh messages and standard events", () => {
+    it("uses the same addressing hint for peer mesh messages", () => {
       const entry = makeEntry({
         source: "mesh:worker-1",
         payload: {
@@ -285,7 +278,7 @@ describe("inbox hints", () => {
           fromId: "worker-1",
         },
       });
-      expect(resolveInboxHint(entry)).toBeUndefined();
+      expect(resolveInboxHint(entry)).toContain("fromId");
     });
   });
 
@@ -294,8 +287,8 @@ describe("inbox hints", () => {
       const entries = [
         makeEntry({
           id: "e1",
-          source: "mesh:human:operator",
-          payload: { type: "human.message" },
+          source: "mesh:00000000-0000-4000-8000-000000000001",
+          payload: { type: "mesh.message" },
         }),
         makeEntry({
           id: "e2",
@@ -307,10 +300,10 @@ describe("inbox hints", () => {
       const hinted = attachInboxHints(entries);
       expect(hinted[0].id).toBe("e1");
       expect(hinted[0].hint).toBeDefined();
-      expect(hinted[0].hint).toContain("human operator");
+      expect(hinted[0].hint).toContain("send_message");
 
       expect(hinted[1].id).toBe("e2");
-      expect(hinted[1].hint).toBeUndefined();
+      expect(hinted[1].hint).toBe(hinted[0].hint);
     });
   });
 });

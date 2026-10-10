@@ -78,7 +78,7 @@ class ActorAvatar extends StatelessWidget {
             return Stack(
               fit: StackFit.expand,
               children: [
-                _avatarPlaceholder(id, size),
+                _avatarPlaceholder(store?.isHuman(id) ?? false, size),
                 AnimatedOpacity(
                   opacity: frame == null ? 0 : 1,
                   duration: const Duration(milliseconds: 200),
@@ -87,7 +87,8 @@ class ActorAvatar extends StatelessWidget {
               ],
             );
           },
-          errorBuilder: (_, _, _) => _avatarPlaceholder(id, size),
+          errorBuilder: (_, _, _) =>
+              _avatarPlaceholder(store?.isHuman(id) ?? false, size),
         );
 
         // A true circle, with no flat tangent edges. A circular `BoxDecoration`
@@ -159,11 +160,11 @@ class ActorAvatar extends StatelessWidget {
 
 /// Neutral silhouette shown until the image resolves, or after its one lazy
 /// request fails. The error path deliberately has no retry mechanism.
-Widget _avatarPlaceholder(String id, double size) => Container(
+Widget _avatarPlaceholder(bool isHuman, double size) => Container(
   color: MeshColors.bgTertiary,
   alignment: Alignment.center,
   child: Icon(
-    id == 'human:operator' ? Icons.person : Icons.pets,
+    isHuman ? Icons.person : Icons.pets,
     size: size * 0.55,
     color: MeshColors.textMuted,
   ),
@@ -370,7 +371,7 @@ class _AvatarLightboxState extends State<AvatarLightbox> {
     width: 400,
     height: 400,
     child: Icon(
-      widget.id == 'human:operator' ? Icons.person : Icons.pets,
+      (widget.store?.isHuman(widget.id) ?? false) ? Icons.person : Icons.pets,
       size: 160,
       color: MeshColors.textMuted,
     ),

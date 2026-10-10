@@ -9,6 +9,7 @@
   "files": [
     "dist/",
     "scripts/gh-hint-wrapper.sh",
+    "scripts/host-watchdog.mjs",
     "scripts/notify-failure.mjs",
     "scripts/rotate-log.mjs",
     "scripts/verify-build.mjs"
@@ -21,7 +22,6 @@
     "analyze:dashboard-ui": "node scripts/flutter-run.mjs analyze",
     "backfill:codex-quota": "pnpm --reporter=silent run build:maintenance --silent && node scripts/backfill-codex-quota-parses.mjs",
     "backfill:token-records": "pnpm --reporter=silent run build:maintenance --silent && node scripts/backfill-run-token-records.mjs",
-    "migrate:legacy-principal": "pnpm --reporter=silent run build:maintenance --silent && node scripts/migrate-legacy-principal.mjs",
     "test:dashboard-ui": "node scripts/flutter-run.mjs test",
     "check:coordinator-path": "pnpm --reporter=silent run build:maintenance --silent && node scripts/check-coordinator-path.mjs",
     "e2e": "node scripts/e2e.mjs",

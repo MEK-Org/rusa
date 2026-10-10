@@ -86,7 +86,7 @@ export function createVoiceService(options: {
 
 /**
  * Subscribe the reply-TTS hook to the dashboard's mesh-event emitter: replies
- * to `human:operator` from actors with walkie presence get rendered and pushed
+ * to durable users from actors with recipient-scoped walkie presence get rendered and pushed
  * on the `voice` channel. Purely observational — never touches actor/mesh
  * code. Returns the unsubscribe function.
  */

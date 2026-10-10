@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parseParsedState, serializeParsedState } from "./parsed-state.js";
+import { inferQuotaState, type ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
+import { extractedNoQuotaValues, parseParsedState, serializeParsedState } from "./parsed-state.js";
 
 describe("versioned parsed quota state", () => {
   const snapshot = {
@@ -135,5 +136,75 @@ describe("versioned parsed quota state", () => {
         )
       ).toBeNull();
     }
+  });
+});
+
+describe("extractedNoQuotaValues (#982)", () => {
+  const scrapedAt = "2030-01-01T01:00:00.000Z";
+  const prev: ProviderQuotaSnapshot = {
+    provider: "agy",
+    status: "available",
+    scrapedAt: "2030-01-01T00:00:00.000Z",
+    limits: [
+      {
+        label: "Weekly Limit",
+        kind: "weekly",
+        percentLeft: 70,
+        resetAtIso: "2030-01-05T00:00:00.000Z",
+      },
+      {
+        label: "Five Hour Limit",
+        kind: "five_hour",
+        percentLeft: 40,
+        resetAtIso: "2030-01-01T03:00:00.000Z",
+      },
+    ],
+  };
+  // Judged on the stored blob, as listScrapeOutcomesSince reads it.
+  const judge = (raw: ProviderQuotaSnapshot) => {
+    const stored = parseParsedState(serializeParsedState(inferQuotaState(raw, prev, scrapedAt)));
+    if (!stored) throw new Error("stored state did not round-trip");
+    return extractedNoQuotaValues(stored);
+  };
+
+  it("fails a read whose windows were all carried over an empty parse", () => {
+    expect(judge({ provider: "agy", status: "unknown", scrapedAt, limits: [] })).toBe(true);
+  });
+
+  it("does not flag an unknown read with nothing to carry as a carried bad read", () => {
+    expect(extractedNoQuotaValues({ provider: "agy", status: "unknown", scrapedAt })).toBe(false);
+  });
+
+  it("keeps a read that extracted model-only limits with status unknown", () => {
+    expect(
+      extractedNoQuotaValues({
+        provider: "claude",
+        status: "unknown",
+        scrapedAt,
+        limits: [{ label: "Fable", kind: "five_hour", percentLeft: 50 }],
+      })
+    ).toBe(false);
+  });
+
+  it("keeps a read that extracted values but carried a missing reset", () => {
+    const raw: ProviderQuotaSnapshot = {
+      provider: "agy",
+      status: "available",
+      scrapedAt,
+      limits: [
+        { label: "Weekly Limit", kind: "weekly", percentLeft: 68 },
+        { label: "Five Hour Limit", kind: "five_hour", percentLeft: 35 },
+      ],
+    };
+    // Both resets were carried, under the same rule name.
+    expect(inferQuotaState(raw, prev, scrapedAt).explanations?.map((e) => e.rule)).toEqual([
+      "carried_forward_bad_read",
+      "carried_forward_bad_read",
+    ]);
+    expect(judge(raw)).toBe(false);
+  });
+
+  it("keeps a clean read", () => {
+    expect(judge({ ...prev, scrapedAt })).toBe(false);
   });
 });

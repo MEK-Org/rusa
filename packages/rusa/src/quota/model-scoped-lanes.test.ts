@@ -4,6 +4,12 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderQuotaSnapshot, QuotaLimit } from "../mcp/quota-mcp.js";
+import type { LogFields, Logger } from "../observability/logger.js";
+import {
+  clearProviderModelCatalog,
+  type ModelEntry,
+  setProviderModelCatalog,
+} from "../providers/model-catalog.js";
 import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import {
   modelLanePacing,
@@ -57,6 +63,31 @@ function recordScrape(store: SharedQuotaStore, scrapedAt: string, limits: QuotaL
   store.recordParsed(id, state, state);
 }
 
+/** The pool's Claude catalog: Fable resolves by identifier or display label. */
+const CATALOG: ModelEntry[] = [
+  { identifier: FABLE, displayLabel: "Claude Fable 5.1" },
+  { identifier: SONNET, displayLabel: "Claude Sonnet 5" },
+];
+
+function recordManual(
+  store: SharedQuotaStore,
+  scrapedAt: string,
+  limits: QuotaLimit[],
+  configuredModels: readonly ModelEntry[] = CATALOG
+) {
+  const mode = store.getQuotaReadingMode("claude");
+  return store.recordManualObservation(
+    {
+      snapshot: { provider: "claude", status: "available", scrapedAt, limits },
+      generation: mode.generation,
+      idempotencyKey: `reading-${scrapedAt}`,
+      acceptedAt: scrapedAt,
+    },
+    { maxIntervalSeconds: 36000 },
+    { configuredModels }
+  );
+}
+
 /**
  * Five-minute scrapes holding a standing error on each lane: the provider
  * window runs `providerError` points ahead of the calendar, Fable
@@ -67,14 +98,20 @@ function recordStandingErrors(
   fromSlot: number,
   slots: number,
   providerError: number,
-  fableError: number
+  fableError: number,
+  record: (
+    store: SharedQuotaStore,
+    scrapedAt: string,
+    limits: QuotaLimit[]
+  ) => unknown = recordScrape,
+  fableModels: string[] = [FABLE]
 ): void {
   for (let slot = fromSlot; slot < fromSlot + slots; slot += 1) {
     const observedMs = STARTED_MS + slot * 5 * 60 * 1000;
     const timeRemainingPct = ((Date.parse(RESET) - observedMs) / WEEK_MS) * 100;
-    recordScrape(store, new Date(observedMs).toISOString(), [
+    record(store, new Date(observedMs).toISOString(), [
       providerLimit(timeRemainingPct - providerError),
-      fableLimit(timeRemainingPct - fableError),
+      fableLimit(timeRemainingPct - fableError, { provider: "claude", models: fableModels }),
     ]);
   }
 }
@@ -193,21 +230,21 @@ describe("model-scoped quota lanes: store (#588)", () => {
       expect(rows).toEqual([{ modelScope: "", percentLeft: 80 }]);
       expect(store.getProviderThrottle("claude")?.modelLanes).toBeUndefined();
 
-      // A manual reading is not catalog-validated, so its model windows are
-      // dropped rather than trusted.
-      const mode = store.setQuotaReadingMode("claude", "manual", "2030-01-01T00:01:00.000Z");
-      const result = store.recordManualObservation({
-        snapshot: {
-          provider: "claude",
-          status: "available",
-          scrapedAt: "2030-01-01T00:05:00.000Z",
-          limits: [providerLimit(79), fableLimit(1)],
-        },
-        generation: mode.generation,
-        idempotencyKey: "reading-1",
-        acceptedAt: "2030-01-01T00:05:30.000Z",
+      // A manual reading with no catalog to resolve against keeps no model
+      // window, as a scrape parsed without one does.
+      store.setQuotaReadingMode("claude", "manual", "2030-01-01T00:01:00.000Z");
+      const result = recordManual(
+        store,
+        "2030-01-01T00:05:00.000Z",
+        [providerLimit(79), fableLimit(1)],
+        []
+      );
+      expect(result).toMatchObject({
+        result: "accepted",
+        droppedWindows: [
+          { label: "Fable weekly", kind: "weekly", models: [FABLE], reason: "no_catalog_match" },
+        ],
       });
-      expect(result.result).toBe("accepted");
       expect(
         store.db
           .prepare("SELECT count(*) AS n FROM quota_observations WHERE model_scope <> ''")
@@ -230,6 +267,94 @@ describe("model-scoped quota lanes: store (#588)", () => {
           .listHistorySince("claude", "2000-01-01T00:00:00.000Z")
           .every((point) => point.scope === "provider")
       ).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("paces a catalog-resolved manual model window exactly as the scrape one", () => {
+    const store = new SharedQuotaStore(tempDb("rusa-966-manual-"));
+    store.configureController({ maxIntervalSeconds: 36000 });
+    store.setQuotaReadingMode("claude", "manual", "2029-12-31T23:59:00.000Z");
+    // The reader spells Fable by its display label; the catalog canonicalises it.
+    recordStandingErrors(store, 0, 12, 2, 12, recordManual, ["claude fable 5.1"]);
+
+    const control = new SharedQuotaStore(tempDb("rusa-966-manual-control-"));
+    control.configureController({ maxIntervalSeconds: 36000 });
+    recordStandingErrors(control, 0, 12, 2, 12);
+    try {
+      // Same readings, same controller history, lane for lane.
+      expect(reasonedRows(store)).toEqual(reasonedRows(control));
+      const lanes = store.getProviderThrottle("claude")?.modelLanes;
+      expect(lanes?.[0]).toMatchObject({
+        models: [FABLE],
+        governingBucketKey: `claude[${FABLE}]:weekly`,
+      });
+      expect(lanes).toEqual(control.getProviderThrottle("claude")?.modelLanes);
+      // The stored snapshot carries the canonical scope, not the reader's spelling.
+      const [latest] = store.listSince("claude", "2030-01-01T00:55:00.000Z");
+      expect(latest?.parsedState?.limits?.[1]?.scope).toEqual({
+        provider: "claude",
+        models: [FABLE],
+      });
+    } finally {
+      store.close();
+      control.close();
+    }
+  });
+
+  it("drops a manual model window the catalog cannot resolve and says why", () => {
+    const store = new SharedQuotaStore(tempDb("rusa-966-manual-drop-"));
+    try {
+      store.setQuotaReadingMode("claude", "manual", "2030-01-01T00:01:00.000Z");
+      const result = recordManual(store, "2030-01-01T00:05:00.000Z", [
+        providerLimit(80),
+        // Legacy bare scope: names no model.
+        { ...fableLimit(10, "model"), label: "Legacy" },
+        // A model this pool does not run.
+        {
+          ...fableLimit(10, { provider: "claude", models: ["claude-reserve-9"] }),
+          label: "Reserve",
+        },
+        // A blank identity.
+        { ...fableLimit(10, { provider: "claude", models: [" "] }), label: "Blank" },
+        // Intersection semantics, as the scrape parser: the unknown name falls away.
+        {
+          ...fableLimit(40, {
+            provider: "claude",
+            models: ["claude-reserve-9", "Claude Sonnet 5"],
+          }),
+          label: "Sonnet weekly",
+        },
+      ]);
+      expect(result).toMatchObject({
+        result: "accepted",
+        droppedWindows: [
+          { label: "Legacy", kind: "weekly", models: [], reason: "no_catalog_match" },
+          {
+            label: "Reserve",
+            kind: "weekly",
+            models: ["claude-reserve-9"],
+            reason: "no_catalog_match",
+          },
+          { label: "Blank", kind: "weekly", models: [" "], reason: "no_catalog_match" },
+        ],
+      });
+      const rows = store.db
+        .prepare(
+          `SELECT model_scope AS modelScope, percent_left AS percentLeft
+           FROM quota_observations ORDER BY model_scope`
+        )
+        .all();
+      expect(rows).toEqual([
+        { modelScope: "", percentLeft: 80 },
+        { modelScope: modelScopeKey([SONNET]), percentLeft: 40 },
+      ]);
+      const [stored] = store.listSince("claude", "2030-01-01T00:00:00.000Z");
+      expect(stored?.parsedState?.limits?.map((limit) => limit.label)).toEqual([
+        "Weekly",
+        "Sonnet weekly",
+      ]);
     } finally {
       store.close();
     }
@@ -692,6 +817,76 @@ describe("model-scoped quota lanes: protocol (#588)", () => {
         expect.arrayContaining([null, [FABLE]])
       );
     } finally {
+      await coordinator.stop();
+      store.close();
+    }
+  }, 15_000);
+
+  it("resolves a socket manual reading against the runtime catalog and logs a dropped row", async () => {
+    const path = tempDb("rusa-966-e2e-");
+    const socketPath = join(path, "..", "coordinator.sock");
+    const store = new SharedQuotaStore(path);
+    const records: Array<{ event: string; fields: LogFields | undefined }> = [];
+    const write = (event: string, fields?: LogFields) => records.push({ event, fields });
+    const logger: Logger = {
+      debug: write,
+      info: write,
+      warn: write,
+      error: write,
+      child: () => logger,
+    };
+    const coordinator = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+      maxIntervalSeconds: 36000,
+      logger,
+    });
+    // The runtime catalog the coordinator loads at startup, as in production.
+    setProviderModelCatalog("claude", CATALOG);
+    try {
+      const mode = store.setQuotaReadingMode("claude", "manual", new Date().toISOString());
+      await coordinator.start();
+      const client = new QuotaCoordinatorClient({ socketPath, configuredProviders: ["claude"] });
+      const nowMs = Date.now();
+      const resetAtIso = new Date(nowMs + 3 * 24 * 60 * 60 * 1000).toISOString();
+      const posted = await client.postManualReading({
+        provider: "claude",
+        generation: mode.generation,
+        idempotencyKey: "reading-966",
+        snapshot: {
+          provider: "claude",
+          status: "available",
+          scrapedAt: new Date(nowMs).toISOString(),
+          limits: [
+            { ...providerLimit(60), resetAtIso },
+            { ...fableLimit(5), resetAtIso },
+            {
+              ...fableLimit(5, { provider: "claude", models: ["claude-reserve-9"] }),
+              label: "Reserve weekly",
+              resetAtIso,
+            },
+          ],
+        },
+      });
+      expect(posted).toMatchObject({ reached: true, statusCode: 200 });
+      // Only the reserve row is dropped: Fable resolved against the runtime catalog.
+      expect(
+        records.filter((record) => record.event === "quota_manual_model_window_dropped")
+      ).toEqual([
+        {
+          event: "quota_manual_model_window_dropped",
+          fields: {
+            provider: "claude",
+            label: "Reserve weekly",
+            kind: "weekly",
+            models: ["claude-reserve-9"],
+            reason: "no_catalog_match",
+          },
+        },
+      ]);
+    } finally {
+      clearProviderModelCatalog("claude");
       await coordinator.stop();
       store.close();
     }

@@ -1,7 +1,6 @@
 import type Database from "better-sqlite3";
 import { z } from "zod";
-import type { ActorRecord, HumanChat } from "../../actor/actor-record.js";
-import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
+import type { ActorRecord } from "../../actor/actor-record.js";
 import {
   lookupModelClassPool,
   type ModelClassStore,
@@ -27,11 +26,6 @@ type ActorRow = {
   title: string | null;
   retired_at: string | null;
   created_at: string;
-};
-
-type LastHumanMessage = {
-  session_id: string | null;
-  sender_id?: string | null;
 };
 
 /**
@@ -582,26 +576,6 @@ export class SqliteActorRepository implements ActorRepository {
       this.desiredOverlay.delete(record.id);
     }
   }
-
-  /**
-   * `mesh_chat` has no recipient index, so this is a full scan. It used to run
-   * inside every record read; it now runs only for the reply tool (#691).
-   */
-  lastHumanChat(id: string): HumanChat | undefined {
-    const row = this.db
-      .prepare(
-        "SELECT session_id, sender_id FROM mesh_chat WHERE recipient_id = ? AND (sender_id = ? OR sender_id IN (SELECT id FROM principals WHERE kind = 'user')) ORDER BY ts DESC, id DESC LIMIT 1"
-      )
-      .get(id, HUMAN_OPERATOR) as LastHumanMessage | undefined;
-    if (!row) return undefined;
-    return {
-      ...(row.session_id ? { sessionId: row.session_id } : {}),
-      ...(row.sender_id ? { principalId: row.sender_id } : {}),
-    };
-  }
-
-  /** The `mesh_chat` row recorded for the message is the durable source. */
-  noteHumanChat(): void {}
 
   private fromRow(row: ActorRow): ActorRecord {
     const handles = this.db

@@ -85,8 +85,11 @@ export function validateProviderSelection(
     const validation = validateModelPin(capabilityName, selection.model);
     if (validation.status === "unknown") {
       console.warn(`[model-catalog] ${validation.warning}`);
-    } else if (validation.efforts && validation.efforts.length > 0) {
-      allowedEfforts = validation.efforts;
+    } else {
+      selection.model = validation.model;
+      if (validation.efforts && validation.efforts.length > 0) {
+        allowedEfforts = validation.efforts;
+      }
     }
   }
   validateReasoningEffort(capabilityName, selection.model, selection.effort, allowedEfforts);

@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { RusaConfig } from "../config/types.js";
+import { clearProviderModelCatalog, setProviderModelCatalog } from "./model-catalog.js";
 import {
   MAX_MODEL_CONFIG_POOL_SIZE,
   type ModelClassStore,
@@ -112,6 +113,35 @@ describe("validateModelConfigPool", () => {
         { portable: true }
       )
     ).toThrow(/duplicate/);
+  });
+
+  describe("against a known catalog", () => {
+    afterEach(() => clearProviderModelCatalog());
+
+    // Model names are case-insensitive (#974): a case variant names the same
+    // model, so it is a duplicate and is stored in the catalog's spelling.
+    it("treats case variants as one model and stores the catalog spelling", () => {
+      setProviderModelCatalog("codex", [
+        { identifier: "gpt-6.1-sol", displayLabel: "gpt-6.1-sol" },
+      ]);
+      expect(
+        validateModelConfigPool(
+          configWith(),
+          { provider: "codex", model: "GPT-6.1-Sol", effort: "high" },
+          { portable: false }
+        )
+      ).toEqual([{ provider: "codex", model: "gpt-6.1-sol", effort: "high" }]);
+      expect(() =>
+        validateModelConfigPool(
+          configWith(),
+          [
+            { provider: "codex", model: "GPT-6.1-Sol", effort: "high" },
+            { provider: "codex", model: "gpt-6.1-sol", effort: "high" },
+          ],
+          { portable: true }
+        )
+      ).toThrow(/duplicate entry: provider "codex" model "gpt-6.1-sol"/);
+    });
   });
 
   it("rejects an invalid tuple by routing through validateProviderSelection", () => {

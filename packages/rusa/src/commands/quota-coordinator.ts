@@ -376,6 +376,7 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
       loadedRevision,
       metrics,
       collectionStats: collection ? () => collection.getAllStats() : undefined,
+      logger: log,
     });
     const backups = new QuotaBackupScheduler({
       databasePath,

@@ -83,7 +83,7 @@ describe("list_subscriptions performance and event loop safety (#687)", () => {
         insertChat.run(
           `chat-${i}`,
           new Date(Date.now() - (5000 - i) * 1000).toISOString(),
-          "human:operator",
+          "00000000-0000-4000-8000-000000000001",
           recipient,
           `Hello ${i}`,
           `session-${i % 10}`

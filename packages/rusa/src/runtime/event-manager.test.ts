@@ -943,9 +943,9 @@ describe("EventManager", () => {
         owners: seedOwners(),
         obligations: {
           findLiveByExternalRef: (ref) =>
-            ref === pullRequest ? { ownerId: "human:operator" } : null,
+            ref === pullRequest ? { ownerId: "00000000-0000-4000-8000-000000000001" } : null,
         },
-        isLive: (id) => id !== "human:operator",
+        isLive: (id) => id !== "00000000-0000-4000-8000-000000000001",
       });
 
       const delivery = em.handleExternalEvent(mergedClosure());
@@ -958,7 +958,7 @@ describe("EventManager", () => {
         "event not covered by any subscription — dropped (GitHub pull_request/closed)",
         `uncovered drop ownership: governingSource=obligation resourceLevel=${pullRequest} isLive=false`,
       ]);
-      for (const line of logs) expect(line).not.toContain("human:operator");
+      for (const line of logs) expect(line).not.toContain("00000000-0000-4000-8000-000000000001");
     });
 
     it("keeps a branch push exact-only and says no rung answered", () => {
@@ -1349,14 +1349,14 @@ describe("EventManager", () => {
       });
 
       const mockObligations = {
-        findLiveByExternalRef: () => ({ ownerId: "human:operator" }),
+        findLiveByExternalRef: () => ({ ownerId: "00000000-0000-4000-8000-000000000001" }),
       };
 
       const resolver = createRoutingKernel({
         owners: ownerStore,
         subscriptions: subStore,
         obligations: mockObligations,
-        isLive: (id) => id !== "human:operator",
+        isLive: (id) => id !== "00000000-0000-4000-8000-000000000001",
       });
 
       const { ownerIds } = resolver.resolveRecipients("github:MEK-Org/rusa/issues/383", {

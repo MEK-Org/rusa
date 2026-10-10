@@ -4,6 +4,8 @@ import type { ActorOptions } from "../actor/actor.js";
 import { createActorLifecycle } from "../actor/actor-lifecycle.js";
 import type { ActorFactoryContext } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
+import { routeRunFailure } from "../actor/failure-sink.js";
+import { runEndPayload } from "../actor/mesh-events.js";
 import { createRunAccounting } from "../actor/run-accounting.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { createActorRunModelConfig } from "../db/repositories/actor-run-model-config.js";
@@ -486,5 +488,74 @@ describe("remote actor run accounting", () => {
       message: { type: "cancelQueued", retain: false },
     });
     expect(handle.resumeCancelledRun()).toBe(false);
+  });
+
+  describe("failure message from a follower (#980)", () => {
+    const STACK = `Error: pin refused\n${Array.from({ length: 40 }, (_, i) => `    at frame${i} (/fixture/f.ts:${i}:1)`).join("\n")}`;
+    const FAILED: RunResult = { success: false, output: STACK, exitCode: 1 };
+
+    /** Report `result` from the follower exactly as the wire carries it; return the notice. */
+    async function noticeFor(result: RunResult): Promise<{ notice: string; ended: RunResult }> {
+      const notices: string[] = [];
+      let ended: RunResult | undefined;
+      context.lifecycle.add({
+        onEnd: async (event) => {
+          if (event.terminal.kind !== "result") return;
+          ended = event.terminal.result;
+          await routeRunFailure(
+            {
+              actors: { get: () => ({ id: ACTOR_ID, parentId: "parent" }) as ActorRecord },
+              sendToParent: (_to, body) => notices.push(body),
+              postToErrorChat: null,
+              rootId: "root",
+              log: () => {},
+            },
+            ACTOR_ID,
+            event.terminal.result,
+            "codex/gpt-fixture-missing",
+            event.runId
+          );
+        },
+      });
+      bootActor();
+      startRun();
+      await reportComplete(JSON.parse(JSON.stringify(result)) as RunResult);
+      await vi.waitFor(() => expect(notices).toHaveLength(1));
+      return { notice: notices[0] ?? "", ended: ended as RunResult };
+    }
+
+    it("delivers a current follower's message and stage without the stack", async () => {
+      const { notice, ended } = await noticeFor({
+        ...FAILED,
+        failure: { stage: "provider-selection", message: "pin refused" },
+      });
+      expect(notice).toContain("could not prepare codex/gpt-fixture-missing.");
+      expect(notice).toContain("Provider was not invoked.");
+      expect(notice.endsWith("pin refused")).toBe(true);
+      expect(notice).not.toContain("at frame");
+      expect(ended.output).toBe(STACK);
+      const [run] = db
+        .prepare("SELECT id, output FROM actor_runs WHERE actor_id = ?")
+        .all(ACTOR_ID) as Array<{
+        id: string;
+        output: string;
+      }>;
+      expect(run?.output).toBe(STACK);
+      expect(notice).toContain(`Run ${run?.id}:`);
+    });
+
+    it("falls back to the bounded stack for an older follower's result", async () => {
+      const { notice, ended } = await noticeFor(FAILED);
+      expect(ended.failure).toBeUndefined();
+      expect(notice).toContain("provider run codex/gpt-fixture-missing failed.");
+      expect(notice).toContain("Error: pin refused");
+      expect(notice).toContain("at frame39");
+      expect(notice).toMatch(/… \[\d+ characters omitted\] …/);
+    });
+
+    it("leaves the run_end payload an older reader parses unchanged", () => {
+      const withFailure = { ...FAILED, failure: { message: "pin refused" }, runId: "r1" };
+      expect(runEndPayload(withFailure)).toBe(runEndPayload({ ...FAILED, runId: "r1" }));
+    });
   });
 });

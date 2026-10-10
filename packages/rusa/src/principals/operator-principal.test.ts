@@ -37,8 +37,8 @@ describe("resolveSoleActiveUser (auth-disabled local mode)", () => {
       expect(result.ok).toBe(false);
       if (!result.ok) {
         expect(result.reason).toBe("none");
-        expect(result.error).toContain("migrate:legacy-principal");
-        expect(result.error).not.toContain("human:operator");
+        expect(result.error).toContain("start in local mode to bootstrap a user");
+        expect(result.error).not.toContain("00000000-0000-4000-8000-000000000001");
       }
     }
   });

@@ -49,10 +49,6 @@ function obligationLogger(): Logger {
   return _obligationLogger;
 }
 
-function isActorEntityId(id: EntityId): boolean {
-  return !id.startsWith("human:") && !id.startsWith("system:");
-}
-
 interface ObligationRow {
   id: string;
   parent_id: string | null;
@@ -692,7 +688,7 @@ export class ObligationRepository {
 
   private scheduler?: ObligationActivationScheduler;
 
-  /** Resolves durable principal ids whose kind cannot be inferred from a prefix. */
+  /** Resolves the kind of a durable principal. */
   private principalKind?: (principalId: string) => PrincipalKind | undefined;
 
   /** Set once the connection carries the TEMP capture table and trigger. */
@@ -959,8 +955,7 @@ export class ObligationRepository {
 
   /**
    * Supply the authoritative principal-kind lookup used by owner validation
-   * and actor-only ready-head delivery. The prefix check remains only as a
-   * compatibility fallback for repositories constructed without principals.
+   * and actor-only ready-head delivery.
    */
   setPrincipalKind(probe: (principalId: string) => PrincipalKind | undefined): void {
     this.principalKind = probe;
@@ -968,11 +963,15 @@ export class ObligationRepository {
 
   private isActorOwner(ownerId: EntityId): boolean {
     const kind = this.principalKind?.(ownerId);
-    return kind === undefined ? isActorEntityId(ownerId) : kind === "actor";
+    return kind === undefined ? this.actorExists?.(ownerId) === true : kind === "actor";
   }
 
   private assertOwnerExists(ownerId: EntityId): void {
-    if (this.isActorOwner(ownerId) && this.actorExists && !this.actorExists(ownerId)) {
+    const kind = this.principalKind?.(ownerId);
+    if (this.principalKind && !kind) {
+      throw new ObligationValidationError(`unknown obligation owner: ${ownerId}`);
+    }
+    if (kind !== "user" && kind !== "system" && this.actorExists && !this.actorExists(ownerId)) {
       throw new ObligationValidationError(`actor owner does not exist: ${ownerId}`);
     }
   }

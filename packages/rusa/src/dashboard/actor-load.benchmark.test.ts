@@ -76,7 +76,9 @@ function seed(
         insert.run(
           `chat-${ordinal}`,
           new Date(ordinal * 1000).toISOString(),
-          message < humanMessagesPerActor ? "human:operator" : `peer-${message % 10}`,
+          message < humanMessagesPerActor
+            ? "00000000-0000-4000-8000-000000000001"
+            : `peer-${message % 10}`,
           `actor-${actor}`,
           "synthetic",
           `session-${ordinal}`

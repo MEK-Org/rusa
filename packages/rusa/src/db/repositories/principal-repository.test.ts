@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
+import { IMPLICIT_USER_EMAIL } from "../../principals/operator-principal.js";
 import { runMigrations } from "../migrations/runner.js";
 import { PrincipalRepository } from "./principal-repository.js";
 
@@ -30,6 +31,76 @@ describe("PrincipalRepository", () => {
   beforeEach(() => {
     db = makeDb();
     principals = new PrincipalRepository(db);
+  });
+
+  it("bootstraps exactly one durable user and does not bypass disabled users", () => {
+    const local = principals.ensureImplicitUser(CREATED_AT);
+    if (!local) throw new Error("Expected durable user fixture");
+    expect(local.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(local.email).toBe(IMPLICIT_USER_EMAIL);
+    expect(local.identity).toBeUndefined();
+    expect(principals.ensureImplicitUser(CREATED_AT)).toBeUndefined();
+    principals.setDisabled(local.id, CREATED_AT);
+    expect(principals.ensureImplicitUser(CREATED_AT)).toBeUndefined();
+    expect(principals.listUsers()).toHaveLength(1);
+  });
+
+  it("does not bootstrap alongside an existing named user", () => {
+    principals.createUser({ email: "owner@example.com", createdAt: CREATED_AT });
+    expect(principals.ensureImplicitUser(CREATED_AT)).toBeUndefined();
+    expect(principals.listUsers()).toHaveLength(1);
+  });
+
+  it("enriches the sole implicit user without changing its id, root, or attributed history", () => {
+    const local = principals.ensureImplicitUser(CREATED_AT);
+    if (!local) throw new Error("Expected durable user fixture");
+    principals.setRootActor(local.id, "root");
+    db.prepare(
+      "INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body) VALUES ('m', ?, ?, 'root', 'local question')"
+    ).run(CREATED_AT, local.id);
+    const claimed = principals.claimUnboundUserByEmail("owner@example.com", IDENTITY, CREATED_AT);
+    if (!claimed) throw new Error("Expected durable user fixture");
+    expect(claimed).toMatchObject({
+      id: local.id,
+      email: "owner@example.com",
+      rootActorId: "root",
+      identity: IDENTITY,
+    });
+    expect(principals.claimUnboundUserByEmail("owner@example.com", IDENTITY, CREATED_AT)?.id).toBe(
+      local.id
+    );
+    expect(db.prepare("SELECT sender_id FROM mesh_chat WHERE id = 'm'").get()).toEqual({
+      sender_id: local.id,
+    });
+    expect(principals.listUsers()).toHaveLength(1);
+    expect(() =>
+      principals.claimUnboundUserByEmail("owner@example.com", OTHER_IDENTITY, CREATED_AT)
+    ).toThrow("another external identity");
+  });
+
+  it("does not guess an implicit claim among multiple users or rebind a disabled user", () => {
+    const local = principals.ensureImplicitUser(CREATED_AT);
+    if (!local) throw new Error("Expected durable user fixture");
+    principals.setDisabled(local.id, CREATED_AT);
+    expect(
+      principals.claimUnboundUserByEmail("owner@example.com", IDENTITY, CREATED_AT)?.disabledAt
+    ).toBe(CREATED_AT);
+    expect(principals.getUser(local.id)?.identity).toBeUndefined();
+    principals.setDisabled(local.id, null);
+    principals.createUser({ email: "colleague@example.com", createdAt: CREATED_AT });
+    expect(
+      principals.claimUnboundUserByEmail("owner@example.com", IDENTITY, CREATED_AT)
+    ).toBeUndefined();
+    expect(principals.getUser(local.id)?.identity).toBeUndefined();
+  });
+
+  it("rejects a reserved-email claim without writing", () => {
+    const local = principals.ensureImplicitUser(CREATED_AT);
+    if (!local) throw new Error("Expected durable user fixture");
+    expect(() =>
+      principals.claimUnboundUserByEmail(IMPLICIT_USER_EMAIL, IDENTITY, CREATED_AT)
+    ).toThrow("Reserved admission email");
+    expect(principals.getUser(local.id)).toEqual(local);
   });
 
   it("keeps an actor principal creation time synchronized with its actor row", () => {

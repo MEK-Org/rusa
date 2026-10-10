@@ -4,10 +4,10 @@
  *
  * Inbound: the memo route stores the raw audio under
  * `$RUSA_HOME/voice/inbox/` and transcribes it; the transcript rides the
- * existing `sendHumanMessage` chat path with the memo marker prefix.
+ * shared `sendMessage` chat path with the memo marker prefix.
  *
  * Outbound: a subscription on the dashboard's mesh-event emitter watches for
- * replies to `human:operator`. While the sending actor has a connected `voice`
+ * replies to durable users. While the actor/user pair has a connected `voice`
  * SSE subscription — or had one within the last {@link VOICE_PRESENCE_GRACE_MS}
  * (a dropped LTE connection mid-drive must not eat a reply) — the reply body is
  * rendered to speech, stored under `$RUSA_HOME/voice/outbox/`, registered
@@ -19,7 +19,6 @@ import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import {
   type EncodedAudio,
@@ -64,8 +63,10 @@ export const MAX_ANNOUNCEMENTS = 50;
 /** One rendered reply awaiting (or having finished) playback. */
 export interface VoiceAnnouncement {
   id: string;
-  /** The actor whose reply this is (the walkie peer, not `human:operator`). */
+  /** The actor whose message is being spoken. */
   actorId: string;
+  recipientId: string;
+  sessionId: string | null;
   /** The speakable text that was synthesized. */
   text: string;
   /** Absolute path of the stored audio file. */
@@ -84,6 +85,8 @@ export interface VoiceAnnouncement {
 export interface VoiceAnnouncementFrame {
   id: string;
   actorId: string;
+  recipientId: string;
+  sessionId: string | null;
   text: string;
   /** Route serving the audio bytes: `/api/mesh/voice/audio/<id>`. */
   audioUrl: string;
@@ -95,6 +98,8 @@ export function toFrame(announcement: VoiceAnnouncement): VoiceAnnouncementFrame
   return {
     id: announcement.id,
     actorId: announcement.actorId,
+    recipientId: announcement.recipientId,
+    sessionId: announcement.sessionId,
     text: announcement.text,
     audioUrl: `/api/mesh/voice/audio/${announcement.id}`,
     mime: announcement.mime,
@@ -134,10 +139,8 @@ export interface VoiceServiceOptions {
    * this: it stays instance-wide.
    */
   /**
-   * Whether a message recipient is a human the walkie should speak for. The
-   * legacy `human:operator` alias always is; after the #460 cutover replies
-   * target the durable user principal, which only principal storage can
-   * recognize. Absent → only the legacy alias is spoken.
+   * Whether principal storage identifies a recipient as an active user.
+   * Without this resolver, no messages are synthesized.
    */
   isHumanRecipient?: (principalId: string) => boolean;
   speechFor?: (actorId: string) => { speech: SpeechClient; voiceName?: string } | undefined;
@@ -165,6 +168,7 @@ export interface VoiceServiceOptions {
 
 interface VoiceSession {
   actorId: string;
+  principalId: string;
   /** Number of open SSE connections carrying this stable session id. */
   connections: number;
   /** Null while a stream remains open; otherwise the reconnect deadline. */
@@ -236,8 +240,8 @@ export class VoiceService {
    * actor is a protocol error rather than an implicit transfer (transfers are
    * slice B). Any live connection holds authority indefinitely.
    */
-  openSession(sessionId: string, actorId: string): void {
-    const existing = this.validateSession(sessionId, actorId);
+  openSession(sessionId: string, actorId: string, principalId: string): void {
+    const existing = this.validateSession(sessionId, actorId, principalId);
     if (existing) {
       if (existing.timer) clearTimeout(existing.timer);
       existing.timer = null;
@@ -247,6 +251,7 @@ export class VoiceService {
     }
     this.sessions.set(sessionId, {
       actorId,
+      principalId,
       connections: 1,
       expiresAt: null,
       timer: null,
@@ -254,13 +259,18 @@ export class VoiceService {
   }
 
   /** Validate a pending stream without granting authority until it is attached. */
-  validateSession(sessionId: string, actorId: string): VoiceSession | undefined {
+  validateSession(
+    sessionId: string,
+    actorId: string,
+    principalId: string
+  ): VoiceSession | undefined {
     if (!sessionId.trim()) throw new Error("sessionId is required");
     if (!actorId.trim()) throw new Error("actorId is required");
+    if (!principalId.trim()) throw new Error("principalId is required");
     this.expireSessions();
     const existing = this.sessions.get(sessionId);
-    if (existing && existing.actorId !== actorId) {
-      throw new Error("sessionId is already bound to a different actor");
+    if (existing && (existing.actorId !== actorId || existing.principalId !== principalId)) {
+      throw new Error("sessionId is already bound to a different actor or user");
     }
     return existing;
   }
@@ -282,7 +292,8 @@ export class VoiceService {
   }
 
   /** Explicit mode exit. Returns false when it was already absent (idempotent). */
-  closeSession(sessionId: string): boolean {
+  closeSession(sessionId: string, principalId?: string): boolean {
+    if (principalId && this.sessions.get(sessionId)?.principalId !== principalId) return false;
     return this.endSession(sessionId);
   }
 
@@ -306,15 +317,17 @@ export class VoiceService {
   }
 
   /** Whether this stable UUID currently authorizes voice memos for its actor. */
-  hasSession(sessionId: string, actorId: string): boolean {
+  hasSession(sessionId: string, actorId: string, principalId: string): boolean {
     const session = this.sessions.get(sessionId);
     return (
-      session?.actorId === actorId && (session.expiresAt === null || session.expiresAt > this.now())
+      session?.actorId === actorId &&
+      session.principalId === principalId &&
+      (session.expiresAt === null || session.expiresAt > this.now())
     );
   }
 
   /** The caller's sole active session UUID, or an error when transfer is ambiguous. */
-  activeSessionIdFor(actorId: string): string {
+  activeSessionFor(actorId: string): { sessionId: string; principalId: string } {
     this.expireSessions();
     const active = [...this.sessions.entries()].filter(
       ([, session]) =>
@@ -325,7 +338,7 @@ export class VoiceService {
     if (active.length > 1) {
       throw new Error("caller holds multiple active voice sessions; transfer is ambiguous");
     }
-    return active[0][0];
+    return { sessionId: active[0][0], principalId: active[0][1].principalId };
   }
 
   /**
@@ -341,7 +354,7 @@ export class VoiceService {
     if (fromActorId === targetActorId) throw new Error("cannot transfer a voice session to itself");
     this.expireSessions();
 
-    const sessionId = this.activeSessionIdFor(fromActorId);
+    const { sessionId } = this.activeSessionFor(fromActorId);
     if (this.hasActiveSession(targetActorId)) {
       throw new Error("target actor already holds an active voice session");
     }
@@ -438,30 +451,33 @@ export class VoiceService {
   // ── Presence ────────────────────────────────────────────────────────────
 
   /** A `voice` SSE subscription for these actors connected. */
-  presenceConnect(actorIds: Iterable<string>): void {
+  presenceConnect(actorIds: Iterable<string>, principalId: string): void {
     for (const actorId of actorIds) {
-      this.liveSubscriptions.set(actorId, (this.liveSubscriptions.get(actorId) ?? 0) + 1);
+      const key = JSON.stringify([actorId, principalId]);
+      this.liveSubscriptions.set(key, (this.liveSubscriptions.get(key) ?? 0) + 1);
     }
   }
 
   /** A `voice` SSE subscription disconnected; starts the grace window. */
-  presenceDisconnect(actorIds: Iterable<string>): void {
+  presenceDisconnect(actorIds: Iterable<string>, principalId: string): void {
     const now = this.now();
     for (const actorId of actorIds) {
-      const count = (this.liveSubscriptions.get(actorId) ?? 0) - 1;
+      const key = JSON.stringify([actorId, principalId]);
+      const count = (this.liveSubscriptions.get(key) ?? 0) - 1;
       if (count > 0) {
-        this.liveSubscriptions.set(actorId, count);
+        this.liveSubscriptions.set(key, count);
       } else {
-        this.liveSubscriptions.delete(actorId);
-        this.lastSeen.set(actorId, now);
+        this.liveSubscriptions.delete(key);
+        this.lastSeen.set(key, now);
       }
     }
   }
 
   /** Live subscription now, or one within the grace window. */
-  hasPresence(actorId: string): boolean {
-    if ((this.liveSubscriptions.get(actorId) ?? 0) > 0) return true;
-    const lastSeen = this.lastSeen.get(actorId);
+  hasPresence(actorId: string, principalId: string): boolean {
+    const key = JSON.stringify([actorId, principalId]);
+    if ((this.liveSubscriptions.get(key) ?? 0) > 0) return true;
+    const lastSeen = this.lastSeen.get(key);
     return lastSeen !== undefined && this.now() - lastSeen < this.presenceGraceMs;
   }
 
@@ -484,8 +500,7 @@ export class VoiceService {
   // ── Outbound: reply TTS ─────────────────────────────────────────────────
 
   /**
-   * Mesh-event hook: on a reply to a human (the legacy `human:operator` alias
-   * or a durable user principal) from an actor with walkie
+   * Mesh-event hook: on a message to a durable user from an actor with walkie
    * presence, render TTS, store it under `voice/outbox/`, register the
    * announcement, and return it (the caller pushes the SSE frame). Returns null
    * for every event this hook doesn't own.
@@ -510,10 +525,10 @@ export class VoiceService {
     }
 
     if (!recipientId) return null;
-    if (recipientId !== HUMAN_OPERATOR && !this.isHumanRecipient(recipientId)) return null;
-    if (!senderId || senderId === HUMAN_OPERATOR || this.isHumanRecipient(senderId)) return null;
+    if (!this.isHumanRecipient(recipientId)) return null;
+    if (!senderId || this.isHumanRecipient(senderId)) return null;
     if (!event.body) return null;
-    if (!this.hasPresence(senderId)) return null;
+    if (!this.hasPresence(senderId, recipientId)) return null;
 
     const text = speakableText(event.body);
     if (!text) return null;
@@ -546,6 +561,8 @@ export class VoiceService {
       const announcement: VoiceAnnouncement = {
         id,
         actorId: senderId,
+        recipientId,
+        sessionId: event.detail,
         text,
         audioPath: encoded.path,
         mime: encoded.mime,
@@ -593,9 +610,12 @@ export class VoiceService {
   }
 
   /** Unplayed announcements for an actor, oldest first (within the ring). */
-  backlog(actorId: string): VoiceAnnouncement[] {
+  backlog(actorId: string, principalId: string): VoiceAnnouncement[] {
     return this.announcements.filter(
-      (announcement) => announcement.actorId === actorId && announcement.playedAt === null
+      (announcement) =>
+        announcement.actorId === actorId &&
+        announcement.recipientId === principalId &&
+        announcement.playedAt === null
     );
   }
 

@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import '../principals.dart';
 import '../store.dart';
 import '../theme.dart';
 import 'avatar.dart';
@@ -20,41 +19,26 @@ class OwnerSelector extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Autocomplete<OwnerOption>(
-      initialValue: TextEditingValue(text: ownerIdCtrl.text),
-      displayStringForOption: (option) => option.display,
+      initialValue: TextEditingValue(text: store.ownerLabel(ownerIdCtrl.text)),
+      displayStringForOption: (option) => option.handle,
+      onSelected: (option) => ownerIdCtrl.text = option.id,
       optionsBuilder: (textEditingValue) {
         final text = textEditingValue.text.toLowerCase();
         final actors = store.actorStates.value.actors.values
             .where((a) => !a.isRetired)
             .map((a) => OwnerOption(kind: 'actor', id: a.id, handle: a.handle));
-        // The durable user principal when the server resolved one, so a pick
-        // from this list never writes the legacy alias back into a migrated
-        // database; the alias only remains as the id on an instance that has
-        // no durable user yet.
-        final humans = [
-          OwnerOption(
-            kind: 'human',
-            id: viewerOwnerId(store.dashboardConfig.value?.userPrincipalId),
-            handle: kOperatorDisplayHandle,
-          ),
-        ];
+        final humans = store.dashboardConfig.value!.users.map((user) =>
+          OwnerOption(kind: 'human', id: user.id, handle: store.ownerLabel(user.id)),
+        );
         final all = [...humans, ...actors];
         if (text.isEmpty) return all;
         return all.where((opt) => opt.handle.toLowerCase().contains(text) || opt.id.toLowerCase().contains(text));
       },
       fieldViewBuilder: (context, textEditingController, focusNode, onFieldSubmitted) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (ownerIdCtrl.text != textEditingController.text) {
-            ownerIdCtrl.text = textEditingController.text;
-          }
-        });
-        textEditingController.addListener(() {
-          ownerIdCtrl.text = textEditingController.text;
-        });
-        
         return TextFormField(
           controller: textEditingController,
           focusNode: focusNode,
+          onChanged: (text) => ownerIdCtrl.text = text,
           style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13, fontFamily: kMonoFontFamily),
           decoration: decoration.copyWith(
             suffixIcon: IconButton(
@@ -93,6 +77,7 @@ class OwnerSelector extends StatelessWidget {
                         ? const Icon(Icons.person, color: MeshColors.textSecondary, size: 24)
                         : ActorAvatar(id: option.id, size: 24, store: store),
                     title: Text(option.handle, style: const TextStyle(color: MeshColors.textPrimary)),
+                    subtitle: Text(option.id, style: const TextStyle(color: MeshColors.textMuted, fontSize: 11)),
                     onTap: () => onSelected(option),
                   );
                 },

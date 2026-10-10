@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { nullLogger } from "../observability/logger.js";
+import { IMPLICIT_USER_EMAIL } from "../principals/operator-principal.js";
 import { DashboardIdentityClaimError, DashboardIdentityResolver } from "./identity.js";
 
 let db: Database.Database;
@@ -33,7 +34,7 @@ it("keeps one stable user across repeated verified logins and admission email ch
   expect(resolver.resolve(token({ email: "new@example.com" })).id).toBe(user.id);
   expect(repo.getUser(user.id)?.email).toBe("new@example.com");
   expect(user.rootActorId).toBeUndefined();
-  expect(repo.get("human:operator")).toBeUndefined();
+  expect(repo.get("00000000-0000-4000-8000-000000000001")).toBeUndefined();
   expect(db.prepare("SELECT COUNT(*) AS n FROM users").get()).toEqual({ n: 1 });
 });
 
@@ -44,6 +45,26 @@ it("claims the explicitly provisioned unbound user matching a verified email", (
   });
   expect(resolver.resolve(token()).id).toBe(pending.id);
   expect(repo.getUser(pending.id)?.identity).toEqual({ issuer: ISSUER, subject: "uid" });
+});
+
+it("claims the local implicit user once, then provisions distinct verified users", () => {
+  const local = repo.ensureImplicitUser("2026-10-01T00:00:00Z");
+  if (!local) throw new Error("Expected durable user fixture");
+  expect(resolver.resolve(token()).id).toBe(local.id);
+  expect(resolver.resolve(token()).id).toBe(local.id);
+  expect(
+    resolver.resolve(token({ uid: "other", sub: "other", email: "other@example.com" })).id
+  ).not.toBe(local.id);
+  expect(repo.listUsers()).toHaveLength(2);
+});
+
+it("does not resolve reserved bootstrap email as a verified login", () => {
+  const local = repo.ensureImplicitUser("2026-10-01T00:00:00Z");
+  if (!local) throw new Error("Expected durable user fixture");
+  expect(() => resolver.resolve(token({ email: IMPLICIT_USER_EMAIL }))).toThrow(
+    "Reserved admission email"
+  );
+  expect(repo.getUser(local.id)?.identity).toBeUndefined();
 });
 
 it("never rebinds a user already held by another identity", () => {

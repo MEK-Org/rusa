@@ -24,12 +24,11 @@ export function createInterruptAbortReason(by: string): string {
 }
 
 export function isInterruptAbortReason(reason: unknown): boolean {
-  return typeof reason === "string" && reason.startsWith(INTERRUPT_ABORT_REASON_PREFIX);
-}
-
-export function parseInterruptSource(reason: string): string | undefined {
-  if (!isInterruptAbortReason(reason)) return undefined;
-  return reason.slice(INTERRUPT_ABORT_REASON_PREFIX.length).trim() || undefined;
+  return (
+    typeof reason === "string" &&
+    reason.startsWith(INTERRUPT_ABORT_REASON_PREFIX) &&
+    reason.slice(INTERRUPT_ABORT_REASON_PREFIX.length).trim().length > 0
+  );
 }
 
 export interface TerminationAttribution {
@@ -69,7 +68,7 @@ export function formatSigtermResult(
   const abortReason = extractAbortReason(signal);
 
   if (isInterruptAbortReason(abortReason)) {
-    const by = parseInterruptSource(abortReason) ?? "operator";
+    const by = abortReason.slice(INTERRUPT_ABORT_REASON_PREFIX.length).trim();
     return {
       output: `${baseOutput}\n[Task interrupted by ${by}]`,
       exitCode: 143, // 128 + SIGTERM (15)

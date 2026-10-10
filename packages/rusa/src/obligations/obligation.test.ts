@@ -103,9 +103,14 @@ describe("parseExternalRef", () => {
 
 describe("obligation entity and status helpers", () => {
   it("accepts every id in the mesh's one id space and rejects a blank one", () => {
-    // Actor UUIDs, `root`, `human:*` and `system:*` all live in one space, and
-    // the category is read off the prefix — there is no separate owner "kind".
-    for (const id of ["actor-1", "root", "human:operator", "system:mesh", "system:service"]) {
+    // Actor, user, and system ids share one space; storage determines kind.
+    for (const id of [
+      "actor-1",
+      "root",
+      "00000000-0000-4000-8000-000000000001",
+      "system:mesh",
+      "system:service",
+    ]) {
       expect(validateEntityId(id)).toBe(id);
     }
     expect(() => validateEntityId("   ")).toThrow(ObligationValidationError);
@@ -136,7 +141,7 @@ describe("obligation history payload validation", () => {
           priority: 10,
         },
         after: {
-          ownerId: "human:operator",
+          ownerId: "00000000-0000-4000-8000-000000000001",
           parentId: null,
           externalRef: null,
           status: "done",
@@ -149,7 +154,7 @@ describe("obligation history payload validation", () => {
     expect(payload.before.ownerId).toBe("actor-a");
     expect(payload.before.parentId).toBe("parent-1");
     expect(payload.before.externalRef).toBe("github:MEK-Org/rusa/issues/185");
-    expect(payload.after.ownerId).toBe("human:operator");
+    expect(payload.after.ownerId).toBe("00000000-0000-4000-8000-000000000001");
     expect(payload.after.parentId).toBeNull();
     expect(payload.after.externalRef).toBeNull();
   });

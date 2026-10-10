@@ -27,11 +27,11 @@ class _InboxTestApi extends FakeApi {
           {
             'id': 'inbox-unhandled',
             'actorId': 'root',
-            'source': 'mesh:human:operator',
+            'source': 'mesh:00000000-0000-4000-8000-000000000001',
             'deliveredAt': '2026-08-19T10:00:00Z',
             'handledAt': null,
             'payload': {
-              'type': 'human.message',
+              'type': 'mesh.message',
               'content': 'Unresolved signal',
             },
           },
@@ -43,12 +43,12 @@ class _InboxTestApi extends FakeApi {
           {
             'id': 'inbox-handled',
             'actorId': 'root',
-            'source': 'mesh:human:operator',
+            'source': 'mesh:00000000-0000-4000-8000-000000000001',
             'deliveredAt': '2026-08-19T09:00:00Z',
             'handledAt': '2026-08-19T09:05:00Z',
             'handledNote': 'Resolved successfully',
             'payload': {
-              'type': 'human.message',
+              'type': 'mesh.message',
               'content': 'Resolved signal',
             },
           },

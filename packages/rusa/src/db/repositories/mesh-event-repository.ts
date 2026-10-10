@@ -8,7 +8,6 @@ import type Database from "better-sqlite3";
 // *forwarding* is the failure-sink's job). This is a type-only import: no
 // runtime coupling from db → actor.
 import type { MeshEventKind } from "../../actor/mesh-events.js";
-import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 export type { MeshEventKind };
 
 /** An appended mesh event (camelCase domain object). */
@@ -412,14 +411,11 @@ export class MeshEventRepository {
    * across a multi-selection. Pass the previous page's `nextCursor` as
    * `before` to page backward in time. `kinds`, if given, restricts to those
    * event kinds. `humanViewerIds`, if given, keeps only the message events a
-   * human viewer may read (#590): those whose every human participant — the
-   * legacy `human:operator` alias or any durable user — is one of these ids,
-   * i.e. the viewer's own conversations plus actor↔actor traffic; an empty
-   * list reads actor↔actor traffic alone. A participant is read from the
-   * mesh_chat row when the event has one (the authoritative, migrated pairing)
-   * and otherwise from the event's own subject and payload peer, so a legacy
-   * row that pre-dates mesh_chat cannot surface another human's conversation
-   * either. Non-message events are unaffected. Returns an empty page for an
+   * human viewer may read (#590): each participant must be the viewer or a
+   * known actor/system principal. An empty list reads only shared traffic.
+   * Participants come from the authoritative mesh_chat row when present,
+   * otherwise from the event's subject and payload peer. Unknown or malformed
+   * participants are withheld. Non-message events are unaffected. Returns an empty page for an
    * empty `actorIds`.
    */
   listEventsByActors(
@@ -517,8 +513,8 @@ export class MeshEventRepository {
  * the returned SQL binds them, so callers must splice it into the statement at
  * the point they call it.
  *
- * Bounded by construction: the viewer's own ids (at most a durable id and the
- * legacy alias) per participant column, never one parameter per known human.
+ * Bounded by construction: the viewer's durable id per participant column,
+ * never one parameter per known human.
  * An empty `viewerIds` — a viewer who cannot be identified — reads actor↔actor
  * traffic alone.
  */
@@ -529,12 +525,12 @@ function humanReadableMessageSql(
   const readable = (participant: string): string => {
     const mine =
       viewerIds.length > 0 ? ` OR ${participant} IN (${viewerIds.map(() => "?").join(", ")})` : "";
-    params.push(...viewerIds, HUMAN_OPERATOR);
-    return `(${participant} IS NULL${mine} OR (${participant} != ? AND ${participant} NOT IN (SELECT id FROM principals WHERE kind = 'user')))`;
+    params.push(...viewerIds);
+    return `(${participant} IN (SELECT id FROM principals WHERE kind IN ('actor', 'system'))${mine})`;
   };
   return `(e.kind NOT IN ('message_sent', 'message_received')
         OR (c.id IS NOT NULL AND ${readable("c.sender_id")} AND ${readable("c.recipient_id")})
-        OR (c.id IS NULL AND ${readable("e.actor_id")} AND ${readable("json_extract(e.payload, '$.to')")} AND ${readable("json_extract(e.payload, '$.from')")})
+        OR (c.id IS NULL AND ${readable("e.actor_id")} AND ${readable("CASE WHEN json_valid(e.payload) THEN CASE e.kind WHEN 'message_sent' THEN json_extract(e.payload, '$.to') ELSE json_extract(e.payload, '$.from') END END")})
       )`;
 }
 

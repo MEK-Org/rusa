@@ -27,6 +27,7 @@ const mockWebhookServerModule = vi.hoisted(() => ({
 }));
 
 const mockReferenceCacheRepo = vi.hoisted(() => ({ get: vi.fn(), set: vi.fn(), delete: vi.fn() }));
+const mockPrincipals = vi.hoisted(() => ({ ensureImplicitUser: vi.fn() }));
 
 const mockDbModule = vi.hoisted(() => ({
   initDb: vi.fn(() => ({})),
@@ -37,6 +38,7 @@ const mockDbModule = vi.hoisted(() => ({
     meshEvents: {},
     meshChat: {},
     obligations: {},
+    principals: mockPrincipals,
     referenceCache: mockReferenceCacheRepo,
   })),
 }));
@@ -81,6 +83,7 @@ describe("runDashboard", () => {
 
     expect(mockConfigLoader.loadConfig).toHaveBeenCalledOnce();
     expect(mockDbModule.initDb).toHaveBeenCalledWith("/tmp/test-mc-home");
+    expect(mockPrincipals.ensureImplicitUser).toHaveBeenCalledOnce();
     // The standalone dashboard now serves the read-only mesh Data API + SSE, so
     // it binds the persisted registry + mesh_events repo (plus an emitter).
     expect(mockWebhookServerModule.startDashboardServer).toHaveBeenCalledWith(
@@ -92,7 +95,7 @@ describe("runDashboard", () => {
     expect(openMock.default).toHaveBeenCalledWith("http://localhost:8080");
   });
 
-  it("stays read-only: never invokes the mutating legacy actor state importer", async () => {
+  it("never invokes the legacy actor state importer", async () => {
     await runDashboard();
 
     expect(mockLegacyImport.importLegacyActorState).not.toHaveBeenCalled();
@@ -109,6 +112,7 @@ describe("runDashboard", () => {
       meshEvents: {},
       meshChat: {},
       obligations: {},
+      principals: mockPrincipals,
       referenceCache: mockReferenceCacheRepo,
     });
 

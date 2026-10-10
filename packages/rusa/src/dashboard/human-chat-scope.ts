@@ -1,16 +1,15 @@
 import type { IncomingMessage } from "node:http";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import {
   type OperatorPrincipalSource,
-  resolveLegacyOperatorAlias,
   resolveSoleActiveUser,
 } from "../principals/operator-principal.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
 import { getDashboardRequestPrincipal } from "./auth.js";
 
-/** The slice of principal storage a chat scope consults: the durable user list. */
-export type HumanChatPrincipalSource = OperatorPrincipalSource;
+/** Durable identities used to identify the viewer and classify participants. */
+export type HumanChatPrincipalSource = OperatorPrincipalSource & Pick<PrincipalRepository, "get">;
 
 /**
  * The durable user a read surface should treat as "me": the authenticated
@@ -19,7 +18,7 @@ export type HumanChatPrincipalSource = OperatorPrincipalSource;
  */
 export function viewingUserPrincipalId(
   req: IncomingMessage,
-  principals: HumanChatPrincipalSource | undefined
+  principals: OperatorPrincipalSource | undefined
 ): string | null {
   const reqPrincipal = getDashboardRequestPrincipal(req);
   if (reqPrincipal) return reqPrincipal.id;
@@ -38,19 +37,12 @@ export function viewingUserPrincipalId(
  */
 export interface HumanChatScope {
   /**
-   * The ids this viewer reads as "me": their durable principal and, when the
-   * legacy `human:operator` alias still resolves to them (sole active user, or
-   * no durable user at all), that alias for unmigrated history. Empty when the
-   * viewer cannot be identified (auth-disabled local mode with several users),
-   * in which case every human is "another human" and nothing human-involving
-   * is readable.
+   * The viewer's durable principal, or empty when they cannot be identified.
    */
   readonly viewerIds: ReadonlySet<string>;
   /**
-   * Whether the viewer may read a message among these participants: yes
-   * unless one of them is a human principal other than the viewer. A human
-   * here is the legacy alias or any durable user, enabled or not; a disabled
-   * colleague's history stays theirs.
+   * Each participant must be the viewer or a known actor/system principal.
+   * Other users (including disabled users) and unknown ids stay private.
    */
   canSee(...participants: string[]): boolean;
 }
@@ -60,22 +52,22 @@ export interface HumanChatScope {
  * given its inputs, so a fan-out can read `users` once and evaluate many
  * viewers against it (see {@link eventAudience}).
  */
-export function humanChatScope(req: IncomingMessage, users: UserPrincipal[]): HumanChatScope {
-  const principals: HumanChatPrincipalSource = { listUsers: () => users };
-  const me = viewingUserPrincipalId(req, principals);
-  // `human:operator` names the viewer only while the alias still resolves to
-  // them (or to itself, when nothing durable exists yet). With several durable
-  // users the alias is ambiguous and belongs to nobody until migrated.
-  const alias = resolveLegacyOperatorAlias(HUMAN_OPERATOR, principals);
+export function humanChatScope(
+  req: IncomingMessage,
+  users: UserPrincipal[],
+  principals?: Pick<HumanChatPrincipalSource, "get">
+): HumanChatScope {
+  const me = viewingUserPrincipalId(req, { listUsers: () => users });
   const viewerIds = new Set<string>();
   if (me) viewerIds.add(me);
-  if (alias.ok && (alias.ownerId === HUMAN_OPERATOR || alias.ownerId === me)) {
-    viewerIds.add(HUMAN_OPERATOR);
-  }
-  const humans = new Set<string>([HUMAN_OPERATOR, ...users.map((u) => u.id)]);
   return {
     viewerIds,
-    canSee: (...participants) => participants.every((id) => viewerIds.has(id) || !humans.has(id)),
+    canSee: (...participants) =>
+      participants.every((id) => {
+        if (viewerIds.has(id)) return true;
+        const kind = principals?.get(id)?.kind;
+        return kind === "actor" || kind === "system";
+      }),
   };
 }
 
@@ -84,7 +76,7 @@ export function resolveHumanChatScope(
   req: IncomingMessage,
   principals: HumanChatPrincipalSource | undefined
 ): HumanChatScope {
-  return humanChatScope(req, principals?.listUsers() ?? []);
+  return humanChatScope(req, principals?.listUsers() ?? [], principals);
 }
 
 /**
@@ -92,10 +84,13 @@ export function resolveHumanChatScope(
  * fixed, the user list is supplied per event so a colleague admitted after the
  * connection opened is honoured from the next frame on.
  */
-export type HumanChatViewer = (users: UserPrincipal[]) => HumanChatScope;
+export type HumanChatViewer = (
+  users: UserPrincipal[],
+  principals?: Pick<HumanChatPrincipalSource, "get">
+) => HumanChatScope;
 
 export function humanChatViewer(req: IncomingMessage): HumanChatViewer {
-  return (users) => humanChatScope(req, users);
+  return (users, principals) => humanChatScope(req, users, principals);
 }
 
 /**
@@ -127,9 +122,7 @@ export function messageEventParticipants(
  * Everything but a message event is shared mesh visibility. A message event
  * reaches a viewer when they may read its two ends; one whose ends cannot be
  * read is withheld from every scoped viewer rather than guessed shared. The
- * user list is read at most once per event, however many viewers are
- * attached, so a fan-out costs no per-viewer principal lookup while a newly
- * admitted colleague is still honoured on the very next frame.
+ * user list is read at most once per event, however many viewers are attached.
  */
 export function eventAudience(
   event: Pick<MeshEvent, "kind" | "actorId" | "payload">,
@@ -141,6 +134,6 @@ export function eventAudience(
   let users: UserPrincipal[] | undefined;
   return (viewer) => {
     users ??= principals?.listUsers() ?? [];
-    return viewer(users).canSee(...participants);
+    return viewer(users, principals).canSee(...participants);
   };
 }

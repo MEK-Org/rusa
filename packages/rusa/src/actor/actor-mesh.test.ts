@@ -10,6 +10,7 @@ import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
@@ -449,6 +450,17 @@ function setup(
   mesh = new ActorMesh({
     supportedVoices: opts.supportedVoices,
     actors: registry,
+    principals: {
+      getUser: (id: string) =>
+        id === TEST_USER_ID
+          ? {
+              id,
+              kind: "user",
+              email: "local@example.test",
+              createdAt: "2026-01-01T00:00:00Z",
+            }
+          : undefined,
+    } as PrincipalRepository,
     rootId: opts.rootId ?? "root",
     capabilityGrants,
     handleForId: opts.handleForId,
@@ -2096,7 +2108,11 @@ describe("ActorMesh", () => {
 
     // Human owners read the recorded state on the dashboard instead.
     expect(
-      mesh.deliverCompletionMatcherClosedUnmergedAttention("human:operator", "ob-9", firstSet)
+      mesh.deliverCompletionMatcherClosedUnmergedAttention(
+        "00000000-0000-4000-8000-000000000001",
+        "ob-9",
+        firstSet
+      )
     ).toBe(false);
   });
 
@@ -2458,6 +2474,9 @@ describe("ActorMesh", () => {
     // B as the head. Transition #3 is B -> A at sequence 3; the actor handles
     // every entry including that one.
     const repo1 = new ObligationRepository(db);
+    repo1.setPrincipalKind((id) =>
+      ["root", "actor-someone-else", "actor-b"].includes(id) ? "actor" : undefined
+    );
     const mesh1 = setup({ inboxStore, actors });
     wire(mesh1.mesh, repo1);
     repo1.create({ id: "ob-a", title: "Task A", ownerId: "root", priority: 1 });
@@ -2473,6 +2492,9 @@ describe("ActorMesh", () => {
     // (previousHeadId, headId, sequence) triple process 1 already delivered and
     // had handled.
     const repo2 = new ObligationRepository(db);
+    repo2.setPrincipalKind((id) =>
+      ["root", "actor-someone-else", "actor-b"].includes(id) ? "actor" : undefined
+    );
     wire(mesh1.mesh, repo2);
     repo2.reassign("ob-b", "actor-someone-else", "system:mesh");
     expect(headEntries()).toHaveLength(5);
@@ -2510,6 +2532,9 @@ describe("ActorMesh", () => {
     // the actor handles it, and a second reconcile pass over the unchanged head
     // within the same process stays silent.
     const repo1 = new ObligationRepository(db);
+    repo1.setPrincipalKind((id) =>
+      ["root", "actor-someone-else", "actor-b"].includes(id) ? "actor" : undefined
+    );
     const mesh1 = setup({ inboxStore, actors });
     repo1.create({ id: "ob-h", title: "Head task", ownerId: "root", priority: 1 });
     mesh1.mesh.reconcileReadyHeads(repo1);
@@ -2545,6 +2570,9 @@ describe("ActorMesh", () => {
     // entry to the new process epoch. The repair id is distinct from Process 1's
     // handled repair id, so the recovery wake lands.
     const repo2 = new ObligationRepository(db);
+    repo2.setPrincipalKind((id) =>
+      ["root", "actor-someone-else", "actor-b"].includes(id) ? "actor" : undefined
+    );
     const mesh2 = setup({ inboxStore, actors });
     mesh2.mesh.reconcileReadyHeads(repo2);
     expect(headEntries()).toHaveLength(3);
@@ -2575,6 +2603,9 @@ describe("ActorMesh", () => {
     // the actor handles it, and a second reconcile pass over the unchanged head
     // stays silent.
     const repo1 = new ObligationRepository(db);
+    repo1.setPrincipalKind((id) =>
+      ["root", "actor-someone-else", "actor-b"].includes(id) ? "actor" : undefined
+    );
     const mesh1 = setup({ inboxStore, actors });
     repo1.create({ id: "ob-h", title: "Head task", ownerId: "root", priority: 1 });
     mesh1.mesh.reconcileReadyHeads(repo1);
@@ -2611,6 +2642,9 @@ describe("ActorMesh", () => {
     // entry to the new process epoch, ensuring the repair id differs from the
     // pre-restart handled entry and the recovery wake lands.
     const repo2 = new ObligationRepository(db);
+    repo2.setPrincipalKind((id) =>
+      ["root", "actor-someone-else", "actor-b"].includes(id) ? "actor" : undefined
+    );
     const mesh2 = setup({ inboxStore, actors });
     mesh2.mesh.reconcileReadyHeads(repo2);
     expect(headEntries()).toHaveLength(3);
@@ -2639,6 +2673,9 @@ describe("ActorMesh", () => {
     // Process 1, boot: H is the derived head. Boot reconciliation appends
     // the initial repair entry; the actor handles it.
     const repo1 = new ObligationRepository(db);
+    repo1.setPrincipalKind((id) =>
+      ["root", "actor-someone-else", "actor-b"].includes(id) ? "actor" : undefined
+    );
     const mesh1 = setup({ inboxStore, actors });
     repo1.create({
       id: "ob-h",
@@ -2660,6 +2697,9 @@ describe("ActorMesh", () => {
     // empty, so the owner receives at most one duplicate entry per the #513
     // operator ruling.
     const repo2 = new ObligationRepository(db);
+    repo2.setPrincipalKind((id) =>
+      ["root", "actor-someone-else", "actor-b"].includes(id) ? "actor" : undefined
+    );
     const mesh2 = setup({ inboxStore, actors });
     mesh2.mesh.reconcileReadyHeads(repo2);
     expect(headEntries()).toHaveLength(2);
@@ -2907,7 +2947,14 @@ describe("ActorMesh", () => {
 
     // A voice memo remains responsive even though normal work is held.
     expect(
-      mesh.sendHumanMessage(worker, "🎙️ [voice memo — reply for the ear]: status?", "voice-a")
+      mesh.sendMessage(
+        worker,
+        "🎙️ [voice memo — reply for the ear]: status?",
+        TEST_USER_ID,
+        "voice-a",
+        undefined,
+        { voice: true }
+      )
     ).toEqual({
       delivered: true,
     });
@@ -2935,7 +2982,7 @@ describe("ActorMesh", () => {
       {
         id: "one",
         ts: "2026-01-01T00:00:01.000Z",
-        senderId: "human:operator",
+        senderId: "00000000-0000-4000-8000-000000000001",
         recipientId: "source",
         body: "first durable memo",
         sessionId: "walkie-session",
@@ -2944,20 +2991,20 @@ describe("ActorMesh", () => {
         id: "two",
         ts: "2026-01-01T00:00:02.000Z",
         senderId: "source",
-        recipientId: "human:operator",
+        recipientId: "00000000-0000-4000-8000-000000000001",
         body: "second durable reply",
         sessionId: "walkie-session",
       },
     ];
     const transferLogs: Array<Record<string, unknown>> = [];
-    const { mesh, fake, tick, registry } = setup({
+    const { mesh, fake, tick } = setup({
       inboxStore,
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceTransferLogger: captureLogger(transferLogs),
       voiceSessionTransfer: {
-        activeSessionIdFor: (actorId) => {
+        activeSessionFor: (actorId) => {
           if (actorId !== holder) throw new Error("caller does not hold an active voice session");
-          return "walkie-session";
+          return { sessionId: "walkie-session", principalId: TEST_USER_ID };
         },
         transferActiveSession: (fromActorId, targetActorId) => {
           if (fromActorId !== holder)
@@ -2996,7 +3043,6 @@ describe("ActorMesh", () => {
       targetActorId: target,
     });
     expect(JSON.stringify(transferLog)).not.toContain("take over the review");
-    expect(registry.lastHumanChat(target)).toBeUndefined();
 
     const handoff = inboxStore.entries.find(
       (entry) => entry.actorId === target && entry.payload.type === "voice.transfer"
@@ -3029,7 +3075,7 @@ describe("ActorMesh", () => {
     const { mesh } = setup({
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceSessionTransfer: {
-        activeSessionIdFor: () => "walkie-session",
+        activeSessionFor: () => ({ sessionId: "walkie-session", principalId: TEST_USER_ID }),
         transferActiveSession: (_fromActorId, targetActorId) => {
           holder = targetActorId;
           return "walkie-session";
@@ -3062,9 +3108,9 @@ describe("ActorMesh", () => {
       inboxStore: failingInbox,
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceSessionTransfer: {
-        activeSessionIdFor: (actorId) => {
+        activeSessionFor: (actorId) => {
           if (actorId !== holder) throw new Error("caller does not hold an active voice session");
-          return "walkie-session";
+          return { sessionId: "walkie-session", principalId: TEST_USER_ID };
         },
         transferActiveSession: (fromActorId, targetActorId) => {
           if (fromActorId !== holder)
@@ -3233,7 +3279,7 @@ describe("ActorMesh", () => {
     await tick();
     expect(firstSignal?.aborted).toBe(false);
 
-    mesh.sendHumanMessage(worker, "private operator body", "session-1");
+    mesh.sendMessage(worker, "private operator body", TEST_USER_ID, "session-1");
     expect(firstSignal?.reason).toBe("interrupt:responsive-notification");
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3290,7 +3336,7 @@ describe("ActorMesh", () => {
       {
         actorId: worker,
         source: "mesh:root",
-        payload: { type: "human.message", priority: "responsive" },
+        payload: { type: "mesh.message", priority: "responsive" },
       },
     ]);
     await vi.advanceTimersByTimeAsync(0);
@@ -3339,14 +3385,14 @@ describe("ActorMesh", () => {
 
     // Newest first, so the voice memo is the first row the scan reads and a
     // deployment with no observer has both its answers after one page.
-    mesh.sendHumanMessage(worker, "older operator body", "session-1");
+    mesh.sendMessage(worker, "older operator body", TEST_USER_ID, "session-1");
     await tick();
 
     // Measure the voice memo's own dispatch: it is the newest row, so the scan
     // has both its answers after one page and stops. A collecting deployment
     // has to read the older row too, and pays a page for it.
     responsiveLists = 0;
-    mesh.sendHumanMessage(worker, "voice body", "session-1", { voice: true });
+    mesh.sendMessage(worker, "voice body", TEST_USER_ID, "session-1", undefined, { voice: true });
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3612,9 +3658,9 @@ describe("ActorMesh", () => {
     await tick();
 
     // Repeated delivery pokes arrive while worker is running
-    mesh.sendHumanMessage(worker, "first operator body", "session-1");
+    mesh.sendMessage(worker, "first operator body", TEST_USER_ID, "session-1");
     await tick();
-    mesh.sendHumanMessage(worker, "second operator body", "session-1");
+    mesh.sendMessage(worker, "second operator body", TEST_USER_ID, "session-1");
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3670,7 +3716,7 @@ describe("ActorMesh", () => {
     const w3 = mesh.spawn({ charter: "worker 3", parentId: "root" });
 
     // 1. Idle state: w3 is idle when responsive message arrives
-    mesh.sendHumanMessage(w3, "hello idle w3", "session-3");
+    mesh.sendMessage(w3, "hello idle w3", TEST_USER_ID, "session-3");
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3689,7 +3735,7 @@ describe("ActorMesh", () => {
     await tick();
 
     // Send responsive message to w2 while w2 is queued behind w1
-    mesh.sendHumanMessage(w2, "hello queued w2", "session-2");
+    mesh.sendMessage(w2, "hello queued w2", TEST_USER_ID, "session-2");
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3698,7 +3744,7 @@ describe("ActorMesh", () => {
     expect(events.filter((e) => e.kind === "responsive_interruption_shadow")).toHaveLength(0);
 
     // 3. Running state: send responsive message to w1 while w1 is actively running
-    mesh.sendHumanMessage(w1, "hello running w1", "session-1");
+    mesh.sendMessage(w1, "hello running w1", TEST_USER_ID, "session-1");
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3756,7 +3802,7 @@ describe("ActorMesh", () => {
 
     // Race 1: Responsive message arrives while worker is running.
     // Even if the run finishes shortly afterward, the arrival happened while running.
-    mesh.sendHumanMessage(worker, "arrival during run", "session-1");
+    mesh.sendMessage(worker, "arrival during run", TEST_USER_ID, "session-1");
     // Release the run and allow any follow-up to finish immediately so worker becomes idle
     holdRun = false;
     resolveRun({ success: true, exitCode: 0, output: "done" });
@@ -3769,7 +3815,7 @@ describe("ActorMesh", () => {
 
     // Race 2: Run has completely ended; actor is now idle.
     // Subsequent responsive arrival must NOT trigger JEV.
-    mesh.sendHumanMessage(worker, "arrival after run ended", "session-1");
+    mesh.sendMessage(worker, "arrival after run ended", TEST_USER_ID, "session-1");
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3810,7 +3856,7 @@ describe("ActorMesh", () => {
     await tick();
 
     // Deliver responsive message while running
-    mesh.sendHumanMessage(worker, "operator request", "session-1");
+    mesh.sendMessage(worker, "operator request", TEST_USER_ID, "session-1");
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -3853,8 +3899,8 @@ describe("ActorMesh", () => {
     inboxStore.append([
       {
         actorId: worker,
-        source: "mesh:human:operator",
-        payload: { type: "human.message", priority: "responsive" },
+        source: "mesh:00000000-0000-4000-8000-000000000001",
+        payload: { type: "mesh.message", priority: "responsive" },
       },
     ]);
     mesh.dispatch(worker);
@@ -4387,7 +4433,7 @@ describe("ActorMesh", () => {
     expect(mesh.sendMessage(child, "from your parent", "root")).toEqual({ delivered: true });
     expect(registry.get(child)?.handles ?? []).toEqual([]);
 
-    expect(mesh.sendHumanMessage(child, "from the operator", "session-1")).toEqual({
+    expect(mesh.sendMessage(child, "from the operator", TEST_USER_ID, "session-1")).toEqual({
       delivered: true,
     });
     expect(registry.get(child)?.handles ?? []).toEqual([]);
@@ -4432,7 +4478,7 @@ describe("ActorMesh", () => {
     const { mesh, registry } = setup({
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceSessionTransfer: {
-        activeSessionIdFor: () => "walkie-session",
+        activeSessionFor: () => ({ sessionId: "walkie-session", principalId: TEST_USER_ID }),
         transferActiveSession: (_fromActorId, targetActorId) => {
           holder = targetActorId;
           return "walkie-session";
@@ -5014,7 +5060,7 @@ describe("ActorMesh", () => {
     expect(mesh.inFlight).toBe(1);
     expect(d.pending()).toBe(1);
 
-    mesh.sendHumanMessage(w2, "urgent", "human-session");
+    mesh.sendMessage(w2, "urgent", TEST_USER_ID, "human-session");
     await vi.advanceTimersByTimeAsync(0);
 
     // w2 jumps out of the normal queue. Only w1 counts against maxConcurrent;
@@ -5864,7 +5910,7 @@ describe("ActorMesh", () => {
       grantableCapabilities: new Set(["understanding-write"]),
     });
 
-    expect(mesh.interrupt("root")).toEqual({ interrupted: false, status: "idle" });
+    expect(mesh.interrupt("root", TEST_USER_ID)).toEqual({ interrupted: false, status: "idle" });
 
     const markUnkillable = vi.spyOn(root, "markUnkillable");
     mesh.markUnkillable("root");
@@ -8025,7 +8071,7 @@ describe("ActorMesh", () => {
 
       // A responsive delivery preserves pool-b, while bypassing
       // pacing/concurrency entirely (blocker still holds the mesh's only slot).
-      mesh.sendHumanMessage(worker, "urgent", "human-session");
+      mesh.sendMessage(worker, "urgent", TEST_USER_ID, "human-session");
       await vi.advanceTimersByTimeAsync(0);
 
       expect(poolARuns).toEqual([]);
@@ -10977,7 +11023,7 @@ describe("ActorMesh", () => {
       expect(onRunEndCalled).toBe(false);
     });
 
-    it("sendMessage and sendHumanMessage targeting retired actor return delivered false", () => {
+    it("messages from agents and humans to retired actors return delivered false", () => {
       const { mesh } = setup();
       const worker = mesh.spawn({ charter: "worker", parentId: "root" });
       mesh.retire(worker);
@@ -10988,7 +11034,7 @@ describe("ActorMesh", () => {
         expect(msgRes.status).toBe("retired");
       }
 
-      const humanRes = mesh.sendHumanMessage(worker, "hello from human", "session-1");
+      const humanRes = mesh.sendMessage(worker, "hello from human", TEST_USER_ID, "session-1");
       expect(humanRes.delivered).toBe(false);
       if (!humanRes.delivered) {
         expect(humanRes.status).toBe("retired");
@@ -11005,7 +11051,7 @@ describe("ActorMesh", () => {
 
       expect(() => mesh.interrupt(child, peer)).toThrow(/may only interrupt its descendants/);
       expect(() => mesh.interrupt(child, parent)).not.toThrow();
-      expect(() => mesh.interrupt(child, "human:operator")).not.toThrow();
+      expect(() => mesh.interrupt(child, "00000000-0000-4000-8000-000000000001")).not.toThrow();
     });
 
     it("scopes generated-root interrupt authority to its own subtree ", () => {
@@ -11051,7 +11097,7 @@ describe("ActorMesh", () => {
       expect(fake(worker).calls).toHaveLength(1);
 
       // Interrupt without any new inbox items
-      const res = mesh.interrupt(worker, "human:operator");
+      const res = mesh.interrupt(worker, "00000000-0000-4000-8000-000000000001");
       expect(res.interrupted).toBe(true);
 
       // Provider finishes with interrupted result
@@ -11060,14 +11106,18 @@ describe("ActorMesh", () => {
         exitCode: 143,
         cancelled: true,
         interrupted: true,
-        output: "[Task interrupted by human:operator]",
+        output: "[Task interrupted by 00000000-0000-4000-8000-000000000001]",
       });
       await tick();
 
       // Since no new inbox items arrived since run start, worker does NOT run again
       expect(fake(worker).calls).toHaveLength(1);
       expect(mesh.activeRunState(worker)).toBeNull();
-      expect(events.some((e) => e.detail?.includes("interrupted by human:operator"))).toBe(true);
+      expect(
+        events.some((e) =>
+          e.detail?.includes("interrupted by 00000000-0000-4000-8000-000000000001")
+        )
+      ).toBe(true);
     });
 
     it("interrupt on running actor runs immediately if a new inbox item arrived after run start", async () => {
@@ -11113,7 +11163,7 @@ describe("ActorMesh", () => {
       ]);
 
       // Interrupt the first run
-      const res = mesh.interrupt(worker, "human:operator");
+      const res = mesh.interrupt(worker, "00000000-0000-4000-8000-000000000001");
       expect(res.interrupted).toBe(true);
 
       resolveRun({
@@ -11121,7 +11171,7 @@ describe("ActorMesh", () => {
         exitCode: 143,
         cancelled: true,
         interrupted: true,
-        output: "[Task interrupted by human:operator]",
+        output: "[Task interrupted by 00000000-0000-4000-8000-000000000001]",
       });
       await tick();
 
@@ -11437,7 +11487,7 @@ describe("ActorMesh", () => {
 
     it("wakes nobody when the obligation owner is the human operator", async () => {
       const woken = await wokenBy(
-        owning({ [REF]: "human:operator" }),
+        owning({ [REF]: "00000000-0000-4000-8000-000000000001" }),
         (mesh) => {
           const delegate = mesh.spawn({ charter: "stale delegate", parentId: "root" });
           mesh.subscribeEventSource(issue, delegate, "root");
@@ -12187,7 +12237,7 @@ describe("strict obligation handling (#382, #917)", () => {
     events?: MeshEventSink,
     completedFocusEntryCounts?: ActorMeshOptions["completedFocusEntryCounts"]
   ) {
-    return setup({
+    const fixture = setup({
       events,
       completedFocusEntryCounts,
       inboxStore,
@@ -12199,6 +12249,17 @@ describe("strict obligation handling (#382, #917)", () => {
         expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
       },
     });
+    repo.setActorExists((id) => fixture.registry.get(id)?.status === "active");
+    repo.setPrincipalKind((id) =>
+      id === "system:mesh"
+        ? "system"
+        : id === TEST_USER_ID
+          ? "user"
+          : fixture.registry.get(id)
+            ? "actor"
+            : undefined
+    );
+    return fixture;
   }
 
   function selectHead(mesh: ActorMesh, actorId: string, obligationId: string): string {
@@ -12454,7 +12515,7 @@ describe("strict obligation handling (#382, #917)", () => {
     });
     expect(rejection(mesh, subject)).toMatch(/pre-existing work/);
 
-    repo.create({ id: "review", title: "Review", ownerId: "human:reviewer" });
+    repo.create({ id: "review", title: "Review", ownerId: TEST_USER_ID });
     repo.addPrerequisite("parent", "review", "system:mesh");
     expect(rejection(mesh, subject)).toBe("");
   });
@@ -12491,7 +12552,13 @@ describe("strict obligation handling (#382, #917)", () => {
     actorId: string
   ): Promise<Client> {
     const server = createObligationsMcpServer(repo, actorId, {
-      resolveOwner: (raw) => resolveObligationOwner(registry, raw),
+      resolveOwner: (raw) =>
+        resolveObligationOwner(registry, raw, {
+          get: (id) =>
+            id === TEST_USER_ID
+              ? { kind: "user", id, email: "user@example.test", createdAt: "t" }
+              : undefined,
+        }),
       canManage: (callerId, obligation) =>
         canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
     });
@@ -12508,6 +12575,7 @@ describe("strict obligation handling (#382, #917)", () => {
 
   /** Route repository head transitions the way runStart's readyHeadSink does. */
   function wireLiveReadyHeads(mesh: ActorMesh): void {
+    repo.setActorExists((id) => mesh.isLiveActor(id));
     repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
       mesh.deliverReadyHeadAttention(
         ownerId,
@@ -12786,7 +12854,7 @@ describe("strict obligation handling (#382, #917)", () => {
     repo.create({ id: "to-human", title: "Human handoff", ownerId: source });
     selectHead(mesh, source, "to-human");
     repo.setCheckpoint("to-human", "Needs an operator decision.", source);
-    expect((await handoff("to-human", "human:operator")).isError).toBeFalsy();
+    expect((await handoff("to-human", "00000000-0000-4000-8000-000000000001")).isError).toBeFalsy();
     expect(rejection(mesh, source)).toMatch(/not an active actor that can be woken/);
     mesh.abandonInboxRun(source);
 
@@ -12933,7 +13001,7 @@ describe("strict obligation handling (#382, #917)", () => {
       id: "standing-question",
       parentId: "standing-effort",
       title: "More work needed under standing maintenance?",
-      ownerId: "human:operator",
+      ownerId: "00000000-0000-4000-8000-000000000001",
       creatorId: subject,
     });
     expect(repo.get("standing-effort")?.status).toBe("waiting");
@@ -13316,7 +13384,7 @@ describe("strict obligation handling (#382, #917)", () => {
       [
         "waiting on a new unmet prerequisite",
         () => {
-          repo.create({ id: "gate", title: "Gate", ownerId: "human:reviewer" });
+          repo.create({ id: "gate", title: "Gate", ownerId: TEST_USER_ID });
           repo.addPrerequisite("head", "gate", "system:mesh");
         },
       ],
@@ -14296,3 +14364,5 @@ describe("accountRun token accounting (#443)", () => {
     });
   });
 });
+
+const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";

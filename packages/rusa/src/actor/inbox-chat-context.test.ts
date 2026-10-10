@@ -289,7 +289,7 @@ describe("chat context on selection", () => {
         [
           makeEntry({
             source: "mesh:human",
-            payload: { type: "human.message", messageId: "h1", fromId: "human" },
+            payload: { type: "mesh.message", messageId: "h1", fromId: "human" },
           }),
         ],
         "actor-a",

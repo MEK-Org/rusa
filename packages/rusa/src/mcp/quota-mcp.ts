@@ -27,6 +27,7 @@ import type { CodingProvider, RunResult, SandboxOptions } from "../providers/typ
 import type { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { QUOTA_PROBE_TTL_MS, type QuotaFreshness } from "../quota/coordinator-protocol.js";
 import { configuredModelRefs, resolveWindowModels } from "../quota/model-window-scope.js";
+import { WHOLE_BAD_READ_CARRY_DETAIL } from "../quota/parsed-state.js";
 import {
   hasSameQuotaWindowScope,
   isModelScopedWindow,
@@ -1249,7 +1250,7 @@ export function inferQuotaState(
           window: limit.label,
           field: "resetAtIso",
           rule: "carried_forward_bad_read",
-          detail: "carried forward previous unexpired window assessment after bad read",
+          detail: WHOLE_BAD_READ_CARRY_DETAIL,
         });
       }
     }

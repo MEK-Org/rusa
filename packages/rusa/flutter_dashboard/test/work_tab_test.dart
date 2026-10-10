@@ -150,7 +150,7 @@ void main() {
       final ob = makeObligation(
         'ob-human-creator',
         ownerId: 'root',
-        creatorId: 'human:operator',
+        creatorId: '00000000-0000-4000-8000-000000000001',
         intent: 'Filed by the operator',
       );
       final api = FakeApi()
@@ -174,7 +174,7 @@ void main() {
 
       expect(find.text('Creator'), findsOneWidget);
       expect(find.text('Operator'), findsOneWidget);
-      expect(find.text('human:operator'), findsNothing);
+      expect(find.text('00000000-0000-4000-8000-000000000001'), findsNothing);
 
       await store.dispose();
     });
@@ -830,6 +830,7 @@ void main() {
 
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
+        await pumpEventQueue();
         store.setFocusedObligationId('child-under-quiet-root');
 
         await tester.pumpWidget(
@@ -884,6 +885,7 @@ void main() {
 
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
+        await pumpEventQueue();
         await tester.pumpWidget(
           MaterialApp(
             home: Scaffold(
@@ -964,6 +966,7 @@ void main() {
 
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
+        await pumpEventQueue();
         store.setFocusedObligationId('child-under-quiet-root');
 
         // Gate the initial load so the widget mounts with an empty forest
@@ -1209,11 +1212,17 @@ void main() {
 
         expect(find.text('EXTERNAL LINK'), findsOneWidget);
         expect(find.byTooltip('View reference context'), findsOneWidget);
-        expect(find.text('Make external link a reference card'), findsOneWidget);
+        expect(
+          find.text('Make external link a reference card'),
+          findsOneWidget,
+        );
         await tester.tap(find.byTooltip('View reference context'));
         await tester.pumpAndSettle();
         expect(find.text('GITHUB'), findsOneWidget);
-        expect(find.text('Make external link a reference card'), findsNWidgets(2));
+        expect(
+          find.text('Make external link a reference card'),
+          findsNWidgets(2),
+        );
         expect(find.text('root-handle'), findsOneWidget);
         expect(
           find.text('Reference card in obligation view preview snippet'),
@@ -1280,7 +1289,10 @@ void main() {
 
         expect(find.text('EXTERNAL LINK'), findsOneWidget);
         expect(find.byTooltip('View reference context'), findsOneWidget);
-        expect(find.text('Done obligation with reference card'), findsOneWidget);
+        expect(
+          find.text('Done obligation with reference card'),
+          findsOneWidget,
+        );
         await tester.tap(find.byTooltip('View reference context'));
         await tester.pumpAndSettle();
         expect(find.byTooltip('Open in new tab'), findsOneWidget);
@@ -1327,7 +1339,13 @@ void main() {
         await tester.pumpAndSettle();
         expect(find.text('GITHUB'), findsOneWidget);
         expect(find.text('GitHub reference'), findsNWidgets(2));
-        expect(find.descendant(of: find.byType(AlertDialog), matching: find.text('Not resolvable yet.')), findsOneWidget);
+        expect(
+          find.descendant(
+            of: find.byType(AlertDialog),
+            matching: find.text('Not resolvable yet.'),
+          ),
+          findsOneWidget,
+        );
         expect(find.byTooltip('Change or unlink'), findsOneWidget);
 
         await store.dispose();
@@ -1766,7 +1784,7 @@ void main() {
           stream: FakeStream(),
           obligationsCache: cache,
         );
-        await store.init();
+        final ready = store.init();
 
         await tester.pumpWidget(
           MaterialApp(
@@ -1784,6 +1802,7 @@ void main() {
             userPrincipalId: 'user-bob',
           ),
         );
+        await ready;
         await pumpEventQueue();
         await tester.pump();
 

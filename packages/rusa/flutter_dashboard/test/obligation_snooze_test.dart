@@ -116,7 +116,7 @@ void main() {
       final snoozedChild = makeObligation(
         'ob-child',
         parentId: 'ob-parent',
-        ownerId: 'human:operator',
+        ownerId: '00000000-0000-4000-8000-000000000001',
         intent: 'Approve release notes',
         snoozedUntil: until,
       );
@@ -147,10 +147,7 @@ void main() {
         find.textContaining('This obligation is snoozed until '),
         findsOneWidget,
       );
-      expect(
-        find.textContaining('Approve release notes'),
-        findsWidgets,
-      );
+      expect(find.textContaining('Approve release notes'), findsWidgets);
       expect(find.textContaining('— snoozed until '), findsOneWidget);
     },
   );

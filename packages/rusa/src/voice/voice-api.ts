@@ -32,7 +32,7 @@ export interface VoiceApiDeps {
   mesh?: ActorMesh;
   /** Null when voice is unconfigured (no provider credentials configured) → routes 503. */
   service: VoiceService | null;
-  /** Durable principals, so a memo is attributed to its sender rather than the legacy alias. */
+  /** Durable principals used to bind each request to its sender. */
   principals?: PrincipalRepository;
   /** Optional structured logger for route events (silenced under tests when omitted). */
   logger?: Logger;
@@ -155,8 +155,11 @@ export function handleVoiceApiRequest(
     return true;
   }
 
+  const principalId = requireOperatorPrincipal(req, res, deps);
+  if (!principalId) return true;
+
   // POST /api/mesh/actors/:id/voice-memo — raw audio bytes in, transcript into
-  // the actor's chat via the same sendHumanMessage path as typed messages.
+  // the actor's chat via the same sendMessage path as typed messages.
   const memoMatch = req.method === "POST" ? pathname.match(MEMO_ROUTE) : null;
   if (memoMatch) {
     const actorId = memoMatch[1];
@@ -184,7 +187,7 @@ export function handleVoiceApiRequest(
     // delivery behavior for a stale/unknown supplied id (including a restart
     // race): rekey this one memo, deliver it, and do not create a lease.
     const sessionId =
-      suppliedSessionId && service.hasSession(suppliedSessionId, actorId)
+      suppliedSessionId && service.hasSession(suppliedSessionId, actorId, principalId)
         ? suppliedSessionId
         : randomUUID();
 
@@ -210,11 +213,14 @@ export function handleVoiceApiRequest(
       // A memo to a non-live actor still transcribes and records (the mesh
       // event is durable), mirroring chat semantics — `delivered` tells the
       // client whether the actor was actually woken.
-      const fromId = requireOperatorPrincipal(req, res, deps);
-      if (!fromId) return;
-      const result = mesh.sendHumanMessage(actorId, VOICE_MEMO_PREFIX + transcript, sessionId, {
-        fromId,
-      });
+      const result = mesh.sendMessage(
+        actorId,
+        VOICE_MEMO_PREFIX + transcript,
+        principalId,
+        sessionId,
+        undefined,
+        { voice: true }
+      );
       sendJson(res, 200, { ok: true, transcript, delivered: result.delivered });
     })().catch((err) => {
       sendJson(res, 500, { error: String(err) });
@@ -238,29 +244,30 @@ export function handleVoiceApiRequest(
         return true;
       }
       try {
-        service.validateSession(sessionId, [...actors][0]);
+        service.validateSession(sessionId, [...actors][0], principalId);
       } catch (err) {
         sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
         return true;
       }
     }
-    service.presenceConnect(actors);
+    service.presenceConnect(actors, principalId);
     const attached = deps.sseHub.addVoiceConnection(
       res,
       actors,
       () => {
-        service.presenceDisconnect(actors);
+        service.presenceDisconnect(actors, principalId);
         if (sessionId) service.disconnectSession(sessionId);
       },
-      sessionId ?? undefined
+      sessionId ?? undefined,
+      principalId
     );
     if (!attached) {
-      service.presenceDisconnect(actors);
+      service.presenceDisconnect(actors, principalId);
       return true;
     }
     // Grant authority only after the stream has actually attached; a rejected
     // connection must not create a reconnect lease on its own.
-    if (sessionId) service.openSession(sessionId, [...actors][0]);
+    if (sessionId) service.openSession(sessionId, [...actors][0], principalId);
     return true;
   }
 
@@ -280,7 +287,7 @@ export function handleVoiceApiRequest(
         sendJson(res, 400, { error: "Missing sessionId" });
         return;
       }
-      service.closeSession(sessionId);
+      service.closeSession(sessionId, principalId);
       sendJson(res, 200, { ok: true });
     })().catch((err) => {
       sendJson(res, 500, { error: String(err) });
@@ -293,7 +300,7 @@ export function handleVoiceApiRequest(
   const audioMatch = req.method === "GET" ? pathname.match(AUDIO_ROUTE) : null;
   if (audioMatch) {
     const announcement = service.get(audioMatch[1]);
-    if (!announcement) {
+    if (!announcement || announcement.recipientId !== principalId) {
       sendJson(res, 404, { error: "unknown announcement id" });
       return true;
     }
@@ -364,7 +371,9 @@ export function handleVoiceApiRequest(
   // actor, oldest first (bounded by the in-memory ring).
   const backlogMatch = req.method === "GET" ? pathname.match(BACKLOG_ROUTE) : null;
   if (backlogMatch) {
-    sendJson(res, 200, { announcements: service.backlog(backlogMatch[1]).map(toFrame) });
+    sendJson(res, 200, {
+      announcements: service.backlog(backlogMatch[1], principalId).map(toFrame),
+    });
     return true;
   }
 
@@ -395,7 +404,7 @@ export function handleVoiceApiRequest(
       }
       let acknowledged: boolean;
       try {
-        acknowledged = service.ack(id);
+        acknowledged = service.get(id)?.recipientId === principalId && service.ack(id);
       } catch {
         logAckOutcome(deps, requestId, "ack_route_failed", 500);
         sendAckResult(res, 500, requestId, { error: "ack request failed" });

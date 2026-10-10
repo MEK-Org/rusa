@@ -15,11 +15,7 @@ export type UserPrincipalId = `${string}-${string}-${string}-${string}-${string}
  * Principals authorized to execute root-level control actions.
  * Constrained to well-known infrastructure literals or a verified user principal UUID.
  */
-export type RootControlPrincipal =
-  | "root-llm"
-  | "human:operator"
-  | "e2e-controller"
-  | UserPrincipalId;
+export type RootControlPrincipal = "root-llm" | "e2e-controller" | UserPrincipalId;
 
 export interface RootChildRequest {
   executionTarget?: string;
@@ -53,7 +49,7 @@ export interface RootControlMesh {
   grantHandle(holderId: string, handle: ActorHandle): void;
   isAncestorOf(ancestorId: string, id: string): boolean;
   retire(id: string, opts?: { force?: boolean; forceQueued?: boolean }): void;
-  interrupt(id: string, by?: string): { interrupted: boolean; status?: string };
+  interrupt(id: string, by: string): { interrupted: boolean; status?: string };
   runNow(id: string, source?: string): { queued: boolean };
   reparentThread(id: string, newParentId: string): void;
   recordEvent(event: {
@@ -147,11 +143,12 @@ export class RootControlService {
     toId: string,
     body: string,
     principal: RootControlPrincipal,
-    deliverAt?: string
+    deliverAt?: string,
+    sessionId?: string
   ): void {
     const text = body.trim();
     if (!text) throw new Error("message body is required");
-    const result = this.options.mesh.sendMessage(toId, text, this.rootId, undefined, deliverAt);
+    const result = this.options.mesh.sendMessage(toId, text, this.rootId, sessionId, deliverAt);
     if (!result.delivered) {
       if (!result.status) {
         throw new Error(`unknown thread id: ${toId}`);

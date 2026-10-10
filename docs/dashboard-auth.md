@@ -1,11 +1,10 @@
 # Dashboard authentication
 
 Rusa optionally admits configured Google accounts to the dashboard. Every admitted
-human has the same shared visibility and control as the existing local operator;
-actions retain `human:operator` attribution. This is not tenant isolation.
-Verified users are recorded in the existing principal repository, but no historical
-identities are migrated and the single root is unchanged. Omit `auth` to keep the
-existing unauthenticated local mode; it does not provision a local user principal.
+human has shared mesh visibility and control, with private human conversations
+and durable user attribution. This is not tenant isolation. The single root is
+unchanged. Omit `auth` for unauthenticated local mode; startup with zero users
+provisions one durable implicit user. No historical identities are rewritten.
 
 ## Durable identities and shared access
 
@@ -16,10 +15,9 @@ transport issuers; after SDK project verification, both are keyed using the cano
 up by email. Email remains the admission policy and mutable metadata, not identity.
 
 An authorized request carries the resolved user principal. Actions still use
-`human:operator` authority, shared by every admitted human; no route uses the
-principal to restrict visibility. Distinct users do not require distinct roots,
-and an existing root can be shared by all users. No root association, implicit
-owner claim, legacy alias, or historical rewrite is performed.
+that user's durable attribution. Human chat and voice are private to their
+recipient; actor traffic and controls are shared. Distinct users do not require
+distinct roots, and an existing root can be shared by all users.
 
 A verified existing session can provision its user on its first request after the
 upgrade, without another login. Subsequent polling only reads identity unless email
@@ -28,9 +26,10 @@ disablement is checked on every request and each stream revalidation (within 60
 seconds), independently of the Firebase revocation cache. Disabling a user preserves
 their record and history; it cannot be bypassed by retaining an old session.
 
-If an email is already held by another identity or an unbound pre-provisioned user,
-access fails closed. It does not implicitly bind by email or reinterpret that record
-as the configured owner. The browser sees the ordinary 401, so the server also logs
+First verified sign-in claims a matching unbound provisioned user, or the sole
+unbound implicit local user, preserving its id and history. The implicit user's
+reserved internal email cannot be admitted. If an email is held by another bound
+identity, access fails closed. The browser sees the ordinary 401, so the server logs
 `dashboard_identity_email_conflict` naming the id of the row that holds the address —
 without the address itself — to distinguish this from a credential failure. Email
 reuse, Firebase project replacement, and identity reassignment require an explicit
@@ -58,9 +57,9 @@ For multiple users, replace `email` with a non-empty `allowedEmails` list:
 
 Use exactly one of `email` or `allowedEmails`; duplicate addresses are rejected
 after trimming and case normalization. The legacy single-email configuration
-remains supported. All listed accounts have equal access to all dashboard data
-and existing operator actions, including instance-wide controls. There is no
-privileged first user, private root, or ownership-derived visibility filter.
+remains supported. All listed accounts have equal access to shared dashboard data
+and operator actions, including instance-wide controls. Each sees only their own
+human conversations. There is no privileged first user or private root.
 Unlisted accounts remain denied. Admission changes require a server restart.
 Root-count relaxation and event-source ownership are separate work; neither is
 required for multiple humans to share this installation.
