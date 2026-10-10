@@ -4,7 +4,11 @@
 **Scope:** Rusa portable context (`brief` mode)  
 **Tracking Issue:** [#954](https://github.com/MEK-Org/rusa/issues/954)  
 **PR:** [#961](https://github.com/MEK-Org/rusa/pull/961)  
-**Governing Authority:** Mesh Root Architecture Ruling (`mesh:messages/4e8bf997-061d-4754-a4c4-53ddfbe96a30`), Parent Steward Charter (`mesh:messages/dd33fde2-dd4f-498b-8981-7b817f8cf454`)
+**Governing Authority:**
+- Mesh Root Architecture Ruling (`mesh:messages/4e8bf997-061d-4754-a4c4-53ddfbe96a30`)
+- Parent Steward Charter (`mesh:messages/dd33fde2-dd4f-498b-8981-7b817f8cf454`)
+- Operator/Architect Selection (`gchat:spaces/AAQAvOIVSGw/messages/suAqm9IGozs.suAqm9IGozs`, Matt Option B)
+- Parent Steward Directive (`mesh:messages/5724cbab-042d-4f1e-af0f-37cb47b2aa2c`)
 
 ---
 
@@ -49,7 +53,7 @@ Reads the caller actor's current brief state and governing charter.
         "generation": 0,
         "text": "...",
         "updatedAt": "2026-10-10T13:00:00.000Z",
-        "reason": "Initial seed"
+        "explanation": "Initial seed"
       }
     ]
   }
@@ -60,24 +64,25 @@ Reads the caller actor's current brief state and governing charter.
 Validates and replaces the caller actor's entire brief text.
 
 - **Parameters:**
-  - `brief` (string, required): The complete replacement brief in Markdown format.
-  - `reason` (string, optional): An explanatory note describing why the brief was updated (recorded in revision history).
+  - `text` (string, required): The complete replacement brief in Markdown format.
+  - `explanation` (string, optional): An explanatory note describing why the brief was updated (recorded in revision history).
 - **Return Type:**
   - **Success:**
     ```json
     {
+      "status": "updated",
       "generation": 2,
       "updatedAt": "2026-10-10T13:35:00.000Z",
-      "bytes": 4120
+      "previousGeneration": 1
     }
     ```
   - **No-Op (Unchanged Text):**
     ```json
     {
+      "status": "unchanged",
       "generation": 1,
       "updatedAt": "2026-10-10T13:30:00.000Z",
-      "bytes": 4120,
-      "noop": true
+      "text": "..."
     }
     ```
   - **Validation Error:** Returns a formatted MCP tool error with a descriptive error message explaining why the write was rejected.
@@ -102,7 +107,7 @@ Alternatively, the equivalent document-level headings (`# WHO I AM`, `# WHAT I D
 ### 4.3 Exclusion of Transient State
 Briefs must capture durable principles, not transient task progress. Updates containing ephemeral status markers are rejected:
 - References to specific unhandled inbox items (`inbox entry`, `selected item`, `unhandled item`).
-- Intermediate task loops or progress tallies (`task 1/4`, `in-progress test run`).
+- Intermediate task loops or progress tallies (`task 1/4`, `in-progress test run`, gate tallies like `gate 2/2`).
 - Scratchpad dumps or ephemeral command outputs.
 
 ### 4.4 Citation Requirements
@@ -113,7 +118,7 @@ Operational principles and prescriptive behavioral rules declared under `WHAT` a
 ### 4.5 Consolidation, Citation Rotation, and No-Ops
 - **Consolidation:** An actor may synthesize multiple related rules into a more concise principle, provided the synthesized rule retains valid citation backing.
 - **Citation Rotation:** When newer commits, issues, or parent directives supersede older examples, the actor may freely rotate or refresh citations.
-- **No-Op Detection:** Submitting identical text is detected as a no-op; it succeeds safely without bumping the `generation` counter or mutating `updatedAt`.
+- **No-Op Detection:** Submitting unchanged text is detected as a no-op; it succeeds safely without bumping the `generation` counter, mutating `updatedAt`, or creating a new revision entry.
 
 ---
 
@@ -163,29 +168,95 @@ When a parent or root architect communicates design boundaries, intentional excl
 
 ---
 
-## 7. Storage, Revision History, and DDL Invariants
+## 7. Storage Architecture & Obligation History Alignment
 
-### 7.1 No New DDL
-All brief state, timestamps, generation counters, and revision histories are stored within the existing SQLite table / JSON document structure managed by `PortableContextStore`. No database schema migrations or DDL changes are introduced.
+Following operator selection (`gchat:.../suAqm9IGozs.suAqm9IGozs`, Matt Option B) and parent steward guidance (`mesh:messages/5724cbab-042d-4f1e-af0f-37cb47b2aa2c`), brief revision storage is designed to align with Rusa's existing `obligation_history` architecture (`0045_obligation_history`).
 
-### 7.2 Revision History Ring Buffer
-Every successful mutation appends a revision record to a bounded ring buffer (retaining the last **10 revisions**):
-```typescript
-interface PortableBriefRevision {
-  generation: number;
-  text: string;
-  updatedAt: string;
-  reason?: string;
-}
+### 7.1 Proposed Schema: `portable_brief_history` Table
+When migrating to dedicated SQL storage, the schema matches the proven `obligation_history` pattern:
+
+```sql
+CREATE TABLE IF NOT EXISTS portable_brief_history (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor_id         TEXT NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
+  generation       INTEGER NOT NULL,
+  timestamp        TEXT NOT NULL CHECK (length(trim(timestamp)) > 0),
+  explanation      TEXT,
+  payload          TEXT NOT NULL CHECK (length(trim(payload)) > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_portable_brief_history_actor
+  ON portable_brief_history(actor_id);
 ```
-This enables full inspectability of brief evolution over time, allowing operators and steward actors to audit what changed, when, and why.
+
+- **Monotonic Integer ID:** Guarantees strict insertion ordering even for multiple mutations within the same millisecond.
+- **RESTRICT Deletion:** Audit trail cannot be deleted by cascading actor row deletion.
+- **Payload Versioning:** Validated by consuming Zod schemas in application code, avoiding rigid SQLite JSON check constraints.
+- **Payload Structure:**
+  ```json
+  {
+    "schemaVersion": 1,
+    "generation": 2,
+    "explanation": "Consolidated platform testing into general principle",
+    "before": {
+      "text": "...",
+      "generation": 1
+    },
+    "after": {
+      "text": "...",
+      "generation": 2
+    }
+  }
+  ```
+
+### 7.2 Zero-DDL Implementation (Staging / PR Phase)
+During active experimental evaluation, the ring buffer lives directly on `portable_context_snapshots.snapshot`:
+```typescript
+export const portableBriefRevisionSchema = z.object({
+  generation: z.number().int().nonnegative(),
+  updatedAt: z.string().min(1),
+  explanation: z.string().optional(),
+  text: z.string(),
+});
+
+export const portableBriefSchema = z.object({
+  text: z.string(),
+  generation: z.number().int().nonnegative(),
+  updatedAt: z.string().min(1),
+  model: z.string().nullable().default(null),
+  citationAuthorities: z.record(z.string(), portableBriefAuthoritySchema).default({}),
+  revisions: z.array(portableBriefRevisionSchema).optional(),
+});
+```
+This zero-DDL approach allows immediate local testing, verification, and UI prototyping without database migrations, while remaining 100% compatible with upgrading to `portable_brief_history`.
 
 ---
 
-## 8. Removal of Background Gemini Rewriter
+## 8. User Interface Specification (Option B)
 
-With actor-owned brief updates:
-- `GeminiBriefRewriter`, `runPortableContextBriefCycle`, `classifyBriefSender`, and `isBriefAttentionHandled` are completely removed.
-- Post-run lifecycle hooks no longer perform background LLM calls.
-- Brief mode no longer requires a `geminiApiKey`.
-- Background retry loops, freeze states, and parent attention inbox alerts for brief rewrites are deprecated and eliminated.
+Per operator selection (`suAqm9IGozs.suAqm9IGozs`), the UI provides clear, inspectable brief history:
+
+1. **Info Card Integration:**
+   - On the actor detail view, the brief card displays:
+     - The current brief generation counter and last update timestamp.
+     - A clickable **History Icon** (`Icons.history`).
+2. **Latest 10 Revisions Popover / Modal:**
+   - Clicking the history icon opens a popover listing up to the 10 most recent accepted revisions.
+   - Each revision entry shows:
+     - `Gen <N>` badge.
+     - Relative and ISO timestamp (`2 hours ago`, `2026-10-10 13:35 UTC`).
+     - Optional actor explanation (`explanation`).
+3. **Before / After Diff Detail:**
+   - Selecting a revision displays a side-by-side or unified Markdown diff comparing that revision against the previous generation (`before` vs. `after`).
+4. **Responsive Mobile Layout:**
+   - On compact screens / mobile viewports, the popover adapts to a full-screen bottom sheet / modal.
+5. **No-Op Protection:**
+   - Unchanged writes do not generate revision entries or shift timestamps, ensuring the history stream remains noise-free.
+
+---
+
+## 9. Rollout and Operational Constraints
+
+- **Design Permission vs. Migration Approval:** Matt's Option B selection represents approved design direction. Dedicated table migration requires steward/root scheduling before shipping to production.
+- **Remote Branch Frozen:** PR [#961](https://github.com/MEK-Org/rusa/pull/961) remote branch remains frozen at `763c05c2` while timing and scope reconciliation completes.
+- **Review Commissioning:** Reviewer dispatch and merge gates remain on hold until authorized by parent steward.
