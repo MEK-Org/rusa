@@ -413,7 +413,6 @@ function setup(
     voiceTransferLogger?: ActorMeshOptions["voiceTransferLogger"];
     now?: () => string;
     responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
-    responsiveInterruptionMode?: ActorMeshOptions["responsiveInterruptionMode"];
     reactToChatMessage?: ActorMeshOptions["reactToChatMessage"];
     secretsDir?: string;
   } = {}
@@ -502,7 +501,6 @@ function setup(
     providerGate: opts.providerGate,
     voiceTransferLogger: opts.voiceTransferLogger,
     responsiveInterruption: opts.responsiveInterruption,
-    responsiveInterruptionMode: opts.responsiveInterruptionMode,
     reactToChatMessage: opts.reactToChatMessage,
     log: (m) => logs.push(m),
     createActor: (ctx) => {

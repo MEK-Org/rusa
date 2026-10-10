@@ -202,7 +202,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
       let decideCalled = false;
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: async () => {
             decideCalled = true;
@@ -255,7 +254,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
       let decideCalled = false;
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: async () => {
             decideCalled = true;
@@ -289,7 +287,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
       let decideCalled = false;
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: async () => {
             decideCalled = true;
@@ -331,7 +328,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
       let decideCalled = false;
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: async () => {
             decideCalled = true;
@@ -376,7 +372,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
       let decideCalled = false;
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: async () => {
             decideCalled = true;
@@ -426,7 +421,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
 
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: async () => ({ interruptProbability: 0.75 }), // >= 0.5 -> interrupt
         },
@@ -467,7 +461,21 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
   });
 
   describe("Fallbacks & Errors", () => {
-    it("preempts running actor on client error fallback", async () => {
+    it.each([
+      [
+        "client error",
+        async (): Promise<JevDecisionResponse> => {
+          throw new Error("HTTP 500 internal error");
+        },
+      ],
+      [
+        "input unavailable",
+        async (): Promise<JevDecisionResponse> => {
+          throw new JevInputUnavailableError();
+        },
+      ],
+      ["invalid probability", async () => ({ interruptProbability: NaN })],
+    ])("preempts running actor on %s fallback", async (_fallback, decide) => {
       let runSignal: AbortSignal | undefined;
       const provider = new FakeProvider((opts) => {
         runSignal = opts.signal;
@@ -476,85 +484,7 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
 
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
-        client: {
-          decide: async () => {
-            throw new Error("HTTP 500 internal error");
-          },
-        },
-      });
-
-      const { mesh, inboxStore, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [entry] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task" } },
-      ]);
-      mesh.dispatch(worker);
-      await tick();
-
-      mesh.selectInboxEntries(worker, [entry.id]);
-      mesh.sendMessage(worker, "operator message", TEST_USER_ID, "s1");
-      await tick();
-
-      // Client error -> fallback to interrupt -> preempted
-      expect(runSignal?.aborted).toBe(true);
-    });
-
-    it("preempts running actor on input unavailable error fallback", async () => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {});
-      });
-
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        mode: "active",
-        client: {
-          decide: async () => {
-            throw new JevInputUnavailableError();
-          },
-        },
-      });
-
-      const { mesh, inboxStore, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [entry] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task" } },
-      ]);
-      mesh.dispatch(worker);
-      await tick();
-
-      mesh.selectInboxEntries(worker, [entry.id]);
-      mesh.sendMessage(worker, "operator message", TEST_USER_ID, "s1");
-      await tick();
-
-      expect(runSignal?.aborted).toBe(true);
-    });
-
-    it("preempts running actor on invalid probability fallback", async () => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {});
-      });
-
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        mode: "active",
-        client: {
-          decide: async () => ({ interruptProbability: NaN }),
-        },
+        client: { decide },
       });
 
       const { mesh, inboxStore, tick } = setup({
@@ -589,7 +519,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
         timeoutMs: 50, // short timeout for testing
-        mode: "active",
         client: {
           decide: () => new Promise(() => {}), // never resolves
         },
@@ -642,7 +571,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
       let resolveJev!: (res: JevDecisionResponse) => void;
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: () =>
             new Promise<JevDecisionResponse>((resolve) => {
@@ -704,7 +632,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
 
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: async () => ({ interruptProbability: 0.1 }), // queue
         },
@@ -749,7 +676,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
 
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: async () => ({ interruptProbability: 0.1 }), // queue
         },
@@ -792,7 +718,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
 
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: async () => ({ interruptProbability: 0.1 }), // queue
         },
@@ -837,7 +762,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
       let e1: { id: string } | undefined;
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: async (req: JevDecisionRequest) => {
             if (e1 && req.input.incomingEntryId === e1.id) {
@@ -888,7 +812,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
       let decideCallCount = 0;
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: async () => {
             decideCallCount++;
@@ -933,7 +856,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
     it("suppresses follower remote preemption when active JEV decides queue", async () => {
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: async () => ({ interruptProbability: 0.1 }), // queue (< 0.5)
         },
@@ -974,7 +896,6 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
     it("preempts follower remote run when active JEV decides interrupt", async () => {
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        mode: "active",
         client: {
           decide: async () => ({ interruptProbability: 0.8 }), // interrupt (>= 0.5)
         },
@@ -1020,7 +941,6 @@ describe("Active JEV late interrupt keeps the replacement run (#533)", () => {
     });
     const classifier = new ShadowResponsiveInterruptionClassifier({
       threshold: 0.5,
-      mode: "active",
       client: { decide },
     });
     const { mesh, inboxStore, tick } = setup({
@@ -1070,5 +990,147 @@ describe("Active JEV late interrupt keeps the replacement run (#533)", () => {
     expect(signals[0]?.aborted).toBe(true);
     expect(signals).toHaveLength(2);
     expect(unseen).toHaveLength(0);
+  });
+});
+
+describe("Active JEV invalidation preempts only for remaining responsive work (#533)", () => {
+  async function running() {
+    const decisions: Array<(response: JevDecisionResponse) => void> = [];
+    const runs: Array<{ signal: AbortSignal; settle: () => void }> = [];
+    const provider = new FakeProvider((opts) => {
+      const signal = (opts as { signal?: AbortSignal }).signal ?? new AbortController().signal;
+      return new Promise<Partial<RunResult>>((resolve, reject) => {
+        runs.push({ signal, settle: () => resolve({}) });
+        signal.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    });
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.5,
+      client: {
+        decide: () => new Promise<JevDecisionResponse>((resolve) => decisions.push(resolve)),
+      },
+    });
+    const { mesh, inboxStore, tick } = setup({
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+      responsiveInterruptionMode: "active",
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+    const [a, b] = inboxStore.append([
+      { actorId: worker, source: "test", payload: { type: "task", id: "a" } },
+      { actorId: worker, source: "test", payload: { type: "task", id: "b" } },
+    ]);
+    mesh.dispatch(worker);
+    await tick();
+    const known = new Set([a.id, b.id]);
+    const arrive = async (text: string) => {
+      mesh.sendMessage(worker, text, TEST_USER_ID, "s1");
+      await tick();
+      const arrival = inboxStore.list(worker).entries.find((e) => !known.has(e.id));
+      if (!arrival) throw new Error("arrival not appended");
+      known.add(arrival.id);
+      return arrival.id;
+    };
+    const entry = (id: string) => inboxStore.list(worker).entries.find((e) => e.id === id);
+    return { mesh, inboxStore, tick, worker, a: a.id, b: b.id, arrive, entry, decisions, runs };
+  }
+
+  it("does not preempt when the queued arrival was handled before the selection changed", async () => {
+    const t = await running();
+    t.mesh.selectInboxEntries(t.worker, [t.a]);
+    const arrival = await t.arrive("low priority");
+    t.decisions.shift()?.({ interruptProbability: 0.1 });
+    await t.tick();
+    expect(t.mesh.isPreemptionSuppressed(t.worker)).toBe(true);
+
+    t.inboxStore.markHandled(t.worker, [arrival]);
+    t.mesh.selectInboxEntries(t.worker, [t.b]);
+    await t.tick();
+
+    expect(t.runs).toHaveLength(1);
+    expect(t.runs[0]?.signal.aborted).toBe(false);
+    expect(t.mesh.isPreemptionSuppressed(t.worker)).toBe(false);
+    t.runs[0]?.settle();
+  });
+
+  it("does not preempt when the run selects the arrival it was holding", async () => {
+    const t = await running();
+    t.mesh.selectInboxEntries(t.worker, [t.a]);
+    const arrival = await t.arrive("low priority");
+    t.decisions.shift()?.({ interruptProbability: 0.1 });
+    await t.tick();
+
+    t.mesh.selectInboxEntries(t.worker, [t.a, arrival]);
+    await t.tick();
+
+    expect(t.runs).toHaveLength(1);
+    expect(t.runs[0]?.signal.aborted).toBe(false);
+    t.runs[0]?.settle();
+  });
+
+  it("keeps holding until the whole selection is handled", async () => {
+    const t = await running();
+    t.mesh.selectInboxEntries(t.worker, [t.a, t.b]);
+    await t.arrive("low priority");
+    t.decisions.shift()?.({ interruptProbability: 0.1 });
+    await t.tick();
+
+    t.inboxStore.markHandled(t.worker, [t.a]);
+    await t.tick();
+    expect(t.runs[0]?.signal.aborted).toBe(false);
+    expect(t.mesh.isPreemptionSuppressed(t.worker)).toBe(true);
+
+    t.inboxStore.markHandled(t.worker, [t.b]);
+    await waitUntil(() => t.runs.length >= 2, 3000);
+    expect(t.runs[0]?.signal.aborted).toBe(true);
+    expect(t.runs).toHaveLength(2);
+    t.runs[1]?.settle();
+  });
+
+  it("ignores a decision from an earlier A selection after A -> B -> A", async () => {
+    const t = await running();
+    t.mesh.selectInboxEntries(t.worker, [t.a]);
+    const first = await t.arrive("first");
+    const staleDecision = t.decisions.shift();
+    t.inboxStore.markHandled(t.worker, [first]);
+    t.mesh.selectInboxEntries(t.worker, [t.b]);
+    t.mesh.selectInboxEntries(t.worker, [t.a]);
+    const second = await t.arrive("second");
+    const currentDecision = t.decisions.shift();
+
+    staleDecision?.({ interruptProbability: 0.9 });
+    await t.tick();
+    expect(t.runs[0]?.signal.aborted).toBe(false);
+
+    currentDecision?.({ interruptProbability: 0.1 });
+    await t.tick();
+    expect(t.runs[0]?.signal.aborted).toBe(false);
+    expect(t.mesh.isPreemptionSuppressed(t.worker)).toBe(true);
+
+    t.runs[0]?.settle();
+    await waitUntil(() => t.runs.length >= 2, 3000);
+    expect(t.runs).toHaveLength(2);
+    expect(t.entry(second)?.seenAt).toBeTruthy();
+    t.runs[1]?.settle();
+  });
+
+  it("a late interrupt decision after Stop does not start another run", async () => {
+    const t = await running();
+    t.mesh.selectInboxEntries(t.worker, [t.a]);
+    await t.arrive("pending");
+    const pending = t.decisions.shift();
+    expect(t.mesh.isPreemptionSuppressed(t.worker)).toBe(true);
+
+    t.mesh.interrupt(t.worker, "root");
+    await t.tick();
+    expect(t.runs[0]?.signal.aborted).toBe(true);
+    const afterStop = t.runs.length;
+
+    pending?.({ interruptProbability: 0.9 });
+    await t.tick();
+    await t.tick();
+    expect(t.runs).toHaveLength(afterStop);
+    expect(t.mesh.isPreemptionSuppressed(t.worker)).toBe(false);
+    for (const run of t.runs) run.settle();
   });
 });

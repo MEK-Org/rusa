@@ -222,18 +222,11 @@ export class ShadowResponsiveInterruptionClassifier {
   private readonly client: JevDecisionClient | undefined;
   private readonly threshold: number;
   private readonly timeoutMs: number;
-  readonly mode: "shadow" | "active";
 
-  constructor(options: {
-    client?: JevDecisionClient;
-    threshold: number;
-    timeoutMs?: number;
-    mode?: "shadow" | "active";
-  }) {
+  constructor(options: { client?: JevDecisionClient; threshold: number; timeoutMs?: number }) {
     this.client = options.client;
     this.threshold = options.threshold;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.mode = options.mode ?? "shadow";
   }
 
   async evaluate(input: ResponsiveInterruptionInput): Promise<ResponsiveInterruptionDecision> {
@@ -331,5 +324,3 @@ export class ShadowResponsiveInterruptionClassifier {
 
 /** A sentinel rather than an Error, so a real client error cannot impersonate it. */
 const DEADLINE_EXCEEDED = Symbol("responsive interruption decision deadline exceeded");
-
-export { ShadowResponsiveInterruptionClassifier as ResponsiveInterruptionClassifier };

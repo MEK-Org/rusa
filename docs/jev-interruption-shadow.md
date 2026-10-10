@@ -1,8 +1,11 @@
 # JEV responsive-interruption shadow mode
 
-This optional, host-owned policy observes whether a newly arrived responsive
-inbox item would interrupt an actor's current work. It is shadow-only: normal
-responsive preemption and hard cancellation controls remain authoritative.
+This optional, host-owned policy judges whether a newly arrived responsive
+inbox item should interrupt an actor's current work. By default it only
+observes (shadow mode): normal responsive preemption and hard cancellation
+controls remain authoritative. A host can opt into [active mode](#active-mode),
+where a "queue" decision may hold a narrow class of arrivals until the
+actor's follow-up turn.
 
 ## Enable
 
@@ -41,10 +44,11 @@ Each decision is bounded: at most 20 candidates are read and sent (the number
 left out is sent as `omittedCandidates`), and each entry's text is cut at 4,000
 characters. Both numbers, the 0.5 interrupt-probability threshold, and the 5-second
 decision deadline are uncalibrated placeholders that the shadow data is meant
-to calibrate. The deadline covers source reads and the request: expiry cancels
-the request, but a source read in progress runs to completion unobserved,
-because the source clients take no cancellation signal. Nothing is sent after
-expiry.
+to calibrate. The deadline covers source reads and the request, and it stops
+waiting rather than cancelling: nothing is sent after expiry, but a request
+already sent is bounded only by the SDK's own timeout (#813), and a source read
+in progress runs to completion unobserved, because the source clients take no
+cancellation signal.
 
 The client uses the official `@typesafe-ai/sdk`, pinned to an exact version,
 and follows the [TypeSafe System One API](https://docs.typesafe.ai/api). It
@@ -110,16 +114,20 @@ jevMode: active
   threshold (`outcome: "queue"`, `reason: "below_threshold"`) suppresses
   preemption of the active turn. The arrival remains durable in the inbox and
   is scheduled as a responsive follow-up when the current turn finishes.
-- **Invalidation:** Suppression is strictly tied to the originating run and its
-  selection. If the actor changes its selection (including re-selecting the same
-  entries — ABA), marks its selected work handled, or if the run ends or Stop is
-  called, suppression is invalidated and preemption occurs immediately if the actor
-  is still running.
+- **Invalidation:** Suppression is tied to the originating run and its
+  selection. Any new selection (including re-selecting the same entries), or
+  marking the last unhandled selected entry handled, drops the held arrivals;
+  the run is then preempted only if one of them is still unhandled and not part
+  of the new selection, so a held arrival the actor has already handled or
+  taken on causes no cancellation. A run that ends, is abandoned, or is stopped
+  drops the held arrivals without preemption; Stop stays authoritative. A
+  preemption keeps the arrival's replacement run, so the arrival is picked up
+  by the next turn.
 - **Failures & deadlines:** Timeouts (5-second decision deadline), transport
   errors, or unreadable inputs preserve baseline preemption. The deadline stops
   waiting; it does not cancel a request already sent, which stays bounded by the
   SDK's own timeout. A decision that resolves after its run or selection has
-  changed is ignored.
+  changed is ignored, and its audit row records `applied: false`.
 
 ## Roll back
 

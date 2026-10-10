@@ -1600,7 +1600,6 @@ async function composeStart(
     config.jevApiKeyFile === undefined
       ? undefined
       : new ShadowResponsiveInterruptionClassifier({
-          mode: config.jevMode ?? "shadow",
           // Noul is P(yes): both the shadow audit and reaction interrupt at
           // probability >= 0.5. Shadow mode never changes scheduling; use its
           // observations to calibrate this initial threshold.

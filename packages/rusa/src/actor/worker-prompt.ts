@@ -125,11 +125,11 @@ enough surrounding context to understand it. Do not infer content from metadata.
 After resolving candidates, coalesce related items, prioritize them, and choose a
 bounded work group with \`inbox.select\`. Pay attention to any \`hint\` returned on
 selected entries for channel-specific reply expectations or threading rules.
-Selecting early also helps your run keep its focus: where a host enables
-active queue policy, an arriving responsive item may be weighed against your
-live selected work and, if judged less urgent, wait for your follow-up turn
-instead of interrupting. That is a judgment, not a guarantee; without a live
-selection, arrivals interrupt as they always have.
+Where a host enables active queue policy, a live selection can also help
+eligible work avoid an unnecessary interruption: an arriving responsive item
+may be weighed against it and, if judged less urgent, wait for your follow-up
+turn. That is a judgment, not a guarantee; arrivals otherwise follow their
+existing policy.
 Act on each selected entry, then mark it handled in the same run with a note
 saying what you did. Handled means the notification was dealt with, not that the
 underlying issue or PR is finished; an inbox entry is not a timer for slow work.

@@ -603,15 +603,14 @@ export class RunManager {
    * coalesced follow-up, so re-request the replacement opportunity the
    * arrival's dispatch would have, from the durable worklist.
    */
-  preemptLiveActor(actorId: string): boolean {
+  preemptLiveActor(actorId: string): void {
     const target = this.live.get(actorId);
-    if (!target) return false;
+    if (!target) return;
     const preemption = target.preemptForResponsive();
-    if (!preemption.preempted) return false;
+    if (!preemption.preempted) return;
     this.onPreempted(actorId, preemption.phase);
     const work = this.durableWork(actorId);
     if (work) target.requestRun(dispatchNudge(work));
-    return true;
   }
 }
 

@@ -786,7 +786,7 @@ export interface ActorMeshOptions {
   onInboxEntriesSeen?: (actorId: string, entries: readonly InboxEntry[]) => void;
   /** Optional JEV policy. In shadow mode (default), it never changes dispatch. In active mode, it conditionally suppresses preemption. */
   responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
-  /** Explicit active or shadow mode for JEV responsive interruption. Defaults to "shadow" (or classifier.mode). */
+  /** The single authority for JEV responsive-interruption mode. Defaults to "shadow". */
   responsiveInterruptionMode?: "shadow" | "active";
   /**
    * Posts a shadow verdict as a reaction on the chat message that arrived.
@@ -883,13 +883,16 @@ interface SelectedHeadSnapshot {
   checkpointBy: string | null;
 }
 
+/**
+ * Responsive arrivals an active policy is holding back from a running actor's
+ * live selection, by inbox entry id: still being weighed, or judged able to
+ * wait for the follow-up turn. A decision applies only while its record is
+ * still the actor's current one, so any run or selection change that replaces
+ * or drops the record makes every earlier decision stale.
+ */
 interface ActiveInterruptionSuppression {
-  actorId: string;
-  runEpoch: number;
-  selectionEpoch: number;
-  selectedEntryIds: readonly string[];
-  pendingEvaluations: Set<string>;
-  suppressedEntries: Set<string>;
+  pending: Set<string>;
+  queued: Set<string>;
 }
 
 export class ActorMesh {
@@ -968,8 +971,6 @@ export class ActorMesh {
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
   private readonly responsiveInterruptionMode: "shadow" | "active";
-  private readonly selectionEpochs = new Map<string, number>();
-  private readonly runEpochs = new Map<string, number>();
   private readonly activeSuppressions = new Map<string, ActiveInterruptionSuppression>();
   private readonly reactToChatMessage?: ActorMeshOptions["reactToChatMessage"];
   private readonly grantable: ReadonlySet<string>;
@@ -1071,8 +1072,7 @@ export class ActorMesh {
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
     this.responsiveInterruption = opts.responsiveInterruption;
-    this.responsiveInterruptionMode =
-      opts.responsiveInterruptionMode ?? opts.responsiveInterruption?.mode ?? "shadow";
+    this.responsiveInterruptionMode = opts.responsiveInterruptionMode ?? "shadow";
     this.reactToChatMessage = opts.reactToChatMessage;
     // A host-global capability is never grantable through the mesh (#549), so
     // a wiring that lists one — the maintenance servers are registered like
@@ -1154,9 +1154,9 @@ export class ActorMesh {
       this.unsubscribeInboxAppends = opts.inboxStore.onItemsAppended((items) => {
         this.scheduleAppendedWork(items);
       });
-      this.unsubscribeInboxHandled = opts.inboxStore.onItemsHandled((actorId, results) => {
+      this.unsubscribeInboxHandled = opts.inboxStore.onItemsHandled((actorId) => {
         this.cancelEmptyQueuedRun(actorId);
-        this.onItemsMarkedHandled(actorId, results);
+        this.onItemsMarkedHandled(actorId);
       });
     }
   }
@@ -1510,9 +1510,7 @@ export class ActorMesh {
 
   isPreemptionSuppressed(actorId: string): boolean {
     actorId = this.resolveThreadId(actorId);
-    const active = this.activeSuppressions.get(actorId);
-    if (!active) return false;
-    return active.pendingEvaluations.size > 0 || active.suppressedEntries.size > 0;
+    return this.activeSuppressions.has(actorId);
   }
 
   private handleResponsiveArrivals(
@@ -1539,15 +1537,25 @@ export class ActorMesh {
     return false;
   }
 
-  private invalidateActiveInterruption(actorId: string, _reason: string): void {
+  /**
+   * Drop the actor's held arrivals once the selection they were weighed
+   * against no longer stands. Preempt only if one of them is still unhandled
+   * and not now part of the run's own selection: otherwise no responsive work
+   * is left for a replacement run, and cancelling would only discard the
+   * running turn.
+   */
+  private invalidateActiveInterruption(actorId: string): void {
     const resolved = this.resolveThreadId(actorId);
     const active = this.activeSuppressions.get(resolved);
     if (!active) return;
     this.activeSuppressions.delete(resolved);
-    const live = this.runs.liveActor(resolved);
-    if (live?.isRunning) {
-      this.runs.preemptLiveActor(resolved);
-    }
+    if (!this.runs.liveActor(resolved)?.isRunning) return;
+    const selected = new Set(this.selectedInboxEntries(resolved));
+    const remaining = [...active.pending, ...active.queued].some((id) => {
+      const entry = this.inboxStore?.read(resolved, id);
+      return entry && !entry.handledAt && !selected.has(id);
+    });
+    if (remaining) this.runs.preemptLiveActor(resolved);
   }
 
   private clearActiveInterruption(actorId: string): void {
@@ -1555,24 +1563,16 @@ export class ActorMesh {
     this.activeSuppressions.delete(resolved);
   }
 
-  private onItemsMarkedHandled(actorId: string, results?: readonly MarkHandledResult[]): void {
+  /**
+   * Held arrivals wait on the live selection as a whole, the same test that
+   * admitted them: handling one selected entry while others remain open keeps
+   * them held, and handling the last one releases them.
+   */
+  private onItemsMarkedHandled(actorId: string): void {
     const resolved = this.resolveThreadId(actorId);
     if (!this.activeSuppressions.has(resolved)) return;
-    const selected = new Set(this.selectedInboxEntries(resolved));
-    if (selected.size === 0) {
-      this.invalidateActiveInterruption(resolved, "no_selection");
-      return;
-    }
-    if (results && results.length > 0) {
-      const handledSelected = results.some((r) => selected.has(r.id));
-      if (handledSelected) {
-        this.invalidateActiveInterruption(resolved, "selected_work_handled");
-      }
-    } else {
-      if (!this.hasLiveUnhandledSelection(resolved, [...selected])) {
-        this.invalidateActiveInterruption(resolved, "selected_work_handled");
-      }
-    }
+    if (this.hasLiveUnhandledSelection(resolved, [...this.selectedInboxEntries(resolved)])) return;
+    this.invalidateActiveInterruption(resolved);
   }
 
   private handleActiveResponsiveArrivals(
@@ -1585,8 +1585,9 @@ export class ActorMesh {
 
     // Explicit Run Now always interrupts immediately without JEV call.
     // Any interrupting batchrow wins: if any row is operator.run_now, preemption cannot be suppressed.
+    // The dispatch preempts on its own, so held arrivals are simply dropped.
     if (incoming.some(({ entry }) => entry.payload.type === "operator.run_now")) {
-      this.invalidateActiveInterruption(actorId, "operator_run_now");
+      this.clearActiveInterruption(actorId);
       return { suppressPreemption: false };
     }
 
@@ -1594,33 +1595,34 @@ export class ActorMesh {
     if (interrupting.length === 0) return;
 
     const selectedEntryIds = [...this.selectedInboxEntries(actorId)];
-    const hasLiveSelection = this.hasLiveUnhandledSelection(actorId, selectedEntryIds);
-    if (!hasLiveSelection) {
+    if (!this.hasLiveUnhandledSelection(actorId, selectedEntryIds)) {
       // No live unhandled selection: baseline interrupts without JEV call
-      this.invalidateActiveInterruption(actorId, "no_live_selection");
+      this.clearActiveInterruption(actorId);
       return { suppressPreemption: false };
     }
 
-    const runEpoch = this.runEpochs.get(actorId) ?? 0;
-    const selectionEpoch = this.selectionEpochs.get(actorId) ?? 0;
-
-    let active = this.activeSuppressions.get(actorId);
-    if (!active || active.runEpoch !== runEpoch || active.selectionEpoch !== selectionEpoch) {
-      active = {
-        actorId,
-        runEpoch,
-        selectionEpoch,
-        selectedEntryIds,
-        pendingEvaluations: new Set<string>(),
-        suppressedEntries: new Set<string>(),
-      };
-      this.activeSuppressions.set(actorId, active);
-    }
+    const active = this.activeSuppressions.get(actorId) ?? {
+      pending: new Set<string>(),
+      queued: new Set<string>(),
+    };
+    this.activeSuppressions.set(actorId, active);
 
     for (const { entry, baseline } of interrupting) {
       const incomingEntryId = entry.id;
       const evaluationId = this.idgen();
-      active.pendingEvaluations.add(evaluationId);
+      active.pending.add(incomingEntryId);
+      // Apply a decision only to the record it was made for; returns whether it applied.
+      const settle = (outcome: "interrupt" | "queue"): boolean => {
+        if (this.activeSuppressions.get(actorId) !== active) return false;
+        if (!active.pending.has(incomingEntryId)) return false;
+        if (outcome === "interrupt") {
+          this.invalidateActiveInterruption(actorId);
+        } else {
+          active.pending.delete(incomingEntryId);
+          active.queued.add(incomingEntryId);
+        }
+        return true;
+      };
 
       void classifier
         .evaluate({
@@ -1631,45 +1633,19 @@ export class ActorMesh {
           pendingEntryIds: [],
         })
         .then((decision) => {
+          const applied = settle(decision.outcome);
           this.recordEvent({
             kind: "responsive_interruption_shadow",
             actorId,
             detail: "active",
-            payload: JSON.stringify({ evaluationId, baseline, decision }),
+            payload: JSON.stringify({ evaluationId, baseline, decision, applied }),
           });
           const prediction = shadowPrediction(decision);
           if (prediction) this.postShadowReaction(entry.payload, prediction, incomingEntryId);
-
-          const current = this.activeSuppressions.get(actorId);
-          if (
-            !current ||
-            current.runEpoch !== runEpoch ||
-            current.selectionEpoch !== selectionEpoch ||
-            !current.pendingEvaluations.has(evaluationId)
-          ) {
-            return;
-          }
-
-          current.pendingEvaluations.delete(evaluationId);
-
-          if (decision.outcome === "interrupt") {
-            this.activeSuppressions.delete(actorId);
-            this.runs.preemptLiveActor(actorId);
-          } else {
-            current.suppressedEntries.add(incomingEntryId);
-          }
         })
         .catch(() => {
           this.log(`responsive interruption active observation failed for ${incomingEntryId}`);
-          const current = this.activeSuppressions.get(actorId);
-          if (
-            current &&
-            current.runEpoch === runEpoch &&
-            current.selectionEpoch === selectionEpoch
-          ) {
-            this.activeSuppressions.delete(actorId);
-            this.runs.preemptLiveActor(actorId);
-          }
+          settle("interrupt");
         });
     }
 
@@ -1859,7 +1835,6 @@ export class ActorMesh {
   actorQueued(actorId: string, context: { responsive: boolean; mode: ActorRunMode }): InboxEntry[] {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
-    this.runEpochs.set(actorId, (this.runEpochs.get(actorId) ?? 0) + 1);
     this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
     // Open the run-scoped head window. An actor absent from this set delivers
@@ -1969,8 +1944,7 @@ export class ActorMesh {
       : [];
     beforeCommit?.(entries);
     this.selectedInboxEntryIds.set(actorId, unique);
-    this.selectionEpochs.set(actorId, (this.selectionEpochs.get(actorId) ?? 0) + 1);
-    this.invalidateActiveInterruption(actorId, "selection_changed");
+    this.invalidateActiveInterruption(actorId);
     if (headObligationIds.length > 0 && supportsObligationClosureReads(closure)) {
       const run: HeadClosureRunState = this.headClosureRuns.get(actorId) ?? {
         headObligationIds: new Set<string>(),
@@ -2293,7 +2267,6 @@ export class ActorMesh {
       );
     }
     this.selectedInboxEntryIds.delete(actorId);
-    this.runEpochs.set(actorId, (this.runEpochs.get(actorId) ?? 0) + 1);
     this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
@@ -2618,7 +2591,6 @@ export class ActorMesh {
   abandonInboxRun(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
-    this.runEpochs.set(actorId, (this.runEpochs.get(actorId) ?? 0) + 1);
     this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
@@ -5493,8 +5465,6 @@ export class ActorMesh {
     this.appendWakesOwed.clear();
     this.runResponsiveReadyAttention.clear();
     this.activeSuppressions.clear();
-    this.selectionEpochs.clear();
-    this.runEpochs.clear();
     this.runs.closeAll();
   }
 
