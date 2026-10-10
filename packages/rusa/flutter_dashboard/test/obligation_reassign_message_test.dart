@@ -36,7 +36,7 @@ Future<FakeApi> _openDialog(WidgetTester tester) async {
   await tester.tap(find.text('open'));
   await tester.pumpAndSettle();
   await tester.enterText(
-    find.widgetWithText(TextFormField, 'e.g. cloudy-porpoise, operator, or UUID'),
+    find.widgetWithText(TextFormField, 'Select a person, or enter an actor handle or UUID'),
     'worker-1',
   );
   return api;

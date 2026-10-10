@@ -83,6 +83,8 @@ function instrumentObligationReads(db: Database.Database): {
   return { db: proxy, tally };
 }
 
+const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";
+
 describe("Obligation mutation history", () => {
   let db: Database.Database;
   let repository: ObligationRepository;
@@ -96,6 +98,13 @@ describe("Obligation mutation history", () => {
       db,
       (id) => ["actor-a", "actor-b", "actor-c"].includes(id),
       () => now
+    );
+    repository.setPrincipalKind((id) =>
+      id === TEST_USER_ID
+        ? "user"
+        : ["actor-a", "actor-b", "actor-c"].includes(id)
+          ? "actor"
+          : undefined
     );
   });
 
@@ -339,20 +348,15 @@ describe("Obligation mutation history", () => {
 
   describe("reassign message (#941)", () => {
     it("records the message with the owner change, attributed to the acting principal", () => {
-      const ob = repository.create({ title: "Review", ownerId: "human:operator" });
+      const ob = repository.create({ title: "Review", ownerId: TEST_USER_ID });
       now += 1000;
-      repository.reassign(
-        ob.id,
-        "actor-a",
-        "human:operator",
-        "  Please address the round-2 note.  "
-      );
+      repository.reassign(ob.id, "actor-a", TEST_USER_ID, "  Please address the round-2 note.  ");
 
       expect(repository.listHistory(ob.id)).toEqual([
         expect.objectContaining({
           mutationKind: "reassign",
-          actingPrincipal: "human:operator",
-          before: { ownerId: "human:operator" },
+          actingPrincipal: TEST_USER_ID,
+          before: { ownerId: TEST_USER_ID },
           after: { ownerId: "actor-a", message: "Please address the round-2 note." },
         }),
       ]);
@@ -396,11 +400,14 @@ describe("Obligation mutation history", () => {
           (id) => ["actor-a", "actor-b"].includes(id),
           () => now
         );
-        const ob = local.create({ id: "review", title: "Review", ownerId: "human:operator" });
+        local.setPrincipalKind((id) =>
+          id === TEST_USER_ID ? "user" : ["actor-a", "actor-b"].includes(id) ? "actor" : undefined
+        );
+        const ob = local.create({ id: "review", title: "Review", ownerId: TEST_USER_ID });
         local.setReadyHeadListener((change) =>
           changes.push({ ownerId: change.ownerId, headId: change.head?.id ?? null })
         );
-        local.reassign(ob.id, "actor-a", "human:operator", message);
+        local.reassign(ob.id, "actor-a", TEST_USER_ID, message);
         return changes;
       };
       expect(deliveries("Back to you.")).toEqual(deliveries());
@@ -411,18 +418,18 @@ describe("Obligation mutation history", () => {
       const ids = ["first", "review", "last"];
       for (const id of ids) {
         now += 1000;
-        repository.create({ id, title: id, ownerId: "human:operator" });
+        repository.create({ id, title: id, ownerId: TEST_USER_ID });
       }
-      const queue = () => repository.listOwned("human:operator").map((o) => o.id);
+      const queue = () => repository.listOwned(TEST_USER_ID).map((o) => o.id);
       expect(queue()).toEqual(ids);
 
-      repository.reassign("review", "actor-a", "human:operator", "Please answer seat 2.");
+      repository.reassign("review", "actor-a", TEST_USER_ID, "Please answer seat 2.");
       expect(queue()).toEqual(["first", "last"]);
-      repository.reassign("review", "human:operator", "actor-a", "Answered; back to you.");
+      repository.reassign("review", TEST_USER_ID, "actor-a", "Answered; back to you.");
 
       expect(queue()).toEqual(ids);
       expect(repository.listHistory("review").map((h) => h.after)).toEqual([
-        { ownerId: "human:operator", message: "Answered; back to you." },
+        { ownerId: TEST_USER_ID, message: "Answered; back to you." },
         { ownerId: "actor-a", message: "Please answer seat 2." },
       ]);
     });

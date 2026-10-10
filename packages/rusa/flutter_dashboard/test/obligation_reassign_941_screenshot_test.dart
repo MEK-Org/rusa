@@ -61,9 +61,9 @@ void main() {
               {
                 'id': 1,
                 'mutationKind': 'reassign',
-                'actingPrincipal': 'human:operator',
+                'actingPrincipal': testUserPrincipalId,
                 'timestamp': '2026-10-06T15:00:00.000Z',
-                'before': {'ownerId': 'human:operator'},
+                'before': {'ownerId': testUserPrincipalId},
                 'after': {'ownerId': 'coder', 'message': _message},
               },
             ],
@@ -114,9 +114,9 @@ void main() {
         await tester.enterText(
           find.widgetWithText(
             TextFormField,
-            'e.g. cloudy-porpoise, operator, or UUID',
+            'Select a person, or enter an actor handle or UUID',
           ),
-          'operator',
+          'coder-handle',
         );
         // Close the owner suggestions so both runs show the bare dialog.
         FocusManager.instance.primaryFocus?.unfocus();
