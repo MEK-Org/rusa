@@ -65,8 +65,46 @@ const SERVER_OPERATIONS = ["quota_snapshot", "quota_history"] as const;
 
 export type DashboardTimingOperation = (typeof SERVER_OPERATIONS)[number];
 
+/** Fixed request methods (#990); anything else is recorded as `other`, never verbatim. */
+export const DASHBOARD_TIMING_METHODS = [
+  "GET",
+  "HEAD",
+  "OPTIONS",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+  "other",
+] as const;
+
+export type DashboardTimingMethod = (typeof DASHBOARD_TIMING_METHODS)[number];
+
+/**
+ * How a server request observation ended (#990). `closed_before_finish` means
+ * the connection closed before the response finished; the server cannot tell
+ * a client abort from a client timeout or a network drop, so it claims neither.
+ */
+const SERVER_TERMINALS = ["finished", "closed_before_finish"] as const;
+
+export type DashboardTimingTerminal = (typeof SERVER_TERMINALS)[number];
+
+/** Request lifecycle observations that are not request-latency samples. */
+const STREAM_LIFECYCLE_LABELS: readonly DashboardTimingLabel[] = [
+  "mesh_stream_open",
+  "mesh_stream_close",
+];
+
+export function dashboardTimingMethod(method: string | undefined): DashboardTimingMethod {
+  return DASHBOARD_TIMING_METHODS.find((fixed) => fixed !== "other" && fixed === method) ?? "other";
+}
+
 export interface DashboardTimingPayload {
-  v: 1;
+  /**
+   * 1: every client row, server rows written before #990, and stream
+   * lifecycle rows. 2: a server request row carrying `method` and `terminal`.
+   * A v1 request row was only ever written on `finish`, with no method.
+   */
+  v: 1 | 2;
   source: TimingSource;
   label: DashboardTimingLabel;
   /** A random UUID, never a user, actor, obligation, URL, or query identifier. */
@@ -87,6 +125,10 @@ export interface DashboardTimingPayload {
    * phases are absent, and records that predate phases have none.
    */
   phases?: DashboardServerPhaseDurations;
+  /** v2 server request rows only. */
+  method?: DashboardTimingMethod;
+  /** v2 server request rows only. */
+  terminal?: DashboardTimingTerminal;
   durationMs: number | null;
   status: number | null;
   bytes: number | null;
@@ -268,8 +310,17 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
     const requestTimings = value.requestTimings;
     const operation = value.operation;
     const phases = value.phases;
+    const method = value.method;
+    const terminal = value.terminal;
+    const isRequestRow =
+      value.v === 2 &&
+      value.source === "server" &&
+      DASHBOARD_TIMING_METHODS.includes(method as DashboardTimingMethod) &&
+      SERVER_TERMINALS.includes(terminal as DashboardTimingTerminal) &&
+      !STREAM_LIFECYCLE_LABELS.includes(value.label as DashboardTimingLabel);
     if (
-      value.v !== 1 ||
+      (value.v !== 1 && !isRequestRow) ||
+      (value.v === 1 && (method !== undefined || terminal !== undefined)) ||
       (value.source !== "server" && value.source !== "client") ||
       !isDashboardTimingLabel(value.label) ||
       (requestId !== undefined && !isUuid(requestId)) ||
@@ -309,9 +360,15 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
       return null;
     }
     return {
-      v: 1,
+      v: isRequestRow ? 2 : 1,
       source: value.source,
       label: value.label,
+      ...(isRequestRow
+        ? {
+            method: method as DashboardTimingMethod,
+            terminal: terminal as DashboardTimingTerminal,
+          }
+        : {}),
       ...(requestId ? { requestId } : {}),
       ...(requestIds ? { requestIds } : {}),
       ...(requestTimings
@@ -385,11 +442,14 @@ export class DashboardTimingRecorder {
     status: number | null;
     bytes: number | null;
     phases?: DashboardServerPhaseDurations;
+    /** Present together on request observations; stream lifecycle rows omit both. */
+    request?: { method: DashboardTimingMethod; terminal: DashboardTimingTerminal };
   }): void {
     this.enqueue({
-      v: 1,
+      v: input.request ? 2 : 1,
       source: "server",
       label: input.label,
+      ...(input.request ? { method: input.request.method, terminal: input.request.terminal } : {}),
       ...(input.operation ? { operation: input.operation } : {}),
       ...(input.requestId ? { requestId: input.requestId } : {}),
       ...(input.phases && Object.keys(input.phases).length > 0 ? { phases: input.phases } : {}),
@@ -447,12 +507,15 @@ export class DashboardTimingRecorder {
 
   summary(opts: { since: Date; label?: DashboardTimingLabel }): DashboardTimingSummary {
     const since = opts.since.toISOString();
-    const allRows = this.events
-      .listByKindSince(DASHBOARD_TIMING_EVENT_KIND, since, DASHBOARD_TIMING_MAX_RECORDS)
-      .flatMap((event) => {
-        const payload = parsePayload(event);
-        return payload ? [{ event, payload }] : [];
-      });
+    const events = this.events.listByKindSince(
+      DASHBOARD_TIMING_EVENT_KIND,
+      since,
+      DASHBOARD_TIMING_MAX_RECORDS
+    );
+    const allRows = events.flatMap((event) => {
+      const payload = parsePayload(event);
+      return payload ? [{ event, payload }] : [];
+    });
     const rows =
       opts.label === undefined
         ? allRows
@@ -468,7 +531,23 @@ export class DashboardTimingRecorder {
             ({ payload }) => payload.source === "server" || payload.label === opts.label
           )
         : rows;
-    return summarize(rows, correlationRows, since, this.dropped);
+    return {
+      ...summarize(rows, correlationRows, since, this.dropped),
+      window: {
+        requestedSince: since,
+        oldestRecordAt: events[0]?.ts ?? null,
+        newestRecordAt: events.at(-1)?.ts ?? null,
+        recordsRead: events.length,
+        readCap: DASHBOARD_TIMING_MAX_RECORDS,
+        // The read takes the newest rows first, so at the cap older in-window
+        // rows may exist (or may have been count-pruned) and are not counted.
+        capReached: events.length >= DASHBOARD_TIMING_MAX_RECORDS,
+        retentionMs: DASHBOARD_TIMING_RETENTION_MS,
+        retentionLimited:
+          opts.since.getTime() < this.now().getTime() - DASHBOARD_TIMING_RETENTION_MS,
+        unreadableRecords: events.length - allRows.length,
+      },
+    };
   }
 
   private enqueue(payload: DashboardTimingPayload): void {
@@ -530,8 +609,52 @@ export interface DashboardTimingGroup {
   flagged: boolean;
 }
 
+/** One population of server request observations, never mixed with another. */
+export interface DashboardTimingPopulation extends DashboardTimingDistribution {
+  count: number;
+}
+
+/**
+ * Server request observations for one fixed label, operation and method,
+ * split by how each request ended (#990). Percentiles never mix populations.
+ */
+export interface DashboardServerPopulationGroup {
+  label: (typeof SERVER_LABELS)[number];
+  operation?: DashboardTimingOperation;
+  /** `unknown` for rows written before #990, which carried no method. */
+  method: DashboardTimingMethod | "unknown";
+  /** Finished with status 100–399. */
+  finishedSuccess: DashboardTimingPopulation;
+  /** Finished with status ≥ 400 (or no recorded status). */
+  finishedFailure: DashboardTimingPopulation;
+  /**
+   * Connection closed before the response finished: abort, client timeout or
+   * network drop, indistinguishably. Null when these rows predate #990, which
+   * never observed such closes.
+   */
+  closedBeforeFinish: DashboardTimingPopulation | null;
+}
+
+/** What the summary actually read, against what was requested (#990). */
+export interface DashboardTimingWindow {
+  requestedSince: string;
+  oldestRecordAt: string | null;
+  newestRecordAt: string | null;
+  /** Timing rows of every label read, before any label filter. */
+  recordsRead: number;
+  readCap: number;
+  /** True when the read hit its cap; older rows in the window are not counted. */
+  capReached: boolean;
+  retentionMs: number;
+  /** True when the requested window starts before the retention horizon. */
+  retentionLimited: boolean;
+  /** Rows read that failed validation and are excluded from every figure. */
+  unreadableRecords: number;
+}
+
 export interface DashboardTimingSummary {
   since: string;
+  window: DashboardTimingWindow;
   sampleCount: number;
   droppedSinceStart: number;
   clientServerCoverage: {
@@ -552,6 +675,9 @@ export interface DashboardTimingSummary {
    * (enrichment runs inside route) and are never summed or subtracted.
    */
   serverPhases: DashboardServerPhaseGroup[];
+  /** Server request populations by label, operation and method (#990). */
+  serverPopulations: DashboardServerPopulationGroup[];
+  /** Per-label groups as before #990: every method and status in one distribution. */
   groups: DashboardTimingGroup[];
 }
 
@@ -696,12 +822,58 @@ function serverPhaseGroups(
     );
 }
 
+function population(payloads: DashboardTimingPayload[]): DashboardTimingPopulation {
+  return {
+    count: payloads.length,
+    ...distribution(
+      payloads.flatMap((payload) => (payload.durationMs === null ? [] : [payload.durationMs]))
+    ),
+  };
+}
+
+function serverPopulationGroups(
+  rows: Array<{ payload: DashboardTimingPayload }>
+): DashboardServerPopulationGroup[] {
+  const groups = new Map<string, DashboardTimingPayload[]>();
+  for (const { payload } of rows) {
+    if (payload.source !== "server" || STREAM_LIFECYCLE_LABELS.includes(payload.label)) continue;
+    const key = `${payload.label}:${payload.operation ?? ""}:${payload.method ?? "unknown"}`;
+    const group = groups.get(key) ?? [];
+    group.push(payload);
+    groups.set(key, group);
+  }
+  return [...groups.values()]
+    .map((payloads) => {
+      const first = payloads[0];
+      // A pre-#990 row was written only on `finish`, so it is a finished response.
+      const finished = payloads.filter((payload) => payload.terminal !== "closed_before_finish");
+      const succeeded = (payload: DashboardTimingPayload) =>
+        payload.status !== null && payload.status < 400;
+      return {
+        label: first.label as (typeof SERVER_LABELS)[number],
+        ...(first.operation ? { operation: first.operation } : {}),
+        method: first.method ?? ("unknown" as const),
+        finishedSuccess: population(finished.filter(succeeded)),
+        finishedFailure: population(finished.filter((payload) => !succeeded(payload))),
+        closedBeforeFinish: first.method
+          ? population(payloads.filter((payload) => payload.terminal === "closed_before_finish"))
+          : null,
+      };
+    })
+    .sort(
+      (a, b) =>
+        a.label.localeCompare(b.label) ||
+        (a.operation ?? "").localeCompare(b.operation ?? "") ||
+        a.method.localeCompare(b.method)
+    );
+}
+
 function summarize(
   rows: Array<{ event: MeshEvent; payload: DashboardTimingPayload }>,
   correlationRows: Array<{ event: MeshEvent; payload: DashboardTimingPayload }>,
   since: string,
   droppedSinceStart: number
-): DashboardTimingSummary {
+): Omit<DashboardTimingSummary, "window"> {
   const groups = new Map<
     string,
     {
@@ -816,6 +988,7 @@ function summarize(
           (a.serverOperation ?? "").localeCompare(b.serverOperation ?? "")
       ),
     serverPhases: serverPhaseGroups(rows),
+    serverPopulations: serverPopulationGroups(rows),
     groups: [...groups.values()]
       .map((group) => {
         const p95Ms = percentile(group.durations, 95);

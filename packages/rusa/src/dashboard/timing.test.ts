@@ -7,6 +7,7 @@ import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js
 import {
   DASHBOARD_TIMING_EVENT_KIND,
   DASHBOARD_TIMING_MAX_QUEUE,
+  DASHBOARD_TIMING_MAX_RECORDS,
   DASHBOARD_TIMING_PRUNE_INTERVAL_MS,
   DashboardTimingRecorder,
   parseDashboardClientTiming,
@@ -506,6 +507,231 @@ describe("dashboard timing recorder", () => {
       correlation: { numerator: 0, denominator: 0, state: "no-referenced-request" },
       measurement: { numerator: 0, denominator: 0, state: "no-referenced-request" },
     });
+  });
+
+  it("keeps success, non-2xx and closed-before-finish populations apart per method (#990)", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    const request = (
+      method: "GET" | "HEAD" | "OPTIONS",
+      terminal: "finished" | "closed_before_finish" = "finished"
+    ) => ({ method, terminal });
+    const server = (durationMs: number, status: number | null, req: ReturnType<typeof request>) =>
+      recorder.recordServer({
+        label: "mesh_obligations",
+        durationMs,
+        status,
+        bytes: 1,
+        request: req,
+      });
+    server(10, 200, request("GET"));
+    server(30, 304, request("GET"));
+    server(900, 500, request("GET"));
+    server(4000, null, request("GET", "closed_before_finish"));
+    server(3, 200, request("HEAD"));
+    server(1, 204, request("OPTIONS"));
+    while (timingRows().length < 6) recorder.flush();
+
+    const summary = recorder.summary({ since: new Date(Date.now() - 60_000) });
+    const empty = { count: 0, p50Ms: null, p95Ms: null, p99Ms: null, maxMs: null };
+    expect(summary.serverPopulations).toEqual([
+      {
+        label: "mesh_obligations",
+        method: "GET",
+        finishedSuccess: { count: 2, p50Ms: 10, p95Ms: 30, p99Ms: 30, maxMs: 30 },
+        finishedFailure: { count: 1, p50Ms: 900, p95Ms: 900, p99Ms: 900, maxMs: 900 },
+        closedBeforeFinish: { count: 1, p50Ms: 4000, p95Ms: 4000, p99Ms: 4000, maxMs: 4000 },
+      },
+      {
+        label: "mesh_obligations",
+        method: "HEAD",
+        finishedSuccess: { count: 1, p50Ms: 3, p95Ms: 3, p99Ms: 3, maxMs: 3 },
+        finishedFailure: empty,
+        closedBeforeFinish: empty,
+      },
+      {
+        label: "mesh_obligations",
+        method: "OPTIONS",
+        finishedSuccess: { count: 1, p50Ms: 1, p95Ms: 1, p99Ms: 1, maxMs: 1 },
+        finishedFailure: empty,
+        closedBeforeFinish: empty,
+      },
+    ]);
+    // The pre-#990 per-label group is unchanged: every method and status together.
+    expect(summary.groups).toEqual([
+      expect.objectContaining({ source: "server", label: "mesh_obligations", count: 6 }),
+    ]);
+  });
+
+  it("reports pre-#990 rows as an unknown method with unknown closes (#990)", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    const legacy = {
+      v: 1,
+      source: "server",
+      label: "mesh_threads",
+      requestId: randomUUID(),
+      durationMs: 12,
+      status: 200,
+      bytes: 1,
+      outcome: null,
+    };
+    events.record({
+      kind: DASHBOARD_TIMING_EVENT_KIND,
+      actorId: null,
+      detail: "synthetic",
+      payload: JSON.stringify(legacy),
+    });
+    events.record({
+      kind: DASHBOARD_TIMING_EVENT_KIND,
+      actorId: null,
+      detail: "synthetic",
+      payload: JSON.stringify({ ...legacy, status: 503, durationMs: 40 }),
+    });
+    recorder.recordServer({
+      label: "mesh_threads",
+      durationMs: 8,
+      status: 200,
+      bytes: 1,
+      request: { method: "GET", terminal: "finished" },
+    });
+    while (timingRows().length < 3) recorder.flush();
+
+    const summary = recorder.summary({ since: new Date(Date.now() - 60_000) });
+    expect(summary.serverPopulations).toEqual([
+      expect.objectContaining({
+        method: "GET",
+        finishedSuccess: expect.objectContaining({ count: 1, maxMs: 8 }),
+        closedBeforeFinish: expect.objectContaining({ count: 0 }),
+      }),
+      expect.objectContaining({
+        method: "unknown",
+        finishedSuccess: expect.objectContaining({ count: 1, maxMs: 12 }),
+        finishedFailure: expect.objectContaining({ count: 1, maxMs: 40 }),
+        closedBeforeFinish: null,
+      }),
+    ]);
+  });
+
+  it("accepts method and terminal only on v2 server request rows (#990)", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    const v2 = {
+      v: 2,
+      source: "server",
+      label: "mesh_threads",
+      method: "GET",
+      terminal: "finished",
+      requestId: randomUUID(),
+      durationMs: 10,
+      status: 200,
+      bytes: 1,
+      outcome: null,
+    };
+    const { method: _method, terminal: _terminal, ...withoutRequest } = v2;
+    const invalid = [
+      { ...withoutRequest },
+      { ...v2, method: undefined },
+      { ...v2, terminal: undefined },
+      { ...v2, method: "PROPFIND" },
+      { ...v2, terminal: "timeout" },
+      { ...v2, v: 1 },
+      { ...withoutRequest, v: 1, method: "GET" },
+      { ...v2, label: "mesh_stream_open" },
+      { ...v2, v: 3 },
+      {
+        ...withoutRequest,
+        source: "client",
+        label: "initial_load",
+        requestId: undefined,
+        requestIds: [],
+        status: null,
+        bytes: null,
+        outcome: "success",
+        method: "GET",
+        terminal: "finished",
+      },
+    ];
+    for (const payload of [...invalid, v2]) {
+      events.record({
+        kind: DASHBOARD_TIMING_EVENT_KIND,
+        actorId: null,
+        detail: "synthetic",
+        payload: JSON.stringify(payload),
+      });
+    }
+
+    const summary = recorder.summary({ since: new Date(Date.now() - 60_000) });
+    expect(summary.sampleCount).toBe(1);
+    expect(summary.window).toMatchObject({
+      recordsRead: invalid.length + 1,
+      unreadableRecords: invalid.length,
+    });
+    expect(summary.serverPopulations).toEqual([
+      expect.objectContaining({
+        label: "mesh_threads",
+        method: "GET",
+        finishedSuccess: expect.objectContaining({ count: 1 }),
+      }),
+    ]);
+  });
+
+  it("says when the read cap or retention, not the request, bounded the window (#990)", () => {
+    const now = new Date("2026-10-05T12:00:00.000Z");
+    const recorder = new DashboardTimingRecorder(events, () => now);
+    const insert = db.prepare(
+      "INSERT INTO mesh_events (id, ts, kind, payload) VALUES (?, ?, ?, ?)"
+    );
+    const payload = JSON.stringify({
+      v: 2,
+      source: "server",
+      label: "mesh_threads",
+      method: "GET",
+      terminal: "finished",
+      durationMs: 1,
+      status: 200,
+      bytes: 1,
+      outcome: null,
+    });
+    const tsAt = (index: number) => new Date(now.getTime() - (index + 1) * 1000).toISOString();
+    db.transaction(() => {
+      for (let index = 0; index < DASHBOARD_TIMING_MAX_RECORDS - 1; index += 1) {
+        insert.run(randomUUID(), tsAt(index), DASHBOARD_TIMING_EVENT_KIND, payload);
+      }
+    })();
+    const day = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    expect(recorder.summary({ since: day }).window).toEqual({
+      requestedSince: day.toISOString(),
+      oldestRecordAt: tsAt(DASHBOARD_TIMING_MAX_RECORDS - 2),
+      newestRecordAt: tsAt(0),
+      recordsRead: DASHBOARD_TIMING_MAX_RECORDS - 1,
+      readCap: DASHBOARD_TIMING_MAX_RECORDS,
+      capReached: false,
+      retentionMs: 7 * 24 * 60 * 60 * 1000,
+      retentionLimited: false,
+      unreadableRecords: 0,
+    });
+
+    // Two older in-window rows: the newest-first read stops at the cap.
+    insert.run(
+      randomUUID(),
+      tsAt(DASHBOARD_TIMING_MAX_RECORDS - 1),
+      DASHBOARD_TIMING_EVENT_KIND,
+      payload
+    );
+    insert.run(
+      randomUUID(),
+      tsAt(DASHBOARD_TIMING_MAX_RECORDS),
+      DASHBOARD_TIMING_EVENT_KIND,
+      payload
+    );
+    const capped = recorder.summary({ since: day });
+    expect(capped.window).toMatchObject({
+      oldestRecordAt: tsAt(DASHBOARD_TIMING_MAX_RECORDS - 1),
+      recordsRead: DASHBOARD_TIMING_MAX_RECORDS,
+      capReached: true,
+    });
+    expect(capped.sampleCount).toBe(DASHBOARD_TIMING_MAX_RECORDS);
+
+    const eightDays = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000);
+    expect(recorder.summary({ since: eightDays }).window.retentionLimited).toBe(true);
   });
 
   it("drops excess post-response observations instead of growing its queue", () => {
