@@ -159,6 +159,53 @@ export function parseConversationId(log: string): string | undefined {
   return log.match(/conversation=([0-9a-f-]{36})/i)?.[1];
 }
 
+// Only the head of the run log is scanned: the launch-time auth outcome is logged
+// within agy's first few hundred lines, and the scan must stay cheap on long runs.
+const AUTH_OUTCOME_SCAN_CHARS = 256 * 1024;
+
+const AUTH_OUTCOME_LINES = {
+  // Taken from the agy 1.3.1/1.3.2 binary's string table; not yet seen in a run log.
+  // The other three lines have been seen in real per-run logs.
+  failed: "Print mode: silent auth failed",
+  succeeded: "Print mode: silent auth succeeded",
+  attempted: "Print mode: not authenticated, trying silent auth",
+  notLoggedIn: "You are not logged into Antigravity",
+} as const;
+
+/**
+ * Summarize agy's sign-in outcome from a failed run's own `--log-file` as one
+ * fixed status line, for diagnosing launch failures after the fact (#971). The
+ * startup "not logged into Antigravity" line also appears in healthy runs that
+ * then sign in silently, so it is reported, never acted on. Only fixed text
+ * leaves this function: no raw log lines, URLs, identifiers or tokens.
+ */
+export function describeAgyAuthOutcome(
+  log: string | { readErrorCode: string } | undefined
+): string {
+  const prefix = "[agy run log: ";
+  if (typeof log !== "string") {
+    // Only ENOENT from the read itself means agy never wrote the log.
+    return log?.readErrorCode === "ENOENT"
+      ? `${prefix}no run log written]`
+      : `${prefix}unreadable]`;
+  }
+  const head = log.slice(0, AUTH_OUTCOME_SCAN_CHARS);
+  const failedAt = head.lastIndexOf(AUTH_OUTCOME_LINES.failed);
+  const succeededAt = head.lastIndexOf(AUTH_OUTCOME_LINES.succeeded);
+  const outcomeAt = Math.max(failedAt, succeededAt);
+  // A later attempt supersedes an earlier outcome: report the attempt, not the stale outcome.
+  if (head.lastIndexOf(AUTH_OUTCOME_LINES.attempted) > outcomeAt) {
+    return `${prefix}silent sign-in started, no outcome logged]`;
+  }
+  if (outcomeAt >= 0) {
+    return `${prefix}silent sign-in ${failedAt > succeededAt ? "failed" : "succeeded"}]`;
+  }
+  if (head.includes(AUTH_OUTCOME_LINES.notLoggedIn)) {
+    return `${prefix}not signed in at startup, no silent sign-in logged]`;
+  }
+  return `${prefix}no sign-in status logged]`;
+}
+
 export interface AntigravityQuotaRefusal {
   reason: "QUOTA_EXHAUSTED";
   retryDelay?: string;
@@ -664,14 +711,16 @@ export class AntigravityProvider implements CodingProvider {
       }
     };
 
+    let runLog: string | { readErrorCode: string } | undefined;
     const captureSessionFromLog = (): string | undefined => {
       let sessionId = capturedSessionId ?? opts.session?.id;
       if (logFile) {
         // The id is logged at run start, so capture it regardless of exit code.
         try {
-          sessionId = parseConversationId(readFileSync(logFile, "utf8")) ?? sessionId;
-        } catch {
-          /* log unreadable */
+          runLog = readFileSync(logFile, "utf8");
+          sessionId = parseConversationId(runLog) ?? sessionId;
+        } catch (error) {
+          runLog = { readErrorCode: (error as NodeJS.ErrnoException).code ?? "UNKNOWN" };
         }
         try {
           unlinkSync(logFile);
@@ -770,6 +819,9 @@ export class AntigravityProvider implements CodingProvider {
           output: effectiveOutput,
           exitCode,
           sessionId,
+          ...(exitCode !== 0 && logFile
+            ? { signInDiagnostic: describeAgyAuthOutcome(runLog) }
+            : {}),
         });
       },
       buildSpawnErrorResult: (err) =>

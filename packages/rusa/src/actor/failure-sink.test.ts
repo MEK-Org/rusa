@@ -393,6 +393,36 @@ describe("routeRunFailure", () => {
       expect(body).toContain("connect ETIMEDOUT");
     });
 
+    it("renders a provider sign-in diagnostic after the clipped cause, never into the classified output", async () => {
+      const classified: RunResult[] = [];
+      const { deps, toParent } = makeDeps(
+        { w1: { id: "w1", parentId: "root" } },
+        {
+          classify: async (result) => {
+            classified.push(structuredClone(result));
+            return { exhausted: false };
+          },
+        }
+      );
+      const cause = `${"x".repeat(900)}\nError: --effort is not supported for model`;
+      const result: RunResult = {
+        success: false,
+        output: cause,
+        exitCode: 1,
+        signInDiagnostic: "[agy run log: silent sign-in failed]",
+      };
+      await routeRunFailure(deps, "w1", result, "antigravity");
+
+      expect(classified[0]?.output).toBe(cause);
+      const body = toParent[0]?.body ?? "";
+      // The clipped cause keeps its own budget and the diagnostic follows it.
+      expect(body).toBe(
+        `[run failed] provider run antigravity failed.\n\n(exit 1)\n\n${clipFailureDiagnostic(cause)}\n` +
+          "[agy run log: silent sign-in failed]"
+      );
+      expect(body).toContain("Error: --effort is not supported for model\n[agy run log:");
+    });
+
     it("labels a provider run failure when no classifier is configured", async () => {
       const { deps, toParent } = makeDeps({ w1: { id: "w1", parentId: "root" } });
       await routeRunFailure(deps, "w1", FAIL, "claude/claude-sonnet-5");
