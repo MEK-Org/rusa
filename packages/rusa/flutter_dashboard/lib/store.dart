@@ -797,8 +797,9 @@ class DashboardStore {
     );
   }
 
-  /// The server's queue may have moved: drop the persisted capture and, once
-  /// this viewer has a queue to keep current, refresh it behind the rows.
+  /// The server's queue may have moved: drop the persisted capture and, while
+  /// Overview shows this viewer's queue, refresh it behind the rows. Off
+  /// screen the next mount refreshes, so nobody pays for a view not shown.
   /// [dropInFlight] is for the viewer's own mutations, whose pre-mutation
   /// response would briefly undo what they just did; obligation events let
   /// it land so a busy mesh cannot starve the queue of updates.
@@ -812,7 +813,11 @@ class DashboardStore {
         principalId: principal,
       );
     }
-    if (_overviewQueue.isClosed || _overviewQueue.value.queue == null) return;
+    if (_overviewQueue.isClosed ||
+        !_overviewQueue.hasListener ||
+        _overviewQueue.value.queue == null) {
+      return;
+    }
     unawaited(refreshOverviewQueue());
   }
 
@@ -823,6 +828,13 @@ class DashboardStore {
     if (queue == null) return false;
     return ids.isEmpty || ids.any(queue.mentions);
   }
+
+  /// Whether a status change can move the queue: it touches a row the queue
+  /// shows, or puts an obligation into a queue section. Status events carry
+  /// no owner, so one entering this viewer's queue looks like any other.
+  bool _overviewQueueMovedBy(Map<String, String> statuses) =>
+      _overviewQueueTouchedBy(statuses.keys.toSet()) ||
+      statuses.values.any(const {'ready', 'waiting', 'scheduled'}.contains);
 
   /// Persists [trees] as the new last-known successful obligations snapshot (#505).
   void saveObligationsSnapshot(List<ObligationTreeDto> trees) {
@@ -1759,7 +1771,7 @@ class DashboardStore {
         !_obligationRefreshes.isClosed) {
       final statuses = _statusChanges(e.payload);
       invalidateObligationsCache();
-      if (_overviewQueueTouchedBy(statuses.keys.toSet())) {
+      if (_overviewQueueMovedBy(statuses)) {
         _overviewQueueOutdated(dropInFlight: false);
       }
       statuses.keys.forEach(_obligationLookups.remove);

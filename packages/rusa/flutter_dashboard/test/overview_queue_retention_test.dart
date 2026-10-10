@@ -227,6 +227,29 @@ void main() {
     });
   });
 
+  testWidgets('a failed refresh over an empty queue shows the error alone', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi(base: Uri.parse(_scope));
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      addTearDown(store.dispose);
+      await tester.pumpWidget(_overview(store));
+      await tester.pump();
+      await tester.pump();
+      expect(find.text('No obligations in your queue.'), findsOneWidget);
+
+      api.obligationQueuePagesError = StateError('offline');
+      await tester.tap(find.byTooltip('Refresh Queue'));
+      await Future<void>.delayed(Duration.zero);
+      await tester.pump();
+      expect(find.textContaining('Queue unavailable:'), findsOneWidget);
+      expect(find.text('Retry'), findsOneWidget);
+      expect(find.text('No obligations in your queue.'), findsNothing);
+    });
+  });
+
   testWidgets('a cold failure still shows the existing error and retry', (
     tester,
   ) async {
@@ -458,7 +481,7 @@ void main() {
     );
 
     test(
-      'an event for a queued obligation refreshes; an unrelated one does not',
+      'while Overview listens, an event that can move the queue refreshes it',
       () async {
         final cache = FakeObligationsCache();
         final api = _populatedApi();
@@ -471,18 +494,34 @@ void main() {
         await store.init();
         await store.refreshOverviewQueue();
         final baseline = api.fetchObligationsCalls.length;
+        var events = 0;
+        void emit(String kind, {String? detail, String? payload}) =>
+            stream.meshCtrl.add(
+              makeEvent(
+                'e-${events++}',
+                kind,
+                actor: 'worker-1',
+                detail: detail,
+                payload: payload,
+              ),
+            );
 
-        stream.meshCtrl.add(
-          makeEvent(
-            'e-unrelated',
-            'obligation_checkpoint_set',
-            actor: 'worker-1',
-            detail: 'someone-elses',
-          ),
+        // Off screen the capture is dropped and the next mount refreshes.
+        emit('obligation_checkpoint_set', detail: 'ob-ready');
+        await pumpEventQueue();
+        expect(api.fetchObligationsCalls.length, baseline);
+        expect(cache.overviewInvalidateCount, 1);
+
+        final sub = store.overviewQueue.listen((_) {});
+        addTearDown(sub.cancel);
+        emit('obligation_checkpoint_set', detail: 'someone-elses');
+        emit(
+          'obligation_status_changed',
+          payload: '{"changes":[{"id":"someone-elses","status":"done"}]}',
         );
         await pumpEventQueue();
         expect(api.fetchObligationsCalls.length, baseline);
-        expect(cache.overviewInvalidateCount, 0);
+        expect(cache.overviewInvalidateCount, 1);
 
         api.obligationsResult = [
           for (final o in api.obligationsResult)
@@ -496,32 +535,30 @@ void main() {
             else
               o,
         ];
-        stream.meshCtrl.add(
-          makeEvent(
-            'e-queued',
-            'obligation_checkpoint_set',
-            actor: 'worker-1',
-            detail: 'ob-ready',
-          ),
-        );
+        emit('obligation_checkpoint_set', detail: 'ob-ready');
         await pumpEventQueue();
         expect(api.fetchObligationsCalls.length, baseline + 3);
-        expect(cache.overviewInvalidateCount, 1);
         expect(
           store.overviewQueue.value.queue!.ready.single.checkpoint,
           'Now halfway',
         );
 
-        stream.meshCtrl.add(
-          makeEvent(
-            'e-status',
-            'obligation_status_changed',
-            actor: 'worker-1',
-            payload: '{"changes":[{"id":"ob-blocker","status":"done"}]}',
+        // An obligation entering the queue is not among the rows shown.
+        api.obligationsResult = [
+          ...api.obligationsResult,
+          makeObligation(
+            'ob-new',
+            ownerId: testUserPrincipalId,
+            intent: 'Newly ready',
           ),
+        ];
+        emit(
+          'obligation_status_changed',
+          payload: '{"changes":[{"id":"ob-new","status":"ready"}]}',
         );
         await pumpEventQueue();
         expect(api.fetchObligationsCalls.length, baseline + 6);
+        expect(_readyIntents(store), ['Ready decision', 'Newly ready']);
         await store.dispose();
       },
     );

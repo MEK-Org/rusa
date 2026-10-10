@@ -346,7 +346,13 @@ class _OverviewTabState extends State<OverviewTab> {
                       padding: EdgeInsets.symmetric(vertical: 20),
                       child: Center(child: CircularProgressIndicator()),
                     )
-                  else if (queue == null)
+                  // An empty queue kept through a failed refresh would claim
+                  // the queue is empty when the refresh could not say.
+                  else if (queue == null ||
+                      (error != null &&
+                          ready.isEmpty &&
+                          waiting.isEmpty &&
+                          scheduled.isEmpty))
                     _queueError(error, isNarrow: isNarrow)
                   else if (ready.isEmpty &&
                       waiting.isEmpty &&
