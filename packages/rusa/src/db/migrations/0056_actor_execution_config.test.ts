@@ -1,4 +1,4 @@
-import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -274,6 +274,7 @@ describe("0056_actor_execution_config", () => {
     runMigrations(original, { throughId: PRIOR });
     seedLegacy(original);
     original.close();
+    const originalBytes = readFileSync(file);
     const copy = join(directory, "mesh-copy.db");
     copyFileSync(file, copy);
 
@@ -281,6 +282,7 @@ describe("0056_actor_execution_config", () => {
     rehearsal.pragma("foreign_keys = ON");
     runMigrations(rehearsal);
     rehearsal.close();
+    expect(readFileSync(file).equals(originalBytes), "original database unchanged").toBe(true);
 
     // Reopen as a fresh process would and read through the repository.
     const reopened = new Database(copy);

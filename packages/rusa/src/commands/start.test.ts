@@ -235,6 +235,7 @@ import {
   type RunStartE2EHandles,
   type RunStartOptions,
   reactToQueuedInboxEntries,
+  rootExecutionIntent,
   runStart,
   shouldAppendServiceBootWake,
   shouldBindDashboardServer,
@@ -7273,6 +7274,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
       true
     );
     expect(booted.actors.get("root")?.executionConfig).toBeUndefined();
+    // runStart cannot boot a non-e2e root here, so the production pairing is
+    // asserted on the helper the composition reads both values from.
+    const productionRoot = rootExecutionIntent({ e2eMode: false });
+    expect(productionRoot.executionConfig).toEqual({ unsandboxed: true });
+    expect(productionRoot.sandbox, "production root sandbox parity").toBe(
+      expectedWorkerSandbox(productionRoot.executionConfig.unsandboxed ?? false)
+    );
     // The backfilled worker and the newly created one are sandboxed by default:
     expect(booted.actors.get("lead")?.executionConfig).toBeUndefined();
     expect(booted.actors.get(spawned)?.executionConfig).toBeUndefined();

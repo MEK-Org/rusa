@@ -750,6 +750,22 @@ export function shouldAppendServiceBootWake(params: { e2eMode: boolean }): boole
   return !params.e2eMode;
 }
 
+/**
+ * The configured root actor runs unsandboxed by default (#465, #550). The e2e
+ * harness has always sandboxed its root independently of deployment mode; retain
+ * that harness-only exception, including container-boundary mode. Its record
+ * states the same requested builder intent, not an isolation/authorization claim.
+ * Both values derive from one flag, so stored intent and builder option agree.
+ */
+export function rootExecutionIntent(params: { e2eMode: boolean }): {
+  sandbox: boolean;
+  executionConfig: ExecutionConfig;
+} {
+  return params.e2eMode
+    ? { sandbox: true, executionConfig: {} }
+    : { sandbox: false, executionConfig: { unsandboxed: true } };
+}
+
 export function shouldBindDashboardServer(params: {
   e2eMode: boolean;
   e2eDashboard: boolean;
@@ -3358,9 +3374,14 @@ async function composeStart(
         mkdirSync(cwd, { recursive: true });
 
         // Workers request managed sandboxed execution by default (#465, #550).
-        // The deployment mapping is:
+        // Workers run untrusted code: a fresh tmpfs /tmp stops one actor reading
+        // another's MCP-config endpoint token from shared /tmp (identity harvest),
+        // and the read-only `/` bind stops tampering with ~/.rusa runtime state,
+        // including mesh.db. The deployment mapping is:
         //   ActorOptions.sandbox = (!unsandboxed && config.sandbox !== "container-boundary")
-        // The flag selects inner sandboxing; container-boundary mode relies on its deployment boundary.
+        // The flag selects inner sandboxing; container-boundary mode relies on its
+        // deployment boundary. The Actor derives the sandbox (rooted at cwd, git+gh);
+        // each provider mounts its own auth dir rw (see providerWritableStateDirs).
         const sandbox = config.sandbox !== "container-boundary";
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
@@ -3810,12 +3831,9 @@ async function composeStart(
   const rootComputerUseAdmission = createComputerUseAdmission(() =>
     mesh.hasActiveCapability(rootId, COMPUTER_USE_CAPABILITY)
   );
-  // The configured root actor runs unsandboxed by default (#465, #550). The e2e
-  // harness has always sandboxed its root independently of deployment mode; retain
-  // that harness-only exception, including container-boundary mode. Its record
-  // states the same requested builder intent, not an isolation/authorization claim.
-  const rootSandboxed = Boolean(opts?.e2e);
-  const rootExecutionConfig: ExecutionConfig = rootSandboxed ? {} : { unsandboxed: true };
+  const { sandbox: rootSandboxed, executionConfig: rootExecutionConfig } = rootExecutionIntent({
+    e2eMode: Boolean(opts?.e2e),
+  });
   const rootActorOptions: ActorOptions = {
     id: rootId,
     cwd: rootAgentDir,

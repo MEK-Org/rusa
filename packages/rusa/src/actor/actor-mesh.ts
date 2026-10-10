@@ -3218,7 +3218,8 @@ export class ActorMesh {
   /**
    * Whether `actorId` currently holds `capability` as an active grant (#549).
    * This is the only source of administrative authority: a parentless record
-   * and the literal `root` address confer nothing on their own. Fail-closed — an unknown or unaddressed actor holds nothing.
+   * and the literal `root` address confer nothing on their own. Fail-closed —
+   * an unknown or unaddressed actor holds nothing.
    */
   hasActiveCapability(actorId: string | undefined, capability: string): boolean {
     if (!actorId) return false;

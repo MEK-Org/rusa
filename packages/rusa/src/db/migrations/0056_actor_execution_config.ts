@@ -9,8 +9,9 @@ import type { Migration } from "./types.js";
  *
  * Actors are sandboxed by default; `unsandboxed: true` records a request to
  * run outside managed sandboxing, independently of where the actor sits in the
- * tree. It is neither an authorization grant nor proof of effective isolation. `executionTarget` is the follower a remotely placed
- * actor runs on; absent, the actor runs on the leader.
+ * tree. It is neither an authorization grant nor proof of effective isolation.
+ * `executionTarget` is the follower a remotely placed actor runs on; absent,
+ * the actor runs on the leader.
  *
  * Per the database JSON policy the column carries no CHECK or json_* validator.
  * SqliteActorRepository enforces the shape by its version, refuses a write
