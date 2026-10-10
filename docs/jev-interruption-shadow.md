@@ -1,8 +1,11 @@
 # JEV responsive-interruption shadow mode
 
-This optional, host-owned policy observes whether a newly arrived responsive
-inbox item would interrupt an actor's current work. It is shadow-only: normal
-responsive preemption and hard cancellation controls remain authoritative.
+This optional, host-owned policy judges whether a newly arrived responsive
+inbox item should interrupt an actor's current work. By default it only
+observes (shadow mode): normal responsive preemption and hard cancellation
+controls remain authoritative. A host can opt into [active mode](#active-mode),
+where a "queue" decision may hold a narrow class of arrivals until the
+actor's follow-up turn.
 
 ## Enable
 
@@ -41,10 +44,11 @@ Each decision is bounded: at most 20 candidates are read and sent (the number
 left out is sent as `omittedCandidates`), and each entry's text is cut at 4,000
 characters. Both numbers, the 0.5 interrupt-probability threshold, and the 5-second
 decision deadline are uncalibrated placeholders that the shadow data is meant
-to calibrate. The deadline covers source reads and the request: expiry cancels
-the request, but a source read in progress runs to completion unobserved,
-because the source clients take no cancellation signal. Nothing is sent after
-expiry.
+to calibrate. The deadline covers source reads and the request, and it stops
+waiting rather than cancelling: nothing is sent after expiry, but a request
+already sent is bounded only by the SDK's own timeout (#813), and a source read
+in progress runs to completion unobserved, because the source clients take no
+cancellation signal.
 
 The client uses the official `@typesafe-ai/sdk`, pinned to an exact version,
 and follows the [TypeSafe System One API](https://docs.typesafe.ai/api). It
@@ -78,14 +82,63 @@ null text. A GitHub comment or review event without a usable id counts as
 unreadable rather than falling back to the issue or PR body. If the arriving
 item's own text cannot be read, the observation is
 recorded as `input_unavailable` and nothing is sent. If transport, response
-parsing, or the timeout fails, that observation safely queues and posts no
-prediction reaction. No
-retry is attempted, because a retry would resend inbox text. The existing
-responsive scheduler still runs exactly as before in every case.
+parsing, or the timeout fails, that observation records `outcome: "interrupt"`
+with the corresponding fallback reason (`timeout`, `client_error`, `invalid_probability`)
+and posts no prediction reaction. No retry is attempted, because a retry would
+resend inbox text. The baseline interruption stands.
+
+## Active mode
+
+By default, JEV runs in shadow mode (`jevMode: shadow`), observing arrivals without
+altering scheduler dispatch. Setting `jevMode: active` enables active interruption
+suppression:
+
+```yaml
+jevApiKeyFile: your-jev-credential-file
+jevMode: active
+```
+
+### Active queue policy behavior
+
+- **Eligibility:** Active JEV is called *only* when an otherwise-interrupting
+  responsive arrival reaches an actor that is actively running and currently
+  holds a live, unhandled selection (`inbox.select`) in that run.
+- **Immediate baseline interrupt (no JEV call):** If the actor is idle or queued,
+  if the actor has no selected work (empty selection or pending-only), or if all
+  selected entries have already been marked handled, JEV is not evaluated and
+  the baseline interrupt proceeds immediately.
+- **Hard operator controls:** `operator.run_now` and direct `interrupt` (Stop)
+  are hard control paths that bypass JEV evaluation and immediately preempt.
+  In a concurrent batch of arriving rows, any interrupting row wins.
+- **Threshold & suppression:** A timely valid decision strictly below the 0.5
+  threshold (`outcome: "queue"`, `reason: "below_threshold"`) suppresses
+  preemption of the active turn. The arrival remains durable in the inbox and
+  is scheduled as a responsive follow-up when the current turn finishes.
+- **Invalidation:** Suppression is tied to the originating run and its
+  selection. Any new selection (including re-selecting the same entries) drops
+  the held arrivals; the run is then preempted only if one of them is still
+  unhandled and not part of the new selection, so a held arrival the actor has
+  already handled or taken on causes no cancellation. Marking the last
+  unhandled selected entry handled does not preempt an arrival already judged
+  able to wait: it keeps waiting for the follow-up turn, so the run can finish
+  its tail steps. An arrival whose decision is still pending at that point has
+  nothing left to be weighed against and falls back to the baseline interrupt.
+  A run that ends, is abandoned, or is stopped drops the held arrivals without
+  preemption; Stop stays authoritative. A preemption keeps the arrival's
+  replacement run, on a local actor and a follower alike, so the arrival is
+  picked up by the next turn.
+- **Failures & deadlines:** Timeouts (5-second decision deadline), transport
+  errors, or unreadable inputs preserve baseline preemption. The deadline stops
+  waiting; it does not cancel a request already sent, which stays bounded by the
+  SDK's own timeout. A decision that resolves after its run or selection has
+  changed is ignored, and its audit row records `applied: false`. Chat
+  reactions remain the classifier's prediction in either case; the audit row is
+  the record of what the scheduler did.
 
 ## Roll back
 
-Remove `jevApiKeyFile` from `config.yaml` and restart `rusa`. This removes the
-observer and its chat reactions; it does not require a database or schema
-migration, and it leaves the normal scheduler unchanged. The credential file
-may be removed separately once the service has restarted without the setting.
+- To revert from active mode to shadow observation: change `jevMode: shadow` (or
+  remove `jevMode`) and restart `rusa`.
+- To disable JEV entirely: remove `jevApiKeyFile` from `config.yaml` and restart
+  `rusa`. This removes the classifier and its chat reactions; it does not require
+  a database or schema migration. The credential file may be removed separately.

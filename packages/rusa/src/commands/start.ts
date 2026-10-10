@@ -1622,6 +1622,8 @@ async function composeStart(
               }
             : {}),
         });
+  // The active queue policy only runs with a JEV classifier in active mode.
+  const activeQueuePolicy = config.jevMode === "active" && responsiveInterruption !== undefined;
 
   const mcpHttp = new McpHttpServer({ servers, logger: log });
   await mcpHttp.start();
@@ -2987,6 +2989,7 @@ async function composeStart(
     onInboxEntriesSeen: (_actorId, entries) =>
       reactToQueuedInboxEntries(issueClient, entries, console.warn, chatClient ?? undefined),
     responsiveInterruption,
+    responsiveInterruptionMode: config.jevMode ?? "shadow",
     ...(responsiveInterruption && chatClient
       ? {
           reactToChatMessage: (messageName: string, emoji: string) =>
@@ -3432,6 +3435,7 @@ async function composeStart(
                   handles,
                   understandingMountEnabled,
                   gitIdentity: meshGitIdentity,
+                  activeQueuePolicy,
                 },
                 injection?.priorContext
               ),
@@ -3848,7 +3852,8 @@ async function composeStart(
           rootActor.charter,
           injection?.priorContext,
           rootHandle,
-          meshGitIdentity
+          meshGitIdentity,
+          activeQueuePolicy
         ),
         injectRecord: injection?.injectRecord,
       };
