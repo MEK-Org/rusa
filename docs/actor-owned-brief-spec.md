@@ -168,11 +168,15 @@ When a parent or root architect communicates design boundaries, intentional excl
 
 ---
 
-## 7. Storage Architecture & Obligation History Alignment
+## 7. Storage Architecture & Single Authoritative History Model
 
-Following operator selection (`gchat:.../suAqm9IGozs.suAqm9IGozs`, Matt Option B) and parent steward guidance (`mesh:messages/5724cbab-042d-4f1e-af0f-37cb47b2aa2c`), brief revision storage is designed to align with Rusa's existing `obligation_history` architecture (`0045_obligation_history`).
+Following operator selection (`gchat:.../suAqm9IGozs.suAqm9IGozs`, Matt Option B) and parent steward guidance (`mesh:messages/5724cbab-042d-4f1e-af0f-37cb47b2aa2c`, `mesh:messages/bc2d762d-5c7d-4f8f-b650-0e052d02d969`), brief revision history is architected around a **single authoritative history model** aligned with Rusa's existing `obligation_history` architecture (`0045_obligation_history`).
 
-### 7.1 Proposed Schema: `portable_brief_history` Table
+There is strictly **one** authoritative history store in any deployment phase—never dual authority or synchronization splits:
+- **Target Production Model:** `portable_brief_history` table is the sole authoritative history store. Active snapshot `state.brief` retains only current state; the "latest 10" UI view is a query against the history table.
+- **Experimental / Staging PR Model:** To avoid premature SQLite schema migrations (DDL) during evaluation, an explicit zero-DDL choice stores the single authoritative history inside `portable_context_snapshots.snapshot.brief.revisions` as a ring buffer (capped at 10). Upon migrating to dedicated DDL, this buffer is superseded by `portable_brief_history`.
+
+### 7.1 Target Production Schema: `portable_brief_history` Table
 When migrating to dedicated SQL storage, the schema matches the proven `obligation_history` pattern:
 
 ```sql
@@ -192,6 +196,7 @@ CREATE INDEX IF NOT EXISTS idx_portable_brief_history_actor
 - **Monotonic Integer ID:** Guarantees strict insertion ordering even for multiple mutations within the same millisecond.
 - **RESTRICT Deletion:** Audit trail cannot be deleted by cascading actor row deletion.
 - **Payload Versioning:** Validated by consuming Zod schemas in application code, avoiding rigid SQLite JSON check constraints.
+- **View-Only Latest 10:** The UI queries `SELECT * FROM portable_brief_history WHERE actor_id = ? ORDER BY id DESC LIMIT 10`. The active snapshot `state.brief` does not duplicate this buffer.
 - **Payload Structure:**
   ```json
   {
@@ -210,7 +215,7 @@ CREATE INDEX IF NOT EXISTS idx_portable_brief_history_actor
   ```
 
 ### 7.2 Zero-DDL Implementation (Staging / PR Phase)
-During active experimental evaluation, the ring buffer lives directly on `portable_context_snapshots.snapshot`:
+During active experimental evaluation in PR #961, an explicit zero-DDL choice keeps the authoritative history inside `portable_context_snapshots.snapshot.brief.revisions`:
 ```typescript
 export const portableBriefRevisionSchema = z.object({
   generation: z.number().int().nonnegative(),
@@ -228,7 +233,29 @@ export const portableBriefSchema = z.object({
   revisions: z.array(portableBriefRevisionSchema).optional(),
 });
 ```
-This zero-DDL approach allows immediate local testing, verification, and UI prototyping without database migrations, while remaining 100% compatible with upgrading to `portable_brief_history`.
+This zero-DDL approach allows immediate local testing, verification, and UI prototyping without database migrations, while remaining 100% structurally compatible with upgrading to `portable_brief_history`.
+
+### 7.3 Mutation Semantics & Lifecycle
+Brief mutations fall into three distinct categories:
+1. **Accepted Update (`brief:replace` with modified text):**
+   - Increments `generation` by 1.
+   - Updates `updatedAt` to current ISO-8601 timestamp.
+   - Records a new revision in the authoritative history (generation, timestamp, optional explanation, new text).
+2. **Reviewed-Through (`brief:reviewed` / confirmation without content modification):**
+   - Marks the brief reviewed through the current generation (`reviewedThroughGeneration`).
+   - Does **not** increment `generation` and does **not** append a revision entry to history.
+3. **No-Op Protection:**
+   - If submitted text is identical to the current active brief, the call is treated as a no-op: rejected or cleanly ignored without bumping `generation`, modifying `updatedAt`, or creating noisy history records.
+
+### 7.4 Concurrency, Validation & Integrity Rules
+- **CAS / Stale-Write Validation:**
+  Every `brief:replace` call requires `expectedGeneration`. If `expectedGeneration !== currentBrief.generation`, the write fails with a stale-write conflict (`409 Conflict`), preventing lost updates and concurrent overwrite races.
+- **Own-Actor Validation:**
+  Only the actor itself (or parent steward with explicit authority) can mutate its brief. Calls to `brief:replace` validate caller identity (`callerActorId === targetActorId`), rejecting cross-actor tampering.
+- **Explanation Optionality:**
+  The `explanation` field is optional (`string | undefined` / nullable). Actors provide concise summaries for deliberate structural refinements (e.g. "Added domain principles"), but automated initial seeds or trivial edits may omit it.
+- **Atomic Persistence & Race Protection:**
+  Active snapshot serialization and history persistence execute within a single transaction boundary, ensuring generation counters, active brief text, and history records cannot drift or expose torn states.
 
 ---
 

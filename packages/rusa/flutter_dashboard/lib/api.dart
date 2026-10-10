@@ -6,6 +6,29 @@ import 'dashboard_timing.dart';
 import 'models.dart';
 import 'session_client.dart';
 
+class BriefRevision {
+  final int generation;
+  final String updatedAt;
+  final String? explanation;
+  final String text;
+
+  const BriefRevision({
+    required this.generation,
+    required this.updatedAt,
+    this.explanation,
+    required this.text,
+  });
+
+  factory BriefRevision.fromJson(Map<String, dynamic> json) {
+    return BriefRevision(
+      generation: json['generation'] as int? ?? 0,
+      updatedAt: json['updatedAt'] as String? ?? '',
+      explanation: json['explanation'] as String?,
+      text: json['text'] as String? ?? '',
+    );
+  }
+}
+
 /// REST client for the PR2 dashboard Data API. All paths are resolved against
 /// the page origin (`Uri.base`), so the same build works on localhost and
 /// behind `tailscale serve` (relative paths, no hard-coded host).
@@ -76,16 +99,32 @@ class DashboardApi {
   ///
   /// Fetch full charter and current stored brief for the actor whose Info tab
   /// is open. The thread list continues to carry only the charter preview.
-  Future<({String charter, bool briefMode, String? brief})> fetchActorInfo(
+  Future<({
+    String charter,
+    bool briefMode,
+    String? brief,
+    int? briefGeneration,
+    String? briefUpdatedAt,
+    List<BriefRevision> briefRevisions,
+  })> fetchActorInfo(
     String threadId,
   ) async {
     final json = await _getJson(
       _u('/api/mesh/threads/charter', {'id': threadId}),
     );
+    final rawRevisions = json['briefRevisions'] as List<dynamic>? ?? const [];
+    final revisions = rawRevisions
+        .whereType<Map<String, dynamic>>()
+        .map(BriefRevision.fromJson)
+        .toList();
+
     return (
       charter: json['charter'] as String? ?? '',
       briefMode: json['briefMode'] == true,
       brief: json['brief'] as String?,
+      briefGeneration: json['briefGeneration'] as int?,
+      briefUpdatedAt: json['briefUpdatedAt'] as String?,
+      briefRevisions: revisions,
     );
   }
 

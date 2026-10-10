@@ -1930,11 +1930,18 @@ export async function handleMeshApiRequest(
       return true;
     }
     const briefMode = thread.context?.type === "portable" && thread.context.mode === "brief";
+    const brief = briefMode ? deps.portableContext?.load(thread.id).brief : null;
     sendJson(res, 200, {
       id: thread.id,
       charter: thread.charter,
       ...(briefMode
-        ? { briefMode: true, brief: deps.portableContext?.load(thread.id).brief?.text ?? null }
+        ? {
+            briefMode: true,
+            brief: brief?.text ?? null,
+            briefGeneration: brief?.generation ?? null,
+            briefUpdatedAt: brief?.updatedAt ?? null,
+            briefRevisions: brief?.revisions ?? [],
+          }
         : {}),
     });
     return true;

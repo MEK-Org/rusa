@@ -688,6 +688,67 @@ void main() {
     },
   );
 
+  testWidgets(
+    'Info displays brief generation badge and opens revision history dialog (Option B)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', created: 't0'),
+            makeThread('a', parent: 'root', created: 't1'),
+          ]
+          ..briefs['a'] = '## WHAT\nActive brief text'
+          ..briefGenerations['a'] = 2
+          ..briefUpdatedAts['a'] = '2026-10-10T13:30:00Z'
+          ..briefRevisions['a'] = [
+            const BriefRevision(
+              generation: 1,
+              updatedAt: '2026-10-10T13:00:00Z',
+              explanation: 'Initial seed',
+              text: '## WHAT\nInitial brief',
+            ),
+            const BriefRevision(
+              generation: 2,
+              updatedAt: '2026-10-10T13:30:00Z',
+              explanation: 'Consolidated domain guidelines',
+              text: '## WHAT\nActive brief text',
+            ),
+          ];
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.pumpWidget(_harness(store));
+        await tester.pump(const Duration(milliseconds: 50));
+        await tester.tap(find.text('a-handle'));
+        await tester.pump(const Duration(milliseconds: 50));
+        await tester.ensureVisible(find.text('Info'));
+        await tester.tap(find.text('Info'));
+        for (var i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+
+        expect(find.text('Brief'), findsOneWidget);
+        expect(find.text('Gen 2'), findsOneWidget);
+        expect(find.byKey(const ValueKey('brief-history-button')), findsOneWidget);
+
+        // Tap history button to open popover/dialog
+        await tester.tap(find.byKey(const ValueKey('brief-history-button')));
+        for (var i = 0; i < 5; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+
+        expect(find.text('Brief Revision History — a-handle'), findsOneWidget);
+        expect(find.text('2 revisions'), findsOneWidget);
+        expect(find.text('Gen 2'), findsWidgets);
+        expect(find.text('Gen 1'), findsOneWidget);
+        expect(find.text('Current'), findsOneWidget);
+        expect(find.text('Explanation: Consolidated domain guidelines'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
   testWidgets('the Info tab keeps the preview when the charter fetch fails', (
     tester,
   ) async {

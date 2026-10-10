@@ -3,12 +3,14 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 import 'package:rxdart/rxdart.dart';
 
+import '../api.dart' show BriefRevision;
 import '../breakpoints.dart';
 import '../dashboard_timing.dart';
 import '../iu/simple_markdown.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
+import '../util.dart' show formatTs;
 import 'actor_status_badge.dart';
 import 'avatar.dart';
 import 'events_tab.dart';
@@ -586,6 +588,9 @@ class _InfoViewState extends State<_InfoView> {
   String? _charter;
   String? _brief;
   bool _briefMode = false;
+  int? _briefGeneration;
+  String? _briefUpdatedAt;
+  List<BriefRevision> _briefRevisions = const [];
   bool _loadingInfo = false;
 
   /// The actor the charter on screen was fetched for. Set while a fetch is in
@@ -642,6 +647,9 @@ class _InfoViewState extends State<_InfoView> {
         _charter = null;
         _brief = null;
         _briefMode = false;
+        _briefGeneration = null;
+        _briefUpdatedAt = null;
+        _briefRevisions = const [];
       });
     }
     Future<void> runFetch() async {
@@ -656,6 +664,9 @@ class _InfoViewState extends State<_InfoView> {
         _charter = info.charter;
         _briefMode = info.briefMode;
         _brief = info.brief;
+        _briefGeneration = info.briefGeneration;
+        _briefUpdatedAt = info.briefUpdatedAt;
+        _briefRevisions = info.briefRevisions;
       });
     }
 
@@ -685,6 +696,47 @@ class _InfoViewState extends State<_InfoView> {
   /// Falling back to the preview rather than to empty means a failed or slow
   /// fetch degrades to less text, not to "No charter."
   String get charter => _charter ?? widget.actor.charterPreview;
+
+  void _showBriefHistory(BuildContext context) {
+    final isNarrow = MediaQuery.sizeOf(context).width < kNarrowBreakpoint;
+    final content = _BriefHistoryDialog(
+      actorHandle: widget.actor.handle,
+      currentGeneration: _briefGeneration,
+      revisions: _briefRevisions,
+      isNarrow: isNarrow,
+    );
+
+    if (isNarrow) {
+      showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: MeshColors.bgSecondary,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+        ),
+        builder: (ctx) => SizedBox(
+          height: MediaQuery.sizeOf(ctx).height * 0.9,
+          child: content,
+        ),
+      );
+    } else {
+      showDialog<void>(
+        context: context,
+        builder: (ctx) => Dialog(
+          backgroundColor: MeshColors.bgSecondary,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(10),
+            side: const BorderSide(color: MeshColors.border),
+          ),
+          child: SizedBox(
+            width: 620,
+            height: 640,
+            child: content,
+          ),
+        ),
+      );
+    }
+  }
 
   Widget _documentBox(Widget child) => Container(
     width: double.infinity,
@@ -857,13 +909,65 @@ class _InfoViewState extends State<_InfoView> {
           ],
           if (_briefMode) ...[
             const SizedBox(height: 24),
-            const Text(
-              'Brief',
-              style: TextStyle(
-                color: MeshColors.textPrimary,
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-              ),
+            Row(
+              children: [
+                const Text(
+                  'Brief',
+                  style: TextStyle(
+                    color: MeshColors.textPrimary,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                if (_briefGeneration != null && _briefGeneration! > 0) ...[
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: MeshColors.bgSecondary,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: MeshColors.border),
+                    ),
+                    child: Text(
+                      'Gen $_briefGeneration',
+                      style: const TextStyle(
+                        color: MeshColors.accent,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+                if (_briefUpdatedAt != null && _briefUpdatedAt!.isNotEmpty) ...[
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      formatTs(_briefUpdatedAt!),
+                      style: const TextStyle(
+                        color: MeshColors.textMuted,
+                        fontSize: 11,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ] else ...[
+                  const Spacer(),
+                ],
+                if (_briefRevisions.isNotEmpty) ...[
+                  const SizedBox(width: 8),
+                  IconButton(
+                    key: const ValueKey('brief-history-button'),
+                    icon: const Icon(Icons.history, size: 16),
+                    tooltip: 'Brief revision history',
+                    visualDensity: VisualDensity.compact,
+                    splashRadius: 16,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    color: MeshColors.textSecondary,
+                    onPressed: () => _showBriefHistory(context),
+                  ),
+                ],
+              ],
             ),
             const SizedBox(height: 12),
             _documentBox(
@@ -1001,3 +1105,231 @@ class _VoicePicker extends StatelessWidget {
     );
   }
 }
+
+class _BriefHistoryDialog extends StatefulWidget {
+  const _BriefHistoryDialog({
+    required this.actorHandle,
+    required this.currentGeneration,
+    required this.revisions,
+    required this.isNarrow,
+  });
+
+  final String actorHandle;
+  final int? currentGeneration;
+  final List<BriefRevision> revisions;
+  final bool isNarrow;
+
+  @override
+  State<_BriefHistoryDialog> createState() => _BriefHistoryDialogState();
+}
+
+class _BriefHistoryDialogState extends State<_BriefHistoryDialog> {
+  late final Set<int> _expandedGenerations;
+
+  @override
+  void initState() {
+    super.initState();
+    _expandedGenerations = <int>{
+      if (widget.revisions.isNotEmpty) widget.revisions.last.generation,
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final reversed = widget.revisions.reversed.toList();
+
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          decoration: const BoxDecoration(
+            border: Border(bottom: BorderSide(color: MeshColors.border)),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.history, size: 18, color: MeshColors.accent),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Brief Revision History — ${widget.actorHandle}',
+                  style: const TextStyle(
+                    color: MeshColors.textPrimary,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: MeshColors.bgTertiary,
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: MeshColors.border),
+                ),
+                child: Text(
+                  '${widget.revisions.length} revision${widget.revisions.length == 1 ? '' : 's'}',
+                  style: const TextStyle(
+                    color: MeshColors.textSecondary,
+                    fontSize: 11,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton(
+                icon: const Icon(Icons.close, size: 18),
+                color: MeshColors.textMuted,
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+                onPressed: () => Navigator.of(context).pop(),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: widget.revisions.isEmpty
+              ? const Center(
+                  child: Text(
+                    'No brief revisions recorded.',
+                    style: TextStyle(color: MeshColors.textSecondary),
+                  ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.all(16),
+                  itemCount: reversed.length,
+                  itemBuilder: (context, index) {
+                    final rev = reversed[index];
+                    final isExpanded = _expandedGenerations.contains(rev.generation);
+                    final isCurrent = rev.generation == widget.currentGeneration;
+
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      decoration: BoxDecoration(
+                        color: MeshColors.bgTertiary,
+                        border: Border.all(
+                          color: isCurrent
+                              ? MeshColors.accent.withValues(alpha: 0.5)
+                              : MeshColors.border,
+                        ),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          InkWell(
+                            borderRadius: BorderRadius.circular(8),
+                            onTap: () {
+                              setState(() {
+                                if (isExpanded) {
+                                  _expandedGenerations.remove(rev.generation);
+                                } else {
+                                  _expandedGenerations.add(rev.generation);
+                                }
+                              });
+                            },
+                            child: Padding(
+                              padding: const EdgeInsets.all(12),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 6,
+                                          vertical: 2,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: isCurrent
+                                              ? MeshColors.accent.withValues(alpha: 0.15)
+                                              : MeshColors.bgSecondary,
+                                          borderRadius: BorderRadius.circular(4),
+                                          border: Border.all(
+                                            color: isCurrent ? MeshColors.accent : MeshColors.border,
+                                          ),
+                                        ),
+                                        child: Text(
+                                          'Gen ${rev.generation}',
+                                          style: TextStyle(
+                                            color: isCurrent ? MeshColors.accent : MeshColors.textSecondary,
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      if (isCurrent) ...[
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 5,
+                                            vertical: 1.5,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0x3310B981),
+                                            borderRadius: BorderRadius.circular(4),
+                                          ),
+                                          child: const Text(
+                                            'Current',
+                                            style: TextStyle(
+                                              color: Color(0xFF10B981),
+                                              fontSize: 10,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 8),
+                                      ],
+                                      Expanded(
+                                        child: Text(
+                                          formatTs(rev.updatedAt),
+                                          style: const TextStyle(
+                                            color: MeshColors.textMuted,
+                                            fontSize: 12,
+                                          ),
+                                        ),
+                                      ),
+                                      Icon(
+                                        isExpanded ? Icons.expand_less : Icons.expand_more,
+                                        size: 18,
+                                        color: MeshColors.textMuted,
+                                      ),
+                                    ],
+                                  ),
+                                  if (rev.explanation != null && rev.explanation!.isNotEmpty) ...[
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      'Explanation: ${rev.explanation}',
+                                      style: const TextStyle(
+                                        color: MeshColors.textSecondary,
+                                        fontSize: 12,
+                                        fontStyle: FontStyle.italic,
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
+                          ),
+                          if (isExpanded) ...[
+                            const Divider(height: 1, color: MeshColors.border),
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.all(12),
+                              color: MeshColors.bgPrimary,
+                              child: SelectionArea(
+                                child: SimpleMarkdown(rev.text),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+}
+

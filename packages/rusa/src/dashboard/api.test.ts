@@ -1783,16 +1783,39 @@ describe("handleMeshApiRequest", () => {
       "## WHAT\nFixture purpose\n\n## HOW\nFixture rules\n\n## DOMAIN\nFixture knowledge";
     const load = vi.fn(() => ({
       ...emptyPortableContextState(UUID_A),
-      brief: text === null ? null : { text },
+      brief: text === null ? null : {
+        text,
+        generation: 2,
+        updatedAt: "2026-10-10T13:30:00.000Z",
+        revisions: [
+          { generation: 1, updatedAt: "2026-10-10T13:00:00.000Z", text: "## WHAT\nInit", explanation: "Seed" },
+          { generation: 2, updatedAt: "2026-10-10T13:30:00.000Z", text, explanation: "Update" },
+        ],
+      },
     }));
     deps.portableContext = { load } as unknown as DashboardDataDeps["portableContext"];
     const read = async () =>
       JSON.parse((await call(deps, "GET", `/api/mesh/threads/charter?id=${UUID_A}`)).res.body);
-    expect(await read()).toMatchObject({ briefMode: true, brief: text });
+    expect(await read()).toMatchObject({
+      briefMode: true,
+      brief: text,
+      briefGeneration: 2,
+      briefUpdatedAt: "2026-10-10T13:30:00.000Z",
+      briefRevisions: [
+        { generation: 1, updatedAt: "2026-10-10T13:00:00.000Z", text: "## WHAT\nInit", explanation: "Seed" },
+        { generation: 2, updatedAt: "2026-10-10T13:30:00.000Z", text, explanation: "Update" },
+      ],
+    });
     text = "## WHAT\nUpdated purpose";
     expect(await read()).toMatchObject({ brief: text });
     text = null;
-    expect(await read()).toMatchObject({ briefMode: true, brief: null });
+    expect(await read()).toMatchObject({
+      briefMode: true,
+      brief: null,
+      briefGeneration: null,
+      briefUpdatedAt: null,
+      briefRevisions: [],
+    });
     expect(load.mock.calls).toEqual([[UUID_A], [UUID_A], [UUID_A]]);
     actors.upsert({
       ...rec(UUID_A, null, "active"),

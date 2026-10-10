@@ -327,14 +327,27 @@ class FakeApi extends DashboardApi {
   /// so it cannot answer with less than the list already carried.
   final charters = <String, String>{};
   final briefs = <String, String?>{};
+  final briefGenerations = <String, int?>{};
+  final briefUpdatedAts = <String, String?>{};
+  final briefRevisions = <String, List<BriefRevision>>{};
 
   @override
-  Future<({String charter, bool briefMode, String? brief})> fetchActorInfo(
+  Future<({
+    String charter,
+    bool briefMode,
+    String? brief,
+    int? briefGeneration,
+    String? briefUpdatedAt,
+    List<BriefRevision> briefRevisions,
+  })> fetchActorInfo(
     String threadId,
   ) async => (
     charter: await fetchCharter(threadId),
     briefMode: briefs.containsKey(threadId),
     brief: briefs[threadId],
+    briefGeneration: briefGenerations[threadId],
+    briefUpdatedAt: briefUpdatedAts[threadId],
+    briefRevisions: briefRevisions[threadId] ?? const [],
   );
   final charterCalls = <String>[];
   Object? charterError;
