@@ -1819,6 +1819,52 @@ describe("ActorMesh", () => {
     expect(rootEntries()).toHaveLength(3);
   });
 
+  it("carries the head's latest reassignment message on ready-head attention (#947)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const reassignment = {
+      previousOwnerId: "human:operator",
+      newOwnerId: "root",
+      message: "Please answer the seat 2 thread.",
+      actingPrincipal: "human:operator",
+      timestamp: "2026-10-10T12:00:00.000Z",
+    };
+    const { mesh, tick } = setup({
+      inboxStore,
+      obligations: {
+        findLiveByExternalRef: () => null,
+        latestReassignment: (id) => {
+          if (id === "broken") throw new Error("unreadable history row");
+          return id === "reassigned" ? reassignment : null;
+        },
+      },
+    });
+    const payloadFor = (id: string) =>
+      inboxStore.entries.find((entry) => entry.source === `obligation:${id}`)?.payload;
+
+    mesh.deliverReadyHeadAttention("root", { id: "reassigned", intent: "review" }, null);
+    mesh.deliverReadyHeadAttention("root", { id: "plain", intent: "next" }, "reassigned");
+    // A history row that cannot be read costs the message, not the attention.
+    mesh.deliverReadyHeadAttention("root", { id: "broken", intent: "last" }, "plain");
+    await tick();
+
+    expect(payloadFor("reassigned")).toEqual({
+      type: "obligation.ready_head",
+      obligationId: "reassigned",
+      intent: "review",
+      latestReassignment: reassignment,
+    });
+    expect(payloadFor("plain")).toEqual({
+      type: "obligation.ready_head",
+      obligationId: "plain",
+      intent: "next",
+    });
+    expect(payloadFor("broken")).toEqual({
+      type: "obligation.ready_head",
+      obligationId: "broken",
+      intent: "last",
+    });
+  });
+
   it("does not re-wake actor when an already delivered transition sequence is repeated after being handled", async () => {
     const inboxStore = createMemoryInboxStore();
     const { mesh, fake, tick } = setup({ inboxStore });

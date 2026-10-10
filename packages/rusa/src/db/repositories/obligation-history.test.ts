@@ -435,6 +435,47 @@ describe("Obligation mutation history", () => {
     });
   });
 
+  describe("latest reassignment (#947)", () => {
+    it("returns the latest reassignment's message with its owners, principal and time", () => {
+      const ob = repository.create({ title: "Review", ownerId: TEST_USER_ID });
+      now += 1000;
+      repository.reassign(ob.id, "actor-a", TEST_USER_ID, "Please address the round-2 note.");
+
+      expect(repository.latestReassignment(ob.id)).toEqual({
+        previousOwnerId: TEST_USER_ID,
+        newOwnerId: "actor-a",
+        message: "Please address the round-2 note.",
+        actingPrincipal: TEST_USER_ID,
+        timestamp: new Date(now).toISOString(),
+      });
+    });
+
+    it("returns only the latest of two reassignments", () => {
+      const ob = repository.create({ title: "Review", ownerId: TEST_USER_ID });
+      repository.reassign(ob.id, "actor-a", TEST_USER_ID, "First pass.");
+      now += 1000;
+      repository.reassign(ob.id, "actor-b", "actor-a", "Second pass.");
+
+      expect(repository.latestReassignment(ob.id)).toMatchObject({
+        previousOwnerId: "actor-a",
+        newOwnerId: "actor-b",
+        message: "Second pass.",
+        actingPrincipal: "actor-a",
+      });
+    });
+
+    it("returns null when never reassigned, or when the latest reassignment had no message", () => {
+      const never = repository.create({ title: "Never", ownerId: "actor-a" });
+      repository.setCheckpoint(never.id, "Some progress.", "actor-a");
+      expect(repository.latestReassignment(never.id)).toBeNull();
+
+      const superseded = repository.create({ title: "Superseded", ownerId: TEST_USER_ID });
+      repository.reassign(superseded.id, "actor-a", TEST_USER_ID, "An older hand-off.");
+      repository.reassign(superseded.id, "actor-b", "actor-a");
+      expect(repository.latestReassignment(superseded.id)).toBeNull();
+    });
+  });
+
   describe("direct mutation coverage", () => {
     it("records reassign mutation with prior and new owner", () => {
       const ob = repository.create({ title: "Task", ownerId: "actor-a" });

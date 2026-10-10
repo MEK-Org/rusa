@@ -29,6 +29,7 @@ import {
   type ObligationHistoryEntry,
   type ObligationHistoryState,
   type ObligationMutationKind,
+  type ObligationReassignment,
   type ObligationStatus,
   type ObligationTree,
   ObligationValidationError,
@@ -3096,6 +3097,42 @@ export class ObligationRepository {
     // Fail-closed for the whole call, like every other reader here: one row
     // that cannot be read makes the trail throw rather than silently shorten.
     return rows.map(parseHistoryRow);
+  }
+
+  /**
+   * The obligation's latest reassignment with its message (#947), so the actor
+   * it was handed to can read why. Null when it was never reassigned, or when
+   * its latest reassignment carried no message: an earlier message described a
+   * hand-off that has since been superseded. Fail-closed like
+   * {@link listHistory}.
+   */
+  latestReassignment(id: string): ObligationReassignment | null {
+    const row = this.db
+      .prepare(
+        `SELECT id, obligation_id, mutation_kind, acting_principal, timestamp, payload
+         FROM obligation_history
+         WHERE obligation_id = ? AND mutation_kind = 'reassign'
+         ORDER BY id DESC
+         LIMIT 1`
+      )
+      .get(id);
+    if (row === undefined) return null;
+    const entry = parseHistoryRow(row);
+    const { before, after } = entry;
+    if (
+      after.message === undefined ||
+      before.ownerId === undefined ||
+      after.ownerId === undefined
+    ) {
+      return null;
+    }
+    return {
+      previousOwnerId: before.ownerId,
+      newOwnerId: after.ownerId,
+      message: after.message,
+      actingPrincipal: entry.actingPrincipal,
+      timestamp: entry.timestamp,
+    };
   }
 
   /**

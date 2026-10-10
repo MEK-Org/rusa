@@ -28,6 +28,7 @@ type ObligationServerRepository = Pick<
   | "setSnooze"
   | "attachArtifact"
   | "listArtifacts"
+  | "latestReassignment"
   | "movePriorityInternal"
   | "markResponsive"
   | "reassign"
@@ -188,7 +189,7 @@ export function createObligationsMcpServer(
     {
       title: "Get one obligation and its direct blockers",
       description:
-        "Read one obligation with its parent plus bounded, independently pageable direct-child and live-blocker projections.",
+        "Read one obligation with its parent plus bounded, independently pageable direct-child and live-blocker projections. latestReassignment, when present, is the message left with the obligation's latest reassignment saying why it moved.",
       inputSchema: {
         id: z.string().trim().min(1),
         limit: z.number().int().min(1).max(100).optional().default(DEFAULT_PAGE_LIMIT),
@@ -231,8 +232,10 @@ export function createObligationsMcpServer(
         });
         const unblocksOffset = childOffset(unblocks_cursor, "unblocks", id);
         const unblocksPage = repository.listUnblocksPage(id, { limit, offset: unblocksOffset });
+        const latestReassignment = repository.latestReassignment(id);
         return toolOk({
           obligation,
+          ...(latestReassignment ? { latestReassignment } : {}),
           artifacts: repository.listArtifacts(id),
           parent: obligation.parentId === null ? null : repository.get(obligation.parentId),
           children: {
@@ -719,7 +722,7 @@ export function createObligationsMcpServer(
           .string()
           .optional()
           .describe(
-            "Optional note saying why the obligation is moving, recorded in its history with the owner change and shown in the dashboard's History. Not delivered to the new owner: their notification is unchanged, and get_obligation does not return history."
+            "Optional note saying why the obligation is moving, recorded in its history with the owner change and shown in the dashboard's History. The new owner reads it as latestReassignment on get_obligation and on any ready-head inbox entry for the obligation; when and whether they are woken is unchanged."
           ),
       },
     },

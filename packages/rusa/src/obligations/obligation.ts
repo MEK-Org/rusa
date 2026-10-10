@@ -538,6 +538,19 @@ export interface ObligationHistoryState {
 /**
  * One immutable, attributable mutation history record (#185).
  */
+/**
+ * An obligation's latest reassignment, when that reassignment carried a
+ * message (#947): who moved it, from whom to whom, when, and why. Read from the
+ * owner-change history row the message is recorded on (#941).
+ */
+export interface ObligationReassignment {
+  previousOwnerId: string;
+  newOwnerId: string;
+  message: string;
+  actingPrincipal: EntityId;
+  timestamp: string;
+}
+
 export interface ObligationHistoryEntry {
   id: number;
   obligationId: string;
