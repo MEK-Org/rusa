@@ -28,6 +28,7 @@ import type { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { QUOTA_PROBE_TTL_MS, type QuotaFreshness } from "../quota/coordinator-protocol.js";
 import { configuredModelRefs, resolveWindowModels } from "../quota/model-window-scope.js";
 import { WHOLE_BAD_READ_CARRY_DETAIL } from "../quota/parsed-state.js";
+import { BUILT_IN_QUOTA_PARSER_WORDING, type QuotaParserWording } from "../quota/parser-wording.js";
 import {
   hasSameQuotaWindowScope,
   isModelScopedWindow,
@@ -237,9 +238,16 @@ export interface QuotaMcpDeps {
     recordParsed(
       id: string,
       rawParsed: ProviderQuotaSnapshot,
-      inferredParsed: ProviderQuotaSnapshot
+      inferredParsed: ProviderQuotaSnapshot,
+      wordingRevisionId?: string | null
     ): void;
-    recordParseError(id: string, error: unknown): void;
+    recordParseError(id: string, error: unknown, wordingRevisionId?: string | null): void;
+    /**
+     * The parser wording in effect for a provider, with the revision that
+     * identifies it (#536). Stores without wording control records omit it and
+     * every parse uses the built-in wording unattributed.
+     */
+    resolveParserWording?(provider: QuotaLlmProvider): QuotaParserWording;
   };
   /**
    * Quota coordinator client for reading quota status via GET /v1/quota without local probes
@@ -636,7 +644,8 @@ async function parseQuotaWithLlm(
   apiKey: string,
   provider: QuotaLlmProvider,
   generatedAtMs = Date.now(),
-  configuredModels: readonly ModelEntry[] = []
+  configuredModels: readonly ModelEntry[] = [],
+  onRequest?: () => void
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   const client = getGeminiClient(apiKey);
   const isAgy = provider === "agy";
@@ -678,59 +687,6 @@ async function parseQuotaWithLlm(
     };
   }
 
-  const providerClause =
-    provider === "claude"
-      ? "For Claude: it will show session/week usage windows with percentage used and reset times (e.g. 'resets in 4 hours 12 minutes' or 'resets Jul 13, 2:59am (UTC)'). " +
-        "Provider-wide session/week rows carry no `models` and alone determine status. " +
-        "Named-model rows such as 'Current Week (Fable)' are model-specific: emit them with `models` set to the configured IDs for that model from the configured model list, and never use them to determine status. " +
-        "If any provider-wide window is 100% used or the output says 'rate limit exceeded' or 'limit exceeded', " +
-        "status is 'exhausted'.\n"
-      : provider === "codex"
-        ? // A real reading has limit rows or an exhaustion banner. codex's /status
-          // also frequently renders `Limits: refresh requested; run /status again
-          // shortly` — an async-refresh PLACEHOLDER, not a reading (issue #8). The
-          // host probe now retries /status in-session on it, so a real table usually
-          // reaches the parser; when only the placeholder renders, classify it as a
-          // known pending/no-data state — unknown with windows=[] — never a number,
-          // never a parse error, and never an invented window (the placeholder names
-          // no 5h/weekly window to label, and downstream drops placeholder windows
-          // anyway, so emitting one would only force the model to guess label/kind).
-          "For Codex: a real reading contains limit rows (e.g. '5h limit:', 'Weekly limit:') " +
-          "or an explicit exhaustion message (\"You've hit your usage limit\" / 'hit your usage limit'). " +
-          "Generic top-level rows labeled only '5h limit:' or 'Weekly limit:' appearing above any model heading are provider-wide account rows: emit them with no `models`; they alone determine status. " +
-          "`GPT-5.3-Codex-Spark limit` is a heading and all rows beneath it are scoped only to the gpt-5.3-codex-spark model class: emit each row beneath this heading (such as '5h limit:' or 'Weekly limit:') with `models: [\"gpt-5.3-codex-spark\"]`, even if that model is not in the configured model list below. Never use model rows to determine provider status. Account rows above the heading remain provider scope. " +
-          "Other named-model, model-family, reserve, and special-allocation limits are model-specific: an inline label containing a model or reserve name before 'Weekly limit' (for example 'gpt-reserve Weekly limit'), or any rows beneath a standalone '<model name> limit:' heading. " +
-          "Emit each model-specific row with `models` set to the matching IDs from the configured model list, and never use model rows to determine provider status. " +
-          "Codex percentages say LEFT: copy the printed N% left as remainingPercent 'N' and leave usedPercent empty. " +
-          `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
-          "status is 'exhausted' only when that message applies to the provider-wide quota; extract provider-wide percentages and reset times (including from 'try again at <date/time>'). " +
-          'KNOWN PENDING STATE: codex\'s /status can render "Limits: refresh requested; run /status again shortly" ' +
-          '(or "run /status again") — codex\'s async-refresh placeholder, NOT a reading and NOT a parse error. ' +
-          "When that placeholder is all that renders, return status='unknown' and windows=[] — do NOT guess a number, do NOT fail the parse, and do NOT emit an invented window for it. " +
-          "Likewise, if the output contains none of the above — no limit rows, no exhaustion message, no refresh placeholder — return status='unknown' and windows=[]. " +
-          "A terminal capture can contain repeated panels, an earlier refresh placeholder, or stale warning text. When at least one fully rendered provider-wide limit panel is present, use the latest such panel and ignore placeholder/warning remnants. " +
-          "The pending-state rule applies only when no rendered provider-wide limit row or provider-wide exhaustion message appears anywhere in the capture.\n"
-        : provider === "agy"
-          ? "For agy: locate the 'GEMINI MODELS' section, which has a Weekly Limit and a " +
-            "Five Hour Limit window. " +
-            "The shared GEMINI MODELS section is provider-wide: emit its rows with no `models`; they alone determine status. " +
-            "Every other named model or model-group section is model-specific: emit its rows with `models` set to the matching IDs from the configured model list (sections matching nothing configured are omitted entirely), and never use them to determine status. " +
-            "CRITICAL — unlike Claude, agy's TUI reports quota REMAINING, not used. It can print a precise decimal percentage beside the bar and a rounded whole-number summary for the same window. Use the more precise printed percentage and ignore the apparent progress-bar length. " +
-            "Copy the printed remaining number N into remainingPercent and leave usedPercent empty " +
-            "(e.g. '0.00% remaining' or '[░░░ …] 0.00%' → remainingPercent '0.00'; '3% remaining' → remainingPercent '3'; '48% remaining' → remainingPercent '48'). " +
-            "A window showing 'Quota available' with a full (100%) bar is fully available: " +
-            "emit remainingPercent '100'. If a window says 'Disabled: You have hit your weekly limit, the 5-hour limit does not currently apply. Your weekly limit will fully refresh in <duration>', " +
-            "emit this window with remainingPercent '0' (exhausted) and extract the reset duration, or if indeterminate emit with placeholder: true. " +
-            "Emit the GEMINI MODELS Weekly Limit and Five Hour Limit at top level in `windows`, each with no `models`. " +
-            "If weekly limit is at 100% used (0% remaining), status is 'exhausted'.\n"
-          : "For Kimi: the interactive /usage panel shows Kimi Code platform quota, commonly including 5h/five-hour and weekly windows. " +
-            "Kimi can print either 'N% used' or 'N% left/remaining'. Copy N into usedPercent for 'used' or into remainingPercent for 'left/remaining', never both " +
-            "(e.g. '63% used' → usedPercent '63'; '0% left' → remainingPercent '0'; '88% left' → remainingPercent '88'). " +
-            "Always use the numeric percentage text; never estimate from a progress bar. Provider-wide windows carry no `models` and alone determine status. " +
-            "Every named-model or model-group limit is model-specific: emit it with `models` set to the matching IDs from the configured model list (rows matching nothing configured are omitted entirely), and never use it to determine status. " +
-            "Extract every visible provider-wide quota window and set kind " +
-            "to 'five_hour', 'weekly', 'session', or 'other'. If any provider window is 100% used (0% left), status is 'exhausted'. " +
-            "If the screen is a login/auth/error state rather than a quota display, return status 'unknown' and no fabricated windows.\n";
   const configuredModelClause =
     configuredModels.length > 0
       ? `CONFIGURED MODELS for ${provider} (the canonical model IDs this pool runs — a ` +
@@ -763,7 +719,7 @@ async function parseQuotaWithLlm(
     "If the output contains ONLY a welcome banner, splash screen, prompt menu, login error, or does NOT contain rendered quota/status limit rows or an explicit exhaustion message, " +
     "you MUST return status='unknown' with windows=[]. NEVER invent, hallucinate, approximate, or assume 100% remaining / 0% used when quota limit information is absent from the text.\n" +
     "PERCENTAGE REQUIREMENT: Read the explicit numeric percentage text and never infer a value from progress-bar artwork. Copy the printed number N as text and never compute a new number: put N in usedPercent if the source reports USED, or in remainingPercent if it reports LEFT or REMAINING. Fill exactly one of the two for each window. The precision of all numbers should be limited to at most 3 decimal places.\n" +
-    providerClause +
+    BUILT_IN_QUOTA_PARSER_WORDING[provider] +
     configuredModelClause +
     describeLocalNow(generatedAtMs) +
     "Use those components to assemble resetAtIso from wall-clock/calendar reset text. This is " +
@@ -792,6 +748,10 @@ async function parseQuotaWithLlm(
     modelName: string,
     seen: ExtractionAttemptObservation
   ): Promise<Partial<ProviderQuotaSnapshot>> => {
+    // The caller uses this to distinguish an LLM attempt from a no-key or
+    // capture-failure fallback. Mark it immediately before the request: a
+    // transport failure still attempted this wording and belongs to it.
+    onRequest?.();
     const response = await client.models.generateContent({
       model: modelName,
       contents: `Parse the following CLI/TUI output of a quota check for the provider '${provider}':\n\n${output}`,
@@ -1031,11 +991,12 @@ export async function parseClaudeQuota(
   output: string,
   apiKey?: string,
   generatedAtMs = Date.now(),
-  configuredModels: readonly ModelEntry[] = []
+  configuredModels: readonly ModelEntry[] = [],
+  onRequest?: () => void
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   // Ratified: parse TUI output with an LLM, not regex — TUIs drift. No-key = fail-closed unknown, never a regex guess.
   if (apiKey) {
-    return parseQuotaWithLlm(output, apiKey, "claude", generatedAtMs, configuredModels);
+    return parseQuotaWithLlm(output, apiKey, "claude", generatedAtMs, configuredModels, onRequest);
   }
   return {
     status: "unknown",
@@ -1096,7 +1057,8 @@ export async function parseCodexQuota(
   output: string,
   apiKey?: string,
   generatedAtMs = Date.now(),
-  configuredModels: readonly ModelEntry[] = []
+  configuredModels: readonly ModelEntry[] = [],
+  onRequest?: () => void
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   // Ratified: parse TUI output with an LLM, not regex — TUIs drift. No-key = fail-closed unknown, never a regex guess.
   if (apiKey) {
@@ -1105,7 +1067,8 @@ export async function parseCodexQuota(
       apiKey,
       "codex",
       generatedAtMs,
-      configuredModels
+      configuredModels,
+      onRequest
     );
   }
   return {
@@ -1118,11 +1081,12 @@ export async function parseAgyQuota(
   output: string,
   apiKey?: string,
   generatedAtMs = Date.now(),
-  configuredModels: readonly ModelEntry[] = []
+  configuredModels: readonly ModelEntry[] = [],
+  onRequest?: () => void
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   // Ratified: parse TUI output with an LLM, not regex — TUIs drift. No-key = fail-closed unknown, never a regex guess.
   if (apiKey) {
-    return parseQuotaWithLlm(output, apiKey, "agy", generatedAtMs, configuredModels);
+    return parseQuotaWithLlm(output, apiKey, "agy", generatedAtMs, configuredModels, onRequest);
   }
   return {
     status: "unknown",
@@ -1134,10 +1098,11 @@ export async function parseKimiQuota(
   output: string,
   apiKey: string,
   generatedAtMs = Date.now(),
-  configuredModels: readonly ModelEntry[] = []
+  configuredModels: readonly ModelEntry[] = [],
+  onRequest?: () => void
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   // Ratified: parse new TUI output with an LLM, not regex — TUIs drift.
-  return parseQuotaWithLlm(output, apiKey, "kimi", generatedAtMs, configuredModels);
+  return parseQuotaWithLlm(output, apiKey, "kimi", generatedAtMs, configuredModels, onRequest);
 }
 
 /**
@@ -1421,7 +1386,7 @@ export class QuotaService {
     provider: "claude" | "codex" | "agy" | "kimi",
     rawOutput: string,
     scrapedAt: string,
-    parse: () => Promise<ProviderQuotaSnapshot> | ProviderQuotaSnapshot
+    parse: (onParserRequest: () => void) => Promise<ProviderQuotaSnapshot> | ProviderQuotaSnapshot
   ): Promise<ProviderQuotaSnapshot> {
     const prevState = this.cache.get(provider)?.state;
     const id = this.deps.scrapeStore?.recordRaw({
@@ -1429,14 +1394,33 @@ export class QuotaService {
       scrapedAt,
       rawOutput,
     });
+    // Captured before extraction begins, so an attempted request is attributed
+    // to the immutable built-in wording it sends in this attribution-only slice.
+    const wording = this.deps.scrapeStore?.resolveParserWording?.(provider) ?? { revisionId: null };
+    let parserRequestAttempted = false;
     try {
-      const rawState = await parse();
+      const rawState = await parse(() => {
+        parserRequestAttempted = true;
+      });
       const inferredState = inferQuotaState(rawState, prevState, scrapedAt);
-      if (id) this.deps.scrapeStore?.recordParsed(id, rawState, inferredState);
+      if (id) {
+        this.deps.scrapeStore?.recordParsed(
+          id,
+          rawState,
+          inferredState,
+          parserRequestAttempted ? wording.revisionId : null
+        );
+      }
       if (rawState.status === "unknown") this.failedReads.add(inferredState);
       return inferredState;
     } catch (error) {
-      if (id) this.deps.scrapeStore?.recordParseError(id, error);
+      if (id) {
+        this.deps.scrapeStore?.recordParseError(
+          id,
+          error,
+          parserRequestAttempted ? wording.revisionId : null
+        );
+      }
       if (prevState?.limits && prevState.limits.length > 0) {
         const hasUnexpired = prevState.limits.some(
           (l) =>
@@ -1649,7 +1633,7 @@ export class QuotaService {
     // Stamp scrapedAt as soon as the scrape itself completes (ISSUE_NUM, ask 5) —
     // before the LLM parse, which is post-processing, not part of the scrape.
     const scrapedAt = this.scrapedAtNow();
-    return this.parsePersistedScrape("claude", output, scrapedAt, async () => {
+    return this.parsePersistedScrape("claude", output, scrapedAt, async (onRequest) => {
       if (result.cancelled) throw new QuotaCaptureError("claude", "/usage", result);
       const apiKey = this.deps.config.geminiApiKey?.trim();
 
@@ -1665,7 +1649,8 @@ export class QuotaService {
         output,
         apiKey,
         Date.parse(scrapedAt),
-        this.configuredModelsFor("claude")
+        this.configuredModelsFor("claude"),
+        onRequest
       );
       return {
         provider: "claude",
@@ -1710,7 +1695,7 @@ export class QuotaService {
     // Stamp scrapedAt as soon as the scrape itself completes (ISSUE_NUM, ask 5) —
     // before the LLM parse, which is post-processing, not part of the scrape.
     const scrapedAt = this.scrapedAtNow();
-    return this.parsePersistedScrape("codex", raw, scrapedAt, async () => {
+    return this.parsePersistedScrape("codex", raw, scrapedAt, async (onRequest) => {
       const apiKey = this.deps.config.geminiApiKey?.trim();
       if (!apiKey) {
         return {
@@ -1724,7 +1709,8 @@ export class QuotaService {
         raw,
         apiKey,
         Date.parse(scrapedAt),
-        this.configuredModelsFor("codex")
+        this.configuredModelsFor("codex"),
+        onRequest
       );
       return {
         provider: "codex",
@@ -1764,14 +1750,15 @@ export class QuotaService {
     // Stamp scrapedAt as soon as the scrape itself completes (ISSUE_NUM, ask 5) —
     // before the LLM parse, which is post-processing, not part of the scrape.
     const scrapedAt = this.scrapedAtNow();
-    return this.parsePersistedScrape("agy", raw, scrapedAt, async () => {
+    return this.parsePersistedScrape("agy", raw, scrapedAt, async (onRequest) => {
       const apiKey = this.deps.config.geminiApiKey?.trim();
       if (apiKey) {
         const parsed = await parseAgyQuota(
           raw,
           apiKey,
           Date.parse(scrapedAt),
-          this.configuredModelsFor("agy")
+          this.configuredModelsFor("agy"),
+          onRequest
         );
         return {
           provider: "agy",
@@ -1833,12 +1820,13 @@ export class QuotaService {
     }
 
     const scrapedAt = this.scrapedAtNow();
-    return this.parsePersistedScrape("kimi", raw, scrapedAt, async () => {
+    return this.parsePersistedScrape("kimi", raw, scrapedAt, async (onRequest) => {
       const parsed = await parseKimiQuota(
         raw,
         apiKey,
         Date.parse(scrapedAt),
-        this.configuredModelsFor("kimi")
+        this.configuredModelsFor("kimi"),
+        onRequest
       );
       return {
         provider: "kimi",

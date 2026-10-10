@@ -39,6 +39,10 @@ import {
   COORDINATOR_PROTOCOL_MINOR,
 } from "../quota/coordinator-protocol.js";
 import { MissedQuotaWindowDetector } from "../quota/missed-windows.js";
+import {
+  BUILT_IN_QUOTA_PARSER_WORDING,
+  quotaParserWordingRevisionId,
+} from "../quota/parser-wording.js";
 import { SharedQuotaStore } from "../quota/shared-store.js";
 import {
   createQuotaMcpServer,
@@ -95,6 +99,34 @@ describe("quota MCP server", () => {
         }
       ).config.systemInstruction;
     }
+
+    // #536: wording attribution preserves prompt structure and embeds the
+    // provider-specific built-in wording in systemInstruction for each provider.
+    it("assembles parser requests containing the built-in wording and prompt contracts for every provider", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () => JSON.stringify({ status: "unknown", windows: [] }),
+      });
+      const at = Date.parse("2026-10-05T04:30:00.000Z");
+      const models = [{ displayLabel: "Example Model", identifier: "example-model" }];
+      const parsers = {
+        claude: parseClaudeQuota,
+        codex: parseCodexQuota,
+        agy: parseAgyQuota,
+        kimi: parseKimiQuota,
+      };
+      for (const [provider, parse] of Object.entries(parsers)) {
+        mockGenerateContent.mockClear();
+        await parse(`synthetic ${provider} capture`, "test-key", at, models);
+        const instruction = lastSystemInstruction();
+        expect(instruction).toContain("You are a precise quota parser.");
+        expect(instruction).toContain("OUTPUT SCOPE CONTRACT:");
+        expect(instruction).toContain("GROUNDING REQUIREMENT:");
+        expect(instruction).toContain("PERCENTAGE REQUIREMENT:");
+        expect(instruction).toContain(
+          BUILT_IN_QUOTA_PARSER_WORDING[provider as keyof typeof parsers]
+        );
+      }
+    });
 
     it("parses Claude quota using LLM successfully", async () => {
       const output = "Claude output here";
@@ -2701,13 +2733,21 @@ describe("quota MCP server", () => {
         return service;
       }
 
-      function latestScrape(): { parse_error: string | null; parsed_state: string | null } {
+      function latestScrape(): {
+        parse_error: string | null;
+        parsed_state: string | null;
+        revision: string | null;
+      } {
         return store.db
           .prepare(
-            `SELECT parse_error, parsed_state FROM quota_scrapes
+            `SELECT parse_error, parsed_state, parser_wording_revision_id AS revision FROM quota_scrapes
              WHERE provider = 'claude' ORDER BY scraped_at DESC, rowid DESC LIMIT 1`
           )
-          .get() as { parse_error: string | null; parsed_state: string | null };
+          .get() as {
+          parse_error: string | null;
+          parsed_state: string | null;
+          revision: string | null;
+        };
       }
 
       it("records a timed-out capture of a local silent process as a failed scrape with its cause", async () => {
@@ -2741,6 +2781,9 @@ describe("quota MCP server", () => {
         expect(row.parse_error).toContain("claude /usage capture failed");
         expect(row.parse_error).toContain("exit 143");
         expect(row.parse_error).toContain("cancelled");
+        // A cancelled capture never called the parser, so it must not claim a
+        // wording revision as its provenance.
+        expect(row.revision).toBeNull();
         expect(store.listScrapeOutcomesSince("claude", baselineAt)).toEqual([
           { observedAt: baselineAt, outcome: "parsed" },
           { observedAt: probeAt, outcome: "failed" },
@@ -2997,6 +3040,82 @@ describe("quota MCP server", () => {
           { observedAt: firstBadAt, outcome: "failed" },
           { observedAt: secondBadAt, outcome: "failed" },
         ]);
+      });
+    });
+
+    describe("parser wording attribution (#536)", () => {
+      let root: string;
+      let store: SharedQuotaStore;
+      beforeEach(() => {
+        mockGenerateContent.mockReset();
+        root = mkdtempSync(join(tmpdir(), "rusa-536-"));
+        store = new SharedQuotaStore(join(root, "shared.db"));
+      });
+      afterEach(() => {
+        store.close();
+        rmSync(root, { recursive: true, force: true });
+      });
+
+      function probeClaude(geminiApiKey: string | null = "test-gemini-key"): Promise<unknown> {
+        return new QuotaService({
+          config: { ...mockConfig, geminiApiKey: geminiApiKey ?? undefined } as RusaConfig,
+          workersDir: root,
+          resolveProvider: mockResolveProvider,
+          scrapeStore: store,
+          ttlMs: 0,
+        }).getQuotaProbeOutcome("claude");
+      }
+
+      function latestRevision(): string | null {
+        return (
+          store.db
+            .prepare(
+              `SELECT parser_wording_revision_id AS revision FROM quota_scrapes
+               ORDER BY rowid DESC LIMIT 1`
+            )
+            .get() as { revision: string | null }
+        ).revision;
+      }
+
+      const builtInId = quotaParserWordingRevisionId(
+        "claude",
+        BUILT_IN_QUOTA_PARSER_WORDING.claude
+      );
+
+      it("sends the built-in wording and records its revision on a parsed scrape", async () => {
+        mockGenerateContent.mockResolvedValue({
+          text: () => JSON.stringify({ status: "unknown", windows: [] }),
+        });
+
+        await probeClaude();
+
+        const request = mockGenerateContent.mock.calls[0][0] as {
+          config: { systemInstruction: string };
+        };
+        expect(request.config.systemInstruction).toContain(BUILT_IN_QUOTA_PARSER_WORDING.claude);
+        expect(latestRevision()).toBe(builtInId);
+      });
+
+      it("records the revision after an attempted extraction returns unknown", async () => {
+        mockGenerateContent.mockRejectedValue(new Error("synthetic extractor outage"));
+
+        await probeClaude();
+
+        const row = store.db
+          .prepare(
+            `SELECT parse_error, parser_wording_revision_id AS revision FROM quota_scrapes
+             ORDER BY rowid DESC LIMIT 1`
+          )
+          .get() as { parse_error: string | null; revision: string | null };
+        expect(row.parse_error).toBeNull();
+        expect(row.revision).toBe(builtInId);
+      });
+
+      it("leaves the revision null when no parser request is sent", async () => {
+        await probeClaude(null);
+
+        expect(mockGenerateContent).not.toHaveBeenCalled();
+        expect(latestRevision()).toBeNull();
       });
     });
 

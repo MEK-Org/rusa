@@ -11,9 +11,11 @@ import {
   type QuotaService,
   type QuotaWindowKind,
 } from "../mcp/quota-mcp.js";
+import { nullLogger } from "../observability/logger.js";
 import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import { QuotaCollectionLoop } from "./coordinator-collection.js";
 import { QuotaCoordinatorService } from "./coordinator-service.js";
+import { BUILT_IN_QUOTA_PARSER_WORDING, quotaParserWordingRevisionId } from "./parser-wording.js";
 import {
   QUOTA_ACTUATOR_SMOOTHING,
   QUOTA_DERIVATIVE_TAU_SECONDS,
@@ -27,6 +29,7 @@ import {
   QUOTA_RAW_RETENTION_MS,
   QUOTA_SCHEMA_VERSION,
   SharedQuotaStore,
+  serializeParsedState,
 } from "./shared-store.js";
 import { isModelScopedWindow, isProviderScopedWindow } from "./window-scope.js";
 
@@ -77,8 +80,10 @@ describe("SharedQuotaStore schema v2 migration", () => {
             .all() as Array<{ name: string }>
         ).map((row) => row.name)
       ).toEqual([
+        "_migrations",
         "quota_manual_observation_receipts",
         "quota_observations",
+        "quota_parser_wording_revisions",
         "quota_provider_reading_modes",
         "quota_scrapes",
       ]);
@@ -144,6 +149,194 @@ describe("SharedQuotaStore schema v2 migration", () => {
           }>
         ).map((column) => column.name)
       ).toEqual(["provider", "mode", "generation", "updated_at"]);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("SharedQuotaStore parser wording attribution (#536)", () => {
+  function snapshot(percentLeft: number): ProviderQuotaSnapshot {
+    return {
+      provider: "claude",
+      status: "available",
+      limits: [
+        {
+          label: "weekly limit",
+          kind: "weekly",
+          scope: "provider",
+          percentLeft,
+          resetAtIso: "2030-01-05T00:00:00.000Z",
+        },
+      ],
+    };
+  }
+
+  function openStore(): { store: SharedQuotaStore; path: string } {
+    const root = mkdtempSync(join(tmpdir(), "rusa-quota-wording-"));
+    roots.push(root);
+    const path = join(root, "quota.db");
+    return { store: new SharedQuotaStore(path), path };
+  }
+
+  it("upgrades a pre-attribution database in place without bumping user_version", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-quota-wording-upgrade-"));
+    roots.push(root);
+    const path = join(root, "quota.db");
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE quota_scrapes (
+        id TEXT PRIMARY KEY, provider TEXT NOT NULL, scraped_at TEXT NOT NULL,
+        raw_output TEXT NOT NULL, parsed_state TEXT, parse_error TEXT
+      );
+      INSERT INTO quota_scrapes (id, provider, scraped_at, raw_output, parse_error)
+      VALUES ('existing', 'claude', '2030-01-01T00:00:00.000Z', 'synthetic', 'synthetic failure');
+    `);
+    legacy.pragma(`user_version = ${QUOTA_SCHEMA_VERSION}`);
+    legacy.close();
+
+    const store = new SharedQuotaStore(path);
+    try {
+      expect(store.db.pragma("user_version", { simple: true })).toBe(QUOTA_SCHEMA_VERSION);
+      expect(
+        store.db
+          .prepare(
+            "SELECT id, parse_error, parser_wording_revision_id AS revision FROM quota_scrapes"
+          )
+          .all()
+      ).toEqual([{ id: "existing", parse_error: "synthetic failure", revision: null }]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("seeds each provider's built-in wording during database open, keyed by content hash", () => {
+    const { store } = openStore();
+    try {
+      const first = store.resolveParserWording("codex");
+      const again = store.resolveParserWording("codex");
+      const expectedId = quotaParserWordingRevisionId("codex", BUILT_IN_QUOTA_PARSER_WORDING.codex);
+      expect(first).toEqual({ revisionId: expectedId });
+      expect(again).toEqual(first);
+      expect(store.db.prepare("SELECT * FROM quota_parser_wording_revisions").all()).toEqual(
+        (["claude", "codex", "agy", "kimi"] as const).map((provider) => ({
+          id: quotaParserWordingRevisionId(provider, BUILT_IN_QUOTA_PARSER_WORDING[provider]),
+          provider,
+          wording: BUILT_IN_QUOTA_PARSER_WORDING[provider],
+        }))
+      );
+    } finally {
+      store.close();
+    }
+  });
+
+  it("still opens and degrades to unattributed parsing when the revision table rejects the seeds", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-quota-wording-broken-"));
+    roots.push(root);
+    const path = join(root, "quota.db");
+    // A control table that exists but cannot take the seed rows: the schema's
+    // `CREATE TABLE IF NOT EXISTS` leaves it alone and registration fails.
+    const broken = new Database(path);
+    broken.exec("CREATE TABLE quota_parser_wording_revisions (id TEXT PRIMARY KEY)");
+    broken.close();
+    const warn = vi.fn();
+
+    const store = new SharedQuotaStore(path, { ...nullLogger, warn });
+    try {
+      expect(warn).toHaveBeenCalledWith("parser_wording_registration_failed", {
+        error: expect.stringContaining("provider"),
+      });
+      expect(store.resolveParserWording("claude")).toEqual({
+        revisionId: null,
+      });
+      const scrape = store.recordRaw({
+        provider: "claude",
+        scrapedAt: "2030-01-01T00:00:00.000Z",
+        rawOutput: "synthetic",
+      });
+      store.recordParsed(scrape, snapshot(50), snapshot(50), null);
+      expect(store.getLatestSnapshot("claude")?.limits?.[0]?.percentLeft).toBe(50);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("degrades to unattributed parsing when an expected revision id holds other wording", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-quota-wording-mismatch-"));
+    roots.push(root);
+    const path = join(root, "quota.db");
+    // `INSERT OR IGNORE` succeeds against an existing id whatever its content,
+    // so registration must check the rows it relies on.
+    const damaged = new Database(path);
+    damaged.exec(
+      "CREATE TABLE quota_parser_wording_revisions (id TEXT PRIMARY KEY, provider TEXT NOT NULL, wording TEXT NOT NULL)"
+    );
+    damaged
+      .prepare(
+        "INSERT INTO quota_parser_wording_revisions (id, provider, wording) VALUES (?, ?, ?)"
+      )
+      .run(
+        quotaParserWordingRevisionId("codex", BUILT_IN_QUOTA_PARSER_WORDING.codex),
+        "codex",
+        "other wording"
+      );
+    damaged.close();
+    const warn = vi.fn();
+
+    const store = new SharedQuotaStore(path, { ...nullLogger, warn });
+    try {
+      expect(warn).toHaveBeenCalledWith("parser_wording_registration_failed", {
+        error: expect.stringContaining("codex"),
+      });
+      expect(store.resolveParserWording("claude")).toEqual({ revisionId: null });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("writes the revision with the parse and keeps pre-change writes readable", () => {
+    const { store, path } = openStore();
+    try {
+      const { revisionId } = store.resolveParserWording("claude");
+      const parsed = store.recordRaw({
+        provider: "claude",
+        scrapedAt: "2030-01-01T00:00:00.000Z",
+        rawOutput: "synthetic",
+      });
+      store.recordParsed(parsed, snapshot(50), snapshot(50), revisionId);
+      const failed = store.recordRaw({
+        provider: "claude",
+        scrapedAt: "2030-01-01T00:05:00.000Z",
+        rawOutput: "synthetic",
+      });
+      store.recordParseError(failed, new Error("synthetic"), revisionId);
+
+      // The statements a pre-change coordinator issues name their columns, so
+      // the new nullable column is simply left null on that binary's rows.
+      const old = new Database(path);
+      old
+        .prepare(
+          `INSERT INTO quota_scrapes (id, provider, scraped_at, raw_output)
+           VALUES ('pre-change', 'claude', '2030-01-01T00:10:00.000Z', 'synthetic')`
+        )
+        .run();
+      old
+        .prepare("UPDATE quota_scrapes SET parsed_state = ?, parse_error = NULL WHERE id = ?")
+        .run(serializeParsedState(snapshot(40)), "pre-change");
+      old.close();
+
+      expect(
+        store.db
+          .prepare(
+            "SELECT id, parser_wording_revision_id AS revision FROM quota_scrapes ORDER BY scraped_at"
+          )
+          .all()
+      ).toEqual([
+        { id: parsed, revision: revisionId },
+        { id: failed, revision: revisionId },
+        { id: "pre-change", revision: null },
+      ]);
+      expect(store.getLatestSnapshot("claude")?.limits?.[0]?.percentLeft).toBe(40);
     } finally {
       store.close();
     }
@@ -432,8 +625,10 @@ describe("SharedQuotaStore canonical observations", () => {
             .all() as Array<{ name: string }>
         ).map((row) => row.name)
       ).toEqual([
+        "_migrations",
         "quota_manual_observation_receipts",
         "quota_observations",
+        "quota_parser_wording_revisions",
         "quota_provider_reading_modes",
         "quota_scrapes",
       ]);
@@ -957,8 +1152,10 @@ describe("SharedQuotaStore persisted controller", () => {
             .all() as Array<{ name: string }>
         ).map((row) => row.name)
       ).toEqual([
+        "_migrations",
         "quota_manual_observation_receipts",
         "quota_observations",
+        "quota_parser_wording_revisions",
         "quota_provider_reading_modes",
         "quota_scrapes",
       ]);

@@ -6,7 +6,13 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import type { QuotaScrape } from "../db/repositories/quota-scrape-repository.js";
 import { BUSY_TIMEOUT_MS, widenToWal } from "../db/wal.js";
-import type { ProviderQuotaSnapshot, QuotaLimit, QuotaWindowKind } from "../mcp/quota-mcp.js";
+import type {
+  ProviderQuotaSnapshot,
+  QuotaLimit,
+  QuotaLlmProvider,
+  QuotaWindowKind,
+} from "../mcp/quota-mcp.js";
+import { createLogger, type Logger } from "../observability/logger.js";
 import type { ModelEntry } from "../providers/model-catalog.js";
 import {
   nullQuotaMetrics,
@@ -15,8 +21,15 @@ import {
   type QuotaObservationResult,
 } from "./coordinator-metrics.js";
 import type { PublishedScrapeOutcome } from "./coordinator-protocol.js";
+import { runQuotaMigrations } from "./migrations/runner.js";
 import { configuredModelRefs, resolveWindowModels } from "./model-window-scope.js";
 import { extractedNoQuotaValues, parseParsedState, serializeParsedState } from "./parsed-state.js";
+import {
+  BUILT_IN_QUOTA_PARSER_WORDING,
+  type QuotaParserWording,
+  quotaParserWordingRevisionId,
+  unattributedBuiltInParserWording,
+} from "./parser-wording.js";
 import { QUOTA_OBSERVATION_SLOT_MS, quotaCycleChanged } from "./quota-cycle.js";
 import {
   assertQuotaSchemaVersion,
@@ -25,10 +38,21 @@ import {
 } from "./schema-guard.js";
 import { isProviderScopedWindow } from "./window-scope.js";
 
+let _quotaStoreLogger: Logger | undefined;
+function quotaStoreLogger(): Logger {
+  _quotaStoreLogger ??= createLogger({ context: { component: "quota-store" } });
+  return _quotaStoreLogger;
+}
+
 export { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION, SchemaVersionRefusalError };
 // Maintenance scripts consume this bundled shared-store artifact, so expose
 // the one persistence decoder/writer rather than duplicating JSON handling.
 export { parseParsedState, serializeParsedState } from "./parsed-state.js";
+export {
+  BUILT_IN_QUOTA_PARSER_WORDING,
+  type QuotaParserWording,
+  quotaParserWordingRevisionId,
+} from "./parser-wording.js";
 
 const SLOT_MS = QUOTA_OBSERVATION_SLOT_MS;
 export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -439,8 +463,12 @@ export class SharedQuotaStore {
    * current behaviour and only the coordinator process opts in.
    */
   private metrics: QuotaMetrics = nullQuotaMetrics;
+  private registeredParserWording = false;
 
-  constructor(readonly databasePath: string) {
+  constructor(
+    readonly databasePath: string,
+    private readonly logger?: Logger
+  ) {
     mkdirSync(dirname(databasePath), { recursive: true });
     this.db = new Database(databasePath);
     try {
@@ -553,139 +581,65 @@ export class SharedQuotaStore {
   }
 
   private ensureSchema(): void {
-    const migrate = this.db.transaction(() => {
-      const rawVersion = this.db.pragma("user_version", { simple: true });
-      const currentVersion = typeof rawVersion === "number" ? rawVersion : Number(rawVersion ?? 0);
-      this.addModelScopeInTransaction();
-      this.db.exec(`
-      CREATE TABLE IF NOT EXISTS quota_scrapes (
-        id TEXT PRIMARY KEY,
-        provider TEXT NOT NULL,
-        scraped_at TEXT NOT NULL,
-        raw_output TEXT NOT NULL,
-        parsed_state TEXT,
-        parse_error TEXT
-      );
-      CREATE INDEX IF NOT EXISTS idx_shared_quota_scrapes_provider_time
-        ON quota_scrapes(provider, scraped_at);
-      CREATE INDEX IF NOT EXISTS idx_shared_quota_scrapes_time
-        ON quota_scrapes(scraped_at);
-
-      CREATE TABLE IF NOT EXISTS quota_observations (
-        provider TEXT NOT NULL,
-        model_scope TEXT NOT NULL DEFAULT '',
-        kind TEXT NOT NULL,
-        observed_slot INTEGER NOT NULL,
-        label TEXT NOT NULL,
-        observed_at TEXT NOT NULL,
-        percent_left REAL NOT NULL,
-        reset_at_iso TEXT,
-        window_ms INTEGER NOT NULL,
-        processed INTEGER NOT NULL DEFAULT 0,
-        controller_error REAL,
-        controller_derivative REAL,
-        controller_integral REAL,
-        uncapped_interval_seconds REAL,
-        interval_seconds REAL,
-        PRIMARY KEY(provider, model_scope, kind, observed_slot)
-      );
-      CREATE INDEX IF NOT EXISTS idx_quota_observations_provider_time
-        ON quota_observations(provider, observed_at);
-      CREATE INDEX IF NOT EXISTS idx_quota_observations_observed_at
-        ON quota_observations(observed_at);
-      CREATE INDEX IF NOT EXISTS idx_quota_observations_scope_kind_time
-        ON quota_observations(provider, model_scope, kind, observed_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_quota_observations_scope_reasoned
-        ON quota_observations(provider, model_scope, kind, observed_at DESC)
-        WHERE interval_seconds IS NOT NULL;
-      CREATE TABLE IF NOT EXISTS quota_provider_reading_modes (
-        provider TEXT PRIMARY KEY,
-        mode TEXT NOT NULL CHECK (mode IN ('manual', 'scrape')),
-        generation INTEGER NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS quota_manual_observation_receipts (
-        provider TEXT NOT NULL,
-        idempotency_key TEXT NOT NULL,
-        generation INTEGER NOT NULL,
-        request_fingerprint TEXT NOT NULL,
-        observed_at TEXT NOT NULL,
-        accepted_at TEXT NOT NULL,
-        PRIMARY KEY(provider, idempotency_key)
-      );
-    `);
-      this.ensureColumnsInTransaction();
-      if (currentVersion < QUOTA_SCHEMA_VERSION) {
-        this.db.pragma(`user_version = ${QUOTA_SCHEMA_VERSION}`);
-      }
-    });
-    migrate.immediate();
+    runQuotaMigrations(this.db);
+    this.registerBuiltInParserWording();
   }
 
   /**
-   * Schema version 3 (#588): move `model_scope` into the observation key. A
-   * primary key cannot be altered in place, so a pre-v3 table is rebuilt with
-   * every row copied as provider-wide (`''`) — before v3 the store rejected
-   * every model-scoped window, so that is exactly what each row was. The old
-   * table's `(provider, kind)` indexes go with it and the schema block below
-   * recreates the scope-aware ones. A database already carrying the column,
-   * or with no observation table yet, is left alone.
+   * Built-in wording is immutable for the life of this binary. Seed all four
+   * rows while opening the database, rather than taking a write lock on every
+   * parse merely to repeat an `INSERT OR IGNORE`. This runs after the schema
+   * transaction and outside it: a revision table that cannot take the seeds, or
+   * already holds an expected id with other content, is a broken control
+   * record, which degrades parsing to unattributed built-in wording rather than
+   * refusing the store (#536).
    */
-  private addModelScopeInTransaction(): void {
-    const columns = (
-      this.db.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>
-    ).map((column) => column.name);
-    if (columns.length === 0 || columns.includes("model_scope")) return;
-    if (!columns.includes("controller_integral")) {
-      this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
-    }
-    this.db.exec(`
-      CREATE TABLE quota_observations_v3 (
-        provider TEXT NOT NULL,
-        model_scope TEXT NOT NULL DEFAULT '',
-        kind TEXT NOT NULL,
-        observed_slot INTEGER NOT NULL,
-        label TEXT NOT NULL,
-        observed_at TEXT NOT NULL,
-        percent_left REAL NOT NULL,
-        reset_at_iso TEXT,
-        window_ms INTEGER NOT NULL,
-        processed INTEGER NOT NULL DEFAULT 0,
-        controller_error REAL,
-        controller_derivative REAL,
-        controller_integral REAL,
-        uncapped_interval_seconds REAL,
-        interval_seconds REAL,
-        PRIMARY KEY(provider, model_scope, kind, observed_slot)
+  private registerBuiltInParserWording(): void {
+    try {
+      const insert = this.db.prepare(
+        `INSERT OR IGNORE INTO quota_parser_wording_revisions (id, provider, wording)
+         VALUES (?, ?, ?)`
       );
-      INSERT INTO quota_observations_v3
-        (provider, model_scope, kind, observed_slot, label, observed_at, percent_left,
-         reset_at_iso, window_ms, processed, controller_error, controller_derivative,
-         controller_integral, uncapped_interval_seconds, interval_seconds)
-      SELECT provider, '', kind, observed_slot, label, observed_at, percent_left,
-             reset_at_iso, window_ms, processed, controller_error, controller_derivative,
-             controller_integral, uncapped_interval_seconds, interval_seconds
-      FROM quota_observations ORDER BY rowid;
-      DROP TABLE quota_observations;
-      ALTER TABLE quota_observations_v3 RENAME TO quota_observations;
-    `);
+      const read = this.db.prepare(
+        "SELECT provider, wording FROM quota_parser_wording_revisions WHERE id = ?"
+      );
+      this.db
+        .transaction(() => {
+          for (const provider of Object.keys(BUILT_IN_QUOTA_PARSER_WORDING) as QuotaLlmProvider[]) {
+            const wording = BUILT_IN_QUOTA_PARSER_WORDING[provider];
+            const id = quotaParserWordingRevisionId(provider, wording);
+            insert.run(id, provider, wording);
+            const row = read.get(id) as { provider: string; wording: string } | undefined;
+            if (row?.provider !== provider || row.wording !== wording) {
+              throw new Error(`revision ${id} does not hold the built-in ${provider} wording`);
+            }
+          }
+        })
+        .immediate();
+      this.registeredParserWording = true;
+    } catch (error) {
+      this.registeredParserWording = false;
+      (this.logger ?? quotaStoreLogger()).warn("parser_wording_registration_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**
-   * `CREATE TABLE IF NOT EXISTS` is a no-op against a database created before a
-   * column existed, so widen those tables in place. The shared quota database is
-   * opened directly by every instance rather than through the instance migration
-   * runner, so its schema has to evolve here.
+   * The parser wording a parse should use, captured before extraction (#536).
+   * This attribution-only slice uses the seeded built-in wording only. Pointer
+   * lookup and activation belong to the later activation slice, where their
+   * writer and rollback semantics can be reviewed together. Registration is
+   * verified once when opening the store: if the revision record could not be
+   * registered, parsing keeps its built-in wording and records no revision.
    */
-  private ensureColumnsInTransaction(): void {
-    const columns = new Set(
-      (
-        this.db.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>
-      ).map((column) => column.name)
-    );
-    if (!columns.has("controller_integral")) {
-      this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
+  resolveParserWording(provider: QuotaLlmProvider): QuotaParserWording {
+    if (!this.registeredParserWording) {
+      return unattributedBuiltInParserWording();
     }
+    return {
+      revisionId: quotaParserWordingRevisionId(provider, BUILT_IN_QUOTA_PARSER_WORDING[provider]),
+    };
   }
 
   /**
@@ -752,7 +706,8 @@ export class SharedQuotaStore {
   recordParsed(
     id: string,
     rawParsed: ProviderQuotaSnapshot,
-    inferredParsed: ProviderQuotaSnapshot
+    inferredParsed: ProviderQuotaSnapshot,
+    wordingRevisionId: string | null = null
   ): void {
     const { raw: _raw, ...inferredState } = inferredParsed;
     const scrape = this.db
@@ -767,8 +722,12 @@ export class SharedQuotaStore {
     }
     this.db.transaction(() => {
       this.db
-        .prepare("UPDATE quota_scrapes SET parsed_state = ?, parse_error = NULL WHERE id = ?")
-        .run(serializeParsedState(inferredState), id);
+        .prepare(
+          `UPDATE quota_scrapes
+           SET parsed_state = ?, parse_error = NULL, parser_wording_revision_id = ?
+           WHERE id = ?`
+        )
+        .run(serializeParsedState(inferredState), wordingRevisionId, id);
       this.insertObservations(inferredParsed, scrape?.scraped_at, scrape?.provider);
     })();
     // Judge the parser's own read: a failed read that carried an earlier
@@ -783,7 +742,7 @@ export class SharedQuotaStore {
     }
   }
 
-  recordParseError(id: string, error: unknown): void {
+  recordParseError(id: string, error: unknown, wordingRevisionId: string | null = null): void {
     const scrape = this.db.prepare("SELECT provider FROM quota_scrapes WHERE id = ?").get(id) as
       | { provider: string }
       | undefined;
@@ -792,8 +751,14 @@ export class SharedQuotaStore {
       return;
     }
     this.db
-      .prepare("UPDATE quota_scrapes SET parse_error = ? WHERE id = ?")
-      .run(error instanceof Error ? (error.stack ?? error.message) : String(error), id);
+      .prepare(
+        "UPDATE quota_scrapes SET parse_error = ?, parser_wording_revision_id = ? WHERE id = ?"
+      )
+      .run(
+        error instanceof Error ? (error.stack ?? error.message) : String(error),
+        wordingRevisionId,
+        id
+      );
     this.metrics.counter(QUOTA_SERVICE_METRICS.parsesTotal, {
       provider: scrape?.provider ?? "unknown",
       outcome: "failure",
