@@ -23,7 +23,7 @@ import {
 import type { PublishedScrapeOutcome } from "./coordinator-protocol.js";
 import { runQuotaMigrations } from "./migrations/runner.js";
 import { configuredModelRefs, resolveWindowModels } from "./model-window-scope.js";
-import { parseParsedState, serializeParsedState } from "./parsed-state.js";
+import { extractedNoQuotaValues, parseParsedState, serializeParsedState } from "./parsed-state.js";
 import {
   BUILT_IN_QUOTA_PARSER_WORDING,
   type QuotaParserWording,
@@ -994,7 +994,9 @@ export class SharedQuotaStore {
   /**
    * Every finished scrape since `sinceIso`, parsed or failed, by stamp (#759).
    * A scrape that parsed to no window, or failed to parse, writes no
-   * observation, so this is the only record that it happened. A row still
+   * observation, so this is the only record that it happened. A scrape fails
+   * when its capture or parse threw, or when it extracted no quota value
+   * (#982), even though carried windows were written for it. A row still
    * being parsed (neither column set) is left out until it finishes; no raw
    * output leaves the store.
    */
@@ -1002,14 +1004,23 @@ export class SharedQuotaStore {
     return (
       this.db
         .prepare(
-          `SELECT scraped_at AS observedAt, parse_error IS NOT NULL AS failed
+          `SELECT scraped_at AS observedAt, parsed_state AS parsedState,
+                  parse_error IS NOT NULL AS threw
            FROM quota_scrapes
            WHERE provider = ? AND scraped_at >= ?
              AND (parsed_state IS NOT NULL OR parse_error IS NOT NULL)
            ORDER BY scraped_at ASC, rowid ASC`
         )
-        .all(provider, sinceIso) as Array<{ observedAt: string; failed: 0 | 1 }>
-    ).map(({ observedAt, failed }) => ({ observedAt, outcome: failed ? "failed" : "parsed" }));
+        .all(provider, sinceIso) as Array<{
+        observedAt: string;
+        parsedState: string | null;
+        threw: 0 | 1;
+      }>
+    ).map(({ observedAt, parsedState, threw }) => {
+      const parsed = threw ? null : parseParsedState(parsedState);
+      const failed = Boolean(threw || parsed === null || extractedNoQuotaValues(parsed));
+      return { observedAt, outcome: failed ? "failed" : "parsed" };
+    });
   }
 
   /**
