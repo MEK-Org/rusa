@@ -5,6 +5,7 @@ import 'package:rxdart/rxdart.dart';
 
 import '../breakpoints.dart';
 import '../dashboard_timing.dart';
+import '../iu/simple_markdown.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -583,6 +584,9 @@ class _InfoView extends StatefulWidget {
 class _InfoViewState extends State<_InfoView> {
   /// The full charter once it arrives. Null means "still the preview".
   String? _charter;
+  String? _brief;
+  bool _briefMode = false;
+  bool _loadingInfo = false;
 
   /// The actor the charter on screen was fetched for. Set while a fetch is in
   /// flight and kept if it succeeds; a failure clears it.
@@ -626,19 +630,33 @@ class _InfoViewState extends State<_InfoView> {
 
   Future<void> _loadCharter({bool trackDetail = false}) async {
     final id = widget.actor.id;
-    if (_loadedFor == id) return;
+    // Brief actors refresh with the existing detail rebuilds, so post-run
+    // rewrites reach an open Info tab without loading every actor's context.
+    if (_loadedFor == id && (!_briefMode || _loadingInfo)) return;
+    final isNewActor = _loadedFor != id;
     _loadedFor = id;
+    _loadingInfo = true;
     final fetch = ++_fetch;
-    setState(() => _charter = null);
+    if (isNewActor) {
+      setState(() {
+        _charter = null;
+        _brief = null;
+        _briefMode = false;
+      });
+    }
     Future<void> runFetch() async {
-      final charter = await widget.store.fetchCharter(id);
+      final info = await widget.store.fetchActorInfo(id);
       // Anything sent since this supersedes it, whichever actor it was asking
       // for: another actor selected, or a second look at the same one after a
       // failure. Only the newest answer is allowed to land.
       if (!mounted || fetch != _fetch) {
         throw StateError('Actor detail fetch superseded or unmounted');
       }
-      setState(() => _charter = charter);
+      setState(() {
+        _charter = info.charter;
+        _briefMode = info.briefMode;
+        _brief = info.brief;
+      });
     }
 
     try {
@@ -655,6 +673,8 @@ class _InfoViewState extends State<_InfoView> {
       // error — but release the id, so the next poll retries rather than
       // pinning the panel to the preview for as long as this actor is selected.
       if (fetch == _fetch) _loadedFor = null;
+    } finally {
+      if (fetch == _fetch) _loadingInfo = false;
     }
   }
 
@@ -665,6 +685,17 @@ class _InfoViewState extends State<_InfoView> {
   /// Falling back to the preview rather than to empty means a failed or slow
   /// fetch degrades to less text, not to "No charter."
   String get charter => _charter ?? widget.actor.charterPreview;
+
+  Widget _documentBox(Widget child) => Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(
+      color: MeshColors.bgTertiary,
+      border: Border.all(color: MeshColors.border),
+      borderRadius: BorderRadius.circular(6),
+    ),
+    child: child,
+  );
 
   Widget _meta(String label, String value) => Text.rich(
     TextSpan(
@@ -824,6 +855,29 @@ class _InfoViewState extends State<_InfoView> {
               ),
             ],
           ],
+          if (_briefMode) ...[
+            const SizedBox(height: 24),
+            const Text(
+              'Brief',
+              style: TextStyle(
+                color: MeshColors.textPrimary,
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 12),
+            _documentBox(
+              _brief == null || _brief!.isEmpty
+                  ? const Text(
+                      'No brief yet.',
+                      style: TextStyle(
+                        color: MeshColors.textSecondary,
+                        fontSize: 13,
+                      ),
+                    )
+                  : SelectionArea(child: SimpleMarkdown(_brief!)),
+            ),
+          ],
           const SizedBox(height: 24),
           const Text(
             'Charter',
@@ -834,19 +888,14 @@ class _InfoViewState extends State<_InfoView> {
             ),
           ),
           const SizedBox(height: 12),
-          charter.isEmpty
-              ? const Text(
-                  'No charter.',
-                  style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
-                )
-              : SelectableText(
-                  charter,
-                  style: const TextStyle(
-                    color: MeshColors.textSecondary,
-                    fontSize: 13,
-                    height: 1.5,
-                  ),
-                ),
+          _documentBox(
+            charter.isEmpty
+                ? const Text(
+                    'No charter.',
+                    style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
+                  )
+                : SelectionArea(child: SimpleMarkdown(charter)),
+          ),
         ],
       ),
     );

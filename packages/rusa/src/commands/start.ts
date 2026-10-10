@@ -104,6 +104,13 @@ import {
   portableContextMaxRuns,
 } from "../actor/portable-context.js";
 import {
+  classifyBriefSender,
+  GeminiBriefRewriter,
+  isBriefAttentionHandled,
+  runPortableContextBriefCycle,
+  seedPortableBriefState,
+} from "../actor/portable-context-brief.js";
+import {
   describeCompaction,
   GeminiPortableContextCompactor,
   type PortableContextCompactionSummary,
@@ -211,7 +218,7 @@ import {
   SLACK_READ_MCP_NAME,
   SLACK_WRITE_MCP_NAME,
 } from "../mcp/slack-mcp.js";
-import { resolveStampedAuthor, stampAuthor } from "../mcp/stamp.js";
+import { HUMAN_OPERATOR, resolveStampedAuthor, stampAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer, TRACKER_MCP_NAME } from "../mcp/tracker-mcp.js";
 import {
   createUnderstandingReadServer,
@@ -298,6 +305,7 @@ import {
 import { type MissedQuotaWindow, MissedQuotaWindowDetector } from "../quota/missed-windows.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import { resolveReference } from "../references/resolve.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
@@ -824,31 +832,53 @@ export function warnMissingConfiguredEventSubscriptionsAtBoot(
  */
 function assemblePortableInjection(
   id: string,
-  mode: "tail" | "ledger",
+  mode: "tail" | "ledger" | "brief",
   store: PortableContextStore
 ): { priorContext: string; injectRecord: InjectRecord } | undefined {
   const repositories = getRepositories();
   const runs = repositories.actorRuns
     .listRecentCompleted(id, portableContextMaxRuns())
     .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
-  const portable =
-    mode === "ledger"
-      ? assemblePortableContextV2({
-          state: store.load(id),
-          messages: repositories.meshChat
-            .listReceivedForActor(id, { limit: portableContextMaxMessages() })
-            .map((message) => ({
-              id: message.id,
-              ts: message.ts,
-              sender: message.senderId,
-              body: message.body,
-            })),
-          runs,
-          // Read-through only. The prompt shows work state; it never authors it
-          // — the obligation store stays the sole lifecycle authority .
-          obligations: getRepositories().obligations.listOwned(id),
-        })
-      : assemblePortableContext(runs);
+  // Tail remains a run-only renderer. Do not load a snapshot or query messages
+  // and obligations before selecting this established path.
+  if (mode === "tail") {
+    const portable = assemblePortableContext(runs);
+    return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
+  }
+
+  let state = store.load(id);
+  // Seed before the first brief-mode prompt, not after its first run. The
+  // switch position is durable before prompt assembly, so this run renders the
+  // charter seed rather than the old ledger and later rewrites see only sources
+  // arriving after this boundary.
+  if (mode === "brief" && state.brief === null) {
+    state = seedPortableBriefState(
+      state,
+      id,
+      repositories.actorRuns.latestLedgerSourcePosition(id),
+      new Date().toISOString()
+    );
+    store.save(state);
+  }
+  const shared = {
+    messages: repositories.meshChat
+      .listReceivedForActor(id, { limit: portableContextMaxMessages() })
+      .map((message) => ({
+        id: message.id,
+        ts: message.ts,
+        sender: message.senderId,
+        body: message.body,
+      })),
+    runs,
+    // Read-through only. The prompt shows work state; it never authors it
+    // — the obligation store stays the sole lifecycle authority .
+    obligations: getRepositories().obligations.listOwned(id),
+  };
+  const portable = assemblePortableContextV2({
+    state,
+    ...shared,
+    ...(mode === "brief" ? { brief: state.brief } : {}),
+  });
   return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
 }
 
@@ -858,8 +888,8 @@ function assembleConfiguredPortableInjection(
   store: PortableContextStore
 ): { priorContext: string; injectRecord: InjectRecord } | undefined {
   if (record.context?.type !== "portable") return undefined;
-  if (record.context.mode === "ledger" && !apiKey) {
-    throw new Error("portable context ledger mode requires geminiApiKey");
+  if ((record.context.mode === "ledger" || record.context.mode === "brief") && !apiKey) {
+    throw new Error(`portable context ${record.context.mode} mode requires geminiApiKey`);
   }
   return assemblePortableInjection(record.id, record.context.mode, store);
 }
@@ -1110,6 +1140,7 @@ async function composeStart(
   }
   const portableContextApiKey = config.geminiApiKey?.trim() || null;
   const portableContextCompactors = new Map<string, PortableContextCompactor>();
+  let briefRewriter: GeminiBriefRewriter | null = null;
   const compactorFor = (context: PortableContextConfig): PortableContextCompactor | null => {
     if (!portableContextApiKey) return null;
     const model = resolvePortableContextCompactorModel(context.compactionModel);
@@ -2568,6 +2599,110 @@ async function composeStart(
     }
   };
 
+  /**
+   * The `brief` mode post-run rewrite cycle (#954). Runs on the same hook as
+   * ledger compaction — after the run, never before prompt assembly — so the
+   * LLM latency stays off responsive wakes. One telemetry event per rewrite
+   * attempt is recorded inside the cycle; a third consecutive failure freezes
+   * rewrites and raises a durable needs-attention entry for the actor's parent
+   * through the existing inbox path. No-op for every other context mode.
+   */
+  const rewriteBriefActorAfterRun = async (actorId: string): Promise<void> => {
+    const current = actors.get(actorId);
+    const context = current?.context?.type === "portable" ? current.context : undefined;
+    if (!current || context?.mode !== "brief") return;
+    if (!portableContextApiKey) {
+      // Assembly already refuses to start a brief-mode actor without a key;
+      // this guard only keeps the post-run hook total.
+      return;
+    }
+    briefRewriter ??= new GeminiBriefRewriter(portableContextApiKey);
+    const repositories = getRepositories();
+    try {
+      await runPortableContextBriefCycle({
+        actorId,
+        charter: current.charter,
+        store: portableContextStore,
+        rewriter: briefRewriter,
+        // Citations resolve against the actor's own stores and the tracker,
+        // but only on a ref's first appearance for the actor — the persisted
+        // resolvedRefs cache and byte-identical carried lines keep a run with
+        // no new GitHub ref at zero tracker calls.
+        resolveRef: async (ref) => {
+          const resolved = await resolveReference(ref, {
+            meshChat: repositories.meshChat,
+            inbox: repositories.inbox,
+            actors: repositories.actors,
+            actorRuns: repositories.actorRuns,
+            issueClient: baseIssueClient,
+            ...(chatClient ? { chatClient } : {}),
+            ...(slackClient ? { slackClient } : {}),
+          });
+          if (resolved.unavailable === null) return { outcome: "resolved" as const };
+          // `resolveReference` deliberately returns a displayable result rather
+          // than throwing. Preserve that distinction here: a 429/5xx/timeout is
+          // a retry-later condition, not evidence that the model fabricated a
+          // citation and therefore not a failure that can freeze this actor.
+          if (
+            /(?:\b429\b|\b5\d\d\b|rate limit|timed? out|timeout|temporar|network|econn|enotfound)/i.test(
+              resolved.unavailable
+            )
+          ) {
+            return { outcome: "unavailable" as const, reason: resolved.unavailable };
+          }
+          return { outcome: "unresolved" as const, reason: resolved.unavailable };
+        },
+        classify: (senderId) =>
+          classifyBriefSender(senderId, actorId, {
+            parentOf: (id) => repositories.actors.parentOf(id),
+            isHumanPrincipal: (id) =>
+              id === HUMAN_OPERATOR || repositories.principals.getUser(id) !== undefined,
+          }),
+        listSources: (position, limit) =>
+          repositories.actorRuns.listLedgerSourcesAfterPosition(actorId, position, limit),
+        latestPosition: () => repositories.actorRuns.latestLedgerSourcePosition(actorId),
+        recordAttempt: (attempt) => {
+          repositories.meshEvents.record({
+            kind: "portable_context_brief_rewrite",
+            actorId,
+            detail: `${attempt.attempt} ${attempt.outcome} gen ${attempt.generation}`,
+            body: JSON.stringify(attempt),
+          });
+        },
+        raiseAttention: ({ actorId: childId, reason }) => {
+          const parentId = repositories.actors.parentOf(childId) ?? childId;
+          if (parentId === childId) {
+            log.warn("portable_context_brief_freeze_no_parent", {
+              actorId: childId,
+              reason,
+            });
+          }
+          const entryId = repositories.inbox.append([
+            {
+              actorId: parentId,
+              source: `portable_context_brief:${childId}`,
+              payload: {
+                type: "portable_context_brief.needs_attention",
+                actorId: childId,
+                reason,
+              },
+            },
+          ])[0]?.id;
+          return entryId ? { ownerId: parentId, entryId } : null;
+        },
+        isAttentionHandled: isBriefAttentionHandled(repositories.inbox),
+        log: (message) => log.warn("portable_context_brief_warning", { message }),
+      });
+    } catch (err) {
+      // Keep the previous brief and cursor; the next run retries. The rejection
+      // reason also rides the per-attempt telemetry row whenever the cycle ran.
+      log.warn("portable_context_brief_rewrite_failed", {
+        actorId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
   // ── Follower gateway: persistent remote execution nodes ──
   let followerHub: FollowerHub | undefined;
   if (config.followers) {
@@ -2812,6 +2947,7 @@ async function composeStart(
             body: JSON.stringify(compacted),
           });
         }
+        await rewriteBriefActorAfterRun(id);
         if (!result.success) {
           await routeRunFailure(
             failureSink,
@@ -4299,6 +4435,7 @@ async function composeStart(
           inbox: getRepositories().inbox,
           actorRuns: getRepositories().actorRuns,
           runPrompts: getRepositories().runPrompts,
+          portableContext: getRepositories().portableContext,
           inboxFocus: getRepositories().inboxFocus,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,

@@ -326,6 +326,16 @@ class FakeApi extends DashboardApi {
   /// preview rather than empty: the route reads the same field the list clipped,
   /// so it cannot answer with less than the list already carried.
   final charters = <String, String>{};
+  final briefs = <String, String?>{};
+
+  @override
+  Future<({String charter, bool briefMode, String? brief})> fetchActorInfo(
+    String threadId,
+  ) async => (
+    charter: await fetchCharter(threadId),
+    briefMode: briefs.containsKey(threadId),
+    brief: briefs[threadId],
+  );
   final charterCalls = <String>[];
   Object? charterError;
 

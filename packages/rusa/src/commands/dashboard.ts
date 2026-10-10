@@ -70,6 +70,7 @@ ${"━".repeat(26)}
       meshEvents: getRepositories().meshEvents,
       meshChat: getRepositories().meshChat,
       obligations: getRepositories().obligations,
+      portableContext: getRepositories().portableContext,
       referenceCache,
       // No mesh runs here, so this emitter never fires live_output; it exists so
       // the SSE endpoint is available (it will carry events only if this process

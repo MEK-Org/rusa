@@ -30,6 +30,10 @@ import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
+import {
+  emptyPortableContextState,
+  PORTABLE_CONTEXT_SCHEMA_VERSION,
+} from "../actor/portable-context-state.js";
 import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
 import { RootModelConfigStartupError } from "../actor/root-model-config.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
@@ -4501,6 +4505,66 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(built.injectRecord?.runCount).toBe(1);
   });
 
+  it("seeds brief mode before its first prompt and never renders the old ledger", async () => {
+    let mesh: ActorMesh | undefined;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+          context: { type: "portable", mode: "brief" },
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const old = emptyPortableContextState("root");
+    old.items = [
+      {
+        id: "old-ledger-line",
+        kind: "decision",
+        priority: "must",
+        status: "active",
+        statement: "This old ledger line must not leak into brief mode.",
+        evidence: [
+          {
+            eventId: "old-source",
+            sender: "root",
+            ts: "2026-10-07T00:00:00.000Z",
+            quote: "old ledger",
+          },
+        ],
+        updatedAt: "2026-10-07T00:00:00.000Z",
+      },
+    ];
+    getRepositories().portableContext.save(old);
+
+    const rootActor = mesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+    const prompt = (
+      rootActor as unknown as { opts: { buildPrompt: () => { prompt: string } } }
+    ).opts.buildPrompt().prompt;
+    expect(prompt).toContain("The charter is in force; it is rendered in the prompt.");
+    expect(prompt).not.toContain("This old ledger line must not leak into brief mode.");
+    expect(getRepositories().portableContext.load("root").brief?.cursor).toBeNull();
+  });
+
   it("applies the existing ledger API-key requirement to a portable root", async () => {
     let ready = false;
     writeFileSync(
@@ -7673,7 +7737,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         .all() as { actor_id: string; snapshot: string }[];
       expect(committed.map((row) => row.actor_id)).toEqual(["root"]);
       expect(JSON.parse(committed[0]?.snapshot ?? "")).toMatchObject({
-        schemaVersion: 3,
+        schemaVersion: PORTABLE_CONTEXT_SCHEMA_VERSION,
         generation: 5,
       });
 

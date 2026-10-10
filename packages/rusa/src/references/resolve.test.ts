@@ -190,6 +190,23 @@ describe("resolveReference — github", () => {
 });
 
 describe("resolveReference — mesh", () => {
+  it("resolves the actor-charter citation used by a brief seed", async () => {
+    const get = vi.fn().mockReturnValue({
+      id: "actor-1",
+      charter: "Own the portable-context experiment.",
+      createdAt: "2026-10-07T00:00:00Z",
+    });
+    const resolved = await resolveReference("mesh:actors/actor-1/charter", {
+      actors: { get } as never,
+    });
+    expect(resolved).toMatchObject({
+      title: "Charter of actor-1",
+      body: "Own the portable-context experiment.",
+      unavailable: null,
+    });
+    expect(get).toHaveBeenCalledWith("actor-1");
+  });
+
   it("exposes raw sender/recipient ids as a structured entity rather than baking them into title text", async () => {
     const getById = vi.fn().mockReturnValue({
       id: "m1",

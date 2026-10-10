@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { Obligation } from "../obligations/obligation.js";
 import {
   isRetiredMemoryKind,
+  type PortableBrief,
   type PortableContextState,
   type PortableMemoryItem,
   type PortableMemoryPriority,
@@ -633,8 +634,31 @@ function boundedMessages(messages: PriorMessage[]): { section: string; selected:
 }
 
 /**
+ * Render the brief-mode durable-intent section: the three sections verbatim
+ * under a heading naming the mode, the brief's own generation and its cursor.
+ * The 16 KB cap is enforced at rewrite time, so unlike the ledger render this
+ * can never emit an "omitted due to budget" line — the property the prompt
+ * header can state flatly.
+ */
+function renderBrief(brief: PortableBrief): string {
+  const cursor = brief.cursor
+    ? `${brief.cursor.ts}#${brief.cursor.sourceOrder}/${brief.cursor.id}`
+    : "start";
+  return (
+    `\n### Durable brief (mode: brief, generation ${brief.generation}, cursor ${cursor})\n\n` +
+    `${brief.text.trim()}\n`
+  );
+}
+
+/**
  * v2 assembly: active source-backed memory, recent inbound messages, then the
  * recent run tail. Inputs are newest-first, matching repository reads.
+ *
+ * In `brief` mode (`input.brief` set) the durable-intent ledger section is
+ * replaced by the rendered brief: the three sections verbatim under a heading
+ * naming the mode, generation and cursor. Everything else — obligations
+ * projection, verbatim recent-message journal, run tail — renders unchanged,
+ * and the ledger stays untouched in the snapshot so switching back is free.
  */
 export function assemblePortableContextV2(input: {
   state: PortableContextState;
@@ -642,11 +666,15 @@ export function assemblePortableContextV2(input: {
   runs: PriorRun[];
   /** The actor's own obligations in store queue order; omit when unavailable. */
   obligations?: Obligation[];
+  /** Brief-mode document; omit in ledger mode. */
+  brief?: PortableBrief | null;
 }): PortableContext | null {
-  const { section: ledger, metrics: ledgerMetrics } = renderLedger(input.state);
+  const ledger = renderLedger(input.state);
+  const briefSection = input.brief ? renderBrief(input.brief) : ledger.section;
+  const ledgerMetrics = input.brief ? undefined : ledger.metrics;
   const obligations = renderObligations(input.obligations ?? []);
   const recentMessages = boundedMessages(input.messages);
-  const fixed = V2_HEADER + ledger + obligations + recentMessages.section;
+  const fixed = V2_HEADER + briefSection + obligations + recentMessages.section;
   if (byteLen(fixed) > PORTABLE_CONTEXT_MAX_BYTES) {
     throw new Error(`portable context fixed sections exceed ${PORTABLE_CONTEXT_MAX_BYTES} bytes`);
   }
@@ -672,7 +700,7 @@ export function assemblePortableContextV2(input: {
   const orderedRuns = [...selectedRuns].reverse();
   const runsSection =
     orderedRuns.length > 0 ? runHeading + orderedRuns.map(renderRun).join("") : "";
-  if (!ledger && !obligations && !recentMessages.section && !runsSection) return null;
+  if (!briefSection && !obligations && !recentMessages.section && !runsSection) return null;
 
   const section = fixed + runsSection;
   return {
@@ -686,11 +714,11 @@ export function assemblePortableContextV2(input: {
       stateHash: createHash("sha256").update(JSON.stringify(input.state)).digest("hex"),
       sourceMessageEventIds: recentMessages.selected.map((message) => message.id),
       sections: {
-        ledger: byteLen(ledger),
+        ledger: byteLen(briefSection),
         messages: byteLen(recentMessages.section),
         runs: byteLen(runsSection),
       },
-      ledger: ledgerMetrics,
+      ledger: ledgerMetrics ?? undefined,
     },
   };
 }

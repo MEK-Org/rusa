@@ -12,13 +12,15 @@ import type { ContextConfig } from "./actor-record.js";
  * - `tail` — the mesh owns the context as a bounded raw window with no
  *   compaction and no LLM in the loop; useful for experiments that want the
  *   aging boundary without a compactor.
+ * - `brief` — the mesh owns a cited three-section durable brief, rewritten
+ *   after runs with the configured Gemini key.
  *
  * There is deliberately no bare `portable` selection. `ledger` and `tail` ARE
  * the portable modes, so a fourth word naming their family would sit at a
  * different level than the other three and leave "portable vs ledger" reading
  * as a real choice when it is not one. One field, one level: name the mode.
  */
-export const CONTEXT_SELECTIONS = ["native", "ledger", "tail"] as const;
+export const CONTEXT_SELECTIONS = ["native", "ledger", "tail", "brief"] as const;
 export type ContextSelection = (typeof CONTEXT_SELECTIONS)[number];
 
 export function isContextSelection(value: unknown): value is ContextSelection {
@@ -72,6 +74,16 @@ export function resolveContextSelection(
       throw new Error("compactionModel is meaningless for tail mode, which never compacts");
     }
     return { type: "portable", mode: "tail" };
+  }
+  if (raw === "brief") {
+    if (compactionModel) {
+      // The brief rewriter is fixed to bare gemini-3.8-flash by the #954 spec;
+      // a stored model here would read as configured and never be consulted.
+      throw new Error(
+        "compactionModel is meaningless for brief mode, whose rewrite model is fixed"
+      );
+    }
+    return { type: "portable", mode: "brief" };
   }
   return { type: "portable", mode: "ledger", compactionModel };
 }
@@ -129,9 +141,9 @@ export function assertSpawnContextSupported(
         "drop conversationId or spawn it with native context"
     );
   }
-  if (context.mode === "ledger" && !caps.ledgerCompactionAvailable) {
+  if ((context.mode === "ledger" || context.mode === "brief") && !caps.ledgerCompactionAvailable) {
     throw new Error(
-      "portable ledger mode needs a Gemini API key for compaction (config geminiApiKey); " +
+      `portable ${context.mode} mode needs a Gemini API key for rewriting (config geminiApiKey); ` +
         "set it, or spawn with tail mode which never compacts"
     );
   }

@@ -1149,6 +1149,22 @@ describe("agent-execution MCP server", () => {
     expect(registry.get(thread_id)?.context).toMatchObject({ type: "portable", mode: "ledger" });
   });
 
+  it("spawn_thread accepts brief through the same supported selection boundary", async () => {
+    const { mesh, registry } = setup();
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const { thread_id } = dataOf(
+      (await client.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "own a brief-mode trial",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+          context_mode: "brief",
+        },
+      })) as CallToolResult
+    ) as { thread_id: string };
+    expect(registry.get(thread_id)?.context).toMatchObject({ type: "portable", mode: "brief" });
+  });
+
   it("spawn_thread leaves the record's context unset when no mode is asked for", async () => {
     // Counter-assertion to the cell above: the default must still be native, or
     // the cell above would pass for the wrong reason (everything portable).

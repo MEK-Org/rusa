@@ -9,7 +9,7 @@ export interface NativeContextConfig {
 
 export interface PortableContextConfig {
   type: "portable";
-  mode: "tail" | "ledger";
+  mode: "tail" | "ledger" | "brief";
   /** Gemini model used to compact ledger context; omitted to use the system default. */
   compactionModel?: string;
 }

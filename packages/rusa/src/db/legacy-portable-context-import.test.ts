@@ -13,6 +13,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   emptyPortableContextState,
+  PORTABLE_CONTEXT_SCHEMA_VERSION,
   type PortableContextState,
   type PortableMemoryItem,
 } from "../actor/portable-context-state.js";
@@ -156,7 +157,7 @@ describe("legacy portable-context import", () => {
 
     expect(runImport().importedSnapshots).toBe(1);
     expect(repositories.portableContext.load(ACTOR_A)).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: PORTABLE_CONTEXT_SCHEMA_VERSION,
       lastFoldedSourceId: "legacy-message-event",
     });
   });

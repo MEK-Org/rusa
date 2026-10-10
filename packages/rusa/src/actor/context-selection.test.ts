@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   assertSpawnContextSupported,
   CONTEXT_SELECTIONS,
+  resolveContextConfig,
   resolveContextSelection,
 } from "./context-selection.js";
 
@@ -25,6 +26,7 @@ describe("resolveContextSelection", () => {
       compactionModel: undefined,
     });
     expect(resolveContextSelection("tail")).toEqual({ type: "portable", mode: "tail" });
+    expect(resolveContextSelection("brief")).toEqual({ type: "portable", mode: "brief" });
   });
 
   it("has no bare portable selection", () => {
@@ -52,11 +54,18 @@ describe("resolveContextSelection", () => {
     expect(() => resolveContextSelection(undefined, { compactionModel: "gemini-x" })).toThrow(
       "requires a portable context selection"
     );
+    // Brief rewrites always use the spec-fixed model, so a configured one would be inert.
+    expect(() => resolveContextSelection("brief", { compactionModel: "gemini-x" })).toThrow(
+      "meaningless for brief mode"
+    );
+    expect(() =>
+      resolveContextConfig({ type: "portable", mode: "brief", compactionModel: "gemini-x" })
+    ).toThrow("meaningless for brief mode");
   });
 
   it("names the valid values when the selection is unknown", () => {
     expect(() => resolveContextSelection("portible")).toThrow("portible");
-    expect(() => resolveContextSelection("portible")).toThrow("native, ledger, tail");
+    expect(() => resolveContextSelection("portible")).toThrow("native, ledger, tail, brief");
     expect(() => resolveContextSelection(7)).toThrow("unknown context selection");
   });
 
@@ -105,10 +114,16 @@ describe("assertSpawnContextSupported", () => {
     ).toThrow("geminiApiKey");
   });
 
-  it("allows ledger when compaction is available, and tail either way", () => {
+  it("allows Gemini-backed modes when available, and tail either way", () => {
     expect(() =>
       assertSpawnContextSupported({ context: { type: "portable", mode: "ledger" } }, available)
     ).not.toThrow();
+    expect(() =>
+      assertSpawnContextSupported({ context: { type: "portable", mode: "brief" } }, available)
+    ).not.toThrow();
+    expect(() =>
+      assertSpawnContextSupported({ context: { type: "portable", mode: "brief" } }, unavailable)
+    ).toThrow("geminiApiKey");
     // Tail never calls the compactor, so a missing key must NOT block it —
     // otherwise the guard would be refusing a configuration that works.
     expect(() =>

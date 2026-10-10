@@ -122,7 +122,7 @@ const legacyContextConfigSchema = z.discriminatedUnion("type", [
     .object({
       schemaVersion: z.literal(LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
       type: z.literal("portable"),
-      mode: z.enum(["tail", "ledger"]),
+      mode: z.enum(["tail", "ledger", "brief"]),
       compactionModel: z.string().optional(),
     })
     .strict(),
@@ -141,7 +141,7 @@ const currentContextConfigSchema = z.discriminatedUnion("type", [
     .object({
       schemaVersion: z.literal(ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
       type: z.literal("portable"),
-      mode: z.enum(["tail", "ledger"]),
+      mode: z.enum(["tail", "ledger", "brief"]),
       compactionModel: z.string().optional(),
       executionTarget: z.string().optional(),
     })
