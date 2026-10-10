@@ -1,13 +1,36 @@
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import {
   createDashboardE2EQuotaApi,
+  resolveE2EInstance,
+  routeClonesToLoopback,
   startChatControlServer,
   startRootControlServer,
 } from "./e2e-actor-mesh.js";
 import type { RunStartE2EHandles } from "./start.js";
+
+const TEST_TMPDIR = tmpdir();
+const E2E_ENV_KEYS = [
+  "RUSA_HOME",
+  "GIT_CONFIG_GLOBAL",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "TMPDIR",
+] as const;
+const ORIGINAL_E2E_ENV = new Map(E2E_ENV_KEYS.map((key) => [key, process.env[key]]));
+
+function restoreE2EEnvironment(): void {
+  for (const key of E2E_ENV_KEYS) {
+    const value = ORIGINAL_E2E_ENV.get(key);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
 
 describe("external root E2E control server", () => {
   let close: (() => Promise<void>) | undefined;
@@ -255,5 +278,58 @@ describe("chat E2E control server", () => {
         text: "Hello E2E",
       })
     );
+  });
+});
+
+describe("resolveE2EInstance", () => {
+  let root = "";
+
+  beforeEach(() => {
+    restoreE2EEnvironment();
+  });
+
+  afterEach(() => {
+    if (root) {
+      rmSync(root, { recursive: true, force: true });
+      root = "";
+    }
+    restoreE2EEnvironment();
+  });
+
+  it("automatically resumes a complete existing root without --resume (watcher restart)", () => {
+    root = mkdtempSync(join(TEST_TMPDIR, "e2e-resolve-watcher-"));
+    const initial = resolveE2EInstance({ root, rootDriver: "external" });
+    expect(initial.resumed).toBe(false);
+    expect(initial.instance.root).toBe(root);
+    const url = "http://127.0.0.1:8087/git/repo.git";
+    routeClonesToLoopback(root, url, initial.instance.repo, initial.resumed);
+    const gitconfig = readFileSync(join(root, "gitconfig"), "utf8");
+    expect(gitconfig.split(`[url "${url}"]`)).toHaveLength(2);
+
+    // Simulate database initialization that happens during the first run.
+    mkdirSync(join(initial.instance.home, "data"), { recursive: true });
+    writeFileSync(join(initial.instance.home, "data", "mesh.db"), "", "utf8");
+
+    // Scratch file written by the first run.
+    writeFileSync(
+      join(initial.instance.scratchPath, "NOTE.txt"),
+      "preserve across watcher restart\n",
+      "utf8"
+    );
+
+    // Next watcher rebuild calls without --resume, passing the same --root.
+    const resolved = resolveE2EInstance({ root, rootDriver: "external" });
+    expect(resolved.resumed).toBe(true);
+    expect(resolved.instance.root).toBe(root);
+    expect(readFileSync(join(resolved.instance.scratchPath, "NOTE.txt"), "utf8")).toBe(
+      "preserve across watcher restart\n"
+    );
+    routeClonesToLoopback(root, url, resolved.instance.repo, resolved.resumed);
+    expect(readFileSync(join(root, "gitconfig"), "utf8")).toBe(gitconfig);
+
+    // An explicit --resume leaves it untouched too.
+    const explicit = resolveE2EInstance({ root, resume: true, rootDriver: "external" });
+    routeClonesToLoopback(root, url, explicit.instance.repo, explicit.resumed);
+    expect(readFileSync(join(root, "gitconfig"), "utf8")).toBe(gitconfig);
   });
 });
