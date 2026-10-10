@@ -16,6 +16,8 @@ import { type E2EGitRemoteServer, startE2EGitRemoteServer } from "../e2e/git-rem
 import { LocalTracker } from "../e2e/local-tracker.js";
 import {
   E2E_RUNS_DIR_NAME,
+  type E2EInstance,
+  missingResumeRequirements,
   PID_FILE,
   provisionE2EInstance,
   resumeE2EInstance,
@@ -104,6 +106,70 @@ export function createDashboardE2EQuotaApi(now = Date.now()): QuotaApiDeps {
   };
 }
 
+export interface ResolveE2EInstanceOptions {
+  root?: string;
+  resume?: boolean;
+  portOffset?: number;
+  baseConfigHome?: string;
+  rootDriver?: "provider" | "external";
+  slack?: SlackConfig;
+}
+
+export interface ResolvedE2EInstance {
+  instance: E2EInstance;
+  resumed: boolean;
+}
+
+/**
+ * Resolves an E2E instance: if `--resume` is explicitly set, or if an existing
+ * `--root` is already complete and structurally resumable (as during watcher
+ * restarts), reopens the existing instance without rewriting state; otherwise
+ * provisions a fresh instance.
+ */
+export function resolveE2EInstance(opts: ResolveE2EInstanceOptions): ResolvedE2EInstance {
+  // Provision OUTSIDE /tmp. Sandboxed workers run under bwrap with `--tmpfs /tmp`,
+  // which replaces /tmp with a fresh empty mount — so anything the instance puts
+  // under /tmp (the bare remote backing the loopback endpoint, the gitconfig with
+  // the clone `insteadOf`) would be invisible to a worker's own process, and the
+  // instance's own git-http-backend child processes need the bare remote to keep
+  // existing across the run. Rooting under $HOME keeps it ro-bound and visible, so
+  // a worker can clone the synthetic repo via the rewritten URL.
+  const runsDir = join(homedir(), E2E_RUNS_DIR_NAME);
+  mkdirSync(runsDir, { recursive: true });
+  if (opts.resume && !opts.root) {
+    throw new Error("--resume requires --root");
+  }
+  const instanceRoot = opts.root ?? mkdtempSync(join(runsDir, "run-"));
+  const shouldResume =
+    opts.resume ||
+    (opts.root !== undefined && missingResumeRequirements(instanceRoot).length === 0);
+
+  const offset = opts.portOffset ?? 0;
+  const instance = shouldResume
+    ? resumeE2EInstance(instanceRoot)
+    : provisionE2EInstance({
+        dashboardPort: 8083 + offset,
+        root: instanceRoot,
+        baseConfigHome: opts.baseConfigHome,
+        // External control does not invoke a root provider, but children still
+        // use the real provider catalog and credentials seeded below.
+        rootActor: {
+          provider: opts.rootDriver === "external" ? "fake" : "claude",
+          model: opts.rootDriver === "external" ? "fake-model" : "claude-sonnet-5",
+        },
+        chat: {
+          projectId: "e2e",
+          subscription: "e2e",
+          pubsubKeyPath: "/dev/null",
+          gchatConfigDir: "/tmp/rusa-e2e-gchat",
+          errorChat: "spaces/e2e-errors",
+        },
+        slack: opts.slack,
+      });
+
+  return { instance, resumed: Boolean(shouldResume) };
+}
+
 /**
  * `e2e am-up` — provision a disposable instance and run the **actor mesh**
  * (`runStart`) against it, with the GitHub and chat edges swapped for fakes and
@@ -154,44 +220,14 @@ export async function runActorMeshE2EUp(opts: {
     process.exit(1);
   }
 
-  // Provision OUTSIDE /tmp. Sandboxed workers run under bwrap with `--tmpfs /tmp`,
-  // which replaces /tmp with a fresh empty mount — so anything the instance puts
-  // under /tmp (the bare remote backing the loopback endpoint, the gitconfig with
-  // the clone `insteadOf`) would be invisible to a worker's own process, and the
-  // instance's own git-http-backend child processes need the bare remote to keep
-  // existing across the run. Rooting under $HOME keeps it ro-bound and visible, so
-  // a worker can clone the synthetic repo via the rewritten URL.
-  const runsDir = join(homedir(), E2E_RUNS_DIR_NAME);
-  mkdirSync(runsDir, { recursive: true });
-  if (opts.resume && !opts.root) {
-    throw new Error("--resume requires --root");
-  }
-  const instanceRoot = opts.root ?? mkdtempSync(join(runsDir, "run-"));
-
-  // Provision with the actor-mesh edges enabled: a root actor (agy, built-in
-  // charter) and a chat config (the real fields are unused — fakes are injected
-  // below — but their presence activates the chat MCP server + inbound path).
-  const instance = opts.resume
-    ? resumeE2EInstance(instanceRoot)
-    : provisionE2EInstance({
-        dashboardPort: 8083 + offset,
-        root: instanceRoot,
-        baseConfigHome: opts.baseConfigHome,
-        // External control does not invoke a root provider, but children still
-        // use the real provider catalog and credentials seeded below.
-        rootActor: {
-          provider: opts.rootDriver === "external" ? "fake" : "claude",
-          model: opts.rootDriver === "external" ? "fake-model" : "claude-sonnet-5",
-        },
-        chat: {
-          projectId: "e2e",
-          subscription: "e2e",
-          pubsubKeyPath: "/dev/null",
-          gchatConfigDir: "/tmp/rusa-e2e-gchat",
-          errorChat: "spaces/e2e-errors",
-        },
-        slack: opts.slack,
-      });
+  const { instance, resumed } = resolveE2EInstance({
+    root: opts.root,
+    resume: opts.resume,
+    portOffset: offset,
+    baseConfigHome: opts.baseConfigHome,
+    rootDriver: opts.rootDriver,
+    slack: opts.slack,
+  });
   const { root: rootDir, home, config, repo } = instance;
   const bot = config.github.account ?? "quickstart-user";
 
@@ -227,7 +263,7 @@ export async function runActorMeshE2EUp(opts: {
   try {
     // Resolve clones of the synthetic repo to the loopback endpoint, so a worker
     // that `git clone`s the GitHub URL transparently hits our throwaway origin.
-    if (!opts.resume) {
+    if (!resumed) {
       appendFileSync(
         join(rootDir, "gitconfig"),
         [
