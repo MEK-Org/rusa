@@ -538,6 +538,16 @@ export interface ObligationHistoryState {
 /**
  * One immutable, attributable mutation history record (#185).
  */
+export interface ObligationHistoryEntry {
+  id: number;
+  obligationId: string;
+  mutationKind: ObligationMutationKind;
+  actingPrincipal: EntityId;
+  timestamp: string;
+  before: ObligationHistoryState;
+  after: ObligationHistoryState;
+}
+
 /**
  * An obligation's latest reassignment, when that reassignment carried a
  * message (#947): who moved it, from whom to whom, when, and why. Read from the
@@ -549,16 +559,6 @@ export interface ObligationReassignment {
   message: string;
   actingPrincipal: EntityId;
   timestamp: string;
-}
-
-export interface ObligationHistoryEntry {
-  id: number;
-  obligationId: string;
-  mutationKind: ObligationMutationKind;
-  actingPrincipal: EntityId;
-  timestamp: string;
-  before: ObligationHistoryState;
-  after: ObligationHistoryState;
 }
 
 /**

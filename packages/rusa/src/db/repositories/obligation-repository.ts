@@ -3104,7 +3104,8 @@ export class ObligationRepository {
    * it was handed to can read why. Null when it was never reassigned, or when
    * its latest reassignment carried no message: an earlier message described a
    * hand-off that has since been superseded. Fail-closed like
-   * {@link listHistory}.
+   * {@link listHistory}: an unreadable row, or a `reassign` row missing either
+   * owner id (the writer always records both), throws.
    */
   latestReassignment(id: string): ObligationReassignment | null {
     const row = this.db
@@ -3119,13 +3120,12 @@ export class ObligationRepository {
     if (row === undefined) return null;
     const entry = parseHistoryRow(row);
     const { before, after } = entry;
-    if (
-      after.message === undefined ||
-      before.ownerId === undefined ||
-      after.ownerId === undefined
-    ) {
-      return null;
+    if (before.ownerId === undefined || after.ownerId === undefined) {
+      throw new ObligationValidationError(
+        `reassign history row ${entry.id} is missing an owner id`
+      );
     }
+    if (after.message === undefined) return null;
     return {
       previousOwnerId: before.ownerId,
       newOwnerId: after.ownerId,

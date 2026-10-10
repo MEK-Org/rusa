@@ -474,6 +474,17 @@ describe("Obligation mutation history", () => {
       repository.reassign(superseded.id, "actor-b", "actor-a");
       expect(repository.latestReassignment(superseded.id)).toBeNull();
     });
+
+    it("throws on a reassign row missing an owner id, like listHistory", () => {
+      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
+
+      db.prepare(
+        `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
+         VALUES (?, 'reassign', 'actor-a', '2026-09-09T12:00:00.000Z', '{"schemaVersion":2,"before":{},"after":{"ownerId":"actor-b","message":"Why."}}')`
+      ).run(ob.id);
+
+      expect(() => repository.latestReassignment(ob.id)).toThrow(ObligationValidationError);
+    });
   });
 
   describe("direct mutation coverage", () => {
