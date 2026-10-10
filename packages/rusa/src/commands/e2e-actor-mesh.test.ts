@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -9,9 +8,9 @@ import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import {
   createDashboardE2EQuotaApi,
   resolveE2EInstance,
+  routeClonesToLoopback,
   startChatControlServer,
   startRootControlServer,
-  withLoopbackRewrite,
 } from "./e2e-actor-mesh.js";
 import type { RunStartE2EHandles } from "./start.js";
 
@@ -302,6 +301,10 @@ describe("resolveE2EInstance", () => {
     const initial = resolveE2EInstance({ root, rootDriver: "external" });
     expect(initial.resumed).toBe(false);
     expect(initial.instance.root).toBe(root);
+    const url = "http://127.0.0.1:8087/git/repo.git";
+    routeClonesToLoopback(root, url, initial.instance.repo, initial.resumed);
+    const gitconfig = readFileSync(join(root, "gitconfig"), "utf8");
+    expect(gitconfig.split(`[url "${url}"]`)).toHaveLength(2);
 
     // Simulate database initialization that happens during the first run.
     mkdirSync(join(initial.instance.home, "data"), { recursive: true });
@@ -321,68 +324,12 @@ describe("resolveE2EInstance", () => {
     expect(readFileSync(join(resolved.instance.scratchPath, "NOTE.txt"), "utf8")).toBe(
       "preserve across watcher restart\n"
     );
-  });
-});
+    routeClonesToLoopback(root, url, resolved.instance.repo, resolved.resumed);
+    expect(readFileSync(join(root, "gitconfig"), "utf8")).toBe(gitconfig);
 
-describe("withLoopbackRewrite", () => {
-  const repo = "acme/widgets";
-  const url = "http://127.0.0.1:8087/git/repo.git";
-  const forms = [
-    `https://github.com/${repo}`,
-    `https://github.com/${repo}.git`,
-    `git@github.com:${repo}.git`,
-  ];
-  let dir = "";
-
-  afterEach(() => {
-    if (dir) {
-      rmSync(dir, { recursive: true, force: true });
-      dir = "";
-    }
-  });
-
-  /** What real Git resolves each clone form to under `gitconfig` (no network). */
-  function resolveWithGit(gitconfig: string): string[] {
-    dir = dir || mkdtempSync(join(TEST_TMPDIR, "e2e-rewrite-"));
-    const path = join(dir, "gitconfig");
-    writeFileSync(path, gitconfig, "utf8");
-    const env = { ...process.env, GIT_CONFIG_GLOBAL: path, GIT_CONFIG_NOSYSTEM: "1" };
-    return forms.map((form) =>
-      execFileSync("git", ["ls-remote", "--get-url", form], {
-        cwd: dir,
-        env,
-        encoding: "utf8",
-      }).trim()
-    );
-  }
-
-  function rewrite(gitconfig: string): string {
-    return withLoopbackRewrite(gitconfig, url, repo) ?? gitconfig;
-  }
-
-  it("routes every clone form to the loopback and is then a no-op", () => {
-    const gitconfig = rewrite("[user]\n\tname = e2e");
-    expect(gitconfig).toMatch(/^\[user\]\n\tname = e2e\n\[url "/);
-    expect(resolveWithGit(gitconfig)).toEqual([url, url, url]);
-    expect(withLoopbackRewrite(gitconfig, url, repo)).toBeNull();
-  });
-
-  it("takes precedence over a mapping from another port offset or ab-context", () => {
-    const otherOffset = withLoopbackRewrite("", "http://127.0.0.1:8088/git/repo.git", repo) ?? "";
-    const abContext = `[url "/runs/run-1/remote/repo.git"]\n\tinsteadOf = https://github.com/${repo}\n`;
-    for (const gitconfig of [otherOffset, abContext]) {
-      expect(resolveWithGit(rewrite(gitconfig))).toEqual([url, url, url]);
-    }
-  });
-
-  it("completes a loopback section with missing or partial values", () => {
-    for (const values of [[], [forms[0]]]) {
-      const gitconfig = [`[url "${url}"]`, ...values.map((f) => `\tinsteadOf = ${f}`), ""].join(
-        "\n"
-      );
-      const rewritten = rewrite(gitconfig);
-      expect(resolveWithGit(rewritten)).toEqual([url, url, url]);
-      expect(withLoopbackRewrite(rewritten, url, repo)).toBeNull();
-    }
+    // An explicit --resume leaves it untouched too.
+    const explicit = resolveE2EInstance({ root, resume: true, rootDriver: "external" });
+    routeClonesToLoopback(root, url, explicit.instance.repo, explicit.resumed);
+    expect(readFileSync(join(root, "gitconfig"), "utf8")).toBe(gitconfig);
   });
 });
