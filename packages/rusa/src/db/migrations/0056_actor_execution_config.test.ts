@@ -184,27 +184,27 @@ function actorIndexes(db: Database.Database): string[] {
 }
 
 const EXPECTED_DOCUMENTS = {
-  "corrupt-context": { context: "{not json", execution: { schemaVersion: 1, sandboxed: true } },
+  "corrupt-context": { context: "{not json", execution: { schemaVersion: 1, unsandboxed: false } },
   "invalid-v2-target": {
     context: { schemaVersion: 2, type: "native", executionTarget: null },
-    execution: { schemaVersion: 1, sandboxed: true },
+    execution: { schemaVersion: 1, unsandboxed: false },
   },
-  lead: { context: null, execution: { schemaVersion: 1, sandboxed: true } },
+  lead: { context: null, execution: { schemaVersion: 1, unsandboxed: false } },
   "placed-native": {
     context: { schemaVersion: 1, type: "native", sessionId: "session-placed" },
-    execution: { schemaVersion: 1, sandboxed: true, executionTarget: "follower-b" },
+    execution: { schemaVersion: 1, unsandboxed: false, executionTarget: "follower-b" },
   },
   "placed-portable": {
     context: { schemaVersion: 1, type: "portable", mode: "ledger", compactionModel: "gemini-test" },
-    execution: { schemaVersion: 1, sandboxed: true, executionTarget: "follower-a" },
+    execution: { schemaVersion: 1, unsandboxed: false, executionTarget: "follower-a" },
   },
   "retired-worker": {
     context: { schemaVersion: 1, type: "portable", mode: "tail" },
-    execution: { schemaVersion: 1, sandboxed: true },
+    execution: { schemaVersion: 1, unsandboxed: false },
   },
   root: {
     context: { schemaVersion: 1, type: "native", sessionId: "session-root" },
-    execution: { schemaVersion: 1, sandboxed: false },
+    execution: { schemaVersion: 1, unsandboxed: true },
   },
 };
 
@@ -248,7 +248,7 @@ describe("0056_actor_execution_config", () => {
     db.close();
   });
 
-  it("copies placement out of context_config and backfills sandboxed once, preserving the rest", () => {
+  it("copies placement out of context_config and backfills unsandboxed once, preserving the rest", () => {
     const db = new Database(file);
     db.pragma("foreign_keys = ON");
     runMigrations(db, { throughId: PRIOR });
@@ -298,45 +298,25 @@ describe("0056_actor_execution_config", () => {
     );
     expect(
       ["root", "lead", "placed-portable", "placed-native", "retired-worker"].map((id) => {
-        const { parentId, sandboxed, executionTarget, status } = actors.get(id) ?? {};
-        return { id, parentId, sandboxed, executionTarget, status };
+        const { parentId, executionConfig, status } = actors.get(id) ?? {};
+        return { id, parentId, executionConfig, status };
       })
     ).toEqual([
-      {
-        id: "root",
-        parentId: null,
-        sandboxed: false,
-        executionTarget: undefined,
-        status: "active",
-      },
-      {
-        id: "lead",
-        parentId: "root",
-        sandboxed: true,
-        executionTarget: undefined,
-        status: "active",
-      },
+      { id: "root", parentId: null, executionConfig: { unsandboxed: true }, status: "active" },
+      { id: "lead", parentId: "root", executionConfig: undefined, status: "active" },
       {
         id: "placed-portable",
         parentId: "lead",
-        sandboxed: true,
-        executionTarget: "follower-a",
+        executionConfig: { executionTarget: "follower-a" },
         status: "active",
       },
       {
         id: "placed-native",
         parentId: "lead",
-        sandboxed: true,
-        executionTarget: "follower-b",
+        executionConfig: { executionTarget: "follower-b" },
         status: "active",
       },
-      {
-        id: "retired-worker",
-        parentId: "root",
-        sandboxed: true,
-        executionTarget: undefined,
-        status: "retired",
-      },
+      { id: "retired-worker", parentId: "root", executionConfig: undefined, status: "retired" },
     ]);
     expect(actors.get("placed-portable")?.context).toEqual({
       type: "portable",
@@ -376,7 +356,7 @@ describe("0056_actor_execution_config", () => {
 
     // A placement the old binary records is a v2 context_config, which is no longer read.
     db.prepare(
-      `UPDATE actors SET execution_config = '{"schemaVersion":1,"sandboxed":false}',
+      `UPDATE actors SET execution_config = '{"schemaVersion":1,"unsandboxed":true}',
          context_config = '{"schemaVersion":2,"type":"native","executionTarget":"follower-a"}'
        WHERE id = 'inserted-by-old'`
     ).run();

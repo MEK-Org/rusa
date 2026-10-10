@@ -3081,9 +3081,11 @@ export class ActorMesh {
       // instead of creating a fresh one (loadSessionId reads record.sessionId).
       sessionId: req.conversationId,
       title: req.title,
-      // The worker builder sandboxes every child it runs (#550).
-      sandboxed: true,
-      executionTarget: req.executionTarget,
+      // A spawned child is sandboxed: the default, since spawn never asks
+      // for `unsandboxed` (#550).
+      ...(req.executionTarget !== undefined
+        ? { executionConfig: { executionTarget: req.executionTarget } }
+        : {}),
       // Every actor gets its own walkie-talkie voice at birth so a transfer or
       // multi-actor chat is audible as different speakers; the operator can
       // re-pick it from the actor info panel at any time.
@@ -3104,7 +3106,7 @@ export class ActorMesh {
     this.grantHandle(parentId, { id });
     let actor: MeshActor;
     try {
-      // `record.executionTarget` is `req.executionTarget`, so the placement a
+      // `record.executionConfig.executionTarget` is `req.executionTarget`, so the placement a
       // spawn asked for reaches the factory through the record like every
       // other construction input.
       actor = this.runs.instantiate(record);
@@ -5514,7 +5516,7 @@ export class ActorMesh {
     return {
       record,
       getRecord: () => this.actors.get(record.id),
-      executionTarget: record.executionTarget,
+      executionTarget: record.executionConfig?.executionTarget,
       mesh: this,
       lifecycle: this.lifecycleFor(record.id),
       gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),

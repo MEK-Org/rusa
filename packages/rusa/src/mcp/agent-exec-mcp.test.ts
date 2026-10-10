@@ -261,7 +261,7 @@ function setup(
       id: rootId,
       charter: "root",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     },
@@ -352,7 +352,6 @@ describe("administrative capability gating of management tools (#549)", () => {
       id: "0b2c3d4e-steward",
       charter: "steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -387,7 +386,7 @@ describe("administrative capability gating of management tools (#549)", () => {
         id,
         charter: id,
         parentId,
-        sandboxed: parentId !== null,
+        ...(parentId === null ? { executionConfig: { unsandboxed: true } } : {}),
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       });
@@ -429,7 +428,6 @@ describe("administrative capability gating of management tools (#549)", () => {
       id: "0b2c3d4e-steward",
       charter: "steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -466,7 +464,6 @@ describe("administrative capability gating of management tools (#549)", () => {
       id: "worker-a",
       charter: "worker",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -548,7 +545,7 @@ describe("administrative capability gating of management tools (#549)", () => {
         id,
         charter: id,
         parentId,
-        sandboxed: parentId !== null,
+        ...(parentId === null ? { executionConfig: { unsandboxed: true } } : {}),
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       });
@@ -619,7 +616,7 @@ describe("administrative capability gating of management tools (#549)", () => {
         id,
         charter: id,
         parentId,
-        sandboxed: parentId !== null,
+        ...(parentId === null ? { executionConfig: { unsandboxed: true } } : {}),
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       });
@@ -755,7 +752,6 @@ describe("administrative capability gating of management tools (#549)", () => {
       id: "0b2c3d4e-steward",
       charter: "steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1798,7 +1794,6 @@ describe("agent-execution MCP server", () => {
       id: "stranger",
       charter: "not mine",
       parentId: "someone-else",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1916,7 +1911,6 @@ describe("agent-execution MCP server", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1941,7 +1935,6 @@ describe("agent-execution MCP server", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1960,7 +1953,6 @@ describe("agent-execution MCP server", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1984,7 +1976,6 @@ describe("agent-execution MCP server", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -3712,7 +3703,6 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       id: "73e0b00f",
       charter: "nightly",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -4959,7 +4949,6 @@ describe("own voice tools (#817)", () => {
         id,
         charter: id,
         parentId: "root",
-        sandboxed: true,
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       });

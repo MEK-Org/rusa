@@ -5,11 +5,11 @@ import type { Migration } from "./types.js";
  * Moves how an actor runs out of topology and out of `context_config` into a
  * versioned `actors.execution_config` document (#550):
  *
- *   { schemaVersion: 1, sandboxed: boolean, executionTarget?: string }
+ *   { schemaVersion: 1, unsandboxed: boolean, executionTarget?: string }
  *
- * `sandboxed` records requested managed sandboxing independently of where the
- * actor sits in the tree. It is neither an authorization grant nor proof of
- * effective isolation. `executionTarget` is the follower a remotely placed
+ * Actors are sandboxed by default; `unsandboxed: true` records a request to
+ * run outside managed sandboxing, independently of where the actor sits in the
+ * tree. It is neither an authorization grant nor proof of effective isolation. `executionTarget` is the follower a remotely placed
  * actor runs on; absent, the actor runs on the leader.
  *
  * Per the database JSON policy the column carries no CHECK or json_* validator.
@@ -17,7 +17,7 @@ import type { Migration } from "./types.js";
  * that leaves the document out, and fails the read of a row without one.
  *
  * The backfill runs once, per row:
- * - `sandboxed` follows legacy topology: the sole parentless actor ran
+ * - `unsandboxed` follows legacy topology: the sole parentless actor ran
  *   unsandboxed and every descendant sandboxed.
  * - A v2 `context_config` (#326) is the only place `executionTarget` was
  *   stored. The target is copied across verbatim, and the context document is
@@ -65,7 +65,7 @@ export const actorExecutionConfig: Migration = {
       update.run(
         JSON.stringify({
           schemaVersion: 1,
-          sandboxed: row.parent_id !== null,
+          unsandboxed: row.parent_id === null,
           ...(executionTarget !== undefined ? { executionTarget } : {}),
         }),
         contextConfig,

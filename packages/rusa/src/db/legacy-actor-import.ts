@@ -187,7 +187,7 @@ function durableRecord(
     ...(legacy.sessionId ? { sessionId: legacy.sessionId } : {}),
     // The same rule migration 0056 backfills with: the sole root ran
     // unsandboxed and every descendant sandboxed (#550).
-    sandboxed: legacy.parentId !== null,
+    ...(legacy.parentId === null ? { executionConfig: { unsandboxed: true } } : {}),
     status: legacy.status,
     createdAt: toCanonicalTimestamp(legacy.createdAt),
   };

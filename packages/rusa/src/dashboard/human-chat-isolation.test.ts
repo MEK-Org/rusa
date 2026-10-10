@@ -84,7 +84,7 @@ function rec(id: string, parentId: string | null): ActorRecord {
     id,
     charter: `charter ${id}`,
     parentId,
-    sandboxed: parentId !== null,
+    ...(parentId === null ? { executionConfig: { unsandboxed: true } } : {}),
     status: "active",
     createdAt: "2026-06-21T00:00:00.000Z",
   };

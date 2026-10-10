@@ -138,6 +138,7 @@ describe("runDashboard", () => {
       meshEvents: {},
       meshChat: {},
       obligations: {},
+      principals: mockPrincipals,
       referenceCache: mockReferenceCacheRepo,
     });
 

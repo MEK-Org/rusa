@@ -592,7 +592,7 @@ function setup(
       id: rootId,
       charter: "root",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     },
@@ -775,7 +775,6 @@ describe("ActorMesh", () => {
         id: externalId,
         charter: "external root",
         parentId: "root",
-        sandboxed: true,
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       },
@@ -961,7 +960,6 @@ describe("ActorMesh", () => {
       id: "t1",
       charter: "resumed work",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -986,7 +984,6 @@ describe("ActorMesh", () => {
       id: "t1",
       charter: "bad worker",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -994,7 +991,6 @@ describe("ActorMesh", () => {
       id: "t2",
       charter: "good worker",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1043,7 +1039,6 @@ describe("ActorMesh", () => {
       id: "dead",
       charter: "done",
       parentId: "root",
-      sandboxed: true,
       status: "retired",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1059,7 +1054,6 @@ describe("ActorMesh", () => {
       id: "t1",
       charter: "work",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1075,7 +1069,6 @@ describe("ActorMesh", () => {
       id: "t1",
       charter: "the elder",
       parentId: "root",
-      sandboxed: true,
       sessionId: "agy-conv-xyz",
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
@@ -1109,7 +1102,6 @@ describe("ActorMesh", () => {
       id: "t1",
       charter: "resumed work",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -1134,7 +1126,6 @@ describe("ActorMesh", () => {
         id,
         charter: "resumed work",
         parentId: "root",
-        sandboxed: true,
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       });
@@ -5350,7 +5341,7 @@ describe("ActorMesh", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5358,7 +5349,6 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5383,7 +5373,7 @@ describe("ActorMesh", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5391,7 +5381,6 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5422,7 +5411,6 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5443,7 +5431,6 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5473,7 +5460,6 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5496,7 +5482,6 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5519,7 +5504,6 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5540,7 +5524,6 @@ describe("ActorMesh", () => {
       id: "worker-thread",
       charter: "doc-toolkit steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5814,7 +5797,6 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5831,7 +5813,6 @@ describe("ActorMesh", () => {
       id: "ab-rig-holder",
       charter: "rig holder",
       parentId: null,
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5839,7 +5820,7 @@ describe("ActorMesh", () => {
       id: "legacy-parentless",
       charter: "legacy parentless record",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5847,7 +5828,6 @@ describe("ActorMesh", () => {
       id: "iu-thread",
       charter: "iu steward",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5867,7 +5847,7 @@ describe("ActorMesh", () => {
     ).rejects.toThrow(/only a capability-admin holder may revoke/);
 
     // So is a parentless record that runs unsandboxed, as root does: neither
-    // topology nor sandboxed confers authority
+    // topology nor running unsandboxed confers authority
     expect(() =>
       mesh.grantCapability("iu-thread", "understanding-write", "legacy-parentless")
     ).toThrow(/only a capability-admin holder may grant/);
@@ -5881,7 +5861,7 @@ describe("ActorMesh", () => {
       id: "account-b-root",
       charter: "another account root",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5889,7 +5869,6 @@ describe("ActorMesh", () => {
       id: "account-b-child",
       charter: "another account child",
       parentId: "account-b-root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -14408,7 +14387,7 @@ describe("accountRun token accounting (#443)", () => {
             id: "second",
             charter: "second",
             parentId: null,
-            sandboxed: false,
+            executionConfig: { unsandboxed: true },
             status: "active",
             createdAt: "2026-01-01T00:00:00.000Z",
           },
@@ -14431,7 +14410,7 @@ describe("accountRun token accounting (#443)", () => {
             id: "second",
             charter: "second",
             parentId: null,
-            sandboxed: false,
+            executionConfig: { unsandboxed: true },
             status: "active",
             createdAt: "2026-01-01T00:00:00.000Z",
           },
@@ -14447,7 +14426,7 @@ describe("accountRun token accounting (#443)", () => {
           id: "root",
           charter: "root",
           parentId: null,
-          sandboxed: false,
+          executionConfig: { unsandboxed: true },
           status: "active",
           createdAt: "2026-01-01T00:00:00.000Z",
           title: "Root again",
@@ -14459,7 +14438,6 @@ describe("accountRun token accounting (#443)", () => {
           id: "child",
           charter: "child",
           parentId: "root",
-          sandboxed: true,
           status: "active",
           createdAt: "2026-01-01T00:00:00.000Z",
         },

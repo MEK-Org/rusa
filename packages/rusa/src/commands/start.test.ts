@@ -2287,7 +2287,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
               id: "root",
               charter: "root",
               parentId: null,
-              sandboxed: false,
+              executionConfig: { unsandboxed: true },
               status: "active",
               createdAt: "2026-01-01T00:00:00.000Z",
             },
@@ -7202,7 +7202,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
   it.each([
     { mode: "default", configSandbox: undefined },
     { mode: "container-boundary", configSandbox: "container-boundary" as const },
-  ])("stores sandboxed and verifies parity with builder options in $mode mode (#550)", async ({
+  ])("stores unsandboxed and verifies parity with builder options in $mode mode (#550)", async ({
     configSandbox,
   }) => {
     if (configSandbox) {
@@ -7256,15 +7256,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
 
     // Worker deployment mapping from root architecture disposition (#550 comment 5989255045):
-    // ActorOptions.sandbox = (sandboxed && config.sandbox !== "container-boundary")
-    const expectedWorkerSandbox = (sandboxed: boolean) =>
-      sandboxed && configSandbox !== "container-boundary";
+    // ActorOptions.sandbox = (!unsandboxed && config.sandbox !== "container-boundary")
+    const expectedWorkerSandbox = (unsandboxed: boolean) =>
+      !unsandboxed && configSandbox !== "container-boundary";
 
     for (const id of ["lead", spawned]) {
       const live = booted.get(id) as unknown as { opts: { sandbox?: boolean } } | undefined;
       if (!live) throw new Error(`${id} is not live`);
-      const stored = booted.actors.get(id)?.sandboxed;
-      if (stored === undefined) throw new Error(`${id} has no sandboxed`);
+      const stored = booted.actors.get(id)?.executionConfig?.unsandboxed ?? false;
       expect(live.opts.sandbox, `${id} sandbox parity`).toBe(expectedWorkerSandbox(stored));
     }
 
@@ -7273,11 +7272,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect((booted.get("root") as unknown as { opts: { sandbox?: boolean } }).opts.sandbox).toBe(
       true
     );
-    expect(booted.actors.get("root")?.sandboxed).toBe(true);
-    // Backfilled worker retained its backfilled sandboxed value:
-    expect(booted.actors.get("lead")?.sandboxed).toBe(true);
-    // Newly created worker explicitly wrote sandboxed:
-    expect(booted.actors.get(spawned)?.sandboxed).toBe(true);
+    expect(booted.actors.get("root")?.executionConfig).toBeUndefined();
+    // The backfilled worker and the newly created one are sandboxed by default:
+    expect(booted.actors.get("lead")?.executionConfig).toBeUndefined();
+    expect(booted.actors.get(spawned)?.executionConfig).toBeUndefined();
   });
 
   it("rehydrates a persisted remote worker after its follower enrolls late", async () => {
@@ -7317,7 +7315,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-09-07T00:00:00.000Z",
     });
@@ -7325,9 +7323,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       id: "placed-worker",
       charter: "wait for the Mac follower",
       parentId: "root",
-      sandboxed: true,
       modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash (High)" }],
-      executionTarget: "mac-mini",
+      executionConfig: { executionTarget: "mac-mini" },
       status: "active",
       createdAt: "2026-09-07T00:01:00.000Z",
     });
@@ -7480,8 +7477,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       id: "retired-worker",
       charter: "finished prior to reconnect",
       parentId: "root",
-      sandboxed: true,
-      executionTarget: "mac-mini",
+      executionConfig: { executionTarget: "mac-mini" },
       status: "retired",
       createdAt: "2026-09-07T00:02:00.000Z",
     });

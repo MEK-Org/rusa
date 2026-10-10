@@ -113,7 +113,6 @@ function record(id: string, overrides: Partial<ActorRecord> = {}): ActorRecord {
     id,
     charter: `charter for ${id}`,
     parentId: "root",
-    sandboxed: true,
     status: "active",
     createdAt: "2026-01-01T00:00:00.000Z",
     ...overrides,
@@ -847,7 +846,7 @@ describe("RunManager", () => {
     it("builds through the construction seam with the whole durable record", () => {
       const h = setup();
       const rec = record("w1", {
-        executionTarget: "mac-mini",
+        executionConfig: { executionTarget: "mac-mini" },
         modelConfig: [{ provider: "claude", model: "opus" }],
         sessionId: "sess-1",
       });

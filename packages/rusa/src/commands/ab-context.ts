@@ -135,7 +135,7 @@ import { type RunStartE2EHandles, runStart } from "./start.js";
  *
  * Root authority decoupling : the holder holds no capability grant, so it has no
  * grant/revoke authority. It is also inert in practice — no provider, no MCP surface and
- * no run loop. Its record states the sandboxed kind every other child of root has.
+ * no run loop. Like every other child of root, it is sandboxed by default.
  */
 export const RIG_HOLDER_ID = "ab-rig-holder";
 
@@ -184,7 +184,6 @@ export function adoptRigHolder(mesh: ActorMesh, rootId: string): string {
       id: RIG_HOLDER_ID,
       charter: RIG_HOLDER_CHARTER,
       parentId: rootId,
-      sandboxed: true,
       status: "active",
       title: "A/B rig (driver-owned)",
       createdAt: new Date().toISOString(),

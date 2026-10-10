@@ -58,7 +58,7 @@ describe("run_token_records run identity", () => {
       id: "root",
       charter: "Root Orchestrator",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: new Date().toISOString(),
     });
@@ -170,7 +170,7 @@ describe("run_token_records run identity", () => {
       id: "root",
       charter: "Root",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: new Date().toISOString(),
     });

@@ -121,7 +121,7 @@ function rec(id: string, parentId: string | null, status: "active" | "retired"):
     id,
     charter: `charter ${id}`,
     parentId,
-    sandboxed: parentId !== null,
+    ...(parentId === null ? { executionConfig: { unsandboxed: true } } : {}),
     status,
     createdAt: "2026-06-21T00:00:00.000Z",
   };
@@ -1456,7 +1456,6 @@ describe("handleMeshApiRequest", () => {
           id,
           charter: `charter ${id} `.repeat(40),
           parentId: "root",
-          sandboxed: true,
           status: "active",
           createdAt: "2026-06-21T00:00:00.000Z",
         });
@@ -1804,7 +1803,7 @@ describe("handleMeshApiRequest", () => {
       id: "root",
       charter: "root charter\nline 2",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1813,7 +1812,6 @@ describe("handleMeshApiRequest", () => {
       charter: "child charter\nline 2",
       title: "Custom Title",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1836,7 +1834,7 @@ describe("handleMeshApiRequest", () => {
       id: UUID_A,
       charter: long,
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1858,7 +1856,7 @@ describe("handleMeshApiRequest", () => {
       id: UUID_A,
       charter: "short charter\nline 2",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1879,7 +1877,7 @@ describe("handleMeshApiRequest", () => {
       id: UUID_A,
       charter: "\u{1F9ED}".repeat(400),
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
@@ -1901,7 +1899,7 @@ describe("handleMeshApiRequest", () => {
       id: UUID_A,
       charter: long,
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });

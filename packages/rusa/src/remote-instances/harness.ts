@@ -230,7 +230,7 @@ export function createHarness(options: {
     {
       id: "root",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       charter: "Coordinate the followers",
       status: "active",
       createdAt: new Date().toISOString(),

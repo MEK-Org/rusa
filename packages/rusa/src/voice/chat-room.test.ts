@@ -15,7 +15,7 @@ function actor(id: string, overrides: Partial<ActorRecord> = {}): ActorRecord {
     id,
     charter: `Charter for ${id}`,
     parentId: id === "root" ? null : "root",
-    sandboxed: id !== "root",
+    ...(id === "root" ? { executionConfig: { unsandboxed: true } } : {}),
     status: "active",
     context: { type: "native" },
     createdAt: "2026-09-30T00:00:00.000Z",

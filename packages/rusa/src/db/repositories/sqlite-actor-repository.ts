@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { z } from "zod";
-import type { ActorRecord } from "../../actor/actor-record.js";
+import type { ActorRecord, ExecutionConfig } from "../../actor/actor-record.js";
 import {
   lookupModelClassPool,
   type ModelClassStore,
@@ -133,14 +133,15 @@ const contextConfigSchema = z.discriminatedUnion("type", [
 type ContextConfigDocument = z.infer<typeof contextConfigSchema>;
 
 /**
- * How the mesh runs an actor (#550): requested managed sandboxing and, for a
- * remotely placed actor, its follower. Every actor has one. The shape is
- * enforced here, by its version, rather than by the database.
+ * The stored {@link ExecutionConfig} (#550): whether the actor runs outside
+ * managed sandboxing and, for a remotely placed actor, its follower. Every
+ * actor row has one, and it always states `unsandboxed` explicitly. The shape
+ * is enforced here, by its version, rather than by the database.
  */
 const executionConfigSchema = z
   .object({
     schemaVersion: z.literal(ACTOR_EXECUTION_CONFIG_SCHEMA_VERSION),
-    sandboxed: z.boolean(),
+    unsandboxed: z.boolean(),
     executionTarget: z.string().optional(),
   })
   .strict();
@@ -320,14 +321,18 @@ function parseContextConfig(
 }
 
 /**
- * Builds the execution-config document every actor row carries. A write that
- * does not state `sandboxed` is refused rather than guessed.
+ * Builds the execution-config document every actor row carries. An actor is
+ * sandboxed unless its record affirmatively says `unsandboxed: true`; the
+ * stored document states that resolved value.
  */
 function buildExecutionConfig(record: ActorRecord): string {
+  const { unsandboxed, executionTarget } = record.executionConfig ?? {};
   const config: ExecutionConfigDocument = {
     schemaVersion: ACTOR_EXECUTION_CONFIG_SCHEMA_VERSION,
-    sandboxed: record.sandboxed,
-    ...(record.executionTarget !== undefined ? { executionTarget: record.executionTarget } : {}),
+    // Only an absent value takes the default; anything else that is not a
+    // boolean fails validation below.
+    unsandboxed: unsandboxed === undefined ? false : unsandboxed,
+    ...(executionTarget !== undefined ? { executionTarget } : {}),
   };
   const parsed = executionConfigSchema.safeParse(config);
   if (!parsed.success) {
@@ -338,19 +343,24 @@ function buildExecutionConfig(record: ActorRecord): string {
   return JSON.stringify(parsed.data);
 }
 
-/** A missing or unknown document fails the read: an actor's execution is never guessed. */
+/**
+ * A missing or unknown document fails the read: an actor's execution is never
+ * guessed. The record omits default values, so a sandboxed leader-local actor
+ * reads back without an `executionConfig`.
+ */
 function parseExecutionConfig(
   actorId: string,
   json: string | null
-): Pick<ActorRecord, "sandboxed" | "executionTarget"> {
+): Pick<ActorRecord, "executionConfig"> {
   if (json === null) {
     throw new Error(`SqliteActorRepository: missing execution_config for actor '${actorId}'`);
   }
   const parsed = parseDocument(actorId, "execution_config", json, executionConfigSchema);
-  return {
-    sandboxed: parsed.sandboxed,
+  const executionConfig: ExecutionConfig = {
+    ...(parsed.unsandboxed ? { unsandboxed: true } : {}),
     ...(parsed.executionTarget !== undefined ? { executionTarget: parsed.executionTarget } : {}),
   };
+  return Object.keys(executionConfig).length > 0 ? { executionConfig } : {};
 }
 
 /** Builds the versioned voice-config document, or null when the actor follows the instance default. */

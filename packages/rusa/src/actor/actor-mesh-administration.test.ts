@@ -46,7 +46,7 @@ function record(
     id,
     charter: id,
     parentId,
-    sandboxed: parentId !== null,
+    ...(parentId === null ? { executionConfig: { unsandboxed: true } } : {}),
     status: "active",
     createdAt: "2026-01-01T00:00:00Z",
     ...extra,

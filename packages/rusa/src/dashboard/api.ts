@@ -2195,7 +2195,7 @@ export async function handleMeshApiRequest(
           handle: r.parentId === null ? rootHandle : generateHandle(r.id),
           parentId: r.parentId,
           status: r.status,
-          executionTarget: r.executionTarget ?? null,
+          executionTarget: r.executionConfig?.executionTarget ?? null,
           provider: r.modelConfig?.[0]?.provider ?? null,
           model: r.modelConfig?.[0]?.model ?? null,
           effort: r.modelConfig?.[0]?.effort ?? null,

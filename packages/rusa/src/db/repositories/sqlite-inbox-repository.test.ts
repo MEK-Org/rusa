@@ -567,7 +567,7 @@ describe("SqliteInboxRepository", () => {
         id: "actor",
         charter: "test invariant",
         parentId: null,
-        sandboxed: false,
+        executionConfig: { unsandboxed: true },
         status: "active",
         createdAt: "2026-07-13T12:00:00Z",
       },

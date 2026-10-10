@@ -81,7 +81,6 @@ describe("createStartRetireCleanups", () => {
       id: actorId,
       charter: "worker",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     };
@@ -116,7 +115,6 @@ describe("createStartRetireCleanups", () => {
       id: actorId,
       charter: "worker",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     };
@@ -151,7 +149,6 @@ describe("createStartRetireCleanups", () => {
       id: actorId,
       charter: "worker",
       parentId: "root",
-      sandboxed: true,
       status: "retired",
       createdAt: "2026-01-01T00:00:00Z",
     };
@@ -176,7 +173,6 @@ describe("createStartRetireCleanups", () => {
       id: actorId,
       charter: "worker",
       parentId: "root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });

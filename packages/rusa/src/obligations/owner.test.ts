@@ -13,7 +13,7 @@ const actors = {
           id,
           charter: "c",
           parentId: null,
-          sandboxed: false,
+          executionConfig: { unsandboxed: true },
           status: "active",
           createdAt: "2026-01-01T00:00:00Z",
         }

@@ -26,7 +26,7 @@ import {
   type MeshObligationClosurePort,
   type RetireCleanup,
 } from "../actor/actor-mesh.js";
-import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
+import type { ActorRecord, ExecutionConfig, PortableContextConfig } from "../actor/actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
   bootstrapCapabilitiesFor,
@@ -2465,7 +2465,8 @@ async function composeStart(
       actorId === rootId ? join(mcHome, "root-agent") : join(workersDir, actorId),
     // File tools run on the leader. Recheck placement at each call so a
     // follower-hosted actor cannot read a stale leader-side workdir.
-    fileToolsAvailableForActor: (actorId) => actors.get(actorId)?.executionTarget === undefined,
+    fileToolsAvailableForActor: (actorId) =>
+      actors.get(actorId)?.executionConfig?.executionTarget === undefined,
     driveClients,
     hostMaintenance: { updateToolDepsFor, pnpmHardlinks: pnpmHardlinksDeps },
     onDriveRead: (actorId, observation) =>
@@ -3314,7 +3315,8 @@ async function composeStart(
           const chatReadUrl = mcpHttp.addServer(`${id}:${CHAT_READ_MCP_NAME}`, () =>
             createChatReadMcpServer(chatClient, {
               workDir: join(workersDir, id),
-              fileToolsAvailable: () => actors.get(id)?.executionTarget === undefined,
+              fileToolsAvailable: () =>
+                actors.get(id)?.executionConfig?.executionTarget === undefined,
             })
           );
           perActorShared.push({ name: CHAT_READ_MCP_NAME, url: chatReadUrl });
@@ -3323,7 +3325,8 @@ async function composeStart(
           const slackReadUrl = mcpHttp.addServer(`${id}:${SLACK_READ_MCP_NAME}`, () =>
             createSlackReadMcpServer(slackClient, {
               workDir: join(workersDir, id),
-              fileToolsAvailable: () => actors.get(id)?.executionTarget === undefined,
+              fileToolsAvailable: () =>
+                actors.get(id)?.executionConfig?.executionTarget === undefined,
             })
           );
           perActorShared.push({ name: SLACK_READ_MCP_NAME, url: slackReadUrl });
@@ -3356,7 +3359,7 @@ async function composeStart(
 
         // Workers request managed sandboxed execution by default (#465, #550).
         // The deployment mapping is:
-        //   ActorOptions.sandbox = (sandboxed && config.sandbox !== "container-boundary")
+        //   ActorOptions.sandbox = (!unsandboxed && config.sandbox !== "container-boundary")
         // The flag selects inner sandboxing; container-boundary mode relies on its deployment boundary.
         const sandbox = config.sandbox !== "container-boundary";
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
@@ -3514,7 +3517,7 @@ async function composeStart(
   if (followerHub) {
     followerHub.onRegister((follower) => {
       for (const record of actors.list()) {
-        if (record.executionTarget !== follower.id) continue;
+        if (record.executionConfig?.executionTarget !== follower.id) continue;
         if (record.status !== "active") {
           followerHub.stopActor(follower.id, record.id);
           continue;
@@ -3812,6 +3815,7 @@ async function composeStart(
   // that harness-only exception, including container-boundary mode. Its record
   // states the same requested builder intent, not an isolation/authorization claim.
   const rootSandboxed = Boolean(opts?.e2e);
+  const rootExecutionConfig: ExecutionConfig = rootSandboxed ? {} : { unsandboxed: true };
   const rootActorOptions: ActorOptions = {
     id: rootId,
     cwd: rootAgentDir,
@@ -3936,7 +3940,7 @@ async function composeStart(
     id: rootId,
     charter: rootActor.charter ?? DEFAULT_ROOT_CHARTER,
     parentId: null,
-    sandboxed: rootSandboxed,
+    executionConfig: rootExecutionConfig,
     // Persisted pool preserved verbatim (validated, same order), or the
     // configured tuple seeding a record that had none. Adoption merges onto
     // the existing row, which is what keeps a persisted pool's `modelClass`.
@@ -4071,12 +4075,17 @@ async function composeStart(
   if (followerHub) {
     const pendingReconnect = actors
       .list()
-      .filter((r) => r.status === "active" && r.executionTarget !== undefined && !mesh.get(r.id));
+      .filter(
+        (r) =>
+          r.status === "active" &&
+          r.executionConfig?.executionTarget !== undefined &&
+          !mesh.get(r.id)
+      );
     for (const record of pendingReconnect) {
       log.warn("follower_actor_pending_reconnect", {
         actorId: record.id,
-        target: record.executionTarget,
-        hint: `Follower '${record.executionTarget}' is not connected; actor will rehydrate when the follower enrolls`,
+        target: record.executionConfig?.executionTarget,
+        hint: `Follower '${record.executionConfig?.executionTarget}' is not connected; actor will rehydrate when the follower enrolls`,
       });
     }
   }

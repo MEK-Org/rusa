@@ -38,7 +38,7 @@ function setup(
     id: rootId,
     charter: "root",
     parentId: null,
-    sandboxed: false,
+    executionConfig: { unsandboxed: true },
     status: "active",
     createdAt: "2026-09-10T00:00:00Z",
   });
@@ -46,7 +46,6 @@ function setup(
     id: "parent",
     charter: "parent",
     parentId: rootId,
-    sandboxed: true,
     status: "active",
     createdAt: "2026-09-10T00:00:00Z",
   });
@@ -54,7 +53,6 @@ function setup(
     id: "worker",
     charter: "worker",
     parentId: "parent",
-    sandboxed: true,
     status: opts.workerStatus ?? "active",
     createdAt: "2026-09-10T00:00:00Z",
   });
@@ -62,7 +60,6 @@ function setup(
     id: "sibling",
     charter: "sibling",
     parentId: "parent",
-    sandboxed: true,
     status: "active",
     createdAt: "2026-09-10T00:00:00Z",
   });
@@ -257,7 +254,7 @@ describe("actor experiment enrollment", () => {
       id: "account-b-root",
       charter: "another account root",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-09-10T00:00:00Z",
     });
@@ -265,7 +262,6 @@ describe("actor experiment enrollment", () => {
       id: "account-b-child",
       charter: "another account child",
       parentId: "account-b-root",
-      sandboxed: true,
       status: "active",
       createdAt: "2026-09-10T00:00:00Z",
     });
@@ -340,7 +336,7 @@ describe("actor experiment enrollment", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      sandboxed: false,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-09-10T00:00:00Z",
     });
