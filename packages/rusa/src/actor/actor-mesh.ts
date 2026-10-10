@@ -1515,12 +1515,11 @@ export class ActorMesh {
     return active.pendingEvaluations.size > 0 || active.suppressedEntries.size > 0;
   }
 
-  // biome-ignore lint/suspicious/noConfusingVoidType: hook may return void or disposition
   private handleResponsiveArrivals(
     actorId: string,
     incoming: readonly ResponsiveArrival[],
     wasRunning: boolean
-  ): ResponsiveArrivalDisposition | void {
+  ): ResponsiveArrivalDisposition | undefined {
     if (this.responsiveInterruptionMode === "active") {
       return this.handleActiveResponsiveArrivals(actorId, incoming, wasRunning);
     }
@@ -1576,12 +1575,11 @@ export class ActorMesh {
     }
   }
 
-  // biome-ignore lint/suspicious/noConfusingVoidType: hook may return void or disposition
   private handleActiveResponsiveArrivals(
     actorId: string,
     incoming: readonly ResponsiveArrival[],
     wasRunning: boolean
-  ): ResponsiveArrivalDisposition | void {
+  ): ResponsiveArrivalDisposition | undefined {
     const classifier = this.responsiveInterruption;
     if (!classifier || incoming.length === 0 || !wasRunning) return;
 

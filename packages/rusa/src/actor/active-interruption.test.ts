@@ -1007,3 +1007,68 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
     });
   });
 });
+
+describe("Active JEV late interrupt keeps the replacement run (#533)", () => {
+  async function lateInterrupt(decide: () => Promise<JevDecisionResponse>, reselect = false) {
+    const signals: AbortSignal[] = [];
+    const provider = new FakeProvider((opts) => {
+      const signal = (opts as { signal?: AbortSignal }).signal;
+      if (signal) signals.push(signal);
+      return new Promise<Partial<RunResult>>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    });
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.5,
+      mode: "active",
+      client: { decide },
+    });
+    const { mesh, inboxStore, tick } = setup({
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+      responsiveInterruptionMode: "active",
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+    const [entry] = inboxStore.append([
+      { actorId: worker, source: "test", payload: { type: "task" } },
+    ]);
+    mesh.dispatch(worker);
+    await tick();
+    mesh.selectInboxEntries(worker, [entry.id]);
+    mesh.sendMessage(worker, "urgent", TEST_USER_ID, "s1");
+    await tick();
+    if (reselect) {
+      mesh.selectInboxEntries(worker, [entry.id]);
+      await tick();
+    }
+    await waitUntil(() => signals.length >= 2, 3000);
+    const unseen = inboxStore.list(worker).entries.filter((e) => !e.seenAt && !e.handledAt);
+    return { signals, unseen };
+  }
+
+  it("re-runs with the arrival after a late >= threshold decision", async () => {
+    const { signals, unseen } = await lateInterrupt(async () => ({ interruptProbability: 0.75 }));
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals).toHaveLength(2);
+    expect(unseen).toHaveLength(0);
+  });
+
+  it("re-runs with the arrival after a late client-error fallback", async () => {
+    const { signals, unseen } = await lateInterrupt(async () => {
+      throw new Error("transport");
+    });
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals).toHaveLength(2);
+    expect(unseen).toHaveLength(0);
+  });
+
+  it("re-runs with the queued arrival when ABA reselection invalidates suppression", async () => {
+    const { signals, unseen } = await lateInterrupt(
+      async () => ({ interruptProbability: 0.1 }),
+      true
+    );
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals).toHaveLength(2);
+    expect(unseen).toHaveLength(0);
+  });
+});

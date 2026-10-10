@@ -126,6 +126,7 @@ Top-level fields:
   providers                Required. Coding providers available to tasks.
   quota                    Optional. Shared quota evidence, persisted controller state, and launch coordination.
   mesh                     Optional. Mesh concurrency settings.
+  geminiApiKey             Optional. Enables Gemini features (quota-error classification, avatar generation, understanding retrieval/distill, Google speech); each skips gracefully when absent.
   jevApiKeyFile            Optional basename of a credential file directly under RUSA_HOME/secrets. Opts into JEV responsive-interruption classification; invalid or unavailable credentials keep the existing scheduler and post no prediction reaction.
   jevMode                  Optional mode for JEV responsive-interruption ("shadow" or "active"). Defaults to shadow. When active, conditionally suppresses preemption for running actors holding selected work.
   elevenlabsApiKey         Optional. Enables ElevenLabs walkie-talkie transcription and actor speech.

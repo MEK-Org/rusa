@@ -164,11 +164,12 @@ export interface RunManagerOptions {
    * Under active queue policy, returning `{ suppressPreemption: true }` suppresses
    * immediate preemption for running actors.
    */
-  // biome-ignore lint/suspicious/noConfusingVoidType: allow void-returning callback handlers
   onResponsiveArrived?: (
     actorId: string,
     arrivals: readonly ResponsiveArrival[],
     isRunning: boolean
+    // An observer may return nothing; only an active policy returns a disposition.
+    // biome-ignore lint/suspicious/noConfusingVoidType: void-returning observers stay assignable
   ) => ResponsiveArrivalDisposition | void;
   /**
    * Query whether active responsive interruption policy currently suppresses preemption
@@ -396,13 +397,12 @@ export class RunManager {
    * baseline: it would interrupt only if this dispatch may preempt and the
    * row's durable policy allows it.
    */
-  // biome-ignore lint/suspicious/noConfusingVoidType: allow void-returning callback handlers
   private observeResponsiveArrival(
     actorId: string,
     work: DurableDispatchWork,
     mayPreempt: boolean,
     isRunning: boolean
-  ): ResponsiveArrivalDisposition | void {
+  ): ResponsiveArrivalDisposition | undefined {
     const observe = this.onResponsiveArrived;
     if (!observe) return;
     const entries = work.unseenResponsiveEntries ?? [];
@@ -418,7 +418,7 @@ export class RunManager {
     if (observed.size > 0) this.observedResponsive.set(actorId, observed);
     else this.observedResponsive.delete(actorId);
     if (arrived.length === 0) return;
-    return observe(
+    const disposition = observe(
       actorId,
       arrived.map((entry) => ({
         entry,
@@ -429,6 +429,7 @@ export class RunManager {
       })),
       isRunning
     );
+    return disposition ?? undefined;
   }
 
   private dispatchInternal(actorId: string, opts: { preempt: boolean }): boolean {
@@ -597,16 +598,19 @@ export class RunManager {
   }
 
   /**
-   * Preempt an active running actor, invoking onPreempted if preemption took effect.
+   * Preempt a live actor after the arrival's own dispatch has already
+   * returned (an active policy decision resolved late). Preemption drops the
+   * coalesced follow-up, so re-request the replacement opportunity the
+   * arrival's dispatch would have, from the durable worklist.
    */
   preemptLiveActor(actorId: string): boolean {
     const target = this.live.get(actorId);
     if (!target) return false;
     const preemption = target.preemptForResponsive();
-    if (preemption.preempted) {
-      this.onPreempted(actorId, preemption.phase);
-      return true;
-    }
+    if (!preemption.preempted) return false;
+    this.onPreempted(actorId, preemption.phase);
+    const work = this.durableWork(actorId);
+    if (work) target.requestRun(dispatchNudge(work));
     return true;
   }
 }

@@ -116,7 +116,10 @@ jevMode: active
   called, suppression is invalidated and preemption occurs immediately if the actor
   is still running.
 - **Failures & deadlines:** Timeouts (5-second decision deadline), transport
-  errors, or unreadable inputs preserve baseline preemption.
+  errors, or unreadable inputs preserve baseline preemption. The deadline stops
+  waiting; it does not cancel a request already sent, which stays bounded by the
+  SDK's own timeout. A decision that resolves after its run or selection has
+  changed is ignored.
 
 ## Roll back
 
