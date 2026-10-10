@@ -588,9 +588,10 @@ export const BRIEF_REWRITE_SYSTEM_INSTRUCTION =
   "The charter governs the brief: it defines the actor's purpose, scope and authority. " +
   "The brief may retain cited evolving guidance even when carrying it out requires charter " +
   "clarification. Recording it does not expand or override the charter. The actor carries out " +
-  "the work its charter permits and reports the remainder to its parent. A parent's charter " +
-  "clarification informs subsequent rewrites under the existing citation and supersession rules. " +
-  "The charter is supplied separately as governing context, not as a new delta message.\n" +
+  "the work its charter permits and reports the remainder to its parent. A charter update may " +
+  "authorize the work without changing the brief; it is governing context, not a new delta " +
+  "message or a reason to rewrite the brief. A direct parent message explaining an intentional " +
+  "scope exclusion may refine the brief under the existing citation and supersession rules.\n" +
   "\n" +
   "Input is the current brief and a bounded delta. Each new message has a verified class and a " +
   "ready-made citation. Human outranks ancestor, which outranks descendant; peer and the actor's " +

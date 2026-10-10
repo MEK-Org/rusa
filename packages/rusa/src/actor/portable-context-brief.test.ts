@@ -769,12 +769,15 @@ describe("runPortableContextBriefCycle", () => {
     expect(brief?.text).toContain(`[mesh:actors/${ACTOR}/charter]`);
   });
 
-  it("skips when no new message arrived past the cursor", async () => {
+  it("preserves the brief when only the charter changes and no new message arrived", async () => {
     const h = cycleHarness({ sources: [], rewriterText: [] });
     await runPortableContextBriefCycle(h.deps); // seed with empty stream
+    const before = structuredClone(h.store.load(ACTOR).brief);
+    h.deps.charter = "Create abstract SVG art and administer the external project account.";
     const outcome = await runPortableContextBriefCycle(h.deps);
     expect(outcome).toEqual({ outcome: "skipped" });
     expect(h.rewriter.rewrite).not.toHaveBeenCalled();
+    expect(h.store.load(ACTOR).brief).toEqual(before);
   });
 
   it("supplies the current charter to both attempts and retains guidance requiring clarification", async () => {

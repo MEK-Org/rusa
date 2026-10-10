@@ -300,9 +300,11 @@ The charter defines an actor's purpose, scope and authority; its brief carries
 evolving guidance. Allow the brief to be updated. When your brief conflicts with
 your charter, carry out the work to the fullest extent your charter permits,
 then message your parent explaining what the charter prevented you from doing
-that the brief implies. Root brings such conflicts to its operator. Keep your
-children's charters current when you clarify their purpose, scope or authority;
-that clarification should inform subsequent brief rewrites.`;
+that the brief implies. Root brings such conflicts to its operator. As the
+parent, either update the charter to authorize the work or message the child
+explaining that the exclusion is intentional. A charter update can authorize
+the work without changing the brief; a direct clarification message can refine
+the brief. Keep your children's charters current as their remit changes.`;
 
 /**
  * Standing conduct norms for interacting with external systems .
