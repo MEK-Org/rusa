@@ -36,7 +36,9 @@ export function createE2EInstanceServer(deps: E2EInstanceMcpDeps, selfId: string
   };
   const down = async ({ destroy }: { destroy?: boolean } = {}) => {
     try {
-      return toolOk(deps.manager.down(selfId, destroy !== undefined ? { destroy } : undefined));
+      return toolOk(
+        destroy !== undefined ? deps.manager.down(selfId, { destroy }) : deps.manager.down(selfId)
+      );
     } catch (err) {
       return toolError(err);
     }
