@@ -320,4 +320,13 @@ describe("resolveE2EInstance", () => {
       "preserve across watcher restart\n"
     );
   });
+
+  it("fails fast with missing-requirement diagnostics when given a nonempty incomplete root", () => {
+    root = mkdtempSync(join(TEST_TMPDIR, "e2e-resolve-incomplete-"));
+    writeFileSync(join(root, "scratch.txt"), "incomplete", "utf8");
+
+    expect(() => resolveE2EInstance({ root, rootDriver: "external" })).toThrow(
+      /cannot resume E2E instance; missing:/
+    );
+  });
 });

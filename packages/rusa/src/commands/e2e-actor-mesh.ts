@@ -1,4 +1,12 @@
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -106,7 +114,7 @@ export function createDashboardE2EQuotaApi(now = Date.now()): QuotaApiDeps {
   };
 }
 
-export interface ResolveE2EInstanceOptions {
+interface ResolveE2EInstanceOptions {
   root?: string;
   resume?: boolean;
   portOffset?: number;
@@ -115,7 +123,7 @@ export interface ResolveE2EInstanceOptions {
   slack?: SlackConfig;
 }
 
-export interface ResolvedE2EInstance {
+interface ResolvedE2EInstance {
   instance: E2EInstance;
   resumed: boolean;
 }
@@ -124,7 +132,9 @@ export interface ResolvedE2EInstance {
  * Resolves an E2E instance: if `--resume` is explicitly set, or if an existing
  * `--root` is already complete and structurally resumable (as during watcher
  * restarts), reopens the existing instance without rewriting state; otherwise
- * provisions a fresh instance.
+ * provisions a fresh instance. If a non-empty directory is supplied that is
+ * incomplete, fails fast with missing-requirement diagnostics rather than
+ * silently attempting to re-provision in place.
  */
 export function resolveE2EInstance(opts: ResolveE2EInstanceOptions): ResolvedE2EInstance {
   // Provision OUTSIDE /tmp. Sandboxed workers run under bwrap with `--tmpfs /tmp`,
@@ -140,9 +150,16 @@ export function resolveE2EInstance(opts: ResolveE2EInstanceOptions): ResolvedE2E
     throw new Error("--resume requires --root");
   }
   const instanceRoot = opts.root ?? mkdtempSync(join(runsDir, "run-"));
-  const shouldResume =
-    opts.resume ||
-    (opts.root !== undefined && missingResumeRequirements(instanceRoot).length === 0);
+  const exists = existsSync(instanceRoot);
+  const isNonEmpty = exists && readdirSync(instanceRoot).length > 0;
+
+  if (isNonEmpty || opts.resume) {
+    const missing = missingResumeRequirements(instanceRoot);
+    if (missing.length > 0) {
+      throw new Error(`cannot resume E2E instance; missing: ${missing.join(", ")}`);
+    }
+  }
+  const shouldResume = isNonEmpty || Boolean(opts.resume);
 
   const offset = opts.portOffset ?? 0;
   const instance = shouldResume
