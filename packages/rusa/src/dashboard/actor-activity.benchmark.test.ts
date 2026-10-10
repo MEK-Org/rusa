@@ -62,6 +62,7 @@ function seed(db: Database.Database, actors: SqliteActorRepository, eventCount: 
       parentId: i === 0 ? null : "actor-0",
       ...(i === 0 ? { isRoot: true } : {}),
       status: "active",
+      ...(i === 0 ? { executionConfig: { unsandboxed: true } } : {}),
       createdAt: new Date(i * 1_000).toISOString(),
     };
     actors.upsert(record);

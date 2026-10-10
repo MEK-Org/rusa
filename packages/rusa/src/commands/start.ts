@@ -26,7 +26,7 @@ import {
   type MeshObligationClosurePort,
   type RetireCleanup,
 } from "../actor/actor-mesh.js";
-import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
+import type { ActorRecord, ExecutionConfig, PortableContextConfig } from "../actor/actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
   bootstrapCapabilitiesFor,
@@ -748,6 +748,22 @@ export function shouldBindWebhookServer(params: { e2eMode: boolean }): boolean {
  */
 export function shouldAppendServiceBootWake(params: { e2eMode: boolean }): boolean {
   return !params.e2eMode;
+}
+
+/**
+ * The configured root actor runs unsandboxed by default (#465, #550). The e2e
+ * harness has always sandboxed its root independently of deployment mode; retain
+ * that harness-only exception, including container-boundary mode. Its record
+ * states the same requested builder intent, not an isolation/authorization claim.
+ * Both values derive from one flag, so stored intent and builder option agree.
+ */
+export function rootExecutionIntent(params: { e2eMode: boolean }): {
+  sandbox: boolean;
+  executionConfig: ExecutionConfig;
+} {
+  return params.e2eMode
+    ? { sandbox: true, executionConfig: {} }
+    : { sandbox: false, executionConfig: { unsandboxed: true } };
 }
 
 export function shouldBindDashboardServer(params: {
@@ -2467,7 +2483,8 @@ async function composeStart(
       actorId === rootId ? join(mcHome, "root-agent") : join(workersDir, actorId),
     // File tools run on the leader. Recheck placement at each call so a
     // follower-hosted actor cannot read a stale leader-side workdir.
-    fileToolsAvailableForActor: (actorId) => actors.get(actorId)?.executionTarget === undefined,
+    fileToolsAvailableForActor: (actorId) =>
+      actors.get(actorId)?.executionConfig?.executionTarget === undefined,
     driveClients,
     hostMaintenance: { updateToolDepsFor, pnpmHardlinks: pnpmHardlinksDeps },
     onDriveRead: (actorId, observation) =>
@@ -3317,7 +3334,8 @@ async function composeStart(
           const chatReadUrl = mcpHttp.addServer(`${id}:${CHAT_READ_MCP_NAME}`, () =>
             createChatReadMcpServer(chatClient, {
               workDir: join(workersDir, id),
-              fileToolsAvailable: () => actors.get(id)?.executionTarget === undefined,
+              fileToolsAvailable: () =>
+                actors.get(id)?.executionConfig?.executionTarget === undefined,
             })
           );
           perActorShared.push({ name: CHAT_READ_MCP_NAME, url: chatReadUrl });
@@ -3326,7 +3344,8 @@ async function composeStart(
           const slackReadUrl = mcpHttp.addServer(`${id}:${SLACK_READ_MCP_NAME}`, () =>
             createSlackReadMcpServer(slackClient, {
               workDir: join(workersDir, id),
-              fileToolsAvailable: () => actors.get(id)?.executionTarget === undefined,
+              fileToolsAvailable: () =>
+                actors.get(id)?.executionConfig?.executionTarget === undefined,
             })
           );
           perActorShared.push({ name: SLACK_READ_MCP_NAME, url: slackReadUrl });
@@ -3357,14 +3376,15 @@ async function composeStart(
         const cwd = join(workersDir, id);
         mkdirSync(cwd, { recursive: true });
 
-        // Sandbox every worker that has a bwrap layout — agy AND claude .
-        // Workers run untrusted code, so isolating them from the privileged plane is
-        // mandatory: a fresh tmpfs /tmp stops one actor reading another's MCP-config
-        // endpoint token from shared /tmp (identity harvest), and the read-only `/`
-        // bind stops tampering with ~/.rusa runtime state, including mesh.db.
-        // Root is NOT built here and stays unsandboxed — it is the trusted plane.
-        // The Actor derives the sandbox (rooted at cwd, git+gh); each provider mounts
-        // its own auth dir rw (see providerWritableStateDirs).
+        // Workers request managed sandboxed execution by default (#465, #550).
+        // Workers run untrusted code: a fresh tmpfs /tmp stops one actor reading
+        // another's MCP-config endpoint token from shared /tmp (identity harvest),
+        // and the read-only `/` bind stops tampering with ~/.rusa runtime state,
+        // including mesh.db. The deployment mapping is:
+        //   ActorOptions.sandbox = (!unsandboxed && config.sandbox !== "container-boundary")
+        // The flag selects inner sandboxing; container-boundary mode relies on its
+        // deployment boundary. The Actor derives the sandbox (rooted at cwd, git+gh);
+        // each provider mounts its own auth dir rw (see providerWritableStateDirs).
         const sandbox = config.sandbox !== "container-boundary";
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
@@ -3522,7 +3542,7 @@ async function composeStart(
   if (followerHub) {
     followerHub.onRegister((follower) => {
       for (const record of actors.list()) {
-        if (record.executionTarget !== follower.id) continue;
+        if (record.executionConfig?.executionTarget !== follower.id) continue;
         if (record.status !== "active") {
           followerHub.stopActor(follower.id, record.id);
           continue;
@@ -3815,6 +3835,9 @@ async function composeStart(
   const rootComputerUseAdmission = createComputerUseAdmission(() =>
     mesh.hasActiveCapability(rootId, COMPUTER_USE_CAPABILITY)
   );
+  const { sandbox: rootSandboxed, executionConfig: rootExecutionConfig } = rootExecutionIntent({
+    e2eMode: Boolean(opts?.e2e),
+  });
   const rootActorOptions: ActorOptions = {
     id: rootId,
     cwd: rootAgentDir,
@@ -3829,7 +3852,7 @@ async function composeStart(
       resolveProvider(config, selected.provider, selected.model, selected.effort),
     mcpServers: rootMcp,
     addDirs,
-    sandbox: Boolean(opts?.e2e),
+    sandbox: rootSandboxed,
     isE2eRoot: Boolean(opts?.e2e),
     loadSessionId: () =>
       actors.get(rootId)?.context?.type === "portable"
@@ -3940,7 +3963,7 @@ async function composeStart(
     id: rootId,
     charter: rootActor.charter ?? DEFAULT_ROOT_CHARTER,
     parentId: null,
-    isRoot: true,
+    executionConfig: rootExecutionConfig,
     // Persisted pool preserved verbatim (validated, same order), or the
     // configured tuple seeding a record that had none. Adoption merges onto
     // the existing row, which is what keeps a persisted pool's `modelClass`.
@@ -4075,12 +4098,17 @@ async function composeStart(
   if (followerHub) {
     const pendingReconnect = actors
       .list()
-      .filter((r) => r.status === "active" && r.executionTarget !== undefined && !mesh.get(r.id));
+      .filter(
+        (r) =>
+          r.status === "active" &&
+          r.executionConfig?.executionTarget !== undefined &&
+          !mesh.get(r.id)
+      );
     for (const record of pendingReconnect) {
       log.warn("follower_actor_pending_reconnect", {
         actorId: record.id,
-        target: record.executionTarget,
-        hint: `Follower '${record.executionTarget}' is not connected; actor will rehydrate when the follower enrolls`,
+        target: record.executionConfig?.executionTarget,
+        hint: `Follower '${record.executionConfig?.executionTarget}' is not connected; actor will rehydrate when the follower enrolls`,
       });
     }
   }

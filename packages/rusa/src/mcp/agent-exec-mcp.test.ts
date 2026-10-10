@@ -261,7 +261,7 @@ function setup(
       id: rootId,
       charter: "root",
       parentId: null,
-      isRoot: true,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     },
@@ -335,7 +335,7 @@ describe("administrative capability gating of management tools (#549)", () => {
     return tools.map((t) => t.name);
   }
 
-  it("shows no management tool on an ungranted parentless (isRoot) endpoint", async () => {
+  it("shows no management tool on an ungranted parentless endpoint", async () => {
     const { mesh } = setup({ seedRootGrants: false });
     const client = await connect(
       createAgentExecMcpServer(mesh, "root", "root", undefined, modelClassDeps())
@@ -386,6 +386,7 @@ describe("administrative capability gating of management tools (#549)", () => {
         id,
         charter: id,
         parentId,
+        ...(parentId === null ? { executionConfig: { unsandboxed: true } } : {}),
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       });
@@ -544,6 +545,7 @@ describe("administrative capability gating of management tools (#549)", () => {
         id,
         charter: id,
         parentId,
+        ...(parentId === null ? { executionConfig: { unsandboxed: true } } : {}),
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       });
@@ -614,6 +616,7 @@ describe("administrative capability gating of management tools (#549)", () => {
         id,
         charter: id,
         parentId,
+        ...(parentId === null ? { executionConfig: { unsandboxed: true } } : {}),
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       });

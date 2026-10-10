@@ -846,7 +846,7 @@ describe("RunManager", () => {
     it("builds through the construction seam with the whole durable record", () => {
       const h = setup();
       const rec = record("w1", {
-        executionTarget: "mac-mini",
+        executionConfig: { executionTarget: "mac-mini" },
         modelConfig: [{ provider: "claude", model: "opus" }],
         sessionId: "sess-1",
       });
