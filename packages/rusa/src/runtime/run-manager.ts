@@ -601,14 +601,17 @@ export class RunManager {
    * Preempt a live actor after the arrival's own dispatch has already
    * returned (an active policy decision resolved late). Preemption drops the
    * coalesced follow-up, so re-request the replacement opportunity the
-   * arrival's dispatch would have, from the durable worklist.
+   * arrival's dispatch would have, from the durable worklist. Request it even
+   * when the preemption is not reported here: a follower handle confirms its
+   * preemption asynchronously and always reports `preempted: false`, while its
+   * follower still drops the coalesced follow-up. The request is ordered after
+   * the preempt command, as in `dispatchInternal`.
    */
   preemptLiveActor(actorId: string): void {
     const target = this.live.get(actorId);
     if (!target) return;
     const preemption = target.preemptForResponsive();
-    if (!preemption.preempted) return;
-    this.onPreempted(actorId, preemption.phase);
+    if (preemption.preempted) this.onPreempted(actorId, preemption.phase);
     const work = this.durableWork(actorId);
     if (work) target.requestRun(dispatchNudge(work));
   }

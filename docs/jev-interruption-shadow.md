@@ -115,19 +115,25 @@ jevMode: active
   preemption of the active turn. The arrival remains durable in the inbox and
   is scheduled as a responsive follow-up when the current turn finishes.
 - **Invalidation:** Suppression is tied to the originating run and its
-  selection. Any new selection (including re-selecting the same entries), or
-  marking the last unhandled selected entry handled, drops the held arrivals;
-  the run is then preempted only if one of them is still unhandled and not part
-  of the new selection, so a held arrival the actor has already handled or
-  taken on causes no cancellation. A run that ends, is abandoned, or is stopped
-  drops the held arrivals without preemption; Stop stays authoritative. A
-  preemption keeps the arrival's replacement run, so the arrival is picked up
-  by the next turn.
+  selection. Any new selection (including re-selecting the same entries) drops
+  the held arrivals; the run is then preempted only if one of them is still
+  unhandled and not part of the new selection, so a held arrival the actor has
+  already handled or taken on causes no cancellation. Marking the last
+  unhandled selected entry handled does not preempt an arrival already judged
+  able to wait: it keeps waiting for the follow-up turn, so the run can finish
+  its tail steps. An arrival whose decision is still pending at that point has
+  nothing left to be weighed against and falls back to the baseline interrupt.
+  A run that ends, is abandoned, or is stopped drops the held arrivals without
+  preemption; Stop stays authoritative. A preemption keeps the arrival's
+  replacement run, on a local actor and a follower alike, so the arrival is
+  picked up by the next turn.
 - **Failures & deadlines:** Timeouts (5-second decision deadline), transport
   errors, or unreadable inputs preserve baseline preemption. The deadline stops
   waiting; it does not cancel a request already sent, which stays bounded by the
   SDK's own timeout. A decision that resolves after its run or selection has
-  changed is ignored, and its audit row records `applied: false`.
+  changed is ignored, and its audit row records `applied: false`. Chat
+  reactions remain the classifier's prediction in either case; the audit row is
+  the record of what the scheduler did.
 
 ## Roll back
 

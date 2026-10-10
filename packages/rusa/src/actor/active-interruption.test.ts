@@ -5,6 +5,7 @@ import Database from "better-sqlite3";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
+import { FakeProvider } from "../providers/fake-provider.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { createHarness, waitUntil } from "../remote-instances/harness.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
@@ -29,28 +30,6 @@ function createTestInbox(): SqliteInboxRepository {
   const db = new Database(":memory:");
   runMigrations(db);
   return new SqliteInboxRepository(db);
-}
-
-class FakeProvider implements CodingProvider {
-  readonly name = "fake";
-  readonly providerName = "fake";
-  constructor(
-    private readonly runner: (opts: {
-      prompt: string;
-      cwd: string;
-      signal?: AbortSignal;
-    }) => Promise<Partial<RunResult>>
-  ) {}
-
-  async run(opts: { prompt: string; cwd: string; signal?: AbortSignal }): Promise<RunResult> {
-    const res = await this.runner(opts);
-    return {
-      success: true,
-      output: "",
-      exitCode: 0,
-      ...res,
-    };
-  }
 }
 
 const defaultTestSecretsDir = mkdtempSync(join(tmpdir(), "rusa-active-interruption-secrets-"));
@@ -139,115 +118,89 @@ function setup(opts: {
   return { mesh: testMesh, inboxStore, events, tick };
 }
 
+type Decide = (request: JevDecisionRequest) => Promise<JevDecisionResponse>;
+
+/**
+ * A worker whose run hangs, with one task appended and, unless `select` is
+ * false, selected in that run: the state every active-mode decision starts from.
+ */
+async function hungWorker(
+  decide: Decide,
+  /** `mode: "default"` omits the mesh option, so the mesh picks its own default. */
+  opts: { select?: boolean; timeoutMs?: number; mode?: "active" | "default" } = {}
+) {
+  let signal: AbortSignal | undefined;
+  let decideCalls = 0;
+  const provider = new FakeProvider((run) => {
+    signal = run.signal;
+    return new Promise<Partial<RunResult>>(() => {});
+  });
+  const classifier = new ShadowResponsiveInterruptionClassifier({
+    threshold: 0.5,
+    ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
+    client: {
+      decide: (request) => {
+        decideCalls++;
+        return decide(request);
+      },
+    },
+  });
+  const t = setup({
+    sharedProvider: provider,
+    responsiveInterruption: classifier,
+    ...(opts.mode === "default" ? {} : { responsiveInterruptionMode: "active" as const }),
+  });
+  const worker = t.mesh.spawn({ charter: "worker", parentId: "root" });
+  const [entry] = t.inboxStore.append([
+    { actorId: worker, source: "test", payload: { type: "task" } },
+  ]);
+  t.mesh.dispatch(worker);
+  await t.tick();
+  if (opts.select !== false) t.mesh.selectInboxEntries(worker, [entry.id]);
+  return {
+    ...t,
+    worker,
+    entry,
+    aborted: () => signal?.aborted,
+    decideCalls: () => decideCalls,
+  };
+}
+
+const queue: Decide = async () => ({ interruptProbability: 0.1 });
+
 describe("Active JEV Responsive Interruption Policy (#533)", () => {
   beforeEach(() => {
     vi.useRealTimers();
   });
 
-  describe("Default Mode is Shadow", () => {
-    it("never suppresses preemption and records detail: shadow", async () => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {}); // hang
-      });
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client: {
-          decide: async () => ({ interruptProbability: 0.1 }), // < 0.5 would queue in active mode
-        },
-      });
+  it("defaults to shadow: never suppresses preemption and records detail: shadow", async () => {
+    // A below-threshold decision would queue in active mode.
+    const t = await hungWorker(queue, { mode: "default" });
+    expect(t.aborted()).toBe(false);
+    t.mesh.sendMessage(t.worker, "operator responsive", TEST_USER_ID, "s1");
+    await t.tick();
 
-      const { mesh, inboxStore, events, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        // responsiveInterruptionMode omitted -> defaults to shadow
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [entry] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task", task: "initial" } },
-      ]);
-      mesh.dispatch(worker);
-      await tick();
-
-      // Worker selects initial task
-      mesh.selectInboxEntries(worker, [entry.id]);
-      expect(runSignal?.aborted).toBe(false);
-
-      // Responsive message arrives
-      mesh.sendMessage(worker, "operator responsive", TEST_USER_ID, "s1");
-      await tick();
-
-      // Shadow mode never suppresses: baseline interrupts immediately!
-      expect(runSignal?.aborted).toBe(true);
-
-      const shadowEvents = events.filter((e) => e.kind === "responsive_interruption_shadow");
-      expect(shadowEvents.length).toBeGreaterThanOrEqual(1);
-      expect(shadowEvents[0].detail).toBe("shadow");
-    });
+    expect(t.aborted()).toBe(true);
+    const shadow = t.events.filter((e) => e.kind === "responsive_interruption_shadow");
+    expect(shadow.length).toBeGreaterThanOrEqual(1);
+    expect(shadow[0].detail).toBe("shadow");
   });
 
   describe("Active Mode Eligibility", () => {
     it("suppresses preemption for running actor with live unhandled selection when JEV decides queue", async () => {
-      let runSignal: AbortSignal | undefined;
-      let resolveRun!: (result: Partial<RunResult>) => void;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise<Partial<RunResult>>((resolve) => {
-          resolveRun = resolve;
-        });
-      });
+      const t = await hungWorker(queue);
+      expect(t.mesh.selectedInboxEntries(t.worker)).toEqual([t.entry.id]);
 
-      let decideCalled = false;
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client: {
-          decide: async () => {
-            decideCalled = true;
-            return { interruptProbability: 0.1 }; // queue (< 0.5)
-          },
-        },
-      });
+      t.mesh.sendMessage(t.worker, "operator responsive message", TEST_USER_ID, "s1");
+      await t.tick();
 
-      const { mesh, inboxStore, events, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [entry] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task" } },
-      ]);
-      mesh.dispatch(worker);
-      await tick();
-
-      // Select work while running
-      mesh.selectInboxEntries(worker, [entry.id]);
-      expect(mesh.selectedInboxEntries(worker)).toEqual([entry.id]);
-
-      // Responsive message arrives
-      mesh.sendMessage(worker, "operator responsive message", TEST_USER_ID, "s1");
-      await tick();
-
-      expect(decideCalled).toBe(true);
-      // Preemption is SUPPRESSED! Signal is NOT aborted.
-      expect(runSignal?.aborted).toBe(false);
-
-      // Audit event recorded with detail: "active"
-      const audit = events.find(
-        (e) => e.kind === "responsive_interruption_shadow" && e.actorId === worker
+      expect(t.decideCalls()).toBe(1);
+      expect(t.aborted()).toBe(false);
+      const audit = t.events.find(
+        (e) => e.kind === "responsive_interruption_shadow" && e.actorId === t.worker
       );
-      expect(audit).toBeDefined();
       expect(audit?.detail).toBe("active");
-      const parsed = JSON.parse(audit?.payload ?? "{}");
-      expect(parsed.decision.outcome).toBe("queue");
-
-      // Running actor completes its turn naturally
-      mesh.finishInboxRun(worker, { successful: true });
-      resolveRun({});
-      await tick();
+      expect(JSON.parse(audit?.payload ?? "{}").decision.outcome).toBe("queue");
     });
 
     it("does not call JEV for idle actor", async () => {
@@ -261,16 +214,13 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
           },
         },
       });
-
       const { mesh, tick } = setup({
         responsiveInterruption: classifier,
         responsiveInterruptionMode: "active",
       });
-
       const worker = mesh.spawn({ charter: "worker", parentId: "root" });
       expect(mesh.runningThreadIds().has(worker)).toBe(false);
 
-      // Message arrives while idle
       mesh.sendMessage(worker, "hello idle", TEST_USER_ID, "s1");
       await tick();
 
@@ -278,285 +228,62 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
     });
 
     it("does not call JEV and interrupts immediately when running actor has NO selection", async () => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {});
-      });
+      const t = await hungWorker(queue, { select: false });
+      expect(t.mesh.selectedInboxEntries(t.worker)).toEqual([]);
 
-      let decideCalled = false;
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client: {
-          decide: async () => {
-            decideCalled = true;
-            return { interruptProbability: 0.1 };
-          },
-        },
-      });
+      t.mesh.sendMessage(t.worker, "operator message", TEST_USER_ID, "s1");
+      await t.tick();
 
-      const { mesh, inboxStore, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      inboxStore.append([{ actorId: worker, source: "test", payload: { type: "task" } }]);
-      mesh.dispatch(worker);
-      await tick();
-
-      // Running, but NO selection made (selectedInboxEntries is empty)
-      expect(mesh.selectedInboxEntries(worker)).toEqual([]);
-
-      // Responsive message arrives
-      mesh.sendMessage(worker, "operator message", TEST_USER_ID, "s1");
-      await tick();
-
-      // Ineligible! No JEV call, interrupts immediately
-      expect(decideCalled).toBe(false);
-      expect(runSignal?.aborted).toBe(true);
+      expect(t.decideCalls()).toBe(0);
+      expect(t.aborted()).toBe(true);
     });
 
     it("does not call JEV and interrupts immediately when selected work is already handled", async () => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {});
-      });
+      const t = await hungWorker(queue);
+      t.inboxStore.markHandled(t.worker, [t.entry.id]);
 
-      let decideCalled = false;
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client: {
-          decide: async () => {
-            decideCalled = true;
-            return { interruptProbability: 0.1 };
-          },
-        },
-      });
+      t.mesh.sendMessage(t.worker, "operator message", TEST_USER_ID, "s1");
+      await t.tick();
 
-      const { mesh, inboxStore, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [entry] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task" } },
-      ]);
-      mesh.dispatch(worker);
-      await tick();
-
-      mesh.selectInboxEntries(worker, [entry.id]);
-      // Mark entry handled
-      inboxStore.markHandled(worker, [entry.id]);
-
-      // Responsive message arrives
-      mesh.sendMessage(worker, "operator message", TEST_USER_ID, "s1");
-      await tick();
-
-      // Ineligible! Selected work is not live unhandled -> interrupts immediately
-      expect(decideCalled).toBe(false);
-      expect(runSignal?.aborted).toBe(true);
+      expect(t.decideCalls()).toBe(0);
+      expect(t.aborted()).toBe(true);
     });
 
     it("does not call JEV and interrupts immediately for operator.run_now", async () => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {});
-      });
-
-      let decideCalled = false;
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client: {
-          decide: async () => {
-            decideCalled = true;
-            return { interruptProbability: 0.1 };
-          },
-        },
-      });
-
-      const { mesh, inboxStore, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [entry] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task" } },
-      ]);
-      mesh.dispatch(worker);
-      await tick();
-
-      mesh.selectInboxEntries(worker, [entry.id]);
-
-      // Append operator.run_now responsive row
-      inboxStore.append([
+      const t = await hungWorker(queue);
+      t.inboxStore.append([
         {
-          actorId: worker,
+          actorId: t.worker,
           source: "operator:control",
           payload: { type: "operator.run_now", priority: "responsive" },
         },
       ]);
-      mesh.dispatch(worker);
-      await tick();
+      t.mesh.dispatch(t.worker);
+      await t.tick();
 
-      expect(decideCalled).toBe(false);
-      expect(runSignal?.aborted).toBe(true);
-    });
-  });
-
-  describe("Threshold & Decisions", () => {
-    it("preempts running actor when JEV probability >= 0.5", async () => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {});
-      });
-
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client: {
-          decide: async () => ({ interruptProbability: 0.75 }), // >= 0.5 -> interrupt
-        },
-      });
-
-      const { mesh, inboxStore, events, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [entry] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task" } },
-      ]);
-      mesh.dispatch(worker);
-      await tick();
-
-      mesh.selectInboxEntries(worker, [entry.id]);
-      expect(runSignal?.aborted).toBe(false);
-
-      mesh.sendMessage(worker, "urgent request", TEST_USER_ID, "s1");
-      await tick();
-
-      // Preempted!
-      expect(runSignal?.aborted).toBe(true);
-
-      const preemptEvent = events.find((e) => e.kind === "run_preempted" && e.actorId === worker);
-      expect(preemptEvent).toBeDefined();
-
-      const shadowEvent = events.find(
-        (e) => e.kind === "responsive_interruption_shadow" && e.actorId === worker
-      );
-      expect(shadowEvent?.detail).toBe("active");
-      const parsed = JSON.parse(shadowEvent?.payload ?? "{}");
-      expect(parsed.decision.outcome).toBe("interrupt");
-    });
-  });
-
-  describe("Fallbacks & Errors", () => {
-    it.each([
-      [
-        "client error",
-        async (): Promise<JevDecisionResponse> => {
-          throw new Error("HTTP 500 internal error");
-        },
-      ],
-      [
-        "input unavailable",
-        async (): Promise<JevDecisionResponse> => {
-          throw new JevInputUnavailableError();
-        },
-      ],
-      ["invalid probability", async () => ({ interruptProbability: NaN })],
-    ])("preempts running actor on %s fallback", async (_fallback, decide) => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {});
-      });
-
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client: { decide },
-      });
-
-      const { mesh, inboxStore, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [entry] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task" } },
-      ]);
-      mesh.dispatch(worker);
-      await tick();
-
-      mesh.selectInboxEntries(worker, [entry.id]);
-      mesh.sendMessage(worker, "operator message", TEST_USER_ID, "s1");
-      await tick();
-
-      expect(runSignal?.aborted).toBe(true);
+      expect(t.decideCalls()).toBe(0);
+      expect(t.aborted()).toBe(true);
     });
   });
 
   describe("Deadline & Late Responses", () => {
     it("preempts running actor when JEV decision deadline expires", async () => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {});
-      });
+      const t = await hungWorker(() => new Promise(() => {}), { timeoutMs: 50 });
+      t.mesh.sendMessage(t.worker, "operator message", TEST_USER_ID, "s1");
+      await t.tick();
+      // Held while waiting for the deadline.
+      expect(t.aborted()).toBe(false);
 
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        timeoutMs: 50, // short timeout for testing
-        client: {
-          decide: () => new Promise(() => {}), // never resolves
-        },
-      });
-
-      const { mesh, inboxStore, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [entry] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task" } },
-      ]);
-      mesh.dispatch(worker);
-      await tick();
-
-      mesh.selectInboxEntries(worker, [entry.id]);
-      mesh.sendMessage(worker, "operator message", TEST_USER_ID, "s1");
-      await tick();
-
-      // Initially suppressed while waiting for deadline
-      expect(runSignal?.aborted).toBe(false);
-
-      // Wait past deadline
       await new Promise((resolve) => setTimeout(resolve, 80));
-      await tick();
+      await t.tick();
 
-      // Deadline expired -> preempted!
-      expect(runSignal?.aborted).toBe(true);
+      expect(t.aborted()).toBe(true);
     });
 
     it("ignores late JEV response after run finishes without preempting subsequent run", async () => {
       let runCount = 0;
       const signals: AbortSignal[] = [];
       let resolveFirstRun!: (r: Partial<RunResult>) => void;
-
       const provider = new FakeProvider((opts) => {
         runCount++;
         if (opts.signal) signals.push(opts.signal);
@@ -565,9 +292,8 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
             resolveFirstRun = resolve;
           });
         }
-        return new Promise(() => {}); // second run hangs
+        return new Promise<Partial<RunResult>>(() => {});
       });
-
       let resolveJev!: (res: JevDecisionResponse) => void;
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
@@ -578,277 +304,73 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
             }),
         },
       });
-
       const { mesh, inboxStore, events, tick } = setup({
         sharedProvider: provider,
         responsiveInterruption: classifier,
         responsiveInterruptionMode: "active",
       });
-
       const worker = mesh.spawn({ charter: "worker", parentId: "root" });
       const [entry] = inboxStore.append([
         { actorId: worker, source: "test", payload: { type: "task" } },
       ]);
       mesh.dispatch(worker);
       await tick();
-
       mesh.selectInboxEntries(worker, [entry.id]);
       expect(runCount).toBe(1);
 
-      // Responsive message arrives during run 1
       mesh.sendMessage(worker, "operator message", TEST_USER_ID, "s1");
       await tick();
 
-      // Run 1 finishes naturally before JEV resolves!
+      // Run 1 finishes before the decision resolves.
       mesh.finishInboxRun(worker, { successful: true });
       resolveFirstRun({});
       await tick();
-
-      // Second run starts (follow-up for the responsive message)
       expect(runCount).toBe(2);
       expect(signals[1].aborted).toBe(false);
 
-      // Now JEV resolves late with "interrupt"
       resolveJev({ interruptProbability: 0.9 });
       await tick();
 
-      // Late response MUST NOT preempt run 2!
       expect(signals[1].aborted).toBe(false);
-
-      // Audit event was still recorded with detail: "active"
       const audit = events.find((e) => e.kind === "responsive_interruption_shadow");
-      expect(audit).toBeDefined();
       expect(audit?.detail).toBe("active");
-    });
-  });
-
-  describe("Invalidation: Selection Changes, ABA, Work Handled, Stop", () => {
-    it("invalidates suppression and preempts running actor when selection changes (ABA)", async () => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {});
-      });
-
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client: {
-          decide: async () => ({ interruptProbability: 0.1 }), // queue
-        },
-      });
-
-      const { mesh, inboxStore, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [e1, e2] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task", id: "t1" } },
-        { actorId: worker, source: "test", payload: { type: "task", id: "t2" } },
-      ]);
-      mesh.dispatch(worker);
-      await tick();
-
-      // Selection A
-      mesh.selectInboxEntries(worker, [e1.id]);
-      mesh.sendMessage(worker, "operator message", TEST_USER_ID, "s1");
-      await tick();
-
-      // Preemption suppressed
-      expect(runSignal?.aborted).toBe(false);
-
-      // Reselection B
-      mesh.selectInboxEntries(worker, [e2.id]);
-      await tick();
-
-      // Selection changed -> invalidation triggered preemption!
-      expect(runSignal?.aborted).toBe(true);
-    });
-
-    it("invalidates suppression and preempts running actor when selected work is marked handled", async () => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {});
-      });
-
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client: {
-          decide: async () => ({ interruptProbability: 0.1 }), // queue
-        },
-      });
-
-      const { mesh, inboxStore, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [e1] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task", id: "t1" } },
-      ]);
-      mesh.dispatch(worker);
-      await tick();
-
-      mesh.selectInboxEntries(worker, [e1.id]);
-      mesh.sendMessage(worker, "operator message", TEST_USER_ID, "s1");
-      await tick();
-
-      // Preemption suppressed
-      expect(runSignal?.aborted).toBe(false);
-
-      // Selected work is marked handled!
-      inboxStore.markHandled(worker, [e1.id]);
-      await tick();
-
-      // Selected work handled -> invalidation triggered preemption!
-      expect(runSignal?.aborted).toBe(true);
-    });
-
-    it("operator interrupt stops actor and clears active suppression", async () => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {});
-      });
-
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client: {
-          decide: async () => ({ interruptProbability: 0.1 }), // queue
-        },
-      });
-
-      const { mesh, inboxStore, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [entry] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task" } },
-      ]);
-      mesh.dispatch(worker);
-      await tick();
-
-      mesh.selectInboxEntries(worker, [entry.id]);
-      mesh.sendMessage(worker, "operator message", TEST_USER_ID, "s1");
-      await tick();
-
-      expect(runSignal?.aborted).toBe(false);
-      expect(mesh.isPreemptionSuppressed(worker)).toBe(true);
-
-      // Operator interrupt
-      mesh.interrupt(worker, "root");
-      await tick();
-
-      expect(mesh.isPreemptionSuppressed(worker)).toBe(false);
     });
   });
 
   describe("Batch Arrivals & Replay Deduplication", () => {
     it("any interrupting batchrow wins when multiple rows arrive concurrently", async () => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {});
-      });
-
-      let e1: { id: string } | undefined;
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client: {
-          decide: async (req: JevDecisionRequest) => {
-            if (e1 && req.input.incomingEntryId === e1.id) {
-              return { interruptProbability: 0.1 }; // queue
-            }
-            return { interruptProbability: 0.9 }; // interrupt
-          },
-        },
-      });
-
-      const { mesh, inboxStore, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [entry] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task" } },
+      let first: { id: string } | undefined;
+      const t = await hungWorker(async (req) => ({
+        interruptProbability: first && req.input.incomingEntryId === first.id ? 0.1 : 0.9,
+      }));
+      const batch = t.inboxStore.append([
+        { actorId: t.worker, source: "test", payload: { type: "task", priority: "responsive" } },
+        { actorId: t.worker, source: "test", payload: { type: "task", priority: "responsive" } },
       ]);
+      first = batch[0];
+      t.mesh.dispatch(t.worker);
+      await t.tick();
 
-      mesh.dispatch(worker);
-      await tick();
-
-      mesh.selectInboxEntries(worker, [entry.id]);
-
-      // Append 2 responsive rows in the same batch
-      const batch = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task", priority: "responsive" } },
-        { actorId: worker, source: "test", payload: { type: "task", priority: "responsive" } },
-      ]);
-      e1 = batch[0];
-
-      mesh.dispatch(worker);
-      await tick();
-
-      // The interrupting row wins -> actor preempted!
-      expect(runSignal?.aborted).toBe(true);
+      expect(t.aborted()).toBe(true);
     });
 
-    it("redundant dispatch pokes do not re-call JEV or bypass suppression", async () => {
-      let runSignal: AbortSignal | undefined;
-      const provider = new FakeProvider((opts) => {
-        runSignal = opts.signal;
-        return new Promise(() => {});
-      });
+    it("later dispatches while an arrival is held do not re-call JEV or bypass suppression", async () => {
+      const t = await hungWorker(queue);
+      t.mesh.sendMessage(t.worker, "operator message", TEST_USER_ID, "s1");
+      await t.tick();
+      expect(t.decideCalls()).toBe(1);
+      expect(t.aborted()).toBe(false);
 
-      let decideCallCount = 0;
-      const classifier = new ShadowResponsiveInterruptionClassifier({
-        threshold: 0.5,
-        client: {
-          decide: async () => {
-            decideCallCount++;
-            return { interruptProbability: 0.1 }; // queue
-          },
-        },
-      });
+      // Redundant pokes for the same unseen arrival, then an ordinary row: each
+      // dispatch still sees the held arrival as unseen responsive work.
+      t.mesh.dispatch(t.worker);
+      t.mesh.dispatch(t.worker);
+      t.inboxStore.append([{ actorId: t.worker, source: "test", payload: { type: "task" } }]);
+      t.mesh.dispatch(t.worker);
+      await t.tick();
 
-      const { mesh, inboxStore, tick } = setup({
-        sharedProvider: provider,
-        responsiveInterruption: classifier,
-        responsiveInterruptionMode: "active",
-      });
-
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      const [entry] = inboxStore.append([
-        { actorId: worker, source: "test", payload: { type: "task" } },
-      ]);
-      mesh.dispatch(worker);
-      await tick();
-
-      mesh.selectInboxEntries(worker, [entry.id]);
-      mesh.sendMessage(worker, "operator message", TEST_USER_ID, "s1");
-      await tick();
-
-      expect(decideCallCount).toBe(1);
-      expect(runSignal?.aborted).toBe(false);
-
-      // Redundant dispatch pokes
-      mesh.dispatch(worker);
-      mesh.dispatch(worker);
-      await tick();
-
-      // No duplicate JEV calls
-      expect(decideCallCount).toBe(1);
-      // No replay bypass: still not preempted!
-      expect(runSignal?.aborted).toBe(false);
+      expect(t.decideCalls()).toBe(1);
+      expect(t.aborted()).toBe(false);
     });
   });
 
@@ -856,84 +378,73 @@ describe("Active JEV Responsive Interruption Policy (#533)", () => {
     it("suppresses follower remote preemption when active JEV decides queue", async () => {
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        client: {
-          decide: async () => ({ interruptProbability: 0.1 }), // queue (< 0.5)
-        },
+        client: { decide: queue },
       });
-
       const h = createHarness({
         cwd: "/tmp",
         delayMs: 300,
         responsiveInterruption: classifier,
         responsiveInterruptionMode: "active",
       });
-
       const id = h.spawn("follower worker");
-
-      // Start run on follower
       h.dispatchNormal(id);
-
-      // Wait until follower is running
       await waitUntil(() => h.mesh.runningThreadIds().has(id));
-
-      // Follower selects work
       const entries = h.inboxStore.list(id).entries;
       expect(entries.length).toBeGreaterThan(0);
       h.mesh.selectInboxEntries(id, [entries[0].id]);
 
-      // Responsive entry arrives
       h.dispatchResponsive(id);
       await new Promise((resolve) => setTimeout(resolve, 50));
 
-      // Remote preemption was SUPPRESSED! No remote_preempt_requested log
       expect(h.logs.some((l) => l.event === "remote_preempt_requested")).toBe(false);
-      // No preempted mesh event
       expect(h.meshEvents.some((e) => e.kind === "run_preempted" && e.actorId === id)).toBe(false);
-
       await h.close();
     });
 
-    it("preempts follower remote run when active JEV decides interrupt", async () => {
+    it("preempts a follower run on a late interrupt decision and re-runs with the arrival", async () => {
+      const decisions: Array<(response: JevDecisionResponse) => void> = [];
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.5,
-        client: {
-          decide: async () => ({ interruptProbability: 0.8 }), // interrupt (>= 0.5)
-        },
+        client: { decide: () => new Promise((resolve) => decisions.push(resolve)) },
       });
-
       const h = createHarness({
         cwd: "/tmp",
-        delayMs: 500,
+        delayMs: 1000,
         responsiveInterruption: classifier,
         responsiveInterruptionMode: "active",
       });
-
       const id = h.spawn("follower worker");
-
       h.dispatchNormal(id);
-
       await waitUntil(() => h.mesh.runningThreadIds().has(id));
-
       const entries = h.inboxStore.list(id).entries;
       expect(entries.length).toBeGreaterThan(0);
       h.mesh.selectInboxEntries(id, [entries[0].id]);
 
       h.dispatchResponsive(id);
+      await waitUntil(() => decisions.length > 0);
+      // Let the arrival's own wake reach the follower first, so the decision is
+      // late: the follower drops that coalesced follow-up when it preempts, and
+      // the leader must re-request the replacement run or the arrival stays unseen.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      decisions[0]?.({ interruptProbability: 0.8 });
       await waitUntil(() => h.logs.some((l) => l.event === "remote_preempt_requested"));
-
-      // Preemption requested on follower!
-      expect(h.logs.some((l) => l.event === "remote_preempt_requested")).toBe(true);
-
+      await waitUntil(
+        () =>
+          h.inboxStore
+            .list(id)
+            .entries.some((e) => e.payload.type === "test.responsive" && e.seenAt !== null),
+        5000
+      );
       await h.close();
     });
   });
 });
 
 describe("Active JEV late interrupt keeps the replacement run (#533)", () => {
-  async function lateInterrupt(decide: () => Promise<JevDecisionResponse>, reselect = false) {
+  async function lateInterrupt(decide: Decide, reselect = false) {
     const signals: AbortSignal[] = [];
     const provider = new FakeProvider((opts) => {
-      const signal = (opts as { signal?: AbortSignal }).signal;
+      const signal = opts.signal;
       if (signal) signals.push(signal);
       return new Promise<Partial<RunResult>>((_resolve, reject) => {
         signal?.addEventListener("abort", () => reject(new Error("aborted")));
@@ -943,7 +454,7 @@ describe("Active JEV late interrupt keeps the replacement run (#533)", () => {
       threshold: 0.5,
       client: { decide },
     });
-    const { mesh, inboxStore, tick } = setup({
+    const { mesh, inboxStore, events, tick } = setup({
       sharedProvider: provider,
       responsiveInterruption: classifier,
       responsiveInterruptionMode: "active",
@@ -963,30 +474,37 @@ describe("Active JEV late interrupt keeps the replacement run (#533)", () => {
     }
     await waitUntil(() => signals.length >= 2, 3000);
     const unseen = inboxStore.list(worker).entries.filter((e) => !e.seenAt && !e.handledAt);
-    return { signals, unseen };
+    const audit = events.find((e) => e.kind === "responsive_interruption_shadow");
+    return { signals, unseen, events, worker, audit: JSON.parse(audit?.payload ?? "{}") };
   }
 
-  it("re-runs with the arrival after a late >= threshold decision", async () => {
-    const { signals, unseen } = await lateInterrupt(async () => ({ interruptProbability: 0.75 }));
+  it.each<[string, Decide]>([
+    [">= threshold decision", async () => ({ interruptProbability: 0.75 })],
+    [
+      "client error fallback",
+      async () => {
+        throw new Error("HTTP 500 internal error");
+      },
+    ],
+    [
+      "input unavailable fallback",
+      async () => {
+        throw new JevInputUnavailableError();
+      },
+    ],
+    ["invalid probability fallback", async () => ({ interruptProbability: Number.NaN })],
+  ])("preempts and re-runs with the arrival after a %s", async (_case, decide) => {
+    const { signals, unseen, events, worker, audit } = await lateInterrupt(decide);
     expect(signals[0]?.aborted).toBe(true);
     expect(signals).toHaveLength(2);
     expect(unseen).toHaveLength(0);
-  });
-
-  it("re-runs with the arrival after a late client-error fallback", async () => {
-    const { signals, unseen } = await lateInterrupt(async () => {
-      throw new Error("transport");
-    });
-    expect(signals[0]?.aborted).toBe(true);
-    expect(signals).toHaveLength(2);
-    expect(unseen).toHaveLength(0);
+    expect(events.some((e) => e.kind === "run_preempted" && e.actorId === worker)).toBe(true);
+    expect(audit.decision.outcome).toBe("interrupt");
+    expect(audit.applied).toBe(true);
   });
 
   it("re-runs with the queued arrival when ABA reselection invalidates suppression", async () => {
-    const { signals, unseen } = await lateInterrupt(
-      async () => ({ interruptProbability: 0.1 }),
-      true
-    );
+    const { signals, unseen } = await lateInterrupt(queue, true);
     expect(signals[0]?.aborted).toBe(true);
     expect(signals).toHaveLength(2);
     expect(unseen).toHaveLength(0);
@@ -998,7 +516,7 @@ describe("Active JEV invalidation preempts only for remaining responsive work (#
     const decisions: Array<(response: JevDecisionResponse) => void> = [];
     const runs: Array<{ signal: AbortSignal; settle: () => void }> = [];
     const provider = new FakeProvider((opts) => {
-      const signal = (opts as { signal?: AbortSignal }).signal ?? new AbortController().signal;
+      const signal = opts.signal ?? new AbortController().signal;
       return new Promise<Partial<RunResult>>((resolve, reject) => {
         runs.push({ signal, settle: () => resolve({}) });
         signal.addEventListener("abort", () => reject(new Error("aborted")));
@@ -1068,22 +586,41 @@ describe("Active JEV invalidation preempts only for remaining responsive work (#
     t.runs[0]?.settle();
   });
 
-  it("keeps holding until the whole selection is handled", async () => {
+  it("lets the turn finish once the whole selection is handled; the queued arrival runs next", async () => {
     const t = await running();
     t.mesh.selectInboxEntries(t.worker, [t.a, t.b]);
-    await t.arrive("low priority");
+    const arrival = await t.arrive("low priority");
     t.decisions.shift()?.({ interruptProbability: 0.1 });
     await t.tick();
 
     t.inboxStore.markHandled(t.worker, [t.a]);
+    t.inboxStore.markHandled(t.worker, [t.b]);
+    // Tail steps after the last mark_handled, such as a new ordinary row
+    // arriving, must not cancel the turn either.
+    t.inboxStore.append([{ actorId: t.worker, source: "test", payload: { type: "task" } }]);
+    t.mesh.dispatch(t.worker);
     await t.tick();
     expect(t.runs[0]?.signal.aborted).toBe(false);
     expect(t.mesh.isPreemptionSuppressed(t.worker)).toBe(true);
 
-    t.inboxStore.markHandled(t.worker, [t.b]);
+    t.runs[0]?.settle();
+    await waitUntil(() => t.runs.length >= 2, 3000);
+    expect(t.runs).toHaveLength(2);
+    expect(t.entry(arrival)?.seenAt).toBeTruthy();
+    t.runs[1]?.settle();
+  });
+
+  it("interrupts when the selection is handled before the decision arrives", async () => {
+    const t = await running();
+    t.mesh.selectInboxEntries(t.worker, [t.a]);
+    const arrival = await t.arrive("undecided");
+
+    t.inboxStore.markHandled(t.worker, [t.a]);
     await waitUntil(() => t.runs.length >= 2, 3000);
     expect(t.runs[0]?.signal.aborted).toBe(true);
     expect(t.runs).toHaveLength(2);
+    expect(t.entry(arrival)?.seenAt).toBeTruthy();
+    expect(t.mesh.isPreemptionSuppressed(t.worker)).toBe(false);
     t.runs[1]?.settle();
   });
 

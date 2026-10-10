@@ -115,7 +115,7 @@ the mesh identity.
 ${shared}`;
 }
 
-export const INBOX_DISCIPLINE = `## Work from your inbox
+const INBOX_DISCIPLINE_HEAD = `## Work from your inbox
 The inbox holds notifications about events to be aware of and that may need a
 response. Start each ordinary run with \`inbox.list\`.
 Items marked \`priority: "responsive"\` always take precedence over normal items;
@@ -124,13 +124,18 @@ items. Use each candidate's identifiers to read its content from the source plus
 enough surrounding context to understand it. Do not infer content from metadata.
 After resolving candidates, coalesce related items, prioritize them, and choose a
 bounded work group with \`inbox.select\`. Pay attention to any \`hint\` returned on
-selected entries for channel-specific reply expectations or threading rules.
-Where a host enables active queue policy, a live selection can also help
-eligible work avoid an unnecessary interruption: an arriving responsive item
-may be weighed against it and, if judged less urgent, wait for your follow-up
-turn. That is a judgment, not a guarantee; arrivals otherwise follow their
-existing policy.
-Act on each selected entry, then mark it handled in the same run with a note
+selected entries for channel-specific reply expectations or threading rules.`;
+
+/**
+ * Rendered only where the host runs the active JEV queue policy (#533): on a
+ * shadow-only host a selection protects nothing, so the sentence would be false.
+ */
+const ACTIVE_QUEUE_POLICY_GUIDANCE = `A live selection can also help eligible work avoid an unnecessary
+interruption: an arriving responsive item may be weighed against it and, if
+judged less urgent, wait for your follow-up turn. That is a judgment, not a
+guarantee; arrivals otherwise follow their existing policy.`;
+
+const INBOX_DISCIPLINE_TAIL = `Act on each selected entry, then mark it handled in the same run with a note
 saying what you did. Handled means the notification was dealt with, not that the
 underlying issue or PR is finished; an inbox entry is not a timer for slow work.
 When CI, a build, a review, or another slow dependency still needs checking,
@@ -146,6 +151,13 @@ unhandled. A successful provider return gets at most one durable recovery for
 selected, still-unhandled work; after that it remains visible as Needs attention
 until the operator handles it. Listed-but-unselected work does not consume or gain a
 recovery attempt.`;
+
+/** The inbox contract, with the active queue policy sentence where the host runs it. */
+export function inboxDiscipline(activeQueuePolicy = false): string {
+  return activeQueuePolicy
+    ? `${INBOX_DISCIPLINE_HEAD}\n${ACTIVE_QUEUE_POLICY_GUIDANCE}\n${INBOX_DISCIPLINE_TAIL}`
+    : `${INBOX_DISCIPLINE_HEAD}\n${INBOX_DISCIPLINE_TAIL}`;
+}
 
 /**
  * How an actor is expected to use the obligation tree. Injected at prompt
@@ -345,6 +357,8 @@ export interface WorkerPromptContext {
   understandingMountEnabled?: boolean;
   /** The mesh's Git identity for mesh-owned commits, or the configuration gap. */
   gitIdentity: MeshGitIdentityResolution;
+  /** Whether the host runs the active JEV queue policy (#533). */
+  activeQueuePolicy?: boolean;
 }
 
 /** A short, one-line label for an actor, derived from its charter. */
@@ -477,7 +491,7 @@ ${GROUNDING_DISCIPLINE}
 
 ${gitIdentityGuidance(ctx.gitIdentity)}
 
-${INBOX_DISCIPLINE}
+${inboxDiscipline(ctx.activeQueuePolicy)}
 
 ${OBLIGATION_DISCIPLINE}
 

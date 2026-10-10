@@ -1566,13 +1566,18 @@ export class ActorMesh {
   /**
    * Held arrivals wait on the live selection as a whole, the same test that
    * admitted them: handling one selected entry while others remain open keeps
-   * them held, and handling the last one releases them.
+   * them held. Once the last one is handled, an arrival already judged able to
+   * wait keeps waiting for the follow-up turn, so the run can finish its tail
+   * steps; the record stays until the run ends, so a later poke cannot preempt
+   * it. An arrival still being weighed has no verdict and nothing left to be
+   * weighed against, so it falls back to interrupting.
    */
   private onItemsMarkedHandled(actorId: string): void {
     const resolved = this.resolveThreadId(actorId);
-    if (!this.activeSuppressions.has(resolved)) return;
+    const active = this.activeSuppressions.get(resolved);
+    if (!active) return;
     if (this.hasLiveUnhandledSelection(resolved, [...this.selectedInboxEntries(resolved)])) return;
-    this.invalidateActiveInterruption(resolved);
+    if (active.pending.size > 0) this.invalidateActiveInterruption(resolved);
   }
 
   private handleActiveResponsiveArrivals(
