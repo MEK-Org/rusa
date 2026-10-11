@@ -160,6 +160,7 @@ import { DashboardTimingRecorder } from "../dashboard/timing.js";
 import {
   ConfiguredActorImportError,
   type ConfiguredActorImportResult,
+  configuredActorCharter,
   importConfiguredActor,
 } from "../db/configured-actor-import.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
@@ -1516,6 +1517,13 @@ async function composeStart(
       selected: configuredImport.plan.kind === "adopt" && configuredImport.plan.selected,
       filled: configuredImport.filled,
       avatarImported: configuredImport.avatarImported,
+    });
+  }
+  if (configuredImport.avatarMissing !== undefined) {
+    log.warn("configured_actor_avatar_missing", {
+      actorId: rootId,
+      path: configuredImport.avatarMissing,
+      action: `rootActor.avatar named no file, and the import does not read it again; copy the image to ${avatarCachePath("root")} or upload one from the dashboard`,
     });
   }
   const importedRoot = actors.get(rootId);
@@ -3960,7 +3968,7 @@ async function composeStart(
       );
       return {
         prompt: buildRootPrompt(
-          record.charter,
+          configuredActorCharter(record.charter),
           injection?.priorContext,
           rootHandle,
           meshGitIdentity,

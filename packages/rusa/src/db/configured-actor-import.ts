@@ -113,6 +113,23 @@ export interface ConfiguredActorImportResult {
   filled: string[];
   /** Whether the configured avatar was copied into the image cache. */
   avatarImported: boolean;
+  /**
+   * The configured avatar path, resolved, when it named no file and nothing
+   * was cached either. The import is the last read of `rootActor.avatar`, so
+   * boot warns rather than letting the skip pass silently.
+   */
+  avatarMissing?: string;
+}
+
+/**
+ * The charter the configured actor's prompt runs on. The previous binary
+ * stored DEFAULT_ROOT_CHARTER when `rootActor.charter` was unset, while its
+ * prompt actually ran on ROOT_ACTOR_CHARTER, so that stored placeholder means
+ * "no charter configured". The import replaces it once; reading it the same
+ * way here covers a row that a rolled-back binary rewrote after the import.
+ */
+export function configuredActorCharter(stored: string): string {
+  return stored === DEFAULT_ROOT_CHARTER ? ROOT_ACTOR_CHARTER : stored;
 }
 
 const SELECT_ACTION =
@@ -365,7 +382,7 @@ export function importConfiguredActor(
       : undefined;
   if (seedPool) filled.push("modelConfig");
 
-  const avatarImported = importAvatar(seed.avatarPath, options.avatarCachePath);
+  const avatar = importAvatar(seed.avatarPath, options.avatarCachePath);
 
   options.db.transaction(() => {
     if (plan.kind === "create") {
@@ -381,7 +398,13 @@ export function importConfiguredActor(
     options.receipts.record(CONFIGURED_ACTOR_IMPORT_SOURCE, now(), 1, record.id);
   })();
 
-  return { plan, actorId: record.id, filled, avatarImported };
+  return {
+    plan,
+    actorId: record.id,
+    filled,
+    avatarImported: avatar === "imported",
+    ...(avatar === "imported" || avatar === undefined ? {} : { avatarMissing: avatar.missing }),
+  };
 }
 
 /**
@@ -389,12 +412,16 @@ export function importConfiguredActor(
  * already there. An existing cached image is the actor's established picture
  * (uploaded or generated), and it already took precedence over the configured
  * path, so it stays. The copy goes through a temporary file and a rename, so
- * an interruption never leaves a partial image behind.
+ * an interruption never leaves a partial image behind. Returns `undefined`
+ * when nothing was configured or the cache already holds an image.
  */
-function importAvatar(configuredPath: string | undefined, cachePath: string): boolean {
-  if (!configuredPath || existsSync(cachePath)) return false;
+function importAvatar(
+  configuredPath: string | undefined,
+  cachePath: string
+): "imported" | { missing: string } | undefined {
+  if (!configuredPath || existsSync(cachePath)) return undefined;
   const source = resolve(configuredPath);
-  if (!existsSync(source)) return false;
+  if (!existsSync(source)) return { missing: source };
   const temp = `${cachePath}.import-${process.pid}.tmp`;
   mkdirSync(dirname(cachePath), { recursive: true });
   try {
@@ -403,5 +430,5 @@ function importAvatar(configuredPath: string | undefined, cachePath: string): bo
   } finally {
     rmSync(temp, { force: true });
   }
-  return true;
+  return "imported";
 }

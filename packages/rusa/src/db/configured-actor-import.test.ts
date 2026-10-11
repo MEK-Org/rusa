@@ -12,6 +12,7 @@ import {
   CONFIGURED_ACTOR_IMPORT_SOURCE,
   ConfiguredActorImportError,
   type ConfiguredActorSeed,
+  configuredActorCharter,
   importConfiguredActor,
   planConfiguredActorImport,
 } from "./configured-actor-import.js";
@@ -415,12 +416,17 @@ describe("configured-actor import (#1002)", () => {
       const avatar = join(home, "configured-avatar.png");
       writeFileSync(avatar, "configured-image");
 
-      expect(run({ seed: { avatarPath: avatar } }).avatarImported).toBe(false);
+      const kept = run({ seed: { avatarPath: avatar } });
+      expect(kept.avatarImported).toBe(false);
+      expect(kept.avatarMissing).toBeUndefined();
       expect(readFileSync(join(home, "avatars", "root.png"), "utf8")).toBe("uploaded-image");
 
       rmSync(join(home, "avatars"), { recursive: true });
       db.prepare("DELETE FROM legacy_import_receipts").run();
-      expect(run({ seed: { avatarPath: join(home, "missing.png") } }).avatarImported).toBe(false);
+      const missing = run({ seed: { avatarPath: join(home, "missing.png") } });
+      expect(missing.avatarImported).toBe(false);
+      // Reported so boot can warn: this was the last read of rootActor.avatar.
+      expect(missing.avatarMissing).toBe(join(home, "missing.png"));
       expect(existsSync(join(home, "avatars", "root.png"))).toBe(false);
     });
   });
@@ -582,6 +588,15 @@ describe("configured-actor import (#1002)", () => {
       expect(() => mesh.adopt(stored, { requestRun: () => {} } as never)).toThrow(
         /Cannot add configured as a second top-level actor: second-top is already top-level/
       );
+    });
+  });
+
+  describe("configuredActorCharter", () => {
+    it("reads the stored placeholder as the charter the prompt runs on", () => {
+      // A rolled-back binary rewrites the placeholder after the import; the
+      // prompt still runs on the built-in charter, as that binary's did.
+      expect(configuredActorCharter(DEFAULT_ROOT_CHARTER)).toBe(ROOT_ACTOR_CHARTER);
+      expect(configuredActorCharter("charter configured")).toBe("charter configured");
     });
   });
 });
