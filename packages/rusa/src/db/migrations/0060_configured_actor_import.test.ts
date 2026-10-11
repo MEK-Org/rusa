@@ -14,7 +14,7 @@ function columns(db: Database.Database, table: string) {
   }>;
 }
 
-describe("0061_configured_actor_import", () => {
+describe("0060_configured_actor_import", () => {
   it("adds nullable provenance and handle columns without touching existing rows", () => {
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");

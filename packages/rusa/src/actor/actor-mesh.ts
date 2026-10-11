@@ -1353,7 +1353,9 @@ export class ActorMesh {
    * can store several parentless actors now (#550), but that is not authority
    * to create them: until forest boot lands, adoption refuses a second one,
    * retired or not, as the dropped unique index did. {@link spawn} cannot make
-   * one at all, since it always resolves a parent.
+   * one at all, since it always resolves a parent. The configured-actor
+   * import's refusal of a reparented imported actor belongs to this guard and
+   * goes with it (#1002).
    */
   private assertSingleTopLevel(record: ActorRecord): void {
     if (record.parentId !== null) return;

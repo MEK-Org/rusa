@@ -22,7 +22,7 @@ import type { Migration } from "./types.js";
  * `rootActor` on every boot, as it always did.
  */
 export const configuredActorImport: Migration = {
-  id: "0061_configured_actor_import",
+  id: "0060_configured_actor_import",
   up: (db: Database) => {
     db.exec(`
       ALTER TABLE legacy_import_receipts ADD COLUMN actor_id TEXT
