@@ -738,6 +738,41 @@ void main() {
       await store.dispose();
     });
 
+    test('a first request a viewer switch overtook is asked again when the '
+        'viewer returns', () async {
+      final api = _populatedApi();
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      _watchViewerQueues(store);
+      final gate = api.obligationQueuePagesGate = Completer<void>();
+      final first = store.obligationSync.refresh(store.viewerQueues());
+      await pumpEventQueue();
+
+      api.dashboardConfigResult = _configFor(_otherViewer);
+      await store.refreshDashboardConfig();
+      api.dashboardConfigResult = _configFor(testUserPrincipalId);
+      await store.refreshDashboardConfig();
+      expect(store.viewerQueues(), _queuesOf(testUserPrincipalId));
+      final returned = store.obligationSync.refresh(store.viewerQueues());
+
+      api.obligationQueuePagesGate = null;
+      gate.complete();
+      await Future.wait([first, returned]);
+      // The held requests belong to the first visit; the return got its own.
+      expect(
+        api.fetchObligationsCalls.where(
+          (c) => c.ownerId == testUserPrincipalId,
+        ),
+        hasLength(6),
+      );
+      expect(_readyIntents(store), ['Ready decision']);
+      expect(
+        store.obligationSync.freshnessOf(store.viewerQueues().first).known,
+        isTrue,
+      );
+      await store.dispose();
+    });
+
     test(
       "the viewer's mutation drops the response it overtook and refreshes",
       () async {

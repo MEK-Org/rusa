@@ -85,7 +85,9 @@ class ObligationSync {
   /// a persisted capture, so they are known but still need a response.
   void reset({Iterable<ObligationQuery> replayed = const []}) {
     _epoch++;
-    for (final q in {..._versions.keys, ...replayed}) {
+    // As in [mutated]: a first request in flight has no version yet, and a
+    // returning viewer that shares it must still get a response of its own.
+    for (final q in {..._versions.keys, ..._inFlight.keys, ...replayed}) {
       _bump(q);
     }
     _setAll({for (final q in replayed) q: const QueryFreshness(known: true)});
