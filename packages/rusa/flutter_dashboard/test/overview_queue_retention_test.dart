@@ -190,11 +190,10 @@ void main() {
         expect(find.text('Waiting decision'), findsOneWidget);
         expect(find.text('2 obligations'), findsOneWidget);
         expect(find.byType(CircularProgressIndicator), findsNothing);
-        // Only the section the change may have moved is revalidated.
+        // Every section is revalidated behind the stored rows.
         await tester.pump();
-        expect(api.fetchObligationsCalls.length - requestsBefore, 1);
-        expect(api.fetchObligationsCalls.last.queue, 'ready');
-        _recordFirstUsefulContent('tab return', mounted, 1);
+        expect(api.fetchObligationsCalls.length - requestsBefore, 3);
+        _recordFirstUsefulContent('tab return', mounted, 3);
 
         api.obligationsResult = [
           ...api.obligationsResult,
@@ -215,7 +214,7 @@ void main() {
     },
   );
 
-  testWidgets('a return within the freshness window sends no request', (
+  testWidgets('every return revalidates, sharing a request still in flight', (
     tester,
   ) async {
     await tester.runAsync(() async {
@@ -226,20 +225,29 @@ void main() {
       await tester.pumpWidget(_overview(store));
       await tester.pump();
       await tester.pump();
-      final requests = api.fetchObligationsCalls.length;
-      expect(requests, 3);
+      expect(api.fetchObligationsCalls, hasLength(3));
 
+      final gate = api.obligationQueuePagesGate = Completer<void>();
       await tester.pumpWidget(_elsewhere());
       await tester.pumpWidget(_overview(store));
       await tester.pump();
       expect(find.text('Ready decision'), findsOneWidget);
-      expect(api.fetchObligationsCalls, hasLength(requests));
+      expect(api.fetchObligationsCalls, hasLength(6));
+      // A return while those are out shares them.
+      await tester.pumpWidget(_elsewhere());
+      await tester.pumpWidget(_overview(store));
+      await tester.pump();
+      expect(find.text('Ready decision'), findsOneWidget);
+      expect(api.fetchObligationsCalls, hasLength(6));
 
-      // The operator's refresh is always sent.
+      gate.complete();
+      api.obligationQueuePagesGate = null;
+      await Future<void>.delayed(Duration.zero);
+      await tester.pump();
       await tester.tap(find.byTooltip('Refresh Queue'));
       await Future<void>.delayed(Duration.zero);
       await tester.pump();
-      expect(api.fetchObligationsCalls, hasLength(requests + 3));
+      expect(api.fetchObligationsCalls, hasLength(9));
     });
   });
 
@@ -394,7 +402,7 @@ void main() {
   });
 
   group('across views', () {
-    testWidgets('a Work load leaves Overview current without a request', (
+    testWidgets('a Work load paints Overview before its own request answers', (
       tester,
     ) async {
       await tester.runAsync(() async {
@@ -402,36 +410,57 @@ void main() {
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
         addTearDown(store.dispose);
-        await tester.pumpWidget(_overview(store));
-        await tester.pump();
-        await tester.pump();
-        expect(find.text('Ready decision'), findsOneWidget);
         int queueRequests() =>
             api.fetchObligationsCalls.where((c) => c.queue != null).length;
-        final before = queueRequests();
 
-        api.obligationsResult = _replacingReady(
-          api,
-          makeObligation(
-            'ob-ready',
-            ownerId: testUserPrincipalId,
-            intent: 'Revised decision',
-          ),
-        );
+        // A cold session opens Work first.
         await tester.pumpWidget(_work(store));
         await tester.pump();
         await tester.pump();
         expect(api.fetchObligationForestCalls, isNotEmpty);
-        expect(find.text('Revised decision'), findsOneWidget);
+        expect(find.text('Ready decision'), findsOneWidget);
+        expect(queueRequests(), 0);
 
-        api.obligationQueuePagesGate = Completer<void>();
+        final gate = api.obligationQueuePagesGate = Completer<void>();
         await tester.pumpWidget(_overview(store));
-        // First frame of the return: Work's response is already shown.
-        expect(find.text('Revised decision'), findsOneWidget);
-        expect(find.text('Ready decision'), findsNothing);
+        // First frame: Work's response, while Overview's requests are held.
+        expect(find.text('Ready decision'), findsOneWidget);
+        expect(find.text('Waiting decision'), findsOneWidget);
         await tester.pump();
-        expect(queueRequests(), before);
-        api.obligationQueuePagesGate!.complete();
+        expect(queueRequests(), 3);
+        gate.complete();
+      });
+    });
+
+    testWidgets('a forest the previous viewer asked for never reaches the '
+        "next viewer's store", (tester) async {
+      await tester.runAsync(() async {
+        final api = _populatedApi();
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
+        final gate = Completer<void>();
+        api.forestGates.add(gate);
+        await tester.pumpWidget(_work(store));
+        await tester.pump();
+        expect(api.fetchObligationForestCalls, hasLength(1));
+
+        // What the next viewer's own requests find.
+        api.obligationsResult = [
+          makeObligation(
+            'ob-other',
+            ownerId: _otherViewer,
+            intent: 'Other viewer live',
+          ),
+        ];
+        api.dashboardConfigResult = _configFor(_otherViewer);
+        await store.refreshDashboardConfig();
+        gate.complete();
+        await Future<void>.delayed(Duration.zero);
+        await tester.pump();
+        await tester.pump();
+        expect(store.obligations['ob-ready'], isNull);
+        expect(store.obligations['ob-waiting'], isNull);
       });
     });
 
@@ -627,7 +656,7 @@ void main() {
       await Future.wait([
         store.obligationSync.refresh(store.viewerQueues()),
         store.obligationSync.refresh(store.viewerQueues()),
-        store.obligationSync.ensureFresh(store.viewerQueues()),
+        store.obligationSync.refresh(store.viewerQueues()),
       ]);
       expect(api.fetchObligationsCalls, hasLength(3));
       await store.dispose();
@@ -671,7 +700,7 @@ void main() {
         gate.complete();
         api.obligationQueuePagesGate = null;
         await inFlight;
-        await store.obligationSync.ensureFresh(store.viewerQueues());
+        await store.obligationSync.refresh(store.viewerQueues());
         expect(_readyIntents(store), ['Other viewer live']);
         expect(store.obligations['ob-ready'], isNull);
         await pumpEventQueue();
@@ -792,14 +821,14 @@ void main() {
           payload: payload,
         );
 
-        // Unwatched, the capture is dropped and the next ensureFresh refreshes.
+        // Unwatched, the capture is dropped and the next mount refreshes.
         emit('obligation_checkpoint_set', detail: 'ob-ready');
         await pumpEventQueue();
         expect(api.fetchObligationsCalls.length, baseline);
         expect(cache.entityInvalidateCount, 1);
         final ready = _query(testUserPrincipalId, ObligationQueue.ready);
         expect(store.obligationSync.freshnessOf(ready).stale, isTrue);
-        await store.obligationSync.ensureFresh(store.viewerQueues());
+        await store.obligationSync.refresh([ready]);
         expect(api.fetchObligationsCalls.length, baseline + 1);
         expect(store.obligationSync.freshnessOf(ready).stale, isFalse);
 
@@ -1166,6 +1195,38 @@ void main() {
       expect(store.current.absent, isEmpty);
       expect(store.current.deleted, {'w'});
       expect(store['b1'], isNotNull);
+
+      // A response sent before the deletion never brings it back.
+      final late = _stamped(
+        makeObligation('w', ownerId: owner, status: 'waiting'),
+        '2099-01-01T00:00:00.000Z',
+      );
+      store.upsert([late]);
+      store.applyDetail(late);
+      store.applyPage(
+        waitingQuery,
+        ObligationPage(obligations: [late], total: 1, hasMore: false),
+        reconcile: true,
+      );
+      expect(store['w'], isNull);
+      expect(store.current.select(waitingQuery), isEmpty);
+    });
+
+    test('a section shows its first page at most, in order', () {
+      final store = ObligationStore();
+      addTearDown(store.close);
+      final count = ObligationQuery.pageLimit + 10;
+      store.upsert([
+        for (var i = count; i > 0; i--)
+          readyRow('r${i.toString().padLeft(3, '0')}', i.toDouble()),
+      ]);
+      final shown = store.current.select(_query(owner, ObligationQueue.ready));
+      expect(shown, hasLength(ObligationQuery.pageLimit));
+      expect(shown.first.id, 'r001');
+      expect(
+        shown.last.id,
+        'r${ObligationQuery.pageLimit.toString().padLeft(3, '0')}',
+      );
     });
 
     test('a strictly older row never overwrites a newer one', () {
@@ -1191,42 +1252,95 @@ void main() {
   group('ObligationSync', () {
     final query = _query(testUserPrincipalId, ObligationQueue.ready);
 
-    test('asks only for what is unknown, stale, failed or old', () async {
-      var clock = DateTime.utc(2026, 10, 10, 12);
+    test('an unwatched change only marks its query; a failure keeps what was '
+        'known', () async {
       final api = _populatedApi();
       final store = ObligationStore();
-      final sync = ObligationSync(api: api, store: store, now: () => clock);
+      final sync = ObligationSync(api: api, store: store);
       addTearDown(store.close);
       addTearDown(sync.close);
 
-      await sync.ensureFresh([query]);
+      await sync.refresh([query]);
       expect(api.fetchObligationsCalls, hasLength(1));
-      clock = clock.add(const Duration(seconds: 10));
-      await sync.ensureFresh([query]);
-      expect(api.fetchObligationsCalls, hasLength(1));
-
-      clock = clock.add(ObligationSync.freshFor);
-      await sync.ensureFresh([query]);
-      expect(api.fetchObligationsCalls, hasLength(2));
-
       sync.obligationsChanged({'ob-ready'});
-      // Nothing watches the query, so the change only marks it.
       await pumpEventQueue();
-      expect(api.fetchObligationsCalls, hasLength(2));
-      await sync.ensureFresh([query]);
-      expect(api.fetchObligationsCalls, hasLength(3));
+      expect(api.fetchObligationsCalls, hasLength(1));
+      expect(sync.freshnessOf(query).stale, isTrue);
 
       api.obligationQueuePagesError = StateError('offline');
       await sync.refresh([query]);
       expect(sync.freshnessOf(query).error, isA<StateError>());
-      // The failure keeps what the store holds and what was known.
       expect(sync.freshnessOf(query).known, isTrue);
       expect(store['ob-ready'], isNotNull);
       api.obligationQueuePagesError = null;
-      await sync.ensureFresh([query]);
-      expect(api.fetchObligationsCalls, hasLength(5));
+      await sync.refresh([query]);
       expect(sync.freshnessOf(query).error, isNull);
+      expect(sync.freshnessOf(query).stale, isFalse);
     });
+
+    test('a request the viewer\'s own change overtook is asked again for '
+        'whoever shares it', () async {
+      final api = _populatedApi();
+      final store = ObligationStore();
+      final sync = ObligationSync(api: api, store: store);
+      addTearDown(store.close);
+      addTearDown(sync.close);
+      final sub = store.watch([query]).listen((_) {});
+      addTearDown(sub.cancel);
+
+      final gate = api.obligationQueuePagesGate = Completer<void>();
+      final first = sync.refresh([query]);
+      await pumpEventQueue();
+      api.obligationsResult = _replacingReady(
+        api,
+        makeObligation(
+          'ob-ready',
+          ownerId: testUserPrincipalId,
+          intent: 'Changed by me',
+        ),
+      );
+      sync.mutated();
+      final shared = sync.refresh([query]);
+      api.obligationQueuePagesGate = null;
+      gate.complete();
+      await Future.wait([first, shared]);
+      expect(api.fetchObligationsCalls, hasLength(2));
+      expect(
+        [for (final o in store.current.select(query)) o.intent],
+        ['Changed by me'],
+      );
+    });
+
+    test(
+      'an event naming a row past the shown page marks its query stale',
+      () async {
+        final api = _populatedApi();
+        final store = ObligationStore();
+        final sync = ObligationSync(api: api, store: store);
+        addTearDown(store.close);
+        addTearDown(sync.close);
+        await sync.refresh([query]);
+        store.upsert([
+          for (var i = 1; i <= ObligationQuery.pageLimit; i++)
+            makeObligation(
+              'p$i',
+              ownerId: testUserPrincipalId,
+              effectivePriority: i.toDouble(),
+            ),
+          makeObligation(
+            'late',
+            ownerId: testUserPrincipalId,
+            effectivePriority: 1000,
+          ),
+        ]);
+        expect(
+          store.current.select(query).map((o) => o.id),
+          isNot(contains('late')),
+        );
+        sync.obligationsChanged({'late'});
+        expect(sync.freshnessOf(query).stale, isTrue);
+      },
+    );
 
     test('a replayed query is known but still asked', () async {
       final api = _populatedApi();
@@ -1237,7 +1351,7 @@ void main() {
       sync.reset(replayed: [query]);
       expect(sync.freshnessOf(query).known, isTrue);
       expect(sync.settledQueries, [query]);
-      await sync.ensureFresh([query]);
+      await sync.refresh([query]);
       expect(api.fetchObligationsCalls, hasLength(1));
     });
 

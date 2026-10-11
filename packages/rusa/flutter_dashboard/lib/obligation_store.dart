@@ -17,6 +17,10 @@ class ObligationQuery {
   final String ownerId;
   final ObligationQueue queue;
 
+  /// Rows per page, asked for explicitly, and the most a section shows: the
+  /// first page, as before the store (#992).
+  static const pageLimit = 50;
+
   bool matches(ObligationDto o) =>
       o.ownerId == ownerId &&
       switch (queue) {
@@ -76,16 +80,19 @@ class ObligationEntities {
   final Map<ObligationQuery, Set<String>> absent;
 
   /// Obligations the server answered "not found" for. Only these are removed
-  /// from [byId].
+  /// from [byId], and none comes back: the server has no row for it, so a
+  /// response that still carried one was sent before the deletion.
   final Set<String> deleted;
 
-  /// The obligations [query] holds, in its order.
+  /// The first page of obligations [query] holds, in its order.
   List<ObligationDto> select(ObligationQuery query) {
     final left = absent[query] ?? const {};
-    return byId.values
-        .where((o) => query.matches(o) && !left.contains(o.id))
-        .toList()
-      ..sort(query.compare);
+    return (byId.values
+            .where((o) => query.matches(o) && !left.contains(o.id))
+            .toList()
+          ..sort(query.compare))
+        .take(ObligationQuery.pageLimit)
+        .toList();
   }
 
   /// The blocking children recorded for [id], or null if none were read.
@@ -276,17 +283,18 @@ class ObligationStore {
     );
   }
 
-  /// A strictly newer copy changed the obligation since any page marked it
-  /// absent, so its fields decide membership again.
+  /// A deleted obligation is never written back. A strictly newer copy
+  /// changed the obligation since any page marked it absent, so its fields
+  /// decide membership again.
   static void _upsertInto(
     _MutableEntities e,
     Iterable<ObligationDto> obligations,
   ) {
     for (final o in obligations) {
+      if (e.deleted.contains(o.id)) continue;
       final held = e.byId[o.id];
       if (held != null && _isNewer(held, than: o)) continue;
       e.byId[o.id] = o;
-      e.deleted.remove(o.id);
       if (held == null || _isNewer(o, than: held)) _forgetAbsence(e, o.id);
     }
   }

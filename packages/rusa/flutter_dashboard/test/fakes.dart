@@ -767,8 +767,8 @@ class FakeApi extends DashboardApi {
   final fetchObligationsCalls =
       <({String? ownerId, String? status, String? queue, bool? rootsOnly})>[];
 
-  /// When set, pages are cut to `limit ?? obligationPageLimit` rows in
-  /// [obligationsResult] order, like the server's default page limit.
+  /// When set, pages are cut to this many rows, or fewer if the request asked
+  /// for fewer, in [obligationsResult] order, like the server's page limit.
   int? obligationPageLimit;
 
   /// Holds every queue-page request (`queue` set, as Overview's My Queue
@@ -814,7 +814,10 @@ class FakeApi extends DashboardApi {
       list = list.where((o) => o.parentId == null).toList();
     }
     final total = list.length;
-    final pageLimit = limit ?? obligationPageLimit;
+    final pageLimit = switch ((limit, obligationPageLimit)) {
+      (final asked?, final max?) => asked < max ? asked : max,
+      (final asked, final max) => asked ?? max,
+    };
     if (pageLimit != null && list.length > pageLimit) {
       list = list.take(pageLimit).toList();
     }

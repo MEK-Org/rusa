@@ -8,12 +8,7 @@ import 'obligation_store.dart';
 
 /// Where one query's data stands with the server.
 class QueryFreshness {
-  const QueryFreshness({
-    this.known = false,
-    this.stale = false,
-    this.error,
-    this.fetchedAt,
-  });
+  const QueryFreshness({this.known = false, this.stale = false, this.error});
 
   /// The store has held this query's full membership at some point: from a
   /// response, or a persisted capture replayed after a reload. An empty
@@ -27,50 +22,30 @@ class QueryFreshness {
   /// The latest refresh's failure, cleared by the next success.
   final Object? error;
 
-  /// When the last successful response arrived in this session; null after a
-  /// replay until the first one.
-  final DateTime? fetchedAt;
+  QueryFreshness get markedStale =>
+      QueryFreshness(known: known, stale: true, error: error);
 
-  QueryFreshness get markedStale => QueryFreshness(
-    known: known,
-    stale: true,
-    error: error,
-    fetchedAt: fetchedAt,
-  );
-
-  QueryFreshness failedWith(Object error) => QueryFreshness(
-    known: known,
-    stale: stale,
-    error: error,
-    fetchedAt: fetchedAt,
-  );
+  QueryFreshness failedWith(Object error) =>
+      QueryFreshness(known: known, stale: stale, error: error);
 }
 
-/// Owns the obligation store's freshness (#992): decides when a query needs
-/// a request, sends at most one at a time per query, and writes each response
-/// into the [ObligationStore], whose projections the views render. Views only
-/// say what they show ([ensureFresh]) or that the operator asked
-/// ([refresh]); obligation events and the viewer's own mutations arrive here
-/// to mark what they may have moved.
+/// Owns the obligation store's freshness (#992): sends at most one request
+/// at a time per query, and writes each response into the [ObligationStore],
+/// whose projections the views render. Views paint what the store holds and
+/// ask for a revalidation ([refresh]) on mount and when the operator asks;
+/// obligation events and the viewer's own mutations arrive here to mark what
+/// they may have moved.
 class ObligationSync {
   ObligationSync({
     required DashboardApi api,
     required ObligationStore store,
     this.onSettled,
     this.onStale,
-    DateTime Function()? now,
   }) : _api = api,
-       _store = store,
-       _now = now ?? DateTime.timestamp;
-
-  /// A query answered within this long, and not marked stale since, is shown
-  /// without a request. Obligation events mark what they touch stale, so
-  /// this only bounds how long an update the dashboard missed can linger.
-  static const freshFor = Duration(seconds: 30);
+       _store = store;
 
   final DashboardApi _api;
   final ObligationStore _store;
-  final DateTime Function() _now;
 
   /// Called after a response lands that no later change overtook, so its
   /// state may be persisted.
@@ -87,8 +62,10 @@ class ObligationSync {
   /// viewer's own mutation committed after it was sent.
   int _epoch = 0;
 
-  /// Per query, bumped whenever it is marked stale; a response is only
-  /// trusted to drop rows if its query was not marked stale while in flight.
+  /// Per query, bumped whenever it is marked stale or the viewer's own
+  /// mutation overtakes its request; a response is only trusted to mark rows
+  /// absent if its query was not bumped while in flight, and a watched query
+  /// bumped while in flight is asked again.
   final Map<ObligationQuery, int> _versions = {};
   final Map<ObligationQuery, Future<void>> _inFlight = {};
 
@@ -113,11 +90,6 @@ class ObligationSync {
     }
     _setAll({for (final q in replayed) q: const QueryFreshness(known: true)});
   }
-
-  /// Requests every query in [queries] that is not fresh: never answered in
-  /// this session, failed last time, marked stale, or older than [freshFor].
-  Future<void> ensureFresh(List<ObligationQuery> queries) =>
-      refresh(queries.where(_needsRequest).toList());
 
   /// Requests [queries] now, sharing any request already in flight for one.
   /// Never throws: a failure is recorded in [freshness] and the stored rows
@@ -162,6 +134,11 @@ class ObligationSync {
   /// moved.
   void mutated() {
     _epoch++;
+    // A first request is not known yet, so marking stale would not ask it
+    // again; whoever shares it must still get a response sent after this.
+    for (final q in _inFlight.keys) {
+      _bump(q);
+    }
     _markStale((_) => true);
   }
 
@@ -170,19 +147,12 @@ class ObligationSync {
   static bool _isLive(String status) =>
       status != 'done' && status != 'cancelled';
 
-  bool _needsRequest(ObligationQuery q) {
-    final f = freshnessOf(q);
-    final at = f.fetchedAt;
-    return at == null ||
-        f.stale ||
-        f.error != null ||
-        _now().difference(at) > freshFor;
-  }
-
+  /// Checks every stored row [q] matches, not only the page it shows: an
+  /// event can move a row from past the page into it.
   bool _mentions(ObligationQuery q, Set<String> ids) {
     final entities = _store.current;
-    return entities
-        .select(q)
+    return entities.byId.values
+        .where(q.matches)
         .any(
           (o) =>
               ids.contains(o.id) ||
@@ -191,8 +161,8 @@ class ObligationSync {
   }
 
   /// Marks the known queries [test] picks stale and refreshes those a view
-  /// shows. Off screen, the next [ensureFresh] refreshes them, so nobody pays
-  /// for a view nobody is looking at.
+  /// shows. Off screen, the next mount refreshes them, so nobody pays for a
+  /// view nobody is looking at.
   void _markStale(bool Function(ObligationQuery) test) {
     final moved = [
       for (final e in _freshness.value.entries)
@@ -230,6 +200,7 @@ class ObligationSync {
       page = await _api.fetchObligations(
         ownerId: q.ownerId,
         queue: q.queue.name,
+        limit: ObligationQuery.pageLimit,
       );
     } catch (e) {
       if (current()) _set(q, freshnessOf(q).failedWith(e));
@@ -241,7 +212,7 @@ class ObligationSync {
     // it is missing.
     final settled = startedAt == (_versions[q] ?? 0);
     final missing = _store.applyPage(q, page, reconcile: settled);
-    _set(q, QueryFreshness(known: true, stale: !settled, fetchedAt: _now()));
+    _set(q, QueryFreshness(known: true, stale: !settled));
     if (settled) onSettled?.call();
     await Future.wait([
       _readMissing(missing, current),

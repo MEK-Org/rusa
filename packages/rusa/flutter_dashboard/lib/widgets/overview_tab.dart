@@ -70,13 +70,12 @@ class _OverviewTabState extends State<OverviewTab> {
     widget.store.obligationSync.freshness.value,
   );
 
-  /// The operator asked: request the queue now, whatever its freshness.
-  void _refreshHumanQueue() =>
-      unawaited(widget.store.obligationSync.refresh(_queries));
+  /// Requests the queue, sharing any request already in flight, while the
+  /// rows the store holds stay on screen.
+  Future<void> _revalidate() => widget.store.obligationSync.refresh(_queries);
 
-  /// Requests the queue only if the freshness policy says it needs one.
-  Future<void> _ensureFresh() =>
-      widget.store.obligationSync.ensureFresh(_queries);
+  /// The operator asked: request the queue now.
+  void _refreshHumanQueue() => unawaited(_revalidate());
 
   /// Times the mount's revalidation as primary navigation; a failed refresh
   /// counts as a failed interaction even though its retained rows still show.
@@ -85,7 +84,7 @@ class _OverviewTabState extends State<OverviewTab> {
       await widget.store.api.trackInteraction(
         DashboardInteraction.primaryNavigation,
         () async {
-          await _ensureFresh();
+          await _revalidate();
           final error = _currentQueueView.error;
           if (error != null) throw error;
         },
@@ -103,7 +102,7 @@ class _OverviewTabState extends State<OverviewTab> {
     if (widget.trackNavigation) {
       unawaited(_trackedRefresh());
     } else {
-      unawaited(_ensureFresh());
+      unawaited(_revalidate());
     }
     // Refresh if the server-resolved viewing principal changes.
     _viewerPrincipalSub = widget.store.dashboardConfig
@@ -113,7 +112,7 @@ class _OverviewTabState extends State<OverviewTab> {
         .listen((_) {
           if (!mounted) return;
           setState(_watchQueue);
-          unawaited(_ensureFresh());
+          unawaited(_revalidate());
         });
     _startLabelTick = Timer.periodic(const Duration(seconds: 30), (_) {
       if (mounted && widget.store.actorStates.value.queuedActors.isNotEmpty) {
