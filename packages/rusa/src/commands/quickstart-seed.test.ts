@@ -4,7 +4,7 @@ import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import { addWorktree, generateRepoKey } from "../gitops/worktree.js";
 import { createSeedBundle, runQuickstartSeed } from "./quickstart.js";
@@ -46,6 +46,16 @@ describe("quickstart seeding through the real git bridge", () => {
   const repoKey = "local/demo";
 
   beforeEach(async () => {
+    // Git detaches auto-maintenance after commit and fetch. A rejected re-seed
+    // still lands a second pack in the bridge repo, so a detached repack could
+    // write under root while afterEach removes it (#999). Keep maintenance in
+    // the foreground so each git call has finished writing when it returns.
+    // gc.autoDetach covers older git, where auto gc detaches on its own.
+    vi.stubEnv("GIT_CONFIG_COUNT", "2");
+    vi.stubEnv("GIT_CONFIG_KEY_0", "maintenance.autoDetach");
+    vi.stubEnv("GIT_CONFIG_VALUE_0", "false");
+    vi.stubEnv("GIT_CONFIG_KEY_1", "gc.autoDetach");
+    vi.stubEnv("GIT_CONFIG_VALUE_1", "false");
     root = mkdtempSync(join(tmpdir(), "rusa-quickstart-seed-"));
     mcHome = join(root, "home");
     hostRepo = join(root, "demo");
@@ -60,6 +70,7 @@ describe("quickstart seeding through the real git bridge", () => {
   afterEach(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
+    vi.unstubAllEnvs();
   });
 
   function seed(): void {
