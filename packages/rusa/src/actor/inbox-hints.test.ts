@@ -273,65 +273,23 @@ describe("inbox hints", () => {
       );
     });
 
-    it("explains outgoing <URL|label> and reading formattedText across all Google Chat paths", () => {
-      const cases: Partial<InboxEntry>[] = [
-        {
-          source: "chat_space:spaces/AAA",
-          payload: {
-            type: "gchat.message",
-            spaceName: "spaces/AAA",
-            threadName: "spaces/AAA/threads/BBB",
-            messageName: "spaces/AAA/messages/CCC",
-          },
+    it("provides top-level guidance with link instructions when thread-head has no spaceName", () => {
+      const entry = makeEntry({
+        source: "unknown",
+        payload: {
+          type: "gchat.message",
+          threadName: "BBB",
+          messageName: "BBB",
         },
-        {
-          source: "chat_space:spaces/AAA",
-          payload: {
-            type: "gchat.message",
-            spaceName: "spaces/AAA",
-            threadName: "spaces/AAA/threads/BBB",
-          },
-        },
-        {
-          source: "chat_space:spaces/AAA",
-          payload: {
-            type: "gchat.message",
-            spaceName: "spaces/AAA",
-            threadName: "spaces/AAA/threads/BBB",
-            messageName: "spaces/AAA/messages/BBB.BBB",
-          },
-        },
-        {
-          source: "unknown",
-          payload: {
-            type: "gchat.message",
-            threadName: "spaces/AAA/threads/BBB",
-            messageName: "spaces/AAA/messages/BBB",
-          },
-        },
-        {
-          source: "chat_space:spaces/AAA",
-          payload: {
-            type: "gchat.message",
-            spaceName: "spaces/AAA",
-          },
-        },
-        {
-          source: "unknown",
-          payload: {
-            type: "gchat.message",
-          },
-        },
-      ];
-
-      for (const c of cases) {
-        const hint = resolveInboxHint(makeEntry(c));
-        expect(hint).toBeDefined();
-        expect(hint).toContain("Format outgoing labeled links as `<URL|label>`.");
-        expect(hint).toContain(
-          "When reading link-bearing messages, consult `formattedText` to preserve link URLs that plain `text` may omit."
-        );
-      }
+      });
+      const hint = resolveInboxHint(entry);
+      expect(hint).toBe(
+        `This Google Chat message is at top-level (not in a thread) — in the UI it appears as a standalone message, and a thread only comes into being if someone replies to it. It still carries a threadName: in Google Chat every message has one, and on a top-level message that id is the handle you would use to start a thread here, not a sign that a thread already exists. You can confirm this one from the payload alone — messageName is 'BBB', whose message id equals its thread id, the signature of a message heading its own as-yet-empty thread. Reply with the chat-write 'send_message' tool, passing the message's spaceName and omitting threadName, unless the message explicitly requests creating a new thread. ${GCHAT_LINK_GUIDANCE}`
+      );
+      expect(hint).toContain("Format outgoing labeled links as `<URL|label>`.");
+      expect(hint).toContain(
+        "When reading link-bearing messages, consult `formattedText` to preserve link URLs that plain `text` may omit."
+      );
     });
 
     it("does not leak Google Chat link guidance into Slack, Voice, or Mesh hints", () => {
