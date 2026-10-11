@@ -1210,6 +1210,48 @@ describe("E2EInstanceManager", () => {
       expect(calls.filter((call) => call.file === "systemd-run")).toHaveLength(1);
     });
 
+    it("does not attribute another home's live singleton to this preserved holder", async () => {
+      const mcHomeA = join(root, "mc-home-a");
+      const mcHomeB = join(root, "mc-home-b");
+      mkdirSync(mcHomeA, { recursive: true });
+      mkdirSync(mcHomeB, { recursive: true });
+      writeFileSync(join(mcHomeA, "config.yaml"), readFileSync(join(mcHome, "config.yaml")));
+      writeFileSync(join(mcHomeB, "config.yaml"), readFileSync(join(mcHome, "config.yaml")));
+
+      const actorWorktreeB = join(workersDir, "actor-b", "rusa");
+      mkdirSync(join(actorWorktreeB, "packages", "rusa", "scripts"), { recursive: true });
+      writeFileSync(
+        join(actorWorktreeB, "package.json"),
+        `${JSON.stringify({ packageManager: "pnpm@10.29.3" })}\n`
+      );
+      writeFileSync(join(actorWorktreeB, "packages", "rusa", "scripts", "e2e.mjs"), "");
+
+      const managerA = manager({ mcHome: mcHomeA });
+      const managerB = manager({ mcHome: mcHomeB });
+      await managerA.up("actor-a", actorWorktree);
+      const runRootA = managerA.status().holder?.resumableRoot;
+      if (!runRootA) throw new Error("expected runRoot for manager A");
+      writeResumableRootAt(runRootA);
+      managerA.stopForMeshShutdown();
+
+      await managerB.up("actor-b", actorWorktreeB);
+      const callsBeforeResume = calls.length;
+
+      await expect(managerA.resume("actor-a", runRootA)).rejects.toThrow(
+        /currently live but belongs to another instance or cannot be attributed; preserved holder handle-actor-a \(actor-a\) may resume only after it becomes inactive/
+      );
+
+      expect(
+        calls.slice(callsBeforeResume).filter((call) => call.file === "systemd-run")
+      ).toHaveLength(0);
+      expect(active).toBe(true);
+      expect(managerA.status().holder?.actorId).toBe("actor-a");
+      expect(existsSync(runRootA)).toBe(true);
+
+      managerB.down("actor-b");
+      await expect(managerA.resume("actor-a", runRootA)).resolves.toMatchObject({ state: "up" });
+    });
+
     it("rejects resume when no preserved holder record exists", async () => {
       const subject = manager();
 

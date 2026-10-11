@@ -802,10 +802,13 @@ export class E2EInstanceManager {
     const existingStatus = this.liveStatus();
     if (this.isLive(existingStatus)) {
       throw new Error(
-        existing
-          ? `e2e-instance: already held by ${existing.actorHandle} (${existing.actorId}) serving ${existing.worktree}; ` +
+        existing && existingStatus.description !== this.unitDescription
+          ? `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} is currently live but belongs to another instance or cannot be attributed; ` +
+              `preserved holder ${existing.actorHandle} (${existing.actorId}) may resume only after it becomes inactive`
+          : existing
+            ? `e2e-instance: already held by ${existing.actorHandle} (${existing.actorId}) serving ${existing.worktree}; ` +
               "it comes down only when that actor calls down/stop, that actor is retired, or the mesh shuts down"
-          : `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} is already active but its holder record is missing; ` +
+            : `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} is already active but its holder record is missing; ` +
               "an operator must stop the orphaned unit before retrying"
       );
     }
