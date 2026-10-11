@@ -27,6 +27,7 @@ type ActorRow = {
   retired_at: string | null;
   created_at: string;
   execution_config: string | null;
+  display_handle: string | null;
 };
 
 /**
@@ -489,13 +490,13 @@ export class SqliteActorRepository implements ActorRepository {
       this.db
         .prepare(`INSERT INTO actors (
         id, charter, parent_id, model_config, context_config, voice_config, title, retired_at, created_at,
-        execution_config
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        execution_config, display_handle
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET charter=excluded.charter, parent_id=excluded.parent_id,
         model_config=excluded.model_config, context_config=excluded.context_config,
         voice_config=excluded.voice_config,
         title=excluded.title, retired_at=excluded.retired_at, created_at=excluded.created_at,
-        execution_config=excluded.execution_config`)
+        execution_config=excluded.execution_config, display_handle=excluded.display_handle`)
         .run(
           record.id,
           record.charter,
@@ -506,7 +507,8 @@ export class SqliteActorRepository implements ActorRepository {
           record.title ?? null,
           retiredAt,
           record.createdAt,
-          executionConfigJson
+          executionConfigJson,
+          record.displayHandle ?? null
         );
       this.principals.ensureActorPrincipal(record.id, record.createdAt);
       this.db.prepare("DELETE FROM actor_handles WHERE actor_id = ?").run(record.id);
@@ -587,6 +589,7 @@ export class SqliteActorRepository implements ActorRepository {
       ...parseContextConfig(row.id, row.context_config),
       ...parseVoiceConfig(row.id, row.voice_config),
       ...(row.title === null ? {} : { title: row.title }),
+      ...(row.display_handle === null ? {} : { displayHandle: row.display_handle }),
       ...(handles.length
         ? {
             handles: handles.map((handle) => {

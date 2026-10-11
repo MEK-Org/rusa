@@ -40,6 +40,7 @@ import { handleQuotaApiRequest, type QuotaHistoryDto } from "../dashboard/quota-
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { buildE2EConfig } from "../e2e/provision.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
@@ -229,6 +230,7 @@ vi.mock("../observability/logger.js", async (importOriginal) => {
 });
 
 import {
+  configuredActorSandbox,
   getShutdownExitCode,
   isLegacyWorktreeKey,
   mechanicallySubscribeCreatedResource,
@@ -560,7 +562,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     };
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
     // Most startup tests exercise the upgrade/restart path used by current prod.
-    // Fresh-install UUID selection is covered directly by resolveRootActorId.
+    // Fresh-install creation is covered by the configured-actor import tests.
     writeFileSync(
       join(homeDir, "threads.json"),
       JSON.stringify({
@@ -4439,6 +4441,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
       }),
       "utf8"
     );
+    // An upgraded portable root: the previous binary wrote `rootActor.context`
+    // onto its row, and since the configured-actor import (#1002) the row,
+    // not config, decides how it runs.
+    writeFileSync(
+      join(homeDir, "threads.json"),
+      JSON.stringify({
+        threads: [{ ...legacyRootThread, context: { type: "portable", mode: "tail" } }],
+      }),
+      "utf8"
+    );
     const rootAgentDir = join(homeDir, "root-agent");
     mkdirSync(rootAgentDir, { recursive: true });
     writeFileSync(
@@ -6190,6 +6202,123 @@ describe("runStart webhook event routing (Phase 4)", () => {
     halt.resume();
   });
 
+  describe("configured-actor import at boot (#1002)", () => {
+    /** Boots, reads what the import left while the database is open, and stops again. */
+    const boot = async (opts: { importActor?: string } = {}) => {
+      let mesh: ActorMesh | undefined;
+      await new Promise<void>((resolve, reject) => {
+        runStart({
+          importActor: opts.importActor,
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        }).catch(reject);
+      });
+      if (!mesh) throw new Error("mesh not ready");
+      const state = {
+        root: getRepositories().actors.get("root"),
+        importedActor: getRepositories().legacyImportReceipts.actorFor("config.yaml:rootActor"),
+        topLevel: getRepositories()
+          .actors.list()
+          .filter((record) => record.parentId === null)
+          .map((record) => record.id),
+      };
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      return state;
+    };
+    const writeRootActorConfig = (rootActor: Record<string, unknown>) =>
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+          rootActor: {
+            provider: "antigravity",
+            model: "Gemini 3.7 Flash",
+            effort: "high",
+            ...rootActor,
+          },
+          geminiApiKey: "fake-gemini-key",
+        }),
+        "utf8"
+      );
+    const withMeshDb = <T>(fn: (db: Database.Database) => T): T => {
+      const db = new Database(join(homeDir, "data", "mesh.db"));
+      try {
+        return fn(db);
+      } finally {
+        db.close();
+      }
+    };
+
+    it("imports once; a restart with edited or removed config keeps the stored actor", async () => {
+      writeRootActorConfig({ charter: "configured charter", handle: "ember-familiar" });
+      const first = await boot();
+      expect(first.root).toMatchObject({ charter: "root", displayHandle: "ember-familiar" });
+      expect(first).toMatchObject({ importedActor: "root", topLevel: ["root"] });
+
+      writeRootActorConfig({ charter: "edited charter", handle: "renamed-familiar" });
+      expect(await boot()).toEqual(first);
+
+      // Removing the optional keys leaves only the required tuple behind.
+      writeRootActorConfig({});
+      expect(await boot()).toEqual(first);
+    });
+
+    it("keeps the single top-level guard: a second top-level actor beside the imported one stops boot", async () => {
+      await boot();
+      withMeshDb((db) =>
+        new SqliteActorRepository(db).upsert({
+          id: "second-top",
+          charter: "synthetic",
+          parentId: null,
+          status: "active",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        })
+      );
+      let ready = false;
+
+      await expect(
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              ready = true;
+              shutdownFn = handles.shutdown;
+            },
+          },
+        })
+      ).rejects.toThrow(/second top-level actor/);
+      expect(ready).toBe(false);
+    });
+
+    it("refuses an ambiguous upgraded home until the operator names the actor", async () => {
+      mkdirSync(join(homeDir, "workers", "root"), { recursive: true });
+      let ready = false;
+
+      await expect(
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              ready = true;
+              shutdownFn = handles.shutdown;
+            },
+          },
+        })
+      ).rejects.toThrow(/spawned-actor workspace/);
+      expect(ready).toBe(false);
+      expect(withMeshDb((db) => db.prepare("SELECT * FROM legacy_import_receipts").all())).toEqual(
+        []
+      );
+
+      expect((await boot({ importActor: "root" })).importedActor).toBe("root");
+    });
+  });
+
   describe("root model_config startup precedence (#333)", () => {
     const portableRootConfig = (rootModel: { model: string; effort?: string }) => ({
       github: { account: "mock-bot" },
@@ -7273,14 +7402,25 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect((booted.get("root") as unknown as { opts: { sandbox?: boolean } }).opts.sandbox).toBe(
       true
     );
-    expect(booted.actors.get("root")?.executionConfig).toBeUndefined();
+    // The row is authoritative after the configured-actor import (#1002): the
+    // 0056 backfill's stored intent stands instead of being rewritten from
+    // boot-time intent on every start.
+    expect(booted.actors.get("root")?.executionConfig).toEqual({ unsandboxed: true });
     // runStart cannot boot a non-e2e root here, so the production pairing is
-    // asserted on the helper the composition reads both values from.
+    // asserted on the helpers the composition reads: a created row stores the
+    // intent, and the builder flag is derived from whatever the row stores.
     const productionRoot = rootExecutionIntent({ e2eMode: false });
     expect(productionRoot.executionConfig).toEqual({ unsandboxed: true });
-    expect(productionRoot.sandbox, "production root sandbox parity").toBe(
-      expectedWorkerSandbox(productionRoot.executionConfig.unsandboxed ?? false)
-    );
+    for (const stored of [productionRoot.executionConfig, {}, { unsandboxed: false }]) {
+      expect(
+        configuredActorSandbox({
+          e2eMode: false,
+          executionConfig: stored,
+          sandboxMode: configSandbox,
+        }),
+        "production root sandbox parity"
+      ).toBe(expectedWorkerSandbox(stored.unsandboxed ?? false));
+    }
     // The backfilled worker and the newly created one are sandboxed by default:
     expect(booted.actors.get("lead")?.executionConfig).toBeUndefined();
     expect(booted.actors.get(spawned)?.executionConfig).toBeUndefined();

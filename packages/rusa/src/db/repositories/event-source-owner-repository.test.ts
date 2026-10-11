@@ -283,12 +283,12 @@ describe("DbEventSourceOwnerStore (file-backed database)", () => {
 
 /**
  * `event_source_owners.actor_id` is FK-owned, which the JSON store had no
- * equivalent of. On a fresh install `resolveRootActorId` mints a root id
- * whose `actors` row only lands later, when `mesh.adopt` upserts it — after
- * the boot wiring that reconciles event sources. These lock the property that
- * makes that ordering safe: reconciliation's only durable write is an UPDATE
- * of an existing row, so nothing is ever INSERTed against an id the `actors`
- * table has not seen yet.
+ * equivalent of. Boot now writes a fresh install's configured actor row in
+ * its one-time import (#1002), before event sources are reconciled, but
+ * reconciliation must not depend on that ordering. These lock the property
+ * that makes any ordering safe: reconciliation's only durable write is an
+ * UPDATE of an existing row, so nothing is ever INSERTed against an id the
+ * `actors` table has not seen yet.
  */
 describe("DbEventSourceOwnerStore (boot before root adoption)", () => {
   it("seeds the config-implied subscriptions for a root that has no actors row yet", () => {

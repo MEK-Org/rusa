@@ -100,4 +100,10 @@ export interface ActorRecord {
   createdAt: string;
   /** Per-actor walkie-talkie voice; absent follows the instance-wide default. */
   voiceConfig?: VoiceConfigDocument;
+  /**
+   * Stored display handle for an actor whose handle is not derived from its id.
+   * Only the configured actor has one, written once by its import (#1002);
+   * absent means the handle is derived from the id.
+   */
+  displayHandle?: string;
 }

@@ -3,6 +3,11 @@ import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { resolveHome } from "../config/index.js";
+import {
+  ConfiguredActorImportError,
+  type ConfiguredActorImportPlan,
+  planConfiguredActorImport,
+} from "../db/configured-actor-import.js";
 import { planLegacyActorImport } from "../db/legacy-actor-import.js";
 import { planLegacyCapabilityGrantImport } from "../db/legacy-capability-grant-import.js";
 import { planLegacyEventSubscriptionImport } from "../db/legacy-event-subscription-import.js";
@@ -20,6 +25,12 @@ export interface DbCheckResult {
   plannedEventSourceOwnerships: number;
   plannedHostJobs: number;
   plannedPortableContextSnapshots: number;
+  /**
+   * What boot's one-time configured-actor import would do (#1002): nothing
+   * (`completed`), create the actor, or adopt an existing one. A home that
+   * boot would refuse fails the check instead, naming the candidates.
+   */
+  configuredActor: ConfiguredActorImportPlan["kind"];
 }
 
 /**
@@ -106,17 +117,20 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
       },
     });
 
-    // Parentless *is* the definition of root that boot's `resolveRootActorId`
-    // uses, and neither side can hold two: the `actors` table carries a unique
-    // index over `parent_id IS NULL`, and a legacy document with anything other
-    // than exactly one root is refused while planning, above. So the first match
-    // is the only match, and preflight recognizes the same config-implied rows
-    // boot would. Boot mints a root id when both sides are empty; preflight
-    // cannot invent one, and does not need to — a minted id has never appeared
-    // in a legacy document, so it matches nothing either.
-    const rootId =
-      repositories.actors.list().find((actor) => actor.parentId === null)?.id ??
-      pendingActors.find((actor) => actor.parentId === null)?.id;
+    // The configured actor, resolved the way boot's one-time import resolves
+    // it, over the actors boot would have committed by then. A home that boot
+    // would refuse (ambiguous, retired or missing) throws here with the same
+    // diagnostic, so a deploy learns it before restarting. Boot mints an id for
+    // an empty home; preflight's minted id has never appeared in a legacy
+    // document, so it matches no config-implied row either.
+    const configuredActorPlan = planConfiguredActorImport({
+      actors: {
+        list: () => actorsVisibleToGrantPlan(repositories.actors.list(), pendingActors),
+      },
+      receipts: repositories.legacyImportReceipts,
+      workersDir: join(home, "workers"),
+    });
+    const rootId = configuredActorPlan.kind === "create" ? undefined : configuredActorPlan.actorId;
     const subscriptionPlan = planLegacyEventSubscriptionImport({
       mcHome: home,
       repositories,
@@ -150,6 +164,7 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
       plannedEventSourceOwnerships: subscriptionPlan.plannedSubscriptions,
       plannedHostJobs: hostJobPlan.plannedJobs,
       plannedPortableContextSnapshots: portableContextPlan.plannedSnapshots,
+      configuredActor: configuredActorPlan.kind,
     };
   } finally {
     db.close();
@@ -173,9 +188,11 @@ export function runDbCheck(opts: { home: string }): void {
         `${result.plannedHostJobs} host job(s), ` +
         `${result.plannedPortableContextSnapshots} portable-context snapshot(s)`
     );
+    console.log(`Configured-actor import: ${result.configuredActor}`);
     console.log("✓ db-check passed");
   } catch (err) {
     console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    if (err instanceof ConfiguredActorImportError) console.error(`   ${err.action}`);
     process.exit(1);
   }
 }

@@ -28,6 +28,9 @@ const mockWebhookServerModule = vi.hoisted(() => ({
 
 const mockReferenceCacheRepo = vi.hoisted(() => ({ get: vi.fn(), set: vi.fn(), delete: vi.fn() }));
 const mockPrincipals = vi.hoisted(() => ({ ensureImplicitUser: vi.fn() }));
+const mockReceipts = vi.hoisted(() => ({
+  actorFor: vi.fn((_source: string): string | undefined => undefined),
+}));
 
 const mockDbModule = vi.hoisted(() => ({
   initDb: vi.fn(() => ({})),
@@ -40,6 +43,7 @@ const mockDbModule = vi.hoisted(() => ({
     obligations: {},
     principals: mockPrincipals,
     referenceCache: mockReferenceCacheRepo,
+    legacyImportReceipts: mockReceipts,
   })),
 }));
 
@@ -114,6 +118,7 @@ describe("runDashboard", () => {
       obligations: {},
       principals: mockPrincipals,
       referenceCache: mockReferenceCacheRepo,
+      legacyImportReceipts: mockReceipts,
     });
 
     await runDashboard();
@@ -140,6 +145,7 @@ describe("runDashboard", () => {
       obligations: {},
       principals: mockPrincipals,
       referenceCache: mockReferenceCacheRepo,
+      legacyImportReceipts: mockReceipts,
     });
 
     await runDashboard();
@@ -151,6 +157,39 @@ describe("runDashboard", () => {
         }),
       })
     );
+  });
+
+  it("names the imported configured actor with its stored handle once the import ran (#1002)", async () => {
+    mockReceipts.actorFor.mockReturnValueOnce("imported-actor");
+    mockDbModule.getRepositories.mockReturnValue({
+      actors: {
+        // A second parentless row listed first: the receipt, not topology, decides.
+        list: vi.fn(() => [
+          { id: "other-top-level", parentId: null },
+          { id: "imported-actor", parentId: null },
+        ]),
+        get: vi.fn((id: string) =>
+          id === "imported-actor"
+            ? { id, parentId: null, displayHandle: "stored-handle" }
+            : undefined
+        ),
+      },
+      meshEvents: {},
+      meshChat: {},
+      obligations: {},
+      principals: mockPrincipals,
+      referenceCache: mockReferenceCacheRepo,
+      legacyImportReceipts: mockReceipts,
+    } as unknown as ReturnType<typeof mockDbModule.getRepositories>);
+
+    await runDashboard();
+
+    expect(mockReceipts.actorFor).toHaveBeenCalledWith("config.yaml:rootActor");
+    const [options] = mockWebhookServerModule.startDashboardServer.mock.calls.at(-1) as unknown as [
+      { mesh: { rootIdentity: unknown } },
+    ];
+    // The config's handle and avatar path are no longer read for an imported actor.
+    expect(options.mesh.rootIdentity).toEqual({ id: "imported-actor", handle: "stored-handle" });
   });
 
   it("wires a repository-backed reference cache so standalone dashboard can serve persisted rows", async () => {

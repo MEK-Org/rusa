@@ -89,12 +89,19 @@ program
     "Auto-deploy this rusa instance when the repository receives a push on the given branch"
   )
   .option("--profile <name>", "Apply a named config profile")
-  .action(async (opts: { deployOnMergeBranch?: string; profile?: string }) => {
-    await runStart({
-      deployOnMergeBranch: opts.deployOnMergeBranch,
-      profile: opts.profile,
-    });
-  });
+  .option(
+    "--import-actor <id>",
+    "Name the existing actor that config.yaml's rootActor describes, when startup reports it cannot tell; read only until that one-time import completes"
+  )
+  .action(
+    async (opts: { deployOnMergeBranch?: string; profile?: string; importActor?: string }) => {
+      await runStart({
+        deployOnMergeBranch: opts.deployOnMergeBranch,
+        profile: opts.profile,
+        importActor: opts.importActor,
+      });
+    }
+  );
 
 const quickstart = program
   .command("quickstart")

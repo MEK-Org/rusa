@@ -1333,10 +1333,10 @@ export class ActorMesh {
    * Register an externally-created actor (the root) so the mesh can route
    * messages to it and the repository knows it exists. Idempotent on the record.
    *
-   * The wiring rebuilds `record` fresh on every boot : it carries the
-   * current config/session while the repository retains durable identity fields.
-   * Merge onto any existing record so the freshly configured fields win without
-   * changing stable creation metadata.
+   * Boot passes the configured actor's stored record as it stands, so nothing
+   * from config is merged in after its one-time import (#1002). The merge onto
+   * any existing record is kept for callers that supply a partial record; a
+   * field the record omits keeps its stored value.
    */
   adopt(record: ActorRecord, actor: MeshActor): void {
     this.assertSingleTopLevel(record);

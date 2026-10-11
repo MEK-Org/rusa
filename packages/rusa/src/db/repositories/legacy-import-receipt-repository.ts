@@ -22,14 +22,29 @@ export class LegacyImportReceiptRepository {
     );
   }
 
-  /** Record the import of `source`. Idempotent: the first receipt's timestamp stands. */
-  record(source: string, at: string, rowCount: number): void {
+  /**
+   * The actor an import of `source` bound, or undefined when `source` has no
+   * receipt or its receipt names no actor. Only the configured-actor import
+   * records one (#1002).
+   */
+  actorFor(source: string): string | undefined {
+    const row = this.db
+      .prepare("SELECT actor_id FROM legacy_import_receipts WHERE source = ?")
+      .get(source) as { actor_id: string | null } | undefined;
+    return row?.actor_id ?? undefined;
+  }
+
+  /**
+   * Record the import of `source`, optionally naming the actor it bound.
+   * Idempotent: the first receipt's timestamp and actor stand.
+   */
+  record(source: string, at: string, rowCount: number, actorId?: string): void {
     this.db
       .prepare(
-        `INSERT INTO legacy_import_receipts (source, imported_at, row_count)
-         VALUES (?, ?, ?)
+        `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
+         VALUES (?, ?, ?, ?)
          ON CONFLICT(source) DO NOTHING`
       )
-      .run(source, at, rowCount);
+      .run(source, at, rowCount, actorId ?? null);
   }
 }
