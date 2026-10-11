@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -563,6 +564,7 @@ describe("instance unit PATH across an install-service reapply (#986)", () => {
         if (value === undefined) delete process.env[name];
         else process.env[name] = value;
       }
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

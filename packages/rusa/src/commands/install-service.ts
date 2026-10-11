@@ -703,7 +703,6 @@ function installSingleRusaService(opts: {
     : null;
   const unitPathEnv = resolveInstanceUnitPathEnv(instance.serviceUnit, installedUnit);
   const userPath = unitPathEnv.path;
-  console.log(`✓ Unit PATH ${describeInstanceUnitPathSource(unitPathEnv, installedUnit !== null)}`);
   const config = loadConfig(instance.mcHome);
 
   // ── ISSUE_NUM phase 1c: cron-backed nightly wake ──
@@ -1047,23 +1046,6 @@ export function describeProbePathSource(
       return instanceUnitInstalled
         ? `from this shell — ${unitName} assigns no PATH of its own; reinstall the instance to give it one`
         : `from this shell (no ${unitName} installed yet)`;
-  }
-}
-
-/** One line saying where a rewritten instance unit's `PATH` came from (#986). */
-export function describeInstanceUnitPathSource(
-  unitPathEnv: ProbePathEnv,
-  instanceUnitInstalled: boolean
-): string {
-  switch (unitPathEnv.source) {
-    case "instance-unit-systemd":
-      return "kept from the installed unit as systemd resolves it; this shell only appended directories";
-    case "instance-unit-file":
-      return "kept from the installed unit file (systemd could not report it); this shell only appended directories";
-    default:
-      return instanceUnitInstalled
-        ? "from this shell (the installed unit assigns no PATH of its own)"
-        : "from this shell (no unit installed yet)";
   }
 }
 
