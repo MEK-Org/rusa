@@ -45,7 +45,7 @@ describe("E2EInstanceManager", () => {
   let flutterRoot = "";
   let claudeExecutable = "";
   let active = false;
-  let activeExecStart: string | undefined;
+  let activeDescription: string | undefined;
   let stopFails = false;
   let calls: Array<{ file: string; args: string[] }> = [];
 
@@ -90,7 +90,7 @@ describe("E2EInstanceManager", () => {
     );
     writeFileSync(claudeExecutable, "");
     active = false;
-    activeExecStart = undefined;
+    activeDescription = undefined;
     stopFails = false;
     calls = [];
   });
@@ -100,9 +100,6 @@ describe("E2EInstanceManager", () => {
     for (const name of ["mc-home-a", "mc-home-b"]) {
       teardownFlutterOverlay(join(root, name, "e2e-instance", "runtime"));
     }
-    teardownFlutterOverlay(
-      join(root, "mc-home-a", "e2e-instance", "runtime-other", "e2e-instance", "runtime")
-    );
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -123,13 +120,15 @@ describe("E2EInstanceManager", () => {
         calls.push({ file, args });
         if (file === "systemd-run") {
           active = true;
-          activeExecStart = args.join(" ");
+          activeDescription = args
+            .find((arg) => arg.startsWith("--description="))
+            ?.slice("--description=".length);
           return "";
         }
         if (file === "systemctl" && args.includes("stop")) {
           if (stopFails) throw new Error("systemctl unavailable");
           active = false;
-          activeExecStart = undefined;
+          activeDescription = undefined;
           return "";
         }
         const lines = [
@@ -138,8 +137,12 @@ describe("E2EInstanceManager", () => {
           `SubState=${active ? "running" : "dead"}`,
           "Result=success",
         ];
-        if (active && activeExecStart) {
-          lines.push(`ExecStart={ path=/usr/bin/bwrap ; argv[]=${activeExecStart} }`);
+        // systemd v252 bus_print_property prints a string property raw, or
+        // "[unprintable]" when it contains a newline.
+        if (active && activeDescription !== undefined) {
+          lines.push(
+            `Description=${activeDescription.includes("\n") ? "[unprintable]" : activeDescription}`
+          );
         }
         return lines.join("\n");
       },
@@ -1442,11 +1445,15 @@ describe("E2EInstanceManager", () => {
       expect(existsSync(runRoot)).toBe(true);
     });
 
-    it("preserves another instance's live unit when an earlier holder with preserved record shuts down", async () => {
-      const mcHomeA = join(root, "mc-home-a");
-      // Use an overlapping home path where A's runtime directory path is an exact substring/prefix
-      // of B's runtime directory path, validating that exact token binding is verified rather than arbitrary inclusion.
-      const mcHomeB = join(root, "mc-home-a", "e2e-instance", "runtime-other");
+    // Each pair is two distinct homes that a display-parsing ownership check
+    // could conflate: a path prefix, and a literal quote that a shell-style
+    // tokenizer would strip from B's raw argv to yield A's path.
+    it.each([
+      ["a path-prefix", "mc-home-a", join("mc-home-a", "e2e-instance", "runtime-other")],
+      ["a literal-quote", "ab", 'a"b"'],
+    ])("preserves another home's live unit when an earlier holder with a preserved record shuts down (%s collision)", async (_shape, nameA, nameB) => {
+      const mcHomeA = join(root, nameA);
+      const mcHomeB = join(root, nameB);
       mkdirSync(mcHomeA, { recursive: true });
       mkdirSync(mcHomeB, { recursive: true });
       writeFileSync(join(mcHomeA, "config.yaml"), readFileSync(join(mcHome, "config.yaml")));
@@ -1464,36 +1471,26 @@ describe("E2EInstanceManager", () => {
       const managerB = manager({ mcHome: mcHomeB });
 
       try {
-        // Manager A brings up the unit.
         await managerA.up("actor-a", actorWorktree);
-        expect(active).toBe(true);
-
-        // Manager A stops for mesh shutdown, preserving A's record while stopping the shared unit.
         managerA.stopForMeshShutdown();
         expect(active).toBe(false);
         expect(existsSync(join(mcHomeA, "e2e-instance.json"))).toBe(true);
 
-        // Manager B now launches the unit from home B.
         await managerB.up("actor-b", actorWorktreeB);
         expect(active).toBe(true);
-        expect(managerB.status().state).toBe("up");
 
+        // A restarts with its preserved record and shuts down again while B's
+        // launch is live: A must not stop it.
         const callsBefore = calls.length;
-
-        // A restarts and later calls stopForMeshShutdown().
-        // readRecord() in managerA still returns A's preserved record.
-        // Because the live unit belongs to B (ExecStart bound to mcHomeB), A must NOT stop B's unit.
         managerA.stopForMeshShutdown();
 
-        const newCalls = calls.slice(callsBefore);
         expect(
-          newCalls.some((call) => call.file === "systemctl" && call.args.includes("stop"))
+          calls
+            .slice(callsBefore)
+            .some((call) => call.file === "systemctl" && call.args.includes("stop"))
         ).toBe(false);
         expect(active).toBe(true);
-        expect(managerB.status().state).toBe("up");
         expect(managerB.status().holder?.actorId).toBe("actor-b");
-
-        // A's preserved record in mcHomeA remains intact.
         expect(existsSync(join(mcHomeA, "e2e-instance.json"))).toBe(true);
       } finally {
         teardownFlutterOverlay(join(mcHomeA, "e2e-instance", "runtime"));
@@ -1501,24 +1498,19 @@ describe("E2EInstanceManager", () => {
       }
     });
 
-    it("throws and preserves state when live unit metadata cannot verify ownership on shutdown", async () => {
-      const subject = manager();
-      await subject.up("actor-a", actorWorktree);
-      const runRoot = subject.status().holder?.resumableRoot;
-      if (!runRoot) throw new Error("expected a persisted resumableRoot");
-
-      // Simulate a live unit whose ExecStart metadata is absent or unreadable
-      activeExecStart = undefined;
-
-      expect(() => subject.stopForMeshShutdown()).toThrow(
-        "metadata unavailable; cannot verify ownership on shutdown"
-      );
-
-      // Attribution, run root, and active state survive together without premature overlay unmount
-      expect(active).toBe(true);
-      expect(existsSync(join(mcHome, "e2e-instance.json"))).toBe(true);
-      expect(existsSync(runRoot)).toBe(true);
-      expect(subject.status().holder?.resumableRoot).toBe(runRoot);
+    it("stops its own live unit on shutdown when the home path contains whitespace", async () => {
+      const spacedHome = join(root, "has space");
+      mkdirSync(spacedHome, { recursive: true });
+      writeFileSync(join(spacedHome, "config.yaml"), readFileSync(join(mcHome, "config.yaml")));
+      const subject = manager({ mcHome: spacedHome });
+      try {
+        await subject.up("actor-a", actorWorktree);
+        subject.stopForMeshShutdown();
+        expect(active).toBe(false);
+        expect(existsSync(join(spacedHome, "e2e-instance.json"))).toBe(true);
+      } finally {
+        teardownFlutterOverlay(join(spacedHome, "e2e-instance", "runtime"));
+      }
     });
   });
 

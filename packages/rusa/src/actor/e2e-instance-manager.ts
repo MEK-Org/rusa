@@ -59,7 +59,7 @@ export interface E2EInstanceLiveStatus {
   activeState: string;
   subState: string;
   result: string;
-  execStart?: string;
+  description?: string;
 }
 
 export interface E2EInstanceStatus {
@@ -169,46 +169,8 @@ function parseSystemdStatus(output: string): E2EInstanceLiveStatus {
     activeState: values.get("ActiveState") ?? "unknown",
     subState: values.get("SubState") ?? "unknown",
     result: values.get("Result") ?? "unknown",
-    execStart: values.get("ExecStart"),
+    description: values.get("Description"),
   };
-}
-
-function extractArgv(execStart: string): string {
-  const match = execStart.match(/argv\[\]=(.*?)(?:;\s*[a-zA-Z0-9_]+=|(?:\s*}\s*$)|$)/s);
-  return match ? match[1].trim() : execStart.trim();
-}
-
-function parseArgvTokens(argvStr: string): string[] {
-  const tokens: string[] = [];
-  let current = "";
-  let inDouble = false;
-  let inSingle = false;
-  let escaped = false;
-
-  for (let i = 0; i < argvStr.length; i++) {
-    const ch = argvStr[i];
-    if (escaped) {
-      current += ch;
-      escaped = false;
-    } else if (ch === "\\") {
-      escaped = true;
-    } else if (ch === '"' && !inSingle) {
-      inDouble = !inDouble;
-    } else if (ch === "'" && !inDouble) {
-      inSingle = !inSingle;
-    } else if (/\s/.test(ch) && !inDouble && !inSingle) {
-      if (current.length > 0) {
-        tokens.push(current);
-        current = "";
-      }
-    } else {
-      current += ch;
-    }
-  }
-  if (current.length > 0) {
-    tokens.push(current);
-  }
-  return tokens;
 }
 
 function resolveHostFlutterRoot(): string | undefined {
@@ -361,7 +323,7 @@ export class E2EInstanceManager {
           "-p",
           "Result",
           "-p",
-          "ExecStart",
+          "Description",
         ])
       );
     } catch {
@@ -378,29 +340,13 @@ export class E2EInstanceManager {
   }
 
   /**
-   * Verifies that the live unit was launched by this instance by checking whether
-   * its systemd ExecStart metadata binds this instance's runtime directory.
+   * Names the launching home in the unit's Description. systemctl prints a
+   * string property as the raw value (newline-bearing values as
+   * "[unprintable]"), so exact equality attributes the live unit to the one
+   * runtime directory that launched it without parsing any argv display.
    */
-  private ownsLiveUnit(liveStatus: E2EInstanceLiveStatus): boolean {
-    if (!this.isLive(liveStatus)) return false;
-    if (!liveStatus.execStart) return false;
-    const runtime = this.runtimeDir;
-    const realRuntime = realpathIfExists(runtime);
-    const validTargets = new Set([runtime, realRuntime]);
-
-    const argvStr = extractArgv(liveStatus.execStart);
-    const tokens = parseArgvTokens(argvStr);
-
-    for (let i = 0; i < tokens.length - 2; i++) {
-      if (
-        (tokens[i] === "--bind" || tokens[i] === "--ro-bind") &&
-        validTargets.has(tokens[i + 1]) &&
-        validTargets.has(tokens[i + 2])
-      ) {
-        return true;
-      }
-    }
-    return false;
+  private get unitDescription(): string {
+    return `Rusa live e2e instance (${this.runtimeDir})`;
   }
 
   private validateOwnedWorktree(actorId: string, requestedPath: string): string {
@@ -914,7 +860,7 @@ export class E2EInstanceManager {
         "--user",
         `--unit=${E2E_INSTANCE_UNIT_NAME}`,
         "--collect",
-        "--property=Description=Rusa live e2e instance",
+        `--description=${this.unitDescription}`,
         "--property=Restart=always",
         "--property=RestartSec=10s",
         "--property=StartLimitIntervalSec=60s",
@@ -981,33 +927,24 @@ export class E2EInstanceManager {
 
   /**
    * Stops the supervisor unit on mesh process shutdown if and only if this
-   * instance holds it and the live unit was launched by this instance (verified
-   * via systemd ExecStart metadata binding this instance's runtime directory),
-   * while preserving the holder record, resumable run root, database, and
-   * runtime state so the holder can resume the instance after restart. A
-   * non-holding instance's shutdown neither stops another instance's unit nor
-   * modifies its state.
+   * instance holds it and the live unit's Description names this instance's
+   * runtime directory, while preserving the holder record, resumable run root,
+   * database, and runtime state so the holder can resume the instance after
+   * restart. Any other live unit (another home's launch, or one this home
+   * cannot attribute) is left running with this home's state untouched.
    */
   stopForMeshShutdown(): void {
-    const holder = this.readRecord();
-    if (!holder) return;
+    if (!this.readRecord()) return;
 
     const live = this.liveStatus();
     if (!this.isLive(live)) {
       teardownFlutterOverlay(this.runtimeDir);
       return;
     }
+    if (live.description !== this.unitDescription) return;
 
-    if (!live.execStart) {
-      throw new Error(
-        `e2e-instance: live unit ${E2E_INSTANCE_UNIT_NAME} metadata unavailable; cannot verify ownership on shutdown`
-      );
-    }
-
-    if (this.ownsLiveUnit(live)) {
-      this.exec("systemctl", ["--user", "stop", E2E_INSTANCE_UNIT_NAME]);
-      teardownFlutterOverlay(this.runtimeDir);
-    }
+    this.exec("systemctl", ["--user", "stop", E2E_INSTANCE_UNIT_NAME]);
+    teardownFlutterOverlay(this.runtimeDir);
   }
 
   /**
