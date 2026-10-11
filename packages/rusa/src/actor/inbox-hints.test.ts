@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
-import { attachInboxHints, isGchatThreadHead, resolveInboxHint } from "./inbox-hints.js";
+import {
+  attachInboxHints,
+  GCHAT_LINK_GUIDANCE,
+  isGchatThreadHead,
+  resolveInboxHint,
+} from "./inbox-hints.js";
 
 function makeEntry(partial: Partial<InboxEntry> = {}): InboxEntry {
   return {
@@ -174,7 +179,7 @@ describe("inbox hints", () => {
       });
       const hint = resolveInboxHint(entry);
       expect(hint).toBe(
-        "This Google Chat message is at top-level in 'spaces/hPHAPyAAAAE' (not in a thread) — in the UI it appears as a standalone message, and a thread only comes into being if someone replies to it. It still carries a threadName: in Google Chat every message has one, and on a top-level message that id is the handle you would use to start a thread here, not a sign that a thread already exists. You can confirm this one from the payload alone — messageName is 'spaces/hPHAPyAAAAE/messages/07k_kyozWSk.07k_kyozWSk', whose message id equals its thread id, the signature of a message heading its own as-yet-empty thread. Reply with the chat-write 'send_message' tool, passing spaceName 'spaces/hPHAPyAAAAE' and omitting threadName, unless the message explicitly requests creating a new thread."
+        `This Google Chat message is at top-level in 'spaces/hPHAPyAAAAE' (not in a thread) — in the UI it appears as a standalone message, and a thread only comes into being if someone replies to it. It still carries a threadName: in Google Chat every message has one, and on a top-level message that id is the handle you would use to start a thread here, not a sign that a thread already exists. You can confirm this one from the payload alone — messageName is 'spaces/hPHAPyAAAAE/messages/07k_kyozWSk.07k_kyozWSk', whose message id equals its thread id, the signature of a message heading its own as-yet-empty thread. Reply with the chat-write 'send_message' tool, passing spaceName 'spaces/hPHAPyAAAAE' and omitting threadName, unless the message explicitly requests creating a new thread. ${GCHAT_LINK_GUIDANCE}`
       );
     });
 
@@ -190,7 +195,7 @@ describe("inbox hints", () => {
       });
       const hint = resolveInboxHint(entry);
       expect(hint).toBe(
-        "This Google Chat message is at top-level in 'spaces/AAA' (not in a thread) — in the UI it appears as a standalone message, and a thread only comes into being if someone replies to it. It still carries a threadName: in Google Chat every message has one, and on a top-level message that id is the handle you would use to start a thread here, not a sign that a thread already exists. You can confirm this one from the payload alone — messageName is 'spaces/AAA/messages/BBB', whose message id equals its thread id, the signature of a message heading its own as-yet-empty thread. Reply with the chat-write 'send_message' tool, passing spaceName 'spaces/AAA' and omitting threadName, unless the message explicitly requests creating a new thread."
+        `This Google Chat message is at top-level in 'spaces/AAA' (not in a thread) — in the UI it appears as a standalone message, and a thread only comes into being if someone replies to it. It still carries a threadName: in Google Chat every message has one, and on a top-level message that id is the handle you would use to start a thread here, not a sign that a thread already exists. You can confirm this one from the payload alone — messageName is 'spaces/AAA/messages/BBB', whose message id equals its thread id, the signature of a message heading its own as-yet-empty thread. Reply with the chat-write 'send_message' tool, passing spaceName 'spaces/AAA' and omitting threadName, unless the message explicitly requests creating a new thread. ${GCHAT_LINK_GUIDANCE}`
       );
     });
 
@@ -205,7 +210,7 @@ describe("inbox hints", () => {
       });
       const hint = resolveInboxHint(entry);
       expect(hint).toBe(
-        "This Google Chat message is at top-level in 'spaces/AAA' (not in a thread) — in the UI it appears as a standalone message, and a thread only comes into being if someone replies to it. It still carries a threadName: in Google Chat every message has one, and on a top-level message that id is the handle you would use to start a thread here, not a sign that a thread already exists. You can confirm this one from the payload alone — messageName is 'spaces/AAA/messages/BBB.BBB', whose message id equals its thread id, the signature of a message heading its own as-yet-empty thread. Reply with the chat-write 'send_message' tool, passing spaceName 'spaces/AAA' and omitting threadName, unless the message explicitly requests creating a new thread."
+        `This Google Chat message is at top-level in 'spaces/AAA' (not in a thread) — in the UI it appears as a standalone message, and a thread only comes into being if someone replies to it. It still carries a threadName: in Google Chat every message has one, and on a top-level message that id is the handle you would use to start a thread here, not a sign that a thread already exists. You can confirm this one from the payload alone — messageName is 'spaces/AAA/messages/BBB.BBB', whose message id equals its thread id, the signature of a message heading its own as-yet-empty thread. Reply with the chat-write 'send_message' tool, passing spaceName 'spaces/AAA' and omitting threadName, unless the message explicitly requests creating a new thread. ${GCHAT_LINK_GUIDANCE}`
       );
     });
 
@@ -221,7 +226,7 @@ describe("inbox hints", () => {
       });
       const hint = resolveInboxHint(entry);
       expect(hint).toBe(
-        "This Google Chat message is in thread 'spaces/AAA/threads/BBB'. You can confirm this one from the payload alone — messageName is 'spaces/AAA/messages/CCC', whose message id differs from its thread id, making this a reply inside an existing thread. Reply inside this thread with the chat-write 'send_message' tool, passing spaceName 'spaces/AAA' and threadName 'spaces/AAA/threads/BBB' (threadName must belong to spaceName)."
+        `This Google Chat message is in thread 'spaces/AAA/threads/BBB'. You can confirm this one from the payload alone — messageName is 'spaces/AAA/messages/CCC', whose message id differs from its thread id, making this a reply inside an existing thread. Reply inside this thread with the chat-write 'send_message' tool, passing spaceName 'spaces/AAA' and threadName 'spaces/AAA/threads/BBB' (threadName must belong to spaceName). ${GCHAT_LINK_GUIDANCE}`
       );
     });
 
@@ -236,7 +241,7 @@ describe("inbox hints", () => {
       });
       const hint = resolveInboxHint(entry);
       expect(hint).toBe(
-        "This Google Chat message is in thread 'spaces/AAA/threads/BBB'. Reply inside this thread with the chat-write 'send_message' tool, passing spaceName 'spaces/AAA' and threadName 'spaces/AAA/threads/BBB' (threadName must belong to spaceName)."
+        `This Google Chat message is in thread 'spaces/AAA/threads/BBB'. Reply inside this thread with the chat-write 'send_message' tool, passing spaceName 'spaces/AAA' and threadName 'spaces/AAA/threads/BBB' (threadName must belong to spaceName). ${GCHAT_LINK_GUIDANCE}`
       );
     });
 
@@ -251,7 +256,7 @@ describe("inbox hints", () => {
       });
       const hint = resolveInboxHint(entry);
       expect(hint).toBe(
-        "This Google Chat message is at top-level in 'spaces/AAA' (not in a thread). Reply with the chat-write 'send_message' tool, passing spaceName 'spaces/AAA' and omitting threadName, unless the message explicitly requests creating a new thread."
+        `This Google Chat message is at top-level in 'spaces/AAA' (not in a thread). Reply with the chat-write 'send_message' tool, passing spaceName 'spaces/AAA' and omitting threadName, unless the message explicitly requests creating a new thread. ${GCHAT_LINK_GUIDANCE}`
       );
     });
 
@@ -264,8 +269,91 @@ describe("inbox hints", () => {
       });
       const hint = resolveInboxHint(entry);
       expect(hint).toBe(
-        "This Google Chat message is at top-level (not in a thread). Reply with the chat-write 'send_message' tool, passing the message's spaceName and omitting threadName, unless the message explicitly requests creating a new thread."
+        `This Google Chat message is at top-level (not in a thread). Reply with the chat-write 'send_message' tool, passing the message's spaceName and omitting threadName, unless the message explicitly requests creating a new thread. ${GCHAT_LINK_GUIDANCE}`
       );
+    });
+
+    it("explains outgoing <URL|label> and reading formattedText across all Google Chat paths", () => {
+      const cases: Partial<InboxEntry>[] = [
+        {
+          source: "chat_space:spaces/AAA",
+          payload: {
+            type: "gchat.message",
+            spaceName: "spaces/AAA",
+            threadName: "spaces/AAA/threads/BBB",
+            messageName: "spaces/AAA/messages/CCC",
+          },
+        },
+        {
+          source: "chat_space:spaces/AAA",
+          payload: {
+            type: "gchat.message",
+            spaceName: "spaces/AAA",
+            threadName: "spaces/AAA/threads/BBB",
+          },
+        },
+        {
+          source: "chat_space:spaces/AAA",
+          payload: {
+            type: "gchat.message",
+            spaceName: "spaces/AAA",
+            threadName: "spaces/AAA/threads/BBB",
+            messageName: "spaces/AAA/messages/BBB.BBB",
+          },
+        },
+        {
+          source: "unknown",
+          payload: {
+            type: "gchat.message",
+            threadName: "spaces/AAA/threads/BBB",
+            messageName: "spaces/AAA/messages/BBB",
+          },
+        },
+        {
+          source: "chat_space:spaces/AAA",
+          payload: {
+            type: "gchat.message",
+            spaceName: "spaces/AAA",
+          },
+        },
+        {
+          source: "unknown",
+          payload: {
+            type: "gchat.message",
+          },
+        },
+      ];
+
+      for (const c of cases) {
+        const hint = resolveInboxHint(makeEntry(c));
+        expect(hint).toBeDefined();
+        expect(hint).toContain("Format outgoing labeled links as `<URL|label>`.");
+        expect(hint).toContain(
+          "When reading link-bearing messages, consult `formattedText` to preserve link URLs that plain `text` may omit."
+        );
+      }
+    });
+
+    it("does not leak Google Chat link guidance into Slack, Voice, or Mesh hints", () => {
+      const slackEntry = makeEntry({
+        source: "slack:channels/C1",
+        payload: { type: "slack.message", channel: "C1", ts: "1.1" },
+      });
+      const voiceEntry = makeEntry({
+        source: "mesh:00000000-0000-4000-8000-000000000001",
+        payload: { type: "human.voice", messageId: "1", fromId: "user-1" },
+      });
+      const meshEntry = makeEntry({
+        source: "mesh:00000000-0000-4000-8000-000000000001",
+        payload: { type: "mesh.message", messageId: "1", fromId: "user-1" },
+      });
+
+      for (const entry of [slackEntry, voiceEntry, meshEntry]) {
+        const hint = resolveInboxHint(entry);
+        expect(hint).toBeDefined();
+        expect(hint).not.toContain("<URL|label>");
+        expect(hint).not.toContain("formattedText");
+      }
     });
   });
 
