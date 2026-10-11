@@ -6297,7 +6297,22 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
 
     it("refuses an ambiguous upgraded home until the operator names the actor", async () => {
-      mkdirSync(join(homeDir, "workers", "root"), { recursive: true });
+      writeFileSync(
+        join(homeDir, "threads.json"),
+        JSON.stringify({
+          threads: [
+            {
+              id: "configured",
+              charter: "root",
+              parentId: null,
+              status: "active",
+              createdAt: "2026-01-01T00:00:00.000Z",
+            },
+          ],
+        }),
+        "utf8"
+      );
+      mkdirSync(join(homeDir, "workers", "configured"), { recursive: true });
       let ready = false;
 
       await expect(
@@ -6315,7 +6330,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
         []
       );
 
-      expect((await boot({ importActor: "root" })).importedActor).toBe("root");
+      expect((await boot({ importActor: "configured" })).importedActor).toBe("configured");
+    });
+
+    it("adopts legacy root actor even when workers/root and probe directories exist", async () => {
+      mkdirSync(join(homeDir, "workers", "root"), { recursive: true });
+      writeFileSync(join(homeDir, "workers", "root", "e2e-verify"), "synthetic");
+      mkdirSync(join(homeDir, "workers", "quota-probe-kimi"), { recursive: true });
+      const res = await boot();
+      expect(res.importedActor).toBe("root");
     });
   });
 

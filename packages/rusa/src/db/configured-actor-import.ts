@@ -5,6 +5,7 @@ import type Database from "better-sqlite3";
 import type { ActorRecord, ContextConfig, ExecutionConfig } from "../actor/actor-record.js";
 import { DEFAULT_ROOT_CHARTER } from "../actor/handle-generator.js";
 import { ROOT_ACTOR_CHARTER } from "../actor/root-prompt.js";
+import { isReservedWorkerDirectory } from "../actor/workspace-sweep.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { LegacyImportReceiptRepository } from "./repositories/legacy-import-receipt-repository.js";
@@ -269,7 +270,7 @@ function assertImportable(
 
 /**
  * Evidence that a sole top-level record is not the actor config describes.
- * Every actor must descend from it; it must never have run as a spawned actor
+ * Every actor must descend from it; for non-reserved candidates, it must not have run as a spawned actor
  * (which would have given it a workspace under `workers/`); and its native
  * session must be its own.
  */
@@ -293,7 +294,12 @@ function consistencyFindings(
   if (detached.length > 0) {
     findings.push(`${detached.map((record) => record.id).join(", ")} do not descend from it`);
   }
-  if (existsSync(join(workersDir, candidate.id))) {
+  // Spawned identity is a registry and durable-tree fact; directory presence
+  // under workers/ is only a tiebreaker. Reserved names defined by
+  // workspace-sweep (canonical root, quota-probe-*, model-probe-*) share the
+  // workers directory without representing a spawned actor workspace.
+  // For any non-reserved candidate, a directory under workers/ indicates a spawned actor.
+  if (!isReservedWorkerDirectory(candidate.id) && existsSync(join(workersDir, candidate.id))) {
     findings.push(`it has a spawned-actor workspace at workers/${candidate.id}`);
   }
   if (candidate.sessionId !== undefined) {

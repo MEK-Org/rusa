@@ -499,6 +499,29 @@ describe("configured-actor import (#1002)", () => {
       );
     });
 
+    it("adopts the legacy 'root' actor even when workers/root and probe directories exist", () => {
+      insertAll([
+        actor("root", {
+          parentId: null,
+          charter: DEFAULT_ROOT_CHARTER,
+          context: { type: "native" },
+          sessionId: "root-session-1",
+          executionConfig: { unsandboxed: true },
+        }),
+        actor("worker", { parentId: "root", context: { type: "portable", mode: "tail" } }),
+      ]);
+      mkdirSync(join(home, "workers", "root"), { recursive: true });
+      writeFileSync(join(home, "workers", "root", "e2e-verify"), "synthetic");
+      mkdirSync(join(home, "workers", "quota-probe-kimi"), { recursive: true });
+      mkdirSync(join(home, "workers", "model-probe-claude"), { recursive: true });
+
+      const result = run();
+      expect(result.plan).toEqual({ kind: "adopt", actorId: "root", selected: false });
+      expect(repositories.legacyImportReceipts.actorFor(CONFIGURED_ACTOR_IMPORT_SOURCE)).toBe(
+        "root"
+      );
+    });
+
     it("refuses a named actor that does not exist or is not top-level", () => {
       insertAll(upgradedActors());
 

@@ -690,4 +690,49 @@ describe("db-check", () => {
     expect(consoleLog).toHaveBeenCalledWith("✓ db-check passed");
     consoleLog.mockRestore();
   });
+
+  it("adopts legacy root actor even when workers/root exists with e2e-verify", () => {
+    runDbCheckAgainstHome(home);
+    const dbPath = join(home, "data", "mesh.db");
+    const db = new Database(dbPath);
+    const repos = new Repositories(db);
+    repos.actors.upsert({
+      id: "root",
+      charter: "root charter",
+      parentId: null,
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    db.close();
+
+    const workersRoot = join(home, "workers", "root");
+    mkdirSync(workersRoot, { recursive: true });
+    writeFileSync(join(workersRoot, "e2e-verify"), "legacy e2e harness artifact");
+    mkdirSync(join(home, "workers", "quota-probe-kimi"), { recursive: true });
+
+    const result = runDbCheckAgainstHome(home);
+    expect(result.configuredActor).toBe("adopt");
+  });
+
+  it("refuses a non-root sole top-level candidate if it has a spawned-actor workspace under workers/", () => {
+    runDbCheckAgainstHome(home);
+    const dbPath = join(home, "data", "mesh.db");
+    const db = new Database(dbPath);
+    const repos = new Repositories(db);
+    repos.actors.upsert({
+      id: "worker-top",
+      charter: "some charter",
+      parentId: null,
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    db.close();
+
+    const workersDir = join(home, "workers", "worker-top");
+    mkdirSync(workersDir, { recursive: true });
+
+    expect(() => runDbCheckAgainstHome(home)).toThrow(
+      /it has a spawned-actor workspace at workers\/worker-top/
+    );
+  });
 });
