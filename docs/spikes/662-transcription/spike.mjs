@@ -29,8 +29,8 @@ function render() {
   const r = trials.at(-1);
   $("start").disabled = Boolean(active) || trials.length >= 20;
   $("cancel").disabled = !active || active.stopping;
-  $("stop").disabled = !active?.recorder || active.stopping;
-  $("mark").disabled = !active?.recorder || active.stopping;
+  $("stop").disabled = !active?.capturing || active.stopping;
+  $("mark").disabled = !active?.capturing || active.stopping;
   for (const id of ["mode", "order", "language", "probe", "install"])
     $(id).disabled = Boolean(active);
   $("status").textContent = r ? `Trial ${r.id}: ${r.phase}` : "Idle";
@@ -243,10 +243,15 @@ function attachRecognition(s) {
     }
     closeRecognition(s, "end");
     r.recognitionEndMs = event(s, "recognition-end");
-    if (!s.stopping) r.phase = "recognition ended early; recorder continues (no auto-restart)";
+    if (!s.stopping) r.phase = earlyEndPhase(s);
     maybeFinish(s);
     render();
   });
+}
+function earlyEndPhase(s) {
+  return s.recordAudio
+    ? "recognition ended early; recorder continues (no auto-restart)"
+    : "recognition ended early; no page recorder (no auto-restart)";
 }
 function startRecognition(s) {
   const r = s.r;
@@ -259,7 +264,9 @@ function startRecognition(s) {
     s.r.recognitionIncomplete = true;
     closeRecognition(s, "start-error");
     event(s, "recognition-start-error", { error: error.message });
-    r.phase = "recognition unavailable; recorder continues";
+    r.phase = s.recordAudio
+      ? "recognition unavailable; recorder continues"
+      : "recognition unavailable; no page recorder (Stop to finish)";
   }
 }
 async function start() {
@@ -274,7 +281,8 @@ async function start() {
     startedAt: new Date().toISOString(),
     mode: $("mode").value,
     language: $("language").value,
-    acquisitionOrder: $("order").value,
+    // Recognition-only never calls getUserMedia, so there is no order to compare.
+    acquisitionOrder: $("mode").value === "recognition-only" ? "none" : $("order").value,
     fixtureVersion: self.FIXTURE_VERSION,
     servedCheckoutSha: $("revision").value || "UNTESTED",
     device: $("device").value || "UNTESTED",
@@ -282,7 +290,7 @@ async function start() {
     navigatorOnline: navigator.onLine,
     localProbe: structuredClone(support),
     displayMode: displayMode(),
-    phase: "acquiring microphone",
+    phase: $("mode").value === "recognition-only" ? "starting recognition" : "acquiring microphone",
     results: [],
     preview: "",
     previewAtStop: null,
@@ -307,7 +315,9 @@ async function start() {
     origin: performance.now(),
     chunks: [],
     recognitionEnded: true,
-    recorderEnded: false,
+    recordAudio: r.mode !== "recognition-only",
+    // Without a page recorder there is nothing to await at Stop.
+    recorderEnded: r.mode === "recognition-only",
   };
   active = s;
   render();
@@ -329,6 +339,14 @@ async function start() {
     }
     if (s.recognition) {
       attachRecognition(s);
+      if (!s.recordAudio) {
+        // No getUserMedia/MediaRecorder: the recognizer is the page's only capture.
+        s.capturing = true;
+        r.phase = "recognizing (no page recorder)";
+        startRecognition(s);
+        render();
+        return;
+      }
       if (r.acquisitionOrder === "recognizer-first") startRecognition(s);
     }
     r.recorderAcquireCallMs = event(s, "recorder-acquire-call");
@@ -365,9 +383,10 @@ async function start() {
     });
     s.recorder.start(); // Same non-timesliced capture as WebVoiceRecorder.
     r.recorderStartMs = event(s, "recorder-start");
+    s.capturing = true;
     r.phase =
       s.recognition && s.recognitionEnded && r.recognitionStartCallMs !== undefined
-        ? "recognition ended early; recorder continues (no auto-restart)"
+        ? earlyEndPhase(s)
         : "recording";
     if (s.recognition && r.acquisitionOrder === "recorder-first") startRecognition(s);
     render();
