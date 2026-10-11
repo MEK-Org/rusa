@@ -837,10 +837,6 @@ class FakeApi extends DashboardApi {
   /// Holds every obligation detail request until completed.
   Completer<void>? obligationDetailGate;
 
-  /// Ids whose detail answers 404 "obligation not found", as the server does
-  /// for an obligation that no longer exists.
-  Set<String> deletedObligationIds = {};
-
   /// Thrown by the detail request for each id (after any gate).
   Map<String, Object> obligationDetailErrors = {};
 
@@ -861,13 +857,6 @@ class FakeApi extends DashboardApi {
     obligationDetailCallCount++;
     final detailGate = obligationDetailGate;
     if (detailGate != null) await detailGate.future;
-    if (deletedObligationIds.contains(id)) {
-      throw DashboardApiException(
-        base.resolve('/api/mesh/obligations/$id'),
-        404,
-        '{"error":"obligation not found"}',
-      );
-    }
     if (obligationDetailErrors[id] case final error?) throw error;
     if (obligationDetailByHistory != null) {
       return obligationDetailByHistory!(id, historyBefore);

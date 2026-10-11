@@ -228,26 +228,16 @@ class ObligationSync {
   }
 
   /// Reads the detail of each obligation a page left out, since absence from
-  /// one query says neither that it is gone nor where it went: the detail's
-  /// copy replaces the stored one, and only "not found" removes it. Any other
-  /// failure keeps the stored copy, still absent from the page's query.
+  /// one query does not say where it went: the detail's copy replaces the
+  /// stored one. Obligations are never deleted, so a failed read keeps the
+  /// stored copy, still absent from the page's query, until the next settled
+  /// page reads it again.
   Future<void> _readMissing(List<String> ids, bool Function() current) =>
       Future.wait(
         ids.map(
-          (id) => _api
-              .fetchObligationDetail(id)
-              .then(
-                (d) {
-                  if (current()) _store.applyDetail(d.obligation);
-                },
-                onError: (Object e) {
-                  if (current() &&
-                      e is DashboardApiException &&
-                      e.status == 404) {
-                    _store.delete(id);
-                  }
-                },
-              ),
+          (id) => _api.fetchObligationDetail(id).then((d) {
+            if (current()) _store.applyDetail(d.obligation);
+          }, onError: (Object _) {}),
         ),
       );
 

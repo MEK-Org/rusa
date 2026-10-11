@@ -363,14 +363,9 @@ class _WorkTabState extends State<WorkTab> {
         : loaded;
   }
 
-  /// The server said this obligation no longer exists.
-  bool _deleted(ObligationDto loaded) =>
-      widget.store.obligations.current.deleted.contains(loaded.id);
-
   List<_FlatNode> _flattenTree(List<ObligationTreeDto> nodes, int depth) {
     final result = <_FlatNode>[];
     for (final node in nodes) {
-      if (_deleted(node.obligation)) continue;
       final obligation = _latest(node.obligation);
       // A terminal obligation still shows if it retains completion history —
       // the same "recurring, or ledger rows survived recurrence being turned
@@ -386,7 +381,6 @@ class _WorkTabState extends State<WorkTab> {
       final hasVisibleChildren = _showDone
           ? node.children.isNotEmpty
           : node.children
-                .where((c) => !_deleted(c.obligation))
                 .map((c) => _latest(c.obligation))
                 .any(
                   (c) =>
@@ -1101,7 +1095,7 @@ class _DetailViewState extends State<_DetailView> {
       if (!mounted || gen != _fetchGeneration) {
         throw StateError('Obligation detail fetch superseded or unmounted');
       }
-      store.obligations.applyDetail(data.obligation);
+      store.obligations.upsert([data.obligation]);
       _shownIds = _idsOf(data);
       setState(() {
         _history = data.history;
@@ -1179,7 +1173,7 @@ class _DetailViewState extends State<_DetailView> {
     future
         .then((data) {
           if (!mounted || gen != _fetchGeneration) return;
-          store.obligations.applyDetail(data.obligation);
+          store.obligations.upsert([data.obligation]);
           _shownIds = _idsOf(data);
           setState(() => _applyRefreshed(data));
         })

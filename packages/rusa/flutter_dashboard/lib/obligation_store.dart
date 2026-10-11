@@ -57,13 +57,12 @@ class ObligationQuery {
 
 /// What the store knows at one instant: every obligation it holds by id, the
 /// blocking children of the obligations whose detail it has read, and what
-/// the server has said about membership and deletion.
+/// the server has said about membership.
 class ObligationEntities {
   const ObligationEntities({
     this.byId = const {},
     this.blockers = const {},
     this.absent = const {},
-    this.deleted = const {},
   });
 
   final Map<String, ObligationDto> byId;
@@ -78,11 +77,6 @@ class ObligationEntities {
   /// what did change, so their content stays until a newer copy or a detail
   /// read replaces it.
   final Map<ObligationQuery, Set<String>> absent;
-
-  /// Obligations the server answered "not found" for. Only these are removed
-  /// from [byId], and none comes back: the server has no row for it, so a
-  /// response that still carried one was sent before the deletion.
-  final Set<String> deleted;
 
   /// The first page of obligations [query] holds, in its order.
   List<ObligationDto> select(ObligationQuery query) {
@@ -200,7 +194,7 @@ class ObligationStore {
   /// when the page is the whole query, and only those ordered before its last
   /// row when more follow. Absence is no evidence of what changed, so the
   /// store keeps the obligation for every other view and query; the caller
-  /// reads its detail to learn its current state ([applyDetail], [delete]).
+  /// reads its detail to learn its current state ([applyDetail]).
   /// Whatever sits past a partial page is left alone.
   List<String> applyPage(
     ObligationQuery query,
@@ -231,20 +225,12 @@ class ObligationStore {
     return missing;
   }
 
-  /// Writes a detail read's copy of an obligation. It was read after any
-  /// page that marked it absent, so its own fields now decide which queries
-  /// hold it.
+  /// Writes the copy of an obligation a detail read returned after the page
+  /// that marked it absent, so its own fields now decide which queries hold
+  /// it. A read not ordered after that page writes through [upsert] instead.
   void applyDetail(ObligationDto obligation) => _write((e) {
     _upsertInto(e, [obligation]);
     _forgetAbsence(e, obligation.id);
-  });
-
-  /// The server answered "not found" for [id]: it is gone for every view.
-  void delete(String id) => _write((e) {
-    e.byId.remove(id);
-    e.blockers.remove(id);
-    _forgetAbsence(e, id);
-    e.deleted.add(id);
   });
 
   /// Records [children] as [id]'s blocking children and upserts them.
@@ -267,7 +253,6 @@ class ObligationStore {
       Map.of(before.byId),
       Map.of(before.blockers),
       Map.of(before.absent),
-      Set.of(before.deleted),
     );
     change(e);
     _entities.add(
@@ -278,20 +263,17 @@ class ObligationStore {
           for (final MapEntry(:key, :value) in e.absent.entries)
             if (value.isNotEmpty) key: value,
         },
-        deleted: e.deleted,
       ),
     );
   }
 
-  /// A deleted obligation is never written back. A strictly newer copy
-  /// changed the obligation since any page marked it absent, so its fields
-  /// decide membership again.
+  /// A strictly newer copy changed the obligation since any page marked it
+  /// absent, so its fields decide membership again.
   static void _upsertInto(
     _MutableEntities e,
     Iterable<ObligationDto> obligations,
   ) {
     for (final o in obligations) {
-      if (e.deleted.contains(o.id)) continue;
       final held = e.byId[o.id];
       if (held != null && _isNewer(held, than: o)) continue;
       e.byId[o.id] = o;
@@ -319,10 +301,9 @@ class ObligationStore {
 }
 
 class _MutableEntities {
-  _MutableEntities(this.byId, this.blockers, this.absent, this.deleted);
+  _MutableEntities(this.byId, this.blockers, this.absent);
 
   final Map<String, ObligationDto> byId;
   final Map<String, List<String>> blockers;
   final Map<ObligationQuery, Set<String>> absent;
-  final Set<String> deleted;
 }
