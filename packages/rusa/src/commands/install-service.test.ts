@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -24,7 +25,13 @@ import {
   writeHostWatchdogUnits,
   writeLogRotationUnits,
 } from "./install-service.js";
-import { hostWatchdogUnitNames, logRotationUnitNames } from "./service-instance.js";
+import {
+  hostWatchdogUnitNames,
+  logRotationUnitNames,
+  readUnitPathEnv,
+  resolveExecutableOnPath,
+  resolveInstanceUnitPathEnv,
+} from "./service-instance.js";
 
 const base = {
   description: "Rusa",
@@ -517,5 +524,45 @@ describe("host watchdog units (#955)", () => {
   it("ships the watchdog in the package, beside the rotator", () => {
     const packageJson = JSON.parse(readFileSync(resolve("package.json"), "utf8"));
     expect(packageJson.files).toContain("scripts/host-watchdog.mjs");
+  });
+});
+
+describe("instance unit PATH across an install-service reapply (#986)", () => {
+  it("a reapply from a sandboxed provider shell leaves codex resolvable", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-986-"));
+    const providerBin = join(root, "node", "bin");
+    const vendorDir = join(root, "codex", "vendor", "codex-path");
+    mkdirSync(providerBin, { recursive: true });
+    mkdirSync(vendorDir, { recursive: true });
+    for (const tool of [join(providerBin, "codex"), join(vendorDir, "rg")]) {
+      writeFileSync(tool, "#!/bin/sh\n", "utf-8");
+      chmodSync(tool, 0o755);
+    }
+    const noSystemd = () => null;
+    const saved = { PATH: process.env.PATH, FNM_DIR: process.env.FNM_DIR };
+    try {
+      process.env.FNM_DIR = "";
+      // First install, from an ordinary login shell.
+      process.env.PATH = `${providerBin}:/usr/bin:/bin`;
+      const installed = buildServiceUnit({
+        ...base,
+        userPath: resolveInstanceUnitPathEnv("rusa.service", null, noSystemd).path,
+      });
+      // Reapply, from inside a codex session: its PATH has only the vendored
+      // helper dir and the system dirs, and no node/provider bin dir.
+      process.env.PATH = `${vendorDir}:/usr/bin:/bin`;
+      const reapplied = buildServiceUnit({
+        ...base,
+        userPath: resolveInstanceUnitPathEnv("rusa.service", installed, noSystemd).path,
+      });
+
+      const unitPath = readUnitPathEnv(reapplied) ?? "";
+      expect(resolveExecutableOnPath("codex", unitPath)).toBe(join(providerBin, "codex"));
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 });
