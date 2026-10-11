@@ -1238,7 +1238,7 @@ describe("E2EInstanceManager", () => {
       const callsBeforeResume = calls.length;
 
       await expect(managerA.resume("actor-a", runRootA)).rejects.toThrow(
-        /currently live but belongs to another instance or cannot be attributed; preserved holder handle-actor-a \(actor-a\) may resume only after it becomes inactive/
+        /currently live but belongs to another instance or cannot be attributed; preserved holder handle-actor-a \(actor-a\) may resume only after that live unit becomes inactive/
       );
 
       expect(
@@ -1250,6 +1250,33 @@ describe("E2EInstanceManager", () => {
 
       managerB.down("actor-b");
       await expect(managerA.resume("actor-a", runRootA)).resolves.toMatchObject({ state: "up" });
+    });
+
+    it("does not attribute an unattributed pre-deploy live singleton to this preserved holder", async () => {
+      const subject = manager();
+      await subject.up("actor-a", actorWorktree);
+      const runRoot = subject.status().holder?.resumableRoot;
+      if (!runRoot) throw new Error("expected a persisted resumableRoot");
+      writeResumableRootAt(runRoot);
+      subject.stopForMeshShutdown();
+
+      // systemd always prints a loaded unit's Description; a unit launched
+      // before #1008 carries the fixed text that names no runtime directory.
+      active = true;
+      activeDescription = "Rusa live e2e instance";
+      const callsBeforeResume = calls.length;
+
+      await expect(subject.resume("actor-a", runRoot)).rejects.toThrow(
+        /currently live but belongs to another instance or cannot be attributed; preserved holder handle-actor-a \(actor-a\) may resume only after that live unit becomes inactive/
+      );
+
+      expect(calls.slice(callsBeforeResume).map((call) => call.file)).toEqual(["systemctl"]);
+      expect(active).toBe(true);
+      expect(subject.status().holder?.actorId).toBe("actor-a");
+      expect(existsSync(runRoot)).toBe(true);
+
+      active = false;
+      await expect(subject.resume("actor-a", runRoot)).resolves.toMatchObject({ state: "up" });
     });
 
     it("rejects resume when no preserved holder record exists", async () => {

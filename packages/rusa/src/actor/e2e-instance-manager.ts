@@ -804,7 +804,7 @@ export class E2EInstanceManager {
       throw new Error(
         existing && existingStatus.description !== this.unitDescription
           ? `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} is currently live but belongs to another instance or cannot be attributed; ` +
-              `preserved holder ${existing.actorHandle} (${existing.actorId}) may resume only after it becomes inactive`
+              `preserved holder ${existing.actorHandle} (${existing.actorId}) may resume only after that live unit becomes inactive`
           : existing
             ? `e2e-instance: already held by ${existing.actorHandle} (${existing.actorId}) serving ${existing.worktree}; ` +
               "it comes down only when that actor calls down/stop, that actor is retired, or the mesh shuts down"
