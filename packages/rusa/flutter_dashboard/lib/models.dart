@@ -2442,6 +2442,28 @@ class ObligationDetailSnapshot {
   final int completionsTotal;
   final bool completionsHasMore;
 
+  /// This snapshot with [obligation] in place of the one it was read with.
+  ObligationDetailSnapshot withObligation(ObligationDto obligation) =>
+      ObligationDetailSnapshot(
+        obligation: obligation,
+        ancestors: ancestors,
+        history: history,
+        historyNextBefore: historyNextBefore,
+        parent: parent,
+        children: children,
+        blockingChildren: blockingChildren,
+        blockedBy: blockedBy,
+        blockedByTotal: blockedByTotal,
+        blockedByHasMore: blockedByHasMore,
+        blocks: blocks,
+        blocksTotal: blocksTotal,
+        blocksHasMore: blocksHasMore,
+        artifacts: artifacts,
+        completions: completions,
+        completionsTotal: completionsTotal,
+        completionsHasMore: completionsHasMore,
+      );
+
   factory ObligationDetailSnapshot.fromJson(
     Map<String, dynamic> j,
   ) => ObligationDetailSnapshot(

@@ -388,6 +388,7 @@ void main() {
 
         // An invalidation event arrives for an unrelated obligation; the open
         // detail view for 'arc' ignores it and does not refetch.
+        final detailReads = api.obligationDetailCallCount;
         stream.meshCtrl.add(
           const MeshEvent(
             id: 'unrelated-checkpoint',
@@ -404,9 +405,13 @@ void main() {
           await tester.pump(const Duration(milliseconds: 10));
         }
 
-        // The detail view for 'arc' still displays the unrefreshed standing and cycles
-        expect(find.text(oldStanding), findsOneWidget);
+        // The detail view for 'arc' was not refetched, so its cycles are
+        // unrefreshed; its header shows the shared store's copy, which the
+        // tree's own reload just updated (#992).
+        expect(api.obligationDetailCallCount, detailReads);
         expect(find.textContaining('Cycle 3'), findsNothing);
+        expect(find.text(oldStanding), findsNothing);
+        expect(find.text(newStanding), findsNWidgets(2));
 
         // Now the targeted invalidation event arrives for 'arc'
         stream.meshCtrl.add(

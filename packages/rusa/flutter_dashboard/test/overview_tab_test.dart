@@ -109,7 +109,8 @@ void main() {
         expect(narrowQueue.left, closeTo(narrowQuota.left, 1));
         expect(narrowQueue.top, lessThan(narrowQuota.top));
         expect(find.text('New Obligation'), findsNothing);
-        expect(find.byIcon(Icons.add), findsOneWidget);
+        // The header's compact create action (the empty queue adds its own).
+        expect(find.byTooltip('New Obligation'), findsOneWidget);
 
         // Just below kNarrowBreakpoint (700): 20px tab padding on each side (40 total).
         // Surface width 739 gives maxWidth 699 < 700 -> stacked vertically.

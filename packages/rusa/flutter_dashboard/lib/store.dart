@@ -11,6 +11,8 @@ import 'dashboard_timing.dart';
 import 'avatar_platform.dart';
 import 'mesh_stream.dart';
 import 'models.dart';
+import 'obligation_store.dart';
+import 'obligation_sync.dart';
 import 'obligations_cache.dart';
 import 'quota_cache.dart';
 import 'tree_preferences_cache.dart';
@@ -628,6 +630,87 @@ class DashboardStore {
     _cachedObligationTrees = null;
     _cachedObligationPrincipal = resolvedPrincipal;
     _seedObligationsFromCache(resolvedPrincipal);
+    _seedObligationStore(resolvedPrincipal);
+  }
+
+  // ── Shared obligation store (#992) ──
+
+  /// Every obligation a request returned for the resolved viewer, by id.
+  /// Views render projections of it; [obligationSync] fills it.
+  final ObligationStore obligations = ObligationStore();
+
+  /// Owns when [obligations] is refreshed and writes the responses into it.
+  late final ObligationSync obligationSync = ObligationSync(
+    api: _api,
+    store: obligations,
+    onSettled: _persistObligationStore,
+    onStale: _dropPersistedObligationStore,
+  );
+
+  /// The viewer [obligations] holds knowledge for.
+  String? _obligationStorePrincipal;
+
+  /// The viewer's own queue sections, as Overview's My Queue shows them.
+  List<ObligationQuery> viewerQueues() {
+    final principal = _obligationStorePrincipal;
+    if (principal == null || principal.isEmpty) return const [];
+    return [
+      for (final queue in ObligationQueue.values)
+        ObligationQuery(ownerId: principal, queue: queue),
+    ];
+  }
+
+  /// Replaces the store with the new viewer's persisted capture once
+  /// dashboard configuration names them, mirroring [_seedObligationsFromCache].
+  /// A re-resolution of the same viewer keeps what the store holds.
+  void _seedObligationStore(String principalId) {
+    if (principalId == _obligationStorePrincipal) return;
+    _obligationStorePrincipal = principalId;
+    var seed = const ObligationEntities();
+    var replayed = const <ObligationQuery>[];
+    final cached = _obligationsCache.loadEntities(
+      scope: _hierarchyScope,
+      principalId: principalId,
+    );
+    if (cached != null) {
+      if (cached.isUsableAt(
+        scope: _hierarchyScope,
+        principalId: principalId,
+        now: DateTime.timestamp(),
+      )) {
+        seed = cached.entities;
+        replayed = cached.queries;
+      } else {
+        _dropPersistedObligationStore();
+      }
+    }
+    obligations.reset(seed);
+    obligationSync.reset(replayed: replayed);
+  }
+
+  void _persistObligationStore() {
+    final principal = _obligationStorePrincipal;
+    if (principal == null || principal.isEmpty) return;
+    _obligationsCache.saveEntities(
+      PersistedObligationEntitiesSnapshot.capture(
+        scope: _hierarchyScope,
+        principalId: principal,
+        queries: obligationSync.settledQueries,
+        entities: obligations.current,
+        now: DateTime.timestamp(),
+      ),
+    );
+  }
+
+  /// A change may have moved what the capture holds, so a reload must not
+  /// replay it; the next settled refresh writes a new one.
+  void _dropPersistedObligationStore() {
+    final principal = _obligationStorePrincipal;
+    if (principal == null || principal.isEmpty) return;
+    _obligationsCache.invalidateEntities(
+      scope: _hierarchyScope,
+      principalId: principal,
+    );
   }
 
   /// Persists [trees] as the new last-known successful obligations snapshot (#505).
@@ -662,10 +745,11 @@ class DashboardStore {
   }
 
   /// Runs an obligation-changing API operation and prevents a later Work-tab
-  /// return from reviving the old persisted forest.
+  /// or Overview return from reviving the old persisted forest or store.
   Future<T> mutateObligations<T>(Future<T> Function() operation) async {
     final result = await operation();
     invalidateObligationsCache();
+    obligationSync.mutated();
     return result;
   }
 
@@ -1553,15 +1637,16 @@ class DashboardStore {
 
     if (e.kind == 'obligation_checkpoint_set' &&
         !_obligationRefreshes.isClosed) {
+      final ids = {if (e.detail != null) e.detail!};
       invalidateObligationsCache();
-      _obligationRefreshes.add(
-        ObligationRefresh(ids: {if (e.detail != null) e.detail!}),
-      );
+      obligationSync.obligationsChanged(ids);
+      _obligationRefreshes.add(ObligationRefresh(ids: ids));
     }
     if (e.kind == 'obligation_status_changed' &&
         !_obligationRefreshes.isClosed) {
       final statuses = _statusChanges(e.payload);
       invalidateObligationsCache();
+      obligationSync.statusesChanged(statuses);
       statuses.keys.forEach(_obligationLookups.remove);
       _obligationRefreshes.add(ObligationRefresh(ids: statuses.keys.toSet()));
       // Recent Activity lists closes only, so a re-ready or block adds no row.
@@ -2084,6 +2169,8 @@ class DashboardStore {
       _walkieActive.close(),
       _chatRoomParticipants.close(),
       _obligationRefreshes.close(),
+      obligations.close(),
+      obligationSync.close(),
     ]);
   }
 }

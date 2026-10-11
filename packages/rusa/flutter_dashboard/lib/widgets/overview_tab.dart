@@ -5,6 +5,8 @@ import 'package:rxdart/rxdart.dart';
 import '../breakpoints.dart';
 import '../dashboard_timing.dart';
 import '../models.dart';
+import '../obligation_store.dart';
+import '../obligation_sync.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../util.dart';
@@ -35,72 +37,82 @@ class OverviewTab extends StatefulWidget {
 }
 
 class _OverviewTabState extends State<OverviewTab> {
-  late Future<Map<String, dynamic>> _humanQueueFuture;
   StreamSubscription<String?>? _viewerPrincipalSub;
 
   /// Re-renders queued cards' relative "Runs in ~N min" labels as time passes
   /// between snapshots; idle while nothing is queued.
   Timer? _startLabelTick;
 
-  Future<Map<String, dynamic>> _loadHumanQueue() async {
-    final api = widget.store.api;
-    final ownerId = widget.store.userPrincipalId;
-    const queues = ['ready', 'waiting', 'scheduled'];
-    // One page per section rather than carving sections out of a shared
-    // page: otherwise one section's rows could exhaust the page limit and
-    // silently drop another section's rows.
-    final results = await Future.wait([
-      for (final queue in queues)
-        api.fetchObligations(ownerId: ownerId, queue: queue),
-    ]);
-    if (!mounted) {
-      throw StateError('Overview queue load superseded or unmounted');
-    }
-    final ready = results[0].obligations;
-    final waiting = results[1].obligations;
-    final scheduled = results[2].obligations
-      ..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
-    final blockers = await Future.wait(
-      waiting.map((o) => api.fetchObligationDetail(o.id)),
+  /// The viewer's queue sections and the projection of the shared obligation
+  /// store this tab subscribes to (#992). The store outlives the tab, so a
+  /// return paints what it holds while [ObligationSync] revalidates it.
+  List<ObligationQuery> _queries = const [];
+  late Stream<_QueueView> _queueView;
+
+  void _watchQueue() {
+    final store = widget.store;
+    _queries = store.viewerQueues();
+    final queries = _queries;
+    // Deferred so each listen gets its own: the layout switch remounts the
+    // StreamBuilder, which listens again.
+    _queueView = Rx.defer(
+      () => Rx.combineLatest2(
+        store.obligations.watch(queries),
+        store.obligationSync.freshness,
+        _QueueView.new,
+      ),
+      reusable: true,
     );
-    if (!mounted) {
-      throw StateError('Overview queue load superseded or unmounted');
-    }
-    final blockerMap = {
-      for (var i = 0; i < waiting.length; i++)
-        waiting[i].id: blockers[i].blockingChildren,
-    };
-    return {
-      'ready': ready,
-      'waiting': waiting,
-      'scheduled': scheduled,
-      'blockerMap': blockerMap,
-    };
   }
 
-  void _refreshHumanQueue() {
-    setState(() {
-      _humanQueueFuture = _loadHumanQueue();
-    });
+  _QueueView get _currentQueueView => _QueueView(
+    ObligationProjection.of(widget.store.obligations.current, _queries),
+    widget.store.obligationSync.freshness.value,
+  );
+
+  /// Requests the queue, sharing any request already in flight, while the
+  /// rows the store holds stay on screen.
+  Future<void> _revalidate() => widget.store.obligationSync.refresh(_queries);
+
+  /// The operator asked: request the queue now.
+  void _refreshHumanQueue() => unawaited(_revalidate());
+
+  /// Times the mount's revalidation as primary navigation; a failed refresh
+  /// counts as a failed interaction even though its retained rows still show.
+  Future<void> _trackedRefresh() async {
+    try {
+      await widget.store.api.trackInteraction(
+        DashboardInteraction.primaryNavigation,
+        () async {
+          await _revalidate();
+          final error = _currentQueueView.error;
+          if (error != null) throw error;
+        },
+      );
+    } catch (_) {
+      // The sync already exposes the failure to the queue section.
+    }
   }
 
   @override
   void initState() {
     super.initState();
     widget.store.refreshQuotaHistory();
-    _humanQueueFuture = widget.trackNavigation
-        ? widget.store.api.trackInteraction(
-            DashboardInteraction.primaryNavigation,
-            _loadHumanQueue,
-          )
-        : _loadHumanQueue();
+    _watchQueue();
+    if (widget.trackNavigation) {
+      unawaited(_trackedRefresh());
+    } else {
+      unawaited(_revalidate());
+    }
     // Refresh if the server-resolved viewing principal changes.
     _viewerPrincipalSub = widget.store.dashboardConfig
         .map((c) => c?.userPrincipalId)
         .distinct()
         .skip(1)
         .listen((_) {
-          if (mounted) _refreshHumanQueue();
+          if (!mounted) return;
+          setState(_watchQueue);
+          unawaited(_revalidate());
         });
     _startLabelTick = Timer.periodic(const Duration(seconds: 30), (_) {
       if (mounted && widget.store.actorStates.value.queuedActors.isNotEmpty) {
@@ -254,18 +266,27 @@ class _OverviewTabState extends State<OverviewTab> {
 
   /// My obligations queue for the viewing person, under every id they hold.
   Widget _buildMyQueueSection() {
-    return FutureBuilder<Map<String, dynamic>>(
-      future: _humanQueueFuture,
+    return StreamBuilder<_QueueView>(
+      stream: _queueView,
+      initialData: _currentQueueView,
       builder: (context, snap) {
-        final ready = snap.data?['ready'] as List<ObligationDto>? ?? const [];
-        final waiting =
-            snap.data?['waiting'] as List<ObligationDto>? ?? const [];
-        final scheduled =
-            snap.data?['scheduled'] as List<ObligationDto>? ?? const [];
-        final blockerMap =
-            snap.data?['blockerMap'] as Map<String, List<ObligationDto>>? ??
-            const {};
+        final view = snap.data ?? _currentQueueView;
+        final error = view.error;
+        List<ObligationDto> rows(ObligationQueue queue) => [
+          for (final q in _queries)
+            if (q.queue == queue) ...view.projection.of(q),
+        ];
+        final ready = rows(ObligationQueue.ready);
+        final waiting = rows(ObligationQueue.waiting);
+        final scheduled = rows(
+          ObligationQueue.scheduled,
+        )..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
+        final blockerMap = view.projection.blockers;
         final totalCount = ready.length + waiting.length + scheduled.length;
+        final isEmpty = totalCount == 0;
+        final known =
+            _queries.isNotEmpty &&
+            _queries.every((q) => view.freshness[q]?.known ?? false);
 
         return LayoutBuilder(
           builder: (_, constraints) {
@@ -365,54 +386,16 @@ class _OverviewTabState extends State<OverviewTab> {
                     style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
                   ),
                   const SizedBox(height: 14),
-                  if (snap.connectionState != ConnectionState.done &&
-                      snap.data == null)
+                  if (isEmpty && !known && error == null)
                     const Padding(
                       padding: EdgeInsets.symmetric(vertical: 20),
                       child: Center(child: CircularProgressIndicator()),
                     )
-                  else if (snap.hasError && snap.data == null)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      child: isNarrow
-                          ? Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  'Queue unavailable: ${snap.error}',
-                                  style: const TextStyle(
-                                    color: MeshColors.textMuted,
-                                    fontSize: 13,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                TextButton(
-                                  onPressed: _refreshHumanQueue,
-                                  child: const Text('Retry'),
-                                ),
-                              ],
-                            )
-                          : Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    'Queue unavailable: ${snap.error}',
-                                    style: const TextStyle(
-                                      color: MeshColors.textMuted,
-                                      fontSize: 13,
-                                    ),
-                                  ),
-                                ),
-                                TextButton(
-                                  onPressed: _refreshHumanQueue,
-                                  child: const Text('Retry'),
-                                ),
-                              ],
-                            ),
-                    )
-                  else if (ready.isEmpty &&
-                      waiting.isEmpty &&
-                      scheduled.isEmpty)
+                  // An empty queue kept through a failed refresh would claim
+                  // the queue is empty when the refresh could not say.
+                  else if (isEmpty && error != null)
+                    _queueError(error, isNarrow: isNarrow)
+                  else if (isEmpty)
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 12),
                       child: isNarrow
@@ -495,6 +478,8 @@ class _OverviewTabState extends State<OverviewTab> {
                             ),
                     )
                   else ...[
+                    // A failed refresh keeps the rows it could not replace.
+                    if (error != null) _queueError(error, isNarrow: isNarrow),
                     if (ready.isNotEmpty) ...[
                       Wrap(
                         spacing: 8,
@@ -624,6 +609,47 @@ class _OverviewTabState extends State<OverviewTab> {
           },
         );
       },
+    );
+  }
+
+  Widget _queueError(Object? error, {required bool isNarrow}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: isNarrow
+          ? Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Queue unavailable: $error',
+                  style: const TextStyle(
+                    color: MeshColors.textMuted,
+                    fontSize: 13,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                TextButton(
+                  onPressed: _refreshHumanQueue,
+                  child: const Text('Retry'),
+                ),
+              ],
+            )
+          : Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Queue unavailable: $error',
+                    style: const TextStyle(
+                      color: MeshColors.textMuted,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+                TextButton(
+                  onPressed: _refreshHumanQueue,
+                  child: const Text('Retry'),
+                ),
+              ],
+            ),
     );
   }
 
@@ -1661,3 +1687,16 @@ class _OverviewTabState extends State<OverviewTab> {
 /// The identity takes a quarter and the inbox item three quarters, so this
 /// keeps the identity at least 280px — room for a handle, model, and title.
 const double _kQueuedFocusColumnMinWidth = 1120;
+
+/// What My Queue renders: the store's projection of the viewer's queue
+/// sections and where each section stands with the server.
+class _QueueView {
+  const _QueueView(this.projection, this.freshness);
+
+  final ObligationProjection projection;
+  final Map<ObligationQuery, QueryFreshness> freshness;
+
+  /// The first failure among the sections' latest refreshes.
+  Object? get error =>
+      projection.rows.keys.map((q) => freshness[q]?.error).nonNulls.firstOrNull;
+}
