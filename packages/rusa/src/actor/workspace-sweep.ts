@@ -117,12 +117,9 @@ export interface WorkspaceSweepOptions {
 
 /**
  * Whether a directory name directly under `<mcHome>/workers/` is a reserved
- * shared or probe directory rather than a spawned worker's workspace.
- *
- * The canonical legacy `root` actor shares this directory (e.g. for e2e test
- * harnesses), and `quota-probe-<provider>` and `model-probe-<provider>` are
- * created on demand for capability and quota scraping. None of these represents
- * a spawned actor workspace that retires.
+ * shared or probe directory rather than a spawned worker's workspace: the
+ * legacy `root` actor's, and the `quota-probe-<provider>` and
+ * `model-probe-<provider>` directories created for quota and model scraping.
  */
 export function isReservedWorkerDirectory(name: string): boolean {
   return name === "root" || name.startsWith("quota-probe-") || name.startsWith("model-probe-");
@@ -153,7 +150,6 @@ export function orphanedWorkspaces(opts: WorkspaceSweepOptions): string[] {
   // here is ever ambiguous and only an exact retired record sweeps one. The
   // provider's short spellings are not this directory's problem.
   for (const name of subdirectories(opts.workersDir)) {
-    if (isReservedWorkerDirectory(name)) continue;
     if (retiredIds.has(name)) orphans.push(join(opts.workersDir, name));
   }
 

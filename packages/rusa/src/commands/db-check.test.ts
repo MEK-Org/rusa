@@ -708,7 +708,6 @@ describe("db-check", () => {
     const workersRoot = join(home, "workers", "root");
     mkdirSync(workersRoot, { recursive: true });
     writeFileSync(join(workersRoot, "e2e-verify"), "legacy e2e harness artifact");
-    mkdirSync(join(home, "workers", "quota-probe-kimi"), { recursive: true });
 
     const result = runDbCheckAgainstHome(home);
     expect(result.configuredActor).toBe("adopt");

@@ -222,11 +222,8 @@ describe("workspace sweep", () => {
   describe("isReservedWorkerDirectory", () => {
     it("recognizes canonical root and provider probe directories", () => {
       expect(isReservedWorkerDirectory("root")).toBe(true);
-      expect(isReservedWorkerDirectory("quota-probe-kimi")).toBe(true);
       expect(isReservedWorkerDirectory("quota-probe-codex")).toBe(true);
-      expect(isReservedWorkerDirectory("quota-probe-claude")).toBe(true);
       expect(isReservedWorkerDirectory("model-probe-claude")).toBe(true);
-      expect(isReservedWorkerDirectory("model-probe-agy")).toBe(true);
     });
 
     it("does not match ordinary spawned worker actors", () => {

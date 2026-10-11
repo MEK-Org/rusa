@@ -136,6 +136,9 @@ export function configuredActorCharter(stored: string): string {
 const SELECT_ACTION =
   "restart once with `rusa start --import-actor <id>` naming the actor that config.yaml's rootActor describes; startup never picks one on its own or creates a substitute";
 
+const REPAIR_ACTION =
+  "repair mesh.db's actors table first: every actor must descend from the configured actor, and no other actor may record its native session; naming an actor does not override either";
+
 /**
  * Decide which actor the configuration describes, without writing anything.
  * Throws {@link ConfiguredActorImportError} when that cannot be decided
@@ -209,6 +212,16 @@ export function planConfiguredActorImport(options: {
       );
     }
     assertImportable(record, parentless, "--import-actor names");
+    // Naming the actor answers which one config describes, so it overrides the
+    // workspace evidence. It does not repair the tree or a shared session.
+    const broken = treeFindings(record, records);
+    if (broken.length > 0) {
+      throw new ConfiguredActorImportError(
+        `--import-actor names ${record.id}, but ${broken.join("; ")}`,
+        REPAIR_ACTION,
+        parentlessIds
+      );
+    }
     return { kind: "adopt", actorId: record.id, selected: true };
   }
 
@@ -228,11 +241,12 @@ export function planConfiguredActorImport(options: {
 
   const candidate = parentless[0] as ActorRecord;
   assertImportable(candidate, parentless, "the sole top-level actor");
-  const inconsistencies = consistencyFindings(candidate, records, options.workersDir);
+  const broken = treeFindings(candidate, records);
+  const inconsistencies = [...broken, ...workspaceFindings(candidate, options.workersDir)];
   if (inconsistencies.length > 0) {
     throw new ConfiguredActorImportError(
       `the sole top-level actor ${candidate.id} does not look like the configured actor: ${inconsistencies.join("; ")}`,
-      SELECT_ACTION,
+      broken.length > 0 ? REPAIR_ACTION : SELECT_ACTION,
       parentlessIds
     );
   }
@@ -269,16 +283,10 @@ function assertImportable(
 }
 
 /**
- * Evidence that a sole top-level record is not the actor config describes.
- * Every actor must descend from it; for non-reserved candidates, it must not have run as a spawned actor
- * (which would have given it a workspace under `workers/`); and its native
- * session must be its own.
+ * State that stops any actor being imported, named or not: every actor must
+ * descend from it, and its native session must be its own.
  */
-function consistencyFindings(
-  candidate: ActorRecord,
-  records: readonly ActorRecord[],
-  workersDir: string
-): string[] {
+function treeFindings(candidate: ActorRecord, records: readonly ActorRecord[]): string[] {
   const findings: string[] = [];
   const byId = new Map(records.map((record) => [record.id, record]));
   const detached = records.filter((record) => {
@@ -294,14 +302,6 @@ function consistencyFindings(
   if (detached.length > 0) {
     findings.push(`${detached.map((record) => record.id).join(", ")} do not descend from it`);
   }
-  // Spawned identity is a registry and durable-tree fact; directory presence
-  // under workers/ is only a tiebreaker. Reserved names defined by
-  // workspace-sweep (canonical root, quota-probe-*, model-probe-*) share the
-  // workers directory without representing a spawned actor workspace.
-  // For any non-reserved candidate, a directory under workers/ indicates a spawned actor.
-  if (!isReservedWorkerDirectory(candidate.id) && existsSync(join(workersDir, candidate.id))) {
-    findings.push(`it has a spawned-actor workspace at workers/${candidate.id}`);
-  }
   if (candidate.sessionId !== undefined) {
     const sharing = records.filter(
       (record) => record.id !== candidate.id && record.sessionId === candidate.sessionId
@@ -313,6 +313,21 @@ function consistencyFindings(
     }
   }
   return findings;
+}
+
+/**
+ * Evidence that a sole top-level record ran as a spawned actor, which would
+ * have given it a workspace under `workers/`. A hard refusal for any id but the
+ * legacy `root`: `workers/root` is a reserved shared directory, not a
+ * workspace that spawning created, so its presence says nothing about how
+ * `root` began. An operator whose configured actor has a workspace for another
+ * reason names it with --import-actor, which skips this check.
+ */
+function workspaceFindings(candidate: ActorRecord, workersDir: string): string[] {
+  if (isReservedWorkerDirectory(candidate.id)) return [];
+  return existsSync(join(workersDir, candidate.id))
+    ? [`it has a spawned-actor workspace at workers/${candidate.id}`]
+    : [];
 }
 
 /**

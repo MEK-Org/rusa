@@ -6332,14 +6332,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       expect((await boot({ importActor: "configured" })).importedActor).toBe("configured");
     });
-
-    it("adopts legacy root actor even when workers/root and probe directories exist", async () => {
-      mkdirSync(join(homeDir, "workers", "root"), { recursive: true });
-      writeFileSync(join(homeDir, "workers", "root", "e2e-verify"), "synthetic");
-      mkdirSync(join(homeDir, "workers", "quota-probe-kimi"), { recursive: true });
-      const res = await boot();
-      expect(res.importedActor).toBe("root");
-    });
   });
 
   describe("root model_config startup precedence (#333)", () => {

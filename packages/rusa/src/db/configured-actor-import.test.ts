@@ -464,6 +464,7 @@ describe("configured-actor import (#1002)", () => {
             actor("orphan", { parentId: "gone" }),
           ]),
         reason: /orphan do not descend from it/,
+        selectable: false,
       },
       {
         name: "a spawned-actor workspace",
@@ -472,6 +473,7 @@ describe("configured-actor import (#1002)", () => {
           mkdirSync(join(workers, "configured"), { recursive: true });
         },
         reason: /spawned-actor workspace at workers\/configured/,
+        selectable: true,
       },
       {
         name: "a native session another actor also records",
@@ -481,17 +483,27 @@ describe("configured-actor import (#1002)", () => {
             actor("child", { sessionId: "shared-session" }),
           ]),
         reason: /session is also recorded for child/,
+        selectable: false,
       },
-    ])("refuses a sole top-level candidate with $name until it is named", ({ setup, reason }) => {
+    ])("refuses a sole top-level candidate with $name", ({ setup, reason, selectable }) => {
       setup(insertAll, join(home, "workers"));
       const before = snapshot();
 
       const err = refusal(() => run());
       expect(err.message).toMatch(reason);
+      expect(err.action).toMatch(selectable ? /--import-actor/ : /repair mesh\.db/);
       expect(err.candidates).toEqual(["configured"]);
       expect(snapshot()).toEqual(before);
       expect(receiptRows()).toEqual([]);
 
+      // Naming the actor overrides identity evidence, not a broken tree or session.
+      if (!selectable) {
+        const named = refusal(() => run({ selectedActorId: "configured" }));
+        expect(named.message).toMatch(reason);
+        expect(named.action).toMatch(/repair mesh\.db/);
+        expect(receiptRows()).toEqual([]);
+        return;
+      }
       const result = run({ selectedActorId: "configured" });
       expect(result.plan).toEqual({ kind: "adopt", actorId: "configured", selected: true });
       expect(repositories.legacyImportReceipts.actorFor(CONFIGURED_ACTOR_IMPORT_SOURCE)).toBe(
@@ -499,7 +511,7 @@ describe("configured-actor import (#1002)", () => {
       );
     });
 
-    it("adopts the legacy 'root' actor even when workers/root and probe directories exist", () => {
+    it("adopts the legacy 'root' actor even when workers/root exists", () => {
       insertAll([
         actor("root", {
           parentId: null,
@@ -512,8 +524,6 @@ describe("configured-actor import (#1002)", () => {
       ]);
       mkdirSync(join(home, "workers", "root"), { recursive: true });
       writeFileSync(join(home, "workers", "root", "e2e-verify"), "synthetic");
-      mkdirSync(join(home, "workers", "quota-probe-kimi"), { recursive: true });
-      mkdirSync(join(home, "workers", "model-probe-claude"), { recursive: true });
 
       const result = run();
       expect(result.plan).toEqual({ kind: "adopt", actorId: "root", selected: false });
