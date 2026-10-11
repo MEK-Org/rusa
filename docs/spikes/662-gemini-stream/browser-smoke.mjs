@@ -21,7 +21,7 @@ class ScriptedRecording extends EventEmitter {
   }
   stop(samples) {
     assert.equal(samples, this.samples);
-    // Deliberately emit after Cancel too: the client must ignore obsolete updates.
+    // Emit after Cancel too; socket closure keeps this response from reaching the page.
     this.timer = setTimeout(
       () =>
         this.emit("update", {
@@ -63,9 +63,10 @@ try {
   await page.addInitScript(() => {
     window.micCalls = 0;
     const original = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-    navigator.mediaDevices.getUserMedia = (options) => {
+    navigator.mediaDevices.getUserMedia = async (options) => {
       window.micCalls++;
-      return original(options);
+      window.micStream = await original(options);
+      return window.micStream;
     };
   });
   await page.goto(`http://127.0.0.1:${spike.server.address().port}/#${spike.token}`);
@@ -96,7 +97,22 @@ try {
   await page.waitForTimeout(1700);
   assert.equal(await page.locator("#status").textContent(), "Cancelled — no message sent");
   assert.match(await page.locator("#transcript").textContent(), /discarded/);
-  checks.push("Cancel during finalization rejects late completion");
+  checks.push("Cancel during finalization closes the connection and restores the grid");
+  await start();
+  await page.evaluate(() => {
+    const track = window.micStream.getAudioTracks()[0];
+    // stop() alone does not emit ended; model a device/permission loss notification.
+    track.stop();
+    track.dispatchEvent(new Event("ended"));
+  });
+  await page.waitForFunction(
+    () =>
+      document.querySelector("#status").textContent ===
+      "Microphone ended unexpectedly; transcript is incomplete"
+  );
+  assert.equal(await page.locator("#stop").isEnabled(), false);
+  assert.equal(await page.locator('[data-target="orange-boat"]').isVisible(), true);
+  checks.push("unexpected microphone end fails visibly and restores the grid");
   await start();
   recordings.at(-1).emit("update", { type: "error", message: "Synthetic provider disconnect" });
   await page.waitForFunction(

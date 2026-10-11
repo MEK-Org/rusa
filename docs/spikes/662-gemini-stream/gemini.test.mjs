@@ -63,6 +63,29 @@ test("mismatched boundary and bare connection closure never label text complete"
   });
   assert.equal(f.events.at(-1).type, "error");
   assert.match(f.events.at(-1).message, /boundary/);
+  const fractional = fixture();
+  fractional.recording.audio(Buffer.alloc(2));
+  fractional.recording.stop(1);
+  fractional.receive({
+    serverContent: { inputTranscription: { text: "verified" }, generationComplete: true },
+    voiceActivity: { type: "ACTIVITY_END", audioOffset: "0.000062500s" },
+  });
+  assert.equal(fractional.recording.phase, "done");
+  for (const audioOffset of [undefined, "invalid", `${"9".repeat(400)}s`, "0.100062500s"]) {
+    const invalid = fixture();
+    invalid.recording.audio(Buffer.alloc(3200));
+    invalid.recording.stop(1600);
+    invalid.receive({
+      serverContent: { inputTranscription: { text: "unverified" }, generationComplete: true },
+      voiceActivity: { type: "ACTIVITY_END", audioOffset },
+    });
+    assert.equal(invalid.recording.phase, "error");
+    assert.equal(
+      invalid.events.some((e) => e.type === "complete"),
+      false
+    );
+    invalid.recording.cancel();
+  }
   const g = fixture();
   g.recording.audio(Buffer.alloc(3200));
   g.recording.stop(1600);

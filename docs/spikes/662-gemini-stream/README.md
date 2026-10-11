@@ -65,9 +65,13 @@ explicit report download. Cancel sends nothing to actors.
 The observed dedicated STT protocol emits final `inputTranscription`,
 `generationComplete` and `voiceActivity.ACTIVITY_END`, but no `turnComplete`.
 The adapter requires all three signals after Stop, in any order, and checks the
-activity's end offset against every accepted sample. It rejects multiple finals
-or premature finalization because their interpretation is not proved by this
-single-activity spike. Transport closure alone is insufficient. A silence-only
+activity's finite end offset, rounded to the nearest 16 kHz PCM sample, against
+the accepted sample count. The observed synthetic offsets had zero sample delta;
+rounding only handles the decimal-seconds representation, with no two-sample
+allowance. It rejects multiple final-text events and final text before Stop,
+because their interpretation is not proved by this single-activity spike.
+Generation/end signals before Stop are ignored; repeated generation/end signals
+during finalization are idempotent. Transport closure alone is insufficient. A silence-only
 session currently times out visibly without the final-text/generation signals.
 This barrier is experimental evidence for this model, not a production
 exactly-once delivery design. The [Live reference](https://ai.google.dev/api/live)
@@ -86,8 +90,12 @@ missing/mismatched acknowledgements, repeated partials, Cancel/late events,
 queue overflow, authentication/origin rejection and active session expiry.
 The browser smoke uses a scripted provider and Chromium's fake microphone; the
 AudioWorklet, PCM framing, HTTP authentication and WebSocket paths are real.
-It checks actor focus/Stop/grid restoration, Cancel during finalization, provider
-failure, mic denial and report download. Set `CHROMIUM_EXECUTABLE` to use an
+It checks actor focus/Stop/grid restoration, Cancel during finalization with socket
+closure, provider failure, a simulated microphone-ended event, mic denial and
+report download. The Cancel browser case proves connection closure and restored
+controls; the provider unit test delivers a late event to the cancelled adapter
+and proves its terminal guard. Neither case proves a delivered stale event reaches
+the browser handler. Set `CHROMIUM_EXECUTABLE` to use an
 existing Chromium executable. Neither command proves real Gemini speech quality
 or Android behavior.
 

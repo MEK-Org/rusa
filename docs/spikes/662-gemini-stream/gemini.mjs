@@ -93,11 +93,14 @@ export class GeminiRecording extends EventEmitter {
         const raw = message.voiceActivity.audioOffset;
         this.endOffset =
           typeof raw === "string" && /^\d+(\.\d+)?s$/.test(raw) ? Number(raw.slice(0, -1)) : NaN;
+        if (!Number.isFinite(this.endOffset))
+          return this.fail("Invalid provider final audio boundary");
       }
       // The STT model emits no turnComplete. Require all three observed signals,
       // in any order, and the terminal audio offset matching every accepted sample.
       if (this.finalText !== null && this.generationComplete && this.endOffset !== null) {
-        if (Math.abs(this.endOffset * 16000 - this.samples) > 2)
+        // Seconds use decimal floating point; compare the nearest PCM sample.
+        if (Math.round(this.endOffset * 16000) !== this.samples)
           return this.fail("Provider final boundary does not cover accepted audio");
         this.phase = "done";
         clearTimeout(this.timer);

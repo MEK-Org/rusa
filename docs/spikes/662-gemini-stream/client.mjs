@@ -2,7 +2,6 @@ const $ = (selector) => document.querySelector(selector);
 const actors = [...document.querySelectorAll(".actor")];
 let authorized = false;
 let current = null;
-let generation = 0;
 const report = {
   fixture: "662-gemini-stream-v1",
   at: new Date().toISOString(),
@@ -38,7 +37,10 @@ function render() {
   $("#cancel").disabled = !busy;
 }
 async function release(run) {
-  for (const track of run.stream?.getTracks() ?? []) track.stop();
+  for (const track of run.stream?.getTracks() ?? []) {
+    track.onended = null;
+    track.stop();
+  }
   run.node?.disconnect();
   run.source?.disconnect();
   if (run.context && run.context.state !== "closed") await run.context.close().catch(() => {});
@@ -80,7 +82,14 @@ async function capture(run) {
       await release(run);
       return;
     }
-    run.captureRate = run.stream.getAudioTracks()[0]?.getSettings().sampleRate ?? null;
+    const tracks = run.stream.getAudioTracks();
+    if (!tracks.length || tracks.some((track) => track.readyState !== "live"))
+      throw new Error("Microphone already ended");
+    for (const track of tracks)
+      track.onended = () => {
+        void fail(run, "Microphone ended unexpectedly; transcript is incomplete");
+      };
+    run.captureRate = tracks[0].getSettings().sampleRate ?? null;
     if (run.context.sampleRate !== 16000) throw new Error("Unsupported AudioContext sample rate");
     await run.context.audioWorklet.addModule("/capture.mjs");
     if (run !== current || run.phase !== "connecting") {
@@ -118,7 +127,6 @@ async function capture(run) {
 async function start(target) {
   if (!authorized || (current && !terminal(current))) return;
   const run = {
-    generation: ++generation,
     target,
     phase: "connecting",
     started: performance.now(),
@@ -209,6 +217,10 @@ async function start(target) {
 async function stop() {
   const run = current;
   if (!run || run.phase !== "recording") return;
+  if (run.stream.getAudioTracks().some((track) => track.readyState !== "live")) {
+    await fail(run, "Microphone ended unexpectedly; transcript is incomplete");
+    return;
+  }
   run.phase = "flushing";
   status("Stopping capture and finalizing transcription…");
   render();
@@ -222,6 +234,10 @@ async function stop() {
       };
       run.node.port.postMessage("flush");
     });
+    if (run.stream.getAudioTracks().some((track) => track.readyState !== "live")) {
+      await fail(run, "Microphone ended unexpectedly; transcript is incomplete");
+      return;
+    }
     await release(run);
     if (run !== current || terminal(run)) return;
     if (samples !== run.samples) throw new Error("sample count mismatch");
