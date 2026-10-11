@@ -59,6 +59,7 @@ export interface E2EInstanceLiveStatus {
   activeState: string;
   subState: string;
   result: string;
+  execStart?: string;
 }
 
 export interface E2EInstanceStatus {
@@ -155,18 +156,59 @@ function configuredCoordinatorSocketDirectory(configPath: string): string | unde
 }
 
 function parseSystemdStatus(output: string): E2EInstanceLiveStatus {
-  const values = new Map(
-    output
-      .trim()
-      .split("\n")
-      .map((line) => line.split("=", 2) as [string, string])
-  );
+  const values = new Map<string, string>();
+  for (const rawLine of output.trim().split("\n")) {
+    const line = rawLine.trim();
+    const eq = line.indexOf("=");
+    if (eq !== -1) {
+      values.set(line.slice(0, eq), line.slice(eq + 1));
+    }
+  }
   return {
     loadState: values.get("LoadState") ?? "unknown",
     activeState: values.get("ActiveState") ?? "unknown",
     subState: values.get("SubState") ?? "unknown",
     result: values.get("Result") ?? "unknown",
+    execStart: values.get("ExecStart"),
   };
+}
+
+function extractArgv(execStart: string): string {
+  const match = execStart.match(/argv\[\]=(.*?)(?:;\s*[a-zA-Z0-9_]+=|(?:\s*}\s*$)|$)/s);
+  return match ? match[1].trim() : execStart.trim();
+}
+
+function parseArgvTokens(argvStr: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let inDouble = false;
+  let inSingle = false;
+  let escaped = false;
+
+  for (let i = 0; i < argvStr.length; i++) {
+    const ch = argvStr[i];
+    if (escaped) {
+      current += ch;
+      escaped = false;
+    } else if (ch === "\\") {
+      escaped = true;
+    } else if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+    } else if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+    } else if (/\s/.test(ch) && !inDouble && !inSingle) {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = "";
+      }
+    } else {
+      current += ch;
+    }
+  }
+  if (current.length > 0) {
+    tokens.push(current);
+  }
+  return tokens;
 }
 
 function resolveHostFlutterRoot(): string | undefined {
@@ -218,8 +260,12 @@ function isLoopbackPortReady(port: number): Promise<boolean> {
  * state that must refresh is mounted writable; static credentials remain
  * read-only. No unrelated home path is exposed.
  *
- * Teardown has exactly three callers: the MCP down/stop tools, the existing
- * actor-retirement cleanup cascade, and the mesh shutdown paths in start.ts.
+ * The supervisor unit has three teardown/stop callers: deliberate teardown via
+ * the MCP down/stop tools, the existing actor-retirement cleanup cascade, and
+ * the restart-preserving mesh shutdown path in start.ts. Deliberate teardown
+ * (down, retirement) stops the unit and reclaims the holder record, runtime,
+ * and run root; mesh shutdown stops only the unit this instance holds and
+ * preserves the holder record and resumable root so the instance can be resumed.
  * There is deliberately no run-end hook, capability-revoke hook, timeout, or
  * poller. Restart=always keeps unexpected child exits (including OOM) restarting
  * in place, with a start limit preventing a configuration error from crash-looping.
@@ -314,6 +360,8 @@ export class E2EInstanceManager {
           "SubState",
           "-p",
           "Result",
+          "-p",
+          "ExecStart",
         ])
       );
     } catch {
@@ -327,6 +375,32 @@ export class E2EInstanceManager {
       status.activeState !== "inactive" &&
       status.activeState !== "failed"
     );
+  }
+
+  /**
+   * Verifies that the live unit was launched by this instance by checking whether
+   * its systemd ExecStart metadata binds this instance's runtime directory.
+   */
+  private ownsLiveUnit(liveStatus: E2EInstanceLiveStatus): boolean {
+    if (!this.isLive(liveStatus)) return false;
+    if (!liveStatus.execStart) return false;
+    const runtime = this.runtimeDir;
+    const realRuntime = realpathIfExists(runtime);
+    const validTargets = new Set([runtime, realRuntime]);
+
+    const argvStr = extractArgv(liveStatus.execStart);
+    const tokens = parseArgvTokens(argvStr);
+
+    for (let i = 0; i < tokens.length - 2; i++) {
+      if (
+        (tokens[i] === "--bind" || tokens[i] === "--ro-bind") &&
+        validTargets.has(tokens[i + 1]) &&
+        validTargets.has(tokens[i + 2])
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private validateOwnedWorktree(actorId: string, requestedPath: string): string {
@@ -905,8 +979,35 @@ export class E2EInstanceManager {
     if (this.readRecord()?.actorId === actorId) this.stopUnit();
   }
 
+  /**
+   * Stops the supervisor unit on mesh process shutdown if and only if this
+   * instance holds it and the live unit was launched by this instance (verified
+   * via systemd ExecStart metadata binding this instance's runtime directory),
+   * while preserving the holder record, resumable run root, database, and
+   * runtime state so the holder can resume the instance after restart. A
+   * non-holding instance's shutdown neither stops another instance's unit nor
+   * modifies its state.
+   */
   stopForMeshShutdown(): void {
-    if (this.readRecord() || this.isLive(this.liveStatus())) this.stopUnit();
+    const holder = this.readRecord();
+    if (!holder) return;
+
+    const live = this.liveStatus();
+    if (!this.isLive(live)) {
+      teardownFlutterOverlay(this.runtimeDir);
+      return;
+    }
+
+    if (!live.execStart) {
+      throw new Error(
+        `e2e-instance: live unit ${E2E_INSTANCE_UNIT_NAME} metadata unavailable; cannot verify ownership on shutdown`
+      );
+    }
+
+    if (this.ownsLiveUnit(live)) {
+      this.exec("systemctl", ["--user", "stop", E2E_INSTANCE_UNIT_NAME]);
+      teardownFlutterOverlay(this.runtimeDir);
+    }
   }
 
   /**
@@ -956,7 +1057,7 @@ export class E2EInstanceManager {
     teardownFlutterOverlay(this.runtimeDir);
     rmSync(this.stateFile, { force: true });
     rmSync(this.runtimeDir, { recursive: true, force: true });
-    // Deliberate teardown (down, retirement, mesh shutdown) discards the
+    // Deliberate teardown (down, retirement) discards the
     // record, so the root it named is no longer resumable by anyone.
     this.discardRunRoot(holder?.resumableRoot);
   }
