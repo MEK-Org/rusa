@@ -208,9 +208,15 @@ Classes are managed at runtime by the root actor with `set_model_class`,
 table of the mesh database, not in `config.yaml`. A class reference is the whole
 `model_config` value (it cannot nest inside a pool or another class), every
 entry must name a configured provider and an explicit model, an unknown class is
-an error, and a multi-entry class still requires a portable actor. Selection
-snapshots the resolved pool onto the actor, so editing a class only affects
-later spawns; move an existing actor with `set_actor_model`.
+an error, and a multi-entry class still requires a portable actor.
+
+An actor spawned or moved with a class reference stays bound to that class: its
+pool is read from the class's current definition, so a `set_model_class` edit
+shows up immediately and takes effect on each bound actor's next run without a
+restart. A run that has already launched keeps the pool it launched on. An
+explicitly declared tuple or pool is a snapshot that class edits never touch, as
+is a legacy record written before class provenance was retained. Move an
+existing actor to a different class or pool with `set_actor_model`.
 
 ## Quota
 
