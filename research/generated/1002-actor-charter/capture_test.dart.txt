@@ -1,0 +1,247 @@
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:rusa_dashboard/models.dart';
+import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/theme.dart';
+import 'package:rusa_dashboard/widgets/actor_tree.dart';
+import 'package:rusa_dashboard/widgets/dashboard_body.dart';
+import 'package:rusa_dashboard/widgets/detail_panel.dart';
+import 'package:rusa_dashboard/widgets/overview_tab.dart';
+
+import 'fakes.dart';
+import 'screenshot_support.dart';
+
+const defaultRootCharter =
+    'Root Orchestrator: Coordinates worker subagents, triages incoming events, maintains project goals, and oversees codebase tasks.';
+
+const defaultRootTitle =
+    'Root Orchestrator: Coordinates worker subagents, triages incoming events, maintains project goals,…';
+
+const rootActorCharter = '''# rusa — root actor
+
+You are **rusa**: a single, persistent engineering colleague. There is one
+of you across every repo and conversation, and you speak in your own voice.
+
+You wake when durable inbox work is available. The prompt never carries event or
+message content. Use identifiers from inbox items to read the content from its
+source (for example, GitHub read MCPs for a GitHub item) plus enough surrounding
+context to understand the message. Never rely on memory of external state
+(issues, PRs, chat): it changes between runs.
+
+On each wake:
+1. Look at what's relevant using your connected tools — the tracker (issues, PRs,
+   review comments) and chat. Always re-read fresh; enumerate, don't assume.
+2. Decide what, if anything, needs doing, then either do the work directly (in
+   the repositories you've been granted) or reply conversationally.
+3. Be communicative — say what you're about to do and what you did, in your own
+   voice, the way a thoughtful colleague would.
+
+Reply where the conversation is happening. If a GitHub event woke you — a comment,
+a review, an issue — respond there, on the PR or issue itself. A 👀 "seen" reaction
+is added mechanically to whatever woke you, so you don't need to add one yourself.
+If a chat message woke you, reply in that chat. Don't relocate a conversation to
+another channel unless it genuinely needs separate attention.
+
+Deposit durable decisions and context into your long-term library, so future you
+and future work can rely on them rather than re-deriving from scratch.
+
+Your own actions should not wake you — but always check the *source* of whatever
+woke you and whether it actually calls for a response.''';
+
+const rootActorPreview =
+    '# rusa — root actor\n\nYou are **rusa**: a single, persistent engineering colleague. There is one\nof you across every repo and conversation, and you speak in your own voice.\n\nYou wake when durable inbox work is available. The prompt never carries event or\nmessage content. Use identifiers from…';
+
+const rootActorTitle = '# rusa — root actor';
+
+final String _outDir = '${Directory.current.path}/screenshots/1002';
+
+List<String> _seedIds() => const [
+      'root',
+      '11111111-1111-4111-8111-111111111111',
+      '22222222-2222-4222-8222-222222222222',
+      '33333333-3333-4333-8333-333333333333',
+      '44444444-4444-4444-8444-444444444444',
+    ];
+
+List<ThreadDto> _seedThreads({required bool isAfter}) => [
+      ThreadDto(
+        id: 'root',
+        handle: 'silicon-familiar',
+        parentId: null,
+        status: 'active',
+        provider: 'anthropic',
+        model: 'claude-opus-4-8',
+        charterPreview: isAfter ? rootActorPreview : defaultRootCharter,
+        title: isAfter ? rootActorTitle : defaultRootTitle,
+        createdAt: '2026-06-26T09:00:00Z',
+        runState: RunState.running,
+      ),
+      ThreadDto(
+        id: '11111111-1111-4111-8111-111111111111',
+        handle: 'cloudy-porpoise',
+        parentId: 'root',
+        status: 'active',
+        provider: 'anthropic',
+        model: 'claude-opus-4-8',
+        charterPreview:
+            'dashboard-refinements implementer: enlarge the detail avatar, fix the circular clip, coalesce run rows.',
+        title:
+            'dashboard-refinements implementer: enlarge the detail avatar, fix the circular clip, coalesce run rows.',
+        createdAt: '2026-06-26T09:01:00Z',
+        runState: RunState.running,
+      ),
+      ThreadDto(
+        id: '22222222-2222-4222-8222-222222222222',
+        handle: 'burning-paca',
+        parentId: 'root',
+        status: 'active',
+        provider: 'anthropic',
+        model: 'claude-opus-4-8',
+        charterPreview: 'mesh-architecture elder',
+        title: 'mesh-architecture elder',
+        createdAt: '2026-06-26T09:02:00Z',
+        runState: RunState.idle,
+      ),
+      ThreadDto(
+        id: '33333333-3333-4333-8333-333333333333',
+        handle: 'kinetic-deer',
+        parentId: '11111111-1111-4111-8111-111111111111',
+        status: 'active',
+        provider: 'google',
+        model: 'gemini-2.5-pro',
+        charterPreview: 'screenshot sub-worker',
+        title: 'screenshot sub-worker',
+        createdAt: '2026-06-26T09:03:00Z',
+        runState: RunState.idle,
+      ),
+      ThreadDto(
+        id: '44444444-4444-4444-8444-444444444444',
+        handle: 'misty-otter',
+        parentId: 'root',
+        status: 'retired',
+        provider: 'anthropic',
+        model: 'claude-opus-4-8',
+        charterPreview: 'retired reviewer',
+        title: 'retired reviewer',
+        createdAt: '2026-06-26T09:04:00Z',
+        runState: RunState.idle,
+      ),
+    ];
+
+Widget _app(DashboardStore store, Key boundaryKey) => MaterialApp(
+      debugShowCheckedModeBanner: false,
+      theme: buildMeshTheme(),
+      home: Scaffold(
+        backgroundColor: MeshColors.bgPrimary,
+        body: RepaintBoundary(
+          key: boundaryKey,
+          child: DashboardBody(store: store),
+        ),
+      ),
+    );
+
+void main() {
+  setUpAll(() async {
+    await loadFonts();
+  });
+
+  for (final phase in ['before', 'after']) {
+    final isAfter = phase == 'after';
+
+    testWidgets('renders synthetic dashboard $phase charter change',
+        (tester) async {
+      await tester.runAsync(() async {
+        final ids = _seedIds();
+        HttpOverrides.global = FakeImageHttpOverrides(await portraits(ids));
+        addTearDown(() => HttpOverrides.global = null);
+
+        final api = FakeApi()
+          ..threadsResult = _seedThreads(isAfter: isAfter)
+          ..charters['root'] = isAfter ? rootActorCharter : defaultRootCharter;
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        store.clickActor('root');
+
+        await tester.binding.setSurfaceSize(const Size(1360, 840));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final key = GlobalKey();
+        await tester.pumpWidget(_app(store, key));
+
+        // Switch from Overview to Actors tab
+        await tester.tap(find.text('Actors'));
+        await tester.pump();
+        await settleImages(tester, portraitUrls(ids));
+
+        expect(find.byType(OverviewTab), findsNothing);
+        expect(find.byType(ActorTree), findsOneWidget);
+
+        // Switch detail pane to Info tab to show the Charter section
+        await tester.ensureVisible(find.text('Info'));
+        await tester.tap(find.text('Info'));
+        for (var i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 50));
+        }
+        expect(find.text('Charter'), findsOneWidget);
+
+        // 1) Wide overview: shows both ActorTree on left and Info panel with Charter on right
+        await captureBoundary(key, '$_outDir/charter_overview_$phase.png');
+
+        // 2) Focused ActorTree (tree list view)
+        final treeKey = GlobalKey();
+        await tester.pumpWidget(
+          MaterialApp(
+            debugShowCheckedModeBanner: false,
+            theme: buildMeshTheme(),
+            home: Scaffold(
+              backgroundColor: MeshColors.bgPrimary,
+              body: RepaintBoundary(
+                key: treeKey,
+                child: Container(
+                  width: 420,
+                  height: 480,
+                  color: MeshColors.bgPrimary,
+                  child: ActorTree(store: store),
+                ),
+              ),
+            ),
+          ),
+        );
+        await settleImages(tester, portraitUrls(ids));
+        await captureBoundary(treeKey, '$_outDir/actor_tree_preview_$phase.png');
+
+        // 3) Focused DetailPanel (Info tab)
+        final detailKey = GlobalKey();
+        await tester.pumpWidget(
+          MaterialApp(
+            debugShowCheckedModeBanner: false,
+            theme: buildMeshTheme(),
+            home: Scaffold(
+              backgroundColor: MeshColors.bgPrimary,
+              body: RepaintBoundary(
+                key: detailKey,
+                child: Container(
+                  width: 650,
+                  height: 750,
+                  color: MeshColors.bgPrimary,
+                  child: DetailPanel(store: store),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.tap(find.text('Info'));
+        for (var i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 50));
+        }
+        expect(find.text('Charter'), findsOneWidget);
+        await captureBoundary(
+            detailKey, '$_outDir/full_charter_detail_$phase.png');
+
+        await store.dispose();
+      });
+    });
+  }
+}
