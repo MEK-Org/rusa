@@ -317,11 +317,14 @@ function treeFindings(candidate: ActorRecord, records: readonly ActorRecord[]): 
 
 /**
  * Evidence that a sole top-level record ran as a spawned actor, which would
- * have given it a workspace under `workers/`. A hard refusal for any id but the
- * legacy `root`: `workers/root` is a reserved shared directory, not a
- * workspace that spawning created, so its presence says nothing about how
- * `root` began. An operator whose configured actor has a workspace for another
- * reason names it with --import-actor, which skips this check.
+ * have given it a workspace under `workers/`. A hard refusal for any id that is
+ * not a reserved worker-directory name (`isReservedWorkerDirectory`: `root`,
+ * `quota-probe-*`, `model-probe-*`). Those directories are created for the
+ * legacy `root` actor and for quota and model scraping, not by spawning, so
+ * their presence says nothing about how an actor of that name began. Spawned
+ * actors get minted UUIDs, so only a legacy id can take a reserved name. An
+ * operator whose configured actor has a workspace for another reason names it
+ * with --import-actor, which skips this check.
  */
 function workspaceFindings(candidate: ActorRecord, workersDir: string): string[] {
   if (isReservedWorkerDirectory(candidate.id)) return [];

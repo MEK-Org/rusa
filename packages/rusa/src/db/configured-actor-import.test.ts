@@ -511,25 +511,27 @@ describe("configured-actor import (#1002)", () => {
       );
     });
 
-    it("adopts the legacy 'root' actor even when workers/root exists", () => {
+    // Any reserved worker-directory name is exempt, not only `root`.
+    it.each([
+      "root",
+      "quota-probe-legacy",
+    ])("adopts a legacy %s actor even when its reserved workers/ directory exists", (id) => {
       insertAll([
-        actor("root", {
+        actor(id, {
           parentId: null,
           charter: DEFAULT_ROOT_CHARTER,
           context: { type: "native" },
           sessionId: "root-session-1",
           executionConfig: { unsandboxed: true },
         }),
-        actor("worker", { parentId: "root", context: { type: "portable", mode: "tail" } }),
+        actor("worker", { parentId: id, context: { type: "portable", mode: "tail" } }),
       ]);
-      mkdirSync(join(home, "workers", "root"), { recursive: true });
-      writeFileSync(join(home, "workers", "root", "e2e-verify"), "synthetic");
+      mkdirSync(join(home, "workers", id), { recursive: true });
+      writeFileSync(join(home, "workers", id, "e2e-verify"), "synthetic");
 
       const result = run();
-      expect(result.plan).toEqual({ kind: "adopt", actorId: "root", selected: false });
-      expect(repositories.legacyImportReceipts.actorFor(CONFIGURED_ACTOR_IMPORT_SOURCE)).toBe(
-        "root"
-      );
+      expect(result.plan).toEqual({ kind: "adopt", actorId: id, selected: false });
+      expect(repositories.legacyImportReceipts.actorFor(CONFIGURED_ACTOR_IMPORT_SOURCE)).toBe(id);
     });
 
     it("refuses a named actor that does not exist or is not top-level", () => {
