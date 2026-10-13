@@ -313,7 +313,7 @@ void main() {
       final api = FakeApi()
         ..threadsResult = [makeThread('root'), makeThread('peer')]
         ..obligationsResult = [ob]
-        ..obExternalReferences['detail'] = reference;
+        ..referencesResult[reference.ref] = reference;
       await showDetail(tester, api, size: const Size(390, 844));
       expect(find.text('root → peer'), findsNothing);
       expect(find.text('root-handle → peer-handle'), findsOneWidget);

@@ -66,6 +66,69 @@ class WebObligationsCache implements ObligationsCache {
     }
   }
 
+  static String _entitiesKey(String scope, String principalId) =>
+      'rusa.dashboard.obligations.entities.v${PersistedObligationEntitiesSnapshot.schemaVersion}.'
+      '${Uri.encodeComponent(scope)}.${Uri.encodeComponent(principalId)}';
+
+  @override
+  PersistedObligationEntitiesSnapshot? loadEntities({
+    required String scope,
+    required String principalId,
+  }) {
+    try {
+      if (principalId.isEmpty) return null;
+      final raw = web.window.localStorage.getItem(
+        _entitiesKey(scope, principalId),
+      );
+      if (raw == null || raw.isEmpty) return null;
+      final rawByteCount = PersistedObligationsSnapshot.encodedSize(raw);
+      if (rawByteCount >
+          PersistedObligationEntitiesSnapshot.maxSerializedBytes) {
+        return null;
+      }
+      return PersistedObligationEntitiesSnapshot.fromJson(
+        jsonDecode(raw),
+        serializedByteCount: rawByteCount,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  void saveEntities(PersistedObligationEntitiesSnapshot snapshot) {
+    try {
+      final raw = snapshot.encode();
+      final key = _entitiesKey(snapshot.scope, snapshot.principalId);
+      if (!PersistedObligationEntitiesSnapshot.rawFitsStorageBudget(raw)) {
+        // A store that outgrew the budget must not leave an older capture
+        // behind to replay.
+        web.window.localStorage.removeItem(key);
+        return;
+      }
+      web.window.localStorage.setItem(key, raw);
+    } catch (_) {
+      // Quota or private browsing: drop the older capture rather than keep it.
+      invalidateEntities(
+        scope: snapshot.scope,
+        principalId: snapshot.principalId,
+      );
+    }
+  }
+
+  @override
+  void invalidateEntities({
+    required String scope,
+    required String principalId,
+  }) {
+    try {
+      if (principalId.isEmpty) return;
+      web.window.localStorage.removeItem(_entitiesKey(scope, principalId));
+    } catch (_) {
+      // Best-effort.
+    }
+  }
+
   @override
   void clear() {
     try {

@@ -45,6 +45,7 @@ describe("E2EInstanceManager", () => {
   let flutterRoot = "";
   let claudeExecutable = "";
   let active = false;
+  let activeDescription: string | undefined;
   let stopFails = false;
   let calls: Array<{ file: string; args: string[] }> = [];
 
@@ -89,12 +90,16 @@ describe("E2EInstanceManager", () => {
     );
     writeFileSync(claudeExecutable, "");
     active = false;
+    activeDescription = undefined;
     stopFails = false;
     calls = [];
   });
 
   afterEach(() => {
     teardownFlutterOverlay(join(mcHome, "e2e-instance", "runtime"));
+    for (const name of ["mc-home-a", "mc-home-b"]) {
+      teardownFlutterOverlay(join(root, name, "e2e-instance", "runtime"));
+    }
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -115,19 +120,31 @@ describe("E2EInstanceManager", () => {
         calls.push({ file, args });
         if (file === "systemd-run") {
           active = true;
+          activeDescription = args
+            .find((arg) => arg.startsWith("--description="))
+            ?.slice("--description=".length);
           return "";
         }
         if (file === "systemctl" && args.includes("stop")) {
           if (stopFails) throw new Error("systemctl unavailable");
           active = false;
+          activeDescription = undefined;
           return "";
         }
-        return [
+        const lines = [
           "LoadState=loaded",
           `ActiveState=${active ? "active" : "inactive"}`,
           `SubState=${active ? "running" : "dead"}`,
           "Result=success",
-        ].join("\n");
+        ];
+        // systemd v252 bus_print_property prints a string property raw, or
+        // "[unprintable]" when it contains a newline.
+        if (active && activeDescription !== undefined) {
+          lines.push(
+            `Description=${activeDescription.includes("\n") ? "[unprintable]" : activeDescription}`
+          );
+        }
+        return lines.join("\n");
       },
       ...overrides,
     });
@@ -671,6 +688,7 @@ describe("E2EInstanceManager", () => {
     // Retirement drops the holder record, so the run root it named is
     // unresumable state and comes down with the instance.
     expect(existsSync(runRoot)).toBe(false);
+    expect(existsSync(join(mcHome, "e2e-instance.json"))).toBe(false);
   });
 
   it("reclaims the holder's run root on a deliberate down(), leaving nothing unresumable", async () => {
@@ -683,8 +701,14 @@ describe("E2EInstanceManager", () => {
 
     subject.down("actor-a");
 
+    expect(active).toBe(false);
     expect(existsSync(runRoot)).toBe(false);
     expect(existsSync(join(mcHome, "e2e-instance.json"))).toBe(false);
+    expect(subject.status().holder).toBeUndefined();
+
+    await expect(subject.resume("actor-a", runRoot)).rejects.toThrow(
+      "e2e-instance: no preserved holder record to resume; call up() to provision a fresh instance"
+    );
   });
 
   it("keeps the run root when a stop fails, since the holder record survives with it", async () => {
@@ -1186,6 +1210,75 @@ describe("E2EInstanceManager", () => {
       expect(calls.filter((call) => call.file === "systemd-run")).toHaveLength(1);
     });
 
+    it("does not attribute another home's live singleton to this preserved holder", async () => {
+      const mcHomeA = join(root, "mc-home-a");
+      const mcHomeB = join(root, "mc-home-b");
+      mkdirSync(mcHomeA, { recursive: true });
+      mkdirSync(mcHomeB, { recursive: true });
+      writeFileSync(join(mcHomeA, "config.yaml"), readFileSync(join(mcHome, "config.yaml")));
+      writeFileSync(join(mcHomeB, "config.yaml"), readFileSync(join(mcHome, "config.yaml")));
+
+      const actorWorktreeB = join(workersDir, "actor-b", "rusa");
+      mkdirSync(join(actorWorktreeB, "packages", "rusa", "scripts"), { recursive: true });
+      writeFileSync(
+        join(actorWorktreeB, "package.json"),
+        `${JSON.stringify({ packageManager: "pnpm@10.29.3" })}\n`
+      );
+      writeFileSync(join(actorWorktreeB, "packages", "rusa", "scripts", "e2e.mjs"), "");
+
+      const managerA = manager({ mcHome: mcHomeA });
+      const managerB = manager({ mcHome: mcHomeB });
+      await managerA.up("actor-a", actorWorktree);
+      const runRootA = managerA.status().holder?.resumableRoot;
+      if (!runRootA) throw new Error("expected runRoot for manager A");
+      writeResumableRootAt(runRootA);
+      managerA.stopForMeshShutdown();
+
+      await managerB.up("actor-b", actorWorktreeB);
+      const callsBeforeResume = calls.length;
+
+      await expect(managerA.resume("actor-a", runRootA)).rejects.toThrow(
+        /currently live but belongs to another instance or cannot be attributed; preserved holder handle-actor-a \(actor-a\) may resume only after that live unit becomes inactive/
+      );
+
+      expect(
+        calls.slice(callsBeforeResume).filter((call) => call.file === "systemd-run")
+      ).toHaveLength(0);
+      expect(active).toBe(true);
+      expect(managerA.status().holder?.actorId).toBe("actor-a");
+      expect(existsSync(runRootA)).toBe(true);
+
+      managerB.down("actor-b");
+      await expect(managerA.resume("actor-a", runRootA)).resolves.toMatchObject({ state: "up" });
+    });
+
+    it("does not attribute an unattributed pre-deploy live singleton to this preserved holder", async () => {
+      const subject = manager();
+      await subject.up("actor-a", actorWorktree);
+      const runRoot = subject.status().holder?.resumableRoot;
+      if (!runRoot) throw new Error("expected a persisted resumableRoot");
+      writeResumableRootAt(runRoot);
+      subject.stopForMeshShutdown();
+
+      // systemd always prints a loaded unit's Description; a unit launched
+      // before #1008 carries the fixed text that names no runtime directory.
+      active = true;
+      activeDescription = "Rusa live e2e instance";
+      const callsBeforeResume = calls.length;
+
+      await expect(subject.resume("actor-a", runRoot)).rejects.toThrow(
+        /currently live but belongs to another instance or cannot be attributed; preserved holder handle-actor-a \(actor-a\) may resume only after that live unit becomes inactive/
+      );
+
+      expect(calls.slice(callsBeforeResume).map((call) => call.file)).toEqual(["systemctl"]);
+      expect(active).toBe(true);
+      expect(subject.status().holder?.actorId).toBe("actor-a");
+      expect(existsSync(runRoot)).toBe(true);
+
+      active = false;
+      await expect(subject.resume("actor-a", runRoot)).resolves.toMatchObject({ state: "up" });
+    });
+
     it("rejects resume when no preserved holder record exists", async () => {
       const subject = manager();
 
@@ -1260,6 +1353,233 @@ describe("E2EInstanceManager", () => {
         startedAt: "2026-08-08T00:00:00.000Z",
         resumableRoot: resumeRoot,
       });
+    });
+  });
+
+  describe("mesh shutdown and holder ownership lifecycle", () => {
+    it("preserves holder record, resumable root, database, actor work, and session/context on holding-instance shutdown", async () => {
+      const subject = manager();
+      await subject.up("actor-a", actorWorktree);
+      const runRoot = subject.status().holder?.resumableRoot;
+      if (!runRoot) throw new Error("expected a persisted resumableRoot");
+
+      // Populate database, session/context, config, and actor work inside resumable root.
+      mkdirSync(join(runRoot, "home", "data"), { recursive: true });
+      writeFileSync(join(runRoot, "home", "data", "mesh.db"), "database-state-bytes");
+      writeFileSync(join(runRoot, "home", "config.yaml"), "providers: {}\n");
+      writeFileSync(join(runRoot, "home", "session-context.json"), JSON.stringify({ cursor: 42 }));
+      mkdirSync(join(runRoot, "scratch"), { recursive: true });
+      writeFileSync(join(runRoot, "scratch", "actor-work.txt"), "in-progress actor draft");
+      mkdirSync(join(runRoot, "remote", "repo.git"), { recursive: true });
+      writeFileSync(join(runRoot, "remote", "repo.git", "HEAD"), "ref: refs/heads/main\n");
+
+      expect(active).toBe(true);
+
+      // Holding-instance mesh shutdown stops the unit but preserves state.
+      subject.stopForMeshShutdown();
+
+      expect(active).toBe(false);
+      expect(calls.some((call) => call.file === "systemctl" && call.args.includes("stop"))).toBe(
+        true
+      );
+
+      // Attribution survives.
+      const stateFile = join(mcHome, "e2e-instance.json");
+      expect(existsSync(stateFile)).toBe(true);
+      expect(subject.status().holder).toEqual({
+        actorId: "actor-a",
+        actorHandle: "handle-actor-a",
+        worktree: actorWorktree,
+        unitName: E2E_INSTANCE_UNIT_NAME,
+        startedAt: "2026-08-08T00:00:00.000Z",
+        resumableRoot: runRoot,
+      });
+      expect(subject.status().state).toBe("down");
+
+      // Database, actor work, and session/context survive intact.
+      expect(existsSync(runRoot)).toBe(true);
+      expect(readFileSync(join(runRoot, "home", "data", "mesh.db"), "utf8")).toBe(
+        "database-state-bytes"
+      );
+      expect(readFileSync(join(runRoot, "home", "session-context.json"), "utf8")).toBe(
+        JSON.stringify({ cursor: 42 })
+      );
+      expect(readFileSync(join(runRoot, "scratch", "actor-work.txt"), "utf8")).toBe(
+        "in-progress actor draft"
+      );
+      expect(readFileSync(join(runRoot, "remote", "repo.git", "HEAD"), "utf8")).toBe(
+        "ref: refs/heads/main\n"
+      );
+    });
+
+    it("resumes successfully after holding-instance mesh shutdown and restart", async () => {
+      const subject = manager();
+      await subject.up("actor-a", actorWorktree);
+      const runRoot = subject.status().holder?.resumableRoot;
+      if (!runRoot) throw new Error("expected a persisted resumableRoot");
+
+      mkdirSync(join(runRoot, "home", "data"), { recursive: true });
+      writeFileSync(join(runRoot, "home", "data", "mesh.db"), "persisted-db");
+      writeFileSync(join(runRoot, "home", "config.yaml"), "providers: {}\n");
+      mkdirSync(join(runRoot, "remote", "repo.git"), { recursive: true });
+      writeFileSync(join(runRoot, "remote", "repo.git", "HEAD"), "ref: refs/heads/main\n");
+      mkdirSync(join(runRoot, "scratch", ".git"), { recursive: true });
+      writeFileSync(join(runRoot, "gitconfig"), "[user]\n");
+
+      subject.stopForMeshShutdown();
+      expect(active).toBe(false);
+
+      // A fresh manager instance pointing to the same mcHome simulates mesh restart.
+      const restarted = manager();
+      expect(restarted.status().state).toBe("down");
+      expect(restarted.status().holder?.resumableRoot).toBe(runRoot);
+
+      const status = await restarted.resume("actor-a", runRoot);
+      expect(status.state).toBe("up");
+      expect(status.holder?.actorId).toBe("actor-a");
+      expect(status.holder?.resumableRoot).toBe(runRoot);
+      expect(readFileSync(join(runRoot, "home", "data", "mesh.db"), "utf8")).toBe("persisted-db");
+    });
+
+    it("isolates non-holding instances: non-holder mesh shutdown neither stops the unit nor modifies state", async () => {
+      const mcHomeA = join(root, "mc-home-a");
+      const mcHomeB = join(root, "mc-home-b");
+      mkdirSync(mcHomeA, { recursive: true });
+      mkdirSync(mcHomeB, { recursive: true });
+      writeFileSync(join(mcHomeA, "config.yaml"), readFileSync(join(mcHome, "config.yaml")));
+      writeFileSync(join(mcHomeB, "config.yaml"), readFileSync(join(mcHome, "config.yaml")));
+
+      const managerA = manager({ mcHome: mcHomeA });
+      const managerB = manager({ mcHome: mcHomeB });
+
+      try {
+        // Manager A brings up the unit.
+        await managerA.up("actor-a", actorWorktree);
+        expect(active).toBe(true);
+        const runRootA = managerA.status().holder?.resumableRoot;
+        if (!runRootA) throw new Error("expected runRoot for manager A");
+
+        // Manager B sees the unit is live on the host/user systemd, but has no holder record in mcHomeB.
+        expect(managerB.status().state).toBe("up");
+        expect(managerB.status().holder).toBeUndefined();
+
+        const callsBefore = calls.length;
+
+        // Non-holding instance B shuts down.
+        managerB.stopForMeshShutdown();
+
+        // Manager B must NOT execute systemctl stop, and unit remains active.
+        const newCalls = calls.slice(callsBefore);
+        expect(
+          newCalls.some((call) => call.file === "systemctl" && call.args.includes("stop"))
+        ).toBe(false);
+        expect(active).toBe(true);
+
+        // Manager A's state and root are completely untouched.
+        expect(managerA.status().state).toBe("up");
+        expect(managerA.status().holder?.actorId).toBe("actor-a");
+        expect(existsSync(join(mcHomeA, "e2e-instance.json"))).toBe(true);
+        expect(existsSync(runRootA)).toBe(true);
+
+        // Manager B created no state files.
+        expect(existsSync(join(mcHomeB, "e2e-instance.json"))).toBe(false);
+      } finally {
+        teardownFlutterOverlay(join(mcHomeA, "e2e-instance", "runtime"));
+        teardownFlutterOverlay(join(mcHomeB, "e2e-instance", "runtime"));
+      }
+    });
+
+    it("keeps attribution and resumable state together on stop failure, retaining retry path", async () => {
+      const subject = manager();
+      await subject.up("actor-a", actorWorktree);
+      const runRoot = subject.status().holder?.resumableRoot;
+      if (!runRoot) throw new Error("expected a persisted resumableRoot");
+
+      stopFails = true;
+
+      // Stop failure throws so start.ts can log shutdown_not_committed and keep mesh up.
+      expect(() => subject.stopForMeshShutdown()).toThrow("systemctl unavailable");
+
+      // State is not destroyed when stop fails: attribution and run root survive together.
+      expect(existsSync(join(mcHome, "e2e-instance.json"))).toBe(true);
+      expect(existsSync(runRoot)).toBe(true);
+      expect(subject.status().holder?.resumableRoot).toBe(runRoot);
+
+      // Subsequent retry succeeds when systemctl is available.
+      stopFails = false;
+      subject.stopForMeshShutdown();
+
+      expect(active).toBe(false);
+      expect(existsSync(join(mcHome, "e2e-instance.json"))).toBe(true);
+      expect(existsSync(runRoot)).toBe(true);
+    });
+
+    // Each pair is two distinct homes that a display-parsing ownership check
+    // could conflate: a path prefix, and a literal quote that a shell-style
+    // tokenizer would strip from B's raw argv to yield A's path.
+    it.each([
+      ["a path-prefix", "mc-home-a", join("mc-home-a", "e2e-instance", "runtime-other")],
+      ["a literal-quote", "ab", 'a"b"'],
+    ])("preserves another home's live unit when an earlier holder with a preserved record shuts down (%s collision)", async (_shape, nameA, nameB) => {
+      const mcHomeA = join(root, nameA);
+      const mcHomeB = join(root, nameB);
+      mkdirSync(mcHomeA, { recursive: true });
+      mkdirSync(mcHomeB, { recursive: true });
+      writeFileSync(join(mcHomeA, "config.yaml"), readFileSync(join(mcHome, "config.yaml")));
+      writeFileSync(join(mcHomeB, "config.yaml"), readFileSync(join(mcHome, "config.yaml")));
+
+      const actorWorktreeB = join(workersDir, "actor-b", "rusa");
+      mkdirSync(join(actorWorktreeB, "packages", "rusa", "scripts"), { recursive: true });
+      writeFileSync(
+        join(actorWorktreeB, "package.json"),
+        `${JSON.stringify({ packageManager: "pnpm@10.29.3" })}\n`
+      );
+      writeFileSync(join(actorWorktreeB, "packages", "rusa", "scripts", "e2e.mjs"), "");
+
+      const managerA = manager({ mcHome: mcHomeA });
+      const managerB = manager({ mcHome: mcHomeB });
+
+      try {
+        await managerA.up("actor-a", actorWorktree);
+        managerA.stopForMeshShutdown();
+        expect(active).toBe(false);
+        expect(existsSync(join(mcHomeA, "e2e-instance.json"))).toBe(true);
+
+        await managerB.up("actor-b", actorWorktreeB);
+        expect(active).toBe(true);
+
+        // A restarts with its preserved record and shuts down again while B's
+        // launch is live: A must not stop it.
+        const callsBefore = calls.length;
+        managerA.stopForMeshShutdown();
+
+        expect(
+          calls
+            .slice(callsBefore)
+            .some((call) => call.file === "systemctl" && call.args.includes("stop"))
+        ).toBe(false);
+        expect(active).toBe(true);
+        expect(managerB.status().holder?.actorId).toBe("actor-b");
+        expect(existsSync(join(mcHomeA, "e2e-instance.json"))).toBe(true);
+      } finally {
+        teardownFlutterOverlay(join(mcHomeA, "e2e-instance", "runtime"));
+        teardownFlutterOverlay(join(mcHomeB, "e2e-instance", "runtime"));
+      }
+    });
+
+    it("stops its own live unit on shutdown when the home path contains whitespace", async () => {
+      const spacedHome = join(root, "has space");
+      mkdirSync(spacedHome, { recursive: true });
+      writeFileSync(join(spacedHome, "config.yaml"), readFileSync(join(mcHome, "config.yaml")));
+      const subject = manager({ mcHome: spacedHome });
+      try {
+        await subject.up("actor-a", actorWorktree);
+        subject.stopForMeshShutdown();
+        expect(active).toBe(false);
+        expect(existsSync(join(spacedHome, "e2e-instance.json"))).toBe(true);
+      } finally {
+        teardownFlutterOverlay(join(spacedHome, "e2e-instance", "runtime"));
+      }
     });
   });
 

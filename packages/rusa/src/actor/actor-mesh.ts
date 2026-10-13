@@ -13,6 +13,7 @@ import {
   isReadyForAttention,
   isTerminalObligationStatus,
   type Obligation,
+  type ObligationReassignment,
   type ObligationStatus,
   prerequisiteEdgeKey,
 } from "../obligations/obligation.js";
@@ -48,6 +49,7 @@ import {
   type MeshProviderGate,
   type QueuedSelection,
   type ResponsiveArrival,
+  type ResponsiveArrivalDisposition,
   RunManager,
   VOICE_INBOX_PAYLOAD_TYPE,
 } from "../runtime/run-manager.js";
@@ -274,6 +276,8 @@ export interface MeshObligationPort {
    * so strict closure judges an expired snooze by the ordinary rules.
    */
   expireDueSnoozes?(ids: readonly string[]): readonly string[];
+  /** The latest reassignment's message (#947), carried on ready-head attention. */
+  latestReassignment?(id: string): ObligationReassignment | null;
 }
 
 /**
@@ -783,8 +787,10 @@ export interface ActorMeshOptions {
   onQueued?: (actorId: string, context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Best-effort receipts for entries first accepted into an execution opportunity. */
   onInboxEntriesSeen?: (actorId: string, entries: readonly InboxEntry[]) => void;
-  /** Optional, shadow-only JEV policy; it never changes the v1 dispatch result. */
+  /** Optional JEV policy. In shadow mode (default), it never changes dispatch. In active mode, it conditionally suppresses preemption. */
   responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
+  /** The single authority for JEV responsive-interruption mode. Defaults to "shadow". */
+  responsiveInterruptionMode?: "shadow" | "active";
   /**
    * Posts a shadow verdict as a reaction on the chat message that arrived.
    * Only ever called when `responsiveInterruption` is also supplied, so an
@@ -880,6 +886,18 @@ interface SelectedHeadSnapshot {
   checkpointBy: string | null;
 }
 
+/**
+ * Responsive arrivals an active policy is holding back from a running actor's
+ * live selection, by inbox entry id: still being weighed, or judged able to
+ * wait for the follow-up turn. A decision applies only while its record is
+ * still the actor's current one, so any run or selection change that replaces
+ * or drops the record makes every earlier decision stale.
+ */
+interface ActiveInterruptionSuppression {
+  pending: Set<string>;
+  queued: Set<string>;
+}
+
 export class ActorMesh {
   readonly actors: ActorRepository;
   readonly principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
@@ -955,6 +973,8 @@ export class ActorMesh {
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
+  private readonly responsiveInterruptionMode: "shadow" | "active";
+  private readonly activeSuppressions = new Map<string, ActiveInterruptionSuppression>();
   private readonly reactToChatMessage?: ActorMeshOptions["reactToChatMessage"];
   private readonly grantable: ReadonlySet<string>;
   private readonly secretsDir: string;
@@ -1055,6 +1075,7 @@ export class ActorMesh {
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
     this.responsiveInterruption = opts.responsiveInterruption;
+    this.responsiveInterruptionMode = opts.responsiveInterruptionMode ?? "shadow";
     this.reactToChatMessage = opts.reactToChatMessage;
     // A host-global capability is never grantable through the mesh (#549), so
     // a wiring that lists one — the maintenance servers are registered like
@@ -1098,8 +1119,9 @@ export class ActorMesh {
               arrivals: readonly ResponsiveArrival[],
               isRunning: boolean
             ) => {
-              this.shadowResponsiveInterruptions(actorId, arrivals, isRunning);
+              return this.handleResponsiveArrivals(actorId, arrivals, isRunning);
             },
+            isPreemptionSuppressed: (actorId: string) => this.isPreemptionSuppressed(actorId),
           }
         : {}),
       onInternalPort: (port) => {
@@ -1137,6 +1159,7 @@ export class ActorMesh {
       });
       this.unsubscribeInboxHandled = opts.inboxStore.onItemsHandled((actorId) => {
         this.cancelEmptyQueuedRun(actorId);
+        this.onItemsMarkedHandled(actorId);
       });
     }
   }
@@ -1316,12 +1339,32 @@ export class ActorMesh {
    * changing stable creation metadata.
    */
   adopt(record: ActorRecord, actor: MeshActor): void {
+    this.assertSingleTopLevel(record);
     const existing = this.actors.get(record.id);
     this.actors.upsert(existing ? { ...existing, ...record } : record);
     this.runs.register(record.id, actor);
     if (actor.lifecycle) this.lifecycles.set(record.id, actor.lifecycle);
     else this.lifecycleFor(record.id);
     this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
+  }
+
+  /**
+   * The running daemon still boots exactly one top-level actor. The repository
+   * can store several parentless actors now (#550), but that is not authority
+   * to create them: until forest boot lands, adoption refuses a second one,
+   * retired or not, as the dropped unique index did. {@link spawn} cannot make
+   * one at all, since it always resolves a parent.
+   */
+  private assertSingleTopLevel(record: ActorRecord): void {
+    if (record.parentId !== null) return;
+    const other = this.actors
+      .list()
+      .find((existing) => existing.parentId === null && existing.id !== record.id);
+    if (other) {
+      throw new Error(
+        `Cannot add ${record.id} as a second top-level actor: ${other.id} is already top-level`
+      );
+    }
   }
 
   /**
@@ -1486,6 +1529,155 @@ export class ActorMesh {
     const resolved = this.resolveThreadId(actorId);
     this.appendWakesOwed.delete(resolved);
     return this.runs.dispatch(resolved);
+  }
+
+  isPreemptionSuppressed(actorId: string): boolean {
+    actorId = this.resolveThreadId(actorId);
+    return this.activeSuppressions.has(actorId);
+  }
+
+  private handleResponsiveArrivals(
+    actorId: string,
+    incoming: readonly ResponsiveArrival[],
+    wasRunning: boolean
+  ): ResponsiveArrivalDisposition | undefined {
+    if (this.responsiveInterruptionMode === "active") {
+      return this.handleActiveResponsiveArrivals(actorId, incoming, wasRunning);
+    }
+    this.shadowResponsiveInterruptions(actorId, incoming, wasRunning);
+  }
+
+  private hasLiveUnhandledSelection(actorId: string, selectedEntryIds: readonly string[]): boolean {
+    if (selectedEntryIds.length === 0) return false;
+    const inbox = this.inboxStore;
+    if (!inbox) return false;
+    for (const id of selectedEntryIds) {
+      const entry = inbox.read(actorId, id);
+      if (entry && !entry.handledAt) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Drop the actor's held arrivals once the selection they were weighed
+   * against no longer stands. Preempt only if one of them is still unhandled
+   * and not now part of the run's own selection: otherwise no responsive work
+   * is left for a replacement run, and cancelling would only discard the
+   * running turn.
+   */
+  private invalidateActiveInterruption(actorId: string): void {
+    const resolved = this.resolveThreadId(actorId);
+    const active = this.activeSuppressions.get(resolved);
+    if (!active) return;
+    this.activeSuppressions.delete(resolved);
+    if (!this.runs.liveActor(resolved)?.isRunning) return;
+    const selected = new Set(this.selectedInboxEntries(resolved));
+    const remaining = [...active.pending, ...active.queued].some((id) => {
+      const entry = this.inboxStore?.read(resolved, id);
+      return entry && !entry.handledAt && !selected.has(id);
+    });
+    if (remaining) this.runs.preemptLiveActor(resolved);
+  }
+
+  private clearActiveInterruption(actorId: string): void {
+    const resolved = this.resolveThreadId(actorId);
+    this.activeSuppressions.delete(resolved);
+  }
+
+  /**
+   * Held arrivals wait on the live selection as a whole, the same test that
+   * admitted them: handling one selected entry while others remain open keeps
+   * them held. Once the last one is handled, an arrival already judged able to
+   * wait keeps waiting for the follow-up turn, so the run can finish its tail
+   * steps; the record stays until the run ends, so a later poke cannot preempt
+   * it. An arrival still being weighed has no verdict and nothing left to be
+   * weighed against, so it falls back to interrupting.
+   */
+  private onItemsMarkedHandled(actorId: string): void {
+    const resolved = this.resolveThreadId(actorId);
+    const active = this.activeSuppressions.get(resolved);
+    if (!active) return;
+    if (this.hasLiveUnhandledSelection(resolved, [...this.selectedInboxEntries(resolved)])) return;
+    if (active.pending.size > 0) this.invalidateActiveInterruption(resolved);
+  }
+
+  private handleActiveResponsiveArrivals(
+    actorId: string,
+    incoming: readonly ResponsiveArrival[],
+    wasRunning: boolean
+  ): ResponsiveArrivalDisposition | undefined {
+    const classifier = this.responsiveInterruption;
+    if (!classifier || incoming.length === 0 || !wasRunning) return;
+
+    // Explicit Run Now always interrupts immediately without JEV call.
+    // Any interrupting batchrow wins: if any row is operator.run_now, preemption cannot be suppressed.
+    // The dispatch preempts on its own, so held arrivals are simply dropped.
+    if (incoming.some(({ entry }) => entry.payload.type === "operator.run_now")) {
+      this.clearActiveInterruption(actorId);
+      return { suppressPreemption: false };
+    }
+
+    const interrupting = incoming.filter(({ baseline }) => baseline === "interrupt");
+    if (interrupting.length === 0) return;
+
+    const selectedEntryIds = [...this.selectedInboxEntries(actorId)];
+    if (!this.hasLiveUnhandledSelection(actorId, selectedEntryIds)) {
+      // No live unhandled selection: baseline interrupts without JEV call
+      this.clearActiveInterruption(actorId);
+      return { suppressPreemption: false };
+    }
+
+    const active = this.activeSuppressions.get(actorId) ?? {
+      pending: new Set<string>(),
+      queued: new Set<string>(),
+    };
+    this.activeSuppressions.set(actorId, active);
+
+    for (const { entry, baseline } of interrupting) {
+      const incomingEntryId = entry.id;
+      const evaluationId = this.idgen();
+      active.pending.add(incomingEntryId);
+      // Apply a decision only to the record it was made for; returns whether it applied.
+      const settle = (outcome: "interrupt" | "queue"): boolean => {
+        if (this.activeSuppressions.get(actorId) !== active) return false;
+        if (!active.pending.has(incomingEntryId)) return false;
+        if (outcome === "interrupt") {
+          this.invalidateActiveInterruption(actorId);
+        } else {
+          active.pending.delete(incomingEntryId);
+          active.queued.add(incomingEntryId);
+        }
+        return true;
+      };
+
+      void classifier
+        .evaluate({
+          evaluationId,
+          actorId,
+          incomingEntryId,
+          selectedEntryIds,
+          pendingEntryIds: [],
+        })
+        .then((decision) => {
+          const applied = settle(decision.outcome);
+          this.recordEvent({
+            kind: "responsive_interruption_shadow",
+            actorId,
+            detail: "active",
+            payload: JSON.stringify({ evaluationId, baseline, decision, applied }),
+          });
+          const prediction = shadowPrediction(decision);
+          if (prediction) this.postShadowReaction(entry.payload, prediction, incomingEntryId);
+        })
+        .catch(() => {
+          this.log(`responsive interruption active observation failed for ${incomingEntryId}`);
+          settle("interrupt");
+        });
+    }
+
+    return { suppressPreemption: true };
   }
 
   /**
@@ -1671,6 +1863,7 @@ export class ActorMesh {
   actorQueued(actorId: string, context: { responsive: boolean; mode: ActorRunMode }): InboxEntry[] {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
+    this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
     // Open the run-scoped head window. An actor absent from this set delivers
     // head attention immediately, which is what every non-run producer wants.
@@ -1779,6 +1972,7 @@ export class ActorMesh {
       : [];
     beforeCommit?.(entries);
     this.selectedInboxEntryIds.set(actorId, unique);
+    this.invalidateActiveInterruption(actorId);
     if (headObligationIds.length > 0 && supportsObligationClosureReads(closure)) {
       const run: HeadClosureRunState = this.headClosureRuns.get(actorId) ?? {
         headObligationIds: new Set<string>(),
@@ -2101,6 +2295,7 @@ export class ActorMesh {
       );
     }
     this.selectedInboxEntryIds.delete(actorId);
+    this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
     this.flushRunResponsiveReadyAttention(actorId);
@@ -2424,6 +2619,7 @@ export class ActorMesh {
   abandonInboxRun(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
+    this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
     this.flushRunResponsiveReadyAttention(actorId);
@@ -2574,6 +2770,7 @@ export class ActorMesh {
       actorId
     );
     const responsive = head.responsive === true;
+    const latestReassignment = this.readLatestReassignment(head.id);
     const entries = this.inboxStore.append([
       {
         id: entryId,
@@ -2583,6 +2780,9 @@ export class ActorMesh {
           type: "obligation.ready_head",
           obligationId: head.id,
           intent: head.intent ?? undefined,
+          // Why the obligation was handed here (#947), so the owner can act on
+          // it without a further read. Absent when there is no such message.
+          ...(latestReassignment ? { latestReassignment } : {}),
           // A responsive head's attention is immediately responsive work:
           // it preempts where the inbox model admits preemption. The priority
           // written here is the only thing that makes the dispatch below
@@ -2596,6 +2796,22 @@ export class ActorMesh {
     }
     this.dispatch(actorId);
     return true;
+  }
+
+  /**
+   * The head's latest reassignment message, read when its attention is
+   * appended. The message only enriches the entry, so a failed read omits it
+   * rather than costing the owner their attention.
+   */
+  private readLatestReassignment(obligationId: string): ObligationReassignment | null {
+    try {
+      return this.obligations?.latestReassignment?.(obligationId) ?? null;
+    } catch (err) {
+      this.log(
+        `latest reassignment read failed for ${obligationId}: ${err instanceof Error ? err.message : String(err)}`
+      );
+      return null;
+    }
   }
 
   /**
@@ -3061,7 +3277,11 @@ export class ActorMesh {
       // instead of creating a fresh one (loadSessionId reads record.sessionId).
       sessionId: req.conversationId,
       title: req.title,
-      executionTarget: req.executionTarget,
+      // A spawned child is sandboxed: the default, since spawn never asks
+      // for `unsandboxed` (#550).
+      ...(req.executionTarget !== undefined
+        ? { executionConfig: { executionTarget: req.executionTarget } }
+        : {}),
       // Every actor gets its own walkie-talkie voice at birth so a transfer or
       // multi-actor chat is audible as different speakers; the operator can
       // re-pick it from the actor info panel at any time.
@@ -3082,7 +3302,7 @@ export class ActorMesh {
     this.grantHandle(parentId, { id });
     let actor: MeshActor;
     try {
-      // `record.executionTarget` is `req.executionTarget`, so the placement a
+      // `record.executionConfig.executionTarget` is `req.executionTarget`, so the placement a
       // spawn asked for reaches the factory through the record like every
       // other construction input.
       actor = this.runs.instantiate(record);
@@ -3193,9 +3413,9 @@ export class ActorMesh {
 
   /**
    * Whether `actorId` currently holds `capability` as an active grant (#549).
-   * This is the only source of administrative authority: a parentless record,
-   * the `isRoot` flag, and the literal `root` address confer nothing on their
-   * own. Fail-closed — an unknown or unaddressed actor holds nothing.
+   * This is the only source of administrative authority: a parentless record
+   * and the literal `root` address confer nothing on their own. Fail-closed —
+   * an unknown or unaddressed actor holds nothing.
    */
   hasActiveCapability(actorId: string | undefined, capability: string): boolean {
     if (!actorId) return false;
@@ -4362,6 +4582,7 @@ export class ActorMesh {
   interrupt(targetId: string, by: string): { interrupted: boolean; status?: string } {
     targetId = this.resolveThreadId(targetId);
     by = this.resolveThreadId(by);
+    this.clearActiveInterruption(targetId);
     const target = this.runs.liveActor(targetId);
     if (!target) {
       return { interrupted: false, status: "not_live" };
@@ -5180,9 +5401,6 @@ export class ActorMesh {
     if (!record) {
       throw new Error(`Cannot reparent unknown thread: ${id}`);
     }
-    if (record.isRoot === true) {
-      throw new Error(`Cannot reparent the root (${id})`);
-    }
     if (record.parentId == null) {
       throw new Error(`Cannot give the top-level thread ${id} a parent`);
     }
@@ -5295,6 +5513,7 @@ export class ActorMesh {
     this.unsubscribeInboxHandled = undefined;
     this.appendWakesOwed.clear();
     this.runResponsiveReadyAttention.clear();
+    this.activeSuppressions.clear();
     this.runs.closeAll();
   }
 
@@ -5496,7 +5715,7 @@ export class ActorMesh {
     return {
       record,
       getRecord: () => this.actors.get(record.id),
-      executionTarget: record.executionTarget,
+      executionTarget: record.executionConfig?.executionTarget,
       mesh: this,
       lifecycle: this.lifecycleFor(record.id),
       gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),

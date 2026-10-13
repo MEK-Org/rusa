@@ -84,7 +84,7 @@ The core primitives:
 | --- | --- |
 | `spawn_thread(charter, model_config, …)` | Create a child actor with its own charter and session. You become its parent. Non-blocking: the child runs asynchronously. `model_config` is required; there is no default model. |
 | `send_message(thread_id, body)` | Deliver a message to another actor's inbox (parent, child, or an introduced peer). The recipient wakes on its own schedule and replies later as a new message. |
-| `introduce(holder, target)` | Grant one actor a handle to another so they can message directly (for example, let a coder reach a reviewer). The id is the capability; the holder sees the target's own title, or its charter's first line when untitled. |
+| `introduce(holder, target)` | Grant one actor a handle to another so they can message directly (for example, let a coder reach a reviewer). The caller must already hold handles to both (its parent and root addresses do not count), and the holder gets no more authority than the caller had. The id is the capability; the holder sees the target's own title, or its charter's first line when untitled. |
 | `list_threads()` | List the actors you have spawned, with charter summaries and status. |
 | `retire_thread(thread_id)` | Mark a descendant (and its subtree) done and stop it. Only a parent can retire its descendants. |
 | `set_actor_model(actor_id, model_config)` | Replace a child's provider/model pool in place (parent or root only). Provider changes and multi-entry pools are only allowed for portable-context actors. |
@@ -208,9 +208,15 @@ Classes are managed at runtime by the root actor with `set_model_class`,
 table of the mesh database, not in `config.yaml`. A class reference is the whole
 `model_config` value (it cannot nest inside a pool or another class), every
 entry must name a configured provider and an explicit model, an unknown class is
-an error, and a multi-entry class still requires a portable actor. Selection
-snapshots the resolved pool onto the actor, so editing a class only affects
-later spawns; move an existing actor with `set_actor_model`.
+an error, and a multi-entry class still requires a portable actor.
+
+An actor spawned or moved with a class reference stays bound to that class: its
+pool is read from the class's current definition, so a `set_model_class` edit
+shows up immediately and takes effect on each bound actor's next run without a
+restart. A run that has already launched keeps the pool it launched on. An
+explicitly declared tuple or pool is a snapshot that class edits never touch, as
+is a legacy record written before class provenance was retained. Move an
+existing actor to a different class or pool with `set_actor_model`.
 
 ## Quota
 

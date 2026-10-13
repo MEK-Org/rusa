@@ -491,7 +491,7 @@ export function createAgentExecMcpServer(
     {
       title: "Introduce one thread to another",
       description:
-        "Give `holder_thread_id` a handle to `target_thread_id` so it can message it directly (e.g. let a coder reach a reviewer). The holder sees the target described by its own title, or its charter's first line when it has none.",
+        "Give `holder_thread_id` a handle to `target_thread_id` so it can message it directly (e.g. let a coder reach a reviewer). You must already hold handles to both; your parent and root addresses are not handles. The holder sees the target described by its own title, or its charter's first line when it has none.",
       inputSchema: {
         holder_thread_id: z.string().describe("The actor that should gain the new handle."),
         target_thread_id: z.string().describe("The actor the handle points at."),
@@ -499,13 +499,31 @@ export function createAgentExecMcpServer(
     },
     async ({ holder_thread_id, target_thread_id }) => {
       try {
-        if (!mesh.actors.get(holder_thread_id)) {
+        const holder = mesh.actors.get(holder_thread_id);
+        if (!holder) {
           return toolError(new Error(`unknown thread id: ${holder_thread_id}`));
         }
-        if (!mesh.actors.get(target_thread_id)) {
+        const target = mesh.actors.get(target_thread_id);
+        if (!target) {
           return toolError(new Error(`unknown thread id: ${target_thread_id}`));
         }
-        mesh.grantHandle(holder_thread_id, { id: target_thread_id });
+        // Holding handles to both actors is sufficient authority to introduce
+        // them, whatever each handle's origin (#814).
+        const held = new Map((mesh.actors.get(selfId)?.handles ?? []).map((h) => [h.id, h]));
+        for (const actor of [holder, target]) {
+          if (!held.has(actor.id)) {
+            return toolError(new Error(`you do not hold a handle to ${actor.id}`));
+          }
+        }
+        // The holder gets no more than the caller has: a target the caller
+        // knows only from a delivered message stays message-origin, so it
+        // cannot carry voice transfer, and never downgrades a handle the
+        // holder already has.
+        const origin = held.get(target.id)?.origin;
+        if (origin === "message" && holder.handles?.some((h) => h.id === target.id)) {
+          return toolOk("introduced");
+        }
+        mesh.grantHandle(holder.id, { id: target.id, ...(origin ? { origin } : {}) });
         return toolOk("introduced");
       } catch (err) {
         return toolError(err);
@@ -898,7 +916,7 @@ export function createAgentExecMcpServer(
     {
       title: "Grant a capability to an actor",
       description:
-        "Grant an allow-listed capability to a specific actor by its thread id. As root you may grant any grantable capability (e.g. 'understanding-write'); as a non-root actor you may grant only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key'; any other 'secret:<filename>' is root-only) and only to your DIRECT children. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths; kebab-case secret names also export an environment variable (e.g. 'secret:mistral-api-key' exports MISTRAL_API_KEY). Idempotent. Takes effect on a live grantee's next run, or when a retired grantee is next revived. Rejected if the capability isn't grantable, fails containment checks, or you lack authority over the grantee.",
+        "Grant an allow-listed capability to a specific actor by its thread id. A 'capability-admin' holder may grant any grantable capability within its own subtree (e.g. 'understanding-write', or 'obligation-responsive', which lets the grantee start responsive obligation branches only on obligations it may already manage); without 'capability-admin' you may grant only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key'; any other 'secret:<filename>' needs a 'capability-admin' holder) and only to your DIRECT children. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths; kebab-case secret names also export an environment variable (e.g. 'secret:mistral-api-key' exports MISTRAL_API_KEY). Idempotent. Takes effect on a live grantee's next run, or when a retired grantee is next revived; 'obligation-responsive' is instead checked on every obligation tool call, so it takes effect immediately, even in an open session. Rejected if the capability isn't grantable, fails containment checks, or you lack authority over the grantee.",
       inputSchema: {
         actor_id: z.string().describe("The grantee actor's thread id."),
         capability: z
@@ -921,7 +939,7 @@ export function createAgentExecMcpServer(
     {
       title: "Revoke a capability from an actor",
       description:
-        "Revoke a previously-granted capability from an actor by its thread id. As root you may revoke any grant; as a non-root actor you may revoke only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key') and only from your DIRECT children. No-op if the grant isn't active. Takes effect on the actor's next run/(re)construction.",
+        "Revoke a previously-granted capability from an actor by its thread id. A 'capability-admin' holder may revoke any grant within its own subtree; without 'capability-admin' you may revoke only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key') and only from your DIRECT children. No-op if the grant isn't active. Takes effect on the actor's next run/(re)construction; 'obligation-responsive' is instead checked on every obligation tool call, so its revocation takes effect immediately, even in an open session.",
       inputSchema: {
         actor_id: z.string().describe("The actor's thread id to revoke from."),
         capability: z.string().describe("The capability to revoke."),
@@ -995,8 +1013,8 @@ export function createAgentExecMcpServer(
   // depth, like the grant-gated `update` tool): each group is registered ONLY
   // when the endpoint's actor holds the named administrative capability as an
   // active grant at session start, AND each handler re-checks the grant live so
-  // a revocation fails closed on an already-open session. Topology (`isRoot`,
-  // a null parent, the configured root id) plays no part: a capable opaque-id
+  // a revocation fails closed on an already-open session. Topology (a null
+  // parent, the configured root id) plays no part: a capable opaque-id
   // actor gets exactly the same tools, and an ungranted parentless actor gets
   // none. Every tool below that touches actors is further confined to the
   // caller's own subtree (self included): a write naming a target actor is

@@ -17,7 +17,7 @@ smoke runner and screenshots, in the PR that revises the #662 proposal or implem
 the chosen approach after the device decision. The runner guards pending fixture
 changes only; it is outside product test discovery and CI.
 
-The fixture identifier is `662-spike-v2` (shared by the page and worker). Bump
+The fixture identifier is `662-spike-v3` (shared by the page and worker). Bump
 `fixture-version.js` for every asset/procedure change. Record `git rev-parse HEAD`
 in the page's **Served checkout SHA** field; serve a clean checkout and export that
 field with the fixture identifier. An unfilled SHA is UNTESTED revision evidence.
@@ -58,6 +58,13 @@ Browser-default recognition may send this synthetic speech to a browser-managed
 recognition service. Recorder-only mode invokes no recognizer. Local-required mode
 sets `processLocally = true` when supported and fails without remote fallback when
 the property is absent. Merely having the property does not prove language support.
+**Recognition only** runs browser-default recognition with no page `getUserMedia` or
+`MediaRecorder` and produces no clip (its acquisition order records `none`).
+It discriminates capture contention: on Android 10+, when two ordinary apps capture
+concurrently, [only one receives audio and the other gets silence](https://developer.android.com/media/platform/sharing-audio-input),
+so a concurrent page recorder may starve a browser-managed recognizer. If concurrent
+trials end `nomatch` while this mode returns results on the same device, contention
+is the likely cause; if this mode also fails, look elsewhere.
 **Probe local support** queries `available({langs, processLocally:true})`. **Install**
 is an explicit language-pack download button, never automatic.
 
@@ -80,6 +87,7 @@ pack; each trial snapshots those conditions and the current probe receipt.
 | Stop mid-phrase | Compare `previewAtStop`, later result events and `finalRecognition`; keep all final revisions visible after Stop |
 | Cancel mid-phrase, then immediate Start | Cancelled trial has no playable/downloadable clip; next trial acquires mic and records normally |
 | Local-required, online then offline | Exact local property/probe/install result; offline successful recognition or concrete error, no remote fallback |
+| Recognition only, 3 full phrases (when concurrent trials return no results) | Result snapshots and `finalRecognition` versus the concurrent trials' `nomatch`/errors on the same device; no clip expected |
 
 Optional robustness checks: cancel during microphone acquisition; silence/denied
 permission/recognition error or early end; background/resume and lock/unlock. Log
@@ -181,6 +189,7 @@ outside the standard runtime/Flutter suites.
 | Offline fixture | Service worker served the harness on offline reload |
 | Initial red receipt | First smoke run failed early-end status assertion; explicit rerender repaired the harness; subsequent smoke exited **0 / PASS** |
 | Actor delivery | None attempted; harness has no delivery path |
+| Recognition only (2026-10-11, fixture v3) | Scripted trial completed with zero `getUserMedia` calls, no recorder events and no clip; preview at Stop and post-stop final revision kept; early recognizer end waits for Stop. Before the change the new smoke failed (`#mode` had no `recognition-only` option) |
 
 Review captures from real Linux headless Chrome, with generated audio and scripted
 recognition (these are not Android/device evidence):

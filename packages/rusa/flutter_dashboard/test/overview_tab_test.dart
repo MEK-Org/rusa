@@ -109,7 +109,8 @@ void main() {
         expect(narrowQueue.left, closeTo(narrowQuota.left, 1));
         expect(narrowQueue.top, lessThan(narrowQuota.top));
         expect(find.text('New Obligation'), findsNothing);
-        expect(find.byIcon(Icons.add), findsOneWidget);
+        // The header's compact create action (the empty queue adds its own).
+        expect(find.byTooltip('New Obligation'), findsOneWidget);
 
         // Just below kNarrowBreakpoint (700): 20px tab padding on each side (40 total).
         // Surface width 739 gives maxWidth 699 < 700 -> stacked vertically.
@@ -155,8 +156,6 @@ void main() {
             kind: 'handled_inbox',
             time: '2026-09-23T14:21:37.000Z',
             actorId: actor,
-            actorHandle: 'kestrel-coder',
-            actorModel: 'claude-opus-4-6, high',
             sourceKind: 'GITHUB ISSUE',
             sourceRef: 'github:MEK-Org/rusa/issues/664',
             summary: 'UI proposal feedback on #664',
@@ -178,7 +177,7 @@ void main() {
 
       expect(tester.takeException(), isNull);
       expect(find.text('Recent Activity'), findsOneWidget);
-      expect(find.text('kestrel-coder'), findsOneWidget);
+      expect(find.text('$actor-handle'), findsOneWidget);
       expect(
         find.textContaining('Packaged design proposal into PR #665'),
         findsOneWidget,
@@ -205,8 +204,6 @@ void main() {
             kind: 'terminal_obligation',
             time: '2026-09-23T14:21:37.000Z',
             actorId: actor,
-            actorHandle: 'kestrel-coder',
-            actorModel: 'claude-opus-4-6, high',
             sourceKind: 'OBLIGATION',
             sourceRef: 'github:MEK-Org/rusa/issues/664',
             summary: 'Render work-outcome dashboard mock-up',
@@ -227,7 +224,7 @@ void main() {
 
       expect(tester.takeException(), isNull);
       expect(find.text('Recent Activity'), findsOneWidget);
-      expect(find.text('kestrel-coder'), findsOneWidget);
+      expect(find.text('$actor-handle'), findsOneWidget);
       expect(find.text('DONE'), findsOneWidget);
       expect(find.textContaining('Landed mock-up and tests'), findsOneWidget);
       expect(
@@ -238,6 +235,42 @@ void main() {
       await store.dispose();
     });
   });
+
+  testWidgets(
+    'Recent Activity never shows a raw id when its actor is absent from the snapshot',
+    (tester) async {
+      await tester.runAsync(() async {
+        const actor = '11111111-1111-4111-8111-111111111112';
+        final api = FakeApi()
+          ..recentActivityResult = const [
+            RecentActivityItem(
+              id: 'inbox_missing_actor',
+              kind: 'handled_inbox',
+              time: '2026-09-23T14:21:37.000Z',
+              actorId: actor,
+              sourceKind: 'GITHUB ISSUE',
+              sourceRef: 'github:MEK-Org/rusa/issues/664',
+              summary: 'review feedback',
+              handledTime: '2026-09-23T14:21:37.000Z',
+              addressedNote: 'Reviewed',
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
+
+        await tester.binding.setSurfaceSize(const Size(1500, 1400));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Unknown actor'), findsOneWidget);
+        expect(find.text(actor), findsNothing);
+        expect(tester.takeException(), isNull);
+      });
+    },
+  );
 
   testWidgets(
     'OverviewTab renders empty state when 00000000-0000-4000-8000-000000000001 has no obligations ',

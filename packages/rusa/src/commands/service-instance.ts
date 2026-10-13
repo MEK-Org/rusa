@@ -168,8 +168,9 @@ export function resolvePathForUnit(pathValue: string): string {
 // ANY such segment (not just the current shell's) to the stable node-versions bin.
 const FNM_MULTISHELL_BIN_RE = /\/fnm_multishells\/[^/]+\/bin\/?$/;
 
-export function resolvePathEnvForUnit(): string {
-  const rawPath = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin";
+export function resolvePathEnvForUnit(
+  rawPath: string = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"
+): string {
   const fnmDir = process.env.FNM_DIR;
   const stableBin = fnmDir
     ? join(fnmDir, "node-versions", process.version, "installation", "bin")
@@ -382,6 +383,37 @@ export function resolveProbePathEnv(
     if (fromFile) return { path: fromFile, source: "instance-unit-file" };
   }
   return { path: resolvePathEnvForUnit(), source: "process" };
+}
+
+/**
+ * Resolve the `PATH` an instance unit should be rewritten with.
+ *
+ * Writing the installer's `process.env.PATH` straight into the unit made the
+ * service's provider lookup a property of whichever shell last ran
+ * `install-service`. A reapply from a sandboxed provider session wrote a `PATH`
+ * with no `codex` on it; the running service kept its old environment, and
+ * every codex run failed from the next restart on — which is issue #986, the
+ * instance-unit sibling of #525.
+ *
+ * So an installed unit's `PATH` is the base, read the way
+ * {@link resolveProbePathEnv} reads it (systemd first so drop-ins count, unit
+ * text as the fallback), and the installer's segments are only appended after
+ * it: a reapply can add a directory but can never remove one, nor reorder
+ * which directory wins for a command the service already resolves. A fresh
+ * install, or a unit that assigns no `PATH`, still takes the installer's.
+ */
+export function resolveInstanceUnitPathEnv(
+  unitName: string,
+  installedUnitContents: string | null,
+  readSystemdPath: (unit: string) => string | null = readSystemdUnitPathEnv
+): ProbePathEnv {
+  const installed = resolveProbePathEnv(unitName, installedUnitContents, readSystemdPath);
+  if (installed.source === "process") return installed;
+  const installerPath = process.env.PATH ?? "";
+  return {
+    path: resolvePathEnvForUnit(`${installed.path}:${installerPath}`),
+    source: installed.source,
+  };
 }
 
 /**

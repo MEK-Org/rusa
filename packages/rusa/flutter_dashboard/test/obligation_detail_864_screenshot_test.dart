@@ -10,6 +10,25 @@ import 'package:rusa_dashboard/widgets/work_tab.dart';
 import 'fakes.dart';
 import 'screenshot_support.dart';
 
+/// What `/api/mesh/references` answers for the refs the detail cites (#940).
+final _references = {
+  for (final reference in const [
+    ReferenceDto(
+      ref: 'github:example-org/example/issues/398',
+      scheme: 'github',
+      title: 'Issue #398 · Export run history as CSV',
+      url: 'https://github.com/example-org/example/issues/398',
+    ),
+    ReferenceDto(
+      ref: 'github:example-org/example/pulls/431',
+      scheme: 'github',
+      title: 'Pull request #431',
+      url: 'https://github.com/example-org/example/pull/431',
+    ),
+  ])
+    reference.ref: reference,
+};
+
 void main() {
   setUpAll(loadFonts);
   for (final size in [const Size(1600, 1000), const Size(390, 844)]) {
@@ -52,6 +71,7 @@ void main() {
         );
         final api = FakeApi()
           ..threadsResult = [makeThread('coder'), makeThread('steward')]
+          ..referencesResult = _references
           ..obligationsResult = [ob, root, child]
           ..obligationDetails['export'] = ObligationDetailSnapshot.fromJson({
             'obligation': {
@@ -95,23 +115,11 @@ void main() {
               },
             ],
             'blockedByTotal': 1,
-            'externalReference': {
-              'ref': 'github:example-org/example/issues/398',
-              'scheme': 'github',
-              'title': 'Issue #398 · Export run history as CSV',
-              'url': 'https://github.com/example-org/example/issues/398',
-            },
             'artifacts': [
               {
                 'ref': 'github:example-org/example/pulls/431',
                 'label': 'Carries the actor-page button',
                 'attachedBy': 'coder',
-                'reference': {
-                  'ref': 'github:example-org/example/pulls/431',
-                  'scheme': 'github',
-                  'title': 'Pull request #431',
-                  'url': 'https://github.com/example-org/example/pull/431',
-                },
               },
             ],
             'history': [
@@ -228,6 +236,7 @@ void main() {
       );
       final api = FakeApi()
         ..threadsResult = [makeThread('coder'), makeThread('steward')]
+        ..referencesResult = _references
         ..obligationsResult = [ob, root, child]
         ..obligationDetails['export'] = ObligationDetailSnapshot.fromJson({
           'obligation': {
@@ -268,23 +277,11 @@ void main() {
             },
           ],
           'blockedByTotal': 1,
-          'externalReference': {
-            'ref': 'github:example-org/example/issues/398',
-            'scheme': 'github',
-            'title': 'Issue #398 · Export run history as CSV',
-            'url': 'https://github.com/example-org/example/issues/398',
-          },
           'artifacts': [
             {
               'ref': 'github:example-org/example/pulls/431',
               'label': 'Carries the actor-page button',
               'attachedBy': 'coder',
-              'reference': {
-                'ref': 'github:example-org/example/pulls/431',
-                'scheme': 'github',
-                'title': 'Pull request #431',
-                'url': 'https://github.com/example-org/example/pull/431',
-              },
             },
           ],
           'history': [

@@ -149,7 +149,7 @@ describe("voice provider routing", () => {
         id,
         charter: id,
         parentId: id === "root" ? null : "root",
-        ...(id === "root" ? { isRoot: true } : {}),
+        ...(id === "root" ? { executionConfig: { unsandboxed: true } } : {}),
         status: "active",
         context: { type: "native" },
         createdAt: "2026-09-30T00:00:00.000Z",

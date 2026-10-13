@@ -21,6 +21,7 @@ import {
   isReadyForAttention,
   isTerminalObligationStatus,
   normalizeCheckpoint,
+  normalizeReassignMessage,
   normalizeSnoozeUntil,
   OBLIGATION_STATUSES,
   type Obligation,
@@ -28,6 +29,7 @@ import {
   type ObligationHistoryEntry,
   type ObligationHistoryState,
   type ObligationMutationKind,
+  type ObligationReassignment,
   type ObligationStatus,
   type ObligationTree,
   ObligationValidationError,
@@ -110,6 +112,7 @@ interface TrackedObligationRow {
   checkpoint: string | null;
   checkpoint_at: string | null;
   checkpoint_by: string | null;
+  responsive: boolean | null;
 }
 
 /** One captured UPDATE, as the TEMP history-capture trigger records it. */
@@ -126,6 +129,7 @@ interface ObligationDeltaRow {
   before_checkpoint: string | null;
   before_checkpoint_at: string | null;
   before_checkpoint_by: string | null;
+  before_responsive: number | null;
   after_owner_id: string;
   after_parent_id: string | null;
   after_priority: number | null;
@@ -137,6 +141,7 @@ interface ObligationDeltaRow {
   after_checkpoint: string | null;
   after_checkpoint_at: string | null;
   after_checkpoint_by: string | null;
+  after_responsive: number | null;
 }
 
 export interface CreateObligationInput {
@@ -732,6 +737,7 @@ export class ObligationRepository {
         before_checkpoint TEXT,
         before_checkpoint_at TEXT,
         before_checkpoint_by TEXT,
+        before_responsive   INTEGER,
         after_owner_id      TEXT NOT NULL,
         after_parent_id     TEXT,
         after_priority      REAL,
@@ -742,7 +748,8 @@ export class ObligationRepository {
         after_snoozed_until TEXT,
         after_checkpoint TEXT,
         after_checkpoint_at TEXT,
-        after_checkpoint_by TEXT
+        after_checkpoint_by TEXT,
+        after_responsive    INTEGER
       );
 
       CREATE TEMP TRIGGER IF NOT EXISTS obligation_history_capture
@@ -758,19 +765,24 @@ export class ObligationRepository {
         OR old.checkpoint IS NOT new.checkpoint
         OR old.checkpoint_at IS NOT new.checkpoint_at
         OR old.checkpoint_by IS NOT new.checkpoint_by
+        OR old.responsive IS NOT new.responsive
       BEGIN
         INSERT INTO obligation_history_delta (
           obligation_id,
           before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
           before_terminal_note, before_resolution_ref, before_snoozed_until, before_checkpoint, before_checkpoint_at, before_checkpoint_by,
+          before_responsive,
           after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
-          after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint, after_checkpoint_at, after_checkpoint_by
+          after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint, after_checkpoint_at, after_checkpoint_by,
+          after_responsive
         ) VALUES (
           new.id,
           old.owner_id, old.parent_id, old.priority, old.status, old.external_ref,
           old.terminal_note, old.resolution_ref, old.snoozed_until, old.checkpoint, old.checkpoint_at, old.checkpoint_by,
+          old.responsive,
           new.owner_id, new.parent_id, new.priority, new.status, new.external_ref,
-          new.terminal_note, new.resolution_ref, new.snoozed_until, new.checkpoint, new.checkpoint_at, new.checkpoint_by
+          new.terminal_note, new.resolution_ref, new.snoozed_until, new.checkpoint, new.checkpoint_at, new.checkpoint_by,
+          new.responsive
         );
       END;
     `);
@@ -1029,6 +1041,12 @@ export class ObligationRepository {
   private historyPrincipalOverrides = new Map<string, EntityId>();
 
   /**
+   * Reassignment messages (#941) for this transaction, keyed by obligation.
+   * Recorded on that obligation's owner-change history row and nowhere else.
+   */
+  private historyReassignMessages = new Map<string, string>();
+
+  /**
    * `(dependentId, prerequisiteId)` keys whose cancellation-attention delivery
    * threw on a previous {@link mutate} call (#212) — e.g. a transient inbox
    * append failure. Kept only as keys, not the stale payload: the next
@@ -1273,6 +1291,7 @@ export class ObligationRepository {
     this.pendingResponsiveReady = [];
     this.pendingStatusChanges = [];
     this.historyPrincipalOverrides.clear();
+    this.historyReassignMessages.clear();
     const actingPrincipal = validateEntityId(principal);
     this.installHistoryCapture();
     let afterHeads = new Map<string, string>();
@@ -1535,8 +1554,10 @@ export class ObligationRepository {
         `SELECT obligation_id,
                 before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
                 before_terminal_note, before_resolution_ref, before_snoozed_until, before_checkpoint, before_checkpoint_at, before_checkpoint_by,
+                before_responsive,
                 after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
-                after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint, after_checkpoint_at, after_checkpoint_by
+                after_terminal_note, after_resolution_ref, after_snoozed_until, after_checkpoint, after_checkpoint_at, after_checkpoint_by,
+                after_responsive
          FROM obligation_history_delta
          ORDER BY seq`
       )
@@ -1559,6 +1580,7 @@ export class ObligationRepository {
         checkpoint: delta.after_checkpoint,
         checkpoint_at: delta.after_checkpoint_at,
         checkpoint_by: delta.after_checkpoint_by,
+        responsive: delta.after_responsive === 1 ? true : null,
       };
       const existing = net.get(delta.obligation_id);
       if (existing) {
@@ -1579,6 +1601,7 @@ export class ObligationRepository {
           checkpoint: delta.before_checkpoint,
           checkpoint_at: delta.before_checkpoint_at,
           checkpoint_by: delta.before_checkpoint_by,
+          responsive: delta.before_responsive === 1 ? true : null,
         },
         after,
       });
@@ -1602,6 +1625,7 @@ export class ObligationRepository {
         b.checkpoint !== a.checkpoint ||
         b.checkpoint_at !== a.checkpoint_at ||
         b.checkpoint_by !== a.checkpoint_by;
+      const responsiveChanged = b.responsive !== a.responsive;
 
       if (
         !ownerChanged &&
@@ -1612,7 +1636,8 @@ export class ObligationRepository {
         !terminalNoteChanged &&
         !resolutionRefChanged &&
         !snoozeChanged &&
-        !checkpointChanged
+        !checkpointChanged &&
+        !responsiveChanged
       ) {
         continue;
       }
@@ -1623,6 +1648,8 @@ export class ObligationRepository {
       if (ownerChanged) {
         beforeState.ownerId = b.owner_id;
         afterState.ownerId = a.owner_id;
+        const message = this.historyReassignMessages.get(id);
+        if (message !== undefined) afterState.message = message;
       }
       if (parentChanged) {
         beforeState.parentId = b.parent_id;
@@ -1659,6 +1686,11 @@ export class ObligationRepository {
         afterState.checkpoint = a.checkpoint;
       }
 
+      if (responsiveChanged) {
+        beforeState.responsive = b.responsive;
+        afterState.responsive = a.responsive;
+      }
+
       // Map the primary modified field to its semantic mutation kind.
       const kind: ObligationMutationKind = ownerChanged
         ? "reassign"
@@ -1672,7 +1704,9 @@ export class ObligationRepository {
                 ? "snooze"
                 : checkpointChanged && !externalRefChanged
                   ? "checkpoint"
-                  : "external_ref";
+                  : responsiveChanged && !externalRefChanged
+                    ? "responsive"
+                    : "external_ref";
 
       insert.run(
         id,
@@ -2735,8 +2769,17 @@ export class ObligationRepository {
   /**
    * Change the owner of one live obligation without changing its identity,
    * position, ancestry, or state. Authorization belongs to the calling surface.
+   *
+   * A `message` (#941) is recorded on the owner-change history row. A
+   * reassignment to the current owner changes nothing and records nothing, so
+   * its message is validated and then dropped.
    */
-  reassign(id: string, newOwnerId: EntityId, principal: EntityId): Obligation {
+  reassign(
+    id: string,
+    newOwnerId: EntityId,
+    principal: EntityId,
+    message?: string | null
+  ): Obligation {
     return this.mutate(principal, () => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
@@ -2744,9 +2787,11 @@ export class ObligationRepository {
       }
       const ownerId = validateEntityId(newOwnerId);
       this.assertOwnerExists(ownerId);
+      const reason = normalizeReassignMessage(message);
       if (ownerId === obligation.ownerId) {
         return obligation;
       }
+      if (reason !== null) this.historyReassignMessages.set(id, reason);
 
       this.db
         .prepare("UPDATE obligations SET owner_id = ?, updated_at = ? WHERE id = ?")
@@ -3078,6 +3123,42 @@ export class ObligationRepository {
   }
 
   /**
+   * The obligation's latest reassignment with its message (#947), so the actor
+   * it was handed to can read why. Null when it was never reassigned, or when
+   * its latest reassignment carried no message: an earlier message described a
+   * hand-off that has since been superseded. Fail-closed like
+   * {@link listHistory}: an unreadable row, or a `reassign` row missing either
+   * owner id (the writer always records both), throws.
+   */
+  latestReassignment(id: string): ObligationReassignment | null {
+    const row = this.db
+      .prepare(
+        `SELECT id, obligation_id, mutation_kind, acting_principal, timestamp, payload
+         FROM obligation_history
+         WHERE obligation_id = ? AND mutation_kind = 'reassign'
+         ORDER BY id DESC
+         LIMIT 1`
+      )
+      .get(id);
+    if (row === undefined) return null;
+    const entry = parseHistoryRow(row);
+    const { before, after } = entry;
+    if (before.ownerId === undefined || after.ownerId === undefined) {
+      throw new ObligationValidationError(
+        `reassign history row ${entry.id} is missing an owner id`
+      );
+    }
+    if (after.message === undefined) return null;
+    return {
+      previousOwnerId: before.ownerId,
+      newOwnerId: after.ownerId,
+      message: after.message,
+      actingPrincipal: entry.actingPrincipal,
+      timestamp: entry.timestamp,
+    };
+  }
+
+  /**
    * A paged, newest-first detail trail. Artifacts and creation of current
    * children project their source timestamps without duplicate audit writes.
    * Current child membership/title/owner is not historical addition to this parent.
@@ -3192,6 +3273,27 @@ export class ObligationRepository {
       )
       .all(limit);
     return rows.map(parseHistoryRow);
+  }
+
+  /**
+   * Which of `refs` some obligation names, as its external ref or an artifact.
+   *
+   * Asks only about the given keys, so a caller checking a bounded batch pays
+   * for that batch rather than for every obligation and its artifacts. Both
+   * columns hold canonical reference keys, so exact matching agrees with
+   * {@link Obligation.externalRef}`.key` and {@link ObligationArtifact.ref}.
+   */
+  citedReferences(refs: readonly string[]): Set<string> {
+    if (refs.length === 0) return new Set();
+    const placeholders = refs.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT external_ref AS ref FROM obligations WHERE external_ref IN (${placeholders})
+         UNION
+         SELECT ref FROM obligation_artifacts WHERE ref IN (${placeholders})`
+      )
+      .all(...refs, ...refs) as { ref: string }[];
+    return new Set(rows.map((row) => row.ref));
   }
 
   listArtifacts(obligationId: string): ObligationArtifact[] {

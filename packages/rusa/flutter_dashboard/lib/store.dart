@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/widgets.dart';
 import 'package:rxdart/rxdart.dart';
 
 import 'actor_display.dart';
@@ -10,6 +11,8 @@ import 'dashboard_timing.dart';
 import 'avatar_platform.dart';
 import 'mesh_stream.dart';
 import 'models.dart';
+import 'obligation_store.dart';
+import 'obligation_sync.dart';
 import 'obligations_cache.dart';
 import 'quota_cache.dart';
 import 'tree_preferences_cache.dart';
@@ -526,6 +529,18 @@ class DashboardStore {
     return actor(id)?.handle;
   }
 
+  /// The model an actor runs on, from the threads snapshot, as the Recent
+  /// Activity cards label it: its first configured model and effort, or
+  /// 'default' when it has none.
+  String actorModelLabel(String id) {
+    final configs = actor(id)?.thread.modelConfig ?? const [];
+    if (configs.isEmpty) return 'default';
+    final effort = configs.first.effort;
+    return effort == null
+        ? configs.first.model
+        : '${configs.first.model}, $effort';
+  }
+
   void setWalkieActive(bool active) {
     if (!_walkieActive.isClosed) {
       _walkieActive.add(active);
@@ -615,6 +630,87 @@ class DashboardStore {
     _cachedObligationTrees = null;
     _cachedObligationPrincipal = resolvedPrincipal;
     _seedObligationsFromCache(resolvedPrincipal);
+    _seedObligationStore(resolvedPrincipal);
+  }
+
+  // ── Shared obligation store (#992) ──
+
+  /// Every obligation a request returned for the resolved viewer, by id.
+  /// Views render projections of it; [obligationSync] fills it.
+  final ObligationStore obligations = ObligationStore();
+
+  /// Owns when [obligations] is refreshed and writes the responses into it.
+  late final ObligationSync obligationSync = ObligationSync(
+    api: _api,
+    store: obligations,
+    onSettled: _persistObligationStore,
+    onStale: _dropPersistedObligationStore,
+  );
+
+  /// The viewer [obligations] holds knowledge for.
+  String? _obligationStorePrincipal;
+
+  /// The viewer's own queue sections, as Overview's My Queue shows them.
+  List<ObligationQuery> viewerQueues() {
+    final principal = _obligationStorePrincipal;
+    if (principal == null || principal.isEmpty) return const [];
+    return [
+      for (final queue in ObligationQueue.values)
+        ObligationQuery(ownerId: principal, queue: queue),
+    ];
+  }
+
+  /// Replaces the store with the new viewer's persisted capture once
+  /// dashboard configuration names them, mirroring [_seedObligationsFromCache].
+  /// A re-resolution of the same viewer keeps what the store holds.
+  void _seedObligationStore(String principalId) {
+    if (principalId == _obligationStorePrincipal) return;
+    _obligationStorePrincipal = principalId;
+    var seed = const ObligationEntities();
+    var replayed = const <ObligationQuery>[];
+    final cached = _obligationsCache.loadEntities(
+      scope: _hierarchyScope,
+      principalId: principalId,
+    );
+    if (cached != null) {
+      if (cached.isUsableAt(
+        scope: _hierarchyScope,
+        principalId: principalId,
+        now: DateTime.timestamp(),
+      )) {
+        seed = cached.entities;
+        replayed = cached.queries;
+      } else {
+        _dropPersistedObligationStore();
+      }
+    }
+    obligations.reset(seed);
+    obligationSync.reset(replayed: replayed);
+  }
+
+  void _persistObligationStore() {
+    final principal = _obligationStorePrincipal;
+    if (principal == null || principal.isEmpty) return;
+    _obligationsCache.saveEntities(
+      PersistedObligationEntitiesSnapshot.capture(
+        scope: _hierarchyScope,
+        principalId: principal,
+        queries: obligationSync.settledQueries,
+        entities: obligations.current,
+        now: DateTime.timestamp(),
+      ),
+    );
+  }
+
+  /// A change may have moved what the capture holds, so a reload must not
+  /// replay it; the next settled refresh writes a new one.
+  void _dropPersistedObligationStore() {
+    final principal = _obligationStorePrincipal;
+    if (principal == null || principal.isEmpty) return;
+    _obligationsCache.invalidateEntities(
+      scope: _hierarchyScope,
+      principalId: principal,
+    );
   }
 
   /// Persists [trees] as the new last-known successful obligations snapshot (#505).
@@ -649,10 +745,11 @@ class DashboardStore {
   }
 
   /// Runs an obligation-changing API operation and prevents a later Work-tab
-  /// return from reviving the old persisted forest.
+  /// or Overview return from reviving the old persisted forest or store.
   Future<T> mutateObligations<T>(Future<T> Function() operation) async {
     final result = await operation();
     invalidateObligationsCache();
+    obligationSync.mutated();
     return result;
   }
 
@@ -660,13 +757,95 @@ class DashboardStore {
     await _requestRuntimeSync();
   }
 
-  Future<void> refreshRecentActivity() async {
+  /// References already resolved for Recent Activity, kept across refreshes
+  /// so a card does not fall back to loading each time the feed reloads.
+  final _activityReferences = <String, ReferenceDto>{};
+  int _recentActivityGeneration = 0;
+  Future<void> Function()? _pendingActivityResolve;
+
+  /// Paints the feed from its ref keys, then fills each card's reference in
+  /// as `/api/mesh/references` answers (#940). Known cards keep their shown
+  /// previews on reload while revalidation refreshes them in the background.
+  Future<void> refreshRecentActivity({bool deferUntilPostFrame = true}) async {
+    final generation = ++_recentActivityGeneration;
+    final List<RecentActivityItem> items;
     try {
-      final items = await _api.fetchRecentActivity(limit: 50);
-      if (!_recentActivity.isClosed) {
-        _recentActivity.add(items);
+      items = await _api.fetchRecentActivity(limit: 50);
+    } catch (_) {
+      return;
+    }
+    if (generation != _recentActivityGeneration) return;
+    final keys = {for (final item in items) ?item.referenceKey};
+    _activityReferences.removeWhere((ref, _) => !keys.contains(ref));
+    void emit() {
+      if (generation != _recentActivityGeneration || _recentActivity.isClosed) {
+        return;
       }
-    } catch (_) {}
+      _recentActivity.add([
+        for (final item in items)
+          item.referenceKey == null
+              ? item
+              : item.withReference(
+                  _activityReferences[item.referenceKey] ??
+                      ReferenceDto.loading(item.referenceKey!),
+                ),
+      ]);
+    }
+
+    emit();
+    if (keys.isEmpty) return;
+
+    Future<void> resolve() async {
+      if (generation != _recentActivityGeneration) return;
+      try {
+        final fetched = await _api.fetchReferences(keys);
+        if (generation != _recentActivityGeneration) return;
+        _activityReferences.addAll(fetched);
+        emit();
+      } catch (error) {
+        if (generation != _recentActivityGeneration) return;
+        final partial = error is PartialReferenceFetchException ? error : null;
+        if (partial != null) _activityReferences.addAll(partial.resolved);
+        final unresolved = partial?.unresolved ?? keys;
+        // Keep an already-filled preview, but settle a new card rather than
+        // leaving its placeholder pending until a later feed refresh. A pending
+        // cache answer is a placeholder, not a filled preview. That refresh
+        // still asks the failed key again and can replace the fallback.
+        _activityReferences.addAll({
+          for (final key in unresolved)
+            if (_activityReferences[key]?.cacheState == null ||
+                _activityReferences[key]?.cacheState == 'pending')
+              key: ReferenceDto(
+                ref: key,
+                scheme: key.split(':').first,
+                title: key,
+                unavailable: 'could not load context',
+                cacheState: 'unavailable',
+              ),
+        });
+        emit();
+      }
+    }
+
+    if (deferUntilPostFrame) {
+      // Resolve after the frame that paints this feed. One callback serves
+      // every refresh until that frame, and only the newest generation's
+      // resolve runs. Asking for the frame keeps the fill from waiting on
+      // unrelated input while Overview is not mounted (#940).
+      final scheduled = _pendingActivityResolve != null;
+      _pendingActivityResolve = resolve;
+      if (!scheduled) {
+        WidgetsBinding.instance
+          ..addPostFrameCallback((_) {
+            final pending = _pendingActivityResolve;
+            _pendingActivityResolve = null;
+            if (pending != null) unawaited(pending());
+          })
+          ..ensureVisualUpdate();
+      }
+      return;
+    }
+    await resolve();
   }
 
   Future<List<String>> fetchRootControlProviders() =>
@@ -1468,15 +1647,16 @@ class DashboardStore {
 
     if (e.kind == 'obligation_checkpoint_set' &&
         !_obligationRefreshes.isClosed) {
+      final ids = {if (e.detail != null) e.detail!};
       invalidateObligationsCache();
-      _obligationRefreshes.add(
-        ObligationRefresh(ids: {if (e.detail != null) e.detail!}),
-      );
+      obligationSync.obligationsChanged(ids);
+      _obligationRefreshes.add(ObligationRefresh(ids: ids));
     }
     if (e.kind == 'obligation_status_changed' &&
         !_obligationRefreshes.isClosed) {
       final statuses = _statusChanges(e.payload);
       invalidateObligationsCache();
+      obligationSync.statusesChanged(statuses);
       statuses.keys.forEach(_obligationLookups.remove);
       _obligationRefreshes.add(ObligationRefresh(ids: statuses.keys.toSet()));
       // Recent Activity lists closes only, so a re-ready or block adds no row.
@@ -1999,6 +2179,8 @@ class DashboardStore {
       _walkieActive.close(),
       _chatRoomParticipants.close(),
       _obligationRefreshes.close(),
+      obligations.close(),
+      obligationSync.close(),
     ]);
   }
 }

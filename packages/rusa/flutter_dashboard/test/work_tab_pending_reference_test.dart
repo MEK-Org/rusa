@@ -1,8 +1,12 @@
 // #595: a cited reference the server answered "pending" (its provider read
 // outlived the 250ms first-response budget) converges in the open detail view
-// through a bounded refetch, without a reload, a selection change or a write.
+// through a bounded re-ask, without a reload, a selection change or a write.
+// Since #940 the re-ask goes to `/api/mesh/references` alone: the detail is
+// fetched once.
 
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
@@ -50,9 +54,10 @@ void main() {
   final obA = makeObligation('ob-a', ownerId: 'root', intent: 'Cites a chat');
   final obB = makeObligation('ob-b', ownerId: 'root', intent: 'Other work');
 
-  /// Serves ob-a's artifact as [referenceFor] answers on each successive call.
-  void serve(ReferenceDto Function(int call) referenceFor) {
-    var calls = 0;
+  /// Serves ob-a citing [_ref], answered as [referenceFor] gives on each
+  /// successive ask.
+  void serve(ReferenceDto Function(int ask) referenceFor) {
+    var asks = 0;
     api.obligationDetailByOffset = (id, _) {
       detailCalls.add(id);
       final ob = id == obA.id ? obA : obB;
@@ -60,17 +65,22 @@ void main() {
         obligation: ob,
         children: const [],
         blockingChildren: const [],
-        artifacts: [
-          if (id == obA.id)
-            ObligationArtifactDto(ref: _ref, reference: referenceFor(calls++)),
-        ],
+        artifacts: [if (id == obA.id) const ObligationArtifactDto(ref: _ref)],
       );
     };
+    api.referenceFor = (ref) => ref == _ref ? referenceFor(asks++) : null;
   }
+
+  /// How many reference batches asked for [ref].
+  int asksFor(String ref) =>
+      api.referenceRequests.where((batch) => batch.contains(ref)).length;
 
   Future<void> open(WidgetTester tester, String intent) async {
     await tester.tap(find.text(intent));
     await tester.pump();
+    await tester.pump();
+    // The separate enrichment request begins in a post-frame callback, and
+    // an immediate fake response settles on the following frame.
     await tester.pump();
   }
 
@@ -119,11 +129,28 @@ void main() {
     await tester.tap(find.text('Close'));
     await tester.pumpAndSettle();
 
-    // Resolved is terminal: nothing more is fetched.
-    final settled = detailCalls.length;
+    // Resolved is terminal: nothing more is asked, and the detail itself was
+    // fetched once.
     await tester.pump(_pastCeiling);
-    expect(detailCalls.length, settled);
-    expect(detailCalls.where((id) => id == obA.id), hasLength(2));
+    expect(asksFor(_ref), 2);
+    expect(detailCalls, [obA.id]);
+    await tester.runAsync(store.dispose);
+  });
+
+  testWidgets('starts reference enrichment in the post-frame phase', (
+    tester,
+  ) async {
+    serve((_) => _resolved());
+    SchedulerPhase? fetchPhase;
+    api.onFetchReferences = () {
+      fetchPhase = SchedulerBinding.instance.schedulerPhase;
+    };
+
+    await mount(tester);
+    await open(tester, 'Cites a chat');
+
+    expect(fetchPhase, SchedulerPhase.postFrameCallbacks);
+    expect(find.text('Chat message'), findsOneWidget);
     await tester.runAsync(store.dispose);
   });
 
@@ -139,7 +166,8 @@ void main() {
 
     expect(find.text('could not load context'), findsOneWidget);
     expect(find.text('loading context'), findsNothing);
-    expect(detailCalls.where((id) => id == obA.id), hasLength(2));
+    expect(asksFor(_ref), 2);
+    expect(detailCalls, [obA.id]);
     await tester.runAsync(store.dispose);
   });
 
@@ -157,12 +185,115 @@ void main() {
     await tester.pump(_pastCeiling);
     await tester.pump();
 
-    expect(
-      detailCalls.where((id) => id == obA.id),
-      hasLength(1 + pendingReferenceRetryDelays.length),
-    );
+    expect(asksFor(_ref), 1 + pendingReferenceRetryDelays.length);
+    expect(detailCalls, [obA.id]);
     expect(find.text('loading context'), findsNothing);
     expect(find.text('could not load context'), findsOneWidget);
+    await tester.runAsync(store.dispose);
+  });
+
+  testWidgets(
+    'a transport failure also reaches the bounded unavailable fallback',
+    (tester) async {
+      serve((_) => _pending());
+      api.referencesError = StateError('offline');
+      await mount(tester);
+      await open(tester, 'Cites a chat');
+
+      for (final delay in pendingReferenceRetryDelays) {
+        await tester.pump(delay);
+        await tester.pump();
+      }
+      await tester.pump(_pastCeiling);
+      await tester.pump();
+
+      expect(asksFor(_ref), 1 + pendingReferenceRetryDelays.length);
+      expect(find.text('could not load context'), findsOneWidget);
+      expect(find.text('loading context'), findsNothing);
+      await tester.runAsync(store.dispose);
+    },
+  );
+
+  testWidgets('a same-obligation refresh revalidates a settled reference', (
+    tester,
+  ) async {
+    serve((_) => _pending());
+    var answers = 0;
+    api.referenceFor = (_) {
+      answers++;
+      return ReferenceDto(
+        ref: _ref,
+        scheme: 'gchat',
+        title: answers == 1 ? 'First version' : 'Refreshed version',
+        cacheState: 'fresh',
+      );
+    };
+    await mount(tester);
+    await open(tester, 'Cites a chat');
+    expect(find.text('First version'), findsOneWidget);
+
+    final refreshGate = Completer<void>();
+    api.referencesGate = refreshGate;
+    stream.meshCtrl.add(
+      MeshEvent(
+        id: 'refresh-settled',
+        ts: '2026-10-01T21:00:00.000Z',
+        kind: 'obligation_checkpoint_set',
+        actorId: 'root',
+        detail: obA.id,
+        body: null,
+        payload: '{"cleared":false}',
+        success: null,
+      ),
+    );
+    for (var i = 0; i < 4; i += 1) {
+      await tester.pump();
+    }
+
+    expect(asksFor(_ref), 2);
+    expect(find.text('First version'), findsOneWidget);
+    refreshGate.complete();
+    await tester.pump();
+
+    expect(find.text('Refreshed version'), findsOneWidget);
+    await tester.runAsync(store.dispose);
+  });
+
+  testWidgets('a same-obligation refresh releases a superseded in-flight ref', (
+    tester,
+  ) async {
+    serve((_) => _resolved());
+    final firstGate = Completer<void>();
+    final secondGate = Completer<void>();
+    api.referencesGate = firstGate;
+    await mount(tester);
+    await open(tester, 'Cites a chat');
+    expect(find.text('loading context'), findsOneWidget);
+
+    api.referencesGate = secondGate;
+    stream.meshCtrl.add(
+      MeshEvent(
+        id: 'refresh-in-flight',
+        ts: '2026-10-01T21:00:00.000Z',
+        kind: 'obligation_checkpoint_set',
+        actorId: 'root',
+        detail: obA.id,
+        body: null,
+        payload: '{"cleared":false}',
+        success: null,
+      ),
+    );
+    for (var i = 0; i < 4; i += 1) {
+      await tester.pump();
+    }
+    firstGate.complete();
+    await tester.pump();
+
+    expect(asksFor(_ref), 2);
+    secondGate.complete();
+    await tester.pump();
+
+    expect(find.text('Chat message'), findsOneWidget);
     await tester.runAsync(store.dispose);
   });
 
@@ -170,35 +301,36 @@ void main() {
       'own retries', (tester) async {
     const refB = 'github:MEK-Org/rusa/issues/2';
     var withB = false;
-    var callsWithB = 0;
+    var asksOfB = 0;
     api.obligationDetailByOffset = (id, _) {
       detailCalls.add(id);
-      final bFirst = withB && callsWithB++ == 0;
       return ObligationDetailSnapshot(
         obligation: obA,
         children: const [],
         blockingChildren: const [],
         artifacts: [
-          ObligationArtifactDto(ref: _ref, reference: _pending()),
-          if (withB)
-            ObligationArtifactDto(
-              ref: refB,
-              reference: ReferenceDto(
-                ref: refB,
-                scheme: 'github',
-                title: bFirst ? refB : 'The second issue',
-                unavailable: bFirst ? 'loading context' : null,
-                cacheState: bFirst ? 'pending' : 'fresh',
-                entity: bFirst
-                    ? null
-                    : const {
-                        'type': 'github_issue',
-                        'title': 'The second issue',
-                        'description': 'Second body',
-                      },
-              ),
-            ),
+          const ObligationArtifactDto(ref: _ref),
+          if (withB) const ObligationArtifactDto(ref: refB),
         ],
+      );
+    };
+    api.referenceFor = (ref) {
+      if (ref == _ref) return _pending();
+      if (ref != refB) return null;
+      final bFirst = asksOfB++ == 0;
+      return ReferenceDto(
+        ref: refB,
+        scheme: 'github',
+        title: bFirst ? refB : 'The second issue',
+        unavailable: bFirst ? 'loading context' : null,
+        cacheState: bFirst ? 'pending' : 'fresh',
+        entity: bFirst
+            ? null
+            : const {
+                'type': 'github_issue',
+                'title': 'The second issue',
+                'description': 'Second body',
+              },
       );
     };
     await mount(tester);
@@ -210,7 +342,7 @@ void main() {
     await tester.pump(_pastCeiling);
     await tester.pump();
     expect(find.text('could not load context'), findsOneWidget);
-    final spent = detailCalls.length;
+    final spent = asksFor(_ref);
 
     // A second citation is attached; the write's event refreshes the pane.
     withB = true;
@@ -242,10 +374,12 @@ void main() {
     expect(find.text('could not load context'), findsOneWidget);
 
     // Only the new citation is pending now, and it resolved: nothing more.
-    final settled = detailCalls.length;
+    // The refetch re-asked the citation that gave up once; its ladder did
+    // not restart.
     await tester.pump(_pastCeiling);
-    expect(detailCalls.length, settled);
-    expect(settled - spent, 2);
+    expect(asksFor(refB), 2);
+    expect(asksFor(_ref) - spent, 1);
+    expect(detailCalls, [obA.id, obA.id]);
     await tester.runAsync(store.dispose);
   });
 
@@ -257,12 +391,12 @@ void main() {
     expect(find.text('loading context'), findsOneWidget);
 
     await open(tester, 'Other work');
-    final afterNavigation = detailCalls.length;
+    final afterNavigation = api.referenceRequests.length;
     await tester.pump(_pastCeiling);
     await tester.pump();
 
-    expect(detailCalls.skip(afterNavigation), isEmpty);
-    expect(detailCalls.last, obB.id);
+    expect(api.referenceRequests.skip(afterNavigation), isEmpty);
+    expect(detailCalls, [obA.id, obB.id]);
     expect(find.text('Late but real'), findsNothing);
     expect(find.text('loading context'), findsNothing);
     await tester.runAsync(store.dispose);
@@ -279,25 +413,27 @@ void main() {
     api.obligationsResult = [linked];
     api.obligationDetailByOffset = (id, _) {
       detailCalls.add(id);
-      final first = calls++ == 0;
       return ObligationDetailSnapshot(
         obligation: linked,
         children: const [],
         blockingChildren: const [],
-        externalReference: ReferenceDto(
-          ref: 'github:MEK-Org/rusa/issues/1',
-          scheme: 'github',
-          title: first ? 'github:MEK-Org/rusa/issues/1' : 'The linked issue',
-          unavailable: first ? 'loading context' : null,
-          cacheState: first ? 'pending' : 'fresh',
-          entity: first
-              ? null
-              : const {
-                  'type': 'github_issue',
-                  'title': 'The linked issue',
-                  'description': 'Issue body',
-                },
-        ),
+      );
+    };
+    api.referenceFor = (ref) {
+      final first = calls++ == 0;
+      return ReferenceDto(
+        ref: 'github:MEK-Org/rusa/issues/1',
+        scheme: 'github',
+        title: first ? 'github:MEK-Org/rusa/issues/1' : 'The linked issue',
+        unavailable: first ? 'loading context' : null,
+        cacheState: first ? 'pending' : 'fresh',
+        entity: first
+            ? null
+            : const {
+                'type': 'github_issue',
+                'title': 'The linked issue',
+                'description': 'Issue body',
+              },
       );
     };
     await mount(tester);
@@ -309,6 +445,54 @@ void main() {
 
     expect(find.text('loading context'), findsNothing);
     expect(find.textContaining('The linked issue'), findsWidgets);
+    await tester.runAsync(store.dispose);
+  });
+
+  testWidgets('navigating A -> B -> A drops slow response from first A load', (
+    tester,
+  ) async {
+    final gateA1 = Completer<void>();
+    api.obligationDetailByOffset = (id, _) {
+      detailCalls.add(id);
+      return ObligationDetailSnapshot(
+        obligation: id == obA.id ? obA : obB,
+        children: const [],
+        blockingChildren: const [],
+        artifacts: id == obA.id
+            ? const [ObligationArtifactDto(ref: _ref)]
+            : const [],
+      );
+    };
+    api.scriptedReferenceResponses.addAll([
+      (_) async {
+        // Capture A1's stale answer before its wait.  A later request must
+        // not be able to alter this result through shared fake state.
+        const obsolete = ReferenceDto(
+          ref: _ref,
+          scheme: 'gchat',
+          title: 'Obsolete title',
+          cacheState: 'fresh',
+        );
+        await gateA1.future;
+        return {_ref: obsolete};
+      },
+      (_) => {_ref: _resolved()},
+    ]);
+
+    await mount(tester);
+    await open(tester, 'Cites a chat');
+    expect(find.text('loading context'), findsOneWidget);
+
+    await open(tester, 'Other work');
+    await open(tester, 'Cites a chat');
+    await tester.pump();
+    expect(find.text('Chat message'), findsOneWidget);
+
+    gateA1.complete();
+    await tester.pump();
+
+    expect(find.text('Chat message'), findsOneWidget);
+    expect(find.text('Obsolete title'), findsNothing);
     await tester.runAsync(store.dispose);
   });
 }

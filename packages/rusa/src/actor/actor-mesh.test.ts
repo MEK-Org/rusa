@@ -54,6 +54,7 @@ import type {
   ActorFactoryContext,
   ActorMeshOptions,
   LiveObligationSummary,
+  MeshActor,
   MeshObligationPort,
   RetireCleanup,
   SpawnRequest,
@@ -591,7 +592,7 @@ function setup(
       id: rootId,
       charter: "root",
       parentId: null,
-      isRoot: true,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     },
@@ -774,7 +775,6 @@ describe("ActorMesh", () => {
         id: externalId,
         charter: "external root",
         parentId: "root",
-        isRoot: false,
         status: "active",
         createdAt: "2026-01-01T00:00:00Z",
       },
@@ -1817,6 +1817,52 @@ describe("ActorMesh", () => {
       true
     );
     expect(rootEntries()).toHaveLength(3);
+  });
+
+  it("carries the head's latest reassignment message on ready-head attention (#947)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const reassignment = {
+      previousOwnerId: "human:operator",
+      newOwnerId: "root",
+      message: "Please answer the seat 2 thread.",
+      actingPrincipal: "human:operator",
+      timestamp: "2026-10-10T12:00:00.000Z",
+    };
+    const { mesh, tick } = setup({
+      inboxStore,
+      obligations: {
+        findLiveByExternalRef: () => null,
+        latestReassignment: (id) => {
+          if (id === "broken") throw new Error("unreadable history row");
+          return id === "reassigned" ? reassignment : null;
+        },
+      },
+    });
+    const payloadFor = (id: string) =>
+      inboxStore.entries.find((entry) => entry.source === `obligation:${id}`)?.payload;
+
+    mesh.deliverReadyHeadAttention("root", { id: "reassigned", intent: "review" }, null);
+    mesh.deliverReadyHeadAttention("root", { id: "plain", intent: "next" }, "reassigned");
+    // A history row that cannot be read costs the message, not the attention.
+    mesh.deliverReadyHeadAttention("root", { id: "broken", intent: "last" }, "plain");
+    await tick();
+
+    expect(payloadFor("reassigned")).toEqual({
+      type: "obligation.ready_head",
+      obligationId: "reassigned",
+      intent: "review",
+      latestReassignment: reassignment,
+    });
+    expect(payloadFor("plain")).toEqual({
+      type: "obligation.ready_head",
+      obligationId: "plain",
+      intent: "next",
+    });
+    expect(payloadFor("broken")).toEqual({
+      type: "obligation.ready_head",
+      obligationId: "broken",
+      intent: "last",
+    });
   });
 
   it("does not re-wake actor when an already delivered transition sequence is repeated after being handled", async () => {
@@ -5341,7 +5387,7 @@ describe("ActorMesh", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      isRoot: true,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5373,7 +5419,7 @@ describe("ActorMesh", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      isRoot: true,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5813,14 +5859,14 @@ describe("ActorMesh", () => {
       id: "ab-rig-holder",
       charter: "rig holder",
       parentId: null,
-      isRoot: false,
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
     registry.upsert({
       id: "legacy-parentless",
-      charter: "legacy record without explicit isRoot",
+      charter: "legacy parentless record",
       parentId: null,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5832,13 +5878,13 @@ describe("ActorMesh", () => {
       createdAt: "2026-01-01T00:00:00Z",
     });
 
-    // Root (with isRoot: true) has grant and revoke authority
+    // Root has grant and revoke authority
     expect(() => mesh.grantCapability("iu-thread", "understanding-write", "root")).not.toThrow();
     await expect(
       mesh.revokeCapability("iu-thread", "understanding-write", "root")
     ).resolves.not.toThrow();
 
-    // ab-rig-holder (parentId: null, isRoot: false) is refused grant & revoke authority
+    // A sandboxed parentless record (ab-rig-holder shape) is refused grant & revoke authority
     expect(() => mesh.grantCapability("iu-thread", "understanding-write", "ab-rig-holder")).toThrow(
       /only a capability-admin holder may grant/
     );
@@ -5846,7 +5892,8 @@ describe("ActorMesh", () => {
       mesh.revokeCapability("iu-thread", "understanding-write", "ab-rig-holder")
     ).rejects.toThrow(/only a capability-admin holder may revoke/);
 
-    // Legacy parentless record without explicit isRoot (defaults falsy) is also refused
+    // So is a parentless record that runs unsandboxed, as root does: neither
+    // topology nor running unsandboxed confers authority
     expect(() =>
       mesh.grantCapability("iu-thread", "understanding-write", "legacy-parentless")
     ).toThrow(/only a capability-admin holder may grant/);
@@ -5860,7 +5907,7 @@ describe("ActorMesh", () => {
       id: "account-b-root",
       charter: "another account root",
       parentId: null,
-      isRoot: true,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
@@ -5875,7 +5922,7 @@ describe("ActorMesh", () => {
     expect(() => mesh.grantCapability("account-b-child", "understanding-write", "root")).toThrow(
       /own subtree/
     );
-    // Being parentless/isRoot confers nothing: the other tree's root is refused
+    // Being parentless confers nothing: the other tree's root is refused
     // until it holds capability-admin itself (a row, not a topology inference).
     expect(() =>
       mesh.grantCapability("account-b-child", "understanding-write", "account-b-root")
@@ -8109,7 +8156,9 @@ describe("ActorMesh", () => {
     const a = mesh.spawn({ charter: "a", parentId: "root" });
     const b = mesh.spawn({ charter: "b", parentId: a }); // b is a's child
 
-    expect(() => mesh.reparentThread("root", a)).toThrow(/reparent the root/);
+    expect(() => mesh.reparentThread("root", a)).toThrow(
+      /Cannot give the top-level thread root a parent/
+    );
     expect(() => mesh.reparentThread(a, a)).toThrow(/to itself/);
     expect(() => mesh.reparentThread(a, "non-existent")).toThrow(/unknown parent/);
     expect(() => mesh.reparentThread("non-existent", a)).toThrow(/unknown thread/);
@@ -11059,7 +11108,7 @@ describe("ActorMesh", () => {
       const { mesh, registry } = setup({ rootId: generatedRootId });
       const ownChild = mesh.spawn({ charter: "own child", parentId: "root" });
       const otherRoot = mesh.spawn({ charter: "another account root", parentId: "root" });
-      registry.patch(otherRoot, { parentId: null, isRoot: true });
+      registry.patch(otherRoot, { parentId: null });
       const otherChild = mesh.spawn({ charter: "other child", parentId: otherRoot });
 
       expect(() => mesh.interrupt(ownChild, "root")).not.toThrow();
@@ -14361,6 +14410,89 @@ describe("accountRun token accounting (#443)", () => {
       expect(sqliteInbox.countUnhandled(queuedWorker)).toBe(0);
 
       db.close();
+    });
+  });
+
+  describe("single top-level actor guard (#550)", () => {
+    const dummyActor = (id: string): MeshActor => ({
+      id,
+      requestRun: () => {},
+      markUnkillable: () => {},
+      close: () => {},
+      preemptForResponsive: () => ({ preempted: false }),
+      isRunning: false,
+    });
+
+    it("refuses to adopt a second parentless actor, leaving the repository unchanged", () => {
+      const { mesh, registry } = setup();
+      const before = registry.list();
+
+      expect(() =>
+        mesh.adopt(
+          {
+            id: "second",
+            charter: "second",
+            parentId: null,
+            executionConfig: { unsandboxed: true },
+            status: "active",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+          dummyActor("second")
+        )
+      ).toThrow("Cannot add second as a second top-level actor: root is already top-level");
+
+      expect(registry.list()).toEqual(before);
+      expect(mesh.isLiveActor("second")).toBe(false);
+    });
+
+    it("counts a retired parentless actor as the top-level one", () => {
+      const { mesh, registry } = setup();
+      registry.patch("root", { status: "retired" });
+      expect(registry.get("root")?.status).toBe("retired");
+
+      expect(() =>
+        mesh.adopt(
+          {
+            id: "second",
+            charter: "second",
+            parentId: null,
+            executionConfig: { unsandboxed: true },
+            status: "active",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+          dummyActor("second")
+        )
+      ).toThrow(/second top-level actor: root/);
+    });
+
+    it("re-adopts the top-level actor itself and adopts actors with a parent", () => {
+      const { mesh, registry } = setup();
+      mesh.adopt(
+        {
+          id: "root",
+          charter: "root",
+          parentId: null,
+          executionConfig: { unsandboxed: true },
+          status: "active",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          title: "Root again",
+        },
+        dummyActor("root")
+      );
+      mesh.adopt(
+        {
+          id: "child",
+          charter: "child",
+          parentId: "root",
+          status: "active",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+        dummyActor("child")
+      );
+
+      expect(registry.list().filter((a) => a.parentId === null)).toHaveLength(1);
+      expect(registry.get("child")?.parentId).toBe("root");
+      expect(registry.get("root")?.title).toBe("Root again");
     });
   });
 });

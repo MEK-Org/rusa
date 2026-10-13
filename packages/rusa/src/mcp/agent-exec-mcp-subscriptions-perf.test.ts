@@ -44,7 +44,7 @@ describe("list_subscriptions performance and event loop safety (#687)", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      isRoot: true,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: new Date().toISOString(),
     });
@@ -192,7 +192,7 @@ describe("list_subscriptions performance and event loop safety (#687)", () => {
       id: "root",
       charter: "root",
       parentId: null,
-      isRoot: true,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: new Date().toISOString(),
     });

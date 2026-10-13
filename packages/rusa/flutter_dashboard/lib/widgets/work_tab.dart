@@ -2,10 +2,12 @@ import 'dart:async';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:flutter/material.dart';
 
+import '../api.dart';
 import '../breakpoints.dart';
 import '../dashboard_timing.dart';
 import '../link_opener.dart';
 import '../models.dart';
+import '../obligation_store.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../util.dart';
@@ -47,6 +49,7 @@ class _WorkTabState extends State<WorkTab> {
   String? _selectedObligationId;
   StreamSubscription<String?>? _focusSub;
   StreamSubscription<ObligationRefresh>? _checkpointSub;
+  StreamSubscription<ObligationEntities>? _storeSub;
   StreamSubscription<String?>? _principalSub;
   bool _showDone = false;
   bool _fetchedTerminalRoots = false;
@@ -87,6 +90,9 @@ class _WorkTabState extends State<WorkTab> {
           _loading = false;
           _isBackgroundRefreshing = false;
         });
+        // Into the shared store too, so the Overview's queue shows what this
+        // load found without a request of its own (#992).
+        widget.store.obligations.upsert(_obligationsIn(forest.trees));
         // Focus-link and Show Done requests include terminal roots. Persist only
         // the default terminal-excluding forest so a later default view cannot
         // paint rows it believes it did not fetch.
@@ -295,6 +301,9 @@ class _WorkTabState extends State<WorkTab> {
     _checkpointSub = widget.store.obligationRefreshes.listen((_) {
       _handleMutation();
     });
+    _storeSub = widget.store.obligations.entities.skip(1).listen((_) {
+      if (mounted) setState(() {});
+    });
     // When the viewing principal changes, refresh labels and re-seed or clear
     // the cached tree for that principal.
     _principalSub = widget.store.dashboardConfig
@@ -328,36 +337,57 @@ class _WorkTabState extends State<WorkTab> {
   void dispose() {
     _focusSub?.cancel();
     _checkpointSub?.cancel();
+    _storeSub?.cancel();
     _principalSub?.cancel();
     super.dispose();
+  }
+
+  static Iterable<ObligationDto> _obligationsIn(
+    List<ObligationTreeDto> nodes,
+  ) sync* {
+    for (final node in nodes) {
+      yield node.obligation;
+      yield* _obligationsIn(node.children);
+    }
+  }
+
+  /// The tree's shape comes from the last forest load; each row shows the
+  /// shared store's copy of its obligation, so a refresh behind another view
+  /// updates the row (#992). Every load writes its rows to the store first,
+  /// so the loaded copy only shows where it is the later write, as a forest
+  /// replayed from its own capture can be.
+  ObligationDto _latest(ObligationDto loaded) {
+    final shared = widget.store.obligations[loaded.id];
+    return shared != null && ObligationStore.isCurrent(shared, than: loaded)
+        ? shared
+        : loaded;
   }
 
   List<_FlatNode> _flattenTree(List<ObligationTreeDto> nodes, int depth) {
     final result = <_FlatNode>[];
     for (final node in nodes) {
+      final obligation = _latest(node.obligation);
       // A terminal obligation still shows if it retains completion history —
       // the same "recurring, or ledger rows survived recurrence being turned
       // off" test the detail panel uses to decide whether to render the
       // COMPLETION HISTORY section at all.
       final visible =
           _showDone ||
-          !node.obligation.isTerminal ||
-          node.obligation.isRecurring ||
-          node.obligation.hasCompletionHistory;
+          !obligation.isTerminal ||
+          obligation.isRecurring ||
+          obligation.hasCompletionHistory;
       if (!visible) continue;
-      final id = node.obligation.id;
+      final id = obligation.id;
       final hasVisibleChildren = _showDone
           ? node.children.isNotEmpty
-          : node.children.any(
-              (c) =>
-                  !c.obligation.isTerminal ||
-                  c.obligation.isRecurring ||
-                  c.obligation.hasCompletionHistory,
-            );
+          : node.children
+                .map((c) => _latest(c.obligation))
+                .any(
+                  (c) =>
+                      !c.isTerminal || c.isRecurring || c.hasCompletionHistory,
+                );
       final isCollapsed = !_expandedIds.contains(id);
-      result.add(
-        _FlatNode(node.obligation, depth, hasVisibleChildren, isCollapsed),
-      );
+      result.add(_FlatNode(obligation, depth, hasVisibleChildren, isCollapsed));
       if (hasVisibleChildren && !isCollapsed) {
         result.addAll(_flattenTree(node.children, depth + 1));
       }
@@ -768,9 +798,9 @@ class _FlatNode {
   final bool isCollapsed;
 }
 
-/// The waits before each refetch of an open obligation whose snapshot still
-/// carries a reference the server answered "pending" (#595). Bounded: after
-/// the last, a still-pending reference is shown as unavailable.
+/// The waits before each re-ask of a reference the open obligation cites that
+/// the server answered "pending" (#595). Bounded: after the last, a
+/// still-pending reference is shown as unavailable.
 const pendingReferenceRetryDelays = [
   Duration(seconds: 1),
   Duration(seconds: 2),
@@ -824,11 +854,17 @@ class _DetailViewState extends State<_DetailView> {
   StreamSubscription<ObligationRefresh>? _checkpointSub;
   int _fetchGeneration = 0;
 
-  /// The scheduled refetch while a reference in the loaded snapshot is still
-  /// pending on the server's background read (#595), and how many the
-  /// current ladder has spent. A ladder covers the pending refs it started
-  /// with; a ref seen pending for the first time starts a fresh one, so each
-  /// distinct ref buys at most one ladder while this obligation is open.
+  /// The references the loaded snapshot cites, resolved through
+  /// `/api/mesh/references` after the pane has painted (#940), and the refs
+  /// asked for and not yet answered.
+  Map<String, ReferenceDto> _references = const {};
+  Set<String> _referencesInFlight = const {};
+
+  /// The scheduled re-ask while a cited reference is still pending on the
+  /// server's background read (#595), and how many the current ladder has
+  /// spent. A ladder covers the pending refs it started with; a ref seen
+  /// pending for the first time starts a fresh one, so each distinct ref buys
+  /// at most one ladder while this obligation is open.
   Timer? _pendingRetry;
   int _pendingAttempts = 0;
   Set<String> _pendingSeen = const {};
@@ -839,6 +875,8 @@ class _DetailViewState extends State<_DetailView> {
   /// Every obligation the loaded snapshot draws besides this one: its parent,
   /// children and dependency edges (#773).
   Set<String> _shownIds = const {};
+
+  StreamSubscription<ObligationDto?>? _sharedSub;
 
   DashboardStore get store => widget.store;
   ValueChanged<DashboardView> get onSelectView => widget.onSelectView;
@@ -857,6 +895,31 @@ class _DetailViewState extends State<_DetailView> {
     super.initState();
     _fetch(trackDetail: true);
     _checkpointSub = widget.store.obligationRefreshes.listen(_onRefresh);
+    _listenToShared();
+  }
+
+  /// Repaints when the shared store's copy of this obligation changes, so a
+  /// refresh behind another view updates the header (#992).
+  void _listenToShared() {
+    _sharedSub?.cancel();
+    _sharedSub = widget.store.obligations.entities
+        .map((e) => e.byId[widget.obligationId])
+        .distinct(identical)
+        .skip(1)
+        .listen((_) {
+          if (mounted) setState(() {});
+        });
+  }
+
+  /// [data] showing the shared store's copy of its obligation where that is
+  /// not an earlier write than the one the detail read.
+  ObligationDetailSnapshot _withShared(ObligationDetailSnapshot data) {
+    final shared = store.obligations[data.obligation.id];
+    return shared == null ||
+            identical(shared, data.obligation) ||
+            !ObligationStore.isCurrent(shared, than: data.obligation)
+        ? data
+        : data.withObligation(shared);
   }
 
   @override
@@ -865,6 +928,10 @@ class _DetailViewState extends State<_DetailView> {
     if (oldWidget.store != widget.store) {
       _checkpointSub?.cancel();
       _checkpointSub = widget.store.obligationRefreshes.listen(_onRefresh);
+    }
+    if (oldWidget.store != widget.store ||
+        oldWidget.obligationId != widget.obligationId) {
+      _listenToShared();
     }
     if (oldWidget.obligationId != widget.obligationId) {
       _shownIds = const {};
@@ -877,6 +944,8 @@ class _DetailViewState extends State<_DetailView> {
       _completionsTotal = 0;
       _completionsHasMore = false;
       _showDoneChildren = false;
+      _references = const {};
+      _referencesInFlight = const {};
       _pendingAttempts = 0;
       _pendingSeen = const {};
       _pendingGaveUp = const {};
@@ -887,6 +956,7 @@ class _DetailViewState extends State<_DetailView> {
   @override
   void dispose() {
     _checkpointSub?.cancel();
+    _sharedSub?.cancel();
     _pendingRetry?.cancel();
     super.dispose();
   }
@@ -896,22 +966,91 @@ class _DetailViewState extends State<_DetailView> {
   int _beginFetch() {
     _pendingRetry?.cancel();
     _pendingRetry = null;
+    // A superseded reference request may never get to its generation-guarded
+    // settle callback. Its keys therefore belong to that old generation too:
+    // release them before the new snapshot asks for its own current refs.
+    _referencesInFlight = const {};
     return ++_fetchGeneration;
   }
 
-  static Set<String> _pendingRefs(ObligationDetailSnapshot data) => {
-    for (final reference in [
-      data.externalReference,
-      for (final artifact in data.artifacts) artifact.reference,
+  /// The refs the pane shows: the external link, keyed as its panel trims
+  /// it, and each artifact. An empty ref names nothing to resolve.
+  static Set<String> _refsOf(ObligationDetailSnapshot data) => {
+    for (final ref in [
+      data.obligation.externalRef?.trim() ?? '',
+      for (final artifact in data.artifacts) artifact.ref,
     ])
-      if (reference?.cacheState == 'pending') reference!.ref,
+      if (ref.isNotEmpty) ref,
   };
 
-  /// Schedules the next bounded refetch when [data] still carries a pending
-  /// reference. The server shares one provider read across these, so they
-  /// cost no extra provider traffic; the timer belongs to this load's
-  /// generation, so navigating away or a newer load leaves it inert.
+  /// A ref with no answer yet reads as pending, like the server's cold read.
+  ReferenceDto _referenceFor(String ref) =>
+      _references[ref] ?? ReferenceDto.loading(ref);
+
+  Set<String> _pendingRefs(ObligationDetailSnapshot data) => {
+    for (final ref in _refsOf(data))
+      if (_referenceFor(ref).cacheState == 'pending' &&
+          !_referencesInFlight.contains(ref))
+        ref,
+  };
+
+  /// A fresh detail snapshot revalidates every reference it cites while the
+  /// existing preview stays visible. A ladder tick asks only pending refs, so
+  /// a provider's cold read remains bounded. A failed ask spends a ladder
+  /// attempt, and a fresh detail load may re-ask a ref whose ladder gave up.
+  void _resolveReferences(
+    ObligationDetailSnapshot data, {
+    bool retrying = false,
+  }) {
+    final wanted = retrying
+        ? _pendingRefs(data).difference(_pendingGaveUp)
+        : _refsOf(data).difference(_referencesInFlight);
+    if (wanted.isEmpty) return;
+    final id = widget.obligationId;
+    final gen = _fetchGeneration;
+    _referencesInFlight = {..._referencesInFlight, ...wanted};
+    void settle([Map<String, ReferenceDto> resolved = const {}]) {
+      if (!mounted || gen != _fetchGeneration || id != widget.obligationId) {
+        return;
+      }
+      setState(() {
+        _referencesInFlight = _referencesInFlight.difference(wanted);
+        _references = {..._references, ...resolved};
+        _schedulePendingRetry(data);
+      });
+    }
+
+    store.api
+        .fetchReferences(wanted)
+        .then(
+          settle,
+          onError: (Object error, StackTrace _) => settle(
+            error is PartialReferenceFetchException ? error.resolved : const {},
+          ),
+        );
+  }
+
+  /// Lets the raw detail snapshot render before asking the separate reference
+  /// route to enrich it. A later navigation or refresh invalidates this
+  /// callback just as it invalidates an in-flight reference response.
+  void _resolveReferencesAfterFirstPaint(ObligationDetailSnapshot data) {
+    final id = widget.obligationId;
+    final gen = _fetchGeneration;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || gen != _fetchGeneration || id != widget.obligationId) {
+        return;
+      }
+      _resolveReferences(data);
+    });
+  }
+
+  /// Schedules the next bounded re-ask when a ref [data] cites is still
+  /// pending. The server shares one provider read across these, so they cost
+  /// no extra provider traffic; the timer belongs to this load's generation,
+  /// so navigating away or a newer load leaves it inert.
   void _schedulePendingRetry(ObligationDetailSnapshot data) {
+    _pendingRetry?.cancel();
+    _pendingRetry = null;
     final pending = _pendingRefs(data).difference(_pendingGaveUp);
     if (pending.isEmpty) return;
     if (!_pendingSeen.containsAll(pending)) {
@@ -924,48 +1063,30 @@ class _DetailViewState extends State<_DetailView> {
     }
     final gen = _fetchGeneration;
     _pendingRetry = Timer(pendingReferenceRetryDelays[_pendingAttempts++], () {
-      if (mounted && gen == _fetchGeneration) _retryPending(data);
+      if (mounted && gen == _fetchGeneration) {
+        _resolveReferences(data, retrying: true);
+      }
     });
-  }
-
-  /// Refetches in place: the shown snapshot stays up until the new one has
-  /// arrived, and a failed retry spends an attempt rather than replacing the
-  /// pane with an error.
-  void _retryPending(ObligationDetailSnapshot shown) {
-    final gen = _beginFetch();
-    store.api
-        .fetchObligationDetail(widget.obligationId)
-        .then((data) {
-          if (!mounted || gen != _fetchGeneration) return;
-          _shownIds = _idsOf(data);
-          setState(() {
-            _future = Future.value(data);
-            _applyRefreshed(data);
-          });
-        })
-        .catchError((_) {
-          if (!mounted || gen != _fetchGeneration) return;
-          setState(() => _schedulePendingRetry(shown));
-        });
   }
 
   /// A reference still pending once its retries ran out is shown as the
   /// server shows any read it could not complete.
-  ReferenceDto? _settled(ReferenceDto? reference) =>
-      reference?.cacheState == 'pending' &&
-          _pendingGaveUp.contains(reference!.ref)
-      ? ReferenceDto(
-          ref: reference.ref,
-          scheme: reference.scheme,
-          title: reference.title,
-          body: reference.body,
-          author: reference.author,
-          timestamp: reference.timestamp,
-          url: reference.url,
-          unavailable: 'could not load context',
-          cacheState: 'unavailable',
-        )
-      : reference;
+  ReferenceDto _settled(String ref) {
+    final reference = _referenceFor(ref);
+    return reference.cacheState == 'pending' && _pendingGaveUp.contains(ref)
+        ? ReferenceDto(
+            ref: reference.ref,
+            scheme: reference.scheme,
+            title: reference.title,
+            body: reference.body,
+            author: reference.author,
+            timestamp: reference.timestamp,
+            url: reference.url,
+            unavailable: 'could not load context',
+            cacheState: 'unavailable',
+          )
+        : reference;
+  }
 
   void _fetch({bool trackDetail = false}) {
     final gen = _beginFetch();
@@ -974,6 +1095,7 @@ class _DetailViewState extends State<_DetailView> {
       if (!mounted || gen != _fetchGeneration) {
         throw StateError('Obligation detail fetch superseded or unmounted');
       }
+      store.obligations.upsert([data.obligation]);
       _shownIds = _idsOf(data);
       setState(() {
         _history = data.history;
@@ -981,7 +1103,7 @@ class _DetailViewState extends State<_DetailView> {
         _completions = data.completions;
         _completionsTotal = data.completionsTotal;
         _completionsHasMore = data.completionsHasMore;
-        _schedulePendingRetry(data);
+        _resolveReferencesAfterFirstPaint(data);
       });
       return data;
     }
@@ -1014,7 +1136,7 @@ class _DetailViewState extends State<_DetailView> {
             _completions = mergeCompletions(data.completions, _completions);
             _completionsTotal = data.completionsTotal;
             _completionsHasMore = _completions.length < data.completionsTotal;
-            _schedulePendingRetry(data);
+            _resolveReferencesAfterFirstPaint(data);
           });
         })
         .catchError((_) {});
@@ -1051,6 +1173,7 @@ class _DetailViewState extends State<_DetailView> {
     future
         .then((data) {
           if (!mounted || gen != _fetchGeneration) return;
+          store.obligations.upsert([data.obligation]);
           _shownIds = _idsOf(data);
           setState(() => _applyRefreshed(data));
         })
@@ -1080,7 +1203,7 @@ class _DetailViewState extends State<_DetailView> {
       _completionsTotal = data.completionsTotal;
       _completionsHasMore = _completions.length < data.completionsTotal;
     }
-    _schedulePendingRetry(data);
+    _resolveReferencesAfterFirstPaint(data);
   }
 
   @override
@@ -1100,7 +1223,7 @@ class _DetailViewState extends State<_DetailView> {
           return const Center(child: CircularProgressIndicator());
         }
 
-        final data = snapshot.data!;
+        final data = _withShared(snapshot.data!);
         final o = data.obligation;
 
         final description = Column(
@@ -1232,13 +1355,7 @@ class _DetailViewState extends State<_DetailView> {
         _SectionHeader('ARTIFACTS'),
         for (final artifact in data.artifacts)
           _referenceLine(
-            _settled(artifact.reference) ??
-                ReferenceDto(
-                  ref: artifact.ref,
-                  scheme: artifact.ref.split(':').first,
-                  title: artifact.ref,
-                  unavailable: 'Not resolvable yet.',
-                ),
+            _settled(artifact.ref),
             label: artifact.label,
             attachedBy: artifact.attachedBy,
           ),
@@ -1465,7 +1582,8 @@ class _DetailViewState extends State<_DetailView> {
                 label: _historyLabel(h),
                 body:
                     h.after['checkpoint'] as String? ??
-                    h.after['terminalNote'] as String?,
+                    h.after['terminalNote'] as String? ??
+                    h.after['message'] as String?,
                 latest:
                     o.hasCheckpoint &&
                     h.after['checkpoint'] == o.checkpoint &&
@@ -1552,6 +1670,11 @@ class _DetailViewState extends State<_DetailView> {
   String _historyLabel(ObligationHistoryDto h) {
     if (h.kind == 'status') {
       return 'changed status ${h.before['status']} → ${h.after['status']}';
+    }
+    if (h.kind == 'responsive') {
+      return h.after['responsive'] == true
+          ? 'marked responsive'
+          : 'cleared responsive';
     }
     if (h.after.containsKey('checkpoint')) {
       return h.after['checkpoint'] == null
@@ -1856,15 +1979,7 @@ class _DetailViewState extends State<_DetailView> {
         ],
       );
     }
-    final reference =
-        _settled(data.externalReference) ??
-        ReferenceDto(
-          ref: ref,
-          scheme: ref.split(':').first,
-          title: ref,
-          unavailable: 'Not resolvable yet.',
-        );
-    return _referenceLine(reference, action: edit);
+    return _referenceLine(_settled(ref), action: edit);
   }
 
   Widget _completionMatcherPanel(CompletionMatcherDto matcher) {

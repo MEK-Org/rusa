@@ -290,12 +290,70 @@ class FakeApi extends DashboardApi {
     return chatRoomParticipants;
   }
 
+  /// What `/api/mesh/references` answers (#940); a ref missing here comes
+  /// back unavailable, as the server answers a ref it cannot resolve.
+  Map<String, ReferenceDto> referencesResult = {};
+
+  /// Each batch asked for, in order.
+  final referenceRequests = <List<String>>[];
+
+  /// Optional observer for assertions about when enrichment starts.
+  void Function()? onFetchReferences;
+
+  /// When set, each references answer waits on this, so a test can see the
+  /// pane painted before its references arrive.
+  Completer<void>? referencesGate;
+  Object? referencesError;
+
+  /// Per-call answers for tests that need independent concurrent responses.
+  /// Each callback receives its request's immutable batch before any wait.
+  final scriptedReferenceResponses =
+      <FutureOr<Map<String, ReferenceDto>> Function(List<String>)>[];
+
+  /// When set, answers each ref ahead of [referencesResult]; null defers.
+  ReferenceDto? Function(String ref)? referenceFor;
+
+  @override
+  Future<Map<String, ReferenceDto>> fetchReferences(
+    Iterable<String> refs,
+  ) async {
+    final batch = refs.toSet().toList();
+    referenceRequests.add(batch);
+    onFetchReferences?.call();
+    if (scriptedReferenceResponses.isNotEmpty) {
+      return scriptedReferenceResponses.removeAt(0)(batch);
+    }
+    await referencesGate?.future;
+    final error = referencesError;
+    if (error != null) throw error;
+    return {
+      for (final ref in batch)
+        ref:
+            referenceFor?.call(ref) ??
+            referencesResult[ref] ??
+            ReferenceDto(
+              ref: ref,
+              scheme: ref.split(':').first,
+              title: ref,
+              unavailable: 'could not load context',
+              cacheState: 'unavailable',
+            ),
+    };
+  }
+
   List<RecentActivityItem> recentActivityResult = [];
   int recentActivityCallCount = 0;
+
+  /// Per-call feed answers, taken ahead of [recentActivityResult].
+  final scriptedRecentActivity =
+      <Future<List<RecentActivityItem>> Function()>[];
 
   @override
   Future<List<RecentActivityItem>> fetchRecentActivity({int limit = 50}) async {
     recentActivityCallCount++;
+    if (scriptedRecentActivity.isNotEmpty) {
+      return scriptedRecentActivity.removeAt(0)();
+    }
     return recentActivityResult;
   }
 
@@ -700,7 +758,6 @@ class FakeApi extends DashboardApi {
   // ── Obligations routes ──
   List<ObligationDto> obligationsResult = [];
   Map<String, ObligationDetailSnapshot> obligationDetails = {};
-  Map<String, ReferenceDto?> obExternalReferences = {};
   Map<String, List<ObligationDto>> obBlockedBy = {};
   Map<String, int> obBlockedByTotal = {};
   Map<String, bool> obBlockedByHasMore = {};
@@ -730,13 +787,21 @@ class FakeApi extends DashboardApi {
   final reorderCalls =
       <({String id, String? previousId, String? nextId, String scope})>[];
   final reparentCalls = <({String id, String? parentId})>[];
-  final reassignCalls = <({String id, String ownerId})>[];
+  final reassignCalls = <({String id, String ownerId, String? message})>[];
   final fetchObligationsCalls =
       <({String? ownerId, String? status, String? queue, bool? rootsOnly})>[];
 
-  /// When set, pages are cut to `limit ?? obligationPageLimit` rows in
-  /// [obligationsResult] order, like the server's default page limit.
+  /// When set, pages are cut to this many rows, or fewer if the request asked
+  /// for fewer, in [obligationsResult] order, like the server's page limit.
   int? obligationPageLimit;
+
+  /// Holds every queue-page request (`queue` set, as Overview's My Queue
+  /// sends) until completed. The page is computed when the call is made, so
+  /// a held request returns the data as it stood then, like a slow response.
+  Completer<void>? obligationQueuePagesGate;
+
+  /// Thrown by queue-page requests (after any gate) while set.
+  Object? obligationQueuePagesError;
 
   @override
   Future<ObligationPage> fetchObligations({
@@ -773,9 +838,18 @@ class FakeApi extends DashboardApi {
       list = list.where((o) => o.parentId == null).toList();
     }
     final total = list.length;
-    final pageLimit = limit ?? obligationPageLimit;
+    final pageLimit = switch ((limit, obligationPageLimit)) {
+      (final asked?, final max?) => asked < max ? asked : max,
+      (final asked, final max) => asked ?? max,
+    };
     if (pageLimit != null && list.length > pageLimit) {
       list = list.take(pageLimit).toList();
+    }
+    if (queue != null) {
+      final gate = obligationQueuePagesGate;
+      if (gate != null) await gate.future;
+      final error = obligationQueuePagesError;
+      if (error != null) throw error;
     }
     return ObligationPage(
       obligations: list,
@@ -783,6 +857,12 @@ class FakeApi extends DashboardApi {
       hasMore: list.length < total,
     );
   }
+
+  /// Holds every obligation detail request until completed.
+  Completer<void>? obligationDetailGate;
+
+  /// Thrown by the detail request for each id (after any gate).
+  Map<String, Object> obligationDetailErrors = {};
 
   ObligationDetailSnapshot Function(String id, String? historyBefore)?
   obligationDetailByHistory;
@@ -799,6 +879,9 @@ class FakeApi extends DashboardApi {
     int? limit,
   }) async {
     obligationDetailCallCount++;
+    final detailGate = obligationDetailGate;
+    if (detailGate != null) await detailGate.future;
+    if (obligationDetailErrors[id] case final error?) throw error;
     if (obligationDetailByHistory != null) {
       return obligationDetailByHistory!(id, historyBefore);
     }
@@ -838,7 +921,6 @@ class FakeApi extends DashboardApi {
       blocks: blocks,
       blocksTotal: obBlocksTotal[id] ?? blocks.length,
       blocksHasMore: obBlocksHasMore[id] ?? false,
-      externalReference: obExternalReferences[id],
     );
   }
 
@@ -1104,8 +1186,9 @@ class FakeApi extends DashboardApi {
   Future<ObligationDto> reassignObligation(
     String id, {
     required String ownerId,
+    String? message,
   }) async {
-    reassignCalls.add((id: id, ownerId: ownerId));
+    reassignCalls.add((id: id, ownerId: ownerId, message: message));
     final old = obligationsResult.firstWhere(
       (o) => o.id == id,
       orElse: () => makeObligation(id),
@@ -1317,10 +1400,37 @@ class FakeObligationsCache implements ObligationsCache {
     invalidateCount++;
   }
 
+  /// Shared obligation store captures (#992), keyed like [_entries].
+  final Map<String, PersistedObligationEntitiesSnapshot> entityEntries = {};
+  int entitySaveCount = 0;
+  int entityInvalidateCount = 0;
+
+  @override
+  PersistedObligationEntitiesSnapshot? loadEntities({
+    required String scope,
+    required String principalId,
+  }) => entityEntries['$scope.$principalId'];
+
+  @override
+  void saveEntities(PersistedObligationEntitiesSnapshot snapshot) {
+    entityEntries['${snapshot.scope}.${snapshot.principalId}'] = snapshot;
+    entitySaveCount++;
+  }
+
+  @override
+  void invalidateEntities({
+    required String scope,
+    required String principalId,
+  }) {
+    entityEntries.remove('$scope.$principalId');
+    entityInvalidateCount++;
+  }
+
   @override
   void clear() {
     stored = null;
     _entries.clear();
+    entityEntries.clear();
     clearCount++;
   }
 }

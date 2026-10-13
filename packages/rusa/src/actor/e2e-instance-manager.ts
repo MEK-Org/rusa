@@ -59,6 +59,7 @@ export interface E2EInstanceLiveStatus {
   activeState: string;
   subState: string;
   result: string;
+  description?: string;
 }
 
 export interface E2EInstanceStatus {
@@ -155,17 +156,20 @@ function configuredCoordinatorSocketDirectory(configPath: string): string | unde
 }
 
 function parseSystemdStatus(output: string): E2EInstanceLiveStatus {
-  const values = new Map(
-    output
-      .trim()
-      .split("\n")
-      .map((line) => line.split("=", 2) as [string, string])
-  );
+  const values = new Map<string, string>();
+  for (const rawLine of output.trim().split("\n")) {
+    const line = rawLine.trim();
+    const eq = line.indexOf("=");
+    if (eq !== -1) {
+      values.set(line.slice(0, eq), line.slice(eq + 1));
+    }
+  }
   return {
     loadState: values.get("LoadState") ?? "unknown",
     activeState: values.get("ActiveState") ?? "unknown",
     subState: values.get("SubState") ?? "unknown",
     result: values.get("Result") ?? "unknown",
+    description: values.get("Description"),
   };
 }
 
@@ -218,8 +222,12 @@ function isLoopbackPortReady(port: number): Promise<boolean> {
  * state that must refresh is mounted writable; static credentials remain
  * read-only. No unrelated home path is exposed.
  *
- * Teardown has exactly three callers: the MCP down/stop tools, the existing
- * actor-retirement cleanup cascade, and the mesh shutdown paths in start.ts.
+ * The supervisor unit has three teardown/stop callers: deliberate teardown via
+ * the MCP down/stop tools, the existing actor-retirement cleanup cascade, and
+ * the restart-preserving mesh shutdown path in start.ts. Deliberate teardown
+ * (down, retirement) stops the unit and reclaims the holder record, runtime,
+ * and run root; mesh shutdown stops only the unit this instance holds and
+ * preserves the holder record and resumable root so the instance can be resumed.
  * There is deliberately no run-end hook, capability-revoke hook, timeout, or
  * poller. Restart=always keeps unexpected child exits (including OOM) restarting
  * in place, with a start limit preventing a configuration error from crash-looping.
@@ -314,6 +322,8 @@ export class E2EInstanceManager {
           "SubState",
           "-p",
           "Result",
+          "-p",
+          "Description",
         ])
       );
     } catch {
@@ -327,6 +337,16 @@ export class E2EInstanceManager {
       status.activeState !== "inactive" &&
       status.activeState !== "failed"
     );
+  }
+
+  /**
+   * Names the launching home in the unit's Description. systemctl prints a
+   * string property as the raw value (newline-bearing values as
+   * "[unprintable]"), so exact equality attributes the live unit to the one
+   * runtime directory that launched it without parsing any argv display.
+   */
+  private get unitDescription(): string {
+    return `Rusa live e2e instance (${this.runtimeDir})`;
   }
 
   private validateOwnedWorktree(actorId: string, requestedPath: string): string {
@@ -782,10 +802,13 @@ export class E2EInstanceManager {
     const existingStatus = this.liveStatus();
     if (this.isLive(existingStatus)) {
       throw new Error(
-        existing
-          ? `e2e-instance: already held by ${existing.actorHandle} (${existing.actorId}) serving ${existing.worktree}; ` +
+        existing && existingStatus.description !== this.unitDescription
+          ? `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} is currently live but belongs to another instance or cannot be attributed; ` +
+              `preserved holder ${existing.actorHandle} (${existing.actorId}) may resume only after that live unit becomes inactive`
+          : existing
+            ? `e2e-instance: already held by ${existing.actorHandle} (${existing.actorId}) serving ${existing.worktree}; ` +
               "it comes down only when that actor calls down/stop, that actor is retired, or the mesh shuts down"
-          : `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} is already active but its holder record is missing; ` +
+            : `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} is already active but its holder record is missing; ` +
               "an operator must stop the orphaned unit before retrying"
       );
     }
@@ -840,7 +863,7 @@ export class E2EInstanceManager {
         "--user",
         `--unit=${E2E_INSTANCE_UNIT_NAME}`,
         "--collect",
-        "--property=Description=Rusa live e2e instance",
+        `--description=${this.unitDescription}`,
         "--property=Restart=always",
         "--property=RestartSec=10s",
         "--property=StartLimitIntervalSec=60s",
@@ -905,8 +928,26 @@ export class E2EInstanceManager {
     if (this.readRecord()?.actorId === actorId) this.stopUnit();
   }
 
+  /**
+   * Stops the supervisor unit on mesh process shutdown if and only if this
+   * instance holds it and the live unit's Description names this instance's
+   * runtime directory, while preserving the holder record, resumable run root,
+   * database, and runtime state so the holder can resume the instance after
+   * restart. Any other live unit (another home's launch, or one this home
+   * cannot attribute) is left running with this home's state untouched.
+   */
   stopForMeshShutdown(): void {
-    if (this.readRecord() || this.isLive(this.liveStatus())) this.stopUnit();
+    if (!this.readRecord()) return;
+
+    const live = this.liveStatus();
+    if (!this.isLive(live)) {
+      teardownFlutterOverlay(this.runtimeDir);
+      return;
+    }
+    if (live.description !== this.unitDescription) return;
+
+    this.exec("systemctl", ["--user", "stop", E2E_INSTANCE_UNIT_NAME]);
+    teardownFlutterOverlay(this.runtimeDir);
   }
 
   /**
@@ -956,7 +997,7 @@ export class E2EInstanceManager {
     teardownFlutterOverlay(this.runtimeDir);
     rmSync(this.stateFile, { force: true });
     rmSync(this.runtimeDir, { recursive: true, force: true });
-    // Deliberate teardown (down, retirement, mesh shutdown) discards the
+    // Deliberate teardown (down, retirement) discards the
     // record, so the root it named is no longer resumable by anyone.
     this.discardRunRoot(holder?.resumableRoot);
   }

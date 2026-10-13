@@ -477,10 +477,11 @@ void main() {
     });
 
     test('reassignObligation sends POST with the new owner', () async {
+      final sent = <Object?>[];
       final mockClient = MockClient((req) async {
         expect(req.url.path, '/api/mesh/obligations/ob-owner/reassign');
         expect(req.method, 'POST');
-        expect(jsonDecode(req.body), {'ownerId': '00000000-0000-4000-8000-000000000001'});
+        sent.add(jsonDecode(req.body));
         return http.Response(
           jsonEncode({
             'ok': true,
@@ -508,6 +509,19 @@ void main() {
         ownerId: '00000000-0000-4000-8000-000000000001',
       );
       expect(result.ownerId, '00000000-0000-4000-8000-000000000001');
+
+      // An optional message (#941) is sent when present and omitted when blank.
+      await api.reassignObligation(
+        'ob-owner',
+        ownerId: '00000000-0000-4000-8000-000000000001',
+        message: 'Please answer seat 2.',
+      );
+      await api.reassignObligation('ob-owner', ownerId: '00000000-0000-4000-8000-000000000001', message: '   ');
+      expect(sent, [
+        {'ownerId': '00000000-0000-4000-8000-000000000001'},
+        {'ownerId': '00000000-0000-4000-8000-000000000001', 'message': 'Please answer seat 2.'},
+        {'ownerId': '00000000-0000-4000-8000-000000000001'},
+      ]);
     });
   });
 

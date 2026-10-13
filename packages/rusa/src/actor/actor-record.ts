@@ -16,6 +16,24 @@ export interface PortableContextConfig {
 
 export type ContextConfig = NativeContextConfig | PortableContextConfig;
 
+/**
+ * How the mesh runs an actor (#465, #550), stored in the versioned
+ * `actors.execution_config` document. It is independent of where the actor
+ * sits in the tree, and a parent change keeps it.
+ */
+export interface ExecutionConfig {
+  /**
+   * Run outside managed sandboxing. Actors are sandboxed by default; only an
+   * actor created with `unsandboxed: true` runs without it. This records the
+   * requested builder intent: it is neither an authorization grant nor proof
+   * of effective isolation. In running systems the deployment mapping is:
+   *   ActorOptions.sandbox = (!unsandboxed && config.sandbox !== "container-boundary")
+   */
+  unsandboxed?: boolean;
+  /** Registered follower ID where this actor is placed remotely; unset means the actor runs on the leader. */
+  executionTarget?: string;
+}
+
 /** A capability to message another actor. The unguessable id is the capability. */
 export interface ActorHandle {
   id: string;
@@ -76,12 +94,10 @@ export interface ActorRecord {
   sessionId?: string;
   context?: ContextConfig;
   title?: string;
-  /** Compatibility view of root topology; repositories derive this from parentId. */
-  isRoot?: boolean;
+  /** Absent means sandboxed on the leader. */
+  executionConfig?: ExecutionConfig;
   status: ActorStatus;
   createdAt: string;
-  /** Registered follower ID where this actor is placed remotely; unset for leader-local execution. */
-  executionTarget?: string;
   /** Per-actor walkie-talkie voice; absent follows the instance-wide default. */
   voiceConfig?: VoiceConfigDocument;
 }

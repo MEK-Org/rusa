@@ -590,6 +590,15 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     }
     parsed.jevApiKeyFile = parsed.jevApiKeyFile.trim();
   }
+  if (parsed.jevMode !== undefined) {
+    if (
+      typeof parsed.jevMode !== "string" ||
+      !["shadow", "active"].includes(parsed.jevMode.trim())
+    ) {
+      throw new Error('config.yaml: jevMode must be "shadow" or "active" when set');
+    }
+    parsed.jevMode = parsed.jevMode.trim() as "shadow" | "active";
+  }
   if (parsed.deployBranch !== undefined) {
     if (typeof parsed.deployBranch !== "string" || !parsed.deployBranch.trim()) {
       throw new Error("config.yaml: deployBranch must be a non-empty string when set");

@@ -2,7 +2,9 @@ import type { ServerResponse } from "node:http";
 import {
   createDashboardRequestId,
   type DashboardTimingRecorder,
+  type DashboardTimingTerminal,
   dashboardTimingLabelForRoute,
+  dashboardTimingMethod,
   dashboardTimingOperationForRoute,
 } from "./timing.js";
 import { attachDashboardPhaseClock, DashboardPhaseClock } from "./timing-phases.js";
@@ -49,6 +51,10 @@ function trackResponse(res: ServerResponse, phases: DashboardPhaseClock): () => 
  * Attach the request-wide, post-response server timing observation. All dynamic
  * API replies get a correlation UUID; the telemetry receiver itself gets the
  * header but is intentionally not measured to avoid recursive events.
+ *
+ * Exactly one record per request (#990): `finished` on `finish`, or
+ * `closed_before_finish` when the connection closes first. A finished response
+ * also emits `close`; the guard keeps that from becoming a second record.
  */
 export function beginDashboardRequestTiming(
   res: ServerResponse,
@@ -68,16 +74,24 @@ export function beginDashboardRequestTiming(
   attachDashboardPhaseClock(phases);
   const responseBytes = trackResponse(res, phases);
   const operation = dashboardTimingOperationForRoute(pathname);
-  res.once("finish", () => {
-    const finishedAt = performance.now();
+  const requestMethod = dashboardTimingMethod(method ?? "GET");
+  let recorded = false;
+  const record = (terminal: DashboardTimingTerminal) => {
+    if (recorded) return;
+    recorded = true;
+    const endedAt = performance.now();
     timings.recordServer({
       label,
       ...(operation ? { operation } : {}),
       requestId,
-      durationMs: Math.round(finishedAt - started),
-      status: res.statusCode,
+      durationMs: Math.round(endedAt - started),
+      // Before headers are sent, statusCode is only the default, not a reply.
+      status: terminal === "finished" || res.headersSent ? res.statusCode : null,
       bytes: responseBytes(),
-      phases: phases.durations(finishedAt),
+      phases: phases.durations(endedAt),
+      request: { method: requestMethod, terminal },
     });
-  });
+  };
+  res.once("finish", () => record("finished"));
+  res.once("close", () => record(res.writableFinished ? "finished" : "closed_before_finish"));
 }

@@ -55,7 +55,9 @@ ${"━".repeat(26)}
     logger: log.child({ component: "reference-cache" }),
   });
   const actors = getRepositories().actors;
-  const rootRecord = actors.list().find((record) => record.isRoot === true);
+  // Keep the daemon's historical first parentless-record selection. Forest
+  // boot owns any future plurality semantics; this read-only viewer does not.
+  const rootRecord = actors.list().find((record) => record.parentId === null);
   // The HALT sentinel is a plain file against the same home, so this read-only
   // viewer can surface the halt state even though no mesh runs in this process.
   const haltSwitch = new HaltSwitch(join(mcHome, "HALT"));

@@ -154,6 +154,26 @@ describe("loadConfig jevApiKeyFile (optional)", () => {
   });
 });
 
+describe("loadConfig jevMode (optional)", () => {
+  it("leaves jevMode undefined when absent", () => {
+    expect(loadConfig(writeConfig()).jevMode).toBeUndefined();
+  });
+
+  it("accepts and trims shadow mode", () => {
+    expect(loadConfig(writeConfig({ jevMode: "  shadow  " })).jevMode).toBe("shadow");
+  });
+
+  it("accepts and trims active mode", () => {
+    expect(loadConfig(writeConfig({ jevMode: "  active  " })).jevMode).toBe("active");
+  });
+
+  it("rejects an invalid mode", () => {
+    expect(() => loadConfig(writeConfig({ jevMode: "invalid" }))).toThrow(
+      /jevMode must be "shadow" or "active"/
+    );
+  });
+});
+
 describe("loadConfig rootActor.context", () => {
   it("normalizes a valid portable ledger context", () => {
     const config = loadConfig(

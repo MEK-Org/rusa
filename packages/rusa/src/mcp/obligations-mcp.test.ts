@@ -89,7 +89,7 @@ describe("obligations MCP", () => {
 
   it("creates responsive obligations and reports inherited responsiveness", async () => {
     const client = await connect(
-      createObligationsMcpServer(repository, "actor-a", { canSetResponsive: true })
+      createObligationsMcpServer(repository, "actor-a", { canSetResponsive: () => true })
     );
     const parent = (await client.callTool({
       name: "create_obligation",
@@ -230,7 +230,11 @@ describe("obligations MCP", () => {
     expect(db.serialize()).toEqual(before);
     expect(repository.require(child.id).effectiveResponsive).toBe(false);
     const root = await connect(
-      createObligationsMcpServer(repository, "opaque-root-id", { canSetResponsive: true })
+      // Composed as start.ts composes root: promotion also requires canManage.
+      createObligationsMcpServer(repository, "opaque-root-id", {
+        canSetResponsive: () => true,
+        canManage: () => true,
+      })
     );
     expect(
       (
@@ -264,7 +268,11 @@ describe("obligations MCP", () => {
     repository.create({ title: "existing hotfix", id: "hotfix", ownerId: "actor-a" });
     repository.create({ title: "child", id: "child", ownerId: "actor-a", parentId: "hotfix" });
     const client = await connect(
-      createObligationsMcpServer(repository, "root-uuid", { canSetResponsive: true })
+      // Composed as start.ts composes root: marking also requires canManage.
+      createObligationsMcpServer(repository, "root-uuid", {
+        canSetResponsive: () => true,
+        canManage: () => true,
+      })
     );
 
     const result = (await client.callTool({
@@ -743,6 +751,45 @@ describe("obligations MCP", () => {
     expect(dataOf(result)).toMatchObject({
       obligation: { id: "task", ownerId: "00000000-0000-4000-8000-000000000001" },
       previousOwnerId: "actor-a",
+    });
+  });
+
+  it("returns the latest reassignment message from get_obligation, and no field without one (#947)", async () => {
+    repository.create({ title: "task", id: "task", ownerId: "actor-a" });
+    repository.create({ title: "other", id: "other", ownerId: "actor-a" });
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    await client.callTool({
+      name: "reassign_obligation",
+      arguments: { id: "task", owner_id: "human:operator", message: "Ready for your review." },
+    });
+    const read = async (id: string) =>
+      dataOf(
+        (await client.callTool({ name: "get_obligation", arguments: { id } })) as CallToolResult
+      );
+
+    expect(await read("task")).toHaveProperty("latestReassignment", {
+      previousOwnerId: "actor-a",
+      newOwnerId: "human:operator",
+      message: "Ready for your review.",
+      actingPrincipal: "actor-a",
+      timestamp: expect.any(String),
+    });
+    expect(await read("other")).not.toHaveProperty("latestReassignment");
+  });
+
+  it("records an optional reassignment message in history (#941)", async () => {
+    repository.create({ title: "task", id: "task", ownerId: "actor-a" });
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const result = (await client.callTool({
+      name: "reassign_obligation",
+      arguments: { id: "task", owner_id: "human:operator", message: "Ready for your review." },
+    })) as CallToolResult;
+
+    expect(result.isError).toBeFalsy();
+    expect(repository.listHistory("task")[0]).toMatchObject({
+      mutationKind: "reassign",
+      actingPrincipal: "actor-a",
+      after: { ownerId: "human:operator", message: "Ready for your review." },
     });
   });
 

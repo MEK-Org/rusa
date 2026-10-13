@@ -17,7 +17,7 @@ import {
   EXTERNAL_CONDUCT_POLICY,
   GROUNDING_DISCIPLINE,
   gitIdentityGuidance,
-  INBOX_DISCIPLINE,
+  inboxDiscipline,
   OBLIGATION_DISCIPLINE,
   trackerWritingGuidance,
   WRITING_FOR_AGENTS_DISCIPLINE,
@@ -63,7 +63,9 @@ export function buildRootPrompt(
   charter: string = ROOT_ACTOR_CHARTER,
   priorContext?: string,
   actorHandle?: string,
-  gitIdentity: MeshGitIdentityResolution = resolveMeshGitIdentity(undefined)
+  gitIdentity: MeshGitIdentityResolution = resolveMeshGitIdentity(undefined),
+  /** Whether the host runs the active JEV queue policy (#533). */
+  activeQueuePolicy = false
 ): string {
   return `${trackerWritingGuidance(actorHandle ?? "rusa")}
 
@@ -75,7 +77,7 @@ ${GROUNDING_DISCIPLINE}
 
 ${gitIdentityGuidance(gitIdentity)}
 
-${INBOX_DISCIPLINE}
+${inboxDiscipline(activeQueuePolicy)}
 
 ${OBLIGATION_DISCIPLINE}
 

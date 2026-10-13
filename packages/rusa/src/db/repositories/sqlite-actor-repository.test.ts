@@ -19,7 +19,7 @@ const root: ActorRecord = {
   sessionId: "session-1",
   context: { type: "native" },
   title: "Root",
-  isRoot: true,
+  executionConfig: { unsandboxed: true },
   status: "active",
   createdAt: "2026-09-03T13:00:00.000Z",
 };
@@ -356,6 +356,8 @@ describe("SqliteActorRepository", () => {
       '{"schemaVersion":1,"type":"native","mode":"tail"}',
       '{"schemaVersion":1,"type":"native","executionTarget":"mac-mini"}',
       '{"schemaVersion":2,"type":"native","unknown":true}',
+      // v2 carried the placement until 0056 moved it to execution_config.
+      '{"schemaVersion":2,"type":"native","executionTarget":"mac-mini"}',
     ]) {
       db.prepare("UPDATE actors SET context_config = ? WHERE id = 'root'").run(invalid);
       expect(() => repository.get("root")).toThrow(/invalid context_config for actor 'root'/);
@@ -582,10 +584,12 @@ describe("SqliteActorRepository", () => {
 
       const reopened = new Database(file);
       reopened.pragma("foreign_keys = ON");
-      expect(new SqliteActorRepository(reopened).get("worker")).toMatchObject({
+      const reread = new SqliteActorRepository(reopened);
+      expect(reread.get("worker")).toMatchObject({
         id: "worker",
         handles: [{ id: "root", role: "parent" }],
       });
+      expect(reread.get("root")).toEqual(root);
       reopened.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -595,26 +599,151 @@ describe("SqliteActorRepository", () => {
   it("enforces relational ownership invariants", () => {
     expect(() => repository.upsert({ ...root, parentId: "missing" })).toThrow();
     repository.upsert(root);
-    expect(() => repository.upsert({ ...root, id: "second-root" })).toThrow();
-    expect(() =>
-      repository.upsert({ ...root, id: "root-with-parent", parentId: "root" })
-    ).toThrow();
     expect(() =>
       db.prepare("INSERT INTO actor_handles (actor_id, target_id) VALUES ('missing', 'root')").run()
     ).toThrow();
   });
 
-  it("refuses a parentless, non-root record", () => {
-    expect(() =>
-      repository.upsert({
-        id: "driver",
-        charter: "A/B driver stub",
-        parentId: null,
-        isRoot: false,
-        status: "active",
-        createdAt: "2026-09-03T13:00:00.000Z",
-      })
-    ).toThrow();
+  it("stores several parentless actors, each with its own execution config (#550)", () => {
+    repository.upsert(root);
+    const driver: ActorRecord = {
+      id: "driver",
+      charter: "A/B driver stub",
+      parentId: null,
+      status: "active",
+      createdAt: "2026-09-03T13:05:00.000Z",
+    };
+    repository.upsert(driver);
+
+    expect(repository.list().filter((record) => record.parentId === null)).toEqual([root, driver]);
+    expect(repository.get("driver")).toEqual(driver);
+    expect(repository.get("root")).not.toHaveProperty("isRoot");
+  });
+
+  it("keeps executionConfig across a parent change (#550)", () => {
+    repository.upsert(root);
+    repository.upsert({
+      id: "lead",
+      charter: "Lead",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-09-03T13:01:00.000Z",
+    });
+    repository.upsert({
+      id: "worker",
+      charter: "Implement",
+      parentId: "lead",
+      executionConfig: { unsandboxed: true },
+      status: "active",
+      createdAt: "2026-09-03T13:02:00.000Z",
+    });
+
+    repository.patch("worker", { parentId: "root" });
+    repository.patch("lead", { parentId: null });
+
+    expect(repository.get("worker")).toMatchObject({
+      parentId: "root",
+      executionConfig: { unsandboxed: true },
+    });
+    expect(repository.get("lead")).toMatchObject({
+      parentId: null,
+    });
+  });
+
+  it("sandboxes an actor unless it is affirmatively unsandboxed, and states that in storage (#550)", () => {
+    const { executionConfig: _omitted, ...defaulted } = root;
+    repository.upsert({ ...defaulted, id: "defaulted" });
+    repository.upsert({
+      ...defaulted,
+      id: "explicit-false",
+      executionConfig: { unsandboxed: false },
+    });
+    repository.upsert({ ...defaulted, id: "empty", executionConfig: {} });
+    repository.upsert({ ...defaulted, id: "unsandboxed", executionConfig: { unsandboxed: true } });
+
+    const stored = (id: string) =>
+      JSON.parse(
+        (
+          db.prepare("SELECT execution_config FROM actors WHERE id = ?").get(id) as {
+            execution_config: string;
+          }
+        ).execution_config
+      );
+    for (const id of ["defaulted", "explicit-false", "empty"]) {
+      expect(stored(id), id).toEqual({ schemaVersion: 1, unsandboxed: false });
+      expect(repository.get(id), id).not.toHaveProperty("executionConfig");
+    }
+    expect(stored("unsandboxed")).toEqual({ schemaVersion: 1, unsandboxed: true });
+    expect(repository.get("unsandboxed")?.executionConfig).toEqual({ unsandboxed: true });
+  });
+
+  it("refuses a write whose unsandboxed is not a boolean (#550)", () => {
+    for (const unsandboxed of [null, "true", 1, ""]) {
+      expect(() =>
+        repository.upsert({ ...root, executionConfig: { unsandboxed } } as unknown as ActorRecord)
+      ).toThrow(/invalid execution_config for actor 'root'/);
+    }
+    expect(repository.get("root")).toBeUndefined();
+  });
+
+  it("stores how an actor runs in its own versioned execution_config (#550)", () => {
+    repository.upsert({
+      ...root,
+      context: { type: "native" },
+      sessionId: "session-root",
+      executionConfig: { unsandboxed: true, executionTarget: "follower-a" },
+    });
+    const row = db
+      .prepare("SELECT context_config, execution_config FROM actors WHERE id = 'root'")
+      .get() as { context_config: string; execution_config: string };
+    expect(JSON.parse(row.execution_config)).toEqual({
+      schemaVersion: 1,
+      unsandboxed: true,
+      executionTarget: "follower-a",
+    });
+    expect(repository.get("root")?.executionConfig).toEqual({
+      unsandboxed: true,
+      executionTarget: "follower-a",
+    });
+    // context_config keeps only the context selection and the session.
+    expect(JSON.parse(row.context_config)).toEqual({
+      schemaVersion: 1,
+      type: "native",
+      sessionId: "session-root",
+    });
+
+    // Clearing the placement returns the actor to the leader.
+    repository.patch("root", { executionConfig: { unsandboxed: true } });
+    expect(repository.get("root")?.executionConfig).toEqual({ unsandboxed: true });
+    expect(
+      JSON.parse(
+        (
+          db.prepare("SELECT execution_config FROM actors WHERE id = 'root'").get() as {
+            execution_config: string;
+          }
+        ).execution_config
+      )
+    ).toEqual({ schemaVersion: 1, unsandboxed: true });
+  });
+
+  it.each([
+    ["missing", null, /missing execution_config for actor 'root'/],
+    ["unversioned", '{"unsandboxed":false}', /invalid execution_config for actor 'root'/],
+    [
+      "future",
+      '{"schemaVersion":2,"unsandboxed":false}',
+      /invalid execution_config for actor 'root'/,
+    ],
+    ["non-boolean", '{"schemaVersion":1,"unsandboxed":"yes"}', /invalid execution_config/],
+    ["implicit default", '{"schemaVersion":1}', /invalid execution_config/],
+    ["superseded field", '{"schemaVersion":1,"sandboxed":true}', /invalid execution_config/],
+    ["unknown field", '{"schemaVersion":1,"unsandboxed":false,"kind":"external"}', /invalid/],
+    ["not JSON", "{", /invalid execution_config for actor 'root'/],
+  ])("refuses to read a %s execution_config rather than guess how the actor runs (#550)", (_label, stored, error) => {
+    repository.upsert(root);
+    db.prepare("UPDATE actors SET execution_config = ? WHERE id = 'root'").run(stored);
+
+    expect(() => repository.get("root")).toThrow(error);
   });
 
   it("keeps a staged desired modelConfig pool in process memory, not the durable document", () => {
@@ -753,7 +882,7 @@ describe("SqliteActorRepository", () => {
       charter: "Run remotely on macOS",
       parentId: "root",
       status: "active",
-      executionTarget: "mac-mini-follower",
+      executionConfig: { executionTarget: "mac-mini-follower" },
       modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
       createdAt: "2026-09-07T12:00:00.000Z",
     };
@@ -761,24 +890,28 @@ describe("SqliteActorRepository", () => {
     repository.upsert(remoteWorker);
 
     const stored = db
-      .prepare("SELECT context_config FROM actors WHERE id = 'worker-remote'")
-      .get() as {
-      context_config: string;
-    };
-    expect(JSON.parse(stored.context_config)).toEqual({
-      schemaVersion: 2,
-      type: "native",
+      .prepare("SELECT context_config, execution_config FROM actors WHERE id = 'worker-remote'")
+      .get() as { context_config: string | null; execution_config: string };
+    expect(JSON.parse(stored.execution_config)).toEqual({
+      schemaVersion: 1,
+      unsandboxed: false,
       executionTarget: "mac-mini-follower",
     });
+    // Placement alone no longer writes a context document.
+    expect(stored.context_config).toBeNull();
 
-    expect(repository.get("worker-remote")?.executionTarget).toBe("mac-mini-follower");
+    expect(repository.get("worker-remote")?.executionConfig?.executionTarget).toBe(
+      "mac-mini-follower"
+    );
 
     // Verify persistence across repository reopen with same db
     const reopened = new SqliteActorRepository(db);
-    expect(reopened.get("worker-remote")?.executionTarget).toBe("mac-mini-follower");
+    expect(reopened.get("worker-remote")?.executionConfig?.executionTarget).toBe(
+      "mac-mini-follower"
+    );
   });
 
-  it("reads the strict v1 context document while emitting the v2 placement shape", () => {
+  it("keeps the v1 context document as it is when an actor is placed", () => {
     repository.upsert(root);
     db.prepare("UPDATE actors SET context_config = ? WHERE id = 'root'").run(
       JSON.stringify({ schemaVersion: 1, type: "native", sessionId: "legacy-session" })
@@ -789,39 +922,20 @@ describe("SqliteActorRepository", () => {
       sessionId: "legacy-session",
     });
 
-    repository.patch("root", { executionTarget: "mac-mini-follower" });
-    const stored = db.prepare("SELECT context_config FROM actors WHERE id = 'root'").get() as {
-      context_config: string;
-    };
-    expect(JSON.parse(stored.context_config)).toEqual({
-      schemaVersion: 2,
-      type: "native",
-      sessionId: "legacy-session",
-      executionTarget: "mac-mini-follower",
+    repository.patch("root", {
+      executionConfig: { unsandboxed: true, executionTarget: "mac-mini-follower" },
     });
-  });
-
-  it("emits v1 for unplaced actors to keep rollback blast radius strictly bounded", () => {
-    repository.upsert(root);
-    const unplacedWorker: ActorRecord = {
-      id: "worker-local",
-      charter: "local test charter",
-      parentId: "root",
-      status: "active",
-      sessionId: "local-session-123",
-      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
-      createdAt: "2026-09-07T12:00:00.000Z",
-    };
-    repository.upsert(unplacedWorker);
-    const stored = db
-      .prepare("SELECT context_config FROM actors WHERE id = 'worker-local'")
-      .get() as {
+    const stored = db.prepare("SELECT context_config FROM actors WHERE id = 'root'").get() as {
       context_config: string;
     };
     expect(JSON.parse(stored.context_config)).toEqual({
       schemaVersion: 1,
       type: "native",
-      sessionId: "local-session-123",
+      sessionId: "legacy-session",
+    });
+    expect(repository.get("root")).toMatchObject({
+      sessionId: "legacy-session",
+      executionConfig: { unsandboxed: true, executionTarget: "mac-mini-follower" },
     });
   });
 
@@ -982,7 +1096,6 @@ describe("SqliteActorRepository", () => {
     repository.upsert({
       ...root,
       id: "eleven-worker",
-      isRoot: false,
       parentId: "root",
       voiceConfig,
     });

@@ -268,6 +268,46 @@ try {
   await fakePage.waitForFunction(() =>
     document.getElementById("status").textContent.includes("completed")
   );
+  // Recognition-only must never open a page microphone stream or recorder.
+  await fakePage.evaluate(() => {
+    window.micCalls = 0;
+    const getUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    navigator.mediaDevices.getUserMedia = (options) => {
+      window.micCalls++;
+      return getUserMedia(options);
+    };
+  });
+  await fakePage.selectOption("#mode", "recognition-only");
+  await fakePage.click("#start");
+  await fakePage.waitForFunction(() => !document.getElementById("stop").disabled);
+  assert.equal(await fakePage.locator("#mark").isEnabled(), true);
+  await fakePage.click("#mark");
+  await fakePage.evaluate(() => window.fakeRecognition.result("eleven boats"));
+  await fakePage.click("#stop");
+  await fakePage.waitForFunction(() =>
+    document.getElementById("status").textContent.includes("completed")
+  );
+  const recognitionOnly = (await fakeSnapshot()).trials.at(-1);
+  assert.equal(await fakePage.evaluate(() => window.micCalls), 0);
+  assert.equal(recognitionOnly.mode, "recognition-only");
+  assert.equal(recognitionOnly.acquisitionOrder, "none");
+  assert.equal(recognitionOnly.previewAtStop, "eleven boats");
+  assert.equal(recognitionOnly.finalRecognition, "eleven paper boats");
+  assert.equal(recognitionOnly.firstPartialBeforeStop, true);
+  assert.equal(recognitionOnly.audio, null);
+  assert.equal(recognitionOnly.recorderStartMs, undefined);
+  assert.ok(!recognitionOnly.events.some((e) => e.type.startsWith("recorder-")));
+  assert.equal(await fakePage.locator("#clip").isVisible(), false);
+  // Early end without a recorder waits for Stop and still finishes cleanly.
+  await fakePage.click("#start");
+  await fakePage.waitForFunction(() => !document.getElementById("stop").disabled);
+  await fakePage.evaluate(() => window.fakeRecognition.dispatchEvent(new Event("end")));
+  assert.ok((await fakeSnapshot()).trials.at(-1).phase.includes("no page recorder"));
+  await fakePage.click("#stop");
+  await fakePage.waitForFunction(() =>
+    document.getElementById("status").textContent.includes("completed")
+  );
+  assert.equal(await fakePage.evaluate(() => window.micCalls), 0);
   // A missing local-required property must fail before microphone acquisition.
   await fakePage.evaluate(() => {
     window.omitLocalSupport = true;
@@ -329,6 +369,7 @@ try {
           "independent 10s recorder timeout releases tracks and discards unfinished audio",
           "cancel discards clip",
           "early recognition end keeps recording",
+          "recognition-only never calls getUserMedia and yields no clip",
           "local-required unsupported fails closed",
           "cancel during acquisition releases late stream",
           "zero actor dispatch",

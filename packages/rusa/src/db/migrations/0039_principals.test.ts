@@ -134,7 +134,7 @@ describe("0039_principals (schema, application bypassed)", () => {
       id: "root",
       charter: "test actor",
       parentId: null,
-      isRoot: true,
+      executionConfig: { unsandboxed: true },
       status: "active",
       createdAt: ROOT_CREATED_AT,
     };
