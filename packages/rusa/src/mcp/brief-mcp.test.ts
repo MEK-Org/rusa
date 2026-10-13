@@ -392,34 +392,6 @@ describe("brief MCP server: citations must exist", () => {
     expect(store.load(ALPHA)).toEqual(before);
   });
 
-  it("refuses a write whose citation does not resolve before the deadline", async () => {
-    const store = new InMemoryPortableContextStore();
-    store.save(seedPortableBriefState(emptyPortableContextState(ALPHA), ALPHA, SEEDED_AT));
-    // A degraded tracker that never answers, as when its client keeps retrying.
-    const { resolveCitation } = syntheticResolver({
-      issueClient: { getIssue: () => new Promise(() => {}) },
-    });
-    const alpha = await connect(
-      createBriefMcpServer({
-        actorId: ALPHA,
-        store,
-        resolveCitation,
-        citationDeadlineMs: 50,
-        now: () => WRITTEN_AT,
-      })
-    );
-    const before = store.load(ALPHA);
-
-    const rejected = await call(alpha, "replace", { text: BRIEF, expected_generation: 0 });
-    expect(rejected.isError).toBe(true);
-    expect(rejected.text).toContain(
-      "citation [github:MEK-Org/rusa/issues/954] could not be resolved: could not be checked within 0.05s; try again later"
-    );
-    expect(rejected.text).toContain("The brief is unchanged.");
-    expect(store.load(ALPHA)).toEqual(before);
-    expect(store.listBriefRevisions(ALPHA, 10)).toEqual([]);
-  });
-
   it("never commits a timed-out write when its citation answers late", async () => {
     const store = new InMemoryPortableContextStore();
     store.save(seedPortableBriefState(emptyPortableContextState(ALPHA), ALPHA, SEEDED_AT));
@@ -449,8 +421,11 @@ describe("brief MCP server: citations must exist", () => {
     const rejected = await call(alpha, "replace", { text: BRIEF, expected_generation: 0 });
     expect(rejected.isError).toBe(true);
     expect(rejected.text).toContain(
-      "citation [github:MEK-Org/rusa/issues/954] could not be resolved: could not be checked within 0.05s"
+      "citation [github:MEK-Org/rusa/issues/954] could not be resolved: could not be checked within 0.05s; try again later"
     );
+    expect(rejected.text).toContain("The brief is unchanged.");
+    expect(store.load(ALPHA)).toEqual(before);
+    expect(store.listBriefRevisions(ALPHA, 10)).toEqual([]);
 
     // The tracker answers after the refusal; nothing may land on its account.
     answer();

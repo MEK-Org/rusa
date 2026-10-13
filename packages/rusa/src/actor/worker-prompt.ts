@@ -319,7 +319,7 @@ implies but its charter excludes, either update the charter to authorize the
 work or message the child explaining that the exclusion is intentional. A
 charter update can authorize the work without changing the brief; a direct
 clarification message can refine the brief. Keep your children's charters
-current as their remit changes.`;
+current when you clarify their purpose, scope or authority.`;
 
 /**
  * Standing conduct norms for interacting with external systems .

@@ -32,7 +32,12 @@ an actor-maintained WHAT/HOW/DOMAIN brief, every statement citing its source,
 injected with the actor's recent journal; `spawn_thread` writes no brief, so a
 new child starts from its charter and the brief grows only by its own cited
 writes. A multi-entry model pool needs a portable mode, and brief counts as
-one, as `ledger` and `tail` do.
+one, as `ledger` and `tail` do. This follows the architecture owner's
+spawn-selection decision
+([#954 (comment)](https://github.com/MEK-Org/rusa/issues/954#issuecomment-6157170282)):
+offering the mode is separate from authority to deploy brief or run the staging
+trial, which stays with the existing rollout owner, and the charter still
+governs what the child may do.
 
 ## 2. Identity
 
@@ -251,7 +256,10 @@ That child-side text renders only for brief-mode actors. Every actor's prompt
 carries the parent side, because any actor may parent a brief-mode child: when
 a child reports work its brief implies but its charter excludes, update the
 charter to authorize it or message the child that the exclusion is intentional
-([#954 (comment)](https://github.com/MEK-Org/rusa/issues/954#issuecomment-6097740257)).
+([#954 (comment)](https://github.com/MEK-Org/rusa/issues/954#issuecomment-6097740257)),
+and keep children's charters current when clarifying their purpose, scope or
+authority
+([#954 (comment)](https://github.com/MEK-Org/rusa/issues/954#issuecomment-6097703419)).
 
 Consolidation and citation rotation are allowed without a supersession guard.
 What keeps them honest is that every accepted write is in the history (§5) with
