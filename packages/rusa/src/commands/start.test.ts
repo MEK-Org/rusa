@@ -9209,6 +9209,67 @@ describe("runStart webhook event routing (Phase 4)", () => {
       }
     });
 
+    it("routes the root's Slack reply into the thread of its selected inbox message", async () => {
+      const secretsDir = join(homeDir, "secrets");
+      mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(secretsDir, "slack-bot-token"), "xoxb-synthetic-bot-token");
+      writeFileSync(join(secretsDir, "slack-app-token"), "xapp-synthetic-app-token");
+      writeConfig({
+        slack: {
+          botTokenPath: join(secretsDir, "slack-bot-token"),
+          appTokenPath: join(secretsDir, "slack-app-token"),
+        },
+      });
+      const startSpy = vi.spyOn(SlackSocketSource.prototype, "start").mockResolvedValue(undefined);
+      const closeSpy = vi.spyOn(SlackSocketSource.prototype, "close").mockResolvedValue(undefined);
+      const slackClient = new SlackClient("xoxb-synthetic-bot-token");
+      const postMessage = vi.fn(async (_args: Record<string, unknown>) => ({
+        ok: true,
+        ts: "1791849600.000300",
+      }));
+      Object.defineProperty(slackClient, "web", { value: { chat: { postMessage } } });
+
+      try {
+        const { mesh, root } = await boot({ slackClient });
+        const [entry] = getRepositories().inbox.append([
+          {
+            actorId: root.id,
+            source: "slack:channels/C1",
+            payload: {
+              type: "slack.message",
+              channel: "C1",
+              ts: "1791849600.000200",
+              threadTs: "1791849600.000100",
+            },
+          },
+        ]);
+        if (!entry) throw new Error("Slack message not appended");
+        mesh.selectInboxEntries(root.id, [entry.id]);
+
+        const url = mcpServersOf(root).find((server) => server.name === "slack-write")?.url;
+        if (!url) throw new Error("slack-write not mounted");
+        const client = new Client({ name: "slack-reply-placement", version: "0.0.0" });
+        await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+        try {
+          const result = await client.callTool({
+            name: "send_message",
+            arguments: { channel: "C1", text: "on it" },
+          });
+          expect(result.isError).toBeFalsy();
+        } finally {
+          await client.close();
+        }
+        expect(postMessage).toHaveBeenCalledOnce();
+        expect(postMessage.mock.calls[0]?.[0]).toMatchObject({
+          channel: "C1",
+          thread_ts: "1791849600.000100",
+        });
+      } finally {
+        startSpy.mockRestore();
+        closeSpy.mockRestore();
+      }
+    });
+
     it("closes the socket source immediately when slack startup fails", async () => {
       const secretsDir = join(homeDir, "secrets");
       mkdirSync(secretsDir, { recursive: true, mode: 0o700 });

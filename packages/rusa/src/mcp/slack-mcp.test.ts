@@ -14,10 +14,12 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { SlackClient } from "../slack/slack-client.js";
 import {
   createSlackReadMcpServer,
   createSlackWriteMcpServer,
+  resolveSlackReplyThreadTs,
   toSlackTimestamp,
 } from "./slack-mcp.js";
 
@@ -454,6 +456,159 @@ describe("Slack write MCP react", () => {
     expect(result.isError).toBe(true);
     expect(result.text).toContain("access denied: Slack channel C_FORBIDDEN");
     expect(react).not.toHaveBeenCalled();
+  });
+});
+
+describe("Slack write MCP reply placement", () => {
+  function slackEntry(channel: string, ts: string, threadTs?: string): InboxEntry {
+    return {
+      id: `entry-${channel}-${ts}`,
+      actorId: "actor-1",
+      source: `slack:channels/${channel}`,
+      deliveredAt: new Date("2026-10-13T00:00:00Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: {
+        type: "slack.message",
+        messageRef: `slack:channels/${channel}/messages/${ts}`,
+        channel,
+        ts,
+        ...(threadTs ? { threadTs } : {}),
+      },
+    };
+  }
+  const topLevel = slackEntry("C1", "100.000001");
+  const threadParent = slackEntry("C1", "100.000001", "100.000001");
+  const reply = slackEntry("C1", "200.000002", "150.000001");
+
+  function logger() {
+    return { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+  }
+
+  it("posts top-level when threadTs is omitted and the selection is top-level", () => {
+    const otherTop = slackEntry("C1", "500.000001");
+    for (const selection of [[], [topLevel], [threadParent], [topLevel, otherTop]]) {
+      const log = logger();
+      expect(resolveSlackReplyThreadTs("C1", undefined, selection, log as never)).toBeUndefined();
+      expect(log.warn).not.toHaveBeenCalled();
+    }
+  });
+
+  it("answers a selected thread reply in its thread when threadTs is omitted", () => {
+    const log = logger();
+    expect(resolveSlackReplyThreadTs("C1", undefined, [reply], log as never)).toBe("150.000001");
+    expect(log.info).toHaveBeenCalledWith("slack_reply_assigned_thread", {
+      channel: "C1",
+      effectiveThreadTs: "150.000001",
+      reason: "selected_thread_entry",
+    });
+    const sameThread = slackEntry("C1", "201.000003", "150.000001");
+    expect(resolveSlackReplyThreadTs("C1", undefined, [reply, sameThread])).toBe("150.000001");
+  });
+
+  it("answers in the thread when its parent and a reply are both selected", () => {
+    for (const parent of [
+      slackEntry("C1", "150.000001"),
+      slackEntry("C1", "150.000001", "150.000001"),
+    ]) {
+      expect(resolveSlackReplyThreadTs("C1", undefined, [parent, reply])).toBe("150.000001");
+      expect(resolveSlackReplyThreadTs("C1", undefined, [reply, parent])).toBe("150.000001");
+    }
+  });
+
+  it("uses an explicit threadTs as given", () => {
+    // A top-level message's own ts starts a thread under it.
+    expect(resolveSlackReplyThreadTs("C1", "100.000001", [topLevel])).toBe("100.000001");
+    expect(resolveSlackReplyThreadTs("C1", "999.000001", [topLevel])).toBe("999.000001");
+    expect(resolveSlackReplyThreadTs("C1", "999.000001", [reply])).toBe("999.000001");
+    expect(resolveSlackReplyThreadTs("C1", "999.000001", [])).toBe("999.000001");
+  });
+
+  it("ignores selected messages in other channels and non-Slack entries", () => {
+    const elsewhere = slackEntry("C2", "300.000001", "250.000001");
+    const chat: InboxEntry = {
+      ...topLevel,
+      id: "chat",
+      source: "chat_space:spaces/C1",
+      payload: { type: "gchat.message", channel: "C1", ts: "1.0", threadTs: "0.5" },
+    };
+    expect(resolveSlackReplyThreadTs("C1", undefined, [elsewhere, chat])).toBeUndefined();
+  });
+
+  it("posts top-level rather than guess between disagreeing selections", () => {
+    const otherThread = slackEntry("C1", "400.000001", "350.000001");
+    for (const selection of [
+      [reply, otherThread],
+      [topLevel, reply],
+    ]) {
+      const log = logger();
+      expect(resolveSlackReplyThreadTs("C1", undefined, selection, log as never)).toBeUndefined();
+      expect(log.warn).toHaveBeenCalledWith("slack_reply_ambiguous_selection", {
+        channel: "C1",
+        matchingCount: 2,
+      });
+    }
+  });
+
+  function routedServer(entries: () => readonly InboxEntry[]) {
+    const dir = workdir();
+    writeFileSync(join(dir, "out.txt"), "bytes");
+    const postMessage = vi.fn(async (_args: Record<string, unknown>) => ({ ok: true, ts: "9.9" }));
+    const uploadV2 = vi.fn(async (_args: Record<string, unknown>) => ({
+      ok: true,
+      files: [{ ok: true, files: [{ id: "F9" }] }],
+    }));
+    const server = createSlackWriteMcpServer(
+      slackWith({ chat: { postMessage }, files: { uploadV2 } }),
+      ["C1", "C2"],
+      { workDir: dir, selectedInboxEntries: entries }
+    );
+    return { server, postMessage, uploadV2 };
+  }
+
+  it("routes send_message and upload_file from the live selection", async () => {
+    let selection: readonly InboxEntry[] = [reply];
+    const { server, postMessage, uploadV2 } = routedServer(() => selection);
+    const client = await connect(server);
+
+    const sent = await call(client, "send_message", { channel: "C1", text: "on it" });
+    expect(JSON.parse(sent.text)).toEqual({
+      ref: "slack:channels/C1/messages/9.9",
+      ts: "9.9",
+      threadTs: "150.000001",
+    });
+    expect(postMessage.mock.calls[0]?.[0]).toMatchObject({ thread_ts: "150.000001" });
+
+    const uploaded = await call(client, "upload_file", {
+      channel: "C1",
+      filePath: "out.txt",
+      initialComment: "attached",
+    });
+    expect(JSON.parse(uploaded.text)).toEqual({
+      fileIds: ["F9"],
+      channel: "C1",
+      threadTs: "150.000001",
+    });
+    expect(uploadV2.mock.calls[0]?.[0]).toMatchObject({ thread_ts: "150.000001" });
+
+    // An unrelated channel is not routed from the C1 selection.
+    await call(client, "send_message", { channel: "C2", text: "elsewhere" });
+    expect(postMessage.mock.calls[1]?.[0]?.thread_ts).toBeUndefined();
+
+    selection = [topLevel];
+    const top = await call(client, "send_message", { channel: "C1", text: "top" });
+    expect(JSON.parse(top.text)).not.toHaveProperty("threadTs");
+    expect(postMessage.mock.calls[2]?.[0]?.thread_ts).toBeUndefined();
+    const started = await call(client, "send_message", {
+      channel: "C1",
+      text: "thread",
+      threadTs: "100.000001",
+    });
+    expect(JSON.parse(started.text)).toMatchObject({ threadTs: "100.000001" });
+    expect(postMessage.mock.calls[3]?.[0]).toMatchObject({ thread_ts: "100.000001" });
+    await call(client, "upload_file", { channel: "C1", filePath: "out.txt" });
+    expect(uploadV2.mock.calls[1]?.[0]?.thread_ts).toBeUndefined();
   });
 });
 

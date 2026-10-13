@@ -1,6 +1,8 @@
 import { basename } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import type { Logger } from "../observability/logger.js";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
 import {
   MAX_SLACK_FILE_BYTES,
   MAX_SLACK_HISTORY_PAGE,
@@ -33,6 +35,10 @@ export interface SlackWriteMcpOptions extends SlackMcpOptions {
    * from coalescing abort and is not repeated by a replacement run.
    */
   onWrite?: () => void;
+  /** Currently selected inbox entries for this run; they decide reply placement (#1034). */
+  selectedInboxEntries?: () => readonly InboxEntry[];
+  /** Optional structured logger for reply routing diagnostics. */
+  logger?: Logger;
 }
 
 function requireWorkDir(options: SlackMcpOptions): string {
@@ -248,6 +254,60 @@ export function createSlackReadMcpServer(
   return server;
 }
 
+function nonEmpty(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+/**
+ * Resolves outbound Slack thread placement from the actor's selected inbox work
+ * in the destination channel (#1034), as Google Chat does (#611). Selected
+ * Slack messages in other channels are ignored.
+ *
+ * - An explicit threadTs is used as given; passing a message's own ts starts a
+ *   thread under it.
+ * - With threadTs omitted, a selected reply in an existing thread is answered in
+ *   that thread, also when the thread's parent is selected with it.
+ * - Otherwise an omitted threadTs posts top-level, including when selected
+ *   messages in this channel point at different threads.
+ */
+export function resolveSlackReplyThreadTs(
+  channel: string,
+  callerThreadTs: string | undefined,
+  selectedEntries: readonly InboxEntry[],
+  logger?: Logger
+): string | undefined {
+  if (callerThreadTs) return callerThreadTs;
+  const selected = selectedEntries.flatMap((entry) => {
+    const payload = entry.payload;
+    if (payload?.type !== "slack.message" || nonEmpty(payload.channel) !== channel) return [];
+    const ts = nonEmpty(payload.ts);
+    if (!ts) return [];
+    // A thread's parent can carry a thread_ts equal to its own ts.
+    const threadTs = nonEmpty(payload.threadTs);
+    return [{ ts, thread: threadTs !== ts ? threadTs : undefined }];
+  });
+  const threads = new Set(selected.flatMap((m) => (m.thread ? [m.thread] : [])));
+  const [thread] = threads;
+  if (!thread) return undefined;
+  if (threads.size === 1 && selected.every((m) => m.thread || m.ts === thread)) {
+    logger?.info("slack_reply_assigned_thread", {
+      channel,
+      effectiveThreadTs: thread,
+      reason: "selected_thread_entry",
+    });
+    return thread;
+  }
+  logger?.warn("slack_reply_ambiguous_selection", { channel, matchingCount: selected.length });
+  return undefined;
+}
+
+const threadTsSchema = z
+  .string()
+  .optional()
+  .describe(
+    "Parent timestamp of the thread to post in, used as given; pass a message's own ts to start a thread under it. When omitted and the Slack message selected from your inbox in this channel is a thread reply, the post goes into that thread; otherwise it posts top-level."
+  );
+
 export function createSlackWriteMcpServer(
   client: SlackClient,
   allowedChannels: "all" | string[],
@@ -256,19 +316,36 @@ export function createSlackWriteMcpServer(
   const server = createMcpServer({ name: SLACK_WRITE_MCP_NAME, version: "0.1.0" });
   const allowed = (channel: string) =>
     allowedChannels === "all" || allowedChannels.includes(channel);
+  const placement = (channel: string, threadTs?: string) =>
+    resolveSlackReplyThreadTs(
+      channel,
+      threadTs,
+      options.selectedInboxEntries?.() ?? [],
+      options.logger
+    );
   server.registerTool(
     "send_message",
     {
       title: "Send a Slack message",
-      description: "Post to a channel or reply in a thread using its parent timestamp.",
-      inputSchema: { channel: z.string(), text: z.string(), threadTs: z.string().optional() },
+      description:
+        "Post to a channel or reply in a thread using its parent timestamp. Without threadTs, a reply to a selected Slack message that is in a thread stays in that thread; otherwise it posts top-level.",
+      inputSchema: {
+        channel: z.string(),
+        text: z.string(),
+        threadTs: threadTsSchema,
+      },
     },
     async ({ channel, text, threadTs }) => {
       try {
         if (!allowed(channel)) throw new Error(`access denied: Slack channel ${channel}`);
-        const ts = await client.send(channel, text, threadTs);
+        const effectiveThreadTs = placement(channel, threadTs);
+        const ts = await client.send(channel, text, effectiveThreadTs);
         options.onWrite?.();
-        return toolOk({ ref: `slack:channels/${channel}/messages/${ts}`, ts });
+        return toolOk({
+          ref: `slack:channels/${channel}/messages/${ts}`,
+          ts,
+          ...(effectiveThreadTs ? { threadTs: effectiveThreadTs } : {}),
+        });
       } catch (err) {
         return toolError(err);
       }
@@ -301,7 +378,7 @@ export function createSlackWriteMcpServer(
     {
       title: "Upload a file to Slack",
       description:
-        "Share a file from your working directory into a channel, or a thread using its parent timestamp. Unavailable for follower-hosted actors (see #812).",
+        "Share a file from your working directory into a channel, or a thread using its parent timestamp. threadTs places it exactly as for send_message. Unavailable for follower-hosted actors (see #812).",
       inputSchema: {
         channel: z.string(),
         filePath: z
@@ -309,13 +386,13 @@ export function createSlackWriteMcpServer(
           .describe(
             "Path to a file inside your working directory, absolute or relative to it; paths outside it are rejected"
           ),
-        threadTs: z.string().optional(),
+        threadTs: threadTsSchema,
         filename: z.string().optional().describe("Defaults to the file's basename"),
         title: z.string().optional(),
         initialComment: z.string().optional().describe("Message text posted with the file"),
       },
     },
-    async ({ channel, filePath, threadTs, filename, title, initialComment }) => {
+    async ({ channel, filePath, threadTs: callerThreadTs, filename, title, initialComment }) => {
       try {
         if (!allowed(channel)) throw new Error(`access denied: Slack channel ${channel}`);
         requireFileToolsAvailable(options);
@@ -326,6 +403,7 @@ export function createSlackWriteMcpServer(
           source,
           options.maxFileBytes ?? MAX_SLACK_FILE_BYTES
         );
+        const threadTs = placement(channel, callerThreadTs);
         const fileIds = await client.uploadFile(channel, {
           filename: filename || basename(source),
           data,

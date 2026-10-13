@@ -232,6 +232,10 @@ export function buildGrantableServers(
         ...(deps.fileToolsAvailableForActor
           ? { fileToolsAvailable: () => deps.fileToolsAvailableForActor?.(selfId) ?? false }
           : {}),
+        selectedInboxEntries: deps.selectedInboxEntriesForActor
+          ? () => deps.selectedInboxEntriesForActor?.(selfId) ?? []
+          : undefined,
+        logger: deps.logger,
       });
     });
   }
