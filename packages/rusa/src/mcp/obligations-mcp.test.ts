@@ -230,7 +230,11 @@ describe("obligations MCP", () => {
     expect(db.serialize()).toEqual(before);
     expect(repository.require(child.id).effectiveResponsive).toBe(false);
     const root = await connect(
-      createObligationsMcpServer(repository, "opaque-root-id", { canSetResponsive: () => true })
+      // Composed as start.ts composes root: promotion also requires canManage.
+      createObligationsMcpServer(repository, "opaque-root-id", {
+        canSetResponsive: () => true,
+        canManage: () => true,
+      })
     );
     expect(
       (

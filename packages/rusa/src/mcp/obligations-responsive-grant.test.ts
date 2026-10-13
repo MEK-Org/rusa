@@ -21,8 +21,9 @@ import { createObligationsMcpServer, OBLIGATION_RESPONSIVE_CAPABILITY } from "./
 
 /**
  * #1026: starting a responsive branch is an explicitly grantable capability.
- * The worker server below is composed exactly as start.ts composes it, so
- * these tests exercise the real grant store → mesh → tool path: a
+ * The worker server below uses the same two authorization options start.ts
+ * composes (owner resolution and event hooks are omitted), so these tests
+ * exercise the real grant store → mesh → tool authorization path: a
  * `capability-admin` holder grants or revokes the row, and the tool consults
  * it on every call.
  */
@@ -200,6 +201,7 @@ describe("grantable responsive-obligation authority (#1026)", () => {
     mesh.grantCapability("steward", OBLIGATION_RESPONSIVE_CAPABILITY, "configured");
     const descendants = repository.create({ ownerId: "steward-child", title: "descendant's" });
     const siblings = repository.create({ ownerId: "sibling", title: "sibling's" });
+    const ownBranch = repository.create({ ownerId: "steward", title: "own", responsive: true });
     const steward = await connect(workerServer("steward"));
 
     const before = db.serialize();
@@ -209,6 +211,22 @@ describe("grantable responsive-obligation authority (#1026)", () => {
     expect(
       errorText(await call(steward, "set_checkpoint", { id: siblings.id, checkpoint: "mine now" }))
     ).toMatch(/not authorized/);
+    // The grant reaches neither a new responsive branch for an owner it cannot
+    // manage, nor a promotion of that owner's work under its own branch.
+    expect(
+      errorText(
+        await call(steward, "create_obligation", {
+          owner_id: "sibling",
+          title: "for sibling",
+          responsive: true,
+        })
+      )
+    ).toMatch(/not authorized/);
+    expect(
+      errorText(
+        await call(steward, "reparent_obligation", { id: siblings.id, parent_id: ownBranch.id })
+      )
+    ).toMatch(/not authorized/);
     expect(db.serialize().equals(before)).toBe(true);
     expect(repository.require(siblings.id).effectiveResponsive).toBe(false);
 
@@ -217,6 +235,15 @@ describe("grantable responsive-obligation authority (#1026)", () => {
       (await call(steward, "mark_obligation_responsive", { id: descendants.id })).isError
     ).toBeFalsy();
     expect(repository.require(descendants.id).effectiveResponsive).toBe(true);
+    expect(
+      (
+        await call(steward, "create_obligation", {
+          owner_id: "steward-child",
+          title: "for child",
+          responsive: true,
+        })
+      ).isError
+    ).toBeFalsy();
   });
 
   it("leaves ungranted actors with the existing restriction and inherited responsiveness", async () => {

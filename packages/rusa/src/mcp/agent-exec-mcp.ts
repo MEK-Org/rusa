@@ -916,7 +916,7 @@ export function createAgentExecMcpServer(
     {
       title: "Grant a capability to an actor",
       description:
-        "Grant an allow-listed capability to a specific actor by its thread id. As root you may grant any grantable capability (e.g. 'understanding-write', or 'obligation-responsive', which lets the grantee start responsive obligation branches on obligations it may already manage); as a non-root actor you may grant only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key'; any other 'secret:<filename>' is root-only) and only to your DIRECT children. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths; kebab-case secret names also export an environment variable (e.g. 'secret:mistral-api-key' exports MISTRAL_API_KEY). Idempotent. Takes effect on a live grantee's next run, or when a retired grantee is next revived. Rejected if the capability isn't grantable, fails containment checks, or you lack authority over the grantee.",
+        "Grant an allow-listed capability to a specific actor by its thread id. A 'capability-admin' holder may grant any grantable capability within its own subtree (e.g. 'understanding-write', or 'obligation-responsive', which lets the grantee start responsive obligation branches only on obligations it may already manage); without 'capability-admin' you may grant only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key'; any other 'secret:<filename>' needs a 'capability-admin' holder) and only to your DIRECT children. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths; kebab-case secret names also export an environment variable (e.g. 'secret:mistral-api-key' exports MISTRAL_API_KEY). Idempotent. Takes effect on a live grantee's next run, or when a retired grantee is next revived; 'obligation-responsive' is instead checked on every obligation tool call, so it takes effect immediately, even in an open session. Rejected if the capability isn't grantable, fails containment checks, or you lack authority over the grantee.",
       inputSchema: {
         actor_id: z.string().describe("The grantee actor's thread id."),
         capability: z
@@ -939,7 +939,7 @@ export function createAgentExecMcpServer(
     {
       title: "Revoke a capability from an actor",
       description:
-        "Revoke a previously-granted capability from an actor by its thread id. As root you may revoke any grant; as a non-root actor you may revoke only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key') and only from your DIRECT children. No-op if the grant isn't active. Takes effect on the actor's next run/(re)construction.",
+        "Revoke a previously-granted capability from an actor by its thread id. A 'capability-admin' holder may revoke any grant within its own subtree; without 'capability-admin' you may revoke only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key') and only from your DIRECT children. No-op if the grant isn't active. Takes effect on the actor's next run/(re)construction; 'obligation-responsive' is instead checked on every obligation tool call, so its revocation takes effect immediately, even in an open session.",
       inputSchema: {
         actor_id: z.string().describe("The actor's thread id to revoke from."),
         capability: z.string().describe("The capability to revoke."),
