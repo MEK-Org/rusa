@@ -899,14 +899,14 @@ describe("Slack read MCP conversation discovery", () => {
     const list = vi.fn(async () => ({ channels: [] }));
     const client = await discoveryServer(list);
     const result = await call(client, "list_conversations", {
-      types: ["mpim", "private_channel", "mpim"],
+      types: ["private_channel", "public_channel", "private_channel"],
       excludeArchived: false,
       limit: 20,
       cursor: "next",
     });
     expect(result.isError).toBe(false);
     expect(list).toHaveBeenCalledWith({
-      types: "mpim,private_channel",
+      types: "private_channel,public_channel",
       exclude_archived: false,
       limit: 20,
       cursor: "next",
@@ -917,7 +917,9 @@ describe("Slack read MCP conversation discovery", () => {
     [{ types: [] }],
     [{ types: ["channel"] }],
     [{ types: ["im"] }],
+    [{ types: ["mpim"] }],
     [{ types: ["public_channel", "im"] }],
+    [{ types: ["private_channel", "mpim"] }],
     [{ limit: 0 }],
     [{ limit: 201 }],
   ])("rejects %j before calling Slack", async (args) => {

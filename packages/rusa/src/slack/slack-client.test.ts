@@ -324,7 +324,6 @@ describe("SlackClient conversation discovery", () => {
               is_private: true,
               is_member: true,
             },
-            { id: "G2", name: "mpdm-a--b-1", is_mpim: true, is_private: true },
             { id: "X1", name: "odd" },
             { name: "no-id", is_channel: true },
           ],
@@ -333,12 +332,12 @@ describe("SlackClient conversation discovery", () => {
       },
     ]);
     const page = await client.listConversations({
-      types: ["public_channel", "private_channel", "mpim"],
+      types: ["public_channel", "private_channel"],
       excludeArchived: true,
       limit: 7,
     });
     expect(requests).toEqual([
-      { types: "public_channel,private_channel,mpim", exclude_archived: "true", limit: "7" },
+      { types: "public_channel,private_channel", exclude_archived: "true", limit: "7" },
     ]);
     expect(page).toEqual({
       conversations: [
@@ -346,7 +345,6 @@ describe("SlackClient conversation discovery", () => {
         { id: "C2", name: "random", type: "public_channel", isMember: false, isArchived: false },
         { id: "G1", name: "ops", type: "private_channel", isMember: true },
         { id: "C3", name: "eng-private", type: "private_channel", isMember: true },
-        { id: "G2", name: "mpdm-a--b-1", type: "mpim" },
         { id: "X1", name: "odd", type: "unknown" },
       ],
       hasMore: true,
@@ -393,7 +391,7 @@ describe("SlackClient conversation discovery", () => {
     });
   });
 
-  it("fails a listing whose type needs a scope the token lacks, naming only that scope", async () => {
+  it("reports Slack's missing_scope answer, naming only the scope it needs", async () => {
     const { client } = slackApi([
       {
         body: {

@@ -126,11 +126,12 @@ function toHistoryMessage(channel: string, m: RawSlackMessage): SlackHistoryMess
 
 /**
  * The conversation types `listConversations` lists. Slack can also list `im`
- * (one row per DM, naming the partner), but listing DMs is left out until an
- * operator asks for a roster of DM partners; a DM whose ID is already known can
- * still be read through the history tools.
+ * (one row per DM, naming the partner) and `mpim` (group DMs, named after their
+ * members), but both are left out until an operator asks for that roster; a DM
+ * or group DM whose ID is already known can still be read through the history
+ * tools.
  */
-export const SLACK_CONVERSATION_TYPES = ["public_channel", "private_channel", "mpim"] as const;
+export const SLACK_CONVERSATION_TYPES = ["public_channel", "private_channel"] as const;
 export type SlackConversationType = (typeof SLACK_CONVERSATION_TYPES)[number];
 
 export interface SlackConversation {
@@ -156,13 +157,11 @@ interface RawSlackConversation {
   is_channel?: boolean;
   is_group?: boolean;
   is_private?: boolean;
-  is_mpim?: boolean;
   is_member?: boolean;
   is_archived?: boolean;
 }
 
 function conversationType(c: RawSlackConversation): SlackConversation["type"] {
-  if (c.is_mpim) return "mpim";
   if (c.is_private || c.is_group) return "private_channel";
   if (c.is_channel) return "public_channel";
   return "unknown";
@@ -430,9 +429,9 @@ export class SlackClient {
 
   /**
    * One page of the conversations of `types` this token can see
-   * (`conversations.list`). Slack lists private channels and group DMs only
-   * where the app is a member, so no page or walk is a complete workspace
-   * inventory.
+   * (`conversations.list`). Slack lists private channels only where the app
+   * is a member, and leaves out a type the token has no scope for, so no page
+   * or walk is a complete workspace inventory.
    */
   async listConversations(query: {
     types: SlackConversationType[];

@@ -30,11 +30,13 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).toContain("auto is pretty when stdout is a terminal");
   });
 
-  it("documents that Slack discovery does not list DMs, even with im:history", () => {
+  it("documents that Slack discovery lists no DMs or group DMs, even with their history scopes", () => {
     expect(CONFIG_DOCS).toContain(
-      "list_conversations lists public channels, private channels and group DMs, not DMs"
+      "list_conversations lists public and private channels, not DMs or group DMs"
     );
-    expect(CONFIG_DOCS).toContain("im:history does not make list_conversations list DMs");
+    expect(CONFIG_DOCS).toContain(
+      "Those scopes do not make list_conversations list DMs or group DMs."
+    );
   });
 
   it("documents the quickstart profile", () => {
