@@ -581,3 +581,193 @@ describe("Slack read MCP history", () => {
     expect(result.text).toMatch(/not a member of this conversation/);
   });
 });
+
+describe("Slack write MCP successful-write hook", () => {
+  const slackError = (code: string) =>
+    Object.assign(new Error(`An API error occurred: ${code}`), {
+      data: { ok: false, error: code },
+    });
+
+  function writer(web: Record<string, unknown>, options: { onWrite?: () => void } = {}) {
+    const onWrite = vi.fn(options.onWrite);
+    const warnings: { event: string; fields?: Record<string, unknown> }[] = [];
+    const logger = {
+      debug: () => {},
+      info: () => {},
+      warn: (event: string, fields?: Record<string, unknown>) => warnings.push({ event, fields }),
+      error: () => {},
+      child: () => logger,
+    };
+    const dir = workdir();
+    writeFileSync(join(dir, "out.txt"), "bytes");
+    const server = createSlackWriteMcpServer(slackWith(web), ["C1"], {
+      workDir: dir,
+      onWrite,
+      logger,
+    });
+    return { server, onWrite, warnings };
+  }
+
+  it("fires once after Slack posts a message, and not when the post or the grant fails", async () => {
+    const postMessage = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, ts: "1791849600.000100" })
+      .mockRejectedValueOnce(slackError("not_in_channel"));
+    const { server, onWrite } = writer({ chat: { postMessage } });
+    const client = await connect(server);
+
+    const sent = await call(client, "send_message", { channel: "C1", text: "hi" });
+    expect(sent.isError).toBe(false);
+    expect(onWrite).toHaveBeenCalledOnce();
+
+    const refused = await call(client, "send_message", { channel: "C1", text: "again" });
+    expect(refused).toMatchObject({
+      isError: true,
+      text: expect.stringContaining("not_in_channel"),
+    });
+    const denied = await call(client, "send_message", { channel: "C2", text: "elsewhere" });
+    expect(denied.isError).toBe(true);
+    expect(postMessage).toHaveBeenCalledTimes(2);
+    expect(onWrite).toHaveBeenCalledOnce();
+  });
+
+  it("counts a post Slack accepted without a timestamp as written while still reporting it", async () => {
+    const { server, onWrite } = writer({ chat: { postMessage: async () => ({ ok: true }) } });
+    const result = await call(await connect(server), "send_message", { channel: "C1", text: "hi" });
+    expect(result).toEqual({
+      isError: true,
+      text: expect.stringContaining("Slack did not return a message timestamp"),
+    });
+    expect(onWrite).toHaveBeenCalledOnce();
+  });
+
+  it("fires once after a reaction is added, and not when Slack refuses it", async () => {
+    const add = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockRejectedValueOnce(slackError("already_reacted"));
+    const { server, onWrite } = writer({ reactions: { add } });
+    const client = await connect(server);
+
+    expect((await call(client, "react", { channel: "C1", ts: "1.0" })).isError).toBe(false);
+    expect(onWrite).toHaveBeenCalledOnce();
+    expect((await call(client, "react", { channel: "C1", ts: "1.0" })).isError).toBe(true);
+    expect(onWrite).toHaveBeenCalledOnce();
+  });
+
+  it("keeps Slack's result when the local hook throws", async () => {
+    const { server, onWrite, warnings } = writer(
+      { chat: { postMessage: async () => ({ ok: true, ts: "1791849600.000100" }) } },
+      {
+        onWrite: () => {
+          throw new Error("actor already gone");
+        },
+      }
+    );
+    const result = await call(await connect(server), "send_message", { channel: "C1", text: "hi" });
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.text)).toEqual({
+      ref: "slack:channels/C1/messages/1791849600.000100",
+      ts: "1791849600.000100",
+    });
+    expect(onWrite).toHaveBeenCalledOnce();
+    expect(warnings).toEqual([
+      {
+        event: "slack_write_hook_failed",
+        fields: { tool: "send_message", error: "actor already gone" },
+      },
+    ]);
+  });
+
+  describe("upload_file across Slack's external upload flow", () => {
+    const UPLOAD_URL = "https://files.slack.com/upload/v1/synthetic";
+    type Step = { ok: boolean; error?: string; files?: unknown[] };
+
+    // The SDK resolves globalThis.fetch when the client is built, so a stub
+    // installed first stands in for every step: the two API calls and the
+    // byte upload to the URL Slack hands back.
+    function uploadApi(steps: { getUrl: Step; complete: Step }) {
+      const requests: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string | URL) => {
+          const target = String(url);
+          requests.push(target === UPLOAD_URL ? "upload bytes" : (target.split("/").pop() ?? ""));
+          if (target === UPLOAD_URL) return new Response("OK", { status: 200 });
+          const body = target.endsWith("files.getUploadURLExternal")
+            ? { ...steps.getUrl, upload_url: UPLOAD_URL, file_id: "F9" }
+            : steps.complete;
+          return new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        })
+      );
+      const onWrite = vi.fn();
+      const dir = workdir();
+      writeFileSync(join(dir, "out.txt"), "bytes");
+      const server = createSlackWriteMcpServer(new SlackClient(TOKEN), ["C1"], {
+        workDir: dir,
+        onWrite,
+      });
+      return { server, onWrite, requests };
+    }
+
+    const upload = async (server: McpServer) =>
+      call(await connect(server), "upload_file", { channel: "C1", filePath: "out.txt" });
+
+    it("fires once Slack completes the upload and shares the file", async () => {
+      const { server, onWrite, requests } = uploadApi({
+        getUrl: { ok: true },
+        complete: { ok: true, files: [{ id: "F9" }] },
+      });
+      const result = await upload(server);
+      expect(result.isError).toBe(false);
+      expect(JSON.parse(result.text)).toEqual({ fileIds: ["F9"], channel: "C1" });
+      expect(requests).toEqual([
+        "files.getUploadURLExternal",
+        "upload bytes",
+        "files.completeUploadExternal",
+      ]);
+      expect(onWrite).toHaveBeenCalledOnce();
+    });
+
+    it("does not fire when Slack refuses an upload URL", async () => {
+      const { server, onWrite, requests } = uploadApi({
+        getUrl: { ok: false, error: "not_in_channel" },
+        complete: { ok: true, files: [{ id: "F9" }] },
+      });
+      expect((await upload(server)).isError).toBe(true);
+      expect(requests).toEqual(["files.getUploadURLExternal"]);
+      expect(onWrite).not.toHaveBeenCalled();
+    });
+
+    it("does not fire when bytes were sent but Slack never completed the share", async () => {
+      const { server, onWrite, requests } = uploadApi({
+        getUrl: { ok: true },
+        complete: { ok: false, error: "channel_not_found" },
+      });
+      const result = await upload(server);
+      expect(result).toEqual({ isError: true, text: expect.stringContaining("channel_not_found") });
+      expect(requests).toEqual([
+        "files.getUploadURLExternal",
+        "upload bytes",
+        "files.completeUploadExternal",
+      ]);
+      expect(onWrite).not.toHaveBeenCalled();
+    });
+
+    it("counts a completed share without file IDs as written while still reporting it", async () => {
+      const { server, onWrite } = uploadApi({
+        getUrl: { ok: true },
+        complete: { ok: true, files: [] },
+      });
+      const result = await upload(server);
+      expect(result).toEqual({
+        isError: true,
+        text: expect.stringContaining("Slack did not confirm the uploaded file"),
+      });
+      expect(onWrite).toHaveBeenCalledOnce();
+    });
+  });
+});

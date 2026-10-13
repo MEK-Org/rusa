@@ -7,6 +7,7 @@ import { FakeChatClient } from "../chat/fake.js";
 import { createSelectedInboxEntriesAccessor } from "../commands/start.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
+import { SlackClient } from "../slack/slack-client.js";
 import type { DistillerState } from "../understanding/distiller-cursor.js";
 import {
   buildGrantableServers,
@@ -455,6 +456,33 @@ describe("grantable capabilities allow-list ", () => {
     // Calling factory with ["*"] should not throw and configure wildcard access
     const writeServer = chatWriteFactory("actor-1", ["*"]);
     expect(writeServer).toBeDefined();
+  });
+
+  it("binds slack-write's successful-write hook to the grantee", async () => {
+    const slackClient = new SlackClient("xoxb-synthetic");
+    const postMessage = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("An API error occurred: not_in_channel"))
+      .mockResolvedValueOnce({ ok: true, ts: "1791849600.000100" });
+    Object.defineProperty(slackClient, "web", { value: { chat: { postMessage } } });
+    const onSlackWrite = vi.fn();
+    const slackWriteFactory = buildGrantableServers({
+      ...STUB_DEPS,
+      slackClient,
+      onSlackWrite,
+    }).get("slack-write");
+    if (!slackWriteFactory) throw new Error("expected slack-write factory");
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await slackWriteFactory("actor-1", ["C1"]).connect(serverTransport);
+    const client = new Client({ name: "test", version: "0.0.0" });
+    await client.connect(clientTransport);
+    const send = () =>
+      client.callTool({ name: "send_message", arguments: { channel: "C1", text: "hi" } });
+
+    expect((await send()).isError).toBe(true);
+    expect(onSlackWrite).not.toHaveBeenCalled();
+    expect((await send()).isError).toBeFalsy();
+    expect(onSlackWrite).toHaveBeenCalledExactlyOnceWith("actor-1");
   });
 
   it("wires selectedInboxEntriesForActor to chat-write capability", async () => {

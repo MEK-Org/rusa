@@ -186,6 +186,12 @@ async function readBodyWithLimit(resp: Response, maxBytes: number): Promise<Buff
   return Buffer.concat(chunks);
 }
 
+/**
+ * Slack answered a write with `ok`, so the side effect happened, but the
+ * response lacked the identifier this client returns for it.
+ */
+export class SlackWriteUnconfirmedError extends Error {}
+
 export class SlackClient {
   readonly web: WebClient;
   /**
@@ -316,7 +322,9 @@ export class SlackClient {
     );
     const completions = (response as { files?: { files?: { id?: string }[] }[] }).files ?? [];
     const ids = completions.flatMap((c) => c.files ?? []).flatMap((f) => (f.id ? [f.id] : []));
-    if (ids.length === 0) throw new Error("Slack did not confirm the uploaded file");
+    if (ids.length === 0) {
+      throw new SlackWriteUnconfirmedError("Slack did not confirm the uploaded file");
+    }
     return ids;
   }
 
@@ -427,7 +435,9 @@ export class SlackClient {
 
   async send(channel: string, text: string, threadTs?: string): Promise<string> {
     const result = await this.web.chat.postMessage({ channel, text, thread_ts: threadTs });
-    if (!result.ts) throw new Error("Slack did not return a message timestamp");
+    if (!result.ts) {
+      throw new SlackWriteUnconfirmedError("Slack did not return a message timestamp");
+    }
     return result.ts;
   }
 

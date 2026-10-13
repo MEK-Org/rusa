@@ -719,6 +719,8 @@ export interface RunStartE2EHooks {
    */
   createWorkerActor?: (context: ActorFactoryContext, options: ActorOptions) => MeshActor;
   chatClient?: ChatClient;
+  /** Stands in for the Slack Web API client; the socket source still needs real config. */
+  slackClient?: SlackClient;
   chatSource?: ChatSource;
   rootDriver?: "provider" | "external";
   dashboard?: boolean;
@@ -1577,7 +1579,8 @@ async function composeStart(
       ),
   };
   let chatClient: ChatClient | null = opts?.e2e?.chatClient ?? null;
-  const slackClient = slackBotToken ? new SlackClient(slackBotToken) : null;
+  const slackClient =
+    opts?.e2e?.slackClient ?? (slackBotToken ? new SlackClient(slackBotToken) : null);
   let gchat: GchatClient | null = null;
   if (!chatClient && config.chat && !opts?.e2e) {
     gchat = new GchatClient(config.chat.gchatConfigDir);
@@ -2478,6 +2481,7 @@ async function composeStart(
     chatClient: chatClient ?? undefined,
     slackClient: slackClient ?? undefined,
     onChatWrite: (actorId) => mesh.markUnkillable(actorId),
+    onSlackWrite: (actorId) => mesh.markUnkillable(actorId),
     getRunSelectionForActor: (id) => activeRunSelections.get(id),
     selectedInboxEntriesForActor,
     logger: log,
@@ -3811,7 +3815,11 @@ async function composeStart(
   const rootSlackUrl =
     slackClient && config.slack
       ? mcpHttp.addServer(`${rootId}:${SLACK_WRITE_MCP_NAME}`, () =>
-          createSlackWriteMcpServer(slackClient, "all", { workDir: rootAgentDir })
+          createSlackWriteMcpServer(slackClient, "all", {
+            workDir: rootAgentDir,
+            onWrite: () => mesh.markUnkillable(rootId),
+            logger: log,
+          })
         )
       : undefined;
 

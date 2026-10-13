@@ -74,6 +74,8 @@ export interface GrantableServerDeps {
   chatClient?: ChatClient;
   slackClient?: SlackClient;
   onChatWrite?: (actorId: string) => void;
+  /** Called with the grantee once Slack accepts one of its writes. */
+  onSlackWrite?: (actorId: string) => void;
   /** Provider selection currently executing for each actor. */
   getRunSelectionForActor: (actorId: string) => RawProviderModelConfig | undefined;
   /** Currently selected inbox entries for an actor run, used to route replies (#611). */
@@ -223,8 +225,11 @@ export function buildGrantableServers(
     map.set(SLACK_WRITE_MCP_NAME, (selfId, params) => {
       if (!deps.slackClient) throw new Error("slackClient is required for slack-write capability");
       const workDir = deps.actorRootFor?.(selfId);
+      const onSlackWrite = deps.onSlackWrite;
       return createSlackWriteMcpServer(deps.slackClient, params.includes("*") ? "all" : params, {
         ...(workDir ? { workDir } : {}),
+        ...(onSlackWrite ? { onWrite: () => onSlackWrite(selfId) } : {}),
+        ...(deps.logger ? { logger: deps.logger } : {}),
         ...(deps.fileToolsAvailableForActor
           ? { fileToolsAvailable: () => deps.fileToolsAvailableForActor?.(selfId) ?? false }
           : {}),
