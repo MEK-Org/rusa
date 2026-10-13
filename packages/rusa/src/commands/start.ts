@@ -1622,7 +1622,6 @@ async function composeStart(
       slackClient: slackClient ?? undefined,
       issueClient,
       actors,
-      actorRuns: getRepositories().actorRuns,
     });
   if (chatClient) {
     const workDir = join(mcHome, "root-agent");

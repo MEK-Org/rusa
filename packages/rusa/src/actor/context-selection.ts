@@ -24,6 +24,18 @@ import type { ContextConfig } from "./actor-record.js";
 export const CONTEXT_SELECTIONS = ["native", "ledger", "tail", "brief"] as const;
 export type ContextSelection = (typeof CONTEXT_SELECTIONS)[number];
 
+/**
+ * The selections an agent may make through `spawn_thread`. `brief` is the #954
+ * experiment, which the operator selects (dashboard, config, E2E harness); no
+ * request asks for agents to start brief-mode children, so the agent-facing
+ * door stays at the three established modes.
+ */
+export const AGENT_SPAWN_CONTEXT_SELECTIONS = [
+  "native",
+  "ledger",
+  "tail",
+] as const satisfies readonly ContextSelection[];
+
 export function isContextSelection(value: unknown): value is ContextSelection {
   return typeof value === "string" && (CONTEXT_SELECTIONS as readonly string[]).includes(value);
 }

@@ -1152,20 +1152,22 @@ describe("agent-execution MCP server", () => {
     expect(registry.get(thread_id)?.context).toMatchObject({ type: "portable", mode: "ledger" });
   });
 
-  it("spawn_thread accepts brief through the same supported selection boundary", async () => {
+  it("spawn_thread does not offer brief mode to agents", async () => {
+    // Brief mode is the operator-selected #954 experiment; the agent-facing
+    // enum stays at the established modes and the schema refuses the rest.
     const { mesh, registry } = setup();
+    const before = registry.list().length;
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-    const { thread_id } = dataOf(
-      (await client.callTool({
-        name: "spawn_thread",
-        arguments: {
-          charter: "own a brief-mode trial",
-          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
-          context_mode: "brief",
-        },
-      })) as CallToolResult
-    ) as { thread_id: string };
-    expect(registry.get(thread_id)?.context).toMatchObject({ type: "portable", mode: "brief" });
+    const result = (await client.callTool({
+      name: "spawn_thread",
+      arguments: {
+        charter: "own a brief-mode trial",
+        model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        context_mode: "brief",
+      },
+    })) as CallToolResult;
+    expect(result.isError).toBe(true);
+    expect(registry.list()).toHaveLength(before);
   });
 
   it("spawn_thread leaves the record's context unset when no mode is asked for", async () => {

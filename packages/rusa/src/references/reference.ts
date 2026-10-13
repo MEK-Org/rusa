@@ -16,7 +16,6 @@
  *   mesh:actors/<actor id>/charter                   an actor's charter (the one
  *                                                    property-of exception to
  *                                                    strict collection/id pairs)
- *   mesh:actors/<actor id>/runs/<run id>             one of an actor's recorded runs
  *
  * **The path is alternating `collection/id` pairs.** A reference may cite a
  * resource at any level, including a whole GitHub owner or repository; callers

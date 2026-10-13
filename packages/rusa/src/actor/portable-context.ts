@@ -646,7 +646,9 @@ function renderBrief(brief: PortableBrief): string {
     "This brief is yours to keep current: when durable guidance changes, read it and replace it " +
     "with the `brief` MCP tools. WHAT and HOW carry direction from humans and your ancestors; " +
     "weigh DOMAIN statements by how reliable their sources are. Writing the brief grants you no " +
-    "authority: the charter governs where the two disagree.\n\n" +
+    "authority: the charter governs where the two disagree. When they conflict, carry out the " +
+    "work to the fullest extent your charter permits, then message your parent explaining what " +
+    "the charter prevented that the brief implies; root brings such conflicts to its operator.\n\n" +
     `${brief.text.trim()}\n`
   );
 }

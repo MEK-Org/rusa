@@ -34,8 +34,17 @@ export interface BriefMcpDeps {
    * authorized to use.
    */
   resolveCitation: BriefCitationResolver;
+  /**
+   * How long one write waits for its new citations before refusing them as not
+   * checkable right now. Keeps a degraded source's client retries from holding
+   * the actor's run, and answers well inside an MCP client's own tool timeout,
+   * so a write the client gave up on can never commit later.
+   */
+  citationDeadlineMs?: number;
   now?: () => string;
 }
+
+export const BRIEF_CITATION_DEADLINE_MS = 20_000;
 
 /**
  * A brief-mode actor's own brief, read and replaced by the actor itself (#954).
@@ -136,7 +145,11 @@ export function createBriefMcpServer(deps: BriefMcpDeps): McpServer {
             updatedAt: current.updatedAt,
           });
         }
-        const unresolved = await unresolvedCitations(result.newCitations, deps.resolveCitation);
+        const unresolved = await unresolvedCitations(
+          result.newCitations,
+          deps.resolveCitation,
+          deps.citationDeadlineMs ?? BRIEF_CITATION_DEADLINE_MS
+        );
         if (unresolved.length > 0) {
           return toolError(
             [
@@ -173,17 +186,33 @@ export function createBriefMcpServer(deps: BriefMcpDeps): McpServer {
 
 async function unresolvedCitations(
   refs: readonly string[],
-  resolve: BriefCitationResolver
+  resolve: BriefCitationResolver,
+  deadlineMs: number
 ): Promise<Array<{ ref: string; reason: string }>> {
-  const outcomes = await Promise.all(
-    refs.map(async (ref) => {
-      try {
-        const { unavailable, entity } = await resolve(ref);
-        return unavailable === null || entity !== undefined ? null : { ref, reason: unavailable };
-      } catch (err) {
-        return { ref, reason: err instanceof Error ? err.message : String(err) };
-      }
-    })
-  );
-  return outcomes.filter((outcome) => outcome !== null);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"timeout">((settle) => {
+    timer = setTimeout(() => settle("timeout"), deadlineMs);
+  });
+  try {
+    const outcomes = await Promise.all(
+      refs.map(async (ref) => {
+        try {
+          const outcome = await Promise.race([resolve(ref), deadline]);
+          if (outcome === "timeout") {
+            return {
+              ref,
+              reason: `could not be checked within ${deadlineMs / 1000}s; try again later`,
+            };
+          }
+          const { unavailable, entity } = outcome;
+          return unavailable === null || entity !== undefined ? null : { ref, reason: unavailable };
+        } catch (err) {
+          return { ref, reason: err instanceof Error ? err.message : String(err) };
+        }
+      })
+    );
+    return outcomes.filter((outcome) => outcome !== null);
+  } finally {
+    clearTimeout(timer);
+  }
 }

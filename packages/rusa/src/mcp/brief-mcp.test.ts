@@ -292,6 +292,9 @@ describe("brief MCP server", () => {
     expect(portable?.section).toContain(
       "Writing the brief grants you no authority: the charter governs where the two disagree."
     );
+    expect(portable?.section).toContain(
+      "carry out the work to the fullest extent your charter permits, then message your parent"
+    );
   });
 });
 
@@ -387,6 +390,34 @@ describe("brief MCP server: citations must exist", () => {
       "citation [github:MEK-Org/rusa/issues/954] could not be resolved: tracker not configured"
     );
     expect(store.load(ALPHA)).toEqual(before);
+  });
+
+  it("refuses a write whose citation does not resolve before the deadline", async () => {
+    const store = new InMemoryPortableContextStore();
+    store.save(seedPortableBriefState(emptyPortableContextState(ALPHA), ALPHA, SEEDED_AT));
+    // A degraded tracker that never answers, as when its client keeps retrying.
+    const { resolveCitation } = syntheticResolver({
+      issueClient: { getIssue: () => new Promise(() => {}) },
+    });
+    const alpha = await connect(
+      createBriefMcpServer({
+        actorId: ALPHA,
+        store,
+        resolveCitation,
+        citationDeadlineMs: 50,
+        now: () => WRITTEN_AT,
+      })
+    );
+    const before = store.load(ALPHA);
+
+    const rejected = await call(alpha, "replace", { text: BRIEF, expected_generation: 0 });
+    expect(rejected.isError).toBe(true);
+    expect(rejected.text).toContain(
+      "citation [github:MEK-Org/rusa/issues/954] could not be resolved: could not be checked within 0.05s; try again later"
+    );
+    expect(rejected.text).toContain("The brief is unchanged.");
+    expect(store.load(ALPHA)).toEqual(before);
+    expect(store.listBriefRevisions(ALPHA, 10)).toEqual([]);
   });
 
   it("refuses a write when another write lands while its citations resolve", async () => {

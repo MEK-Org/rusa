@@ -1,5 +1,4 @@
 import type { ChatClient } from "../chat/types.js";
-import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
@@ -76,8 +75,6 @@ export interface ReferenceResolverDeps {
   >;
   /** Reads actor records; powers `mesh:actors/<id>/charter` resolution. */
   actors?: Pick<ActorRepository, "get">;
-  /** Reads actor runs; powers `mesh:actors/<id>/runs/<runId>` resolution. */
-  actorRuns?: Pick<ActorRunRepository, "getById">;
 }
 
 function unresolved(reference: Reference, title: string, reason: string): ResolvedReference {
@@ -165,24 +162,6 @@ function resolveMesh(
       body: actor.charter,
       author: null,
       timestamp: actor.createdAt,
-      url: null,
-      unavailable: null,
-    };
-  }
-
-  if (first?.[0] === "actors" && second?.[0] === "runs") {
-    if (!deps.actorRuns) return unresolved(reference, "Actor run", "run store not available");
-    const run = deps.actorRuns.getById(second[1]);
-    if (!run || run.actorId !== first[1]) {
-      return unresolved(reference, "Actor run", "run not found for actor");
-    }
-    return {
-      ref: reference.key,
-      scheme: reference.scheme,
-      title: `Run ${run.id}`,
-      body: run.output,
-      author: run.actorId,
-      timestamp: run.endedAt ?? run.startedAt,
       url: null,
       unavailable: null,
     };

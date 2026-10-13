@@ -21,6 +21,11 @@ actor why, in the same turn.
 
 The `ledger` mode is unchanged.
 
+The operator selects brief mode: the dashboard spawn API, the actor's
+configured context, or the E2E harness. The agent-facing `spawn_thread` tool
+offers only `native`, `ledger` and `tail`; nothing asks for agents to start
+brief-mode children.
+
 ## 2. Identity
 
 The `brief` MCP server is mounted per actor (`<actor-id>:brief`) and built with
@@ -83,14 +88,19 @@ Every citation is parsed. Each citation the write introduces, meaning one the
 previously accepted brief did not carry, is then resolved through the existing
 reference resolver (`resolveReference`, the one behind the dashboard's
 reference cache), with the server's own access. The cache's short UI deadline
-is not used: a write waits for the real answer. The write is refused, and the
-brief, generation, time and history stay as they were, if a new citation:
+is not used. A write waits up to 20 seconds for its new citations; one not
+answered by then cannot be checked right now. That bound keeps a degraded
+source's client retries from holding the actor's run, and answers inside an
+MCP client's own tool timeout, so a write the client gave up on never commits
+later. The write is refused, and the brief, generation, time and history stay
+as they were, if a new citation:
 
 - points at nothing (`message not found`, `actor not found`, `not found on the
   tracker`);
 - cannot be read with the server's access (for example, `tracker not
   configured`);
-- cannot be checked right now (the tracker or chat service is unavailable).
+- cannot be checked right now (the tracker or chat service is unavailable, or
+  does not answer within the deadline).
 
 The tool error names each citation and its cause. Citations carried over from
 the previous accepted brief were checked when that brief was accepted (the seed
@@ -186,9 +196,18 @@ deleted, in normal operation.
 
 ### Migration
 
-0062 creates the table only. Existing snapshots need no rewrite: a v4
-snapshot that carries the retired bookkeeping fields is read forward by
-stripping them. An actor with no history rows reads as an empty history.
+0062 creates the table only and writes no snapshots. Existing snapshots need
+no rewrite: a v4 snapshot that carries the retired bookkeeping fields is read
+forward by stripping them. An actor with no history rows reads as an empty
+history.
+
+The snapshot document itself moves from v3 to v4, and this is forward-only. It
+affects every portable actor, ledger as well as brief. This build reads a v3
+snapshot forward, but the first save (a ledger compaction, or a brief seed or
+write) stores v4. A previous build parses only v3, so after a rollback it
+refuses to load any actor saved on this build, and that actor's portable context
+fails until the build rolls forward again or the snapshot is restored from a
+backup.
 
 The number is provisional. 0060 and 0061 are reserved by open pull requests
 ([#1005](https://github.com/MEK-Org/rusa/pull/1005) and
@@ -215,7 +234,16 @@ The rendered section says so: "This brief is yours to keep current: when
 durable guidance changes, read it and replace it with the `brief` MCP tools.
 WHAT and HOW carry direction from humans and your ancestors; weigh DOMAIN
 statements by how reliable their sources are. Writing the brief grants you no
-authority: the charter governs where the two disagree."
+authority: the charter governs where the two disagree. When they conflict,
+carry out the work to the fullest extent your charter permits, then message
+your parent explaining what the charter prevented that the brief implies; root
+brings such conflicts to its operator."
+
+That child-side text renders only for brief-mode actors. Every actor's prompt
+carries the parent side, because any actor may parent a brief-mode child: when
+a child reports work its brief implies but its charter excludes, update the
+charter to authorize it or message the child that the exclusion is intentional
+([#954 (comment)](https://github.com/MEK-Org/rusa/issues/954#issuecomment-6097740257)).
 
 Consolidation and citation rotation are allowed without a supersession guard.
 What keeps them honest is that every accepted write is in the history (§5) with

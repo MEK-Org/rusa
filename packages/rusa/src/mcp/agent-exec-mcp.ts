@@ -8,7 +8,10 @@ import {
   MODEL_ADMIN_CAPABILITY,
   ROOM_ADMIN_CAPABILITY,
 } from "../actor/administrative-capabilities.js";
-import { CONTEXT_SELECTIONS, resolveContextSelection } from "../actor/context-selection.js";
+import {
+  AGENT_SPAWN_CONTEXT_SELECTIONS,
+  resolveContextSelection,
+} from "../actor/context-selection.js";
 import {
   type EventResource,
   normalizeEventResource,
@@ -273,7 +276,7 @@ export function createAgentExecMcpServer(
             "A brief one-line description of what this actor is tasked with, shown under its name in the dashboard."
           ),
         context_mode: z
-          .enum(CONTEXT_SELECTIONS)
+          .enum(AGENT_SPAWN_CONTEXT_SELECTIONS)
           .optional()
           .describe(
             "Who owns the child's memory between runs. Omit (or 'native') for the default: the provider keeps the session and resumes it. 'ledger' and 'tail' hand ownership to the mesh — the child is called FRESH every run with its own recent history injected into the prompt, so it survives provider quota exhaustion and can be re-mounted on a different harness. 'ledger' keeps a rolling compacted digest plus recent messages and is the one to reach for; 'tail' is a raw window that never compacts. Incompatible with conversation_id."
