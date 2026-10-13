@@ -1,7 +1,9 @@
 # Actor-owned portable brief
 
-**Status:** draft for review. The storage change below adds a migration and needs the
-normal schema gate before it ships.
+**Status:** draft for review, revised to the contract settled in
+[#954 (comment)](https://github.com/MEK-Org/rusa/issues/954#issuecomment-6155205270).
+The storage change below adds a migration and needs the normal schema gate
+before it ships.
 **Tracking:** [#954](https://github.com/MEK-Org/rusa/issues/954),
 [#961](https://github.com/MEK-Org/rusa/pull/961)
 
@@ -47,12 +49,15 @@ stored first (generation 0) and returned.
 | `expected_generation` differs from the stored generation | tool error: `stale brief write: expected generation N, current is M; …` | unchanged |
 | `text` equals the stored brief, ignoring trailing whitespace | `{ status: "unchanged", generation, updatedAt }` | unchanged: no revision, generation and time kept, explanation discarded |
 | `text` fails validation (§4) | tool error listing every problem | unchanged |
+| a citation the write introduces cannot be resolved (§4) | tool error naming each citation and its cause, then `The brief is unchanged.` | unchanged |
+| the brief changed while citations were being resolved | tool error: `stale brief write for actor <id>: expected generation N, current is M; …` | unchanged; the other write is kept |
 | otherwise | `{ status: "updated", generation: N+1, updatedAt }` | brief replaced and one revision appended, together (§5) |
 
 The generation check is a compare-and-set. The handler checks it first so the
-actor gets a clear error, and the store checks it again inside the write
-transaction, so a write based on a brief that has since changed is refused
-rather than overwriting it.
+actor gets a clear error. Resolving citations is asynchronous, so the store
+checks the generation again inside the write transaction, after resolution
+finished. A write based on a brief that changed meanwhile is refused rather
+than overwriting it. Stale, rejected and no-op writes append nothing.
 
 The explanation is optional. It is trimmed, an empty one is dropped, and it is
 capped at 2 KiB. It is shown in the history.
@@ -72,13 +77,38 @@ An accepted write must:
   review ids, gate tallies (`3/4`), or bare `#123` references without their
   repository. Citations may contain such ids; only the statement text is checked.
 
-Citations are checked for syntax only. A citation that parses but points at
-nothing is accepted.
+### Citations must exist
+
+Every citation is parsed. Each citation the write introduces, meaning one the
+previously accepted brief did not carry, is then resolved through the existing
+reference resolver (`resolveReference`, the one behind the dashboard's
+reference cache), with the server's own access. The cache's short UI deadline
+is not used: a write waits for the real answer. The write is refused, and the
+brief, generation, time and history stay as they were, if a new citation:
+
+- points at nothing (`message not found`, `actor not found`, `not found on the
+  tracker`);
+- cannot be read with the server's access (for example, `tracker not
+  configured`);
+- cannot be checked right now (the tracker or chat service is unavailable).
+
+The tool error names each citation and its cause. Citations carried over from
+the previous accepted brief were checked when that brief was accepted (the seed
+cites only the actor's own charter), so they are not resolved again. An outage
+on an old source does not block an edit. A charter citation
+(`[mesh:actors/<id>/charter]`) means the actor's current charter.
+
+An existing source with an empty body, such as an issue with no description,
+counts as resolved. A Google Chat message with no text (`message has no text`)
+is refused, because the resolver returns nothing to show that it exists.
+
+### Whole-document check
 
 The check covers the whole document, not a diff against the previous one. The
 actor may consolidate, reword, drop lines, and change which source it cites for
 a principle. One representative citation per principle is enough. There is no
-per-line supersession bookkeeping.
+byte-identical guard and no per-line supersession bookkeeping. The history
+(§5) keeps every accepted change inspectable instead.
 
 ## 5. Storage
 
@@ -91,7 +121,7 @@ same document untouched, so switching back to ledger mode loses nothing.
 `updatedAt` is the time of the last accepted write (the seed time before the
 first one).
 
-### History: `portable_brief_revisions` (migration 0060)
+### History: `portable_brief_revisions` (migration 0062)
 
 ```sql
 CREATE TABLE portable_brief_revisions (
@@ -122,9 +152,19 @@ in step.
 snapshot, refuses a stale `expectedGeneration`, writes the new snapshot and
 inserts the revision. If any step fails, both roll back. `UNIQUE(actor_id,
 generation)` backstops the compare-and-set: if two writers both passed the
-check, only one can insert generation N+1. The tests cover two database
-connections racing, an insert failing after the snapshot write (the snapshot
-rolls back), and a reopen after restart.
+check, only one can insert generation N+1.
+
+The tests cover:
+
+- two database connections whose writes are interleaved on one thread (both
+  read generation N, one commits, the other is refused). This is a
+  deterministic interleaving, not truly simultaneous writers; truly concurrent
+  writers are serialized by SQLite's `BEGIN IMMEDIATE` lock and the `UNIQUE`
+  backstop, which the tests do not race;
+- a write that lands while another write's citations are being resolved (the
+  later write is refused and the earlier one kept);
+- an insert failing after the snapshot write (the snapshot rolls back);
+- a reopen after restart.
 
 ### Retention
 
@@ -146,16 +186,23 @@ deleted, in normal operation.
 
 ### Migration
 
-0060 creates the table only. Existing snapshots need no rewrite: a v4
+0062 creates the table only. Existing snapshots need no rewrite: a v4
 snapshot that carries the retired bookkeeping fields is read forward by
-stripping them. An actor with no history rows reads as an empty history. 0060
-is the next number after 0059 on staging at the time of writing; it must be
-renumbered if another migration lands first.
+stripping them. An actor with no history rows reads as an empty history.
+
+The number is provisional. 0060 and 0061 are reserved by open pull requests
+([#1005](https://github.com/MEK-Org/rusa/pull/1005) and
+[#1024](https://github.com/MEK-Org/rusa/pull/1024)); this change does not
+depend on either. Migrations apply by name, so a gap on staging is harmless. The
+number must be rechecked, and renumbered if taken, before this lands.
 
 ## 6. Authority
 
 The charter governs. The brief carries evolving guidance under it and never
-overrides it. Both of a parent's existing ways to direct an actor still work:
+overrides it. Writing its own brief grants an actor no authority: WHAT and HOW
+carry direction from humans and the actor's ancestors, and DOMAIN statements
+are weighed by how reliable their sources are. Both of a parent's existing ways
+to direct an actor still work:
 
 1. **Charter change.** The new charter is in force on the next run. The actor
    does not have to rewrite its brief before acting on it. The seed's WHAT line
@@ -166,7 +213,14 @@ overrides it. Both of a parent's existing ways to direct an actor still work:
 
 The rendered section says so: "This brief is yours to keep current: when
 durable guidance changes, read it and replace it with the `brief` MCP tools.
-The charter governs where the two disagree."
+WHAT and HOW carry direction from humans and your ancestors; weigh DOMAIN
+statements by how reliable their sources are. Writing the brief grants you no
+authority: the charter governs where the two disagree."
+
+Consolidation and citation rotation are allowed without a supersession guard.
+What keeps them honest is that every accepted write is in the history (§5) with
+its before, after and explanation, and that each citation it introduces must
+exist (§4).
 
 ## 7. Dashboard (Option B)
 
@@ -190,7 +244,12 @@ The charter governs where the two disagree."
   its brief and finds nothing to change writes the same text, which is a no-op.
 - **There is no HTTP 409.** Staleness is a tool error from `replace`, not an
   HTTP status. The dashboard is read-only for briefs.
-- **Citations are not resolved** (§4).
+- **Citations do not prove support.** A new citation must exist (§4). Whether
+  the cited source actually says what the statement claims is not checked; the
+  history makes that reviewable.
+- **Retired machinery.** The post-run Gemini writer, its scheduler hook,
+  retries and failure accounting, the freeze, and the oversized-source handling
+  are removed, not disabled.
 - **Compaction and a mode switch.** A ledger compaction reads the snapshot,
   waits for the model, then saves. If the actor switched to brief mode and
   committed a brief during that wait, saving the stale copy would roll the

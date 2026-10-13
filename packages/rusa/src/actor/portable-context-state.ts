@@ -83,7 +83,7 @@ export type PortableMemoryItem = z.infer<typeof portableMemoryItemSchema>;
  *
  * The actor writes its own brief through the brief MCP server; nothing rewrites
  * it after a run. The snapshot holds only the CURRENT brief. Its accepted-write
- * history lives in `portable_brief_revisions` (0060), the one authoritative
+ * history lives in `portable_brief_revisions` (0062), the one authoritative
  * history, appended in the same transaction that replaces this document.
  */
 export const portableBriefSchema = z.object({

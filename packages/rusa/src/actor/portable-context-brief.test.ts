@@ -36,10 +36,10 @@ describe("findBriefStateExclusion", () => {
 
   it("rejects run/message ids, review ids, gate tallies and bare issue numbers", () => {
     expect(
-      findBriefStateExclusion("run 714e7bff-4b08-43a8-a0b9-02806cb41714 failed before launch")
+      findBriefStateExclusion("run 12345678-aaaa-4bbb-8ccc-123456789abc failed before launch")
     ).toContain("run/message id");
-    expect(findBriefStateExclusion("review 5448063297 is outstanding")).toContain("review id");
-    expect(findBriefStateExclusion("see pullrequestreview-5448063297")).toContain("review id");
+    expect(findBriefStateExclusion("review 1234567890 is outstanding")).toContain("review id");
+    expect(findBriefStateExclusion("see pullrequestreview-1234567890")).toContain("review id");
     expect(findBriefStateExclusion("the gate stands at 1/2")).toContain("gate tally");
     expect(findBriefStateExclusion("carry on with #954 as commissioned")).toContain(
       "bare issue number"
@@ -115,6 +115,8 @@ describe("validateActorBriefUpdate", () => {
     expect(validateActorBriefUpdate({ text: `${VALID}\n\n`, previousText: SEED_TEXT })).toEqual({
       outcome: "accepted",
       text: VALID,
+      // The seed already cites the charter, so only the other two are new.
+      newCitations: ["mesh:messages/m-1", "github:MEK-Org/rusa/issues/954"],
     });
   });
 
@@ -133,9 +135,21 @@ describe("validateActorBriefUpdate", () => {
       `## WHAT\n` +
       `Draw abstract SVG art; keep the brief small. [mesh:messages/m-9]\n` +
       `\n## HOW\n\n## DOMAIN\n`;
-    expect(validateActorBriefUpdate({ text: consolidated, previousText: VALID }).outcome).toBe(
-      "accepted"
-    );
+    expect(validateActorBriefUpdate({ text: consolidated, previousText: VALID })).toMatchObject({
+      outcome: "accepted",
+      newCitations: ["mesh:messages/m-9"],
+    });
+  });
+
+  it("names only the citations a write introduces, ignoring non-reference brackets", () => {
+    const rotated = VALID.replace(
+      "[mesh:messages/m-1]",
+      "[mesh:messages/m-1] [mesh:messages/m-2]"
+    ).replace("Draw abstract SVG art", "Draw abstract SVG art [sic]");
+    expect(validateActorBriefUpdate({ text: rotated, previousText: VALID })).toMatchObject({
+      outcome: "accepted",
+      newCitations: ["mesh:messages/m-2"],
+    });
   });
 
   it("refuses an oversized brief and an oversized explanation", () => {
@@ -176,10 +190,19 @@ describe("validateActorBriefUpdate", () => {
   it("trims the explanation and drops a blank one", () => {
     expect(
       validateActorBriefUpdate({ text: VALID, previousText: SEED_TEXT, explanation: "  why  " })
-    ).toEqual({ outcome: "accepted", text: VALID, explanation: "why" });
+    ).toEqual({
+      outcome: "accepted",
+      text: VALID,
+      explanation: "why",
+      newCitations: ["mesh:messages/m-1", "github:MEK-Org/rusa/issues/954"],
+    });
     expect(
       validateActorBriefUpdate({ text: VALID, previousText: SEED_TEXT, explanation: "  " })
-    ).toEqual({ outcome: "accepted", text: VALID });
+    ).toEqual({
+      outcome: "accepted",
+      text: VALID,
+      newCitations: ["mesh:messages/m-1", "github:MEK-Org/rusa/issues/954"],
+    });
   });
 });
 

@@ -113,7 +113,7 @@ describe("Database Migration System", () => {
       "0056_actor_execution_config",
       "0058_user_google_account_id",
       "0059_obligation_completion_matchers",
-      "0060_portable_brief_revisions",
+      "0062_portable_brief_revisions",
     ]);
 
     const tableNames = (

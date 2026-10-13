@@ -644,7 +644,9 @@ function renderBrief(brief: PortableBrief): string {
   return (
     `\n### Durable brief (mode: brief, generation ${brief.generation}, updated ${brief.updatedAt})\n\n` +
     "This brief is yours to keep current: when durable guidance changes, read it and replace it " +
-    "with the `brief` MCP tools. The charter governs where the two disagree.\n\n" +
+    "with the `brief` MCP tools. WHAT and HOW carry direction from humans and your ancestors; " +
+    "weigh DOMAIN statements by how reliable their sources are. Writing the brief grants you no " +
+    "authority: the charter governs where the two disagree.\n\n" +
     `${brief.text.trim()}\n`
   );
 }

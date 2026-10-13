@@ -192,7 +192,29 @@ export interface ActorBriefValidationInput {
 export type ActorBriefValidationResult =
   | { outcome: "noop" }
   | { outcome: "invalid"; errors: string[] }
-  | { outcome: "accepted"; text: string; explanation?: string };
+  | {
+      outcome: "accepted";
+      text: string;
+      explanation?: string;
+      /**
+       * Canonical citations this write introduces: cited here but not by the
+       * brief it replaces. Each must resolve before the write is stored.
+       */
+      newCitations: string[];
+    };
+
+/** Canonical keys of every structured citation in `text`, in first-seen order. */
+export function briefCitations(text: string): string[] {
+  const keys = new Set<string>();
+  for (const group of text.matchAll(/\[([^\]]+)\]/g)) {
+    try {
+      keys.add(parseReference(group[1].trim()).key);
+    } catch {
+      // Not a reference: statement text such as `[sic]`.
+    }
+  }
+  return [...keys];
+}
 
 /**
  * Validate an actor-authored brief write before anything is stored.
@@ -208,6 +230,11 @@ export type ActorBriefValidationResult =
  * actor may consolidate, reword, drop lines, and rotate which representative
  * source it cites, with no per-line supersession bookkeeping. The charter
  * still governs; the brief carries evolving guidance under it.
+ *
+ * This check is syntactic. An accepted result names the citations the write
+ * introduces, and the caller must resolve each one before storing the write
+ * (#954 disposition 6155205270): a citation the replaced brief already carried
+ * was resolved when that brief was accepted, or is the seed's own charter line.
  */
 export function validateActorBriefUpdate(
   input: ActorBriefValidationInput
@@ -240,7 +267,13 @@ export function validateActorBriefUpdate(
   }
 
   if (errors.length > 0) return { outcome: "invalid", errors };
-  return { outcome: "accepted", text, ...(explanation === undefined ? {} : { explanation }) };
+  const previous = new Set(briefCitations(input.previousText));
+  return {
+    outcome: "accepted",
+    text,
+    ...(explanation === undefined ? {} : { explanation }),
+    newCitations: briefCitations(text).filter((ref) => !previous.has(ref)),
+  };
 }
 
 // ── Seeding ──

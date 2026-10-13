@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { portableBriefRevisions } from "./0060_portable_brief_revisions.js";
+import { portableBriefRevisions } from "./0062_portable_brief_revisions.js";
 
 function seedDb(): Database.Database {
   const db = new Database(":memory:");
@@ -39,7 +39,7 @@ const insert = (
  * What the database itself guarantees when application code is bypassed.
  * Behavior through the repository is in `portable-context-repository.test.ts`.
  */
-describe("0060_portable_brief_revisions", () => {
+describe("0062_portable_brief_revisions", () => {
   it("creates the table with the 0045-shaped columns", () => {
     const db = seedDb();
     const columns = (

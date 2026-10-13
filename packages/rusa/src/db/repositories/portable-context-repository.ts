@@ -21,7 +21,7 @@ type BriefRevisionRow = {
   payload: string;
 };
 
-/** `portable_brief_revisions.payload` (0060), validated here at the point of consumption. */
+/** `portable_brief_revisions.payload` (0062), validated here at the point of consumption. */
 const briefRevisionPayloadSchema = z.object({
   schemaVersion: z.literal(1),
   before: z.string(),

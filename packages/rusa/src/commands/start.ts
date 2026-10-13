@@ -304,6 +304,7 @@ import {
 import { type MissedQuotaWindow, MissedQuotaWindowDetector } from "../quota/missed-windows.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import { resolveReference } from "../references/resolve.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
@@ -1611,6 +1612,18 @@ async function composeStart(
       : errorSink?.kind === "slack" && slackClient
         ? (text: string) => slackClient.send(errorSink.target, text).then(() => {})
         : null;
+  // A brief write's new citations resolve through the same resolver and
+  // clients the dashboard uses; nothing here widens what they can read (#954).
+  const resolveBriefCitation = (ref: string) =>
+    resolveReference(ref, {
+      meshChat: getRepositories().meshChat,
+      inbox: getRepositories().inbox,
+      chatClient: chatClient ?? undefined,
+      slackClient: slackClient ?? undefined,
+      issueClient,
+      actors,
+      actorRuns: getRepositories().actorRuns,
+    });
   if (chatClient) {
     const workDir = join(mcHome, "root-agent");
     // This root-owned server runs on the local leader; follower placement is
@@ -3397,6 +3410,7 @@ async function composeStart(
             createBriefMcpServer({
               actorId: id,
               store: portableContextStore,
+              resolveCitation: resolveBriefCitation,
             })
           );
           workerMcp.push({ name: BRIEF_MCP_NAME, url: briefUrl });
@@ -3867,6 +3881,7 @@ async function composeStart(
       createBriefMcpServer({
         actorId: rootId,
         store: portableContextStore,
+        resolveCitation: resolveBriefCitation,
       })
     );
     rootMcp.push({ name: BRIEF_MCP_NAME, url: rootBriefUrl });

@@ -35,7 +35,7 @@ import type { Migration } from "./types.js";
  * `WHERE actor_id = ? ORDER BY generation DESC`.
  */
 export const portableBriefRevisions: Migration = {
-  id: "0060_portable_brief_revisions",
+  id: "0062_portable_brief_revisions",
   up: (db: Database) => {
     db.exec(`
       CREATE TABLE portable_brief_revisions (
