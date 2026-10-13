@@ -61,13 +61,17 @@ const ISO_INSTANT =
 /**
  * Milliseconds for an ISO-8601 instant, or NaN. `Date.parse` rolls an
  * impossible calendar date such as 30 February into the next month, so the
- * wall-clock fields must read back unchanged.
+ * wall-clock fields must read back unchanged; a field out of range in every
+ * month, such as month 13, is already an invalid date.
  */
 function isoInstantMs(value: string): number {
   const match = ISO_INSTANT.exec(value);
   if (!match) return Number.NaN;
   const wall = `${match[1]}T${match[2]}:${match[3] ?? "00"}`;
-  if (new Date(`${wall}Z`).toISOString().slice(0, 19) !== wall) return Number.NaN;
+  const probe = new Date(`${wall}Z`);
+  if (Number.isNaN(probe.getTime()) || probe.toISOString().slice(0, 19) !== wall) {
+    return Number.NaN;
+  }
   return Date.parse(value);
 }
 

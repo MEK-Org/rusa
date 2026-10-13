@@ -694,6 +694,10 @@ describe("Slack read MCP history", () => {
     [{ oldest: "2026-02-30T00:00:00Z" }, /oldest must be a Slack timestamp/],
     [{ latest: "2026-04-31T09:00:00+02:00" }, /latest must be a Slack timestamp/],
     [{ latest: "2026-10-13T24:00:00Z" }, /latest must be a Slack timestamp/],
+    [{ oldest: "2026-13-01T00:00:00Z" }, /oldest must be a Slack timestamp/],
+    [{ oldest: "2026-01-32T00:00:00Z" }, /oldest must be a Slack timestamp/],
+    [{ latest: "2026-01-01T25:00:00Z" }, /latest must be a Slack timestamp/],
+    [{ latest: "2026-01-01T00:60:00Z" }, /latest must be a Slack timestamp/],
     [
       { oldest: "2026-10-14T00:00:00Z", latest: "2026-10-13T00:00:00Z" },
       /oldest must not be after latest/,
