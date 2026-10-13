@@ -1,13 +1,11 @@
 import { basename } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { Logger } from "../observability/logger.js";
 import {
   MAX_SLACK_FILE_BYTES,
   MAX_SLACK_HISTORY_PAGE,
   type SlackClient,
   type SlackHistoryQuery,
-  SlackWriteUnconfirmedError,
 } from "../slack/slack-client.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
@@ -35,7 +33,6 @@ export interface SlackWriteMcpOptions extends SlackMcpOptions {
    * from coalescing abort and is not repeated by a replacement run.
    */
   onWrite?: () => void;
-  logger?: Logger;
 }
 
 function requireWorkDir(options: SlackMcpOptions): string {
@@ -259,24 +256,6 @@ export function createSlackWriteMcpServer(
   const server = createMcpServer({ name: SLACK_WRITE_MCP_NAME, version: "0.1.0" });
   const allowed = (channel: string) =>
     allowedChannels === "all" || allowedChannels.includes(channel);
-  // The write already happened in Slack, so a failing local hook must not turn
-  // its result into an error that invites the actor to send it again.
-  const wrote = (tool: string) => {
-    try {
-      options.onWrite?.();
-    } catch (err) {
-      options.logger?.warn("slack_write_hook_failed", {
-        tool,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  };
-  // Slack accepted a write whose response lacked the identifier we return:
-  // report the error, but the side effect still counts.
-  const failed = (tool: string, err: unknown) => {
-    if (err instanceof SlackWriteUnconfirmedError) wrote(tool);
-    return toolError(err);
-  };
   server.registerTool(
     "send_message",
     {
@@ -288,10 +267,10 @@ export function createSlackWriteMcpServer(
       try {
         if (!allowed(channel)) throw new Error(`access denied: Slack channel ${channel}`);
         const ts = await client.send(channel, text, threadTs);
-        wrote("send_message");
+        options.onWrite?.();
         return toolOk({ ref: `slack:channels/${channel}/messages/${ts}`, ts });
       } catch (err) {
-        return failed("send_message", err);
+        return toolError(err);
       }
     }
   );
@@ -310,10 +289,10 @@ export function createSlackWriteMcpServer(
       try {
         if (!allowed(channel)) throw new Error(`access denied: Slack channel ${channel}`);
         await client.react(channel, ts, emoji);
-        wrote("react");
+        options.onWrite?.();
         return toolOk({ ok: true });
       } catch (err) {
-        return failed("react", err);
+        return toolError(err);
       }
     }
   );
@@ -354,10 +333,16 @@ export function createSlackWriteMcpServer(
           ...(title ? { title } : {}),
           ...(initialComment ? { initialComment } : {}),
         });
-        wrote("upload_file");
+        // Slack completed the share, so the file is posted even if no ID came back.
+        options.onWrite?.();
+        if (fileIds.length === 0) {
+          throw new Error(
+            "Slack completed the upload but returned no file ID; check the channel before uploading again"
+          );
+        }
         return toolOk({ fileIds, channel, ...(threadTs ? { threadTs } : {}) });
       } catch (err) {
-        return failed("upload_file", err);
+        return toolError(err);
       }
     }
   );

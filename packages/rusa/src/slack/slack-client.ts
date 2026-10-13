@@ -186,12 +186,6 @@ async function readBodyWithLimit(resp: Response, maxBytes: number): Promise<Buff
   return Buffer.concat(chunks);
 }
 
-/**
- * Slack answered a write with `ok`, so the side effect happened, but the
- * response lacked the identifier this client returns for it.
- */
-export class SlackWriteUnconfirmedError extends Error {}
-
 export class SlackClient {
   readonly web: WebClient;
   /**
@@ -298,7 +292,9 @@ export class SlackClient {
   /**
    * Share a file into a channel, or a thread when `threadTs` is given, through
    * Slack's external upload flow (`files.getUploadURLExternal`, upload, then
-   * `files.completeUploadExternal`), which the SDK's `uploadV2` drives.
+   * `files.completeUploadExternal`), which the SDK's `uploadV2` drives. Returns
+   * the file IDs Slack reports; the list is empty if Slack completed the share
+   * without naming a file.
    */
   async uploadFile(
     channel: string,
@@ -322,9 +318,6 @@ export class SlackClient {
     );
     const completions = (response as { files?: { files?: { id?: string }[] }[] }).files ?? [];
     const ids = completions.flatMap((c) => c.files ?? []).flatMap((f) => (f.id ? [f.id] : []));
-    if (ids.length === 0) {
-      throw new SlackWriteUnconfirmedError("Slack did not confirm the uploaded file");
-    }
     return ids;
   }
 
@@ -435,9 +428,7 @@ export class SlackClient {
 
   async send(channel: string, text: string, threadTs?: string): Promise<string> {
     const result = await this.web.chat.postMessage({ channel, text, thread_ts: threadTs });
-    if (!result.ts) {
-      throw new SlackWriteUnconfirmedError("Slack did not return a message timestamp");
-    }
+    if (!result.ts) throw new Error("Slack did not return a message timestamp");
     return result.ts;
   }
 

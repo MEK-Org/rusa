@@ -3818,7 +3818,6 @@ async function composeStart(
           createSlackWriteMcpServer(slackClient, "all", {
             workDir: rootAgentDir,
             onWrite: () => mesh.markUnkillable(rootId),
-            logger: log,
           })
         )
       : undefined;

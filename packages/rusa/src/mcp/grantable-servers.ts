@@ -229,7 +229,6 @@ export function buildGrantableServers(
       return createSlackWriteMcpServer(deps.slackClient, params.includes("*") ? "all" : params, {
         ...(workDir ? { workDir } : {}),
         ...(onSlackWrite ? { onWrite: () => onSlackWrite(selfId) } : {}),
-        ...(deps.logger ? { logger: deps.logger } : {}),
         ...(deps.fileToolsAvailableForActor
           ? { fileToolsAvailable: () => deps.fileToolsAvailableForActor?.(selfId) ?? false }
           : {}),
