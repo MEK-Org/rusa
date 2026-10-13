@@ -39,7 +39,21 @@ function requireFileToolsAvailable(options: SlackMcpOptions): void {
 }
 
 const SLACK_TS = /^\d{1,12}(\.\d{1,6})?$/;
-const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+const ISO_INSTANT =
+  /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * Milliseconds for an ISO-8601 instant, or NaN. `Date.parse` rolls an
+ * impossible calendar date such as 30 February into the next month, so the
+ * wall-clock fields must read back unchanged.
+ */
+function isoInstantMs(value: string): number {
+  const match = ISO_INSTANT.exec(value);
+  if (!match) return Number.NaN;
+  const wall = `${match[1]}T${match[2]}:${match[3] ?? "00"}`;
+  if (new Date(`${wall}Z`).toISOString().slice(0, 19) !== wall) return Number.NaN;
+  return Date.parse(value);
+}
 
 /**
  * A history bound as Slack expects it: seconds since the epoch with up to six
@@ -48,7 +62,7 @@ const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}
  */
 export function toSlackTimestamp(value: string, field: string): string {
   if (SLACK_TS.test(value)) return value;
-  const ms = ISO_INSTANT.test(value) ? Date.parse(value) : Number.NaN;
+  const ms = isoInstantMs(value);
   if (!Number.isFinite(ms) || ms < 0) {
     throw new Error(
       `${field} must be a Slack timestamp (e.g. 1712345678.000100) or an ISO-8601 instant with an offset (e.g. 2026-10-13T00:00:00Z)`

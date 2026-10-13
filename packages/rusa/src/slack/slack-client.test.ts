@@ -269,4 +269,17 @@ describe("SlackClient history pages", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(Date.now() - started).toBeLessThan(5000);
   });
+
+  it("reports a Slack outage or network failure at once instead of retrying it", async () => {
+    const { client, fetch } = slackApi([{ status: 503, body: { ok: false } }]);
+    const started = Date.now();
+    await expect(client.listHistory("C1", { limit: 10 })).rejects.toThrow(/statusCode = 503/);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    fetch.mockRejectedValueOnce(new TypeError("fetch failed"));
+    await expect(client.listThreadReplies("C1", "5.0", { limit: 10 })).rejects.toThrow(
+      /fetch failed/
+    );
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
 });

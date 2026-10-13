@@ -190,15 +190,20 @@ export class SlackClient {
   readonly web: WebClient;
   /**
    * The history tools' client: a rate-limited call fails with Slack's
-   * retry-after instead of the SDK silently waiting, so an actor's tool call
-   * reports the limit rather than stalling.
+   * retry-after instead of the SDK silently waiting, and a network or HTTP
+   * failure is not retried, so an actor's tool call reports the failure rather
+   * than stalling for the SDK's default of ten retries over about 30 minutes.
    */
   readonly historyWeb: WebClient;
   readonly #botToken: string;
 
   constructor(botToken: string, options: { fetch?: FetchFunction } = {}) {
     this.web = new WebClient(botToken, options);
-    this.historyWeb = new WebClient(botToken, { ...options, rejectRateLimitedCalls: true });
+    this.historyWeb = new WebClient(botToken, {
+      ...options,
+      rejectRateLimitedCalls: true,
+      retryConfig: { retries: 0 },
+    });
     this.#botToken = botToken;
   }
 

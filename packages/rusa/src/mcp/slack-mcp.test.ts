@@ -15,7 +15,11 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SlackClient } from "../slack/slack-client.js";
-import { createSlackReadMcpServer, createSlackWriteMcpServer } from "./slack-mcp.js";
+import {
+  createSlackReadMcpServer,
+  createSlackWriteMcpServer,
+  toSlackTimestamp,
+} from "./slack-mcp.js";
 
 const TOKEN = "xoxb-synthetic";
 const FILE_URL = "https://files.slack.com/files-pri/T1-F1/download/report.txt";
@@ -532,6 +536,9 @@ describe("Slack read MCP history", () => {
     [{ oldest: "yesterday" }, /oldest must be a Slack timestamp/],
     [{ latest: "2026-10-13" }, /latest must be a Slack timestamp/],
     [{ latest: "2026-10-13T00:00:00" }, /latest must be a Slack timestamp/],
+    [{ oldest: "2026-02-30T00:00:00Z" }, /oldest must be a Slack timestamp/],
+    [{ latest: "2026-04-31T09:00:00+02:00" }, /latest must be a Slack timestamp/],
+    [{ latest: "2026-10-13T24:00:00Z" }, /latest must be a Slack timestamp/],
     [
       { oldest: "2026-10-14T00:00:00Z", latest: "2026-10-13T00:00:00Z" },
       /oldest must not be after latest/,
@@ -545,6 +552,11 @@ describe("Slack read MCP history", () => {
     expect(result.isError).toBe(true);
     expect(result.text).toMatch(message);
     expect(history).not.toHaveBeenCalled();
+  });
+
+  it("accepts real calendar instants, including a leap day and fractional seconds", () => {
+    expect(toSlackTimestamp("2028-02-29T12:00:00.5Z", "oldest")).toBe("1835438400.500000");
+    expect(toSlackTimestamp("2026-10-13T23:59+05:30", "latest")).toBe("1791916140.000000");
   });
 
   it("rejects a thread timestamp that is not a Slack timestamp", async () => {
