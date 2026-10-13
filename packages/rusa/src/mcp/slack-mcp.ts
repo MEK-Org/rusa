@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { Logger } from "../observability/logger.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import {
+  MAX_SLACK_DOWNLOAD_BYTES,
   MAX_SLACK_FILE_BYTES,
   MAX_SLACK_HISTORY_PAGE,
   SLACK_CONVERSATION_TYPES,
@@ -17,7 +18,7 @@ import {
   readBoundedRegularFile,
   resolveAttachmentPath,
   resolveDownloadPath,
-  writeNewFileInWorkdir,
+  streamNewFileInWorkdir,
 } from "./workdir-path.js";
 
 export const SLACK_READ_MCP_NAME = "slack-read";
@@ -28,6 +29,10 @@ export interface SlackMcpOptions {
   workDir?: string;
   /** Rechecked when a file tool is called, because follower placement can change live. */
   fileToolsAvailable?: () => boolean;
+  /**
+   * Per-file byte cap. Uploads default to {@link MAX_SLACK_FILE_BYTES}; downloads
+   * default to {@link MAX_SLACK_DOWNLOAD_BYTES}, which this can lower but not raise.
+   */
   maxFileBytes?: number;
 }
 
@@ -262,7 +267,7 @@ export function createSlackReadMcpServer(
     {
       title: "Download a file attached to a Slack message",
       description:
-        "Save a file attached to the message at channel/ts into your working directory. The destination must not already exist; its directory must. Unavailable for follower-hosted actors (see #812).",
+        "Stream a file attached to the message at channel/ts to destinationPath inside your working directory (up to 1 GiB) and return its path, byte count, SHA-256, content type, and name. The destination must not already exist; its directory must. A failed or oversized download leaves no file. Unavailable for follower-hosted actors (see #812).",
       inputSchema: {
         channel: z.string(),
         ts: z.string().describe("Timestamp of the message the file is attached to"),
@@ -277,18 +282,22 @@ export function createSlackReadMcpServer(
         requireFileToolsAvailable(options);
         const workDir = requireWorkDir(options);
         const target = await resolveDownloadPath(workDir, destinationPath);
-        const { file, data } = await client.downloadMessageFile(
+        const { file, contentType, body } = await client.downloadMessageFile(
           channel,
           ts,
           fileId,
-          options.maxFileBytes ?? MAX_SLACK_FILE_BYTES
+          Math.min(options.maxFileBytes ?? MAX_SLACK_DOWNLOAD_BYTES, MAX_SLACK_DOWNLOAD_BYTES)
         );
-        // Opened only now, after the fetch, and walked from the root so a
-        // directory swapped during the fetch cannot redirect the write.
-        await writeNewFileInWorkdir(workDir, target, data);
+        // Opened only now, once Slack has answered, and walked from the root so
+        // a directory swapped during the fetch cannot redirect the write. A
+        // failed or oversized stream unlinks the partial file.
+        const { bytes, sha256 } = await streamNewFileInWorkdir(workDir, target, body);
         return toolOk({
           path: target,
-          bytes: data.length,
+          bytes,
+          sha256,
+          contentType,
+          name: file.name ?? file.id,
           file,
           source: `slack:channels/${channel}/messages/${ts}`,
         });

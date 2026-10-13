@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { ErrorCode, type FetchFunction, WebClient } from "@slack/web-api";
+import { boundedResponse } from "../chat/bounded-response.js";
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 
 export function readSlackToken(path: string, home: string): string {
@@ -15,8 +16,14 @@ export function readSlackToken(path: string, home: string): string {
   return token;
 }
 
-/** Default cap on a file an actor may download from or upload to Slack. */
+/** Default cap on a file an actor may upload to Slack. */
 export const MAX_SLACK_FILE_BYTES = 50 * 1024 * 1024;
+
+/**
+ * Default and ceiling for a Slack file download, matching Chat's attachment
+ * download limit. This is rusa's bound, not a Slack service limit.
+ */
+export const MAX_SLACK_DOWNLOAD_BYTES = 1024 * 1024 * 1024;
 
 /** The only host a bot token is ever sent to when fetching a private file. */
 const SLACK_FILE_HOST = "files.slack.com";
@@ -224,21 +231,6 @@ function sizeLimitError(maxBytes: number): Error {
   return new Error(`file size limit exceeded: file is larger than ${maxBytes} bytes`);
 }
 
-async function readBodyWithLimit(resp: Response, maxBytes: number): Promise<Buffer> {
-  if (!resp.body) return Buffer.alloc(0);
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of resp.body as unknown as AsyncIterable<Uint8Array>) {
-    total += chunk.byteLength;
-    if (total > maxBytes) {
-      await resp.body.cancel().catch(() => {});
-      throw sizeLimitError(maxBytes);
-    }
-    chunks.push(Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks);
-}
-
 export class SlackClient {
   readonly web: WebClient;
   /**
@@ -302,14 +294,19 @@ export class SlackClient {
    * resolved through that message, never by bare ID, so a caller can only read
    * files it can name a source message for. The bot token is sent only to
    * Slack's private file host, and the size cap holds whether or not Slack
-   * reported the size up front.
+   * reported the size up front. The body is returned as a stream that errors
+   * once it passes `maxBytes`, so the caller never holds the whole file.
    */
   async downloadMessageFile(
     channel: string,
     ts: string,
     fileId: string,
-    maxBytes = MAX_SLACK_FILE_BYTES
-  ): Promise<{ file: SlackFile; data: Buffer }> {
+    maxBytes = MAX_SLACK_DOWNLOAD_BYTES
+  ): Promise<{
+    file: SlackFile;
+    contentType: string;
+    body: ReadableStream<Uint8Array> | null;
+  }> {
     const found = await this.findMessage(channel, ts);
     const raw = ((found.files ?? []) as RawSlackFile[]).find((file) => file.id === fileId);
     if (!raw?.id) throw new Error(`Slack file ${fileId} is not attached to ${channel}/${ts}`);
@@ -335,12 +332,12 @@ export class SlackClient {
         "Slack returned an HTML page instead of the file; check the files:read scope"
       );
     }
-    const declared = Number(resp.headers.get("content-length"));
-    if (Number.isFinite(declared) && declared > maxBytes) {
-      await resp.body?.cancel().catch(() => {});
-      throw sizeLimitError(maxBytes);
-    }
-    return { file, data: await readBodyWithLimit(resp, maxBytes) };
+    const bounded = await boundedResponse(resp, maxBytes, "file");
+    return {
+      file,
+      contentType: raw.mimetype || contentType || "application/octet-stream",
+      body: bounded.body,
+    };
   }
 
   /**

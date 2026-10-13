@@ -1,9 +1,12 @@
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -15,7 +18,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
-import { SlackClient } from "../slack/slack-client.js";
+import { MAX_SLACK_DOWNLOAD_BYTES, SlackClient } from "../slack/slack-client.js";
 import {
   createSlackReadMcpServer,
   createSlackWriteMcpServer,
@@ -111,9 +114,20 @@ describe("Slack read MCP files", () => {
       destinationPath: "report.txt",
     });
     expect(result.isError).toBe(false);
-    expect(JSON.parse(result.text)).toMatchObject({
+    expect(JSON.parse(result.text)).toEqual({
+      path: join(dir, "report.txt"),
       bytes: 5,
-      file: { id: "F1", name: "report.txt" },
+      sha256: createHash("sha256").update("hello").digest("hex"),
+      contentType: "text/plain",
+      name: "report.txt",
+      file: {
+        id: "F1",
+        name: "report.txt",
+        title: "Report",
+        mimetype: "text/plain",
+        filetype: "text",
+        size: 5,
+      },
       source: "slack:channels/C1/messages/1.0",
     });
     expect(readFileSync(join(dir, "report.txt"), "utf8")).toBe("hello");
@@ -284,6 +298,165 @@ describe("Slack read MCP files", () => {
     expect(result.isError).toBe(true);
     expect(result.text).toContain("access denied");
     expect(existsSync(join(outside, "new.txt"))).toBe(false);
+  });
+});
+
+describe("Slack read MCP streamed downloads", () => {
+  const args = { channel: "C1", ts: "1.0", fileId: "F1", destinationPath: "out.bin" };
+
+  async function reader(file: Record<string, unknown>, options: { maxFileBytes?: number } = {}) {
+    const dir = workdir();
+    const client = await connect(
+      createSlackReadMcpServer(slackWith({ conversations: { replies: messageWithFile(file) } }), {
+        workDir: dir,
+        ...options,
+      })
+    );
+    return { dir, download: () => call(client, "download_file", args) };
+  }
+
+  function withoutSize(file: Record<string, unknown>): Record<string, unknown> {
+    const { size: _size, ...rest } = file;
+    return rest;
+  }
+
+  it("defaults to Chat's 1 GiB download limit, which an option can lower but not raise", async () => {
+    expect(MAX_SLACK_DOWNLOAD_BYTES).toBe(1024 * 1024 * 1024);
+    const fetchMock = vi.fn(async () => new Response("hello"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    // Past the old 50 MiB default, but within 1 GiB: fetched.
+    const within = await reader({ ...reportFile, size: 60 * 1024 * 1024 });
+    expect((await within.download()).isError).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const over = { ...reportFile, size: MAX_SLACK_DOWNLOAD_BYTES + 1 };
+    for (const options of [{}, { maxFileBytes: 2 * MAX_SLACK_DOWNLOAD_BYTES }]) {
+      const { dir, download } = await reader(over, options);
+      expect((await download()).text).toContain(
+        `file size limit exceeded: file is larger than ${MAX_SLACK_DOWNLOAD_BYTES} bytes`
+      );
+      expect(existsSync(join(dir, "out.bin"))).toBe(false);
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a declared Content-Length over the limit before creating the file", async () => {
+    const fetchMock = vi.fn(
+      async () => new Response("123456789", { headers: { "content-length": "9" } })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { dir, download } = await reader(withoutSize(reportFile), { maxFileBytes: 8 });
+    expect((await download()).text).toContain(
+      "file size limit exceeded: file is larger than 8 bytes"
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it("removes the partial file when the stream overflows or the network fails mid-download", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        let sent = 0;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              sent += 1;
+              controller.enqueue(new Uint8Array(4).fill(sent));
+            },
+          })
+        );
+      })
+    );
+    const overflow = await reader(withoutSize(reportFile), { maxFileBytes: 10 });
+    expect((await overflow.download()).text).toContain("file size limit exceeded");
+    expect(readdirSync(overflow.dir)).toEqual([]);
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode("partial"));
+                controller.error(new Error("socket hang up"));
+              },
+            })
+          )
+      )
+    );
+    const interrupted = await reader(reportFile);
+    const result = await interrupted.download();
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("socket hang up");
+    expect(readdirSync(interrupted.dir)).toEqual([]);
+  });
+
+  it("writes chunks to disk as they arrive rather than buffering the whole body", async () => {
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              async start(controller) {
+                controller.enqueue(new TextEncoder().encode("first"));
+                await finished;
+                controller.enqueue(new TextEncoder().encode("-second"));
+                controller.close();
+              },
+            })
+          )
+      )
+    );
+    const { dir, download } = await reader(withoutSize(reportFile));
+    const pending = download();
+    const target = join(dir, "out.bin");
+    await vi.waitFor(() => expect(statSync(target).size).toBe(5));
+    finish();
+    const result = await pending;
+    expect(JSON.parse(result.text)).toMatchObject({
+      bytes: 12,
+      sha256: createHash("sha256").update("first-second").digest("hex"),
+    });
+    expect(readFileSync(target, "utf8")).toBe("first-second");
+  });
+
+  it("returns exact receipts for empty and binary files", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(null))
+    );
+    const empty = await reader({ ...reportFile, size: 0 });
+    expect(JSON.parse((await empty.download()).text)).toMatchObject({
+      bytes: 0,
+      sha256: createHash("sha256").digest("hex"),
+    });
+    expect(statSync(join(empty.dir, "out.bin")).size).toBe(0);
+
+    const binary = Uint8Array.from({ length: 256 }, (_, i) => i);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(binary, { headers: { "content-type": "application/octet-stream" } })
+      )
+    );
+    const { mimetype: _mimetype, ...untyped } = { ...reportFile, name: "blob.bin", size: 256 };
+    const bin = await reader(untyped);
+    expect(JSON.parse((await bin.download()).text)).toMatchObject({
+      bytes: 256,
+      sha256: createHash("sha256").update(binary).digest("hex"),
+      contentType: "application/octet-stream",
+      name: "blob.bin",
+    });
+    expect(new Uint8Array(readFileSync(join(bin.dir, "out.bin")))).toEqual(binary);
   });
 });
 
