@@ -233,7 +233,7 @@ slack:
   botTokenPath             Required. File directly inside RUSA_HOME/secrets containing the xoxb bot token.
                            Configure app_mentions:read,
                            im:history, channels:history, channels:read, chat:write, and reactions:write bot scopes,
-                           plus files:read and files:write for the attachment tools.
+                           plus files:read and files:write for the attachment tools and users:read for get_user.
                            Attachment tools run on the leader and refuse follower-hosted actors (#812).
                            The list_channel_history and list_thread_replies tools read with the token's own
                            access: channels:history covers public channels; add groups:history, mpim:history

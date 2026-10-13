@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { readSlackToken, SlackClient } from "./slack-client.js";
+import { readSlackToken, SLACK_MESSAGE_LIMITS, SlackClient } from "./slack-client.js";
 
 describe("Slack token placement", () => {
   it("reads only files directly in the masked RUSA_HOME/secrets directory", () => {
@@ -87,26 +87,26 @@ describe("SlackClient.react", () => {
   });
 });
 
-describe("SlackClient history pages", () => {
-  type Reply = { status?: number; headers?: Record<string, string>; body?: unknown };
+type Reply = { status?: number; headers?: Record<string, string>; body?: unknown };
 
-  /** A real WebClient over a synthetic Slack API: each request takes the next scripted reply. */
-  function slackApi(replies: Reply[]) {
-    const requests: { method: string; params: Record<string, string> }[] = [];
-    const fetch = vi.fn(async (url: string | URL, init?: { body?: unknown }) => {
-      const method = String(url).split("/").pop() ?? "";
-      const params = Object.fromEntries(new URLSearchParams(String(init?.body ?? "")));
-      delete params.token;
-      requests.push({ method, params });
-      const reply = replies.shift() ?? { body: { ok: true } };
-      return new Response(JSON.stringify(reply.body ?? {}), {
-        status: reply.status ?? 200,
-        headers: { "content-type": "application/json", ...reply.headers },
-      });
+/** A real WebClient over a synthetic Slack API: each request takes the next scripted reply. */
+function slackApi(replies: Reply[]) {
+  const requests: { method: string; params: Record<string, string> }[] = [];
+  const fetch = vi.fn(async (url: string | URL, init?: { body?: unknown }) => {
+    const method = String(url).split("/").pop() ?? "";
+    const params = Object.fromEntries(new URLSearchParams(String(init?.body ?? "")));
+    delete params.token;
+    requests.push({ method, params });
+    const reply = replies.shift() ?? { body: { ok: true } };
+    return new Response(JSON.stringify(reply.body ?? {}), {
+      status: reply.status ?? 200,
+      headers: { "content-type": "application/json", ...reply.headers },
     });
-    return { client: new SlackClient("xoxb-synthetic", { fetch }), requests, fetch };
-  }
+  });
+  return { client: new SlackClient("xoxb-synthetic", { fetch }), requests, fetch };
+}
 
+describe("SlackClient history pages", () => {
   it("reads one bounded channel page newest first and hands back the cursor", async () => {
     const { client, requests } = slackApi([
       {
@@ -409,5 +409,291 @@ describe("SlackClient conversation discovery", () => {
       "Slack token lacks a scope conversations.list needs for this request (needed: groups:read)"
     );
     expect((err as Error).message).not.toContain("chat:write");
+  });
+});
+
+describe("SlackClient.getMessage", () => {
+  function clientWithMessage(message: Record<string, unknown>): SlackClient {
+    const client = new SlackClient("xoxb-test");
+    const replies = vi.fn(async () => ({ messages: [message] }));
+    Object.defineProperty(client, "web", { value: { conversations: { replies } } });
+    return client;
+  }
+
+  it("keeps edits, reactions, blocks, rich attachments and file metadata from a user message", async () => {
+    const blocks = [
+      {
+        type: "rich_text",
+        block_id: "b1",
+        elements: [
+          {
+            type: "rich_text_section",
+            elements: [
+              { type: "user", user_id: "U2" },
+              { type: "link", url: "https://example.com/spec", text: "spec" },
+            ],
+          },
+        ],
+      },
+    ];
+    const attachments = [
+      {
+        id: 1,
+        from_url: "https://example.com/spec",
+        title: "Spec",
+        title_link: "https://example.com/spec",
+        text: "Unfurled summary",
+        service_name: "example.com",
+      },
+    ];
+    const forwarded = {
+      is_share: true,
+      text: "forwarded",
+      files: [
+        { id: "F3", name: "a.txt", url_private: "https://files.slack.com/files-pri/T1-F3/a.txt" },
+      ],
+    };
+    const client = clientWithMessage({
+      type: "message",
+      ts: "1700000000.000100",
+      user: "U1",
+      text: "ping <@U2> about <https://example.com/spec|spec> in <#C9|general>",
+      thread_ts: "1700000000.000001",
+      edited: { user: "U1", ts: "1700000050.000000" },
+      reactions: [{ name: "eyes", count: 2, users: ["U2", "U3"] }],
+      blocks,
+      attachments: [...attachments, forwarded],
+      files: [
+        {
+          id: "F1",
+          name: "notes.txt",
+          mimetype: "text/plain",
+          size: 12,
+          user: "U1",
+          created: 1700000000,
+          url_private: "https://files.slack.com/files-pri/T1-F1/notes.txt",
+          url_private_download: "https://files.slack.com/files-pri/T1-F1/download/notes.txt",
+        },
+        { id: "F2", mode: "tombstone" },
+      ],
+    });
+
+    const message = await client.getMessage("C1", "1700000000.000100");
+
+    expect(message).toEqual({
+      channel: "C1",
+      ts: "1700000000.000100",
+      type: "message",
+      user: "U1",
+      text: "ping <@U2> about <https://example.com/spec|spec> in <#C9|general>",
+      threadTs: "1700000000.000001",
+      edited: { user: "U1", ts: "1700000050.000000" },
+      reactions: [{ name: "eyes", count: 2, users: ["U2", "U3"] }],
+      blocks,
+      attachments: [
+        ...attachments,
+        { is_share: true, text: "forwarded", files: [{ id: "F3", name: "a.txt" }] },
+      ],
+      files: [
+        {
+          id: "F1",
+          name: "notes.txt",
+          mimetype: "text/plain",
+          size: 12,
+          user: "U1",
+          created: 1700000000,
+        },
+        { id: "F2", mode: "tombstone" },
+      ],
+    });
+    expect(JSON.stringify(message)).not.toContain("files.slack.com");
+  });
+
+  it("names a bot sender through its bot fields without a user ID", async () => {
+    const client = clientWithMessage({
+      type: "message",
+      subtype: "bot_message",
+      ts: "2.0",
+      text: "deploy finished",
+      bot_id: "B1",
+      username: "Deploy Bot",
+      bot_profile: { id: "B1", name: "Deploy Bot", app_id: "A1", deleted: false, icons: {} },
+    });
+    expect(await client.getMessage("C1", "2.0")).toEqual({
+      channel: "C1",
+      ts: "2.0",
+      type: "message",
+      subtype: "bot_message",
+      text: "deploy finished",
+      botId: "B1",
+      username: "Deploy Bot",
+      botProfile: { id: "B1", name: "Deploy Bot", appId: "A1", deleted: false },
+    });
+  });
+
+  it("leaves absent fields absent and keeps empty values Slack returned", async () => {
+    const absent = await clientWithMessage({ ts: "3.0" }).getMessage("C1", "3.0");
+    expect(absent).toEqual({ channel: "C1", ts: "3.0" });
+    expect("text" in absent).toBe(false);
+
+    const empty = await clientWithMessage({
+      ts: "3.0",
+      text: "",
+      user: "U1",
+      reactions: [],
+      files: [],
+    }).getMessage("C1", "3.0");
+    expect(empty).toEqual({
+      channel: "C1",
+      ts: "3.0",
+      text: "",
+      user: "U1",
+      reactions: [],
+      files: [],
+    });
+  });
+
+  it("bounds arrays and rich payloads and names each field it cut", async () => {
+    const { files, reactions, reactionUsers, richBytes } = SLACK_MESSAGE_LIMITS;
+    const bigBlock = { type: "section", text: { type: "mrkdwn", text: "x".repeat(richBytes / 4) } };
+    const message = await clientWithMessage({
+      ts: "4.0",
+      text: "busy",
+      files: Array.from({ length: files + 5 }, (_, i) => ({ id: `F${i}` })),
+      reactions: [
+        {
+          name: "tada",
+          count: reactionUsers + 10,
+          users: Array.from({ length: reactionUsers + 10 }, (_, i) => `U${i}`),
+        },
+        ...Array.from({ length: reactions + 5 }, (_, i) => ({ name: `r${i}`, count: 1 })),
+      ],
+      blocks: Array.from({ length: 8 }, () => bigBlock),
+      attachments: [{ text: "x".repeat(richBytes) }],
+    }).getMessage("C1", "4.0");
+
+    expect(message.files).toHaveLength(files);
+    expect(message.reactions).toHaveLength(reactions);
+    expect(message.reactions?.[0]).toMatchObject({ name: "tada", count: reactionUsers + 10 });
+    expect(message.reactions?.[0]?.users).toHaveLength(reactionUsers);
+    expect(message.blocks?.length).toBeGreaterThan(0);
+    expect(message.blocks?.length).toBeLessThan(8);
+    expect(Buffer.byteLength(JSON.stringify(message.blocks))).toBeLessThanOrEqual(richBytes);
+    expect(message.attachments).toEqual([]);
+    expect(message.truncated).toEqual([
+      "files",
+      "reactions",
+      "reactions.tada.users",
+      "blocks",
+      "attachments",
+    ]);
+  });
+
+  it("reports a missing message as an error", async () => {
+    const client = new SlackClient("xoxb-test");
+    const replies = vi.fn(async () => ({ messages: [] }));
+    Object.defineProperty(client, "web", { value: { conversations: { replies } } });
+    await expect(client.getMessage("C1", "5.0")).rejects.toThrow("Slack message not found: C1/5.0");
+  });
+});
+
+describe("SlackClient.getUser", () => {
+  function clientWithUsersInfo(info: (args: { user: string }) => Promise<unknown>): SlackClient {
+    const client = new SlackClient("xoxb-test");
+    Object.defineProperty(client, "historyWeb", { value: { users: { info: vi.fn(info) } } });
+    return client;
+  }
+
+  function platformError(code: string): Error {
+    return Object.assign(new Error(`An API error occurred: ${code}`), {
+      code: "slack_webapi_platform_error",
+      data: { ok: false, error: code },
+    });
+  }
+
+  it("returns an active user's names and account kind", async () => {
+    const client = clientWithUsersInfo(async ({ user }) => ({
+      ok: true,
+      user: {
+        id: user,
+        team_id: "T1",
+        name: "ada",
+        real_name: "Ada Example",
+        deleted: false,
+        is_bot: false,
+        is_app_user: false,
+        is_restricted: false,
+        tz: "Etc/UTC",
+        profile: { display_name: "ada", real_name: "Ada Example", email: "ada@example.com" },
+      },
+    }));
+    const found = await client.getUser("U1");
+    expect(found).toEqual({
+      id: "U1",
+      status: "active",
+      name: "ada",
+      realName: "Ada Example",
+      displayName: "ada",
+      isBot: false,
+      isAppUser: false,
+      isRestricted: false,
+      teamId: "T1",
+    });
+    expect(JSON.stringify(found)).not.toContain("example.com");
+  });
+
+  it("marks a deactivated account deleted and keeps an empty display name", async () => {
+    const client = clientWithUsersInfo(async () => ({
+      ok: true,
+      user: { id: "U2", name: "former", deleted: true, profile: { display_name: "" } },
+    }));
+    expect(await client.getUser("U2")).toEqual({
+      id: "U2",
+      status: "deleted",
+      name: "former",
+      displayName: "",
+    });
+  });
+
+  it("reports a bot user as a bot", async () => {
+    const client = clientWithUsersInfo(async () => ({
+      ok: true,
+      user: { id: "U3", name: "deploybot", is_bot: true, deleted: false, profile: {} },
+    }));
+    expect(await client.getUser("U3")).toMatchObject({ id: "U3", status: "active", isBot: true });
+  });
+
+  it("returns unknown for a user Slack cannot find or show", async () => {
+    for (const code of ["user_not_found", "user_not_visible"]) {
+      const client = clientWithUsersInfo(async () => {
+        throw platformError(code);
+      });
+      expect(await client.getUser("U404")).toEqual({
+        id: "U404",
+        status: "unknown",
+        reason: code,
+      });
+    }
+  });
+
+  it("surfaces other API errors with Slack's code", async () => {
+    const client = clientWithUsersInfo(async () => {
+      throw platformError("invalid_auth");
+    });
+    await expect(client.getUser("U1")).rejects.toThrow("Slack users.info failed: invalid_auth");
+  });
+
+  it("rephrases a missing scope and a rate limit without retrying", async () => {
+    const { client, fetch } = slackApi([
+      { body: { ok: false, error: "missing_scope", needed: "users:read" } },
+      { status: 429, headers: { "retry-after": "30" }, body: { ok: false, error: "ratelimited" } },
+    ]);
+    await expect(client.getUser("U1")).rejects.toThrow(
+      "Slack token lacks a scope users.info needs for this request (needed: users:read)"
+    );
+    await expect(client.getUser("U1")).rejects.toThrow(
+      "Slack rate limited users.info; retry after 30 seconds"
+    );
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });

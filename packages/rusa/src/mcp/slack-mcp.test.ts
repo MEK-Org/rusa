@@ -694,6 +694,10 @@ describe("Slack read MCP history", () => {
     [{ oldest: "2026-02-30T00:00:00Z" }, /oldest must be a Slack timestamp/],
     [{ latest: "2026-04-31T09:00:00+02:00" }, /latest must be a Slack timestamp/],
     [{ latest: "2026-10-13T24:00:00Z" }, /latest must be a Slack timestamp/],
+    [{ oldest: "2026-13-01T00:00:00Z" }, /oldest must be a Slack timestamp/],
+    [{ oldest: "2026-01-32T00:00:00Z" }, /oldest must be a Slack timestamp/],
+    [{ latest: "2026-01-01T25:00:00Z" }, /latest must be a Slack timestamp/],
+    [{ latest: "2026-01-01T00:60:00Z" }, /latest must be a Slack timestamp/],
     [
       { oldest: "2026-10-14T00:00:00Z", latest: "2026-10-13T00:00:00Z" },
       /oldest must not be after latest/,
@@ -928,5 +932,52 @@ describe("Slack read MCP conversation discovery", () => {
     const result = await call(client, "list_conversations", args);
     expect(result.isError).toBe(true);
     expect(list).not.toHaveBeenCalled();
+  });
+});
+
+describe("Slack read MCP sender lookup", () => {
+  it("answers get_user with a profile, unknown for a missing user, and an error otherwise", async () => {
+    const info = vi.fn(async ({ user }: { user: string }) => {
+      if (user === "U1") {
+        return { ok: true, user: { id: "U1", name: "ada", deleted: false, profile: {} } };
+      }
+      const code = user === "U404" ? "user_not_found" : "missing_scope";
+      throw Object.assign(new Error(`An API error occurred: ${code}`), {
+        data: { ok: false, error: code },
+      });
+    });
+    const slack = new SlackClient(TOKEN);
+    Object.defineProperty(slack, "historyWeb", { value: { users: { info } } });
+    const client = await connect(createSlackReadMcpServer(slack));
+
+    const found = await call(client, "get_user", { user: "U1" });
+    expect(found.isError).toBe(false);
+    expect(JSON.parse(found.text)).toEqual({ id: "U1", status: "active", name: "ada" });
+
+    const missing = await call(client, "get_user", { user: "U404" });
+    expect(missing.isError).toBe(false);
+    expect(JSON.parse(missing.text)).toEqual({
+      id: "U404",
+      status: "unknown",
+      reason: "user_not_found",
+    });
+
+    const denied = await call(client, "get_user", { user: "U2" });
+    expect(denied.isError).toBe(true);
+    expect(denied.text).toContain("missing_scope");
+  });
+
+  it("returns get_message errors from the Slack API as tool errors", async () => {
+    const replies = vi.fn(async () => {
+      throw Object.assign(new Error("An API error occurred: channel_not_found"), {
+        data: { ok: false, error: "channel_not_found" },
+      });
+    });
+    const client = await connect(
+      createSlackReadMcpServer(slackWith({ conversations: { replies } }))
+    );
+    const result = await call(client, "get_message", { channel: "C404", ts: "1.0" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("channel_not_found");
   });
 });

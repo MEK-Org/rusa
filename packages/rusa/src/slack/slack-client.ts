@@ -29,6 +29,12 @@ export interface SlackFile {
   mimetype?: string;
   filetype?: string;
   size?: number;
+  /** User ID of the uploader. */
+  user?: string;
+  /** Upload time, in Unix seconds. */
+  created?: number;
+  /** Slack's file mode; `tombstone` marks a deleted file, `hidden_by_limit` one past the plan limit. */
+  mode?: string;
 }
 
 export interface SlackMessage {
@@ -40,6 +46,73 @@ export interface SlackMessage {
   files?: SlackFile[];
 }
 
+/** Bounds on the arrays and rich payloads one {@link SlackMessageDetail} carries. */
+export const SLACK_MESSAGE_LIMITS = {
+  files: 20,
+  reactions: 50,
+  reactionUsers: 50,
+  /** Serialized JSON bytes kept for each of `blocks` and `attachments`. */
+  richBytes: 32 * 1024,
+} as const;
+
+/**
+ * One Slack message as `get_message` returns it. A field is present only when
+ * Slack returned it, so absent means Slack said nothing while an empty string
+ * or array is what Slack said. `text` is Slack's own mrkdwn with link markup
+ * such as `<@U1>`, `<#C1>` and `<https://example.com|label>` left intact.
+ * Unlike a Google Chat message, it carries no sender display name: `user` is an
+ * ID to look up with `getUser`, and bot posts name themselves through
+ * `botId`, `botProfile` and `username`. Arrays and rich payloads past
+ * {@link SLACK_MESSAGE_LIMITS} are cut to whole items, and `truncated` names
+ * each field cut. This is the single-message read; listings, including the
+ * history tools' {@link SlackHistoryMessage}, return the slimmer
+ * {@link SlackMessage} summary, which has no reactions or rich payloads and
+ * reports an absent `text` as `""`.
+ */
+export interface SlackMessageDetail {
+  channel: string;
+  ts: string;
+  text?: string;
+  type?: string;
+  subtype?: string;
+  user?: string;
+  botId?: string;
+  /** Name Slack shows for a bot or webhook post; chosen by the poster, so never proof of identity. */
+  username?: string;
+  botProfile?: { id?: string; name?: string; appId?: string; deleted?: boolean };
+  threadTs?: string;
+  replyCount?: number;
+  edited?: { user?: string; ts?: string };
+  reactions?: { name: string; count?: number; users?: string[] }[];
+  /** Block Kit blocks, as Slack returned them. */
+  blocks?: unknown[];
+  /** Legacy rich attachments (link unfurls, app cards), as Slack returned them. */
+  attachments?: unknown[];
+  files?: SlackFile[];
+  truncated?: string[];
+}
+
+/**
+ * A Slack user's profile. `status` is `unknown` when Slack has no user by that
+ * ID visible to this token; `reason` then carries Slack's error code. Names are
+ * chosen by the user and never identify a principal or grant authority.
+ */
+export interface SlackUser {
+  id: string;
+  status: "active" | "deleted" | "unknown";
+  reason?: string;
+  name?: string;
+  realName?: string;
+  displayName?: string;
+  isBot?: boolean;
+  isAppUser?: boolean;
+  /** Guest account. */
+  isRestricted?: boolean;
+  /** Belongs to another workspace reached through a shared channel. */
+  isStranger?: boolean;
+  teamId?: string;
+}
+
 interface RawSlackFile {
   id?: string;
   name?: string;
@@ -47,7 +120,29 @@ interface RawSlackFile {
   mimetype?: string;
   filetype?: string;
   size?: number;
+  user?: string;
+  created?: number;
+  mode?: string;
   url_private_download?: string;
+}
+
+interface RawSlackMessage {
+  type?: string;
+  subtype?: string;
+  ts?: string;
+  text?: string;
+  user?: string;
+  bot_id?: string;
+  username?: string;
+  bot_profile?: { id?: string; name?: string; app_id?: string; deleted?: boolean };
+  thread_ts?: string;
+  reply_count?: number;
+  latest_reply?: string;
+  edited?: { user?: string; ts?: string };
+  reactions?: { name?: string; count?: number; users?: string[] }[];
+  blocks?: unknown[];
+  attachments?: unknown[];
+  files?: RawSlackFile[];
 }
 
 function toSlackFile(file: RawSlackFile & { id: string }): SlackFile {
@@ -58,6 +153,9 @@ function toSlackFile(file: RawSlackFile & { id: string }): SlackFile {
     ...(file.mimetype ? { mimetype: file.mimetype } : {}),
     ...(file.filetype ? { filetype: file.filetype } : {}),
     ...(file.size !== undefined ? { size: file.size } : {}),
+    ...(file.user ? { user: file.user } : {}),
+    ...(file.created !== undefined ? { created: file.created } : {}),
+    ...(file.mode ? { mode: file.mode } : {}),
   };
 }
 
@@ -94,20 +192,8 @@ export interface SlackHistoryQuery {
   cursor?: string;
 }
 
-interface RawSlackMessage {
-  ts?: string;
-  text?: string;
-  user?: string;
-  bot_id?: string;
-  subtype?: string;
-  thread_ts?: string;
-  reply_count?: number;
-  latest_reply?: string;
-  files?: unknown[];
-}
-
 function toHistoryMessage(channel: string, m: RawSlackMessage): SlackHistoryMessage {
-  const files = ((m.files ?? []) as RawSlackFile[])
+  const files = (m.files ?? [])
     .filter((file): file is RawSlackFile & { id: string } => Boolean(file.id))
     .map(toSlackFile);
   return {
@@ -178,7 +264,7 @@ function toConversation(c: RawSlackConversation & { id: string }): SlackConversa
 }
 
 /**
- * Rephrase a Web API failure from a history read so the actor can tell a missing
+ * Rephrase a Web API failure from a read tool so the actor can tell a missing
  * scope, a conversation the app cannot see, and a rate limit apart. Only Slack's
  * error code and the scope it says is needed are echoed, never the request.
  */
@@ -220,6 +306,106 @@ export function describeSlackReadError(method: string, err: unknown): Error {
   }
 }
 
+/** Copy only the keys whose value is defined, so absent stays absent. */
+function defined<T extends Record<string, unknown>>(fields: T): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(fields).filter(([, value]) => value !== undefined)
+  ) as Partial<T>;
+}
+
+/**
+ * Drops Slack's private file URLs, which a forwarded message's attachments can
+ * nest, so downloads go through `download_file`. This is policy, not a security
+ * boundary: other Slack URLs such as `permalink` and `thumb_*` stay.
+ */
+function withoutPrivateUrls(key: string, value: unknown): unknown {
+  return key.startsWith("url_private") ? undefined : value;
+}
+
+/** Keep the leading items whose serialized JSON fits in `maxBytes`. */
+function boundedJson(items: unknown[], maxBytes: number): unknown[] {
+  const kept: unknown[] = [];
+  let total = 2;
+  for (const item of items) {
+    const json = JSON.stringify(item, withoutPrivateUrls) ?? "null";
+    total += Buffer.byteLength(json) + 1;
+    if (total > maxBytes) break;
+    kept.push(JSON.parse(json));
+  }
+  return kept;
+}
+
+function toSlackMessageDetail(channel: string, ts: string, raw: RawSlackMessage) {
+  const limits = SLACK_MESSAGE_LIMITS;
+  const truncated: string[] = [];
+  const cap = <T>(field: string, items: T[], max: number): T[] => {
+    if (items.length > max) truncated.push(field);
+    return items.slice(0, max);
+  };
+  const capJson = (field: string, items: unknown[] | undefined) => {
+    if (!Array.isArray(items)) return undefined;
+    const kept = boundedJson(items, limits.richBytes);
+    if (kept.length < items.length) truncated.push(field);
+    return kept;
+  };
+  const files = Array.isArray(raw.files)
+    ? cap(
+        "files",
+        raw.files.filter((file): file is RawSlackFile & { id: string } => Boolean(file.id)),
+        limits.files
+      ).map(toSlackFile)
+    : undefined;
+  const reactions = Array.isArray(raw.reactions)
+    ? cap(
+        "reactions",
+        raw.reactions.filter((r): r is typeof r & { name: string } => Boolean(r.name)),
+        limits.reactions
+      ).map((r) =>
+        defined({
+          name: r.name,
+          count: r.count,
+          users: Array.isArray(r.users)
+            ? cap(`reactions.${r.name}.users`, r.users, limits.reactionUsers)
+            : undefined,
+        })
+      )
+    : undefined;
+  const botProfile = raw.bot_profile
+    ? defined({
+        id: raw.bot_profile.id,
+        name: raw.bot_profile.name,
+        appId: raw.bot_profile.app_id,
+        deleted: raw.bot_profile.deleted,
+      })
+    : undefined;
+  const edited = raw.edited ? defined({ user: raw.edited.user, ts: raw.edited.ts }) : undefined;
+  const detail = defined({
+    channel,
+    ts,
+    text: typeof raw.text === "string" ? raw.text : undefined,
+    type: raw.type,
+    subtype: raw.subtype,
+    user: raw.user,
+    botId: raw.bot_id,
+    username: raw.username,
+    botProfile,
+    threadTs: raw.thread_ts,
+    replyCount: raw.reply_count,
+    edited,
+    reactions,
+    blocks: capJson("blocks", raw.blocks),
+    attachments: capJson("attachments", raw.attachments),
+    files,
+    truncated: truncated.length > 0 ? truncated : undefined,
+  });
+  return detail as SlackMessageDetail;
+}
+
+function slackErrorCode(err: unknown): string | undefined {
+  const data = (err as { data?: { error?: unknown } } | null)?.data;
+  return typeof data?.error === "string" ? data.error : undefined;
+}
+
 function sizeLimitError(maxBytes: number): Error {
   return new Error(`file size limit exceeded: file is larger than ${maxBytes} bytes`);
 }
@@ -242,11 +428,11 @@ async function readBodyWithLimit(resp: Response, maxBytes: number): Promise<Buff
 export class SlackClient {
   readonly web: WebClient;
   /**
-   * The history and discovery tools' client: a rate-limited call fails with
-   * Slack's retry-after instead of the SDK silently waiting, and a network or
-   * HTTP failure is not retried, so an actor's tool call reports the failure
-   * rather than stalling for the SDK's default of ten retries over about 30
-   * minutes.
+   * The client for the history and discovery tools and `getUser`: a
+   * rate-limited call fails with Slack's retry-after instead of the SDK
+   * silently waiting, and a network or HTTP failure is not retried, so an
+   * actor's tool call reports the failure rather than stalling for the SDK's
+   * default of ten retries over about 30 minutes.
    */
   readonly historyWeb: WebClient;
   readonly #botToken: string;
@@ -282,19 +468,37 @@ export class SlackClient {
     return found;
   }
 
-  async getMessage(channel: string, ts: string): Promise<SlackMessage> {
+  async getMessage(channel: string, ts: string): Promise<SlackMessageDetail> {
     const found = await this.findMessage(channel, ts);
-    const files = ((found.files ?? []) as RawSlackFile[])
-      .filter((file): file is RawSlackFile & { id: string } => Boolean(file.id))
-      .map(toSlackFile);
-    return {
-      channel,
-      ts,
-      text: found.text ?? "",
-      user: found.user,
-      threadTs: found.thread_ts,
-      ...(files.length > 0 ? { files } : {}),
-    };
+    return toSlackMessageDetail(channel, ts, found as RawSlackMessage);
+  }
+
+  /** One `users.info` call; an ID Slack cannot find comes back as `unknown`, not an error. */
+  async getUser(user: string): Promise<SlackUser> {
+    let response: Awaited<ReturnType<WebClient["users"]["info"]>>;
+    try {
+      response = await this.historyWeb.users.info({ user });
+    } catch (err) {
+      const code = slackErrorCode(err);
+      if (code === "user_not_found" || code === "user_not_visible") {
+        return { id: user, status: "unknown", reason: code };
+      }
+      throw describeSlackReadError("users.info", err);
+    }
+    const found = response.user;
+    if (!found?.id) return { id: user, status: "unknown", reason: "no_user_in_response" };
+    return defined({
+      id: found.id,
+      status: found.deleted ? "deleted" : "active",
+      name: found.name,
+      realName: found.real_name ?? found.profile?.real_name,
+      displayName: found.profile?.display_name,
+      isBot: found.is_bot,
+      isAppUser: found.is_app_user,
+      isRestricted: found.is_restricted,
+      isStranger: found.is_stranger,
+      teamId: found.team_id,
+    }) as SlackUser;
   }
 
   /**
