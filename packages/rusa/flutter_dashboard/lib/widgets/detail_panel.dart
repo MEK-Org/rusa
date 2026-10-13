@@ -993,14 +993,19 @@ class _InfoViewState extends State<_InfoView> {
             ),
           ),
           const SizedBox(height: 12),
-          _documentBox(
-            charter.isEmpty
-                ? const Text(
-                    'No charter.',
-                    style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
-                  )
-                : SelectionArea(child: SimpleMarkdown(charter)),
-          ),
+          charter.isEmpty
+              ? const Text(
+                  'No charter.',
+                  style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
+                )
+              : SelectableText(
+                  charter,
+                  style: const TextStyle(
+                    color: MeshColors.textSecondary,
+                    fontSize: 13,
+                    height: 1.5,
+                  ),
+                ),
         ],
       ),
     );

@@ -38,4 +38,33 @@ void main() {
       (added, 'A'),
     ]);
   });
+
+  group('a brief of many short lines, within the 16 KiB cap', () {
+    // ~15,000 blank lines fit in 16 KiB; a full table would be 225M cells.
+    final blanks = List.filled(15000, '').join('\n');
+    final before = '## WHAT\n$blanks\n## HOW\n\n## DOMAIN';
+
+    test('one changed heading keeps every shared line and diffs only it', () {
+      final diff = ops(before, before.replaceFirst('## HOW', '## How'));
+      expect(diff.where((l) => l.$1 != same), [
+        (removed, '## HOW'),
+        (added, '## How'),
+      ]);
+      expect(diff.length, 15000 + 5);
+    });
+
+    test('edits at both ends past the table bound read as the whole middle '
+        'removed then added', () {
+      final after = '## what\n$blanks\n## HOW\n\n## DOMAIN\nNew. [x:y]';
+      final diff = ops(before, after);
+      final removedLines = diff.where((l) => l.$1 == removed).toList();
+      final addedLines = diff.where((l) => l.$1 == added).toList();
+      expect(diff.where((l) => l.$1 == same), isEmpty);
+      expect(removedLines.length, 15000 + 4);
+      expect(addedLines.length, 15000 + 5);
+      expect(removedLines.first, (removed, '## WHAT'));
+      expect(addedLines.last, (added, 'New. [x:y]'));
+      expect(diff.indexOf(addedLines.first), removedLines.length);
+    });
+  });
 }
