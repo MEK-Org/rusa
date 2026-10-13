@@ -124,6 +124,67 @@ function toHistoryMessage(channel: string, m: RawSlackMessage): SlackHistoryMess
   };
 }
 
+/** The conversation types Slack's `conversations.list` can enumerate. */
+export const SLACK_CONVERSATION_TYPES = [
+  "public_channel",
+  "private_channel",
+  "mpim",
+  "im",
+] as const;
+export type SlackConversationType = (typeof SLACK_CONVERSATION_TYPES)[number];
+
+export interface SlackConversation {
+  id: string;
+  /** Absent for direct messages, which Slack does not name. */
+  name?: string;
+  type: SlackConversationType | "unknown";
+  /** Whether the app is a member; absent when Slack does not say, as for DMs. */
+  isMember?: boolean;
+  isArchived?: boolean;
+  /** For a direct message: the other user's ID. */
+  user?: string;
+}
+
+export interface SlackConversationPage {
+  types: SlackConversationType[];
+  conversations: SlackConversation[];
+  /** Whether Slack has more to list; a page may be short, or even empty, while it does. */
+  hasMore: boolean;
+  nextCursor?: string;
+}
+
+interface RawSlackConversation {
+  id?: string;
+  name?: string;
+  is_channel?: boolean;
+  is_group?: boolean;
+  is_private?: boolean;
+  is_im?: boolean;
+  is_mpim?: boolean;
+  is_member?: boolean;
+  is_archived?: boolean;
+  user?: string;
+}
+
+function conversationType(c: RawSlackConversation): SlackConversation["type"] {
+  if (c.is_im) return "im";
+  if (c.is_mpim) return "mpim";
+  if (c.is_private || c.is_group) return "private_channel";
+  if (c.is_channel) return "public_channel";
+  return "unknown";
+}
+
+function toConversation(c: RawSlackConversation & { id: string }): SlackConversation {
+  return {
+    id: c.id,
+    ...(c.name ? { name: c.name } : {}),
+    type: conversationType(c),
+    ...(c.is_member !== undefined ? { isMember: c.is_member } : {}),
+    ...(c.is_archived !== undefined ? { isArchived: c.is_archived } : {}),
+    ...(c.is_im && c.user ? { user: c.user } : {}),
+  };
+}
+
 /**
  * Rephrase a Web API failure from a history read so the actor can tell a missing
  * scope, a conversation the app cannot see, and a rate limit apart. Only Slack's
@@ -147,7 +208,7 @@ export function describeSlackReadError(method: string, err: unknown): Error {
   switch (code) {
     case "missing_scope":
       return new Error(
-        `Slack token lacks the scope ${method} needs for this conversation` +
+        `Slack token lacks a scope ${method} needs for this request` +
           (coded.data.needed ? ` (needed: ${coded.data.needed})` : "")
       );
     case "not_in_channel":
@@ -189,10 +250,11 @@ async function readBodyWithLimit(resp: Response, maxBytes: number): Promise<Buff
 export class SlackClient {
   readonly web: WebClient;
   /**
-   * The history tools' client: a rate-limited call fails with Slack's
-   * retry-after instead of the SDK silently waiting, and a network or HTTP
-   * failure is not retried, so an actor's tool call reports the failure rather
-   * than stalling for the SDK's default of ten retries over about 30 minutes.
+   * The history and discovery tools' client: a rate-limited call fails with
+   * Slack's retry-after instead of the SDK silently waiting, and a network or
+   * HTTP failure is not retried, so an actor's tool call reports the failure
+   * rather than stalling for the SDK's default of ten retries over about 30
+   * minutes.
    */
   readonly historyWeb: WebClient;
   readonly #botToken: string;
@@ -371,6 +433,37 @@ export class SlackClient {
       cursor = response.response_metadata?.next_cursor || undefined;
     } while (cursor && replies.length < maxScanned);
     return replies.slice(-opts.limit);
+  }
+
+  /**
+   * One page of the conversations of `types` this token can see
+   * (`conversations.list`). Slack lists private channels and DMs only where the
+   * app is a member, so no page or walk is a complete workspace inventory.
+   */
+  async listConversations(query: {
+    types: SlackConversationType[];
+    excludeArchived: boolean;
+    limit: number;
+    cursor?: string;
+  }): Promise<SlackConversationPage> {
+    let response: Awaited<ReturnType<WebClient["conversations"]["list"]>>;
+    try {
+      response = await this.historyWeb.conversations.list({
+        types: query.types.join(","),
+        exclude_archived: query.excludeArchived,
+        limit: query.limit,
+        ...(query.cursor ? { cursor: query.cursor } : {}),
+      });
+    } catch (err) {
+      throw describeSlackReadError("conversations.list", err);
+    }
+    return {
+      types: query.types,
+      conversations: ((response.channels ?? []) as RawSlackConversation[])
+        .filter((c): c is RawSlackConversation & { id: string } => Boolean(c.id))
+        .map(toConversation),
+      ...pageContinuation(response),
+    };
   }
 
   /**
