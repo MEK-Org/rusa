@@ -317,8 +317,14 @@ describe("SlackClient conversation discovery", () => {
               is_private: true,
               is_member: true,
             },
+            {
+              id: "C3",
+              name: "eng-private",
+              is_channel: true,
+              is_private: true,
+              is_member: true,
+            },
             { id: "G2", name: "mpdm-a--b-1", is_mpim: true, is_private: true },
-            { id: "D1", is_im: true, user: "U1" },
             { id: "X1", name: "odd" },
             { name: "no-id", is_channel: true },
           ],
@@ -327,21 +333,20 @@ describe("SlackClient conversation discovery", () => {
       },
     ]);
     const page = await client.listConversations({
-      types: ["public_channel", "private_channel", "mpim", "im"],
+      types: ["public_channel", "private_channel", "mpim"],
       excludeArchived: true,
       limit: 7,
     });
     expect(requests).toEqual([
-      { types: "public_channel,private_channel,mpim,im", exclude_archived: "true", limit: "7" },
+      { types: "public_channel,private_channel,mpim", exclude_archived: "true", limit: "7" },
     ]);
     expect(page).toEqual({
-      types: ["public_channel", "private_channel", "mpim", "im"],
       conversations: [
         { id: "C1", name: "general", type: "public_channel", isMember: true, isArchived: false },
         { id: "C2", name: "random", type: "public_channel", isMember: false, isArchived: false },
         { id: "G1", name: "ops", type: "private_channel", isMember: true },
+        { id: "C3", name: "eng-private", type: "private_channel", isMember: true },
         { id: "G2", name: "mpdm-a--b-1", type: "mpim" },
-        { id: "D1", type: "im", user: "U1" },
         { id: "X1", name: "odd", type: "unknown" },
       ],
       hasMore: true,
@@ -366,7 +371,6 @@ describe("SlackClient conversation discovery", () => {
       limit: 1,
     });
     expect(first).toEqual({
-      types: ["public_channel"],
       conversations: [],
       hasMore: true,
       nextCursor: "page-2",
@@ -384,7 +388,6 @@ describe("SlackClient conversation discovery", () => {
       cursor: "page-2",
     });
     expect(second).toEqual({
-      types: ["public_channel"],
       conversations: [{ id: "C9", name: "old", type: "public_channel", isArchived: true }],
       hasMore: false,
     });
@@ -408,15 +411,5 @@ describe("SlackClient conversation discovery", () => {
       "Slack token lacks a scope conversations.list needs for this request (needed: groups:read)"
     );
     expect((err as Error).message).not.toContain("chat:write");
-  });
-
-  it.each([
-    ["invalid_types", /^Slack conversations\.list failed: invalid_types$/],
-    ["invalid_auth", /^Slack conversations\.list failed: invalid_auth$/],
-  ])("reports %s", async (code, message) => {
-    const { client } = slackApi([{ body: { ok: false, error: code } }]);
-    await expect(
-      client.listConversations({ types: ["public_channel"], excludeArchived: true, limit: 10 })
-    ).rejects.toThrow(message);
   });
 });

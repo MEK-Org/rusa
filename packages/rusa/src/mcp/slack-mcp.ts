@@ -176,7 +176,7 @@ export function createSlackReadMcpServer(
     {
       title: "List Slack conversations",
       description:
-        "Discover conversations this Slack token can see, one page per call, with each one's ID, name, type and, where Slack reports it, whether the app is a member. Slack lists private channels, group DMs and DMs only where the app is a member, so even a full walk is not a complete workspace inventory. Pass nextCursor back with the same types until it is absent; a page can be short or empty while more remain. Each type needs its read scope (channels:read, groups:read, mpim:read, im:read); a missing one fails the whole call.",
+        "Discover public channels, private channels and group DMs this Slack token can see, one page per call, with each one's ID, name, type and, where Slack reports it, whether the app is a member. DMs are not listed; read a DM whose ID you already have with the history tools. Slack lists private channels and group DMs only where the app is a member, so even a full walk is not a complete workspace inventory. Pass nextCursor back with the same types until it is absent; a page can be short or empty while more remain. Each type needs its read scope (channels:read, groups:read, mpim:read); a missing one fails the whole call.",
       inputSchema: {
         types: z
           .array(z.enum(SLACK_CONVERSATION_TYPES))

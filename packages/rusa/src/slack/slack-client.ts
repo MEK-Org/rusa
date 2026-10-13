@@ -124,29 +124,26 @@ function toHistoryMessage(channel: string, m: RawSlackMessage): SlackHistoryMess
   };
 }
 
-/** The conversation types Slack's `conversations.list` can enumerate. */
-export const SLACK_CONVERSATION_TYPES = [
-  "public_channel",
-  "private_channel",
-  "mpim",
-  "im",
-] as const;
+/**
+ * The conversation types `listConversations` lists. Slack can also list `im`
+ * (one row per DM, naming the partner), but listing DMs is left out until an
+ * operator asks for a roster of DM partners; a DM whose ID is already known can
+ * still be read through the history tools.
+ */
+export const SLACK_CONVERSATION_TYPES = ["public_channel", "private_channel", "mpim"] as const;
 export type SlackConversationType = (typeof SLACK_CONVERSATION_TYPES)[number];
 
 export interface SlackConversation {
   id: string;
-  /** Absent for direct messages, which Slack does not name. */
   name?: string;
+  /** `"unknown"` when Slack's flags match none of the listed types. */
   type: SlackConversationType | "unknown";
-  /** Whether the app is a member; absent when Slack does not say, as for DMs. */
+  /** Whether the app is a member; absent when Slack does not say. */
   isMember?: boolean;
   isArchived?: boolean;
-  /** For a direct message: the other user's ID. */
-  user?: string;
 }
 
 export interface SlackConversationPage {
-  types: SlackConversationType[];
   conversations: SlackConversation[];
   /** Whether Slack has more to list; a page may be short, or even empty, while it does. */
   hasMore: boolean;
@@ -159,15 +156,12 @@ interface RawSlackConversation {
   is_channel?: boolean;
   is_group?: boolean;
   is_private?: boolean;
-  is_im?: boolean;
   is_mpim?: boolean;
   is_member?: boolean;
   is_archived?: boolean;
-  user?: string;
 }
 
 function conversationType(c: RawSlackConversation): SlackConversation["type"] {
-  if (c.is_im) return "im";
   if (c.is_mpim) return "mpim";
   if (c.is_private || c.is_group) return "private_channel";
   if (c.is_channel) return "public_channel";
@@ -181,7 +175,6 @@ function toConversation(c: RawSlackConversation & { id: string }): SlackConversa
     type: conversationType(c),
     ...(c.is_member !== undefined ? { isMember: c.is_member } : {}),
     ...(c.is_archived !== undefined ? { isArchived: c.is_archived } : {}),
-    ...(c.is_im && c.user ? { user: c.user } : {}),
   };
 }
 
@@ -437,8 +430,9 @@ export class SlackClient {
 
   /**
    * One page of the conversations of `types` this token can see
-   * (`conversations.list`). Slack lists private channels and DMs only where the
-   * app is a member, so no page or walk is a complete workspace inventory.
+   * (`conversations.list`). Slack lists private channels and group DMs only
+   * where the app is a member, so no page or walk is a complete workspace
+   * inventory.
    */
   async listConversations(query: {
     types: SlackConversationType[];
@@ -458,7 +452,6 @@ export class SlackClient {
       throw describeSlackReadError("conversations.list", err);
     }
     return {
-      types: query.types,
       conversations: ((response.channels ?? []) as RawSlackConversation[])
         .filter((c): c is RawSlackConversation & { id: string } => Boolean(c.id))
         .map(toConversation),
