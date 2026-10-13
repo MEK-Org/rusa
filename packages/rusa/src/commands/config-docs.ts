@@ -244,8 +244,10 @@ slack:
                            it needs channels:read, and groups:read or mpim:read for the other types it is asked
                            to list. Slack shows it private channels and group DMs only where the app is a
                            member, so a listing is not a complete workspace inventory.
-                           Every actor gets these read tools with no channel allowlist, so any actor can list
-                           whatever the token can read, including DMs the app is in when im:history is granted.
+                           Every actor gets these read tools with no channel allowlist: any actor can list the
+                           types above, and can read the history of any conversation whose ID it already has and
+                           the token can read, including a DM the app is in when im:history is granted.
+                           im:history does not make list_conversations list DMs.
   Root owns inbound slack:channels; workers may receive delegated channels.
   Message references use slack:channels/<id>/messages/<timestamp>.
 

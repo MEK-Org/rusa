@@ -30,6 +30,13 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).toContain("auto is pretty when stdout is a terminal");
   });
 
+  it("documents that Slack discovery does not list DMs, even with im:history", () => {
+    expect(CONFIG_DOCS).toContain(
+      "list_conversations lists public channels, private channels and group DMs, not DMs"
+    );
+    expect(CONFIG_DOCS).toContain("im:history does not make list_conversations list DMs");
+  });
+
   it("documents the quickstart profile", () => {
     expect(CONFIG_DOCS).toContain("profile: quickstart");
     expect(CONFIG_DOCS).toContain("local git bridge delivery");
