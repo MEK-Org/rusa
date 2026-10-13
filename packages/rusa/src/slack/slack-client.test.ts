@@ -86,3 +86,187 @@ describe("SlackClient.react", () => {
     });
   });
 });
+
+describe("SlackClient history pages", () => {
+  type Reply = { status?: number; headers?: Record<string, string>; body?: unknown };
+
+  /** A real WebClient over a synthetic Slack API: each request takes the next scripted reply. */
+  function slackApi(replies: Reply[]) {
+    const requests: { method: string; params: Record<string, string> }[] = [];
+    const fetch = vi.fn(async (url: string | URL, init?: { body?: unknown }) => {
+      const method = String(url).split("/").pop() ?? "";
+      const params = Object.fromEntries(new URLSearchParams(String(init?.body ?? "")));
+      delete params.token;
+      requests.push({ method, params });
+      const reply = replies.shift() ?? { body: { ok: true } };
+      return new Response(JSON.stringify(reply.body ?? {}), {
+        status: reply.status ?? 200,
+        headers: { "content-type": "application/json", ...reply.headers },
+      });
+    });
+    return { client: new SlackClient("xoxb-synthetic", { fetch }), requests, fetch };
+  }
+
+  it("reads one bounded channel page newest first and hands back the cursor", async () => {
+    const { client, requests } = slackApi([
+      {
+        body: {
+          ok: true,
+          messages: [
+            { ts: "1791849700.000200", text: "later", user: "U1" },
+            {
+              ts: "1791849650.000100",
+              text: "thread parent",
+              user: "U2",
+              thread_ts: "1791849650.000100",
+              reply_count: 3,
+              latest_reply: "1791849690.000000",
+            },
+          ],
+          has_more: true,
+          response_metadata: { next_cursor: "bmV4dA==" },
+        },
+      },
+    ]);
+    const page = await client.listHistory("C1", {
+      oldest: "1791849600.000000",
+      latest: "1791936000.000000",
+      limit: 2,
+    });
+    expect(requests).toEqual([
+      {
+        method: "conversations.history",
+        params: {
+          channel: "C1",
+          limit: "2",
+          oldest: "1791849600.000000",
+          latest: "1791936000.000000",
+        },
+      },
+    ]);
+    expect(page).toEqual({
+      channel: "C1",
+      order: "newest_first",
+      messages: [
+        { channel: "C1", ts: "1791849700.000200", text: "later", user: "U1" },
+        {
+          channel: "C1",
+          ts: "1791849650.000100",
+          text: "thread parent",
+          user: "U2",
+          threadTs: "1791849650.000100",
+          replyCount: 3,
+          latestReply: "1791849690.000000",
+        },
+      ],
+      hasMore: true,
+      nextCursor: "bmV4dA==",
+    });
+  });
+
+  it("walks a range across pages until Slack stops returning a cursor", async () => {
+    const { client, requests } = slackApi([
+      {
+        body: {
+          ok: true,
+          messages: [{ ts: "3.0", text: "c" }],
+          has_more: true,
+          response_metadata: { next_cursor: "page-2" },
+        },
+      },
+      {
+        body: {
+          ok: true,
+          messages: [{ ts: "2.0", text: "b", bot_id: "B1", subtype: "bot_message" }],
+          has_more: false,
+          response_metadata: { next_cursor: "" },
+        },
+      },
+    ]);
+    const first = await client.listHistory("C1", { oldest: "1.0", inclusive: true, limit: 1 });
+    const second = await client.listHistory("C1", {
+      oldest: "1.0",
+      inclusive: true,
+      limit: 1,
+      ...(first.nextCursor ? { cursor: first.nextCursor } : {}),
+    });
+    expect(requests.map((r) => r.params)).toEqual([
+      { channel: "C1", limit: "1", oldest: "1.0", inclusive: "true" },
+      { channel: "C1", limit: "1", oldest: "1.0", inclusive: "true", cursor: "page-2" },
+    ]);
+    expect(second).toEqual({
+      channel: "C1",
+      order: "newest_first",
+      messages: [{ channel: "C1", ts: "2.0", text: "b", botId: "B1", subtype: "bot_message" }],
+      hasMore: false,
+    });
+  });
+
+  it("reads a thread page oldest first through conversations.replies", async () => {
+    const { client, requests } = slackApi([
+      {
+        body: {
+          ok: true,
+          messages: [
+            { ts: "5.0", text: "parent", user: "U1", thread_ts: "5.0", reply_count: 2 },
+            { ts: "5.1", text: "first reply", user: "U2", thread_ts: "5.0" },
+          ],
+          has_more: true,
+          response_metadata: { next_cursor: "replies-2" },
+        },
+      },
+    ]);
+    const page = await client.listThreadReplies("C1", "5.0", { latest: "6.0", limit: 2 });
+    expect(requests).toEqual([
+      {
+        method: "conversations.replies",
+        params: { channel: "C1", ts: "5.0", limit: "2", latest: "6.0" },
+      },
+    ]);
+    expect(page.order).toBe("oldest_first");
+    expect(page.threadTs).toBe("5.0");
+    expect(page.messages.map((m) => m.text)).toEqual(["parent", "first reply"]);
+    expect(page.nextCursor).toBe("replies-2");
+  });
+
+  it("names the needed scope without echoing the token's granted scopes", async () => {
+    const { client } = slackApi([
+      {
+        body: {
+          ok: false,
+          error: "missing_scope",
+          needed: "groups:history",
+          provided: "channels:history,chat:write",
+        },
+      },
+    ]);
+    const err = await client.listHistory("G1", { limit: 10 }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe(
+      "Slack token lacks the scope conversations.history needs for this conversation (needed: groups:history)"
+    );
+    expect((err as Error).message).not.toContain("chat:write");
+  });
+
+  it.each([
+    ["not_in_channel", /not a member of this conversation.*not_in_channel/],
+    ["channel_not_found", /not found or not visible to this token/],
+    ["thread_not_found", /thread not found/],
+    ["invalid_cursor", /^Slack conversations\.replies failed: invalid_cursor$/],
+  ])("reports %s from an inaccessible thread or conversation", async (code, message) => {
+    const { client } = slackApi([{ body: { ok: false, error: code } }]);
+    await expect(client.listThreadReplies("C9", "5.0", { limit: 10 })).rejects.toThrow(message);
+  });
+
+  it("reports a rate limit with Slack's retry-after instead of waiting it out", async () => {
+    const { client, fetch } = slackApi([
+      { status: 429, headers: { "retry-after": "30" }, body: { ok: false, error: "ratelimited" } },
+    ]);
+    const started = Date.now();
+    await expect(client.listHistory("C1", { limit: 10 })).rejects.toThrow(
+      "Slack rate limited conversations.history; retry after 30 seconds"
+    );
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+});

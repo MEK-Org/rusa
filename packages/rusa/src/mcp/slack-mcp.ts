@@ -1,7 +1,12 @@
 import { basename } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { MAX_SLACK_FILE_BYTES, type SlackClient } from "../slack/slack-client.js";
+import {
+  MAX_SLACK_FILE_BYTES,
+  MAX_SLACK_HISTORY_PAGE,
+  type SlackClient,
+  type SlackHistoryQuery,
+} from "../slack/slack-client.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 import {
@@ -31,6 +36,73 @@ function requireFileToolsAvailable(options: SlackMcpOptions): void {
   if (options.fileToolsAvailable?.() === false) {
     throw new Error("Slack file tools are unavailable for follower-hosted actors (see #812)");
   }
+}
+
+const SLACK_TS = /^\d{1,12}(\.\d{1,6})?$/;
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * A history bound as Slack expects it: seconds since the epoch with up to six
+ * decimals. Accepts a Slack message timestamp as-is, or an ISO-8601 instant
+ * with an explicit offset so a date range never depends on the host's zone.
+ */
+export function toSlackTimestamp(value: string, field: string): string {
+  if (SLACK_TS.test(value)) return value;
+  const ms = ISO_INSTANT.test(value) ? Date.parse(value) : Number.NaN;
+  if (!Number.isFinite(ms) || ms < 0) {
+    throw new Error(
+      `${field} must be a Slack timestamp (e.g. 1712345678.000100) or an ISO-8601 instant with an offset (e.g. 2026-10-13T00:00:00Z)`
+    );
+  }
+  return (ms / 1000).toFixed(6);
+}
+
+const historyBoundsSchema = {
+  oldest: z
+    .string()
+    .optional()
+    .describe(
+      "Only messages after this time: a Slack timestamp or ISO-8601 instant with offset (exclusive unless inclusive)"
+    ),
+  latest: z
+    .string()
+    .optional()
+    .describe(
+      "Only messages before this time: a Slack timestamp or ISO-8601 instant with offset (exclusive unless inclusive); defaults to now"
+    ),
+  inclusive: z.boolean().optional().describe("Include messages exactly at oldest or latest"),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(MAX_SLACK_HISTORY_PAGE)
+    .optional()
+    .describe(`Page size, at most ${MAX_SLACK_HISTORY_PAGE} (default 50)`),
+  cursor: z
+    .string()
+    .optional()
+    .describe("nextCursor from the previous page; keep the same channel, thread and bounds"),
+};
+
+function historyQuery(input: {
+  oldest?: string | undefined;
+  latest?: string | undefined;
+  inclusive?: boolean | undefined;
+  limit?: number | undefined;
+  cursor?: string | undefined;
+}): SlackHistoryQuery {
+  const oldest = input.oldest ? toSlackTimestamp(input.oldest, "oldest") : undefined;
+  const latest = input.latest ? toSlackTimestamp(input.latest, "latest") : undefined;
+  if (oldest && latest && Number(oldest) > Number(latest)) {
+    throw new Error("oldest must not be after latest");
+  }
+  return {
+    limit: input.limit ?? 50,
+    ...(oldest ? { oldest } : {}),
+    ...(latest ? { latest } : {}),
+    ...(input.inclusive ? { inclusive: true } : {}),
+    ...(input.cursor ? { cursor: input.cursor } : {}),
+  };
 }
 
 export function createSlackReadMcpServer(
@@ -64,6 +136,48 @@ export function createSlackReadMcpServer(
     async ({ channel }) => {
       try {
         return toolOk(await client.getChannel(channel));
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+  server.registerTool(
+    "list_channel_history",
+    {
+      title: "List a page of Slack channel history",
+      description:
+        "Read one page of a conversation's messages, newest first, optionally between oldest and latest. Thread replies appear only when broadcast to the channel; a thread parent carries replyCount, so read the thread with list_thread_replies. To walk a date range, set oldest and latest and pass each page's nextCursor back until it is absent. Needs the history scope for the conversation type (channels:history, groups:history, im:history or mpim:history); Slack answers not_in_channel when the app has not been added to the conversation.",
+      inputSchema: {
+        channel: z.string().describe("Conversation ID, e.g. C0123"),
+        ...historyBoundsSchema,
+      },
+    },
+    async ({ channel, ...bounds }) => {
+      try {
+        return toolOk(await client.listHistory(channel, historyQuery(bounds)));
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+  server.registerTool(
+    "list_thread_replies",
+    {
+      title: "List a page of Slack thread replies",
+      description:
+        "Read one page of the thread rooted at threadTs, oldest first, optionally between oldest and latest. Slack may include the parent message (its ts equals threadTs). Pass each page's nextCursor back until it is absent to walk the thread. Needs the same history scope and conversation access as list_channel_history.",
+      inputSchema: {
+        channel: z.string().describe("Conversation ID, e.g. C0123"),
+        threadTs: z.string().describe("Timestamp of the thread's parent message"),
+        ...historyBoundsSchema,
+      },
+    },
+    async ({ channel, threadTs, ...bounds }) => {
+      try {
+        if (!SLACK_TS.test(threadTs)) {
+          throw new Error("threadTs must be a Slack message timestamp, e.g. 1712345678.000100");
+        }
+        return toolOk(await client.listThreadReplies(channel, threadTs, historyQuery(bounds)));
       } catch (err) {
         return toolError(err);
       }

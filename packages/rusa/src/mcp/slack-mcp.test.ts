@@ -452,3 +452,120 @@ describe("Slack write MCP react", () => {
     expect(react).not.toHaveBeenCalled();
   });
 });
+
+describe("Slack read MCP history", () => {
+  function historyServer(conversations: Record<string, unknown>) {
+    const client = new SlackClient(TOKEN);
+    Object.defineProperty(client, "historyWeb", { value: { conversations } });
+    return connect(createSlackReadMcpServer(client));
+  }
+
+  it("turns an ISO-8601 date range into Slack timestamp bounds", async () => {
+    const history = vi.fn(async () => ({ messages: [], has_more: false }));
+    const client = await historyServer({ history });
+    const result = await call(client, "list_channel_history", {
+      channel: "C1",
+      oldest: "2026-10-13T02:00:00+02:00",
+      latest: "2026-10-14T00:00:00Z",
+      limit: 25,
+    });
+    expect(result.isError).toBe(false);
+    expect(history).toHaveBeenCalledWith({
+      channel: "C1",
+      limit: 25,
+      oldest: "1791849600.000000",
+      latest: "1791936000.000000",
+    });
+    expect(JSON.parse(result.text)).toEqual({
+      channel: "C1",
+      order: "newest_first",
+      messages: [],
+      hasMore: false,
+    });
+  });
+
+  it("passes Slack timestamps, inclusivity and the cursor through with a default page size", async () => {
+    const replies = vi.fn(async () => ({
+      messages: [{ ts: "5.1", text: "reply", user: "U2", thread_ts: "5.0" }],
+    }));
+    const client = await historyServer({ replies });
+    const result = await call(client, "list_thread_replies", {
+      channel: "C1",
+      threadTs: "5.0",
+      oldest: "5.0",
+      inclusive: true,
+      cursor: "replies-2",
+    });
+    expect(result.isError).toBe(false);
+    expect(replies).toHaveBeenCalledTimes(1);
+    expect(replies).toHaveBeenCalledWith({
+      channel: "C1",
+      ts: "5.0",
+      limit: 50,
+      oldest: "5.0",
+      inclusive: true,
+      cursor: "replies-2",
+    });
+    expect(JSON.parse(result.text)).toMatchObject({ threadTs: "5.0", order: "oldest_first" });
+  });
+
+  it("lists attached file metadata without private URLs", async () => {
+    const history = vi.fn(async () => ({
+      messages: [{ ts: "1.0", text: "see attached", user: "U1", files: [reportFile] }],
+    }));
+    const client = await historyServer({ history });
+    const { text } = await call(client, "list_channel_history", { channel: "C1" });
+    expect(JSON.parse(text).messages[0].files).toEqual([
+      {
+        id: "F1",
+        name: "report.txt",
+        title: "Report",
+        mimetype: "text/plain",
+        filetype: "text",
+        size: 5,
+      },
+    ]);
+    expect(text).not.toContain("files.slack.com");
+  });
+
+  it.each([
+    [{ oldest: "yesterday" }, /oldest must be a Slack timestamp/],
+    [{ latest: "2026-10-13" }, /latest must be a Slack timestamp/],
+    [{ latest: "2026-10-13T00:00:00" }, /latest must be a Slack timestamp/],
+    [
+      { oldest: "2026-10-14T00:00:00Z", latest: "2026-10-13T00:00:00Z" },
+      /oldest must not be after latest/,
+    ],
+    [{ limit: 0 }, /limit|Too small|>=1/i],
+    [{ limit: 201 }, /limit|Too big|<=200/i],
+  ])("rejects invalid bounds %j before calling Slack", async (bounds, message) => {
+    const history = vi.fn(async () => ({ messages: [] }));
+    const client = await historyServer({ history });
+    const result = await call(client, "list_channel_history", { channel: "C1", ...bounds });
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(message);
+    expect(history).not.toHaveBeenCalled();
+  });
+
+  it("rejects a thread timestamp that is not a Slack timestamp", async () => {
+    const replies = vi.fn(async () => ({ messages: [] }));
+    const client = await historyServer({ replies });
+    const result = await call(client, "list_thread_replies", { channel: "C1", threadTs: "latest" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/threadTs must be a Slack message timestamp/);
+    expect(replies).not.toHaveBeenCalled();
+  });
+
+  it("surfaces Slack's access errors as tool errors", async () => {
+    const history = vi.fn(async () => {
+      throw Object.assign(new Error("An API error occurred: not_in_channel"), {
+        code: "slack_webapi_platform_error",
+        data: { ok: false, error: "not_in_channel" },
+      });
+    });
+    const client = await historyServer({ history });
+    const result = await call(client, "list_channel_history", { channel: "C1" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/not a member of this conversation/);
+  });
+});

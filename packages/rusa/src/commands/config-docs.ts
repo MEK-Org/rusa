@@ -235,6 +235,11 @@ slack:
                            im:history, channels:history, channels:read, chat:write, and reactions:write bot scopes,
                            plus files:read and files:write for the attachment tools.
                            Attachment tools run on the leader and refuse follower-hosted actors (#812).
+                           The list_channel_history and list_thread_replies tools read with the token's own
+                           access: channels:history covers public channels; add groups:history, mpim:history
+                           or im:history for private channels, group DMs or DMs. Slack answers not_in_channel
+                           when the app has not been added to the conversation. Each call returns one page;
+                           walk a date range or thread by passing nextCursor back with the same bounds.
   Root owns inbound slack:channels; workers may receive delegated channels.
   Message references use slack:channels/<id>/messages/<timestamp>.
 
