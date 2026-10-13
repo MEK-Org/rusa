@@ -14,16 +14,19 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { SlackClient } from "../slack/slack-client.js";
 import {
   createSlackReadMcpServer,
   createSlackWriteMcpServer,
+  MAX_SLACK_MESSAGE_CHARS,
   resolveSlackReplyThreadTs,
   toSlackTimestamp,
 } from "./slack-mcp.js";
 
 const TOKEN = "xoxb-synthetic";
+const actorHandle = "actor-handle";
 const FILE_URL = "https://files.slack.com/files-pri/T1-F1/download/report.txt";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -300,7 +303,10 @@ describe("Slack write MCP upload_file", () => {
     writeFileSync(join(dir, "out.png"), "png-bytes");
     const uploadV2 = uploader();
     const client = await connect(
-      createSlackWriteMcpServer(slackWith({ files: { uploadV2 } }), ["C1"], { workDir: dir })
+      createSlackWriteMcpServer(slackWith({ files: { uploadV2 } }), ["C1"], {
+        actorHandle,
+        workDir: dir,
+      })
     );
     const result = await call(client, "upload_file", {
       channel: "C1",
@@ -313,7 +319,7 @@ describe("Slack write MCP upload_file", () => {
       channel_id: "C1",
       file: Buffer.from("png-bytes"),
       filename: "out.png",
-      initial_comment: "chart attached",
+      initial_comment: "chart attached\n\n_actor-handle_",
       thread_ts: "1.0",
     });
   });
@@ -328,6 +334,7 @@ describe("Slack write MCP upload_file", () => {
     const uploadV2 = uploader();
     const client = await connect(
       createSlackWriteMcpServer(slackWith({ files: { uploadV2 } }), ["C1"], {
+        actorHandle,
         workDir: dir,
         maxFileBytes: 8,
       })
@@ -362,6 +369,7 @@ describe("Slack write MCP upload_file", () => {
     const uploadV2 = uploader();
     const write = await connect(
       createSlackWriteMcpServer(slackWith({ chat: { postMessage }, files: { uploadV2 } }), ["C1"], {
+        actorHandle,
         workDir: dir,
         fileToolsAvailable,
       })
@@ -416,13 +424,91 @@ describe("Slack write MCP upload_file", () => {
   });
 });
 
+describe("Slack write MCP attribution", () => {
+  it("signs each post with the run's current model, keeping markup and thread", async () => {
+    const postMessage = vi.fn(async (_args: Record<string, unknown>) => ({ ok: true, ts: "2.0" }));
+    let selection: RawProviderModelConfig | undefined = {
+      provider: "test",
+      model: "model-a",
+      effort: "high",
+    };
+    const client = await connect(
+      createSlackWriteMcpServer(slackWith({ chat: { postMessage } }), ["C1"], {
+        actorHandle,
+        getRunSelection: () => selection,
+      })
+    );
+    const text = "see <https://example.com|the docs> and *this*";
+
+    await call(client, "send_message", { channel: "C1", text, threadTs: "1.0" });
+    selection = { provider: "test", model: "model-b" };
+    await call(client, "send_message", { channel: "C1", text });
+    selection = undefined;
+    await call(client, "send_message", { channel: "C1", text });
+
+    expect(postMessage.mock.calls.map(([args]) => args)).toEqual([
+      { channel: "C1", text: `${text}\n\n_actor-handle (model-a, high)_`, thread_ts: "1.0" },
+      { channel: "C1", text: `${text}\n\n_actor-handle (model-b)_`, thread_ts: undefined },
+      { channel: "C1", text: `${text}\n\n_actor-handle_`, thread_ts: undefined },
+    ]);
+  });
+
+  it("does not add a second footer to text that already ends with it", async () => {
+    const postMessage = vi.fn(async (_args: Record<string, unknown>) => ({ ok: true, ts: "2.0" }));
+    const client = await connect(
+      createSlackWriteMcpServer(slackWith({ chat: { postMessage } }), ["C1"], { actorHandle })
+    );
+    await call(client, "send_message", { channel: "C1", text: "hi\n\n_actor-handle_" });
+    expect(postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "hi\n\n_actor-handle_" })
+    );
+  });
+
+  it("refuses text that Slack would truncate once the footer is added", async () => {
+    const postMessage = vi.fn(async (_args: Record<string, unknown>) => ({ ok: true, ts: "2.0" }));
+    const client = await connect(
+      createSlackWriteMcpServer(slackWith({ chat: { postMessage } }), ["C1"], { actorHandle })
+    );
+    const footer = "\n\n_actor-handle_";
+    const fits = "x".repeat(MAX_SLACK_MESSAGE_CHARS - footer.length);
+
+    expect((await call(client, "send_message", { channel: "C1", text: fits })).isError).toBe(false);
+    const tooLong = await call(client, "send_message", { channel: "C1", text: `${fits}x` });
+    expect(tooLong).toEqual({
+      isError: true,
+      text: expect.stringContaining("40001 characters with its footer"),
+    });
+    expect(postMessage).toHaveBeenCalledOnce();
+  });
+
+  it("gives an uploaded file a footer comment when the caller wrote none", async () => {
+    const dir = workdir();
+    writeFileSync(join(dir, "out.png"), "png-bytes");
+    const uploadV2 = vi.fn(async (_args: Record<string, unknown>) => ({
+      ok: true,
+      files: [{ ok: true, files: [{ id: "F9" }] }],
+    }));
+    const client = await connect(
+      createSlackWriteMcpServer(slackWith({ files: { uploadV2 } }), ["C1"], {
+        actorHandle,
+        getRunSelection: () => ({ provider: "test", model: "model-a" }),
+        workDir: dir,
+      })
+    );
+    await call(client, "upload_file", { channel: "C1", filePath: "out.png" });
+    expect(uploadV2).toHaveBeenCalledWith(
+      expect.objectContaining({ initial_comment: "_actor-handle (model-a)_" })
+    );
+  });
+});
+
 describe("Slack write MCP react", () => {
   it("registers react tool and forwards reaction parameters", async () => {
     const react = vi.fn(async () => {});
     const client = slackWith({});
     client.react = react;
 
-    const server = createSlackWriteMcpServer(client, ["C_ALLOWED"]);
+    const server = createSlackWriteMcpServer(client, ["C_ALLOWED"], { actorHandle });
     const mcpClient = await connect(server);
 
     const tools = await mcpClient.listTools();
@@ -446,7 +532,7 @@ describe("Slack write MCP react", () => {
     const client = slackWith({});
     client.react = react;
 
-    const server = createSlackWriteMcpServer(client, ["C_ALLOWED"]);
+    const server = createSlackWriteMcpServer(client, ["C_ALLOWED"], { actorHandle });
     const mcpClient = await connect(server);
 
     const result = await call(mcpClient, "react", {
@@ -562,7 +648,7 @@ describe("Slack write MCP reply placement", () => {
     const server = createSlackWriteMcpServer(
       slackWith({ chat: { postMessage }, files: { uploadV2 } }),
       ["C1", "C2"],
-      { workDir: dir, selectedInboxEntries: entries }
+      { actorHandle, workDir: dir, selectedInboxEntries: entries }
     );
     return { server, postMessage, uploadV2 };
   }
@@ -745,7 +831,7 @@ describe("Slack write MCP successful-write hook", () => {
 
   function writer(web: Record<string, unknown>) {
     const onWrite = vi.fn();
-    const server = createSlackWriteMcpServer(slackWith(web), ["C1"], { onWrite });
+    const server = createSlackWriteMcpServer(slackWith(web), ["C1"], { actorHandle, onWrite });
     return { server, onWrite };
   }
 
@@ -814,6 +900,7 @@ describe("Slack write MCP successful-write hook", () => {
       const dir = workdir();
       writeFileSync(join(dir, "out.txt"), "bytes");
       const server = createSlackWriteMcpServer(new SlackClient(TOKEN), ["C1"], {
+        actorHandle,
         workDir: dir,
         onWrite,
       });

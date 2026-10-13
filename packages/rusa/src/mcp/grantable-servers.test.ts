@@ -522,9 +522,10 @@ describe("grantable capabilities allow-list ", () => {
       await client.connect(clientTransport);
       await client.callTool({ name: "send_message", arguments: { channel: "C1", text: "hi" } });
     }
+    // Text carries #1035's footer; this test pins placement only.
     expect(send.mock.calls).toEqual([
-      ["C1", "hi", "1.000001"],
-      ["C1", "hi", undefined],
+      ["C1", expect.stringMatching(/^hi\n/), "1.000001"],
+      ["C1", expect.stringMatching(/^hi\n/), undefined],
     ]);
   });
 

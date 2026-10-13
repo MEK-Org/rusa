@@ -1,4 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { generateHandle } from "../actor/handle-generator.js";
 import type { CalendarClientProvider } from "../calendar/calendar-client.js";
 import type { ChatClient } from "../chat/types.js";
 import type { DriveClient } from "../drive/drive-client.js";
@@ -227,6 +228,8 @@ export function buildGrantableServers(
       const workDir = deps.actorRootFor?.(selfId);
       const onSlackWrite = deps.onSlackWrite;
       return createSlackWriteMcpServer(deps.slackClient, params.includes("*") ? "all" : params, {
+        actorHandle: generateHandle(selfId),
+        getRunSelection: () => deps.getRunSelectionForActor(selfId),
         ...(workDir ? { workDir } : {}),
         ...(onSlackWrite ? { onWrite: () => onSlackWrite(selfId) } : {}),
         ...(deps.fileToolsAvailableForActor

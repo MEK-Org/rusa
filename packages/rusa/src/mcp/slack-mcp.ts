@@ -2,6 +2,7 @@ import { basename } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Logger } from "../observability/logger.js";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import {
   MAX_SLACK_FILE_BYTES,
@@ -11,6 +12,7 @@ import {
   type SlackConversationType,
   type SlackHistoryQuery,
 } from "../slack/slack-client.js";
+import { appendVisibleActorSignature, formatVisibleActorSignature } from "./actor-signature.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 import {
@@ -23,6 +25,12 @@ import {
 export const SLACK_READ_MCP_NAME = "slack-read";
 export const SLACK_WRITE_MCP_NAME = "slack-write";
 
+/**
+ * Slack truncates `chat.postMessage` text past this many characters (per its
+ * method docs), which would cut off the footer, so longer text is refused.
+ */
+export const MAX_SLACK_MESSAGE_CHARS = 40_000;
+
 export interface SlackMcpOptions {
   /** The calling actor's workdir; file uploads read from and downloads write into it. */
   workDir?: string;
@@ -32,6 +40,10 @@ export interface SlackMcpOptions {
 }
 
 export interface SlackWriteMcpOptions extends SlackMcpOptions {
+  /** Named in the footer added to every message and file comment this server posts. */
+  actorHandle: string;
+  /** The exact normalized selection for the provider attempt currently writing. */
+  getRunSelection?: () => RawProviderModelConfig | undefined;
   /**
    * Called once Slack has accepted a write, so the run that made it is protected
    * from coalescing abort and is not repeated by a replacement run.
@@ -357,7 +369,7 @@ const threadTsSchema = z
 export function createSlackWriteMcpServer(
   client: SlackClient,
   allowedChannels: "all" | string[],
-  options: SlackWriteMcpOptions = {}
+  options: SlackWriteMcpOptions
 ): McpServer {
   const server = createMcpServer({ name: SLACK_WRITE_MCP_NAME, version: "0.1.0" });
   const allowed = (channel: string) =>
@@ -369,12 +381,17 @@ export function createSlackWriteMcpServer(
       options.selectedInboxEntries?.() ?? [],
       options.logger
     );
+  const signedText = (text: string) =>
+    appendVisibleActorSignature(
+      text,
+      formatVisibleActorSignature(options.actorHandle, options.getRunSelection?.(), "slack")
+    );
   server.registerTool(
     "send_message",
     {
       title: "Send a Slack message",
       description:
-        "Post to a channel or reply in a thread using its parent timestamp. Without threadTs, a reply to a selected Slack message that is in a thread stays in that thread; otherwise it posts top-level.",
+        "Post to a channel or reply in a thread using its parent timestamp. Without threadTs, a reply to a selected Slack message that is in a thread stays in that thread; otherwise it posts top-level. A footer naming you and your model is added, so don't sign the text yourself.",
       inputSchema: {
         channel: z.string(),
         text: z.string(),
@@ -384,8 +401,15 @@ export function createSlackWriteMcpServer(
     async ({ channel, text, threadTs }) => {
       try {
         if (!allowed(channel)) throw new Error(`access denied: Slack channel ${channel}`);
+        const signed = signedText(text);
+        // UTF-16 length is never below Slack's character count, so this refuses early, not late.
+        if (signed.length > MAX_SLACK_MESSAGE_CHARS) {
+          throw new Error(
+            `Slack message is ${signed.length} characters with its footer; Slack truncates past ${MAX_SLACK_MESSAGE_CHARS}, so split it across messages`
+          );
+        }
         const effectiveThreadTs = placement(channel, threadTs);
-        const ts = await client.send(channel, text, effectiveThreadTs);
+        const ts = await client.send(channel, signed, effectiveThreadTs);
         options.onWrite?.();
         return toolOk({
           ref: `slack:channels/${channel}/messages/${ts}`,
@@ -424,7 +448,7 @@ export function createSlackWriteMcpServer(
     {
       title: "Upload a file to Slack",
       description:
-        "Share a file from your working directory into a channel, or a thread using its parent timestamp. threadTs places it exactly as for send_message. Unavailable for follower-hosted actors (see #812).",
+        "Share a file from your working directory into a channel, or a thread using its parent timestamp. threadTs places it exactly as for send_message. The file's comment gets a footer naming you and your model, even when you give no comment. Unavailable for follower-hosted actors (see #812).",
       inputSchema: {
         channel: z.string(),
         filePath: z
@@ -455,7 +479,7 @@ export function createSlackWriteMcpServer(
           data,
           ...(threadTs ? { threadTs } : {}),
           ...(title ? { title } : {}),
-          ...(initialComment ? { initialComment } : {}),
+          initialComment: signedText(initialComment ?? ""),
         });
         // Slack completed the share, so the file is posted even if no ID came back.
         options.onWrite?.();

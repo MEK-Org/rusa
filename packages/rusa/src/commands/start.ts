@@ -3816,6 +3816,8 @@ async function composeStart(
     slackClient && config.slack
       ? mcpHttp.addServer(`${rootId}:${SLACK_WRITE_MCP_NAME}`, () =>
           createSlackWriteMcpServer(slackClient, "all", {
+            actorHandle: rootHandle,
+            getRunSelection: () => activeRunSelections.get(rootId),
             workDir: rootAgentDir,
             onWrite: () => mesh.markUnkillable(rootId),
             selectedInboxEntries: () => selectedInboxEntriesForActor(rootId),
