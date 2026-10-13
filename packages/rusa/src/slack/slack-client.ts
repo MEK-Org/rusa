@@ -29,6 +29,13 @@ export interface SlackFile {
   mimetype?: string;
   filetype?: string;
   size?: number;
+}
+
+/**
+ * File metadata in a {@link SlackMessageDetail}. As in the message, a field is
+ * present only when Slack returned it, and an empty value Slack returned stays.
+ */
+export interface SlackFileDetail extends SlackFile {
   /** User ID of the uploader. */
   user?: string;
   /** Upload time, in Unix seconds. */
@@ -93,7 +100,7 @@ export interface SlackMessageDetail {
   blocks?: unknown[];
   /** Legacy rich attachments (link unfurls, app cards), as Slack returned them. */
   attachments?: unknown[];
-  files?: SlackFile[];
+  files?: SlackFileDetail[];
   truncated?: string[];
 }
 
@@ -158,9 +165,6 @@ function toSlackFile(file: RawSlackFile & { id: string }): SlackFile {
     ...(file.mimetype ? { mimetype: file.mimetype } : {}),
     ...(file.filetype ? { filetype: file.filetype } : {}),
     ...(file.size !== undefined ? { size: file.size } : {}),
-    ...(file.user ? { user: file.user } : {}),
-    ...(file.created !== undefined ? { created: file.created } : {}),
-    ...(file.mode ? { mode: file.mode } : {}),
   };
 }
 
@@ -318,6 +322,20 @@ function defined<T extends Record<string, unknown>>(fields: T): Partial<T> {
   ) as Partial<T>;
 }
 
+function toSlackFileDetail(file: RawSlackFile & { id: string }): SlackFileDetail {
+  return defined({
+    id: file.id,
+    name: file.name,
+    title: file.title,
+    mimetype: file.mimetype,
+    filetype: file.filetype,
+    size: file.size,
+    user: file.user,
+    created: file.created,
+    mode: file.mode,
+  }) as SlackFileDetail;
+}
+
 /**
  * Drops Slack's private file URLs, which a forwarded message's attachments can
  * nest, so downloads go through `download_file`. This is policy, not a security
@@ -358,7 +376,7 @@ function toSlackMessageDetail(channel: string, ts: string, raw: RawSlackMessage)
         "files",
         raw.files.filter((file): file is RawSlackFile & { id: string } => Boolean(file.id)),
         limits.files
-      ).map(toSlackFile)
+      ).map(toSlackFileDetail)
     : undefined;
   const reactions = Array.isArray(raw.reactions)
     ? cap(

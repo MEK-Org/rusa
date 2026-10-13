@@ -541,7 +541,7 @@ describe("SlackClient.getMessage", () => {
       text: "",
       user: "U1",
       reactions: [],
-      files: [],
+      files: [{ id: "F1", title: "" }],
     }).getMessage("C1", "3.0");
     expect(empty).toEqual({
       channel: "C1",
@@ -549,7 +549,7 @@ describe("SlackClient.getMessage", () => {
       text: "",
       user: "U1",
       reactions: [],
-      files: [],
+      files: [{ id: "F1", title: "" }],
     });
   });
 
