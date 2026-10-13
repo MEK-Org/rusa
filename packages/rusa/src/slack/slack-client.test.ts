@@ -642,25 +642,22 @@ describe("SlackClient.getUser", () => {
     expect(JSON.stringify(found)).not.toContain("example.com");
   });
 
-  it("marks a deactivated account deleted and keeps an empty display name", async () => {
-    const client = clientWithUsersInfo(async () => ({
+  it("marks a deactivated account deleted and a bot user a bot", async () => {
+    const deleted = clientWithUsersInfo(async () => ({
       ok: true,
       user: { id: "U2", name: "former", deleted: true, profile: { display_name: "" } },
     }));
-    expect(await client.getUser("U2")).toEqual({
+    expect(await deleted.getUser("U2")).toEqual({
       id: "U2",
       status: "deleted",
       name: "former",
       displayName: "",
     });
-  });
-
-  it("reports a bot user as a bot", async () => {
-    const client = clientWithUsersInfo(async () => ({
+    const bot = clientWithUsersInfo(async () => ({
       ok: true,
       user: { id: "U3", name: "deploybot", is_bot: true, deleted: false, profile: {} },
     }));
-    expect(await client.getUser("U3")).toMatchObject({ id: "U3", status: "active", isBot: true });
+    expect(await bot.getUser("U3")).toMatchObject({ id: "U3", status: "active", isBot: true });
   });
 
   it("returns unknown for a user Slack cannot find or show", async () => {
@@ -676,17 +673,11 @@ describe("SlackClient.getUser", () => {
     }
   });
 
-  it("surfaces other API errors with Slack's code", async () => {
-    const client = clientWithUsersInfo(async () => {
-      throw platformError("invalid_auth");
-    });
-    await expect(client.getUser("U1")).rejects.toThrow("Slack users.info failed: invalid_auth");
-  });
-
-  it("rephrases a missing scope and a rate limit without retrying", async () => {
+  it("rephrases a missing scope and a rate limit without retrying, and passes other codes through", async () => {
     const { client, fetch } = slackApi([
       { body: { ok: false, error: "missing_scope", needed: "users:read" } },
       { status: 429, headers: { "retry-after": "30" }, body: { ok: false, error: "ratelimited" } },
+      { body: { ok: false, error: "invalid_auth" } },
     ]);
     await expect(client.getUser("U1")).rejects.toThrow(
       "Slack token lacks a scope users.info needs for this request (needed: users:read)"
@@ -694,6 +685,7 @@ describe("SlackClient.getUser", () => {
     await expect(client.getUser("U1")).rejects.toThrow(
       "Slack rate limited users.info; retry after 30 seconds"
     );
-    expect(fetch).toHaveBeenCalledTimes(2);
+    await expect(client.getUser("U1")).rejects.toThrow("Slack users.info failed: invalid_auth");
+    expect(fetch).toHaveBeenCalledTimes(3);
   });
 });

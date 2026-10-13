@@ -46,7 +46,12 @@ export interface SlackMessage {
   files?: SlackFile[];
 }
 
-/** Bounds on the arrays and rich payloads one {@link SlackMessageDetail} carries. */
+/**
+ * Bounds on the arrays and rich payloads one {@link SlackMessageDetail} carries.
+ * These are estimates, not sizes measured from real messages: generous enough
+ * for an ordinary rich message, small enough to keep one read out of the way of
+ * an agent's context.
+ */
 export const SLACK_MESSAGE_LIMITS = {
   files: 20,
   reactions: 50,
