@@ -240,6 +240,8 @@ slack:
                            or im:history for private channels, group DMs or DMs. Slack answers not_in_channel
                            when the app has not been added to the conversation. Each call returns one page;
                            walk a date range or thread by passing nextCursor back with the same bounds.
+                           Every actor gets these read tools with no channel allowlist, so any actor can list
+                           whatever the token can read, including DMs the app is in when im:history is granted.
   Root owns inbound slack:channels; workers may receive delegated channels.
   Message references use slack:channels/<id>/messages/<timestamp>.
 
