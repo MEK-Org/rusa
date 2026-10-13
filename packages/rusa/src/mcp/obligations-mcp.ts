@@ -65,7 +65,10 @@ export interface ObligationsMcpOptions {
    * {@link OBLIGATION_RESPONSIVE_CAPABILITY} grant (#1026). Read on every call
    * so a revocation applies to an already-open session. Ordinary
    * ownership/ancestry does not confer it, and it confers nothing beyond it:
-   * marking still requires {@link canManage}.
+   * marking still requires {@link canManage}. It gates only starting or
+   * promoting a branch: filing under an already responsive parent and
+   * reassigning live work keep their existing authorization, so it does not
+   * guarantee that unmanaged owners never receive responsive attention.
    */
   canSetResponsive?: () => boolean;
   /**
@@ -374,7 +377,7 @@ export function createObligationsMcpServer(
       description:
         "Create a new obligation. `title` is the heading a queue shows; keep it to one short line and put the detail in `intent`. If parent_id is specified, the parent obligation transitions to waiting if it was ready. `blocked_by` names other obligations this one must wait on: it is created `waiting` outright unless every one of them is already `done`. Rejected if this obligation is itself recurring or scheduled, or if anything named in `blocked_by` is: recurrence and prerequisite edges cannot mix on either side. Only " +
         RESPONSIVE_AUTHORITY +
-        " may start a newly responsive branch, and only for an owner it may otherwise manage; any actor may pass `responsive: true` under an already effectively responsive parent. Children inherit responsiveness automatically. `responsive` marks the obligation (and everything filed under it) responsive: when it becomes ready or is assigned ready, its owner gets immediately responsive inbox attention that may preempt an in-flight run.",
+        " may start a newly responsive branch, and only for an owner it may otherwise manage; any actor may pass `responsive: true` under an already effectively responsive parent. Children inherit responsiveness automatically, whoever owns them: this rule gates only starting or promoting a branch, so filing under an existing responsive parent (and reassign_obligation) keep their existing authorization and can still direct responsive attention at an owner the caller does not manage. `responsive` marks the obligation (and everything filed under it) responsive: when it becomes ready or is assigned ready, its owner gets immediately responsive inbox attention that may preempt an in-flight run.",
       inputSchema: {
         owner_id: z.string().trim().min(1),
         title: z.string().trim().min(1).max(OBLIGATION_TITLE_MAX),

@@ -289,4 +289,44 @@ describe("grantable responsive-obligation authority (#1026)", () => {
     ).toContain("only root");
     expect(db.serialize().equals(before)).toBe(true);
   });
+
+  it("leaves inherited filing and reassignment to unmanaged owners as they were", async () => {
+    // Scope (a): the authority gates starting or promoting a branch only. The
+    // existing delegation paths keep their own authorization, even when the
+    // owner receiving responsive attention is one the caller cannot manage.
+    const { repository, workerServer } = setup();
+    const urgent = repository.create({
+      ownerId: "steward-child",
+      title: "urgent",
+      responsive: true,
+    });
+    const handoff = repository.create({
+      ownerId: "steward-child",
+      title: "handoff",
+      parentId: urgent.id,
+    });
+    const worker = await connect(workerServer("steward-child"));
+
+    const filed = await call(worker, "create_obligation", {
+      owner_id: "sibling",
+      title: "for sibling",
+      parent_id: urgent.id,
+    });
+    expect(filed.isError).toBeFalsy();
+    const { obligation } = JSON.parse((filed.content as Array<{ text: string }>)[0]?.text ?? "{}");
+    expect(repository.require(obligation.id)).toMatchObject({
+      ownerId: "sibling",
+      effectiveResponsive: true,
+    });
+
+    const moved = await call(worker, "reassign_obligation", {
+      id: handoff.id,
+      owner_id: "sibling",
+    });
+    expect(moved.isError).toBeFalsy();
+    expect(repository.require(handoff.id)).toMatchObject({
+      ownerId: "sibling",
+      effectiveResponsive: true,
+    });
+  });
 });
