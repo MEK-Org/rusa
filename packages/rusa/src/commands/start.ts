@@ -200,7 +200,11 @@ import {
 import { McpHttpServer } from "../mcp/http-server.js";
 import { createInboxMcpServer, INBOX_MCP_NAME, type SelectedInboxRun } from "../mcp/inbox-mcp.js";
 import { createMeshChatMcpServer, MESH_CHAT_MCP_NAME } from "../mcp/mesh-chat-mcp.js";
-import { createObligationsMcpServer, OBLIGATIONS_MCP_NAME } from "../mcp/obligations-mcp.js";
+import {
+  createObligationsMcpServer,
+  OBLIGATION_RESPONSIVE_CAPABILITY,
+  OBLIGATIONS_MCP_NAME,
+} from "../mcp/obligations-mcp.js";
 import type { PnpmHardlinksToolDeps } from "../mcp/pnpm-hardlinks-mcp.js";
 import { createPnpmInstallMcpServer, PNPM_INSTALL_MCP_NAME } from "../mcp/pnpm-install-mcp.js";
 import { createQuotaMcpServer, createQuotaService, QUOTA_MCP_NAME } from "../mcp/quota-mcp.js";
@@ -3028,11 +3032,13 @@ async function composeStart(
     // host-global names listed here (`update`, `pnpm-hardlinks`, `model-admin`,
     // `room-admin`)
     // are stripped by the mesh: it never grants one, and only the seed below
-    // creates their rows.
+    // creates their rows. `obligation-responsive` (#1026) likewise mounts
+    // nothing: each worker's obligations server reads the grant per call.
     grantableCapabilities: new Set([
       ...grantableServers.keys(),
       SECRET_CAPABILITY_BASE,
       COMPUTER_USE_CAPABILITY,
+      OBLIGATION_RESPONSIVE_CAPABILITY,
       ...ADMINISTRATIVE_CAPABILITIES,
     ]),
     secretsDir: secretsDirPath(mcHome),
@@ -3271,6 +3277,7 @@ async function composeStart(
               resolveObligationOwner(actors, raw, getRepositories().principals),
             canManage: (callerId, obligation) =>
               canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
+            canSetResponsive: () => mesh.hasActiveCapability(id, OBLIGATION_RESPONSIVE_CAPABILITY),
             recordEvent: (event) => mesh.recordEvent(event),
             validateCompletionMatcher,
             evaluateCompletionMatcher: (obligationId) =>
@@ -3728,7 +3735,7 @@ async function composeStart(
   );
   const rootObligationsUrl = mcpHttp.addServer(`${rootId}:${OBLIGATIONS_MCP_NAME}`, () =>
     createObligationsMcpServer(getRepositories().obligations, rootId, {
-      canSetResponsive: true,
+      canSetResponsive: () => true,
       canManage: () => true,
       resolveOwner: (raw) => resolveObligationOwner(actors, raw, getRepositories().principals),
       recordEvent: (event) => mesh.recordEvent(event),
