@@ -44,7 +44,7 @@ export interface BriefMcpDeps {
   now?: () => string;
 }
 
-export const BRIEF_CITATION_DEADLINE_MS = 20_000;
+export const BRIEF_CITATION_DEADLINE_MS = 15_000;
 
 /**
  * A brief-mode actor's own brief, read and replaced by the actor itself (#954).

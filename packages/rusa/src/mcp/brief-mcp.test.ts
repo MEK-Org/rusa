@@ -420,6 +420,45 @@ describe("brief MCP server: citations must exist", () => {
     expect(store.listBriefRevisions(ALPHA, 10)).toEqual([]);
   });
 
+  it("never commits a timed-out write when its citation answers late", async () => {
+    const store = new InMemoryPortableContextStore();
+    store.save(seedPortableBriefState(emptyPortableContextState(ALPHA), ALPHA, SEEDED_AT));
+    let answer!: () => void;
+    const late = new Promise<void>((settle) => {
+      answer = settle;
+    });
+    const { resolveCitation } = syntheticResolver({
+      issueClient: {
+        getIssue: async (_repo: string, number: number) => {
+          await late;
+          return { ...ISSUES[number], author: "maintainer" } as never;
+        },
+      },
+    });
+    const alpha = await connect(
+      createBriefMcpServer({
+        actorId: ALPHA,
+        store,
+        resolveCitation,
+        citationDeadlineMs: 50,
+        now: () => WRITTEN_AT,
+      })
+    );
+    const before = store.load(ALPHA);
+
+    const rejected = await call(alpha, "replace", { text: BRIEF, expected_generation: 0 });
+    expect(rejected.isError).toBe(true);
+    expect(rejected.text).toContain(
+      "citation [github:MEK-Org/rusa/issues/954] could not be resolved: could not be checked within 0.05s"
+    );
+
+    // The tracker answers after the refusal; nothing may land on its account.
+    answer();
+    await new Promise((settle) => setTimeout(settle, 10));
+    expect(store.load(ALPHA)).toEqual(before);
+    expect(store.listBriefRevisions(ALPHA, 10)).toEqual([]);
+  });
+
   it("refuses a write when another write lands while its citations resolve", async () => {
     const store = new InMemoryPortableContextStore();
     store.save(seedPortableBriefState(emptyPortableContextState(ALPHA), ALPHA, SEEDED_AT));

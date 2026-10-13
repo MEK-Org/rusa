@@ -5173,7 +5173,7 @@ export class ActorMesh {
    * any thread in its subtree, itself included; any other caller may only set
    * the model for its own descendants (and never its own).
    * A pool of more than one entry, or a change of provider, requires a
-   * portable (ledger/tail) actor — a native provider session can't move.
+   * portable (ledger/tail/brief) actor — a native provider session can't move.
    * The replacement is atomic (the whole pool or nothing). A run already in
    * flight keeps its launched pool and the replacement applies when that run
    * ends; an idle or queued actor has it applied and persisted now (#652), so
@@ -5218,7 +5218,7 @@ export class ActorMesh {
     const portable = record.context?.type === "portable";
     if (validated.length > 1 && !portable) {
       throw new Error(
-        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can use a multi-candidate pool.`
+        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail/brief) actors can use a multi-candidate pool.`
       );
     }
     const currentProvider = record.modelConfig?.[0]?.provider;
@@ -5229,7 +5229,7 @@ export class ActorMesh {
       validated[0].provider !== currentProvider
     ) {
       throw new Error(
-        `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can be moved across providers.`
+        `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail/brief) actors can be moved across providers.`
       );
     }
     // Boundary contract (#199, #652): an in-flight run completes on its

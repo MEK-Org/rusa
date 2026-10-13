@@ -21,10 +21,18 @@ actor why, in the same turn.
 
 The `ledger` mode is unchanged.
 
-The operator selects brief mode: the dashboard spawn API, the actor's
-configured context, or the E2E harness. The agent-facing `spawn_thread` tool
-offers only `native`, `ledger` and `tail`; nothing asks for agents to start
-brief-mode children.
+Brief is selected like the other portable modes. Any actor that may spawn can
+pass `context_mode: "brief"` to `spawn_thread` for its own child, and the
+operator can select it through the dashboard spawn API or an actor's configured
+context. Spawning adds no new authority check and no root-only path: the
+existing spawn authorization, charter, actor isolation and the
+`conversation_id` incompatibility of portable modes apply unchanged, and the
+default when no mode is given stays `native`. The tool describes the mode as
+an actor-maintained WHAT/HOW/DOMAIN brief, every statement citing its source,
+injected with the actor's recent journal; `spawn_thread` writes no brief, so a
+new child starts from its charter and the brief grows only by its own cited
+writes. A multi-entry model pool needs a portable mode, and brief counts as
+one, as `ledger` and `tail` do.
 
 ## 2. Identity
 
@@ -88,11 +96,11 @@ Every citation is parsed. Each citation the write introduces, meaning one the
 previously accepted brief did not carry, is then resolved through the existing
 reference resolver (`resolveReference`, the one behind the dashboard's
 reference cache), with the server's own access. The cache's short UI deadline
-is not used. A write waits up to 20 seconds for its new citations; one not
-answered by then cannot be checked right now. That bound keeps a degraded
-source's client retries from holding the actor's run, and answers inside an
-MCP client's own tool timeout, so a write the client gave up on never commits
-later. The write is refused, and the brief, generation, time and history stay
+is not used. A write waits up to 15 seconds in total for its new citations;
+one not answered by then cannot be checked right now. That bound keeps a
+degraded source's client retries from holding the actor's run, and the write
+is decided when the deadline passes: a citation that answers afterwards cannot
+make the refused write commit. The write is refused, and the brief, generation, time and history stay
 as they were, if a new citation:
 
 - points at nothing (`message not found`, `actor not found`, `not found on the
