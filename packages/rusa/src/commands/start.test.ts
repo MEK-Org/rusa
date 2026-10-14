@@ -9139,12 +9139,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(records("service_stopped")).toEqual([]);
     });
 
-    it("protects root and granted-worker runs once a Slack write succeeds, not when it fails", async () => {
+    it("protects root and granted-worker runs once a Slack write succeeds, not when it fails, and signs each run's posts", async () => {
       const secretsDir = join(homeDir, "secrets");
       mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
       writeFileSync(join(secretsDir, "slack-bot-token"), "xoxb-synthetic-bot-token");
       writeFileSync(join(secretsDir, "slack-app-token"), "xapp-synthetic-app-token");
       writeConfig({
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+          handle: "slack-root",
+        },
         slack: {
           botTokenPath: join(secretsDir, "slack-bot-token"),
           appTokenPath: join(secretsDir, "slack-app-token"),
@@ -9195,6 +9201,24 @@ describe("runStart webhook event routing (Phase 4)", () => {
           }
         };
 
+        type AttemptOptions = {
+          onProviderAttempt?: (attempt: {
+            providerName: string;
+            model?: string;
+            effort?: string;
+          }) => void;
+        };
+        (root as unknown as { opts: AttemptOptions }).opts.onProviderAttempt?.({
+          providerName: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+        });
+        (worker as unknown as { opts: AttemptOptions }).opts.onProviderAttempt?.({
+          providerName: "antigravity",
+          model: "Gemini 3.7 Pro",
+          effort: "low",
+        });
+
         for (const actor of [root, worker]) {
           expect(killable(actor)).toBe(true);
           expect((await send(actor, "refused")).isError).toBe(true);
@@ -9203,6 +9227,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
           expect(killable(actor)).toBe(false);
         }
         expect(postMessage).toHaveBeenCalledTimes(4);
+
+        // Each run signs with its own handle and model: root's configured handle, the grantee's own.
+        const rootFooter = "\n\n_slack-root (Gemini 3.7 Flash, high)_";
+        const workerFooter = `\n\n_${generateHandle("slack-write-worker")} (Gemini 3.7 Pro, low)_`;
+        expect(postMessage.mock.calls.map(([args]) => args.text)).toEqual([
+          `refused${rootFooter}`,
+          `posted${rootFooter}`,
+          `refused${workerFooter}`,
+          `posted${workerFooter}`,
+        ]);
       } finally {
         startSpy.mockRestore();
         closeSpy.mockRestore();
@@ -9264,88 +9298,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           channel: "C1",
           thread_ts: "1791849600.000100",
         });
-      } finally {
-        startSpy.mockRestore();
-        closeSpy.mockRestore();
-      }
-    });
-
-    it("signs root and granted-worker Slack posts with each run's own handle and model", async () => {
-      const secretsDir = join(homeDir, "secrets");
-      mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
-      writeFileSync(join(secretsDir, "slack-bot-token"), "xoxb-synthetic-bot-token");
-      writeFileSync(join(secretsDir, "slack-app-token"), "xapp-synthetic-app-token");
-      writeConfig({
-        slack: {
-          botTokenPath: join(secretsDir, "slack-bot-token"),
-          appTokenPath: join(secretsDir, "slack-app-token"),
-        },
-      });
-      const startSpy = vi.spyOn(SlackSocketSource.prototype, "start").mockResolvedValue(undefined);
-      const closeSpy = vi.spyOn(SlackSocketSource.prototype, "close").mockResolvedValue(undefined);
-      const slackClient = new SlackClient("xoxb-synthetic-bot-token");
-      const postMessage = vi.fn(async (_args: { text: string }) => ({
-        ok: true,
-        ts: "1791849600.000100",
-      }));
-      Object.defineProperty(slackClient, "web", { value: { chat: { postMessage } } });
-      withWorker("slack-write-worker");
-      writeFileSync(
-        join(homeDir, "capability-grants.json"),
-        JSON.stringify({
-          grants: [
-            {
-              actorId: "slack-write-worker",
-              capability: "slack-write:C1",
-              grantedBy: "root",
-              grantedAt: "2026-10-13T00:00:00.000Z",
-            },
-          ],
-        }),
-        "utf8"
-      );
-      type AttemptOptions = {
-        onProviderAttempt?: (attempt: {
-          providerName: string;
-          model?: string;
-          effort?: string;
-        }) => void;
-      };
-      const send = async (actor: unknown, text: string) => {
-        const url = mcpServersOf(actor).find((server) => server.name === "slack-write")?.url;
-        if (!url) throw new Error("slack-write not mounted");
-        const client = new Client({ name: "slack-write-signature", version: "0.0.0" });
-        await client.connect(new StreamableHTTPClientTransport(new URL(url)));
-        try {
-          return await client.callTool({
-            name: "send_message",
-            arguments: { channel: "C1", text },
-          });
-        } finally {
-          await client.close();
-        }
-      };
-
-      try {
-        const { mesh, root } = await boot({ slackClient });
-        const worker = workerOf(mesh, "slack-write-worker");
-        (root as unknown as { opts: AttemptOptions }).opts.onProviderAttempt?.({
-          providerName: "antigravity",
-          model: "Gemini 3.7 Flash",
-          effort: "high",
-        });
-        (worker as unknown as { opts: AttemptOptions }).opts.onProviderAttempt?.({
-          providerName: "antigravity",
-          model: "Gemini 3.7 Pro",
-          effort: "low",
-        });
-
-        expect((await send(root, "from root")).isError).toBeFalsy();
-        expect((await send(worker, "from worker")).isError).toBeFalsy();
-        expect(postMessage.mock.calls.map(([args]) => args.text)).toEqual([
-          `from root\n\n_${generateHandle("root")} (Gemini 3.7 Flash, high)_`,
-          `from worker\n\n_${generateHandle("slack-write-worker")} (Gemini 3.7 Pro, low)_`,
-        ]);
       } finally {
         startSpy.mockRestore();
         closeSpy.mockRestore();
