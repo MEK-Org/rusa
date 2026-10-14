@@ -11,7 +11,7 @@ import type {
   IssueClient,
 } from "../gitops/issue-client.js";
 import { parseAuthor, stampAuthor, verifyAuthorStamp } from "./stamp.js";
-import { createTrackerMcpServer } from "./tracker-mcp.js";
+import { createTrackerMcpServer, GITHUB_IMAGE_LINK_INSTRUCTION } from "./tracker-mcp.js";
 
 type Call = { method: string; args: unknown[] };
 
@@ -1251,5 +1251,51 @@ describe("tracker MCP server", () => {
     })) as CallToolResult;
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain("boom");
+  });
+
+  describe("posting tool descriptions and image-link guidance (#1067)", () => {
+    it("attaches GITHUB_IMAGE_LINK_INSTRUCTION to all tracker tools accepting Markdown bodies and no others", async () => {
+      const { client: backend } = recordingIssueClient();
+      const client = await connect(createTrackerMcpServer("test-actor-1", backend));
+      const { tools } = await client.listTools();
+
+      const expectedPostingTools = new Set([
+        "create_pull_request",
+        "create_issue",
+        "post_comment",
+        "post_review",
+        "create_pr_review_comment",
+        "update_body",
+      ]);
+
+      const toolsWithGuidance = tools
+        .filter((t) => t.description?.includes(GITHUB_IMAGE_LINK_INSTRUCTION))
+        .map((t) => t.name);
+
+      expect(new Set(toolsWithGuidance)).toEqual(expectedPostingTools);
+
+      for (const tool of tools) {
+        if (expectedPostingTools.has(tool.name)) {
+          expect(tool.description).toContain(GITHUB_IMAGE_LINK_INSTRUCTION);
+        } else {
+          expect(tool.description).not.toContain(GITHUB_IMAGE_LINK_INSTRUCTION);
+        }
+      }
+    });
+
+    it("uses generic examples and explains private repository proxy behavior", () => {
+      expect(GITHUB_IMAGE_LINK_INSTRUCTION).toContain(
+        "https://github.com/<owner>/<repo>/raw/<ref>/<path>"
+      );
+      expect(GITHUB_IMAGE_LINK_INSTRUCTION).toContain(
+        "https://github.com/<owner>/<repo>/blob/<ref>/<path>?raw=true"
+      );
+      expect(GITHUB_IMAGE_LINK_INSTRUCTION).toContain("raw.githubusercontent.com");
+      expect(GITHUB_IMAGE_LINK_INSTRUCTION).toContain("private repositories");
+      // Must not leak specific account, repo, infrastructure, or credential identifiers
+      expect(GITHUB_IMAGE_LINK_INSTRUCTION).not.toMatch(
+        /MEK-Org|rusa|token|auth_token|ghp_|github_pat/i
+      );
+    });
   });
 });
