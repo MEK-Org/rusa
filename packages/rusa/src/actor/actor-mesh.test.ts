@@ -238,6 +238,7 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
             right.id.localeCompare(left.id)
         )
         .slice(0, limit),
+    slackMessageWorkspaces: () => [],
     markSeen: (actorId, seenAt = new Date("2026-01-01T00:00:00Z")) => {
       const unseen = entries.filter(
         (entry) => entry.actorId === actorId && entry.seenAt === null && entry.handledAt === null

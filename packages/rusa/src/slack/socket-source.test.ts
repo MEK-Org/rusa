@@ -1,6 +1,6 @@
 import { ErrorCode } from "@slack/web-api";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseSlackEvent, rememberSlackSelf } from "./socket-source.js";
+import { parseSlackEvent, rememberSlackSelf, slackInboxEvent } from "./socket-source.js";
 import { slackMessageWakes } from "./wake-mode.js";
 
 describe("Slack event ingestion", () => {
@@ -145,5 +145,25 @@ describe("Slack bot identity lookup", () => {
     expect(identify).toHaveBeenCalledTimes(3);
     expect(selfUserId()).toBe("UBOT");
     expect(onError).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("Slack inbox event (#1038)", () => {
+  // Synthetic Slack ids; not a real workspace or user.
+  const message = parseSlackEvent({
+    event_id: "Ev1",
+    event: { type: "app_mention", channel: "C1", ts: "1720000000.000001", user: "U1" },
+  });
+
+  it("carries the sender's verified workspace, and none it could not prove", () => {
+    if (!message) throw new Error("expected a parsed message");
+    expect(slackInboxEvent({ ...message, workspaceId: "T0HOME" }).rawPayload).toEqual({
+      channel: "C1",
+      ts: "1720000000.000001",
+      threadTs: undefined,
+      user: "U1",
+      workspaceId: "T0HOME",
+    });
+    expect(slackInboxEvent(message).rawPayload).not.toHaveProperty("workspaceId");
   });
 });

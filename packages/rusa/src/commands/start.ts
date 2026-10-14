@@ -315,7 +315,7 @@ import {
   HierarchicalEventSourceResolver,
 } from "../runtime/event-manager.js";
 import { ResourceScope } from "../runtime/resource-scope.js";
-import { readSlackToken, SlackClient } from "../slack/slack-client.js";
+import { readSlackToken, type SlackBotIdentity, SlackClient } from "../slack/slack-client.js";
 import {
   rememberSlackSelf,
   type SlackInboundMessage,
@@ -1911,9 +1911,18 @@ async function composeStart(
     meshChat: getRepositories().meshChat,
   });
   const inboxOpenQuestionSources = (): InboxOpenQuestionSources => {
-    const { obligations, principals } = getRepositories();
+    const { obligations, principals, slackPrincipalBindings } = getRepositories();
     return {
-      resolveSenderPrincipal: (entry) => resolveInboxSenderPrincipal(entry, principals),
+      resolveSenderPrincipal: (entry) =>
+        resolveInboxSenderPrincipal(entry, principals, {
+          // The workspace the Slack connection is installed in, learned when
+          // the socket starts. Selection compares each message's proven
+          // workspace against it, so a connection to another workspace never
+          // inherits bindings (#1038).
+          activeWorkspaceId: () => slackClient?.installationWorkspaceId,
+          activePrincipalId: (workspaceId, slackUserId) =>
+            slackPrincipalBindings.activePrincipalId(workspaceId, slackUserId),
+        }),
       listOpenQuestions: (ownerId, creatorId, limit) =>
         obligations.listOwnedPage(ownerId, { creatorId, openOnly: true, limit }),
       listArtifacts: (obligationId) => obligations.listArtifacts(obligationId),
@@ -4416,6 +4425,7 @@ async function composeStart(
         mesh: {
           mesh,
           actors,
+          slackPrincipalBindings: getRepositories().slackPrincipalBindings,
           meshEvents: getRepositories().meshEvents,
           timings: dashboardTimings,
           meshChat: getRepositories().meshChat,
@@ -4814,6 +4824,23 @@ async function composeStart(
           }),
         (event) => log.info("slack_event_received", event)
       );
+      // One bounded identity read before the socket starts supplies both the
+      // installation's workspace, which the client keeps for selection and
+      // reference resolution, and the bot's own user id. If it fails, or
+      // reports Enterprise Grid, the workspace stays unknown, so Slack senders
+      // resolve to no human and proven references are refused while delivery
+      // continues, and the user id is looked up lazily as before.
+      let startupIdentity: SlackBotIdentity | undefined;
+      try {
+        startupIdentity = await slackClient.identify({ atStartup: true });
+        if (!startupIdentity.teamId) {
+          throw new Error("Slack auth.test reported no single-workspace team id");
+        }
+      } catch (err) {
+        log.warn("slack_installation_workspace_unknown", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
       const deliver = async (msg: SlackInboundMessage) => {
         const delivery = await mesh.deliverExternalEvent(slackInboxEvent(msg));
         log.info("slack_message_delivered", { channel: msg.channel, eventId: msg.eventId });
@@ -4835,13 +4862,14 @@ async function composeStart(
         // identity: until it is known, a plain-text mention goes undetected.
         {
           selfUserId: rememberSlackSelf(
-            () => slackClient.identify(),
+            () => (startupIdentity ? Promise.resolve(startupIdentity) : slackClient.identify()),
             (err) =>
               log.warn("slack_self_identity_unavailable", {
                 error: err instanceof Error ? err.message : String(err),
               })
           ),
           wakeModeFor: (channel) => mesh.chatWakeModeFor(`slack:channels/${channel}`),
+          installationWorkspaceId: slackClient.installationWorkspaceId,
         }
       );
       resources.acquire("slack source", () => source?.close());

@@ -108,7 +108,14 @@ export interface RawChatIntegrationEvent extends RawEventMetadata {
 
 export interface RawSlackIntegrationEvent extends RawEventMetadata {
   sourceType: "slack";
-  rawPayload: { channel: string; ts: string; threadTs?: string; user: string };
+  rawPayload: {
+    channel: string;
+    ts: string;
+    threadTs?: string;
+    user: string;
+    /** The sender's verified workspace, kept for identity resolution (#1038). */
+    workspaceId?: string;
+  };
 }
 
 /** Timer ingress already owns a canonical payload; EventManager adds routing and durability. */
@@ -756,6 +763,7 @@ export class EventManager {
         ts: message.ts,
         threadTs: message.threadTs,
         senderName: message.user,
+        ...(message.workspaceId ? { workspaceId: message.workspaceId } : {}),
         priority: "responsive",
       },
       dedupeKey: raw.idempotencyKey ?? `${message.channel}:${message.ts}`,

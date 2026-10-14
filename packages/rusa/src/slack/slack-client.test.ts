@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { readSlackToken, SLACK_MESSAGE_LIMITS, SlackClient } from "./slack-client.js";
 
 describe("Slack token placement", () => {
@@ -711,5 +711,113 @@ describe("SlackClient.sendFileBytes", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe("SlackClient.identify (#1038)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  /** A promise's outcome so far, readable without awaiting it. */
+  function settled<T>(promise: Promise<T>) {
+    let outcome: { resolved: T } | { rejected: unknown } | undefined;
+    promise.then(
+      (resolved) => {
+        outcome = { resolved };
+      },
+      (rejected: unknown) => {
+        outcome = { rejected };
+      }
+    );
+    return { outcome: () => outcome };
+  }
+
+  it("reads the bot's user and its installation's team from one auth.test", async () => {
+    const { client, requests } = slackApi([
+      { body: { ok: true, user_id: "U0BOT", team_id: "T0HOME" } },
+      { body: { ok: true, user_id: "U0BOT", team_id: "" } },
+    ]);
+    await expect(client.identify({ atStartup: true })).resolves.toEqual({
+      userId: "U0BOT",
+      teamId: "T0HOME",
+    });
+    expect(client.installationWorkspaceId).toBe("T0HOME");
+    // A team Slack does not report is absent, never guessed, and a later read
+    // never moves the installation's workspace.
+    await expect(client.identify()).resolves.toEqual({ userId: "U0BOT" });
+    expect(client.installationWorkspaceId).toBe("T0HOME");
+    expect(requests.map((request) => request.method)).toEqual(["auth.test", "auth.test"]);
+  });
+
+  it("withholds the team of an Enterprise Grid installation", async () => {
+    const { client } = slackApi([
+      { body: { ok: true, user_id: "U0BOT", team_id: "T0HOME", enterprise_id: "E0GRID" } },
+      { body: { ok: true, user_id: "U0BOT", team_id: "T0HOME", is_enterprise_install: true } },
+      { body: { ok: true, user_id: "U0BOT", team_id: "T0HOME", enterprise_id: "" } },
+    ]);
+    // The bot's own user id still seeds self-detection; only the workspace is withheld.
+    await expect(client.identify({ atStartup: true })).resolves.toEqual({ userId: "U0BOT" });
+    await expect(client.identify({ atStartup: true })).resolves.toEqual({ userId: "U0BOT" });
+    expect(client.installationWorkspaceId).toBeUndefined();
+    // An empty enterprise id names no enterprise.
+    await expect(client.identify({ atStartup: true })).resolves.toEqual({
+      userId: "U0BOT",
+      teamId: "T0HOME",
+    });
+  });
+
+  it("gives up on a rate limit at startup however long it asks to wait", async () => {
+    vi.useFakeTimers();
+    const { client, fetch } = slackApi([
+      {
+        status: 429,
+        headers: { "retry-after": "3600" },
+        body: { ok: false, error: "ratelimited" },
+      },
+      { body: { ok: true, user_id: "U0BOT", team_id: "T0HOME" } },
+    ]);
+    const read = settled(client.identify({ atStartup: true }));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(read.outcome()).toMatchObject({ rejected: { retryAfter: 3600 } });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(client.installationWorkspaceId).toBeUndefined();
+  });
+
+  it("cancels a startup attempt that never answers and gives up after four", async () => {
+    vi.useFakeTimers();
+    // Node's AbortSignal.timeout runs on a timer fake timers cannot advance, so
+    // the test stands in one that they can, recording the bound it was given.
+    const bounds: number[] = [];
+    vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+      bounds.push(ms);
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("timed out", "TimeoutError")), ms);
+      return controller.signal;
+    });
+    const fetch = vi.fn(
+      (_url: string | URL, init?: { signal?: AbortSignal }) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        })
+    );
+    const client = new SlackClient("xoxb-synthetic", { fetch });
+    const read = settled(client.identify({ atStartup: true }));
+    // Four attempts of ten seconds and backoffs of 1, 2 and 4 seconds: 47 seconds.
+    await vi.advanceTimersByTimeAsync(47_000);
+    expect(read.outcome()).toMatchObject({ rejected: { code: "slack_webapi_request_error" } });
+    expect(fetch).toHaveBeenCalledTimes(4);
+    expect(bounds).toEqual([10_000, 10_000, 10_000, 10_000]);
+  });
+
+  it("fails a later read at once, leaving the retry to its caller", async () => {
+    const { client, fetch } = slackApi([
+      { status: 503, body: { ok: false } },
+      { status: 429, headers: { "retry-after": "30" }, body: { ok: false, error: "ratelimited" } },
+    ]);
+    await expect(client.identify()).rejects.toThrow(/statusCode = 503/);
+    await expect(client.identify()).rejects.toMatchObject({ retryAfter: 30 });
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });

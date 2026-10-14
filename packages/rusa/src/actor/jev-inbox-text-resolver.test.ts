@@ -15,7 +15,7 @@ const entry = (overrides: Record<string, unknown> = {}) => ({
 
 function deps(row: ReturnType<typeof entry> | null = entry()) {
   return {
-    inbox: { read: vi.fn(() => row) },
+    inbox: { read: vi.fn(() => row), slackMessageWorkspaces: vi.fn(() => []) },
     chatClient: {
       getMessage: vi.fn(async () => ({ name: "spaces/S/messages/M", text: "real chat text" })),
       getSpace: vi.fn(),
@@ -23,6 +23,7 @@ function deps(row: ReturnType<typeof entry> | null = entry()) {
     slackClient: {
       getMessage: vi.fn(async () => ({ channel: "C", ts: "1.2", text: "real slack text" })),
       getChannel: vi.fn(),
+      installationWorkspaceId: undefined,
     },
     meshChat: {
       getById: vi.fn(() => ({

@@ -1,4 +1,5 @@
 import type { ObligationPage } from "../db/repositories/obligation-repository.js";
+import { SLACK_ID } from "../db/repositories/slack-principal-binding-repository.js";
 import type { ObligationArtifact } from "../obligations/obligation.js";
 import type { PrincipalRef, UserPrincipal } from "../principals/principal-ref.js";
 import { inboxEntryReference } from "../references/inbox-reference.js";
@@ -49,20 +50,63 @@ export interface InboxSenderPrincipals {
 }
 
 /**
+ * What the Slack branch reads (#1038): the live connection's workspace, and
+ * the human an operator bound to an exact workspace/user pair, if that binding
+ * is active.
+ */
+export interface InboxSlackSenderBindings {
+  activeWorkspaceId: () => string | undefined;
+  activePrincipalId: (workspaceId: string, slackUserId: string) => string | undefined;
+}
+
+const SLACK_TS = /^\d+\.\d+$/;
+
+/**
  * The user principal who sent an inbox entry, or undefined when the sender is
  * not a known user. Only identities the mesh already trusts resolve, and
  * nothing is guessed from display names:
  * - a dashboard or voice message carries the authenticated principal as
  *   `fromId` on a `mesh:<fromId>` source, and that id must name a user row;
  * - a Google Chat message names its sender `users/{id}`, and that id must equal
- *   the Google account id a user's verified dashboard sign-in recorded.
+ *   the Google account id a user's verified dashboard sign-in recorded;
+ * - a Slack message resolves only through an operator's active binding of its
+ *   exact workspace and user id, read now rather than at ingestion. Its source,
+ *   channel, timestamp and message reference must agree, and the workspace
+ *   proven at ingestion must be the live connection's. A row without that
+ *   proof, from another workspace, or bound to nobody stays unmatched.
  * Unknown ids, disabled users, and other sources stay unmatched.
  */
 export function resolveInboxSenderPrincipal(
   entry: Pick<InboxEntry, "source" | "payload">,
-  principals: InboxSenderPrincipals
+  principals: InboxSenderPrincipals,
+  slack?: InboxSlackSenderBindings
 ): string | undefined {
   const { source, payload } = entry;
+  if (payload.type === "slack.message") {
+    const { channel, ts, messageRef, workspaceId, senderName } = payload;
+    if (
+      slack === undefined ||
+      typeof channel !== "string" ||
+      typeof ts !== "string" ||
+      typeof workspaceId !== "string" ||
+      typeof senderName !== "string" ||
+      !SLACK_ID.test(channel) ||
+      !SLACK_TS.test(ts) ||
+      !SLACK_ID.test(workspaceId) ||
+      !SLACK_ID.test(senderName) ||
+      source !== `slack:channels/${channel}` ||
+      messageRef !== `slack:channels/${channel}/messages/${ts}` ||
+      workspaceId !== slack.activeWorkspaceId()
+    ) {
+      return undefined;
+    }
+    const principalId = slack.activePrincipalId(workspaceId, senderName);
+    if (principalId === undefined) return undefined;
+    const principal = principals.get(principalId);
+    return principal?.kind === "user" && principal.disabledAt === undefined
+      ? principalId
+      : undefined;
+  }
   if (payload.type === "gchat.message") {
     const sender = payload.senderName;
     if (typeof sender !== "string" || !source.startsWith("gchat:")) return undefined;

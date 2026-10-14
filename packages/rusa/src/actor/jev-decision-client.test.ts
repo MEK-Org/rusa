@@ -299,7 +299,10 @@ describe("JEV interruption regressions (#710)", () => {
       ])
     );
     const resolve = createJevInboxTextResolver({
-      inbox: { read: (_actorId, entryId) => rows.get(entryId) ?? null },
+      inbox: {
+        read: (_actorId, entryId) => rows.get(entryId) ?? null,
+        slackMessageWorkspaces: () => [],
+      },
       chatClient: {
         getMessage: async (name: string) => ({
           name,

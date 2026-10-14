@@ -478,4 +478,21 @@ export class SqliteInboxRepository implements InboxRepository {
     // row visible rather than collapsing unrelated operator actions.
     return rows.map(toEntry);
   }
+
+  slackMessageWorkspaces(messageRef: string): string[] {
+    const channel = /^slack:channels\/([^/]+)\/messages\/[^/]+$/.exec(messageRef)?.[1];
+    if (channel === undefined) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT json_extract(payload_json, '$.workspaceId') AS workspaceId
+         FROM actor_inbox_entries
+         WHERE source = ?
+           AND json_extract(payload_json, '$.type') = 'slack.message'
+           AND json_extract(payload_json, '$.messageRef') = ?
+           AND json_type(payload_json, '$.workspaceId') = 'text'
+         ORDER BY workspaceId`
+      )
+      .all(`slack:channels/${channel}`, messageRef) as Array<{ workspaceId: string }>;
+    return rows.map((row) => row.workspaceId);
+  }
 }

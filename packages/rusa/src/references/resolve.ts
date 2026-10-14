@@ -63,10 +63,11 @@ export interface ReferenceResolverDeps {
   /** Resolve a pre-import actor address in a historical inbox citation. */
   resolveActorId?: (id: string) => string;
   meshChat?: Pick<MeshChatRepository, "getById">;
-  inbox?: Pick<InboxRepository, "read">;
+  /** Reads inbox rows, and the origin proof a Slack message reference is checked against. */
+  inbox?: Pick<InboxRepository, "read" | "slackMessageWorkspaces">;
   /** Reads a Google Chat message; absent when the chat edge is not configured. */
   chatClient?: Pick<ChatClient, "getMessage" | "getSpace">;
-  slackClient?: Pick<SlackClient, "getMessage" | "getChannel">;
+  slackClient?: Pick<SlackClient, "getMessage" | "getChannel" | "installationWorkspaceId">;
   /** Reads issues and pull requests; absent when no tracker is wired. */
   issueClient?: Partial<
     Pick<
@@ -264,6 +265,8 @@ async function resolveSlack(
   if (messagePart[0] !== "messages" || !/^\d+\.\d+$/.test(messagePart[1])) {
     return unresolved(reference, reference.key, "unrecognised Slack resource");
   }
+  const mismatch = slackWorkspaceMismatch(reference.key, deps);
+  if (mismatch) return unresolved(reference, reference.key, mismatch);
   const found = await deps.slackClient.getMessage(channel, messagePart[1]);
   const text = found.text ?? "";
   return {
@@ -277,6 +280,35 @@ async function resolveSlack(
     unavailable: text ? null : "message has no text",
     entity: { type: "slack_message", contents: text },
   };
+}
+
+/**
+ * Why a Slack message reference must not be read through the active
+ * connection, or null when it may be (#1038). The origin proof is the set of
+ * verified workspaces on the inbox rows that delivered this exact message.
+ * With no proof, the reference resolves as it always has, and a successful
+ * read implies no authority. With proof, the active connection's workspace
+ * must be known and equal every proven value, so a reference issued under one
+ * workspace is never shown as the cited decision through a connection to
+ * another. Nothing deletes inbox rows, so a recorded proof keeps applying.
+ * Checked before any network read, and the refusal carries no entity, so the
+ * reference cache stores nothing for it. The reference cache applies the
+ * same check to an entity it already holds before serving it, since that row
+ * may predate a change of workspace.
+ */
+export function slackWorkspaceMismatch(
+  messageRef: string,
+  deps: Pick<ReferenceResolverDeps, "inbox" | "slackClient">
+): string | null {
+  const proven = deps.inbox?.slackMessageWorkspaces(messageRef) ?? [];
+  if (proven.length === 0) return null;
+  const active = deps.slackClient?.installationWorkspaceId;
+  if (active === undefined) {
+    return "Slack workspace mismatch: the active connection's workspace is unknown";
+  }
+  return proven.every((workspaceId) => workspaceId === active)
+    ? null
+    : "Slack workspace mismatch: the message was received in another workspace";
 }
 
 const POSITIVE_INT = /^[1-9]\d*$/;

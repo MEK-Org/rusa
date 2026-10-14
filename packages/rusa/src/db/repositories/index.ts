@@ -26,6 +26,7 @@ import { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 import { RawInputRepository } from "./raw-input-repository.js";
 import { ReferenceCacheRepository } from "./reference-cache-repository.js";
 import { RunPromptRepository } from "./run-prompt-repository.js";
+import { SlackPrincipalBindingRepository } from "./slack-principal-binding-repository.js";
 import { SqliteActorRepository } from "./sqlite-actor-repository.js";
 import {
   type InboxListenerErrorHandler,
@@ -70,6 +71,7 @@ export class Repositories {
   readonly portableContext: DbPortableContextStore;
   readonly principals: PrincipalRepository;
   readonly referenceCache: ReferenceCacheRepository;
+  readonly slackPrincipalBindings: SlackPrincipalBindingRepository;
 
   constructor(db: Database.Database) {
     this.runPrompts = new RunPromptRepository(db);
@@ -101,6 +103,7 @@ export class Repositories {
     this.obligations.setPrincipalKind((principalId) => this.principals.get(principalId)?.kind);
     this.portableContext = new DbPortableContextStore(db);
     this.referenceCache = new ReferenceCacheRepository(db);
+    this.slackPrincipalBindings = new SlackPrincipalBindingRepository(db, this.principals);
   }
 
   /**

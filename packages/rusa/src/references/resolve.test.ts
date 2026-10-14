@@ -219,7 +219,7 @@ describe("#1005 legacy inbox citations", () => {
     });
     const ref = "mesh:actors/root/inbox/entry";
     const resolved = await resolveReference(ref, {
-      inbox: { read },
+      inbox: { read, slackMessageWorkspaces: () => [] },
       resolveActorId: (id) => (id === "root" ? "imported-uuid" : id),
     });
     expect(read).toHaveBeenCalledWith("imported-uuid", "entry");

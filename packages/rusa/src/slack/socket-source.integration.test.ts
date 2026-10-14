@@ -52,6 +52,35 @@ describe("Slack Socket Mode delivery", () => {
     );
     expect(ack).toHaveBeenCalledOnce();
   });
+
+  it("keeps the sender's workspace only when the envelope proves the installation's (#1038)", async () => {
+    const onMessage = vi.fn(async (_message: SlackInboundMessage) => {});
+    await new SlackSocketSource("app-token").start(onMessage, {
+      wakeModeFor: () => undefined,
+      installationWorkspaceId: "T0HOME",
+    });
+    const deliver = (eventId: string, teamId: string) =>
+      mock.listeners.get("slack_event")?.({
+        type: "events_api",
+        body: {
+          team_id: teamId,
+          event_id: eventId,
+          event: { type: "app_mention", channel: "C1", ts: "1720000000.000001", user: "U1" },
+        },
+        ack: async () => {},
+      });
+
+    await deliver("Ev-home", "T0HOME");
+    await deliver("Ev-other", "T0OTHER");
+
+    expect(onMessage.mock.calls.map(([message]) => [message.eventId, message.workspaceId])).toEqual(
+      [
+        ["Ev-home", "T0HOME"],
+        ["Ev-other", undefined],
+      ]
+    );
+    expect(onMessage.mock.calls[1]?.[0]).not.toHaveProperty("workspaceId");
+  });
 });
 
 describe("Slack receipt reaction (#609)", () => {

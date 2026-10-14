@@ -1,6 +1,7 @@
 import { SocketModeClient } from "@slack/socket-mode";
 import type { ChatWakeMode } from "../chat/wake-mode.js";
 import type { DurableEventDelivery, RawSlackIntegrationEvent } from "../runtime/event-manager.js";
+import { verifiedSenderWorkspace } from "./sender-workspace.js";
 import {
   mentionsSlackUser,
   type SlackWakeFacts,
@@ -16,6 +17,8 @@ export interface SlackInboundMessage extends SlackWakeFacts {
   threadTs?: string;
   /** The envelope that carried this message, kept for diagnostics only. */
   eventId: string;
+  /** The sender's verified workspace (#1038); absent when it cannot be proven. */
+  workspaceId?: string;
 }
 
 /**
@@ -135,6 +138,7 @@ export function slackInboxEvent(message: SlackInboundMessage): RawSlackIntegrati
       ts: message.ts,
       threadTs: message.threadTs,
       user: message.user,
+      ...(message.workspaceId ? { workspaceId: message.workspaceId } : {}),
     },
     idempotencyKey: `${message.channel}:${message.ts}`,
     priority: "responsive",
@@ -158,9 +162,14 @@ export class SlackSocketSource {
     this.socket = new SocketModeClient({ appToken });
   }
 
+  /**
+   * `installationWorkspaceId` is the team this connection's bot token belongs
+   * to. A message keeps a `workspaceId` only when its envelope agrees with it
+   * (#1038); without one, no message carries a workspace.
+   */
   async start(
     onMessage: (message: SlackInboundMessage) => Promise<void>,
-    policy: SlackWakePolicy = COMPATIBILITY_POLICY
+    policy: SlackWakePolicy & { installationWorkspaceId?: string } = COMPATIBILITY_POLICY
   ): Promise<void> {
     this.socket.on("slack_event", async ({ body, type, ack }) => {
       if (type !== "events_api") {
@@ -183,8 +192,9 @@ export class SlackSocketSource {
         await ack();
         return;
       }
+      const workspaceId = verifiedSenderWorkspace(body, policy.installationWorkspaceId);
       try {
-        await onMessage(message);
+        await onMessage(workspaceId === undefined ? message : { ...message, workspaceId });
         await ack();
       } catch (error) {
         this.onError(error);

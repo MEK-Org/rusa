@@ -171,6 +171,15 @@ export interface InboxRepository {
    * receive each item separately rather than a guessed coalesced group.
    */
   listRecentHandledEntries(limit?: number): InboxEntry[];
+  /**
+   * The distinct verified workspaces recorded on Slack message rows, for any
+   * actor, that carry exactly this `slack:channels/<channel>/messages/<ts>`
+   * reference: the origin proof reference resolution checks against the
+   * active connection (#1038). Rows without a workspace contribute nothing.
+   * The SQLite store searches the `actor_inbox_source` index rather than
+   * scanning the table.
+   */
+  slackMessageWorkspaces(messageRef: string): string[];
 }
 
 export function validateInboxPayload(payload: unknown): asserts payload is InboxPayload {
@@ -245,6 +254,9 @@ export class EmptyInboxRepository implements InboxRepository {
     return { handled: [], replacements: [] };
   }
   listRecentHandledEntries(_limit = 50): InboxEntry[] {
+    return [];
+  }
+  slackMessageWorkspaces(_messageRef: string): string[] {
     return [];
   }
 }

@@ -7,6 +7,7 @@ import {
   type ResolvedReferenceWithEntity,
   resolveReference,
   resolveReferenceSync,
+  slackWorkspaceMismatch,
 } from "./resolve.js";
 
 /**
@@ -151,6 +152,17 @@ export class ReferenceCacheService {
 
       if (valid && entity) {
         const base = resolveReferenceSync(key, deps);
+        // A message cached through one Slack workspace is never served
+        // through a connection to another, fresh or stale (#1038).
+        const refusal = entity.type === "slack_message" ? slackWorkspaceMismatch(key, deps) : null;
+        if (refusal) {
+          this.logger?.info("reference_cache_unavailable", {
+            scheme: reference.scheme,
+            type: entity.type,
+            refused: true,
+          });
+          return { ...base, unavailable: refusal, cacheState: "unavailable" };
+        }
         const title = deriveDisplayTitle(reference, entity) ?? base.title;
         if (now < refreshAfter) {
           // Fresh external hit

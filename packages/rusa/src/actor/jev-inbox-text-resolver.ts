@@ -15,7 +15,7 @@ import type { JevResolvedInboxEntry, ResolveJevInboxEntry } from "./jev-decision
 export const JEV_MAX_ENTRY_TEXT_CHARS = 4_000;
 export interface JevInboxTextResolverDeps
   extends Pick<ReferenceResolverDeps, "meshChat" | "chatClient" | "slackClient" | "issueClient"> {
-  inbox: Pick<InboxRepository, "read">;
+  inbox: Pick<InboxRepository, "read" | "slackMessageWorkspaces">;
 }
 
 /**

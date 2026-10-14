@@ -348,6 +348,7 @@ describe("brief MCP server: citations must exist", () => {
         slackClient: {
           getMessage: async () => ({ channel: "C1", text: "", ts: "1.1" }),
           getChannel: async () => ({ id: "C1", name: "synthetic" }),
+          installationWorkspaceId: undefined,
         },
         issueClient: {
           getPullRequestReview: async () => ({

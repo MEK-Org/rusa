@@ -8,6 +8,7 @@ import type { InboxEntry, InboxPayload } from "../../repositories/inbox-reposito
 import { actorInbox } from "../migrations/0003_actor_inbox.js";
 import { actorInboxSeen } from "../migrations/0012_actor_inbox_seen.js";
 import { actorInboxHandledNote } from "../migrations/0015_actor_inbox_handled_note.js";
+import { slackPrincipalBindings } from "../migrations/0063_slack_principal_bindings.js";
 import { Repositories } from "./index.js";
 import { SqliteInboxRepository } from "./sqlite-inbox-repository.js";
 
@@ -44,6 +45,62 @@ describe("SqliteInboxRepository", () => {
     actorInboxSeen.up(db);
     actorInboxHandledNote.up(db);
     store = new SqliteInboxRepository(db, () => new Date("2026-07-13T12:00:00.000Z"));
+  });
+
+  it("proves a Slack message's workspaces only from rows delivering that exact message (#1038)", () => {
+    const ref = "slack:channels/C123/messages/1720000000.000001";
+    const row = (actorId: string, source: string, payload: InboxPayload) => ({
+      actorId,
+      source,
+      payload,
+    });
+    const message = { type: "slack.message", messageRef: ref, channel: "C123" };
+    store.append([
+      row("actor-a", "slack:channels/C123", { ...message, workspaceId: "T0HOME" }),
+      row("actor-b", "slack:channels/C123", { ...message, workspaceId: "T0HOME" }),
+      row("actor-c", "slack:channels/C123", { ...message, workspaceId: "T0SECOND" }),
+      row("actor-d", "slack:channels/C123", message),
+      row("actor-e", "slack:channels/C123", { ...message, workspaceId: 7 }),
+      row("actor-f", "slack:channels/C999", { ...message, workspaceId: "T0SOURCE" }),
+      row("actor-g", "slack:channels/C123", {
+        ...message,
+        type: "slack.reaction",
+        workspaceId: "T0TYPE",
+      }),
+      row("actor-h", "slack:channels/C123", {
+        ...message,
+        messageRef: "slack:channels/C123/messages/1720000000.000002",
+        workspaceId: "T0MESSAGE",
+      }),
+    ]);
+
+    expect(store.slackMessageWorkspaces(ref)).toEqual(["T0HOME", "T0SECOND"]);
+    expect(store.slackMessageWorkspaces("slack:channels/C123/messages/1720000000.000009")).toEqual(
+      []
+    );
+    expect(store.slackMessageWorkspaces("slack:channels/C123")).toEqual([]);
+  });
+
+  it("searches the source index for a Slack message's workspaces instead of scanning the inbox (#1038)", () => {
+    slackPrincipalBindings.up(db);
+    const ref = "slack:channels/C123/messages/1720000000.000001";
+    const prepare = vi.spyOn(db, "prepare");
+    store.slackMessageWorkspaces(ref);
+    const sql = prepare.mock.calls.at(-1)?.[0];
+    prepare.mockRestore();
+    expect(sql).toContain("FROM actor_inbox_entries");
+
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all("slack:channels/C123", ref) as Array<{
+      detail: string;
+    }>;
+    const inbox = plan
+      .map((step) => step.detail)
+      .filter((detail) => /actor_inbox_entries/.test(detail));
+    expect(inbox).toEqual([
+      expect.stringMatching(
+        /^SEARCH actor_inbox_entries USING INDEX actor_inbox_source \(source=\?\)$/
+      ),
+    ]);
   });
 
   it("lists handled activity per durable entry instead of inferring a timestamp batch", () => {

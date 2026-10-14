@@ -28,9 +28,11 @@ import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { ReferenceCacheRepository } from "../db/repositories/reference-cache-repository.js";
+import { SlackPrincipalBindingRepository } from "../db/repositories/slack-principal-binding-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 
 import { createLogger } from "../observability/logger.js";
+import type { UserPrincipal } from "../principals/principal-ref.js";
 import { assertConcreteModelConfig } from "../providers/model-config.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
@@ -138,6 +140,13 @@ const googleVoiceConfig = (voiceName: string) => ({
   provider: "google" as const,
   config: { voiceName },
 });
+
+/** The authenticated dashboard session a test request carries; none unless a test sets one. */
+const dashboardSession = vi.hoisted(() => ({ current: undefined as UserPrincipal | undefined }));
+vi.mock("./auth.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./auth.js")>()),
+  getDashboardRequestPrincipal: () => dashboardSession.current,
+}));
 
 const UUID_A = "aaaaaaaa-0000-4000-8000-000000000001";
 const UUID_B = "bbbbbbbb-0000-4000-8000-000000000002";
@@ -1017,6 +1026,212 @@ describe("handleMeshApiRequest", () => {
     const { res } = await call(deps, "GET", "/api/mesh/control/options");
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ providers: ["agy", "codex"] });
+  });
+
+  describe("/api/mesh/slack/principal-bindings (#1038)", () => {
+    // Synthetic Slack ids; not a real workspace or user.
+    const PATH = "/api/mesh/slack/principal-bindings";
+    let bindings: SlackPrincipalBindingRepository;
+    let bindingDeps: DashboardDataDeps;
+    /** A second human, disabled unless a test enables it, so LOCAL_USER stays the sole operator. */
+    let human: string;
+
+    beforeEach(() => {
+      bindings = new SlackPrincipalBindingRepository(db, principals);
+      bindingDeps = { ...deps, slackPrincipalBindings: bindings };
+      human = principals.createUser({
+        email: "human@example.com",
+        createdAt: "2026-06-21T00:00:00.000Z",
+      }).id;
+      principals.setDisabled(human, "2026-06-22T00:00:00.000Z");
+      dashboardSession.current = principals.getUser(LOCAL_USER);
+    });
+    afterEach(() => {
+      dashboardSession.current = undefined;
+    });
+
+    const auditCount = () =>
+      (
+        db.prepare("SELECT COUNT(*) AS n FROM slack_principal_binding_events").get() as {
+          n: number;
+        }
+      ).n;
+    const send = async (localDeps: DashboardDataDeps, body: Record<string, unknown>) => {
+      const { res } = await call(localDeps, "POST", PATH, JSON.stringify(body));
+      await settled(res);
+      return { status: res.statusCode, body: JSON.parse(res.body) };
+    };
+    const grantBody = (principalId: string, slackUserId = "U0ONE") => ({
+      action: "grant",
+      workspaceId: "T0HOME",
+      slackUserId,
+      principalId,
+      decisionRef: "mesh:messages/decision",
+    });
+
+    it("grants, lists and revokes as the operator, recording who decided", async () => {
+      expect(await send(bindingDeps, grantBody(human))).toMatchObject({ status: 400 });
+
+      const granted = await send(bindingDeps, grantBody(LOCAL_USER));
+      expect(granted).toEqual({
+        status: 200,
+        body: {
+          changed: true,
+          binding: {
+            workspaceId: "T0HOME",
+            slackUserId: "U0ONE",
+            principalId: LOCAL_USER,
+            grantedAt: expect.any(String),
+            grantedBy: LOCAL_USER,
+            grantRef: "mesh:messages/decision",
+          },
+        },
+      });
+      expect(await send(bindingDeps, grantBody(LOCAL_USER))).toMatchObject({
+        status: 200,
+        body: { changed: false },
+      });
+
+      // Another human holds U0TWO; granting it to the operator is not a silent rebind.
+      principals.setDisabled(human, null);
+      bindings.grant({
+        ...grantBody(human, "U0TWO"),
+        operatorId: LOCAL_USER,
+        at: "2026-06-22T00:00:00.000Z",
+      });
+      principals.setDisabled(human, "2026-06-22T00:00:00.000Z");
+      expect(await send(bindingDeps, grantBody(LOCAL_USER, "U0TWO"))).toMatchObject({
+        status: 409,
+      });
+      expect(bindings.activePrincipalId("T0HOME", "U0TWO")).toBe(human);
+
+      const listed = await call(bindingDeps, "GET", PATH);
+      expect(
+        JSON.parse(listed.res.body).bindings.map((b: { slackUserId: string }) => b.slackUserId)
+      ).toEqual(["U0ONE", "U0TWO"]);
+
+      expect(
+        await send(bindingDeps, {
+          action: "revoke",
+          workspaceId: "T0HOME",
+          slackUserId: "U0ONE",
+          decisionRef: "mesh:messages/revoked",
+        })
+      ).toMatchObject({
+        status: 200,
+        body: {
+          changed: true,
+          binding: { revokedBy: LOCAL_USER, revokeRef: "mesh:messages/revoked" },
+        },
+      });
+      expect(bindings.activePrincipalId("T0HOME", "U0ONE")).toBeUndefined();
+      expect(
+        db
+          .prepare(
+            `SELECT action, operator_id FROM slack_principal_binding_events
+             WHERE workspace_id = 'T0HOME' AND slack_user_id = 'U0ONE' ORDER BY id`
+          )
+          .all()
+          .map((event) => Object.values(event as object))
+      ).toEqual([
+        ["grant", LOCAL_USER],
+        ["revoke", LOCAL_USER],
+      ]);
+    });
+
+    it("refuses malformed requests without writing", async () => {
+      const cases: Array<[Record<string, unknown>, number]> = [
+        [grantBody(LOCAL_USER, "Local Operator"), 400],
+        [grantBody(LOCAL_USER, "operator@example.com"), 400],
+        [{ ...grantBody(LOCAL_USER), workspaceId: undefined }, 400],
+        [{ ...grantBody(LOCAL_USER), decisionRef: "" }, 400],
+        [grantBody(UUID_A), 400],
+        [grantBody("system:mesh"), 400],
+        [{ ...grantBody(LOCAL_USER), action: "rebind" }, 400],
+        [
+          {
+            action: "revoke",
+            workspaceId: "T0HOME",
+            slackUserId: "U0NONE",
+            decisionRef: "mesh:messages/r",
+          },
+          404,
+        ],
+      ];
+      for (const [body, status] of cases) {
+        expect((await send(bindingDeps, body)).status, JSON.stringify(body)).toBe(status);
+      }
+      const { res } = await call(bindingDeps, "POST", PATH, "not json");
+      await settled(res);
+      expect(res.statusCode).toBe(400);
+      expect((await call(bindingDeps, "DELETE", PATH)).res.statusCode).toBe(405);
+      expect(bindings.list()).toEqual([]);
+    });
+
+    it("refuses writes on an auth-disabled instance, even with one enabled user", async () => {
+      dashboardSession.current = undefined;
+      bindings.grant({
+        ...grantBody(LOCAL_USER, "U0TWO"),
+        operatorId: LOCAL_USER,
+        at: "2026-06-22T00:00:00.000Z",
+      });
+      const before = { bindings: bindings.list(), audit: auditCount() };
+
+      const grant = await send(bindingDeps, grantBody(LOCAL_USER));
+      expect(grant.status).toBe(403);
+      expect(grant.body.error).toContain("authenticated dashboard operator");
+      const revoke = await send(bindingDeps, {
+        action: "revoke",
+        workspaceId: "T0HOME",
+        slackUserId: "U0TWO",
+        decisionRef: "mesh:messages/revoked",
+      });
+      expect(revoke.status).toBe(403);
+
+      expect({ bindings: bindings.list(), audit: auditCount() }).toEqual(before);
+      // The existing binding still resolves its sender, and reads keep the #460 gate.
+      expect(bindings.activePrincipalId("T0HOME", "U0TWO")).toBe(LOCAL_USER);
+      expect((await call(bindingDeps, "GET", PATH)).res.statusCode).toBe(200);
+    });
+
+    it.each([
+      ["no session, several enabled users", () => principals.setDisabled(human, null), undefined],
+      [
+        "a disabled session principal",
+        () => principals.setDisabled(LOCAL_USER, "2026-06-23T00:00:00.000Z"),
+        "not an enabled user",
+      ],
+      [
+        "a session principal missing from storage",
+        () => {
+          dashboardSession.current = {
+            kind: "user",
+            id: "ghost",
+            createdAt: "2026-06-21T00:00:00.000Z",
+            email: "ghost@example.com",
+          };
+        },
+        "not an enabled user",
+      ],
+    ])("refuses a write from %s without writing", async (_case, arrange, fragment) => {
+      if (fragment === undefined) dashboardSession.current = undefined;
+      arrange();
+      const refused = await send(bindingDeps, grantBody(human));
+      expect(refused.status).toBe(403);
+      if (fragment) expect(refused.body.error).toContain(fragment);
+      expect(bindings.list()).toEqual([]);
+      expect(auditCount()).toBe(0);
+    });
+
+    it("refuses an unidentified operator's read", async () => {
+      dashboardSession.current = undefined;
+      principals.setDisabled(human, null);
+      expect((await call(bindingDeps, "GET", PATH)).res.statusCode).toBe(403);
+    });
+
+    it("reports missing storage rather than pretending to bind", async () => {
+      expect((await send(deps, grantBody(LOCAL_USER))).status).toBe(503);
+    });
   });
 
   describe("per-actor voice routes", () => {

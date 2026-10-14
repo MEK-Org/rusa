@@ -123,6 +123,10 @@ class FakeInboxStore implements InboxRepository {
   replaceEntries(): { handled: MarkHandledResult[]; replacements: InboxEntry[] } {
     return { handled: [], replacements: [] };
   }
+
+  slackMessageWorkspaces(): string[] {
+    return [];
+  }
 }
 
 function createRoutingKernel(opts: {
@@ -178,6 +182,25 @@ describe("EventManager", () => {
       "slack:channels/C123/messages/1720000000.000001"
     );
     expect(inbox.entries).toHaveLength(1);
+  });
+
+  it("keeps a verified Slack workspace on the payload and adds none without one (#1038)", () => {
+    const resolver: EventRoutingKernel = {
+      resolveOwner: unusedLadder,
+      allOutcomesCheckSuiteOwners: () => [],
+      resolveRecipients: () => ({ directed: false, ownerIds: ["root"], subscriberIds: [] }),
+    };
+    const manager = new EventManager({ inboxStore: new FakeInboxStore(), resolver });
+    const message = { channel: "C123", ts: "1720000000.000001", user: "U123" };
+
+    const verified = manager.normalizeEvent({
+      sourceType: "slack",
+      rawPayload: { ...message, workspaceId: "T0HOME" },
+    });
+    const unverified = manager.normalizeEvent({ sourceType: "slack", rawPayload: message });
+
+    expect(verified?.payload).toMatchObject({ senderName: "U123", workspaceId: "T0HOME" });
+    expect(unverified?.payload).not.toHaveProperty("workspaceId");
   });
   describe("Normalization without changing public payloads", () => {
     it("normalizes GitHub webhook payloads preserving exact issue/comment payload contracts", async () => {

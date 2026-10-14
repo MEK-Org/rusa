@@ -30,6 +30,10 @@ import {
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import type { RunPromptRepository } from "../db/repositories/run-prompt-repository.js";
 import {
+  SlackPrincipalBindingError,
+  type SlackPrincipalBindingRepository,
+} from "../db/repositories/slack-principal-binding-repository.js";
+import {
   type Obligation,
   type ObligationStatus,
   SnoozeTimerUnavailableError,
@@ -78,6 +82,8 @@ import {
 export interface DashboardDataDeps {
   actors: ActorRepository;
   principals?: PrincipalRepository;
+  /** Operator-managed Slack identity bindings (#1038). Absent → that route 503s. */
+  slackPrincipalBindings?: SlackPrincipalBindingRepository;
   /** Application logger for route diagnostics. Absent → nothing is logged. */
   logger?: Logger;
   meshEvents: MeshEventRepository;
@@ -872,6 +878,112 @@ export function requireOperatorPrincipal(
   return null;
 }
 
+const SLACK_PRINCIPAL_BINDINGS_PATH = "/api/mesh/slack/principal-bindings";
+
+/**
+ * The enabled user behind an authenticated dashboard session, or a 403. Unlike
+ * requireOperatorPrincipal there is no sole-active-user fallback, so an
+ * auth-disabled instance is always refused.
+ */
+function requireAuthenticatedOperator(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: Pick<DashboardDataDeps, "principals"> | null
+): string | null {
+  const session = getDashboardRequestPrincipal(req);
+  if (!session) {
+    sendJson(res, 403, {
+      error:
+        "changing a Slack identity binding requires an authenticated dashboard operator; configure dashboard auth",
+    });
+    return null;
+  }
+  const operator = deps?.principals?.getUser(session.id);
+  if (!operator || operator.disabledAt !== undefined) {
+    sendJson(res, 403, { error: "the authenticated operator is not an enabled user principal" });
+    return null;
+  }
+  return operator.id;
+}
+
+const SLACK_BINDING_ERROR_STATUS = { invalid: 400, not_found: 404, conflict: 409 } as const;
+
+/**
+ * Operator administration of Slack identity bindings (#1038). GET lists every
+ * binding, active and revoked. POST `{action: "grant", workspaceId,
+ * slackUserId, principalId, decisionRef}` binds the exact Slack pair an
+ * operator attests to an existing enabled human; `{action: "revoke",
+ * workspaceId, slackUserId, decisionRef}` ends it. Reads take the ordinary
+ * operator gate. A write attests that a Slack account is a particular human,
+ * so it needs an authenticated operator session: the auth-disabled sole-user
+ * fallback attributes an action without attesting anyone, and a caller-supplied
+ * decisionRef is not authentication. The operator is recorded as the granting
+ * or revoking party. There is no actor tool and no automatic enrollment: this
+ * route is the only way a binding is made.
+ */
+function handleSlackPrincipalBindings(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: DashboardDataDeps | null
+): void {
+  if (req.method !== "GET" && req.method !== "POST") {
+    sendJson(res, 405, { error: "method not allowed" });
+    return;
+  }
+  const operatorId =
+    req.method === "GET"
+      ? requireOperatorPrincipal(req, res, deps)
+      : requireAuthenticatedOperator(req, res, deps);
+  if (!operatorId) return;
+  const bindings = deps?.slackPrincipalBindings;
+  if (!bindings) {
+    sendJson(res, 503, { error: "Slack principal binding storage unavailable" });
+    return;
+  }
+  if (req.method === "GET") {
+    sendJson(res, 200, { bindings: bindings.list() });
+    return;
+  }
+  readBody(req)
+    .then((bodyStr) => {
+      let body: Record<string, unknown>;
+      try {
+        const parsed: unknown = JSON.parse(bodyStr);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          throw new Error("not an object");
+        }
+        body = parsed as Record<string, unknown>;
+      } catch {
+        sendJson(res, 400, { error: "Invalid JSON body" });
+        return;
+      }
+      const text = (key: string) => (typeof body[key] === "string" ? body[key] : "");
+      const common = {
+        workspaceId: text("workspaceId"),
+        slackUserId: text("slackUserId"),
+        operatorId,
+        decisionRef: text("decisionRef"),
+        at: new Date().toISOString(),
+      };
+      try {
+        if (body.action === "grant") {
+          sendJson(res, 200, bindings.grant({ ...common, principalId: text("principalId") }));
+        } else if (body.action === "revoke") {
+          sendJson(res, 200, bindings.revoke(common));
+        } else {
+          sendJson(res, 400, { error: 'action must be "grant" or "revoke"' });
+        }
+      } catch (err) {
+        if (err instanceof SlackPrincipalBindingError) {
+          sendJson(res, SLACK_BINDING_ERROR_STATUS[err.code], { error: err.message });
+          return;
+        }
+        throw err;
+      }
+    })
+    .catch((err) => sendJson(res, 500, { error: String(err) }));
+}
+
 /**
  * The participant set a `/api/mesh/chat` query may read (#590). The viewer's
  * durable id is always included, so an actor selection reads the viewer's
@@ -969,6 +1081,11 @@ export async function handleMeshApiRequest(
   let resolvedScope: HumanChatScope | undefined;
   const viewerScope = (): HumanChatScope =>
     (resolvedScope ??= resolveHumanChatScope(req, deps?.principals));
+
+  if (pathname === SLACK_PRINCIPAL_BINDINGS_PATH) {
+    handleSlackPrincipalBindings(req, res, deps);
+    return true;
+  }
 
   if (req.method === "POST") {
     if (pathname === "/api/mesh/actors") {

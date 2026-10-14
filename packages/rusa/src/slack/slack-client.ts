@@ -4,6 +4,7 @@ import { basename, join, resolve } from "node:path";
 import { ErrorCode, type FetchFunction, WebClient } from "@slack/web-api";
 import { boundedResponse } from "../chat/bounded-response.js";
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
+import { namesEnterprise } from "./sender-workspace.js";
 
 export function readSlackToken(path: string, home: string): string {
   const secretsDir = secretsDirPath(home);
@@ -531,6 +532,21 @@ function sizeLimitError(maxBytes: number): Error {
   return new Error(`file size limit exceeded: file is larger than ${maxBytes} bytes`);
 }
 
+/** The installed bot's own Slack identity, as `auth.test` reports it. */
+export interface SlackBotIdentity {
+  userId: string;
+  /**
+   * The installation's workspace; absent when Slack reports none or reports an
+   * Enterprise Grid organization, which no verified contract covers yet.
+   */
+  teamId?: string;
+}
+
+/** Three retries with backoffs of 1, 2 and 4 seconds. */
+const STARTUP_RETRY = { retries: 3, factor: 2, minTimeout: 1000, maxTimeout: 4000 };
+/** Each startup attempt is cancelled after this long, then retried. */
+const STARTUP_ATTEMPT_TIMEOUT_MS = 10_000;
+
 export class SlackClient {
   readonly web: WebClient;
   /**
@@ -544,7 +560,17 @@ export class SlackClient {
    * failure is never sent again, which could post the files twice.
    */
   readonly historyWeb: WebClient;
+  /**
+   * The client for the one identity read made before the socket starts. Each
+   * attempt is cancelled after ten seconds and a failure is retried three
+   * times, so a brief outage at boot still resolves while the read always
+   * settles within about 47 seconds: four attempts of ten seconds plus seven
+   * of backoff. A rate limit fails at once rather than being waited out, since
+   * Slack's retry-after has no upper bound (#1038).
+   */
+  readonly startupWeb: WebClient;
   readonly #botToken: string;
+  #installationWorkspaceId: string | undefined;
 
   constructor(botToken: string, options: { fetch?: FetchFunction } = {}) {
     this.web = new WebClient(botToken, options);
@@ -553,14 +579,44 @@ export class SlackClient {
       rejectRateLimitedCalls: true,
       retryConfig: { retries: 0 },
     });
+    this.startupWeb = new WebClient(botToken, {
+      ...options,
+      rejectRateLimitedCalls: true,
+      retryConfig: STARTUP_RETRY,
+      timeout: STARTUP_ATTEMPT_TIMEOUT_MS,
+    });
     this.#botToken = botToken;
   }
 
-  /** The installed bot's own Slack identity, as `auth.test` reports it for this token. */
-  async identify(): Promise<{ userId: string }> {
-    const response = await this.historyWeb.auth.test();
+  /**
+   * The workspace this connection is installed in, as the startup identity
+   * read reported it (#1038). Undefined until that read succeeds, and for the
+   * life of the connection when it fails or reports Enterprise Grid, so every
+   * workspace check against it fails closed.
+   */
+  get installationWorkspaceId(): string | undefined {
+    return this.#installationWorkspaceId;
+  }
+
+  /**
+   * The installed bot's own Slack identity, from one `auth.test` for this
+   * token: its user id and, when Slack reports one outside Enterprise Grid,
+   * the team id of the workspace it is installed in (#1038). The startup read
+   * retries briefly (see {@link startupWeb}) and records the team as
+   * {@link installationWorkspaceId}; any later read fails promptly (see
+   * {@link historyWeb}) and leaves it unchanged.
+   */
+  async identify(options: { atStartup?: boolean } = {}): Promise<SlackBotIdentity> {
+    const web = options.atStartup ? this.startupWeb : this.historyWeb;
+    const response = await web.auth.test();
     if (!response.user_id) throw new Error("Slack auth.test did not return the bot's user id");
-    return { userId: response.user_id };
+    const grid = namesEnterprise(response.enterprise_id) || response.is_enterprise_install === true;
+    const teamId =
+      !grid && typeof response.team_id === "string" && response.team_id !== ""
+        ? response.team_id
+        : undefined;
+    if (options.atStartup) this.#installationWorkspaceId = teamId;
+    return teamId ? { userId: response.user_id, teamId } : { userId: response.user_id };
   }
 
   async getChannel(channel: string): Promise<{ id: string; name: string }> {

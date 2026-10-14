@@ -142,6 +142,7 @@ export interface WebhookServerOptions {
 export interface DashboardMeshRefs {
   actors: ActorRepository;
   principals?: PrincipalRepository;
+  slackPrincipalBindings?: DashboardDataDeps["slackPrincipalBindings"];
   meshEvents: MeshEventRepository;
   /** Optional content-free timing recorder, owned by the live start wiring. */
   timings?: DashboardDataDeps["timings"];
@@ -658,6 +659,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
       ? {
           actors: options.mesh.actors,
           principals,
+          slackPrincipalBindings: options.mesh.slackPrincipalBindings,
           logger: options.logger,
           meshEvents: options.mesh.meshEvents,
           timings: options.mesh.timings,

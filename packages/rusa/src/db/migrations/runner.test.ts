@@ -115,6 +115,7 @@ describe("Database Migration System", () => {
       "0059_obligation_completion_matchers",
       "0060_configured_actor_import",
       "0062_portable_brief_revisions",
+      "0063_slack_principal_bindings",
     ]);
 
     const tableNames = (
