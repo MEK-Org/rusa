@@ -685,9 +685,6 @@ it("retains follower session across 20s-hold vs 25s-abort race without duplicate
         // The leader completes its 20-second long poll, but a lost response
         // leaves the follower waiting until its 25-second client timeout.
         dropPollResponse = true;
-        res.on("close", () => {
-          heldPoll = undefined;
-        });
       } else if (pollSessions.length > 2) {
         heldPoll = res;
         return;
@@ -830,3 +827,139 @@ it("retains follower session across 20s-hold vs 25s-abort race without duplicate
     rmSync(home, { recursive: true, force: true });
   }
 }, 50_000);
+
+it("does not let a stale events 410 clear a re-registered follower session", async () => {
+  const home = mkdtempSync(join(tmpdir(), "rusa-follower-stale-events-"));
+  const token = randomBytes(32).toString("hex");
+  const tokenFile = join(home, "token");
+  writeFileSync(tokenFile, token, { mode: 0o600 });
+
+  let registerCount = 0;
+  let initialPollDelivered = false;
+  let heldEvents: ServerResponse | undefined;
+  let pendingInvalidationPoll: ServerResponse | undefined;
+  let heldNewSessionPoll: ServerResponse | undefined;
+  let heldContinuedPoll: ServerResponse | undefined;
+  let newSessionPollCount = 0;
+  const sessions = ["session-1", "session-2", "unexpected-session-3"];
+
+  function invalidateInitialPoll(response: ServerResponse): void {
+    pendingInvalidationPoll = undefined;
+    response.writeHead(410, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "Session expired" }));
+  }
+
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
+    const path = req.url ?? "/";
+
+    if (path === "/register") {
+      const session = sessions[registerCount++] ?? `unexpected-session-${registerCount}`;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ session, protocolVersion: INSTANCE_PROTOCOL_VERSION }));
+      return;
+    }
+
+    if (path === "/poll") {
+      if (body.session === "session-1") {
+        if (!initialPollDelivered) {
+          initialPollDelivered = true;
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify([
+              {
+                actorId: "actor-stale-events",
+                message: {
+                  type: "init",
+                  bootstrap: {
+                    id: "actor-stale-events",
+                    cwd: "/ignored",
+                    providerOptions: { name: "fake", providers: { fake: { type: "fake" } } },
+                  },
+                },
+              },
+            ])
+          );
+        } else if (heldEvents) {
+          invalidateInitialPoll(res);
+        } else {
+          pendingInvalidationPoll = res;
+        }
+        return;
+      }
+
+      if (body.session === "session-2") {
+        newSessionPollCount++;
+        if (newSessionPollCount === 1) heldNewSessionPoll = res;
+        else heldContinuedPoll = res;
+        return;
+      }
+    }
+
+    if (path === "/events") {
+      if (body.session === "session-1") {
+        heldEvents = res;
+        if (pendingInvalidationPoll) invalidateInitialPoll(pendingInvalidationPoll);
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({}));
+      return;
+    }
+
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({}));
+  });
+
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const port = (server.address() as { port: number }).port;
+  const child = spawn(
+    process.execPath,
+    [
+      resolve("build/follower/follower.js"),
+      "--leader",
+      `http://127.0.0.1:${port}`,
+      "--id",
+      "test-stale-events",
+      "--home",
+      home,
+      "--token-file",
+      tokenFile,
+      "--sandbox",
+      "none",
+    ],
+    { stdio: ["ignore", "pipe", "pipe"] }
+  );
+  const exited = once(child, "exit");
+
+  try {
+    await waitUntil(() => heldEvents !== undefined && heldNewSessionPoll !== undefined, 10_000);
+    expect(registerCount).toBe(2);
+
+    const staleEvents = heldEvents;
+    if (!staleEvents) throw new Error("Expected held stale events response");
+    heldEvents = undefined;
+    staleEvents.writeHead(410, { "content-type": "application/json" });
+    staleEvents.end(JSON.stringify({ error: "Session expired" }));
+
+    const firstNewSessionPoll = heldNewSessionPoll;
+    if (!firstNewSessionPoll) throw new Error("Expected held new-session poll");
+    heldNewSessionPoll = undefined;
+    firstNewSessionPoll.writeHead(200, { "content-type": "application/json" });
+    firstNewSessionPoll.end(JSON.stringify([]));
+
+    await waitUntil(() => heldContinuedPoll !== undefined || registerCount > 2, 5_000);
+    expect(registerCount).toBe(2);
+    expect(heldContinuedPoll).toBeDefined();
+  } finally {
+    heldContinuedPoll?.writeHead(200, { "content-type": "application/json" });
+    heldContinuedPoll?.end(JSON.stringify([]));
+    child.kill("SIGTERM");
+    await exited;
+    server.closeAllConnections();
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 30_000);
