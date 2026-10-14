@@ -56,6 +56,7 @@ import {
   reconcileEventSources,
   resourceKey,
 } from "../actor/event-subscriptions.js";
+import { COMPACTED_MEMORY_DELTA_EXPERIMENT } from "../actor/experiments.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import {
   FailureEscalationBackoff,
@@ -112,6 +113,11 @@ import {
   quarantineCountsByClass,
   resolvePortableContextCompactorModel,
 } from "../actor/portable-context-compactor.js";
+import {
+  type PortableJournalMode,
+  type PortableJournalRecord,
+  selectDeltaJournal,
+} from "../actor/portable-context-delta.js";
 import type { PortableContextStore } from "../actor/portable-context-state.js";
 import {
   type PoolLaneCandidate,
@@ -169,6 +175,7 @@ import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
 import { importLegacyPortableContextState } from "../db/legacy-portable-context-import.js";
+import type { PortableLedgerSource } from "../db/repositories/actor-run-repository.js";
 import type {
   ObligationStatusChange,
   PrerequisiteAttention,
@@ -835,6 +842,35 @@ export function warnMissingConfiguredEventSubscriptionsAtBoot(
 }
 
 /**
+ * Page ceiling on the unfolded tail a delta-mode prompt reads (#1062). Fifty
+ * sources a page; the journal's own count and byte budgets apply after this,
+ * so the ceiling only bounds the read, never what the ledger will fold.
+ */
+export const PORTABLE_CONTEXT_DELTA_MAX_PAGES = 4;
+
+/**
+ * The durable sources after the ledger's fold cursor, oldest first — exactly
+ * what the next fold will consume. `truncated` reports that the tail ran past
+ * the page ceiling; the sources kept are the OLDEST, so the newest-message cap
+ * below is applied by `selectDeltaJournal` on what was read.
+ */
+export function readUnfoldedLedgerSources(
+  actorId: string,
+  afterSourceId: string | null,
+  maxPages = PORTABLE_CONTEXT_DELTA_MAX_PAGES
+): { sources: PortableLedgerSource[]; truncated: boolean } {
+  const sources: PortableLedgerSource[] = [];
+  let cursor = afterSourceId;
+  for (let page = 0; page < maxPages; page++) {
+    const result = getRepositories().actorRuns.listLedgerSourcesAfter(actorId, cursor, 50);
+    sources.push(...result.sources);
+    if (!result.hasMore) return { sources, truncated: false };
+    cursor = result.sources.at(-1)?.id ?? cursor;
+  }
+  return { sources, truncated: true };
+}
+
+/**
  * Assemble a portable-context (design ISSUE_NUM) actor's
  * stateless prefix from its own durable recent run outputs, plus the per-run inject
  * record that rides on the run's `run_start` event. Returns undefined when there's
@@ -849,43 +885,87 @@ export function warnMissingConfiguredEventSubscriptionsAtBoot(
 function assemblePortableInjection(
   id: string,
   mode: "tail" | "ledger",
-  store: PortableContextStore
+  store: PortableContextStore,
+  journal: PortableJournalMode = "window",
+  onDeltaFallback: (error: unknown) => void = () => {}
 ): { priorContext: string; injectRecord: InjectRecord } | undefined {
   const repositories = getRepositories();
   const runs = repositories.actorRuns
     .listRecentCompleted(id, portableContextMaxRuns())
     .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
-  const portable =
-    mode === "ledger"
-      ? assemblePortableContextV2({
-          state: store.load(id),
-          messages: repositories.meshChat
-            .listReceivedForActor(id, { limit: portableContextMaxMessages() })
-            .map((message) => ({
-              id: message.id,
-              ts: message.ts,
-              sender: message.senderId,
-              body: message.body,
-            })),
-          runs,
-          // Read-through only. The prompt shows work state; it never authors it
-          // — the obligation store stays the sole lifecycle authority .
-          obligations: getRepositories().obligations.listOwned(id),
-        })
-      : assemblePortableContext(runs);
+  if (mode !== "ledger") {
+    const portable = assemblePortableContext(runs);
+    return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
+  }
+  const state = store.load(id);
+  // Read-through only. The prompt shows work state; it never authors it
+  // — the obligation store stays the sole lifecycle authority .
+  const obligations = repositories.obligations.listOwned(id);
+  const windowJournal = () => ({
+    messages: repositories.meshChat
+      .listReceivedForActor(id, { limit: portableContextMaxMessages() })
+      .map((message) => ({
+        id: message.id,
+        ts: message.ts,
+        sender: message.senderId,
+        body: message.body,
+      })),
+    runs,
+    journal: undefined as PortableJournalRecord | undefined,
+  });
+  // Compacted memory plus delta (#1062): the verbatim journal is only what the
+  // ledger has not folded yet. A read failure here falls back to the window the
+  // actor would have had outside the experiment — buildPrompt has no catch, so
+  // an exception would keep the actor from starting at all.
+  const selectJournal = () => {
+    if (journal !== "delta") return windowJournal();
+    try {
+      const unfolded = readUnfoldedLedgerSources(id, state.lastFoldedSourceId);
+      const delta = selectDeltaJournal({
+        unfolded: unfolded.sources,
+        recentRuns: runs,
+        maxMessages: portableContextMaxMessages(),
+      });
+      return {
+        messages: delta.messages,
+        runs: delta.runs,
+        journal: {
+          mode: "delta" as const,
+          foldCursor: state.lastFoldedSourceId,
+          unfoldedSources: delta.unfoldedSources,
+          unfoldedMessages: delta.unfoldedMessages,
+          unfoldedYields: delta.unfoldedYields,
+          truncated: unfolded.truncated,
+        },
+      };
+    } catch (error) {
+      onDeltaFallback(error);
+      return windowJournal();
+    }
+  };
+  const selected = selectJournal();
+  const portable = assemblePortableContextV2({
+    state,
+    messages: selected.messages,
+    runs: selected.runs,
+    obligations,
+    journal: selected.journal,
+  });
   return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
 }
 
 function assembleConfiguredPortableInjection(
   record: ActorRecord,
   apiKey: string | null,
-  store: PortableContextStore
+  store: PortableContextStore,
+  journal: PortableJournalMode = "window",
+  onDeltaFallback?: (error: unknown) => void
 ): { priorContext: string; injectRecord: InjectRecord } | undefined {
   if (record.context?.type !== "portable") return undefined;
   if (record.context.mode === "ledger" && !apiKey) {
     throw new Error("portable context ledger mode requires geminiApiKey");
   }
-  return assemblePortableInjection(record.id, record.context.mode, store);
+  return assemblePortableInjection(record.id, record.context.mode, store, journal, onDeltaFallback);
 }
 
 export async function compactPortableContext(input: {
@@ -2570,6 +2650,23 @@ async function composeStart(
     }
   };
 
+  // Compacted memory plus delta (#1062) is an enrollment, evaluated at every
+  // prompt build and run end so unenrolling takes effect on the next run with
+  // nothing else to flip. `mesh` is assigned below; both readers run later.
+  const portableJournalModeFor = (actorId: string): PortableJournalMode =>
+    mesh.isEnrolledInExperiment(actorId, COMPACTED_MEMORY_DELTA_EXPERIMENT) ? "delta" : "window";
+  const warnDeltaFallback = (actorId: string, error: unknown): void => {
+    log.warn("portable_context_delta_fallback", {
+      actorId,
+      error: error instanceof Error ? error.message : String(error),
+      impact: "this run's journal is the fixed recent window; the fold cursor is unchanged",
+    });
+  };
+  const isPortableLedgerActor = (actorId: string): boolean => {
+    const context = actors.get(actorId)?.context;
+    return context?.type === "portable" && context.mode === "ledger";
+  };
+
   const compactPortableActorAfterRun = async (
     actorId: string
   ): Promise<PortableContextCompactionSummary | null> => {
@@ -2828,7 +2925,28 @@ async function composeStart(
       onEnd: async (event) => {
         if (event.terminal.kind === "abandoned") return;
         const { result } = event.terminal;
-        const compacted = await compactPortableActorAfterRun(id);
+        // Deferred interruption compaction (#1062): an enrolled ledger actor
+        // whose run was interrupted skips the fold here, so the responsive
+        // successor — which is what interrupted it — starts without waiting on
+        // the compactor. The cursor is untouched; the sources stay in mesh_chat
+        // and actor_runs, and the next ordinary run end folds them once.
+        const deferred =
+          result.interrupted === true &&
+          isPortableLedgerActor(id) &&
+          portableJournalModeFor(id) === "delta";
+        if (deferred) {
+          mesh.recordEvent({
+            kind: "portable_context_compaction_deferred",
+            actorId: id,
+            detail: `interrupted by ${result.interruptSource ?? "unknown"}`,
+            payload: JSON.stringify({
+              runId: event.runId,
+              interruptSource: result.interruptSource ?? null,
+              foldCursor: portableContextStore.load(id).lastFoldedSourceId,
+            }),
+          });
+        }
+        const compacted = deferred ? null : await compactPortableActorAfterRun(id);
         if (compacted) {
           mesh.recordEvent({
             kind: "portable_context_compacted",
@@ -3455,7 +3573,9 @@ async function composeStart(
             const injection = assembleConfiguredPortableInjection(
               r,
               portableContextApiKey,
-              portableContextStore
+              portableContextStore,
+              portableJournalModeFor(id),
+              (error) => warnDeltaFallback(id, error)
             );
             return {
               prompt: buildWorkerPrompt(
@@ -3886,7 +4006,9 @@ async function composeStart(
       const injection = assembleConfiguredPortableInjection(
         record,
         portableContextApiKey,
-        portableContextStore
+        portableContextStore,
+        portableJournalModeFor(rootId),
+        (error) => warnDeltaFallback(rootId, error)
       );
       return {
         prompt: buildRootPrompt(

@@ -6,6 +6,7 @@ import {
 } from "./experiment-enrollment-store.contract.js";
 import {
   assertKnownExperiment,
+  COMPACTED_MEMORY_DELTA_EXPERIMENT,
   EXPERIMENTS,
   type ExperimentRegistry,
   experimentNames,
@@ -19,9 +20,10 @@ const FIXTURE_REGISTRY: ExperimentRegistry = {
 };
 
 describe("the experiment registry", () => {
-  it("is empty between rollouts: strict obligation handling is no longer an experiment (#917)", () => {
-    expect(experimentNames()).toEqual([]);
-    expect(Object.keys(EXPERIMENTS)).toEqual([]);
+  it("registers compacted memory plus delta (#1062) and nothing retired (#917)", () => {
+    expect(experimentNames()).toEqual([COMPACTED_MEMORY_DELTA_EXPERIMENT]);
+    expect(Object.keys(EXPERIMENTS)).toEqual(["compacted_memory_delta"]);
+    expect(EXPERIMENTS[COMPACTED_MEMORY_DELTA_EXPERIMENT]?.intent).toContain("#1062");
     expect(isKnownExperiment("strict_obligation_handling")).toBe(false);
   });
 
@@ -50,7 +52,7 @@ describe("the experiment registry", () => {
       "unknown experiment: not_an_experiment (known: another_rollout, fixture_rollout)"
     );
     expect(() => assertKnownExperiment("not_an_experiment")).toThrow(
-      "unknown experiment: not_an_experiment (known: none)"
+      "unknown experiment: not_an_experiment (known: compacted_memory_delta)"
     );
   });
 });

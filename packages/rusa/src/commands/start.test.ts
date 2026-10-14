@@ -26,9 +26,11 @@ import {
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
+import { COMPACTED_MEMORY_DELTA_EXPERIMENT } from "../actor/experiments.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
+import type { InjectRecord } from "../actor/portable-context.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
 import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
 import { RootModelConfigStartupError } from "../actor/root-model-config.js";
@@ -2001,11 +2003,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       return actor;
     };
 
-    // The retired experiment is gone from the live surface: nothing is listed,
-    // and its name can no longer be enrolled. Strict closure needs neither.
+    // The retired experiment is gone from the live surface: only the live
+    // registry (#1062) is listed, and the retired name can no longer be
+    // enrolled. Strict closure needs neither.
     expect(
       payloadOf(await call(urlOf(root, "mesh"), "list_actor_experiments", {})).experiments
-    ).toEqual([]);
+    ).toEqual([expect.objectContaining({ name: "compacted_memory_delta" })]);
     expect(
       (
         await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
@@ -4663,6 +4666,182 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const advancedState = getRepositories().portableContext.load("root");
     expect(advancedState.generation).toBe(2);
     expect(advancedState.lastFoldedSourceId).not.toBe(state.lastFoldedSourceId);
+    compactSpy.mockRestore();
+  });
+
+  it("defers an interrupted run's fold under compacted_memory_delta and folds the delta once later (#1062)", async () => {
+    let mesh: ActorMesh | undefined;
+    const COMPACTOR_DELAY_MS = 300;
+    const batches: string[][] = [];
+    const compactSpy = vi
+      .spyOn(GeminiPortableContextCompactor.prototype, "compact")
+      .mockImplementation(async ({ state, messages, now }) => {
+        await new Promise((resolve) => setTimeout(resolve, COMPACTOR_DELAY_MS));
+        batches.push(messages.map((message) => message.id));
+        const first = messages[0];
+        return {
+          state: {
+            ...state,
+            generation: state.generation + 1,
+            updatedAt: now,
+            lastFoldedSourceId: messages.at(-1)?.id ?? state.lastFoldedSourceId,
+            items: [
+              ...state.items,
+              {
+                id: `mem-${state.generation + 1}`,
+                kind: "decision" as const,
+                priority: "must" as const,
+                status: "active" as const,
+                statement: `Folded generation ${state.generation + 1}.`,
+                evidence: [
+                  {
+                    eventId: first?.id ?? "missing-source",
+                    sender: "operator",
+                    ts: first?.ts ?? now,
+                    quote: (first?.body ?? "missing").slice(0, 40),
+                  },
+                ],
+                updatedAt: now,
+              },
+            ],
+          },
+          quarantined: [],
+          operations: 1,
+        };
+      });
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+          context: { type: "portable", mode: "ledger" },
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const rootActor = mesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+    const actorOpts = (
+      rootActor as unknown as {
+        opts: { buildPrompt: () => { prompt: string; injectRecord?: InjectRecord } };
+      }
+    ).opts;
+    const selected = { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" };
+    const inbound = (body: string): string =>
+      getRepositories().meshChat.record({ senderId: "operator", recipientId: "root", body });
+    const interruptedRun = async (): Promise<number> => {
+      const runId = await startLifecycleRun(rootActor as Actor, selected);
+      const started = Date.now();
+      await endLifecycleRun(rootActor as Actor, runId, {
+        success: false,
+        output: "partial\n[Task interrupted by operator]",
+        exitCode: 143,
+        cancelled: true,
+        interrupted: true,
+        interruptSource: "operator",
+      });
+      return Date.now() - started;
+    };
+    const ordinaryRun = async (output: string): Promise<void> => {
+      const runId = await startLifecycleRun(rootActor as Actor, selected);
+      await endLifecycleRun(rootActor as Actor, runId, { success: true, output, exitCode: 0 });
+    };
+    const deferredEvents = () =>
+      getRepositories().meshEvents.listEventsByActors(["root"], {
+        kinds: ["portable_context_compaction_deferred"],
+        limit: 10,
+      }).events;
+
+    // Flag off: an interrupted run still folds synchronously, as today.
+    const a = inbound("Message A, folded while unenrolled.");
+    const offElapsed = await interruptedRun();
+    expect(offElapsed).toBeGreaterThanOrEqual(COMPACTOR_DELAY_MS - 20);
+    expect(batches).toEqual([[a]]);
+    expect(deferredEvents()).toHaveLength(0);
+    const folded = getRepositories().portableContext.load("root");
+    expect(folded.lastFoldedSourceId).toBe(a);
+
+    // Flag on: the interrupted run defers; the successor would not have waited.
+    expect(mesh.enrollActorInExperiment("root", COMPACTED_MEMORY_DELTA_EXPERIMENT, "root")).toEqual(
+      {
+        actorId: "root",
+        changed: true,
+      }
+    );
+    const b = inbound("Message B, arrives before an interrupted run.");
+    const onElapsed = await interruptedRun();
+    expect(onElapsed).toBeLessThan(COMPACTOR_DELAY_MS / 2);
+    expect(batches).toEqual([[a]]);
+    expect(getRepositories().portableContext.load("root")).toEqual(folded);
+    const deferred = deferredEvents();
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]?.detail).toBe("interrupted by operator");
+    expect(JSON.parse(deferred[0]?.payload ?? "{}")).toMatchObject({
+      interruptSource: "operator",
+      foldCursor: a,
+    });
+
+    // The successor's prompt: compacted memory plus only the unfolded delta.
+    const deltaPrompt = actorOpts.buildPrompt();
+    expect(deltaPrompt.injectRecord?.journal).toMatchObject({
+      mode: "delta",
+      foldCursor: a,
+      unfoldedSources: 1,
+      unfoldedMessages: 1,
+      truncated: false,
+    });
+    expect(deltaPrompt.injectRecord?.sourceMessageEventIds).toEqual([b]);
+    expect(deltaPrompt.prompt).toContain("Message B, arrives before an interrupted run.");
+    expect(deltaPrompt.prompt).toContain("Folded generation 1.");
+    // Message A is represented by its ledger item (and its evidence quote), not
+    // re-sent verbatim: exactly one verbatim message block, and it is B's.
+    expect(deltaPrompt.prompt.split("#### Message from operator").length - 1).toBe(1);
+
+    // A second interruption accumulates; the next ordinary run end folds both once.
+    const c = inbound("Message C, arrives before a second interrupted run.");
+    await interruptedRun();
+    expect(batches).toEqual([[a]]);
+    expect(deferredEvents()).toHaveLength(2);
+    await ordinaryRun("ordinary run output");
+    expect(batches).toEqual([[a], [b, c]]);
+    const advanced = getRepositories().portableContext.load("root");
+    expect(advanced.generation).toBe(2);
+    expect(advanced.lastFoldedSourceId).toBe(c);
+    expect(actorOpts.buildPrompt().injectRecord?.sourceMessageEventIds).toEqual([]);
+
+    // Flag off again: the window journal and synchronous fold return on the
+    // next run, and nothing accumulated while enrolled is lost.
+    expect(
+      mesh.unenrollActorFromExperiment("root", COMPACTED_MEMORY_DELTA_EXPERIMENT, "root")
+    ).toEqual({
+      actorId: "root",
+      changed: true,
+    });
+    const d = inbound("Message D, after unenrolling.");
+    const windowPrompt = actorOpts.buildPrompt();
+    expect(windowPrompt.injectRecord?.journal).toBeUndefined();
+    expect(windowPrompt.injectRecord?.sourceMessageEventIds).toEqual([a, b, c, d]);
+    await interruptedRun();
+    expect(batches).toEqual([[a], [b, c], [d]]);
+    expect(deferredEvents()).toHaveLength(2);
     compactSpy.mockRestore();
   });
 

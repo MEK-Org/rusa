@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Obligation } from "../obligations/obligation.js";
+import type { PortableJournalRecord } from "./portable-context-delta.js";
 import {
   isRetiredMemoryKind,
   type PortableContextState,
@@ -70,6 +71,12 @@ export interface InjectRecord {
   sections?: { ledger: number; messages: number; runs: number };
   /** Aggregate content-free metrics on active durable ledger items and overflow (#328). */
   ledger?: LedgerMetrics;
+  /**
+   * How the verbatim journal was selected (#1062). Absent means the fixed
+   * recent window, the behavior every ledger actor has outside the
+   * `compacted_memory_delta` experiment; present means the delta journal.
+   */
+  journal?: PortableJournalRecord;
 }
 
 export interface PortableContext {
@@ -642,6 +649,8 @@ export function assemblePortableContextV2(input: {
   runs: PriorRun[];
   /** The actor's own obligations in store queue order; omit when unavailable. */
   obligations?: Obligation[];
+  /** Journal provenance for the inject record (#1062); omit for the fixed window. */
+  journal?: PortableJournalRecord;
 }): PortableContext | null {
   const { section: ledger, metrics: ledgerMetrics } = renderLedger(input.state);
   const obligations = renderObligations(input.obligations ?? []);
@@ -691,6 +700,7 @@ export function assemblePortableContextV2(input: {
         runs: byteLen(runsSection),
       },
       ledger: ledgerMetrics,
+      ...(input.journal ? { journal: input.journal } : {}),
     },
   };
 }

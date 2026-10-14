@@ -129,6 +129,13 @@ export type MeshEventKind =
   // A portable-context v2 ledger folded one or more inbound messages. `actorId`
   // is the remembered actor; detail/body carry generation/count metadata only.
   | "portable_context_compacted"
+  // A portable-context ledger actor enrolled in `compacted_memory_delta` (#1062)
+  // ended a run interrupted and skipped the post-run fold so its responsive
+  // successor starts without waiting on the compactor. `actorId` is the
+  // remembered actor; detail/payload carry the interrupt source, the run id and
+  // the unchanged fold cursor — never message bodies. The next ordinary run end
+  // folds everything after the cursor once.
+  | "portable_context_compaction_deferred"
   | "run_coalesced"
   // Historical yield lifecycle, read but no longer written since explicit yield
   // was removed (#828): the actor received the one corrective yield-elicitation
