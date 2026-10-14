@@ -22,7 +22,6 @@ import {
   resolveAttachmentPath,
   resolveDownloadPath,
   streamNewFileInWorkdir,
-  writeNewFileInWorkdir,
 } from "./workdir-path.js";
 
 // One-shot hook run right after the next realpath resolves, to land a swap in
@@ -148,9 +147,9 @@ describe("workdir root acquisition", () => {
     const { root, outside, swap } = rootAncestorSwap();
     const destination = await resolveDownloadPath(root, "new.txt");
     afterRealpath.run = swap;
-    await expect(writeNewFileInWorkdir(root, destination, Buffer.from("x"))).rejects.toThrow(
-      "access denied"
-    );
+    await expect(
+      streamNewFileInWorkdir(root, destination, streamFrom([Buffer.from("x")]))
+    ).rejects.toThrow("access denied");
     expect(existsSync(join(outside, "root", "new.txt"))).toBe(false);
   });
 });

@@ -34,7 +34,7 @@ export async function resolveAttachmentPath(workDir: string, filePath: string): 
  * Resolve a download destination inside the calling actor's workdir. The
  * parent directory must already exist and realpath inside the workdir, so a
  * symlinked directory cannot redirect the write elsewhere. This only
- * validates the name; write it with {@link writeNewFileInWorkdir}, which holds
+ * validates the name; write it with {@link streamNewFileInWorkdir}, which holds
  * the boundary at the open itself.
  */
 export async function resolveDownloadPath(
@@ -128,29 +128,6 @@ async function openInWorkdir(
     });
   } finally {
     await dir.close();
-  }
-}
-
-/**
- * Create a new file at a {@link resolveDownloadPath} result and write `data`
- * through the descriptor. The final component is created exclusively, so an
- * existing file or symlink there is refused too.
- */
-export async function writeNewFileInWorkdir(
-  workDir: string,
-  path: string,
-  data: Uint8Array
-): Promise<void> {
-  const handle = await openInWorkdir(
-    workDir,
-    path,
-    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-    0o666
-  );
-  try {
-    await handle.writeFile(data);
-  } finally {
-    await handle.close();
   }
 }
 
