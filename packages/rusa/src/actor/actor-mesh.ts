@@ -1,9 +1,5 @@
 import { randomUUID } from "node:crypto";
-import {
-  type ChatWakeMode,
-  chatWakeModeFromConfig,
-  tryChatSpaceResource,
-} from "../chat/wake-mode.js";
+import { type ChatWakeMode, chatWakeModeFromConfig } from "../chat/wake-mode.js";
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
@@ -28,6 +24,7 @@ import {
 } from "../providers/model-config.js";
 import type { AbortReason } from "../providers/termination-attribution.js";
 import type { RunResult } from "../providers/types.js";
+import { parseReference } from "../references/reference.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import {
   EmptyInboxRepository,
@@ -53,7 +50,6 @@ import {
   RunManager,
   VOICE_INBOX_PAYLOAD_TYPE,
 } from "../runtime/run-manager.js";
-import { trySlackConversationResource } from "../slack/wake-mode.js";
 import { randomSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { googleVoiceConfig } from "../voice/voice-config.js";
@@ -4017,8 +4013,8 @@ export class ActorMesh {
   /**
    * The stored wake mode of one Google Chat space or Slack conversation, or
    * `undefined` when it follows its integration's default (#692, #1037).
-   * Slack callers supply `slack:channels/<id>`; Google Chat also accepts its
-   * API's `spaces/<id>` name. Only the exact conversation row counts, without
+   * Callers supply `gchat:spaces/<id>` or `slack:channels/<id>`.
+   * Only the exact conversation row counts, without
    * inheriting a parent, thread, or global policy. Read for every arrival, so
    * a change governs the next message; the host is the caller, so no ownership
    * check applies here.
@@ -4028,12 +4024,16 @@ export class ActorMesh {
    * without throwing before the emergency halt brake (#695 review).
    */
   chatWakeModeFor(conversation: EventResource): ChatWakeMode | undefined {
-    const candidate = typeof conversation === "string" ? conversation.trim() : "";
-    const resource = candidate.startsWith("slack:channels/")
-      ? trySlackConversationResource(candidate.slice("slack:channels/".length))
-      : tryChatSpaceResource(candidate);
-    if (!resource) return undefined;
-    return chatWakeModeFromConfig(this.eventSourceOwners.getConfig(resource));
+    let ref: ReturnType<typeof parseReference>;
+    try {
+      ref = parseReference(conversation);
+    } catch {
+      return undefined;
+    }
+    const collection =
+      ref.scheme === "gchat" ? "spaces" : ref.scheme === "slack" ? "channels" : undefined;
+    if (ref.segments.length !== 2 || ref.segments[0] !== collection) return undefined;
+    return chatWakeModeFromConfig(this.eventSourceOwners.getConfig(ref.key));
   }
 
   /**

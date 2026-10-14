@@ -2448,9 +2448,9 @@ describe("agent-execution MCP server", () => {
         config: { version: 1, chatWakeMode: "mentions" },
       });
       expect(res.isError).toBeFalsy();
-      expect(mesh.chatWakeModeFor("spaces/team")).toBe("mentions");
+      expect(mesh.chatWakeModeFor("gchat:spaces/team")).toBe("mentions");
       // Another of root's spaces is untouched, and the owner has no say over it.
-      expect(mesh.chatWakeModeFor("spaces/other")).toBeUndefined();
+      expect(mesh.chatWakeModeFor("gchat:spaces/other")).toBeUndefined();
       res = await call(ownerClient, "set_event_source_config", {
         source: "gchat:spaces/other",
         config: { version: 1, chatWakeMode: "all" },
@@ -2464,14 +2464,14 @@ describe("agent-execution MCP server", () => {
         config: { version: 1, chatWakeMode: "mentions" },
       });
       expect(res.isError).toBe(true);
-      expect(mesh.chatWakeModeFor("spaces/team")).toBe("mentions");
+      expect(mesh.chatWakeModeFor("gchat:spaces/team")).toBe("mentions");
 
       res = await call(ownerClient, "set_event_source_config", {
         source: "gchat:spaces/team",
         config: null,
       });
       expect(dataOf(res)).toEqual({ resource: "gchat:spaces/team", config: null });
-      expect(mesh.chatWakeModeFor("spaces/team")).toBeUndefined();
+      expect(mesh.chatWakeModeFor("gchat:spaces/team")).toBeUndefined();
       // An unparseable or non-space resource returns undefined without throwing (#695).
       expect(mesh.chatWakeModeFor("malformed space name")).toBeUndefined();
       expect(mesh.chatWakeModeFor("gchat:spaces")).toBeUndefined();
@@ -2521,7 +2521,7 @@ describe("agent-execution MCP server", () => {
         source: "gchat:spaces/C1",
         config: { version: 1, chatWakeMode: "all" },
       });
-      expect(mesh.chatWakeModeFor("spaces/C1")).toBe("all");
+      expect(mesh.chatWakeModeFor("gchat:spaces/C1")).toBe("all");
 
       // A broad Slack policy is not inherited by any one conversation.
       const broad = await call(rootClient, "set_event_source_config", {
