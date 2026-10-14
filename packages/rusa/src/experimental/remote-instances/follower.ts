@@ -83,6 +83,7 @@ function emit(actorId: string, message: FollowerEvent["message"], eventId?: stri
 async function flush(): Promise<void> {
   if (sending || stopped) return;
   sending = true;
+  let sent = "";
   try {
     while ((pendingBatch || events.length) && !stopped) {
       if (!pendingBatch) {
@@ -93,6 +94,7 @@ async function flush(): Promise<void> {
           events: events.slice(0, count),
         };
       }
+      sent = session;
       await post("/events", {
         batchId: pendingBatch.batchId,
         events: pendingBatch.events,
@@ -102,7 +104,7 @@ async function flush(): Promise<void> {
     }
   } catch (error) {
     log.warn("follower_event_flush_failed", { err: error });
-    if (error instanceof FollowerHttpError && error.status === 410) {
+    if (error instanceof FollowerHttpError && error.status === 410 && session === sent) {
       session = "";
     }
     if (!stopped && (pendingBatch || events.length) && !sendTimer) {
@@ -138,6 +140,7 @@ process.on("SIGTERM", () => {
 
 async function run(): Promise<void> {
   let backoffMs = 500;
+  // Keep this plus the request timeout below the leader's 45-second follower expiry.
   const maxBackoffMs = 10_000;
 
   while (!stopped) {
