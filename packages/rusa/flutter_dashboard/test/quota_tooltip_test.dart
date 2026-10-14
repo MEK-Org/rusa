@@ -592,6 +592,39 @@ void main() {
       );
     });
 
+    testWidgets('does not warning-style a reading healthy at fetch (#1055)', (
+      tester,
+    ) async {
+      final fetchedAt = now.subtract(const Duration(hours: 3));
+      final read = fetchedAt.subtract(const Duration(minutes: 5));
+      final weekly = QuotaWindowDto(
+        id: 'weekly',
+        label: 'Weekly',
+        usedPercent: 40,
+        status: 'available',
+        headline: true,
+        windowMs: 7 * 24 * 3600 * 1000,
+        resetAtIso: now.add(const Duration(days: 3)).toIso8601String(),
+        scrapedAt: read.toIso8601String(),
+      );
+
+      final tooltip = QuotaTooltip(
+        providerName: 'Claude',
+        windows: [weekly],
+        scrapedAt: read.toIso8601String(),
+        showThrottle: false,
+        staleCheckedAt: fetchedAt,
+        now: now,
+      );
+      await tester.pumpWidget(MaterialApp(home: Scaffold(body: tooltip)));
+
+      final lastReadWidget = tester.widget<Text>(
+        find.textContaining('Last Read: 3 hours ago'),
+      );
+      final span = lastReadWidget.textSpan as TextSpan;
+      expect((span.children?[1] as TextSpan).style, null);
+    });
+
     testWidgets('renders the same 2h warning for a stale reading served as-is (#759)', (
       tester,
     ) async {

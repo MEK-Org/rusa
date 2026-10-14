@@ -744,11 +744,16 @@ class QuotaIndicators extends StatelessWidget {
       builder: (_, snap) => StreamBuilder<bool>(
         stream: store.quotaRefreshing,
         initialData: store.quotaRefreshing.valueOrNull ?? false,
-        builder: (_, refreshingSnap) => _QuotaHeaderStrip(
-          snapshot: snap.data,
-          quotaProviders: quotaProviders,
-          refreshing: refreshingSnap.data ?? false,
-          axis: axis,
+        builder: (_, refreshingSnap) => StreamBuilder<bool>(
+          stream: store.quotaStale,
+          initialData: store.quotaStale.valueOrNull ?? false,
+          builder: (_, staleSnap) => _QuotaHeaderStrip(
+            snapshot: snap.data,
+            quotaProviders: quotaProviders,
+            refreshing: refreshingSnap.data ?? false,
+            cacheStale: staleSnap.data ?? false,
+            axis: axis,
+          ),
         ),
       ),
     );
@@ -760,6 +765,7 @@ class _QuotaHeaderStrip extends StatelessWidget {
     required this.snapshot,
     required this.quotaProviders,
     this.refreshing = false,
+    this.cacheStale = false,
     this.axis = Axis.horizontal,
   });
 
@@ -773,10 +779,19 @@ class _QuotaHeaderStrip extends StatelessWidget {
   /// number is on its way.
   final bool refreshing;
 
+  /// True while the strip shows a browser-cached snapshot that no live fetch
+  /// has confirmed (restored on load, or the last refresh failed). Dimming is
+  /// how a stale browser cache shows (#1055); the warning triangle is reserved
+  /// for scrapes that were already overdue when the snapshot was fetched.
+  final bool cacheStale;
+
   @override
   Widget build(BuildContext context) {
     final snap = snapshot;
     if (snap == null) return const SizedBox.shrink();
+    // The server stamps `generatedAt` per `/api/quota` request (served
+    // no-store), so it is the fetch time on the same clock as `scrapedAt`.
+    final fetchedAt = DateTime.tryParse(snap.generatedAt);
     final providerIds = quotaProviders.keys.toList(growable: false);
     final providers = providerIds
         .map((id) => (config: quotaProviders[id]!, provider: snap.provider(id)))
@@ -789,6 +804,7 @@ class _QuotaHeaderStrip extends StatelessWidget {
           axis: axis,
           provider: entry.provider!,
           weeklyWindow: _findWindow(entry.provider, entry.config.primaryWindow),
+          fetchedAt: fetchedAt,
           sessionWindow: entry.config.sessionWindow == null
               ? null
               : _findWindow(entry.provider, entry.config.sessionWindow!),
@@ -801,6 +817,7 @@ class _QuotaHeaderStrip extends StatelessWidget {
             axis: axis,
             provider: entry.provider!,
             weeklyWindow: fableWeeklyWindow(entry.provider!),
+            fetchedAt: fetchedAt,
             sessionWindow: null,
             label: 'Fable',
             throttle: fableThrottle(entry.provider!),
@@ -809,7 +826,7 @@ class _QuotaHeaderStrip extends StatelessWidget {
       ],
     ];
     return AnimatedOpacity(
-      opacity: refreshing ? 0.55 : 1.0,
+      opacity: refreshing || cacheStale ? 0.55 : 1.0,
       duration: const Duration(milliseconds: 200),
       child: axis == Axis.vertical
           ? Column(
@@ -901,6 +918,7 @@ class _ProviderQuotaRing extends StatelessWidget {
     required this.provider,
     required this.weeklyWindow,
     required this.sessionWindow,
+    this.fetchedAt,
     this.axis = Axis.horizontal,
     this.label,
     this.throttle,
@@ -910,6 +928,10 @@ class _ProviderQuotaRing extends StatelessWidget {
   final ProviderQuotaDto provider;
   final QuotaWindowDto? weeklyWindow;
   final QuotaWindowDto? sessionWindow;
+
+  /// When the snapshot was fetched, or null for a payload without a usable
+  /// `generatedAt` (then readings are aged against the wall clock, as before).
+  final DateTime? fetchedAt;
 
   /// Overrides the provider name, for a ring that shows one model's
   /// allocation within the provider (#752).
@@ -931,10 +953,11 @@ class _ProviderQuotaRing extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final now = DateTime.now();
-    final staleFor = staleReadingAge([
-      weeklyWindow,
-      if (sessionWindow != null) sessionWindow,
-    ], now);
+    final staleFor = staleReadingAge(
+      [weeklyWindow, if (sessionWindow != null) sessionWindow],
+      now,
+      checkedAt: fetchedAt,
+    );
     final name = label ?? _providerLabel(provider.provider);
     final windows = <QuotaWindowDto>[
       weeklyWindow ??
@@ -970,6 +993,7 @@ class _ProviderQuotaRing extends StatelessWidget {
       scrapedAt: scrapedAt,
       showThrottle: showThrottle,
       staleFor: staleFor,
+      staleCheckedAt: fetchedAt,
       now: now,
     );
     final tooltip = tooltipWidget.toPlainText(now);
