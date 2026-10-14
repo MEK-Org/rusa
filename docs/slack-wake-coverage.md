@@ -6,11 +6,12 @@ row sets it with `set_event_source_config` and reads it back with
 `list_event_sources`, the same tools Google Chat wake mode uses:
 
 ```json
-{ "version": 1, "slackWakeMode": "all" }
+{ "version": 1, "chatWakeMode": "all" }
 ```
 
-`slackWakeMode` is `"all"` or `"mentions"`. Other keys in the object are kept
-as they are; setting the whole config to `null` restores the default. The mode
+`chatWakeMode` is `"all"` or `"mentions"`, the same field used for Google Chat.
+Other keys in the object are kept as they are; setting the whole config to
+`null` restores the default. The mode
 is read for every arriving event, so a change applies to the next message
 without a restart. Only the exact conversation's row counts: a thread, a parent
 source, or another conversation never lends it a policy. A missing, invalid or

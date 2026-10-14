@@ -53,11 +53,7 @@ import {
   RunManager,
   VOICE_INBOX_PAYLOAD_TYPE,
 } from "../runtime/run-manager.js";
-import {
-  type SlackWakeMode,
-  slackWakeModeFromConfig,
-  trySlackConversationResource,
-} from "../slack/wake-mode.js";
+import { trySlackConversationResource } from "../slack/wake-mode.js";
 import { randomSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { googleVoiceConfig } from "../voice/voice-config.js";
@@ -4042,10 +4038,10 @@ export class ActorMesh {
    * governs the next event; the host is the caller, so no ownership check
    * applies here.
    */
-  slackWakeModeFor(channel: string): SlackWakeMode | undefined {
+  slackWakeModeFor(channel: string): ChatWakeMode | undefined {
     const resource = trySlackConversationResource(channel);
     if (!resource) return undefined;
-    return slackWakeModeFromConfig(this.eventSourceOwners.getConfig(resource));
+    return chatWakeModeFromConfig(this.eventSourceOwners.getConfig(resource));
   }
 
   /**

@@ -1,19 +1,5 @@
-import { parseEventSourceConfigV1 } from "../chat/wake-mode.js";
+import type { ChatWakeMode } from "../chat/wake-mode.js";
 import { parseReference } from "../references/reference.js";
-
-/**
- * How one Slack conversation wakes its event-source owner (#1037).
- *
- * - `all`: every ordinary human message wakes, as do app mentions.
- * - `mentions`: only a message that directly mentions the installed bot wakes.
- *
- * A conversation with no stored mode keeps the compatibility default: a
- * one-to-one DM wakes on every message, and a channel or group DM wakes only
- * through Slack's `app_mention` event. The default is derived per event rather
- * than written down, so conversations that existed before the setting keep
- * exactly the behavior they had; nothing is migrated.
- */
-export type SlackWakeMode = "all" | "mentions";
 
 /** The conversation kinds an ordinary Slack message can wake from. */
 export type SlackConversationKind = "im" | "channel" | "mpim";
@@ -60,8 +46,19 @@ export function mentionsSlackUser(text: string, selfUserId: string): boolean {
     .some((rest) => /^[^<>]*>/.test(rest));
 }
 
-/** Whether an arriving event wakes the conversation's owner under `mode` (or the default when unset). */
-export function slackMessageWakes(msg: SlackWakeFacts, mode: SlackWakeMode | undefined): boolean {
+/**
+ * How one Slack conversation wakes its event-source owner (#1037).
+ *
+ * - `all`: every ordinary human message wakes, as do app mentions.
+ * - `mentions`: only a message that directly mentions the installed bot wakes.
+ *
+ * A conversation with no stored mode keeps the compatibility default: a
+ * one-to-one DM wakes on every message, and a channel or group DM wakes only
+ * through Slack's `app_mention` event. The default is derived per event rather
+ * than written down, so conversations that existed before the setting keep
+ * exactly the behavior they had; nothing is migrated.
+ */
+export function slackMessageWakes(msg: SlackWakeFacts, mode: ChatWakeMode | undefined): boolean {
   // Slack sends `app_mention` only for a direct mention of the app's bot user,
   // which every mode admits; when unset this is the long-standing channel path,
   // kept even when Slack omits `channel_type`.
@@ -72,11 +69,6 @@ export function slackMessageWakes(msg: SlackWakeFacts, mode: SlackWakeMode | und
   // ordinary message there is not admitted a second time.
   if (effective === undefined) return false;
   return effective === "all" || msg.mentionsSelf;
-}
-
-/** Read this feature's value from the event source's versioned generic config blob. */
-export function slackWakeModeFromConfig(raw: string | null | undefined): SlackWakeMode | undefined {
-  return parseEventSourceConfigV1(raw)?.slackWakeMode;
 }
 
 /**

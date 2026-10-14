@@ -5,6 +5,7 @@ import {
   InMemoryEventSourceSubscriptionStore,
   parentOf,
 } from "../actor/event-subscriptions.js";
+import { chatWakeModeFromConfig } from "../chat/wake-mode.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { InboxRepository } from "../repositories/inbox-repository.js";
@@ -16,7 +17,7 @@ import {
   slackInboxEvent,
   withReceiptReaction,
 } from "./socket-source.js";
-import { slackWakeModeFromConfig, trySlackConversationResource } from "./wake-mode.js";
+import { trySlackConversationResource } from "./wake-mode.js";
 
 type SocketEnvelope = { type: string; body: unknown; ack: () => Promise<void> };
 const mock = vi.hoisted(() => ({
@@ -124,7 +125,7 @@ async function harness(
       selfUserId: rememberSlackSelf(() => slack.identify(), onError),
       wakeModeFor: (channel) => {
         const resource = trySlackConversationResource(channel);
-        return resource ? slackWakeModeFromConfig(owners.getConfig(resource)) : undefined;
+        return resource ? chatWakeModeFromConfig(owners.getConfig(resource)) : undefined;
       },
     }
   );
@@ -182,7 +183,7 @@ describe("Slack per-conversation wake policy (#1037)", () => {
     let ts = 1000;
     for (const { channel, channelType, owner } of CONVERSATIONS) {
       for (const mode of modes) {
-        h.setMode(channel, mode ? { version: 1, slackWakeMode: mode } : null);
+        h.setMode(channel, mode ? { version: 1, chatWakeMode: mode } : null);
         for (const [mention, text] of Object.entries(mentions) as [
           keyof typeof mentions,
           string,
@@ -242,7 +243,7 @@ describe("Slack per-conversation wake policy (#1037)", () => {
       (c) => c.channelType !== "im"
     )) {
       for (const mode of [undefined, "all", "mentions"] as const) {
-        h.setMode(channel, mode ? { version: 1, slackWakeMode: mode } : null);
+        h.setMode(channel, mode ? { version: 1, chatWakeMode: mode } : null);
         for (const omitType of [false, true]) {
           for (const threadTs of [undefined, "999.000001"]) {
             const messageTs = `${++ts}.000001`;
@@ -277,7 +278,7 @@ describe("Slack per-conversation wake policy (#1037)", () => {
       subscribedBy: "root",
       subscribedAt: "2026-10-14T00:00:00.000Z",
     });
-    h.setMode("C1", { version: 1, slackWakeMode: "all" });
+    h.setMode("C1", { version: 1, chatWakeMode: "all" });
     const event = (type: string, ts: string) => ({
       type,
       channel_type: "channel",
@@ -317,7 +318,7 @@ describe("Slack per-conversation wake policy (#1037)", () => {
   it("wakes no one and posts no receipt for self, bot, subtype, malformed, unknown, or uncovered events", async () => {
     const h = await harness();
     for (const { channel } of CONVERSATIONS)
-      h.setMode(channel, { version: 1, slackWakeMode: "all" });
+      h.setMode(channel, { version: 1, chatWakeMode: "all" });
     const human = {
       type: "message",
       channel_type: "im",
@@ -376,12 +377,12 @@ describe("Slack per-conversation wake policy (#1037)", () => {
         .map((item) => item.payload.ts)
         .sort();
 
-    h.setMode("C1", { version: 1, slackWakeMode: "all", note: "kept" });
+    h.setMode("C1", { version: 1, chatWakeMode: "all", note: "kept" });
     expect(h.owners.getConfig("slack:channels/C1")).toBe(
-      JSON.stringify({ version: 1, slackWakeMode: "all", note: "kept" })
+      JSON.stringify({ version: 1, chatWakeMode: "all", note: "kept" })
     );
     await h.send(plain("4001.000001"));
-    h.setMode("C1", { version: 1, slackWakeMode: "mentions", note: "kept" });
+    h.setMode("C1", { version: 1, chatWakeMode: "mentions", note: "kept" });
     await h.send(plain("4002.000001"));
     h.setMode("C1", null);
     expect(h.owners.getConfig("slack:channels/C1")).toBeNull();
@@ -391,22 +392,23 @@ describe("Slack per-conversation wake policy (#1037)", () => {
     // Invalid or unsupported config never widens coverage: the channel keeps
     // its app_mention-only default, and a DM keeps waking.
     const invalid = [
-      { version: 1, slackWakeMode: "everything" },
-      { version: 2, slackWakeMode: "all" },
-      { slackWakeMode: "all" },
+      { version: 1, chatWakeMode: "everything" },
+      { version: 2, chatWakeMode: "all" },
+      { chatWakeMode: "all" },
+      { version: 1, slackWakeMode: "all" },
     ];
     for (const [index, config] of invalid.entries()) {
       h.setMode("C1", config);
       await h.send(plain(`401${index}.000001`));
     }
     expect(delivered()).toEqual(["4001.000001"]);
-    h.setMode("D1", { version: 2, slackWakeMode: "mentions" });
+    h.setMode("D1", { version: 2, chatWakeMode: "mentions" });
     await h.send({ ...plain("4020.000001"), channel_type: "im", channel: "D1" });
     expect(h.items("owner-dm")).toHaveLength(1);
 
     // A mode stored on another conversation does not reach this one.
     h.setMode("C1", null);
-    h.setMode("G1", { version: 1, slackWakeMode: "all" });
+    h.setMode("G1", { version: 1, chatWakeMode: "all" });
     await h.send(plain("4030.000001"));
     expect(delivered()).toEqual(["4001.000001"]);
   });
@@ -479,7 +481,7 @@ describe("Slack per-conversation wake policy (#1037)", () => {
         throw Object.assign(new Error("invalid_auth"), { data: { error: "invalid_auth" } });
       },
     });
-    h.setMode("M1", { version: 1, slackWakeMode: "mentions" });
+    h.setMode("M1", { version: 1, chatWakeMode: "mentions" });
     const mention = (ts: string) => ({
       type: "message",
       channel_type: "mpim",
@@ -517,7 +519,7 @@ describe("Slack per-conversation wake policy (#1037)", () => {
   it("never holds an event or its ack behind an identity lookup", async () => {
     // A lookup that never settles, standing in for a slow or rate-limited Slack.
     const h = await harness({ firstIdentify: () => new Promise(() => {}) });
-    h.setMode("C1", { version: 1, slackWakeMode: "mentions" });
+    h.setMode("C1", { version: 1, chatWakeMode: "mentions" });
     const dm = { type: "message", channel_type: "im", channel: "D1", user: HUMAN, text: "hi" };
 
     // A default-mode DM needs no identity: it is delivered and acked at once.

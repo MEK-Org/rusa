@@ -2,15 +2,15 @@ import { parseReference } from "../references/reference.js";
 import type { ChatMessage } from "./types.js";
 
 /**
- * How a Google Chat space wakes its event-source owner (#692).
+ * How a chat conversation wakes its event-source owner (#692, #1037).
  *
- * - `mentions`: only a message that @mentions the Rusa user wakes.
+ * - `mentions`: only a message that directly mentions the chat user or bot wakes.
  * - `all`: every message wakes.
  *
- * A space with no stored mode keeps the built-in default: a direct message or
- * a two-person space wakes on every message, and any larger space wakes only on
- * mentions. The default is derived per message rather than written down, so
- * spaces that existed before the setting did keep exactly the behavior they had.
+ * A Google Chat space with no stored mode keeps the built-in default: a direct
+ * message or two-person space wakes on every message, and any larger space wakes
+ * only on mentions. Each integration derives its default per message rather
+ * than storing it, so existing conversations keep their previous behavior.
  */
 export type ChatWakeMode = "mentions" | "all";
 
@@ -61,7 +61,6 @@ export function tryChatSpaceResource(space: string): string | undefined {
 export type EventSourceConfigV1 = Record<string, unknown> & {
   version: 1;
   chatWakeMode?: ChatWakeMode;
-  slackWakeMode?: "all" | "mentions";
   checkSuiteCompletionMode?: "failures-only" | "all-outcomes";
 };
 
@@ -81,10 +80,6 @@ export function parseEventSourceConfigV1(
     }
     const chatWakeMode = (parsed as { chatWakeMode?: unknown }).chatWakeMode;
     if (chatWakeMode !== undefined && chatWakeMode !== "mentions" && chatWakeMode !== "all") {
-      return undefined;
-    }
-    const slackWakeMode = (parsed as { slackWakeMode?: unknown }).slackWakeMode;
-    if (slackWakeMode !== undefined && slackWakeMode !== "mentions" && slackWakeMode !== "all") {
       return undefined;
     }
     const checkSuiteCompletionMode = (parsed as { checkSuiteCompletionMode?: unknown })

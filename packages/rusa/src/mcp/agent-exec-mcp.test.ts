@@ -2518,7 +2518,7 @@ describe("agent-execution MCP server", () => {
       // A broad Slack policy is not inherited by any one conversation.
       const broad = await call(rootClient, "set_event_source_config", {
         source: "slack:channels",
-        config: { version: 1, slackWakeMode: "all" },
+        config: { version: 1, chatWakeMode: "all" },
       });
       expect(broad.isError).toBeFalsy();
       expect(mesh.slackWakeModeFor("C1")).toBeUndefined();
@@ -2530,7 +2530,7 @@ describe("agent-execution MCP server", () => {
       // Only the exact owner may write it; root delegated it away.
       let res = await call(rootClient, "set_event_source_config", {
         source: "slack:channels/C1",
-        config: { version: 1, slackWakeMode: "all" },
+        config: { version: 1, chatWakeMode: "all" },
       });
       expect(res.isError).toBe(true);
       expect(mesh.slackWakeModeFor("C1")).toBeUndefined();
@@ -2538,7 +2538,7 @@ describe("agent-execution MCP server", () => {
       // all -> mentions -> unset, each read back from the exact row, keeping
       // unrelated keys the owner wrote alongside it.
       for (const mode of ["all", "mentions"] as const) {
-        const config = { version: 1, slackWakeMode: mode, chatWakeMode: "all", note: "kept" };
+        const config = { version: 1, chatWakeMode: mode, note: "kept" };
         res = await call(ownerClient, "set_event_source_config", {
           source: "slack:channels/C1",
           config,
@@ -2556,7 +2556,7 @@ describe("agent-execution MCP server", () => {
 
       res = await call(ownerClient, "set_event_source_config", {
         source: "slack:channels/C1",
-        config: { version: 1, slackWakeMode: "loud" },
+        config: { version: 1, chatWakeMode: "loud" },
       });
       expect(res.isError).toBeFalsy();
       expect(mesh.slackWakeModeFor("C1")).toBeUndefined();

@@ -1,9 +1,9 @@
 import { SocketModeClient } from "@slack/socket-mode";
+import type { ChatWakeMode } from "../chat/wake-mode.js";
 import type { DurableEventDelivery, RawSlackIntegrationEvent } from "../runtime/event-manager.js";
 import {
   mentionsSlackUser,
   type SlackWakeFacts,
-  type SlackWakeMode,
   slackConversationKind,
   slackMessageWakes,
 } from "./wake-mode.js";
@@ -73,7 +73,7 @@ export interface SlackWakePolicy {
    */
   selfUserId?: () => string | undefined;
   /** The exact conversation's stored mode, or `undefined` for the default. */
-  wakeModeFor: (channel: string) => SlackWakeMode | undefined;
+  wakeModeFor: (channel: string) => ChatWakeMode | undefined;
 }
 
 const COMPATIBILITY_POLICY: SlackWakePolicy = { wakeModeFor: () => undefined };
@@ -204,7 +204,7 @@ export class SlackSocketSource {
     const selfUserId = policy.selfUserId?.();
     const message = parseSlackEvent(body, selfUserId);
     if (!message) return null;
-    let mode: SlackWakeMode | undefined;
+    let mode: ChatWakeMode | undefined;
     try {
       mode = policy.wakeModeFor(message.channel);
     } catch (error) {
