@@ -4015,31 +4015,23 @@ export class ActorMesh {
   }
 
   /**
-   * The stored wake mode of a Google Chat space, or `undefined` when the space
-   * follows the built-in default (#692). Read by chat ingestion for every
-   * arriving message, so a change governs the next message; the host is the
-   * caller, so no ownership check applies here.
+   * The stored wake mode of one Google Chat space or Slack conversation, or
+   * `undefined` when it follows its integration's default (#692, #1037).
+   * Slack callers supply `slack:channels/<id>`; Google Chat also accepts its
+   * API's `spaces/<id>` name. Only the exact conversation row counts, without
+   * inheriting a parent, thread, or global policy. Read for every arrival, so
+   * a change governs the next message; the host is the caller, so no ownership
+   * check applies here.
    *
-   * An unexpected or unparseable inbound space name cannot have a stored mode;
+   * An unexpected or unparseable inbound conversation cannot have a stored mode;
    * it falls back safely to `undefined` so ingestion keeps the built-in default
    * without throwing before the emergency halt brake (#695 review).
    */
-  chatWakeModeFor(space: EventResource): ChatWakeMode | undefined {
-    const resource = tryChatSpaceResource(space);
-    if (!resource) return undefined;
-    return chatWakeModeFromConfig(this.eventSourceOwners.getConfig(resource));
-  }
-
-  /**
-   * The stored wake mode of one Slack conversation, or `undefined` when it
-   * follows the compatibility default (#1037). Only the exact
-   * `slack:channels/<id>` row counts: no thread, parent, or global policy is
-   * inherited. Read by Slack ingestion for every arriving event, so a change
-   * governs the next event; the host is the caller, so no ownership check
-   * applies here.
-   */
-  slackWakeModeFor(channel: string): ChatWakeMode | undefined {
-    const resource = trySlackConversationResource(channel);
+  chatWakeModeFor(conversation: EventResource): ChatWakeMode | undefined {
+    const candidate = typeof conversation === "string" ? conversation.trim() : "";
+    const resource = candidate.startsWith("slack:channels/")
+      ? trySlackConversationResource(candidate.slice("slack:channels/".length))
+      : tryChatSpaceResource(candidate);
     if (!resource) return undefined;
     return chatWakeModeFromConfig(this.eventSourceOwners.getConfig(resource));
   }

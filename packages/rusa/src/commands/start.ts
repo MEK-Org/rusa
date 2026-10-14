@@ -4768,7 +4768,7 @@ async function composeStart(
                 error: err instanceof Error ? err.message : String(err),
               })
           ),
-          wakeModeFor: (channel) => mesh.slackWakeModeFor(channel),
+          wakeModeFor: (channel) => mesh.chatWakeModeFor(`slack:channels/${channel}`),
         }
       );
       resources.acquire("slack source", () => source?.close());
