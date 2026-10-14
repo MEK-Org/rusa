@@ -373,23 +373,32 @@ describe("Slack read MCP streamed downloads", () => {
     expect((await overflow.download()).text).toContain("file size limit exceeded");
     expect(readdirSync(overflow.dir)).toEqual([]);
 
+    let hangUp!: () => void;
+    const hungUp = new Promise<void>((resolve) => {
+      hangUp = resolve;
+    });
     vi.stubGlobal(
       "fetch",
       vi.fn(
         async () =>
           new Response(
             new ReadableStream<Uint8Array>({
-              start(controller) {
+              async start(controller) {
                 controller.enqueue(new TextEncoder().encode("partial"));
+                await hungUp;
                 controller.error(new Error("socket hang up"));
               },
             })
           )
       )
     );
-    const interrupted = await reader(reportFile);
-    const result = await interrupted.download();
+    const interrupted = await reader(withoutSize(reportFile));
+    const pending = interrupted.download();
+    await vi.waitFor(() => expect(statSync(join(interrupted.dir, "out.bin")).size).toBe(7));
+    hangUp();
+    const result = await pending;
     expect(result.isError).toBe(true);
+    expect(result.text).not.toContain("sha256");
     expect(result.text).toContain("socket hang up");
     expect(readdirSync(interrupted.dir)).toEqual([]);
   });
