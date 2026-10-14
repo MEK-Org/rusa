@@ -576,6 +576,12 @@ describe("distiller MCP — nightly reports ", () => {
     expect(md).toContain("Example distilled theme");
     expect(md).toContain("## Deliberately left out");
     expect(md).toContain("A transient thing");
+    expect(md).toContain("Recorded the example landing.");
+    expect(md).toContain("Confidence: **high** — Explicit ruling.");
+    expect(md).not.toContain("Commitment claims");
+    expect(index.runs[0].counts).not.toHaveProperty("commitment_claims");
+    expect(index.runs[0].counts).not.toHaveProperty("commitment_claims_flagged");
+    expect(index.runs[0].counts).not.toHaveProperty("commitment_claims_unknown");
 
     // Re-rendering the same run upserts (does not duplicate) its index entry.
     const rerun = dataOf(
