@@ -32,9 +32,11 @@ conversation type is ignored, even under `all`.
 
 A mention means the installed bot's own user, encoded by Slack as `<@U…>`. A
 display name, another user, a user group, `@here` and `@channel` are not. The
-bot's identity comes from `auth.test` on the bot token, looked up when the first
-event arrives and retried if it fails; until it is known, plain-text mentions go
-undetected and only `app_mention` events count as mentions.
+bot's identity comes from `auth.test` on the bot token, looked up when the
+socket source starts, without retries or rate-limit waits, and looked up again
+on a later event if it fails. No event waits for it: until it is known,
+plain-text mentions go undetected and only `app_mention` events count as
+mentions.
 
 A thread reply follows its conversation's mode and keeps its `thread_ts`. Taking
 part in a thread does not opt later replies into waking.

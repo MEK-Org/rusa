@@ -4758,8 +4758,8 @@ async function composeStart(
             })
         ),
         // Each conversation's stored mode is read per event (#1037), so a
-        // change governs the next arrival. The bot's identity is looked up
-        // lazily: until it is known, a plain-text mention goes undetected.
+        // change governs the next arrival. No event waits for the bot's
+        // identity: until it is known, a plain-text mention goes undetected.
         {
           selfUserId: rememberSlackSelf(
             () => slackClient.identify(),

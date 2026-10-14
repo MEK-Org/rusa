@@ -67,8 +67,11 @@ export function parseSlackEvent(body: unknown, selfUserId?: string): SlackInboun
  * every event, so a stored mode change governs the next one without a restart.
  */
 export interface SlackWakePolicy {
-  /** The installed bot's own Slack user id, or `undefined` when it is unknown. */
-  selfUserId?: () => Promise<string | undefined>;
+  /**
+   * The installed bot's own Slack user id, or `undefined` while it is unknown.
+   * It never waits, so no lookup stands between an event and its ack.
+   */
+  selfUserId?: () => string | undefined;
   /** The exact conversation's stored mode, or `undefined` for the default. */
   wakeModeFor: (channel: string) => SlackWakeMode | undefined;
 }
@@ -76,25 +79,34 @@ export interface SlackWakePolicy {
 const COMPATIBILITY_POLICY: SlackWakePolicy = { wakeModeFor: () => undefined };
 
 /**
- * Remember the installed bot's identity once it is known. A failed lookup is
- * reported and retried on a later event; meanwhile the source knows no self
- * user, which only narrows what wakes: a plain-text mention goes undetected
- * and Slack's `app_mention` event still arrives.
+ * Remember the installed bot's identity once it is known. The returned getter
+ * never waits: it answers from what is already known and, while nothing is,
+ * starts a lookup unless one is in flight. A failed lookup is reported and
+ * retried on a later event. Meanwhile the source knows no self user: a
+ * plain-text mention goes undetected, though Slack's `app_mention` event still
+ * arrives, and the bot's own posts are still dropped by their `bot_id`.
  */
 export function rememberSlackSelf(
   identify: () => Promise<{ userId: string }>,
   onError: (error: unknown) => void
-): () => Promise<string | undefined> {
-  let known: Promise<string> | undefined;
-  return async () => {
-    known ??= identify().then((self) => self.userId);
-    try {
-      return await known;
-    } catch (error) {
-      known = undefined;
-      onError(error);
-      return undefined;
+): () => string | undefined {
+  let known: string | undefined;
+  let lookup: Promise<void> | undefined;
+  return () => {
+    if (known === undefined && !lookup) {
+      lookup = Promise.resolve()
+        .then(identify)
+        .then(
+          (self) => {
+            known = self.userId;
+          },
+          (error: unknown) => onError(error)
+        )
+        .finally(() => {
+          lookup = undefined;
+        });
     }
+    return known;
   };
 }
 
@@ -146,7 +158,7 @@ export class SlackSocketSource {
       }
       // Ignore irrelevant events promptly. A relevant event is acknowledged only
       // after the durable inbox accepts it, so Slack can retry a failed delivery.
-      const message = await this.admit(body, policy);
+      const message = this.admit(body, policy);
       const incoming = (
         body as { event?: { type?: string; channel_type?: string; subtype?: string } }
       )?.event;
@@ -167,6 +179,8 @@ export class SlackSocketSource {
         this.onError(error);
       }
     });
+    // Start the identity lookup while the socket connects.
+    policy.selfUserId?.();
     await this.socket.start();
   }
 
@@ -175,8 +189,8 @@ export class SlackSocketSource {
    * A policy read that fails is reported and treated as unset, so it can only
    * fall back to the compatibility default, never broaden coverage.
    */
-  private async admit(body: unknown, policy: SlackWakePolicy): Promise<SlackInboundMessage | null> {
-    const selfUserId = await policy.selfUserId?.();
+  private admit(body: unknown, policy: SlackWakePolicy): SlackInboundMessage | null {
+    const selfUserId = policy.selfUserId?.();
     const message = parseSlackEvent(body, selfUserId);
     if (!message) return null;
     let mode: SlackWakeMode | undefined;

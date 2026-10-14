@@ -50,7 +50,13 @@ const settle = () => new Promise((resolve) => setImmediate(resolve));
  * socket source admits by the exact row's stored mode, the inbox event is keyed
  * by message identity, and the receipt follows durable acceptance.
  */
-async function harness(options: { inbox?: (real: InboxRepository) => InboxRepository } = {}) {
+async function harness(
+  options: {
+    inbox?: (real: InboxRepository) => InboxRepository;
+    /** How the first identity lookup, made as the source starts, answers. */
+    firstIdentify?: () => Promise<{ ok: boolean; user_id?: string }>;
+  } = {}
+) {
   mock.listeners.clear();
   const owners = new InMemoryEventSourceOwnerStore();
   const subscriptions = new InMemoryEventSourceSubscriptionStore();
@@ -85,7 +91,13 @@ async function harness(options: { inbox?: (real: InboxRepository) => InboxReposi
   // ever called, never anything that would change the app's access.
   const webCalls: string[] = [];
   const react = vi.fn(async (_args: { channel: string; timestamp: string }) => ({ ok: true }));
-  const identify = vi.fn(async () => ({ ok: true, user_id: BOT }));
+  const identify = vi.fn(
+    async (): Promise<{ ok: boolean; user_id?: string }> => ({
+      ok: true,
+      user_id: BOT,
+    })
+  );
+  if (options.firstIdentify) identify.mockImplementationOnce(options.firstIdentify);
   const slack = new SlackClient("xoxb-synthetic");
   const recording = (name: string, fn: (...args: never[]) => unknown) =>
     vi.fn((...args: never[]) => {
@@ -93,10 +105,12 @@ async function harness(options: { inbox?: (real: InboxRepository) => InboxReposi
       return fn(...args);
     });
   Object.defineProperty(slack, "web", {
-    value: {
-      auth: { test: recording("auth.test", identify) },
-      reactions: { add: recording("reactions.add", react) },
-    },
+    value: { reactions: { add: recording("reactions.add", react) } },
+  });
+  // Identity goes through the bounded client, which neither retries nor waits
+  // out a rate limit.
+  Object.defineProperty(slack, "historyWeb", {
+    value: { auth: { test: recording("auth.test", identify) } },
   });
 
   const deliver = vi.fn(async (message: Parameters<typeof slackInboxEvent>[0]) =>
@@ -114,6 +128,8 @@ async function harness(options: { inbox?: (real: InboxRepository) => InboxReposi
       },
     }
   );
+  // Let the identity lookup made at start settle, as it does before real traffic.
+  await settle();
 
   let seq = 0;
   const send = async (event: Record<string, unknown>, eventId = `Ev${++seq}`) => {
@@ -456,10 +472,11 @@ describe("Slack per-conversation wake policy (#1037)", () => {
   });
 
   it("detects plain-text bot mentions only once the bot's identity is known", async () => {
-    const h = await harness();
-    h.identify.mockRejectedValueOnce(
-      Object.assign(new Error("invalid_auth"), { data: { error: "invalid_auth" } })
-    );
+    const h = await harness({
+      firstIdentify: async () => {
+        throw Object.assign(new Error("invalid_auth"), { data: { error: "invalid_auth" } });
+      },
+    });
     h.setMode("M1", { version: 1, slackWakeMode: "mentions" });
     const mention = (ts: string) => ({
       type: "message",
@@ -469,13 +486,15 @@ describe("Slack per-conversation wake policy (#1037)", () => {
       user: HUMAN,
       text: `<@${BOT}> ping`,
     });
-
-    // Identity unavailable: the mention cannot be recognized, so nothing wakes.
-    await h.send(mention("7001.000001"));
-    expect(h.items("owner-group-dm")).toEqual([]);
+    // The lookup made at start failed and was reported.
     expect(h.onError).toHaveBeenCalledOnce();
 
-    // The next event retries identity and is recognized; later events reuse it.
+    // Identity still unknown: the mention cannot be recognized, so nothing
+    // wakes, and this event starts the retry.
+    await h.send(mention("7001.000001"));
+    expect(h.items("owner-group-dm")).toEqual([]);
+
+    // Once the retry succeeds the mention is recognized; later events reuse it.
     await h.send(mention("7002.000001"));
     await h.send(mention("7003.000001"));
     expect(
@@ -485,5 +504,41 @@ describe("Slack per-conversation wake policy (#1037)", () => {
         .sort()
     ).toEqual(["7002.000001", "7003.000001"]);
     expect(h.identify).toHaveBeenCalledTimes(2);
+  });
+
+  it("never holds an event or its ack behind an identity lookup", async () => {
+    // A lookup that never settles, standing in for a slow or rate-limited Slack.
+    const h = await harness({ firstIdentify: () => new Promise(() => {}) });
+    h.setMode("C1", { version: 1, slackWakeMode: "mentions" });
+    const dm = { type: "message", channel_type: "im", channel: "D1", user: HUMAN, text: "hi" };
+
+    // A default-mode DM needs no identity: it is delivered and acked at once.
+    const delivered = await h.send({ ...dm, ts: "8001.000001" });
+    expect(delivered).toHaveBeenCalledOnce();
+    expect(h.items("owner-dm").map((item) => item.payload.ts)).toEqual(["8001.000001"]);
+
+    // An event that cannot wake is acked at once too.
+    const ignored = await h.send({
+      ...dm,
+      channel_type: "channel",
+      channel: "C1",
+      ts: "8002.000001",
+    });
+    expect(ignored).toHaveBeenCalledOnce();
+    expect(h.items("owner-public")).toEqual([]);
+
+    // Slack's own app_mention still wakes a mentions-mode conversation.
+    const mentioned = await h.send({
+      type: "app_mention",
+      channel: "C1",
+      ts: "8003.000001",
+      user: HUMAN,
+      text: `<@${BOT}> hi`,
+    });
+    expect(mentioned).toHaveBeenCalledOnce();
+    expect(h.items("owner-public").map((item) => item.payload.ts)).toEqual(["8003.000001"]);
+
+    // The in-flight lookup is shared, not repeated per event.
+    expect(h.identify).toHaveBeenCalledOnce();
   });
 });

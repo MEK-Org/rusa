@@ -451,11 +451,12 @@ async function readBodyWithLimit(resp: Response, maxBytes: number): Promise<Buff
 export class SlackClient {
   readonly web: WebClient;
   /**
-   * The client for the history and discovery tools and `getUser`: a
-   * rate-limited call fails with Slack's retry-after instead of the SDK
+   * The client for the history and discovery tools, `getUser` and `identify`:
+   * a rate-limited call fails with Slack's retry-after instead of the SDK
    * silently waiting, and a network or HTTP failure is not retried, so an
    * actor's tool call reports the failure rather than stalling for the SDK's
-   * default of ten retries over about 30 minutes.
+   * default of ten retries over about 30 minutes, and an ingress identity
+   * lookup fails promptly and is retried on a later event.
    */
   readonly historyWeb: WebClient;
   readonly #botToken: string;
@@ -472,7 +473,7 @@ export class SlackClient {
 
   /** The installed bot's own Slack identity, as `auth.test` reports it for this token. */
   async identify(): Promise<{ userId: string }> {
-    const response = await this.web.auth.test();
+    const response = await this.historyWeb.auth.test();
     if (!response.user_id) throw new Error("Slack auth.test did not return the bot's user id");
     return { userId: response.user_id };
   }
