@@ -4,6 +4,7 @@ import { FinishReason, Type } from "@google/genai";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { RusaConfig } from "../config/types.js";
+import { generateGeminiContent } from "../observability/gemini-usage.js";
 import {
   type ScrapeAgyUsageOptions,
   scrapeAgyUsage as scrapeAgyUsageImpl,
@@ -792,7 +793,7 @@ async function parseQuotaWithLlm(
     modelName: string,
     seen: ExtractionAttemptObservation
   ): Promise<Partial<ProviderQuotaSnapshot>> => {
-    const response = await client.models.generateContent({
+    const response = await generateGeminiContent(client, "quota_parse", {
       model: modelName,
       contents: `Parse the following CLI/TUI output of a quota check for the provider '${provider}':\n\n${output}`,
       config: {

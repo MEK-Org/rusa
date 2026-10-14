@@ -10,6 +10,7 @@ import { runDbCheck } from "./commands/db-check.js";
 import { runDev } from "./commands/dev.js";
 import { runActorMeshE2EUp } from "./commands/e2e-actor-mesh.js";
 import { runForwardWebhooks } from "./commands/forward-webhooks.js";
+import { runGeminiUsageReport } from "./commands/gemini-usage-report.js";
 import { runInit } from "./commands/init.js";
 import { runInstallQuotaCoordinator, runInstallService } from "./commands/install-service.js";
 import { runActorLogs, runLogs } from "./commands/logs.js";
@@ -80,6 +81,20 @@ program
   .action(() => {
     printConfigDocs();
   });
+
+program
+  .command("gemini-usage-report")
+  .description("Aggregate Gemini usage from retained JSONL exports on demand")
+  .argument("<files...>", "JSONL log exports; use - for stdin")
+  .requiredOption("--from <utc>", "Inclusive start in ISO UTC (Z)")
+  .requiredOption("--to <utc>", "Exclusive end in ISO UTC (Z)")
+  .option("--json", "Print structured report")
+  .option("--gap <note...>", "Disclose known retention, rotation or missing-source gaps")
+  .action(
+    async (files: string[], opts: { from: string; to: string; json?: boolean; gap?: string[] }) => {
+      await runGeminiUsageReport(files, { ...opts, gaps: opts.gap });
+    }
+  );
 
 program
   .command("start")

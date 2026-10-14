@@ -244,6 +244,7 @@ import {
   resolveDiskAlertConfig,
 } from "../observability/disk-alert.js";
 import { resolveErrorSink } from "../observability/error-sink.js";
+import { configureGeminiUsage } from "../observability/gemini-usage.js";
 import {
   collectConfigSecretEntries,
   collectEnvSecretEntries,
@@ -1091,6 +1092,7 @@ async function composeStart(
     secrets: readSecrets,
     context: { component: "start" },
   });
+  configureGeminiUsage(log, mcHome);
   // This file name is configuration, not a credential. Read the value only on
   // the host plane and register it with the log scrubber before any client can
   // use it. A bad/missing file intentionally leaves the opt-in observer

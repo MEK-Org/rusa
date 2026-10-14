@@ -1,5 +1,6 @@
 import { Type } from "@google/genai";
 import { sanitizeFailureText } from "../actor/failure-sink.js";
+import { generateGeminiContent } from "../observability/gemini-usage.js";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
 import type { RunResult } from "./types.js";
 
@@ -45,7 +46,7 @@ export async function classifyRunExhaustion(
 
   try {
     const client = getGeminiClient(geminiApiKey);
-    const response = await client.models.generateContent({
+    const response = await generateGeminiContent(client, "exhaustion_classification", {
       model: "gemini-3.5-flash-lite",
       contents:
         "Classify this failed coding-agent run. Return exhausted=true only when the failure " +

@@ -7,6 +7,7 @@ import { loadConfig, resolveHome } from "../config/index.js";
 import type { RusaConfig } from "../config/types.js";
 import { ModelScrapeRepository } from "../db/repositories/model-scrape-repository.js";
 import { createQuotaService } from "../mcp/quota-mcp.js";
+import { configureGeminiUsage } from "../observability/gemini-usage.js";
 import { createLogger, type Logger } from "../observability/logger.js";
 import {
   codexAuthBrokerConfigured,
@@ -273,6 +274,7 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
     opts.loadedRevision === undefined ? coordinatorLoadedRevision() : opts.loadedRevision;
   const mcHome = opts.home ?? resolveHome();
   const config = loadConfig(mcHome);
+  configureGeminiUsage(log, mcHome);
   // The coordinator's quota probes refresh the same login as the daemons do.
   configureCodexAuthBroker(codexAuthBrokerConfigured(config));
   const probeOff = opts.probeOff === true || process.env.RUSA_QUOTA_COORDINATOR_PROBE_OFF === "1";
