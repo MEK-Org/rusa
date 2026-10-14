@@ -481,6 +481,35 @@ describe("Slack write MCP attribution", () => {
     expect(postMessage).toHaveBeenCalledOnce();
   });
 
+  it("refuses a file comment that Slack would truncate once the footer is added", async () => {
+    const dir = workdir();
+    writeFileSync(join(dir, "out.png"), "png-bytes");
+    const uploadV2 = vi.fn(async (_args: Record<string, unknown>) => ({
+      ok: true,
+      files: [{ ok: true, files: [{ id: "F9" }] }],
+    }));
+    const client = await connect(
+      createSlackWriteMcpServer(slackWith({ files: { uploadV2 } }), ["C1"], {
+        actorHandle,
+        workDir: dir,
+      })
+    );
+    const footer = "\n\n_actor-handle_";
+    const fits = "x".repeat(MAX_SLACK_MESSAGE_CHARS - footer.length);
+    const upload = (initialComment: string) =>
+      call(client, "upload_file", { channel: "C1", filePath: "out.png", initialComment });
+
+    expect((await upload(fits)).isError).toBe(false);
+    expect(await upload(`${fits}x`)).toEqual({
+      isError: true,
+      text: expect.stringContaining("40001 characters with its footer"),
+    });
+    expect(uploadV2).toHaveBeenCalledOnce();
+    expect(uploadV2).toHaveBeenCalledWith(
+      expect.objectContaining({ initial_comment: `${fits}${footer}` })
+    );
+  });
+
   it("gives an uploaded file a footer comment when the caller wrote none", async () => {
     const dir = workdir();
     writeFileSync(join(dir, "out.png"), "png-bytes");

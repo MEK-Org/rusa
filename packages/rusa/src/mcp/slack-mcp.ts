@@ -27,7 +27,9 @@ export const SLACK_WRITE_MCP_NAME = "slack-write";
 
 /**
  * Slack truncates `chat.postMessage` text past this many characters (per its
- * method docs), which would cut off the footer, so longer text is refused.
+ * method docs), which would cut off the footer, so longer text is refused. A
+ * file's comment is held to the same bound: Slack documents no separate limit
+ * for it.
  */
 export const MAX_SLACK_MESSAGE_CHARS = 40_000;
 
@@ -381,11 +383,19 @@ export function createSlackWriteMcpServer(
       options.selectedInboxEntries?.() ?? [],
       options.logger
     );
-  const signedText = (text: string) =>
-    appendVisibleActorSignature(
+  const signedText = (text: string) => {
+    const signed = appendVisibleActorSignature(
       text,
       formatVisibleActorSignature(options.actorHandle, options.getRunSelection?.(), "slack")
     );
+    // UTF-16 length is never below Slack's character count, so this refuses early, not late.
+    if (signed.length > MAX_SLACK_MESSAGE_CHARS) {
+      throw new Error(
+        `Slack text is ${signed.length} characters with its footer; Slack truncates past ${MAX_SLACK_MESSAGE_CHARS}, so shorten it or split it across messages`
+      );
+    }
+    return signed;
+  };
   server.registerTool(
     "send_message",
     {
@@ -402,12 +412,6 @@ export function createSlackWriteMcpServer(
       try {
         if (!allowed(channel)) throw new Error(`access denied: Slack channel ${channel}`);
         const signed = signedText(text);
-        // UTF-16 length is never below Slack's character count, so this refuses early, not late.
-        if (signed.length > MAX_SLACK_MESSAGE_CHARS) {
-          throw new Error(
-            `Slack message is ${signed.length} characters with its footer; Slack truncates past ${MAX_SLACK_MESSAGE_CHARS}, so split it across messages`
-          );
-        }
         const effectiveThreadTs = placement(channel, threadTs);
         const ts = await client.send(channel, signed, effectiveThreadTs);
         options.onWrite?.();
@@ -466,6 +470,7 @@ export function createSlackWriteMcpServer(
       try {
         if (!allowed(channel)) throw new Error(`access denied: Slack channel ${channel}`);
         requireFileToolsAvailable(options);
+        const comment = signedText(initialComment ?? "");
         const workDir = requireWorkDir(options);
         const source = await resolveAttachmentPath(workDir, filePath);
         const data = await readBoundedRegularFile(
@@ -479,7 +484,7 @@ export function createSlackWriteMcpServer(
           data,
           ...(threadTs ? { threadTs } : {}),
           ...(title ? { title } : {}),
-          initialComment: signedText(initialComment ?? ""),
+          initialComment: comment,
         });
         // Slack completed the share, so the file is posted even if no ID came back.
         options.onWrite?.();
