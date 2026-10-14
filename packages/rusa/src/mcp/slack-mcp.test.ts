@@ -1400,7 +1400,7 @@ describe("Slack write MCP send_message with files", () => {
     ]);
     for (const upload of fake.uploads) {
       expect(upload.contentLength).toBe(String(upload.body.length));
-      expect(upload.authorization).toBeNull();
+      expect(upload.authorization).toBe(`Bearer ${TOKEN}`);
     }
     const [completion] = fake.completions;
     expect(Object.fromEntries(completion ?? [])).toMatchObject({
@@ -1552,6 +1552,51 @@ describe("Slack write MCP send_message with files", () => {
     expect(unknown.text).toContain("may or may not have been shared");
     expect(dropped.completions).toHaveLength(1);
     expect(second.onWrite).toHaveBeenCalledOnce();
+  });
+
+  // https://docs.slack.dev/reference/methods/files.completeUploadExternal/#errors
+  it.each([
+    ["internal_error", "internal_error"],
+    ["fatal_error", "fatal_error"],
+    ["file_update_failed", "file_update_failed"],
+    ["service_unavailable", "service_unavailable"],
+    ["an unknown code", "synthetic_new_code"],
+    ["no error code", undefined],
+  ])("counts a share failing with %s as possibly posted", async (_label, error) => {
+    const fake = fakeSlack({ complete: () => ({ ok: false, ...(error ? { error } : {}) }) });
+    const { dir, onWrite, client } = await writer();
+    writeFileSync(join(dir, "a.txt"), "a");
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "a.txt" }],
+    });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain(`(${error ?? "no error code"})`);
+    expect(result.text).toContain("may or may not have been shared");
+    expect(result.text).not.toContain("nothing was shared");
+    expect(fake.completions).toHaveLength(1);
+    expect(onWrite).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "posting_to_channel_denied",
+    "invalid_auth",
+    "ratelimited",
+  ])("reports a share refused with %s as nothing shared", async (error) => {
+    const fake = fakeSlack({ complete: () => ({ ok: false, error }) });
+    const { dir, onWrite, client } = await writer();
+    writeFileSync(join(dir, "a.txt"), "a");
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "a.txt" }],
+    });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain(error);
+    expect(result.text).toContain("nothing was shared");
+    expect(fake.completions).toHaveLength(1);
+    expect(onWrite).not.toHaveBeenCalled();
   });
 
   it("reports files Slack did not confirm, after counting the share as written", async () => {
