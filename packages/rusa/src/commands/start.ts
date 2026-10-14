@@ -851,8 +851,8 @@ export const PORTABLE_CONTEXT_DELTA_MAX_PAGES = 4;
 /**
  * The durable sources after the ledger's fold cursor, oldest first — exactly
  * what the next fold will consume. `truncated` reports that the tail ran past
- * the page ceiling; the sources kept are the OLDEST, so the newest-message cap
- * below is applied by `selectDeltaJournal` on what was read.
+ * the page ceiling; the sources kept are the OLDEST, so a truncated read must
+ * fall back to the recent window to keep the newest messages visible.
  */
 export function readUnfoldedLedgerSources(
   actorId: string,
@@ -913,10 +913,9 @@ function assemblePortableInjection(
     runs,
     journal: undefined as PortableJournalRecord | undefined,
   });
-  // Compacted memory plus delta (#1062): the verbatim journal is only what the
-  // ledger has not folded yet. A read failure here falls back to the window the
-  // actor would have had outside the experiment — buildPrompt has no catch, so
-  // an exception would keep the actor from starting at all.
+  // Compacted memory plus delta (#1062): verbatim messages after the fold cursor
+  // plus the unchanged runs window. A failed or truncated read falls back to the
+  // recent window, so the actor starts with its newest messages still visible.
   const selectJournal = () => {
     if (journal !== "delta") return windowJournal();
     try {
@@ -926,17 +925,22 @@ function assemblePortableInjection(
         recentRuns: runs,
         maxMessages: portableContextMaxMessages(),
       });
+      const journalRecord: PortableJournalRecord = {
+        mode: unfolded.truncated ? "window" : "delta",
+        foldCursor: state.lastFoldedSourceId,
+        unfoldedSources: delta.unfoldedSources,
+        unfoldedMessages: delta.unfoldedMessages,
+        unfoldedYields: delta.unfoldedYields,
+        truncated: unfolded.truncated,
+      };
+      if (unfolded.truncated) {
+        onDeltaFallback(new Error("unfolded source tail exceeds the delta journal page ceiling"));
+        return { ...windowJournal(), journal: journalRecord };
+      }
       return {
         messages: delta.messages,
         runs: delta.runs,
-        journal: {
-          mode: "delta" as const,
-          foldCursor: state.lastFoldedSourceId,
-          unfoldedSources: delta.unfoldedSources,
-          unfoldedMessages: delta.unfoldedMessages,
-          unfoldedYields: delta.unfoldedYields,
-          truncated: unfolded.truncated,
-        },
+        journal: journalRecord,
       };
     } catch (error) {
       onDeltaFallback(error);

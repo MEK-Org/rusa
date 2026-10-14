@@ -4878,6 +4878,48 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await interruptedRun();
     expect(batches).toEqual([[a], [b, c], [d]]);
     expect(deferredEvents()).toHaveLength(2);
+
+    // A compactor outage or repeated interruptions can grow the unfolded tail
+    // past its read ceiling. Show the newest window, not the oldest 200 sources.
+    mesh.enrollActorInExperiment("root", COMPACTED_MEMORY_DELTA_EXPERIMENT, "root");
+    const backlog: string[] = [];
+    for (let i = 0; i < 205; i++) {
+      backlog.push(
+        getRepositories().meshChat.record({
+          ts: new Date(Date.UTC(2026, 9, 15, 0, 0, i)).toISOString(),
+          senderId: "operator",
+          recipientId: "root",
+          body: `Backlog instruction ${i}`,
+        })
+      );
+    }
+    const fallbackPrompt = actorOpts.buildPrompt();
+    expect(fallbackPrompt.injectRecord?.journal).toMatchObject({
+      mode: "window",
+      foldCursor: d,
+      unfoldedSources: 200,
+      unfoldedMessages: 200,
+      truncated: true,
+    });
+    expect(fallbackPrompt.injectRecord?.sourceMessageEventIds).toEqual(backlog.slice(-10));
+    expect(fallbackPrompt.prompt).toContain("Backlog instruction 204");
+    expect(fallbackPrompt.prompt).not.toContain("Backlog instruction 194");
+    expect(fallbackPrompt.injectRecord?.sourceEventIds).toEqual(
+      getRepositories()
+        .actorRuns.listRecentCompleted("root", 10)
+        .map((run) => run.id)
+        .reverse()
+    );
+    expect(getRepositories().portableContext.load("root").lastFoldedSourceId).toBe(d);
+    expect(
+      logCapture.lines
+        .map((line) => JSON.parse(line))
+        .some(
+          (entry) =>
+            entry.msg === "portable_context_delta_fallback" &&
+            entry.error === "unfolded source tail exceeds the delta journal page ceiling"
+        )
+    ).toBe(true);
   });
 
   it("persists token accounting records for ended root runs with reported token usage (#443)", async () => {

@@ -7,19 +7,19 @@ actor until an administrator enrolls it.
 ## What it changes
 
 Outside the experiment, a ledger actor's prompt carries its compacted ledger
-**and** a fixed window of recent inbound messages and run outputs, whether or
-not the fold already absorbed them. After every run end, including an
+**and** a fixed window of recent inbound messages and run outputs. The ledger
+can already have absorbed those messages; it does not absorb completed run
+outputs. After every run end, including an
 interrupted one, the actor's successor waits for the compactor before it can
 start.
 
 An enrolled actor gets two changes:
 
-1. **Delta journal.** The verbatim journal is only the durable sources recorded
-   after the ledger's fold cursor (`lastFoldedSourceId`): the inbound messages
-   and yield notes the ledger has not folded yet, plus the actor's most recent
-   completed run so it can still see what it just did. Sources before the
-   cursor are represented by the ledger alone. The existing count and byte
-   budgets still apply.
+1. **Delta journal.** Verbatim inbound messages come only from the durable
+   sources after the ledger's fold cursor (`lastFoldedSourceId`). Earlier
+   messages are represented by the ledger alone. The recent completed runs
+   window stays unchanged because those outputs are not folded into the
+   ledger. The existing count and byte budgets still apply.
 2. **Deferred interruption compaction.** When a run ends interrupted (an
    explicit interrupt or a responsive preemption), the post-run fold is
    skipped and a `portable_context_compaction_deferred` event is recorded. The
@@ -57,9 +57,13 @@ folds deferred by interruptions) is still after the cursor, so the next run
 end folds it as before. There is no state to migrate in either direction and
 the snapshot schema version is unchanged.
 
-If the delta read fails for an enrolled actor, the prompt falls back to the
-fixed window for that run and logs `portable_context_delta_fallback`; the
-actor still starts.
+If the delta read fails or the unfolded tail exceeds its four-page ceiling
+(200 sources), the prompt falls back to the fixed recent window for that run
+and logs `portable_context_delta_fallback`; the actor still starts with the
+newest messages visible. A truncated read retains `journal.truncated: true`,
+its fold cursor and source counts in the inject record, with
+`journal.mode: window`. The fold cursor is unchanged. A failed read has no
+journal accounting.
 
 ## Measuring
 
@@ -67,9 +71,10 @@ Nothing here is a savings claim until measured. The signals to compare for an
 enrolled actor against its own pre-enrollment runs:
 
 - `run_start` events carry the inject record. `bytes` is the injected prefix
-  size; `sections` breaks it down; `journal.mode` is `delta` for enrolled
-  runs and absent for window runs, with `journal.unfoldedSources` and
-  `journal.foldCursor` for provenance.
+  size; `sections` breaks it down; `journal.mode` is `delta` for a complete
+  delta read and `window` for a truncated-tail fallback, with
+  `journal.unfoldedSources` and `journal.foldCursor` for provenance. Journal
+  accounting is absent outside the experiment or when the delta read fails.
 - `portable_context_compacted` events count folds and their size; a deferred
   fold shows up as one `portable_context_compaction_deferred` followed by one
   larger `portable_context_compacted` at the next ordinary run end.
@@ -78,6 +83,17 @@ enrolled actor against its own pre-enrollment runs:
 
 The unit-level before/after on an identical fixture is printed by
 `packages/rusa/src/actor/portable-context-delta.test.ts`.
+The fixture contains eight folded messages, two unfolded messages, ten runs
+and eight ledger decisions. Observed prefix sizes (bytes, not tokens):
+
+| Journal | Total | Ledger | Messages | Runs |
+| --- | --- | --- | --- | --- |
+| Window | 9720 | 1005 | 4072 | 4365 |
+| Delta | 6488 | 1005 | 840 | 4365 |
+
+All ten run outputs and the ledger section remain unchanged. Only the eight
+folded message bodies are omitted from the delta journal. These fixture
+measurements do not establish production savings.
 
 The startup integration fixture in `src/commands/start.test.ts` holds the first
 fold behind a promise barrier and proves an unenrolled interrupted run cannot

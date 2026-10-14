@@ -56,24 +56,24 @@ describe("selectDeltaJournal (#1062)", () => {
     expect(journal.unfoldedYields).toBe(1);
   });
 
-  it("shows unfolded yields' runs plus the latest run, and drops folded runs", () => {
+  it("keeps the full recent runs window regardless of unfolded yield ids", () => {
     const journal = selectDeltaJournal({
       unfolded: [yielded("r2", 2, "yield two")],
       recentRuns: [run("r4", 4, "out four"), run("r3", 3, "out three"), run("r2", 2, "out two")],
       maxMessages: 10,
     });
-    // r4 is the latest run (always kept); r2's yield is unfolded; r3 was folded.
-    expect(journal.runs.map((r) => r.id)).toEqual(["r4", "r2"]);
+    // Run outputs are not absorbed by the ledger; all three remain verbatim.
+    expect(journal.runs.map((r) => r.id)).toEqual(["r4", "r3", "r2"]);
   });
 
-  it("is empty apart from the latest run when everything is folded", () => {
+  it("keeps the recent runs window when no sources remain unfolded", () => {
     const journal = selectDeltaJournal({
       unfolded: [],
       recentRuns: [run("r9", 9, "latest"), run("r8", 8, "older")],
       maxMessages: 10,
     });
     expect(journal.messages).toEqual([]);
-    expect(journal.runs.map((r) => r.id)).toEqual(["r9"]);
+    expect(journal.runs.map((r) => r.id)).toEqual(["r9", "r8"]);
     expect(journal.unfoldedSources).toBe(0);
   });
 
@@ -187,7 +187,9 @@ describe("compacted memory plus delta on an identical fixture (#1062)", () => {
     // The window re-sent every message the ledger already absorbed; the delta sends two.
     expect(window.record.sourceMessageEventIds).toHaveLength(FOLDED_MESSAGES + UNFOLDED_MESSAGES);
     expect(after.record.sourceMessageEventIds).toEqual(["msg-8", "msg-9"]);
-    expect(after.record.sourceEventIds).toEqual(["run-9"]);
+    expect(after.record.sourceEventIds).toEqual(window.record.sourceEventIds);
+    expect(after.record.sourceEventIds).toHaveLength(RUNS);
+    expect(after.record.sections?.runs).toBe(window.record.sections?.runs);
     expect(after.record.bytes).toBeLessThan(window.record.bytes);
     expect(after.record.journal).toMatchObject({ mode: "delta", unfoldedMessages: 2 });
     expect(window.record.journal).toBeUndefined();
