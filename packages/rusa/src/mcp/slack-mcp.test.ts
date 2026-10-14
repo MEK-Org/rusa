@@ -1560,6 +1560,8 @@ describe("Slack write MCP send_message with files", () => {
     ["fatal_error", "fatal_error"],
     ["file_update_failed", "file_update_failed"],
     ["service_unavailable", "service_unavailable"],
+    ["team_added_to_org", "team_added_to_org"],
+    ["org_login_required", "org_login_required"],
     ["an unknown code", "synthetic_new_code"],
     ["no error code", undefined],
   ])("counts a share failing with %s as possibly posted", async (_label, error) => {

@@ -339,7 +339,10 @@ export const MAX_SLACK_MESSAGE_FILES = 10;
  * says `internal_error` and `fatal_error` may have succeeded in part, and it
  * does not say that `file_update_failed`, `request_timeout` or
  * `service_unavailable` happen before any side effect, so those, any code not
- * listed here and a missing code all leave the outcome unknown.
+ * listed here and a missing code all leave the outcome unknown. The same goes
+ * for `team_added_to_org` and `org_login_required`: the table says only that
+ * the workspace is migrating to an Enterprise Organization, not that the call
+ * is refused before anything is shared.
  */
 const SHARE_REFUSAL_CODES = new Set([
   "access_denied",
@@ -369,11 +372,9 @@ const SHARE_REFUSAL_CODES = new Set([
   "not_allowed_token_type",
   "not_authed",
   "not_in_channel",
-  "org_login_required",
   "posting_to_channel_denied",
   "ratelimited",
   "team_access_not_granted",
-  "team_added_to_org",
   "token_expired",
   "token_revoked",
   "two_factor_setup_required",
