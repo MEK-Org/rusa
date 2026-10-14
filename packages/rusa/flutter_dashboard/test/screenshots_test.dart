@@ -44,6 +44,103 @@ void main() {
     await loadFonts();
   });
 
+  // Appearance only; the ring tests assert the warning and dimming (#1055).
+  testWidgets('renders quota scrape warning and cache dimming states (#1055)', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      await tester.binding.setSurfaceSize(const Size(520, 120));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final key = GlobalKey();
+      final now = DateTime.now().toUtc();
+
+      QuotaSnapshotDto snapshot(DateTime fetchedAt, Duration scrapeAge) {
+        final scrapedAt = fetchedAt.subtract(scrapeAge).toIso8601String();
+        return QuotaSnapshotDto(
+          generatedAt: fetchedAt.toIso8601String(),
+          providers: [
+            ProviderQuotaDto(
+              provider: 'claude',
+              status: 'available',
+              usedPercent: 30,
+              tier: null,
+              message: null,
+              scrapedAt: scrapedAt,
+              windows: [
+                QuotaWindowDto(
+                  id: 'weekly',
+                  label: 'Weekly',
+                  usedPercent: 30,
+                  status: 'available',
+                  headline: true,
+                  windowMs: 604800000,
+                  resetAtIso: now.add(const Duration(days: 3)).toIso8601String(),
+                  scrapedAt: scrapedAt,
+                ),
+              ],
+            ),
+          ],
+        );
+      }
+
+      Future<void> render(DashboardStore store, String filename) async {
+        // Mount each state fresh so the strip's opacity is not mid-animation.
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pumpWidget(
+          RepaintBoundary(
+            key: key,
+            child: MaterialApp(
+              debugShowCheckedModeBanner: false,
+              theme: buildMeshTheme(),
+              home: Scaffold(
+                backgroundColor: MeshColors.bgPrimary,
+                body: Center(child: QuotaIndicators(store: store)),
+              ),
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 250));
+        await captureBoundary(key, '$_outDir/$filename');
+        await store.dispose();
+      }
+
+      Future<DashboardStore> fetched(QuotaSnapshotDto snap) async {
+        final store = DashboardStore(
+          api: FakeApi()..quotaResult = snap,
+          stream: FakeStream(),
+        );
+        await store.refreshQuota();
+        return store;
+      }
+
+      DashboardStore cached(QuotaSnapshotDto snap) => DashboardStore(
+        api: FakeApi(),
+        stream: FakeStream(),
+        quotaCache: FakeQuotaCache(snap),
+      );
+
+      final idle = now.subtract(const Duration(hours: 3));
+      const healthy = Duration(minutes: 5);
+      const overdue = Duration(hours: 3);
+      await render(
+        await fetched(snapshot(now, healthy)),
+        'header_quota_1055_fresh_healthy.png',
+      );
+      await render(
+        await fetched(snapshot(now, overdue)),
+        'header_quota_1055_fresh_stale_scrape.png',
+      );
+      await render(
+        cached(snapshot(idle, healthy)),
+        'header_quota_1055_idle_healthy_cache.png',
+      );
+      await render(
+        cached(snapshot(idle, overdue)),
+        'header_quota_1055_idle_stale_scrape.png',
+      );
+    });
+  });
+
   testWidgets(
     'renders overview queue and quota columns wide and stacked narrow',
     (tester) async {
