@@ -48,6 +48,7 @@ import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { McpHttpServer } from "../mcp/http-server.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import type { DiskUsageAlertDeps } from "../observability/disk-alert.js";
+import * as exhaustionClassifier from "../providers/exhaustion-classifier.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
@@ -4673,11 +4674,30 @@ describe("runStart webhook event routing (Phase 4)", () => {
     let mesh: ActorMesh | undefined;
     const COMPACTOR_DELAY_MS = 300;
     const batches: string[][] = [];
+    let enterFirstFold!: () => void;
+    let releaseFirstFold!: () => void;
+    const firstFoldEntered = new Promise<void>((resolve) => {
+      enterFirstFold = resolve;
+    });
+    const firstFoldGate = new Promise<void>((resolve) => {
+      releaseFirstFold = resolve;
+    });
+    onTestFinished(() => releaseFirstFold());
+    // The compactor needs a synthetic API key, but failed-run classification
+    // is unrelated to this fixture and must stay offline.
+    const classifierSpy = vi
+      .spyOn(exhaustionClassifier, "createExhaustionClassifier")
+      .mockReturnValue(async () => ({ exhausted: false }));
+    onTestFinished(() => classifierSpy.mockRestore());
     const compactSpy = vi
       .spyOn(GeminiPortableContextCompactor.prototype, "compact")
       .mockImplementation(async ({ state, messages, now }) => {
-        await new Promise((resolve) => setTimeout(resolve, COMPACTOR_DELAY_MS));
         batches.push(messages.map((message) => message.id));
+        if (batches.length === 1) {
+          enterFirstFold();
+          await firstFoldGate;
+        }
+        await new Promise((resolve) => setTimeout(resolve, COMPACTOR_DELAY_MS));
         const first = messages[0];
         return {
           state: {
@@ -4709,6 +4729,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           operations: 1,
         };
       });
+    onTestFinished(() => compactSpy.mockRestore());
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
@@ -4772,8 +4793,17 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     // Flag off: an interrupted run still folds synchronously, as today.
     const a = inbound("Message A, folded while unenrolled.");
-    const offElapsed = await interruptedRun();
-    expect(offElapsed).toBeGreaterThanOrEqual(COMPACTOR_DELAY_MS - 20);
+    let offSettled = false;
+    const offRun = interruptedRun().then((elapsed) => {
+      offSettled = true;
+      return elapsed;
+    });
+    await firstFoldEntered;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(offSettled).toBe(false);
+    expect(getRepositories().portableContext.load("root").lastFoldedSourceId).toBeNull();
+    releaseFirstFold();
+    const offElapsed = await offRun;
     expect(batches).toEqual([[a]]);
     expect(deferredEvents()).toHaveLength(0);
     const folded = getRepositories().portableContext.load("root");
@@ -4788,7 +4818,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
     );
     const b = inbound("Message B, arrives before an interrupted run.");
     const onElapsed = await interruptedRun();
-    expect(onElapsed).toBeLessThan(COMPACTOR_DELAY_MS / 2);
+    // Call order proves the barrier is absent regardless of runner load.
+    // Elapsed times remain fixture measurements, not a host-speed assertion.
+    expect(compactSpy).toHaveBeenCalledTimes(1);
+    console.info(
+      `[portable-context-interrupt-fixture] compactorDelayMs=${COMPACTOR_DELAY_MS} ` +
+        `windowEndMs=${offElapsed} deltaEndMs=${onElapsed}`
+    );
     expect(batches).toEqual([[a]]);
     expect(getRepositories().portableContext.load("root")).toEqual(folded);
     const deferred = deferredEvents();
@@ -4842,7 +4878,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await interruptedRun();
     expect(batches).toEqual([[a], [b, c], [d]]);
     expect(deferredEvents()).toHaveLength(2);
-    compactSpy.mockRestore();
   });
 
   it("persists token accounting records for ended root runs with reported token usage (#443)", async () => {

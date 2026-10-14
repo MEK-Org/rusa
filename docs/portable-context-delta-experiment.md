@@ -1,7 +1,7 @@
 # Compacted memory plus delta (`compacted_memory_delta`)
 
 A default-off experiment for portable-context actors in **ledger** mode
-(tracked as ISSUE_NUM in this repository's tracker). Nothing changes for any
+(tracked as #1062 in this repository's tracker). Nothing changes for any
 actor until an administrator enrolls it.
 
 ## What it changes
@@ -78,3 +78,10 @@ enrolled actor against its own pre-enrollment runs:
 
 The unit-level before/after on an identical fixture is printed by
 `packages/rusa/src/actor/portable-context-delta.test.ts`.
+
+The startup integration fixture in `src/commands/start.test.ts` holds the first
+fold behind a promise barrier and proves an unenrolled interrupted run cannot
+settle before the fold is released. An enrolled interrupted run settles without
+calling the compactor, with the cursor unchanged. It also prints run-end elapsed
+times with a 300 ms synthetic compactor delay; those measurements describe the
+fixture, not a production latency bound, and no host-speed threshold is asserted.
