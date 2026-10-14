@@ -470,6 +470,13 @@ export class SlackClient {
     this.#botToken = botToken;
   }
 
+  /** The installed bot's own Slack identity, as `auth.test` reports it for this token. */
+  async identify(): Promise<{ userId: string }> {
+    const response = await this.web.auth.test();
+    if (!response.user_id) throw new Error("Slack auth.test did not return the bot's user id");
+    return { userId: response.user_id };
+  }
+
   async getChannel(channel: string): Promise<{ id: string; name: string }> {
     const response = await this.web.conversations.info({ channel });
     const found = response.channel;

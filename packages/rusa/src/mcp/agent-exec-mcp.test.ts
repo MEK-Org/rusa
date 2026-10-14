@@ -2500,6 +2500,74 @@ describe("agent-execution MCP server", () => {
       );
     });
 
+    it("configures one Slack conversation's wake mode through its exact owner only (#1037)", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "conversation owner",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      const ownerClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
+      mesh.subscribeEventSource("slack:channels", "root", "root");
+      const call = async (client: typeof rootClient, name: string, args: Record<string, unknown>) =>
+        (await client.callTool({ name, arguments: args })) as CallToolResult;
+
+      // A broad Slack policy is not inherited by any one conversation.
+      const broad = await call(rootClient, "set_event_source_config", {
+        source: "slack:channels",
+        config: { version: 1, slackWakeMode: "all" },
+      });
+      expect(broad.isError).toBeFalsy();
+      expect(mesh.slackWakeModeFor("C1")).toBeUndefined();
+
+      await call(rootClient, "delegate_event_source", {
+        child_thread_id: "t1",
+        source: "slack:channels/C1",
+      });
+      // Only the exact owner may write it; root delegated it away.
+      let res = await call(rootClient, "set_event_source_config", {
+        source: "slack:channels/C1",
+        config: { version: 1, slackWakeMode: "all" },
+      });
+      expect(res.isError).toBe(true);
+      expect(mesh.slackWakeModeFor("C1")).toBeUndefined();
+
+      // all -> mentions -> unset, each read back from the exact row, keeping
+      // unrelated keys the owner wrote alongside it.
+      for (const mode of ["all", "mentions"] as const) {
+        const config = { version: 1, slackWakeMode: mode, chatWakeMode: "all", note: "kept" };
+        res = await call(ownerClient, "set_event_source_config", {
+          source: "slack:channels/C1",
+          config,
+        });
+        expect(res.isError).toBeFalsy();
+        expect(dataOf(await call(ownerClient, "list_event_sources", {}))).toEqual([
+          { resource: "slack:channels/C1", config },
+        ]);
+        expect(mesh.slackWakeModeFor("C1")).toBe(mode);
+      }
+      // Another conversation, and a thread or message below this one, borrow nothing.
+      expect(mesh.slackWakeModeFor("C2")).toBeUndefined();
+      expect(mesh.slackWakeModeFor("C1/messages/1.0")).toBeUndefined();
+      expect(mesh.slackWakeModeFor("")).toBeUndefined();
+
+      res = await call(ownerClient, "set_event_source_config", {
+        source: "slack:channels/C1",
+        config: { version: 1, slackWakeMode: "loud" },
+      });
+      expect(res.isError).toBeFalsy();
+      expect(mesh.slackWakeModeFor("C1")).toBeUndefined();
+      res = await call(ownerClient, "set_event_source_config", {
+        source: "slack:channels/C1",
+        config: null,
+      });
+      expect(dataOf(res)).toEqual({ resource: "slack:channels/C1", config: null });
+      expect(mesh.slackWakeModeFor("C1")).toBeUndefined();
+    });
+
     it("keeps opaque source configuration with its exact row during a live obligation claim (#692)", async () => {
       const issue = "github:MEK-Org/rusa/issues/692";
       const liveObligations: Record<string, string | null> = {};

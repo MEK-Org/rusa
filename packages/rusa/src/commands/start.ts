@@ -315,8 +315,10 @@ import {
 import { ResourceScope } from "../runtime/resource-scope.js";
 import { readSlackToken, SlackClient } from "../slack/slack-client.js";
 import {
+  rememberSlackSelf,
   type SlackInboundMessage,
   SlackSocketSource,
+  slackInboxEvent,
   withReceiptReaction,
 } from "../slack/socket-source.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
@@ -4740,18 +4742,7 @@ async function composeStart(
         (event) => log.info("slack_event_received", event)
       );
       const deliver = async (msg: SlackInboundMessage) => {
-        const delivery = await mesh.deliverExternalEvent({
-          sourceType: "slack",
-          rawPayload: {
-            channel: msg.channel,
-            ts: msg.ts,
-            threadTs: msg.threadTs,
-            user: msg.user,
-          },
-          idempotencyKey: msg.eventId,
-          priority: "responsive",
-          eventSummary: `Slack message from ${msg.user}`,
-        });
+        const delivery = await mesh.deliverExternalEvent(slackInboxEvent(msg));
         log.info("slack_message_delivered", { channel: msg.channel, eventId: msg.eventId });
         return delivery;
       };
@@ -4765,7 +4756,20 @@ async function composeStart(
               eventId: msg.eventId,
               error: err instanceof Error ? err.message : String(err),
             })
-        )
+        ),
+        // Each conversation's stored mode is read per event (#1037), so a
+        // change governs the next arrival. The bot's identity is looked up
+        // lazily: until it is known, a plain-text mention goes undetected.
+        {
+          selfUserId: rememberSlackSelf(
+            () => slackClient.identify(),
+            (err) =>
+              log.warn("slack_self_identity_unavailable", {
+                error: err instanceof Error ? err.message : String(err),
+              })
+          ),
+          wakeModeFor: (channel) => mesh.slackWakeModeFor(channel),
+        }
       );
       resources.acquire("slack source", () => source?.close());
       log.info("slack_socket_active");

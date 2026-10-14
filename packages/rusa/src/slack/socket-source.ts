@@ -1,17 +1,31 @@
 import { SocketModeClient } from "@slack/socket-mode";
-import type { DurableEventDelivery } from "../runtime/event-manager.js";
+import type { DurableEventDelivery, RawSlackIntegrationEvent } from "../runtime/event-manager.js";
+import {
+  mentionsSlackUser,
+  type SlackWakeFacts,
+  type SlackWakeMode,
+  slackConversationKind,
+  slackMessageWakes,
+} from "./wake-mode.js";
 
-export interface SlackInboundMessage {
+export interface SlackInboundMessage extends SlackWakeFacts {
   channel: string;
   ts: string;
   text: string;
   user: string;
   threadTs?: string;
-  isDirectMessage: boolean;
+  /** The envelope that carried this message, kept for diagnostics only. */
   eventId: string;
 }
 
-export function parseSlackEvent(body: unknown): SlackInboundMessage | null {
+/**
+ * Normalize one Events API envelope into the message it carries, or `null`
+ * when it is not a human message this source handles: another event type, an
+ * edit/delete/system subtype, a bot or the installed bot itself, or an ordinary
+ * message from a conversation type this source does not support. Wake policy
+ * is applied separately, by {@link slackMessageWakes}.
+ */
+export function parseSlackEvent(body: unknown, selfUserId?: string): SlackInboundMessage | null {
   if (!body || typeof body !== "object") return null;
   const envelope = body as {
     event_id?: string;
@@ -29,16 +43,79 @@ export function parseSlackEvent(body: unknown): SlackInboundMessage | null {
   };
   const event = envelope.event;
   if (!event || (event.type !== "app_mention" && event.type !== "message")) return null;
-  if (event.type === "message" && event.channel_type !== "im") return null;
   if (event.subtype || event.bot_id || !event.user || !event.channel || !event.ts) return null;
+  if (selfUserId && event.user === selfUserId) return null;
+  const conversationKind = slackConversationKind(event.channel_type);
+  if (event.type === "message" && conversationKind === undefined) return null;
+  const text = typeof event.text === "string" ? event.text : "";
   return {
     channel: event.channel,
     ts: event.ts,
-    text: event.text ?? "",
+    text,
     user: event.user,
     threadTs: event.thread_ts,
-    isDirectMessage: event.channel_type === "im",
+    eventKind: event.type,
+    conversationKind,
+    mentionsSelf:
+      event.type === "app_mention" || (selfUserId ? mentionsSlackUser(text, selfUserId) : false),
     eventId: envelope.event_id ?? `${event.channel}:${event.ts}`,
+  };
+}
+
+/**
+ * What decides whether an arriving event wakes anyone. Both parts are read for
+ * every event, so a stored mode change governs the next one without a restart.
+ */
+export interface SlackWakePolicy {
+  /** The installed bot's own Slack user id, or `undefined` when it is unknown. */
+  selfUserId?: () => Promise<string | undefined>;
+  /** The exact conversation's stored mode, or `undefined` for the default. */
+  wakeModeFor: (channel: string) => SlackWakeMode | undefined;
+}
+
+const COMPATIBILITY_POLICY: SlackWakePolicy = { wakeModeFor: () => undefined };
+
+/**
+ * Remember the installed bot's identity once it is known. A failed lookup is
+ * reported and retried on a later event; meanwhile the source knows no self
+ * user, which only narrows what wakes: a plain-text mention goes undetected
+ * and Slack's `app_mention` event still arrives.
+ */
+export function rememberSlackSelf(
+  identify: () => Promise<{ userId: string }>,
+  onError: (error: unknown) => void
+): () => Promise<string | undefined> {
+  let known: Promise<string> | undefined;
+  return async () => {
+    known ??= identify().then((self) => self.userId);
+    try {
+      return await known;
+    } catch (error) {
+      known = undefined;
+      onError(error);
+      return undefined;
+    }
+  };
+}
+
+/**
+ * The durable inbox event for an admitted message. It is keyed by the message
+ * itself, not the envelope: Slack sends one message as both `message` and
+ * `app_mention`, each with its own event ID and retries, and every one of
+ * those must land as a single inbox item per owner.
+ */
+export function slackInboxEvent(message: SlackInboundMessage): RawSlackIntegrationEvent {
+  return {
+    sourceType: "slack",
+    rawPayload: {
+      channel: message.channel,
+      ts: message.ts,
+      threadTs: message.threadTs,
+      user: message.user,
+    },
+    idempotencyKey: `${message.channel}:${message.ts}`,
+    priority: "responsive",
+    eventSummary: `Slack message from ${message.user}`,
   };
 }
 
@@ -58,7 +135,10 @@ export class SlackSocketSource {
     this.socket = new SocketModeClient({ appToken });
   }
 
-  async start(onMessage: (message: SlackInboundMessage) => Promise<void>): Promise<void> {
+  async start(
+    onMessage: (message: SlackInboundMessage) => Promise<void>,
+    policy: SlackWakePolicy = COMPATIBILITY_POLICY
+  ): Promise<void> {
     this.socket.on("slack_event", async ({ body, type, ack }) => {
       if (type !== "events_api") {
         await ack();
@@ -66,7 +146,7 @@ export class SlackSocketSource {
       }
       // Ignore irrelevant events promptly. A relevant event is acknowledged only
       // after the durable inbox accepts it, so Slack can retry a failed delivery.
-      const message = parseSlackEvent(body);
+      const message = await this.admit(body, policy);
       const incoming = (
         body as { event?: { type?: string; channel_type?: string; subtype?: string } }
       )?.event;
@@ -88,6 +168,24 @@ export class SlackSocketSource {
       }
     });
     await this.socket.start();
+  }
+
+  /**
+   * The message an event carries when its conversation's policy says it wakes.
+   * A policy read that fails is reported and treated as unset, so it can only
+   * fall back to the compatibility default, never broaden coverage.
+   */
+  private async admit(body: unknown, policy: SlackWakePolicy): Promise<SlackInboundMessage | null> {
+    const selfUserId = await policy.selfUserId?.();
+    const message = parseSlackEvent(body, selfUserId);
+    if (!message) return null;
+    let mode: SlackWakeMode | undefined;
+    try {
+      mode = policy.wakeModeFor(message.channel);
+    } catch (error) {
+      this.onError(error);
+    }
+    return slackMessageWakes(message, mode) ? message : null;
   }
 
   async close(): Promise<void> {

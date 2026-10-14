@@ -61,6 +61,7 @@ export function tryChatSpaceResource(space: string): string | undefined {
 export type EventSourceConfigV1 = Record<string, unknown> & {
   version: 1;
   chatWakeMode?: ChatWakeMode;
+  slackWakeMode?: "all" | "mentions";
   checkSuiteCompletionMode?: "failures-only" | "all-outcomes";
 };
 
@@ -80,6 +81,10 @@ export function parseEventSourceConfigV1(
     }
     const chatWakeMode = (parsed as { chatWakeMode?: unknown }).chatWakeMode;
     if (chatWakeMode !== undefined && chatWakeMode !== "mentions" && chatWakeMode !== "all") {
+      return undefined;
+    }
+    const slackWakeMode = (parsed as { slackWakeMode?: unknown }).slackWakeMode;
+    if (slackWakeMode !== undefined && slackWakeMode !== "mentions" && slackWakeMode !== "all") {
       return undefined;
     }
     const checkSuiteCompletionMode = (parsed as { checkSuiteCompletionMode?: unknown })

@@ -53,6 +53,11 @@ import {
   RunManager,
   VOICE_INBOX_PAYLOAD_TYPE,
 } from "../runtime/run-manager.js";
+import {
+  type SlackWakeMode,
+  slackWakeModeFromConfig,
+  trySlackConversationResource,
+} from "../slack/wake-mode.js";
 import { randomSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { googleVoiceConfig } from "../voice/voice-config.js";
@@ -4027,6 +4032,20 @@ export class ActorMesh {
     const resource = tryChatSpaceResource(space);
     if (!resource) return undefined;
     return chatWakeModeFromConfig(this.eventSourceOwners.getConfig(resource));
+  }
+
+  /**
+   * The stored wake mode of one Slack conversation, or `undefined` when it
+   * follows the compatibility default (#1037). Only the exact
+   * `slack:channels/<id>` row counts: no thread, parent, or global policy is
+   * inherited. Read by Slack ingestion for every arriving event, so a change
+   * governs the next event; the host is the caller, so no ownership check
+   * applies here.
+   */
+  slackWakeModeFor(channel: string): SlackWakeMode | undefined {
+    const resource = trySlackConversationResource(channel);
+    if (!resource) return undefined;
+    return slackWakeModeFromConfig(this.eventSourceOwners.getConfig(resource));
   }
 
   /**
