@@ -59,7 +59,15 @@ describe("Slack event ingestion", () => {
     expect(message("app_home", "hi")).toBeNull();
     expect(message("im", "<@UBOT> hi")?.mentionsSelf).toBe(true);
     expect(message("im", "<@UBOT|rusa> hi")?.mentionsSelf).toBe(true);
-    for (const text of ["@rusa hi", "<@UBOTX> hi", "<!here> hi", "<!channel>", "<!subteam^S1>"]) {
+    for (const text of [
+      "@rusa hi",
+      "<@UBOTX> hi",
+      "example: <@UBOT|unfinished",
+      "<@UBOT|x <@UOTHER> hi",
+      "<!here> hi",
+      "<!channel>",
+      "<!subteam^S1>",
+    ]) {
       expect(message("im", text)?.mentionsSelf, text).toBe(false);
     }
     // Without a known identity, no plain-text mention is recognized.

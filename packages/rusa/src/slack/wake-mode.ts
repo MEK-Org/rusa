@@ -51,7 +51,13 @@ export function slackConversationKind(
  * user group (`<!subteam^…>`), `@here` and `@channel` are not self mentions.
  */
 export function mentionsSlackUser(text: string, selfUserId: string): boolean {
-  return text.includes(`<@${selfUserId}>`) || text.includes(`<@${selfUserId}|`);
+  if (text.includes(`<@${selfUserId}>`)) return true;
+  // A labeled mention counts only as a closed token; Slack escapes `<` and `>`
+  // in message text, so the label cannot contain either.
+  return text
+    .split(`<@${selfUserId}|`)
+    .slice(1)
+    .some((rest) => /^[^<>]*>/.test(rest));
 }
 
 /** Whether an arriving event wakes the conversation's owner under `mode` (or the default when unset). */
