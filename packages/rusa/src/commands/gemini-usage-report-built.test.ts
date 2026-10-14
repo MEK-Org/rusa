@@ -73,8 +73,8 @@ log.info("credential_probe", { apiKey: "synthetic-sensitive-value", promptTokenC
     ) as GeminiUsageReport;
     expect(report.instances).toHaveLength(2);
     expect(report.processes).toHaveLength(2);
-    expect(report.groups).toHaveLength(11);
-    expect(report.duplicates).toBe(14);
+    expect(report.groups).toHaveLength(10);
+    expect(report.duplicates).toBe(13);
     expect(report.knownGaps).toEqual(["earlier rotation unavailable"]);
     expect(report.groups.find((g) => g.purpose === "quota_parse")).toMatchObject({
       calls: 6,

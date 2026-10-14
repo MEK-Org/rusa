@@ -16,7 +16,6 @@ export const GEMINI_USAGE_PURPOSES = [
   "model_catalog_parse",
   "kimi_screen_classification",
   "exhaustion_classification",
-  "commitment_polarity",
   "understanding_distillation",
   "understanding_retrieval",
   "avatar_generation",

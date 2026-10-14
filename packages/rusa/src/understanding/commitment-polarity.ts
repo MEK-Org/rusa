@@ -1,5 +1,4 @@
 import { Type } from "@google/genai";
-import { generateGeminiContent } from "../observability/gemini-usage.js";
 import { extractGeminiText, getGeminiClient, withGeminiRetry } from "./gemini-utils.js";
 
 /** Cheap, fast model — this is a per-claim yes/no/unknown read, not a distillation. */
@@ -149,7 +148,7 @@ export function createCommitmentPolarityEvaluator(
     try {
       const client = getGeminiClient(key);
       const response = await withGeminiRetry(() =>
-        generateGeminiContent(client, "commitment_polarity", {
+        client.models.generateContent({
           model: POLARITY_MODEL,
           contents: renderClaim(claim),
           config: { responseMimeType: "application/json", responseSchema: RESPONSE_SCHEMA },
