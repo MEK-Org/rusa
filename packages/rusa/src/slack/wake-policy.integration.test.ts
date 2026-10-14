@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   InMemoryEventSourceOwnerStore,
   InMemoryEventSourceSubscriptionStore,
@@ -162,6 +162,7 @@ async function harness(
 
 describe("Slack per-conversation wake policy (#1037)", () => {
   beforeEach(() => mock.listeners.clear());
+  afterEach(() => vi.useRealTimers());
 
   // Root's contract table, for an ordinary `message` event.
   function messageWakes(
@@ -472,6 +473,7 @@ describe("Slack per-conversation wake policy (#1037)", () => {
   });
 
   it("detects plain-text bot mentions only once the bot's identity is known", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     const h = await harness({
       firstIdentify: async () => {
         throw Object.assign(new Error("invalid_auth"), { data: { error: "invalid_auth" } });
@@ -490,19 +492,25 @@ describe("Slack per-conversation wake policy (#1037)", () => {
     expect(h.onError).toHaveBeenCalledOnce();
 
     // Identity still unknown: the mention cannot be recognized, so nothing
-    // wakes, and this event starts the retry.
+    // wakes, and inside the 30-second cooldown no lookup is retried.
     await h.send(mention("7001.000001"));
+    expect(h.items("owner-group-dm")).toEqual([]);
+    expect(h.identify).toHaveBeenCalledOnce();
+
+    // After the cooldown this event starts the retry.
+    vi.setSystemTime(Date.now() + 30_000);
+    await h.send(mention("7002.000001"));
     expect(h.items("owner-group-dm")).toEqual([]);
 
     // Once the retry succeeds the mention is recognized; later events reuse it.
-    await h.send(mention("7002.000001"));
     await h.send(mention("7003.000001"));
+    await h.send(mention("7004.000001"));
     expect(
       h
         .items("owner-group-dm")
         .map((item) => item.payload.ts)
         .sort()
-    ).toEqual(["7002.000001", "7003.000001"]);
+    ).toEqual(["7003.000001", "7004.000001"]);
     expect(h.identify).toHaveBeenCalledTimes(2);
   });
 

@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { parseSlackEvent } from "./socket-source.js";
+import { ErrorCode } from "@slack/web-api";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { parseSlackEvent, rememberSlackSelf } from "./socket-source.js";
 import { slackMessageWakes } from "./wake-mode.js";
 
 describe("Slack event ingestion", () => {
@@ -86,5 +87,55 @@ describe("Slack event ingestion", () => {
     expect(
       parseSlackEvent({ event: { ...base, channel_type: "im", subtype: "message_changed" } })
     ).toBeNull();
+  });
+});
+
+describe("Slack bot identity lookup", () => {
+  afterEach(() => vi.useRealTimers());
+
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+  it("waits out Slack's retry-after, else 30 seconds, before looking up again", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const rateLimited = Object.assign(new Error("rate limited"), {
+      code: ErrorCode.RateLimitedError,
+      retryAfter: 45,
+    });
+    const identify = vi
+      .fn<() => Promise<{ userId: string }>>()
+      .mockRejectedValueOnce(rateLimited)
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValue({ userId: "UBOT" });
+    const onError = vi.fn();
+    const selfUserId = rememberSlackSelf(identify, onError);
+
+    // The first lookup is rate limited with retry-after 45s.
+    expect(selfUserId()).toBeUndefined();
+    await settle();
+    expect(onError).toHaveBeenCalledWith(rateLimited);
+
+    // Events inside that window answer at once and start no lookup.
+    vi.advanceTimersByTime(44_999);
+    expect(selfUserId()).toBeUndefined();
+    await settle();
+    expect(identify).toHaveBeenCalledOnce();
+
+    // After it, the next event looks up again; this failure names no
+    // retry-after, so the wait is the 30-second minimum.
+    vi.advanceTimersByTime(1);
+    expect(selfUserId()).toBeUndefined();
+    await settle();
+    expect(identify).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(29_999);
+    selfUserId();
+    await settle();
+    expect(identify).toHaveBeenCalledTimes(2);
+
+    vi.advanceTimersByTime(1);
+    selfUserId();
+    await settle();
+    expect(identify).toHaveBeenCalledTimes(3);
+    expect(selfUserId()).toBe("UBOT");
+    expect(onError).toHaveBeenCalledTimes(2);
   });
 });

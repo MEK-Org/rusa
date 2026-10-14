@@ -78,13 +78,18 @@ export interface SlackWakePolicy {
 
 const COMPATIBILITY_POLICY: SlackWakePolicy = { wakeModeFor: () => undefined };
 
+/** The least wait before another identity lookup after one fails. */
+const SELF_LOOKUP_COOLDOWN_MS = 30_000;
+
 /**
  * Remember the installed bot's identity once it is known. The returned getter
  * never waits: it answers from what is already known and, while nothing is,
  * starts a lookup unless one is in flight. A failed lookup is reported and
- * retried on a later event. Meanwhile the source knows no self user: a
- * plain-text mention goes undetected, though Slack's `app_mention` event still
- * arrives, and the bot's own posts are still dropped by their `bot_id`.
+ * retried on a later event, but not before Slack's retry-after has passed, nor
+ * sooner than 30 seconds, so a rate limit is not met with a lookup per event.
+ * Meanwhile the source knows no self user: a plain-text mention goes
+ * undetected, though Slack's `app_mention` event still arrives, and the bot's
+ * own posts are still dropped by their `bot_id`.
  */
 export function rememberSlackSelf(
   identify: () => Promise<{ userId: string }>,
@@ -92,15 +97,21 @@ export function rememberSlackSelf(
 ): () => string | undefined {
   let known: string | undefined;
   let lookup: Promise<void> | undefined;
+  let retryAt = 0;
   return () => {
-    if (known === undefined && !lookup) {
+    if (known === undefined && !lookup && Date.now() >= retryAt) {
       lookup = Promise.resolve()
         .then(identify)
         .then(
           (self) => {
             known = self.userId;
           },
-          (error: unknown) => onError(error)
+          (error: unknown) => {
+            const retryAfter = (error as { retryAfter?: unknown } | undefined)?.retryAfter;
+            const wait = typeof retryAfter === "number" ? retryAfter * 1000 : 0;
+            retryAt = Date.now() + Math.max(wait, SELF_LOOKUP_COOLDOWN_MS);
+            onError(error);
+          }
         )
         .finally(() => {
           lookup = undefined;
