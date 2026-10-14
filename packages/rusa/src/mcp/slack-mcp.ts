@@ -1,3 +1,4 @@
+import type { FileHandle } from "node:fs/promises";
 import { basename } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -5,9 +6,11 @@ import type { Logger } from "../observability/logger.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import {
+  describeShareFailure,
   MAX_SLACK_DOWNLOAD_BYTES,
   MAX_SLACK_FILE_BYTES,
   MAX_SLACK_HISTORY_PAGE,
+  MAX_SLACK_MESSAGE_FILES,
   SLACK_CONVERSATION_TYPES,
   type SlackClient,
   type SlackConversationType,
@@ -17,6 +20,8 @@ import { appendVisibleActorSignature, formatVisibleActorSignature } from "./acto
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 import {
+  exactFileStream,
+  openBoundedRegularFile,
   readBoundedRegularFile,
   resolveAttachmentPath,
   resolveDownloadPath,
@@ -397,6 +402,107 @@ const threadTsSchema = z
     "Parent timestamp of the thread to post in, used as given; pass a message's own ts to start a thread under it. When omitted and the Slack message selected from your inbox in this channel is a thread reply, the post goes into that thread; otherwise it posts top-level."
   );
 
+interface SharedFile {
+  fileId: string;
+  name: string;
+  bytes: number;
+  sha256: string;
+}
+
+/**
+ * Share `text` and several workdir files as one Slack message (#1032). Every
+ * path is confined, opened and sized before Slack is called, so a bad path or
+ * an oversized file posts nothing. Each file is then reserved and streamed in
+ * turn; Slack shares nothing until the single completion call, so a failure up
+ * to there is safe to retry. The completion is sent once, and its failure says
+ * whether anything may have been posted.
+ */
+async function sendWithFiles(
+  client: SlackClient,
+  options: SlackWriteMcpOptions,
+  channel: string,
+  text: string,
+  threadTs: string | undefined,
+  files: readonly { filePath: string; filename?: string | undefined; title?: string | undefined }[]
+): Promise<{ channel: string; threadTs?: string; files: SharedFile[] }> {
+  requireFileToolsAvailable(options);
+  const workDir = requireWorkDir(options);
+  const maxBytes = options.maxFileBytes ?? MAX_SLACK_FILE_BYTES;
+  const opened: { handle: FileHandle; bytes: number; name: string; title?: string }[] = [];
+  try {
+    for (const file of files) {
+      const source = await resolveAttachmentPath(workDir, file.filePath).catch((err: Error) => {
+        throw new Error(`${file.filePath}: ${err.message}`);
+      });
+      const { handle, bytes } = await openBoundedRegularFile(workDir, source, maxBytes).catch(
+        (err: Error) => {
+          throw new Error(`${file.filePath}: ${err.message}`);
+        }
+      );
+      opened.push({
+        handle,
+        bytes,
+        name: file.filename || basename(source),
+        ...(file.title ? { title: file.title } : {}),
+      });
+    }
+    const uploaded: (SharedFile & { title?: string })[] = [];
+    for (const file of opened) {
+      try {
+        const { fileId, uploadUrl } = await client.reserveFileUpload(file.name, file.bytes);
+        const content = exactFileStream(file.handle, file.bytes);
+        await client.sendFileBytes(uploadUrl, file.bytes, content.stream);
+        uploaded.push({
+          fileId,
+          name: file.name,
+          bytes: file.bytes,
+          sha256: content.sha256(),
+          ...(file.title ? { title: file.title } : {}),
+        });
+      } catch (err) {
+        // fetch reports a failed request body as "fetch failed" with the reason as its cause.
+        const cause = (err as Error).cause;
+        const reason = cause instanceof Error ? cause.message : (err as Error).message;
+        throw new Error(
+          `uploading ${file.name} failed after ${uploaded.length} of ${opened.length} files were uploaded; nothing was shared, so sending again is safe: ${reason}`
+        );
+      }
+    }
+    const [first, ...rest] = uploaded.map((f) => ({
+      id: f.fileId,
+      ...(f.title ? { title: f.title } : {}),
+    }));
+    if (!first) throw new Error("no files to share");
+    let confirmed: string[];
+    try {
+      confirmed = await client.completeFileShare(channel, [first, ...rest], {
+        ...(threadTs ? { threadTs } : {}),
+        ...(text ? { text } : {}),
+      });
+    } catch (err) {
+      const { error, mayHaveShared } = describeShareFailure(err);
+      // A share that may have posted must not be repeated by a replacement run.
+      if (mayHaveShared) options.onWrite?.();
+      throw error;
+    }
+    // Slack accepted the share, so the message is posted even if its answer is short.
+    options.onWrite?.();
+    const unconfirmed = uploaded.filter((f) => !confirmed.includes(f.fileId));
+    if (unconfirmed.length > 0) {
+      throw new Error(
+        `Slack completed the share but did not confirm ${unconfirmed.map((f) => `${f.name} (${f.fileId})`).join(", ")}; check the channel before sending again`
+      );
+    }
+    return {
+      channel,
+      ...(threadTs ? { threadTs } : {}),
+      files: uploaded.map(({ title: _title, ...file }) => file),
+    };
+  } finally {
+    await Promise.all(opened.map((file) => file.handle.close().catch(() => {})));
+  }
+}
+
 export function createSlackWriteMcpServer(
   client: SlackClient,
   allowedChannels: "all" | string[],
@@ -429,18 +535,47 @@ export function createSlackWriteMcpServer(
     "send_message",
     {
       title: "Send a Slack message",
-      description:
-        "Post to a channel or reply in a thread using its parent timestamp. Without threadTs, a reply to a selected Slack message that is in a thread stays in that thread; otherwise it posts top-level. A footer naming you and your model is added, so don't sign the text yourself.",
+      description: `Post to a channel or reply in a thread using its parent timestamp. Without threadTs, a reply to a selected Slack message that is in a thread stays in that thread; otherwise it posts top-level. A footer naming you and your model is added, so don't sign the text yourself. With files (1 to ${MAX_SLACK_MESSAGE_FILES} paths in your working directory), the text and every file are shared as one message: each file is uploaded first, then all are shared together in one step, so a failure before that step posts nothing. The result then lists each file's ID, bytes and SHA-256 but no message ts; read the channel to find the message. Files come only from your working directory; an existing Slack file ID cannot be attached. File sending is unavailable for follower-hosted actors (see #812).`,
       inputSchema: {
         channel: z.string(),
-        text: z.string(),
+        text: z.string().describe("Message text; may be empty when files are given"),
         threadTs: threadTsSchema,
+        files: z
+          .array(
+            z.strictObject({
+              filePath: z
+                .string()
+                .describe(
+                  "Path to a file inside your working directory, absolute or relative to it; paths outside it are rejected"
+                ),
+              filename: z.string().optional().describe("Defaults to the file's basename"),
+              title: z.string().optional(),
+            })
+          )
+          .min(1)
+          .max(MAX_SLACK_MESSAGE_FILES)
+          .optional()
+          .describe(
+            `Files to share with the text as one message, at most ${MAX_SLACK_MESSAGE_FILES}`
+          ),
       },
     },
-    async ({ channel, text, threadTs }) => {
+    async ({ channel, text, threadTs, files }) => {
       try {
         if (!allowed(channel)) throw new Error(`access denied: Slack channel ${channel}`);
         const signed = signedText(text);
+        if (files) {
+          return toolOk(
+            await sendWithFiles(
+              client,
+              options,
+              channel,
+              signed,
+              placement(channel, threadTs),
+              files
+            )
+          );
+        }
         const effectiveThreadTs = placement(channel, threadTs);
         const ts = await client.send(channel, signed, effectiveThreadTs);
         options.onWrite?.();

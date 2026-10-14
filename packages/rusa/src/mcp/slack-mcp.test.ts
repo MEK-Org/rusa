@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -1254,5 +1255,321 @@ describe("Slack read MCP sender lookup", () => {
     const denied = await call(client, "get_user", { user: "U2" });
     expect(denied.isError).toBe(true);
     expect(denied.text).toContain("missing_scope");
+  });
+});
+
+describe("Slack write MCP send_message with files", () => {
+  const UPLOAD_HOST = "https://files.slack.com/upload/v1/";
+  type ApiReply = { ok: boolean; error?: string; files?: { id: string }[] };
+
+  interface FakeSlack {
+    requests: string[];
+    reserved: { filename: string; length: number }[];
+    uploads: { body: Buffer; contentLength: string | null; authorization: string | null }[];
+    completions: URLSearchParams[];
+  }
+
+  // The SDK resolves globalThis.fetch when the client is built, so one stub
+  // stands in for the API calls and the byte uploads to the URLs Slack returns.
+  function fakeSlack(
+    opts: {
+      uploadStatus?: (n: number) => number;
+      beforeUpload?: (n: number) => void;
+      complete?: (params: URLSearchParams) => ApiReply | Promise<never>;
+    } = {}
+  ): FakeSlack {
+    const fake: FakeSlack = { requests: [], reserved: [], uploads: [], completions: [] };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const target = String(url);
+        const headers = new Headers(init?.headers);
+        if (target.startsWith(UPLOAD_HOST)) {
+          const n = fake.uploads.length;
+          fake.requests.push(`upload ${target.slice(UPLOAD_HOST.length)}`);
+          opts.beforeUpload?.(n);
+          const body = Buffer.from(await new Response(init?.body).arrayBuffer());
+          fake.uploads.push({
+            body,
+            contentLength: headers.get("content-length"),
+            authorization: headers.get("authorization"),
+          });
+          return new Response("OK", { status: opts.uploadStatus?.(n) ?? 200 });
+        }
+        const method = target.split("/").pop() ?? "";
+        fake.requests.push(method);
+        const params = new URLSearchParams(String(init?.body ?? ""));
+        let reply: ApiReply & Record<string, unknown>;
+        if (method === "files.getUploadURLExternal") {
+          const id = `F${fake.reserved.length + 1}`;
+          fake.reserved.push({
+            filename: params.get("filename") ?? "",
+            length: Number(params.get("length")),
+          });
+          reply = { ok: true, file_id: id, upload_url: `${UPLOAD_HOST}${id}` };
+        } else if (method === "files.completeUploadExternal") {
+          fake.completions.push(params);
+          const files = JSON.parse(params.get("files") ?? "[]") as { id: string }[];
+          reply = await (opts.complete?.(params) ?? {
+            ok: true,
+            files: files.map((f) => ({ id: f.id })),
+          });
+        } else {
+          reply = { ok: false, error: "unknown_method" };
+        }
+        return new Response(JSON.stringify(reply), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      })
+    );
+    return fake;
+  }
+
+  /** The file part of the multipart form posted to an upload URL. */
+  function filePart(body: Buffer): Buffer {
+    const start = body.indexOf("\r\n\r\n") + 4;
+    const end = body.lastIndexOf("\r\n--");
+    return body.subarray(start, end);
+  }
+
+  const sha256 = (data: string | Buffer) => createHash("sha256").update(data).digest("hex");
+
+  async function writer(
+    opts: { maxFileBytes?: number; selected?: InboxEntry[]; followerHosted?: boolean } = {}
+  ) {
+    const dir = workdir();
+    const onWrite = vi.fn();
+    const server = createSlackWriteMcpServer(new SlackClient(TOKEN), ["C1"], {
+      actorHandle,
+      getRunSelection: () => ({ provider: "test", model: "model-a" }),
+      workDir: dir,
+      onWrite,
+      ...(opts.maxFileBytes ? { maxFileBytes: opts.maxFileBytes } : {}),
+      ...(opts.selected ? { selectedInboxEntries: () => opts.selected ?? [] } : {}),
+      ...(opts.followerHosted ? { fileToolsAvailable: () => false } : {}),
+    });
+    return { dir, onWrite, client: await connect(server) };
+  }
+
+  it("shares text and several workdir files as one message in a thread", async () => {
+    const fake = fakeSlack();
+    const { dir, onWrite, client } = await writer();
+    mkdirSync(join(dir, "out"));
+    writeFileSync(join(dir, "out", "chart.png"), "png-bytes");
+    writeFileSync(join(dir, "notes.txt"), "a\r\n--not-a-boundary\r\n");
+
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "results attached",
+      threadTs: "1.0",
+      files: [
+        { filePath: "out/chart.png", title: "Chart" },
+        { filePath: "notes.txt", filename: "notes-final.txt" },
+      ],
+    });
+
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.text)).toEqual({
+      channel: "C1",
+      threadTs: "1.0",
+      files: [
+        { fileId: "F1", name: "chart.png", bytes: 9, sha256: sha256("png-bytes") },
+        {
+          fileId: "F2",
+          name: "notes-final.txt",
+          bytes: 21,
+          sha256: sha256("a\r\n--not-a-boundary\r\n"),
+        },
+      ],
+    });
+    expect(fake.requests).toEqual([
+      "files.getUploadURLExternal",
+      "upload F1",
+      "files.getUploadURLExternal",
+      "upload F2",
+      "files.completeUploadExternal",
+    ]);
+    expect(fake.reserved).toEqual([
+      { filename: "chart.png", length: 9 },
+      { filename: "notes-final.txt", length: 21 },
+    ]);
+    expect(fake.uploads.map((u) => filePart(u.body).toString())).toEqual([
+      "png-bytes",
+      "a\r\n--not-a-boundary\r\n",
+    ]);
+    for (const upload of fake.uploads) {
+      expect(upload.contentLength).toBe(String(upload.body.length));
+      expect(upload.authorization).toBeNull();
+    }
+    const [completion] = fake.completions;
+    expect(Object.fromEntries(completion ?? [])).toMatchObject({
+      channel_id: "C1",
+      thread_ts: "1.0",
+      initial_comment: "results attached\n\n_actor-handle (model-a)_",
+    });
+    expect(JSON.parse(completion?.get("files") ?? "")).toEqual([
+      { id: "F1", title: "Chart" },
+      { id: "F2" },
+    ]);
+    expect(onWrite).toHaveBeenCalledOnce();
+  });
+
+  it("places files from the live selection and signs empty text with the footer alone", async () => {
+    const fake = fakeSlack();
+    const selected: InboxEntry[] = [
+      {
+        id: "e1",
+        actorId: "a1",
+        source: "slack",
+        payload: { type: "slack.message", channel: "C1", ts: "150.000002", threadTs: "150.000001" },
+      } as unknown as InboxEntry,
+    ];
+    const { dir, client } = await writer({ selected });
+    writeFileSync(join(dir, "out.txt"), "x");
+
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "",
+      files: [{ filePath: "out.txt" }],
+    });
+
+    expect(JSON.parse(result.text)).toMatchObject({ threadTs: "150.000001" });
+    expect(fake.completions[0]?.get("thread_ts")).toBe("150.000001");
+    expect(fake.completions[0]?.get("initial_comment")).toBe("_actor-handle (model-a)_");
+  });
+
+  it("refuses bad paths, oversized files, too many files and Chat-only inputs before calling Slack", async () => {
+    const fake = fakeSlack();
+    const { dir, onWrite, client } = await writer({ maxFileBytes: 8 });
+    const outside = workdir();
+    writeFileSync(join(outside, "secret.txt"), "secret");
+    symlinkSync(join(outside, "secret.txt"), join(dir, "link.txt"));
+    writeFileSync(join(dir, "ok.txt"), "ok");
+    writeFileSync(join(dir, "big.bin"), "123456789");
+    mkdirSync(join(dir, "folder"));
+    const send = (files: unknown[], channel = "C1") =>
+      call(client, "send_message", { channel, text: "hi", files });
+
+    expect((await send([{ filePath: "ok.txt" }], "C2")).text).toContain(
+      "access denied: Slack channel C2"
+    );
+    expect((await send([{ filePath: "ok.txt" }, { filePath: "missing.txt" }])).text).toContain(
+      "missing.txt: ENOENT"
+    );
+    expect((await send([{ filePath: join(outside, "secret.txt") }])).text).toContain(
+      "escapes the actor workdir"
+    );
+    expect((await send([{ filePath: "link.txt" }])).text).toContain(
+      "resolves outside the actor workdir"
+    );
+    expect((await send([{ filePath: "ok.txt" }, { filePath: "big.bin" }])).text).toContain(
+      "big.bin: file size limit exceeded: file is larger than 8 bytes"
+    );
+    expect((await send([{ filePath: "folder" }])).text).toContain("not a regular file");
+    const tooMany = await send(Array.from({ length: 11 }, () => ({ filePath: "ok.txt" })));
+    expect(tooMany.isError).toBe(true);
+    expect((await send([])).isError).toBe(true);
+    const chatRef = await send([{ attachmentDataRef: { resourceName: "spaces/S/attachments/A" } }]);
+    expect(chatRef.isError).toBe(true);
+    expect(fake.requests).toEqual([]);
+    expect(onWrite).not.toHaveBeenCalled();
+  });
+
+  it("refuses file sending while follower-hosted, before touching Slack", async () => {
+    const fake = fakeSlack();
+    const { dir, client } = await writer({ followerHosted: true });
+    writeFileSync(join(dir, "ok.txt"), "ok");
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "ok.txt" }],
+    });
+    expect(result.text).toContain("unavailable for follower-hosted actors (see #812)");
+    expect(fake.requests).toEqual([]);
+  });
+
+  it("shares nothing when an upload fails partway, and says sending again is safe", async () => {
+    const fake = fakeSlack({ uploadStatus: (n) => (n === 1 ? 500 : 200) });
+    const { dir, onWrite, client } = await writer();
+    writeFileSync(join(dir, "a.txt"), "a");
+    writeFileSync(join(dir, "b.txt"), "b");
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "a.txt" }, { filePath: "b.txt" }],
+    });
+    expect(result).toEqual({
+      isError: true,
+      text: expect.stringContaining(
+        "uploading b.txt failed after 1 of 2 files were uploaded; nothing was shared, so sending again is safe: Slack file upload failed: HTTP 500"
+      ),
+    });
+    expect(fake.requests).not.toContain("files.completeUploadExternal");
+    expect(onWrite).not.toHaveBeenCalled();
+  });
+
+  it("refuses a file that changes while it is uploaded", async () => {
+    let grows = "";
+    const fake = fakeSlack({ beforeUpload: () => appendFileSync(grows, "d") });
+    const { dir, onWrite, client } = await writer();
+    grows = join(dir, "grows.txt");
+    writeFileSync(grows, "abc");
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "grows.txt" }],
+    });
+    expect(result.text).toContain("nothing was shared");
+    expect(result.text).toContain("file changed while it was read: it grew");
+    expect(fake.requests).not.toContain("files.completeUploadExternal");
+    expect(onWrite).not.toHaveBeenCalled();
+  });
+
+  it("sends the share once: a refusal shared nothing, an unknown outcome counts as written", async () => {
+    const refused = fakeSlack({ complete: () => ({ ok: false, error: "not_in_channel" }) });
+    const first = await writer();
+    writeFileSync(join(first.dir, "a.txt"), "a");
+    const result = await call(first.client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "a.txt" }],
+    });
+    expect(result.text).toContain("not_in_channel");
+    expect(result.text).toContain("nothing was shared");
+    expect(refused.completions).toHaveLength(1);
+    expect(first.onWrite).not.toHaveBeenCalled();
+
+    const dropped = fakeSlack({ complete: () => Promise.reject(new TypeError("socket hang up")) });
+    const second = await writer();
+    writeFileSync(join(second.dir, "a.txt"), "a");
+    const unknown = await call(second.client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "a.txt" }],
+    });
+    expect(unknown.isError).toBe(true);
+    expect(unknown.text).toContain("may or may not have been shared");
+    expect(dropped.completions).toHaveLength(1);
+    expect(second.onWrite).toHaveBeenCalledOnce();
+  });
+
+  it("reports files Slack did not confirm, after counting the share as written", async () => {
+    fakeSlack({ complete: () => ({ ok: true, files: [{ id: "F1" }] }) });
+    const { dir, onWrite, client } = await writer();
+    writeFileSync(join(dir, "a.txt"), "a");
+    writeFileSync(join(dir, "b.txt"), "b");
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "a.txt" }, { filePath: "b.txt" }],
+    });
+    expect(result).toEqual({
+      isError: true,
+      text: expect.stringContaining(
+        "Slack completed the share but did not confirm b.txt (F2); check the channel before sending again"
+      ),
+    });
+    expect(onWrite).toHaveBeenCalledOnce();
   });
 });

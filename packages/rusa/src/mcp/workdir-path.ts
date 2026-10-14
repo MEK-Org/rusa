@@ -243,3 +243,74 @@ export async function readBoundedRegularFile(
     await handle.close();
   }
 }
+
+/**
+ * Open a confined regular file for a streamed read, holding the same boundary
+ * as {@link readBoundedRegularFile} without reading the content. Its size at
+ * open is checked against `maxBytes` and returned; {@link exactFileStream}
+ * then refuses a file that grows or shrinks before it is fully read. The caller
+ * owns the handle and must close it.
+ */
+export async function openBoundedRegularFile(
+  workDir: string,
+  path: string,
+  maxBytes: number,
+  noun = "file"
+): Promise<{ handle: FileHandle; bytes: number }> {
+  const handle = await openInWorkdir(
+    workDir,
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+  );
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new Error("access denied: filePath is not a regular file");
+    if (info.size > maxBytes) {
+      throw new Error(`${noun} size limit exceeded: ${noun} is larger than ${maxBytes} bytes`);
+    }
+    return { handle, bytes: info.size };
+  } catch (err) {
+    await handle.close();
+    throw err;
+  }
+}
+
+/**
+ * Stream exactly `bytes` bytes from an {@link openBoundedRegularFile} handle,
+ * 64 KiB at a time, hashing them as they pass. The stream errors if the file
+ * ends early or has bytes beyond `bytes`, so what was sized is what was sent.
+ * `sha256()` is the digest once the stream has ended.
+ */
+export function exactFileStream(
+  handle: FileHandle,
+  bytes: number
+): { stream: ReadableStream<Uint8Array>; sha256: () => string } {
+  const hash = createHash("sha256");
+  let position = 0;
+  let digest: string | undefined;
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (position === bytes) {
+        const { bytesRead } = await handle.read(Buffer.alloc(1), 0, 1, position);
+        if (bytesRead > 0) throw new Error("file changed while it was read: it grew");
+        digest = hash.digest("hex");
+        controller.close();
+        return;
+      }
+      const chunk = Buffer.alloc(Math.min(READ_CHUNK_BYTES, bytes - position));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+      if (bytesRead === 0) throw new Error("file changed while it was read: it shrank");
+      position += bytesRead;
+      const data = chunk.subarray(0, bytesRead);
+      hash.update(data);
+      controller.enqueue(new Uint8Array(data));
+    },
+  });
+  return {
+    stream,
+    sha256: () => {
+      if (digest === undefined) throw new Error("file stream has not been read to its end");
+      return digest;
+    },
+  };
+}

@@ -689,3 +689,27 @@ describe("SlackClient.getUser", () => {
     expect(fetch).toHaveBeenCalledTimes(3);
   });
 });
+
+describe("SlackClient.sendFileBytes", () => {
+  it("uploads only to Slack's file host over https, and cancels the content otherwise", async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    try {
+      const client = new SlackClient("xoxb-synthetic");
+      for (const url of [
+        "https://files.example.com/upload/v1/F1",
+        "http://files.slack.com/upload/v1/F1",
+      ]) {
+        const cancel = vi.fn();
+        const content = new ReadableStream<Uint8Array>({ cancel });
+        await expect(client.sendFileBytes(url, 1, content)).rejects.toThrow(
+          "refusing to upload file content to"
+        );
+        expect(cancel).toHaveBeenCalledOnce();
+      }
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});

@@ -18,6 +18,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
+  exactFileStream,
+  openBoundedRegularFile,
   readBoundedRegularFile,
   resolveAttachmentPath,
   resolveDownloadPath,
@@ -259,5 +261,68 @@ describe("streamNewFileInWorkdir", () => {
     expect(existsSync(join(dir, "sub-moved", "partial.bin"))).toBe(false);
     expect(readdirSync(join(dir, "sub-moved"))).toEqual([]);
     expect(readFileSync(join(outside, "partial.bin"), "utf-8")).toBe("unrelated");
+  });
+});
+
+describe("openBoundedRegularFile and exactFileStream", () => {
+  async function drain(stream: ReadableStream<Uint8Array>): Promise<Uint8Array[]> {
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of stream as unknown as AsyncIterable<Uint8Array>) chunks.push(chunk);
+    return chunks;
+  }
+
+  it("streams exactly the sized bytes in bounded chunks with their digest", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rusa-exact-stream-"));
+    const content = Buffer.alloc(200 * 1024, 7);
+    writeFileSync(join(dir, "big.bin"), content);
+    const { handle, bytes } = await openBoundedRegularFile(dir, join(dir, "big.bin"), 300 * 1024);
+    try {
+      expect(bytes).toBe(content.length);
+      const { stream, sha256 } = exactFileStream(handle, bytes);
+      expect(sha256).toThrow("not been read to its end");
+      const chunks = await drain(stream);
+      expect(chunks.length).toBe(4);
+      expect(Math.max(...chunks.map((c) => c.byteLength))).toBe(64 * 1024);
+      expect(Buffer.concat(chunks).equals(content)).toBe(true);
+      expect(sha256()).toBe(createHash("sha256").update(content).digest("hex"));
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it("refuses oversized, non-regular and symlinked sources before reading", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rusa-exact-stream-"));
+    writeFileSync(join(dir, "big.bin"), "123456789");
+    mkdirSync(join(dir, "sub"));
+    writeFileSync(join(dir, "real.txt"), "ok");
+    symlinkSync(join(dir, "real.txt"), join(dir, "link.txt"));
+    await expect(openBoundedRegularFile(dir, join(dir, "big.bin"), 8)).rejects.toThrow(
+      "file size limit exceeded: file is larger than 8 bytes"
+    );
+    await expect(openBoundedRegularFile(dir, join(dir, "sub"), 8)).rejects.toThrow(
+      "not a regular file"
+    );
+    await expect(openBoundedRegularFile(dir, join(dir, "link.txt"), 8)).rejects.toThrow();
+  });
+
+  it("errors when the file grows or shrinks after it was sized", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rusa-exact-stream-"));
+    writeFileSync(join(dir, "grow.txt"), "abc");
+    writeFileSync(join(dir, "shrink.txt"), "abcdef");
+    const grow = await openBoundedRegularFile(dir, join(dir, "grow.txt"), 100);
+    const shrink = await openBoundedRegularFile(dir, join(dir, "shrink.txt"), 100);
+    try {
+      appendFileSync(join(dir, "grow.txt"), "d");
+      writeFileSync(join(dir, "shrink.txt"), "ab");
+      await expect(drain(exactFileStream(grow.handle, grow.bytes).stream)).rejects.toThrow(
+        "file changed while it was read: it grew"
+      );
+      await expect(drain(exactFileStream(shrink.handle, shrink.bytes).stream)).rejects.toThrow(
+        "file changed while it was read: it shrank"
+      );
+    } finally {
+      await grow.handle.close();
+      await shrink.handle.close();
+    }
   });
 });
