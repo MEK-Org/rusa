@@ -623,6 +623,30 @@ function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
 }
 
 /**
+ * The ancestors of a page's rows, each once and none that is itself a row.
+ * Every ancestor is read at most once, so the reads stay within the page's
+ * distinct ancestry however many rows share it, and a cycle ends the walk.
+ */
+function pageAncestors(
+  obligations: Pick<ObligationRepository, "get">,
+  rows: readonly Obligation[]
+): Obligation[] {
+  const seen = new Set(rows.map((row) => row.id));
+  const ancestors: Obligation[] = [];
+  for (const row of rows) {
+    let parentId = row.parentId;
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId);
+      const parent = obligations.get(parentId);
+      if (!parent) break;
+      ancestors.push(parent);
+      parentId = parent.parentId;
+    }
+  }
+  return ancestors;
+}
+
+/**
  * Inbox entries intentionally store lightweight pointers. The dashboard is the
  * presentation boundary, so resolve a mesh-message pointer, a GitHub source
  * (see `deriveGitHubInboxNotification` — its `source` is the exact reference
@@ -2385,6 +2409,14 @@ export async function handleMeshApiRequest(
       limit,
       offset,
     });
+    // `ancestors=true` (My Queue, #1076) adds every row's ancestors to the
+    // page once each, so the client can draw each row's path from the page it
+    // already asked for instead of one detail read per row.
+    const rawAncestors = url.searchParams.get("ancestors");
+    if (rawAncestors === "true" || rawAncestors === "1") {
+      sendJson(res, 200, { ...page, ancestors: pageAncestors(deps.obligations, page.obligations) });
+      return true;
+    }
     sendJson(res, 200, page);
     return true;
   }

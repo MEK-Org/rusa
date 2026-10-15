@@ -203,6 +203,7 @@ class ObligationSync {
         ownerId: q.ownerId,
         queue: q.queue.name,
         limit: ObligationQuery.pageLimit,
+        ancestors: true,
       );
     } catch (e) {
       if (current()) _set(q, freshnessOf(q).failedWith(e));

@@ -162,7 +162,7 @@ class PersistedObligationEntitiesSnapshot {
   static const int maxSerializedBytes = 256 * 1024;
 
   /// Captures what [entities] holds for [queries]: their rows, and the
-  /// recorded blockers of those rows.
+  /// recorded blockers and held ancestors of those rows.
   factory PersistedObligationEntitiesSnapshot.capture({
     required String scope,
     required String principalId,
@@ -186,6 +186,8 @@ class PersistedObligationEntitiesSnapshot {
           ...rows,
           for (final children in blockers.values)
             for (final c in children) c: ?entities.byId[c],
+          for (final id in rows.keys)
+            for (final a in entities.ancestorsOf(id)) a.id: a,
         },
         blockers: blockers,
       ),

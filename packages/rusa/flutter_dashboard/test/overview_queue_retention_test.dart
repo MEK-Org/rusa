@@ -1566,9 +1566,12 @@ void main() {
         byId: {
           'r': makeObligation(
             'r',
+            parentId: 'p',
             ownerId: testUserPrincipalId,
             intent: 'Ready',
           ),
+          'p': makeObligation('p', parentId: 'top', ownerId: 'worker-1'),
+          'top': makeObligation('top', ownerId: 'worker-1'),
           'w': makeObligation(
             'w',
             ownerId: testUserPrincipalId,
@@ -1581,7 +1584,12 @@ void main() {
             nextReadyAt: '2026-10-11T00:00:00.000Z',
           ),
           'b': makeObligation('b', parentId: 'w'),
-          'unrelated': makeObligation('unrelated', ownerId: _otherViewer),
+          'unrelated': makeObligation(
+            'unrelated',
+            parentId: 'unrelated-parent',
+            ownerId: _otherViewer,
+          ),
+          'unrelated-parent': makeObligation('unrelated-parent'),
         },
         blockers: {
           'w': ['b'],
@@ -1595,8 +1603,17 @@ void main() {
         entities: entities,
         now: now,
       );
-      // Only the captured queries' rows and their blockers are kept.
-      expect(snapshot.entities.byId.keys.toSet(), {'r', 'w', 's', 'b'});
+      // Only the captured queries' rows, their blockers and their ancestors
+      // (#1076) are kept.
+      expect(snapshot.entities.byId.keys.toSet(), {
+        'r',
+        'p',
+        'top',
+        'w',
+        's',
+        'b',
+      });
+      expect(snapshot.entities.ancestorsOf('r').map((o) => o.id), ['top', 'p']);
       expect(snapshot.entities.blockers, {
         'w': ['b'],
       });
