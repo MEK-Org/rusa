@@ -5,9 +5,13 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RusaConfig } from "../config/types.js";
 import { type ProviderQuotaSnapshot, QuotaService } from "../mcp/quota-mcp.js";
+import type { ModelEntry } from "../providers/model-catalog.js";
 import type { CodingProvider } from "../providers/types.js";
+import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import { QuotaCollectionLoop } from "./coordinator-collection.js";
 import { QuotaCoordinatorService } from "./coordinator-service.js";
+import { quotaLaneKey } from "./lane-estimate.js";
+import { MissedQuotaWindowDetector } from "./missed-windows.js";
 import { SharedQuotaStore } from "./shared-store.js";
 
 const mockGenerateContent = vi.fn();
@@ -96,6 +100,7 @@ function configuredClaudeService(opts: {
   now: () => number;
   run: ReturnType<typeof vi.fn>;
   ttlMs?: number;
+  modelCatalog?: readonly ModelEntry[];
 }): QuotaService {
   const provider: CodingProvider = {
     name: "claude",
@@ -113,6 +118,7 @@ function configuredClaudeService(opts: {
     scrapeStore: opts.store,
     now: opts.now,
     ttlMs: opts.ttlMs,
+    modelCatalogFor: opts.modelCatalog ? () => opts.modelCatalog ?? [] : undefined,
   });
 }
 
@@ -755,6 +761,99 @@ describe("QuotaCollectionLoop", () => {
       await firstCoordinator.stop();
       restartedStore?.close();
       if (!firstStoreClosed) store.close();
+    }
+  });
+
+  it("#1078: keeps one Fable lane when the parser drops one of the window's model aliases", async () => {
+    const root = makeRoot();
+    const store = new SharedQuotaStore(join(root, "quota.db"));
+    store.configureController({ maxIntervalSeconds: 3600 });
+    const fableModels = ["claude-fable-5", "claude-fable-5-1"];
+    const catalog: ModelEntry[] = [
+      { identifier: "claude-fable-5", displayLabel: "Claude Fable 5" },
+      { identifier: "claude-fable-5-1", displayLabel: "Claude Fable 5.1" },
+      { identifier: "claude-opus-5-5", displayLabel: "Claude Opus 5.5" },
+    ];
+    const resetAtIso = "2026-10-19T03:00:00.000Z";
+    // The two captures of the issue: the same "Current week (Fable)" line,
+    // which the parser mapped to both Fable IDs and then to one of them.
+    const capture = (usedPercent: string, models: string[]) => ({
+      text: () =>
+        JSON.stringify({
+          status: "available",
+          windows: [
+            { label: "Current week (all models)", kind: "weekly", usedPercent: "40", resetAtIso },
+            { label: "Current week (Fable)", kind: "weekly", usedPercent, resetAtIso, models },
+          ],
+        }),
+    });
+    mockGenerateContent.mockReset();
+    mockGenerateContent
+      .mockResolvedValueOnce(capture("53", fableModels))
+      .mockResolvedValueOnce(capture("54", ["claude-fable-5"]));
+    let nowMs = Date.parse("2026-10-15T20:30:17.000Z");
+    const run = vi.fn().mockResolvedValue({
+      success: true,
+      output: "synthetic Claude /usage panel",
+      exitCode: 0,
+    });
+    const quotaService = configuredClaudeService({
+      root,
+      store,
+      now: () => nowMs,
+      run,
+      ttlMs: 1,
+      modelCatalog: catalog,
+    });
+    const loop = new QuotaCollectionLoop({
+      store,
+      quotaService,
+      providers: ["claude"],
+      maxIntervalSeconds: 3600,
+    });
+    const socketPath = join(root, "coordinator.sock");
+    const coordinator = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+      now: () => nowMs,
+    });
+    const client = new QuotaCoordinatorClient({ socketPath, configuredProviders: ["claude"] });
+    const detector = new MissedQuotaWindowDetector();
+    const since = "2026-10-15T00:00:00.000Z";
+    const observe = async () => {
+      const history = (await client.getHistory("claude", since)) ?? [];
+      return {
+        history,
+        missed: detector.observe("claude", history, client.getCachedScrapeOutcomes("claude")),
+      };
+    };
+    try {
+      await coordinator.start();
+      await loop.tick();
+      expect((await observe()).missed).toEqual([]);
+
+      nowMs = Date.parse("2026-10-15T21:00:17.000Z");
+      await loop.tick();
+      const { history, missed } = await observe();
+
+      expect(run).toHaveBeenCalledTimes(2);
+      expect(missed).toEqual([]);
+      const fableRows = history.filter((record) => record.scope === "model");
+      expect(
+        new Set(fableRows.map((record) => quotaLaneKey("model", record.models ?? [], record.kind)))
+      ).toEqual(new Set([quotaLaneKey("model", fableModels, "weekly")]));
+      expect(fableRows.map((record) => [record.observedAt, record.percentLeft])).toEqual([
+        ["2026-10-15T20:30:17.000Z", 47],
+        ["2026-10-15T21:00:17.000Z", 46],
+      ]);
+      const latestFable = store
+        .getLatestSnapshot("claude")
+        ?.limits?.find((limit) => limit.label === "Current week (Fable)");
+      expect(latestFable?.scope).toEqual({ provider: "claude", models: fableModels });
+    } finally {
+      await coordinator.stop();
+      store.close();
     }
   });
 });

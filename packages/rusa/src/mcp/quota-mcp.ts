@@ -27,7 +27,11 @@ import { resolveProvider } from "../providers/registry.js";
 import type { CodingProvider, RunResult, SandboxOptions } from "../providers/types.js";
 import type { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { QUOTA_PROBE_TTL_MS, type QuotaFreshness } from "../quota/coordinator-protocol.js";
-import { configuredModelRefs, resolveWindowModels } from "../quota/model-window-scope.js";
+import {
+  configuredModelRefs,
+  keepWindowLaneModels,
+  resolveWindowModels,
+} from "../quota/model-window-scope.js";
 import { WHOLE_BAD_READ_CARRY_DETAIL } from "../quota/parsed-state.js";
 import {
   hasSameQuotaWindowScope,
@@ -1432,7 +1436,16 @@ export class QuotaService {
     });
     try {
       const rawState = await parse();
-      const inferredState = inferQuotaState(rawState, prevState, scrapedAt);
+      // The lane an earlier reading established keeps a model window the
+      // parser mapped to fewer of its models this time (#1078).
+      const limits =
+        rawState.limits &&
+        keepWindowLaneModels(
+          rawState.limits,
+          prevState?.limits ?? [],
+          configuredModelRefs(this.configuredModelsFor(provider))
+        );
+      const inferredState = inferQuotaState({ ...rawState, limits }, prevState, scrapedAt);
       if (id) this.deps.scrapeStore?.recordParsed(id, rawState, inferredState);
       if (rawState.status === "unknown") this.failedReads.add(inferredState);
       return inferredState;

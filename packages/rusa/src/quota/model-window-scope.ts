@@ -1,4 +1,6 @@
+import type { QuotaLimit } from "../mcp/quota-mcp.js";
 import type { ModelEntry } from "../providers/model-catalog.js";
+import { isModelScopedWindow } from "./window-scope.js";
 
 /**
  * Catalog-aware validation of model-scoped quota windows — the trust boundary
@@ -87,4 +89,51 @@ export function resolveWindowModels(
     .map((ref) => ref.identifier.trim())
     .filter((identifier, index, all) => Boolean(identifier) && all.indexOf(identifier) === index)
     .filter((identifier) => matched.has(identifier));
+}
+
+/**
+ * Keep a model window on the lane its earlier reading established when the
+ * parser names only some of that lane's models (#1078). The model list is the
+ * lane's durable identity — stored scope, pacing, history, and missed-window
+ * detection all key on it — but the parser maps one panel line to model IDs
+ * with occasional variance, e.g. "Current week (Fable)" read as both Fable IDs
+ * on most scrapes and as one of them on a few. Read literally, each such
+ * reading opens a new lane and reports the established one missed.
+ *
+ * A window keeps `previous`'s models when exactly one previous model window
+ * has its label and kind, the current models are a strict subset of that
+ * window's, and every one of that window's models is still in the configured
+ * catalog. A dropped model that left the catalog is a real narrowing and
+ * becomes the new lane; a reading naming more models than before is taken as
+ * read.
+ */
+export function keepWindowLaneModels(
+  limits: readonly QuotaLimit[],
+  previous: readonly QuotaLimit[],
+  configured: readonly ConfiguredModelRef[]
+): QuotaLimit[] {
+  const configuredIds = new Set(configured.map((ref) => ref.identifier.trim()));
+  const sameWindow = (left: QuotaLimit, right: QuotaLimit) =>
+    left.kind === right.kind &&
+    left.label.trim().toLowerCase() === right.label.trim().toLowerCase();
+  return limits.map((limit) => {
+    const models = windowModels(limit);
+    if (!models || typeof limit.scope !== "object") return limit;
+    const matches = previous.filter((prev) => windowModels(prev) && sameWindow(prev, limit));
+    const lane = matches.length === 1 ? windowModels(matches[0]) : null;
+    if (
+      !lane ||
+      lane.length <= models.length ||
+      !models.every((model) => lane.includes(model)) ||
+      !lane.every((model) => configuredIds.has(model))
+    ) {
+      return limit;
+    }
+    return { ...limit, scope: { ...limit.scope, models: [...lane] } };
+  });
+}
+
+function windowModels(limit: QuotaLimit): readonly string[] | null {
+  if (!isModelScopedWindow(limit) || typeof limit.scope !== "object") return null;
+  return limit.scope.models ?? null;
 }
