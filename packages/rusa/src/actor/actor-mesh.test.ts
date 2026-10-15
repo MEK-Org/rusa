@@ -14788,6 +14788,8 @@ describe("ready-head attention while the owner is only queued (#1071)", () => {
     await h.settle();
     expect(fresh()).toHaveLength(1);
     expect(h.rowsFor(parentId)).toHaveLength(2);
+    expect(h.starts.map((start) => start.responsive)).toEqual([true]);
+    expect(h.mesh.activeRunState(h.owner)).toBeNull();
     h.db.close();
   });
 
