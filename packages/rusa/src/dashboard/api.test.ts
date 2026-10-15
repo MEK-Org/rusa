@@ -3889,12 +3889,8 @@ describe("handleMeshApiRequest", () => {
         obligations.create({ title: "A", id: "a", ownerId: "actor-1", parentId: "area" });
         obligations.create({ title: "B", id: "b", ownerId: "actor-1", parentId: "area" });
         obligations.create({ title: "Other", id: "other", ownerId: "actor-2" });
-        const page = async () => {
-          const { res } = await call(
-            deps,
-            "GET",
-            "/api/mesh/obligations?ownerId=actor-1&queue=ready&ancestors=true"
-          );
+        const page = async (query = "ownerId=actor-1&queue=ready&ancestors=true") => {
+          const { res } = await call(deps, "GET", `/api/mesh/obligations?${query}`);
           expect(res.statusCode).toBe(200);
           const data = JSON.parse(res.body);
           return {
@@ -3909,6 +3905,13 @@ describe("handleMeshApiRequest", () => {
         // A reparent is what the next page reports.
         obligations.reparent("b", "other", LOCAL_USER);
         expect(await page()).toEqual({ rows: ["a", "b"], ancestors: ["area", "other", "root"] });
+
+        // An ancestor that is itself a row of the page is left to the rows.
+        obligations.create({ title: "A1", id: "a1", ownerId: "actor-1", parentId: "a" });
+        expect(await page("ownerId=actor-1&ancestors=true")).toEqual({
+          rows: ["a", "a1", "b"],
+          ancestors: ["area", "other", "root"],
+        });
 
         const { res: plain } = await call(
           deps,

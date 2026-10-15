@@ -162,7 +162,9 @@ class PersistedObligationEntitiesSnapshot {
   static const int maxSerializedBytes = 256 * 1024;
 
   /// Captures what [entities] holds for [queries]: their rows, and the
-  /// recorded blockers and held ancestors of those rows.
+  /// recorded blockers and held ancestors of those rows. Ancestors only draw
+  /// the rows' paths, so when they would push the capture past
+  /// [maxSerializedBytes] it keeps the rows and blockers without them.
   factory PersistedObligationEntitiesSnapshot.capture({
     required String scope,
     required String principalId,
@@ -176,22 +178,29 @@ class PersistedObligationEntitiesSnapshot {
         for (final o in entities.select(q)) o.id: o,
     };
     final blockers = {for (final id in rows.keys) id: ?entities.blockers[id]};
-    return PersistedObligationEntitiesSnapshot(
+    final withoutPaths = {
+      ...rows,
+      for (final children in blockers.values)
+        for (final c in children) c: ?entities.byId[c],
+    };
+    PersistedObligationEntitiesSnapshot holding(
+      Map<String, ObligationDto> byId,
+    ) => PersistedObligationEntitiesSnapshot(
       scope: scope,
       principalId: principalId,
       savedAt: now.toUtc().toIso8601String(),
       queries: kept,
-      entities: ObligationEntities(
-        byId: {
-          ...rows,
-          for (final children in blockers.values)
-            for (final c in children) c: ?entities.byId[c],
-          for (final id in rows.keys)
-            for (final a in entities.ancestorsOf(id)) a.id: a,
-        },
-        blockers: blockers,
-      ),
+      entities: ObligationEntities(byId: byId, blockers: blockers),
     );
+    final withPaths = holding({
+      ...withoutPaths,
+      for (final id in rows.keys)
+        for (final a in entities.ancestorsOf(id)) a.id: a,
+    });
+    return withPaths.entities.byId.length == withoutPaths.length ||
+            rawFitsStorageBudget(withPaths.encode())
+        ? withPaths
+        : holding(withoutPaths);
   }
 
   Map<String, dynamic> toJson() => {

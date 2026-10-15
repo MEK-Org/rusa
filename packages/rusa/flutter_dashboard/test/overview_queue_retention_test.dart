@@ -1629,6 +1629,34 @@ void main() {
       expect(back.savedAt, now.toIso8601String());
     });
 
+    test('keeps a capture that fits without the paths it cannot afford', () {
+      final budget = PersistedObligationEntitiesSnapshot.maxSerializedBytes;
+      final snapshot = PersistedObligationEntitiesSnapshot.capture(
+        scope: _scope,
+        principalId: testUserPrincipalId,
+        queries: _queuesOf(testUserPrincipalId),
+        entities: ObligationEntities(
+          byId: {
+            'r': makeObligation(
+              'r',
+              parentId: 'p',
+              ownerId: testUserPrincipalId,
+            ),
+            'p': makeObligation('p', intent: 'x' * budget),
+          },
+        ),
+        now: now,
+      );
+      // The row is retained and its path is what goes (#1076).
+      expect(snapshot.entities.byId.keys, ['r']);
+      expect(
+        PersistedObligationEntitiesSnapshot.rawFitsStorageBudget(
+          snapshot.encode(),
+        ),
+        isTrue,
+      );
+    });
+
     test('rejects other versions, malformed shapes and oversized payloads', () {
       final good = _capture(testUserPrincipalId, ['x'], now: now).toJson();
       expect(PersistedObligationEntitiesSnapshot.fromJson(good), isNotNull);
