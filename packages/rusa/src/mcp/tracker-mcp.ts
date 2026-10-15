@@ -17,11 +17,13 @@ export const TRACKER_MCP_NAME = "tracker";
 
 /**
  * Shared guidance for embedding repository images in Markdown across tracker posting tools.
- * In private repositories, raw.githubusercontent.com fails authentication through GitHub's
- * image proxy (Camo); linking via github.com/raw or blob?raw=true allows authenticated rendering.
+ * GitHub's "Basic writing and formatting syntax" docs (Images) give `blob/<ref>/<path>?raw=true`
+ * for images in issues, pull requests and comments, and say private-repository images render
+ * only for viewers with read access. A commit SHA as `<ref>` keeps evidence images rendering
+ * after the branch moves or is deleted.
  */
 export const GITHUB_IMAGE_LINK_INSTRUCTION =
-  "To embed repository images in Markdown so they render across both public and private repositories, use `![alt](https://github.com/<owner>/<repo>/raw/<ref>/<path>)` (or `https://github.com/<owner>/<repo>/blob/<ref>/<path>?raw=true`). Do not use `raw.githubusercontent.com`, which fails authentication via GitHub's image proxy in private repositories.";
+  "To show a repository image in Markdown, use `![alt](https://github.com/<owner>/<repo>/blob/<commit-sha>/<path>?raw=true)`; a commit SHA keeps it rendering after branches move or are deleted. In private repositories it renders only for viewers with read access.";
 
 export interface TrackerMcpOptions {
   onWrite?: () => void;

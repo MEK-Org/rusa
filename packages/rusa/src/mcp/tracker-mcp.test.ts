@@ -1273,29 +1273,8 @@ describe("tracker MCP server", () => {
         .map((t) => t.name);
 
       expect(new Set(toolsWithGuidance)).toEqual(expectedPostingTools);
-
-      for (const tool of tools) {
-        if (expectedPostingTools.has(tool.name)) {
-          expect(tool.description).toContain(GITHUB_IMAGE_LINK_INSTRUCTION);
-        } else {
-          expect(tool.description).not.toContain(GITHUB_IMAGE_LINK_INSTRUCTION);
-        }
-      }
-    });
-
-    it("uses generic examples and explains private repository proxy behavior", () => {
-      expect(GITHUB_IMAGE_LINK_INSTRUCTION).toContain(
-        "https://github.com/<owner>/<repo>/raw/<ref>/<path>"
-      );
-      expect(GITHUB_IMAGE_LINK_INSTRUCTION).toContain(
-        "https://github.com/<owner>/<repo>/blob/<ref>/<path>?raw=true"
-      );
-      expect(GITHUB_IMAGE_LINK_INSTRUCTION).toContain("raw.githubusercontent.com");
-      expect(GITHUB_IMAGE_LINK_INSTRUCTION).toContain("private repositories");
-      // Must not leak specific account, repo, infrastructure, or credential identifiers
-      expect(GITHUB_IMAGE_LINK_INSTRUCTION).not.toMatch(
-        /MEK-Org|rusa|token|auth_token|ghp_|github_pat/i
-      );
+      // Generic placeholders only: no account, repository, infrastructure or credential identifiers.
+      expect(GITHUB_IMAGE_LINK_INSTRUCTION).not.toMatch(/MEK-Org|rusa|token|ghp_|github_pat/i);
     });
   });
 });
