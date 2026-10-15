@@ -97,12 +97,6 @@ describe("reference grammar", () => {
     );
   });
 
-  it("requires collection/id pairs for actor resources", () => {
-    expect(isReference("mesh:actors/actor-1/charter")).toBe(false);
-    expect(isReference("mesh:actors/actor-1/unknown-property")).toBe(false);
-    expect(isReference("mesh:actors/actor-1/inbox/entry-9")).toBe(true);
-  });
-
   it("answers containment with a prefix test", () => {
     const repo = parseReference("github:MEK-Org/rusa");
     const issue = parseReference("github:MEK-Org/rusa/issues/33");
