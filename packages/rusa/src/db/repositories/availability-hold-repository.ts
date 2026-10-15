@@ -65,7 +65,8 @@ const COLUMNS = "scope, expiry, reason, created_by, created_at";
  * as one versioned JSON document, `{"schemaVersion":1,"provider":…}` or
  * `{"schemaVersion":1,"provider":…,"model":…}`, always serialized the same way
  * so the unique index on `scope` sees a repeated scope. Reads parse and
- * validate every row they touch and throw on a scope they do not understand.
+ * validate every row they touch and throw on a scope they do not understand,
+ * including one that is not in that canonical form.
  */
 export class AvailabilityHoldRepository {
   constructor(private readonly db: Database.Database) {}
@@ -114,12 +115,12 @@ export class AvailabilityHoldRepository {
       const scopes = models
         ? new Set(models.map((model) => scopeJson(provider, model)))
         : undefined;
-      const rows = this.selectAll().filter((row) =>
-        scopes ? scopes.has(row.scope) : row.hold.provider === provider
-      );
+      const rows = this.selectAll()
+        .map((row) => ({ scope: row.scope, hold: toHold(row) }))
+        .filter((row) => (scopes ? scopes.has(row.scope) : row.hold.provider === provider));
       const remove = this.db.prepare("DELETE FROM availability_holds WHERE scope = ?");
       for (const row of rows) remove.run(row.scope);
-      return rows.map((row) => row.hold);
+      return rows.map((row) => row.hold).sort(compareHolds);
     })();
   }
 
@@ -128,7 +129,7 @@ export class AvailabilityHoldRepository {
    * Pass `now` to see only holds still active at that instant.
    */
   list(options: { now?: number } = {}): AvailabilityHold[] {
-    const holds = this.selectAll().map((row) => row.hold);
+    const holds = this.selectAll().map(toHold).sort(compareHolds);
     const { now } = options;
     return now === undefined ? holds : holds.filter((hold) => isActive(hold, now));
   }
@@ -137,26 +138,27 @@ export class AvailabilityHoldRepository {
    * True iff an active hold covers `provider`, or `model` on it. A caller that
    * cannot name its model is treated as held when any model on the provider is
    * held, matching the `/halt` brake: it must not run on a held lane.
+   * Expired rows are skipped before their scope is parsed, so only an active
+   * row this code cannot read blocks selection.
    */
   isHeld(provider: string, model: string | undefined, now: number): boolean {
     const normalizedProvider = normalizeProvider(provider);
     if (!normalizedProvider) return false;
     const normalizedModel = model === undefined ? undefined : normalizeModel(model);
-    return this.selectAll().some(({ hold }) => {
-      if (hold.provider !== normalizedProvider || !isActive(hold, now)) return false;
+    return this.selectAll().some((row) => {
+      if (!isActiveAt(row.expiry ?? undefined, now)) return false;
+      const hold = toHold(row);
+      if (hold.provider !== normalizedProvider) return false;
       if (hold.model === undefined || !normalizedModel) return true;
       return hold.model === normalizedModel;
     });
   }
 
-  /** Every stored row with its parsed hold, by provider, provider-wide first. */
-  private selectAll(): Array<{ scope: string; hold: AvailabilityHold }> {
-    const rows = this.db
+  /** Every stored row, unparsed and in no particular order. */
+  private selectAll(): AvailabilityHoldRow[] {
+    return this.db
       .prepare(`SELECT ${COLUMNS} FROM availability_holds`)
       .all() as AvailabilityHoldRow[];
-    return rows
-      .map((row) => ({ scope: row.scope, hold: toHold(row) }))
-      .sort((a, b) => compareHolds(a.hold, b.hold));
   }
 }
 
@@ -169,7 +171,11 @@ function compareHolds(a: AvailabilityHold, b: AvailabilityHold): number {
 }
 
 function isActive(hold: AvailabilityHold, now: number): boolean {
-  return hold.expiry === undefined || Date.parse(hold.expiry) > now;
+  return isActiveAt(hold.expiry, now);
+}
+
+function isActiveAt(expiry: string | undefined, now: number): boolean {
+  return expiry === undefined || Date.parse(expiry) > now;
 }
 
 /**
@@ -184,12 +190,26 @@ function scopeJson(provider: string, model: string | null): string {
   });
 }
 
+/**
+ * Parse a stored scope. Only the text {@link scopeJson} writes for normalized
+ * names is accepted: any other spelling of the same scope would get past the
+ * unique index and be missed by a clear that matches the stored text.
+ */
 function parseScope(scope: string): z.infer<typeof scopeDocumentSchema> {
+  let document: z.infer<typeof scopeDocumentSchema>;
   try {
-    return scopeDocumentSchema.parse(JSON.parse(scope));
+    document = scopeDocumentSchema.parse(JSON.parse(scope));
   } catch (cause) {
     throw new Error(`invalid availability hold scope ${JSON.stringify(scope)}`, { cause });
   }
+  const canonical = scopeJson(
+    normalizeProvider(document.provider),
+    document.model === undefined ? null : normalizeModel(document.model)
+  );
+  if (scope !== canonical) {
+    throw new Error(`invalid availability hold scope ${JSON.stringify(scope)}`);
+  }
+  return document;
 }
 
 function toHold(row: AvailabilityHoldRow): AvailabilityHold {

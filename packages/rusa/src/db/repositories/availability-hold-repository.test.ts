@@ -65,32 +65,75 @@ describe("AvailabilityHoldRepository", () => {
     expect(holds.list()).toHaveLength(1);
   });
 
-  it("normalizes provider aliases and canonicalizes timestamps", () => {
-    const [stored] = holds.set({
-      provider: " AGY ",
-      expiry: "2026-10-05T20:52:00+02:00",
-      reason: "capacity",
-      createdBy: "root",
-      createdAt: CREATED,
-    });
+  it.each([
+    {
+      name: "normalizes a provider alias and canonicalizes timestamps",
+      sets: [{ provider: " AGY ", expiry: "2026-10-05T20:52:00+02:00", reason: "capacity" }],
+      heldAs: ["agy", "gemini-3-pro"],
+      rows: [
+        {
+          scope: '{"schemaVersion":1,"provider":"antigravity"}',
+          expiry: LATER,
+          reason: "capacity",
+          created_by: "root",
+        },
+      ],
+    },
+    {
+      name: "stores a model scope as normalized names",
+      sets: [{ provider: "codex", models: ["GPT-5.5"] }],
+      heldAs: ["codex", "gpt-5.5"],
+      rows: [
+        {
+          scope: '{"schemaVersion":1,"provider":"codex","model":"gpt-5.5"}',
+          expiry: null,
+          reason: "",
+          created_by: "root",
+        },
+      ],
+    },
+    {
+      name: "replaces a provider-wide hold set again instead of stacking another",
+      sets: [
+        { provider: "kimi", expiry: LATER },
+        { provider: "Kimi", reason: "outage", createdBy: "steward" },
+      ],
+      heldAs: ["kimi", "kimi-k2"],
+      rows: [
+        {
+          scope: '{"schemaVersion":1,"provider":"kimi"}',
+          expiry: null,
+          reason: "outage",
+          created_by: "steward",
+        },
+      ],
+    },
+    {
+      name: "replaces a model hold set again under another spelling",
+      sets: [
+        { provider: " KIMI ", models: ["Kimi-K2"] },
+        { provider: "kimi", models: [" kimi-k2 "], reason: "again", createdBy: "steward" },
+      ],
+      heldAs: ["kimi", "kimi-k2"],
+      rows: [
+        {
+          scope: '{"schemaVersion":1,"provider":"kimi","model":"kimi-k2"}',
+          expiry: null,
+          reason: "again",
+          created_by: "steward",
+        },
+      ],
+    },
+  ])("set() $name, storing one canonical versioned scope", ({ sets, heldAs, rows }) => {
+    let stored: ReturnType<typeof holds.set> = [];
+    for (const hold of sets) stored = holds.set({ createdBy: "root", createdAt: CREATED, ...hold });
 
-    expect(stored).toEqual({
-      provider: "antigravity",
-      expiry: LATER,
-      reason: "capacity",
-      createdBy: "root",
-      createdAt: CREATED,
-    });
-    expect(holds.isHeld("agy", "gemini-3-pro", NOW)).toBe(true);
-  });
-
-  it("replaces a hold with the same scope instead of stacking another", () => {
-    holds.set({ provider: "kimi", expiry: LATER, createdBy: "root", createdAt: CREATED });
-    holds.set({ provider: "kimi", reason: "outage", createdBy: "steward", createdAt: CREATED });
-
-    expect(holds.list()).toEqual([
-      { provider: "kimi", reason: "outage", createdBy: "steward", createdAt: CREATED },
-    ]);
+    expect(
+      db.prepare("SELECT scope, expiry, reason, created_by FROM availability_holds").all()
+    ).toEqual(rows);
+    expect(stored).toEqual(holds.list());
+    const [provider, model] = heldAs;
+    expect(holds.isHeld(provider ?? "", model, NOW)).toBe(true);
   });
 
   it("lets provider-wide and model-scoped holds coexist", () => {
@@ -150,31 +193,6 @@ describe("AvailabilityHoldRepository", () => {
     }
   });
 
-  it("stores each hold's scope as one canonical, versioned JSON object", () => {
-    holds.set({ provider: "Kimi", createdBy: "root", createdAt: CREATED });
-    holds.set({ provider: "codex", models: ["GPT-5.5"], createdBy: "root", createdAt: CREATED });
-
-    expect(db.prepare("SELECT scope FROM availability_holds ORDER BY scope").all()).toEqual([
-      { scope: '{"schemaVersion":1,"provider":"codex","model":"gpt-5.5"}' },
-      { scope: '{"schemaVersion":1,"provider":"kimi"}' },
-    ]);
-  });
-
-  it("serializes equal scopes identically, so setting one again replaces its row", () => {
-    holds.set({ provider: " KIMI ", models: ["Kimi-K2"], createdBy: "root", createdAt: CREATED });
-    holds.set({
-      provider: "kimi",
-      models: [" kimi-k2 "],
-      reason: "again",
-      createdBy: "steward",
-      createdAt: CREATED,
-    });
-
-    expect(db.prepare("SELECT scope, reason FROM availability_holds").all()).toEqual([
-      { scope: '{"schemaVersion":1,"provider":"kimi","model":"kimi-k2"}', reason: "again" },
-    ]);
-  });
-
   it("refuses to read a stored scope it does not understand", () => {
     const insert = db.prepare(
       `INSERT INTO availability_holds (scope, created_by, created_at) VALUES (?, 'root', '${CREATED}')`
@@ -186,6 +204,12 @@ describe("AvailabilityHoldRepository", () => {
       '{"schemaVersion":1,"provider":""}',
       '{"schemaVersion":1,"provider":"kimi","model":""}',
       '{"schemaVersion":1,"provider":"kimi","models":["kimi-k2"]}',
+      // Valid documents in a form set() never writes: reordered keys, added
+      // whitespace and unnormalized names would each slip past the unique
+      // index and a byte-matched clear.
+      '{"provider":"kimi","model":"kimi-k2","schemaVersion":1}',
+      '{ "schemaVersion": 1, "provider": "kimi" }',
+      '{"schemaVersion":1,"provider":"Kimi","model":"Kimi-K2"}',
     ]) {
       db.prepare("DELETE FROM availability_holds").run();
       insert.run(scope);
@@ -194,6 +218,19 @@ describe("AvailabilityHoldRepository", () => {
         /invalid availability hold scope/
       );
     }
+  });
+
+  it("skips an expired row before reading its scope when checking a lane", () => {
+    db.prepare(
+      `INSERT INTO availability_holds (scope, expiry, created_by, created_at)
+       VALUES ('kimi', ?, 'root', ?)`
+    ).run(new Date(NOW - 1).toISOString(), CREATED);
+    holds.set({ provider: "codex", createdBy: "root", createdAt: CREATED });
+
+    expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(false);
+    expect(holds.isHeld("codex", "gpt-5.5", NOW)).toBe(true);
+    // Listing still reads every row, so the bad one is reported, not hidden.
+    expect(() => holds.list()).toThrow(/invalid availability hold scope/);
   });
 
   it("refuses blank scopes and unparseable timestamps", () => {

@@ -21,8 +21,10 @@ import {
   AvailabilityHolds,
   describeHold,
   HALT_FILE_IMPORT_CREATOR,
+  haltIndicator,
   importScopedHaltFile,
 } from "./availability-holds.js";
+import type { HaltState } from "./halt-switch.js";
 
 const START = Date.parse("2026-10-05T12:00:00.000Z");
 const HOUR = 60 * 60 * 1000;
@@ -121,13 +123,62 @@ describe("AvailabilityHolds", () => {
       createdBy: "root",
     });
 
-    expect(holds.clear({ provider: "codex" })).toEqual([]);
+    expect(holds.clear({ provider: "codex" })).toEqual({ released: [], expired: [] });
     expect(released).toEqual([]);
-    expect(holds.clear({ provider: "kimi", models: ["kimi-k2"] })).toHaveLength(1);
+    expect(holds.clear({ provider: "kimi", models: ["kimi-k2"] }).released).toHaveLength(1);
     expect(released).toHaveLength(1);
     expect(holds.isHeld("kimi", "kimi-k2")).toBe(false);
     vi.advanceTimersByTime(2 * HOUR);
     expect(released).toHaveLength(1);
+  });
+
+  it("removes expired records apart from released holds, and only a released hold fires onReleased", () => {
+    holds.set({
+      provider: "kimi",
+      expiry: new Date(START + HOUR).toISOString(),
+      createdBy: "root",
+    });
+    holds.set({ provider: "codex", models: ["gpt-5.5"], createdBy: "root" });
+    vi.advanceTimersByTime(HOUR);
+    released.length = 0;
+
+    const expiredOnly = holds.clear({ provider: "kimi" });
+    expect(expiredOnly.released).toEqual([]);
+    expect(expiredOnly.expired.map((hold) => hold.provider)).toEqual(["kimi"]);
+    expect(released).toEqual([]);
+    expect(repo.list().map((hold) => hold.provider)).toEqual(["codex"]);
+
+    const active = holds.clear({ provider: "codex" });
+    expect(active.released.map((hold) => hold.model)).toEqual(["gpt-5.5"]);
+    expect(active.expired).toEqual([]);
+    expect(released).toEqual([active.released]);
+  });
+
+  it("reports every hold that expired by the time a late wake fires", () => {
+    let lag = 0;
+    const lagging = new AvailabilityHolds({
+      repo,
+      now: () => Date.now() + lag,
+      onReleased: (cleared) => released.push(cleared),
+    });
+    lagging.set({
+      provider: "codex",
+      expiry: new Date(START + HOUR).toISOString(),
+      createdBy: "root",
+    });
+    lagging.set({
+      provider: "kimi",
+      expiry: new Date(START + HOUR + 10).toISOString(),
+      createdBy: "root",
+    });
+    // The wake armed for codex runs 25ms late, after kimi expired too.
+    lag = 25;
+    vi.advanceTimersByTime(HOUR);
+    lagging.stop();
+
+    expect(released.map((batch) => batch.map((hold) => hold.provider))).toEqual([
+      ["codex", "kimi"],
+    ]);
   });
 
   it("arms the expiry wake for holds stored before startup", () => {
@@ -166,9 +217,102 @@ describe("AvailabilityHolds silent changes", () => {
       onReleased: () => calls.push("released"),
     });
     holds.set({ provider: "kimi", createdBy: "root" }, { silent: true });
-    expect(holds.clear({ provider: "kimi" }, { silent: true })).toHaveLength(1);
+    expect(holds.clear({ provider: "kimi" }, { silent: true }).released).toHaveLength(1);
     expect(calls).toEqual([]);
     holds.stop();
+  });
+});
+
+describe("haltIndicator", () => {
+  const UNTIL = "2026-10-05T13:00:00.000Z";
+  const hold = (provider: string, model?: string, expiry: string | null = UNTIL) => ({
+    provider,
+    ...(model ? { model } : {}),
+    ...(expiry ? { expiry } : {}),
+    reason: "chat /halt from Operator",
+    createdBy: "chat:users/operator",
+    createdAt: "2026-10-05T12:00:00.000Z",
+  });
+  const reason = "chat /halt from Operator";
+
+  it.each<{
+    name: string;
+    brake: HaltState | null;
+    holds: AvailabilityHold[];
+    snapshot: HaltState | null;
+  }>([
+    { name: "nothing halted", brake: null, holds: [], snapshot: null },
+    {
+      name: "the brake file alone",
+      brake: { providers: ["codex"], until: UNTIL },
+      holds: [],
+      snapshot: { providers: ["codex"], until: UNTIL },
+    },
+    {
+      name: "the global brake, which covers every hold",
+      brake: { reason: "stop" },
+      holds: [hold("codex")],
+      snapshot: { reason: "stop" },
+    },
+    {
+      name: "a scoped brake file beside holds",
+      brake: { providers: ["claude"] },
+      holds: [hold("codex")],
+      snapshot: null,
+    },
+    {
+      name: "provider-wide holds sharing an expiry",
+      brake: null,
+      holds: [hold("claude"), hold("codex")],
+      snapshot: { reason, providers: ["claude", "codex"], until: UNTIL },
+    },
+    {
+      name: "a full providers × models product with no expiry",
+      brake: null,
+      holds: [
+        hold("codex", "gpt-5.5", null),
+        hold("codex", "gpt-5.5-mini", null),
+        hold("openrouter", "gpt-5.5", null),
+        hold("openrouter", "gpt-5.5-mini", null),
+      ],
+      snapshot: {
+        reason,
+        providers: ["codex", "openrouter"],
+        models: ["gpt-5.5", "gpt-5.5-mini"],
+      },
+    },
+    {
+      name: "holds with different expiries",
+      brake: null,
+      holds: [hold("claude"), hold("codex", undefined, null)],
+      snapshot: null,
+    },
+    {
+      name: "a provider-wide hold beside a model hold",
+      brake: null,
+      holds: [hold("claude"), hold("codex", "gpt-5.5")],
+      snapshot: null,
+    },
+    {
+      name: "model holds that are not a full product",
+      brake: null,
+      holds: [hold("codex", "gpt-5.5"), hold("openrouter", "gpt-5.5-mini")],
+      snapshot: null,
+    },
+  ])("reports $name exactly or not at all", ({ brake, holds, snapshot }) => {
+    const indicator = haltIndicator({ state: () => brake }, () => holds);
+
+    expect(indicator.isHalted()).toBe(brake !== null || holds.length > 0);
+    expect(indicator.haltSnapshot()).toEqual(snapshot);
+  });
+
+  it("omits a reason the holds do not share", () => {
+    const indicator = haltIndicator({ state: () => null }, () => [
+      hold("claude"),
+      { ...hold("codex"), reason: "capacity" },
+    ]);
+
+    expect(indicator.haltSnapshot()).toEqual({ providers: ["claude", "codex"], until: UNTIL });
   });
 });
 

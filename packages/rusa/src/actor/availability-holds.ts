@@ -5,7 +5,7 @@ import type {
   AvailabilityHoldRepository,
   AvailabilityHoldScope,
 } from "../db/repositories/availability-hold-repository.js";
-import { HaltSwitch } from "./halt-switch.js";
+import { type HaltState, HaltSwitch } from "./halt-switch.js";
 import type { MeshEventInput } from "./mesh-events.js";
 
 /** The longest delay `setTimeout` honors; longer delays fire immediately. */
@@ -22,8 +22,14 @@ export interface AvailabilityHoldsOptions {
   now?: () => number;
   /** A hold was set: cancel queued starts whose reserved lane it now covers. */
   onHeld?: (holds: AvailabilityHold[]) => void;
-  /** A hold was cleared or expired: replay starts a hold cancelled. */
+  /** An active hold was cleared or expired: replay starts a hold cancelled. */
   onReleased?: (holds: AvailabilityHold[]) => void;
+}
+
+/** What one `clear` removed: holds still in force, and records already expired. */
+export interface ClearedHolds {
+  released: AvailabilityHold[];
+  expired: AvailabilityHold[];
 }
 
 /**
@@ -86,15 +92,18 @@ export class AvailabilityHolds {
 
   /**
    * Clear holds on a provider: every hold on it without `models`, otherwise
-   * only those model holds. Returns the cleared holds, expired ones included.
+   * only those model holds. Holds that were still in force are `released`;
+   * matching records that had already expired are removed and returned apart,
+   * and alone they release nothing, so `onReleased` does not fire for them.
    */
-  clear(scope: AvailabilityHoldScope, options: HoldChangeOptions = {}): AvailabilityHold[] {
-    return this.released(this.options.repo.clear(scope), options);
-  }
-
-  /** True iff `hold` is still in force (it has no expiry, or it is in the future). */
-  isActive(hold: AvailabilityHold): boolean {
-    return hold.expiry === undefined || Date.parse(hold.expiry) > this.now();
+  clear(scope: AvailabilityHoldScope, options: HoldChangeOptions = {}): ClearedHolds {
+    const cleared = this.options.repo.clear(scope);
+    const now = this.now();
+    const released = cleared.filter((hold) => isActiveAt(hold, now));
+    const expired = cleared.filter((hold) => !isActiveAt(hold, now));
+    this.schedule();
+    if (released.length > 0 && !options.silent) this.options.onReleased?.(released);
+    return { released, expired };
   }
 
   /** Arm the expiry timer from the stored holds; call once at startup. */
@@ -105,12 +114,6 @@ export class AvailabilityHolds {
   stop(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
-  }
-
-  private released(cleared: AvailabilityHold[], options: HoldChangeOptions): AvailabilityHold[] {
-    this.schedule();
-    if (cleared.length > 0 && !options.silent) this.options.onReleased?.(cleared);
-    return cleared;
   }
 
   /** Wake at the earliest future expiry among stored holds. */
@@ -126,16 +129,73 @@ export class AvailabilityHolds {
     this.timer = setTimeout(
       () => {
         this.timer = null;
-        const expired = this.options.repo
-          .list()
-          .filter((hold) => hold.expiry !== undefined && Date.parse(hold.expiry) === due);
+        // Every hold that expired since this wake was armed. A late timer also
+        // takes holds whose expiry fell between `due` and now, which the
+        // re-arm below no longer sees as future.
+        const fired = this.now();
+        const expired = this.options.repo.list().filter((hold) => {
+          if (hold.expiry === undefined) return false;
+          const expiry = Date.parse(hold.expiry);
+          return expiry >= due && expiry <= fired;
+        });
         this.schedule();
-        if (this.now() >= due && expired.length > 0) this.options.onReleased?.(expired);
+        if (fired >= due && expired.length > 0) this.options.onReleased?.(expired);
       },
       Math.min(Math.max(next - now, 0), MAX_TIMER_DELAY_MS)
     );
     this.timer.unref?.();
   }
+}
+
+function isActiveAt(hold: AvailabilityHold, now: number): boolean {
+  return hold.expiry === undefined || Date.parse(hold.expiry) > now;
+}
+
+/**
+ * The dashboard header's halt indicator (#908) over the brake and the holds
+ * together. `isHalted` lights for either. `haltSnapshot` reports a scope only
+ * when one `HaltState` describes exactly what is held: the brake file alone,
+ * the global brake (which covers every hold), or, with no brake, holds that
+ * form one providers × models product with one expiry. Anything else reports
+ * null rather than a scope that is not held. `activeHolds` returns the holds
+ * in force now.
+ */
+export function haltIndicator(
+  haltSwitch: Pick<HaltSwitch, "state">,
+  activeHolds: () => AvailabilityHold[]
+): { isHalted: () => boolean; haltSnapshot: () => HaltState | null } {
+  return {
+    isHalted: () => haltSwitch.state() !== null || activeHolds().length > 0,
+    haltSnapshot: () => {
+      const brake = haltSwitch.state();
+      const holds = activeHolds();
+      if (holds.length === 0) return brake;
+      if (brake) return brake.providers?.length || brake.models?.length ? null : brake;
+      return holdsAsHaltState(holds);
+    },
+  };
+}
+
+function holdsAsHaltState(holds: AvailabilityHold[]): HaltState | null {
+  const [first] = holds;
+  if (!first || holds.some((hold) => hold.expiry !== first.expiry)) return null;
+  const providers = [...new Set(holds.map((hold) => hold.provider))];
+  const models = [...new Set(holds.flatMap((hold) => (hold.model ? [hold.model] : [])))];
+  // Stored scopes are unique, so the holds are the whole product exactly when
+  // every one is provider-wide or every one is model-scoped and they number
+  // providers × models.
+  const product =
+    models.length === 0
+      ? holds.length === providers.length
+      : holds.every((hold) => hold.model) && holds.length === providers.length * models.length;
+  if (!product) return null;
+  const reason = holds.every((hold) => hold.reason === first.reason) ? first.reason : "";
+  return {
+    ...(reason ? { reason } : {}),
+    providers,
+    ...(models.length ? { models } : {}),
+    ...(first.expiry ? { until: first.expiry } : {}),
+  };
 }
 
 /**

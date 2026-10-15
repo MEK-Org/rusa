@@ -1298,23 +1298,27 @@ export function createAgentExecMcpServer(
       {
         title: "Clear availability holds (root only)",
         description:
-          "Clear holds on a provider. Without models, every hold on the provider is cleared, provider-wide and model-scoped alike; with models, only those model holds are cleared and a provider-wide hold stays. Cleared entries become eligible again from their unchanged pools, and queued starts a hold cancelled replay. Returns the cleared holds (empty when nothing matched). Only the configured actor, holding model-admin, has this tool.",
+          "Clear holds on a provider. Without models, every hold on the provider is cleared, provider-wide and model-scoped alike; with models, only those model holds are cleared and a provider-wide hold stays. Cleared entries become eligible again from their unchanged pools, and queued starts a hold cancelled replay. Returns { released, expired_removed }: released lists the holds that were still in force (empty when none matched); expired_removed counts matching records that had already expired, which list_availability_holds does not show and whose removal releases nothing. Only the configured actor, holding model-admin, has this tool.",
         inputSchema: scopeInput,
       },
       async ({ provider, models }) => {
         const denied = assertModelAdmin();
         if (denied) return denied;
         try {
-          const cleared = availabilityHolds.clear({ provider, models });
-          if (cleared.length > 0) {
+          const { released, expired } = availabilityHolds.clear({ provider, models });
+          const result = {
+            released: released.map(holdView),
+            expired_removed: expired.length,
+          };
+          if (released.length + expired.length > 0) {
             mesh.recordEvent({
               kind: "root_control_action",
               actorId: selfId,
               detail: `${MODEL_ADMIN_CAPABILITY} clear_availability_hold`,
-              payload: JSON.stringify(cleared.map(holdView)),
+              payload: JSON.stringify(result),
             });
           }
-          return toolOk(cleared.map(holdView));
+          return toolOk(result);
         } catch (err) {
           return toolError(err);
         }

@@ -36,6 +36,7 @@ import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
 import {
   AvailabilityHolds,
   describeHold,
+  haltIndicator,
   importScopedHaltFile,
 } from "../actor/availability-holds.js";
 import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
@@ -4720,10 +4721,10 @@ async function composeStart(
           // Read-only exposures: the emergency-brake state and a snapshot of
           // which actors are executing a run right now — for the header HALTED
           // indicator and per-thread run-state dots. No new mesh behavior.
-          // A scoped `/halt` lit the indicator when it was the HALT file, so
-          // an active availability hold still does (#539).
-          isHalted: () => haltSwitch.hasActiveHalt() || availabilityHolds.list().length > 0,
-          haltSnapshot: () => haltSwitch.state(),
+          // A scoped `/halt` lit the indicator, and #908's tooltip named its
+          // scope, when it was the HALT file, so an active availability hold
+          // still does (#539).
+          ...haltIndicator(haltSwitch, () => availabilityHolds.list()),
           // Surfaces the boot-time `at`/`atrm`/`atd`/`atq` AND `crontab`/crond/
           // cron.allow-cron.deny preflights so a missing one-shot facility or an
           // unusable crontab is dashboard/health-visible, not just a startup
@@ -5057,7 +5058,7 @@ async function composeStart(
         if (scopedProviders.length > 0) {
           // A scoped `/resume` releases only matching holds; the global
           // brake is not a provider's to release.
-          const released = scopedProviders.flatMap((provider) =>
+          const cleared = scopedProviders.map((provider) =>
             availabilityHolds.clear(
               {
                 provider,
@@ -5066,8 +5067,9 @@ async function composeStart(
               { silent: true }
             )
           );
-          const resumed = released.length ? resumeAfterHalt() : [];
-          const active = released.filter((hold) => availabilityHolds.isActive(hold));
+          const active = cleared.flatMap((batch) => batch.released);
+          const expired = cleared.reduce((count, batch) => count + batch.expired.length, 0);
+          const resumed = active.length ? resumeAfterHalt() : [];
           const remaining = availabilityHolds
             .list()
             .filter((hold) => scopedProviders.includes(hold.provider));
@@ -5077,7 +5079,6 @@ async function composeStart(
               ? `▶ Released availability holds${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : ""}:\n${holdLines(active)}`
               : `▶ No availability hold in force matched ${named}; nothing was released.`,
           ];
-          const expired = released.length - active.length;
           if (expired > 0) lines.push(`Also removed ${expired} expired hold record(s).`);
           if (remaining.length) lines.push(`Still held:\n${holdLines(remaining)}`);
           if (haltSwitch.hasActiveHalt()) {

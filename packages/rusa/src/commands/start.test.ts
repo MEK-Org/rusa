@@ -4278,6 +4278,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
       }),
       expect.objectContaining({ provider: "codex", expiry: until }),
     ]);
+    // The header names a scoped halt as it did when that was the HALT file
+    // (#908): these holds are exactly one providers × expiry scope.
+    const dashboardMesh = () => startDashboardServerSpy.mock.calls[0]?.[0].mesh;
+    expect(dashboardMesh()?.isHalted?.()).toBe(true);
+    expect(dashboardMesh()?.haltSnapshot?.()).toEqual({
+      reason: "chat /halt from Operator",
+      providers: ["claude", "codex"],
+      until,
+    });
 
     // Holds coexist: another scope needs no /resume first.
     await message("/halt provider:antigravity", "messages/halt-2");
@@ -4326,8 +4335,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(held("antigravity")).toBe(true);
     expect(held("claude")).toBe(true);
     // The header's HALTED indicator follows the holds, not just the brake.
-    const dashboardHalted = () => startDashboardServerSpy.mock.calls[0]?.[0].mesh?.isHalted?.();
-    expect(dashboardHalted()).toBe(true);
+    // An indefinite and a bounded hold are no single scope, so none is named.
+    expect(dashboardMesh()?.isHalted?.()).toBe(true);
+    expect(dashboardMesh()?.haltSnapshot?.()).toBeNull();
     expect(
       getRepositories()
         .availabilityHolds.list()
@@ -4347,7 +4357,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(lastReply()).toContain("/resume provider:");
 
     await message("/resume provider:antigravity,claude", "messages/resume-rest");
-    expect(dashboardHalted()).toBe(false);
+    expect(dashboardMesh()?.isHalted?.()).toBe(false);
+    expect(dashboardMesh()?.haltSnapshot?.()).toBeNull();
   });
 
   it("wires model-admin availability holds into the configured actor's endpoint and run admission (#539)", async () => {

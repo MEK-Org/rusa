@@ -3442,12 +3442,27 @@ describe("availability hold tools (#539)", () => {
       provider: "codex",
       models: ["gpt-5.5"],
     });
-    expect((dataOf(cleared) as Array<{ model: string }>).map((hold) => hold.model)).toEqual([
-      "gpt-5.5",
-    ]);
+    expect(dataOf(cleared)).toEqual({
+      released: [expect.objectContaining({ provider: "codex", model: "gpt-5.5" })],
+      expired_removed: 0,
+    });
     expect(availabilityHolds.isHeld("codex", "gpt-5.5")).toBe(false);
     expect(availabilityHolds.isHeld("codex", "gpt-5.5-mini")).toBe(true);
     expect(repo.list()).toHaveLength(2);
+
+    // A record that already expired is counted apart, never reported as released.
+    repo.set({
+      provider: "kimi",
+      models: ["kimi-k2"],
+      expiry: "2026-10-05T11:00:00Z",
+      createdBy: "root",
+      createdAt: "2026-10-05T10:00:00Z",
+    });
+    const kimi = await call(root, "clear_availability_hold", { provider: "kimi" });
+    expect(dataOf(kimi)).toEqual({
+      released: [expect.objectContaining({ provider: "kimi", model: null })],
+      expired_removed: 1,
+    });
 
     const details = events
       .filter((event) => event.kind === "root_control_action")
@@ -3455,6 +3470,7 @@ describe("availability hold tools (#539)", () => {
     expect(details).toEqual([
       "model-admin set_availability_hold",
       "model-admin set_availability_hold",
+      "model-admin clear_availability_hold",
       "model-admin clear_availability_hold",
     ]);
   });
