@@ -37,8 +37,9 @@ describe("inbox hints", () => {
             },
           })
         );
+        expect(hint).toContain("omitting threadTs.");
         expect(hint).toContain(
-          "omitting threadTs, unless the message explicitly requests a new thread"
+          "If the message explicitly requests a new thread, pass threadTs '1720000000.000001'"
         );
       }
     });

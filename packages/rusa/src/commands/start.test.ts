@@ -26,9 +26,11 @@ import {
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
+import { COMPACTED_MEMORY_DELTA_EXPERIMENT } from "../actor/experiments.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
+import type { InjectRecord } from "../actor/portable-context.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
 import {
   emptyPortableContextState,
@@ -50,6 +52,7 @@ import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { McpHttpServer } from "../mcp/http-server.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import type { DiskUsageAlertDeps } from "../observability/disk-alert.js";
+import * as exhaustionClassifier from "../providers/exhaustion-classifier.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
@@ -60,6 +63,7 @@ import { FollowerInstance } from "../remote-instances/follower-instance.js";
 import { INSTANCE_PROTOCOL_VERSION } from "../remote-instances/protocol.js";
 import { RemoteInstance } from "../remote-instances/remote-instance.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
+import { SlackClient } from "../slack/slack-client.js";
 import { SlackSocketSource } from "../slack/socket-source.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";
 import { SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
@@ -2004,11 +2008,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       return actor;
     };
 
-    // The retired experiment is gone from the live surface: nothing is listed,
-    // and its name can no longer be enrolled. Strict closure needs neither.
+    // The retired experiment is gone from the live surface: only the live
+    // registry (#1062) is listed, and the retired name can no longer be
+    // enrolled. Strict closure needs neither.
     expect(
       payloadOf(await call(urlOf(root, "mesh"), "list_actor_experiments", {})).experiments
-    ).toEqual([]);
+    ).toEqual([expect.objectContaining({ name: "compacted_memory_delta" })]);
     expect(
       (
         await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
@@ -4507,7 +4512,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(built.injectRecord?.runCount).toBe(1);
   });
 
-  it("seeds brief mode before its first prompt, without a Gemini key, and never renders the old ledger", async () => {
+  it.each([
+    false,
+    true,
+  ])("seeds brief mode without a Gemini key and retains its window with delta enrollment=%s", async (deltaEnrolled) => {
     let mesh: ActorMesh | undefined;
     writeFileSync(
       join(homeDir, "config.yaml"),
@@ -4535,7 +4543,21 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     });
     if (!mesh) throw new Error("mesh not ready");
+    if (deltaEnrolled) {
+      mesh.enrollActorInExperiment("root", COMPACTED_MEMORY_DELTA_EXPERIMENT, "root");
+    }
+    const foldedMessage = getRepositories().meshChat.record({
+      senderId: "operator",
+      recipientId: "root",
+      body: "Message before the preserved ledger cursor.",
+    });
+    getRepositories().meshChat.record({
+      senderId: "operator",
+      recipientId: "root",
+      body: "Message after the preserved ledger cursor.",
+    });
     const old = emptyPortableContextState("root");
+    old.lastFoldedSourceId = foldedMessage;
     old.items = [
       {
         id: "old-ledger-line",
@@ -4558,11 +4580,19 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     const rootActor = mesh.get("root");
     if (!rootActor) throw new Error("root actor not ready");
-    const prompt = (
-      rootActor as unknown as { opts: { buildPrompt: () => { prompt: string } } }
-    ).opts.buildPrompt().prompt;
-    expect(prompt).toContain("The charter is in force; it is rendered in the prompt.");
+    const built = (
+      rootActor as unknown as {
+        opts: { buildPrompt: () => { prompt: string; injectRecord?: InjectRecord } };
+      }
+    ).opts.buildPrompt();
+    const prompt = built.prompt;
+    expect(prompt).toContain("## WHAT\n\n## HOW\n\n## DOMAIN\n");
     expect(prompt).not.toContain("This old ledger line must not leak into brief mode.");
+    expect(prompt).toContain("Message before the preserved ledger cursor.");
+    expect(prompt).toContain("Message after the preserved ledger cursor.");
+    expect(built.injectRecord?.journal).toBeUndefined();
+    expect(built.injectRecord?.ledger).toBeUndefined();
+    expect(getRepositories().portableContext.load("root").lastFoldedSourceId).toBe(foldedMessage);
     expect(getRepositories().portableContext.load("root").brief?.generation).toBe(0);
   });
 
@@ -4726,6 +4756,263 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(advancedState.generation).toBe(2);
     expect(advancedState.lastFoldedSourceId).not.toBe(state.lastFoldedSourceId);
     compactSpy.mockRestore();
+  });
+
+  it("defers an interrupted run's fold under compacted_memory_delta and folds the delta once later (#1062)", async () => {
+    let mesh: ActorMesh | undefined;
+    const COMPACTOR_DELAY_MS = 300;
+    const batches: string[][] = [];
+    let enterFirstFold!: () => void;
+    let releaseFirstFold!: () => void;
+    const firstFoldEntered = new Promise<void>((resolve) => {
+      enterFirstFold = resolve;
+    });
+    const firstFoldGate = new Promise<void>((resolve) => {
+      releaseFirstFold = resolve;
+    });
+    onTestFinished(() => releaseFirstFold());
+    // The compactor needs a synthetic API key, but failed-run classification
+    // is unrelated to this fixture and must stay offline.
+    const classifierSpy = vi
+      .spyOn(exhaustionClassifier, "createExhaustionClassifier")
+      .mockReturnValue(async () => ({ exhausted: false }));
+    onTestFinished(() => classifierSpy.mockRestore());
+    const compactSpy = vi
+      .spyOn(GeminiPortableContextCompactor.prototype, "compact")
+      .mockImplementation(async ({ state, messages, now }) => {
+        batches.push(messages.map((message) => message.id));
+        if (batches.length === 1) {
+          enterFirstFold();
+          await firstFoldGate;
+        }
+        await new Promise((resolve) => setTimeout(resolve, COMPACTOR_DELAY_MS));
+        const first = messages[0];
+        return {
+          state: {
+            ...state,
+            generation: state.generation + 1,
+            updatedAt: now,
+            lastFoldedSourceId: messages.at(-1)?.id ?? state.lastFoldedSourceId,
+            items: [
+              ...state.items,
+              {
+                id: `mem-${state.generation + 1}`,
+                kind: "decision" as const,
+                priority: "must" as const,
+                status: "active" as const,
+                statement: `Folded generation ${state.generation + 1}.`,
+                evidence: [
+                  {
+                    eventId: first?.id ?? "missing-source",
+                    sender: "operator",
+                    ts: first?.ts ?? now,
+                    quote: (first?.body ?? "missing").slice(0, 40),
+                  },
+                ],
+                updatedAt: now,
+              },
+            ],
+          },
+          quarantined: [],
+          operations: 1,
+        };
+      });
+    onTestFinished(() => compactSpy.mockRestore());
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+          context: { type: "portable", mode: "ledger" },
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const rootActor = mesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+    const actorOpts = (
+      rootActor as unknown as {
+        opts: { buildPrompt: () => { prompt: string; injectRecord?: InjectRecord } };
+      }
+    ).opts;
+    const selected = { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" };
+    const inbound = (body: string): string =>
+      getRepositories().meshChat.record({ senderId: "operator", recipientId: "root", body });
+    const interruptedRun = async (): Promise<number> => {
+      const runId = await startLifecycleRun(rootActor as Actor, selected);
+      const started = Date.now();
+      await endLifecycleRun(rootActor as Actor, runId, {
+        success: false,
+        output: "partial\n[Task interrupted by operator]",
+        exitCode: 143,
+        cancelled: true,
+        interrupted: true,
+        interruptSource: "operator",
+      });
+      return Date.now() - started;
+    };
+    const ordinaryRun = async (output: string): Promise<void> => {
+      const runId = await startLifecycleRun(rootActor as Actor, selected);
+      await endLifecycleRun(rootActor as Actor, runId, { success: true, output, exitCode: 0 });
+    };
+    const deferredEvents = () =>
+      getRepositories().meshEvents.listEventsByActors(["root"], {
+        kinds: ["portable_context_compaction_deferred"],
+        limit: 10,
+      }).events;
+
+    // Flag off: an interrupted run still folds synchronously, as today.
+    const a = inbound("Message A, folded while unenrolled.");
+    let offSettled = false;
+    const offRun = interruptedRun().then((elapsed) => {
+      offSettled = true;
+      return elapsed;
+    });
+    await firstFoldEntered;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(offSettled).toBe(false);
+    expect(getRepositories().portableContext.load("root").lastFoldedSourceId).toBeNull();
+    releaseFirstFold();
+    const offElapsed = await offRun;
+    expect(batches).toEqual([[a]]);
+    expect(deferredEvents()).toHaveLength(0);
+    const folded = getRepositories().portableContext.load("root");
+    expect(folded.lastFoldedSourceId).toBe(a);
+
+    // Flag on: the interrupted run defers; the successor would not have waited.
+    expect(mesh.enrollActorInExperiment("root", COMPACTED_MEMORY_DELTA_EXPERIMENT, "root")).toEqual(
+      {
+        actorId: "root",
+        changed: true,
+      }
+    );
+    const b = inbound("Message B, arrives before an interrupted run.");
+    const onElapsed = await interruptedRun();
+    // Call order proves the barrier is absent regardless of runner load.
+    // Elapsed times remain fixture measurements, not a host-speed assertion.
+    expect(compactSpy).toHaveBeenCalledTimes(1);
+    console.info(
+      `[portable-context-interrupt-fixture] compactorDelayMs=${COMPACTOR_DELAY_MS} ` +
+        `windowEndMs=${offElapsed} deltaEndMs=${onElapsed}`
+    );
+    expect(batches).toEqual([[a]]);
+    expect(getRepositories().portableContext.load("root")).toEqual(folded);
+    const deferred = deferredEvents();
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]?.detail).toBe("interrupted by operator");
+    expect(JSON.parse(deferred[0]?.payload ?? "{}")).toMatchObject({
+      interruptSource: "operator",
+      foldCursor: a,
+    });
+
+    // The successor's prompt: compacted memory plus only the unfolded delta.
+    const deltaPrompt = actorOpts.buildPrompt();
+    expect(deltaPrompt.injectRecord?.journal).toMatchObject({
+      mode: "delta",
+      foldCursor: a,
+      unfoldedSources: 1,
+      unfoldedMessages: 1,
+      truncated: false,
+    });
+    expect(deltaPrompt.injectRecord?.sourceMessageEventIds).toEqual([b]);
+    expect(deltaPrompt.prompt).toContain("Message B, arrives before an interrupted run.");
+    expect(deltaPrompt.prompt).toContain("Folded generation 1.");
+    // Message A is represented by its ledger item (and its evidence quote), not
+    // re-sent verbatim: exactly one verbatim message block, and it is B's.
+    expect(deltaPrompt.prompt.split("#### Message from operator").length - 1).toBe(1);
+
+    // A second interruption accumulates; the next ordinary run end folds both once.
+    const c = inbound("Message C, arrives before a second interrupted run.");
+    await interruptedRun();
+    expect(batches).toEqual([[a]]);
+    expect(deferredEvents()).toHaveLength(2);
+    await ordinaryRun("ordinary run output");
+    expect(batches).toEqual([[a], [b, c]]);
+    const advanced = getRepositories().portableContext.load("root");
+    expect(advanced.generation).toBe(2);
+    expect(advanced.lastFoldedSourceId).toBe(c);
+    expect(actorOpts.buildPrompt().injectRecord?.sourceMessageEventIds).toEqual([]);
+
+    // Flag off again: the window journal and synchronous fold return on the
+    // next run, and nothing accumulated while enrolled is lost.
+    expect(
+      mesh.unenrollActorFromExperiment("root", COMPACTED_MEMORY_DELTA_EXPERIMENT, "root")
+    ).toEqual({
+      actorId: "root",
+      changed: true,
+    });
+    const d = inbound("Message D, after unenrolling.");
+    const windowPrompt = actorOpts.buildPrompt();
+    expect(windowPrompt.injectRecord?.journal).toBeUndefined();
+    expect(windowPrompt.injectRecord?.sourceMessageEventIds).toEqual([a, b, c, d]);
+    await interruptedRun();
+    expect(batches).toEqual([[a], [b, c], [d]]);
+    expect(deferredEvents()).toHaveLength(2);
+
+    // A compactor outage or repeated interruptions can grow the unfolded tail
+    // past its read ceiling. Show the newest window, not the oldest 200 sources.
+    mesh.enrollActorInExperiment("root", COMPACTED_MEMORY_DELTA_EXPERIMENT, "root");
+    // The reader keeps only sources stamped later than the cursor (d, recorded
+    // on the real clock moments ago), so the backlog starts at a fixed horizon
+    // ahead of it. The backlog stamps repeat across runs; the cursor is still
+    // real-clock, so this assumes the test runs before 3026.
+    const backlogStart = Date.UTC(3026, 0, 1);
+    const backlog: string[] = [];
+    for (let i = 0; i < 205; i++) {
+      backlog.push(
+        getRepositories().meshChat.record({
+          ts: new Date(backlogStart + i * 1_000).toISOString(),
+          senderId: "operator",
+          recipientId: "root",
+          body: `Backlog instruction ${i}`,
+        })
+      );
+    }
+    const fallbackPrompt = actorOpts.buildPrompt();
+    expect(fallbackPrompt.injectRecord?.journal).toMatchObject({
+      mode: "window",
+      foldCursor: d,
+      unfoldedSources: 200,
+      unfoldedMessages: 200,
+      truncated: true,
+    });
+    expect(fallbackPrompt.injectRecord?.sourceMessageEventIds).toEqual(backlog.slice(-10));
+    expect(fallbackPrompt.prompt).toContain("Backlog instruction 204");
+    expect(fallbackPrompt.prompt).not.toContain("Backlog instruction 194");
+    expect(fallbackPrompt.injectRecord?.sourceEventIds).toEqual(
+      getRepositories()
+        .actorRuns.listRecentCompleted("root", 10)
+        .map((run) => run.id)
+        .reverse()
+    );
+    expect(getRepositories().portableContext.load("root").lastFoldedSourceId).toBe(d);
+    expect(
+      logCapture.lines
+        .map((line) => JSON.parse(line))
+        .some(
+          (entry) =>
+            entry.msg === "portable_context_delta_fallback" &&
+            entry.error === "unfolded source tail exceeds the delta journal page ceiling"
+        )
+    ).toBe(true);
   });
 
   it("persists token accounting records for ended root runs with reported token usage (#443)", async () => {
@@ -9199,6 +9486,171 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(exitMock()).not.toHaveBeenCalled();
       expect(dbMock.closeDb).not.toHaveBeenCalled();
       expect(records("service_stopped")).toEqual([]);
+    });
+
+    it("protects root and granted-worker runs once a Slack write succeeds, not when it fails, and signs each run's posts", async () => {
+      const secretsDir = join(homeDir, "secrets");
+      mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(secretsDir, "slack-bot-token"), "xoxb-synthetic-bot-token");
+      writeFileSync(join(secretsDir, "slack-app-token"), "xapp-synthetic-app-token");
+      writeConfig({
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+          handle: "slack-root",
+        },
+        slack: {
+          botTokenPath: join(secretsDir, "slack-bot-token"),
+          appTokenPath: join(secretsDir, "slack-app-token"),
+        },
+      });
+      const startSpy = vi.spyOn(SlackSocketSource.prototype, "start").mockResolvedValue(undefined);
+      const closeSpy = vi.spyOn(SlackSocketSource.prototype, "close").mockResolvedValue(undefined);
+      const slackClient = new SlackClient("xoxb-synthetic-bot-token");
+      const postMessage = vi.fn(async ({ text }: { text: string }) => {
+        if (text.startsWith("refused")) throw new Error("An API error occurred: not_in_channel");
+        return { ok: true, ts: "1791849600.000100" };
+      });
+      Object.defineProperty(slackClient, "web", { value: { chat: { postMessage } } });
+      withWorker("slack-write-worker");
+      // A durable channel grant, as the worker would hold it after a restart.
+      writeFileSync(
+        join(homeDir, "capability-grants.json"),
+        JSON.stringify({
+          grants: [
+            {
+              actorId: "slack-write-worker",
+              capability: "slack-write:C1",
+              grantedBy: "root",
+              grantedAt: "2026-10-13T00:00:00.000Z",
+            },
+          ],
+        }),
+        "utf8"
+      );
+
+      try {
+        const { mesh, root } = await boot({ slackClient });
+        const worker = workerOf(mesh, "slack-write-worker");
+        // The flag a coalescing voice nudge reads before aborting the run in flight.
+        const killable = (actor: unknown): boolean => (actor as { killable: boolean }).killable;
+        const send = async (actor: unknown, text: string) => {
+          const url = mcpServersOf(actor).find((server) => server.name === "slack-write")?.url;
+          if (!url) throw new Error("slack-write not mounted");
+          const client = new Client({ name: "slack-write-hook", version: "0.0.0" });
+          await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+          try {
+            return await client.callTool({
+              name: "send_message",
+              arguments: { channel: "C1", text },
+            });
+          } finally {
+            await client.close();
+          }
+        };
+
+        type AttemptOptions = {
+          onProviderAttempt?: (attempt: {
+            providerName: string;
+            model?: string;
+            effort?: string;
+          }) => void;
+        };
+        (root as unknown as { opts: AttemptOptions }).opts.onProviderAttempt?.({
+          providerName: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+        });
+        (worker as unknown as { opts: AttemptOptions }).opts.onProviderAttempt?.({
+          providerName: "antigravity",
+          model: "Gemini 3.7 Pro",
+          effort: "low",
+        });
+
+        for (const actor of [root, worker]) {
+          expect(killable(actor)).toBe(true);
+          expect((await send(actor, "refused")).isError).toBe(true);
+          expect(killable(actor)).toBe(true);
+          expect((await send(actor, "posted")).isError).toBeFalsy();
+          expect(killable(actor)).toBe(false);
+        }
+        expect(postMessage).toHaveBeenCalledTimes(4);
+
+        // Each run signs with its own handle and model: root's configured handle, the grantee's own.
+        const rootFooter = "\n\n_slack-root (Gemini 3.7 Flash, high)_";
+        const workerFooter = `\n\n_${generateHandle("slack-write-worker")} (Gemini 3.7 Pro, low)_`;
+        expect(postMessage.mock.calls.map(([args]) => args.text)).toEqual([
+          `refused${rootFooter}`,
+          `posted${rootFooter}`,
+          `refused${workerFooter}`,
+          `posted${workerFooter}`,
+        ]);
+      } finally {
+        startSpy.mockRestore();
+        closeSpy.mockRestore();
+      }
+    });
+
+    it("routes the root's Slack reply into the thread of its selected inbox message", async () => {
+      const secretsDir = join(homeDir, "secrets");
+      mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(secretsDir, "slack-bot-token"), "xoxb-synthetic-bot-token");
+      writeFileSync(join(secretsDir, "slack-app-token"), "xapp-synthetic-app-token");
+      writeConfig({
+        slack: {
+          botTokenPath: join(secretsDir, "slack-bot-token"),
+          appTokenPath: join(secretsDir, "slack-app-token"),
+        },
+      });
+      const startSpy = vi.spyOn(SlackSocketSource.prototype, "start").mockResolvedValue(undefined);
+      const closeSpy = vi.spyOn(SlackSocketSource.prototype, "close").mockResolvedValue(undefined);
+      const slackClient = new SlackClient("xoxb-synthetic-bot-token");
+      const postMessage = vi.fn(async (_args: Record<string, unknown>) => ({
+        ok: true,
+        ts: "1791849600.000300",
+      }));
+      Object.defineProperty(slackClient, "web", { value: { chat: { postMessage } } });
+
+      try {
+        const { mesh, root } = await boot({ slackClient });
+        const [entry] = getRepositories().inbox.append([
+          {
+            actorId: root.id,
+            source: "slack:channels/C1",
+            payload: {
+              type: "slack.message",
+              channel: "C1",
+              ts: "1791849600.000200",
+              threadTs: "1791849600.000100",
+            },
+          },
+        ]);
+        if (!entry) throw new Error("Slack message not appended");
+        mesh.selectInboxEntries(root.id, [entry.id]);
+
+        const url = mcpServersOf(root).find((server) => server.name === "slack-write")?.url;
+        if (!url) throw new Error("slack-write not mounted");
+        const client = new Client({ name: "slack-reply-placement", version: "0.0.0" });
+        await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+        try {
+          const result = await client.callTool({
+            name: "send_message",
+            arguments: { channel: "C1", text: "on it" },
+          });
+          expect(result.isError).toBeFalsy();
+        } finally {
+          await client.close();
+        }
+        expect(postMessage).toHaveBeenCalledOnce();
+        expect(postMessage.mock.calls[0]?.[0]).toMatchObject({
+          channel: "C1",
+          thread_ts: "1791849600.000100",
+        });
+      } finally {
+        startSpy.mockRestore();
+        closeSpy.mockRestore();
+      }
     });
 
     it("closes the socket source immediately when slack startup fails", async () => {

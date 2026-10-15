@@ -1,7 +1,6 @@
 import type { ChatClient } from "../chat/types.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
-import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { InboxRepository } from "../repositories/inbox-repository.js";
 import type { SlackClient } from "../slack/slack-client.js";
 import {
@@ -73,8 +72,6 @@ export interface ReferenceResolverDeps {
       "getIssue" | "listIssueComments" | "getPrReviewComments" | "getPullRequestReview"
     >
   >;
-  /** Reads actor records; powers `mesh:actors/<id>/charter` resolution. */
-  actors?: Pick<ActorRepository, "get">;
 }
 
 function unresolved(reference: Reference, title: string, reason: string): ResolvedReference {
@@ -142,26 +139,6 @@ function resolveMesh(
       body: JSON.stringify(entry.payload ?? null, null, 2),
       author: first[1],
       timestamp: entry.deliveredAt?.toISOString() ?? null,
-      url: null,
-      unavailable: null,
-    };
-  }
-
-  if (first?.[0] === "actors" && reference.segments[2] === "charter") {
-    // `mesh:actors/<id>/charter` — the charter is a property OF the actor
-    // resource, so it carries no id segment of its own (the one deliberate
-    // exception to strict collection/id pairs in the grammar). The brief seeds
-    // its WHAT/HOW line with exactly this ref (#954).
-    if (!deps.actors) return unresolved(reference, "Actor charter", "actor store not available");
-    const actor = deps.actors.get(first[1]);
-    if (!actor) return unresolved(reference, "Actor charter", "actor not found");
-    return {
-      ref: reference.key,
-      scheme: reference.scheme,
-      title: `Charter of ${actor.id}`,
-      body: actor.charter,
-      author: null,
-      timestamp: actor.createdAt,
       url: null,
       unavailable: null,
     };
@@ -285,16 +262,17 @@ async function resolveSlack(
     return unresolved(reference, reference.key, "unrecognised Slack resource");
   }
   const found = await deps.slackClient.getMessage(channel, messagePart[1]);
+  const text = found.text ?? "";
   return {
     ref: reference.key,
     scheme: reference.scheme,
     title: `Slack message in ${channel}`,
-    body: found.text,
+    body: text,
     author: found.user ?? null,
     timestamp: new Date(Number(found.ts) * 1000).toISOString(),
     url: referenceUrl(reference),
-    unavailable: found.text ? null : "message has no text",
-    entity: { type: "slack_message", contents: found.text },
+    unavailable: text ? null : "message has no text",
+    entity: { type: "slack_message", contents: text },
   };
 }
 

@@ -23,7 +23,7 @@ const WRITTEN_AT = "2026-10-10T12:05:00.000Z";
 
 const BRIEF =
   `## WHAT\n` +
-  `Draw abstract SVG art for the assigned project. [mesh:actors/${ALPHA}/charter]\n` +
+  `Draw abstract SVG art for the assigned project. [mesh:messages/m-purpose]\n` +
   `\n` +
   `## HOW\n` +
   `Keep the palette to three colours. [mesh:messages/m-1]\n` +
@@ -67,7 +67,7 @@ const ISSUES: Record<number, { title: string; body: string }> = {
 
 /**
  * Citations resolve through the real reference resolver over synthetic
- * stores: mesh messages m-1 and m-2, the two actors, and the issues above.
+ * stores: mesh messages m-purpose, m-1 and m-2, and the issues above.
  * `resolved` records every ref the server asked about.
  */
 function syntheticResolver(overrides: Partial<ReferenceResolverDeps> = {}) {
@@ -75,7 +75,7 @@ function syntheticResolver(overrides: Partial<ReferenceResolverDeps> = {}) {
   const deps: ReferenceResolverDeps = {
     meshChat: {
       getById: (id: string) =>
-        ["m-1", "m-2"].includes(id)
+        ["m-purpose", "m-1", "m-2"].includes(id)
           ? ({
               id,
               senderId: "parent",
@@ -84,12 +84,6 @@ function syntheticResolver(overrides: Partial<ReferenceResolverDeps> = {}) {
               ts: SEEDED_AT,
             } as never)
           : null,
-    },
-    actors: {
-      get: (id: string) =>
-        [ALPHA, BETA].includes(id)
-          ? ({ id, charter: `charter of ${id}`, createdAt: SEEDED_AT } as never)
-          : undefined,
     },
     issueClient: {
       getIssue: async (_repo: string, number: number) => {
@@ -109,7 +103,7 @@ function syntheticResolver(overrides: Partial<ReferenceResolverDeps> = {}) {
 function harness(resolver = syntheticResolver()) {
   const store = new InMemoryPortableContextStore();
   for (const actorId of [ALPHA, BETA]) {
-    store.save(seedPortableBriefState(emptyPortableContextState(actorId), actorId, SEEDED_AT));
+    store.save(seedPortableBriefState(emptyPortableContextState(actorId), SEEDED_AT));
   }
   const clientFor = (actorId: string) =>
     connect(
@@ -129,7 +123,7 @@ describe("brief MCP server", () => {
     const alpha = await clientFor(ALPHA);
 
     expect((await call(alpha, "read")).data).toEqual({
-      text: seedBriefText(ALPHA),
+      text: seedBriefText(),
       generation: 0,
       updatedAt: SEEDED_AT,
     });
@@ -176,7 +170,7 @@ describe("brief MCP server", () => {
         generation: 1,
         updatedAt: WRITTEN_AT,
         actingPrincipal: ALPHA,
-        before: seedBriefText(ALPHA),
+        before: seedBriefText(),
         after: BRIEF,
         explanation: "Distilled the palette rule.",
       },
@@ -305,8 +299,12 @@ describe("brief MCP server: citations must exist", () => {
 
     const written = await call(alpha, "replace", { text: BRIEF, expected_generation: 0 });
     expect(written.data).toMatchObject({ status: "updated", generation: 1 });
-    // The seed already cites the charter; the write adds the message and the issue.
-    expect(resolved.sort()).toEqual(["github:MEK-Org/rusa/issues/954", "mesh:messages/m-1"]);
+    // The empty seed has no citations; the first write resolves all three.
+    expect(resolved.sort()).toEqual([
+      "github:MEK-Org/rusa/issues/954",
+      "mesh:messages/m-1",
+      "mesh:messages/m-purpose",
+    ]);
 
     resolved.length = 0;
     const next = BRIEF.replace(
@@ -333,12 +331,6 @@ describe("brief MCP server: citations must exist", () => {
       "[github:MEK-Org/rusa/issues/954]",
       "[github:MEK-Org/rusa/issues/404]",
       "citation [github:MEK-Org/rusa/issues/404] could not be resolved: not found on the tracker",
-    ],
-    [
-      "another actor's charter for an actor that does not exist",
-      `[mesh:actors/${ALPHA}/charter]`,
-      "[mesh:actors/actor-gone/charter]",
-      "citation [mesh:actors/actor-gone/charter] could not be resolved: actor not found",
     ],
   ])("rejects %s and keeps the last accepted brief", async (_label, from, to, reason) => {
     const { store, clientFor } = harness();
@@ -394,7 +386,7 @@ describe("brief MCP server: citations must exist", () => {
 
   it("never commits a timed-out write when its citation answers late", async () => {
     const store = new InMemoryPortableContextStore();
-    store.save(seedPortableBriefState(emptyPortableContextState(ALPHA), ALPHA, SEEDED_AT));
+    store.save(seedPortableBriefState(emptyPortableContextState(ALPHA), SEEDED_AT));
     let answer!: () => void;
     const late = new Promise<void>((settle) => {
       answer = settle;
@@ -436,7 +428,7 @@ describe("brief MCP server: citations must exist", () => {
 
   it("refuses a write when another write lands while its citations resolve", async () => {
     const store = new InMemoryPortableContextStore();
-    store.save(seedPortableBriefState(emptyPortableContextState(ALPHA), ALPHA, SEEDED_AT));
+    store.save(seedPortableBriefState(emptyPortableContextState(ALPHA), SEEDED_AT));
     const INTERLEAVED = BRIEF.replace("three colours", "four colours");
     const { resolveCitation } = syntheticResolver({
       issueClient: {
@@ -473,7 +465,7 @@ describe("brief MCP server: citations must exist", () => {
     const alpha = await clientFor(ALPHA);
     const wide =
       `## WHAT\n` +
-      `Draw abstract SVG art for the assigned project. [mesh:actors/${ALPHA}/charter]\n` +
+      `Draw abstract SVG art for the assigned project. [mesh:messages/m-purpose]\n` +
       `\n` +
       `## HOW\n` +
       `Keep the palette to three colours. [mesh:messages/m-1]\n` +
@@ -487,7 +479,7 @@ describe("brief MCP server: citations must exist", () => {
 
     const consolidated =
       `## WHAT\n` +
-      `Draw abstract SVG art for the assigned project. [mesh:actors/${ALPHA}/charter]\n` +
+      `Draw abstract SVG art for the assigned project. [mesh:messages/m-purpose]\n` +
       `\n` +
       `## HOW\n` +
       `Keep it flat: three colours, no gradients. [mesh:messages/m-2]\n` +

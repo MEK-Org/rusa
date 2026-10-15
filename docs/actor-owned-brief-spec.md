@@ -2,6 +2,8 @@
 
 **Status:** draft for review, revised to the contract settled in
 [#954 (comment)](https://github.com/MEK-Org/rusa/issues/954#issuecomment-6155205270).
+The [review amendment](https://github.com/MEK-Org/rusa/pull/961#issuecomment-6202255237)
+removes charter references and starts each brief with empty sections.
 The storage change below adds a migration and needs the normal schema gate
 before it ships.
 **Tracking:** [#954](https://github.com/MEK-Org/rusa/issues/954),
@@ -54,7 +56,8 @@ it. Workers and the root mount the server when their context is
 
 No arguments. Returns `{ text, generation, updatedAt }` for the caller's brief.
 If the actor has just switched to brief mode and has no brief yet, the seed is
-stored first (generation 0) and returned.
+stored first (generation 0) and returned. The seed contains only the three
+empty section headings; the actor adds cited statements as it works.
 
 ### `replace`
 
@@ -88,7 +91,7 @@ An accepted write must:
 - contain `## WHAT`, `## HOW` and `## DOMAIN`, once each and in that order, with
   no other headings and nothing before the first section;
 - end every non-blank statement line with at least one structured citation,
-  such as `[mesh:messages/<id>]`, `[mesh:actors/<id>/charter]` or
+  such as `[mesh:messages/<id>]` or
   `[github:OWNER/REPO/issues/<n>]`, with nothing after the first citation but
   more citations;
 - name no per-resource state in a statement: commit SHAs, run or message UUIDs,
@@ -108,7 +111,7 @@ is decided when the deadline passes: a citation that answers afterwards cannot
 make the refused write commit. The write is refused, and the brief, generation, time and history stay
 as they were, if a new citation:
 
-- points at nothing (`message not found`, `actor not found`, `not found on the
+- points at nothing (`message not found`, `not found on the
   tracker`);
 - cannot be read with the server's access (for example, `tracker not
   configured`);
@@ -116,10 +119,9 @@ as they were, if a new citation:
   does not answer within the deadline).
 
 The tool error names each citation and its cause. Citations carried over from
-the previous accepted brief were checked when that brief was accepted (the seed
-cites only the actor's own charter), so they are not resolved again. An outage
-on an old source does not block an edit. A charter citation
-(`[mesh:actors/<id>/charter]`) means the actor's current charter.
+the previous accepted brief were checked when that brief was accepted, so they
+are not resolved again. The empty seed has no citations. An outage on an old
+source does not block an edit. Charter references are not supported.
 
 An existing source with an empty body, such as an issue with no description,
 counts as resolved. A Google Chat message with no text (`message has no text`)
@@ -237,8 +239,8 @@ are weighed by how reliable their sources are. Both of a parent's existing ways
 to direct an actor still work:
 
 1. **Charter change.** The new charter is in force on the next run. The actor
-   does not have to rewrite its brief before acting on it. The seed's WHAT line
-   cites `[mesh:actors/<id>/charter]`, which resolves to the current charter.
+   does not have to rewrite its brief before acting on it. The charter is
+   already rendered in the prompt, independently of the brief.
 2. **Direction by message.** The parent sends a message. The actor folds the
    durable part into its brief and cites the message
    (`[mesh:messages/<id>]`).

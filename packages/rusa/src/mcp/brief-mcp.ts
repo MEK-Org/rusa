@@ -69,7 +69,7 @@ export function createBriefMcpServer(deps: BriefMcpDeps): McpServer {
   const currentBrief = (): PortableBrief => {
     const state = deps.store.load(deps.actorId);
     if (state.brief) return state.brief;
-    const seeded = seedPortableBriefState(state, deps.actorId, now());
+    const seeded = seedPortableBriefState(state, now());
     deps.store.save(seeded);
     return seeded.brief as PortableBrief;
   };

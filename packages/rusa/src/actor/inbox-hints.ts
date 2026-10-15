@@ -83,7 +83,7 @@ export function resolveInboxHint(entry: InboxEntry): string | undefined {
     if (threadTs && threadTs !== ts) {
       return `${intro} This message is in an existing thread. Reply with slack-write send_message using channel '${channel}' and threadTs '${threadTs}'.`;
     }
-    return `${intro} This message is at the top level. Reply with slack-write send_message using channel '${channel}' and omitting threadTs, unless the message explicitly requests a new thread.`;
+    return `${intro} This message is at the top level. Reply with slack-write send_message using channel '${channel}' and omitting threadTs. If the message explicitly requests a new thread, pass threadTs '${ts}' to start one under it.`;
   }
 
   // an issue, ISSUE_NUM: Google Chat threading guidance

@@ -55,7 +55,7 @@ describe("parsePortableContextState", () => {
     const state = {
       ...emptyPortableContextState("actor-a"),
       brief: {
-        text: "## WHAT\nThe charter is in force. [mesh:actors/actor-a/charter]\n\n## HOW\n\n## DOMAIN",
+        text: "## WHAT\nDraw abstract SVG art. [mesh:messages/m-purpose]\n\n## HOW\n\n## DOMAIN",
         generation: 3,
         updatedAt: "2026-10-07T00:01:00.000Z",
       },
@@ -66,7 +66,7 @@ describe("parsePortableContextState", () => {
 
   it("reads a brief written with the retired rewrite bookkeeping as just its text, generation and time", () => {
     const brief = {
-      text: "## WHAT\nThe charter is in force. [mesh:actors/actor-a/charter]\n\n## HOW\n\n## DOMAIN",
+      text: "## WHAT\nDraw abstract SVG art. [mesh:messages/m-purpose]\n\n## HOW\n\n## DOMAIN",
       generation: 3,
       updatedAt: "2026-10-07T00:01:00.000Z",
     };
@@ -78,7 +78,7 @@ describe("parsePortableContextState", () => {
         model: "gemini-3.8-flash",
         consecutiveFailures: 1,
         frozen: false,
-        resolvedRefs: ["mesh:actors/actor-a/charter"],
+        resolvedRefs: ["mesh:messages/m-purpose"],
       },
     };
 

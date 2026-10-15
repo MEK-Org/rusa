@@ -1921,11 +1921,7 @@ describe("handleMeshApiRequest", () => {
       `## WHAT\nPurpose ${n}. [mesh:messages/m-${n}]\n\n## HOW\n\n## DOMAIN\n`;
     for (const actorId of [UUID_A, UUID_B]) {
       store.save(
-        seedPortableBriefState(
-          emptyPortableContextState(actorId),
-          actorId,
-          "2026-10-10T12:00:00.000Z"
-        )
+        seedPortableBriefState(emptyPortableContextState(actorId), "2026-10-10T12:00:00.000Z")
       );
     }
     store.commitBrief({
@@ -3968,6 +3964,44 @@ describe("handleMeshApiRequest", () => {
 
         const { res: badQueue } = await call(deps, "GET", "/api/mesh/obligations?queue=done");
         expect(badQueue.statusCode).toBe(400);
+      });
+
+      it("adds each row's ancestors once when asked, and only then (#1076)", async () => {
+        obligations.create({ title: "Root", id: "root", ownerId: "actor-2" });
+        obligations.create({ title: "Area", id: "area", ownerId: "actor-2", parentId: "root" });
+        obligations.create({ title: "A", id: "a", ownerId: "actor-1", parentId: "area" });
+        obligations.create({ title: "B", id: "b", ownerId: "actor-1", parentId: "area" });
+        obligations.create({ title: "Other", id: "other", ownerId: "actor-2" });
+        const page = async (query = "ownerId=actor-1&queue=ready&ancestors=true") => {
+          const { res } = await call(deps, "GET", `/api/mesh/obligations?${query}`);
+          expect(res.statusCode).toBe(200);
+          const data = JSON.parse(res.body);
+          return {
+            rows: data.obligations.map((o: { id: string }) => o.id).sort(),
+            ancestors: data.ancestors.map((o: { id: string }) => o.id).sort(),
+          };
+        };
+
+        // Shared ancestry arrives once.
+        expect(await page()).toEqual({ rows: ["a", "b"], ancestors: ["area", "root"] });
+
+        // A reparent is what the next page reports.
+        obligations.reparent("b", "other", LOCAL_USER);
+        expect(await page()).toEqual({ rows: ["a", "b"], ancestors: ["area", "other", "root"] });
+
+        // An ancestor that is itself a row of the page is left to the rows.
+        obligations.create({ title: "A1", id: "a1", ownerId: "actor-1", parentId: "a" });
+        expect(await page("ownerId=actor-1&ancestors=true")).toEqual({
+          rows: ["a", "a1", "b"],
+          ancestors: ["area", "other", "root"],
+        });
+
+        const { res: plain } = await call(
+          deps,
+          "GET",
+          "/api/mesh/obligations?ownerId=actor-1&queue=ready"
+        );
+        expect(JSON.parse(plain.body)).not.toHaveProperty("ancestors");
       });
 
       it("503s when obligations data is unavailable", async () => {

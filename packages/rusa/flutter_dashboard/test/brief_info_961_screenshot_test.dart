@@ -20,7 +20,6 @@ const _parentId = '00000000-0000-4000-8000-000000000000';
 // brief grammar requires of an accepted write.
 const _seed =
     '''## WHAT
-The charter is in force; it is rendered in the prompt. [mesh:actors/$_actorId/charter]
 
 ## HOW
 
@@ -28,7 +27,7 @@ The charter is in force; it is rendered in the prompt. [mesh:actors/$_actorId/ch
 
 const _gen1 =
     '''## WHAT
-Draw abstract SVG art for the assigned gallery. [mesh:actors/$_actorId/charter]
+Draw abstract SVG art for the assigned gallery. [mesh:messages/m-purpose]
 
 ## HOW
 Keep each piece to three colours. [mesh:messages/m-palette]
@@ -39,7 +38,7 @@ The gallery renders at 1:1 pixel density. [github:MEK-Org/rusa/issues/954]''';
 
 const _gen2 =
     '''## WHAT
-Draw abstract SVG art for the assigned gallery. [mesh:actors/$_actorId/charter]
+Draw abstract SVG art for the assigned gallery. [mesh:messages/m-purpose]
 
 ## HOW
 Keep each piece to two colours and one accent. [mesh:messages/m-palette-2]

@@ -165,7 +165,8 @@ reads them with the inbox MCP tools, marks them handled when it has acted, and
 unhandled entries survive restarts. GitHub events arrive over a webhook
 listener; there is no polling fallback. See
 [`event-subscriptions.ts`](packages/rusa/src/actor/event-subscriptions.ts) for
-the source grammar.
+the source grammar. Which Slack messages wake an actor is set per conversation; see
+[Slack wake coverage](docs/slack-wake-coverage.md).
 
 ## Providers and Models
 

@@ -6,6 +6,7 @@ import {
   Type,
 } from "@google/genai";
 import type { SyncClient } from "@thkp-eng/goals-core";
+import { generateGeminiContent } from "../observability/gemini-usage.js";
 import { handleGraphReadTool } from "./graph-read-tools.js";
 import { getNodeContents, getReachableNodeIds } from "./graph-store.js";
 import type { RetrievedNode } from "./retrieve.js";
@@ -127,7 +128,7 @@ export async function searchNodesLlm(
   while (turns < MAX_TURNS) {
     turns++;
 
-    const response = await genAI.models.generateContent({
+    const response = await generateGeminiContent(genAI, "understanding_retrieval", {
       model,
       contents: history,
       config: {

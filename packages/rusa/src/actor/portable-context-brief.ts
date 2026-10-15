@@ -234,7 +234,7 @@ export function briefCitations(text: string): string[] {
  * This check is syntactic. An accepted result names the citations the write
  * introduces, and the caller must resolve each one before storing the write
  * (#954 disposition 6155205270): a citation the replaced brief already carried
- * was resolved when that brief was accepted, or is the seed's own charter line.
+ * was resolved when that brief was accepted.
  */
 export function validateActorBriefUpdate(
   input: ActorBriefValidationInput
@@ -278,23 +278,15 @@ export function validateActorBriefUpdate(
 
 // ── Seeding ──
 
-/** The post-switch seed: one cited WHAT line, no charter copy, empty HOW and DOMAIN. */
-export function seedBriefText(actorId: string): string {
-  return (
-    `## WHAT\n` +
-    `The charter is in force; it is rendered in the prompt. [mesh:actors/${actorId}/charter]\n` +
-    `\n` +
-    `## HOW\n` +
-    `\n` +
-    `## DOMAIN\n`
-  );
+/** The first brief has the three empty sections; the actor adds cited statements. */
+export function seedBriefText(): string {
+  return "## WHAT\n\n## HOW\n\n## DOMAIN\n";
 }
 
 /** Seed the brief at generation 0 on the first brief-mode prompt, leaving ledger fields untouched. */
 export function seedPortableBriefState(
   state: PortableContextState,
-  actorId: string,
   now: string
 ): PortableContextState {
-  return { ...state, brief: { text: seedBriefText(actorId), generation: 0, updatedAt: now } };
+  return { ...state, brief: { text: seedBriefText(), generation: 0, updatedAt: now } };
 }

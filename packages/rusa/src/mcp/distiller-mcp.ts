@@ -2,7 +2,6 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ChatSpaceMembership } from "../chat/spaces.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
-import type { CommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import type { DistillerStore } from "../understanding/distiller-cursor.js";
 import {
   appendJournalEntry,
@@ -71,12 +70,6 @@ export const DISTILLER_EVENTS_MAX_LIMIT = 200;
 export interface DistillerReportsDeps {
   paths: IuReportPaths;
   now?: () => string;
-  /**
-   * Semantic evaluator for the ISSUE_NUM commitment-claim polarity check. Omitted
-   * where no model key is configured, in which case the rendered report states
-   * that the check did not run — there is deliberately no lexical fallback .
-   */
-  evaluateCommitment?: CommitmentPolarityEvaluator;
 }
 
 export interface DistillerMcpDeps {
@@ -353,14 +346,7 @@ export function createDistillerServer(deps: DistillerMcpDeps): McpServer {
       try {
         if (!deps.reports) return toolError("report emission is not configured on this host");
         const now = deps.reports.now?.() ?? new Date().toISOString();
-        return toolOk(
-          await renderAndIndex(deps.reports.paths, run_id, {
-            now,
-            ...(deps.reports.evaluateCommitment
-              ? { evaluateCommitment: deps.reports.evaluateCommitment }
-              : {}),
-          })
-        );
+        return toolOk(renderAndIndex(deps.reports.paths, run_id, { now }));
       } catch (err) {
         return toolError(err);
       }

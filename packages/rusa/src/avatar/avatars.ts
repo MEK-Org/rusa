@@ -14,6 +14,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateHandle } from "../actor/handle-generator.js";
 import { resolveHome } from "../config/index.js";
+import { observeGeminiRequest } from "../observability/gemini-usage.js";
 
 /**
  * Per-actor avatars (an issue). Each actor's handle (`{adjective}-{animal}`,
@@ -152,34 +153,37 @@ export interface AvatarGenDeps {
  * a failure throws and the fire-and-forget caller logs it and moves on.
  */
 async function callGeminiImage(apiKey: string, prompt: string): Promise<Buffer> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      // Native square 512x512 output (ISSUE_NUM, ISSUE_NUM): model renders 1:1 at 512 size.
-      generationConfig: {
-        imageConfig: {
-          aspectRatio: "1:1",
-          imageSize: "512",
+  const json = await observeGeminiRequest("avatar_generation", GEMINI_IMAGE_MODEL, async () => {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        // Native square 512x512 output (ISSUE_NUM, ISSUE_NUM): model renders 1:1 at 512 size.
+        generationConfig: {
+          imageConfig: {
+            aspectRatio: "1:1",
+            imageSize: "512",
+          },
         },
-      },
-    }),
-  });
-  if (!res.ok) {
-    throw new Error(`gemini image API request failed (status ${res.status})`);
-  }
-  let json: {
-    candidates?: { content?: { parts?: { inlineData?: { data?: string } }[] } }[];
-  };
-  try {
-    json = (await res.json()) as {
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`gemini image API request failed (status ${res.status})`);
+    }
+    let json: {
       candidates?: { content?: { parts?: { inlineData?: { data?: string } }[] } }[];
     };
-  } catch {
-    throw new Error("gemini image API returned a non-JSON body");
-  }
+    try {
+      json = (await res.json()) as {
+        candidates?: { content?: { parts?: { inlineData?: { data?: string } }[] } }[];
+      };
+    } catch {
+      throw new Error("gemini image API returned a non-JSON body");
+    }
+    return json;
+  });
   const parts = json.candidates?.[0]?.content?.parts ?? [];
   for (const part of parts) {
     const data = part.inlineData?.data;

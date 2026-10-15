@@ -34,6 +34,7 @@ class _FlakyQueueApi extends FakeApi {
     bool? rootsOnly,
     int? limit,
     int? offset,
+    bool ancestors = false,
   }) {
     if (failQueue && queue != null) {
       return Future.error(StateError('HTTP 503 from /api/obligations'));
@@ -45,6 +46,7 @@ class _FlakyQueueApi extends FakeApi {
       rootsOnly: rootsOnly,
       limit: limit,
       offset: offset,
+      ancestors: ancestors,
     );
   }
 }

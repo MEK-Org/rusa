@@ -16,11 +16,11 @@ import {
 } from "./portable-context-state.js";
 
 const ACTOR = "actor-under-test";
-const SEED_TEXT = seedBriefText(ACTOR);
+const SEED_TEXT = seedBriefText();
 
 const VALID =
   `## WHAT\n` +
-  `Draw abstract SVG art for the assigned project. [mesh:actors/${ACTOR}/charter]\n` +
+  `Draw abstract SVG art for the assigned project. [mesh:messages/m-purpose]\n` +
   `\n` +
   `## HOW\n` +
   `Prefer one representative citation per principle. [mesh:messages/m-1]\n` +
@@ -56,11 +56,8 @@ describe("parseBriefDocument", () => {
   it("parses the seed document", () => {
     const { parsed, errors } = parseBriefDocument(SEED_TEXT);
     expect(errors).toEqual([]);
-    expect(parsed?.lines).toHaveLength(1);
-    expect(parsed?.lines[0]).toMatchObject({
-      section: "WHAT",
-      refs: [`mesh:actors/${ACTOR}/charter`],
-    });
+    expect(SEED_TEXT).toBe("## WHAT\n\n## HOW\n\n## DOMAIN\n");
+    expect(parsed?.lines).toEqual([]);
   });
 
   it("collects shape problems: missing/out-of-order/duplicate sections, no citation, stray heading", () => {
@@ -115,8 +112,11 @@ describe("validateActorBriefUpdate", () => {
     expect(validateActorBriefUpdate({ text: `${VALID}\n\n`, previousText: SEED_TEXT })).toEqual({
       outcome: "accepted",
       text: VALID,
-      // The seed already cites the charter, so only the other two are new.
-      newCitations: ["mesh:messages/m-1", "github:MEK-Org/rusa/issues/954"],
+      newCitations: [
+        "mesh:messages/m-purpose",
+        "mesh:messages/m-1",
+        "github:MEK-Org/rusa/issues/954",
+      ],
     });
   });
 
@@ -194,26 +194,34 @@ describe("validateActorBriefUpdate", () => {
       outcome: "accepted",
       text: VALID,
       explanation: "why",
-      newCitations: ["mesh:messages/m-1", "github:MEK-Org/rusa/issues/954"],
+      newCitations: [
+        "mesh:messages/m-purpose",
+        "mesh:messages/m-1",
+        "github:MEK-Org/rusa/issues/954",
+      ],
     });
     expect(
       validateActorBriefUpdate({ text: VALID, previousText: SEED_TEXT, explanation: "  " })
     ).toEqual({
       outcome: "accepted",
       text: VALID,
-      newCitations: ["mesh:messages/m-1", "github:MEK-Org/rusa/issues/954"],
+      newCitations: [
+        "mesh:messages/m-purpose",
+        "mesh:messages/m-1",
+        "github:MEK-Org/rusa/issues/954",
+      ],
     });
   });
 });
 
 describe("seedPortableBriefState", () => {
-  it("seeds generation 0 with the charter line and leaves the ledger fields alone", () => {
+  it("seeds generation 0 with empty sections and leaves the ledger fields alone", () => {
     const state: PortableContextState = {
       ...emptyPortableContextState(ACTOR),
       generation: 41,
       lastFoldedSourceId: "legacy-source",
     };
-    const seeded = seedPortableBriefState(state, ACTOR, "2026-10-10T00:00:00.000Z");
+    const seeded = seedPortableBriefState(state, "2026-10-10T00:00:00.000Z");
     expect(seeded).toEqual({
       ...state,
       brief: { text: SEED_TEXT, generation: 0, updatedAt: "2026-10-10T00:00:00.000Z" },
@@ -305,7 +313,7 @@ describe("brief render", () => {
     expect(portable?.section).toContain("### Durable brief (mode: brief, generation 7");
     expect(portable?.section).toContain("updated 2026-10-07T01:00:00Z)");
     expect(portable?.section).toContain("read it and replace it with the `brief` MCP tools");
-    expect(portable?.section).toContain("The charter is in force");
+    expect(portable?.section).toContain(SEED_TEXT);
     expect(portable?.section).not.toContain("A ledger statement that must NOT render");
     expect(portable?.section).not.toContain("omitted due to budget");
     expect(portable?.section).toContain("### Recent messages (verbatim)");

@@ -1584,11 +1584,7 @@ describe("compactPortableContext integration (spec 6b)", () => {
     recordInbound("a durable decision");
     const store = new InMemoryPortableContextStore();
     store.save(
-      seedPortableBriefState(
-        emptyPortableContextState("actor-a"),
-        "actor-a",
-        "2026-10-10T12:00:00Z"
-      )
+      seedPortableBriefState(emptyPortableContextState("actor-a"), "2026-10-10T12:00:00Z")
     );
     const brief = "## WHAT\nDraw. [mesh:messages/m-1]\n\n## HOW\n\n## DOMAIN\n";
     const commit = (expectedGeneration: number, text: string) =>

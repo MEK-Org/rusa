@@ -282,6 +282,7 @@ class _OverviewTabState extends State<OverviewTab> {
           ObligationQueue.scheduled,
         )..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
         final blockerMap = view.projection.blockers;
+        final ancestorMap = view.projection.ancestors;
         final totalCount = ready.length + waiting.length + scheduled.length;
         final isEmpty = totalCount == 0;
         final known =
@@ -517,7 +518,7 @@ class _OverviewTabState extends State<OverviewTab> {
                         ],
                       ),
                       const SizedBox(height: 8),
-                      _buildQueueList(ready, blockerMap, isReadyList: true),
+                      _buildQueueList(ready, blockerMap, ancestorMap, isReadyList: true),
                       if (waiting.isNotEmpty) const SizedBox(height: 16),
                     ],
                     if (waiting.isNotEmpty) ...[
@@ -558,7 +559,7 @@ class _OverviewTabState extends State<OverviewTab> {
                         ],
                       ),
                       const SizedBox(height: 8),
-                      _buildQueueList(waiting, blockerMap, isReadyList: false),
+                      _buildQueueList(waiting, blockerMap, ancestorMap, isReadyList: false),
                       if (scheduled.isNotEmpty) const SizedBox(height: 16),
                     ],
                     if (scheduled.isNotEmpty) ...[
@@ -600,7 +601,12 @@ class _OverviewTabState extends State<OverviewTab> {
                         ],
                       ),
                       const SizedBox(height: 8),
-                      _buildQueueList(scheduled, const {}, isReadyList: false),
+                      _buildQueueList(
+                        scheduled,
+                        const {},
+                        ancestorMap,
+                        isReadyList: false,
+                      ),
                     ],
                   ],
                 ],
@@ -655,7 +661,8 @@ class _OverviewTabState extends State<OverviewTab> {
 
   Widget _buildQueueList(
     List<ObligationDto> items,
-    Map<String, List<ObligationDto>> blockerMap, {
+    Map<String, List<ObligationDto>> blockerMap,
+    Map<String, List<ObligationDto>> ancestorMap, {
     required bool isReadyList,
   }) {
     return Container(
@@ -670,6 +677,7 @@ class _OverviewTabState extends State<OverviewTab> {
             _buildQueueItemCard(
               items[i],
               blockerMap[items[i].id],
+              ancestors: ancestorMap[items[i].id] ?? const [],
               items: items,
               index: i,
               isReadyList: isReadyList,
@@ -685,6 +693,7 @@ class _OverviewTabState extends State<OverviewTab> {
   Widget _buildQueueItemCard(
     ObligationDto o,
     List<ObligationDto>? blockers, {
+    required List<ObligationDto> ancestors,
     required List<ObligationDto> items,
     required int index,
     required bool isReadyList,
@@ -693,6 +702,7 @@ class _OverviewTabState extends State<OverviewTab> {
       obligation: o,
       store: widget.store,
       blockers: blockers,
+      ancestors: ancestors,
       onSelectView: widget.onSelectView,
       showKindChip: false,
       onMutated: _refreshHumanQueue,

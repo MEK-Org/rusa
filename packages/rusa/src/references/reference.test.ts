@@ -21,7 +21,6 @@ describe("reference grammar", () => {
       "slack:channels/C123/messages/1720000000.000001",
       "mesh:messages/abc-123",
       "mesh:actors/actor-1/inbox/entry-9",
-      "mesh:actors/actor-1/charter",
     ]) {
       expect(parseReference(value).key).toBe(value);
       expect(isReference(value)).toBe(true);
@@ -98,10 +97,10 @@ describe("reference grammar", () => {
     );
   });
 
-  it("keeps the actor-charter property exception narrow", () => {
-    expect(isReference("mesh:actors/actor-1/charter")).toBe(true);
+  it("requires collection/id pairs for actor resources", () => {
+    expect(isReference("mesh:actors/actor-1/charter")).toBe(false);
     expect(isReference("mesh:actors/actor-1/unknown-property")).toBe(false);
-    expect(isReference("mesh:actors/actor-1/charter/extra")).toBe(false);
+    expect(isReference("mesh:actors/actor-1/inbox/entry-9")).toBe(true);
   });
 
   it("answers containment with a prefix test", () => {

@@ -1,9 +1,13 @@
+import { createHash } from "node:crypto";
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -14,10 +18,19 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SlackClient } from "../slack/slack-client.js";
-import { createSlackReadMcpServer, createSlackWriteMcpServer } from "./slack-mcp.js";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
+import { MAX_SLACK_DOWNLOAD_BYTES, SlackClient } from "../slack/slack-client.js";
+import {
+  createSlackReadMcpServer,
+  createSlackWriteMcpServer,
+  MAX_SLACK_MESSAGE_CHARS,
+  resolveSlackReplyThreadTs,
+  toSlackTimestamp,
+} from "./slack-mcp.js";
 
 const TOKEN = "xoxb-synthetic";
+const actorHandle = "actor-handle";
 const FILE_URL = "https://files.slack.com/files-pri/T1-F1/download/report.txt";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -105,9 +118,20 @@ describe("Slack read MCP files", () => {
       destinationPath: "report.txt",
     });
     expect(result.isError).toBe(false);
-    expect(JSON.parse(result.text)).toMatchObject({
+    expect(JSON.parse(result.text)).toEqual({
+      path: join(dir, "report.txt"),
       bytes: 5,
-      file: { id: "F1", name: "report.txt" },
+      sha256: createHash("sha256").update("hello").digest("hex"),
+      contentType: "text/plain",
+      name: "report.txt",
+      file: {
+        id: "F1",
+        name: "report.txt",
+        title: "Report",
+        mimetype: "text/plain",
+        filetype: "text",
+        size: 5,
+      },
       source: "slack:channels/C1/messages/1.0",
     });
     expect(readFileSync(join(dir, "report.txt"), "utf8")).toBe("hello");
@@ -281,6 +305,174 @@ describe("Slack read MCP files", () => {
   });
 });
 
+describe("Slack read MCP streamed downloads", () => {
+  const args = { channel: "C1", ts: "1.0", fileId: "F1", destinationPath: "out.bin" };
+
+  async function reader(file: Record<string, unknown>, options: { maxFileBytes?: number } = {}) {
+    const dir = workdir();
+    const client = await connect(
+      createSlackReadMcpServer(slackWith({ conversations: { replies: messageWithFile(file) } }), {
+        workDir: dir,
+        ...options,
+      })
+    );
+    return { dir, download: () => call(client, "download_file", args) };
+  }
+
+  function withoutSize(file: Record<string, unknown>): Record<string, unknown> {
+    const { size: _size, ...rest } = file;
+    return rest;
+  }
+
+  it("defaults to Chat's 1 GiB download limit, which an option can lower but not raise", async () => {
+    expect(MAX_SLACK_DOWNLOAD_BYTES).toBe(1024 * 1024 * 1024);
+    const fetchMock = vi.fn(async () => new Response("hello"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    // Past the old 50 MiB default, but within 1 GiB: fetched.
+    const within = await reader({ ...reportFile, size: 60 * 1024 * 1024 });
+    expect((await within.download()).isError).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const over = { ...reportFile, size: MAX_SLACK_DOWNLOAD_BYTES + 1 };
+    for (const options of [{}, { maxFileBytes: 2 * MAX_SLACK_DOWNLOAD_BYTES }]) {
+      const { dir, download } = await reader(over, options);
+      expect((await download()).text).toContain(
+        `file size limit exceeded: file is larger than ${MAX_SLACK_DOWNLOAD_BYTES} bytes`
+      );
+      expect(existsSync(join(dir, "out.bin"))).toBe(false);
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a declared Content-Length over the limit before creating the file", async () => {
+    const fetchMock = vi.fn(
+      async () => new Response("123456789", { headers: { "content-length": "9" } })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { dir, download } = await reader(withoutSize(reportFile), { maxFileBytes: 8 });
+    expect((await download()).text).toContain(
+      "file size limit exceeded: file is larger than 8 bytes"
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it("removes the partial file when the stream overflows or the network fails mid-download", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        let sent = 0;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              sent += 1;
+              controller.enqueue(new Uint8Array(4).fill(sent));
+            },
+          })
+        );
+      })
+    );
+    const overflow = await reader(withoutSize(reportFile), { maxFileBytes: 10 });
+    expect((await overflow.download()).text).toContain("file size limit exceeded");
+    expect(readdirSync(overflow.dir)).toEqual([]);
+
+    let hangUp!: () => void;
+    const hungUp = new Promise<void>((resolve) => {
+      hangUp = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              async start(controller) {
+                controller.enqueue(new TextEncoder().encode("partial"));
+                await hungUp;
+                controller.error(new Error("socket hang up"));
+              },
+            })
+          )
+      )
+    );
+    const interrupted = await reader(withoutSize(reportFile));
+    const pending = interrupted.download();
+    await vi.waitFor(() => expect(statSync(join(interrupted.dir, "out.bin")).size).toBe(7));
+    hangUp();
+    const result = await pending;
+    expect(result.isError).toBe(true);
+    expect(result.text).not.toContain("sha256");
+    expect(result.text).toContain("socket hang up");
+    expect(readdirSync(interrupted.dir)).toEqual([]);
+  });
+
+  it("writes chunks to disk as they arrive rather than buffering the whole body", async () => {
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              async start(controller) {
+                controller.enqueue(new TextEncoder().encode("first"));
+                await finished;
+                controller.enqueue(new TextEncoder().encode("-second"));
+                controller.close();
+              },
+            })
+          )
+      )
+    );
+    const { dir, download } = await reader(withoutSize(reportFile));
+    const pending = download();
+    const target = join(dir, "out.bin");
+    await vi.waitFor(() => expect(statSync(target).size).toBe(5));
+    finish();
+    const result = await pending;
+    expect(JSON.parse(result.text)).toMatchObject({
+      bytes: 12,
+      sha256: createHash("sha256").update("first-second").digest("hex"),
+    });
+    expect(readFileSync(target, "utf8")).toBe("first-second");
+  });
+
+  it("returns exact receipts for empty and binary files", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(null))
+    );
+    const empty = await reader({ ...reportFile, size: 0 });
+    expect(JSON.parse((await empty.download()).text)).toMatchObject({
+      bytes: 0,
+      sha256: createHash("sha256").digest("hex"),
+    });
+    expect(statSync(join(empty.dir, "out.bin")).size).toBe(0);
+
+    const binary = Uint8Array.from({ length: 256 }, (_, i) => i);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(binary, { headers: { "content-type": "application/octet-stream" } })
+      )
+    );
+    const { mimetype: _mimetype, ...untyped } = { ...reportFile, name: "blob.bin", size: 256 };
+    const bin = await reader(untyped);
+    expect(JSON.parse((await bin.download()).text)).toMatchObject({
+      bytes: 256,
+      sha256: createHash("sha256").update(binary).digest("hex"),
+      contentType: "application/octet-stream",
+      name: "blob.bin",
+    });
+    expect(new Uint8Array(readFileSync(join(bin.dir, "out.bin")))).toEqual(binary);
+  });
+});
+
 describe("Slack write MCP upload_file", () => {
   function uploader() {
     return vi.fn(async (_args: Record<string, unknown>) => ({
@@ -294,7 +486,10 @@ describe("Slack write MCP upload_file", () => {
     writeFileSync(join(dir, "out.png"), "png-bytes");
     const uploadV2 = uploader();
     const client = await connect(
-      createSlackWriteMcpServer(slackWith({ files: { uploadV2 } }), ["C1"], { workDir: dir })
+      createSlackWriteMcpServer(slackWith({ files: { uploadV2 } }), ["C1"], {
+        actorHandle,
+        workDir: dir,
+      })
     );
     const result = await call(client, "upload_file", {
       channel: "C1",
@@ -307,7 +502,7 @@ describe("Slack write MCP upload_file", () => {
       channel_id: "C1",
       file: Buffer.from("png-bytes"),
       filename: "out.png",
-      initial_comment: "chart attached",
+      initial_comment: "chart attached\n\n_actor-handle_",
       thread_ts: "1.0",
     });
   });
@@ -322,6 +517,7 @@ describe("Slack write MCP upload_file", () => {
     const uploadV2 = uploader();
     const client = await connect(
       createSlackWriteMcpServer(slackWith({ files: { uploadV2 } }), ["C1"], {
+        actorHandle,
         workDir: dir,
         maxFileBytes: 8,
       })
@@ -356,6 +552,7 @@ describe("Slack write MCP upload_file", () => {
     const uploadV2 = uploader();
     const write = await connect(
       createSlackWriteMcpServer(slackWith({ chat: { postMessage }, files: { uploadV2 } }), ["C1"], {
+        actorHandle,
         workDir: dir,
         fileToolsAvailable,
       })
@@ -410,13 +607,120 @@ describe("Slack write MCP upload_file", () => {
   });
 });
 
+describe("Slack write MCP attribution", () => {
+  it("signs each post with the run's current model, keeping markup and thread", async () => {
+    const postMessage = vi.fn(async (_args: Record<string, unknown>) => ({ ok: true, ts: "2.0" }));
+    let selection: RawProviderModelConfig | undefined = {
+      provider: "test",
+      model: "model-a",
+      effort: "high",
+    };
+    const client = await connect(
+      createSlackWriteMcpServer(slackWith({ chat: { postMessage } }), ["C1"], {
+        actorHandle,
+        getRunSelection: () => selection,
+      })
+    );
+    const text = "see <https://example.com|the docs> and *this*";
+
+    await call(client, "send_message", { channel: "C1", text, threadTs: "1.0" });
+    selection = { provider: "test", model: "model-b" };
+    await call(client, "send_message", { channel: "C1", text });
+    selection = undefined;
+    await call(client, "send_message", { channel: "C1", text });
+
+    expect(postMessage.mock.calls.map(([args]) => args)).toEqual([
+      { channel: "C1", text: `${text}\n\n_actor-handle (model-a, high)_`, thread_ts: "1.0" },
+      { channel: "C1", text: `${text}\n\n_actor-handle (model-b)_`, thread_ts: undefined },
+      { channel: "C1", text: `${text}\n\n_actor-handle_`, thread_ts: undefined },
+    ]);
+  });
+
+  it("does not add a second footer to text that already ends with it", async () => {
+    const postMessage = vi.fn(async (_args: Record<string, unknown>) => ({ ok: true, ts: "2.0" }));
+    const client = await connect(
+      createSlackWriteMcpServer(slackWith({ chat: { postMessage } }), ["C1"], { actorHandle })
+    );
+    await call(client, "send_message", { channel: "C1", text: "hi\n\n_actor-handle_" });
+    expect(postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "hi\n\n_actor-handle_" })
+    );
+  });
+
+  it("refuses text that Slack would truncate once the footer is added", async () => {
+    const postMessage = vi.fn(async (_args: Record<string, unknown>) => ({ ok: true, ts: "2.0" }));
+    const client = await connect(
+      createSlackWriteMcpServer(slackWith({ chat: { postMessage } }), ["C1"], { actorHandle })
+    );
+    const footer = "\n\n_actor-handle_";
+    const fits = "x".repeat(MAX_SLACK_MESSAGE_CHARS - footer.length);
+
+    expect((await call(client, "send_message", { channel: "C1", text: fits })).isError).toBe(false);
+    const tooLong = await call(client, "send_message", { channel: "C1", text: `${fits}x` });
+    expect(tooLong).toEqual({
+      isError: true,
+      text: expect.stringContaining("40001 characters with its footer"),
+    });
+    expect(postMessage).toHaveBeenCalledOnce();
+  });
+
+  it("refuses a file comment that Slack would truncate once the footer is added", async () => {
+    const dir = workdir();
+    writeFileSync(join(dir, "out.png"), "png-bytes");
+    const uploadV2 = vi.fn(async (_args: Record<string, unknown>) => ({
+      ok: true,
+      files: [{ ok: true, files: [{ id: "F9" }] }],
+    }));
+    const client = await connect(
+      createSlackWriteMcpServer(slackWith({ files: { uploadV2 } }), ["C1"], {
+        actorHandle,
+        workDir: dir,
+      })
+    );
+    const footer = "\n\n_actor-handle_";
+    const fits = "x".repeat(MAX_SLACK_MESSAGE_CHARS - footer.length);
+    const upload = (initialComment: string) =>
+      call(client, "upload_file", { channel: "C1", filePath: "out.png", initialComment });
+
+    expect((await upload(fits)).isError).toBe(false);
+    expect(await upload(`${fits}x`)).toEqual({
+      isError: true,
+      text: expect.stringContaining("40001 characters with its footer"),
+    });
+    expect(uploadV2).toHaveBeenCalledOnce();
+    expect(uploadV2).toHaveBeenCalledWith(
+      expect.objectContaining({ initial_comment: `${fits}${footer}` })
+    );
+  });
+
+  it("gives an uploaded file a footer comment when the caller wrote none", async () => {
+    const dir = workdir();
+    writeFileSync(join(dir, "out.png"), "png-bytes");
+    const uploadV2 = vi.fn(async (_args: Record<string, unknown>) => ({
+      ok: true,
+      files: [{ ok: true, files: [{ id: "F9" }] }],
+    }));
+    const client = await connect(
+      createSlackWriteMcpServer(slackWith({ files: { uploadV2 } }), ["C1"], {
+        actorHandle,
+        getRunSelection: () => ({ provider: "test", model: "model-a" }),
+        workDir: dir,
+      })
+    );
+    await call(client, "upload_file", { channel: "C1", filePath: "out.png" });
+    expect(uploadV2).toHaveBeenCalledWith(
+      expect.objectContaining({ initial_comment: "_actor-handle (model-a)_" })
+    );
+  });
+});
+
 describe("Slack write MCP react", () => {
   it("registers react tool and forwards reaction parameters", async () => {
     const react = vi.fn(async () => {});
     const client = slackWith({});
     client.react = react;
 
-    const server = createSlackWriteMcpServer(client, ["C_ALLOWED"]);
+    const server = createSlackWriteMcpServer(client, ["C_ALLOWED"], { actorHandle });
     const mcpClient = await connect(server);
 
     const tools = await mcpClient.listTools();
@@ -440,7 +744,7 @@ describe("Slack write MCP react", () => {
     const client = slackWith({});
     client.react = react;
 
-    const server = createSlackWriteMcpServer(client, ["C_ALLOWED"]);
+    const server = createSlackWriteMcpServer(client, ["C_ALLOWED"], { actorHandle });
     const mcpClient = await connect(server);
 
     const result = await call(mcpClient, "react", {
@@ -450,5 +754,869 @@ describe("Slack write MCP react", () => {
     expect(result.isError).toBe(true);
     expect(result.text).toContain("access denied: Slack channel C_FORBIDDEN");
     expect(react).not.toHaveBeenCalled();
+  });
+});
+
+describe("Slack write MCP reply placement", () => {
+  function slackEntry(channel: string, ts: string, threadTs?: string): InboxEntry {
+    return {
+      id: `entry-${channel}-${ts}`,
+      actorId: "actor-1",
+      source: `slack:channels/${channel}`,
+      deliveredAt: new Date("2026-10-13T00:00:00Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: {
+        type: "slack.message",
+        messageRef: `slack:channels/${channel}/messages/${ts}`,
+        channel,
+        ts,
+        ...(threadTs ? { threadTs } : {}),
+      },
+    };
+  }
+  const topLevel = slackEntry("C1", "100.000001");
+  const threadParent = slackEntry("C1", "100.000001", "100.000001");
+  const reply = slackEntry("C1", "200.000002", "150.000001");
+
+  function logger() {
+    return { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+  }
+
+  it("posts top-level when threadTs is omitted and the selection is top-level", () => {
+    const otherTop = slackEntry("C1", "500.000001");
+    for (const selection of [[], [topLevel], [threadParent], [topLevel, otherTop]]) {
+      const log = logger();
+      expect(resolveSlackReplyThreadTs("C1", undefined, selection, log as never)).toBeUndefined();
+      expect(log.warn).not.toHaveBeenCalled();
+    }
+  });
+
+  it("answers a selected thread reply in its thread when threadTs is omitted", () => {
+    const log = logger();
+    expect(resolveSlackReplyThreadTs("C1", undefined, [reply], log as never)).toBe("150.000001");
+    expect(log.info).toHaveBeenCalledWith("slack_reply_assigned_thread", {
+      channel: "C1",
+      effectiveThreadTs: "150.000001",
+      reason: "selected_thread_entry",
+    });
+    const sameThread = slackEntry("C1", "201.000003", "150.000001");
+    expect(resolveSlackReplyThreadTs("C1", undefined, [reply, sameThread])).toBe("150.000001");
+  });
+
+  it("answers in the thread when its parent and a reply are both selected", () => {
+    for (const parent of [
+      slackEntry("C1", "150.000001"),
+      slackEntry("C1", "150.000001", "150.000001"),
+    ]) {
+      expect(resolveSlackReplyThreadTs("C1", undefined, [parent, reply])).toBe("150.000001");
+      expect(resolveSlackReplyThreadTs("C1", undefined, [reply, parent])).toBe("150.000001");
+    }
+  });
+
+  it("uses an explicit threadTs as given", () => {
+    // A top-level message's own ts starts a thread under it.
+    expect(resolveSlackReplyThreadTs("C1", "100.000001", [topLevel])).toBe("100.000001");
+    expect(resolveSlackReplyThreadTs("C1", "999.000001", [topLevel])).toBe("999.000001");
+    expect(resolveSlackReplyThreadTs("C1", "999.000001", [reply])).toBe("999.000001");
+    expect(resolveSlackReplyThreadTs("C1", "999.000001", [])).toBe("999.000001");
+  });
+
+  it("ignores selected messages in other channels and non-Slack entries", () => {
+    const elsewhere = slackEntry("C2", "300.000001", "250.000001");
+    const chat: InboxEntry = {
+      ...topLevel,
+      id: "chat",
+      source: "chat_space:spaces/C1",
+      payload: { type: "gchat.message", channel: "C1", ts: "1.0", threadTs: "0.5" },
+    };
+    expect(resolveSlackReplyThreadTs("C1", undefined, [elsewhere, chat])).toBeUndefined();
+  });
+
+  it("posts top-level rather than guess between disagreeing selections", () => {
+    const otherThread = slackEntry("C1", "400.000001", "350.000001");
+    for (const selection of [
+      [reply, otherThread],
+      [topLevel, reply],
+    ]) {
+      const log = logger();
+      expect(resolveSlackReplyThreadTs("C1", undefined, selection, log as never)).toBeUndefined();
+      expect(log.warn).toHaveBeenCalledWith("slack_reply_ambiguous_selection", {
+        channel: "C1",
+        matchingCount: 2,
+      });
+    }
+  });
+
+  function routedServer(entries: () => readonly InboxEntry[]) {
+    const dir = workdir();
+    writeFileSync(join(dir, "out.txt"), "bytes");
+    const postMessage = vi.fn(async (_args: Record<string, unknown>) => ({ ok: true, ts: "9.9" }));
+    const uploadV2 = vi.fn(async (_args: Record<string, unknown>) => ({
+      ok: true,
+      files: [{ ok: true, files: [{ id: "F9" }] }],
+    }));
+    const server = createSlackWriteMcpServer(
+      slackWith({ chat: { postMessage }, files: { uploadV2 } }),
+      ["C1", "C2"],
+      { actorHandle, workDir: dir, selectedInboxEntries: entries }
+    );
+    return { server, postMessage, uploadV2 };
+  }
+
+  it("routes send_message and upload_file from the live selection", async () => {
+    let selection: readonly InboxEntry[] = [reply];
+    const { server, postMessage, uploadV2 } = routedServer(() => selection);
+    const client = await connect(server);
+
+    const sent = await call(client, "send_message", { channel: "C1", text: "on it" });
+    expect(JSON.parse(sent.text)).toEqual({
+      ref: "slack:channels/C1/messages/9.9",
+      ts: "9.9",
+      threadTs: "150.000001",
+    });
+    expect(postMessage.mock.calls[0]?.[0]).toMatchObject({ thread_ts: "150.000001" });
+
+    const uploaded = await call(client, "upload_file", {
+      channel: "C1",
+      filePath: "out.txt",
+      initialComment: "attached",
+    });
+    expect(JSON.parse(uploaded.text)).toEqual({
+      fileIds: ["F9"],
+      channel: "C1",
+      threadTs: "150.000001",
+    });
+    expect(uploadV2.mock.calls[0]?.[0]).toMatchObject({ thread_ts: "150.000001" });
+
+    // An unrelated channel is not routed from the C1 selection.
+    await call(client, "send_message", { channel: "C2", text: "elsewhere" });
+    expect(postMessage.mock.calls[1]?.[0]?.thread_ts).toBeUndefined();
+
+    selection = [topLevel];
+    const top = await call(client, "send_message", { channel: "C1", text: "top" });
+    expect(JSON.parse(top.text)).not.toHaveProperty("threadTs");
+    expect(postMessage.mock.calls[2]?.[0]?.thread_ts).toBeUndefined();
+    const started = await call(client, "send_message", {
+      channel: "C1",
+      text: "thread",
+      threadTs: "100.000001",
+    });
+    expect(JSON.parse(started.text)).toMatchObject({ threadTs: "100.000001" });
+    expect(postMessage.mock.calls[3]?.[0]).toMatchObject({ thread_ts: "100.000001" });
+    await call(client, "upload_file", { channel: "C1", filePath: "out.txt" });
+    expect(uploadV2.mock.calls[1]?.[0]?.thread_ts).toBeUndefined();
+  });
+});
+
+describe("Slack read MCP history", () => {
+  function historyServer(conversations: Record<string, unknown>) {
+    const client = new SlackClient(TOKEN);
+    Object.defineProperty(client, "historyWeb", { value: { conversations } });
+    return connect(createSlackReadMcpServer(client));
+  }
+
+  it("turns an ISO-8601 date range into Slack timestamp bounds", async () => {
+    const history = vi.fn(async () => ({ messages: [], has_more: false }));
+    const client = await historyServer({ history });
+    const result = await call(client, "list_channel_history", {
+      channel: "C1",
+      oldest: "2026-10-13T02:00:00+02:00",
+      latest: "2026-10-14T00:00:00Z",
+      limit: 25,
+    });
+    expect(result.isError).toBe(false);
+    expect(history).toHaveBeenCalledWith({
+      channel: "C1",
+      limit: 25,
+      oldest: "1791849600.000000",
+      latest: "1791936000.000000",
+    });
+    expect(JSON.parse(result.text)).toEqual({
+      channel: "C1",
+      order: "newest_first",
+      messages: [],
+      hasMore: false,
+    });
+  });
+
+  it("passes Slack timestamps, inclusivity and the cursor through with a default page size", async () => {
+    const replies = vi.fn(async () => ({
+      messages: [{ ts: "5.1", text: "reply", user: "U2", thread_ts: "5.0" }],
+    }));
+    const client = await historyServer({ replies });
+    const result = await call(client, "list_thread_replies", {
+      channel: "C1",
+      threadTs: "5.0",
+      oldest: "5.0",
+      inclusive: true,
+      cursor: "replies-2",
+    });
+    expect(result.isError).toBe(false);
+    expect(replies).toHaveBeenCalledTimes(1);
+    expect(replies).toHaveBeenCalledWith({
+      channel: "C1",
+      ts: "5.0",
+      limit: 50,
+      oldest: "5.0",
+      inclusive: true,
+      cursor: "replies-2",
+    });
+    expect(JSON.parse(result.text)).toMatchObject({ threadTs: "5.0", order: "oldest_first" });
+  });
+
+  it("lists attached file metadata without private URLs", async () => {
+    const history = vi.fn(async () => ({
+      messages: [{ ts: "1.0", text: "see attached", user: "U1", files: [reportFile] }],
+    }));
+    const client = await historyServer({ history });
+    const { text } = await call(client, "list_channel_history", { channel: "C1" });
+    expect(JSON.parse(text).messages[0].files).toEqual([
+      {
+        id: "F1",
+        name: "report.txt",
+        title: "Report",
+        mimetype: "text/plain",
+        filetype: "text",
+        size: 5,
+      },
+    ]);
+    expect(text).not.toContain("files.slack.com");
+  });
+
+  it.each([
+    [{ oldest: "yesterday" }, /oldest must be a Slack timestamp/],
+    [{ latest: "2026-10-13" }, /latest must be a Slack timestamp/],
+    [{ latest: "2026-10-13T00:00:00" }, /latest must be a Slack timestamp/],
+    [{ oldest: "2026-02-30T00:00:00Z" }, /oldest must be a Slack timestamp/],
+    [{ latest: "2026-04-31T09:00:00+02:00" }, /latest must be a Slack timestamp/],
+    [{ latest: "2026-10-13T24:00:00Z" }, /latest must be a Slack timestamp/],
+    [{ oldest: "2026-13-01T00:00:00Z" }, /oldest must be a Slack timestamp/],
+    [{ oldest: "2026-01-32T00:00:00Z" }, /oldest must be a Slack timestamp/],
+    [{ latest: "2026-01-01T25:00:00Z" }, /latest must be a Slack timestamp/],
+    [{ latest: "2026-01-01T00:60:00Z" }, /latest must be a Slack timestamp/],
+    [
+      { oldest: "2026-10-14T00:00:00Z", latest: "2026-10-13T00:00:00Z" },
+      /oldest must not be after latest/,
+    ],
+    [{ limit: 0 }, /limit|Too small|>=1/i],
+    [{ limit: 201 }, /limit|Too big|<=200/i],
+  ])("rejects invalid bounds %j before calling Slack", async (bounds, message) => {
+    const history = vi.fn(async () => ({ messages: [] }));
+    const client = await historyServer({ history });
+    const result = await call(client, "list_channel_history", { channel: "C1", ...bounds });
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(message);
+    expect(history).not.toHaveBeenCalled();
+  });
+
+  it("accepts real calendar instants, including a leap day and fractional seconds", () => {
+    expect(toSlackTimestamp("2028-02-29T12:00:00.5Z", "oldest")).toBe("1835438400.500000");
+    expect(toSlackTimestamp("2026-10-13T23:59+05:30", "latest")).toBe("1791916140.000000");
+  });
+
+  it("rejects a thread timestamp that is not a Slack timestamp", async () => {
+    const replies = vi.fn(async () => ({ messages: [] }));
+    const client = await historyServer({ replies });
+    const result = await call(client, "list_thread_replies", { channel: "C1", threadTs: "latest" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/threadTs must be a Slack message timestamp/);
+    expect(replies).not.toHaveBeenCalled();
+  });
+
+  it("surfaces Slack's access errors as tool errors", async () => {
+    const history = vi.fn(async () => {
+      throw Object.assign(new Error("An API error occurred: not_in_channel"), {
+        code: "slack_webapi_platform_error",
+        data: { ok: false, error: "not_in_channel" },
+      });
+    });
+    const client = await historyServer({ history });
+    const result = await call(client, "list_channel_history", { channel: "C1" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/not a member of this conversation/);
+  });
+});
+
+describe("Slack write MCP successful-write hook", () => {
+  const slackError = (code: string) =>
+    Object.assign(new Error(`An API error occurred: ${code}`), {
+      data: { ok: false, error: code },
+    });
+
+  function writer(web: Record<string, unknown>) {
+    const onWrite = vi.fn();
+    const server = createSlackWriteMcpServer(slackWith(web), ["C1"], { actorHandle, onWrite });
+    return { server, onWrite };
+  }
+
+  it("fires once after Slack posts a message, and not when the post or the grant fails", async () => {
+    const postMessage = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, ts: "1791849600.000100" })
+      .mockRejectedValueOnce(slackError("not_in_channel"));
+    const { server, onWrite } = writer({ chat: { postMessage } });
+    const client = await connect(server);
+
+    const sent = await call(client, "send_message", { channel: "C1", text: "hi" });
+    expect(sent.isError).toBe(false);
+    expect(onWrite).toHaveBeenCalledOnce();
+
+    const refused = await call(client, "send_message", { channel: "C1", text: "again" });
+    expect(refused).toMatchObject({
+      isError: true,
+      text: expect.stringContaining("not_in_channel"),
+    });
+    const denied = await call(client, "send_message", { channel: "C2", text: "elsewhere" });
+    expect(denied.isError).toBe(true);
+    expect(postMessage).toHaveBeenCalledTimes(2);
+    expect(onWrite).toHaveBeenCalledOnce();
+  });
+
+  it("fires once after a reaction is added, and not when Slack refuses it", async () => {
+    const add = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockRejectedValueOnce(slackError("already_reacted"));
+    const { server, onWrite } = writer({ reactions: { add } });
+    const client = await connect(server);
+
+    expect((await call(client, "react", { channel: "C1", ts: "1.0" })).isError).toBe(false);
+    expect(onWrite).toHaveBeenCalledOnce();
+    expect((await call(client, "react", { channel: "C1", ts: "1.0" })).isError).toBe(true);
+    expect(onWrite).toHaveBeenCalledOnce();
+  });
+
+  describe("upload_file across Slack's external upload flow", () => {
+    const UPLOAD_URL = "https://files.slack.com/upload/v1/synthetic";
+    type Step = { ok: boolean; error?: string; files?: unknown[] };
+
+    // The SDK resolves globalThis.fetch when the client is built, so a stub
+    // installed first stands in for every step: the two API calls and the
+    // byte upload to the URL Slack hands back.
+    function uploadApi(steps: { getUrl: Step; complete: Step }) {
+      const requests: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string | URL) => {
+          const target = String(url);
+          requests.push(target === UPLOAD_URL ? "upload bytes" : (target.split("/").pop() ?? ""));
+          if (target === UPLOAD_URL) return new Response("OK", { status: 200 });
+          const body = target.endsWith("files.getUploadURLExternal")
+            ? { ...steps.getUrl, upload_url: UPLOAD_URL, file_id: "F9" }
+            : steps.complete;
+          return new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        })
+      );
+      const onWrite = vi.fn();
+      const dir = workdir();
+      writeFileSync(join(dir, "out.txt"), "bytes");
+      const server = createSlackWriteMcpServer(new SlackClient(TOKEN), ["C1"], {
+        actorHandle,
+        workDir: dir,
+        onWrite,
+      });
+      return { server, onWrite, requests };
+    }
+
+    const upload = async (server: McpServer) =>
+      call(await connect(server), "upload_file", { channel: "C1", filePath: "out.txt" });
+
+    it("fires once Slack completes the upload and shares the file", async () => {
+      const { server, onWrite, requests } = uploadApi({
+        getUrl: { ok: true },
+        complete: { ok: true, files: [{ id: "F9" }] },
+      });
+      const result = await upload(server);
+      expect(result.isError).toBe(false);
+      expect(JSON.parse(result.text)).toEqual({ fileIds: ["F9"], channel: "C1" });
+      expect(requests).toEqual([
+        "files.getUploadURLExternal",
+        "upload bytes",
+        "files.completeUploadExternal",
+      ]);
+      expect(onWrite).toHaveBeenCalledOnce();
+    });
+
+    it("does not fire when bytes were sent but Slack never completed the share", async () => {
+      const { server, onWrite, requests } = uploadApi({
+        getUrl: { ok: true },
+        complete: { ok: false, error: "channel_not_found" },
+      });
+      const result = await upload(server);
+      expect(result).toEqual({ isError: true, text: expect.stringContaining("channel_not_found") });
+      expect(requests).toEqual([
+        "files.getUploadURLExternal",
+        "upload bytes",
+        "files.completeUploadExternal",
+      ]);
+      expect(onWrite).not.toHaveBeenCalled();
+    });
+
+    it("counts a completed share without file IDs as written while still reporting it", async () => {
+      const { server, onWrite } = uploadApi({
+        getUrl: { ok: true },
+        complete: { ok: true, files: [] },
+      });
+      const result = await upload(server);
+      expect(result).toEqual({
+        isError: true,
+        text: expect.stringContaining("Slack completed the upload but returned no file ID"),
+      });
+      expect(onWrite).toHaveBeenCalledOnce();
+    });
+  });
+});
+
+describe("Slack read MCP conversation discovery", () => {
+  function discoveryServer(list: ReturnType<typeof vi.fn>) {
+    const client = new SlackClient(TOKEN);
+    Object.defineProperty(client, "historyWeb", { value: { conversations: { list } } });
+    return connect(createSlackReadMcpServer(client));
+  }
+
+  it("defaults to unarchived public channels, one page of 100", async () => {
+    const list = vi.fn(async () => ({
+      channels: [{ id: "C1", name: "general", is_channel: true, is_member: true }],
+    }));
+    const client = await discoveryServer(list);
+    const result = await call(client, "list_conversations", {});
+    expect(result.isError).toBe(false);
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(list).toHaveBeenCalledWith({
+      types: "public_channel",
+      exclude_archived: true,
+      limit: 100,
+    });
+    expect(JSON.parse(result.text)).toEqual({
+      conversations: [{ id: "C1", name: "general", type: "public_channel", isMember: true }],
+      hasMore: false,
+    });
+  });
+
+  it("passes requested types once each, the archive filter and the cursor", async () => {
+    const list = vi.fn(async () => ({ channels: [] }));
+    const client = await discoveryServer(list);
+    const result = await call(client, "list_conversations", {
+      types: ["private_channel", "public_channel", "private_channel"],
+      excludeArchived: false,
+      limit: 20,
+      cursor: "next",
+    });
+    expect(result.isError).toBe(false);
+    expect(list).toHaveBeenCalledWith({
+      types: "private_channel,public_channel",
+      exclude_archived: false,
+      limit: 20,
+      cursor: "next",
+    });
+  });
+
+  it.each([
+    [{ types: [] }],
+    [{ types: ["channel"] }],
+    [{ types: ["im"] }],
+    [{ types: ["mpim"] }],
+    [{ types: ["public_channel", "im"] }],
+    [{ types: ["private_channel", "mpim"] }],
+    [{ limit: 0 }],
+    [{ limit: 201 }],
+  ])("rejects %j before calling Slack", async (args) => {
+    const list = vi.fn(async () => ({ channels: [] }));
+    const client = await discoveryServer(list);
+    const result = await call(client, "list_conversations", args);
+    expect(result.isError).toBe(true);
+    expect(list).not.toHaveBeenCalled();
+  });
+});
+
+describe("Slack read MCP sender lookup", () => {
+  it("answers get_user with a profile and wraps errors as tool errors", async () => {
+    const info = vi.fn(async ({ user }: { user: string }) => {
+      if (user === "U1") {
+        return { ok: true, user: { id: "U1", name: "ada", deleted: false, profile: {} } };
+      }
+      throw Object.assign(new Error("An API error occurred: missing_scope"), {
+        data: { ok: false, error: "missing_scope" },
+      });
+    });
+    const slack = new SlackClient(TOKEN);
+    Object.defineProperty(slack, "historyWeb", { value: { users: { info } } });
+    const client = await connect(createSlackReadMcpServer(slack));
+
+    const found = await call(client, "get_user", { user: "U1" });
+    expect(found.isError).toBe(false);
+    expect(JSON.parse(found.text)).toEqual({ id: "U1", status: "active", name: "ada" });
+
+    const denied = await call(client, "get_user", { user: "U2" });
+    expect(denied.isError).toBe(true);
+    expect(denied.text).toContain("missing_scope");
+  });
+});
+
+describe("Slack write MCP send_message with files", () => {
+  const UPLOAD_HOST = "https://files.slack.com/upload/v1/";
+  type ApiReply = { ok: boolean; error?: string; files?: { id: string }[] };
+
+  interface FakeSlack {
+    requests: string[];
+    reserved: { filename: string; length: number }[];
+    uploads: { body: Buffer; contentLength: string | null; authorization: string | null }[];
+    completions: URLSearchParams[];
+  }
+
+  // The SDK resolves globalThis.fetch when the client is built, so one stub
+  // stands in for the API calls and the byte uploads to the URLs Slack returns.
+  function fakeSlack(
+    opts: {
+      uploadStatus?: (n: number) => number;
+      beforeUpload?: (n: number) => void;
+      complete?: (params: URLSearchParams) => ApiReply | Promise<never>;
+    } = {}
+  ): FakeSlack {
+    const fake: FakeSlack = { requests: [], reserved: [], uploads: [], completions: [] };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const target = String(url);
+        const headers = new Headers(init?.headers);
+        if (target.startsWith(UPLOAD_HOST)) {
+          const n = fake.uploads.length;
+          fake.requests.push(`upload ${target.slice(UPLOAD_HOST.length)}`);
+          opts.beforeUpload?.(n);
+          const body = Buffer.from(await new Response(init?.body).arrayBuffer());
+          fake.uploads.push({
+            body,
+            contentLength: headers.get("content-length"),
+            authorization: headers.get("authorization"),
+          });
+          return new Response("OK", { status: opts.uploadStatus?.(n) ?? 200 });
+        }
+        const method = target.split("/").pop() ?? "";
+        fake.requests.push(method);
+        const params = new URLSearchParams(String(init?.body ?? ""));
+        let reply: ApiReply & Record<string, unknown>;
+        if (method === "files.getUploadURLExternal") {
+          const id = `F${fake.reserved.length + 1}`;
+          fake.reserved.push({
+            filename: params.get("filename") ?? "",
+            length: Number(params.get("length")),
+          });
+          reply = { ok: true, file_id: id, upload_url: `${UPLOAD_HOST}${id}` };
+        } else if (method === "files.completeUploadExternal") {
+          fake.completions.push(params);
+          const files = JSON.parse(params.get("files") ?? "[]") as { id: string }[];
+          reply = await (opts.complete?.(params) ?? {
+            ok: true,
+            files: files.map((f) => ({ id: f.id })),
+          });
+        } else {
+          reply = { ok: false, error: "unknown_method" };
+        }
+        return new Response(JSON.stringify(reply), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      })
+    );
+    return fake;
+  }
+
+  /** The file part of the multipart form posted to an upload URL. */
+  function filePart(body: Buffer): Buffer {
+    const start = body.indexOf("\r\n\r\n") + 4;
+    const end = body.lastIndexOf("\r\n--");
+    return body.subarray(start, end);
+  }
+
+  const sha256 = (data: string | Buffer) => createHash("sha256").update(data).digest("hex");
+
+  async function writer(
+    opts: { maxFileBytes?: number; selected?: InboxEntry[]; followerHosted?: boolean } = {}
+  ) {
+    const dir = workdir();
+    const onWrite = vi.fn();
+    const server = createSlackWriteMcpServer(new SlackClient(TOKEN), ["C1"], {
+      actorHandle,
+      getRunSelection: () => ({ provider: "test", model: "model-a" }),
+      workDir: dir,
+      onWrite,
+      ...(opts.maxFileBytes ? { maxFileBytes: opts.maxFileBytes } : {}),
+      ...(opts.selected ? { selectedInboxEntries: () => opts.selected ?? [] } : {}),
+      ...(opts.followerHosted ? { fileToolsAvailable: () => false } : {}),
+    });
+    return { dir, onWrite, client: await connect(server) };
+  }
+
+  it("shares text and several workdir files as one message in a thread", async () => {
+    const fake = fakeSlack();
+    const { dir, onWrite, client } = await writer();
+    mkdirSync(join(dir, "out"));
+    writeFileSync(join(dir, "out", "chart.png"), "png-bytes");
+    writeFileSync(join(dir, "notes.txt"), "a\r\n--not-a-boundary\r\n");
+
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "results attached",
+      threadTs: "1.0",
+      files: [
+        { filePath: "out/chart.png", title: "Chart" },
+        { filePath: "notes.txt", filename: "notes-final.txt" },
+      ],
+    });
+
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.text)).toEqual({
+      channel: "C1",
+      threadTs: "1.0",
+      files: [
+        { fileId: "F1", name: "chart.png", bytes: 9, sha256: sha256("png-bytes") },
+        {
+          fileId: "F2",
+          name: "notes-final.txt",
+          bytes: 21,
+          sha256: sha256("a\r\n--not-a-boundary\r\n"),
+        },
+      ],
+    });
+    expect(fake.requests).toEqual([
+      "files.getUploadURLExternal",
+      "upload F1",
+      "files.getUploadURLExternal",
+      "upload F2",
+      "files.completeUploadExternal",
+    ]);
+    expect(fake.reserved).toEqual([
+      { filename: "chart.png", length: 9 },
+      { filename: "notes-final.txt", length: 21 },
+    ]);
+    expect(fake.uploads.map((u) => filePart(u.body).toString())).toEqual([
+      "png-bytes",
+      "a\r\n--not-a-boundary\r\n",
+    ]);
+    for (const upload of fake.uploads) {
+      expect(upload.contentLength).toBe(String(upload.body.length));
+      expect(upload.authorization).toBe(`Bearer ${TOKEN}`);
+    }
+    const [completion] = fake.completions;
+    expect(Object.fromEntries(completion ?? [])).toMatchObject({
+      channel_id: "C1",
+      thread_ts: "1.0",
+      initial_comment: "results attached\n\n_actor-handle (model-a)_",
+    });
+    expect(JSON.parse(completion?.get("files") ?? "")).toEqual([
+      { id: "F1", title: "Chart" },
+      { id: "F2" },
+    ]);
+    expect(onWrite).toHaveBeenCalledOnce();
+  });
+
+  it("places files from the live selection and signs empty text with the footer alone", async () => {
+    const fake = fakeSlack();
+    const selected: InboxEntry[] = [
+      {
+        id: "e1",
+        actorId: "a1",
+        source: "slack",
+        payload: { type: "slack.message", channel: "C1", ts: "150.000002", threadTs: "150.000001" },
+      } as unknown as InboxEntry,
+    ];
+    const { dir, client } = await writer({ selected });
+    writeFileSync(join(dir, "out.txt"), "x");
+
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "",
+      files: [{ filePath: "out.txt" }],
+    });
+
+    expect(JSON.parse(result.text)).toMatchObject({ threadTs: "150.000001" });
+    expect(fake.completions[0]?.get("thread_ts")).toBe("150.000001");
+    expect(fake.completions[0]?.get("initial_comment")).toBe("_actor-handle (model-a)_");
+  });
+
+  it("refuses bad paths, oversized files, too many files and Chat-only inputs before calling Slack", async () => {
+    const fake = fakeSlack();
+    const { dir, onWrite, client } = await writer({ maxFileBytes: 8 });
+    const outside = workdir();
+    writeFileSync(join(outside, "secret.txt"), "secret");
+    symlinkSync(join(outside, "secret.txt"), join(dir, "link.txt"));
+    writeFileSync(join(dir, "ok.txt"), "ok");
+    writeFileSync(join(dir, "big.bin"), "123456789");
+    mkdirSync(join(dir, "folder"));
+    const send = (files: unknown[], channel = "C1") =>
+      call(client, "send_message", { channel, text: "hi", files });
+
+    expect((await send([{ filePath: "ok.txt" }], "C2")).text).toContain(
+      "access denied: Slack channel C2"
+    );
+    expect((await send([{ filePath: "ok.txt" }, { filePath: "missing.txt" }])).text).toContain(
+      "missing.txt: ENOENT"
+    );
+    expect((await send([{ filePath: join(outside, "secret.txt") }])).text).toContain(
+      "escapes the actor workdir"
+    );
+    expect((await send([{ filePath: "link.txt" }])).text).toContain(
+      "resolves outside the actor workdir"
+    );
+    expect((await send([{ filePath: "ok.txt" }, { filePath: "big.bin" }])).text).toContain(
+      "big.bin: file size limit exceeded: file is larger than 8 bytes"
+    );
+    expect((await send([{ filePath: "folder" }])).text).toContain("not a regular file");
+    const tooMany = await send(Array.from({ length: 11 }, () => ({ filePath: "ok.txt" })));
+    expect(tooMany.isError).toBe(true);
+    expect((await send([])).isError).toBe(true);
+    const chatRef = await send([{ attachmentDataRef: { resourceName: "spaces/S/attachments/A" } }]);
+    expect(chatRef.isError).toBe(true);
+    expect(fake.requests).toEqual([]);
+    expect(onWrite).not.toHaveBeenCalled();
+  });
+
+  it("refuses file sending while follower-hosted, before touching Slack", async () => {
+    const fake = fakeSlack();
+    const { dir, client } = await writer({ followerHosted: true });
+    writeFileSync(join(dir, "ok.txt"), "ok");
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "ok.txt" }],
+    });
+    expect(result.text).toContain("unavailable for follower-hosted actors (see #812)");
+    expect(fake.requests).toEqual([]);
+  });
+
+  it("shares nothing when an upload fails partway, and says sending again is safe", async () => {
+    const fake = fakeSlack({ uploadStatus: (n) => (n === 1 ? 500 : 200) });
+    const { dir, onWrite, client } = await writer();
+    writeFileSync(join(dir, "a.txt"), "a");
+    writeFileSync(join(dir, "b.txt"), "b");
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "a.txt" }, { filePath: "b.txt" }],
+    });
+    expect(result).toEqual({
+      isError: true,
+      text: expect.stringContaining(
+        "uploading b.txt failed after 1 of 2 files were uploaded; nothing was shared, so sending again is safe: Slack file upload failed: HTTP 500"
+      ),
+    });
+    expect(fake.requests).not.toContain("files.completeUploadExternal");
+    expect(onWrite).not.toHaveBeenCalled();
+  });
+
+  it("refuses a file that changes while it is uploaded", async () => {
+    let grows = "";
+    const fake = fakeSlack({ beforeUpload: () => appendFileSync(grows, "d") });
+    const { dir, onWrite, client } = await writer();
+    grows = join(dir, "grows.txt");
+    writeFileSync(grows, "abc");
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "grows.txt" }],
+    });
+    expect(result.text).toContain("nothing was shared");
+    expect(result.text).toContain("file changed while it was read: it grew");
+    expect(fake.requests).not.toContain("files.completeUploadExternal");
+    expect(onWrite).not.toHaveBeenCalled();
+  });
+
+  it("sends the share once: a refusal shared nothing, an unknown outcome counts as written", async () => {
+    const refused = fakeSlack({ complete: () => ({ ok: false, error: "not_in_channel" }) });
+    const first = await writer();
+    writeFileSync(join(first.dir, "a.txt"), "a");
+    const result = await call(first.client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "a.txt" }],
+    });
+    expect(result.text).toContain("not_in_channel");
+    expect(result.text).toContain("nothing was shared");
+    expect(refused.completions).toHaveLength(1);
+    expect(first.onWrite).not.toHaveBeenCalled();
+
+    const dropped = fakeSlack({ complete: () => Promise.reject(new TypeError("socket hang up")) });
+    const second = await writer();
+    writeFileSync(join(second.dir, "a.txt"), "a");
+    const unknown = await call(second.client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "a.txt" }],
+    });
+    expect(unknown.isError).toBe(true);
+    expect(unknown.text).toContain("may or may not have been shared");
+    expect(dropped.completions).toHaveLength(1);
+    expect(second.onWrite).toHaveBeenCalledOnce();
+  });
+
+  // https://docs.slack.dev/reference/methods/files.completeUploadExternal/#errors
+  it.each([
+    ["internal_error", "internal_error"],
+    ["fatal_error", "fatal_error"],
+    ["file_update_failed", "file_update_failed"],
+    ["service_unavailable", "service_unavailable"],
+    ["team_added_to_org", "team_added_to_org"],
+    ["org_login_required", "org_login_required"],
+    ["an unknown code", "synthetic_new_code"],
+    ["no error code", undefined],
+  ])("counts a share failing with %s as possibly posted", async (_label, error) => {
+    const fake = fakeSlack({ complete: () => ({ ok: false, ...(error ? { error } : {}) }) });
+    const { dir, onWrite, client } = await writer();
+    writeFileSync(join(dir, "a.txt"), "a");
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "a.txt" }],
+    });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain(`(${error ?? "no error code"})`);
+    expect(result.text).toContain("may or may not have been shared");
+    expect(result.text).not.toContain("nothing was shared");
+    expect(fake.completions).toHaveLength(1);
+    expect(onWrite).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "posting_to_channel_denied",
+    "invalid_auth",
+    "ratelimited",
+  ])("reports a share refused with %s as nothing shared", async (error) => {
+    const fake = fakeSlack({ complete: () => ({ ok: false, error }) });
+    const { dir, onWrite, client } = await writer();
+    writeFileSync(join(dir, "a.txt"), "a");
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "a.txt" }],
+    });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain(error);
+    expect(result.text).toContain("nothing was shared");
+    expect(fake.completions).toHaveLength(1);
+    expect(onWrite).not.toHaveBeenCalled();
+  });
+
+  it("reports files Slack did not confirm, after counting the share as written", async () => {
+    fakeSlack({ complete: () => ({ ok: true, files: [{ id: "F1" }] }) });
+    const { dir, onWrite, client } = await writer();
+    writeFileSync(join(dir, "a.txt"), "a");
+    writeFileSync(join(dir, "b.txt"), "b");
+    const result = await call(client, "send_message", {
+      channel: "C1",
+      text: "hi",
+      files: [{ filePath: "a.txt" }, { filePath: "b.txt" }],
+    });
+    expect(result).toEqual({
+      isError: true,
+      text: expect.stringContaining(
+        "Slack completed the share but did not confirm b.txt (F2); check the channel before sending again"
+      ),
+    });
+    expect(onWrite).toHaveBeenCalledOnce();
   });
 });

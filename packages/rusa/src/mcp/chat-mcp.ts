@@ -15,7 +15,7 @@ import {
 import type { Logger } from "../observability/logger.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
-import { formatVisibleActorSignature } from "./actor-signature.js";
+import { appendVisibleActorSignature, formatVisibleActorSignature } from "./actor-signature.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 import {
@@ -484,13 +484,6 @@ export function resolveChatReplyThreadName(
     matchingCount: parsedEntries.length,
   });
   return undefined;
-}
-
-/** Add the terminal Chat footer unless the caller already supplied this exact one. */
-function appendVisibleActorSignature(body: string, signature: string): string {
-  const escapedSignature = signature.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const trailingSignature = new RegExp(`(?:^|\\r?\\n)${escapedSignature}[\\t ]*(?:\\r?\\n)?$`);
-  return trailingSignature.test(body) ? body : body ? `${body}\n\n${signature}` : signature;
 }
 
 /**

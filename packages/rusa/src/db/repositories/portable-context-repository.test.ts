@@ -220,7 +220,7 @@ describe("DbPortableContextStore", () => {
       (db.prepare("SELECT COUNT(*) AS n FROM portable_brief_revisions").get() as { n: number }).n;
 
     beforeEach(() => {
-      store.save(seedPortableBriefState(state(), ACTOR_A, SEEDED_AT));
+      store.save(seedPortableBriefState(state(), SEEDED_AT));
     });
 
     it("replaces the current brief and appends one revision carrying before, after and explanation", () => {

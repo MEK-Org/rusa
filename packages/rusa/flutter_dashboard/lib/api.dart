@@ -581,6 +581,7 @@ class DashboardApi {
     bool? rootsOnly,
     int? limit,
     int? offset,
+    bool ancestors = false,
   }) async {
     final q = <String, String>{
       'ownerId': ?ownerId,
@@ -589,6 +590,7 @@ class DashboardApi {
       if (rootsOnly != null) 'rootsOnly': '$rootsOnly',
       if (limit != null) 'limit': '$limit',
       if (offset != null) 'offset': '$offset',
+      if (ancestors) 'ancestors': 'true',
     };
     return ObligationPage.fromJson(
       await _getJson(_u('/api/mesh/obligations', q)),
