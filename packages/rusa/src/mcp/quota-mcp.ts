@@ -5,6 +5,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { RusaConfig } from "../config/types.js";
 import { generateGeminiContent } from "../observability/gemini-usage.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import {
   type ScrapeAgyUsageOptions,
   scrapeAgyUsage as scrapeAgyUsageImpl,
@@ -251,6 +252,8 @@ export interface QuotaMcpDeps {
    * (§12 item 4, #356). When configured, get_quota routes through the coordinator client.
    */
   coordinatorClient?: QuotaCoordinatorClient | null;
+  /** Structured diagnostics from parsing. Defaults to discarding them. */
+  logger?: Logger;
 }
 
 /**
@@ -1443,9 +1446,13 @@ export class QuotaService {
       if (limit === read || typeof limit.scope !== "object" || typeof read.scope !== "object") {
         return;
       }
-      console.info(
-        `[quota-mcp] [${provider}] kept "${limit.label}" ${limit.kind} on lane [${limit.scope.models?.join(",")}]; parser named [${read.scope.models?.join(",")}]`
-      );
+      (this.deps.logger ?? nullLogger).info("quota_window_lane_kept", {
+        provider,
+        window: limit.label,
+        kind: limit.kind,
+        laneModels: limit.scope.models,
+        parsedModels: read.scope.models,
+      });
     });
     return kept;
   }

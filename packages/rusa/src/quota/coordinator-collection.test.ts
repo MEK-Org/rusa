@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RusaConfig } from "../config/types.js";
 import { type ProviderQuotaSnapshot, QuotaService } from "../mcp/quota-mcp.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import type { ModelEntry } from "../providers/model-catalog.js";
 import type { CodingProvider } from "../providers/types.js";
 import { QuotaCoordinatorClient } from "./coordinator-client.js";
@@ -101,6 +102,7 @@ function configuredClaudeService(opts: {
   run: ReturnType<typeof vi.fn>;
   ttlMs?: number;
   modelCatalog?: readonly ModelEntry[];
+  logger?: Logger;
 }): QuotaService {
   const provider: CodingProvider = {
     name: "claude",
@@ -119,6 +121,7 @@ function configuredClaudeService(opts: {
     now: opts.now,
     ttlMs: opts.ttlMs,
     modelCatalogFor: opts.modelCatalog ? () => opts.modelCatalog ?? [] : undefined,
+    logger: opts.logger,
   });
 }
 
@@ -769,6 +772,7 @@ describe("QuotaCollectionLoop", () => {
     const store = new SharedQuotaStore(join(root, "quota.db"));
     store.configureController({ maxIntervalSeconds: 3600 });
     const fableModels = ["claude-fable-5", "claude-fable-5-1"];
+    const info = vi.fn();
     const catalog: ModelEntry[] = [
       { identifier: "claude-fable-5", displayLabel: "Claude Fable 5" },
       { identifier: "claude-fable-5-1", displayLabel: "Claude Fable 5.1" },
@@ -804,6 +808,7 @@ describe("QuotaCollectionLoop", () => {
       run,
       ttlMs: 1,
       modelCatalog: catalog,
+      logger: { ...nullLogger, info },
     });
     const loop = new QuotaCollectionLoop({
       store,
@@ -828,7 +833,6 @@ describe("QuotaCollectionLoop", () => {
         missed: detector.observe("claude", history, client.getCachedScrapeOutcomes("claude")),
       };
     };
-    const info = vi.spyOn(console, "info").mockImplementation(() => {});
     try {
       await coordinator.start();
       await loop.tick();
@@ -841,9 +845,18 @@ describe("QuotaCollectionLoop", () => {
 
       expect(run).toHaveBeenCalledTimes(2);
       expect(missed).toEqual([]);
-      expect(info).toHaveBeenCalledWith(
-        '[quota-mcp] [claude] kept "Current week (Fable)" weekly on lane [claude-fable-5,claude-fable-5-1]; parser named [claude-fable-5]'
-      );
+      expect(info.mock.calls).toEqual([
+        [
+          "quota_window_lane_kept",
+          {
+            provider: "claude",
+            window: "Current week (Fable)",
+            kind: "weekly",
+            laneModels: fableModels,
+            parsedModels: ["claude-fable-5"],
+          },
+        ],
+      ]);
       const fableRows = history.filter((record) => record.scope === "model");
       expect(
         new Set(fableRows.map((record) => quotaLaneKey("model", record.models ?? [], record.kind)))
@@ -857,7 +870,6 @@ describe("QuotaCollectionLoop", () => {
         ?.limits?.find((limit) => limit.label === "Current week (Fable)");
       expect(latestFable?.scope).toEqual({ provider: "claude", models: fableModels });
     } finally {
-      info.mockRestore();
       await coordinator.stop();
       store.close();
     }
