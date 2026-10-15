@@ -4722,8 +4722,7 @@ async function composeStart(
           // indicator and per-thread run-state dots. No new mesh behavior.
           // A scoped `/halt` lit the indicator when it was the HALT file, so
           // an active availability hold still does (#539).
-          isHalted: () =>
-            haltSwitch.hasActiveHalt() || availabilityHolds.list().length > 0,
+          isHalted: () => haltSwitch.hasActiveHalt() || availabilityHolds.list().length > 0,
           haltSnapshot: () => haltSwitch.state(),
           // Surfaces the boot-time `at`/`atrm`/`atd`/`atq` AND `crontab`/crond/
           // cron.allow-cron.deny preflights so a missing one-shot facility or an
