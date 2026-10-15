@@ -150,6 +150,16 @@ describe("AvailabilityHoldRepository", () => {
     }
   });
 
+  it("stores each hold's scope as one JSON object", () => {
+    holds.set({ provider: "Kimi", createdBy: "root", createdAt: CREATED });
+    holds.set({ provider: "codex", models: ["GPT-5.5"], createdBy: "root", createdAt: CREATED });
+
+    expect(db.prepare("SELECT scope FROM availability_holds ORDER BY scope").all()).toEqual([
+      { scope: '{"provider":"codex","model":"gpt-5.5"}' },
+      { scope: '{"provider":"kimi"}' },
+    ]);
+  });
+
   it("refuses blank scopes and unparseable timestamps", () => {
     expect(() => holds.set({ provider: " ", createdBy: "root", createdAt: CREATED })).toThrow(
       /requires a provider/

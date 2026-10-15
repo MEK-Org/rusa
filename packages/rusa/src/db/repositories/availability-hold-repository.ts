@@ -28,15 +28,17 @@ export interface SetAvailabilityHold extends AvailabilityHoldScope {
 }
 
 type AvailabilityHoldRow = {
-  provider: string;
-  model: string | null;
+  scope: string;
   expiry: string | null;
   reason: string;
   created_by: string;
   created_at: string;
 };
 
-const COLUMNS = "provider, model, expiry, reason, created_by, created_at";
+const COLUMNS = "scope, expiry, reason, created_by, created_at";
+const PROVIDER = "json_extract(scope, '$.provider')";
+const MODEL = "json_extract(scope, '$.model')";
+const ORDER = `${PROVIDER}, ${MODEL} IS NOT NULL, ${MODEL}`;
 
 /**
  * Data access for durable availability holds (`availability_holds`).
@@ -45,7 +47,8 @@ const COLUMNS = "provider, model, expiry, reason, created_by, created_at";
  * without touching any configured pool. Provider and model names are
  * normalized the same way `/halt` normalizes them, so `agy` and `antigravity`
  * name the same lane. Expiry is evaluated against the caller's clock on every
- * read; expired rows stay until they are cleared.
+ * read; expired rows stay until they are cleared. Each row's scope is stored
+ * as one canonical JSON object, `{"provider":…}` or `{"provider":…,"model":…}`.
  */
 export class AvailabilityHoldRepository {
   constructor(private readonly db: Database.Database) {}
@@ -60,8 +63,8 @@ export class AvailabilityHoldRepository {
     const expiry = hold.expiry === undefined ? null : canonicalTimestamp(hold.expiry, "expiry");
     const createdAt = canonicalTimestamp(hold.createdAt, "createdAt");
     const upsert = this.db.prepare(
-      `INSERT INTO availability_holds (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT (provider, COALESCE(model, '')) DO UPDATE SET
+      `INSERT INTO availability_holds (${COLUMNS}) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (scope) DO UPDATE SET
          expiry = excluded.expiry,
          reason = excluded.reason,
          created_by = excluded.created_by,
@@ -69,10 +72,10 @@ export class AvailabilityHoldRepository {
     );
     return this.db.transaction(() =>
       (models ?? [null]).map((model) => {
-        upsert.run(provider, model, expiry, hold.reason ?? "", hold.createdBy, createdAt);
+        const scope = scopeJson(provider, model);
+        upsert.run(scope, expiry, hold.reason ?? "", hold.createdBy, createdAt);
         return toHold({
-          provider,
-          model,
+          scope,
           expiry,
           reason: hold.reason ?? "",
           created_by: hold.createdBy,
@@ -95,23 +98,19 @@ export class AvailabilityHoldRepository {
         ? models.flatMap(
             (model) =>
               this.db
-                .prepare(
-                  `SELECT ${COLUMNS} FROM availability_holds WHERE provider = ? AND model = ?`
-                )
-                .all(provider, model) as AvailabilityHoldRow[]
+                .prepare(`SELECT ${COLUMNS} FROM availability_holds WHERE scope = ?`)
+                .all(scopeJson(provider, model)) as AvailabilityHoldRow[]
           )
         : (this.db
             .prepare(
-              `SELECT ${COLUMNS} FROM availability_holds WHERE provider = ? ORDER BY model IS NOT NULL, model`
+              `SELECT ${COLUMNS} FROM availability_holds WHERE ${PROVIDER} = ? ORDER BY ${ORDER}`
             )
             .all(provider) as AvailabilityHoldRow[]);
       if (models) {
-        const remove = this.db.prepare(
-          "DELETE FROM availability_holds WHERE provider = ? AND model = ?"
-        );
-        for (const model of models) remove.run(provider, model);
+        const remove = this.db.prepare("DELETE FROM availability_holds WHERE scope = ?");
+        for (const model of models) remove.run(scopeJson(provider, model));
       } else {
-        this.db.prepare("DELETE FROM availability_holds WHERE provider = ?").run(provider);
+        this.db.prepare(`DELETE FROM availability_holds WHERE ${PROVIDER} = ?`).run(provider);
       }
       return rows.map(toHold);
     })();
@@ -136,21 +135,20 @@ export class AvailabilityHoldRepository {
     const normalizedProvider = normalizeProvider(provider);
     if (!normalizedProvider) return false;
     const rows = this.db
-      .prepare(`SELECT ${COLUMNS} FROM availability_holds WHERE provider = ?`)
+      .prepare(`SELECT ${COLUMNS} FROM availability_holds WHERE ${PROVIDER} = ?`)
       .all(normalizedProvider) as AvailabilityHoldRow[];
     const normalizedModel = model === undefined ? undefined : normalizeModel(model);
     return rows.some((row) => {
-      if (!isActive(toHold(row), now)) return false;
-      if (row.model === null || !normalizedModel) return true;
-      return row.model === normalizedModel;
+      const hold = toHold(row);
+      if (!isActive(hold, now)) return false;
+      if (hold.model === undefined || !normalizedModel) return true;
+      return hold.model === normalizedModel;
     });
   }
 
   private selectAll(): AvailabilityHoldRow[] {
     return this.db
-      .prepare(
-        `SELECT ${COLUMNS} FROM availability_holds ORDER BY provider, model IS NOT NULL, model`
-      )
+      .prepare(`SELECT ${COLUMNS} FROM availability_holds ORDER BY ${ORDER}`)
       .all() as AvailabilityHoldRow[];
   }
 }
@@ -159,10 +157,16 @@ function isActive(hold: AvailabilityHold, now: number): boolean {
   return hold.expiry === undefined || Date.parse(hold.expiry) > now;
 }
 
+/** Canonical scope text: the form the table's CHECK and unique index accept. */
+function scopeJson(provider: string, model: string | null): string {
+  return JSON.stringify(model === null ? { provider } : { provider, model });
+}
+
 function toHold(row: AvailabilityHoldRow): AvailabilityHold {
+  const scope = JSON.parse(row.scope) as { provider: string; model?: string };
   return {
-    provider: row.provider,
-    ...(row.model === null ? {} : { model: row.model }),
+    provider: scope.provider,
+    ...(scope.model === undefined ? {} : { model: scope.model }),
     ...(row.expiry === null ? {} : { expiry: row.expiry }),
     reason: row.reason,
     createdBy: row.created_by,
