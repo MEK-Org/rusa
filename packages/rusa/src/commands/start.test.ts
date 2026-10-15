@@ -4882,11 +4882,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // A compactor outage or repeated interruptions can grow the unfolded tail
     // past its read ceiling. Show the newest window, not the oldest 200 sources.
     mesh.enrollActorInExperiment("root", COMPACTED_MEMORY_DELTA_EXPERIMENT, "root");
+    // The reader keeps only sources stamped later than the cursor (d, recorded
+    // on the real clock moments ago), so the backlog steps forward from now.
+    // A fixed calendar date would fall behind the cursor once the clock passed it.
+    const backlogStart = Date.now() + 1_000;
     const backlog: string[] = [];
     for (let i = 0; i < 205; i++) {
       backlog.push(
         getRepositories().meshChat.record({
-          ts: new Date(Date.UTC(2026, 9, 15, 0, 0, i)).toISOString(),
+          ts: new Date(backlogStart + i * 1_000).toISOString(),
           senderId: "operator",
           recipientId: "root",
           body: `Backlog instruction ${i}`,
