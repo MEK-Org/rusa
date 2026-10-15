@@ -100,12 +100,13 @@ export function resolveWindowModels(
  * on most scrapes and as one of them on a few. Read literally, each such
  * reading opens a new lane and reports the established one missed.
  *
- * A window keeps `previous`'s models when exactly one previous model window
- * has its label and kind, the current models are a strict subset of that
- * window's, and every one of that window's models is still in the configured
- * catalog. A dropped model that left the catalog is a real narrowing and
- * becomes the new lane; a reading naming more models than before is taken as
- * read.
+ * A window keeps `previous`'s models when exactly one previous and exactly
+ * one current model window have its label and kind, the current models are a
+ * strict subset of that previous window's, and every one of that window's
+ * models is still in the configured catalog. Two current windows sharing a
+ * label and kind are two allocations, not an omission, and are taken as read.
+ * A dropped model that left the catalog is a real narrowing and becomes the
+ * new lane; a reading naming more models than before is taken as read.
  */
 export function keepWindowLaneModels(
   limits: readonly QuotaLimit[],
@@ -120,7 +121,8 @@ export function keepWindowLaneModels(
     const models = windowModels(limit);
     if (!models || typeof limit.scope !== "object") return limit;
     const matches = previous.filter((prev) => windowModels(prev) && sameWindow(prev, limit));
-    const lane = matches.length === 1 ? windowModels(matches[0]) : null;
+    const peers = limits.filter((other) => windowModels(other) && sameWindow(other, limit));
+    const lane = matches.length === 1 && peers.length === 1 ? windowModels(matches[0]) : null;
     if (
       !lane ||
       lane.length <= models.length ||

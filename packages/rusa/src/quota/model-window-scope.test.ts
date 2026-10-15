@@ -123,4 +123,17 @@ describe("keepWindowLaneModels (#1078)", () => {
       )
     ).toEqual([["claude-fable-5"]]);
   });
+
+  it("takes two current windows of the same label and kind as read", () => {
+    const split = keepWindowLaneModels(
+      [
+        { ...window(["claude-fable-5"]), percentLeft: 40 },
+        { ...window(["claude-fable-5-1"]), percentLeft: 70 },
+      ],
+      [window(FABLE)],
+      catalog
+    );
+    expect(modelsOf(split)).toEqual([["claude-fable-5"], ["claude-fable-5-1"]]);
+    expect(split.map((limit) => limit.percentLeft)).toEqual([40, 70]);
+  });
 });
