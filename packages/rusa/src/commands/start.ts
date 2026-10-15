@@ -104,6 +104,7 @@ import {
   portableContextMaxMessages,
   portableContextMaxRuns,
 } from "../actor/portable-context.js";
+import { seedPortableBriefState } from "../actor/portable-context-brief.js";
 import {
   describeCompaction,
   GeminiPortableContextCompactor,
@@ -188,6 +189,7 @@ import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitop
 import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
 import { getRemoteUrl, initEmptyBareRepo } from "../gitops/worktree.js";
 import { AGENT_EXEC_MCP_NAME, createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
+import { BRIEF_MCP_NAME, createBriefMcpServer } from "../mcp/brief-mcp.js";
 import {
   CHAT_READ_MCP_NAME,
   CHAT_WRITE_MCP_NAME,
@@ -310,6 +312,7 @@ import {
 import { type MissedQuotaWindow, MissedQuotaWindowDetector } from "../quota/missed-windows.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import { resolveReference } from "../references/resolve.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
@@ -884,7 +887,7 @@ export function readUnfoldedLedgerSources(
  */
 function assemblePortableInjection(
   id: string,
-  mode: "tail" | "ledger",
+  mode: "tail" | "ledger" | "brief",
   store: PortableContextStore,
   journal: PortableJournalMode = "window",
   onDeltaFallback: (error: unknown) => void = () => {}
@@ -893,13 +896,22 @@ function assemblePortableInjection(
   const runs = repositories.actorRuns
     .listRecentCompleted(id, portableContextMaxRuns())
     .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
-  if (mode !== "ledger") {
+  // Tail remains a run-only renderer. Do not load a snapshot or query messages
+  // and obligations before selecting this established path.
+  if (mode === "tail") {
     const portable = assemblePortableContext(runs);
     return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
   }
-  const state = store.load(id);
+
+  let state = store.load(id);
+  // Seed before the first brief-mode prompt, so the first brief-mode run
+  // renders the empty brief sections rather than the old ledger.
+  if (mode === "brief" && state.brief === null) {
+    state = seedPortableBriefState(state, new Date().toISOString());
+    store.save(state);
+  }
   // Read-through only. The prompt shows work state; it never authors it
-  // — the obligation store stays the sole lifecycle authority .
+  // — the obligation store stays the sole lifecycle authority.
   const obligations = repositories.obligations.listOwned(id);
   const windowJournal = () => ({
     messages: repositories.meshChat
@@ -917,7 +929,8 @@ function assemblePortableInjection(
   // plus the unchanged runs window. A failed or truncated read falls back to the
   // recent window, so the actor starts with its newest messages still visible.
   const selectJournal = () => {
-    if (journal !== "delta") return windowJournal();
+    // Brief writes do not advance the ledger fold cursor; keep their recent window.
+    if (mode !== "ledger" || journal !== "delta") return windowJournal();
     try {
       const unfolded = readUnfoldedLedgerSources(id, state.lastFoldedSourceId);
       const delta = selectDeltaJournal({
@@ -954,6 +967,7 @@ function assemblePortableInjection(
     runs: selected.runs,
     obligations,
     journal: selected.journal,
+    ...(mode === "brief" ? { brief: state.brief } : {}),
   });
   return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
 }
@@ -1000,10 +1014,11 @@ export async function compactPortableContext(input: {
       messages: page.sources,
       now: (input.now ?? (() => new Date().toISOString()))(),
     });
-    state = result.state;
+    // A brief may have committed while the fold awaited the model, including
+    // through another connection. Preserve it inside the store's write lock.
+    state = input.store.saveFolded(result.state);
     quarantinedOperations.push(...result.quarantined);
     operations += result.operations;
-    input.store.save(state);
     folded += page.sources.length;
     foldedSelf += page.sources.filter((source) => source.kind === "run_yielded").length;
     bytes += page.sources.reduce(
@@ -1679,6 +1694,16 @@ async function composeStart(
       : errorSink?.kind === "slack" && slackClient
         ? (text: string) => slackClient.send(errorSink.target, text).then(() => {})
         : null;
+  // A brief write's new citations resolve through the same resolver and
+  // clients the dashboard uses; nothing here widens what they can read (#954).
+  const resolveBriefCitation = (ref: string) =>
+    resolveReference(ref, {
+      meshChat: getRepositories().meshChat,
+      inbox: getRepositories().inbox,
+      chatClient: chatClient ?? undefined,
+      slackClient: slackClient ?? undefined,
+      issueClient,
+    });
   if (chatClient) {
     const workDir = join(mcHome, "root-agent");
     // This root-owned server runs on the local leader; follower placement is
@@ -2321,7 +2346,7 @@ async function composeStart(
       backups: legacyPortableContextImport.backupFiles,
     });
   }
-  const portableContextStore: PortableContextStore = getRepositories().portableContext;
+  const portableContextStore = getRepositories().portableContext;
   const e2eInstance = new E2EInstanceManager({
     mcHome,
     workersDir,
@@ -2634,6 +2659,7 @@ async function composeStart(
   const teardownActorMcp = (actorId: string) => {
     liveWorkerMcp.delete(actorId);
     void mcpHttp.removeServer(actorId);
+    void mcpHttp.removeServer(`${actorId}:${BRIEF_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${INBOX_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${OBLIGATIONS_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${MESH_CHAT_MCP_NAME}`);
@@ -3494,6 +3520,17 @@ async function composeStart(
           { name: PNPM_INSTALL_MCP_NAME, url: pnpmInstallUrl },
         ];
 
+        if (rec.context?.type === "portable" && rec.context.mode === "brief") {
+          const briefUrl = mcpHttp.addServer(`${id}:${BRIEF_MCP_NAME}`, () =>
+            createBriefMcpServer({
+              actorId: id,
+              store: portableContextStore,
+              resolveCitation: resolveBriefCitation,
+            })
+          );
+          workerMcp.push({ name: BRIEF_MCP_NAME, url: briefUrl });
+        }
+
         // Mount any capabilities granted to this actor (by id) on top of the default
         // worker set (ISSUE_NUM, phase 1a). A granted-but-not-mountable capability (none
         // registered) is skipped safely. Parameterized capabilities (e.g. chat-write:spaces/AAAA)
@@ -3963,6 +4000,16 @@ async function composeStart(
     rootMcp.push({ name: CHAT_WRITE_MCP_NAME, url: rootChatUrl });
   }
   if (rootSlackUrl) rootMcp.push({ name: SLACK_WRITE_MCP_NAME, url: rootSlackUrl });
+  if (rootActor.context?.type === "portable" && rootActor.context.mode === "brief") {
+    const rootBriefUrl = mcpHttp.addServer(`${rootId}:${BRIEF_MCP_NAME}`, () =>
+      createBriefMcpServer({
+        actorId: rootId,
+        store: portableContextStore,
+        resolveCitation: resolveBriefCitation,
+      })
+    );
+    rootMcp.push({ name: BRIEF_MCP_NAME, url: rootBriefUrl });
+  }
   refreshLiveActorMcp(rootId);
 
   const externalRoot =
@@ -4476,6 +4523,7 @@ async function composeStart(
           inbox: getRepositories().inbox,
           actorRuns: getRepositories().actorRuns,
           runPrompts: getRepositories().runPrompts,
+          portableContext: getRepositories().portableContext,
           inboxFocus: getRepositories().inboxFocus,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,

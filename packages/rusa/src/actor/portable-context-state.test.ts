@@ -25,9 +25,64 @@ describe("parsePortableContextState", () => {
     };
 
     expect(parsePortableContextState(JSON.parse(JSON.stringify(legacy)))).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       lastFoldedSourceId: "legacy-message-event",
     });
+  });
+
+  it("reads a v3 document forward by adding an empty brief object", () => {
+    const current = emptyPortableContextState("actor-a");
+    const v3 = {
+      ...current,
+      schemaVersion: 3,
+      brief: undefined,
+      generation: 7,
+      lastFoldedSourceId: "durable-source-1",
+    };
+
+    const parsed = parsePortableContextState(JSON.parse(JSON.stringify(v3)));
+    expect(parsed).toMatchObject({
+      schemaVersion: 4,
+      generation: 7,
+      lastFoldedSourceId: "durable-source-1",
+      brief: null,
+    });
+    // The v3 ledger fields the brief mode must never touch round-trip untouched.
+    expect(parsed.items).toEqual(current.items);
+  });
+
+  it("round-trips a v4 document with a live brief object", () => {
+    const state = {
+      ...emptyPortableContextState("actor-a"),
+      brief: {
+        text: "## WHAT\nDraw abstract SVG art. [mesh:messages/m-purpose]\n\n## HOW\n\n## DOMAIN",
+        generation: 3,
+        updatedAt: "2026-10-07T00:01:00.000Z",
+      },
+    };
+
+    expect(parsePortableContextState(JSON.parse(JSON.stringify(state)))).toEqual(state);
+  });
+
+  it("reads a brief written with the retired rewrite bookkeeping as just its text, generation and time", () => {
+    const brief = {
+      text: "## WHAT\nDraw abstract SVG art. [mesh:messages/m-purpose]\n\n## HOW\n\n## DOMAIN",
+      generation: 3,
+      updatedAt: "2026-10-07T00:01:00.000Z",
+    };
+    const stored = {
+      ...emptyPortableContextState("actor-a"),
+      brief: {
+        ...brief,
+        cursor: { ts: "2026-10-07T00:00:00.000Z", sourceOrder: 0, id: "message-1" },
+        model: "gemini-3.8-flash",
+        consecutiveFailures: 1,
+        frozen: false,
+        resolvedRefs: ["mesh:messages/m-purpose"],
+      },
+    };
+
+    expect(parsePortableContextState(JSON.parse(JSON.stringify(stored))).brief).toEqual(brief);
   });
 
   it("still accepts a document holding retired kinds (ISSUE_NUM leg 3)", () => {

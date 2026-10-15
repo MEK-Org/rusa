@@ -311,7 +311,15 @@ When drafting instructions, charters, or sub-task prompts for other agents:
 - **Anchor completion in verified evidence:** Define "done" as showing the concrete command or artifact already produced, together with its observed result — not a claimed condition.
 - **State desired behavior positively:** State what to do directly rather than forbidding unwanted actions.
 - **Prefer compact, connotation-rich phrasing:** Use tight idioms and direct imperatives over long procedural explanations (e.g. "keep the loop tight", "make it go red first").
-- **Rely on the single source of truth:** Point to the authoritative record instead of restating it; prune instructions that no longer change behavior.`;
+- **Rely on the single source of truth:** Point to the authoritative record instead of restating it; prune instructions that no longer change behavior.
+
+The charter defines an actor's purpose, scope and authority; a brief-mode
+actor's brief carries evolving guidance. When a child reports work its brief
+implies but its charter excludes, either update the charter to authorize the
+work or message the child explaining that the exclusion is intentional. A
+charter update can authorize the work without changing the brief; a direct
+clarification message can refine the brief. Keep your children's charters
+current when you clarify their purpose, scope or authority.`;
 
 /**
  * Standing conduct norms for interacting with external systems .

@@ -6,6 +6,7 @@ import { resolveContextSelection } from "../actor/context-selection.js";
 import type { HaltState } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { inboxEntryObligationRefs } from "../actor/inbox-focus.js";
+import type { PortableBriefStore, PortableContextStore } from "../actor/portable-context-state.js";
 import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
@@ -88,6 +89,8 @@ export interface DashboardDataDeps {
   /** Completed selection intervals used only to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
   runPrompts?: RunPromptRepository;
+  portableContext?: Pick<PortableContextStore, "load"> &
+    Pick<PortableBriefStore, "listBriefRevisions">;
   /** Durable per-entry obligation associations for activity correlation. */
   inboxFocus?: InboxFocusRepository;
   sseHub: SseHub;
@@ -2087,7 +2090,25 @@ export async function handleMeshApiRequest(
       sendJson(res, 404, { error: "thread not found" });
       return true;
     }
-    sendJson(res, 200, { id: thread.id, charter: thread.charter });
+    const briefMode = thread.context?.type === "portable" && thread.context.mode === "brief";
+    const brief = briefMode ? deps.portableContext?.load(thread.id).brief : null;
+    sendJson(res, 200, {
+      id: thread.id,
+      charter: thread.charter,
+      ...(briefMode
+        ? {
+            briefMode: true,
+            brief: brief?.text ?? null,
+            briefGeneration: brief?.generation ?? null,
+            briefUpdatedAt: brief?.updatedAt ?? null,
+            // The latest ten accepted writes, newest first; the history table
+            // keeps every one, this is only the view's page.
+            briefRevisions: brief
+              ? (deps.portableContext?.listBriefRevisions(thread.id, 10) ?? [])
+              : [],
+          }
+        : {}),
+    });
     return true;
   }
 

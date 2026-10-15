@@ -3,11 +3,15 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 import 'package:rxdart/rxdart.dart';
 
+import '../api.dart' show BriefRevision;
 import '../breakpoints.dart';
+import '../brief_diff.dart';
 import '../dashboard_timing.dart';
+import '../iu/simple_markdown.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
+import '../util.dart' show formatTs;
 import 'actor_status_badge.dart';
 import 'avatar.dart';
 import 'events_tab.dart';
@@ -583,6 +587,11 @@ class _InfoView extends StatefulWidget {
 class _InfoViewState extends State<_InfoView> {
   /// The full charter once it arrives. Null means "still the preview".
   String? _charter;
+  String? _brief;
+  bool _briefMode = false;
+  int? _briefGeneration;
+  String? _briefUpdatedAt;
+  List<BriefRevision> _briefRevisions = const [];
 
   /// The actor the charter on screen was fetched for. Set while a fetch is in
   /// flight and kept if it succeeds; a failure clears it.
@@ -626,19 +635,37 @@ class _InfoViewState extends State<_InfoView> {
 
   Future<void> _loadCharter({bool trackDetail = false}) async {
     final id = widget.actor.id;
+    // Charter, brief and the bounded history are one snapshot per tab opening.
     if (_loadedFor == id) return;
+    final isNewActor = _loadedFor != id;
     _loadedFor = id;
     final fetch = ++_fetch;
-    setState(() => _charter = null);
+    if (isNewActor) {
+      setState(() {
+        _charter = null;
+        _brief = null;
+        _briefMode = false;
+        _briefGeneration = null;
+        _briefUpdatedAt = null;
+        _briefRevisions = const [];
+      });
+    }
     Future<void> runFetch() async {
-      final charter = await widget.store.fetchCharter(id);
+      final info = await widget.store.fetchActorInfo(id);
       // Anything sent since this supersedes it, whichever actor it was asking
       // for: another actor selected, or a second look at the same one after a
       // failure. Only the newest answer is allowed to land.
       if (!mounted || fetch != _fetch) {
         throw StateError('Actor detail fetch superseded or unmounted');
       }
-      setState(() => _charter = charter);
+      setState(() {
+        _charter = info.charter;
+        _briefMode = info.briefMode;
+        _brief = info.brief;
+        _briefGeneration = info.briefGeneration;
+        _briefUpdatedAt = info.briefUpdatedAt;
+        _briefRevisions = info.briefRevisions;
+      });
     }
 
     try {
@@ -665,6 +692,44 @@ class _InfoViewState extends State<_InfoView> {
   /// Falling back to the preview rather than to empty means a failed or slow
   /// fetch degrades to less text, not to "No charter."
   String get charter => _charter ?? widget.actor.charterPreview;
+
+  /// Option B: the latest ten writes, then one write's change and
+  /// explanation. A centred dialog on wide screens, fullscreen on narrow ones.
+  void _showBriefHistory(BuildContext context) {
+    final isNarrow = MediaQuery.sizeOf(context).width < kNarrowBreakpoint;
+    final content = _BriefHistory(
+      actorHandle: widget.actor.handle,
+      currentGeneration: _briefGeneration,
+      revisions: _briefRevisions,
+    );
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => isNarrow
+          ? Dialog.fullscreen(
+              backgroundColor: MeshColors.bgSecondary,
+              child: SafeArea(child: content),
+            )
+          : Dialog(
+              backgroundColor: MeshColors.bgSecondary,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+                side: const BorderSide(color: MeshColors.border),
+              ),
+              child: SizedBox(width: 680, height: 640, child: content),
+            ),
+    );
+  }
+
+  Widget _documentBox(Widget child) => Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(
+      color: MeshColors.bgTertiary,
+      border: Border.all(color: MeshColors.border),
+      borderRadius: BorderRadius.circular(6),
+    ),
+    child: child,
+  );
 
   Widget _meta(String label, String value) => Text.rich(
     TextSpan(
@@ -824,6 +889,97 @@ class _InfoViewState extends State<_InfoView> {
               ),
             ],
           ],
+          if (_briefMode) ...[
+            const SizedBox(height: 24),
+            Row(
+              children: [
+                const Text(
+                  'Brief',
+                  style: TextStyle(
+                    color: MeshColors.textPrimary,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                if (_briefGeneration != null) ...[
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: MeshColors.bgSecondary,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: MeshColors.border),
+                    ),
+                    child: Text(
+                      'Gen $_briefGeneration',
+                      style: const TextStyle(
+                        color: MeshColors.accent,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+                if (_briefUpdatedAt != null && _briefUpdatedAt!.isNotEmpty) ...[
+                  const SizedBox(width: 8),
+                  Expanded(
+                    // Generation zero records the seed time; later generations
+                    // record accepted writes. Both are persisted updates.
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: InkWell(
+                        key: const ValueKey('brief-history-time'),
+                        onTap: _briefRevisions.isEmpty
+                            ? null
+                            : () => _showBriefHistory(context),
+                        child: Text(
+                          'updated ${formatTs(_briefUpdatedAt!)}',
+                          style: const TextStyle(
+                            color: MeshColors.textMuted,
+                            fontSize: 11,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                  ),
+                ] else ...[
+                  const Spacer(),
+                ],
+                if (_briefRevisions.isNotEmpty) ...[
+                  const SizedBox(width: 8),
+                  IconButton(
+                    key: const ValueKey('brief-history-button'),
+                    icon: const Icon(Icons.history, size: 16),
+                    tooltip: 'Brief history',
+                    visualDensity: VisualDensity.compact,
+                    splashRadius: 16,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    color: MeshColors.textSecondary,
+                    onPressed: () => _showBriefHistory(context),
+                  ),
+                ],
+              ],
+            ),
+            const SizedBox(height: 12),
+            _documentBox(
+              _brief == null || _brief!.isEmpty
+                  ? const Text(
+                      'No brief yet.',
+                      style: TextStyle(
+                        color: MeshColors.textSecondary,
+                        fontSize: 13,
+                      ),
+                    )
+                  : SelectionArea(
+                      child: SimpleMarkdown(_brief!.split('\n').join('\n\n')),
+                    ),
+            ),
+          ],
           const SizedBox(height: 24),
           const Text(
             'Charter',
@@ -949,6 +1105,322 @@ class _VoicePicker extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// The brief's history: the latest ten accepted writes, newest first, and on
+/// selecting one, what it changed (a line diff from the text it replaced) and
+/// the actor's explanation for it.
+class _BriefHistory extends StatefulWidget {
+  const _BriefHistory({
+    required this.actorHandle,
+    required this.currentGeneration,
+    required this.revisions,
+  });
+
+  final String actorHandle;
+  final int? currentGeneration;
+
+  /// Newest first, as the API pages them.
+  final List<BriefRevision> revisions;
+
+  @override
+  State<_BriefHistory> createState() => _BriefHistoryState();
+}
+
+class _BriefHistoryState extends State<_BriefHistory> {
+  BriefRevision? _selected;
+
+  static Widget _chip(String label, {bool current = false}) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+    decoration: BoxDecoration(
+      color: current
+          ? MeshColors.accent.withValues(alpha: 0.15)
+          : MeshColors.bgSecondary,
+      borderRadius: BorderRadius.circular(4),
+      border: Border.all(
+        color: current ? MeshColors.accent : MeshColors.border,
+      ),
+    ),
+    child: Text(
+      label,
+      style: TextStyle(
+        color: current ? MeshColors.accent : MeshColors.textSecondary,
+        fontSize: 11,
+        fontWeight: FontWeight.w600,
+      ),
+    ),
+  );
+
+  static Widget _label(String text) => Text(
+    text,
+    style: const TextStyle(
+      color: MeshColors.textPrimary,
+      fontSize: 13,
+      fontWeight: FontWeight.w600,
+    ),
+  );
+
+  static Widget _explanation(BriefRevision rev, {int? maxLines}) {
+    final given = rev.explanation;
+    return given == null || given.isEmpty
+        ? const Text(
+            'No explanation given.',
+            style: TextStyle(
+              color: MeshColors.textMuted,
+              fontSize: 12,
+              fontStyle: FontStyle.italic,
+            ),
+          )
+        : Text(
+            given,
+            maxLines: maxLines,
+            overflow: maxLines == null ? null : TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: MeshColors.textSecondary,
+              fontSize: 12,
+              height: 1.4,
+            ),
+          );
+  }
+
+  static String _tally(List<BriefDiffLine> diff) {
+    final added = diff.where((l) => l.op == BriefDiffOp.added).length;
+    final removed = diff.where((l) => l.op == BriefDiffOp.removed).length;
+    return '+$added −$removed';
+  }
+
+  bool _isCurrent(BriefRevision rev) =>
+      rev.generation == widget.currentGeneration;
+
+  Widget _header(BuildContext context) {
+    final selected = _selected;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: const BoxDecoration(
+        border: Border(bottom: BorderSide(color: MeshColors.border)),
+      ),
+      child: Row(
+        children: [
+          if (selected != null)
+            IconButton(
+              key: const ValueKey('brief-history-back'),
+              icon: const Icon(Icons.arrow_back, size: 18),
+              tooltip: 'All changes',
+              color: MeshColors.textSecondary,
+              visualDensity: VisualDensity.compact,
+              onPressed: () => setState(() => _selected = null),
+            )
+          else
+            const Padding(
+              padding: EdgeInsets.all(8),
+              child: Icon(Icons.history, size: 18, color: MeshColors.accent),
+            ),
+          const SizedBox(width: 4),
+          Expanded(
+            child: Text(
+              selected == null
+                  ? 'Brief history — ${widget.actorHandle}'
+                  : 'Generation ${selected.generation} change',
+              style: const TextStyle(
+                color: MeshColors.textPrimary,
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+              ),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if (selected == null)
+            _chip(
+              'Latest ${widget.revisions.length} '
+              'change${widget.revisions.length == 1 ? '' : 's'}',
+            ),
+          IconButton(
+            icon: const Icon(Icons.close, size: 18),
+            tooltip: 'Close',
+            color: MeshColors.textMuted,
+            visualDensity: VisualDensity.compact,
+            onPressed: () => Navigator.of(context).pop(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _list() {
+    if (widget.revisions.isEmpty) {
+      return const Center(
+        child: Text(
+          'No brief changes recorded.',
+          style: TextStyle(color: MeshColors.textSecondary),
+        ),
+      );
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.all(12),
+      itemCount: widget.revisions.length,
+      itemBuilder: (context, index) {
+        final rev = widget.revisions[index];
+        final current = _isCurrent(rev);
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Material(
+            color: MeshColors.bgTertiary,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+              side: BorderSide(
+                color: current
+                    ? MeshColors.accent.withValues(alpha: 0.5)
+                    : MeshColors.border,
+              ),
+            ),
+            child: InkWell(
+              key: ValueKey('brief-revision-${rev.generation}'),
+              borderRadius: BorderRadius.circular(8),
+              onTap: () => setState(() => _selected = rev),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        _chip('Gen ${rev.generation}', current: current),
+                        if (current) ...[
+                          const SizedBox(width: 6),
+                          _chip('Current', current: true),
+                        ],
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            formatTs(rev.updatedAt),
+                            style: const TextStyle(
+                              color: MeshColors.textMuted,
+                              fontSize: 12,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        Text(
+                          _tally(diffBriefLines(rev.before, rev.after)),
+                          style: const TextStyle(
+                            color: MeshColors.textSecondary,
+                            fontSize: 11,
+                            fontFamily: kMonoFontFamily,
+                          ),
+                        ),
+                        const Icon(
+                          Icons.chevron_right,
+                          size: 18,
+                          color: MeshColors.textMuted,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    _explanation(rev, maxLines: 2),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _diffLine(BriefDiffLine line) {
+    final (prefix, color, background) = switch (line.op) {
+      BriefDiffOp.added => (
+        '+ ',
+        MeshColors.statusActive,
+        MeshColors.statusActive.withValues(alpha: 0.12),
+      ),
+      BriefDiffOp.removed => (
+        '− ',
+        MeshColors.statusHalted,
+        MeshColors.statusHalted.withValues(alpha: 0.12),
+      ),
+      BriefDiffOp.same => ('  ', MeshColors.textSecondary, Colors.transparent),
+    };
+    return Container(
+      width: double.infinity,
+      color: background,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+      child: Text(
+        '$prefix${line.text}',
+        style: TextStyle(
+          color: color,
+          fontSize: 12,
+          height: 1.45,
+          fontFamily: kMonoFontFamily,
+        ),
+      ),
+    );
+  }
+
+  Widget _detail(BriefRevision rev) {
+    final diff = diffBriefLines(rev.before, rev.after);
+    return ListView(
+      key: const ValueKey('brief-revision-detail'),
+      padding: const EdgeInsets.all(16),
+      children: [
+        Wrap(
+          spacing: 8,
+          runSpacing: 6,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            _chip('Gen ${rev.generation}', current: _isCurrent(rev)),
+            if (_isCurrent(rev)) _chip('Current', current: true),
+            Text(
+              formatTs(rev.updatedAt),
+              style: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        _label('Explanation'),
+        const SizedBox(height: 6),
+        SelectionArea(child: _explanation(rev)),
+        const SizedBox(height: 16),
+        Row(
+          children: [
+            _label('Change'),
+            const SizedBox(width: 8),
+            Text(
+              _tally(diff),
+              style: const TextStyle(
+                color: MeshColors.textSecondary,
+                fontSize: 11,
+                fontFamily: kMonoFontFamily,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Container(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          decoration: BoxDecoration(
+            color: MeshColors.bgPrimary,
+            border: Border.all(color: MeshColors.border),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: SelectionArea(
+            child: Column(children: [for (final line in diff) _diffLine(line)]),
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final selected = _selected;
+    return Column(
+      children: [
+        _header(context),
+        Expanded(child: selected == null ? _list() : _detail(selected)),
+      ],
     );
   }
 }

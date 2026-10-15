@@ -32,6 +32,10 @@ import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import type { InjectRecord } from "../actor/portable-context.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
+import {
+  emptyPortableContextState,
+  PORTABLE_CONTEXT_SCHEMA_VERSION,
+} from "../actor/portable-context-state.js";
 import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
 import { RootModelConfigStartupError } from "../actor/root-model-config.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
@@ -4508,6 +4512,106 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(built.injectRecord?.runCount).toBe(1);
   });
 
+  it("seeds brief mode without a Gemini key and retains its window before and after delta enrollment", async () => {
+    let mesh: ActorMesh | undefined;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+          context: { type: "portable", mode: "brief" },
+        },
+      }),
+      "utf8"
+    );
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const foldedMessage = getRepositories().meshChat.record({
+      senderId: "operator",
+      recipientId: "root",
+      body: "Message before the preserved ledger cursor.",
+    });
+    getRepositories().meshChat.record({
+      senderId: "operator",
+      recipientId: "root",
+      body: "Message after the preserved ledger cursor.",
+    });
+    const old = emptyPortableContextState("root");
+    old.lastFoldedSourceId = foldedMessage;
+    old.items = [
+      {
+        id: "old-ledger-line",
+        kind: "decision",
+        priority: "must",
+        status: "active",
+        statement: "This old ledger line must not leak into brief mode.",
+        evidence: [
+          {
+            eventId: "old-source",
+            sender: "root",
+            ts: "2026-10-07T00:00:00.000Z",
+            quote: "old ledger",
+          },
+        ],
+        updatedAt: "2026-10-07T00:00:00.000Z",
+      },
+    ];
+    getRepositories().portableContext.save(old);
+
+    const rootActor = mesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+    for (const deltaEnrolled of [false, true]) {
+      if (deltaEnrolled)
+        mesh.enrollActorInExperiment("root", COMPACTED_MEMORY_DELTA_EXPERIMENT, "root");
+      const built = (
+        rootActor as unknown as {
+          opts: { buildPrompt: () => { prompt: string; injectRecord?: InjectRecord } };
+        }
+      ).opts.buildPrompt();
+      const prompt = built.prompt;
+      expect(prompt).toContain("## WHAT\n\n## HOW\n\n## DOMAIN\n");
+      expect(prompt).not.toContain("This old ledger line must not leak into brief mode.");
+      expect(prompt).toContain("Message before the preserved ledger cursor.");
+      expect(prompt).toContain("Message after the preserved ledger cursor.");
+      expect(built.injectRecord?.journal).toBeUndefined();
+      expect(built.injectRecord?.ledger).toBeUndefined();
+      expect(getRepositories().portableContext.load("root").lastFoldedSourceId).toBe(foldedMessage);
+      expect(getRepositories().portableContext.load("root").brief?.generation).toBe(0);
+    }
+    // A brief mount must disappear with its actor, including live HTTP access.
+    const workerId = mesh.spawn({
+      charter: "Synthetic brief worker",
+      parentId: "root",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      context: { type: "portable", mode: "brief" },
+    });
+    const worker = mesh.get(workerId) as unknown as {
+      opts: { mcpServers: Array<{ name: string; url: string }> };
+    };
+    const url = worker.opts.mcpServers.find((server) => server.name === "brief")?.url;
+    if (!url) throw new Error("brief MCP missing");
+    const client = new Client({ name: "brief-retirement", version: "0.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+    expect((await client.callTool({ name: "read", arguments: {} })).isError).not.toBe(true);
+    await client.close();
+    mesh.retire(workerId);
+    await vi.waitFor(async () => expect((await fetch(url)).status).toBe(404));
+  });
+
   it("applies the existing ledger API-key requirement to a portable root", async () => {
     let ready = false;
     writeFileSync(
@@ -8023,7 +8127,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         .all() as { actor_id: string; snapshot: string }[];
       expect(committed.map((row) => row.actor_id)).toEqual(["root"]);
       expect(JSON.parse(committed[0]?.snapshot ?? "")).toMatchObject({
-        schemaVersion: 3,
+        schemaVersion: PORTABLE_CONTEXT_SCHEMA_VERSION,
         generation: 5,
       });
 

@@ -1152,6 +1152,33 @@ describe("agent-execution MCP server", () => {
     expect(registry.get(thread_id)?.context).toMatchObject({ type: "portable", mode: "ledger" });
   });
 
+  it("spawn_thread lets an ordinary authorized spawner select brief", async () => {
+    // Brief is a supported selection like ledger and tail: any actor that may
+    // spawn can choose it for its own child, with no root-only door.
+    const { mesh, registry } = setup();
+    registry.upsert({
+      id: "worker-1",
+      charter: "worker-1",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "worker-1", "root"));
+    const { thread_id } = dataOf(
+      (await client.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "own a brief-mode trial",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+          context_mode: "brief",
+        },
+      })) as CallToolResult
+    ) as { thread_id: string };
+    const child = registry.get(thread_id);
+    expect(child?.parentId).toBe("worker-1");
+    expect(child?.context).toMatchObject({ type: "portable", mode: "brief" });
+  });
+
   it("spawn_thread leaves the record's context unset when no mode is asked for", async () => {
     // Counter-assertion to the cell above: the default must still be native, or
     // the cell above would pass for the wrong reason (everything portable).
@@ -4378,7 +4405,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         /Cannot set a modelConfig pool of more than one entry on non-portable actor/
       );
       expect((poolRefusal.content[0] as { text: string }).text).toMatch(
-        /Only portable \(ledger\/tail\) actors can use a multi-candidate pool/
+        /Only portable \(ledger\/tail\/brief\) actors can use a multi-candidate pool/
       );
 
       // Refusal 2: Cross-provider move on native actor
@@ -4394,7 +4421,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         /Cannot change provider on non-portable actor/
       );
       expect((providerRefusal.content[0] as { text: string }).text).toMatch(
-        /Only portable \(ledger\/tail\) actors can be moved across providers/
+        /Only portable \(ledger\/tail\/brief\) actors can be moved across providers/
       );
     });
 

@@ -52,6 +52,7 @@ import { runPrompts } from "./0055_run_prompts.js";
 import { actorExecutionConfig } from "./0056_actor_execution_config.js";
 import { userGoogleAccountId } from "./0058_user_google_account_id.js";
 import { obligationCompletionMatchers } from "./0059_obligation_completion_matchers.js";
+import { portableBriefRevisions } from "./0062_portable_brief_revisions.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -116,4 +117,5 @@ export const migrations: Migration[] = [
   actorExecutionConfig,
   userGoogleAccountId,
   obligationCompletionMatchers,
+  portableBriefRevisions,
 ];
