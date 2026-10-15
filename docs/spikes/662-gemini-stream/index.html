@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gemini streaming transcription prototype</title>
+<style>
+.actor[hidden],#access[hidden]{display:none}:root{color-scheme:dark;font:16px system-ui,sans-serif;background:#111820;color:#e6ecf2}body{margin:0}main{max-width:780px;margin:auto;padding:24px 18px}h1{font-size:1.45rem;margin:0 0 8px}.muted{color:#a6b3bf;font-size:.9rem}button,input{font:inherit}button{cursor:pointer;border:1px solid #526477;border-radius:12px;background:#223343;color:#e6ecf2;padding:14px 20px}button:disabled{cursor:default;opacity:.5}button:focus-visible,input:focus-visible{outline:3px solid #86d2ca;outline-offset:3px}.grid{display:flex;gap:16px;justify-content:center;margin:28px 0}.actor{display:grid;justify-items:center;gap:12px;min-width:120px}.avatar{border-radius:50%;display:grid;place-items:center;width:80px;height:80px;background:#376f91;font-size:2rem}.actor:nth-child(2) .avatar{background:#985e34}.focused .actor{min-width:190px}.focused .avatar{width:120px;height:120px}.actor.active{border-color:#69d2b1;box-shadow:0 0 0 2px #69d2b1}.panel{background:#1a2530;border:1px solid #344556;border-radius:16px;padding:20px}.transcript{white-space:pre-wrap;overflow-wrap:anywhere;min-height:160px;font-size:1.3rem;line-height:1.55}.transcript.partial{color:#c1d7e7}#status{font-weight:600;min-height:24px}#status.error{color:#ffb2a1}.controls{display:flex;justify-content:center;gap:12px;margin:16px 0;min-height:54px}.meter{height:6px;background:#344556;border-radius:8px;margin:16px 0}.meter span{display:block;height:100%;width:0;background:#69d2b1}.summary{display:flex;flex-wrap:wrap;gap:8px 18px;font-variant-numeric:tabular-nums;font-size:.9rem;color:#b2c0ce}.trial{margin:20px 0;line-height:1.6}details{margin-top:24px}pre{white-space:pre-wrap;word-break:break-word;font:12px ui-monospace,monospace;max-height:220px;overflow:auto}#access{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}input{border:1px solid #526477;border-radius:8px;background:#1a2530;color:#e6ecf2;padding:10px;max-width:100%;flex:1;min-width:160px}#download{padding:8px 12px;font-size:.9rem}.notice{color:#e1c896;font-size:.9rem}@media(max-width:400px){.actor{min-width:90px;padding:12px}main{padding:18px 12px}}
+</style>
+<script type="module" src="/client.mjs"></script>
+</head>
+<body><main>
+<h1>Live transcription</h1>
+<div class="muted">662-gemini-stream-v1 · standalone interaction prototype</div>
+<form id="access"><label for="code" class="muted">Launch access code</label><input id="code" type="password" autocomplete="off" required><button type="submit">Connect</button></form>
+<div id="actors" class="grid">
+<button type="button" class="actor" data-target="blue-kite" disabled><span class="avatar" aria-hidden="true">K</span><span>Blue Kite</span></button>
+<button type="button" class="actor" data-target="orange-boat" disabled><span class="avatar" aria-hidden="true">B</span><span>Orange Boat</span></button>
+</div>
+<div class="panel">
+<div id="status" role="status">Connect with the private launch code</div>
+<div class="meter" aria-hidden="true"><span id="level"></span></div>
+<div id="transcript" class="transcript">Tap an actor to start. Tap it again to stop.</div>
+<div class="summary"><span id="elapsed">0:00</span><span id="frames">0 audio frames</span><span id="latency">First text: — · Stop to final: —</span></div>
+</div>
+<div class="controls"><button type="button" id="stop" disabled>Stop</button><button type="button" id="cancel" disabled>Cancel</button></div>
+<div class="notice">Delivery is disabled in this prototype. Recordings are limited to four minutes.</div>
+<div class="trial"><strong>Try a pause and a correction</strong><br>“The blue kite is above the quiet garden. I said blue, blue, not green. The code is B, L, U, E.”<br>Pause for 30–120 seconds, then say: “The orange boat is beside the wooden bridge.” Only Stop should finish the session.</div>
+<button type="button" id="download">Download trial report</button>
+<details><summary>Raw event log</summary><pre id="events"></pre></details>
+</main></body></html>

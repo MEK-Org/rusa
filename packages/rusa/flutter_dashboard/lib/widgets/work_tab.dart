@@ -7,6 +7,7 @@ import '../breakpoints.dart';
 import '../dashboard_timing.dart';
 import '../link_opener.dart';
 import '../models.dart';
+import '../obligation_store.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../util.dart';
@@ -48,6 +49,7 @@ class _WorkTabState extends State<WorkTab> {
   String? _selectedObligationId;
   StreamSubscription<String?>? _focusSub;
   StreamSubscription<ObligationRefresh>? _checkpointSub;
+  StreamSubscription<ObligationEntities>? _storeSub;
   StreamSubscription<String?>? _principalSub;
   bool _showDone = false;
   bool _fetchedTerminalRoots = false;
@@ -88,6 +90,9 @@ class _WorkTabState extends State<WorkTab> {
           _loading = false;
           _isBackgroundRefreshing = false;
         });
+        // Into the shared store too, so the Overview's queue shows what this
+        // load found without a request of its own (#992).
+        widget.store.obligations.upsert(_obligationsIn(forest.trees));
         // Focus-link and Show Done requests include terminal roots. Persist only
         // the default terminal-excluding forest so a later default view cannot
         // paint rows it believes it did not fetch.
@@ -296,6 +301,9 @@ class _WorkTabState extends State<WorkTab> {
     _checkpointSub = widget.store.obligationRefreshes.listen((_) {
       _handleMutation();
     });
+    _storeSub = widget.store.obligations.entities.skip(1).listen((_) {
+      if (mounted) setState(() {});
+    });
     // When the viewing principal changes, refresh labels and re-seed or clear
     // the cached tree for that principal.
     _principalSub = widget.store.dashboardConfig
@@ -329,36 +337,57 @@ class _WorkTabState extends State<WorkTab> {
   void dispose() {
     _focusSub?.cancel();
     _checkpointSub?.cancel();
+    _storeSub?.cancel();
     _principalSub?.cancel();
     super.dispose();
+  }
+
+  static Iterable<ObligationDto> _obligationsIn(
+    List<ObligationTreeDto> nodes,
+  ) sync* {
+    for (final node in nodes) {
+      yield node.obligation;
+      yield* _obligationsIn(node.children);
+    }
+  }
+
+  /// The tree's shape comes from the last forest load; each row shows the
+  /// shared store's copy of its obligation, so a refresh behind another view
+  /// updates the row (#992). Every load writes its rows to the store first,
+  /// so the loaded copy only shows where it is the later write, as a forest
+  /// replayed from its own capture can be.
+  ObligationDto _latest(ObligationDto loaded) {
+    final shared = widget.store.obligations[loaded.id];
+    return shared != null && ObligationStore.isCurrent(shared, than: loaded)
+        ? shared
+        : loaded;
   }
 
   List<_FlatNode> _flattenTree(List<ObligationTreeDto> nodes, int depth) {
     final result = <_FlatNode>[];
     for (final node in nodes) {
+      final obligation = _latest(node.obligation);
       // A terminal obligation still shows if it retains completion history —
       // the same "recurring, or ledger rows survived recurrence being turned
       // off" test the detail panel uses to decide whether to render the
       // COMPLETION HISTORY section at all.
       final visible =
           _showDone ||
-          !node.obligation.isTerminal ||
-          node.obligation.isRecurring ||
-          node.obligation.hasCompletionHistory;
+          !obligation.isTerminal ||
+          obligation.isRecurring ||
+          obligation.hasCompletionHistory;
       if (!visible) continue;
-      final id = node.obligation.id;
+      final id = obligation.id;
       final hasVisibleChildren = _showDone
           ? node.children.isNotEmpty
-          : node.children.any(
-              (c) =>
-                  !c.obligation.isTerminal ||
-                  c.obligation.isRecurring ||
-                  c.obligation.hasCompletionHistory,
-            );
+          : node.children
+                .map((c) => _latest(c.obligation))
+                .any(
+                  (c) =>
+                      !c.isTerminal || c.isRecurring || c.hasCompletionHistory,
+                );
       final isCollapsed = !_expandedIds.contains(id);
-      result.add(
-        _FlatNode(node.obligation, depth, hasVisibleChildren, isCollapsed),
-      );
+      result.add(_FlatNode(obligation, depth, hasVisibleChildren, isCollapsed));
       if (hasVisibleChildren && !isCollapsed) {
         result.addAll(_flattenTree(node.children, depth + 1));
       }
@@ -847,6 +876,8 @@ class _DetailViewState extends State<_DetailView> {
   /// children and dependency edges (#773).
   Set<String> _shownIds = const {};
 
+  StreamSubscription<ObligationDto?>? _sharedSub;
+
   DashboardStore get store => widget.store;
   ValueChanged<DashboardView> get onSelectView => widget.onSelectView;
 
@@ -864,6 +895,31 @@ class _DetailViewState extends State<_DetailView> {
     super.initState();
     _fetch(trackDetail: true);
     _checkpointSub = widget.store.obligationRefreshes.listen(_onRefresh);
+    _listenToShared();
+  }
+
+  /// Repaints when the shared store's copy of this obligation changes, so a
+  /// refresh behind another view updates the header (#992).
+  void _listenToShared() {
+    _sharedSub?.cancel();
+    _sharedSub = widget.store.obligations.entities
+        .map((e) => e.byId[widget.obligationId])
+        .distinct(identical)
+        .skip(1)
+        .listen((_) {
+          if (mounted) setState(() {});
+        });
+  }
+
+  /// [data] showing the shared store's copy of its obligation where that is
+  /// not an earlier write than the one the detail read.
+  ObligationDetailSnapshot _withShared(ObligationDetailSnapshot data) {
+    final shared = store.obligations[data.obligation.id];
+    return shared == null ||
+            identical(shared, data.obligation) ||
+            !ObligationStore.isCurrent(shared, than: data.obligation)
+        ? data
+        : data.withObligation(shared);
   }
 
   @override
@@ -872,6 +928,10 @@ class _DetailViewState extends State<_DetailView> {
     if (oldWidget.store != widget.store) {
       _checkpointSub?.cancel();
       _checkpointSub = widget.store.obligationRefreshes.listen(_onRefresh);
+    }
+    if (oldWidget.store != widget.store ||
+        oldWidget.obligationId != widget.obligationId) {
+      _listenToShared();
     }
     if (oldWidget.obligationId != widget.obligationId) {
       _shownIds = const {};
@@ -896,6 +956,7 @@ class _DetailViewState extends State<_DetailView> {
   @override
   void dispose() {
     _checkpointSub?.cancel();
+    _sharedSub?.cancel();
     _pendingRetry?.cancel();
     super.dispose();
   }
@@ -1034,6 +1095,7 @@ class _DetailViewState extends State<_DetailView> {
       if (!mounted || gen != _fetchGeneration) {
         throw StateError('Obligation detail fetch superseded or unmounted');
       }
+      store.obligations.upsert([data.obligation]);
       _shownIds = _idsOf(data);
       setState(() {
         _history = data.history;
@@ -1111,6 +1173,7 @@ class _DetailViewState extends State<_DetailView> {
     future
         .then((data) {
           if (!mounted || gen != _fetchGeneration) return;
+          store.obligations.upsert([data.obligation]);
           _shownIds = _idsOf(data);
           setState(() => _applyRefreshed(data));
         })
@@ -1160,7 +1223,7 @@ class _DetailViewState extends State<_DetailView> {
           return const Center(child: CircularProgressIndicator());
         }
 
-        final data = snapshot.data!;
+        final data = _withShared(snapshot.data!);
         final o = data.obligation;
 
         final description = Column(

@@ -85,7 +85,7 @@ const modelClassReferenceSchema = z.strictObject({
  * A single provider/model/effort choice, an ordered pool of acceptable choices
  * tried earliest-available first, or a reference to a named model class that
  * expands to such a pool. A pool longer than one entry requires a portable
- * (ledger/tail) actor — a native provider session can't move between
+ * (ledger/tail/brief) actor — a native provider session can't move between
  * candidates.
  */
 const modelConfigSchema = z.union([
@@ -258,7 +258,7 @@ export function createAgentExecMcpServer(
             "What the new actor owns — its standing brief, authored by you. Include its full scope: the repo(s) to work in (it clones them itself), the deliverable, and whether it should open one PR or several."
           ),
         model_config: modelConfigSchema.describe(
-          "Required. Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires context_mode 'ledger' or 'tail', since a native provider session can't move between candidates. `{\"class\": \"<name>\"}` instead names a runtime-managed model class and expands to its currently committed pool (same portability rule). There is no default: choose the child's model deliberately, and a native spawn must declare exactly one entry."
+          "Required. Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires a portable context_mode ('ledger', 'tail' or 'brief'), since a native provider session can't move between candidates. `{\"class\": \"<name>\"}` instead names a runtime-managed model class and expands to its currently committed pool (same portability rule). There is no default: choose the child's model deliberately, and a native spawn must declare exactly one entry."
         ),
         conversation_id: z
           .string()
@@ -276,7 +276,7 @@ export function createAgentExecMcpServer(
           .enum(CONTEXT_SELECTIONS)
           .optional()
           .describe(
-            "Who owns the child's memory between runs. Omit (or 'native') for the default: the provider keeps the session and resumes it. 'ledger' and 'tail' hand ownership to the mesh — the child is called FRESH every run with its own recent history injected into the prompt, so it survives provider quota exhaustion and can be re-mounted on a different harness. 'ledger' keeps a rolling compacted digest plus recent messages and is the one to reach for; 'tail' is a raw window that never compacts. Incompatible with conversation_id."
+            "Who owns the child's memory between runs. Omit (or 'native') for the default: the provider keeps the session and resumes it. 'ledger' and 'tail' hand ownership to the mesh — the child is called FRESH every run with its own recent history injected into the prompt, so it survives provider quota exhaustion and can be re-mounted on a different harness. 'ledger' keeps a rolling compacted digest plus recent messages and is the one to reach for; 'tail' is a raw window that never compacts. 'brief' instead injects a WHAT/HOW/DOMAIN brief that the child maintains itself, with every claim citing its source, plus its recent journal; nothing writes the brief for it, so it starts from the charter and grows only by the child's own cited edits. Incompatible with conversation_id."
           ),
         target: z
           .string()
@@ -793,7 +793,7 @@ export function createAgentExecMcpServer(
     {
       title: "Set an event source's configuration",
       description:
-        "Replace the configuration object on an event source whose active exact ownership row is yours, or pass null to clear it. Configuration does not materialize a source or change routing: use exact-source delegation or reclaim to establish the row first. A live obligation claim does not grant access to another row's configuration. Consumer-specific keys apply from the next event; Google Chat wake mode uses { version: 1, chatWakeMode: 'mentions' | 'all' }, check-suite completion delivery uses { version: 1, checkSuiteCompletionMode: 'failures-only' | 'all-outcomes' }, and null restores built-in defaults.",
+        "Replace the configuration object on an event source whose active exact ownership row is yours, or pass null to clear it. Configuration does not materialize a source or change routing: use exact-source delegation or reclaim to establish the row first. A live obligation claim does not grant access to another row's configuration. Consumer-specific keys apply from the next event; Google Chat and Slack wake modes use { version: 1, chatWakeMode: 'mentions' | 'all' } on an exact gchat:spaces/<id> or slack:channels/<id> source (it filters delivered events; it cannot add Slack scopes, membership, or subscriptions), check-suite completion delivery uses { version: 1, checkSuiteCompletionMode: 'failures-only' | 'all-outcomes' }, and null restores built-in defaults.",
       inputSchema: {
         ...eventResourceInputSchema,
         config: z
@@ -916,7 +916,7 @@ export function createAgentExecMcpServer(
     {
       title: "Grant a capability to an actor",
       description:
-        "Grant an allow-listed capability to a specific actor by its thread id. As root you may grant any grantable capability (e.g. 'understanding-write'); as a non-root actor you may grant only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key'; any other 'secret:<filename>' is root-only) and only to your DIRECT children. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths; kebab-case secret names also export an environment variable (e.g. 'secret:mistral-api-key' exports MISTRAL_API_KEY). Idempotent. Takes effect on a live grantee's next run, or when a retired grantee is next revived. Rejected if the capability isn't grantable, fails containment checks, or you lack authority over the grantee.",
+        "Grant an allow-listed capability to a specific actor by its thread id. A 'capability-admin' holder may grant any grantable capability within its own subtree (e.g. 'understanding-write', or 'obligation-responsive', which lets the grantee start responsive obligation branches only on obligations it may already manage); without 'capability-admin' you may grant only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key'; any other 'secret:<filename>' needs a 'capability-admin' holder) and only to your DIRECT children. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths; kebab-case secret names also export an environment variable (e.g. 'secret:mistral-api-key' exports MISTRAL_API_KEY). Idempotent. Takes effect on a live grantee's next run, or when a retired grantee is next revived; 'obligation-responsive' is instead checked on every obligation tool call, so it takes effect immediately, even in an open session. Rejected if the capability isn't grantable, fails containment checks, or you lack authority over the grantee.",
       inputSchema: {
         actor_id: z.string().describe("The grantee actor's thread id."),
         capability: z
@@ -939,7 +939,7 @@ export function createAgentExecMcpServer(
     {
       title: "Revoke a capability from an actor",
       description:
-        "Revoke a previously-granted capability from an actor by its thread id. As root you may revoke any grant; as a non-root actor you may revoke only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key') and only from your DIRECT children. No-op if the grant isn't active. Takes effect on the actor's next run/(re)construction.",
+        "Revoke a previously-granted capability from an actor by its thread id. A 'capability-admin' holder may revoke any grant within its own subtree; without 'capability-admin' you may revoke only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key') and only from your DIRECT children. No-op if the grant isn't active. Takes effect on the actor's next run/(re)construction; 'obligation-responsive' is instead checked on every obligation tool call, so its revocation takes effect immediately, even in an open session.",
       inputSchema: {
         actor_id: z.string().describe("The actor's thread id to revoke from."),
         capability: z.string().describe("The capability to revoke."),
@@ -963,7 +963,7 @@ export function createAgentExecMcpServer(
         "Replace an existing actor's declared provider/model/effort pool in-place in the actor repository without service restart — " +
         "a full replacement of the pool, not a per-field patch. " +
         "Allowed for the actor's parent, or root for any actor including itself. If a run is in flight, it finishes on its current pool and the change applies and persists when that run ends; an idle or queued actor has the change applied and persisted immediately, and queued work is re-admitted against the new pool. " +
-        "A pool of more than one entry, or a change of provider, is only permitted for portable (ledger/tail) actors. " +
+        "A pool of more than one entry, or a change of provider, is only permitted for portable (ledger/tail/brief) actors. " +
         "Preserves the actor's accumulated context and session history.",
       inputSchema: {
         actor_id: z.string().describe("The actor's thread id (or direct child handle) to update."),

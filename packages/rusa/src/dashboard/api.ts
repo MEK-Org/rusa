@@ -6,6 +6,7 @@ import { resolveContextSelection } from "../actor/context-selection.js";
 import type { HaltState } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { inboxEntryObligationRefs } from "../actor/inbox-focus.js";
+import type { PortableBriefStore, PortableContextStore } from "../actor/portable-context-state.js";
 import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
@@ -88,6 +89,8 @@ export interface DashboardDataDeps {
   /** Completed selection intervals used only to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
   runPrompts?: RunPromptRepository;
+  portableContext?: Pick<PortableContextStore, "load"> &
+    Pick<PortableBriefStore, "listBriefRevisions">;
   /** Durable per-entry obligation associations for activity correlation. */
   inboxFocus?: InboxFocusRepository;
   sseHub: SseHub;
@@ -620,6 +623,30 @@ function parsePositiveInt(url: URL, name: string): number | undefined {
 function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
   const requested = parsePositiveInt(url, "limit") ?? DEFAULT_LIMIT;
   return Math.min(requested, maxLimit);
+}
+
+/**
+ * The ancestors of a page's rows, each once and none that is itself a row.
+ * Every ancestor is read at most once, so the reads stay within the page's
+ * distinct ancestry however many rows share it, and a cycle ends the walk.
+ */
+function pageAncestors(
+  obligations: Pick<ObligationRepository, "get">,
+  rows: readonly Obligation[]
+): Obligation[] {
+  const seen = new Set(rows.map((row) => row.id));
+  const ancestors: Obligation[] = [];
+  for (const row of rows) {
+    let parentId = row.parentId;
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId);
+      const parent = obligations.get(parentId);
+      if (!parent) break;
+      ancestors.push(parent);
+      parentId = parent.parentId;
+    }
+  }
+  return ancestors;
 }
 
 /**
@@ -2063,7 +2090,25 @@ export async function handleMeshApiRequest(
       sendJson(res, 404, { error: "thread not found" });
       return true;
     }
-    sendJson(res, 200, { id: thread.id, charter: thread.charter });
+    const briefMode = thread.context?.type === "portable" && thread.context.mode === "brief";
+    const brief = briefMode ? deps.portableContext?.load(thread.id).brief : null;
+    sendJson(res, 200, {
+      id: thread.id,
+      charter: thread.charter,
+      ...(briefMode
+        ? {
+            briefMode: true,
+            brief: brief?.text ?? null,
+            briefGeneration: brief?.generation ?? null,
+            briefUpdatedAt: brief?.updatedAt ?? null,
+            // The latest ten accepted writes, newest first; the history table
+            // keeps every one, this is only the view's page.
+            briefRevisions: brief
+              ? (deps.portableContext?.listBriefRevisions(thread.id, 10) ?? [])
+              : [],
+          }
+        : {}),
+    });
     return true;
   }
 
@@ -2385,6 +2430,14 @@ export async function handleMeshApiRequest(
       limit,
       offset,
     });
+    // `ancestors=true` (My Queue, #1076) adds every row's ancestors to the
+    // page once each, so the client can draw each row's path from the page it
+    // already asked for instead of one detail read per row.
+    const rawAncestors = url.searchParams.get("ancestors");
+    if (rawAncestors === "true" || rawAncestors === "1") {
+      sendJson(res, 200, { ...page, ancestors: pageAncestors(deps.obligations, page.obligations) });
+      return true;
+    }
     sendJson(res, 200, page);
     return true;
   }

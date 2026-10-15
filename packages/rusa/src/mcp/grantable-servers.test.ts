@@ -7,6 +7,7 @@ import { FakeChatClient } from "../chat/fake.js";
 import { createSelectedInboxEntriesAccessor } from "../commands/start.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
+import { SlackClient } from "../slack/slack-client.js";
 import type { DistillerState } from "../understanding/distiller-cursor.js";
 import {
   buildGrantableServers,
@@ -491,6 +492,41 @@ describe("grantable capabilities allow-list ", () => {
       arguments: { spaceName: "spaces/A", text: "hi", threadName: "spaces/A/threads/M1" },
     });
     expect(fakeChatClient.sent[0]?.threadName).toBeUndefined();
+  });
+
+  it("wires selectedInboxEntriesForActor to slack-write reply placement", async () => {
+    const slackClient = new SlackClient("xoxb-synthetic");
+    const send = vi.fn(async () => "9.9");
+    slackClient.send = send;
+    const threadReply: InboxEntry = {
+      id: "e-slack",
+      actorId: "actor-1",
+      source: "slack:channels/C1",
+      deliveredAt: new Date(),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: { type: "slack.message", channel: "C1", ts: "2.000001", threadTs: "1.000001" },
+    };
+    const servers = buildGrantableServers({
+      ...STUB_DEPS,
+      slackClient,
+      selectedInboxEntriesForActor: (actorId) => (actorId === "actor-1" ? [threadReply] : []),
+    });
+    const slackWriteFactory = servers.get("slack-write");
+    if (!slackWriteFactory) throw new Error("expected slack-write factory");
+    for (const actorId of ["actor-1", "actor-2"]) {
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await slackWriteFactory(actorId, ["C1"]).connect(serverTransport);
+      const client = new Client({ name: "test", version: "0.0.0" });
+      await client.connect(clientTransport);
+      await client.callTool({ name: "send_message", arguments: { channel: "C1", text: "hi" } });
+    }
+    // Text carries #1035's footer; this test pins placement only.
+    expect(send.mock.calls).toEqual([
+      ["C1", expect.stringMatching(/^hi\n/), "1.000001"],
+      ["C1", expect.stringMatching(/^hi\n/), undefined],
+    ]);
   });
 
   it("integrates createSelectedInboxEntriesAccessor with grantable chat-write and routes replies", async () => {

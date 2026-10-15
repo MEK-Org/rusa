@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "@google/genai";
 import { parse as parseToml } from "smol-toml";
+import { generateGeminiContent } from "../observability/gemini-usage.js";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
 import { parseCodexModel } from "./reasoning-effort.js";
 
@@ -120,7 +121,7 @@ export async function extractModelCatalog(
 
   try {
     const client = getGeminiClient(apiKey);
-    const response = await client.models.generateContent({
+    const response = await generateGeminiContent(client, "model_catalog_parse", {
       model: "gemini-3.5-flash-lite",
       contents: `Extract the model catalog for provider '${descriptor.provider}' from this raw enumeration output:\n\n${rawOutput}`,
       config: {

@@ -262,16 +262,17 @@ async function resolveSlack(
     return unresolved(reference, reference.key, "unrecognised Slack resource");
   }
   const found = await deps.slackClient.getMessage(channel, messagePart[1]);
+  const text = found.text ?? "";
   return {
     ref: reference.key,
     scheme: reference.scheme,
     title: `Slack message in ${channel}`,
-    body: found.text,
+    body: text,
     author: found.user ?? null,
     timestamp: new Date(Number(found.ts) * 1000).toISOString(),
     url: referenceUrl(reference),
-    unavailable: found.text ? null : "message has no text",
-    entity: { type: "slack_message", contents: found.text },
+    unavailable: text ? null : "message has no text",
+    entity: { type: "slack_message", contents: text },
   };
 }
 

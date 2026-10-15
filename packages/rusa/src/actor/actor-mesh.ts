@@ -1,9 +1,5 @@
 import { randomUUID } from "node:crypto";
-import {
-  type ChatWakeMode,
-  chatWakeModeFromConfig,
-  tryChatSpaceResource,
-} from "../chat/wake-mode.js";
+import { type ChatWakeMode, chatWakeModeFromConfig } from "../chat/wake-mode.js";
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
@@ -28,6 +24,7 @@ import {
 } from "../providers/model-config.js";
 import type { AbortReason } from "../providers/termination-attribution.js";
 import type { RunResult } from "../providers/types.js";
+import { parseReference } from "../references/reference.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import {
   EmptyInboxRepository,
@@ -997,7 +994,13 @@ export class ActorMesh {
   }
 
   private readonly selectedInboxEntryIds = new Map<string, string[]>();
-  /** Actors currently inside a run, for the ready-head window below. */
+  /**
+   * Actors whose own run has started and not yet ended, for the ready-head
+   * window below. A run that is only queued — behind the concurrency cap or in
+   * provider pacing — is outside it: nothing it has done can have moved the
+   * head, and nothing would read a buffered transition until the queue drained,
+   * so its head attention lands at once (#1071).
+   */
   private readonly actorsInRun = new Set<string>();
   /**
    * Ready-head churn observed while an actor is mid-run, collapsed at run end
@@ -1298,6 +1301,9 @@ export class ActorMesh {
         {
           onQueued: (event) => {
             this.actorQueued(event.actorId, event);
+          },
+          onStart: (event) => {
+            this.actorStarted(event.actorId);
           },
           onEnd: (event) => {
             if (event.terminal.kind === "result") {
@@ -1867,11 +1873,6 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
     this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
-    // Open the run-scoped head window. An actor absent from this set delivers
-    // head attention immediately, which is what every non-run producer wants.
-    this.actorsInRun.add(actorId);
-    this.runHeadNet.delete(actorId);
-    this.runResponsiveReadyAttention.delete(actorId);
     const entries = context.mode === "ordinary" ? this.markInboxSeen(actorId) : [];
     try {
       this.onQueued?.(actorId, context);
@@ -1879,6 +1880,19 @@ export class ActorMesh {
       this.log(`onQueued(${actorId}) failed: ${err instanceof Error ? err.message : String(err)}`);
     }
     return entries;
+  }
+
+  /**
+   * Lifecycle boundary where the run's provider work begins: open the
+   * run-scoped head window. An actor absent from the window — idle, or only
+   * queued — delivers head attention immediately, which is what every non-run
+   * producer wants (#1071).
+   */
+  actorStarted(actorId: string): void {
+    actorId = this.resolveThreadId(actorId);
+    this.actorsInRun.add(actorId);
+    this.runHeadNet.delete(actorId);
+    this.runResponsiveReadyAttention.delete(actorId);
   }
 
   private markInboxSeen(actorId: string): InboxEntry[] {
@@ -2640,9 +2654,15 @@ export class ActorMesh {
     this.actorsInRun.delete(actorId);
     const net = this.runHeadNet.get(actorId);
     this.runHeadNet.delete(actorId);
-    // Nothing moved, it settled back where it started, or it ended with no head
-    // at all — in the last case there is no obligation to point the actor at.
-    if (!net || net.to === null || net.to.id === net.from) return;
+    if (!net) return;
+    // It settled back where it started, or it ended with no head at all — in
+    // the last case there is no obligation to point the actor at.
+    if (net.to === null || net.to.id === net.from) {
+      this.log(
+        `ready-head attention for ${actorId} suppressed at run end: net ${net.from ?? "none"} -> ${net.to?.id ?? "none"}`
+      );
+      return;
+    }
     this.appendReadyHeadEntry(actorId, net.to, net.from, null, net.epoch);
   }
 
@@ -4016,19 +4036,29 @@ export class ActorMesh {
   }
 
   /**
-   * The stored wake mode of a Google Chat space, or `undefined` when the space
-   * follows the built-in default (#692). Read by chat ingestion for every
-   * arriving message, so a change governs the next message; the host is the
-   * caller, so no ownership check applies here.
+   * The stored wake mode of one Google Chat space or Slack conversation, or
+   * `undefined` when it follows its integration's default (#692, #1037).
+   * Callers supply `gchat:spaces/<id>` or `slack:channels/<id>`.
+   * Only the exact conversation row counts, without
+   * inheriting a parent, thread, or global policy. Read for every arrival, so
+   * a change governs the next message; the host is the caller, so no ownership
+   * check applies here.
    *
-   * An unexpected or unparseable inbound space name cannot have a stored mode;
+   * An unexpected or unparseable inbound conversation cannot have a stored mode;
    * it falls back safely to `undefined` so ingestion keeps the built-in default
    * without throwing before the emergency halt brake (#695 review).
    */
-  chatWakeModeFor(space: EventResource): ChatWakeMode | undefined {
-    const resource = tryChatSpaceResource(space);
-    if (!resource) return undefined;
-    return chatWakeModeFromConfig(this.eventSourceOwners.getConfig(resource));
+  chatWakeModeFor(conversation: EventResource): ChatWakeMode | undefined {
+    let ref: ReturnType<typeof parseReference>;
+    try {
+      ref = parseReference(conversation);
+    } catch {
+      return undefined;
+    }
+    const collection =
+      ref.scheme === "gchat" ? "spaces" : ref.scheme === "slack" ? "channels" : undefined;
+    if (ref.segments.length !== 2 || ref.segments[0] !== collection) return undefined;
+    return chatWakeModeFromConfig(this.eventSourceOwners.getConfig(ref.key));
   }
 
   /**
@@ -5175,7 +5205,7 @@ export class ActorMesh {
    * any thread in its subtree, itself included; any other caller may only set
    * the model for its own descendants (and never its own).
    * A pool of more than one entry, or a change of provider, requires a
-   * portable (ledger/tail) actor — a native provider session can't move.
+   * portable (ledger/tail/brief) actor — a native provider session can't move.
    * The replacement is atomic (the whole pool or nothing). A run already in
    * flight keeps its launched pool and the replacement applies when that run
    * ends; an idle or queued actor has it applied and persisted now (#652), so
@@ -5220,7 +5250,7 @@ export class ActorMesh {
     const portable = record.context?.type === "portable";
     if (validated.length > 1 && !portable) {
       throw new Error(
-        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can use a multi-candidate pool.`
+        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail/brief) actors can use a multi-candidate pool.`
       );
     }
     const currentProvider = record.modelConfig?.[0]?.provider;
@@ -5231,7 +5261,7 @@ export class ActorMesh {
       validated[0].provider !== currentProvider
     ) {
       throw new Error(
-        `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can be moved across providers.`
+        `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail/brief) actors can be moved across providers.`
       );
     }
     // Boundary contract (#199, #652): an in-flight run completes on its

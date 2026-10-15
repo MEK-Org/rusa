@@ -384,6 +384,30 @@ class FakeApi extends DashboardApi {
   /// preview rather than empty: the route reads the same field the list clipped,
   /// so it cannot answer with less than the list already carried.
   final charters = <String, String>{};
+  final briefs = <String, String?>{};
+  final briefGenerations = <String, int?>{};
+  final briefUpdatedAts = <String, String?>{};
+  final briefRevisions = <String, List<BriefRevision>>{};
+
+  @override
+  Future<
+    ({
+      String charter,
+      bool briefMode,
+      String? brief,
+      int? briefGeneration,
+      String? briefUpdatedAt,
+      List<BriefRevision> briefRevisions,
+    })
+  >
+  fetchActorInfo(String threadId) async => (
+    charter: await fetchCharter(threadId),
+    briefMode: briefs.containsKey(threadId),
+    brief: briefs[threadId],
+    briefGeneration: briefGenerations[threadId],
+    briefUpdatedAt: briefUpdatedAts[threadId],
+    briefRevisions: briefRevisions[threadId] ?? const [],
+  );
   final charterCalls = <String>[];
   Object? charterError;
 
@@ -765,11 +789,27 @@ class FakeApi extends DashboardApi {
   final reparentCalls = <({String id, String? parentId})>[];
   final reassignCalls = <({String id, String ownerId, String? message})>[];
   final fetchObligationsCalls =
-      <({String? ownerId, String? status, String? queue, bool? rootsOnly})>[];
+      <
+        ({
+          String? ownerId,
+          String? status,
+          String? queue,
+          bool? rootsOnly,
+          bool ancestors,
+        })
+      >[];
 
-  /// When set, pages are cut to `limit ?? obligationPageLimit` rows in
-  /// [obligationsResult] order, like the server's default page limit.
+  /// When set, pages are cut to this many rows, or fewer if the request asked
+  /// for fewer, in [obligationsResult] order, like the server's page limit.
   int? obligationPageLimit;
+
+  /// Holds every queue-page request (`queue` set, as Overview's My Queue
+  /// sends) until completed. The page is computed when the call is made, so
+  /// a held request returns the data as it stood then, like a slow response.
+  Completer<void>? obligationQueuePagesGate;
+
+  /// Thrown by queue-page requests (after any gate) while set.
+  Object? obligationQueuePagesError;
 
   @override
   Future<ObligationPage> fetchObligations({
@@ -779,12 +819,14 @@ class FakeApi extends DashboardApi {
     bool? rootsOnly,
     int? limit,
     int? offset,
+    bool ancestors = false,
   }) async {
     fetchObligationsCalls.add((
       ownerId: ownerId,
       status: status,
       queue: queue,
       rootsOnly: rootsOnly,
+      ancestors: ancestors,
     ));
     var list = obligationsResult;
     if (ownerId != null) {
@@ -806,16 +848,50 @@ class FakeApi extends DashboardApi {
       list = list.where((o) => o.parentId == null).toList();
     }
     final total = list.length;
-    final pageLimit = limit ?? obligationPageLimit;
+    final pageLimit = switch ((limit, obligationPageLimit)) {
+      (final asked?, final max?) => asked < max ? asked : max,
+      (final asked, final max) => asked ?? max,
+    };
     if (pageLimit != null && list.length > pageLimit) {
       list = list.take(pageLimit).toList();
+    }
+    if (queue != null) {
+      final gate = obligationQueuePagesGate;
+      if (gate != null) await gate.future;
+      final error = obligationQueuePagesError;
+      if (error != null) throw error;
     }
     return ObligationPage(
       obligations: list,
       total: total,
       hasMore: list.length < total,
+      ancestors: ancestors ? _pageAncestors(list) : const [],
     );
   }
+
+  /// Mirrors the server's `ancestors=true`: each row's ancestors in
+  /// [obligationsResult], once each and none that is a row.
+  List<ObligationDto> _pageAncestors(List<ObligationDto> rows) {
+    final byId = {for (final o in obligationsResult) o.id: o};
+    final seen = {for (final o in rows) o.id};
+    final out = <ObligationDto>[];
+    for (final row in rows) {
+      var parentId = row.parentId;
+      while (parentId != null && seen.add(parentId)) {
+        final parent = byId[parentId];
+        if (parent == null) break;
+        out.add(parent);
+        parentId = parent.parentId;
+      }
+    }
+    return out;
+  }
+
+  /// Holds every obligation detail request until completed.
+  Completer<void>? obligationDetailGate;
+
+  /// Thrown by the detail request for each id (after any gate).
+  Map<String, Object> obligationDetailErrors = {};
 
   ObligationDetailSnapshot Function(String id, String? historyBefore)?
   obligationDetailByHistory;
@@ -832,6 +908,9 @@ class FakeApi extends DashboardApi {
     int? limit,
   }) async {
     obligationDetailCallCount++;
+    final detailGate = obligationDetailGate;
+    if (detailGate != null) await detailGate.future;
+    if (obligationDetailErrors[id] case final error?) throw error;
     if (obligationDetailByHistory != null) {
       return obligationDetailByHistory!(id, historyBefore);
     }
@@ -1350,10 +1429,37 @@ class FakeObligationsCache implements ObligationsCache {
     invalidateCount++;
   }
 
+  /// Shared obligation store captures (#992), keyed like [_entries].
+  final Map<String, PersistedObligationEntitiesSnapshot> entityEntries = {};
+  int entitySaveCount = 0;
+  int entityInvalidateCount = 0;
+
+  @override
+  PersistedObligationEntitiesSnapshot? loadEntities({
+    required String scope,
+    required String principalId,
+  }) => entityEntries['$scope.$principalId'];
+
+  @override
+  void saveEntities(PersistedObligationEntitiesSnapshot snapshot) {
+    entityEntries['${snapshot.scope}.${snapshot.principalId}'] = snapshot;
+    entitySaveCount++;
+  }
+
+  @override
+  void invalidateEntities({
+    required String scope,
+    required String principalId,
+  }) {
+    entityEntries.remove('$scope.$principalId');
+    entityInvalidateCount++;
+  }
+
   @override
   void clear() {
     stored = null;
     _entries.clear();
+    entityEntries.clear();
     clearCount++;
   }
 }

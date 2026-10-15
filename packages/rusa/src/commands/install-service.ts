@@ -48,7 +48,7 @@ import {
   readUnitEnvironment,
   resolveExecutableOnPath,
   resolveExecutableSource,
-  resolvePathEnvForUnit,
+  resolveInstanceUnitPathEnv,
   resolvePathForUnit,
   resolveRepoRoot,
   resolveServiceDashboardUrl,
@@ -694,7 +694,15 @@ function installSingleRusaService(opts: {
     opts.executableSource ?? resolveExecutableSource(deploymentMode, opts.repoPath);
   const cliPath = resolvePathForUnit(executableSource.cliPath);
   const nodePath = resolvePathForUnit(executableSource.nodePath);
-  const userPath = resolvePathEnvForUnit();
+  // #986: a reapply keeps the PATH the installed unit already runs with and
+  // only appends this shell's directories, so installing from a narrow shell
+  // can no longer strip provider CLIs out of the next restart.
+  const installedUnitFile = join(opts.systemdUserDir, instance.serviceUnit);
+  const installedUnit = existsSync(installedUnitFile)
+    ? readFileSync(installedUnitFile, "utf-8")
+    : null;
+  const unitPathEnv = resolveInstanceUnitPathEnv(instance.serviceUnit, installedUnit);
+  const userPath = unitPathEnv.path;
   const config = loadConfig(instance.mcHome);
 
   // ── ISSUE_NUM phase 1c: cron-backed nightly wake ──

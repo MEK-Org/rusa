@@ -493,12 +493,13 @@ Future<void> showReassignObligationDialog(
                           .map((a) => a.id);
                       final resolvedId = matches.isNotEmpty ? matches.first : typedText;
 
-                      await store.api.reassignObligation(
-                        obligation.id,
-                        ownerId: resolvedId,
-                        message: messageCtrl.text.trim(),
+                      await store.mutateObligations(
+                        () => store.api.reassignObligation(
+                          obligation.id,
+                          ownerId: resolvedId,
+                          message: messageCtrl.text.trim(),
+                        ),
                       );
-                      store.invalidateObligationsCache();
                       if (context.mounted) {
                         Navigator.of(dialogContext).pop();
                         ScaffoldMessenger.of(context).showSnackBar(

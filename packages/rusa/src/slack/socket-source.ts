@@ -1,17 +1,31 @@
 import { SocketModeClient } from "@slack/socket-mode";
-import type { DurableEventDelivery } from "../runtime/event-manager.js";
+import type { ChatWakeMode } from "../chat/wake-mode.js";
+import type { DurableEventDelivery, RawSlackIntegrationEvent } from "../runtime/event-manager.js";
+import {
+  mentionsSlackUser,
+  type SlackWakeFacts,
+  slackConversationKind,
+  slackMessageWakes,
+} from "./wake-mode.js";
 
-export interface SlackInboundMessage {
+export interface SlackInboundMessage extends SlackWakeFacts {
   channel: string;
   ts: string;
   text: string;
   user: string;
   threadTs?: string;
-  isDirectMessage: boolean;
+  /** The envelope that carried this message, kept for diagnostics only. */
   eventId: string;
 }
 
-export function parseSlackEvent(body: unknown): SlackInboundMessage | null {
+/**
+ * Normalize one Events API envelope into the message it carries, or `null`
+ * when it is not a human message this source handles: another event type, an
+ * edit/delete/system subtype, a bot or the installed bot itself, or an ordinary
+ * message from a conversation type this source does not support. Wake policy
+ * is applied separately, by {@link slackMessageWakes}.
+ */
+export function parseSlackEvent(body: unknown, selfUserId?: string): SlackInboundMessage | null {
   if (!body || typeof body !== "object") return null;
   const envelope = body as {
     event_id?: string;
@@ -29,16 +43,102 @@ export function parseSlackEvent(body: unknown): SlackInboundMessage | null {
   };
   const event = envelope.event;
   if (!event || (event.type !== "app_mention" && event.type !== "message")) return null;
-  if (event.type === "message" && event.channel_type !== "im") return null;
   if (event.subtype || event.bot_id || !event.user || !event.channel || !event.ts) return null;
+  if (selfUserId && event.user === selfUserId) return null;
+  const conversationKind = slackConversationKind(event.channel_type);
+  if (event.type === "message" && conversationKind === undefined) return null;
+  const text = typeof event.text === "string" ? event.text : "";
   return {
     channel: event.channel,
     ts: event.ts,
-    text: event.text ?? "",
+    text,
     user: event.user,
     threadTs: event.thread_ts,
-    isDirectMessage: event.channel_type === "im",
+    eventKind: event.type,
+    conversationKind,
+    mentionsSelf:
+      event.type === "app_mention" || (selfUserId ? mentionsSlackUser(text, selfUserId) : false),
     eventId: envelope.event_id ?? `${event.channel}:${event.ts}`,
+  };
+}
+
+/**
+ * What decides whether an arriving event wakes anyone. Both parts are read for
+ * every event, so a stored mode change governs the next one without a restart.
+ */
+export interface SlackWakePolicy {
+  /**
+   * The installed bot's own Slack user id, or `undefined` while it is unknown.
+   * It never waits, so no lookup stands between an event and its ack.
+   */
+  selfUserId?: () => string | undefined;
+  /** The exact conversation's stored mode, or `undefined` for the default. */
+  wakeModeFor: (channel: string) => ChatWakeMode | undefined;
+}
+
+const COMPATIBILITY_POLICY: SlackWakePolicy = { wakeModeFor: () => undefined };
+
+/** The least wait before another identity lookup after one fails. */
+const SELF_LOOKUP_COOLDOWN_MS = 30_000;
+
+/**
+ * Remember the installed bot's identity once it is known. The returned getter
+ * never waits: it answers from what is already known and, while nothing is,
+ * starts a lookup unless one is in flight. A failed lookup is reported and
+ * retried on a later event, but not before Slack's retry-after has passed, nor
+ * sooner than 30 seconds, so a rate limit is not met with a lookup per event.
+ * Meanwhile the source knows no self user: a plain-text mention goes
+ * undetected, though Slack's `app_mention` event still arrives, and the bot's
+ * own posts are still dropped by their `bot_id`.
+ */
+export function rememberSlackSelf(
+  identify: () => Promise<{ userId: string }>,
+  onError: (error: unknown) => void
+): () => string | undefined {
+  let known: string | undefined;
+  let lookup: Promise<void> | undefined;
+  let retryAt = 0;
+  return () => {
+    if (known === undefined && !lookup && Date.now() >= retryAt) {
+      lookup = Promise.resolve()
+        .then(identify)
+        .then(
+          (self) => {
+            known = self.userId;
+          },
+          (error: unknown) => {
+            const retryAfter = (error as { retryAfter?: unknown } | undefined)?.retryAfter;
+            const wait = typeof retryAfter === "number" ? retryAfter * 1000 : 0;
+            retryAt = Date.now() + Math.max(wait, SELF_LOOKUP_COOLDOWN_MS);
+            onError(error);
+          }
+        )
+        .finally(() => {
+          lookup = undefined;
+        });
+    }
+    return known;
+  };
+}
+
+/**
+ * The durable inbox event for an admitted message. It is keyed by the message
+ * itself, not the envelope: Slack sends one message as both `message` and
+ * `app_mention`, each with its own event ID and retries, and every one of
+ * those must land as a single inbox item per owner.
+ */
+export function slackInboxEvent(message: SlackInboundMessage): RawSlackIntegrationEvent {
+  return {
+    sourceType: "slack",
+    rawPayload: {
+      channel: message.channel,
+      ts: message.ts,
+      threadTs: message.threadTs,
+      user: message.user,
+    },
+    idempotencyKey: `${message.channel}:${message.ts}`,
+    priority: "responsive",
+    eventSummary: `Slack message from ${message.user}`,
   };
 }
 
@@ -58,7 +158,10 @@ export class SlackSocketSource {
     this.socket = new SocketModeClient({ appToken });
   }
 
-  async start(onMessage: (message: SlackInboundMessage) => Promise<void>): Promise<void> {
+  async start(
+    onMessage: (message: SlackInboundMessage) => Promise<void>,
+    policy: SlackWakePolicy = COMPATIBILITY_POLICY
+  ): Promise<void> {
     this.socket.on("slack_event", async ({ body, type, ack }) => {
       if (type !== "events_api") {
         await ack();
@@ -66,7 +169,7 @@ export class SlackSocketSource {
       }
       // Ignore irrelevant events promptly. A relevant event is acknowledged only
       // after the durable inbox accepts it, so Slack can retry a failed delivery.
-      const message = parseSlackEvent(body);
+      const message = this.admit(body, policy);
       const incoming = (
         body as { event?: { type?: string; channel_type?: string; subtype?: string } }
       )?.event;
@@ -87,7 +190,27 @@ export class SlackSocketSource {
         this.onError(error);
       }
     });
+    // Start the identity lookup while the socket connects.
+    policy.selfUserId?.();
     await this.socket.start();
+  }
+
+  /**
+   * The message an event carries when its conversation's policy says it wakes.
+   * A policy read that fails is reported and treated as unset, so it can only
+   * fall back to the compatibility default, never broaden coverage.
+   */
+  private admit(body: unknown, policy: SlackWakePolicy): SlackInboundMessage | null {
+    const selfUserId = policy.selfUserId?.();
+    const message = parseSlackEvent(body, selfUserId);
+    if (!message) return null;
+    let mode: ChatWakeMode | undefined;
+    try {
+      mode = policy.wakeModeFor(message.channel);
+    } catch (error) {
+      this.onError(error);
+    }
+    return slackMessageWakes(message, mode) ? message : null;
   }
 
   async close(): Promise<void> {

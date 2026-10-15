@@ -1,3 +1,9 @@
+import {
+  beginGeminiAttempt,
+  type GeminiUsagePurpose,
+  observeGeminiRequest,
+} from "../observability/gemini-usage.js";
+
 /**
  * Gemini speech endpoints for walkie-talkie mode : audio transcription
  * (voice memo → text) and text-to-speech (actor reply → PCM audio).
@@ -69,21 +75,24 @@ async function generateContent(
   fetchImpl: typeof fetch,
   model: string,
   apiKey: string,
-  body: unknown
+  body: unknown,
+  purpose: GeminiUsagePurpose
 ): Promise<GeminiGenerateResponse> {
-  const response = await fetchImpl(
-    `${GEMINI_BASE}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
+  return observeGeminiRequest(purpose, model, async () => {
+    const response = await fetchImpl(
+      `${GEMINI_BASE}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }
+    );
+    if (!response.ok) {
+      const detail = (await response.text().catch(() => "")).slice(0, 300);
+      throw new Error(`Gemini ${model} HTTP ${response.status}: ${detail}`);
     }
-  );
-  if (!response.ok) {
-    const detail = (await response.text().catch(() => "")).slice(0, 300);
-    throw new Error(`Gemini ${model} HTTP ${response.status}: ${detail}`);
-  }
-  return (await response.json()) as GeminiGenerateResponse;
+    return (await response.json()) as GeminiGenerateResponse;
+  });
 }
 
 /** Parse the sample rate out of a PCM mime like `audio/L16;codec=pcm;rate=24000`. */
@@ -102,18 +111,24 @@ export function createGeminiSpeechClient(options: GeminiSpeechOptions): SpeechCl
 
   return {
     async transcribe(audio: Buffer, mimeType: string): Promise<string> {
-      const result = await generateContent(fetchImpl, transcriptionModel, options.apiKey, {
-        contents: [
-          {
-            parts: [
-              { text: TRANSCRIBE_INSTRUCTION },
-              // snake_case per the REST API's accepted form (mirrors the
-              // documented inline_data audio recipe).
-              { inline_data: { mime_type: mimeType, data: audio.toString("base64") } },
-            ],
-          },
-        ],
-      });
+      const result = await generateContent(
+        fetchImpl,
+        transcriptionModel,
+        options.apiKey,
+        {
+          contents: [
+            {
+              parts: [
+                { text: TRANSCRIBE_INSTRUCTION },
+                // snake_case per the REST API's accepted form (mirrors the
+                // documented inline_data audio recipe).
+                { inline_data: { mime_type: mimeType, data: audio.toString("base64") } },
+              ],
+            },
+          ],
+        },
+        "speech_transcription"
+      );
       const parts = result.candidates?.[0]?.content?.parts ?? [];
       const transcript = parts
         .map((part) => part.text ?? "")
@@ -126,15 +141,21 @@ export function createGeminiSpeechClient(options: GeminiSpeechOptions): SpeechCl
     },
 
     async synthesize(text: string, voiceName?: string): Promise<SynthesizedPcm> {
-      const result = await generateContent(fetchImpl, ttsModel, options.apiKey, {
-        contents: [{ parts: [{ text }] }],
-        generationConfig: {
-          responseModalities: ["AUDIO"],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName ?? defaultVoiceName } },
+      const result = await generateContent(
+        fetchImpl,
+        ttsModel,
+        options.apiKey,
+        {
+          contents: [{ parts: [{ text }] }],
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName ?? defaultVoiceName } },
+            },
           },
         },
-      });
+        "speech_synthesis"
+      );
       const parts = result.candidates?.[0]?.content?.parts ?? [];
       const audioPart = parts.find((part) => part.inlineData?.data);
       if (!audioPart?.inlineData?.data) {
@@ -150,99 +171,122 @@ export function createGeminiSpeechClient(options: GeminiSpeechOptions): SpeechCl
       text: string,
       voiceName?: string
     ): Promise<{ sampleRate: number; pcmStream: AsyncIterable<Buffer> }> {
-      const response = await fetchImpl(
-        `${GEMINI_BASE}/${ttsModel}:streamGenerateContent?alt=sse&key=${encodeURIComponent(options.apiKey)}`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text }] }],
-            generationConfig: {
-              responseModalities: ["AUDIO"],
-              speechConfig: {
-                voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName ?? defaultVoiceName } },
+      const attempt = beginGeminiAttempt("speech_synthesis", ttsModel);
+      let openReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      try {
+        const response = await fetchImpl(
+          `${GEMINI_BASE}/${ttsModel}:streamGenerateContent?alt=sse&key=${encodeURIComponent(options.apiKey)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text }] }],
+              generationConfig: {
+                responseModalities: ["AUDIO"],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: voiceName ?? defaultVoiceName },
+                  },
+                },
               },
-            },
-          }),
-        }
-      );
-      if (!response.ok) {
-        const detail = (await response.text().catch(() => "")).slice(0, 300);
-        throw new Error(`Gemini ${ttsModel} HTTP ${response.status}: ${detail}`);
-      }
-      if (!response.body) throw new Error("No response body");
-      const reader = (response.body as unknown as ReadableStream<Uint8Array>).getReader();
-      const decoder = new TextDecoder("utf-8");
-      let buffer = "";
-
-      let sampleRate = 24000;
-      let firstAudioBuffer: Buffer | null = null;
-      let foundFirst = false;
-
-      async function nextSseData(): Promise<string | null> {
-        while (true) {
-          const match = buffer.match(/\r?\n\r?\n/);
-          if (match && match.index !== undefined) {
-            const eventStr = buffer.slice(0, match.index).trim();
-            buffer = buffer.slice(match.index + match[0].length);
-            if (eventStr.startsWith("data: ")) {
-              const data = eventStr.slice(6);
-              if (data !== "[DONE]") return data;
-            }
-            continue;
+            }),
           }
-          const { done, value } = await reader.read();
-          if (done) {
-            const eventStr = buffer.trim();
-            buffer = "";
-            if (eventStr.startsWith("data: ")) {
-              const data = eventStr.slice(6);
-              if (data !== "[DONE]") return data;
-            }
-            return null;
-          }
-          buffer += decoder.decode(value, { stream: true });
+        );
+        if (!response.ok) {
+          const detail = (await response.text().catch(() => "")).slice(0, 300);
+          throw new Error(`Gemini ${ttsModel} HTTP ${response.status}: ${detail}`);
         }
-      }
+        if (!response.body) throw new Error("No response body");
+        const reader = (response.body as unknown as ReadableStream<Uint8Array>).getReader();
+        openReader = reader;
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+        let ended = false;
 
-      while (!foundFirst) {
-        const data = await nextSseData();
-        if (!data) break;
-        const result = JSON.parse(data) as GeminiGenerateResponse;
-        const parts = result.candidates?.[0]?.content?.parts ?? [];
-        const audioPart = parts.find((part) => part.inlineData?.data);
-        if (audioPart?.inlineData?.data) {
-          sampleRate = pcmRateFromMime(audioPart.inlineData.mimeType);
-          firstAudioBuffer = Buffer.from(audioPart.inlineData.data, "base64");
-          foundFirst = true;
-        }
-      }
+        let sampleRate = 24000;
+        let firstAudioBuffer: Buffer | null = null;
+        let foundFirst = false;
 
-      if (!foundFirst) {
-        throw new Error("Gemini TTS stream ended with no audio");
-      }
-
-      const asyncIterable = {
-        async *[Symbol.asyncIterator]() {
-          try {
-            if (firstAudioBuffer) yield firstAudioBuffer;
-            while (true) {
-              const data = await nextSseData();
-              if (!data) break;
-              const result = JSON.parse(data) as GeminiGenerateResponse;
-              const parts = result.candidates?.[0]?.content?.parts ?? [];
-              const audioPart = parts.find((part) => part.inlineData?.data);
-              if (audioPart?.inlineData?.data) {
-                yield Buffer.from(audioPart.inlineData.data, "base64");
+        async function nextSseData(): Promise<string | null> {
+          while (true) {
+            const match = buffer.match(/\r?\n\r?\n/);
+            if (match && match.index !== undefined) {
+              const eventStr = buffer.slice(0, match.index).trim();
+              buffer = buffer.slice(match.index + match[0].length);
+              if (eventStr.startsWith("data: ")) {
+                const data = eventStr.slice(6);
+                if (data !== "[DONE]") return data;
               }
+              continue;
             }
-          } finally {
-            reader.releaseLock();
+            const { done, value } = await reader.read();
+            if (done) {
+              ended = true;
+              const eventStr = buffer.trim();
+              buffer = "";
+              if (eventStr.startsWith("data: ")) {
+                const data = eventStr.slice(6);
+                if (data !== "[DONE]") return data;
+              }
+              return null;
+            }
+            buffer += decoder.decode(value, { stream: true });
           }
-        },
-      };
+        }
 
-      return { sampleRate, pcmStream: asyncIterable };
+        while (!foundFirst) {
+          const data = await nextSseData();
+          if (!data) break;
+          const result = JSON.parse(data) as GeminiGenerateResponse;
+          attempt.observe(result);
+          const parts = result.candidates?.[0]?.content?.parts ?? [];
+          const audioPart = parts.find((part) => part.inlineData?.data);
+          if (audioPart?.inlineData?.data) {
+            sampleRate = pcmRateFromMime(audioPart.inlineData.mimeType);
+            firstAudioBuffer = Buffer.from(audioPart.inlineData.data, "base64");
+            foundFirst = true;
+          }
+        }
+
+        if (!foundFirst) {
+          attempt.finish("response");
+          reader.releaseLock();
+          openReader = undefined;
+          throw new Error("Gemini TTS stream ended with no audio");
+        }
+
+        const asyncIterable = {
+          async *[Symbol.asyncIterator]() {
+            try {
+              if (firstAudioBuffer) yield firstAudioBuffer;
+              while (true) {
+                const data = await nextSseData();
+                if (!data) break;
+                const result = JSON.parse(data) as GeminiGenerateResponse;
+                attempt.observe(result);
+                const parts = result.candidates?.[0]?.content?.parts ?? [];
+                const audioPart = parts.find((part) => part.inlineData?.data);
+                if (audioPart?.inlineData?.data) {
+                  yield Buffer.from(audioPart.inlineData.data, "base64");
+                }
+              }
+            } catch (error) {
+              attempt.finish("error", true);
+              throw error;
+            } finally {
+              attempt.finish(ended ? "response" : "cancelled", !ended);
+              reader.releaseLock();
+              openReader = undefined;
+            }
+          },
+        };
+
+        return { sampleRate, pcmStream: asyncIterable };
+      } catch (error) {
+        attempt.finish("error", true);
+        openReader?.releaseLock();
+        throw error;
+      }
     },
   };
 }

@@ -1,0 +1,31 @@
+{
+  "index": {
+    "v": 1,
+    "runs": [
+      {
+        "date": "2026-10-14",
+        "run_id": "2026-10-13T03:00:00.000Z__2026-10-14T03:00:00.000Z",
+        "windowFrom": "2026-10-13T03:00:00.000Z",
+        "windowTo": "2026-10-14T03:00:00.000Z",
+        "journalPath": "journal/2026-10-14.jsonl",
+        "reportPath": "rendered/2026-10-14.md",
+        "status": "complete",
+        "counts": {
+          "decisions": 1,
+          "distilled": 1,
+          "adjudicated_away": 0,
+          "skipped": 0,
+          "deferred": 0,
+          "nodes_touched": 0,
+          "node_ops": 0,
+          "iu_hints": 0,
+          "chat_spaces_configured": 0,
+          "chat_messages_read": 0,
+          "github_qualifiers_run": 3
+        },
+        "generatedAt": "2026-10-14T03:12:00.000Z"
+      }
+    ]
+  },
+  "markdown": "# IU Distill — 2026-10-14\n\n_window 2026-10-13T03:00:00.000Z → 2026-10-14T03:00:00.000Z · cursor ? → 2026-10-14T03:00:00.000Z · mesh included_\n\n## What the IU learned\n\n### Retry delay\n\nUse a two-second retry delay.\n\n- Confidence: **high** — Explicit operator decision.\n- Sources:\n  - `example/project/issues/1/comments/2` (github_issue_comment) — @example-operator: \"Use a two-second retry delay.\"\n\n## Deliberately left out\n\n_Nothing skipped this run._\n\n## Run summary\n\n- Decisions: 1 (distilled 1 · adjudicated_away 0 · skipped 0 · deferred 0)\n- Nodes touched: 0 · node ops: 0 · IU-hints: 0\n- GitHub coverage: `--created` + `--updated` + `--closed` over example/project — window-complete for the index read . — Synthetic complete read.\n- Chat coverage: **chat was not in this run's read set** (0 spaces in membership). Anything decided only in chat is invisible to this run.\n- Cursor advanced: yes → 2026-10-14T03:00:00.000Z\n"
+}

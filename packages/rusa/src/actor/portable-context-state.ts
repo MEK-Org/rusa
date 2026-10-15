@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PORTABLE_CONTEXT_SCHEMA_VERSION = 3 as const;
+export const PORTABLE_CONTEXT_SCHEMA_VERSION = 4 as const;
 
 /**
  * Every kind a *persisted* ledger snapshot may contain.
@@ -71,6 +71,31 @@ const portableMemoryItemSchema = z.object({
 });
 export type PortableMemoryItem = z.infer<typeof portableMemoryItemSchema>;
 
+/**
+ * The per-actor `brief` portable-context mode document (#954).
+ *
+ * Stored INSIDE the versioned snapshot document (schemaVersion v4) rather than
+ * in its own table: `portable_context_snapshots` is already one versioned JSON
+ * document per actor with no database-level shape constraint, and keeping the
+ * brief beside the ledger is what makes switch-back free — the ledger `items`,
+ * ledger generation and `lastFoldedSourceId` stay in the same document,
+ * untouched by brief writes.
+ *
+ * The actor writes its own brief through the brief MCP server; nothing rewrites
+ * it after a run. The snapshot holds only the CURRENT brief. Its accepted-write
+ * history lives in `portable_brief_revisions` (0062), the one authoritative
+ * history, appended in the same transaction that replaces this document.
+ */
+export const portableBriefSchema = z.object({
+  /** The three-section brief text (WHAT/HOW/DOMAIN), verbatim. */
+  text: z.string(),
+  /** Accepted-write counter: 0 for the seed, +1 per accepted change, unchanged by a no-op. */
+  generation: z.number().int().nonnegative(),
+  /** Time of the last accepted write (the seed time before the first one). */
+  updatedAt: z.string().min(1),
+});
+export type PortableBrief = z.infer<typeof portableBriefSchema>;
+
 const portableContextStateFields = {
   actorId: z.string().min(1),
   generation: z.number().int().nonnegative(),
@@ -89,6 +114,8 @@ export const portableContextStateSchema = z.object({
   ...portableContextStateFields,
   /** Durable mesh_chat or actor_runs id; never a mesh_events cursor after v3 writes. */
   lastFoldedSourceId: z.string().min(1).nullable(),
+  /** The brief-mode document; null until the actor is switched to brief mode. */
+  brief: portableBriefSchema.nullable(),
 });
 export type PortableContextState = z.infer<typeof portableContextStateSchema>;
 
@@ -96,6 +123,13 @@ const portableContextStateV2Schema = z.object({
   schemaVersion: z.literal(2),
   ...portableContextStateFields,
   lastFoldedMessageEventId: z.string().min(1).nullable(),
+});
+
+/** A v3 document: identical to v4 except it predates the `brief` object. */
+const portableContextStateV3Schema = z.object({
+  schemaVersion: z.literal(3),
+  ...portableContextStateFields,
+  lastFoldedSourceId: z.string().min(1).nullable(),
 });
 
 /**
@@ -107,19 +141,34 @@ const portableContextStateV2Schema = z.object({
  * document only ever becomes state by passing through here. Exported because
  * both consumers need the same forward read — the durable store on every load,
  * and the one-time legacy importer on every file it parses.
+ *
+ * The chain is incremental, one version at a time, exactly as v2→v3 was: v2
+ * renames the event watermark to the durable-source cursor, v3→v4 (#954)
+ * adds the nullable `brief` object. Each step only ever ADDS fields, so a
+ * document written by any older build reads forward without data loss and the
+ * ledger fields it already carried round-trip byte-identically.
  */
 export function parsePortableContextState(value: unknown): PortableContextState {
   const version =
     value !== null && typeof value === "object" && "schemaVersion" in value
       ? (value as { schemaVersion?: unknown }).schemaVersion
       : undefined;
-  if (version !== 2) return portableContextStateSchema.parse(value);
+  if (version !== 2 && version !== 3) return portableContextStateSchema.parse(value);
+  if (version === 3) {
+    const v3 = portableContextStateV3Schema.parse(value);
+    return portableContextStateSchema.parse({
+      ...v3,
+      schemaVersion: PORTABLE_CONTEXT_SCHEMA_VERSION,
+      brief: null,
+    });
+  }
   const legacy = portableContextStateV2Schema.parse(value);
   return portableContextStateSchema.parse({
     ...legacy,
     schemaVersion: PORTABLE_CONTEXT_SCHEMA_VERSION,
     lastFoldedSourceId: legacy.lastFoldedMessageEventId,
     lastFoldedMessageEventId: undefined,
+    brief: null,
   });
 }
 
@@ -132,6 +181,7 @@ export function emptyPortableContextState(actorId: string): PortableContextState
     lastFoldedSourceId: null,
     compactor: null,
     items: [],
+    brief: null,
   };
 }
 
@@ -144,10 +194,94 @@ export function emptyPortableContextState(actorId: string): PortableContextState
 export interface PortableContextStore {
   load(actorId: string): PortableContextState;
   save(state: PortableContextState): void;
+  /** Save ledger fold fields while atomically preserving the latest stored brief. */
+  saveFolded(state: PortableContextState): PortableContextState;
 }
 
-export class InMemoryPortableContextStore implements PortableContextStore {
+/** One accepted brief write, read back from the append-only brief history. */
+export interface PortableBriefRevision {
+  generation: number;
+  updatedAt: string;
+  /** Server-bound writer identity; never taken from tool input. */
+  actingPrincipal: string;
+  /** The brief text this write replaced. */
+  before: string;
+  after: string;
+  /** The writer's optional account of why it changed the brief. */
+  explanation?: string;
+}
+
+export interface PortableBriefCommit {
+  actorId: string;
+  /** The generation the writer read; a write against any other generation is refused. */
+  expectedGeneration: number;
+  text: string;
+  explanation?: string;
+  actingPrincipal: string;
+  at: string;
+}
+
+/** A write whose expected generation is no longer the stored one. Nothing was written. */
+export class StaleBriefWriteError extends Error {
+  constructor(
+    readonly actorId: string,
+    readonly expectedGeneration: number,
+    readonly currentGeneration: number | null
+  ) {
+    super(
+      currentGeneration === null
+        ? `actor ${actorId} has no brief to replace`
+        : `stale brief write for actor ${actorId}: expected generation ${expectedGeneration}, current is ${currentGeneration}; read the brief again before replacing it`
+    );
+    this.name = "StaleBriefWriteError";
+  }
+}
+
+/**
+ * Brief writes and their history. {@link commitBrief} is the only accepted-write
+ * path: it rereads the stored brief, refuses a stale `expectedGeneration`, and
+ * replaces the snapshot and appends the revision as one unit, so the current
+ * brief and its history cannot disagree.
+ */
+export interface PortableBriefStore {
+  commitBrief(input: PortableBriefCommit): PortableBriefRevision;
+  /** Newest first, at most `limit`. */
+  listBriefRevisions(actorId: string, limit: number): PortableBriefRevision[];
+}
+
+/** The snapshot an accepted brief write leaves behind; shared by both stores. */
+export function applyBriefCommit(
+  state: PortableContextState,
+  input: PortableBriefCommit
+): { state: PortableContextState; revision: PortableBriefRevision } {
+  const current = state.brief;
+  if (current === null || current.generation !== input.expectedGeneration) {
+    throw new StaleBriefWriteError(
+      input.actorId,
+      input.expectedGeneration,
+      current?.generation ?? null
+    );
+  }
+  const revision: PortableBriefRevision = {
+    generation: current.generation + 1,
+    updatedAt: input.at,
+    actingPrincipal: input.actingPrincipal,
+    before: current.text,
+    after: input.text,
+    ...(input.explanation === undefined ? {} : { explanation: input.explanation }),
+  };
+  return {
+    state: {
+      ...state,
+      brief: { text: input.text, generation: revision.generation, updatedAt: input.at },
+    },
+    revision,
+  };
+}
+
+export class InMemoryPortableContextStore implements PortableContextStore, PortableBriefStore {
   private readonly states = new Map<string, PortableContextState>();
+  private readonly revisions = new Map<string, PortableBriefRevision[]>();
 
   load(actorId: string): PortableContextState {
     return structuredClone(this.states.get(actorId) ?? emptyPortableContextState(actorId));
@@ -156,5 +290,22 @@ export class InMemoryPortableContextStore implements PortableContextStore {
   save(state: PortableContextState): void {
     portableContextStateSchema.parse(state);
     this.states.set(state.actorId, structuredClone(state));
+  }
+
+  saveFolded(state: PortableContextState): PortableContextState {
+    const saved = { ...state, brief: this.load(state.actorId).brief };
+    this.save(saved);
+    return saved;
+  }
+
+  commitBrief(input: PortableBriefCommit): PortableBriefRevision {
+    const { state, revision } = applyBriefCommit(this.load(input.actorId), input);
+    this.save(state);
+    this.revisions.set(input.actorId, [...(this.revisions.get(input.actorId) ?? []), revision]);
+    return structuredClone(revision);
+  }
+
+  listBriefRevisions(actorId: string, limit: number): PortableBriefRevision[] {
+    return structuredClone((this.revisions.get(actorId) ?? []).slice(-limit).reverse());
   }
 }

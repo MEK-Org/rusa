@@ -6,6 +6,43 @@ import 'dashboard_timing.dart';
 import 'models.dart';
 import 'session_client.dart';
 
+/// One accepted write to an actor's brief, as `GET /api/mesh/threads/charter`
+/// lists it: newest first, at most ten. An unchanged write records nothing.
+class BriefRevision {
+  final int generation;
+  final String updatedAt;
+
+  /// The actor that made the write; the server binds it, the writer cannot.
+  final String actingPrincipal;
+
+  /// The brief text this write replaced.
+  final String before;
+  final String after;
+
+  /// The writer's own account of the change, when it gave one.
+  final String? explanation;
+
+  const BriefRevision({
+    required this.generation,
+    required this.updatedAt,
+    required this.actingPrincipal,
+    required this.before,
+    required this.after,
+    this.explanation,
+  });
+
+  factory BriefRevision.fromJson(Map<String, dynamic> json) {
+    return BriefRevision(
+      generation: json['generation'] as int? ?? 0,
+      updatedAt: json['updatedAt'] as String? ?? '',
+      actingPrincipal: json['actingPrincipal'] as String? ?? '',
+      before: json['before'] as String? ?? '',
+      after: json['after'] as String? ?? '',
+      explanation: json['explanation'] as String?,
+    );
+  }
+}
+
 /// Most refs one `/api/mesh/references` request may name; mirrors
 /// `MAX_REFERENCE_BATCH` on the server, which refuses a larger batch.
 const int referenceBatchLimit = 20;
@@ -93,13 +130,40 @@ class DashboardApi {
   ///
   /// The thread list carries only a clipped preview, since it is the same field
   /// for every actor on every poll. The whole text is fetched here, for the one
-  /// actor whose detail panel is open.
-  Future<String> fetchCharter(String threadId) async {
+  /// actor whose detail panel is open, together with a brief-mode actor's
+  /// current brief and its latest ten accepted writes.
+  Future<
+    ({
+      String charter,
+      bool briefMode,
+      String? brief,
+      int? briefGeneration,
+      String? briefUpdatedAt,
+      List<BriefRevision> briefRevisions,
+    })
+  >
+  fetchActorInfo(String threadId) async {
     final json = await _getJson(
       _u('/api/mesh/threads/charter', {'id': threadId}),
     );
-    return json['charter'] as String? ?? '';
+    final rawRevisions = json['briefRevisions'] as List<dynamic>? ?? const [];
+    final revisions = rawRevisions
+        .whereType<Map<String, dynamic>>()
+        .map(BriefRevision.fromJson)
+        .toList();
+
+    return (
+      charter: json['charter'] as String? ?? '',
+      briefMode: json['briefMode'] == true,
+      brief: json['brief'] as String?,
+      briefGeneration: json['briefGeneration'] as int?,
+      briefUpdatedAt: json['briefUpdatedAt'] as String?,
+      briefRevisions: revisions,
+    );
   }
+
+  Future<String> fetchCharter(String threadId) async =>
+      (await fetchActorInfo(threadId)).charter;
 
   Future<List<String>> fetchRootControlProviders() async {
     final json = await _getJson(_u('/api/mesh/control/options'));
@@ -517,6 +581,7 @@ class DashboardApi {
     bool? rootsOnly,
     int? limit,
     int? offset,
+    bool ancestors = false,
   }) async {
     final q = <String, String>{
       'ownerId': ?ownerId,
@@ -525,6 +590,7 @@ class DashboardApi {
       if (rootsOnly != null) 'rootsOnly': '$rootsOnly',
       if (limit != null) 'limit': '$limit',
       if (offset != null) 'offset': '$offset',
+      if (ancestors) 'ancestors': 'true',
     };
     return ObligationPage.fromJson(
       await _getJson(_u('/api/mesh/obligations', q)),

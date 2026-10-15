@@ -10,6 +10,7 @@ import { z } from "zod";
 import type { RusaConfig } from "../config/types.js";
 import { createTask, getRepositories } from "../db/index.js";
 import type { RawInput } from "../db/repositories/index.js";
+import { generateGeminiContent } from "../observability/gemini-usage.js";
 import { extractGeminiReasoning, extractGeminiText } from "./gemini-utils.js";
 import { handleGraphReadTool } from "./graph-read-tools.js";
 import {
@@ -950,7 +951,7 @@ export async function runDistillation(
         .join(" -> ")}`
     );
 
-    const response = await genAI.models.generateContent({
+    const response = await generateGeminiContent(genAI, "understanding_distillation", {
       model: DISTILLATION_MODEL,
       contents: requestContents,
       config: {

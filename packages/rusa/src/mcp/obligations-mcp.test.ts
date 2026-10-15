@@ -89,7 +89,7 @@ describe("obligations MCP", () => {
 
   it("creates responsive obligations and reports inherited responsiveness", async () => {
     const client = await connect(
-      createObligationsMcpServer(repository, "actor-a", { canSetResponsive: true })
+      createObligationsMcpServer(repository, "actor-a", { canSetResponsive: () => true })
     );
     const parent = (await client.callTool({
       name: "create_obligation",
@@ -230,7 +230,11 @@ describe("obligations MCP", () => {
     expect(db.serialize()).toEqual(before);
     expect(repository.require(child.id).effectiveResponsive).toBe(false);
     const root = await connect(
-      createObligationsMcpServer(repository, "opaque-root-id", { canSetResponsive: true })
+      // Composed as start.ts composes root: promotion also requires canManage.
+      createObligationsMcpServer(repository, "opaque-root-id", {
+        canSetResponsive: () => true,
+        canManage: () => true,
+      })
     );
     expect(
       (
@@ -264,7 +268,11 @@ describe("obligations MCP", () => {
     repository.create({ title: "existing hotfix", id: "hotfix", ownerId: "actor-a" });
     repository.create({ title: "child", id: "child", ownerId: "actor-a", parentId: "hotfix" });
     const client = await connect(
-      createObligationsMcpServer(repository, "root-uuid", { canSetResponsive: true })
+      // Composed as start.ts composes root: marking also requires canManage.
+      createObligationsMcpServer(repository, "root-uuid", {
+        canSetResponsive: () => true,
+        canManage: () => true,
+      })
     );
 
     const result = (await client.callTool({

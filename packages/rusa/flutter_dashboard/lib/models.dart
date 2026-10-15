@@ -2256,11 +2256,15 @@ class ObligationPage {
     required this.obligations,
     required this.total,
     required this.hasMore,
+    this.ancestors = const [],
   });
 
   final List<ObligationDto> obligations;
   final int total;
   final bool hasMore;
+
+  /// The rows' ancestors, each once, when the page was asked for them (#1076).
+  final List<ObligationDto> ancestors;
 
   factory ObligationPage.fromJson(Map<String, dynamic> j) => ObligationPage(
     obligations: (j['obligations'] as List<dynamic>? ?? const [])
@@ -2268,6 +2272,9 @@ class ObligationPage {
         .toList(),
     total: j['total'] as int? ?? 0,
     hasMore: j['hasMore'] as bool? ?? false,
+    ancestors: (j['ancestors'] as List<dynamic>? ?? const [])
+        .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
   );
 }
 
@@ -2441,6 +2448,28 @@ class ObligationDetailSnapshot {
   final List<ObligationCompletionDto> completions;
   final int completionsTotal;
   final bool completionsHasMore;
+
+  /// This snapshot with [obligation] in place of the one it was read with.
+  ObligationDetailSnapshot withObligation(ObligationDto obligation) =>
+      ObligationDetailSnapshot(
+        obligation: obligation,
+        ancestors: ancestors,
+        history: history,
+        historyNextBefore: historyNextBefore,
+        parent: parent,
+        children: children,
+        blockingChildren: blockingChildren,
+        blockedBy: blockedBy,
+        blockedByTotal: blockedByTotal,
+        blockedByHasMore: blockedByHasMore,
+        blocks: blocks,
+        blocksTotal: blocksTotal,
+        blocksHasMore: blocksHasMore,
+        artifacts: artifacts,
+        completions: completions,
+        completionsTotal: completionsTotal,
+        completionsHasMore: completionsHasMore,
+      );
 
   factory ObligationDetailSnapshot.fromJson(
     Map<String, dynamic> j,

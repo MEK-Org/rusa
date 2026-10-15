@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { Type } from "@google/genai";
 import { z } from "zod";
 import type { PortableLedgerSource } from "../db/repositories/actor-run-repository.js";
+import { generateGeminiContent } from "../observability/gemini-usage.js";
 import {
   extractGeminiText,
   getGeminiClient,
@@ -566,7 +567,7 @@ export class GeminiPortableContextCompactor implements PortableContextCompactor 
     if (input.messages.length === 0) return { state: input.state, quarantined: [], operations: 0 };
     const client = getGeminiClient(this.apiKey);
     const response = await withGeminiRetry(() =>
-      client.models.generateContent({
+      generateGeminiContent(client, "portable_compaction", {
         model: this.model,
         contents: compactorPrompt(input.state, input.messages, input.actorId),
         config: {

@@ -10,6 +10,11 @@ import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
+import { seedPortableBriefState } from "../actor/portable-context-brief.js";
+import {
+  emptyPortableContextState,
+  InMemoryPortableContextStore,
+} from "../actor/portable-context-state.js";
 import type { RootChildRequest, RootControlService } from "../actor/root-control.js";
 import {
   AvatarGenerationCoordinator,
@@ -1907,6 +1912,84 @@ describe("handleMeshApiRequest", () => {
     const { res } = await call(deps, "GET", `/api/mesh/threads/charter?id=${UUID_A}`);
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ id: UUID_A, charter: long });
+  });
+
+  it("serves only the selected brief actor's current brief and its latest ten writes", async () => {
+    actors.upsert({ ...rec(UUID_A, null, "active"), context: { type: "portable", mode: "brief" } });
+    const store = new InMemoryPortableContextStore();
+    const brief = (n: number) =>
+      `## WHAT\nPurpose ${n}. [mesh:messages/m-${n}]\n\n## HOW\n\n## DOMAIN\n`;
+    for (const actorId of [UUID_A, UUID_B]) {
+      store.save(
+        seedPortableBriefState(emptyPortableContextState(actorId), "2026-10-10T12:00:00.000Z")
+      );
+    }
+    store.commitBrief({
+      actorId: UUID_B,
+      expectedGeneration: 0,
+      text: brief(99),
+      actingPrincipal: UUID_B,
+      at: "2026-10-10T12:30:00.000Z",
+    });
+    for (let n = 1; n <= 12; n += 1) {
+      store.commitBrief({
+        actorId: UUID_A,
+        expectedGeneration: n - 1,
+        text: brief(n),
+        ...(n === 12 ? { explanation: "Narrowed the purpose." } : {}),
+        actingPrincipal: UUID_A,
+        at: `2026-10-10T13:${String(n).padStart(2, "0")}:00.000Z`,
+      });
+    }
+    const load = vi.spyOn(store, "load");
+    const listBriefRevisions = vi.spyOn(store, "listBriefRevisions");
+    deps.portableContext = store;
+    const read = async () =>
+      JSON.parse((await call(deps, "GET", `/api/mesh/threads/charter?id=${UUID_A}`)).res.body);
+
+    const body = await read();
+    expect(body).toMatchObject({
+      briefMode: true,
+      brief: brief(12),
+      briefGeneration: 12,
+      briefUpdatedAt: "2026-10-10T13:12:00.000Z",
+    });
+    expect(body.briefRevisions.map((r: { generation: number }) => r.generation)).toEqual([
+      12, 11, 10, 9, 8, 7, 6, 5, 4, 3,
+    ]);
+    expect(body.briefRevisions[0]).toEqual({
+      generation: 12,
+      updatedAt: "2026-10-10T13:12:00.000Z",
+      actingPrincipal: UUID_A,
+      before: brief(11),
+      after: brief(12),
+      explanation: "Narrowed the purpose.",
+    });
+    expect(body.briefRevisions[1]).not.toHaveProperty("explanation");
+    expect(load.mock.calls).toEqual([[UUID_A]]);
+    expect(listBriefRevisions.mock.calls).toEqual([[UUID_A, 10]]);
+
+    store.save({ ...store.load(UUID_A), brief: null });
+    load.mockClear();
+    listBriefRevisions.mockClear();
+    expect(await read()).toMatchObject({
+      briefMode: true,
+      brief: null,
+      briefGeneration: null,
+      briefUpdatedAt: null,
+      briefRevisions: [],
+    });
+    expect(listBriefRevisions).not.toHaveBeenCalled();
+
+    actors.upsert({
+      ...rec(UUID_A, null, "active"),
+      context: { type: "portable", mode: "ledger" },
+    });
+    load.mockClear();
+    const ledger = await read();
+    expect(ledger).not.toHaveProperty("brief");
+    expect(ledger).not.toHaveProperty("briefRevisions");
+    expect(load).not.toHaveBeenCalled();
   });
 
   it("GET /api/mesh/threads/charter 404s for an unknown or missing id", async () => {
@@ -3881,6 +3964,44 @@ describe("handleMeshApiRequest", () => {
 
         const { res: badQueue } = await call(deps, "GET", "/api/mesh/obligations?queue=done");
         expect(badQueue.statusCode).toBe(400);
+      });
+
+      it("adds each row's ancestors once when asked, and only then (#1076)", async () => {
+        obligations.create({ title: "Root", id: "root", ownerId: "actor-2" });
+        obligations.create({ title: "Area", id: "area", ownerId: "actor-2", parentId: "root" });
+        obligations.create({ title: "A", id: "a", ownerId: "actor-1", parentId: "area" });
+        obligations.create({ title: "B", id: "b", ownerId: "actor-1", parentId: "area" });
+        obligations.create({ title: "Other", id: "other", ownerId: "actor-2" });
+        const page = async (query = "ownerId=actor-1&queue=ready&ancestors=true") => {
+          const { res } = await call(deps, "GET", `/api/mesh/obligations?${query}`);
+          expect(res.statusCode).toBe(200);
+          const data = JSON.parse(res.body);
+          return {
+            rows: data.obligations.map((o: { id: string }) => o.id).sort(),
+            ancestors: data.ancestors.map((o: { id: string }) => o.id).sort(),
+          };
+        };
+
+        // Shared ancestry arrives once.
+        expect(await page()).toEqual({ rows: ["a", "b"], ancestors: ["area", "root"] });
+
+        // A reparent is what the next page reports.
+        obligations.reparent("b", "other", LOCAL_USER);
+        expect(await page()).toEqual({ rows: ["a", "b"], ancestors: ["area", "other", "root"] });
+
+        // An ancestor that is itself a row of the page is left to the rows.
+        obligations.create({ title: "A1", id: "a1", ownerId: "actor-1", parentId: "a" });
+        expect(await page("ownerId=actor-1&ancestors=true")).toEqual({
+          rows: ["a", "a1", "b"],
+          ancestors: ["area", "other", "root"],
+        });
+
+        const { res: plain } = await call(
+          deps,
+          "GET",
+          "/api/mesh/obligations?ownerId=actor-1&queue=ready"
+        );
+        expect(JSON.parse(plain.body)).not.toHaveProperty("ancestors");
       });
 
       it("503s when obligations data is unavailable", async () => {

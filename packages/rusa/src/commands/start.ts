@@ -56,6 +56,7 @@ import {
   reconcileEventSources,
   resourceKey,
 } from "../actor/event-subscriptions.js";
+import { COMPACTED_MEMORY_DELTA_EXPERIMENT } from "../actor/experiments.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import {
   FailureEscalationBackoff,
@@ -99,6 +100,7 @@ import {
   portableContextMaxMessages,
   portableContextMaxRuns,
 } from "../actor/portable-context.js";
+import { seedPortableBriefState } from "../actor/portable-context-brief.js";
 import {
   describeCompaction,
   GeminiPortableContextCompactor,
@@ -108,6 +110,11 @@ import {
   quarantineCountsByClass,
   resolvePortableContextCompactorModel,
 } from "../actor/portable-context-compactor.js";
+import {
+  type PortableJournalMode,
+  type PortableJournalRecord,
+  selectDeltaJournal,
+} from "../actor/portable-context-delta.js";
 import type { PortableContextStore } from "../actor/portable-context-state.js";
 import {
   type PoolLaneCandidate,
@@ -172,6 +179,7 @@ import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
 import { importLegacyPortableContextState } from "../db/legacy-portable-context-import.js";
+import type { PortableLedgerSource } from "../db/repositories/actor-run-repository.js";
 import type {
   ObligationStatusChange,
   PrerequisiteAttention,
@@ -184,6 +192,7 @@ import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitop
 import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
 import { getRemoteUrl, initEmptyBareRepo } from "../gitops/worktree.js";
 import { AGENT_EXEC_MCP_NAME, createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
+import { BRIEF_MCP_NAME, createBriefMcpServer } from "../mcp/brief-mcp.js";
 import {
   CHAT_READ_MCP_NAME,
   CHAT_WRITE_MCP_NAME,
@@ -203,7 +212,11 @@ import {
 import { McpHttpServer } from "../mcp/http-server.js";
 import { createInboxMcpServer, INBOX_MCP_NAME, type SelectedInboxRun } from "../mcp/inbox-mcp.js";
 import { createMeshChatMcpServer, MESH_CHAT_MCP_NAME } from "../mcp/mesh-chat-mcp.js";
-import { createObligationsMcpServer, OBLIGATIONS_MCP_NAME } from "../mcp/obligations-mcp.js";
+import {
+  createObligationsMcpServer,
+  OBLIGATION_RESPONSIVE_CAPABILITY,
+  OBLIGATIONS_MCP_NAME,
+} from "../mcp/obligations-mcp.js";
 import type { PnpmHardlinksToolDeps } from "../mcp/pnpm-hardlinks-mcp.js";
 import { createPnpmInstallMcpServer, PNPM_INSTALL_MCP_NAME } from "../mcp/pnpm-install-mcp.js";
 import { createQuotaMcpServer, createQuotaService, QUOTA_MCP_NAME } from "../mcp/quota-mcp.js";
@@ -243,6 +256,7 @@ import {
   resolveDiskAlertConfig,
 } from "../observability/disk-alert.js";
 import { resolveErrorSink } from "../observability/error-sink.js";
+import { configureGeminiUsage } from "../observability/gemini-usage.js";
 import {
   collectConfigSecretEntries,
   collectEnvSecretEntries,
@@ -301,6 +315,7 @@ import {
 import { type MissedQuotaWindow, MissedQuotaWindowDetector } from "../quota/missed-windows.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import { resolveReference } from "../references/resolve.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
@@ -314,11 +329,12 @@ import {
 import { ResourceScope } from "../runtime/resource-scope.js";
 import { readSlackToken, SlackClient } from "../slack/slack-client.js";
 import {
+  rememberSlackSelf,
   type SlackInboundMessage,
   SlackSocketSource,
+  slackInboxEvent,
   withReceiptReaction,
 } from "../slack/socket-source.js";
-import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import {
   DistillerCursorStore,
   latestOpCreatedAt,
@@ -718,6 +734,8 @@ export interface RunStartE2EHooks {
    */
   createWorkerActor?: (context: ActorFactoryContext, options: ActorOptions) => MeshActor;
   chatClient?: ChatClient;
+  /** Stands in for the Slack Web API client; the socket source still needs real config. */
+  slackClient?: SlackClient;
   chatSource?: ChatSource;
   rootDriver?: "provider" | "external";
   dashboard?: boolean;
@@ -854,6 +872,35 @@ export function warnMissingConfiguredEventSubscriptionsAtBoot(
 }
 
 /**
+ * Page ceiling on the unfolded tail a delta-mode prompt reads (#1062). Fifty
+ * sources a page; the journal's own count and byte budgets apply after this,
+ * so the ceiling only bounds the read, never what the ledger will fold.
+ */
+export const PORTABLE_CONTEXT_DELTA_MAX_PAGES = 4;
+
+/**
+ * The durable sources after the ledger's fold cursor, oldest first — exactly
+ * what the next fold will consume. `truncated` reports that the tail ran past
+ * the page ceiling; the sources kept are the OLDEST, so a truncated read must
+ * fall back to the recent window to keep the newest messages visible.
+ */
+export function readUnfoldedLedgerSources(
+  actorId: string,
+  afterSourceId: string | null,
+  maxPages = PORTABLE_CONTEXT_DELTA_MAX_PAGES
+): { sources: PortableLedgerSource[]; truncated: boolean } {
+  const sources: PortableLedgerSource[] = [];
+  let cursor = afterSourceId;
+  for (let page = 0; page < maxPages; page++) {
+    const result = getRepositories().actorRuns.listLedgerSourcesAfter(actorId, cursor, 50);
+    sources.push(...result.sources);
+    if (!result.hasMore) return { sources, truncated: false };
+    cursor = result.sources.at(-1)?.id ?? cursor;
+  }
+  return { sources, truncated: true };
+}
+
+/**
  * Assemble a portable-context (design ISSUE_NUM) actor's
  * stateless prefix from its own durable recent run outputs, plus the per-run inject
  * record that rides on the run's `run_start` event. Returns undefined when there's
@@ -867,44 +914,103 @@ export function warnMissingConfiguredEventSubscriptionsAtBoot(
  */
 function assemblePortableInjection(
   id: string,
-  mode: "tail" | "ledger",
-  store: PortableContextStore
+  mode: "tail" | "ledger" | "brief",
+  store: PortableContextStore,
+  journal: PortableJournalMode = "window",
+  onDeltaFallback: (error: unknown) => void = () => {}
 ): { priorContext: string; injectRecord: InjectRecord } | undefined {
   const repositories = getRepositories();
   const runs = repositories.actorRuns
     .listRecentCompleted(id, portableContextMaxRuns())
     .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
-  const portable =
-    mode === "ledger"
-      ? assemblePortableContextV2({
-          state: store.load(id),
-          messages: repositories.meshChat
-            .listReceivedForActor(id, { limit: portableContextMaxMessages() })
-            .map((message) => ({
-              id: message.id,
-              ts: message.ts,
-              sender: message.senderId,
-              body: message.body,
-            })),
-          runs,
-          // Read-through only. The prompt shows work state; it never authors it
-          // — the obligation store stays the sole lifecycle authority .
-          obligations: getRepositories().obligations.listOwned(id),
-        })
-      : assemblePortableContext(runs);
+  // Tail remains a run-only renderer. Do not load a snapshot or query messages
+  // and obligations before selecting this established path.
+  if (mode === "tail") {
+    const portable = assemblePortableContext(runs);
+    return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
+  }
+
+  let state = store.load(id);
+  // Seed before the first brief-mode prompt, so the first brief-mode run
+  // renders the empty brief sections rather than the old ledger.
+  if (mode === "brief" && state.brief === null) {
+    state = seedPortableBriefState(state, new Date().toISOString());
+    store.save(state);
+  }
+  // Read-through only. The prompt shows work state; it never authors it
+  // — the obligation store stays the sole lifecycle authority.
+  const obligations = repositories.obligations.listOwned(id);
+  const windowJournal = () => ({
+    messages: repositories.meshChat
+      .listReceivedForActor(id, { limit: portableContextMaxMessages() })
+      .map((message) => ({
+        id: message.id,
+        ts: message.ts,
+        sender: message.senderId,
+        body: message.body,
+      })),
+    runs,
+    journal: undefined as PortableJournalRecord | undefined,
+  });
+  // Compacted memory plus delta (#1062): verbatim messages after the fold cursor
+  // plus the unchanged runs window. A failed or truncated read falls back to the
+  // recent window, so the actor starts with its newest messages still visible.
+  const selectJournal = () => {
+    // Brief writes do not advance the ledger fold cursor; keep their recent window.
+    if (mode !== "ledger" || journal !== "delta") return windowJournal();
+    try {
+      const unfolded = readUnfoldedLedgerSources(id, state.lastFoldedSourceId);
+      const delta = selectDeltaJournal({
+        unfolded: unfolded.sources,
+        recentRuns: runs,
+        maxMessages: portableContextMaxMessages(),
+      });
+      const journalRecord: PortableJournalRecord = {
+        mode: unfolded.truncated ? "window" : "delta",
+        foldCursor: state.lastFoldedSourceId,
+        unfoldedSources: delta.unfoldedSources,
+        unfoldedMessages: delta.unfoldedMessages,
+        unfoldedYields: delta.unfoldedYields,
+        truncated: unfolded.truncated,
+      };
+      if (unfolded.truncated) {
+        onDeltaFallback(new Error("unfolded source tail exceeds the delta journal page ceiling"));
+        return { ...windowJournal(), journal: journalRecord };
+      }
+      return {
+        messages: delta.messages,
+        runs: delta.runs,
+        journal: journalRecord,
+      };
+    } catch (error) {
+      onDeltaFallback(error);
+      return windowJournal();
+    }
+  };
+  const selected = selectJournal();
+  const portable = assemblePortableContextV2({
+    state,
+    messages: selected.messages,
+    runs: selected.runs,
+    obligations,
+    journal: selected.journal,
+    ...(mode === "brief" ? { brief: state.brief } : {}),
+  });
   return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
 }
 
 function assembleConfiguredPortableInjection(
   record: ActorRecord,
   apiKey: string | null,
-  store: PortableContextStore
+  store: PortableContextStore,
+  journal: PortableJournalMode = "window",
+  onDeltaFallback?: (error: unknown) => void
 ): { priorContext: string; injectRecord: InjectRecord } | undefined {
   if (record.context?.type !== "portable") return undefined;
   if (record.context.mode === "ledger" && !apiKey) {
     throw new Error("portable context ledger mode requires geminiApiKey");
   }
-  return assemblePortableInjection(record.id, record.context.mode, store);
+  return assemblePortableInjection(record.id, record.context.mode, store, journal, onDeltaFallback);
 }
 
 export async function compactPortableContext(input: {
@@ -935,10 +1041,11 @@ export async function compactPortableContext(input: {
       messages: page.sources,
       now: (input.now ?? (() => new Date().toISOString()))(),
     });
-    state = result.state;
+    // A brief may have committed while the fold awaited the model, including
+    // through another connection. Preserve it inside the store's write lock.
+    state = input.store.saveFolded(result.state);
     quarantinedOperations.push(...result.quarantined);
     operations += result.operations;
-    input.store.save(state);
     folded += page.sources.length;
     foldedSelf += page.sources.filter((source) => source.kind === "run_yielded").length;
     bytes += page.sources.reduce(
@@ -1110,6 +1217,7 @@ async function composeStart(
     secrets: readSecrets,
     context: { component: "start" },
   });
+  configureGeminiUsage(log, mcHome);
   // This file name is configuration, not a credential. Read the value only on
   // the host plane and register it with the log scrubber before any client can
   // use it. A bad/missing file intentionally leaves the opt-in observer
@@ -1668,7 +1776,8 @@ async function composeStart(
       ),
   };
   let chatClient: ChatClient | null = opts?.e2e?.chatClient ?? null;
-  const slackClient = slackBotToken ? new SlackClient(slackBotToken) : null;
+  const slackClient =
+    opts?.e2e?.slackClient ?? (slackBotToken ? new SlackClient(slackBotToken) : null);
   let gchat: GchatClient | null = null;
   if (!chatClient && config.chat && !opts?.e2e) {
     gchat = new GchatClient(config.chat.gchatConfigDir);
@@ -1680,6 +1789,16 @@ async function composeStart(
       : errorSink?.kind === "slack" && slackClient
         ? (text: string) => slackClient.send(errorSink.target, text).then(() => {})
         : null;
+  // A brief write's new citations resolve through the same resolver and
+  // clients the dashboard uses; nothing here widens what they can read (#954).
+  const resolveBriefCitation = (ref: string) =>
+    resolveReference(ref, {
+      meshChat: getRepositories().meshChat,
+      inbox: getRepositories().inbox,
+      chatClient: chatClient ?? undefined,
+      slackClient: slackClient ?? undefined,
+      issueClient,
+    });
   if (chatClient) {
     const workDir = join(mcHome, "root-agent");
     // This root-owned server runs on the local leader; follower placement is
@@ -2323,7 +2442,7 @@ async function composeStart(
       backups: legacyPortableContextImport.backupFiles,
     });
   }
-  const portableContextStore: PortableContextStore = getRepositories().portableContext;
+  const portableContextStore = getRepositories().portableContext;
   const e2eInstance = new E2EInstanceManager({
     mcHome,
     workersDir,
@@ -2364,7 +2483,6 @@ async function composeStart(
   const gmailClient = new GoogleGmailClient(config.chat?.gchatConfigDir);
   const calendarClients = new GoogleCalendarClientProvider(config.chat?.gchatConfigDir);
   const driveClients = new GoogleDriveClient(config.chat?.gchatConfigDir);
-  const commitmentPolarityEvaluator = createCommitmentPolarityEvaluator(config.geminiApiKey);
   // The one live attribution source: populated only for an actual provider
   // attempt (including fallbacks), and cleared by every terminal run hook.
   const activeRunSelections = new Map<string, RawProviderModelConfig>();
@@ -2514,10 +2632,6 @@ async function composeStart(
       store: distillerStore,
       reports: {
         paths: iuReportPaths(mcHome),
-        // ISSUE_NUM polarity check as a cheap semantic read . Unset key =>
-        // undefined => the report says the check did not run, which is the
-        // honest answer; it never degrades to a lexical guess.
-        ...(commitmentPolarityEvaluator ? { evaluateCommitment: commitmentPolarityEvaluator } : {}),
       },
       ...(chatClientForSpaces
         ? { listChatSpaces: () => listAllChatSpaces(chatClientForSpaces) }
@@ -2570,6 +2684,7 @@ async function composeStart(
     chatClient: chatClient ?? undefined,
     slackClient: slackClient ?? undefined,
     onChatWrite: (actorId) => mesh.markUnkillable(actorId),
+    onSlackWrite: (actorId) => mesh.markUnkillable(actorId),
     getRunSelectionForActor: (id) => activeRunSelections.get(id),
     selectedInboxEntriesForActor,
     logger: log,
@@ -2640,6 +2755,7 @@ async function composeStart(
   const teardownActorMcp = (actorId: string) => {
     liveWorkerMcp.delete(actorId);
     void mcpHttp.removeServer(actorId);
+    void mcpHttp.removeServer(`${actorId}:${BRIEF_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${INBOX_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${OBLIGATIONS_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${MESH_CHAT_MCP_NAME}`);
@@ -2658,6 +2774,23 @@ async function composeStart(
     for (const cap of grantableServers.keys()) {
       void mcpHttp.removeServer(`${actorId}:${cap}`);
     }
+  };
+
+  // Compacted memory plus delta (#1062) is an enrollment, evaluated at every
+  // prompt build and run end so unenrolling takes effect on the next run with
+  // nothing else to flip. `mesh` is assigned below; both readers run later.
+  const portableJournalModeFor = (actorId: string): PortableJournalMode =>
+    mesh.isEnrolledInExperiment(actorId, COMPACTED_MEMORY_DELTA_EXPERIMENT) ? "delta" : "window";
+  const warnDeltaFallback = (actorId: string, error: unknown): void => {
+    log.warn("portable_context_delta_fallback", {
+      actorId,
+      error: error instanceof Error ? error.message : String(error),
+      impact: "this run's journal is the fixed recent window; the fold cursor is unchanged",
+    });
+  };
+  const isPortableLedgerActor = (actorId: string): boolean => {
+    const context = actors.get(actorId)?.context;
+    return context?.type === "portable" && context.mode === "ledger";
   };
 
   const compactPortableActorAfterRun = async (
@@ -2918,7 +3051,28 @@ async function composeStart(
       onEnd: async (event) => {
         if (event.terminal.kind === "abandoned") return;
         const { result } = event.terminal;
-        const compacted = await compactPortableActorAfterRun(id);
+        // Deferred interruption compaction (#1062): an enrolled ledger actor
+        // whose run was interrupted skips the fold here, so the responsive
+        // successor — which is what interrupted it — starts without waiting on
+        // the compactor. The cursor is untouched; the sources stay in mesh_chat
+        // and actor_runs, and the next ordinary run end folds them once.
+        const deferred =
+          result.interrupted === true &&
+          isPortableLedgerActor(id) &&
+          portableJournalModeFor(id) === "delta";
+        if (deferred) {
+          mesh.recordEvent({
+            kind: "portable_context_compaction_deferred",
+            actorId: id,
+            detail: `interrupted by ${result.interruptSource ?? "unknown"}`,
+            payload: JSON.stringify({
+              runId: event.runId,
+              interruptSource: result.interruptSource ?? null,
+              foldCursor: portableContextStore.load(id).lastFoldedSourceId,
+            }),
+          });
+        }
+        const compacted = deferred ? null : await compactPortableActorAfterRun(id);
         if (compacted) {
           mesh.recordEvent({
             kind: "portable_context_compacted",
@@ -3124,11 +3278,13 @@ async function composeStart(
     // host-global names listed here (`update`, `pnpm-hardlinks`, `model-admin`,
     // `room-admin`)
     // are stripped by the mesh: it never grants one, and only the seed below
-    // creates their rows.
+    // creates their rows. `obligation-responsive` (#1026) likewise mounts
+    // nothing: each worker's obligations server reads the grant per call.
     grantableCapabilities: new Set([
       ...grantableServers.keys(),
       SECRET_CAPABILITY_BASE,
       COMPUTER_USE_CAPABILITY,
+      OBLIGATION_RESPONSIVE_CAPABILITY,
       ...ADMINISTRATIVE_CAPABILITIES,
     ]),
     secretsDir: secretsDirPath(mcHome),
@@ -3363,6 +3519,7 @@ async function composeStart(
               resolveObligationOwner(actors, raw, getRepositories().principals),
             canManage: (callerId, obligation) =>
               canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
+            canSetResponsive: () => mesh.hasActiveCapability(id, OBLIGATION_RESPONSIVE_CAPABILITY),
             recordEvent: (event) => mesh.recordEvent(event),
             validateCompletionMatcher,
             evaluateCompletionMatcher: (obligationId) =>
@@ -3455,6 +3612,17 @@ async function composeStart(
           { name: PNPM_INSTALL_MCP_NAME, url: pnpmInstallUrl },
         ];
 
+        if (rec.context?.type === "portable" && rec.context.mode === "brief") {
+          const briefUrl = mcpHttp.addServer(`${id}:${BRIEF_MCP_NAME}`, () =>
+            createBriefMcpServer({
+              actorId: id,
+              store: portableContextStore,
+              resolveCitation: resolveBriefCitation,
+            })
+          );
+          workerMcp.push({ name: BRIEF_MCP_NAME, url: briefUrl });
+        }
+
         // Mount any capabilities granted to this actor (by id) on top of the default
         // worker set (ISSUE_NUM, phase 1a). A granted-but-not-mountable capability (none
         // registered) is skipped safely. Parameterized capabilities (e.g. chat-write:spaces/AAAA)
@@ -3538,7 +3706,9 @@ async function composeStart(
             const injection = assembleConfiguredPortableInjection(
               r,
               portableContextApiKey,
-              portableContextStore
+              portableContextStore,
+              portableJournalModeFor(id),
+              (error) => warnDeltaFallback(id, error)
             );
             return {
               prompt: buildWorkerPrompt(
@@ -3820,7 +3990,7 @@ async function composeStart(
   );
   const rootObligationsUrl = mcpHttp.addServer(`${rootId}:${OBLIGATIONS_MCP_NAME}`, () =>
     createObligationsMcpServer(getRepositories().obligations, rootId, {
-      canSetResponsive: true,
+      canSetResponsive: () => true,
       canManage: () => true,
       resolveOwner: (raw) => resolveObligationOwner(actors, raw, getRepositories().principals),
       recordEvent: (event) => mesh.recordEvent(event),
@@ -3896,7 +4066,14 @@ async function composeStart(
   const rootSlackUrl =
     slackClient && config.slack
       ? mcpHttp.addServer(`${rootId}:${SLACK_WRITE_MCP_NAME}`, () =>
-          createSlackWriteMcpServer(slackClient, "all", { workDir: rootAgentDir })
+          createSlackWriteMcpServer(slackClient, "all", {
+            actorHandle: rootHandle,
+            getRunSelection: () => activeRunSelections.get(rootId),
+            workDir: rootAgentDir,
+            onWrite: () => mesh.markUnkillable(rootId),
+            selectedInboxEntries: () => selectedInboxEntriesForActor(rootId),
+            logger: log,
+          })
         )
       : undefined;
 
@@ -3915,6 +4092,16 @@ async function composeStart(
     rootMcp.push({ name: CHAT_WRITE_MCP_NAME, url: rootChatUrl });
   }
   if (rootSlackUrl) rootMcp.push({ name: SLACK_WRITE_MCP_NAME, url: rootSlackUrl });
+  if (rootActor.context?.type === "portable" && rootActor.context.mode === "brief") {
+    const rootBriefUrl = mcpHttp.addServer(`${rootId}:${BRIEF_MCP_NAME}`, () =>
+      createBriefMcpServer({
+        actorId: rootId,
+        store: portableContextStore,
+        resolveCitation: resolveBriefCitation,
+      })
+    );
+    rootMcp.push({ name: BRIEF_MCP_NAME, url: rootBriefUrl });
+  }
   refreshLiveActorMcp(rootId);
 
   const externalRoot =
@@ -3964,7 +4151,9 @@ async function composeStart(
       const injection = assembleConfiguredPortableInjection(
         record,
         portableContextApiKey,
-        portableContextStore
+        portableContextStore,
+        portableJournalModeFor(rootId),
+        (error) => warnDeltaFallback(rootId, error)
       );
       return {
         prompt: buildRootPrompt(
@@ -4419,6 +4608,7 @@ async function composeStart(
           inbox: getRepositories().inbox,
           actorRuns: getRepositories().actorRuns,
           runPrompts: getRepositories().runPrompts,
+          portableContext: getRepositories().portableContext,
           inboxFocus: getRepositories().inboxFocus,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,
@@ -4561,7 +4751,7 @@ async function composeStart(
       if (config.chat?.excludedSpaces?.includes(msg.spaceName)) {
         return;
       }
-      const trigger = chatMessageWakes(msg, mesh.chatWakeModeFor(msg.spaceName));
+      const trigger = chatMessageWakes(msg, mesh.chatWakeModeFor(`gchat:${msg.spaceName}`));
       const who = msg.senderDisplayName ?? msg.senderName;
       console.log(`[chat] ${trigger ? "▶ trigger" : "·"} ${msg.spaceName} from ${who}`);
       if (!trigger) return;
@@ -4808,18 +4998,7 @@ async function composeStart(
         (event) => log.info("slack_event_received", event)
       );
       const deliver = async (msg: SlackInboundMessage) => {
-        const delivery = await mesh.deliverExternalEvent({
-          sourceType: "slack",
-          rawPayload: {
-            channel: msg.channel,
-            ts: msg.ts,
-            threadTs: msg.threadTs,
-            user: msg.user,
-          },
-          idempotencyKey: msg.eventId,
-          priority: "responsive",
-          eventSummary: `Slack message from ${msg.user}`,
-        });
+        const delivery = await mesh.deliverExternalEvent(slackInboxEvent(msg));
         log.info("slack_message_delivered", { channel: msg.channel, eventId: msg.eventId });
         return delivery;
       };
@@ -4833,7 +5012,20 @@ async function composeStart(
               eventId: msg.eventId,
               error: err instanceof Error ? err.message : String(err),
             })
-        )
+        ),
+        // Each conversation's stored mode is read per event (#1037), so a
+        // change governs the next arrival. No event waits for the bot's
+        // identity: until it is known, a plain-text mention goes undetected.
+        {
+          selfUserId: rememberSlackSelf(
+            () => slackClient.identify(),
+            (err) =>
+              log.warn("slack_self_identity_unavailable", {
+                error: err instanceof Error ? err.message : String(err),
+              })
+          ),
+          wakeModeFor: (channel) => mesh.chatWakeModeFor(`slack:channels/${channel}`),
+        }
       );
       resources.acquire("slack source", () => source?.close());
       log.info("slack_socket_active");

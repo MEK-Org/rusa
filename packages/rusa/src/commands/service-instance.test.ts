@@ -6,6 +6,7 @@ import {
   readUnitPathEnv,
   resolveExecutableOnPath,
   resolveExecutableSource,
+  resolveInstanceUnitPathEnv,
   resolvePathEnvForUnit,
   resolveProbePathEnv,
   resolveServiceDashboardUrl,
@@ -195,6 +196,65 @@ describe("resolveProbePathEnv", () => {
     expect(
       resolveProbePathEnv("rusa-staging.service", "[Service]\nRestart=always", noSystemd).source
     ).toBe("process");
+  });
+});
+
+describe("resolveInstanceUnitPathEnv", () => {
+  const noSystemd = () => null;
+  // The shell #986's reapply ran from: a provider sandbox whose first segment
+  // holds only that provider's vendored helpers, and no node/provider bin dir.
+  const sandboxPath =
+    "/home/u/.local/share/fnm/node-versions/v24/installation/lib/node_modules/@openai/codex/vendor/codex-path:/usr/bin:/bin";
+  const installedUnit =
+    "[Service]\nEnvironment=PATH=/home/u/.local/share/fnm/node-versions/v24/installation/bin:/home/u/.local/bin:/usr/bin:/bin";
+
+  it("keeps every installed segment, in order, ahead of anything this shell adds", () => {
+    process.env.FNM_DIR = "";
+    process.env.PATH = sandboxPath;
+
+    expect(resolveInstanceUnitPathEnv("rusa.service", installedUnit, noSystemd)).toEqual({
+      path: [
+        "/home/u/.local/share/fnm/node-versions/v24/installation/bin",
+        "/home/u/.local/bin",
+        "/usr/bin",
+        "/bin",
+        "/home/u/.local/share/fnm/node-versions/v24/installation/lib/node_modules/@openai/codex/vendor/codex-path",
+      ].join(":"),
+      source: "instance-unit-file",
+    });
+  });
+
+  it("starts from what systemd resolves, so a drop-in PATH is not demoted", () => {
+    process.env.FNM_DIR = "";
+    process.env.PATH = "/usr/bin:/bin";
+
+    expect(
+      resolveInstanceUnitPathEnv("rusa.service", installedUnit, () => "/dropin/bin:/usr/bin")
+    ).toEqual({ path: "/dropin/bin:/usr/bin:/bin", source: "instance-unit-systemd" });
+  });
+
+  it("still rewrites an ephemeral fnm shell bin, wherever it came from", () => {
+    process.env.FNM_DIR = "/home/u/.local/share/fnm";
+    const stableBin = `/home/u/.local/share/fnm/node-versions/${process.version}/installation/bin`;
+    process.env.PATH = "/run/user/1000/fnm_multishells/2_3/bin:/usr/bin";
+    const unit = "[Service]\nEnvironment=PATH=/run/user/1000/fnm_multishells/1_2/bin:/usr/bin";
+
+    expect(resolveInstanceUnitPathEnv("rusa.service", unit, noSystemd).path).toBe(
+      `${stableBin}:/usr/bin`
+    );
+  });
+
+  it("takes this shell's PATH for a fresh install or a unit with no PATH", () => {
+    process.env.FNM_DIR = "";
+    process.env.PATH = "/opt/bin:/usr/bin";
+
+    expect(resolveInstanceUnitPathEnv("rusa.service", null, noSystemd)).toEqual({
+      path: "/opt/bin:/usr/bin",
+      source: "process",
+    });
+    expect(
+      resolveInstanceUnitPathEnv("rusa.service", "[Service]\nRestart=always", noSystemd)
+    ).toEqual({ path: "/opt/bin:/usr/bin", source: "process" });
   });
 });
 

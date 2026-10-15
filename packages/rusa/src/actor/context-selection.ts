@@ -12,13 +12,16 @@ import type { ContextConfig } from "./actor-record.js";
  * - `tail` — the mesh owns the context as a bounded raw window with no
  *   compaction and no LLM in the loop; useful for experiments that want the
  *   aging boundary without a compactor.
+ * - `brief` — the actor keeps one cited three-section durable brief, which
+ *   it reads and replaces itself through the brief MCP tools; no LLM rewrites
+ *   it, so it needs no Gemini key.
  *
  * There is deliberately no bare `portable` selection. `ledger` and `tail` ARE
  * the portable modes, so a fourth word naming their family would sit at a
  * different level than the other three and leave "portable vs ledger" reading
  * as a real choice when it is not one. One field, one level: name the mode.
  */
-export const CONTEXT_SELECTIONS = ["native", "ledger", "tail"] as const;
+export const CONTEXT_SELECTIONS = ["native", "ledger", "tail", "brief"] as const;
 export type ContextSelection = (typeof CONTEXT_SELECTIONS)[number];
 
 export function isContextSelection(value: unknown): value is ContextSelection {
@@ -72,6 +75,16 @@ export function resolveContextSelection(
       throw new Error("compactionModel is meaningless for tail mode, which never compacts");
     }
     return { type: "portable", mode: "tail" };
+  }
+  if (raw === "brief") {
+    if (compactionModel) {
+      // The actor writes its own brief and nothing compacts it, so a model
+      // here would be accepted, stored, and never consulted.
+      throw new Error(
+        "compactionModel is meaningless for brief mode, which the actor writes itself"
+      );
+    }
+    return { type: "portable", mode: "brief" };
   }
   return { type: "portable", mode: "ledger", compactionModel };
 }

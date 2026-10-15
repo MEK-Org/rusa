@@ -1,12 +1,5 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { z } from "zod";
-import {
-  type CommitmentClaimInput,
-  type CommitmentClaimSource,
-  type CommitmentPolarityEvaluator,
-  type CommitmentPolarityVerdict,
-  evaluateClaims,
-} from "./commitment-polarity.js";
 import type { iuReportPaths } from "./persistence-utils.js";
 
 /**
@@ -370,219 +363,13 @@ function renderNodeOp(op: Record<string, unknown>): string {
   return `  - **${title}** (${kind}${mode})${summary ? ` — ${summary}` : ""}${supersedes}`;
 }
 
-// ---- Commitment-claim polarity check  ----
-
 /**
- * One high-confidence commitment claim, after the semantic evaluator has read it
- * against its own cited sources.
- *
- * `verdict` is three-state and the third state is the point : `unknown`
- * means the check ran and could not decide, which is neither a flag nor a pass.
- * Folding it into either direction is the defect this whole section exists to
- * catch, one level up.
+ * Render a run's journal into the human-readable nightly markdown report.
+ * Deterministic projection: what was learned, what was deliberately left out
+ * (present even when empty), and the run footer. Conclusions and confidence
+ * remain the distilling actor's judgment.
  */
-export interface CommitmentClaimCheck {
-  theme: string;
-  verdict: "flagged" | "clear" | "unknown";
-  reason?:
-    | "no_quoted_source"
-    | "source_contradicts_claim"
-    | "commitment_undetermined"
-    | "polarity_undetermined";
-  detail?: string;
-}
-
-/**
- * The section-level result. `status: "unavailable"` is not an empty result set —
- * it means the evaluator was not configured on this host, so nothing was checked
- * and `candidates` decisions went unread. Rendering that as "no flags" would be
- * concluding clean from a check that never ran.
- */
-export interface CommitmentCheckReport {
-  status: "evaluated" | "unavailable";
-  reason?: string;
-  candidates: number;
-  checks: CommitmentClaimCheck[];
-}
-
-function commitmentCandidates(
-  entries: JournalLine[]
-): { theme: string; input: CommitmentClaimInput }[] {
-  const out: { theme: string; input: CommitmentClaimInput }[] = [];
-  for (const e of entries) {
-    if (e.type !== "decision" || e.confidence !== "high") continue;
-    const theme = typeof e.theme === "string" && e.theme ? e.theme : "(untitled)";
-    const conclusion = typeof e.conclusion === "string" ? e.conclusion : "";
-    const rawSources = Array.isArray(e.sources) ? (e.sources as Record<string, unknown>[]) : [];
-    const sources: CommitmentClaimSource[] = [];
-    for (const s of rawSources) {
-      const excerpt = typeof s.excerpt === "string" ? s.excerpt.trim() : "";
-      if (!excerpt) continue;
-      sources.push({ ref: typeof s.ref === "string" && s.ref ? s.ref : "(no ref)", excerpt });
-    }
-    out.push({ theme, input: { theme, conclusion, sources } });
-  }
-  return out;
-}
-
-function checkFromVerdict(
-  theme: string,
-  input: CommitmentClaimInput,
-  verdict: CommitmentPolarityVerdict
-): CommitmentClaimCheck | null {
-  // Not a commitment claim at all — the ISSUE_NUM failure mode cannot apply, so it is
-  // not a candidate rather than a passing one.
-  if (verdict.assertsCommitment === "no") return null;
-
-  if (verdict.assertsCommitment === "unknown") {
-    return {
-      theme,
-      verdict: "unknown",
-      reason: "commitment_undetermined",
-      detail:
-        verdict.detail ??
-        "the evaluator could not tell whether this states a settled outcome or a proposal",
-    };
-  }
-
-  // Asserts a commitment at high confidence and quotes nothing: the check could
-  // not run against a source, and an unverifiable claim is a first-class flag
-  // rather than a silent skip.
-  if (input.sources.length === 0) {
-    return {
-      theme,
-      verdict: "flagged",
-      reason: "no_quoted_source",
-      detail:
-        "asserts a commitment at high confidence with no quoted excerpt to check it against — the polarity check could not run",
-    };
-  }
-
-  if (verdict.sourcePolarity === "contradicts") {
-    const where = verdict.ref ? `cited source \`${verdict.ref}\`` : "a cited source";
-    const why = verdict.detail ? ` ${verdict.detail}` : "";
-    return {
-      theme,
-      verdict: "flagged",
-      reason: "source_contradicts_claim",
-      detail: `${where} may say the opposite:${why} — "${verdict.quote ?? ""}"`,
-    };
-  }
-
-  if (verdict.sourcePolarity === "unknown") {
-    return {
-      theme,
-      verdict: "unknown",
-      reason: "polarity_undetermined",
-      detail:
-        verdict.detail ?? "the evaluator could not decide what the cited sources say about it",
-    };
-  }
-
-  return { theme, verdict: "clear" };
-}
-
-/**
- * The ISSUE_NUM control, run over a rendered run: for every high-confidence decision
- * that asserts something was *settled*, read its own cited excerpts and say
- * whether they support it, contradict it, or cannot settle the question.
- *
- * This is a semantic read by a cheap model , not a lexical one. The lexical
- * version it replaced could not distinguish "the proposal was adopted" from
- * "adopting the proposal was declined" except by a token-proximity window, and a
- * refusal phrased without any of its listed tokens was invisible to it.
- *
- * It stays inside the "no new judgment" contract: it points a human at a sentence
- * and never re-decides a disposition, edits a conclusion, or changes a confidence.
- * A flag is a pointer, not a verdict.
- */
-export async function checkCommitmentClaims(
-  entries: JournalLine[],
-  evaluate: CommitmentPolarityEvaluator | undefined
-): Promise<CommitmentCheckReport> {
-  const candidates = commitmentCandidates(entries);
-  if (!evaluate) {
-    return {
-      status: "unavailable",
-      reason:
-        "no semantic evaluator is configured on this host (geminiApiKey unset), so no claim was checked",
-      candidates: candidates.length,
-      checks: [],
-    };
-  }
-  const verdicts = await evaluateClaims(
-    candidates.map((c) => c.input),
-    evaluate
-  );
-  const checks: CommitmentClaimCheck[] = [];
-  for (let i = 0; i < candidates.length; i++) {
-    const check = checkFromVerdict(candidates[i].theme, candidates[i].input, verdicts[i]);
-    if (check) checks.push(check);
-  }
-  return { status: "evaluated", candidates: candidates.length, checks };
-}
-
-function renderCommitmentCheck(report: CommitmentCheckReport): string[] {
-  const out = ["## Commitment claims (polarity check)", ""];
-  if (report.status === "unavailable") {
-    out.push(
-      `**Not run** — ${report.reason ?? "the semantic evaluator was unavailable"}. ${report.candidates} high-confidence decision(s) went unchecked; that is unknown, not clean.`,
-      ""
-    );
-    return out;
-  }
-  const flagged = report.checks.filter((c) => c.verdict === "flagged");
-  const unknown = report.checks.filter((c) => c.verdict === "unknown");
-  if (report.checks.length === 0) {
-    out.push(
-      `_No high-confidence commitment claims this run (${report.candidates} high-confidence decision(s) read)._`,
-      ""
-    );
-    return out;
-  }
-  if (flagged.length === 0 && unknown.length === 0) {
-    out.push(
-      `_${report.checks.length} high-confidence commitment claim(s) read against their own quoted sources; none contradicted._`,
-      ""
-    );
-    return out;
-  }
-  if (flagged.length > 0) {
-    out.push(
-      `**${flagged.length} of ${report.checks.length} high-confidence commitment claim(s) need a human re-read.** A pointer at a sentence, not a verdict — it does not re-decide anything.`,
-      ""
-    );
-    for (const c of flagged) out.push(`- **${c.theme}** — ${c.detail}`);
-    out.push("");
-  }
-  if (unknown.length > 0) {
-    out.push(
-      `**${unknown.length} claim(s) could not be judged** — neither flagged nor cleared. Read these yourself; the check declining to answer is not a pass.`,
-      ""
-    );
-    for (const c of unknown) out.push(`- **${c.theme}** — ${c.detail}`);
-    out.push("");
-  }
-  return out;
-}
-
-/**
- * Render a run's journal into the human-readable nightly markdown report. A
- * deterministic projection — no new judgment, pure formatting — with the four
- * contract sections: what was learned, what was deliberately left out (never
- * omitted, even when empty — the ISSUE_NUM blind-spot surface), the commitment-claim
- * polarity check (ISSUE_NUM, likewise never omitted — a check that is silent when it
- * passes is indistinguishable from a check that did not run), and the run footer.
- *
- * The polarity check is the one non-deterministic input, so it is performed by
- * {@link checkCommitmentClaims} and passed IN rather than run here: the render
- * stays a pure function of (journal, check report), and the same report feeds the
- * markdown and `index.json` instead of being evaluated twice with two answers.
- */
-export function renderReportMarkdown(
-  entries: JournalLine[],
-  commitment: CommitmentCheckReport
-): string {
+export function renderReportMarkdown(entries: JournalLine[]): string {
   const meta = entries.find((e) => e.type === "run_meta");
   const summary = lastRunSummary(entries);
   const decisions = entries.filter((e) => e.type === "decision");
@@ -631,10 +418,8 @@ export function renderReportMarkdown(
     out.push("");
   }
 
-  out.push(...renderCommitmentCheck(commitment));
-
   out.push("## Run summary", "");
-  const counts = countsOf(entries, commitment);
+  const counts = countsOf(entries);
   out.push(
     `- Decisions: ${counts.decisions} (distilled ${counts.distilled} · adjudicated_away ${counts.adjudicated_away} · skipped ${counts.skipped} · deferred ${counts.deferred})`
   );
@@ -828,17 +613,9 @@ function renderChatCoverage(summary: JournalLine | undefined): string[] {
  * count against a sum of ops flagged the ordinary case as a discrepancy . The
  * invariant check is distinct-nodes against distinct-nodes, which the journal can
  * settle because every op names its `node_id`; a real disagreement is still stated
- * rather than silently resolved in either direction. The `commitment_claims*` figures come from
- * the check report the caller already ran  — the `run_summary` has no say in
- * them, so they carry into `index.json` for the dashboard without a contest. When
- * the check did not run they are `"unknown"` strings, which {@link numericCountsOf}
- * then omits: a dashboard that finds no key knows it does not know, whereas a `0`
- * would read as "checked, nothing found".
+ * rather than silently resolved in either direction.
  */
-function countsOf(
-  entries: JournalLine[],
-  commitment: CommitmentCheckReport
-): Record<string, number | string> {
+function countsOf(entries: JournalLine[]): Record<string, number | string> {
   const summary = lastRunSummary(entries);
   const provided = (summary?.counts ?? {}) as Record<string, number | undefined>;
   const decisions = entries.filter((e) => e.type === "decision");
@@ -865,15 +642,6 @@ function countsOf(
         : distinctNodes,
     node_ops: nodeOps,
     iu_hints: typeof provided.iu_hints === "number" ? provided.iu_hints : "unknown",
-    commitment_claims: commitment.status === "evaluated" ? commitment.checks.length : "unknown",
-    commitment_claims_flagged:
-      commitment.status === "evaluated"
-        ? commitment.checks.filter((c) => c.verdict === "flagged").length
-        : "unknown",
-    commitment_claims_unknown:
-      commitment.status === "evaluated"
-        ? commitment.checks.filter((c) => c.verdict === "unknown").length
-        : "unknown",
     ...chatCountsOf(summary),
     ...githubCountsOf(summary),
   };
@@ -922,12 +690,9 @@ function chatCountsOf(summary: JournalLine | undefined): Record<string, number |
  * journal cannot settle is OMITTED rather than coerced to a number — a consumer
  * that finds no key knows it does not know, whereas a `0` reads as a measurement.
  */
-function numericCountsOf(
-  entries: JournalLine[],
-  commitment: CommitmentCheckReport
-): Record<string, number> {
+function numericCountsOf(entries: JournalLine[]): Record<string, number> {
   return Object.fromEntries(
-    Object.entries(countsOf(entries, commitment)).filter(
+    Object.entries(countsOf(entries)).filter(
       (entry): entry is [string, number] => typeof entry[1] === "number"
     )
   );
@@ -947,7 +712,6 @@ export function buildIndexRun(
     relJournalPath: string;
     relReportPath: string;
     generatedAt: string;
-    commitment: CommitmentCheckReport;
   }
 ): IndexRun {
   const meta = entries.find((e) => e.type === "run_meta");
@@ -963,7 +727,7 @@ export function buildIndexRun(
     journalPath: args.relJournalPath,
     reportPath: args.relReportPath,
     status: statusOf(entries),
-    counts: numericCountsOf(entries, args.commitment),
+    counts: numericCountsOf(entries),
     generatedAt: args.generatedAt,
   };
 }
@@ -990,25 +754,18 @@ function readIndex(indexPath: string): ReportIndex {
  * Read a run's journal, render the markdown report, write it, and upsert the run
  * into `index.json`. The write-side counterpart to {@link appendJournalEntry};
  * called once after the run's `run_summary` line is appended.
- *
- * Async because the commitment-claim polarity check is a semantic read (ISSUE_NUM /
- * ISSUE_NUM). It runs ONCE here and its report feeds both the markdown and the index
- * counts — evaluating separately per consumer would let the two disagree about
- * the same run. A host with no evaluator renders the section as "did not run"
- * rather than falling back to a lexical approximation.
  */
-export async function renderAndIndex(
+export function renderAndIndex(
   paths: IuReportPaths,
   runId: string,
-  opts: { now: string; evaluateCommitment?: CommitmentPolarityEvaluator }
-): Promise<RenderResult> {
+  opts: { now: string }
+): RenderResult {
   const { date, journalPath } = resolveRunFile(paths, runId, { create: false });
   const entries = readLines(journalPath);
   if (entries.length === 0)
     throw new Error(`no journal entries for run ${runId} at ${journalPath}`);
 
-  const commitment = await checkCommitmentClaims(entries, opts.evaluateCommitment);
-  const markdown = renderReportMarkdown(entries, commitment);
+  const markdown = renderReportMarkdown(entries);
   mkdirSync(paths.renderedDir, { recursive: true });
   const reportPath = paths.renderedPath(date);
   writeFileSync(reportPath, markdown);
@@ -1020,7 +777,6 @@ export async function renderAndIndex(
     relJournalPath,
     relReportPath,
     generatedAt: opts.now,
-    commitment,
   });
   const nextIndex = upsertIndexRun(readIndex(paths.indexPath), run);
   mkdirSync(paths.reportsDir, { recursive: true });

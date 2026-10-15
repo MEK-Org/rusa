@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Type } from "@google/genai";
+import { generateGeminiContent } from "../observability/gemini-usage.js";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
 import {
   classifierIdFor,
@@ -110,7 +111,7 @@ export async function evaluateKimiScreen(
 
   try {
     const client = getGeminiClient(apiKey);
-    const response = await client.models.generateContent({
+    const response = await generateGeminiContent(client, "kimi_screen_classification", {
       model: KIMI_CLASSIFIER_MODEL,
       contents: `Classify this complete raw Kimi CLI screen:\n\n${rawOutput}`,
       config: {

@@ -45,16 +45,32 @@ export interface ExperimentDefinition {
 export type ExperimentRegistry = Readonly<Record<string, ExperimentDefinition>>;
 
 /**
+ * Compacted memory plus delta (#1062). An enrolled ledger-mode actor's prompt
+ * carries its compacted ledger plus only the durable sources recorded after
+ * the last successful fold, instead of a fixed window that re-sends sources
+ * the ledger already absorbed; and a run that ends interrupted defers its fold
+ * to the next ordinary run end so the responsive successor does not wait on
+ * the compactor. Default off: nobody is enrolled until an administrator
+ * enrolls them. See `docs/portable-context-delta-experiment.md`.
+ */
+export const COMPACTED_MEMORY_DELTA_EXPERIMENT = "compacted_memory_delta";
+
+/**
  * The complete set of experiments an actor may be enrolled in. Adding one is a
  * code change here and nowhere else — no migration, no schema constraint, no
  * data backfill. Removing one is the same edit plus deleting its rows, which is
  * exactly the disposability an experiment is supposed to have.
  *
- * Empty while nothing is being rolled out. `strict_obligation_handling` (#382)
- * was the last entry; strict head closure is now every actor's behavior
- * (#917), so its rows are stale and cleared with `unenroll_actor_experiment`.
+ * `strict_obligation_handling` (#382) was retired when strict head closure
+ * became every actor's behavior (#917); its rows are stale and cleared with
+ * `unenroll_actor_experiment`.
  */
-export const EXPERIMENTS: ExperimentRegistry = {};
+export const EXPERIMENTS: ExperimentRegistry = {
+  [COMPACTED_MEMORY_DELTA_EXPERIMENT]: {
+    intent:
+      "Ledger-mode prompt carries compacted memory plus only the sources after the last successful fold; an interrupted run defers its fold to the next ordinary run end (#1062).",
+  },
+};
 
 /** The registered names in a stable order, for readback and error messages. */
 export function experimentNames(registry: ExperimentRegistry = EXPERIMENTS): string[] {
