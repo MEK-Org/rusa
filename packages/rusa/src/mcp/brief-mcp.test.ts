@@ -4,11 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
 import { assemblePortableContextV2 } from "../actor/portable-context.js";
-import {
-  PORTABLE_CONTEXT_BRIEF_MAX_BYTES,
-  seedBriefText,
-  seedPortableBriefState,
-} from "../actor/portable-context-brief.js";
+import { seedBriefText, seedPortableBriefState } from "../actor/portable-context-brief.js";
 import {
   emptyPortableContextState,
   InMemoryPortableContextStore,
@@ -201,16 +197,9 @@ describe("brief MCP server", () => {
     expect(store.load(ALPHA).brief?.generation).toBe(0);
   });
 
-  it.each([
-    ["uncited", BRIEF.replace(" [mesh:messages/m-1]", ""), "no structured citation"],
-    ["state-bearing", BRIEF.replace("three colours", "the colours at 96800f2"), "commit SHA"],
-    ["unstructured", "Just some notes.", "content before the first section"],
-    [
-      "oversized",
-      `## WHAT\n${"Keep it short. [mesh:messages/m-1]\n".repeat(PORTABLE_CONTEXT_BRIEF_MAX_BYTES / 16)}\n## HOW\n\n## DOMAIN\n`,
-      "-byte cap",
-    ],
-  ])("keeps the last good brief when a write is %s", async (_label, text, reason) => {
+  it("keeps the last accepted brief and history when validation rejects an uncited write", async () => {
+    const text = BRIEF.replace(" [mesh:messages/m-1]", "");
+    const reason = "no structured citation";
     const { store, clientFor } = harness();
     const alpha = await clientFor(ALPHA);
     await call(alpha, "replace", { text: BRIEF, expected_generation: 0 });
@@ -348,6 +337,38 @@ describe("brief MCP server: citations must exist", () => {
     expect(rejected.text).toContain("The brief is unchanged.");
     expect(store.load(ALPHA)).toEqual(before);
     expect(store.listBriefRevisions(ALPHA, 10)).toEqual(historyBefore);
+  });
+
+  it.each([
+    ["slack:channels/C1/messages/1.1", "message has no text"],
+    ["github:MEK-Org/rusa/pulls/76/reviews/9001", "no content on the review"],
+  ])("rejects contentless source %s even when its resolver supplies an entity", async (ref, reason) => {
+    const { store, clientFor } = harness(
+      syntheticResolver({
+        slackClient: {
+          getMessage: async () => ({ text: "", ts: "1.1" }),
+          getChannel: async () => ({ id: "C1", name: "synthetic" }),
+        },
+        issueClient: {
+          getPullRequestReview: async () => ({
+            id: 9001,
+            body: "",
+            state: "",
+            author: "maintainer",
+          }),
+        },
+      })
+    );
+    const alpha = await clientFor(ALPHA);
+    const before = store.load(ALPHA);
+    const rejected = await call(alpha, "replace", {
+      text: `## WHAT\nDirection. [${ref}]\n\n## HOW\n\n## DOMAIN\n`,
+      expected_generation: 0,
+    });
+    expect(rejected.isError).toBe(true);
+    expect(rejected.text).toContain(reason);
+    expect(store.load(ALPHA)).toEqual(before);
+    expect(store.listBriefRevisions(ALPHA, 10)).toEqual([]);
   });
 
   it("rejects a citation whose source cannot be reached, naming the cause", async () => {

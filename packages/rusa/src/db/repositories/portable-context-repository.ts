@@ -95,6 +95,16 @@ export class DbPortableContextStore implements PortableContextStore, PortableBri
       .run(state.actorId, JSON.stringify(state));
   }
 
+  saveFolded(state: PortableContextState): PortableContextState {
+    return this.db
+      .transaction(() => {
+        const saved = { ...state, brief: this.load(state.actorId).brief };
+        this.save(saved);
+        return saved;
+      })
+      .immediate();
+  }
+
   /**
    * Accept one brief write. The reread, the generation check, the snapshot
    * replace and the history append run in one immediate transaction, so a

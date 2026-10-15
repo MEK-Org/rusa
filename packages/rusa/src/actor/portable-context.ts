@@ -62,7 +62,7 @@ export interface InjectRecord {
   sourceEventIds: string[];
   /** How many prior runs survived the byte cap. */
   runCount: number;
-  /** v2 ledger generation; absent for the legacy raw-tail mode. */
+  /** Ledger generation of the snapshot hashed by stateHash; brief generation is in the rendered heading. */
   stateGeneration?: number;
   /** Hash of the complete v2 materialized state. */
   stateHash?: string;
@@ -681,12 +681,12 @@ export function assemblePortableContextV2(input: {
   /** Journal provenance for the inject record (#1062); omit for the fixed window. */
   journal?: PortableJournalRecord;
 }): PortableContext | null {
-  const ledger = renderLedger(input.state);
-  const briefSection = input.brief ? renderBrief(input.brief) : ledger.section;
-  const ledgerMetrics = input.brief ? undefined : ledger.metrics;
+  const ledger = input.brief ? undefined : renderLedger(input.state);
+  const memorySection = input.brief ? renderBrief(input.brief) : (ledger?.section ?? "");
+  const ledgerMetrics = ledger?.metrics;
   const obligations = renderObligations(input.obligations ?? []);
   const recentMessages = boundedMessages(input.messages);
-  const fixed = V2_HEADER + briefSection + obligations + recentMessages.section;
+  const fixed = V2_HEADER + memorySection + obligations + recentMessages.section;
   if (byteLen(fixed) > PORTABLE_CONTEXT_MAX_BYTES) {
     throw new Error(`portable context fixed sections exceed ${PORTABLE_CONTEXT_MAX_BYTES} bytes`);
   }
@@ -712,7 +712,7 @@ export function assemblePortableContextV2(input: {
   const orderedRuns = [...selectedRuns].reverse();
   const runsSection =
     orderedRuns.length > 0 ? runHeading + orderedRuns.map(renderRun).join("") : "";
-  if (!briefSection && !obligations && !recentMessages.section && !runsSection) return null;
+  if (!memorySection && !obligations && !recentMessages.section && !runsSection) return null;
 
   const section = fixed + runsSection;
   return {
@@ -726,7 +726,7 @@ export function assemblePortableContextV2(input: {
       stateHash: createHash("sha256").update(JSON.stringify(input.state)).digest("hex"),
       sourceMessageEventIds: recentMessages.selected.map((message) => message.id),
       sections: {
-        ledger: byteLen(briefSection),
+        ledger: byteLen(memorySection),
         messages: byteLen(recentMessages.section),
         runs: byteLen(runsSection),
       },

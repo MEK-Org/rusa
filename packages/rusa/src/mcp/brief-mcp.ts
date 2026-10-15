@@ -10,6 +10,7 @@ import type {
   PortableBriefStore,
   PortableContextStore,
 } from "../actor/portable-context-state.js";
+import type { ReferenceEntity } from "../references/resolve.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 
@@ -22,7 +23,7 @@ export const BRIEF_MCP_NAME = "brief";
  */
 export type BriefCitationResolver = (
   ref: string
-) => Promise<{ unavailable: string | null; entity?: unknown }>;
+) => Promise<{ unavailable: string | null; entity?: ReferenceEntity }>;
 
 export interface BriefMcpDeps {
   /** The calling actor. Baked into this server instance; no tool takes an actor id. */
@@ -205,7 +206,9 @@ async function unresolvedCitations(
             };
           }
           const { unavailable, entity } = outcome;
-          return unavailable === null || entity !== undefined ? null : { ref, reason: unavailable };
+          const emptyIssue =
+            entity?.type === "github_issue" || entity?.type === "github_pull_request";
+          return unavailable === null || emptyIssue ? null : { ref, reason: unavailable };
         } catch (err) {
           return { ref, reason: err instanceof Error ? err.message : String(err) };
         }

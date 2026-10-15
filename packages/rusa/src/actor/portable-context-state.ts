@@ -194,6 +194,8 @@ export function emptyPortableContextState(actorId: string): PortableContextState
 export interface PortableContextStore {
   load(actorId: string): PortableContextState;
   save(state: PortableContextState): void;
+  /** Save ledger fold fields while atomically preserving the latest stored brief. */
+  saveFolded(state: PortableContextState): PortableContextState;
 }
 
 /** One accepted brief write, read back from the append-only brief history. */
@@ -288,6 +290,12 @@ export class InMemoryPortableContextStore implements PortableContextStore, Porta
   save(state: PortableContextState): void {
     portableContextStateSchema.parse(state);
     this.states.set(state.actorId, structuredClone(state));
+  }
+
+  saveFolded(state: PortableContextState): PortableContextState {
+    const saved = { ...state, brief: this.load(state.actorId).brief };
+    this.save(saved);
+    return saved;
   }
 
   commitBrief(input: PortableBriefCommit): PortableBriefRevision {

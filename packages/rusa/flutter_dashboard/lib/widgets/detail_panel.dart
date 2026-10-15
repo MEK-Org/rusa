@@ -592,7 +592,6 @@ class _InfoViewState extends State<_InfoView> {
   int? _briefGeneration;
   String? _briefUpdatedAt;
   List<BriefRevision> _briefRevisions = const [];
-  bool _loadingInfo = false;
 
   /// The actor the charter on screen was fetched for. Set while a fetch is in
   /// flight and kept if it succeeds; a failure clears it.
@@ -636,12 +635,10 @@ class _InfoViewState extends State<_InfoView> {
 
   Future<void> _loadCharter({bool trackDetail = false}) async {
     final id = widget.actor.id;
-    // Brief actors refresh with the existing detail rebuilds, so the actor's
-    // own writes reach an open Info tab without loading every actor's context.
-    if (_loadedFor == id && (!_briefMode || _loadingInfo)) return;
+    // Charter, brief and the bounded history are one snapshot per tab opening.
+    if (_loadedFor == id) return;
     final isNewActor = _loadedFor != id;
     _loadedFor = id;
-    _loadingInfo = true;
     final fetch = ++_fetch;
     if (isNewActor) {
       setState(() {
@@ -685,8 +682,6 @@ class _InfoViewState extends State<_InfoView> {
       // error — but release the id, so the next poll retries rather than
       // pinning the panel to the preview for as long as this actor is selected.
       if (fetch == _fetch) _loadedFor = null;
-    } finally {
-      if (fetch == _fetch) _loadingInfo = false;
     }
   }
 
@@ -906,7 +901,7 @@ class _InfoViewState extends State<_InfoView> {
                     fontWeight: FontWeight.w600,
                   ),
                 ),
-                if (_briefGeneration != null && _briefGeneration! > 0) ...[
+                if (_briefGeneration != null) ...[
                   const SizedBox(width: 8),
                   Container(
                     padding: const EdgeInsets.symmetric(
@@ -931,8 +926,8 @@ class _InfoViewState extends State<_InfoView> {
                 if (_briefUpdatedAt != null && _briefUpdatedAt!.isNotEmpty) ...[
                   const SizedBox(width: 8),
                   Expanded(
-                    // The update time is the accepted-write time, and the
-                    // way into its history alongside the icon.
+                    // Generation zero records the seed time; later generations
+                    // record accepted writes. Both are persisted updates.
                     child: Align(
                       alignment: Alignment.centerLeft,
                       child: InkWell(
@@ -980,7 +975,9 @@ class _InfoViewState extends State<_InfoView> {
                         fontSize: 13,
                       ),
                     )
-                  : SelectionArea(child: SimpleMarkdown(_brief!)),
+                  : SelectionArea(
+                      child: SimpleMarkdown(_brief!.split('\n').join('\n\n')),
+                    ),
             ),
           ],
           const SizedBox(height: 24),

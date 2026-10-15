@@ -25,8 +25,8 @@ const byteLen = (s: string): number => Buffer.byteLength(s, "utf8");
 
 // ── State exclusion (the brief is understanding, never per-resource state) ──
 
-/** 7+ hex with at least one digit: matches short SHAs like 96800f2 but not the word "defaced". */
-const HEAD_SHA_PATTERN = /\b(?=[0-9a-fA-F]*\d)[0-9a-fA-F]{7,40}\b/;
+/** Mixed hex avoids treating ordinary words and decimal counts as commit ids. */
+const HEAD_SHA_PATTERN = /\b(?=[0-9a-fA-F]*\d)(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{7,40}\b/;
 const RUN_OR_MESSAGE_ID_PATTERN =
   /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/;
 const REVIEW_ID_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
@@ -35,9 +35,9 @@ const REVIEW_ID_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   [/discussion_r\d+\b/i, "discussion_r<id>"],
   [/\breview\s+(?:#?\d{6,})\b/i, "review <id>"],
 ];
-const GATE_TALLY_PATTERN = /\b\d{1,2}\s*\/\s*\d{1,2}\b/;
-/** A #NNN with no owner/repo in front of it. */
-const BARE_ISSUE_REF_PATTERN = /(^|[^\w/#])#(\d+)\b/;
+// Ratios and dates are ordinary understanding; gate status needs a status cue.
+const GATE_TALLY_PATTERN =
+  /\b(?:gate(?:\s+stands\s+at)?\s+\d+\s*\/\s*\d+|\d+\s*\/\s*\d+\s+(?:approvals?|reviews?|seats?))\b/i;
 
 /**
  * Why `statement` names per-resource state, or null when it is clean. Checks
@@ -61,8 +61,13 @@ export function findBriefStateExclusions(statement: string): string[] {
   }
   const tally = statement.match(GATE_TALLY_PATTERN);
   if (tally) result.push(`names a gate tally (${tally[0]})`);
-  const issue = statement.match(BARE_ISSUE_REF_PATTERN);
-  if (issue) result.push(`names a bare issue number (${issue[0].trim()}) without its repository`);
+  for (const issue of statement.matchAll(/#\d+\b/g)) {
+    const prefix = statement.slice(0, issue.index);
+    if (!/(?:^|[^\w./-])[\w.-]+\/[\w.-]+$/.test(prefix)) {
+      result.push(`names a bare issue number (${issue[0]}) without its owner/repository`);
+      break;
+    }
+  }
   return result;
 }
 
@@ -203,17 +208,13 @@ export type ActorBriefValidationResult =
       newCitations: string[];
     };
 
-/** Canonical keys of every structured citation in `text`, in first-seen order. */
-export function briefCitations(text: string): string[] {
-  const keys = new Set<string>();
-  for (const group of text.matchAll(/\[([^\]]+)\]/g)) {
-    try {
-      keys.add(parseReference(group[1].trim()).key);
-    } catch {
-      // Not a reference: statement text such as `[sic]`.
-    }
-  }
-  return [...keys];
+/** Canonical citation keys from the already validated statement lines. */
+function briefCitations(parsed: ParsedBrief | undefined): string[] {
+  return [
+    ...new Set(
+      (parsed?.lines ?? []).flatMap((line) => line.refs.map((ref) => parseReference(ref).key))
+    ),
+  ];
 }
 
 /**
@@ -267,12 +268,12 @@ export function validateActorBriefUpdate(
   }
 
   if (errors.length > 0) return { outcome: "invalid", errors };
-  const previous = new Set(briefCitations(input.previousText));
+  const previous = new Set(briefCitations(parseBriefDocument(input.previousText).parsed));
   return {
     outcome: "accepted",
     text,
     ...(explanation === undefined ? {} : { explanation }),
-    newCitations: briefCitations(text).filter((ref) => !previous.has(ref)),
+    newCitations: briefCitations(parsed).filter((ref) => !previous.has(ref)),
   };
 }
 

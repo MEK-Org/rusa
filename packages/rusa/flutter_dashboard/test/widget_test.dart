@@ -636,57 +636,64 @@ void main() {
     });
   });
 
-  testWidgets(
-    'Info shows and refreshes a brief, then clears it on actor switch',
-    (tester) async {
-      await tester.runAsync(() async {
-        final api = FakeApi()
-          ..threadsResult = [
-            makeThread('root', created: 't0'),
-            makeThread('a', parent: 'root', created: 't1'),
-            makeThread('b', parent: 'root', created: 't2'),
-          ]
-          ..briefs['a'] =
-              '## WHAT\n**Fixture purpose**\n## HOW\n- Fixture rules\n## DOMAIN\nFixture knowledge';
-        final store = DashboardStore(api: api, stream: FakeStream());
-        await store.init();
-        await tester.pumpWidget(_harness(store));
-        await tester.pump(const Duration(milliseconds: 50));
-        await tester.tap(find.text('a-handle'));
-        await tester.pump(const Duration(milliseconds: 50));
-        await tester.ensureVisible(find.text('Info'));
-        await tester.tap(find.text('Info'));
-        for (var i = 0; i < 10; i++) {
-          await tester.pump(const Duration(milliseconds: 100));
-        }
-        expect(find.text('Brief'), findsOneWidget);
-        expect(find.text('WHAT'), findsOneWidget);
-        expect(find.text('Fixture purpose'), findsOneWidget);
-        expect(find.text('Fixture rules'), findsOneWidget);
-        expect(find.text(api.briefs['a']!), findsNothing);
-        api.briefs['a'] = '## WHAT\nUpdated purpose';
-        await store.refreshThreads();
-        for (var i = 0; i < 10; i++) {
-          await tester.pump(const Duration(milliseconds: 100));
-        }
-        expect(find.text('Updated purpose'), findsOneWidget);
-        expect(find.text('Fixture purpose'), findsNothing);
-        api.briefs['a'] = null;
-        await store.refreshThreads();
-        for (var i = 0; i < 10; i++) {
-          await tester.pump(const Duration(milliseconds: 100));
-        }
-        expect(find.text('No brief yet.'), findsOneWidget);
-        await tester.tap(find.text('b-handle'));
-        for (var i = 0; i < 10; i++) {
-          await tester.pump(const Duration(milliseconds: 100));
-        }
-        expect(find.text('Brief'), findsNothing);
-        expect(find.text('Updated purpose'), findsNothing);
-        await store.dispose();
-      });
-    },
-  );
+  testWidgets('Info caches a brief until actor selection changes', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread('a', parent: 'root', created: 't1'),
+          makeThread('b', parent: 'root', created: 't2'),
+        ]
+        ..briefs['a'] =
+            '## WHAT\n**Fixture purpose**\n## HOW\n- Fixture rules\n## DOMAIN\nFixture knowledge';
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      await tester.pumpWidget(_harness(store));
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.tap(find.text('a-handle'));
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.ensureVisible(find.text('Info'));
+      await tester.tap(find.text('Info'));
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.text('Brief'), findsOneWidget);
+      expect(find.text('WHAT'), findsOneWidget);
+      expect(find.text('Fixture purpose'), findsOneWidget);
+      expect(find.text('Fixture rules'), findsOneWidget);
+      expect(find.text(api.briefs['a']!), findsNothing);
+      api.briefs['a'] = '## WHAT\nUpdated purpose';
+      final calls = api.charterCalls.length;
+      await store.refreshThreads();
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.text('Fixture purpose'), findsOneWidget);
+      expect(find.text('Updated purpose'), findsNothing);
+      expect(api.charterCalls, hasLength(calls));
+      await tester.tap(find.text('b-handle'));
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.text('Brief'), findsNothing);
+      await tester.tap(find.text('a-handle'));
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.text('Updated purpose'), findsOneWidget);
+      expect(find.text('Fixture purpose'), findsNothing);
+      expect(api.charterCalls, hasLength(calls + 2));
+      await tester.tap(find.text('b-handle'));
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.text('Brief'), findsNothing);
+      expect(find.text('Updated purpose'), findsNothing);
+      await store.dispose();
+    });
+  });
 
   testWidgets(
     'Info opens the latest brief changes, then one change with its explanation (Option B)',

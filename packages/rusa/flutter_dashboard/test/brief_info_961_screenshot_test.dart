@@ -18,15 +18,13 @@ const _parentId = '00000000-0000-4000-8000-000000000000';
 
 // Synthetic fixtures: each statement line ends in a structured citation, as the
 // brief grammar requires of an accepted write.
-const _seed =
-    '''## WHAT
+const _seed = '''## WHAT
 
 ## HOW
 
 ## DOMAIN''';
 
-const _gen1 =
-    '''## WHAT
+const _gen1 = '''## WHAT
 Draw abstract SVG art for the assigned gallery. [mesh:messages/m-purpose]
 
 ## HOW
@@ -36,8 +34,7 @@ Report each finished piece to the parent. [mesh:messages/m-report]
 ## DOMAIN
 The gallery renders at 1:1 pixel density. [github:MEK-Org/rusa/issues/954]''';
 
-const _gen2 =
-    '''## WHAT
+const _gen2 = '''## WHAT
 Draw abstract SVG art for the assigned gallery. [mesh:messages/m-purpose]
 
 ## HOW
@@ -199,6 +196,63 @@ Future<void> _capture(
 
 void main() {
   setUpAll(loadFonts);
+
+  testWidgets(
+    'Info distinguishes an empty seeded brief and caches it across mesh rebuilds',
+    (tester) async {
+      await tester.runAsync(() async {
+        tester.view
+          ..physicalSize = const Size(390, 844)
+          ..devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+        final api = FakeApi()
+          ..threadsResult = [makeThread(_actorId)]
+          ..briefs[_actorId] = _seed
+          ..briefGenerations[_actorId] = 0
+          ..briefUpdatedAts[_actorId] = '2026-10-10T12:00:00Z';
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        store.clickActor(_actorId);
+        final boundaryKey = GlobalKey();
+        await tester.pumpWidget(_app(store, boundaryKey, mobile: true));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Info'));
+        await tester.pumpAndSettle();
+        expect(find.text('Gen 0'), findsOneWidget);
+        expect(find.text('No brief yet.'), findsNothing);
+        expect(
+          find.byKey(const ValueKey('brief-history-button')),
+          findsNothing,
+        );
+        await captureBoundary(
+          boundaryKey,
+          '$_outDir/961_brief_info_mobile_seed.png',
+        );
+        final calls = api.charterCalls.length;
+        await store.refreshThreads();
+        await tester.pumpAndSettle();
+        expect(api.charterCalls, hasLength(calls));
+
+        // Reopening reads fresh data; null is the distinct, unseeded state.
+        await tester.tap(find.text('Live Output'));
+        await tester.pumpAndSettle();
+        api.briefs[_actorId] = null;
+        api.briefGenerations[_actorId] = null;
+        api.briefUpdatedAts[_actorId] = null;
+        await tester.tap(find.text('Info'));
+        await tester.pumpAndSettle();
+        expect(find.text('No brief yet.'), findsOneWidget);
+        expect(find.text('Gen 0'), findsNothing);
+        expect(api.charterCalls, hasLength(calls + 1));
+        await captureBoundary(
+          boundaryKey,
+          '$_outDir/961_brief_info_mobile_unseeded.png',
+        );
+        await tester.pumpWidget(const SizedBox.shrink());
+        await store.dispose();
+      });
+    },
+  );
 
   for (final mobile in [false, true]) {
     for (final step in _Step.values) {

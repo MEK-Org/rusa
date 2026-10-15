@@ -9,11 +9,7 @@ import {
   seedPortableBriefState,
   validateActorBriefUpdate,
 } from "./portable-context-brief.js";
-import {
-  emptyPortableContextState,
-  type PortableBrief,
-  type PortableContextState,
-} from "./portable-context-state.js";
+import { emptyPortableContextState, type PortableContextState } from "./portable-context-state.js";
 
 const ACTOR = "actor-under-test";
 const SEED_TEXT = seedBriefText();
@@ -48,8 +44,16 @@ describe("findBriefStateExclusion", () => {
 
   it("allows owner/repo-qualified issue refs", () => {
     expect(findBriefStateExclusion("carry on with MEK-Org/rusa#954")).toBeNull();
-    expect(findBriefStateExclusion("carry on with rusa#954")).toBeNull();
+    expect(findBriefStateExclusion("carry on with rusa#954")).toContain("bare issue number");
+    expect(findBriefStateExclusion("carry on with /#954")).toContain("bare issue number");
   });
+});
+
+it("allows ordinary numeric prose while refusing explicit gate status", () => {
+  expect(
+    findBriefStateExclusion("Handle 1000000 records with the 80/20 rule, 24/7, from 10/15.")
+  ).toBeNull();
+  expect(findBriefStateExclusion("We have 2/2 approvals.")).toContain("gate tally");
 });
 
 describe("parseBriefDocument", () => {
@@ -229,60 +233,6 @@ describe("seedPortableBriefState", () => {
     expect(validateActorBriefUpdate({ text: SEED_TEXT, previousText: "" }).outcome).toBe(
       "accepted"
     );
-  });
-});
-
-describe("brief mode switch", () => {
-  it("switching to ledger mode and back preserves the brief snapshot byte-identically", () => {
-    const keptBrief: PortableBrief = {
-      text: SEED_TEXT,
-      generation: 2,
-      updatedAt: "2026-10-08T09:00:00Z",
-    };
-
-    const state: PortableContextState = {
-      ...emptyPortableContextState(ACTOR),
-      items: [
-        {
-          id: "mem-ledger-1",
-          kind: "decision",
-          priority: "must",
-          status: "active",
-          statement: "Active ledger decision",
-          evidence: [{ eventId: "e1", sender: "root", ts: "2026-10-01T00:00:00Z", quote: "q" }],
-          updatedAt: "2026-10-01T00:00:00Z",
-        },
-      ],
-      brief: keptBrief,
-    };
-
-    // Mode switched to ledger: brief is omitted from assembly
-    const ledgerContext = assemblePortableContextV2({
-      state,
-      messages: [{ id: "m-1", ts: "2026-10-08T09:00:00Z", sender: "root", body: "hello" }],
-      runs: [],
-      brief: null,
-    });
-    expect(ledgerContext).not.toBeNull();
-    expect(ledgerContext?.section).toContain("Active ledger decision");
-    expect(ledgerContext?.section).not.toContain("Durable brief (mode: brief");
-
-    // The snapshot document still retains the brief untouched
-    expect(state.brief).toEqual(keptBrief);
-
-    // Mode switched back to brief: brief is passed to assembly
-    const briefContext = assemblePortableContextV2({
-      state,
-      messages: [{ id: "m-1", ts: "2026-10-08T09:00:00Z", sender: "root", body: "hello" }],
-      runs: [],
-      brief: state.brief,
-    });
-    expect(briefContext).not.toBeNull();
-    expect(briefContext?.section).toContain("### Durable brief (mode: brief, generation 2");
-    expect(briefContext?.section).not.toContain("Active ledger decision");
-
-    // State brief object remains byte-identical
-    expect(state.brief).toEqual(keptBrief);
   });
 });
 

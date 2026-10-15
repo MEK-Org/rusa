@@ -4512,10 +4512,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(built.injectRecord?.runCount).toBe(1);
   });
 
-  it.each([
-    false,
-    true,
-  ])("seeds brief mode without a Gemini key and retains its window with delta enrollment=%s", async (deltaEnrolled) => {
+  it("seeds brief mode without a Gemini key and retains its window before and after delta enrollment", async () => {
     let mesh: ActorMesh | undefined;
     writeFileSync(
       join(homeDir, "config.yaml"),
@@ -4543,9 +4540,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     });
     if (!mesh) throw new Error("mesh not ready");
-    if (deltaEnrolled) {
-      mesh.enrollActorInExperiment("root", COMPACTED_MEMORY_DELTA_EXPERIMENT, "root");
-    }
     const foldedMessage = getRepositories().meshChat.record({
       senderId: "operator",
       recipientId: "root",
@@ -4580,20 +4574,42 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     const rootActor = mesh.get("root");
     if (!rootActor) throw new Error("root actor not ready");
-    const built = (
-      rootActor as unknown as {
-        opts: { buildPrompt: () => { prompt: string; injectRecord?: InjectRecord } };
-      }
-    ).opts.buildPrompt();
-    const prompt = built.prompt;
-    expect(prompt).toContain("## WHAT\n\n## HOW\n\n## DOMAIN\n");
-    expect(prompt).not.toContain("This old ledger line must not leak into brief mode.");
-    expect(prompt).toContain("Message before the preserved ledger cursor.");
-    expect(prompt).toContain("Message after the preserved ledger cursor.");
-    expect(built.injectRecord?.journal).toBeUndefined();
-    expect(built.injectRecord?.ledger).toBeUndefined();
-    expect(getRepositories().portableContext.load("root").lastFoldedSourceId).toBe(foldedMessage);
-    expect(getRepositories().portableContext.load("root").brief?.generation).toBe(0);
+    for (const deltaEnrolled of [false, true]) {
+      if (deltaEnrolled)
+        mesh.enrollActorInExperiment("root", COMPACTED_MEMORY_DELTA_EXPERIMENT, "root");
+      const built = (
+        rootActor as unknown as {
+          opts: { buildPrompt: () => { prompt: string; injectRecord?: InjectRecord } };
+        }
+      ).opts.buildPrompt();
+      const prompt = built.prompt;
+      expect(prompt).toContain("## WHAT\n\n## HOW\n\n## DOMAIN\n");
+      expect(prompt).not.toContain("This old ledger line must not leak into brief mode.");
+      expect(prompt).toContain("Message before the preserved ledger cursor.");
+      expect(prompt).toContain("Message after the preserved ledger cursor.");
+      expect(built.injectRecord?.journal).toBeUndefined();
+      expect(built.injectRecord?.ledger).toBeUndefined();
+      expect(getRepositories().portableContext.load("root").lastFoldedSourceId).toBe(foldedMessage);
+      expect(getRepositories().portableContext.load("root").brief?.generation).toBe(0);
+    }
+    // A brief mount must disappear with its actor, including live HTTP access.
+    const workerId = mesh.spawn({
+      charter: "Synthetic brief worker",
+      parentId: "root",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      context: { type: "portable", mode: "brief" },
+    });
+    const worker = mesh.get(workerId) as unknown as {
+      opts: { mcpServers: Array<{ name: string; url: string }> };
+    };
+    const url = worker.opts.mcpServers.find((server) => server.name === "brief")?.url;
+    if (!url) throw new Error("brief MCP missing");
+    const client = new Client({ name: "brief-retirement", version: "0.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+    expect((await client.callTool({ name: "read", arguments: {} })).isError).not.toBe(true);
+    await client.close();
+    mesh.retire(workerId);
+    await vi.waitFor(async () => expect((await fetch(url)).status).toBe(404));
   });
 
   it("applies the existing ledger API-key requirement to a portable root", async () => {

@@ -2,8 +2,10 @@
 
 **Status:** draft for review, revised to the contract settled in
 [#954 (comment)](https://github.com/MEK-Org/rusa/issues/954#issuecomment-6155205270).
-The [review amendment](https://github.com/MEK-Org/rusa/pull/961#issuecomment-6202255237)
-removes charter references and starts each brief with empty sections.
+The [review amendment](https://github.com/MEK-Org/rusa/pull/961#issuecomment-6202960922)
+records the operator's 2026-10-15 21:00:12 UTC request to remove charter
+references. Removing the sole charter-cited seed statement leaves the three
+empty sections; this is distinct from the earlier actor-owned contract.
 The storage change below adds a migration and needs the normal schema gate
 before it ships.
 **Tracking:** [#954](https://github.com/MEK-Org/rusa/issues/954),
@@ -95,8 +97,9 @@ An accepted write must:
   `[github:OWNER/REPO/issues/<n>]`, with nothing after the first citation but
   more citations;
 - name no per-resource state in a statement: commit SHAs, run or message UUIDs,
-  review ids, gate tallies (`3/4`), or bare `#123` references without their
-  repository. Citations may contain such ids; only the statement text is checked.
+  review ids, explicitly labelled gate tallies (`gate 3/4`, `2/2 approvals`),
+  or `#123` references without their owner/repository. Mixed hexadecimal tokens
+  are treated as commit ids; ordinary decimal counts, ratios and dates are allowed. Citations may contain such ids; only the statement text is checked.
 
 ### Citations must exist
 
@@ -123,9 +126,10 @@ the previous accepted brief were checked when that brief was accepted, so they
 are not resolved again. The empty seed has no citations. An outage on an old
 source does not block an edit. Charter references are not supported.
 
-An existing source with an empty body, such as an issue with no description,
-counts as resolved. A Google Chat message with no text (`message has no text`)
-is refused, because the resolver returns nothing to show that it exists.
+An existing GitHub issue or pull request with an empty body counts as resolved.
+A textless Chat or Slack message, or a GitHub review with neither body nor
+verdict, is refused using the resolver's unavailable reason. A review's verdict
+counts as content even without a comment.
 
 ### Whole-document check
 
@@ -142,7 +146,9 @@ byte-identical guard and no per-line supersession bookkeeping. The history
 The current brief lives in the actor's existing portable-context snapshot
 (`portable_context_snapshots`, schemaVersion 4) as
 `brief: { text, generation, updatedAt } | null`. The ledger fields stay in the
-same document untouched, so switching back to ledger mode loses nothing.
+same document untouched. Ledger folds preserve the latest brief inside a
+`BEGIN IMMEDIATE` transaction spanning the reread and snapshot save, so a brief
+committed through a second connection cannot be overwritten by a stale fold.
 `updatedAt` is the time of the last accepted write (the seed time before the
 first one).
 
@@ -270,8 +276,14 @@ exist (§4).
 
 ## 7. Dashboard (Option B)
 
-- The Info tab's Brief header shows the generation and `updated <time>`. The
-  history icon and the time both open the history.
+- The Info tab's Brief header shows every persisted generation, including
+  generation 0, and `updated <time>` (seed time at zero, accepted-write time
+  thereafter). A null brief says "No brief yet." Statements render as separate
+  paragraphs, preserving their boundaries. The history icon and time open
+  history when accepted writes exist.
+- Charter, brief and the latest ten revisions are fetched once when Info opens
+  or the selected actor changes. Unrelated mesh updates do not refetch them;
+  reopening the tab reads a fresh snapshot.
 - The history lists the latest ten accepted writes, newest first. Each shows
   its generation, time, a `+added −removed` line count and the explanation (or
   "No explanation given.").
@@ -300,6 +312,7 @@ exist (§4).
   waits for the model, then saves. If the actor switched to brief mode and
   committed a brief during that wait, saving the stale copy would roll the
   snapshot behind its history, and every later commit would then fail on
-  `UNIQUE`. The compaction now takes the stored brief at save time. Taking it
-  and saving it are synchronous, with no await between them. A test commits
-  during the fold and checks that the brief survives and the next write lands.
+  `UNIQUE`. The compaction now takes the stored brief and saves the ledger
+  fields inside one immediate repository transaction. A fold test commits
+  during the model wait; a real two-connection test verifies preservation and
+  exclusion of another writer during the reread/save transaction.

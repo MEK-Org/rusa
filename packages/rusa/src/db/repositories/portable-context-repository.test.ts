@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { seedPortableBriefState } from "../../actor/portable-context-brief.js";
 import {
   emptyPortableContextState,
@@ -288,6 +288,36 @@ describe("DbPortableContextStore", () => {
         expect(() => commit(otherStore, 0, 2)).toThrow(StaleBriefWriteError);
         expect(otherStore.load(ACTOR_A).brief?.text).toBe(brief(1));
         expect(rowCount()).toBe(1);
+      } finally {
+        other.close();
+      }
+    });
+
+    it("preserves a second connection's brief and holds its write lock across the fold save", () => {
+      const folded = { ...store.load(ACTOR_A), generation: 9, lastFoldedSourceId: "folded" };
+      const other = open();
+      other.pragma("busy_timeout = 0");
+      try {
+        const otherStore = new DbPortableContextStore(other);
+        commit(otherStore, 0, 1);
+        const load = store.load.bind(store);
+        const lockedRead = vi.spyOn(store, "load").mockImplementationOnce((actorId) => {
+          const current = load(actorId);
+          expect(() => commit(otherStore, 1, 2)).toThrow(/locked/);
+          return current;
+        });
+        try {
+          expect(store.saveFolded(folded)).toMatchObject({
+            generation: 9,
+            lastFoldedSourceId: "folded",
+            brief: { text: brief(1), generation: 1 },
+          });
+        } finally {
+          lockedRead.mockRestore();
+        }
+        expect(store.load(ACTOR_A).brief?.generation).toBe(1);
+        expect(rowCount()).toBe(1);
+        expect(commit(otherStore, 1, 2).generation).toBe(2);
       } finally {
         other.close();
       }

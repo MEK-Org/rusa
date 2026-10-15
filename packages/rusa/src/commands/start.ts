@@ -1014,15 +1014,11 @@ export async function compactPortableContext(input: {
       messages: page.sources,
       now: (input.now ?? (() => new Date().toISOString()))(),
     });
-    // The fold read `state` before awaiting the model. The brief is not the
-    // fold's to write: if the actor's mode switched and it committed a brief
-    // meanwhile, saving the stale copy would roll the snapshot back under
-    // brief history that is already ahead of it. Take the stored brief as it
-    // is now; the reread and the save run with no await between them.
-    state = { ...result.state, brief: input.store.load(input.actorId).brief };
+    // A brief may have committed while the fold awaited the model, including
+    // through another connection. Preserve it inside the store's write lock.
+    state = input.store.saveFolded(result.state);
     quarantinedOperations.push(...result.quarantined);
     operations += result.operations;
-    input.store.save(state);
     folded += page.sources.length;
     foldedSelf += page.sources.filter((source) => source.kind === "run_yielded").length;
     bytes += page.sources.reduce(
@@ -2663,6 +2659,7 @@ async function composeStart(
   const teardownActorMcp = (actorId: string) => {
     liveWorkerMcp.delete(actorId);
     void mcpHttp.removeServer(actorId);
+    void mcpHttp.removeServer(`${actorId}:${BRIEF_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${INBOX_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${OBLIGATIONS_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${MESH_CHAT_MCP_NAME}`);
