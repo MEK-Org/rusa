@@ -4883,8 +4883,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // past its read ceiling. Show the newest window, not the oldest 200 sources.
     mesh.enrollActorInExperiment("root", COMPACTED_MEMORY_DELTA_EXPERIMENT, "root");
     // The reader keeps only sources stamped later than the cursor (d, recorded
-    // on the real clock moments ago), so this fixed horizon stays ahead of it.
-    // Keeping the fixture explicit avoids coupling it to the wall clock.
+    // on the real clock moments ago), so the backlog starts at a fixed horizon
+    // ahead of it. The backlog stamps repeat across runs; the cursor is still
+    // real-clock, so this assumes the test runs before 3026.
     const backlogStart = Date.UTC(3026, 0, 1);
     const backlog: string[] = [];
     for (let i = 0; i < 205; i++) {
