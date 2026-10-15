@@ -994,7 +994,13 @@ export class ActorMesh {
   }
 
   private readonly selectedInboxEntryIds = new Map<string, string[]>();
-  /** Actors currently inside a run, for the ready-head window below. */
+  /**
+   * Actors whose own run has started and not yet ended, for the ready-head
+   * window below. A run that is only queued — behind the concurrency cap or in
+   * provider pacing — is outside it: nothing it has done can have moved the
+   * head, and nothing would read a buffered transition until the queue drained,
+   * so its head attention lands at once (#1071).
+   */
   private readonly actorsInRun = new Set<string>();
   /**
    * Ready-head churn observed while an actor is mid-run, collapsed at run end
@@ -1295,6 +1301,9 @@ export class ActorMesh {
         {
           onQueued: (event) => {
             this.actorQueued(event.actorId, event);
+          },
+          onStart: (event) => {
+            this.actorStarted(event.actorId);
           },
           onEnd: (event) => {
             if (event.terminal.kind === "result") {
@@ -1862,11 +1871,6 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
     this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
-    // Open the run-scoped head window. An actor absent from this set delivers
-    // head attention immediately, which is what every non-run producer wants.
-    this.actorsInRun.add(actorId);
-    this.runHeadNet.delete(actorId);
-    this.runResponsiveReadyAttention.delete(actorId);
     const entries = context.mode === "ordinary" ? this.markInboxSeen(actorId) : [];
     try {
       this.onQueued?.(actorId, context);
@@ -1874,6 +1878,19 @@ export class ActorMesh {
       this.log(`onQueued(${actorId}) failed: ${err instanceof Error ? err.message : String(err)}`);
     }
     return entries;
+  }
+
+  /**
+   * Lifecycle boundary where the run's provider work begins: open the
+   * run-scoped head window. An actor absent from the window — idle, or only
+   * queued — delivers head attention immediately, which is what every non-run
+   * producer wants (#1071).
+   */
+  actorStarted(actorId: string): void {
+    actorId = this.resolveThreadId(actorId);
+    this.actorsInRun.add(actorId);
+    this.runHeadNet.delete(actorId);
+    this.runResponsiveReadyAttention.delete(actorId);
   }
 
   private markInboxSeen(actorId: string): InboxEntry[] {
@@ -2635,9 +2652,15 @@ export class ActorMesh {
     this.actorsInRun.delete(actorId);
     const net = this.runHeadNet.get(actorId);
     this.runHeadNet.delete(actorId);
-    // Nothing moved, it settled back where it started, or it ended with no head
-    // at all — in the last case there is no obligation to point the actor at.
-    if (!net || net.to === null || net.to.id === net.from) return;
+    if (!net) return;
+    // It settled back where it started, or it ended with no head at all — in
+    // the last case there is no obligation to point the actor at.
+    if (net.to === null || net.to.id === net.from) {
+      this.log(
+        `ready-head attention for ${actorId} suppressed at run end: net ${net.from ?? "none"} -> ${net.to?.id ?? "none"}`
+      );
+      return;
+    }
     this.appendReadyHeadEntry(actorId, net.to, net.from, null, net.epoch);
   }
 
