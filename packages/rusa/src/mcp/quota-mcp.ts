@@ -1422,6 +1422,34 @@ export class QuotaService {
     });
   }
 
+  /**
+   * The lane an earlier reading established keeps a Claude model window the
+   * parser mapped to fewer of its models this time (#1078). Bounded to Claude,
+   * where the alias flap was observed; other providers' readings stand as read.
+   */
+  private keepClaudeLaneModels(
+    provider: "claude" | "codex" | "agy" | "kimi",
+    limits: QuotaLimit[] | undefined,
+    previous: readonly QuotaLimit[] | undefined
+  ): QuotaLimit[] | undefined {
+    if (provider !== "claude" || !limits) return limits;
+    const kept = keepWindowLaneModels(
+      limits,
+      previous ?? [],
+      configuredModelRefs(this.configuredModelsFor(provider))
+    );
+    kept.forEach((limit, index) => {
+      const read = limits[index];
+      if (limit === read || typeof limit.scope !== "object" || typeof read.scope !== "object") {
+        return;
+      }
+      console.info(
+        `[quota-mcp] [${provider}] kept "${limit.label}" ${limit.kind} on lane [${limit.scope.models?.join(",")}]; parser named [${read.scope.models?.join(",")}]`
+      );
+    });
+    return kept;
+  }
+
   private async parsePersistedScrape(
     provider: "claude" | "codex" | "agy" | "kimi",
     rawOutput: string,
@@ -1436,15 +1464,7 @@ export class QuotaService {
     });
     try {
       const rawState = await parse();
-      // The lane an earlier reading established keeps a model window the
-      // parser mapped to fewer of its models this time (#1078).
-      const limits =
-        rawState.limits &&
-        keepWindowLaneModels(
-          rawState.limits,
-          prevState?.limits ?? [],
-          configuredModelRefs(this.configuredModelsFor(provider))
-        );
+      const limits = this.keepClaudeLaneModels(provider, rawState.limits, prevState?.limits);
       const inferredState = inferQuotaState({ ...rawState, limits }, prevState, scrapedAt);
       if (id) this.deps.scrapeStore?.recordParsed(id, rawState, inferredState);
       if (rawState.status === "unknown") this.failedReads.add(inferredState);

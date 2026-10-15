@@ -828,10 +828,12 @@ describe("QuotaCollectionLoop", () => {
         missed: detector.observe("claude", history, client.getCachedScrapeOutcomes("claude")),
       };
     };
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
     try {
       await coordinator.start();
       await loop.tick();
       expect((await observe()).missed).toEqual([]);
+      expect(info).not.toHaveBeenCalled();
 
       nowMs = Date.parse("2026-10-15T21:00:17.000Z");
       await loop.tick();
@@ -839,6 +841,9 @@ describe("QuotaCollectionLoop", () => {
 
       expect(run).toHaveBeenCalledTimes(2);
       expect(missed).toEqual([]);
+      expect(info).toHaveBeenCalledWith(
+        '[quota-mcp] [claude] kept "Current week (Fable)" weekly on lane [claude-fable-5,claude-fable-5-1]; parser named [claude-fable-5]'
+      );
       const fableRows = history.filter((record) => record.scope === "model");
       expect(
         new Set(fableRows.map((record) => quotaLaneKey("model", record.models ?? [], record.kind)))
@@ -852,6 +857,7 @@ describe("QuotaCollectionLoop", () => {
         ?.limits?.find((limit) => limit.label === "Current week (Fable)");
       expect(latestFable?.scope).toEqual({ provider: "claude", models: fableModels });
     } finally {
+      info.mockRestore();
       await coordinator.stop();
       store.close();
     }

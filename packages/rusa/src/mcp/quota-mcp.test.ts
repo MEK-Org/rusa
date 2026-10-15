@@ -2402,6 +2402,47 @@ describe("quota MCP server", () => {
         expect(inferred.limits).toHaveLength(1);
       });
 
+      it("takes a narrower codex model window as read, without keeping the earlier lane (#1078)", async () => {
+        const sparkModels = ["gpt-5.3-codex-spark", "gpt-5.3-codex-spark-mini"];
+        const service = new QuotaService({
+          config: {
+            providers: { codex: { cliCommand: "codex" } },
+            geminiApiKey: "test-gemini-key",
+          } as unknown as RusaConfig,
+          workersDir: "/tmp/workers",
+          scrapeCodexStatus: vi.fn().mockResolvedValue(twoPanelCapture()),
+          modelCatalogFor: () => [
+            ...codexCatalog,
+            ...sparkModels.map((identifier) => ({ displayLabel: identifier, identifier })),
+          ],
+          now: () => scrapedAtMs,
+          ttlMs: 0,
+        });
+        service.hydrate("codex", {
+          provider: "codex",
+          status: "available",
+          scrapedAt: "2026-09-16T10:47:36.825Z",
+          limits: [
+            {
+              label: "Weekly limit",
+              kind: "weekly",
+              percentLeft: 100,
+              resetAtIso: sparkWeeklyReset,
+              scope: { provider: "codex", models: sparkModels },
+            },
+          ],
+        });
+        mockGenerateContent.mockResolvedValue({ text: () => JSON.stringify(reservePanelResponse) });
+
+        const state = await service.getQuota("codex");
+
+        expect(
+          state.limits
+            ?.filter((limit) => typeof limit.scope === "object" && limit.scope.models)
+            .map((limit) => typeof limit.scope === "object" && limit.scope.models)
+        ).toEqual([["gpt-5.3-codex-spark"], ["gpt-5.3-codex-spark"]]);
+      });
+
       it("keeps the last good reading when the refresh never completes within the bounded retry", async () => {
         const capture = pendingOnlyCapture();
         const scrapeCodexStatus = vi.fn().mockResolvedValue(capture);
