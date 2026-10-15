@@ -150,14 +150,50 @@ describe("AvailabilityHoldRepository", () => {
     }
   });
 
-  it("stores each hold's scope as one JSON object", () => {
+  it("stores each hold's scope as one canonical, versioned JSON object", () => {
     holds.set({ provider: "Kimi", createdBy: "root", createdAt: CREATED });
     holds.set({ provider: "codex", models: ["GPT-5.5"], createdBy: "root", createdAt: CREATED });
 
     expect(db.prepare("SELECT scope FROM availability_holds ORDER BY scope").all()).toEqual([
-      { scope: '{"provider":"codex","model":"gpt-5.5"}' },
-      { scope: '{"provider":"kimi"}' },
+      { scope: '{"schemaVersion":1,"provider":"codex","model":"gpt-5.5"}' },
+      { scope: '{"schemaVersion":1,"provider":"kimi"}' },
     ]);
+  });
+
+  it("serializes equal scopes identically, so setting one again replaces its row", () => {
+    holds.set({ provider: " KIMI ", models: ["Kimi-K2"], createdBy: "root", createdAt: CREATED });
+    holds.set({
+      provider: "kimi",
+      models: [" kimi-k2 "],
+      reason: "again",
+      createdBy: "steward",
+      createdAt: CREATED,
+    });
+
+    expect(db.prepare("SELECT scope, reason FROM availability_holds").all()).toEqual([
+      { scope: '{"schemaVersion":1,"provider":"kimi","model":"kimi-k2"}', reason: "again" },
+    ]);
+  });
+
+  it("refuses to read a stored scope it does not understand", () => {
+    const insert = db.prepare(
+      `INSERT INTO availability_holds (scope, created_by, created_at) VALUES (?, 'root', '${CREATED}')`
+    );
+    for (const scope of [
+      "kimi",
+      '{"provider":"kimi"}',
+      '{"schemaVersion":2,"provider":"kimi"}',
+      '{"schemaVersion":1,"provider":""}',
+      '{"schemaVersion":1,"provider":"kimi","model":""}',
+      '{"schemaVersion":1,"provider":"kimi","models":["kimi-k2"]}',
+    ]) {
+      db.prepare("DELETE FROM availability_holds").run();
+      insert.run(scope);
+      expect(() => holds.list(), scope).toThrow(/invalid availability hold scope/);
+      expect(() => holds.isHeld("kimi", "kimi-k2", NOW), scope).toThrow(
+        /invalid availability hold scope/
+      );
+    }
   });
 
   it("refuses blank scopes and unparseable timestamps", () => {

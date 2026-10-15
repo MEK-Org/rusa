@@ -29,43 +29,19 @@ describe("0057_availability_holds", () => {
     expect(db.prepare("SELECT COUNT(*) AS n FROM availability_holds").get()).toEqual({ n: 0 });
   });
 
-  it("accepts provider-wide and model scopes in canonical JSON", () => {
+  it("leaves scope shape to the repository and only keeps scope text unique", () => {
     const db = new Database(":memory:");
     availabilityHolds.up(db);
     const insert = db.prepare(
       `INSERT INTO availability_holds (scope, created_by, created_at) VALUES (?, 'root', '${CREATED}')`
     );
 
-    insert.run('{"provider":"kimi"}');
-    insert.run('{"provider":"kimi","model":"kimi-k2"}');
-    expect(() => insert.run('{"provider":"kimi"}')).toThrow(/UNIQUE/);
-    expect(() => insert.run('{"provider":"kimi","model":"kimi-k2"}')).toThrow(/UNIQUE/);
-  });
-
-  it("refuses scopes that are blank, unnormalized, or not canonical JSON", () => {
-    const db = new Database(":memory:");
-    availabilityHolds.up(db);
-    const insert = db.prepare(
-      `INSERT INTO availability_holds (scope, created_by, created_at) VALUES (?, 'root', '${CREATED}')`
-    );
-
-    for (const scope of [
-      "kimi",
-      "[]",
-      "{}",
-      '{"provider":""}',
-      '{"provider":"Kimi"}',
-      '{"provider":" kimi"}',
-      '{"provider":7}',
-      '{"provider":"kimi","model":""}',
-      '{"provider":"kimi","model":"Kimi-K2"}',
-      '{"provider":"kimi","model":null}',
-      '{"model":"kimi-k2","provider":"kimi"}',
-      '{"provider": "kimi"}',
-      '{"provider":"kimi","models":["kimi-k2"]}',
-    ]) {
-      expect(() => insert.run(scope), scope).toThrow(/CHECK|malformed JSON/);
+    // No CHECK or json_* validator: the versioned scope document is validated
+    // by AvailabilityHoldRepository, the code that consumes it.
+    for (const scope of ["kimi", "{}", '{"provider":"Kimi"}', '{"schemaVersion":2}']) {
+      expect(() => insert.run(scope), scope).not.toThrow();
     }
+    expect(() => insert.run("kimi")).toThrow(/UNIQUE/);
     expect(() => insert.run(null)).toThrow(/NOT NULL/);
   });
 });

@@ -5,14 +5,18 @@ import type { Migration } from "./types.js";
  * Durable availability holds (#539).
  *
  * A hold takes a provider lane, or one of its models, out of selection without
- * editing any configured model pool. `scope` is a JSON object naming what the
- * row holds: `{"provider":"kimi"}` holds the whole provider, and
- * `{"provider":"kimi","model":"kimi-k2"}` holds that one model on it. Several
- * rows may coexist, and setting the same scope again replaces its row.
+ * editing any configured model pool. `scope` is a versioned JSON document
+ * naming what the row holds: `{"schemaVersion":1,"provider":"kimi"}` holds the
+ * whole provider, and `{"schemaVersion":1,"provider":"kimi","model":"kimi-k2"}`
+ * holds that one model on it. Several rows may coexist, and setting the same
+ * scope again replaces its row.
  *
- * Scope text is canonical (provider first, model only when present, no other
- * keys or whitespace) with names normalized (trimmed, lowercase), so equal
- * scopes are equal strings and the unique index on `scope` sees duplicates.
+ * The column has no database-level shape constraint (no CHECK, no `json_valid`,
+ * no `json_extract`), matching `host_jobs.manifest` (0040) and
+ * `portable_context_snapshots.snapshot` (0048). `AvailabilityHoldRepository`
+ * owns the shape: it validates the document on read and writes one canonical,
+ * normalized serialization, so equal scopes are equal strings and the unique
+ * index on `scope` sees duplicates.
  *
  * `expiry` is an ISO-8601 UTC timestamp, or NULL for a hold that lasts until it
  * is cleared. Expired rows are ignored at selection time and are not deleted
@@ -23,28 +27,7 @@ export const availabilityHolds: Migration = {
   up: (db: Database) => {
     db.exec(`
       CREATE TABLE availability_holds (
-        scope      TEXT NOT NULL CHECK (
-          json_valid(scope)
-          AND json_type(scope, '$.provider') = 'text'
-          AND json_extract(scope, '$.provider') <> ''
-          AND json_extract(scope, '$.provider') = lower(trim(json_extract(scope, '$.provider')))
-          AND (
-            json_type(scope, '$.model') IS NULL
-            OR (
-              json_type(scope, '$.model') = 'text'
-              AND json_extract(scope, '$.model') <> ''
-              AND json_extract(scope, '$.model') = lower(trim(json_extract(scope, '$.model')))
-            )
-          )
-          AND scope = CASE
-            WHEN json_type(scope, '$.model') IS NULL
-              THEN json_object('provider', json_extract(scope, '$.provider'))
-            ELSE json_object(
-              'provider', json_extract(scope, '$.provider'),
-              'model', json_extract(scope, '$.model')
-            )
-          END
-        ),
+        scope      TEXT NOT NULL,
         expiry     TEXT,
         reason     TEXT NOT NULL DEFAULT '',
         created_by TEXT NOT NULL,
