@@ -346,7 +346,7 @@ describe("brief MCP server: citations must exist", () => {
     const { store, clientFor } = harness(
       syntheticResolver({
         slackClient: {
-          getMessage: async () => ({ text: "", ts: "1.1" }),
+          getMessage: async () => ({ channel: "C1", text: "", ts: "1.1" }),
           getChannel: async () => ({ id: "C1", name: "synthetic" }),
         },
         issueClient: {
