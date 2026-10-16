@@ -32,7 +32,6 @@ describe("ChatRoomService", () => {
     new ChatRoomService({
       store: new ChatRoomRepository(db),
       actors,
-      rootId: "root",
       voices: () => buildSupportedVoiceCatalog(),
       defaultVoice: DEFAULT,
       isHumanPrincipal: (id) => id === "00000000-0000-4000-8000-000000000001",
@@ -48,8 +47,30 @@ describe("ChatRoomService", () => {
     clock = 0;
   });
 
-  it("starts as root alone", () => {
-    expect(service().participants()).toEqual([{ actorId: "root", addedBy: null, addedAt: null }]);
+  it("starts empty until an actor receives an explicit room binding", () => {
+    const room = service();
+    expect(room.participants()).toEqual([]);
+    room.add("root", "operator");
+    expect(room.participants()).toEqual([
+      { actorId: "root", addedBy: "operator", addedAt: "2026-09-30T12:00:00.000Z" },
+    ]);
+  });
+
+  it("has no implicit participant when an empty store booted with no imported actor (#1003)", () => {
+    actors.upsert(actor("a", { parentId: null }));
+    const room = new ChatRoomService({
+      store: new ChatRoomRepository(db),
+      actors,
+      voices: () => buildSupportedVoiceCatalog(),
+      defaultVoice: DEFAULT,
+      isHumanPrincipal: () => false,
+    });
+
+    expect(room.participants()).toEqual([]);
+    room.add("a", "00000000-0000-4000-8000-000000000001");
+    expect(room.participants().map((participant) => participant.actorId)).toEqual(["a"]);
+    expect(room.remove("a")).toBe(true);
+    expect(room.participants()).toEqual([]);
   });
 
   it("persists added participants in join order, visible to a fresh reader", () => {
@@ -61,7 +82,6 @@ describe("ChatRoomService", () => {
     // A new service over the same database stands in for another dashboard
     // (or a restart): membership is mesh state, not per-session state.
     expect(service().participants()).toEqual([
-      { actorId: "root", addedBy: null, addedAt: null },
       { actorId: "b", addedBy: "root", addedAt: "2026-09-30T12:00:00.000Z" },
       { actorId: "a", addedBy: "root", addedAt: "2026-09-30T12:00:01.000Z" },
     ]);
@@ -87,6 +107,7 @@ describe("ChatRoomService", () => {
     // `b` is explicitly set to the first catalog voice, so the next pick skips it.
     actors.upsert(actor("b", { voiceConfig: googleVoiceConfig("Achernar") }));
     const room = service();
+    room.add("root", "operator");
     room.add("b", "root");
 
     const result = room.add("a", "root");
@@ -122,21 +143,20 @@ describe("ChatRoomService", () => {
       voice: googleVoiceConfig("Kore"),
       replacedVoice: null,
     });
-    expect(room.participants()).toHaveLength(2);
+    expect(room.participants()).toHaveLength(1);
   });
 
-  it("refuses root, aliases, human principals, and unknown or retired actors", () => {
+  it("refuses aliases, human principals, and unknown or retired actors", () => {
     actors.upsert(actor("gone", { status: "retired" }));
     const room = service();
 
-    expect(() => room.add("root", "root")).toThrow(/always in the Chat Room/);
     expect(() => room.add("parent", "root")).toThrow(/alias/);
     expect(() => room.add("00000000-0000-4000-8000-000000000001", "root")).toThrow(
       /human principals/
     );
     expect(() => room.add("nobody", "root")).toThrow(/unknown actor/);
     expect(() => room.add("gone", "root")).toThrow(/retired/);
-    expect(room.participants()).toHaveLength(1);
+    expect(room.participants()).toHaveLength(0);
   });
 
   it("refuses to add when every voice is already spoken for", () => {
@@ -144,18 +164,18 @@ describe("ChatRoomService", () => {
     const room = new ChatRoomService({
       store: new ChatRoomRepository(db),
       actors,
-      rootId: "root",
       voices: () => [{ label: "Laomedeia", providerLabel: "Gemini", voiceConfig: DEFAULT }],
       defaultVoice: DEFAULT,
       isHumanPrincipal: () => false,
     });
 
+    room.add("root", "operator");
     expect(() => room.add("a", "root")).toThrow(/no unused voice/);
     expect(room.participants()).toHaveLength(1);
     expect(actors.get("a")?.voiceConfig).toBeUndefined();
   });
 
-  it("removes a participant, keeps its voice, and never removes root", () => {
+  it("removes a participant, keeps its voice, and permits explicit binding revocation", () => {
     actors.upsert(actor("a"));
     const room = service();
     room.add("a", "root");
@@ -163,9 +183,15 @@ describe("ChatRoomService", () => {
 
     expect(room.remove("a")).toBe(true);
     expect(room.remove("a")).toBe(false);
-    expect(room.participants()).toEqual([{ actorId: "root", addedBy: null, addedAt: null }]);
+    expect(room.participants()).toEqual([]);
+    // A fresh service stands in for a restart: removal is a durable revocation,
+    // not a transient dashboard filter.
+    expect(service().participants()).toEqual([]);
     expect(actors.get("a")?.voiceConfig).toEqual(assigned);
-    expect(() => room.remove("root")).toThrow(/cannot be removed/);
+    room.add("root", "operator");
+    expect(room.remove("root")).toBe(true);
+    expect(room.participants()).toEqual([]);
+    expect(service().participants()).toEqual([]);
     expect(() => room.remove("parent")).toThrow(/use an actor id, not an alias/);
   });
 
@@ -175,6 +201,6 @@ describe("ChatRoomService", () => {
     room.add("a", "root");
     actors.patch("a", { status: "retired" });
 
-    expect(room.participants()).toEqual([{ actorId: "root", addedBy: null, addedAt: null }]);
+    expect(room.participants()).toEqual([]);
   });
 });

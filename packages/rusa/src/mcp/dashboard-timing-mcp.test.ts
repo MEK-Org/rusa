@@ -46,6 +46,7 @@ describe("dashboard timing MCP", () => {
         retentionMs: 7 * 24 * 60 * 60 * 1000,
         retentionLimited: false,
         unreadableRecords: 0,
+        unreadableSubstages: 0,
       },
     }));
     const client = await connect(createDashboardTimingMcpServer({ summary }));

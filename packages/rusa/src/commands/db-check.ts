@@ -120,18 +120,21 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
     // The configured actor, resolved the way boot's one-time import resolves
     // it, over the actors boot would have committed by then. A home that boot
     // would refuse (ambiguous, retired or missing) throws here with the same
-    // diagnostic, so a deploy learns it before restarting. Boot mints an id for
-    // an empty home; preflight's minted id has never appeared in a legacy
-    // document, so it matches no config-implied row either.
+    // diagnostic, so a deploy learns it before restarting. An empty home
+    // imports no actor (#1003); a session-only legacy home gets a minted id,
+    // which has never appeared in a legacy document, so it matches no
+    // config-implied row either.
     const configuredActorPlan = planConfiguredActorImport({
       actors: {
         list: () => actorsVisibleToGrantPlan(repositories.actors.list(), pendingActors),
       },
       receipts: repositories.legacyImportReceipts,
       workersDir: join(home, "workers"),
+      legacyRootSession:
+        plan.plan.kind === "deferred-root-session" || plan.plan.kind === "deferred-empty-threads",
     });
     const rootId =
-      configuredActorPlan.kind === "create"
+      configuredActorPlan.kind === "create" || configuredActorPlan.kind === "none"
         ? undefined
         : configuredActorPlan.kind === "adopt"
           ? (configuredActorPlan.previousActorId ?? configuredActorPlan.actorId)

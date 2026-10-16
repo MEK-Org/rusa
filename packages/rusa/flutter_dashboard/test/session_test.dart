@@ -85,6 +85,29 @@ class _Client extends http.BaseClient {
 }
 
 void main() {
+  test('dashboard actor creation requests portable brief context', () async {
+    final client = _Client([http.Response('{"id":"first"}', 201)]);
+    final api = DashboardApi(
+      base: Uri.parse('http://localhost'),
+      client: client,
+    );
+    expect(
+      await api.spawnRootChild(
+        charter: 'Start here',
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+      ),
+      'first',
+    );
+    expect(client.paths, ['/api/mesh/actors']);
+    expect(jsonDecode(client.requestBodies.single), {
+      'charter': 'Start here',
+      'provider': 'codex',
+      'model': 'gpt-5.6-sol',
+      'contextMode': 'brief',
+    });
+  });
+
   test(
     'restored Firebase user reaches the dashboard before background cookie validation',
     () async {

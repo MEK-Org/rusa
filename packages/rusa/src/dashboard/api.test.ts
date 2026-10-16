@@ -10,6 +10,7 @@ import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
+import type { OperatorActorControl } from "../actor/operator-actor-control.js";
 import { seedPortableBriefState } from "../actor/portable-context-brief.js";
 import {
   emptyPortableContextState,
@@ -175,11 +176,12 @@ describe("handleMeshApiRequest", () => {
   let LOCAL_USER: string;
   let deps: DashboardDataDeps;
   let rootSpawns: Array<{ request: unknown; principal: string }>;
-  let rootReparents: Array<{ id: string; parentId: string; principal: string }>;
   let rootHoldClears: Array<{
     scope: { provider: string; models?: string[] };
     principal: string;
   }>;
+  let operatorReparents: Array<{ id: string; parentId: string | null; principal: string }>;
+  let operatorObligationsAdmin: Array<{ id: string; enabled: boolean; principal: string }>;
   let admissionReorders: unknown[];
 
   beforeEach(() => {
@@ -204,8 +206,9 @@ describe("handleMeshApiRequest", () => {
       createdAt: "2026-06-21T00:00:00.000Z",
     }).id;
     rootSpawns = [];
-    rootReparents = [];
     rootHoldClears = [];
+    operatorReparents = [];
+    operatorObligationsAdmin = [];
     admissionReorders = [];
     const mockMesh = {
       sendMessage: (toId: string, body: string, from: string, sessionId: string) => {
@@ -236,9 +239,6 @@ describe("handleMeshApiRequest", () => {
           rootSpawns.push({ request, principal });
           return UUID_A;
         },
-        reparentChild: (id: string, parentId: string, principal: string) => {
-          rootReparents.push({ id, parentId, principal });
-        },
         clearAvailabilityHolds: (
           scope: { provider: string; models?: string[] },
           principal: string
@@ -259,6 +259,15 @@ describe("handleMeshApiRequest", () => {
           };
         },
       } as unknown as RootControlService,
+      operatorActors: {
+        reparent: (id: string, parentId: string | null, principal: string) => {
+          operatorReparents.push({ id, parentId, principal });
+        },
+        setObligationsAdmin: (id: string, enabled: boolean, principal: string) => {
+          operatorObligationsAdmin.push({ id, enabled, principal });
+          return { actorId: id, capability: "obligations-admin", active: enabled };
+        },
+      } as unknown as OperatorActorControl,
       reorderAdmissionQueue: (request) => {
         admissionReorders.push(request);
         return { status: "ok", order: [] };
@@ -752,6 +761,7 @@ describe("handleMeshApiRequest", () => {
     const mutations = (): Array<[string, string, string | undefined]> => [
       ["POST", "/api/mesh/actors", JSON.stringify({ charter: "c", provider: "agy", model: "m" })],
       ["POST", `/api/mesh/actors/${UUID_B}/reparent`, JSON.stringify({ parentId: UUID_A })],
+      ["POST", `/api/mesh/actors/${UUID_B}/reparent`, JSON.stringify({ parentId: null })],
       ["POST", `/api/mesh/actors/${UUID_A}/chat`, JSON.stringify({ body: "hi" })],
       ["POST", `/api/mesh/actors/${UUID_A}/interrupt`, JSON.stringify({ by: LOCAL_USER })],
       ["POST", `/api/mesh/actors/${UUID_A}/run-now`, undefined],
@@ -777,7 +787,7 @@ describe("handleMeshApiRequest", () => {
         expect(JSON.parse(res.body).error, `${method} ${path}`).toContain(fragment);
       }
       expect(rootSpawns).toEqual([]);
-      expect(rootReparents).toEqual([]);
+      expect(operatorReparents).toEqual([]);
       expect(admissionReorders).toEqual([]);
       expect(meshChat.listForActor(UUID_A)).toEqual([]);
       expect(obligations.get("task")?.ownerId).toBe(UUID_A);
@@ -1221,7 +1231,7 @@ describe("handleMeshApiRequest", () => {
     ]);
   });
 
-  it("POST /api/mesh/actors/:id/reparent delegates an operator-root move", async () => {
+  it("POST /api/mesh/actors/:id/reparent delegates an operator move", async () => {
     const { res } = await call(
       deps,
       "POST",
@@ -1232,16 +1242,65 @@ describe("handleMeshApiRequest", () => {
 
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ ok: true });
-    expect(rootReparents).toEqual([{ id: UUID_B, parentId: UUID_A, principal: LOCAL_USER }]);
+    expect(operatorReparents).toEqual([{ id: UUID_B, parentId: UUID_A, principal: LOCAL_USER }]);
   });
 
-  it("POST /api/mesh/actors/:id/reparent rejects a missing parent before root control", async () => {
-    const { res } = await call(deps, "POST", `/api/mesh/actors/${UUID_B}/reparent`, "{}");
+  it("POST /api/mesh/actors/:id/obligations-admin returns the operator binding readback", async () => {
+    const { res } = await call(
+      deps,
+      "POST",
+      `/api/mesh/actors/${UUID_B}/obligations-admin`,
+      JSON.stringify({ enabled: true })
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({
+      ok: true,
+      binding: { actorId: UUID_B, capability: "obligations-admin", active: true },
+    });
+    expect(operatorObligationsAdmin).toEqual([
+      { id: UUID_B, enabled: true, principal: LOCAL_USER },
+    ]);
+  });
+
+  it.each([
+    "{}",
+    JSON.stringify({ enabled: "true" }),
+    JSON.stringify({ enabled: null }),
+  ])("POST /api/mesh/actors/:id/obligations-admin rejects %s before the operator boundary", async (body) => {
+    const { res } = await call(deps, "POST", `/api/mesh/actors/${UUID_B}/obligations-admin`, body);
     await settled(res);
 
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toBe("parentId is required");
-    expect(rootReparents).toEqual([]);
+    expect(JSON.parse(res.body).error).toBe("enabled must be a boolean");
+    expect(operatorObligationsAdmin).toEqual([]);
+  });
+
+  it("POST /api/mesh/actors/:id/reparent detaches with an explicit null parent (#1003)", async () => {
+    const { res } = await call(
+      deps,
+      "POST",
+      `/api/mesh/actors/${UUID_B}/reparent`,
+      JSON.stringify({ parentId: null })
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(200);
+    expect(operatorReparents).toEqual([{ id: UUID_B, parentId: null, principal: LOCAL_USER }]);
+  });
+
+  it.each([
+    "{}",
+    JSON.stringify({ parentId: "  " }),
+    JSON.stringify({ parentId: 7 }),
+  ])("POST /api/mesh/actors/:id/reparent rejects %s before the operator boundary", async (body) => {
+    const { res } = await call(deps, "POST", `/api/mesh/actors/${UUID_B}/reparent`, body);
+    await settled(res);
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("parentId is required (null detaches to top level)");
+    expect(operatorReparents).toEqual([]);
   });
 
   it("POST /api/mesh/availability-holds/clear clears through authenticated root control", async () => {

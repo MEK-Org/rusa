@@ -363,6 +363,15 @@ describe("reconcileEventSources", () => {
     });
   });
 
+  it("seeds no implied rows when an empty store booted with no imported actor (#1003)", () => {
+    const store = new InMemoryEventSourceOwnerStore();
+    const result = reconcileEventSources(store, [rootOrg, chat], undefined, () => "t");
+
+    expect(result.store.list()).toEqual([]);
+    expect(result.store.activeForResource(rootOrg)).toEqual([]);
+    expect(result.droppedDelegations).toEqual([]);
+  });
+
   it("keeps configured root sources as non-configurable implied rows", () => {
     const persistent = new InMemoryEventSourceOwnerStore();
     const result = reconcileEventSources(persistent, [chat], rootId, () => "2026-07-02T00:00:00Z");

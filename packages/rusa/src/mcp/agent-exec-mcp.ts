@@ -125,7 +125,7 @@ export function createAgentExecMcpServer(
    * its own (#549): every management tool below is gated by an active
    * capability.
    */
-  rootId: string,
+  rootId: string | undefined,
   wakeScheduler?: ActorWakeScheduler,
   options?: {
     onWrite?: () => void;
@@ -916,8 +916,10 @@ export function createAgentExecMcpServer(
   );
 
   // ── Capability grants (ISSUE_NUM phase 1a, generalized for secret grants in
-  // #542) ── Registered on EVERY endpoint: root can grant any grantable
-  // capability to any actor (as before), and a non-root actor can grant/revoke
+  // #542) ── Registered on EVERY endpoint: a capability-admin actor can grant
+  // most grantable capabilities within its subtree, while an authenticated
+  // operator alone provisions the separately guarded obligations-admin binding;
+  // a non-root actor can grant/revoke
   // capabilities in the parent-grantable allow-list (exactly the
   // PARENT_GRANTABLE_CAPABILITIES secret names — 'secret:gemini-api-key' and
   // 'secret:mistral-api-key'; any other 'secret:<filename>' needs a
@@ -1516,10 +1518,13 @@ export function createAgentExecMcpServer(
       {
         title: "Move an actor to a new parent (actor-admin)",
         description:
-          "Re-parent an actor to a new parent by thread id (e.g. promote a steward and move workers under it so they report to it). Requires the actor-admin capability; both the actor and its new parent must lie in your own subtree. Changes who receives the actor's reports and failure notices and who may retire it (ownership is the parent edge), and grants the new parent a handle so it can message the actor. The actor's own subtree moves with it. Rejected if it would create a cycle, target the root, or reference an unknown thread.",
+          "Re-parent an actor to a new parent by thread id (e.g. promote a steward and move workers under it so they report to it), or pass a null new_parent_id to detach it to top level. Requires the actor-admin capability; the actor must be a strict descendant of yours, and a non-null new parent must lie in your own subtree. Changes who receives the actor's reports and failure notices and who may retire it (ownership is the parent edge), and grants the new parent a handle so it can message the actor. The actor's own subtree moves with it. Detaching moves the actor out of your subtree, so you lose administrative reach over it at once. Rejected if it would create a cycle, move yourself, or reference an unknown or retired thread.",
         inputSchema: {
           thread_id: z.string().describe("The actor to move."),
-          new_parent_id: z.string().describe("The actor that becomes its new parent."),
+          new_parent_id: z
+            .string()
+            .nullable()
+            .describe("The actor that becomes its new parent, or null to detach it to top level."),
         },
       },
       async ({ thread_id, new_parent_id }) => {
@@ -1527,9 +1532,20 @@ export function createAgentExecMcpServer(
         if (denied) return denied;
         try {
           assertInSubtree(ACTOR_ADMIN_CAPABILITY, thread_id, "reparent");
-          assertInSubtree(ACTOR_ADMIN_CAPABILITY, new_parent_id, "reparent under");
+          // Ancestry includes the caller itself; moving yourself is not a
+          // reorganization of your subtree, detached or not.
+          if (thread_id === selfId || mesh.resolveLiveActorId(thread_id)?.id === selfId) {
+            throw new Error(`${selfId} may not reparent itself`);
+          }
+          if (new_parent_id !== null) {
+            assertInSubtree(ACTOR_ADMIN_CAPABILITY, new_parent_id, "reparent under");
+          }
           mesh.reparentThread(thread_id, new_parent_id);
-          return toolOk(`reparented ${thread_id} under ${new_parent_id}`);
+          return toolOk(
+            new_parent_id === null
+              ? `detached ${thread_id} to top level`
+              : `reparented ${thread_id} under ${new_parent_id}`
+          );
         } catch (err) {
           return toolError(err);
         }
@@ -1708,7 +1724,7 @@ export function createAgentExecMcpServer(
       {
         title: "List Chat Room participants (room-admin)",
         description:
-          "List the dashboard Chat Room's participants: root first, then each added actor in the order it was added. Requires the room-admin capability.",
+          "List the dashboard Chat Room's participants: each added actor in the order it was added. Requires the room-admin capability.",
         inputSchema: {},
       },
       async () => {
@@ -1733,7 +1749,7 @@ export function createAgentExecMcpServer(
       {
         title: "Add an actor to the Chat Room (room-admin)",
         description:
-          "Add a live actor to the one mesh-wide Chat Room that every dashboard shows. Root is always a participant. Human principals and aliases such as 'root' or 'parent' cannot be added. If the actor's voice is already used by another participant, it is assigned the next unused voice through its ordinary voice setting so listeners can tell participants apart. Adding a current participant changes nothing. Requires the room-admin capability.",
+          "Add a live actor to the one mesh-wide Chat Room that every dashboard shows. The roster is exactly the actors added here; no actor is a participant implicitly. Human principals and aliases such as 'root' or 'parent' cannot be added. If the actor's voice is already used by another participant, it is assigned the next unused voice through its ordinary voice setting so listeners can tell participants apart. Adding a current participant changes nothing. Requires the room-admin capability.",
         inputSchema: {
           actor_id: z.string().min(1).describe("The actor's thread id."),
         },
@@ -1761,7 +1777,7 @@ export function createAgentExecMcpServer(
       {
         title: "Remove an actor from the Chat Room (room-admin)",
         description:
-          "Remove an actor from the mesh-wide Chat Room. Root cannot be removed. The actor keeps its voice setting. Requires the room-admin capability.",
+          "Remove an actor from the mesh-wide Chat Room. The actor keeps its voice setting. Requires the room-admin capability.",
         inputSchema: {
           actor_id: z.string().min(1).describe("The participant's thread id."),
         },

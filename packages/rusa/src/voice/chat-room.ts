@@ -32,8 +32,6 @@ export interface ChatRoomStore {
 export interface ChatRoomServiceDeps {
   store: ChatRoomStore;
   actors: Pick<ActorRepository, "get" | "patch">;
-  /** The configured root actor: always a participant, never stored or removable. */
-  rootId: string;
   /** Voices an actor may be assigned, in preference order (the dashboard catalog). */
   voices: () => readonly SupportedVoice[];
   /** The voice an actor without a stored `voiceConfig` speaks with. */
@@ -44,7 +42,7 @@ export interface ChatRoomServiceDeps {
 }
 
 /** Aliases a caller might reach for that name no single stable actor. */
-const ALIASES = new Set(["root", "parent", "self", "me"]);
+const ALIASES = new Set(["parent", "self", "me"]);
 
 function voiceKey(voice: VoiceConfigDocument): string {
   return voice.provider === "google"
@@ -53,12 +51,13 @@ function voiceKey(voice: VoiceConfigDocument): string {
 }
 
 /**
- * The one mesh-wide voice Chat Room (#663). Membership is mesh state: root is
- * always in the room, and actors join or leave only through the root-held
- * `room-admin` tools, so every dashboard renders the same roster. Adding an
- * actor whose voice another participant already speaks with assigns it the
- * next unused voice through its ordinary per-actor voice setting, so listeners
- * can tell participants apart by ear.
+ * The one mesh-wide voice Chat Room (#663). Membership is an explicit durable,
+ * removable purpose-specific binding: configuration/import identity and
+ * topology do not put an actor in the room. Actors join or leave through the
+ * existing `room-admin` authority, so every dashboard renders the same stored
+ * roster. Adding an actor whose voice another participant already speaks with
+ * assigns it the next unused voice through its ordinary per-actor voice
+ * setting, so listeners can tell participants apart by ear.
  */
 export class ChatRoomService {
   private readonly now: () => string;
@@ -67,16 +66,12 @@ export class ChatRoomService {
     this.now = deps.now ?? (() => new Date().toISOString());
   }
 
-  /** Root first, then live stored participants in the order they were added. */
+  /** Live stored participants in the order they were explicitly added. */
   participants(): ChatRoomParticipant[] {
-    const stored = this.deps.store
+    return this.deps.store
       .list()
-      .filter((member) => member.actorId !== this.deps.rootId)
-      .filter((member) => this.deps.actors.get(member.actorId)?.status === "active");
-    return [
-      { actorId: this.deps.rootId, addedBy: null, addedAt: null },
-      ...stored.map(({ actorId, addedBy, addedAt }) => ({ actorId, addedBy, addedAt })),
-    ];
+      .filter((member) => this.deps.actors.get(member.actorId)?.status === "active")
+      .map(({ actorId, addedBy, addedAt }) => ({ actorId, addedBy, addedAt }));
   }
 
   add(target: string, addedBy: string): ChatRoomAddResult {
@@ -113,9 +108,6 @@ export class ChatRoomService {
   /** Returns false when the actor was not in the room. Its voice is left as-is. */
   remove(target: string): boolean {
     const id = target.trim();
-    if (id === this.deps.rootId) {
-      throw new Error("root is always in the Chat Room and cannot be removed");
-    }
     if (ALIASES.has(id.toLowerCase())) {
       throw new Error("use an actor id, not an alias");
     }
@@ -124,9 +116,6 @@ export class ChatRoomService {
 
   private resolveAddable(target: string): ActorRecord {
     const id = target.trim();
-    if (id === this.deps.rootId) {
-      throw new Error("root is always in the Chat Room");
-    }
     if (ALIASES.has(id.toLowerCase())) {
       throw new Error(`'${id}' is an alias, not a participant; pass the actor's thread id`);
     }

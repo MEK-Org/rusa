@@ -1264,6 +1264,9 @@ class _OverviewTabState extends State<OverviewTab> {
                   if (item.reference != null)
                     ReferencePreview(
                       reference: item.reference!,
+                      lookupActorHandle: (id) => widget.store.actor(id)?.handle,
+                      isViewer: widget.store.isViewer,
+                      humanDisplayName: widget.store.operatorDisplayName,
                       kindLabel: item.sourceKind,
                       summary: item.summary,
                       showBody: false,

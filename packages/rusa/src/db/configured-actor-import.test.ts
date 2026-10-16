@@ -91,6 +91,7 @@ describe("configured-actor import (#1002)", () => {
       seed?: Partial<ConfiguredActorSeed>;
       selectedActorId?: string;
       idgen?: () => string;
+      legacyRootSession?: boolean;
     } = {}
   ) =>
     importConfiguredActor({
@@ -102,6 +103,7 @@ describe("configured-actor import (#1002)", () => {
       avatarCachePath: join(home, "avatars", "root.png"),
       selectedActorId: overrides.selectedActorId,
       idgen: overrides.idgen ?? (() => "minted-id"),
+      legacyRootSession: overrides.legacyRootSession,
       now: () => IMPORTED_AT,
     });
 
@@ -159,9 +161,58 @@ describe("configured-actor import (#1002)", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  describe("empty home", () => {
-    it("creates the configured actor from config and records the receipt in one step", () => {
+  describe("empty home (#1003)", () => {
+    it("synthesizes no actor and records that the import bound none", () => {
+      const result = run({ seed: { charter: "configured charter" } });
+
+      expect(result).toEqual({
+        plan: { kind: "none", recorded: false },
+        actorId: undefined,
+        filled: [],
+        avatarImported: false,
+      });
+      expect(modelConfig).not.toHaveBeenCalled();
+      expect(repositories.actors.list()).toEqual([]);
+      expect(receiptRows()).toEqual([
+        {
+          source: CONFIGURED_ACTOR_IMPORT_SOURCE,
+          imported_at: IMPORTED_AT,
+          row_count: 0,
+          actor_id: null,
+        },
+      ]);
+    });
+
+    it("never adopts a first actor created after the empty import", () => {
+      run();
+      const receipt = receiptRows();
+      repositories.actors.upsert(actor("first", { parentId: null, charter: DEFAULT_ROOT_CHARTER }));
+      const before = snapshot();
+
+      reopen();
+      expect(run({ seed: { charter: "configured charter" } }).plan).toEqual({
+        kind: "none",
+        recorded: true,
+      });
+      expect(plan()).toEqual({ kind: "none", recorded: true });
+      expect(refusal(() => plan("first")).message).toMatch(/bound no actor/);
+      expect(modelConfig).not.toHaveBeenCalled();
+      expect(snapshot()).toEqual(before);
+      expect(receiptRows()).toEqual(receipt);
+    });
+
+    it("does not copy a configured avatar for an actor it never created", () => {
+      const avatar = join(home, "configured-avatar.png");
+      writeFileSync(avatar, "synthetic image");
+      expect(run({ seed: { avatarPath: avatar } }).avatarImported).toBe(false);
+      expect(existsSync(join(home, "avatars", "root.png"))).toBe(false);
+    });
+  });
+
+  describe("session-only legacy home", () => {
+    it("creates the actor the legacy root session belongs to and records the receipt in one step", () => {
       const result = run({
+        legacyRootSession: true,
         seed: {
           charter: "configured charter",
           context: { type: "portable", mode: "ledger" },
@@ -194,8 +245,8 @@ describe("configured-actor import (#1002)", () => {
       ]);
     });
 
-    it("uses the built-in charter and folds a deferred legacy session into a native actor", () => {
-      run({ seed: { sessionId: "legacy-session" } });
+    it("uses the built-in charter and folds the legacy session into a native actor", () => {
+      run({ legacyRootSession: true, seed: { sessionId: "legacy-session" } });
 
       expect(repositories.actors.get("minted-id")).toMatchObject({
         charter: ROOT_ACTOR_CHARTER,
@@ -210,7 +261,7 @@ describe("configured-actor import (#1002)", () => {
         throw new Error("provider not declared");
       });
 
-      expect(() => run()).toThrow(/provider not declared/);
+      expect(() => run({ legacyRootSession: true })).toThrow(/provider not declared/);
       expect(repositories.actors.list()).toEqual([]);
       expect(receiptRows()).toEqual([]);
     });
@@ -218,7 +269,10 @@ describe("configured-actor import (#1002)", () => {
 
   describe("repeated import and restart", () => {
     it("runs once: a repeat, a reopen and changed or removed config all leave the actor alone", () => {
-      run({ seed: { charter: "first charter", context: { type: "native" } } });
+      run({
+        legacyRootSession: true,
+        seed: { charter: "first charter", context: { type: "native" } },
+      });
       const created = snapshot();
       const receipt = receiptRows();
       modelConfig.mockClear();
@@ -594,30 +648,32 @@ describe("configured-actor import (#1002)", () => {
       expect(repositories.actors.list()).toEqual([]);
     });
 
-    it("refuses an imported actor that has been reparented", () => {
+    it("keeps a reparented imported actor bound to its durable receipt", () => {
       repositories.actors.upsert(actor("new-top", { parentId: null }));
       repositories.actors.patch("configured", { parentId: "new-top" });
 
-      expect(refusal(() => run()).message).toMatch(/no longer top-level \(parent new-top\)/);
+      expect(run()).toMatchObject({ actorId: "configured" });
+      expect(plan()).toEqual({ kind: "completed", actorId: "configured" });
+      expect(repositories.actors.get("configured")?.parentId).toBe("new-top");
     });
 
-    it("refuses a receipt that names no actor", () => {
+    it("refuses a receipt that counts an imported row but names no actor", () => {
       db.prepare("UPDATE legacy_import_receipts SET actor_id = NULL").run();
 
       expect(refusal(() => run()).message).toMatch(/receipt names no actor/);
     });
   });
 
-  describe("single top-level guard", () => {
-    it("stays in force after the import: the receipt never admits a second top-level actor", () => {
+  describe("forest after the import (#1003)", () => {
+    it("lets a second top-level actor boot beside the imported one; the receipt still names it", () => {
       insertAll(upgradedActors());
       run();
-      // A second top-level row that appears after the import is not refused by
-      // the import (the receipt decides which actor is configured) ...
+      // A second top-level row that appears after the import does not change
+      // which actor the receipt names ...
       repositories.actors.upsert(actor("second-top", { parentId: null }));
       expect(plan()).toEqual({ kind: "completed", actorId: "configured" });
 
-      // ... but adoption still refuses to run with two.
+      // ... and adoption no longer refuses to run a forest.
       const mesh = new ActorMesh({
         actors: repositories.actors,
         createActor: () => {
@@ -626,9 +682,14 @@ describe("configured-actor import (#1002)", () => {
       });
       const stored = repositories.actors.get("configured");
       if (!stored) throw new Error("configured actor missing");
-      expect(() => mesh.adopt(stored, { requestRun: () => {} } as never)).toThrow(
-        /Cannot add configured as a second top-level actor: second-top is already top-level/
-      );
+      mesh.adopt(stored, { requestRun: () => {} } as never);
+      expect(
+        repositories.actors
+          .list()
+          .filter((record) => record.parentId === null)
+          .map((record) => record.id)
+          .sort()
+      ).toEqual(["configured", "second-top"]);
     });
   });
 

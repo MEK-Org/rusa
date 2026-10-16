@@ -89,14 +89,19 @@ export interface ConfiguredActorSeed {
 export interface ConfiguredActorImportOptions {
   db: Database.Database;
   actors: ActorRepository;
-  receipts: Pick<LegacyImportReceiptRepository, "actorFor" | "has" | "record">;
-  seed: ConfiguredActorSeed;
+  receipts: Pick<LegacyImportReceiptRepository, "actorFor" | "has" | "record" | "rowCount">;
+  seed?: ConfiguredActorSeed;
   /** Directory holding spawned actors' workspaces, used as identity evidence. */
   workersDir: string;
   /** Where the configured actor's image is cached. */
   avatarCachePath: string;
   /** Explicit operator choice (`rusa start --import-actor`), for ambiguous state. */
   selectedActorId?: string;
+  /**
+   * The legacy root ran only as a native session, with no actor row: the one
+   * case where an empty actor table still has an actor to import.
+   */
+  legacyRootSession?: boolean;
   idgen?: () => string;
   now?: () => string;
 }
@@ -105,14 +110,21 @@ export interface ConfiguredActorImportOptions {
 export type ConfiguredActorImportPlan =
   /** A receipt already names the actor; nothing to import. */
   | { kind: "completed"; actorId: string }
-  /** An empty actor table: create the configured actor from config. */
+  /**
+   * An empty store (#1003): no actor is synthesized. The receipt records that
+   * the import bound none, so a first actor created later is never mistaken
+   * for the configured one. `recorded` is true once that receipt exists.
+   */
+  | { kind: "none"; recorded: boolean }
+  /** A session-only legacy home: create the actor its root session belongs to. */
   | { kind: "create"; actorId: string }
   /** An existing actor becomes the imported one; config fills its gaps. */
   | { kind: "adopt"; actorId: string; previousActorId?: string; selected: boolean };
 
 export interface ConfiguredActorImportResult {
   plan: ConfiguredActorImportPlan;
-  actorId: string;
+  /** The imported actor; undefined when the import bound none. */
+  actorId: string | undefined;
   /** Fields the import wrote from config; empty when it was already complete. */
   filled: string[];
   /** Whether the configured avatar was copied into the image cache. */
@@ -149,9 +161,12 @@ const REPAIR_ACTION =
  */
 export function planConfiguredActorImport(options: {
   actors: Pick<ActorRepository, "list">;
-  receipts: Pick<LegacyImportReceiptRepository, "actorFor" | "has">;
+  receipts: Pick<LegacyImportReceiptRepository, "actorFor" | "has" | "rowCount">;
   workersDir: string;
   selectedActorId?: string;
+  legacyRootSession?: boolean;
+  /** Absent configuration binds no new actor, even beside an existing forest. */
+  hasConfiguration?: boolean;
   idgen?: () => string;
 }): ConfiguredActorImportPlan {
   const { actors, receipts, selectedActorId } = options;
@@ -160,6 +175,15 @@ export function planConfiguredActorImport(options: {
 
   if (receipts.has(CONFIGURED_ACTOR_IMPORT_SOURCE)) {
     const actorId = receipts.actorFor(CONFIGURED_ACTOR_IMPORT_SOURCE);
+    if (actorId === undefined && receipts.rowCount(CONFIGURED_ACTOR_IMPORT_SOURCE) === 0) {
+      if (selectedActorId !== undefined) {
+        throw new ConfiguredActorImportError(
+          `--import-actor names ${selectedActorId}, but the configured-actor import ran on an empty store and bound no actor`,
+          "drop --import-actor; an actor created after that import is an ordinary actor, never the configured one"
+        );
+      }
+      return { kind: "none", recorded: true };
+    }
     if (actorId === undefined) {
       throw new ConfiguredActorImportError(
         "the configured-actor import receipt names no actor",
@@ -185,25 +209,28 @@ export function planConfiguredActorImport(options: {
         [actorId]
       );
     }
-    if (record.status !== "active") {
+    if (record.status !== "active" && options.hasConfiguration !== false) {
       throw new ConfiguredActorImportError(
         `the imported configured actor ${actorId} is retired`,
         "startup will not revive a retired actor or create a replacement for it; restore a backup taken before the retirement",
         [actorId]
       );
     }
-    // Part of the single top-level guard (ActorMesh.assertSingleTopLevel), not
-    // of the import: the imported actor having a parent is only wrong because
-    // the runtime still boots exactly one top-level actor. Forest boot (#1003)
-    // removes this refusal together with that guard.
-    if (record.parentId !== null) {
+    // The receipt identifies this one imported actor; it does not pin its
+    // topology. An authenticated operator may later move it beneath another
+    // forest, and restart must reconstruct the persisted tree as it stands
+    // rather than demanding that an import-time parentlessness survive (#1003).
+    return { kind: "completed", actorId };
+  }
+
+  if (options.hasConfiguration === false) {
+    if (selectedActorId !== undefined) {
       throw new ConfiguredActorImportError(
-        `the imported configured actor ${actorId} is no longer top-level (parent ${record.parentId})`,
-        "until forest boot lands the runtime boots its configured actor as the single top-level actor; restore its null parent_id in mesh.db's actors table",
-        [actorId]
+        "--import-actor requires rootActor configuration",
+        "drop --import-actor when no configured actor is being imported"
       );
     }
-    return { kind: "completed", actorId };
+    return { kind: "none", recorded: false };
   }
 
   const parentless = records.filter((record) => record.parentId === null);
@@ -233,7 +260,9 @@ export function planConfiguredActorImport(options: {
   }
 
   if (records.length === 0) {
-    return { kind: "create", actorId: (options.idgen ?? randomUUID)() };
+    return options.legacyRootSession
+      ? { kind: "create", actorId: (options.idgen ?? randomUUID)() }
+      : { kind: "none", recorded: false };
   }
 
   if (parentless.length !== 1) {
@@ -293,7 +322,7 @@ function assertImportable(
   if (others.length > 0) {
     throw new ConfiguredActorImportError(
       `${subject} ${record.id}, but ${others.map((other) => other.id).join(", ")} ${others.length === 1 ? "is" : "are"} also top-level`,
-      "until forest boot lands the runtime boots exactly one top-level actor; reparent or remove the others in mesh.db first, then name the configured actor with --import-actor",
+      "a legacy home ran exactly one top-level actor, so the import cannot tell which one config describes; reparent or remove the others in mesh.db first, then name the configured actor with --import-actor",
       parentless.map((other) => other.id)
     );
   }
@@ -352,17 +381,32 @@ function workspaceFindings(candidate: ActorRecord, workersDir: string): string[]
 
 /**
  * Run the import if it has not run: plan, copy the avatar, then commit the
- * actor row and receipt together. Returns the configured actor's id either way.
+ * actor row and receipt together. Returns the configured actor's id, or undefined
+ * when an empty store left nothing to import (#1003).
  */
 export function importConfiguredActor(
   options: ConfiguredActorImportOptions
 ): ConfiguredActorImportResult {
-  const plan = planConfiguredActorImport(options);
+  const plan = planConfiguredActorImport({
+    ...options,
+    hasConfiguration: options.seed !== undefined,
+  });
   if (plan.kind === "completed") {
     return { plan, actorId: plan.actorId, filled: [], avatarImported: false };
   }
+  if (plan.kind === "none") {
+    if (!plan.recorded) {
+      options.receipts.record(
+        CONFIGURED_ACTOR_IMPORT_SOURCE,
+        (options.now ?? (() => new Date().toISOString()))(),
+        0
+      );
+    }
+    return { plan, actorId: undefined, filled: [], avatarImported: false };
+  }
 
   const { actors, seed } = options;
+  if (!seed) throw new Error("configured actor import requires configuration");
   const now = options.now ?? (() => new Date().toISOString());
   const existing =
     plan.kind === "adopt" ? actors.get(plan.previousActorId ?? plan.actorId) : undefined;
