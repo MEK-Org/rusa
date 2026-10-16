@@ -6661,8 +6661,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(await boot()).toEqual(first);
     });
 
-    it("keeps the single top-level guard: a second top-level actor beside the imported one stops boot", async () => {
-      await boot();
+    it("boots a forest: a second top-level actor beside the imported one survives restart (#1003)", async () => {
+      const first = await boot();
       withMeshDb((db) =>
         new SqliteActorRepository(db).upsert({
           id: "second-top",
@@ -6672,19 +6672,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
           createdAt: "2026-01-01T00:00:00.000Z",
         })
       );
-      let ready = false;
 
-      await expect(
-        runStart({
-          e2e: {
-            onReady: (handles) => {
-              ready = true;
-              shutdownFn = handles.shutdown;
-            },
-          },
-        })
-      ).rejects.toThrow(/second top-level actor/);
-      expect(ready).toBe(false);
+      const second = await boot();
+      expect(second.importedActor).toBe(first.importedActor);
+      expect([...second.topLevel].sort()).toEqual([first.importedActor, "second-top"].sort());
+      expect(await boot()).toEqual(second);
     });
 
     it("refuses an ambiguous upgraded home until the operator names the actor", async () => {

@@ -192,10 +192,10 @@ export function planConfiguredActorImport(options: {
         [actorId]
       );
     }
-    // Part of the single top-level guard (ActorMesh.assertSingleTopLevel), not
-    // of the import: the imported actor having a parent is only wrong because
-    // the runtime still boots exactly one top-level actor. Forest boot (#1003)
-    // removes this refusal together with that guard.
+    // Not part of the import: the imported actor having a parent is only wrong
+    // because boot still runs it through the configured-actor path as a
+    // top-level actor. Once boot constructs it like every other actor (#1003),
+    // this refusal goes.
     if (record.parentId !== null) {
       throw new ConfiguredActorImportError(
         `the imported configured actor ${actorId} is no longer top-level (parent ${record.parentId})`,

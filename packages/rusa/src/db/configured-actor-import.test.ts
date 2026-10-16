@@ -608,16 +608,16 @@ describe("configured-actor import (#1002)", () => {
     });
   });
 
-  describe("single top-level guard", () => {
-    it("stays in force after the import: the receipt never admits a second top-level actor", () => {
+  describe("forest after the import (#1003)", () => {
+    it("lets a second top-level actor boot beside the imported one; the receipt still names it", () => {
       insertAll(upgradedActors());
       run();
-      // A second top-level row that appears after the import is not refused by
-      // the import (the receipt decides which actor is configured) ...
+      // A second top-level row that appears after the import does not change
+      // which actor the receipt names ...
       repositories.actors.upsert(actor("second-top", { parentId: null }));
       expect(plan()).toEqual({ kind: "completed", actorId: "configured" });
 
-      // ... but adoption still refuses to run with two.
+      // ... and adoption no longer refuses to run a forest.
       const mesh = new ActorMesh({
         actors: repositories.actors,
         createActor: () => {
@@ -626,9 +626,14 @@ describe("configured-actor import (#1002)", () => {
       });
       const stored = repositories.actors.get("configured");
       if (!stored) throw new Error("configured actor missing");
-      expect(() => mesh.adopt(stored, { requestRun: () => {} } as never)).toThrow(
-        /Cannot add configured as a second top-level actor: second-top is already top-level/
-      );
+      mesh.adopt(stored, { requestRun: () => {} } as never);
+      expect(
+        repositories.actors
+          .list()
+          .filter((record) => record.parentId === null)
+          .map((record) => record.id)
+          .sort()
+      ).toEqual(["configured", "second-top"]);
     });
   });
 
