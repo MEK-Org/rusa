@@ -205,7 +205,7 @@ class DashboardApi {
       },
       body: jsonEncode({
         'provider': provider,
-        if (models != null) 'models': models,
+        'models': ?models,
       }),
     );
     if (res.statusCode != 200) {
