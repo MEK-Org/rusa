@@ -10,6 +10,7 @@ import {
   DASHBOARD_TIMING_MAX_RECORDS,
   DASHBOARD_TIMING_PRUNE_INTERVAL_MS,
   DashboardTimingRecorder,
+  dashboardTimingLabelForRoute,
   parseDashboardClientTiming,
 } from "./timing.js";
 import type { DashboardServerSubstages } from "./timing-phases.js";
@@ -1046,5 +1047,15 @@ describe("dashboard timing recorder", () => {
 
     expect(() => recorder.flush()).not.toThrow();
     expect(recorder.droppedCount).toBe(1);
+  });
+});
+
+describe("dashboardTimingLabelForRoute", () => {
+  it("excludes long-lived streams from latency samples", () => {
+    expect(dashboardTimingLabelForRoute("/api/mesh/voice/stream", "GET")).toBeNull();
+    expect(dashboardTimingLabelForRoute("/api/mesh/stream", "GET")).toBe("mesh_stream_open");
+    expect(dashboardTimingLabelForRoute("/api/health", "GET")).toBeNull();
+    expect(dashboardTimingLabelForRoute("/api/dashboard/config", "GET")).toBe("dashboard_config");
+    expect(dashboardTimingLabelForRoute("/api/mesh/voice/audio/abc", "GET")).toBe("api_other");
   });
 });
