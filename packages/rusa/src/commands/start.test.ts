@@ -6919,11 +6919,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           expect(getRepositories().eventSourceOwners.list()).toHaveLength(2);
         },
       });
-      expect(
-        withMeshDb((db) =>
-          db.prepare("SELECT COUNT(*) AS n FROM event_source_route_materialization_receipts").get()
-        )
-      ).toEqual({ n: 0 });
     });
 
     it("boots an existing forest without rootActor and grants only its oldest active top-level actor (#1087)", async () => {

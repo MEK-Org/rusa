@@ -3301,9 +3301,8 @@ async function composeStart(
     // agent-exec endpoint itself, so they have no server factory either; the
     // mesh and the endpoint both consult the grant rows directly. The
     // host-global names listed here (`update`, `pnpm-hardlinks`, `model-admin`,
-    // `room-admin`) are stripped by the mesh: it never grants one, and no
-    // operator path creates one yet (#1087), so only a row an earlier boot
-    // seeded authorizes them. `obligation-responsive` (#1026) and
+    // `room-admin`) are stripped by the mesh: it never grants one, so a
+    // durable row from the default bootstrap is required. `obligation-responsive` (#1026) and
     // `obligations-admin` (#1003) likewise mount nothing: each worker's
     // obligations server reads the binding per call; the latter is changed only
     // through the authenticated operator boundary.
