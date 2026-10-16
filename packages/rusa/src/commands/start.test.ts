@@ -4683,6 +4683,54 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await vi.waitFor(async () => expect((await fetch(url)).status).toBe(404));
   });
 
+  it("keeps the root brief mount from durable context after config is edited", async () => {
+    const writeConfig = (context: { type: "native" } | { type: "portable"; mode: "brief" }) =>
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+          rootActor: {
+            provider: "antigravity",
+            model: "Gemini 3.7 Flash",
+            effort: "high",
+            context,
+          },
+        }),
+        "utf8"
+      );
+    const boot = async (): Promise<Actor> => {
+      let root: Actor | undefined;
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            onReady: (handles) => {
+              root = handles.root as Actor | undefined;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      if (!root) throw new Error("configured root not ready");
+      return root;
+    };
+
+    writeConfig({ type: "portable", mode: "brief" });
+    const first = await boot();
+    expect(
+      (first as unknown as { opts: { mcpServers: Array<{ name: string }> } }).opts.mcpServers
+    ).toContainEqual(expect.objectContaining({ name: "brief" }));
+    await shutdownFn?.();
+    shutdownFn = undefined;
+
+    writeConfig({ type: "native" });
+    const restarted = await boot();
+    expect(
+      (restarted as unknown as { opts: { mcpServers: Array<{ name: string }> } }).opts.mcpServers
+    ).toContainEqual(expect.objectContaining({ name: "brief" }));
+  });
+
   it("applies the existing ledger API-key requirement to a portable root", async () => {
     let ready = false;
     writeFileSync(
@@ -6628,7 +6676,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
   describe("configured-actor import at boot (#1002)", () => {
     /** Boots, reads what the import left while the database is open, and stops again. */
-    const boot = async (opts: { importActor?: string } = {}) => {
+    const boot = async (
+      opts: { importActor?: string; inspect?: (mesh: ActorMesh) => void } = {}
+    ) => {
       let mesh: ActorMesh | undefined;
       await new Promise<void>((resolve, reject) => {
         runStart({
@@ -6637,6 +6687,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
             onReady: (handles) => {
               mesh = handles.mesh;
               shutdownFn = handles.shutdown;
+              opts.inspect?.(handles.mesh);
               resolve();
             },
           },
@@ -6747,23 +6798,74 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(await boot()).toEqual(first);
     });
 
-    it("boots a forest: a second top-level actor beside the imported one survives restart (#1003)", async () => {
+    it("rehydrates forest descendants with retained state and normal delivery after restart (#1003)", async () => {
       const first = await boot();
-      withMeshDb((db) =>
-        new SqliteActorRepository(db).upsert({
-          id: "second-top",
-          charter: "synthetic",
-          parentId: null,
-          status: "active",
-          createdAt: "2026-01-01T00:00:00.000Z",
-        })
-      );
+      const importedActor = first.importedActor;
+      if (!importedActor) throw new Error("configured actor was not imported");
+      withMeshDb((db) => {
+        const actors = new SqliteActorRepository(db);
+        [
+          {
+            id: "second-top",
+            charter: "synthetic",
+            parentId: null,
+            status: "active" as const,
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+          {
+            id: "imported-child",
+            charter: "retained imported descendant",
+            parentId: importedActor,
+            sessionId: "imported-child-session",
+            context: { type: "portable" as const, mode: "tail" as const },
+            status: "active" as const,
+            createdAt: "2026-01-01T00:00:01.000Z",
+          },
+          {
+            id: "second-child",
+            charter: "retained ordinary descendant",
+            parentId: "second-top",
+            sessionId: "second-child-session",
+            status: "active" as const,
+            createdAt: "2026-01-01T00:00:02.000Z",
+          },
+        ].forEach((record) => {
+          actors.upsert(record);
+        });
+      });
 
       const second = await boot();
-      expect(second.importedActor).toBe(first.importedActor);
-      expect([...second.topLevel].sort()).toEqual([first.importedActor, "second-top"].sort());
-      expect(second.live).toEqual([first.importedActor, "second-top"].sort());
-      expect(await boot()).toEqual(second);
+      expect(second.importedActor).toBe(importedActor);
+      expect([...second.topLevel].sort()).toEqual([importedActor, "second-top"].sort());
+      expect(second.live).toEqual(
+        [importedActor, "second-top", "imported-child", "second-child"].sort()
+      );
+      expect(withMeshDb((db) => new SqliteActorRepository(db).get("imported-child"))).toMatchObject(
+        {
+          parentId: importedActor,
+          context: { type: "portable", mode: "tail" },
+        }
+      );
+      expect(withMeshDb((db) => new SqliteActorRepository(db).get("second-child"))).toMatchObject({
+        parentId: "second-top",
+        sessionId: "second-child-session",
+      });
+
+      let delivered = false;
+      const restarted = await boot({
+        inspect: (mesh) => {
+          expect(mesh.get("imported-child")).toBeDefined();
+          expect(mesh.get("second-child")).toBeDefined();
+          expect(mesh.sendMessage("second-child", "retained delivery", importedActor)).toEqual({
+            delivered: true,
+          });
+          delivered = getRepositories()
+            .inbox.list("second-child", { status: "unhandled" })
+            .entries.some((entry) => entry.payload.type === "mesh.message");
+        },
+      });
+      expect(delivered).toBe(true);
+      expect(restarted.live).toEqual(second.live);
     });
 
     it("rehydrates a demoted imported actor beneath an ordinary forest across restart (#1003)", async () => {

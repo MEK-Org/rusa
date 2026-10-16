@@ -3423,6 +3423,11 @@ export class ActorMesh {
     return this.grants.activeFor(this.resolveThreadId(actorId)).includes(capability);
   }
 
+  /** Resolve the legacy root alias at an external mutation boundary. */
+  resolveActorId(actorId: string): string {
+    return this.resolveThreadId(actorId);
+  }
+
   /** Resolve the legacy root address without making the literal id an authority signal. */
   private resolveThreadId(actorId: string): string {
     return actorId === "root" && this.rootId ? this.rootId : actorId;

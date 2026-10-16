@@ -4217,7 +4217,9 @@ async function composeStart(
       rootMcp.push({ name: CHAT_WRITE_MCP_NAME, url: rootChatUrl });
     }
     if (rootSlackUrl) rootMcp.push({ name: SLACK_WRITE_MCP_NAME, url: rootSlackUrl });
-    if (rootActor.context?.type === "portable" && rootActor.context.mode === "brief") {
+    // After the one-time import, context is actor state. Config edits must not
+    // mount or remove a root tool on later boots.
+    if (importedRoot.context?.type === "portable" && importedRoot.context.mode === "brief") {
       const rootBriefUrl = mcpHttp.addServer(`${rootId}:${BRIEF_MCP_NAME}`, () =>
         createBriefMcpServer({
           actorId: rootId,

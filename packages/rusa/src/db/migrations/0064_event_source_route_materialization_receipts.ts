@@ -20,7 +20,6 @@ export const eventSourceRouteMaterializationReceipts: Migration = {
       CREATE TABLE event_source_route_materialization_receipts (
         version             INTEGER PRIMARY KEY,
         completed_at        TEXT NOT NULL CHECK (length(trim(completed_at)) > 0),
-        route_count         INTEGER NOT NULL CHECK (route_count >= 0),
         input_snapshot_json TEXT NOT NULL CHECK (length(trim(input_snapshot_json)) > 0)
       );
     `);

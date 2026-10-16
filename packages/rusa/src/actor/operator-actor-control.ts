@@ -34,6 +34,7 @@ export interface ObligationsAdminBinding {
 
 export interface OperatorActorControlMesh {
   reparentThread(id: string, newParentId: string | null): void;
+  resolveActorId(id: string): string;
   recordEvent(event: {
     kind: "operator_actor_reparent" | "operator_obligations_admin";
     actorId: string;
@@ -64,13 +65,16 @@ export class OperatorActorControl {
   ) {}
 
   reparent(actorId: string, newParentId: string | null, principal: RootControlPrincipal): void {
-    const fromParentId = this.mesh.list().find((record) => record.id === actorId)?.parentId ?? null;
+    const canonicalActorId = this.mesh.resolveActorId(actorId);
+    const canonicalParentId = newParentId === null ? null : this.mesh.resolveActorId(newParentId);
+    const fromParentId =
+      this.mesh.list().find((record) => record.id === canonicalActorId)?.parentId ?? null;
     const audit = (outcome: OperatorReparentAudit["outcome"], reason?: string) =>
       this.record({
         principal,
-        actorId,
+        actorId: canonicalActorId,
         fromParentId,
-        toParentId: newParentId,
+        toParentId: canonicalParentId,
         outcome,
         ...(reason !== undefined ? { reason } : {}),
       });
@@ -82,7 +86,7 @@ export class OperatorActorControl {
       throw new Error(reason);
     }
     try {
-      this.mesh.reparentThread(actorId, newParentId);
+      this.mesh.reparentThread(canonicalActorId, canonicalParentId);
     } catch (err) {
       audit("denied", err instanceof Error ? err.message : String(err));
       throw err;
@@ -102,10 +106,11 @@ export class OperatorActorControl {
     enabled: boolean,
     principal: RootControlPrincipal
   ): ObligationsAdminBinding {
+    const canonicalActorId = this.mesh.resolveActorId(actorId);
     const audit = (outcome: OperatorObligationsAdminAudit["outcome"], reason?: string) =>
       this.recordObligationsAdmin({
         principal,
-        actorId,
+        actorId: canonicalActorId,
         enabled,
         outcome,
         ...(reason !== undefined ? { reason } : {}),
@@ -115,30 +120,30 @@ export class OperatorActorControl {
       audit("denied", reason);
       throw new Error(reason);
     }
-    if (!this.mesh.list().some((record) => record.id === actorId)) {
-      const reason = `unknown actor: ${actorId}`;
+    if (!this.mesh.list().some((record) => record.id === canonicalActorId)) {
+      const reason = `unknown actor: ${canonicalActorId}`;
       audit("denied", reason);
       throw new Error(reason);
     }
 
     if (enabled) {
       this.grants.grant({
-        actorId,
+        actorId: canonicalActorId,
         capability: OBLIGATIONS_ADMIN_CAPABILITY,
         grantedBy: `operator:${principal}`,
         grantedAt: this.now(),
       });
     } else {
-      this.grants.revoke(actorId, OBLIGATIONS_ADMIN_CAPABILITY, this.now());
+      this.grants.revoke(canonicalActorId, OBLIGATIONS_ADMIN_CAPABILITY, this.now());
     }
-    const active = this.grants.activeFor(actorId).includes(OBLIGATIONS_ADMIN_CAPABILITY);
+    const active = this.grants.activeFor(canonicalActorId).includes(OBLIGATIONS_ADMIN_CAPABILITY);
     if (active !== enabled) {
       const reason = `durable ${OBLIGATIONS_ADMIN_CAPABILITY} readback did not match requested state`;
       audit("denied", reason);
       throw new Error(reason);
     }
     audit("ok");
-    return { actorId, capability: OBLIGATIONS_ADMIN_CAPABILITY, active };
+    return { actorId: canonicalActorId, capability: OBLIGATIONS_ADMIN_CAPABILITY, active };
   }
 
   private record(audit: OperatorReparentAudit): void {

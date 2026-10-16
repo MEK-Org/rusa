@@ -195,6 +195,32 @@ describe("OperatorActorControl (#1003)", () => {
     ]);
   });
 
+  it("uses durable actor IDs when the legacy root alias crosses an operator boundary", () => {
+    const { actors, audits, control, grants, obligationAudits } = setup();
+
+    control.reparent("root", "other", OPERATOR);
+    expect(actors.get("imported")?.parentId).toBe("other");
+    expect(audits()).toEqual([
+      {
+        principal: OPERATOR,
+        actorId: "imported",
+        fromParentId: null,
+        toParentId: "other",
+        outcome: "ok",
+      },
+    ]);
+
+    expect(control.setObligationsAdmin("root", true, OPERATOR)).toEqual({
+      actorId: "imported",
+      capability: OBLIGATIONS_ADMIN_CAPABILITY,
+      active: true,
+    });
+    expect(grants.activeFor("imported")).toEqual([OBLIGATIONS_ADMIN_CAPABILITY]);
+    expect(obligationAudits()).toEqual([
+      expect.objectContaining({ actorId: "imported", outcome: "ok" }),
+    ]);
+  });
+
   it("denies and audits root-LLM and unknown-target obligations-admin requests", () => {
     const { control, grants, obligationAudits } = setup();
 

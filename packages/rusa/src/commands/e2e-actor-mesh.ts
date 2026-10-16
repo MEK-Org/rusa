@@ -413,6 +413,8 @@ export function startRootControlServer(opts: {
   port: number;
   handles: RunStartE2EHandles;
 }): Server {
+  const rootId = opts.handles.rootControl.rootId;
+  if (!rootId) throw new Error("root-control server requires an imported root actor");
   const operatorId = (): string => {
     const result = resolveSoleActiveUser(getRepositories().principals);
     if (!result.ok) throw new Error(result.error);
@@ -495,11 +497,7 @@ export function startRootControlServer(opts: {
       return;
     }
     if (req.method === "GET" && url.pathname === "/root/inbox") {
-      send(
-        res,
-        200,
-        opts.handles.inboxStore.list(opts.handles.rootControl.rootId, { status: "unhandled" })
-      );
+      send(res, 200, opts.handles.inboxStore.list(rootId, { status: "unhandled" }));
       return;
     }
     if (req.method !== "POST") {
@@ -568,12 +566,7 @@ export function startRootControlServer(opts: {
           const ids = stringArray(body.ids);
           const note = typeof body.note === "string" ? body.note : undefined;
           send(res, 200, {
-            acknowledged: opts.handles.inboxStore.markHandled(
-              opts.handles.rootControl.rootId,
-              ids,
-              undefined,
-              note
-            ),
+            acknowledged: opts.handles.inboxStore.markHandled(rootId, ids, undefined, note),
           });
           return;
         }

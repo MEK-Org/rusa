@@ -135,10 +135,14 @@ describe("DbEventSourceOwnerStore (DB-specific)", () => {
     expect(
       db
         .prepare(
-          "SELECT route_count FROM event_source_route_materialization_receipts WHERE version = 1"
+          "SELECT input_snapshot_json FROM event_source_route_materialization_receipts WHERE version = 1"
         )
         .get()
-    ).toEqual({ route_count: 0 });
+    ).toEqual(
+      expect.objectContaining({
+        input_snapshot_json: expect.stringContaining('"disposition":"unrouted_missing_audit"'),
+      })
+    );
   });
 
   it("materializes a current config route once, then keeps the scope boundary on edits", () => {
@@ -211,10 +215,14 @@ describe("DbEventSourceOwnerStore (DB-specific)", () => {
     expect(
       db
         .prepare(
-          "SELECT route_count FROM event_source_route_materialization_receipts WHERE version = 1"
+          "SELECT input_snapshot_json FROM event_source_route_materialization_receipts WHERE version = 1"
         )
         .get()
-    ).toEqual({ route_count: 0 });
+    ).toEqual(
+      expect.objectContaining({
+        input_snapshot_json: expect.stringContaining('"disposition":"no_actor"'),
+      })
+    );
   });
 
   it("preserves current active ownership and revocation without recreating either", () => {

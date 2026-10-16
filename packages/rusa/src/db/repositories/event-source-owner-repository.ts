@@ -45,10 +45,7 @@ type ConfiguredActorReceiptRow = {
   actor_id: string | null;
 };
 
-type RouteMaterializationReceiptRow = {
-  route_count: number;
-  input_snapshot_json: string;
-};
+type RouteMaterializationReceiptRow = { input_snapshot_json: string };
 
 type RouteMaterializationSnapshot = {
   version: 1;
@@ -130,6 +127,10 @@ function parseRouteMaterializationSnapshot(raw: string): RouteMaterializationSna
     throw new Error("event-source route materialization receipt has an invalid snapshot");
   }
   return snapshot as RouteMaterializationSnapshot;
+}
+
+function materializedRouteCount(snapshot: RouteMaterializationSnapshot): number {
+  return snapshot.routes.filter((route) => route.disposition === "materialized").length;
 }
 
 /**
@@ -269,20 +270,17 @@ export class DbEventSourceOwnerStore implements EventSourceOwnerStore {
       const configuredRoots = [...new Set(options.configuredRoots.map(resourceKey))].sort();
       const completed = this.db
         .prepare(
-          `SELECT route_count, input_snapshot_json
+          `SELECT input_snapshot_json
            FROM event_source_route_materialization_receipts WHERE version = ?`
         )
         .get(ROUTE_MATERIALIZATION_VERSION) as RouteMaterializationReceiptRow | undefined;
       if (completed) {
-        parseRouteMaterializationSnapshot(completed.input_snapshot_json);
-        if (!Number.isInteger(completed.route_count) || completed.route_count < 0) {
-          throw new Error("event-source route materialization receipt has an invalid route count");
-        }
+        const snapshot = parseRouteMaterializationSnapshot(completed.input_snapshot_json);
         return {
           store: this,
           droppedDelegations: this.dropUnanchoredDelegations(configuredRoots, options.at),
           unroutedMissingOwnerships: [],
-          routeCount: completed.route_count,
+          routeCount: materializedRouteCount(snapshot),
         };
       }
 
@@ -357,10 +355,10 @@ export class DbEventSourceOwnerStore implements EventSourceOwnerStore {
       this.db
         .prepare(
           `INSERT INTO event_source_route_materialization_receipts
-             (version, completed_at, route_count, input_snapshot_json)
-           VALUES (?, ?, ?, ?)`
+             (version, completed_at, input_snapshot_json)
+           VALUES (?, ?, ?)`
         )
-        .run(ROUTE_MATERIALIZATION_VERSION, options.at, routeCount, inputSnapshot);
+        .run(ROUTE_MATERIALIZATION_VERSION, options.at, inputSnapshot);
 
       return { store: this, droppedDelegations, unroutedMissingOwnerships, routeCount };
     };

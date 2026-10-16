@@ -25,11 +25,29 @@ function setup(extra: Partial<RootControlOptions> = {}) {
   return {
     mesh,
     events,
-    service: new RootControlService({ mesh, providers: ["claude", "agy"], ...extra }),
+    service: new RootControlService({
+      mesh,
+      rootId: "root",
+      providers: ["claude", "agy"],
+      ...extra,
+    }),
   };
 }
 
 describe("RootControlService", () => {
+  it("refuses root-controlled mutations when an empty store has no root actor", () => {
+    const { mesh, events, service } = setup({ rootId: undefined });
+
+    expect(() =>
+      service.spawnChild(
+        { charter: "do not synthesize a parent", modelConfig: { provider: "agy", model: "flash" } },
+        "e2e-controller"
+      )
+    ).toThrow(/unavailable until an operator creates an actor/);
+    expect(mesh.spawn).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+  });
+
   it("spawns under root and records the external principal without changing ownership", () => {
     const { mesh, events, service } = setup();
     const id = service.spawnChild(
@@ -302,6 +320,7 @@ describe("RootControlService", () => {
     });
     const service = new RootControlService({
       mesh,
+      rootId: "root",
       providers: ["agy"],
       resolveModelConfig: (input) =>
         isModelClassReference(input) && input.class === "fast"
