@@ -214,17 +214,10 @@ export function planConfiguredActorImport(options: {
         [actorId]
       );
     }
-    // Not part of the import: the imported actor having a parent is only wrong
-    // because boot still runs it through the configured-actor path as a
-    // top-level actor. Once boot constructs it like every other actor (#1003),
-    // this refusal goes.
-    if (record.parentId !== null) {
-      throw new ConfiguredActorImportError(
-        `the imported configured actor ${actorId} is no longer top-level (parent ${record.parentId})`,
-        "until forest boot lands the runtime boots its configured actor as the single top-level actor; restore its null parent_id in mesh.db's actors table",
-        [actorId]
-      );
-    }
+    // The receipt identifies this one imported actor; it does not pin its
+    // topology. An authenticated operator may later move it beneath another
+    // forest, and restart must reconstruct the persisted tree as it stands
+    // rather than demanding that an import-time parentlessness survive (#1003).
     return { kind: "completed", actorId };
   }
 

@@ -901,8 +901,10 @@ export function createAgentExecMcpServer(
   );
 
   // ── Capability grants (ISSUE_NUM phase 1a, generalized for secret grants in
-  // #542) ── Registered on EVERY endpoint: root can grant any grantable
-  // capability to any actor (as before), and a non-root actor can grant/revoke
+  // #542) ── Registered on EVERY endpoint: a capability-admin actor can grant
+  // most grantable capabilities within its subtree, while an authenticated
+  // operator alone provisions the separately guarded obligations-admin binding;
+  // a non-root actor can grant/revoke
   // capabilities in the parent-grantable allow-list (exactly the
   // PARENT_GRANTABLE_CAPABILITIES secret names — 'secret:gemini-api-key' and
   // 'secret:mistral-api-key'; any other 'secret:<filename>' needs a

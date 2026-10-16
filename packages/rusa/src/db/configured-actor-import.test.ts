@@ -648,11 +648,13 @@ describe("configured-actor import (#1002)", () => {
       expect(repositories.actors.list()).toEqual([]);
     });
 
-    it("refuses an imported actor that has been reparented", () => {
+    it("keeps a reparented imported actor bound to its durable receipt", () => {
       repositories.actors.upsert(actor("new-top", { parentId: null }));
       repositories.actors.patch("configured", { parentId: "new-top" });
 
-      expect(refusal(() => run()).message).toMatch(/no longer top-level \(parent new-top\)/);
+      expect(run()).toMatchObject({ actorId: "configured" });
+      expect(plan()).toEqual({ kind: "completed", actorId: "configured" });
+      expect(repositories.actors.get("configured")?.parentId).toBe("new-top");
     });
 
     it("refuses a receipt that counts an imported row but names no actor", () => {

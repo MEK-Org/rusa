@@ -1151,6 +1151,54 @@ export async function handleMeshApiRequest(
       return true;
     }
 
+    // POST /api/mesh/actors/:id/obligations-admin — the authenticated
+    // operator's explicit, durable cross-owner obligation binding (#1003).
+    // No actor-facing capability grant may create or revoke this reach.
+    const obligationsAdminMatch = pathname.match(
+      /^\/api\/mesh\/actors\/([^/]+)\/obligations-admin$/
+    );
+    if (obligationsAdminMatch) {
+      const operatorActors = deps?.operatorActors;
+      if (!operatorActors) {
+        sendJson(res, 503, { error: "operator actor control unavailable" });
+        return true;
+      }
+      const actorId = decodeURIComponent(obligationsAdminMatch[1]);
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (
+            typeof parsed !== "object" ||
+            parsed === null ||
+            Array.isArray(parsed) ||
+            typeof (parsed as Record<string, unknown>).enabled !== "boolean"
+          ) {
+            sendJson(res, 400, { error: "enabled must be a boolean" });
+            return;
+          }
+          const principal = requireOperatorPrincipal(req, res, deps);
+          if (!principal) return;
+          try {
+            const binding = operatorActors.setObligationsAdmin(
+              actorId,
+              (parsed as Record<string, boolean>).enabled,
+              principal
+            );
+            sendJson(res, 200, { ok: true, binding });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
     // POST /api/mesh/actors/:id/reparent — the authenticated operator's
     // boundary for reorganizing actor forests (#1003). `parentId: null`
     // detaches the actor to top level; every decided attempt is audited.

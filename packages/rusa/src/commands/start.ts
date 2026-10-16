@@ -30,6 +30,7 @@ import type { ActorRecord, ExecutionConfig, PortableContextConfig } from "../act
 import {
   ADMINISTRATIVE_CAPABILITIES,
   bootstrapCapabilitiesFor,
+  OBLIGATIONS_ADMIN_CAPABILITY,
   seedConfiguredActorGrants,
 } from "../actor/administrative-capabilities.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
@@ -3335,13 +3336,16 @@ async function composeStart(
     // host-global names listed here (`update`, `pnpm-hardlinks`, `model-admin`,
     // `room-admin`)
     // are stripped by the mesh: it never grants one, and only the seed below
-    // creates their rows. `obligation-responsive` (#1026) likewise mounts
-    // nothing: each worker's obligations server reads the grant per call.
+    // creates their rows. `obligation-responsive` (#1026) and
+    // `obligations-admin` (#1003) likewise mount nothing: each worker's
+    // obligations server reads the binding per call; the latter is changed only
+    // through the authenticated operator boundary.
     grantableCapabilities: new Set([
       ...grantableServers.keys(),
       SECRET_CAPABILITY_BASE,
       COMPUTER_USE_CAPABILITY,
       OBLIGATION_RESPONSIVE_CAPABILITY,
+      OBLIGATIONS_ADMIN_CAPABILITY,
       ...ADMINISTRATIVE_CAPABILITIES,
     ]),
     secretsDir: secretsDirPath(mcHome),
@@ -3576,6 +3580,7 @@ async function composeStart(
             resolveOwner: (raw) =>
               resolveObligationOwner(actors, raw, getRepositories().principals),
             canManage: (callerId, obligation) =>
+              mesh.hasActiveCapability(callerId, OBLIGATIONS_ADMIN_CAPABILITY) ||
               canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
             canSetResponsive: () => mesh.hasActiveCapability(id, OBLIGATION_RESPONSIVE_CAPABILITY),
             recordEvent: (event) => mesh.recordEvent(event),
@@ -4104,7 +4109,13 @@ async function composeStart(
     const rootObligationsUrl = mcpHttp.addServer(`${rootId}:${OBLIGATIONS_MCP_NAME}`, () =>
       createObligationsMcpServer(getRepositories().obligations, rootId, {
         canSetResponsive: () => true,
-        canManage: () => true,
+        // Import provenance and rootActor configuration no longer confer
+        // cross-owner obligation authority. The configured actor retains the
+        // same ordinary owner/subtree relation as every actor, and an
+        // authenticated operator may grant its separate durable binding.
+        canManage: (callerId, obligation) =>
+          mesh.hasActiveCapability(callerId, OBLIGATIONS_ADMIN_CAPABILITY) ||
+          canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
         resolveOwner: (raw) => resolveObligationOwner(actors, raw, getRepositories().principals),
         recordEvent: (event) => mesh.recordEvent(event),
         validateCompletionMatcher,
@@ -4750,7 +4761,7 @@ async function composeStart(
             return entries.length > 0 ? entries : null;
           },
           rootControl,
-          operatorActors: new OperatorActorControl(mesh),
+          operatorActors: new OperatorActorControl(mesh, capabilityGrants),
           // The configured actor's identity, so the dashboard shows this
           // instance's own handle instead of the default root-actor. Both the
           // handle and the image (cached under `avatars/root.png`) are the

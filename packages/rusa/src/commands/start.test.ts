@@ -23,6 +23,7 @@ import {
   ActorMesh,
   RetirementBlockedError,
 } from "../actor/actor-mesh.js";
+import { OBLIGATIONS_ADMIN_CAPABILITY } from "../actor/administrative-capabilities.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
@@ -2733,6 +2734,43 @@ describe("runStart webhook event routing (Phase 4)", () => {
       (await call(root, "mark_obligation_responsive", { id: ordinary.id })).isError
     ).toBeFalsy();
     expect(getRepositories().obligations.require(ordinary.id).effectiveResponsive).toBe(true);
+
+    // The configured actor gets no cross-owner authority from its import or
+    // rootActor config. An explicit durable operator binding is checked for
+    // every mutation, including after this already-open endpoint is revoked.
+    const human = getRepositories().principals.createUser({
+      email: "obligation-owner@example.com",
+      createdAt: "2026-10-16T05:30:00.000Z",
+    });
+    const humanOwned = getRepositories().obligations.create({
+      title: "human-owned",
+      ownerId: human.id,
+    });
+    expect(getRepositories().capabilityGrants.activeFor(rootId)).not.toContain(
+      OBLIGATIONS_ADMIN_CAPABILITY
+    );
+    expect(
+      (await call(root, "set_checkpoint", { id: humanOwned.id, checkpoint: "before grant" }))
+        .isError
+    ).toBe(true);
+    getRepositories().capabilityGrants.grant({
+      actorId: rootId,
+      capability: OBLIGATIONS_ADMIN_CAPABILITY,
+      grantedBy: "operator:synthetic",
+      grantedAt: "2026-10-16T05:30:00.000Z",
+    });
+    expect(
+      (await call(root, "set_checkpoint", { id: humanOwned.id, checkpoint: "after grant" })).isError
+    ).toBeFalsy();
+    getRepositories().capabilityGrants.revoke(
+      rootId,
+      OBLIGATIONS_ADMIN_CAPABILITY,
+      "2026-10-16T05:31:00.000Z"
+    );
+    expect(
+      (await call(root, "set_checkpoint", { id: humanOwned.id, checkpoint: "after revoke" }))
+        .isError
+    ).toBe(true);
   });
 
   it("wires lifecycle abandonment through both production actor factories", async () => {
@@ -6726,6 +6764,30 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect([...second.topLevel].sort()).toEqual([first.importedActor, "second-top"].sort());
       expect(second.live).toEqual([first.importedActor, "second-top"].sort());
       expect(await boot()).toEqual(second);
+    });
+
+    it("rehydrates a demoted imported actor beneath an ordinary forest across restart (#1003)", async () => {
+      const first = await boot();
+      const importedActor = first.importedActor;
+      if (!importedActor) throw new Error("configured actor was not imported");
+      withMeshDb((db) => {
+        const actors = new SqliteActorRepository(db);
+        actors.upsert({
+          id: "ordinary-top",
+          charter: "synthetic",
+          parentId: null,
+          status: "active",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        });
+        actors.patch(importedActor, { parentId: "ordinary-top" });
+      });
+
+      const demoted = await boot();
+      expect(demoted.root).toMatchObject({ id: importedActor, parentId: "ordinary-top" });
+      expect(demoted.importedActor).toBe(importedActor);
+      expect(demoted.topLevel).toEqual(["ordinary-top"]);
+      expect(demoted.live).toEqual([importedActor, "ordinary-top"].sort());
+      expect(await boot()).toEqual(demoted);
     });
 
     it("refuses an ambiguous upgraded home until the operator names the actor", async () => {

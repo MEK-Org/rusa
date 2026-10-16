@@ -1,4 +1,6 @@
 import type { ActorRecord } from "./actor-record.js";
+import { OBLIGATIONS_ADMIN_CAPABILITY } from "./administrative-capabilities.js";
+import type { CapabilityGrantStore } from "./capability-grants.js";
 import type { RootControlPrincipal } from "./root-control.js";
 
 /** What a human operator's reparent was asked to do and how it ended. */
@@ -13,10 +15,27 @@ export interface OperatorReparentAudit {
   reason?: string;
 }
 
+/** A human operator's request to change an actor's cross-owner obligation reach. */
+export interface OperatorObligationsAdminAudit {
+  principal: string;
+  actorId: string;
+  enabled: boolean;
+  outcome: "ok" | "denied";
+  /** Why a denied request was refused. */
+  reason?: string;
+}
+
+/** Durable readback returned after the operator action commits. */
+export interface ObligationsAdminBinding {
+  actorId: string;
+  capability: typeof OBLIGATIONS_ADMIN_CAPABILITY;
+  active: boolean;
+}
+
 export interface OperatorActorControlMesh {
   reparentThread(id: string, newParentId: string | null): void;
   recordEvent(event: {
-    kind: "operator_actor_reparent";
+    kind: "operator_actor_reparent" | "operator_obligations_admin";
     actorId: string;
     detail?: string;
     payload?: string;
@@ -38,7 +57,11 @@ export interface OperatorActorControlMesh {
  * the edge change itself.
  */
 export class OperatorActorControl {
-  constructor(private readonly mesh: OperatorActorControlMesh) {}
+  constructor(
+    private readonly mesh: OperatorActorControlMesh,
+    private readonly grants: CapabilityGrantStore,
+    private readonly now: () => string = () => new Date().toISOString()
+  ) {}
 
   reparent(actorId: string, newParentId: string | null, principal: RootControlPrincipal): void {
     const fromParentId = this.mesh.list().find((record) => record.id === actorId)?.parentId ?? null;
@@ -67,12 +90,72 @@ export class OperatorActorControl {
     audit("ok");
   }
 
+  /**
+   * The only production mutation path for `obligations-admin` (#1003). It is
+   * intentionally not an ActorMesh capability grant: even a capability-admin
+   * actor must not obtain cross-owner obligation reach by delegation. The
+   * response is a store readback, so an operator can observe the durable
+   * binding before relying on it.
+   */
+  setObligationsAdmin(
+    actorId: string,
+    enabled: boolean,
+    principal: RootControlPrincipal
+  ): ObligationsAdminBinding {
+    const audit = (outcome: OperatorObligationsAdminAudit["outcome"], reason?: string) =>
+      this.recordObligationsAdmin({
+        principal,
+        actorId,
+        enabled,
+        outcome,
+        ...(reason !== undefined ? { reason } : {}),
+      });
+    if (principal === "root-llm") {
+      const reason = "only an authenticated human operator may provision obligations-admin";
+      audit("denied", reason);
+      throw new Error(reason);
+    }
+    if (!this.mesh.list().some((record) => record.id === actorId)) {
+      const reason = `unknown actor: ${actorId}`;
+      audit("denied", reason);
+      throw new Error(reason);
+    }
+
+    if (enabled) {
+      this.grants.grant({
+        actorId,
+        capability: OBLIGATIONS_ADMIN_CAPABILITY,
+        grantedBy: `operator:${principal}`,
+        grantedAt: this.now(),
+      });
+    } else {
+      this.grants.revoke(actorId, OBLIGATIONS_ADMIN_CAPABILITY, this.now());
+    }
+    const active = this.grants.activeFor(actorId).includes(OBLIGATIONS_ADMIN_CAPABILITY);
+    if (active !== enabled) {
+      const reason = `durable ${OBLIGATIONS_ADMIN_CAPABILITY} readback did not match requested state`;
+      audit("denied", reason);
+      throw new Error(reason);
+    }
+    audit("ok");
+    return { actorId, capability: OBLIGATIONS_ADMIN_CAPABILITY, active };
+  }
+
   private record(audit: OperatorReparentAudit): void {
     const to = audit.toParentId ?? "top level";
     this.mesh.recordEvent({
       kind: "operator_actor_reparent",
       actorId: audit.actorId,
       detail: `${audit.principal} reparent ${audit.outcome}: ${audit.fromParentId ?? "top level"} -> ${to}`,
+      payload: JSON.stringify(audit),
+    });
+  }
+
+  private recordObligationsAdmin(audit: OperatorObligationsAdminAudit): void {
+    this.mesh.recordEvent({
+      kind: "operator_obligations_admin",
+      actorId: audit.actorId,
+      detail: `${audit.principal} ${audit.enabled ? "enabled" : "revoked"} obligations-admin: ${audit.outcome}`,
       payload: JSON.stringify(audit),
     });
   }

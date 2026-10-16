@@ -50,6 +50,25 @@ export const ACTOR_ADMIN_CAPABILITY = "actor-admin";
 export const ROOM_ADMIN_CAPABILITY = "room-admin";
 
 /**
+ * Manage obligations regardless of their owner or actor-tree position. This is
+ * deliberately distinct from actor administration: it lets a named actor work
+ * human-owned and orphan-owned obligations, but grants no lifecycle, model, or
+ * capability authority. An authenticated operator provisions it directly;
+ * configuration and the configured-actor import never seed it (#1003).
+ */
+export const OBLIGATIONS_ADMIN_CAPABILITY = "obligations-admin";
+
+/**
+ * Capabilities whose durable rows are changed only through an authenticated
+ * operator boundary. Keeping this separate from host-global capabilities is
+ * intentional: obligations administration has no host-wide side effect, but
+ * an actor-facing grantor must not bootstrap cross-owner obligation reach.
+ */
+export const OPERATOR_PROVISIONED_CAPABILITIES: ReadonlySet<string> = new Set([
+  OBLIGATIONS_ADMIN_CAPABILITY,
+]);
+
+/**
  * The capabilities administered on the agent-execution endpoint itself. They
  * mount no server of their own; the mesh consults them for authority and the
  * endpoint registers the matching management tools for a holder.

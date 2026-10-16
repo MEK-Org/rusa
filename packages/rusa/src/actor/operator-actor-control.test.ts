@@ -3,8 +3,14 @@ import { InMemoryActorRepository } from "../repositories/in-memory-actor-reposit
 import type { Actor } from "./actor.js";
 import { ActorMesh } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
+import { OBLIGATIONS_ADMIN_CAPABILITY } from "./administrative-capabilities.js";
+import { InMemoryCapabilityGrantStore } from "./capability-grants.js";
 import type { MeshEventInput } from "./mesh-events.js";
-import { OperatorActorControl, type OperatorReparentAudit } from "./operator-actor-control.js";
+import {
+  OperatorActorControl,
+  type OperatorObligationsAdminAudit,
+  type OperatorReparentAudit,
+} from "./operator-actor-control.js";
 
 const OPERATOR = "00000000-0000-4000-8000-000000000001";
 
@@ -22,6 +28,7 @@ function record(id: string, parentId: string | null): ActorRecord {
 /** Two forests: imported → steward → worker, and other → other-child. */
 function setup() {
   const actors = new InMemoryActorRepository();
+  const grants = new InMemoryCapabilityGrantStore();
   const events: MeshEventInput[] = [];
   for (const [id, parentId] of [
     ["imported", null],
@@ -42,7 +49,18 @@ function setup() {
     events
       .filter((event) => event.kind === "operator_actor_reparent")
       .map((event) => JSON.parse(event.payload ?? "{}") as OperatorReparentAudit);
-  return { actors, events, audits, control: new OperatorActorControl(mesh) };
+  const obligationAudits = (): OperatorObligationsAdminAudit[] =>
+    events
+      .filter((event) => event.kind === "operator_obligations_admin")
+      .map((event) => JSON.parse(event.payload ?? "{}") as OperatorObligationsAdminAudit);
+  return {
+    actors,
+    events,
+    grants,
+    audits,
+    obligationAudits,
+    control: new OperatorActorControl(mesh, grants, () => "2026-10-16T05:30:00.000Z"),
+  };
 }
 
 describe("OperatorActorControl (#1003)", () => {
@@ -134,6 +152,68 @@ describe("OperatorActorControl (#1003)", () => {
     expect(actors.get("worker")?.parentId).toBe("steward");
     expect(audits()).toEqual([
       expect.objectContaining({ principal: "root-llm", actorId: "worker", outcome: "denied" }),
+    ]);
+  });
+
+  it("provisions, reads back, revokes, and audits obligations administration separately", () => {
+    const { control, grants, obligationAudits } = setup();
+
+    expect(control.setObligationsAdmin("worker", true, OPERATOR)).toEqual({
+      actorId: "worker",
+      capability: OBLIGATIONS_ADMIN_CAPABILITY,
+      active: true,
+    });
+    expect(grants.activeFor("worker")).toEqual([OBLIGATIONS_ADMIN_CAPABILITY]);
+    expect(grants.list()).toMatchObject([
+      {
+        actorId: "worker",
+        capability: OBLIGATIONS_ADMIN_CAPABILITY,
+        grantedBy: `operator:${OPERATOR}`,
+        grantedAt: "2026-10-16T05:30:00.000Z",
+      },
+    ]);
+
+    expect(control.setObligationsAdmin("worker", false, OPERATOR)).toEqual({
+      actorId: "worker",
+      capability: OBLIGATIONS_ADMIN_CAPABILITY,
+      active: false,
+    });
+    expect(grants.activeFor("worker")).toEqual([]);
+    expect(obligationAudits()).toEqual([
+      expect.objectContaining({
+        principal: OPERATOR,
+        actorId: "worker",
+        enabled: true,
+        outcome: "ok",
+      }),
+      expect.objectContaining({
+        principal: OPERATOR,
+        actorId: "worker",
+        enabled: false,
+        outcome: "ok",
+      }),
+    ]);
+  });
+
+  it("denies and audits root-LLM and unknown-target obligations-admin requests", () => {
+    const { control, grants, obligationAudits } = setup();
+
+    expect(() => control.setObligationsAdmin("worker", true, "root-llm")).toThrow(/human operator/);
+    expect(() => control.setObligationsAdmin("ghost", true, OPERATOR)).toThrow(/unknown actor/);
+    expect(grants.list()).toEqual([]);
+    expect(obligationAudits()).toEqual([
+      expect.objectContaining({
+        principal: "root-llm",
+        actorId: "worker",
+        enabled: true,
+        outcome: "denied",
+      }),
+      expect.objectContaining({
+        principal: OPERATOR,
+        actorId: "ghost",
+        enabled: true,
+        outcome: "denied",
+      }),
     ]);
   });
 });

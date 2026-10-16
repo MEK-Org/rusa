@@ -64,6 +64,7 @@ import type { ActorRecord } from "./actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
   CAPABILITY_ADMIN_CAPABILITY,
+  OBLIGATIONS_ADMIN_CAPABILITY,
   seedConfiguredActorGrants,
 } from "./administrative-capabilities.js";
 import type { AtIo } from "./at-queue.js";
@@ -5822,6 +5823,27 @@ describe("ActorMesh", () => {
     await expect(
       mesh.revokeCapability("ghost-grantee", "understanding-write", "root")
     ).rejects.toThrow("unknown thread id: ghost-grantee");
+  });
+
+  it("reserves obligations-admin grant and revoke for the authenticated operator boundary (#1003)", async () => {
+    const { mesh, capabilityGrants } = setup({
+      grantableCapabilities: new Set([OBLIGATIONS_ADMIN_CAPABILITY]),
+    });
+    const child = mesh.spawn({ charter: "child", parentId: "root" });
+
+    expect(() => mesh.grantCapability(child, OBLIGATIONS_ADMIN_CAPABILITY, "root")).toThrow(
+      /authenticated operator/
+    );
+    capabilityGrants.grant({
+      actorId: child,
+      capability: OBLIGATIONS_ADMIN_CAPABILITY,
+      grantedBy: "operator:test",
+      grantedAt: "2026-10-16T05:30:00.000Z",
+    });
+    await expect(
+      mesh.revokeCapability(child, OBLIGATIONS_ADMIN_CAPABILITY, "root")
+    ).rejects.toThrow(/authenticated operator/);
+    expect(mesh.hasActiveCapability(child, OBLIGATIONS_ADMIN_CAPABILITY)).toBe(true);
   });
 
   it("a parent cannot grant a non-allow-listed capability, even to its direct child", async () => {
