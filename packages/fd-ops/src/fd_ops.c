@@ -164,25 +164,22 @@ static napi_value fd_fstatat(napi_env env, napi_callback_info info) {
   return result;
 }
 
-// linkat(olddirfd, oldname, newdirfd, newname). Never follows oldname and
-// fails with EEXIST rather than replacing newname, so it publishes without
-// overwriting.
+// linkat(dirfd, oldname, newname). Links within the one held directory, so it
+// cannot publish elsewhere. Never follows oldname and fails with EEXIST rather
+// than replacing newname, so it publishes without overwriting.
 static napi_value fd_linkat(napi_env env, napi_callback_info info) {
-  napi_value argv[4];
-  get_args(env, info, 4, argv);
-  int32_t olddirfd, newdirfd;
-  if (!get_fd(env, argv[0], "olddirfd", &olddirfd) ||
-      !get_fd(env, argv[2], "newdirfd", &newdirfd)) {
-    return NULL;
-  }
+  napi_value argv[3];
+  get_args(env, info, 3, argv);
+  int32_t dirfd;
+  if (!get_fd(env, argv[0], "dirfd", &dirfd)) return NULL;
   char *oldname = get_component(env, argv[1]);
   if (oldname == NULL) return NULL;
-  char *newname = get_component(env, argv[3]);
+  char *newname = get_component(env, argv[2]);
   if (newname == NULL) {
     free(oldname);
     return NULL;
   }
-  int rc = linkat(olddirfd, oldname, newdirfd, newname, 0);
+  int rc = linkat(dirfd, oldname, dirfd, newname, 0);
   int err = errno;
   free(oldname);
   free(newname);

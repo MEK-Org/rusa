@@ -21,8 +21,11 @@ export interface FdOps {
   openat(dirfd: number, name: string, flags: number, mode?: number): number;
   /** `fstatat` with `AT_SYMLINK_NOFOLLOW`. */
   fstatat(dirfd: number, name: string): FdStat;
-  /** `linkat` without following `oldname`; `EEXIST` rather than replacing `newname`. */
-  linkat(olddirfd: number, oldname: string, newdirfd: number, newname: string): void;
+  /**
+   * `linkat` within the one held directory, without following `oldname`;
+   * `EEXIST` rather than replacing `newname`.
+   */
+  linkat(dirfd: number, oldname: string, newname: string): void;
   /** `unlinkat` of a non-directory entry; a symlink is removed itself. */
   unlinkat(dirfd: number, name: string): void;
 }

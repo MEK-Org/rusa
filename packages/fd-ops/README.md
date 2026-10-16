@@ -49,6 +49,8 @@ its decisions:
   `unlinkIfSame` cleanup. `linkat` has no current call site: the eventual
   Slice-1 design may use it only if it adds a verified temp-to-final,
   no-overwrite publish step. That design is not part of this helper PR.
+  `linkat` takes one directory descriptor for both names, so it can only
+  publish beside the temp file in that held destination directory.
 
 The primitive calls are synchronous by design: each is one bounded
 descriptor-relative syscall that either returns a descriptor or fails. The

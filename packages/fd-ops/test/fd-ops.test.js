@@ -141,12 +141,12 @@ describe("@rusa/fd-ops", () => {
         name
       );
       assert.equal(
-        errorCode(() => fd.linkat(dir, "x", dir, name)),
+        errorCode(() => fd.linkat(dir, "x", name)),
         "ERR_INVALID_COMPONENT",
         name
       );
       assert.equal(
-        errorCode(() => fd.linkat(dir, name, dir, "x")),
+        errorCode(() => fd.linkat(dir, name, "x")),
         "ERR_INVALID_COMPONENT",
         name
       );
@@ -190,12 +190,7 @@ describe("@rusa/fd-ops", () => {
         label
       );
       assert.equal(
-        errorCode(() => fd.linkat(bad, missing, held, missing)),
-        "ERR_OUT_OF_RANGE",
-        label
-      );
-      assert.equal(
-        errorCode(() => fd.linkat(held, missing, bad, missing)),
+        errorCode(() => fd.linkat(bad, missing, missing)),
         "ERR_OUT_OF_RANGE",
         label
       );
@@ -293,7 +288,7 @@ describe("@rusa/fd-ops", () => {
       fd.openat(held, ".tmp-1", constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600)
     );
     writeSync(tmp, "payload");
-    fd.linkat(held, ".tmp-1", held, "final.txt");
+    fd.linkat(held, ".tmp-1", "final.txt");
     fd.unlinkat(held, ".tmp-1");
     assert.deepEqual(readdirSync(dir), ["final.txt"]);
     const digest = createHash("sha256")
@@ -310,11 +305,11 @@ describe("@rusa/fd-ops", () => {
     symlinkSync(join(outside, "nowhere"), join(dir, "dangling"));
     const held = openDir(dir);
     assert.equal(
-      errorCode(() => fd.linkat(held, ".tmp", held, "taken")),
+      errorCode(() => fd.linkat(held, ".tmp", "taken")),
       "EEXIST"
     );
     assert.equal(
-      errorCode(() => fd.linkat(held, ".tmp", held, "dangling")),
+      errorCode(() => fd.linkat(held, ".tmp", "dangling")),
       "EEXIST"
     );
     assert.equal(readFileSync(join(dir, "taken"), "utf8"), "competitor");
@@ -331,30 +326,23 @@ describe("@rusa/fd-ops", () => {
     assert.equal(readFileSync(join(outside, "keep"), "utf8"), "kept");
   });
 
-  test("openat forces a FIFO non-blocking in a bounded child", () => {
+  test("openat forces a FIFO non-blocking, reported non-regular, in a bounded child", () => {
     const dir = scratch("fifo");
     execFileSync("mkfifo", [join(dir, "pipe")]);
     const script = [
-      'import { closeSync, constants, openSync } from "node:fs";',
+      'import { closeSync, constants, fstatSync, openSync } from "node:fs";',
       `import { loadFdOps } from ${JSON.stringify(new URL("../index.js", import.meta.url).href)};`,
       `const held = openSync(${JSON.stringify(dir)}, constants.O_RDONLY | constants.O_DIRECTORY);`,
       'const handle = loadFdOps().openat(held, "pipe", constants.O_RDONLY);',
+      "const regular = fstatSync(handle).isFile();",
       "closeSync(handle); closeSync(held);",
+      "process.stdout.write(String(regular));",
     ].join(" ");
     const output = execFileSync(process.execPath, ["--input-type=module", "--eval", script], {
       encoding: "utf8",
       timeout: 1_000,
     });
-    assert.equal(output, "");
-  });
-
-  test("a non-blocking FIFO is still reported as non-regular", () => {
-    const dir = scratch("fifo-type");
-    execFileSync("mkfifo", [join(dir, "pipe")]);
-    const handle = track(
-      fd.openat(openDir(dir), "pipe", constants.O_RDONLY | constants.O_NONBLOCK)
-    );
-    assert.equal(fstatSync(handle).isFile(), false);
+    assert.equal(output, "false");
   });
 
   test("errors carry Node-style code, errno and syscall", () => {
