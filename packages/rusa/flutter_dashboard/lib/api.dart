@@ -43,6 +43,24 @@ class BriefRevision {
   }
 }
 
+/// The operator-visible receipt from clearing one availability-hold scope.
+class AvailabilityHoldClearResult {
+  const AvailabilityHoldClearResult({
+    required this.released,
+    required this.expiredRemoved,
+  });
+
+  final int released;
+  final int expiredRemoved;
+
+  factory AvailabilityHoldClearResult.fromJson(Map<String, dynamic> json) {
+    return AvailabilityHoldClearResult(
+      released: (json['released'] as List<dynamic>? ?? const []).length,
+      expiredRemoved: json['expired_removed'] as int? ?? 0,
+    );
+  }
+}
+
 /// Most refs one `/api/mesh/references` request may name; mirrors
 /// `MAX_REFERENCE_BATCH` on the server, which refuses a larger batch.
 const int referenceBatchLimit = 20;
@@ -170,6 +188,32 @@ class DashboardApi {
     return (json['providers'] as List<dynamic>? ?? const [])
         .whereType<String>()
         .toList();
+  }
+
+  /// Authenticated operator recovery for one held provider/model scope.
+  /// The server performs the release/replay transition without starting a run.
+  Future<AvailabilityHoldClearResult> clearAvailabilityHolds({
+    required String provider,
+    List<String>? models,
+  }) async {
+    final uri = _u('/api/mesh/availability-holds/clear');
+    final res = await _client.post(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'provider': provider,
+        if (models != null) 'models': models,
+      }),
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+    return AvailabilityHoldClearResult.fromJson(
+      jsonDecode(res.body) as Map<String, dynamic>,
+    );
   }
 
   Future<String> spawnRootChild({

@@ -184,6 +184,43 @@ class _EventsLogFakeApi extends FakeApi {
 }
 
 void main() {
+  testWidgets('clears a provider hold from the hierarchy control', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..threadsResult = [makeThread('root', created: 't0')]
+        ..rootControlProviders = ['codex'];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      addTearDown(store.dispose);
+      await store.init();
+      await tester.pumpWidget(_harness(store));
+
+      await tester.tap(find.byTooltip('Clear availability holds'));
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.text('Clear availability holds'), findsOneWidget);
+      expect(
+        find.text('Restore a held provider or selected model lanes.'),
+        findsOneWidget,
+      );
+
+      await tester.enterText(
+        find.widgetWithText(
+          TextFormField,
+          'Models (optional, comma-separated)',
+        ),
+        'gpt-5.6, gpt-5.7',
+      );
+      await tester.tap(find.widgetWithText(FilledButton, 'Clear'));
+      await tester.pump(const Duration(milliseconds: 100));
+
+      final clear = api.rootHoldClearCalls.single;
+      expect(clear.provider, 'codex');
+      expect(clear.models, ['gpt-5.6', 'gpt-5.7']);
+      expect(find.text('Cleared 2 active availability holds.'), findsOneWidget);
+    });
+  });
+
   testWidgets('spawns a root child from the hierarchy control', (tester) async {
     await tester.runAsync(() async {
       final api = FakeApi()

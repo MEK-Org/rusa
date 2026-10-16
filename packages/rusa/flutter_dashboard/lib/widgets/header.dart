@@ -391,9 +391,17 @@ class MeshHeader extends StatelessWidget {
                             selected == DashboardView.actors &&
                             detail == null) ...[
                           SizedBox(width: compact ? 6 : 10),
-                          ActorTreeControls(
-                            store: store,
-                            compact: compactControls,
+                          StreamBuilder<bool>(
+                            stream: store.actorsStale,
+                            initialData: store.actorsStale.valueOrNull ?? false,
+                            builder: (_, staleSnap) => ActorTreeControls(
+                              store: store,
+                              // The cached badge takes the same narrow phone
+                              // row. Keep recovery reachable while shedding
+                              // only the redundant Retired label in that state.
+                              compact:
+                                  compactControls || (staleSnap.data ?? false),
+                            ),
                           ),
                         ],
                         if (!drawerNav && onLogout != null) ...[

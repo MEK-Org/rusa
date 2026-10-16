@@ -234,6 +234,10 @@ class FakeApi extends DashboardApi {
   List<String> rootControlProviders = ['agy', 'codex'];
   final rootSpawnCalls =
       <({String charter, String? title, String? provider, String? model})>[];
+  final rootHoldClearCalls = <({String provider, List<String>? models})>[];
+  AvailabilityHoldClearResult rootHoldClearResult =
+      const AvailabilityHoldClearResult(released: 2, expiredRemoved: 0);
+  Object? rootHoldClearError;
   String spawnedRootChildId = 'spawned-child';
   final actorReparentCalls = <({String id, String parentId})>[];
   Object? actorReparentError;
@@ -377,6 +381,17 @@ class FakeApi extends DashboardApi {
   @override
   Future<List<String>> fetchRootControlProviders() async =>
       rootControlProviders;
+
+  @override
+  Future<AvailabilityHoldClearResult> clearAvailabilityHolds({
+    required String provider,
+    List<String>? models,
+  }) async {
+    rootHoldClearCalls.add((provider: provider, models: models));
+    final error = rootHoldClearError;
+    if (error != null) throw error;
+    return rootHoldClearResult;
+  }
 
   /// Full charters the detail panel can pull, keyed by thread id. Absent means
   /// the server had nothing to add beyond the preview — which is what the real
