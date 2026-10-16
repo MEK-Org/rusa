@@ -14,8 +14,9 @@ installs the workspace needs a C toolchain:
 
 - **Linux:** `python3`, `make` and a C compiler (`build-essential` on Debian and
   Ubuntu). The Docker image already installs these for `better-sqlite3`.
-- **macOS:** the Xcode Command Line Tools (`xcode-select --install`). This has
-  not yet been verified on a Mac.
+- **macOS:** the Xcode Command Line Tools (`xcode-select --install`). A
+  disposable macOS build/load has been observed, but each source revision still
+  needs its own macOS runtime validation before it can ship.
 
 The first build also downloads Node's headers for the running Node version
 into node-gyp's cache. Every `pnpm install` recompiles the addon, so there is no

@@ -105,6 +105,20 @@ describe("@rusa/fd-ops", () => {
     assert.equal(readAll(handle), "hello");
   });
 
+  test("openat admits a regular entry while refusing a final symlink", () => {
+    const dir = scratch("no-follow-compatible");
+    const outside = scratch("no-follow-compatible-outside");
+    writeFileSync(join(dir, "regular"), "inside");
+    writeFileSync(join(outside, "secret"), "outside");
+    symlinkSync(join(outside, "secret"), join(dir, "link"));
+    const held = openDir(dir);
+    assert.equal(readAll(track(fd.openat(held, "regular", constants.O_RDONLY))), "inside");
+    assert.equal(
+      errorCode(() => fd.openat(held, "link", constants.O_RDONLY)),
+      "ELOOP"
+    );
+  });
+
   test("openat defaults an omitted create mode to Node's 0o666", () => {
     const dir = scratch("default-mode");
     const previousUmask = process.umask(0);

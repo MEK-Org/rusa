@@ -19,10 +19,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#ifndef O_NOFOLLOW_ANY
-#define O_NOFOLLOW_ANY 0
-#endif
-
 // Throw an Error shaped like Node's own fs errors: "<CODE>: <text>, <syscall>"
 // with code, errno (negative, as libuv reports it) and syscall properties.
 static void throw_errno(napi_env env, int err, const char *syscall) {
@@ -102,8 +98,10 @@ static void get_args(napi_env env, napi_callback_info info, size_t want, napi_va
   for (size_t i = argc; i < want; i++) napi_get_undefined(env, &argv[i]);
 }
 
-// openat(dirfd, name, flags, mode = 0666) -> fd. O_NOFOLLOW (and O_NOFOLLOW_ANY
-// where the platform has it), O_CLOEXEC, and O_NONBLOCK are always added.
+// openat(dirfd, name, flags, mode = 0666) -> fd. O_NOFOLLOW, O_CLOEXEC, and
+// O_NONBLOCK are always added. Each call resolves exactly one component, so
+// O_NOFOLLOW rejects the only component the syscall could otherwise follow on
+// both Linux and Darwin. Darwin rejects O_NOFOLLOW | O_NOFOLLOW_ANY together.
 static napi_value fd_openat(napi_env env, napi_callback_info info) {
   napi_value argv[4];
   get_args(env, info, 4, argv);
@@ -117,9 +115,7 @@ static napi_value fd_openat(napi_env env, napi_callback_info info) {
   if (mode_type != napi_undefined && !get_int(env, argv[3], "mode", 0, &mode)) return NULL;
   char *name = get_component(env, argv[1]);
   if (name == NULL) return NULL;
-  int fd = openat(dirfd, name,
-                  flags | O_NOFOLLOW | O_NOFOLLOW_ANY | O_CLOEXEC | O_NONBLOCK,
-                  (mode_t)mode);
+  int fd = openat(dirfd, name, flags | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, (mode_t)mode);
   int err = errno;
   free(name);
   if (fd < 0) {

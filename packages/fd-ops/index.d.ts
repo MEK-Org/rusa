@@ -14,8 +14,9 @@ export interface FdStat {
  */
 export interface FdOps {
   /**
-   * `openat` with `O_NOFOLLOW`, `O_CLOEXEC`, `O_NONBLOCK` and, on macOS,
-   * `O_NOFOLLOW_ANY` added. An omitted create mode is `0o666` before umask.
+   * `openat` with `O_NOFOLLOW`, `O_CLOEXEC`, and `O_NONBLOCK` added. Each call
+   * resolves one component, so `O_NOFOLLOW` rejects a final symlink on Linux
+   * and macOS. An omitted create mode is `0o666` before umask.
    */
   openat(dirfd: number, name: string, flags: number, mode?: number): number;
   /** `fstatat` with `AT_SYMLINK_NOFOLLOW`. */
