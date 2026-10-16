@@ -23,7 +23,11 @@ import {
   ActorMesh,
   RetirementBlockedError,
 } from "../actor/actor-mesh.js";
-import { OBLIGATIONS_ADMIN_CAPABILITY } from "../actor/administrative-capabilities.js";
+import {
+  CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES,
+  CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR,
+  OBLIGATIONS_ADMIN_CAPABILITY,
+} from "../actor/administrative-capabilities.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
@@ -9572,6 +9576,65 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "mesh-chat-read",
         "pnpm-install",
       ]);
+    });
+
+    it("upgrades a staging-shaped root without Chat or Slack write until it grants them explicitly", async () => {
+      // Staging's boot seeded only the administrative and host-maintenance rows;
+      // Chat and Slack write were direct configured-actor mounts with no row.
+      writeFileSync(
+        join(homeDir, "capability-grants.json"),
+        JSON.stringify({
+          grants: CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES.map((capability) => ({
+            actorId: rootId,
+            capability,
+            grantedBy: CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR,
+            grantedAt: "2026-10-01T00:00:00.000Z",
+          })),
+        }),
+        "utf8"
+      );
+      const secretsDir = join(homeDir, "secrets");
+      mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(secretsDir, "slack-bot-token"), "xoxb-synthetic-bot-token");
+      writeFileSync(join(secretsDir, "slack-app-token"), "xapp-synthetic-app-token");
+      writeConfig({
+        ...chatConfig,
+        slack: {
+          botTokenPath: join(secretsDir, "slack-bot-token"),
+          appTokenPath: join(secretsDir, "slack-app-token"),
+        },
+      });
+      const startSpy = vi.spyOn(SlackSocketSource.prototype, "start").mockResolvedValue(undefined);
+      const closeSpy = vi.spyOn(SlackSocketSource.prototype, "close").mockResolvedValue(undefined);
+      try {
+        const { mesh, root } = await boot({
+          chatClient: new FakeChatClient(),
+          chatSource: new FakeChatSource(),
+          slackClient: new SlackClient("xoxb-synthetic-bot-token"),
+        });
+        if (!root) throw new Error("configured actor missing");
+        const names = () => mcpServersOf(root).map((server) => server.name);
+
+        expect([...mesh.activeCapabilitiesFor(root.id)].sort()).toEqual(
+          [...CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES].sort()
+        );
+        expect(names()).toContain("chat-read");
+        expect(names()).not.toContain("chat-write");
+        expect(names()).not.toContain("slack-write");
+
+        // The documented restore: root, holding its imported capability-admin
+        // row, grants itself each write surface; both mount live.
+        mesh.grantCapability(root.id, "chat-write:*", root.id);
+        mesh.grantCapability(root.id, "slack-write:*", root.id);
+
+        expect(mesh.activeCapabilitiesFor(root.id)).toEqual(
+          expect.arrayContaining(["chat-write:*", "slack-write:*"])
+        );
+        expect(names()).toEqual(expect.arrayContaining(["chat-write", "slack-write"]));
+      } finally {
+        startSpy.mockRestore();
+        closeSpy.mockRestore();
+      }
     });
 
     it("records the same run accounting, events and logs for root and worker runs", async () => {

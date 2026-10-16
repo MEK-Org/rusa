@@ -2189,8 +2189,8 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  // GET /api/mesh/chat-room — the Chat Room roster: root first, then added
-  // actors in the order they joined. Read-only: root manages membership.
+  // GET /api/mesh/chat-room — the Chat Room roster: explicitly added actors in
+  // the order they joined. Read-only: a room-admin holder manages membership.
   if (pathname === "/api/mesh/chat-room") {
     if (!deps.chatRoom) {
       sendJson(res, 503, { error: "chat room unavailable (no live mesh bound)" });

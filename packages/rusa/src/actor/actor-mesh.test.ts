@@ -5591,6 +5591,28 @@ describe("ActorMesh", () => {
     expect(mesh.activeCapabilitiesFor("worker-thread")).toEqual(["chat-write:spaces/AAQA29JwOwg"]);
   });
 
+  it("grants channel-scoped slack-write by its base capability (#1003)", () => {
+    const { mesh, registry } = setup({
+      grantableCapabilities: new Set(["slack-write"]),
+    });
+    registry.upsert({
+      id: "worker-thread",
+      charter: "doc-toolkit steward",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+
+    // The mount path already aggregates `slack-write:<channel>` rows by base;
+    // the grant path has to accept them for that mount to be reachable.
+    mesh.grantCapability("worker-thread", "slack-write:*", "root");
+    mesh.grantCapability("worker-thread", "slack-write:C0123456789", "root");
+    expect(mesh.activeCapabilitiesFor("worker-thread")).toEqual([
+      "slack-write:*",
+      "slack-write:C0123456789",
+    ]);
+  });
+
   it("a parent grants an allow-listed secret to its DIRECT child, audited with peerId = grantor", async () => {
     const events: MeshEventInput[] = [];
     const { mesh } = setup({

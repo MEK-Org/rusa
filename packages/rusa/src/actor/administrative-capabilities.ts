@@ -97,9 +97,10 @@ export const HOST_MAINTENANCE_CAPABILITIES: ReadonlySet<string> = new Set([
  * registry, and managing the mesh-wide Chat Room roster. The subtree boundary that bounds every other delegation cannot
  * bound these, so the mesh never grants one — not downward, and not to the
  * grantor itself, which is the path by which a delegated `capability-admin`
- * holder would otherwise widen into host authority. Only the bootstrap seed
- * (or a direct row) creates one; a holder may revoke it from itself, and that
- * revocation is deliberately one-way from inside the mesh.
+ * holder would otherwise widen into host authority. Startup no longer seeds
+ * one and no operator path creates one yet (#1087), so only an existing row
+ * authorizes it; a holder may revoke it from itself, and that revocation is
+ * deliberately one-way from inside the mesh.
  */
 export const HOST_GLOBAL_CAPABILITIES: ReadonlySet<string> = new Set([
   MODEL_ADMIN_CAPABILITY,
@@ -109,8 +110,8 @@ export const HOST_GLOBAL_CAPABILITIES: ReadonlySet<string> = new Set([
 
 /**
  * Everything the configured actor held implicitly before administration became
- * grant-derived. This is the compatibility set the wiring seeds once per
- * installation so an upgrade keeps the configured actor's operational access.
+ * grant-derived. Startup no longer seeds it (#1003); rows an earlier boot
+ * seeded stand, and #1087 owns any new default provisioning.
  */
 export const CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES: readonly string[] = [
   ...ADMINISTRATIVE_CAPABILITIES,

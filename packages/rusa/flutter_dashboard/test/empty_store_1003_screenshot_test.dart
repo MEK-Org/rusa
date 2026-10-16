@@ -9,6 +9,15 @@
 // lists it as the implicit participant. `after` is this PR: the same fresh
 // install boots no actor at all, so the tree renders the existing "No actors"
 // empty state and the voice room renders its empty-state text.
+//
+// It also renders an upgraded install whose room previously showed only the
+// configured actor: `before` is staging (that actor is the implicit
+// participant), `after` is this PR's first boot (no stored row, so the tab
+// waits on an empty roster although the actor is still in the tree), and
+// `restored` follows a room-admin holder re-adding it by durable id. The tab
+// renders from the roster alone, so those frames are pixel-identical to the
+// empty-store room captures above (`restored` matches `before`); the test
+// asserts each state without writing duplicate files.
 
 import 'dart:io';
 
@@ -134,13 +143,85 @@ void main() {
           } else {
             // No participants -> no controller: the tab waits on a roster that
             // only an operator-created actor can ever populate (#1003).
-            expect(find.text('Waiting for the room participant list…'), findsOneWidget);
+            expect(
+              find.text('Waiting for the room participant list…'),
+              findsOneWidget,
+            );
           }
           expect(tester.takeException(), isNull);
           await captureBoundary(
             roomKey,
             '$_outDir/1003_empty_store_room_${viewport}_$phase.png',
           );
+          await tester.pumpWidget(const SizedBox.shrink());
+        });
+      });
+    }
+
+    for (final phase in ['before', 'after', 'restored']) {
+      testWidgets('upgraded room $viewport $phase', (tester) async {
+        await tester.runAsync(() async {
+          final roster = phase == 'after' ? const <String>[] : [_importedId];
+          HttpOverrides.global = FakeImageHttpOverrides(
+            await portraits([_importedId]),
+          );
+          addTearDown(() => HttpOverrides.global = null);
+          tester.view
+            ..physicalSize = size
+            ..devicePixelRatio = 1.0;
+          addTearDown(tester.view.reset);
+
+          final api = FakeApi()
+            ..threadsResult = [
+              ThreadDto(
+                id: _importedId,
+                handle: _handle,
+                parentId: null,
+                status: 'active',
+                provider: 'antigravity',
+                model: 'Gemini 3.7 Flash',
+                charterPreview: _charter,
+                title: _charter,
+                createdAt: '2026-01-01T00:00:00Z',
+                runState: RunState.idle,
+              ),
+            ]
+            ..charters[_importedId] = _charter
+            ..chatRoomParticipants = roster;
+          final walkie = FakeWalkie(api);
+          final store = DashboardStore(
+            api: api,
+            stream: FakeStream(),
+            walkie: walkie.deps,
+          );
+          await store.refreshThreads();
+          addTearDown(store.dispose);
+
+          final roomKey = GlobalKey();
+          await tester.pumpWidget(
+            MaterialApp(
+              debugShowCheckedModeBanner: false,
+              theme: buildMeshTheme(),
+              home: Scaffold(
+                backgroundColor: MeshColors.bgPrimary,
+                body: RepaintBoundary(
+                  key: roomKey,
+                  child: ChatRoomTab(store: store),
+                ),
+              ),
+            ),
+          );
+          await tester.pump(const Duration(milliseconds: 250));
+          if (roster.isEmpty) {
+            // The actor still exists in the tree; only its implicit seat is gone.
+            expect(
+              find.text('Waiting for the room participant list…'),
+              findsOneWidget,
+            );
+          } else {
+            expect(find.text(_handle), findsWidgets);
+          }
+          expect(tester.takeException(), isNull);
           await tester.pumpWidget(const SizedBox.shrink());
         });
       });

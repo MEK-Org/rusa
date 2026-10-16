@@ -3510,6 +3510,8 @@ export class ActorMesh {
     let baseCapability = capability;
     if (capability.startsWith("chat-write:")) {
       baseCapability = "chat-write";
+    } else if (capability.startsWith("slack-write:")) {
+      baseCapability = "slack-write";
     } else if (capability.startsWith("calendar-read:")) {
       baseCapability = "calendar-read";
     } else if (capability.startsWith("calendar-write:")) {
@@ -3551,10 +3553,11 @@ export class ActorMesh {
     // acts on the whole daemon, so no subtree bound can contain a grant of it:
     // refused for every grantor, the grantee itself included — the self-grant
     // is exactly how a delegated capability-admin holder would otherwise widen
-    // into host authority. Only the bootstrap seed creates such a row (#549).
+    // into host authority. Startup no longer seeds these rows, and no operator
+    // path creates one yet (#1087); an existing row stands (#549).
     if (HOST_GLOBAL_CAPABILITIES.has(capability)) {
       throw new Error(
-        `${capability} is host-global and is never granted through the mesh; only the bootstrap seed creates it, and a revocation is one-way`
+        `${capability} is host-global and is never granted through the mesh; no creation path exists yet (#1087), an existing row stands, and a revocation is one-way`
       );
     }
     if (OPERATOR_PROVISIONED_CAPABILITIES.has(capability)) {

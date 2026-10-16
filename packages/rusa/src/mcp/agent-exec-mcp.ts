@@ -1581,7 +1581,7 @@ export function createAgentExecMcpServer(
       {
         title: "List Chat Room participants (room-admin)",
         description:
-          "List the dashboard Chat Room's participants: root first, then each added actor in the order it was added. Requires the room-admin capability.",
+          "List the dashboard Chat Room's participants: each added actor in the order it was added. Requires the room-admin capability.",
         inputSchema: {},
       },
       async () => {
@@ -1606,7 +1606,7 @@ export function createAgentExecMcpServer(
       {
         title: "Add an actor to the Chat Room (room-admin)",
         description:
-          "Add a live actor to the one mesh-wide Chat Room that every dashboard shows. Root is always a participant. Human principals and aliases such as 'root' or 'parent' cannot be added. If the actor's voice is already used by another participant, it is assigned the next unused voice through its ordinary voice setting so listeners can tell participants apart. Adding a current participant changes nothing. Requires the room-admin capability.",
+          "Add a live actor to the one mesh-wide Chat Room that every dashboard shows. The roster is exactly the actors added here; no actor is a participant implicitly. Human principals and aliases such as 'root' or 'parent' cannot be added. If the actor's voice is already used by another participant, it is assigned the next unused voice through its ordinary voice setting so listeners can tell participants apart. Adding a current participant changes nothing. Requires the room-admin capability.",
         inputSchema: {
           actor_id: z.string().min(1).describe("The actor's thread id."),
         },
@@ -1634,7 +1634,7 @@ export function createAgentExecMcpServer(
       {
         title: "Remove an actor from the Chat Room (room-admin)",
         description:
-          "Remove an actor from the mesh-wide Chat Room. Root cannot be removed. The actor keeps its voice setting. Requires the room-admin capability.",
+          "Remove an actor from the mesh-wide Chat Room. The actor keeps its voice setting. Requires the room-admin capability.",
         inputSchema: {
           actor_id: z.string().min(1).describe("The participant's thread id."),
         },

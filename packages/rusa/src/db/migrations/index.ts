@@ -54,7 +54,6 @@ import { userGoogleAccountId } from "./0058_user_google_account_id.js";
 import { obligationCompletionMatchers } from "./0059_obligation_completion_matchers.js";
 import { configuredActorImport } from "./0060_configured_actor_import.js";
 import { portableBriefRevisions } from "./0062_portable_brief_revisions.js";
-import { eventSourceRouteMaterializationReceipts } from "./0064_event_source_route_materialization_receipts.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -121,5 +120,4 @@ export const migrations: Migration[] = [
   obligationCompletionMatchers,
   configuredActorImport,
   portableBriefRevisions,
-  eventSourceRouteMaterializationReceipts,
 ];
