@@ -1045,6 +1045,7 @@ export async function handleMeshApiRequest(
             !(
               models === undefined ||
               (Array.isArray(models) &&
+                models.length > 0 &&
                 models.every((model) => typeof model === "string" && model.trim().length > 0))
             )
           ) {

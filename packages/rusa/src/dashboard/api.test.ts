@@ -1288,7 +1288,7 @@ describe("handleMeshApiRequest", () => {
       deps,
       "POST",
       "/api/mesh/availability-holds/clear",
-      JSON.stringify({ provider: "codex", models: [""] })
+      JSON.stringify({ provider: "codex", models: [] })
     );
     await settled(res);
 
