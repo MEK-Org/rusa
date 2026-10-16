@@ -178,9 +178,11 @@ export function parseHaltCommand(text: string): HaltCommand | null {
   return parseScopeAtoms(match[1], "halt", true);
 }
 
-/** Parse `/resume` (or `/continue`) atoms without involving an actor/LLM. */
+/** Parse `/resume` atoms and the bare `/continue` alias without involving an actor/LLM. */
 export function parseResumeCommand(text: string): ResumeCommand | null {
-  const match = text.trim().match(/^\/(?:resume|continue)(?:\s+(.*))?$/i);
+  const trimmed = text.trim();
+  if (/^\/continue$/i.test(trimmed)) return {};
+  const match = trimmed.match(/^\/resume(?:\s+(.*))?$/i);
   if (!match) return null;
   return parseScopeAtoms(match[1], "resume", false);
 }

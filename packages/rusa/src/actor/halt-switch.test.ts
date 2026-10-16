@@ -151,6 +151,10 @@ describe("parseResumeCommand", () => {
   it("parses bare, provider-scoped and model-scoped resumes", () => {
     expect(parseResumeCommand("/resume")).toEqual({});
     expect(parseResumeCommand("/continue")).toEqual({});
+    // `/continue` remains the existing bare alias. Free text must reach the
+    // root as ordinary chat rather than becoming an unrequested scoped resume.
+    expect(parseResumeCommand("/continue with the review")).toBeNull();
+    expect(parseResumeCommand("/continue provider:codex")).toBeNull();
     expect(parseResumeCommand("/resume provider:Codex,agy")).toEqual({
       providers: ["codex", "antigravity"],
     });
