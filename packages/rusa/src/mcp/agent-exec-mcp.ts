@@ -121,7 +121,7 @@ export function createAgentExecMcpServer(
    * spawn/send through `rootControl` for attribution; it grants no authority
    * (#549) — every management tool below is gated by an active capability.
    */
-  rootId: string,
+  rootId: string | undefined,
   wakeScheduler?: ActorWakeScheduler,
   options?: {
     onWrite?: () => void;

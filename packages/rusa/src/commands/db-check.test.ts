@@ -194,6 +194,17 @@ describe("db-check", () => {
     ).toBe("root-session");
   });
 
+  it("plans no configured actor on a fresh home, and creation only for a session-only legacy home (#1003)", () => {
+    expect(runDbCheckAgainstHome(home).configuredActor).toBe("none");
+
+    mkdirSync(join(home, "root-agent"), { recursive: true });
+    writeFileSync(
+      join(home, "root-agent", "session.json"),
+      JSON.stringify({ sessionId: "root-session" })
+    );
+    expect(runDbCheckAgainstHome(home).configuredActor).toBe("create");
+  });
+
   it("plans the event-subscription import against actors the same run has only planned", () => {
     writeFileSync(
       join(home, "threads.json"),

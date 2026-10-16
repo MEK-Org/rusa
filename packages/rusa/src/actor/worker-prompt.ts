@@ -357,8 +357,8 @@ as you address them. Failed runs still mechanically notify the parent.`;
 export interface WorkerPromptContext {
   /** This worker's own thread id. */
   threadId: string;
-  /** The thread to report back to (the spawning parent). */
-  parentId: string;
+  /** The thread to report back to (the spawning parent); null for a top-level actor (#1003). */
+  parentId: string | null;
   /** Extra actors this worker may message, already resolved to display labels. */
   handles?: ResolvedHandle[];
   /** Whether the Integrated Understanding read-only filesystem mount is enabled. */
@@ -398,7 +398,8 @@ export function resolveHandleLabels(
 
 /** Render the reachable actors as a bullet list: parent first, then granted handles. */
 function renderAddressBook(ctx: WorkerPromptContext): string {
-  const lines = [`- \`${ctx.parentId}\` — your **parent** (report results here)`];
+  const lines =
+    ctx.parentId === null ? [] : [`- \`${ctx.parentId}\` — your **parent** (report results here)`];
   for (const h of ctx.handles ?? []) {
     lines.push(`- \`${h.id}\` — ${h.label}`);
   }
@@ -413,6 +414,7 @@ function renderAddressBook(ctx: WorkerPromptContext): string {
  * threads, since routing the outbox is the whole point of a worker.
  */
 export function buildWorkerScaffold(ctx: WorkerPromptContext): string {
+  if (ctx.parentId === null) return buildTopLevelScaffold(ctx);
   return `# Worker actor
 
 You are a **worker** in a self-similar actor mesh — one focused colleague spun up
@@ -442,6 +444,40 @@ How you operate:
   believe the charter is satisfied, send a message to your parent (\`send_message\`)
   proposing completion with a concise summary note: that puts you idle until your
   parent acts.
+- You may spawn your own sub-workers for parallel/sub-tasks using the same
+  primitive, and they report to you.`;
+}
+
+/**
+ * The scaffold for an ordinary actor with no parent (#1003): a forest root an
+ * operator created or detached. Nobody above it retires it or receives its
+ * reports, so it is told so instead of being handed a parent it does not have.
+ */
+function buildTopLevelScaffold(ctx: WorkerPromptContext): string {
+  const addressBook = renderAddressBook(ctx);
+  return `# Top-level actor
+
+You are a **top-level actor** in a self-similar actor mesh, working on the charter
+below. You are thread \`${ctx.threadId}\`. You have **no parent**: no actor spawned
+you, receives your reports or retires you. The human operator directs you through
+the messages that wake you, and only an operator can move you under a parent.
+
+${addressBook ? `Actors you can message (with your messaging tool, by thread id):\n${addressBook}` : "No other actors are in your address book yet."}
+
+How you operate:
+- **Re-derive state every wake** with your tools; never trust memory of issues,
+  PRs, or chat — they change between wakes.
+- **Respond appropriately to whatever woke you.** Whoever messages you is named
+  in the message or inbox item, so reply to them (send_message to the incoming
+  fromId and sessionId for mesh chat, or external channels
+  according to inbox hints).
+- **Report charter progress to whoever directs you.** With no parent thread, a
+  milestone, blocker or proposed completion goes back to the sender of the work.
+  Failed runs reach the operator's error chat mechanically.
+- Do the work your charter describes (real git/gh in the repos you've been
+  granted), then report what you did.
+- **You don't decide your own completion.** When you believe the charter is
+  satisfied, say so to whoever directs you; the operator retires you.
 - You may spawn your own sub-workers for parallel/sub-tasks using the same
   primitive, and they report to you.`;
 }

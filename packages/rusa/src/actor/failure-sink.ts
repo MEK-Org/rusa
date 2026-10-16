@@ -22,8 +22,8 @@ export interface FailureSinkDeps {
   ) => void;
   /** Mechanical post to the configured error chat, or null if unconfigured. */
   postToErrorChat: ((text: string) => void) | null;
-  /** Id of the root actor (the one with no parent). */
-  rootId: string;
+  /** The imported configured actor; undefined when an empty store booted with none. */
+  rootId: string | undefined;
   /** Backstop sink (journal). */
   log: (message: string) => void;
   /** Optional workers home directory to check for unpushed work on SIGTERM. */
@@ -416,18 +416,25 @@ function routeMechanicalFailureNotice(
     return;
   }
 
-  if (actorId === deps.rootId) {
+  // Every top-level actor of the forest (#1003) has no parent to tell, so its
+  // failure goes where the configured actor's always has: the error chat.
+  if (actorId === deps.rootId || record !== undefined) {
+    const subject = actorId === deps.rootId ? "root" : `top-level actor ${actorId}`;
     if (result && isUserCancelled(result, deps.principals)) {
-      deps.log(`suppressing error chat for root ${label} — interrupted by human operator`);
+      deps.log(`suppressing error chat for ${subject} ${label} — interrupted by human operator`);
       return;
     }
     if (deps.postToErrorChat) {
-      deps.postToErrorChat(`⚠️ System Root's root ${label} ${summary}${extraMessage}`);
+      deps.postToErrorChat(
+        actorId === deps.rootId
+          ? `⚠️ System Root's root ${label} ${summary}${extraMessage}`
+          : `⚠️ Top-level actor ${actorId} ${label} ${summary}${extraMessage}`
+      );
     } else {
-      deps.log(`root ${label} but no error chat is configured ${summary}${extraMessage}`);
+      deps.log(`${subject} ${label} but no error chat is configured ${summary}${extraMessage}`);
     }
     return;
   }
 
-  deps.log(`${label} for ${actorId} dropped — no parent and not root ${summary}${extraMessage}`);
+  deps.log(`${label} for ${actorId} dropped — no actor record ${summary}${extraMessage}`);
 }

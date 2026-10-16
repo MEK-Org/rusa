@@ -52,6 +52,24 @@ describe("ChatRoomService", () => {
     expect(service().participants()).toEqual([{ actorId: "root", addedBy: null, addedAt: null }]);
   });
 
+  it("has no implicit participant when an empty store booted with no imported actor (#1003)", () => {
+    actors.upsert(actor("a", { parentId: null }));
+    const room = new ChatRoomService({
+      store: new ChatRoomRepository(db),
+      actors,
+      rootId: undefined,
+      voices: () => buildSupportedVoiceCatalog(),
+      defaultVoice: DEFAULT,
+      isHumanPrincipal: () => false,
+    });
+
+    expect(room.participants()).toEqual([]);
+    room.add("a", "00000000-0000-4000-8000-000000000001");
+    expect(room.participants().map((participant) => participant.actorId)).toEqual(["a"]);
+    expect(room.remove("a")).toBe(true);
+    expect(room.participants()).toEqual([]);
+  });
+
   it("persists added participants in join order, visible to a fresh reader", () => {
     actors.upsert(actor("a", { voiceConfig: googleVoiceConfig("Kore") }));
     actors.upsert(actor("b", { voiceConfig: googleVoiceConfig("Fenrir") }));

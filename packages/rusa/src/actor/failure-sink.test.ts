@@ -430,6 +430,25 @@ describe("routeRunFailure", () => {
       );
     });
 
+    it("reports a top-level actor beside the root to error chat, and with no root at all (#1003)", async () => {
+      const records = { second: { id: "second", parentId: null } };
+      const result: RunResult = {
+        success: false,
+        output: "",
+        exitCode: 1,
+        failure: { message: "boom" },
+      };
+      for (const rootId of ["root", undefined]) {
+        const { deps, toParent, toChat, logs } = makeDeps(records, { rootId });
+        await routeRunFailure(deps, "second", result, "codex/gpt-fixture @ high", "run-3");
+        expect(toParent).toEqual([]);
+        expect(logs.filter((line) => line.includes("dropped"))).toEqual([]);
+        expect(toChat).toEqual([
+          "⚠️ Top-level actor second run failed Run run-3: provider run codex/gpt-fixture @ high failed.\n\n(exit 1)\n\nboom",
+        ]);
+      }
+    });
+
     it("says a refused selection was never invoked, and skips exhaustion classification", async () => {
       let classified = 0;
       const { deps, toParent } = makeDeps(

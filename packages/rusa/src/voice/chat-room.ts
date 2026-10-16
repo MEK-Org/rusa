@@ -32,8 +32,11 @@ export interface ChatRoomStore {
 export interface ChatRoomServiceDeps {
   store: ChatRoomStore;
   actors: Pick<ActorRepository, "get" | "patch">;
-  /** The configured root actor: always a participant, never stored or removable. */
-  rootId: string;
+  /**
+   * The configured root actor: always a participant, never stored or
+   * removable. Undefined when an empty store booted with none (#1003).
+   */
+  rootId: string | undefined;
   /** Voices an actor may be assigned, in preference order (the dashboard catalog). */
   voices: () => readonly SupportedVoice[];
   /** The voice an actor without a stored `voiceConfig` speaks with. */
@@ -74,7 +77,9 @@ export class ChatRoomService {
       .filter((member) => member.actorId !== this.deps.rootId)
       .filter((member) => this.deps.actors.get(member.actorId)?.status === "active");
     return [
-      { actorId: this.deps.rootId, addedBy: null, addedAt: null },
+      ...(this.deps.rootId === undefined
+        ? []
+        : [{ actorId: this.deps.rootId, addedBy: null, addedAt: null }]),
       ...stored.map(({ actorId, addedBy, addedAt }) => ({ actorId, addedBy, addedAt })),
     ];
   }

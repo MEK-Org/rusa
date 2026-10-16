@@ -512,9 +512,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
         ? {
             ...options.e2e,
             onReady: (handles) => {
+              // An empty store (#1003) boots with no configured actor at all.
               const root = handles.mesh.get("root");
-              if (!root) throw new Error("configured actor missing at readiness");
-              rootId = root.id;
+              if (!root && handles.root) throw new Error("configured actor missing at readiness");
+              if (root) rootId = root.id;
               return options.e2e?.onReady?.(handles);
             },
           }
@@ -6613,6 +6614,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
           .actors.list()
           .filter((record) => record.parentId === null)
           .map((record) => record.id),
+        live: getRepositories()
+          .actors.list()
+          .filter((record) => record.status === "active" && mesh?.get(record.id) !== undefined)
+          .map((record) => record.id)
+          .sort(),
       };
       await shutdownFn?.();
       shutdownFn = undefined;
@@ -6642,6 +6648,48 @@ describe("runStart webhook event routing (Phase 4)", () => {
         db.close();
       }
     };
+
+    it("boots an empty store without synthesizing an actor, even beside legacy rootActor syntax (#1003)", async () => {
+      // A fresh install: no legacy registry, only the legacy rootActor syntax.
+      rmSync(join(homeDir, "threads.json"));
+      writeRootActorConfig({ charter: "configured charter", handle: "ember-familiar" });
+      const first = await boot();
+      expect(first.importedActor).toBeUndefined();
+      expect(first.topLevel).toEqual([]);
+      expect(withMeshDb((db) => db.prepare("SELECT COUNT(*) AS n FROM actors").get())).toEqual({
+        n: 0,
+      });
+      // A restart is still empty: the first actor comes from the operator, not config.
+      expect(await boot()).toEqual(first);
+
+      // An actor the operator creates later boots as an ordinary top-level
+      // actor; config never claims it, and the receipt still binds none.
+      withMeshDb((db) =>
+        new SqliteActorRepository(db).upsert({
+          id: "first-actor",
+          charter: "synthetic",
+          parentId: null,
+          modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
+          status: "active",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        })
+      );
+      const withActor = await boot();
+      expect(withActor).toMatchObject({
+        importedActor: undefined,
+        topLevel: ["first-actor"],
+        live: ["first-actor"],
+      });
+      expect(withActor.root).toBeUndefined();
+      expect(
+        withMeshDb((db) =>
+          db
+            .prepare("SELECT row_count, actor_id FROM legacy_import_receipts WHERE source = ?")
+            .get("config.yaml:rootActor")
+        )
+      ).toEqual({ row_count: 0, actor_id: null });
+      expect(await boot()).toEqual(withActor);
+    });
 
     it("imports once; a restart with edited or removed config keeps the stored actor", async () => {
       writeRootActorConfig({ charter: "configured charter", handle: "ember-familiar" });
@@ -6676,6 +6724,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       const second = await boot();
       expect(second.importedActor).toBe(first.importedActor);
       expect([...second.topLevel].sort()).toEqual([first.importedActor, "second-top"].sort());
+      expect(second.live).toEqual([first.importedActor, "second-top"].sort());
       expect(await boot()).toEqual(second);
     });
 
@@ -7133,8 +7182,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(bootRecords("root_model_config_file_ignored")).toEqual([]);
     });
 
-    it("seeds a fresh database with a minted root from the configured tuple", async () => {
+    it("seeds a session-only legacy home's minted root from the configured tuple", async () => {
+      // A fresh store synthesizes no actor (#1003); only a legacy home whose
+      // root kept just a session still gets its configured actor minted.
       rmSync(join(homeDir, "threads.json"));
+      mkdirSync(join(homeDir, "root-agent"), { recursive: true });
+      writeFileSync(
+        join(homeDir, "root-agent", "session.json"),
+        JSON.stringify({ sessionId: "root-session" })
+      );
 
       const mesh = await boot();
 
@@ -9801,6 +9857,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       try {
         const { mesh, root } = await boot({ slackClient });
+        if (!root) throw new Error("configured actor missing");
         const [entry] = getRepositories().inbox.append([
           {
             actorId: root.id,

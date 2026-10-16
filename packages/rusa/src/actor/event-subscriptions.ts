@@ -286,13 +286,15 @@ export interface EventSourceBootSyncResult {
 export function reconcileEventSources(
   persistentStore: EventSourceOwnerStore,
   configured: EventResource[],
-  rootId: string,
+  rootId: string | undefined,
   now: () => string
 ): EventSourceBootSyncResult {
   const impliedStore = new InMemoryEventSourceOwnerStore();
   const droppedDelegations: EventSourceOwnership[] = [];
 
+  // An empty store (#1003) has no imported actor to hold the implied rows.
   for (const resource of configured) {
+    if (rootId === undefined) break;
     // One active subscriber per resource. We seed implied subscriptions for the root,
     // but the UnionEventSourceOwnerStore means persistent explicit overrides (if any)
     // will take precedence if the root later delegates it or drops it.
