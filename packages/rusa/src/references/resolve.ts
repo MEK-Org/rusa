@@ -60,6 +60,8 @@ export type ResolvedReferenceWithEntity = ResolvedReference & {
 };
 
 export interface ReferenceResolverDeps {
+  /** Resolve a pre-import actor address in a historical inbox citation. */
+  resolveActorId?: (id: string) => string;
   meshChat?: Pick<MeshChatRepository, "getById">;
   inbox?: Pick<InboxRepository, "read">;
   /** Reads a Google Chat message; absent when the chat edge is not configured. */
@@ -130,14 +132,15 @@ function resolveMesh(
     // segment rather than resolver context — a reference has to be readable
     // without the reader already knowing whose inbox it came from.
     if (!deps.inbox) return unresolved(reference, "Inbox entry", "inbox not available");
-    const entry = deps.inbox.read(first[1], second[1]);
+    const actorId = deps.resolveActorId?.(first[1]) ?? first[1];
+    const entry = deps.inbox.read(actorId, second[1]);
     if (!entry) return unresolved(reference, "Inbox entry", "entry not found");
     return {
       ref: reference.key,
       scheme: reference.scheme,
       title: entry.source,
       body: JSON.stringify(entry.payload ?? null, null, 2),
-      author: first[1],
+      author: actorId,
       timestamp: entry.deliveredAt?.toISOString() ?? null,
       url: null,
       unavailable: null,
@@ -156,7 +159,7 @@ function resolveMesh(
  */
 export function resolveReferenceSync(
   ref: string,
-  deps: Pick<ReferenceResolverDeps, "meshChat" | "inbox">
+  deps: Pick<ReferenceResolverDeps, "meshChat" | "inbox" | "resolveActorId">
 ): ResolvedReferenceWithEntity {
   let reference: Reference;
   try {

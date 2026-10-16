@@ -116,6 +116,16 @@ export interface WorkspaceSweepOptions {
 }
 
 /**
+ * Whether a directory name directly under `<mcHome>/workers/` is a reserved
+ * shared or probe directory rather than a spawned worker's workspace: the
+ * legacy `root` actor's, and the `quota-probe-<provider>` and
+ * `model-probe-<provider>` directories created for quota and model scraping.
+ */
+export function isReservedWorkerDirectory(name: string): boolean {
+  return name === "root" || name.startsWith("quota-probe-") || name.startsWith("model-probe-");
+}
+
+/**
  * Absolute paths of the workspaces of actors that have retired.
  *
  * `root`, `quota-probe-<provider>` and `model-probe-<provider>` share the

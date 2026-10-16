@@ -6,6 +6,7 @@ import {
   CAPABILITY_ADMIN_CAPABILITY,
   CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES,
   CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR,
+  defaultGrantRecipient,
   EXPERIMENT_ADMIN_CAPABILITY,
   MODEL_ADMIN_CAPABILITY,
   ROOM_ADMIN_CAPABILITY,
@@ -92,5 +93,43 @@ describe("administrative capabilities", () => {
     const store = new InMemoryCapabilityGrantStore();
     seedConfiguredActorGrants(store, "configured");
     expect(store.activeFor("other-parentless")).toEqual([]);
+  });
+});
+
+describe("default grant recipient (#1087)", () => {
+  const record = (
+    id: string,
+    createdAt: string,
+    parentId: string | null = null,
+    status: "active" | "retired" = "active"
+  ) => ({
+    id,
+    charter: id,
+    createdAt,
+    parentId,
+    status,
+  });
+
+  it("selects the earliest created active parentless actor, independent of listing order", () => {
+    const oldest = record("oldest", "2026-01-02T00:00:00Z");
+    const records = [
+      record("later", "2026-01-03T00:00:00Z"),
+      record("retired", "2026-01-01T00:00:00Z", null, "retired"),
+      record("child", "2026-01-01T00:00:00Z", "oldest"),
+      oldest,
+    ];
+    expect(defaultGrantRecipient(records)).toBe(oldest);
+    expect(defaultGrantRecipient([...records].reverse())).toBe(oldest);
+    expect(defaultGrantRecipient([])).toBeUndefined();
+    expect(defaultGrantRecipient(records.slice(1, 3))).toBeUndefined();
+  });
+
+  it("compares instants across offsets and breaks equal creation timestamps by id", () => {
+    const a = record("a", "2026-01-01T01:00:00+01:00");
+    const b = record("b", "2026-01-01T00:00:00Z");
+    expect(defaultGrantRecipient([b, a])).toBe(a);
+    expect(defaultGrantRecipient([a, record("earlier", "2026-01-01T00:30:00+01:00")])?.id).toBe(
+      "earlier"
+    );
   });
 });

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  isReservedWorkerDirectory,
   orphanedWorkspaces,
   removableWorkspaceNames,
   sweepOrphanedWorkspaces,
@@ -216,5 +217,20 @@ describe("workspace sweep", () => {
     const orphans = orphanedWorkspaces({ workersDir, scratchDir, actors: REGISTRY });
 
     expect(orphans).toEqual([join(workersDir, RETIRED)]);
+  });
+
+  describe("isReservedWorkerDirectory", () => {
+    it("recognizes canonical root and provider probe directories", () => {
+      expect(isReservedWorkerDirectory("root")).toBe(true);
+      expect(isReservedWorkerDirectory("quota-probe-codex")).toBe(true);
+      expect(isReservedWorkerDirectory("model-probe-claude")).toBe(true);
+    });
+
+    it("does not match ordinary spawned worker actors", () => {
+      expect(isReservedWorkerDirectory("worker-1")).toBe(false);
+      expect(isReservedWorkerDirectory(LIVE)).toBe(false);
+      expect(isReservedWorkerDirectory(RETIRED)).toBe(false);
+      expect(isReservedWorkerDirectory("configured")).toBe(false);
+    });
   });
 });

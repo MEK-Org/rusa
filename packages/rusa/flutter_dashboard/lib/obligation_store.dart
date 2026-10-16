@@ -93,31 +93,57 @@ class ObligationEntities {
   /// A child the store no longer holds is left out.
   List<ObligationDto>? blockersOf(String id) =>
       blockers[id]?.map((c) => byId[c]).nonNulls.toList();
+
+  /// [id]'s ancestors the store holds, root first and parent last, found by
+  /// following parent ids. The walk stops at the first one it does not hold,
+  /// so an unavailable ancestor shortens the path to the parents it does hold
+  /// rather than leaving a gap. A cycle ends it too.
+  List<ObligationDto> ancestorsOf(String id) {
+    final seen = {id};
+    final path = <ObligationDto>[];
+    var parentId = byId[id]?.parentId;
+    while (parentId != null && seen.add(parentId)) {
+      final parent = byId[parentId];
+      if (parent == null) break;
+      path.add(parent);
+      parentId = parent.parentId;
+    }
+    return path.reversed.toList();
+  }
 }
 
-/// The rows of a set of queries plus the recorded blockers of those rows:
-/// what a view subscribed to those queries renders.
+/// The rows of a set of queries plus the recorded blockers and held
+/// ancestors of those rows: what a view subscribed to those queries renders.
 class ObligationProjection {
-  const ObligationProjection(this.rows, this.blockers);
+  const ObligationProjection(
+    this.rows,
+    this.blockers, [
+    this.ancestors = const {},
+  ]);
 
   factory ObligationProjection.of(
     ObligationEntities entities,
     Iterable<ObligationQuery> queries,
   ) {
     final rows = {for (final q in queries) q: entities.select(q)};
-    return ObligationProjection(rows, {
-      for (final o in rows.values.expand((r) => r))
-        o.id: ?entities.blockersOf(o.id),
-    });
+    final shown = rows.values.expand((r) => r);
+    return ObligationProjection(
+      rows,
+      {for (final o in shown) o.id: ?entities.blockersOf(o.id)},
+      {for (final o in shown) o.id: entities.ancestorsOf(o.id)},
+    );
   }
 
   final Map<ObligationQuery, List<ObligationDto>> rows;
   final Map<String, List<ObligationDto>> blockers;
 
+  /// Each row's ancestors, root first ([ObligationEntities.ancestorsOf]).
+  final Map<String, List<ObligationDto>> ancestors;
+
   List<ObligationDto> of(ObligationQuery query) => rows[query] ?? const [];
 
   /// Whether nothing either projection shows differs: same rows, by identity,
-  /// in the same order, with the same blockers.
+  /// in the same order, with the same blockers and ancestors.
   bool sameAs(ObligationProjection other) {
     bool same(List<ObligationDto>? a, List<ObligationDto>? b) {
       if (a == null || b == null || a.length != b.length) return false;
@@ -127,10 +153,15 @@ class ObligationProjection {
       return true;
     }
 
+    bool sameMap(
+      Map<String, List<ObligationDto>> a,
+      Map<String, List<ObligationDto>> b,
+    ) => a.length == b.length && a.keys.every((id) => same(a[id], b[id]));
+
     return rows.length == other.rows.length &&
         rows.keys.every((q) => same(rows[q], other.rows[q])) &&
-        blockers.length == other.blockers.length &&
-        blockers.keys.every((id) => same(blockers[id], other.blockers[id]));
+        sameMap(blockers, other.blockers) &&
+        sameMap(ancestors, other.ancestors);
   }
 }
 
@@ -187,8 +218,8 @@ class ObligationStore {
       _write((e) => _upsertInto(e, obligations));
 
   /// Applies one page of [query] in server order and returns the obligations
-  /// it showed absent. Its rows are upserted, and are members of [query]
-  /// again. When [reconcile] is set, an obligation whose stored copy matches
+  /// it showed absent. Its rows, and any ancestors it carried, are upserted,
+  /// and its rows are members of [query] again. When [reconcile] is set, an obligation whose stored copy matches
   /// [query] but which the page left out is marked absent from [query], as
   /// long as the server would have ordered it within the page: every one
   /// when the page is the whole query, and only those ordered before its last
@@ -221,6 +252,7 @@ class ObligationStore {
       }
       e.absent[query] = absent;
       _upsertInto(e, rows);
+      _upsertInto(e, page.ancestors);
     });
     return missing;
   }

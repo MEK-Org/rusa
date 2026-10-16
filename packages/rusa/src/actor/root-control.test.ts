@@ -19,18 +19,55 @@ function setup(extra: Partial<RootControlOptions> = {}) {
     retire: vi.fn(),
     interrupt: vi.fn(() => ({ interrupted: true })),
     runNow: vi.fn(() => ({ queued: true })),
-    reparentThread: vi.fn(),
     recordEvent: (event) => events.push(event),
     list: vi.fn(() => []),
   };
   return {
     mesh,
     events,
-    service: new RootControlService({ mesh, providers: ["claude", "agy"], ...extra }),
+    service: new RootControlService({
+      mesh,
+      rootId: "root",
+      providers: ["claude", "agy"],
+      ...extra,
+    }),
   };
 }
 
 describe("RootControlService", () => {
+  it("refuses actor-controlled bootstrap when an empty store has no root actor", () => {
+    const { mesh, events, service } = setup({ rootId: undefined });
+
+    expect(() =>
+      service.spawnChild(
+        { charter: "do not synthesize a parent", modelConfig: { provider: "agy", model: "flash" } },
+        "root-llm"
+      )
+    ).toThrow(/authenticated.*operator/);
+    expect(mesh.spawn).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+  });
+
+  it("lets an operator create the first parentless actor, then creates children under it", () => {
+    const actors = new InMemoryActorRepository();
+    const mesh = new ActorMesh({
+      actors,
+      idgen: (() => {
+        let n = 0;
+        return () => `actor-${++n}`;
+      })(),
+      createActor: () => ({ run: vi.fn() }) as unknown as Actor,
+    });
+    const service = new RootControlService({ mesh, providers: ["agy"] });
+    const request = { charter: "start here", modelConfig: { provider: "agy", model: "flash" } };
+    const first = service.spawnChild(request, "e2e-controller");
+    const second = service.spawnChild(request, "e2e-controller");
+    expect(actors.get(first)?.parentId).toBeNull();
+    expect(actors.get(second)?.parentId).toBe(first);
+    expect(actors.get(first)?.handles).toContainEqual({ id: second });
+    expect(service.rootId).toBe(first);
+  });
+
   it("spawns under root and records the external principal without changing ownership", () => {
     const { mesh, events, service } = setup();
     const id = service.spawnChild(
@@ -303,6 +340,7 @@ describe("RootControlService", () => {
     });
     const service = new RootControlService({
       mesh,
+      rootId: "root",
       providers: ["agy"],
       resolveModelConfig: (input) =>
         isModelClassReference(input) && input.class === "fast"
@@ -345,35 +383,5 @@ describe("RootControlService", () => {
       action: "run_now_child",
       targetId: "child-1",
     });
-  });
-
-  it("reparents a root descendant and audits the new parent", () => {
-    const { mesh, events, service } = setup();
-
-    service.reparentChild("worker-1", "steward-2", "00000000-0000-4000-8000-000000000001");
-
-    expect(mesh.reparentThread).toHaveBeenCalledWith("worker-1", "steward-2");
-    expect(JSON.parse(events[0]?.payload ?? "{}")).toMatchObject({
-      action: "reparent_child",
-      targetId: "worker-1",
-      newParentId: "steward-2",
-      principal: "00000000-0000-4000-8000-000000000001",
-    });
-  });
-
-  it("refuses a root, foreign actor, or foreign destination before asking the mesh to reparent it", () => {
-    const { mesh, service } = setup();
-    vi.mocked(mesh.isAncestorOf).mockImplementation((_, id) => id !== "foreign");
-
-    expect(() =>
-      service.reparentChild("root", "worker-2", "00000000-0000-4000-8000-000000000001")
-    ).toThrow(/root descendants/);
-    expect(() =>
-      service.reparentChild("foreign", "worker-2", "00000000-0000-4000-8000-000000000001")
-    ).toThrow(/root descendants/);
-    expect(() =>
-      service.reparentChild("worker-1", "foreign", "00000000-0000-4000-8000-000000000001")
-    ).toThrow(/root descendants/);
-    expect(mesh.reparentThread).not.toHaveBeenCalled();
   });
 });

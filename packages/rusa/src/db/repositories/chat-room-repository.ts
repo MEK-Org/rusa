@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 
-/** One stored Chat Room participant. Root is implicit and never stored. */
+/** One explicit, durable Chat Room participant binding. */
 export interface ChatRoomMember {
   actorId: string;
   addedBy: string;

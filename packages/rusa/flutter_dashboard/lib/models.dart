@@ -2256,11 +2256,15 @@ class ObligationPage {
     required this.obligations,
     required this.total,
     required this.hasMore,
+    this.ancestors = const [],
   });
 
   final List<ObligationDto> obligations;
   final int total;
   final bool hasMore;
+
+  /// The rows' ancestors, each once, when the page was asked for them (#1076).
+  final List<ObligationDto> ancestors;
 
   factory ObligationPage.fromJson(Map<String, dynamic> j) => ObligationPage(
     obligations: (j['obligations'] as List<dynamic>? ?? const [])
@@ -2268,6 +2272,9 @@ class ObligationPage {
         .toList(),
     total: j['total'] as int? ?? 0,
     hasMore: j['hasMore'] as bool? ?? false,
+    ancestors: (j['ancestors'] as List<dynamic>? ?? const [])
+        .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
   );
 }
 

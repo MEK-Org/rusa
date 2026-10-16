@@ -15,6 +15,16 @@ import { createMcpServer } from "./strict-server.js";
 
 export const TRACKER_MCP_NAME = "tracker";
 
+/**
+ * Shared guidance for embedding repository images in Markdown across tracker posting tools.
+ * GitHub's "Basic writing and formatting syntax" docs (Images) give `blob/<ref>/<path>?raw=true`
+ * for images in issues, pull requests and comments, and say private-repository images render
+ * only for viewers with read access. A commit SHA as `<ref>` keeps evidence images rendering
+ * after the branch moves or is deleted.
+ */
+export const GITHUB_IMAGE_LINK_INSTRUCTION =
+  "To show a repository image in Markdown, use `![alt](https://github.com/<owner>/<repo>/blob/<commit-sha>/<path>?raw=true)`; a commit SHA keeps it rendering after branches move or are deleted. In private repositories it renders only for viewers with read access.";
+
 export interface TrackerMcpOptions {
   onWrite?: () => void;
   gitBridge?: { port: number };
@@ -102,7 +112,9 @@ export function createTrackerMcpServer(
     {
       title: "Create or update a pull request",
       description:
-        "Create a PR for the given head branch, or update the existing PR if one already exists for that branch. Returns the PR URL, followed by a 'draft:' line whenever the PR is a draft after the call.",
+        "Create a PR for the given head branch, or update the existing PR if one already exists for that branch. " +
+        "Returns the PR URL, followed by a 'draft:' line whenever the PR is a draft after the call.\n\n" +
+        GITHUB_IMAGE_LINK_INSTRUCTION,
       inputSchema: {
         repo: z.string().describe("Repository in owner/name format"),
         head: z.string().describe("Feature branch name"),
@@ -280,7 +292,8 @@ export function createTrackerMcpServer(
     {
       title: "Comment on an issue or PR",
       description:
-        "Post a comment on an issue or pull request. The comment will be stamped with your authenticated identity.",
+        "Post a comment on an issue or pull request. The comment will be stamped with your authenticated identity.\n\n" +
+        GITHUB_IMAGE_LINK_INSTRUCTION,
       inputSchema: {
         repo: z.string().describe("Repository in owner/name format"),
         issueNumber: z.number().int().describe("The issue or PR number"),
@@ -304,7 +317,8 @@ export function createTrackerMcpServer(
     {
       title: "Create an issue",
       description:
-        "Create an issue. The issue body will be stamped with your authenticated identity.",
+        "Create an issue. The issue body will be stamped with your authenticated identity.\n\n" +
+        GITHUB_IMAGE_LINK_INSTRUCTION,
       inputSchema: {
         repo: z.string().describe("Repository in owner/name format"),
         title: z.string().describe("The issue title"),
@@ -423,7 +437,8 @@ export function createTrackerMcpServer(
         "Submit a review on a pull request (approve, request changes, or comment), optionally with inline comments. " +
         "The review body and inline comments will be stamped with your authenticated identity.\n\n" +
         "NOTE: GitHub rejects APPROVE and REQUEST_CHANGES verdicts on pull requests authored by the same GitHub account " +
-        "(which includes mesh-authored PRs). On such PRs, submit with event: 'COMMENT' and express your verdict in the body text.",
+        "(which includes mesh-authored PRs). On such PRs, submit with event: 'COMMENT' and express your verdict in the body text.\n\n" +
+        GITHUB_IMAGE_LINK_INSTRUCTION,
       inputSchema: {
         repo: z.string().describe("Repository in owner/name format"),
         prNumber: z.number().int().describe("The pull request number"),
@@ -507,7 +522,8 @@ export function createTrackerMcpServer(
         "1. Line/range comment: provide 'path', 'line', and optionally 'side' (defaults to 'RIGHT'), 'startLine', 'startSide'\n" +
         "2. File comment: provide 'path' and 'subjectType: \"file\"'\n" +
         "3. Reply: provide 'inReplyTo' (target comment ID; omit placement fields)\n\n" +
-        "The comment body will be stamped with your authenticated identity.",
+        "The comment body will be stamped with your authenticated identity.\n\n" +
+        GITHUB_IMAGE_LINK_INSTRUCTION,
       inputSchema: {
         repo: z.string().describe("Repository in owner/name format"),
         prNumber: z.number().int().describe("The pull request number"),
@@ -792,7 +808,8 @@ export function createTrackerMcpServer(
       description:
         "Replace the ENTIRE body of an issue or pull request with the given text — this is " +
         "not an append or patch, it overwrites the whole body, so include everything you " +
-        "want kept. The new body will be re-stamped with your authenticated identity.",
+        "want kept. The new body will be re-stamped with your authenticated identity.\n\n" +
+        GITHUB_IMAGE_LINK_INSTRUCTION,
       inputSchema: {
         repo: z.string().describe("Repository in owner/name format"),
         issueNumber: z.number().int().describe("The issue or PR number"),

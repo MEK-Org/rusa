@@ -26,7 +26,7 @@ function writeConfig(overrides: Record<string, unknown> = {}): string {
 }
 
 describe("loadConfig deployBranch", () => {
-  it("requires an explicit root provider and model", () => {
+  it("allows boot configuration with no rootActor", () => {
     const home = mkdtempSync(join(tmpdir(), "rusa-config-"));
     writeFileSync(
       join(home, "config.yaml"),
@@ -37,7 +37,7 @@ describe("loadConfig deployBranch", () => {
       }),
       "utf8"
     );
-    expect(() => loadConfig(home)).toThrow(/rootActor must specify an explicit provider and model/);
+    expect(loadConfig(home).rootActor).toBeUndefined();
   });
 
   it("defaults deployBranch to master when omitted", () => {

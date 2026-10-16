@@ -1,4 +1,5 @@
 import type { ServerResponse } from "node:http";
+import { type EventLoopUtilization, performance } from "node:perf_hooks";
 import {
   createDashboardRequestId,
   type DashboardTimingRecorder,
@@ -11,10 +12,15 @@ import { attachDashboardPhaseClock, DashboardPhaseClock } from "./timing-phases.
 
 /**
  * Count only response-body bytes; headers and socket framing are intentionally
- * excluded. The first header write or body write also ends the route phase.
+ * excluded. The first header write or body write also ends the route phase,
+ * and the first body handoff (`end`) is when `finishMs` starts.
  */
-function trackResponse(res: ServerResponse, phases: DashboardPhaseClock): () => number {
+function trackResponse(
+  res: ServerResponse,
+  phases: DashboardPhaseClock
+): { bytes: () => number; endedAt: () => number | undefined } {
   let bytes = 0;
+  let endedAt: number | undefined;
   // ServerResponse has overloaded write/end signatures. This tiny structural
   // view preserves each runtime call unchanged while allowing one wrapper to
   // observe the first argument from every overload.
@@ -31,6 +37,8 @@ function trackResponse(res: ServerResponse, phases: DashboardPhaseClock): () => 
     return originalWriteHead(...args);
   };
   const add = (chunk: unknown, encoding: BufferEncoding | undefined) => {
+    // After `end`, a repeated `write`/`end` hands off nothing.
+    if (endedAt !== undefined) return;
     if (typeof chunk === "string") bytes += Buffer.byteLength(chunk, encoding);
     else if (Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) bytes += chunk.byteLength;
   };
@@ -42,9 +50,18 @@ function trackResponse(res: ServerResponse, phases: DashboardPhaseClock): () => 
   response.end = (...args: unknown[]) => {
     phases.finishRoute();
     add(args[0], typeof args[1] === "string" && Buffer.isEncoding(args[1]) ? args[1] : undefined);
+    // First wins: a repeated end on an ended response hands off nothing.
+    endedAt ??= performance.now();
     return originalEnd(...args);
   };
-  return () => bytes;
+  return { bytes: () => bytes, endedAt: () => endedAt };
+}
+
+/** Whole percent of loop time spent running JavaScript since `start`. */
+function loopBusyPct(start: EventLoopUtilization): number | undefined {
+  const { utilization } = performance.eventLoopUtilization(start);
+  if (!Number.isFinite(utilization)) return undefined;
+  return Math.min(100, Math.max(0, Math.round(utilization * 100)));
 }
 
 /**
@@ -55,6 +72,7 @@ function trackResponse(res: ServerResponse, phases: DashboardPhaseClock): () => 
  * Exactly one record per request (#990): `finished` on `finish`, or
  * `closed_before_finish` when the connection closes first. A finished response
  * also emits `close`; the guard keeps that from becoming a second record.
+ * `loopBusyPct` covers the same start-to-terminal window as `durationMs`.
  */
 export function beginDashboardRequestTiming(
   res: ServerResponse,
@@ -70,9 +88,10 @@ export function beginDashboardRequestTiming(
   // must not masquerade as one giant request-latency sample.
   if (label === "mesh_stream_open") return;
   const started = performance.now();
+  const loopAtStart = performance.eventLoopUtilization();
   const phases = new DashboardPhaseClock();
   attachDashboardPhaseClock(phases);
-  const responseBytes = trackResponse(res, phases);
+  const response = trackResponse(res, phases);
   const operation = dashboardTimingOperationForRoute(pathname);
   const requestMethod = dashboardTimingMethod(method ?? "GET");
   let recorded = false;
@@ -80,6 +99,8 @@ export function beginDashboardRequestTiming(
     if (recorded) return;
     recorded = true;
     const endedAt = performance.now();
+    const handoffAt = response.endedAt();
+    const busy = loopBusyPct(loopAtStart);
     timings.recordServer({
       label,
       ...(operation ? { operation } : {}),
@@ -87,8 +108,16 @@ export function beginDashboardRequestTiming(
       durationMs: Math.round(endedAt - started),
       // Before headers are sent, statusCode is only the default, not a reply.
       status: terminal === "finished" || res.headersSent ? res.statusCode : null,
-      bytes: responseBytes(),
+      bytes: response.bytes(),
       phases: phases.durations(endedAt),
+      substages: {
+        ...phases.substages(endedAt),
+        // A close before finish never completed the handoff, so it has none.
+        ...(terminal === "finished" && handoffAt !== undefined
+          ? { finishMs: Math.round(Math.max(0, endedAt - handoffAt)) }
+          : {}),
+        ...(busy === undefined ? {} : { loopBusyPct: busy }),
+      },
       request: { method: requestMethod, terminal },
     });
   };

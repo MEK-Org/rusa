@@ -85,7 +85,7 @@ const modelClassReferenceSchema = z.strictObject({
  * A single provider/model/effort choice, an ordered pool of acceptable choices
  * tried earliest-available first, or a reference to a named model class that
  * expands to such a pool. A pool longer than one entry requires a portable
- * (ledger/tail) actor — a native provider session can't move between
+ * (ledger/tail/brief) actor — a native provider session can't move between
  * candidates.
  */
 const modelConfigSchema = z.union([
@@ -121,7 +121,7 @@ export function createAgentExecMcpServer(
    * spawn/send through `rootControl` for attribution; it grants no authority
    * (#549) — every management tool below is gated by an active capability.
    */
-  rootId: string,
+  rootId: string | undefined,
   wakeScheduler?: ActorWakeScheduler,
   options?: {
     onWrite?: () => void;
@@ -258,7 +258,7 @@ export function createAgentExecMcpServer(
             "What the new actor owns — its standing brief, authored by you. Include its full scope: the repo(s) to work in (it clones them itself), the deliverable, and whether it should open one PR or several."
           ),
         model_config: modelConfigSchema.describe(
-          "Required. Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires context_mode 'ledger' or 'tail', since a native provider session can't move between candidates. `{\"class\": \"<name>\"}` instead names a runtime-managed model class and expands to its currently committed pool (same portability rule). There is no default: choose the child's model deliberately, and a native spawn must declare exactly one entry."
+          "Required. Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires a portable context_mode ('ledger', 'tail' or 'brief'), since a native provider session can't move between candidates. `{\"class\": \"<name>\"}` instead names a runtime-managed model class and expands to its currently committed pool (same portability rule). There is no default: choose the child's model deliberately, and a native spawn must declare exactly one entry."
         ),
         conversation_id: z
           .string()
@@ -276,7 +276,7 @@ export function createAgentExecMcpServer(
           .enum(CONTEXT_SELECTIONS)
           .optional()
           .describe(
-            "Who owns the child's memory between runs. Omit (or 'native') for the default: the provider keeps the session and resumes it. 'ledger' and 'tail' hand ownership to the mesh — the child is called FRESH every run with its own recent history injected into the prompt, so it survives provider quota exhaustion and can be re-mounted on a different harness. 'ledger' keeps a rolling compacted digest plus recent messages and is the one to reach for; 'tail' is a raw window that never compacts. Incompatible with conversation_id."
+            "Who owns the child's memory between runs. Omit (or 'native') for the default: the provider keeps the session and resumes it. 'ledger' and 'tail' hand ownership to the mesh — the child is called FRESH every run with its own recent history injected into the prompt, so it survives provider quota exhaustion and can be re-mounted on a different harness. 'ledger' keeps a rolling compacted digest plus recent messages and is the one to reach for; 'tail' is a raw window that never compacts. 'brief' instead injects a WHAT/HOW/DOMAIN brief that the child maintains itself, with every claim citing its source, plus its recent journal; nothing writes the brief for it, so it starts from the charter and grows only by the child's own cited edits. Incompatible with conversation_id."
           ),
         target: z
           .string()
@@ -901,8 +901,10 @@ export function createAgentExecMcpServer(
   );
 
   // ── Capability grants (ISSUE_NUM phase 1a, generalized for secret grants in
-  // #542) ── Registered on EVERY endpoint: root can grant any grantable
-  // capability to any actor (as before), and a non-root actor can grant/revoke
+  // #542) ── Registered on EVERY endpoint: a capability-admin actor can grant
+  // most grantable capabilities within its subtree, while an authenticated
+  // operator alone provisions the separately guarded obligations-admin binding;
+  // a non-root actor can grant/revoke
   // capabilities in the parent-grantable allow-list (exactly the
   // PARENT_GRANTABLE_CAPABILITIES secret names — 'secret:gemini-api-key' and
   // 'secret:mistral-api-key'; any other 'secret:<filename>' needs a
@@ -963,7 +965,7 @@ export function createAgentExecMcpServer(
         "Replace an existing actor's declared provider/model/effort pool in-place in the actor repository without service restart — " +
         "a full replacement of the pool, not a per-field patch. " +
         "Allowed for the actor's parent, or root for any actor including itself. If a run is in flight, it finishes on its current pool and the change applies and persists when that run ends; an idle or queued actor has the change applied and persisted immediately, and queued work is re-admitted against the new pool. " +
-        "A pool of more than one entry, or a change of provider, is only permitted for portable (ledger/tail) actors. " +
+        "A pool of more than one entry, or a change of provider, is only permitted for portable (ledger/tail/brief) actors. " +
         "Preserves the actor's accumulated context and session history.",
       inputSchema: {
         actor_id: z.string().describe("The actor's thread id (or direct child handle) to update."),
@@ -1373,10 +1375,13 @@ export function createAgentExecMcpServer(
       {
         title: "Move an actor to a new parent (actor-admin)",
         description:
-          "Re-parent an actor to a new parent by thread id (e.g. promote a steward and move workers under it so they report to it). Requires the actor-admin capability; both the actor and its new parent must lie in your own subtree. Changes who receives the actor's reports and failure notices and who may retire it (ownership is the parent edge), and grants the new parent a handle so it can message the actor. The actor's own subtree moves with it. Rejected if it would create a cycle, target the root, or reference an unknown thread.",
+          "Re-parent an actor to a new parent by thread id (e.g. promote a steward and move workers under it so they report to it), or pass a null new_parent_id to detach it to top level. Requires the actor-admin capability; the actor must be a strict descendant of yours, and a non-null new parent must lie in your own subtree. Changes who receives the actor's reports and failure notices and who may retire it (ownership is the parent edge), and grants the new parent a handle so it can message the actor. The actor's own subtree moves with it. Detaching moves the actor out of your subtree, so you lose administrative reach over it at once. Rejected if it would create a cycle, move yourself, or reference an unknown or retired thread.",
         inputSchema: {
           thread_id: z.string().describe("The actor to move."),
-          new_parent_id: z.string().describe("The actor that becomes its new parent."),
+          new_parent_id: z
+            .string()
+            .nullable()
+            .describe("The actor that becomes its new parent, or null to detach it to top level."),
         },
       },
       async ({ thread_id, new_parent_id }) => {
@@ -1384,9 +1389,20 @@ export function createAgentExecMcpServer(
         if (denied) return denied;
         try {
           assertInSubtree(ACTOR_ADMIN_CAPABILITY, thread_id, "reparent");
-          assertInSubtree(ACTOR_ADMIN_CAPABILITY, new_parent_id, "reparent under");
+          // Ancestry includes the caller itself; moving yourself is not a
+          // reorganization of your subtree, detached or not.
+          if (thread_id === selfId || mesh.resolveLiveActorId(thread_id)?.id === selfId) {
+            throw new Error(`${selfId} may not reparent itself`);
+          }
+          if (new_parent_id !== null) {
+            assertInSubtree(ACTOR_ADMIN_CAPABILITY, new_parent_id, "reparent under");
+          }
           mesh.reparentThread(thread_id, new_parent_id);
-          return toolOk(`reparented ${thread_id} under ${new_parent_id}`);
+          return toolOk(
+            new_parent_id === null
+              ? `detached ${thread_id} to top level`
+              : `reparented ${thread_id} under ${new_parent_id}`
+          );
         } catch (err) {
           return toolError(err);
         }
@@ -1565,7 +1581,7 @@ export function createAgentExecMcpServer(
       {
         title: "List Chat Room participants (room-admin)",
         description:
-          "List the dashboard Chat Room's participants: root first, then each added actor in the order it was added. Requires the room-admin capability.",
+          "List the dashboard Chat Room's participants: each added actor in the order it was added. Requires the room-admin capability.",
         inputSchema: {},
       },
       async () => {
@@ -1590,7 +1606,7 @@ export function createAgentExecMcpServer(
       {
         title: "Add an actor to the Chat Room (room-admin)",
         description:
-          "Add a live actor to the one mesh-wide Chat Room that every dashboard shows. Root is always a participant. Human principals and aliases such as 'root' or 'parent' cannot be added. If the actor's voice is already used by another participant, it is assigned the next unused voice through its ordinary voice setting so listeners can tell participants apart. Adding a current participant changes nothing. Requires the room-admin capability.",
+          "Add a live actor to the one mesh-wide Chat Room that every dashboard shows. The roster is exactly the actors added here; no actor is a participant implicitly. Human principals and aliases such as 'root' or 'parent' cannot be added. If the actor's voice is already used by another participant, it is assigned the next unused voice through its ordinary voice setting so listeners can tell participants apart. Adding a current participant changes nothing. Requires the room-admin capability.",
         inputSchema: {
           actor_id: z.string().min(1).describe("The actor's thread id."),
         },
@@ -1618,7 +1634,7 @@ export function createAgentExecMcpServer(
       {
         title: "Remove an actor from the Chat Room (room-admin)",
         description:
-          "Remove an actor from the mesh-wide Chat Room. Root cannot be removed. The actor keeps its voice setting. Requires the room-admin capability.",
+          "Remove an actor from the mesh-wide Chat Room. The actor keeps its voice setting. Requires the room-admin capability.",
         inputSchema: {
           actor_id: z.string().min(1).describe("The participant's thread id."),
         },

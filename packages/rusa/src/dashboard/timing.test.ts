@@ -12,6 +12,7 @@ import {
   DashboardTimingRecorder,
   parseDashboardClientTiming,
 } from "./timing.js";
+import type { DashboardServerSubstages } from "./timing-phases.js";
 
 describe("dashboard timing recorder", () => {
   let db: Database.Database;
@@ -572,6 +573,208 @@ describe("dashboard timing recorder", () => {
     ]);
   });
 
+  it("summarizes substages per method and terminal population with a fixed 300 ms tail (#990)", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    const server = (
+      durationMs: number,
+      status: number | null,
+      substages?: DashboardServerSubstages,
+      method: "GET" | "HEAD" = "GET",
+      terminal: "finished" | "closed_before_finish" = "finished"
+    ) =>
+      recorder.recordServer({
+        label: "mesh_obligations",
+        durationMs,
+        status,
+        bytes: 1,
+        phases: { auth: 5 },
+        ...(substages ? { substages } : {}),
+        request: { method, terminal },
+      });
+    server(40, 200, {
+      authAdapterMs: 4,
+      authRevocation: false,
+      identityMs: 1,
+      finishMs: 2,
+      loopBusyPct: 10,
+    });
+    server(320, 200, {
+      authAdapterMs: 250,
+      authRevocation: true,
+      identityMs: 1,
+      finishMs: 3,
+      loopBusyPct: 5,
+    });
+    server(900, 200, {
+      authAdapterMs: 20,
+      authRevocation: false,
+      codecMs: 700,
+      finishMs: 1,
+      loopBusyPct: 95,
+    });
+    // A success row from a head that predates substages: unknown, not zero.
+    server(50, 200);
+    server(30, 503, { authAdapterMs: 25, authRevocation: true, authFallbackMs: 4, loopBusyPct: 0 });
+    server(4000, null, { codecMs: 3000, loopBusyPct: 1 }, "GET", "closed_before_finish");
+    server(3, 200, undefined, "HEAD");
+    while (timingRows().length < 7) recorder.flush();
+
+    const summary = recorder.summary({ since: new Date(Date.now() - 60_000) });
+    const [get, head] = summary.serverPopulations;
+    expect(get.method).toBe("GET");
+    const cohort = (numerator: number, denominator: number) =>
+      expect.objectContaining({ numerator, denominator });
+    // Coverage denominators are this population, including the row without substages.
+    expect(get.finishedSuccess).toMatchObject({
+      count: 4,
+      maxMs: 900,
+      substages: {
+        authAdapterMs: { p50Ms: 20, maxMs: 250, coverage: cohort(3, 4) },
+        identityMs: { maxMs: 1, coverage: cohort(2, 4) },
+        codecMs: { maxMs: 700, coverage: cohort(1, 4) },
+        finishMs: { coverage: cohort(3, 4) },
+        loopBusyPct: { p50Pct: 10, maxPct: 95, coverage: cohort(3, 4) },
+        authRevocation: { requested: 1, coverage: cohort(3, 4) },
+      },
+      tail: {
+        thresholdMs: 300,
+        count: 2,
+        substages: {
+          authAdapterMs: { p50Ms: 20, maxMs: 250, coverage: cohort(2, 2) },
+          codecMs: { maxMs: 700, coverage: cohort(1, 2) },
+          loopBusyPct: { p50Pct: 5, maxPct: 95, coverage: cohort(2, 2) },
+        },
+      },
+    });
+    // Percent units are never labelled as milliseconds.
+    expect(get.finishedSuccess.substages?.loopBusyPct).not.toHaveProperty("p50Ms");
+    expect(get.finishedSuccess.substages).not.toHaveProperty("authFallbackMs");
+    expect(get.finishedFailure.substages).toMatchObject({
+      authAdapterMs: { maxMs: 25, coverage: cohort(1, 1) },
+      authFallbackMs: { maxMs: 4, coverage: cohort(1, 1) },
+    });
+    expect(get.finishedFailure.tail).toMatchObject({ count: 0, substages: {} });
+    expect(get.closedBeforeFinish?.substages).toMatchObject({ codecMs: { maxMs: 3000 } });
+    expect(get.closedBeforeFinish?.substages).not.toHaveProperty("finishMs");
+    // Populations with no substage rows keep exactly their pre-#990 shape.
+    expect(head.finishedSuccess).toEqual({ count: 1, p50Ms: 3, p95Ms: 3, p99Ms: 3, maxMs: 3 });
+    // Legacy phase groups mix methods and statuses and stay unchanged.
+    expect(summary.serverPhases[0]).not.toHaveProperty("substages");
+    expect(summary.serverPhases[0]).not.toHaveProperty("tail");
+  });
+
+  it("drops only malformed substages and keeps the row in every population (#990)", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    const row = (substages: unknown, extra: Record<string, unknown> = {}) => ({
+      v: 2,
+      source: "server",
+      label: "mesh_obligations",
+      method: "GET",
+      terminal: "finished",
+      durationMs: 400,
+      status: 200,
+      bytes: 1,
+      outcome: null,
+      substages,
+      ...extra,
+    });
+    const malformed = [
+      row({ authAdapterMs: 1, unknownMs: 2 }),
+      row({ authAdapterMs: -1 }),
+      row({ authAdapterMs: 1.5 }),
+      row({ loopBusyPct: 101 }),
+      row({ loopBusyPct: 12.5 }),
+      row({ authRevocation: "yes" }),
+      row([1]),
+      row("fast"),
+      row(null),
+      // Substages belong only to v2 request rows.
+      { ...row({ authAdapterMs: 1 }), v: 1, method: undefined, terminal: undefined },
+    ];
+    for (const payload of [...malformed, row({ authAdapterMs: 7, loopBusyPct: 40 })]) {
+      events.record({
+        kind: DASHBOARD_TIMING_EVENT_KIND,
+        actorId: null,
+        detail: "synthetic",
+        payload: JSON.stringify(payload),
+      });
+    }
+
+    const summary = recorder.summary({ since: new Date(Date.now() - 60_000) });
+    expect(summary.sampleCount).toBe(malformed.length + 1);
+    expect(summary.window).toMatchObject({
+      unreadableRecords: 0,
+      unreadableSubstages: malformed.length,
+    });
+    const [get, unknown] = summary.serverPopulations;
+    expect(unknown).toMatchObject({ method: "unknown", finishedSuccess: { count: 1 } });
+    expect(unknown.finishedSuccess).not.toHaveProperty("substages");
+    expect(get.finishedSuccess).toMatchObject({
+      count: malformed.length,
+      p99Ms: 400,
+      substages: {
+        authAdapterMs: { maxMs: 7, coverage: { numerator: 1, denominator: malformed.length } },
+        loopBusyPct: { maxPct: 40 },
+      },
+      tail: { thresholdMs: 300, count: malformed.length },
+    });
+  });
+
+  it("reads an empty substages object as absent, keeping the pre-#990 shape (#990)", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    events.record({
+      kind: DASHBOARD_TIMING_EVENT_KIND,
+      actorId: null,
+      detail: "synthetic",
+      payload: JSON.stringify({
+        v: 2,
+        source: "server",
+        label: "mesh_obligations",
+        method: "GET",
+        terminal: "finished",
+        durationMs: 400,
+        status: 200,
+        bytes: 1,
+        outcome: null,
+        substages: {},
+      }),
+    });
+
+    const summary = recorder.summary({ since: new Date(Date.now() - 60_000) });
+    expect(summary.window).toMatchObject({ unreadableRecords: 0, unreadableSubstages: 0 });
+    expect(summary.serverPopulations[0].finishedSuccess).toEqual({
+      count: 1,
+      p50Ms: 400,
+      p95Ms: 400,
+      p99Ms: 400,
+      maxMs: 400,
+    });
+  });
+
+  it("writes substages only on request rows and never empty (#990)", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    recorder.recordServer({
+      label: "mesh_stream_close",
+      durationMs: 5,
+      status: null,
+      bytes: null,
+      substages: { loopBusyPct: 3 },
+    });
+    recorder.recordServer({
+      label: "mesh_threads",
+      durationMs: 5,
+      status: 200,
+      bytes: 1,
+      substages: {},
+      request: { method: "GET", terminal: "finished" },
+    });
+    recorder.flush();
+    expect(timingRows().map((event) => JSON.parse(event.payload ?? "{}"))).toEqual([
+      expect.not.objectContaining({ substages: expect.anything() }),
+      expect.not.objectContaining({ substages: expect.anything() }),
+    ]);
+  });
+
   it("keeps a premature close out of client/server pairing and coverage (#990)", () => {
     const recorder = new DashboardTimingRecorder(events);
     const closedId = randomUUID();
@@ -753,6 +956,7 @@ describe("dashboard timing recorder", () => {
       retentionMs: 7 * 24 * 60 * 60 * 1000,
       retentionLimited: false,
       unreadableRecords: 0,
+      unreadableSubstages: 0,
     });
 
     // Two older in-window rows: the newest-first read stops at the cap.

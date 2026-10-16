@@ -636,6 +636,222 @@ void main() {
     });
   });
 
+  testWidgets('Info caches a brief until actor selection changes', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread('a', parent: 'root', created: 't1'),
+          makeThread('b', parent: 'root', created: 't2'),
+        ]
+        ..briefs['a'] =
+            '## WHAT\n**Fixture purpose**\n## HOW\n- Fixture rules\n## DOMAIN\nFixture knowledge';
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      await tester.pumpWidget(_harness(store));
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.tap(find.text('a-handle'));
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.ensureVisible(find.text('Info'));
+      await tester.tap(find.text('Info'));
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.text('Brief'), findsOneWidget);
+      expect(find.text('WHAT'), findsOneWidget);
+      expect(find.text('Fixture purpose'), findsOneWidget);
+      expect(find.text('Fixture rules'), findsOneWidget);
+      expect(find.text(api.briefs['a']!), findsNothing);
+      api.briefs['a'] = '## WHAT\nUpdated purpose';
+      final calls = api.charterCalls.length;
+      await store.refreshThreads();
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.text('Fixture purpose'), findsOneWidget);
+      expect(find.text('Updated purpose'), findsNothing);
+      expect(api.charterCalls, hasLength(calls));
+      await tester.tap(find.text('b-handle'));
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.text('Brief'), findsNothing);
+      await tester.tap(find.text('a-handle'));
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.text('Updated purpose'), findsOneWidget);
+      expect(find.text('Fixture purpose'), findsNothing);
+      expect(api.charterCalls, hasLength(calls + 2));
+      await tester.tap(find.text('b-handle'));
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.text('Brief'), findsNothing);
+      expect(find.text('Updated purpose'), findsNothing);
+      await store.dispose();
+    });
+  });
+
+  testWidgets(
+    'Info opens the latest brief changes, then one change with its explanation (Option B)',
+    (tester) async {
+      await tester.runAsync(() async {
+        const seed =
+            '## WHAT\nSeed purpose [mesh:messages/m-0]\n\n## HOW\n\n## DOMAIN';
+        const gen1 =
+            '## WHAT\nSeed purpose [mesh:messages/m-0]\n\n## HOW\nThree colours [mesh:messages/m-1]\n\n## DOMAIN';
+        const gen2 =
+            '## WHAT\nSeed purpose [mesh:messages/m-0]\n\n## HOW\nTwo colours [mesh:messages/m-2]\n\n## DOMAIN';
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', created: 't0'),
+            makeThread('a', parent: 'root', created: 't1'),
+          ]
+          ..briefs['a'] = gen2
+          ..briefGenerations['a'] = 2
+          ..briefUpdatedAts['a'] = '2026-10-10T13:30:00Z'
+          ..briefRevisions['a'] = [
+            const BriefRevision(
+              generation: 2,
+              updatedAt: '2026-10-10T13:30:00Z',
+              actingPrincipal: 'a',
+              before: gen1,
+              after: gen2,
+              explanation: 'The parent narrowed the palette.',
+            ),
+            const BriefRevision(
+              generation: 1,
+              updatedAt: '2026-10-10T13:00:00Z',
+              actingPrincipal: 'a',
+              before: seed,
+              after: gen1,
+            ),
+          ];
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.pumpWidget(_harness(store));
+        await tester.pump(const Duration(milliseconds: 50));
+        await tester.tap(find.text('a-handle'));
+        await tester.pump(const Duration(milliseconds: 50));
+        await tester.ensureVisible(find.text('Info'));
+        await tester.tap(find.text('Info'));
+        for (var i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+
+        expect(find.text('Brief'), findsOneWidget);
+        expect(find.text('Gen 2'), findsOneWidget);
+        expect(
+          find.byKey(const ValueKey('brief-history-button')),
+          findsOneWidget,
+        );
+
+        // The update time opens the history as well as the icon does.
+        await tester.tap(find.byKey(const ValueKey('brief-history-time')));
+        for (var i = 0; i < 5; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        expect(find.text('Brief history — a-handle'), findsOneWidget);
+        expect(find.text('Latest 2 changes'), findsOneWidget);
+        expect(find.text('Current'), findsOneWidget);
+        expect(find.text('The parent narrowed the palette.'), findsOneWidget);
+        expect(find.text('No explanation given.'), findsOneWidget);
+        expect(find.text('+1 −1'), findsOneWidget);
+        expect(find.text('+1 −0'), findsOneWidget);
+
+        await tester.tap(find.byKey(const ValueKey('brief-revision-2')));
+        for (var i = 0; i < 3; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        expect(
+          find.byKey(const ValueKey('brief-revision-detail')),
+          findsOneWidget,
+        );
+        expect(find.text('Generation 2 change'), findsOneWidget);
+        expect(find.text('Explanation'), findsOneWidget);
+        expect(find.text('The parent narrowed the palette.'), findsOneWidget);
+        expect(
+          find.text('− Three colours [mesh:messages/m-1]'),
+          findsOneWidget,
+        );
+        expect(find.text('+ Two colours [mesh:messages/m-2]'), findsOneWidget);
+        expect(find.text('  Seed purpose [mesh:messages/m-0]'), findsOneWidget);
+
+        await tester.tap(find.byKey(const ValueKey('brief-history-back')));
+        for (var i = 0; i < 3; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        await tester.tap(find.byKey(const ValueKey('brief-revision-1')));
+        for (var i = 0; i < 3; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        expect(find.text('Generation 1 change'), findsOneWidget);
+        expect(find.text('No explanation given.'), findsOneWidget);
+        expect(
+          find.text('+ Three colours [mesh:messages/m-1]'),
+          findsOneWidget,
+        );
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets('the brief history is fullscreen on a narrow screen', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      tester.view
+        ..physicalSize = const Size(390, 844)
+        ..devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread('a', parent: 'root', created: 't1'),
+        ]
+        ..briefs['a'] = '## WHAT\nB [mesh:messages/m-1]\n\n## HOW\n\n## DOMAIN'
+        ..briefGenerations['a'] = 1
+        ..briefUpdatedAts['a'] = '2026-10-10T13:00:00Z'
+        ..briefRevisions['a'] = [
+          const BriefRevision(
+            generation: 1,
+            updatedAt: '2026-10-10T13:00:00Z',
+            actingPrincipal: 'a',
+            before: '## WHAT\nA [mesh:messages/m-0]\n\n## HOW\n\n## DOMAIN',
+            after: '## WHAT\nB [mesh:messages/m-1]\n\n## HOW\n\n## DOMAIN',
+          ),
+        ];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      store.clickActor('a');
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: DetailPanel(store: store, narrow: true)),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.tap(find.text('Info'));
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      await tester.tap(find.byKey(const ValueKey('brief-history-button')));
+      for (var i = 0; i < 5; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      final dialog = find.ancestor(
+        of: find.text('Brief history — a-handle'),
+        matching: find.byType(Dialog),
+      );
+      expect(tester.getSize(dialog), const Size(390, 844));
+      await store.dispose();
+    });
+  });
+
   testWidgets('the Info tab keeps the preview when the charter fetch fails', (
     tester,
   ) async {
@@ -1422,10 +1638,7 @@ void main() {
         expect(codexMsg, contains('5h: window reset at '));
         expect(codexMsg, contains('no fresh read since'));
         expect(codexMsg, isNot(contains('5h: 53% remaining')));
-        expect(
-          codexMsg,
-          isNot(contains('5h: 47% quota remaining')),
-        );
+        expect(codexMsg, isNot(contains('5h: 47% quota remaining')));
 
         await store.dispose();
       });

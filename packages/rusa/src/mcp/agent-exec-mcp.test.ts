@@ -458,7 +458,7 @@ describe("administrative capability gating of management tools (#549)", () => {
     expect(dataOf(after)).toMatch(/experiment-admin/);
   });
 
-  it("lets the seeded configured actor manage the Chat Room and hides it from a child (#663)", async () => {
+  it("lets an explicitly granted actor manage explicit Chat Room bindings and hides it from a child (#663)", async () => {
     const { mesh, registry } = setup();
     registry.upsert({
       id: "worker-a",
@@ -482,7 +482,6 @@ describe("administrative capability gating of management tools (#549)", () => {
         transaction: (fn) => fn(),
       },
       actors: registry,
-      rootId: "root",
       voices: () => buildSupportedVoiceCatalog(),
       defaultVoice: googleVoiceConfig("Laomedeia"),
       isHumanPrincipal: () => false,
@@ -497,6 +496,11 @@ describe("administrative capability gating of management tools (#549)", () => {
     const root = await connect(
       createAgentExecMcpServer(mesh, "root", "root", undefined, { chatRoom })
     );
+    const boundRoot = (await root.callTool({
+      name: "add_room_participant",
+      arguments: { actor_id: "root" },
+    })) as CallToolResult;
+    expect(boundRoot.isError).toBeFalsy();
     const added = (await root.callTool({
       name: "add_room_participant",
       arguments: { actor_id: "worker-a" },
@@ -560,6 +564,60 @@ describe("administrative capability gating of management tools (#549)", () => {
     }
     return fixture;
   }
+
+  it("reparent_thread detaches a strict descendant and refuses moves outside the subtree (#1003)", async () => {
+    const fixture = subtreeFixture([ACTOR_ADMIN_CAPABILITY]);
+    const { mesh, registry } = fixture;
+    for (const [id, parentId] of [
+      ["grandchild", "steward-child"],
+      ["other-forest", null],
+      ["other-child", "other-forest"],
+    ] as const) {
+      registry.upsert({
+        id,
+        charter: id,
+        parentId,
+        ...(parentId === null ? { executionConfig: { unsandboxed: true } } : {}),
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    const client = await connect(createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root"));
+    const reparent = async (thread_id: string, new_parent_id: string | null) =>
+      (await client.callTool({
+        name: "reparent_thread",
+        arguments: { thread_id, new_parent_id },
+      })) as CallToolResult;
+
+    for (const [thread_id, new_parent_id, reason] of [
+      // Cross-forest destination and an actor outside the caller's subtree.
+      ["steward-child", "other-forest", /subtree/],
+      ["other-child", null, /subtree/],
+      ["sibling", null, /subtree/],
+      // Moving yourself is refused whether attaching or detaching.
+      ["0b2c3d4e-steward", null, /itself/],
+      ["0b2c3d4e-steward", "steward-child", /itself/],
+    ] as const) {
+      const refused = await reparent(thread_id, new_parent_id);
+      expect(refused.isError, `${thread_id} -> ${new_parent_id}`).toBe(true);
+      expect(dataOf(refused)).toMatch(reason);
+    }
+    expect(registry.get("steward-child")?.parentId).toBe("0b2c3d4e-steward");
+    expect(registry.get("other-child")?.parentId).toBe("other-forest");
+
+    // Within the subtree a move still works, and null detaches a descendant.
+    expect((await reparent("grandchild", "0b2c3d4e-steward")).isError).toBeFalsy();
+    expect(registry.get("grandchild")?.parentId).toBe("0b2c3d4e-steward");
+    const detached = await reparent("steward-child", null);
+    expect(detached.isError).toBeFalsy();
+    expect(registry.get("steward-child")?.parentId).toBeNull();
+
+    // The former parent loses administrative reach immediately.
+    const reattach = await reparent("steward-child", "0b2c3d4e-steward");
+    expect(reattach.isError).toBe(true);
+    expect(dataOf(reattach)).toMatch(/subtree/);
+    expect(registry.get("steward-child")?.parentId).toBeNull();
+  });
 
   it("confines wake schedules to the holder's subtree, slot suffixes included", async () => {
     const { mesh } = subtreeFixture([ACTOR_ADMIN_CAPABILITY]);
@@ -1150,6 +1208,33 @@ describe("agent-execution MCP server", () => {
       })) as CallToolResult
     ) as { thread_id: string };
     expect(registry.get(thread_id)?.context).toMatchObject({ type: "portable", mode: "ledger" });
+  });
+
+  it("spawn_thread lets an ordinary authorized spawner select brief", async () => {
+    // Brief is a supported selection like ledger and tail: any actor that may
+    // spawn can choose it for its own child, with no root-only door.
+    const { mesh, registry } = setup();
+    registry.upsert({
+      id: "worker-1",
+      charter: "worker-1",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "worker-1", "root"));
+    const { thread_id } = dataOf(
+      (await client.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "own a brief-mode trial",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+          context_mode: "brief",
+        },
+      })) as CallToolResult
+    ) as { thread_id: string };
+    const child = registry.get(thread_id);
+    expect(child?.parentId).toBe("worker-1");
+    expect(child?.context).toMatchObject({ type: "portable", mode: "brief" });
   });
 
   it("spawn_thread leaves the record's context unset when no mode is asked for", async () => {
@@ -4378,7 +4463,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         /Cannot set a modelConfig pool of more than one entry on non-portable actor/
       );
       expect((poolRefusal.content[0] as { text: string }).text).toMatch(
-        /Only portable \(ledger\/tail\) actors can use a multi-candidate pool/
+        /Only portable \(ledger\/tail\/brief\) actors can use a multi-candidate pool/
       );
 
       // Refusal 2: Cross-provider move on native actor
@@ -4394,7 +4479,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         /Cannot change provider on non-portable actor/
       );
       expect((providerRefusal.content[0] as { text: string }).text).toMatch(
-        /Only portable \(ledger\/tail\) actors can be moved across providers/
+        /Only portable \(ledger\/tail\/brief\) actors can be moved across providers/
       );
     });
 

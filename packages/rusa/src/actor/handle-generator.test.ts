@@ -50,4 +50,8 @@ describe("resolveRootHandle", () => {
   it("uses the configured handle when set (e.g. a staging instance)", () => {
     expect(resolveRootHandle({ rootActor: { handle: "ember-familiar" } })).toBe("ember-familiar");
   });
+
+  it("treats an empty configured handle as unset", () => {
+    expect(resolveRootHandle({ rootActor: { handle: "" } })).toBe("root-actor");
+  });
 });

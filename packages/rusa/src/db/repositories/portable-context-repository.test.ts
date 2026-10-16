@@ -2,11 +2,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { seedPortableBriefState } from "../../actor/portable-context-brief.js";
 import {
   emptyPortableContextState,
+  PORTABLE_CONTEXT_SCHEMA_VERSION,
   type PortableContextState,
   type PortableMemoryItem,
+  StaleBriefWriteError,
 } from "../../actor/portable-context-state.js";
 import { runMigrations } from "../migrations/runner.js";
 import { widenToWal } from "../wal.js";
@@ -134,7 +137,7 @@ describe("DbPortableContextStore", () => {
     );
 
     expect(store.load(ACTOR_A)).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: PORTABLE_CONTEXT_SCHEMA_VERSION,
       lastFoldedSourceId: "legacy-message-event",
     });
   });
@@ -193,5 +196,166 @@ describe("DbPortableContextStore", () => {
 
     db = open();
     expect(new DbPortableContextStore(db).load(ACTOR_A)).toEqual(saved);
+  });
+
+  describe("brief writes and history", () => {
+    const SEEDED_AT = "2026-10-10T00:00:00.000Z";
+    const brief = (n: number): string =>
+      `## WHAT\nPrinciple number ${n}. [mesh:messages/m-${n}]\n\n## HOW\n\n## DOMAIN\n`;
+    const commit = (
+      target: DbPortableContextStore,
+      expectedGeneration: number,
+      n: number,
+      explanation?: string
+    ) =>
+      target.commitBrief({
+        actorId: ACTOR_A,
+        expectedGeneration,
+        text: brief(n),
+        ...(explanation === undefined ? {} : { explanation }),
+        actingPrincipal: ACTOR_A,
+        at: `2026-10-10T00:0${n}:00.000Z`,
+      });
+    const rowCount = (): number =>
+      (db.prepare("SELECT COUNT(*) AS n FROM portable_brief_revisions").get() as { n: number }).n;
+
+    beforeEach(() => {
+      store.save(seedPortableBriefState(state(), SEEDED_AT));
+    });
+
+    it("replaces the current brief and appends one revision carrying before, after and explanation", () => {
+      const seed = store.load(ACTOR_A).brief?.text;
+      const revision = commit(store, 0, 1, "first distillation");
+
+      expect(revision).toEqual({
+        generation: 1,
+        updatedAt: "2026-10-10T00:01:00.000Z",
+        actingPrincipal: ACTOR_A,
+        before: seed,
+        after: brief(1),
+        explanation: "first distillation",
+      });
+      expect(store.load(ACTOR_A)).toEqual({
+        ...state(),
+        brief: { text: brief(1), generation: 1, updatedAt: "2026-10-10T00:01:00.000Z" },
+      });
+      expect(store.listBriefRevisions(ACTOR_A, 10)).toEqual([revision]);
+    });
+
+    it("lists newest first, pages by limit, and keeps every accepted write", () => {
+      for (let n = 1; n <= 4; n += 1) commit(store, n - 1, n);
+
+      expect(store.listBriefRevisions(ACTOR_A, 2).map((r) => r.generation)).toEqual([4, 3]);
+      expect(store.listBriefRevisions(ACTOR_A, 10).map((r) => r.generation)).toEqual([4, 3, 2, 1]);
+      expect(store.listBriefRevisions(ACTOR_A, 10)[0]).toMatchObject({
+        before: brief(3),
+        after: brief(4),
+      });
+      expect(store.listBriefRevisions(ACTOR_B, 10)).toEqual([]);
+      expect(rowCount()).toBe(4);
+    });
+
+    it("refuses a stale expected generation and changes nothing", () => {
+      commit(store, 0, 1);
+      const before = store.load(ACTOR_A);
+
+      expect(() => commit(store, 0, 2)).toThrow(StaleBriefWriteError);
+      expect(() => commit(store, 5, 2)).toThrow(/expected generation 5, current is 1/);
+      expect(store.load(ACTOR_A)).toEqual(before);
+      expect(rowCount()).toBe(1);
+    });
+
+    it("refuses a write for an actor with no brief", () => {
+      expect(() =>
+        store.commitBrief({
+          actorId: ACTOR_B,
+          expectedGeneration: 0,
+          text: brief(1),
+          actingPrincipal: ACTOR_B,
+          at: SEEDED_AT,
+        })
+      ).toThrow(/has no brief to replace/);
+      expect(rowCount()).toBe(0);
+    });
+
+    it("lets only one of two connections that read the same generation commit", () => {
+      const other = open();
+      try {
+        const otherStore = new DbPortableContextStore(other);
+        expect(otherStore.load(ACTOR_A).brief?.generation).toBe(0);
+        commit(store, 0, 1);
+
+        expect(() => commit(otherStore, 0, 2)).toThrow(StaleBriefWriteError);
+        expect(otherStore.load(ACTOR_A).brief?.text).toBe(brief(1));
+        expect(rowCount()).toBe(1);
+      } finally {
+        other.close();
+      }
+    });
+
+    it("preserves a second connection's brief and holds its write lock across the fold save", () => {
+      const folded = { ...store.load(ACTOR_A), generation: 9, lastFoldedSourceId: "folded" };
+      const other = open();
+      other.pragma("busy_timeout = 0");
+      try {
+        const otherStore = new DbPortableContextStore(other);
+        commit(otherStore, 0, 1);
+        const load = store.load.bind(store);
+        const lockedRead = vi.spyOn(store, "load").mockImplementationOnce((actorId) => {
+          const current = load(actorId);
+          expect(() => commit(otherStore, 1, 2)).toThrow(/locked/);
+          return current;
+        });
+        try {
+          expect(store.saveFolded(folded)).toMatchObject({
+            generation: 9,
+            lastFoldedSourceId: "folded",
+            brief: { text: brief(1), generation: 1 },
+          });
+        } finally {
+          lockedRead.mockRestore();
+        }
+        expect(store.load(ACTOR_A).brief?.generation).toBe(1);
+        expect(rowCount()).toBe(1);
+        expect(commit(otherStore, 1, 2).generation).toBe(2);
+      } finally {
+        other.close();
+      }
+    });
+
+    it("rolls the snapshot back when the history append fails", () => {
+      // A row already holding generation 1 makes the append violate
+      // UNIQUE(actor_id, generation) after the snapshot write in the same
+      // transaction; the snapshot must not keep a brief its history lacks.
+      db.prepare(
+        `INSERT INTO portable_brief_revisions (actor_id, generation, acting_principal, timestamp, payload)
+         VALUES (?, 1, ?, ?, ?)`
+      ).run(ACTOR_A, ACTOR_A, SEEDED_AT, '{"schemaVersion":1,"before":"","after":""}');
+      const before = store.load(ACTOR_A);
+
+      expect(() => commit(store, 0, 1)).toThrow(/UNIQUE/);
+      expect(store.load(ACTOR_A)).toEqual(before);
+    });
+
+    it("survives a restart: brief and history read back after reopening", () => {
+      commit(store, 0, 1, "why");
+      commit(store, 1, 2);
+      const current = store.load(ACTOR_A);
+      const history = store.listBriefRevisions(ACTOR_A, 10);
+      db.close();
+
+      db = open();
+      const reopened = new DbPortableContextStore(db);
+      expect(reopened.load(ACTOR_A)).toEqual(current);
+      expect(reopened.listBriefRevisions(ACTOR_A, 10)).toEqual(history);
+    });
+
+    it("names a history row whose payload it cannot read", () => {
+      db.prepare(
+        `INSERT INTO portable_brief_revisions (actor_id, generation, acting_principal, timestamp, payload)
+         VALUES (?, 1, ?, ?, ?)`
+      ).run(ACTOR_A, ACTOR_A, SEEDED_AT, '{"schemaVersion":9}');
+      expect(() => store.listBriefRevisions(ACTOR_A, 10)).toThrow();
+    });
   });
 });

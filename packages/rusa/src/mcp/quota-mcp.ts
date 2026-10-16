@@ -5,6 +5,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { RusaConfig } from "../config/types.js";
 import { generateGeminiContent } from "../observability/gemini-usage.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import {
   type ScrapeAgyUsageOptions,
   scrapeAgyUsage as scrapeAgyUsageImpl,
@@ -27,7 +28,11 @@ import { resolveProvider } from "../providers/registry.js";
 import type { CodingProvider, RunResult, SandboxOptions } from "../providers/types.js";
 import type { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { QUOTA_PROBE_TTL_MS, type QuotaFreshness } from "../quota/coordinator-protocol.js";
-import { configuredModelRefs, resolveWindowModels } from "../quota/model-window-scope.js";
+import {
+  configuredModelRefs,
+  keepWindowLaneModels,
+  resolveWindowModels,
+} from "../quota/model-window-scope.js";
 import { WHOLE_BAD_READ_CARRY_DETAIL } from "../quota/parsed-state.js";
 import {
   hasSameQuotaWindowScope,
@@ -247,6 +252,8 @@ export interface QuotaMcpDeps {
    * (§12 item 4, #356). When configured, get_quota routes through the coordinator client.
    */
   coordinatorClient?: QuotaCoordinatorClient | null;
+  /** Structured diagnostics from parsing. Defaults to discarding them. */
+  logger?: Logger;
 }
 
 /**
@@ -1418,6 +1425,38 @@ export class QuotaService {
     });
   }
 
+  /**
+   * The lane an earlier reading established keeps a Claude model window the
+   * parser mapped to fewer of its models this time (#1078). Bounded to Claude,
+   * where the alias flap was observed; other providers' readings stand as read.
+   */
+  private keepClaudeLaneModels(
+    provider: "claude" | "codex" | "agy" | "kimi",
+    limits: QuotaLimit[] | undefined,
+    previous: readonly QuotaLimit[] | undefined
+  ): QuotaLimit[] | undefined {
+    if (provider !== "claude" || !limits) return limits;
+    const kept = keepWindowLaneModels(
+      limits,
+      previous ?? [],
+      configuredModelRefs(this.configuredModelsFor(provider))
+    );
+    kept.forEach((limit, index) => {
+      const read = limits[index];
+      if (limit === read || typeof limit.scope !== "object" || typeof read.scope !== "object") {
+        return;
+      }
+      (this.deps.logger ?? nullLogger).info("quota_window_lane_kept", {
+        provider,
+        window: limit.label,
+        kind: limit.kind,
+        laneModels: limit.scope.models,
+        parsedModels: read.scope.models,
+      });
+    });
+    return kept;
+  }
+
   private async parsePersistedScrape(
     provider: "claude" | "codex" | "agy" | "kimi",
     rawOutput: string,
@@ -1432,7 +1471,8 @@ export class QuotaService {
     });
     try {
       const rawState = await parse();
-      const inferredState = inferQuotaState(rawState, prevState, scrapedAt);
+      const limits = this.keepClaudeLaneModels(provider, rawState.limits, prevState?.limits);
+      const inferredState = inferQuotaState({ ...rawState, limits }, prevState, scrapedAt);
       if (id) this.deps.scrapeStore?.recordParsed(id, rawState, inferredState);
       if (rawState.status === "unknown") this.failedReads.add(inferredState);
       return inferredState;

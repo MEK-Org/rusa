@@ -6,6 +6,8 @@ import { resolveContextSelection } from "../actor/context-selection.js";
 import type { HaltState } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { inboxEntryObligationRefs } from "../actor/inbox-focus.js";
+import type { OperatorActorControl } from "../actor/operator-actor-control.js";
+import type { PortableBriefStore, PortableContextStore } from "../actor/portable-context-state.js";
 import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
@@ -66,7 +68,11 @@ import {
 import { selectPrioritizedInboxItem } from "./inbox-selection.js";
 import type { SseHub } from "./sse.js";
 import type { DashboardTimingRecorder } from "./timing.js";
-import { measureDashboardPhase, startDashboardPhase } from "./timing-phases.js";
+import {
+  measureDashboardPhase,
+  startDashboardPhase,
+  startDashboardSubstage,
+} from "./timing-phases.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {
@@ -88,6 +94,8 @@ export interface DashboardDataDeps {
   /** Completed selection intervals used only to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
   runPrompts?: RunPromptRepository;
+  portableContext?: Pick<PortableContextStore, "load"> &
+    Pick<PortableBriefStore, "listBriefRevisions">;
   /** Durable per-entry obligation associations for activity correlation. */
   inboxFocus?: InboxFocusRepository;
   sseHub: SseHub;
@@ -100,6 +108,8 @@ export interface DashboardDataDeps {
   chatRoom?: Pick<ChatRoomService, "participants">;
   /** Root-authorized commands exposed to trusted dashboard operators. */
   rootControl?: RootControlService;
+  /** The authenticated operator's actor-forest boundary (#1003). */
+  operatorActors?: OperatorActorControl;
   /**
    * Read-only view of the mesh's emergency-brake state (the HALT sentinel),
    * surfaced as the top-level `halted` flag on `/api/mesh/threads`. Optional:
@@ -193,6 +203,7 @@ export interface DashboardDataDeps {
    */
   avatarGeneration?: AvatarGenerationCoordinator;
   supportedVoices?: readonly SupportedVoice[];
+  resolveActorId?: (id: string) => string;
   referenceCache?: import("../references/cache-service.js").ReferenceCacheService;
   chatClient?: import("../chat/types.js").ChatClient;
   slackClient?: import("../slack/slack-client.js").SlackClient;
@@ -522,9 +533,14 @@ function negotiateEncoding(req: IncomingMessage | undefined): Encoding | undefin
   return ENCODINGS.find((encoding) => (weights.get(encoding) ?? wildcard) > 0);
 }
 
-function compress(encoding: Encoding, payload: Buffer): Promise<Buffer> {
+/** `onCodecDone` runs when the codec callback arrives, before its continuation. */
+function compress(encoding: Encoding, payload: Buffer, onCodecDone: () => void): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const done = (err: Error | null, out: Buffer) => (err ? reject(err) : resolve(out));
+    const done = (err: Error | null, out: Buffer) => {
+      onCodecDone();
+      if (err) reject(err);
+      else resolve(out);
+    };
     if (encoding === "gzip") {
       gzip(payload, done);
       return;
@@ -570,7 +586,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   // Off the event loop: zlib's async form runs on the threadpool, so a 2 MB
   // body costs this request latency and not every concurrent one.
   const endCompression = startDashboardPhase("compression");
-  compress(encoding, payload).then(
+  compress(encoding, payload, startDashboardSubstage("codecMs")).then(
     (compressed) => {
       endCompression();
       if (res.writableEnded) return;
@@ -620,6 +636,30 @@ function parsePositiveInt(url: URL, name: string): number | undefined {
 function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
   const requested = parsePositiveInt(url, "limit") ?? DEFAULT_LIMIT;
   return Math.min(requested, maxLimit);
+}
+
+/**
+ * The ancestors of a page's rows, each once and none that is itself a row.
+ * Every ancestor is read at most once, so the reads stay within the page's
+ * distinct ancestry however many rows share it, and a cycle ends the walk.
+ */
+function pageAncestors(
+  obligations: Pick<ObligationRepository, "get">,
+  rows: readonly Obligation[]
+): Obligation[] {
+  const seen = new Set(rows.map((row) => row.id));
+  const ancestors: Obligation[] = [];
+  for (const row of rows) {
+    let parentId = row.parentId;
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId);
+      const parent = obligations.get(parentId);
+      if (!parent) break;
+      ancestors.push(parent);
+      parentId = parent.parentId;
+    }
+  }
+  return ancestors;
 }
 
 /**
@@ -1120,12 +1160,62 @@ export async function handleMeshApiRequest(
       return true;
     }
 
-    // POST /api/mesh/actors/:id/reparent — operator-root reorganization.
+    // POST /api/mesh/actors/:id/obligations-admin — the authenticated
+    // operator's explicit, durable cross-owner obligation binding (#1003).
+    // No actor-facing capability grant may create or revoke this reach.
+    const obligationsAdminMatch = pathname.match(
+      /^\/api\/mesh\/actors\/([^/]+)\/obligations-admin$/
+    );
+    if (obligationsAdminMatch) {
+      const operatorActors = deps?.operatorActors;
+      if (!operatorActors) {
+        sendJson(res, 503, { error: "operator actor control unavailable" });
+        return true;
+      }
+      const actorId = decodeURIComponent(obligationsAdminMatch[1]);
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (
+            typeof parsed !== "object" ||
+            parsed === null ||
+            Array.isArray(parsed) ||
+            typeof (parsed as Record<string, unknown>).enabled !== "boolean"
+          ) {
+            sendJson(res, 400, { error: "enabled must be a boolean" });
+            return;
+          }
+          const principal = requireOperatorPrincipal(req, res, deps);
+          if (!principal) return;
+          try {
+            const binding = operatorActors.setObligationsAdmin(
+              actorId,
+              (parsed as Record<string, boolean>).enabled,
+              principal
+            );
+            sendJson(res, 200, { ok: true, binding });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/actors/:id/reparent — the authenticated operator's
+    // boundary for reorganizing actor forests (#1003). `parentId: null`
+    // detaches the actor to top level; every decided attempt is audited.
     const reparentActorMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/reparent$/);
     if (reparentActorMatch) {
-      const rootControl = deps?.rootControl;
-      if (!rootControl) {
-        sendJson(res, 503, { error: "root control unavailable" });
+      const operatorActors = deps?.operatorActors;
+      if (!operatorActors) {
+        sendJson(res, 503, { error: "operator actor control unavailable" });
         return true;
       }
       const actorId = decodeURIComponent(reparentActorMatch[1]);
@@ -1142,15 +1232,17 @@ export async function handleMeshApiRequest(
             sendJson(res, 400, { error: "Missing or invalid parentId" });
             return;
           }
+          // Detaching is explicit: an absent or blank parentId is a malformed
+          // request, never a request for top level.
           const parentId = (parsed as Record<string, unknown>).parentId;
-          if (typeof parentId !== "string" || !parentId.trim()) {
-            sendJson(res, 400, { error: "parentId is required" });
+          if (parentId !== null && (typeof parentId !== "string" || !parentId.trim())) {
+            sendJson(res, 400, { error: "parentId is required (null detaches to top level)" });
             return;
           }
           const principal = requireOperatorPrincipal(req, res, deps);
           if (!principal) return;
           try {
-            rootControl.reparentChild(actorId, parentId.trim(), principal);
+            operatorActors.reparent(actorId, parentId === null ? null : parentId.trim(), principal);
             sendJson(res, 200, { ok: true });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -2063,7 +2155,25 @@ export async function handleMeshApiRequest(
       sendJson(res, 404, { error: "thread not found" });
       return true;
     }
-    sendJson(res, 200, { id: thread.id, charter: thread.charter });
+    const briefMode = thread.context?.type === "portable" && thread.context.mode === "brief";
+    const brief = briefMode ? deps.portableContext?.load(thread.id).brief : null;
+    sendJson(res, 200, {
+      id: thread.id,
+      charter: thread.charter,
+      ...(briefMode
+        ? {
+            briefMode: true,
+            brief: brief?.text ?? null,
+            briefGeneration: brief?.generation ?? null,
+            briefUpdatedAt: brief?.updatedAt ?? null,
+            // The latest ten accepted writes, newest first; the history table
+            // keeps every one, this is only the view's page.
+            briefRevisions: brief
+              ? (deps.portableContext?.listBriefRevisions(thread.id, 10) ?? [])
+              : [],
+          }
+        : {}),
+    });
     return true;
   }
 
@@ -2088,8 +2198,8 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  // GET /api/mesh/chat-room — the Chat Room roster: root first, then added
-  // actors in the order they joined. Read-only: root manages membership.
+  // GET /api/mesh/chat-room — the Chat Room roster: explicitly added actors in
+  // the order they joined. Read-only: a room-admin holder manages membership.
   if (pathname === "/api/mesh/chat-room") {
     if (!deps.chatRoom) {
       sendJson(res, 503, { error: "chat room unavailable (no live mesh bound)" });
@@ -2385,6 +2495,14 @@ export async function handleMeshApiRequest(
       limit,
       offset,
     });
+    // `ancestors=true` (My Queue, #1076) adds every row's ancestors to the
+    // page once each, so the client can draw each row's path from the page it
+    // already asked for instead of one detail read per row.
+    const rawAncestors = url.searchParams.get("ancestors");
+    if (rawAncestors === "true" || rawAncestors === "1") {
+      sendJson(res, 200, { ...page, ancestors: pageAncestors(deps.obligations, page.obligations) });
+      return true;
+    }
     sendJson(res, 200, page);
     return true;
   }

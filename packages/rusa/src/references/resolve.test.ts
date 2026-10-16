@@ -209,3 +209,20 @@ describe("resolveReference — mesh", () => {
     expect(resolved.author).toBe("actor-1");
   });
 });
+
+describe("#1005 legacy inbox citations", () => {
+  it("resolves the old actor address while preserving the original reference", async () => {
+    const read = vi.fn().mockReturnValue({
+      source: "mesh:child",
+      payload: { type: "mesh.message", messageId: "message" },
+      deliveredAt: new Date("2026-01-01T00:00:00Z"),
+    });
+    const ref = "mesh:actors/root/inbox/entry";
+    const resolved = await resolveReference(ref, {
+      inbox: { read },
+      resolveActorId: (id) => (id === "root" ? "imported-uuid" : id),
+    });
+    expect(read).toHaveBeenCalledWith("imported-uuid", "entry");
+    expect(resolved).toMatchObject({ ref, author: "imported-uuid", unavailable: null });
+  });
+});

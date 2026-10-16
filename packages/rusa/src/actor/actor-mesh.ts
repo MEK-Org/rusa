@@ -69,6 +69,7 @@ import {
   EXPERIMENT_ADMIN_CAPABILITY,
   HOST_GLOBAL_CAPABILITIES,
   MODEL_ADMIN_CAPABILITY,
+  OPERATOR_PROVISIONED_CAPABILITIES,
 } from "./administrative-capabilities.js";
 import {
   type CapabilityGrantStore,
@@ -172,8 +173,8 @@ export interface SpawnRequest {
   executionTarget?: string;
   /** What the new actor owns — authored by the spawning message (B.5). */
   charter: string;
-  /** The spawning actor's id (becomes the child's parent + gets a handle to the child). */
-  parentId: string;
+  /** Parent actor, or null for a top-level actor created by the operator. */
+  parentId: string | null;
   /**
    * The child's declared provider/model/effort pool — a single entry or a
    * bounded, non-empty, portable-only-above-length-one array (design MEK-Org/rusa#169).
@@ -994,7 +995,13 @@ export class ActorMesh {
   }
 
   private readonly selectedInboxEntryIds = new Map<string, string[]>();
-  /** Actors currently inside a run, for the ready-head window below. */
+  /**
+   * Actors whose own run has started and not yet ended, for the ready-head
+   * window below. A run that is only queued — behind the concurrency cap or in
+   * provider pacing — is outside it: nothing it has done can have moved the
+   * head, and nothing would read a buffered transition until the queue drained,
+   * so its head attention lands at once (#1071).
+   */
   private readonly actorsInRun = new Set<string>();
   /**
    * Ready-head churn observed while an actor is mid-run, collapsed at run end
@@ -1296,6 +1303,9 @@ export class ActorMesh {
           onQueued: (event) => {
             this.actorQueued(event.actorId, event);
           },
+          onStart: (event) => {
+            this.actorStarted(event.actorId);
+          },
           onEnd: (event) => {
             if (event.terminal.kind === "result") {
               this.finishInboxRun(event.actorId, {
@@ -1330,38 +1340,18 @@ export class ActorMesh {
    * Register an externally-created actor (the root) so the mesh can route
    * messages to it and the repository knows it exists. Idempotent on the record.
    *
-   * The wiring rebuilds `record` fresh on every boot : it carries the
-   * current config/session while the repository retains durable identity fields.
-   * Merge onto any existing record so the freshly configured fields win without
-   * changing stable creation metadata.
+   * Boot passes the configured actor's stored record as it stands, so nothing
+   * from config is merged in after its one-time import (#1002). The merge onto
+   * any existing record is kept for callers that supply a partial record; a
+   * field the record omits keeps its stored value.
    */
   adopt(record: ActorRecord, actor: MeshActor): void {
-    this.assertSingleTopLevel(record);
     const existing = this.actors.get(record.id);
     this.actors.upsert(existing ? { ...existing, ...record } : record);
     this.runs.register(record.id, actor);
     if (actor.lifecycle) this.lifecycles.set(record.id, actor.lifecycle);
     else this.lifecycleFor(record.id);
     this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
-  }
-
-  /**
-   * The running daemon still boots exactly one top-level actor. The repository
-   * can store several parentless actors now (#550), but that is not authority
-   * to create them: until forest boot lands, adoption refuses a second one,
-   * retired or not, as the dropped unique index did. {@link spawn} cannot make
-   * one at all, since it always resolves a parent.
-   */
-  private assertSingleTopLevel(record: ActorRecord): void {
-    if (record.parentId !== null) return;
-    const other = this.actors
-      .list()
-      .find((existing) => existing.parentId === null && existing.id !== record.id);
-    if (other) {
-      throw new Error(
-        `Cannot add ${record.id} as a second top-level actor: ${other.id} is already top-level`
-      );
-    }
   }
 
   /**
@@ -1404,7 +1394,7 @@ export class ActorMesh {
    */
   reconcilePendingDeliveries(): void {
     if (!this.scheduledMessages) return;
-    for (const message of this.scheduledMessages.listMessageDeliveries()) {
+    for (const message of this.pendingScheduledMessages()) {
       const recipient = this.actors.get(message.toId);
       if (recipient?.status === "active") continue;
       try {
@@ -1862,11 +1852,6 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
     this.clearActiveInterruption(actorId);
     this.headClosureRuns.delete(actorId);
-    // Open the run-scoped head window. An actor absent from this set delivers
-    // head attention immediately, which is what every non-run producer wants.
-    this.actorsInRun.add(actorId);
-    this.runHeadNet.delete(actorId);
-    this.runResponsiveReadyAttention.delete(actorId);
     const entries = context.mode === "ordinary" ? this.markInboxSeen(actorId) : [];
     try {
       this.onQueued?.(actorId, context);
@@ -1874,6 +1859,19 @@ export class ActorMesh {
       this.log(`onQueued(${actorId}) failed: ${err instanceof Error ? err.message : String(err)}`);
     }
     return entries;
+  }
+
+  /**
+   * Lifecycle boundary where the run's provider work begins: open the
+   * run-scoped head window. An actor absent from the window — idle, or only
+   * queued — delivers head attention immediately, which is what every non-run
+   * producer wants (#1071).
+   */
+  actorStarted(actorId: string): void {
+    actorId = this.resolveThreadId(actorId);
+    this.actorsInRun.add(actorId);
+    this.runHeadNet.delete(actorId);
+    this.runResponsiveReadyAttention.delete(actorId);
   }
 
   private markInboxSeen(actorId: string): InboxEntry[] {
@@ -2635,9 +2633,15 @@ export class ActorMesh {
     this.actorsInRun.delete(actorId);
     const net = this.runHeadNet.get(actorId);
     this.runHeadNet.delete(actorId);
-    // Nothing moved, it settled back where it started, or it ended with no head
-    // at all — in the last case there is no obligation to point the actor at.
-    if (!net || net.to === null || net.to.id === net.from) return;
+    if (!net) return;
+    // It settled back where it started, or it ended with no head at all — in
+    // the last case there is no obligation to point the actor at.
+    if (net.to === null || net.to.id === net.from) {
+      this.log(
+        `ready-head attention for ${actorId} suppressed at run end: net ${net.from ?? "none"} -> ${net.to?.id ?? "none"}`
+      );
+      return;
+    }
     this.appendReadyHeadEntry(actorId, net.to, net.from, null, net.epoch);
   }
 
@@ -3257,7 +3261,7 @@ export class ActorMesh {
       throw new Error("modelConfig must declare at least one provider/model entry");
     }
     const id = this.idgen();
-    const parentId = this.resolveThreadId(req.parentId);
+    const parentId = req.parentId === null ? null : this.resolveThreadId(req.parentId);
     // Store provenance only when the caller declared a class in modelConfig.
     // The validation gate resolves that reference to this concrete snapshot;
     // an explicit tuple/pool cannot attach an arbitrary class label.
@@ -3296,7 +3300,7 @@ export class ActorMesh {
     // Spawning grants the parent a handle to the child, so it can message it.
     // No role — the parent authored the charter, so the child's charter is the
     // truthful label (resolved at prompt time).
-    this.grantHandle(parentId, { id });
+    if (parentId !== null) this.grantHandle(parentId, { id });
     let actor: MeshActor;
     try {
       // `record.executionConfig.executionTarget` is `req.executionTarget`, so the placement a
@@ -3304,7 +3308,7 @@ export class ActorMesh {
       // other construction input.
       actor = this.runs.instantiate(record);
     } catch (err) {
-      this.revokeHandle(parentId, id);
+      if (parentId !== null) this.revokeHandle(parentId, id);
       this.actors.patch(id, { status: "retired" });
       throw err;
     }
@@ -3419,6 +3423,11 @@ export class ActorMesh {
     return this.grants.activeFor(this.resolveThreadId(actorId)).includes(capability);
   }
 
+  /** Resolve the legacy root alias at an external mutation boundary. */
+  resolveActorId(actorId: string): string {
+    return this.resolveThreadId(actorId);
+  }
+
   /** Resolve the legacy root address without making the literal id an authority signal. */
   private resolveThreadId(actorId: string): string {
     return actorId === "root" && this.rootId ? this.rootId : actorId;
@@ -3486,9 +3495,11 @@ export class ActorMesh {
    * Grant an extra `capability` to a specific actor by id (ISSUE_NUM, phase 1a).
    * We enforce the allow-list so the primitive can never hand out a capability
    * the wiring didn't mark grantable, plus grantor authorization: a
-   * `capability-admin` holder may grant anything grantable in its subtree; any
-   * other grantor only a {@link PARENT_GRANTABLE_CAPABILITIES} capability, and
-   * only to its direct children. Idempotent per (actorId, capability). MCP-server grants take effect
+   * `capability-admin` holder may grant most grantable capabilities in its
+   * subtree; an operator-provisioned capability is refused here regardless of
+   * grantor. Any other grantor may only grant a {@link PARENT_GRANTABLE_CAPABILITIES}
+   * capability, and only to its direct children. Idempotent per (actorId,
+   * capability). MCP-server grants take effect
    * on a live actor's next run; secrets are rebound by its next sandboxed run.
    * Throws if the capability isn't grantable or the grantor lacks authority.
    */
@@ -3499,6 +3510,8 @@ export class ActorMesh {
     let baseCapability = capability;
     if (capability.startsWith("chat-write:")) {
       baseCapability = "chat-write";
+    } else if (capability.startsWith("slack-write:")) {
+      baseCapability = "slack-write";
     } else if (capability.startsWith("calendar-read:")) {
       baseCapability = "calendar-read";
     } else if (capability.startsWith("calendar-write:")) {
@@ -3540,10 +3553,16 @@ export class ActorMesh {
     // acts on the whole daemon, so no subtree bound can contain a grant of it:
     // refused for every grantor, the grantee itself included — the self-grant
     // is exactly how a delegated capability-admin holder would otherwise widen
-    // into host authority. Only the bootstrap seed creates such a row (#549).
+    // into host authority. Startup no longer seeds these rows, and no operator
+    // path creates one yet (#1087); an existing row stands (#549).
     if (HOST_GLOBAL_CAPABILITIES.has(capability)) {
       throw new Error(
-        `${capability} is host-global and is never granted through the mesh; only the bootstrap seed creates it, and a revocation is one-way`
+        `${capability} is host-global and is never granted through the mesh; no creation path exists yet (#1087), an existing row stands, and a revocation is one-way`
+      );
+    }
+    if (OPERATOR_PROVISIONED_CAPABILITIES.has(capability)) {
+      throw new Error(
+        `${capability} is provisioned only by an authenticated operator; actor-facing grants cannot create it`
       );
     }
     // One rule: the BASE must be grantable (`secret` for every `secret:<file>`).
@@ -3578,8 +3597,10 @@ export class ActorMesh {
   /**
    * Revoke a previously-granted `capability` from `actorId`, subject to the same
    * grantor authorization as {@link grantCapability}: a `capability-admin`
-   * holder revokes anything in its subtree; any other `revokedBy` only a
-   * parent-grantable capability from a direct child. No-op on the store if not active, but the unmount hook still
+   * holder revokes most capabilities in its subtree; an operator-provisioned
+   * capability is refused here regardless of grantor. Any other `revokedBy`
+   * only revokes a parent-grantable capability from a direct child. No-op on
+   * the store if not active, but the unmount hook still
    * fires so a stale mounted endpoint is torn down idempotently. Revocation takes
    * effect immediately via {@link ActorMeshOptions.onCapabilityRevoked} (the
    * wiring unmounts the granted endpoint → a 404), not only at the actor's next
@@ -3588,6 +3609,11 @@ export class ActorMesh {
   async revokeCapability(actorId: string, capability: string, revokedBy: string): Promise<void> {
     actorId = this.resolveThreadId(actorId);
     revokedBy = this.resolveThreadId(revokedBy);
+    if (OPERATOR_PROVISIONED_CAPABILITIES.has(capability)) {
+      throw new Error(
+        `${capability} is provisioned only by an authenticated operator; actor-facing revocations cannot change it`
+      );
+    }
     this.assertGrantAuthority(revokedBy, actorId, capability, "revoke");
     this.grants.revoke(actorId, capability, this.now());
     this.recordEvent({ kind: "capability_revoked", actorId, detail: capability });
@@ -4284,10 +4310,7 @@ export class ActorMesh {
       if (!this.scheduledMessages) {
         throw new Error("Scheduled-message OS scheduler is not configured");
       }
-      if (
-        this.scheduledMessages.listMessageDeliveries().filter((message) => message.toId === toId)
-          .length >= 10
-      ) {
+      if (this.pendingScheduledMessages().filter((message) => message.toId === toId).length >= 10) {
         throw new Error(
           `Cannot schedule message: recipient ${toId} has reached the cap of 10 pending deliveries.`
         );
@@ -4812,7 +4835,7 @@ export class ActorMesh {
       }
     }
     const messages: MessageRetirementBlocker[] = [];
-    for (const message of this.scheduledMessages?.listMessageDeliveries() ?? []) {
+    for (const message of this.pendingScheduledMessages()) {
       const incoming = subtree.has(message.toId);
       const outgoing = subtree.has(message.fromId);
       if (!incoming && !outgoing) continue;
@@ -4863,9 +4886,7 @@ export class ActorMesh {
     reason?: string
   ): { messageId: string; fromId: string; toId: string; deliverAt: string } {
     by = this.resolveThreadId(by);
-    const message = this.scheduledMessages
-      ?.listMessageDeliveries()
-      .find((entry) => entry.id === messageId);
+    const message = this.pendingScheduledMessages().find((entry) => entry.id === messageId);
     if (!message) {
       throw new Error(
         `unknown pending message id: ${messageId} — it may have already been delivered or cancelled`
@@ -5180,7 +5201,7 @@ export class ActorMesh {
    * any thread in its subtree, itself included; any other caller may only set
    * the model for its own descendants (and never its own).
    * A pool of more than one entry, or a change of provider, requires a
-   * portable (ledger/tail) actor — a native provider session can't move.
+   * portable (ledger/tail/brief) actor — a native provider session can't move.
    * The replacement is atomic (the whole pool or nothing). A run already in
    * flight keeps its launched pool and the replacement applies when that run
    * ends; an idle or queued actor has it applied and persisted now (#652), so
@@ -5225,7 +5246,7 @@ export class ActorMesh {
     const portable = record.context?.type === "portable";
     if (validated.length > 1 && !portable) {
       throw new Error(
-        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can use a multi-candidate pool.`
+        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail/brief) actors can use a multi-candidate pool.`
       );
     }
     const currentProvider = record.modelConfig?.[0]?.provider;
@@ -5236,7 +5257,7 @@ export class ActorMesh {
       validated[0].provider !== currentProvider
     ) {
       throw new Error(
-        `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can be moved across providers.`
+        `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail/brief) actors can be moved across providers.`
       );
     }
     // Boundary contract (#199, #652): an in-flight run completes on its
@@ -5391,26 +5412,49 @@ export class ActorMesh {
 
   /**
    * Move an actor to a new parent (the re-org primitive — e.g. promote a steward
-   * and reparent workers under it). Root-only at the tool layer. Changes who
-   * receives the actor's reports and failure notices and who may retire it (ownership
-   * is the `parentId` edge), and grants the new parent a handle so it can message
-   * the actor. The actor's own subtree rides along — it stays attached, so the whole
-   * branch moves. Guards: refuses to reparent the root or any existing top-level
-   * boundary, a no-op self-parent, an unknown actor/parent, or a move that would
-   * create a cycle (the new parent must not be the actor or any of its descendants).
-   * Existing handles (incl. the old parent's) are left intact — handles are a graph,
+   * and reparent workers under it), or detach it to top level with `null`.
+   * Changes who receives the actor's reports and failure notices and who may
+   * retire it (ownership is the `parentId` edge), and grants a new parent a
+   * handle so it can message the actor. The actor's own subtree rides along —
+   * it stays attached, so the whole branch moves. Administrative reach is the
+   * live ancestry, so a former parent loses it the moment the edge changes.
+   *
+   * This is the validation authority, not the authorization one: callers decide
+   * who may move what (#1003). Every check runs against the records as they
+   * stand now — the moved actor must be active, a destination must be a
+   * different, known, active actor that is not in the moved actor's subtree
+   * (cycle), and `null` refuses an actor that is already top-level. Existing
+   * handles (incl. the old parent's) are left intact — handles are a graph,
    * ownership is the tree.
    */
-  reparentThread(id: string, newParentId: string): void {
+  reparentThread(id: string, newParentId: string | null): void {
     id = this.resolveThreadId(id);
-    newParentId = this.resolveThreadId(newParentId);
+    if (newParentId !== null) newParentId = this.resolveThreadId(newParentId);
     const record = this.actors.get(id);
     if (!record) {
       throw new Error(`Cannot reparent unknown thread: ${id}`);
     }
-    if (record.parentId == null) {
-      throw new Error(`Cannot give the top-level thread ${id} a parent`);
+    // A retired actor has no live branch to reorganize; reviving is its own act.
+    if (record.status !== "active") {
+      throw new Error(`Cannot reparent non-active thread ${id} (status: ${record.status})`);
     }
+    if (newParentId === null) {
+      if (record.parentId === null) {
+        throw new Error(`Cannot detach ${id}: it is already top-level`);
+      }
+    } else {
+      this.assertReparentDestination(id, newParentId);
+    }
+    this.actors.patch(id, { parentId: newParentId });
+    if (newParentId !== null) this.grantHandle(newParentId, { id }); // the new parent can now message the actor
+    this.recordEvent({
+      kind: "actor_reparented",
+      actorId: id,
+      payload: JSON.stringify({ fromParentId: record.parentId, toParentId: newParentId }),
+    });
+  }
+
+  private assertReparentDestination(id: string, newParentId: string): void {
     if (id === newParentId) {
       throw new Error(`Cannot reparent ${id} to itself`);
     }
@@ -5419,7 +5463,7 @@ export class ActorMesh {
       throw new Error(`Cannot reparent ${id} to unknown parent: ${newParentId}`);
     }
     // The new parent must be live, else the actor's reports would drop into
-    // a retired void (elder ISSUE_NUM rec a).
+    // a retired void.
     if (newParent.status !== "active") {
       throw new Error(
         `Cannot reparent ${id} under non-active parent ${newParentId} (status: ${newParent.status})`
@@ -5427,7 +5471,7 @@ export class ActorMesh {
     }
     // Cycle guard: walk up from the proposed parent; if we reach `id`, the move
     // would make `id` its own ancestor. The visited-set is defensive insurance so a
-    // pre-corrupted cyclic tree can't spin this forever (elder ISSUE_NUM rec b).
+    // pre-corrupted cyclic tree can't spin this forever.
     const seen = new Set<string>();
     for (
       let cursor: string | null | undefined = newParentId;
@@ -5439,13 +5483,6 @@ export class ActorMesh {
       }
       seen.add(cursor);
     }
-    this.actors.patch(id, { parentId: newParentId });
-    this.grantHandle(newParentId, { id }); // the new parent can now message the actor
-    this.recordEvent({
-      kind: "actor_reparented",
-      actorId: id,
-      payload: JSON.stringify({ fromParentId: record.parentId, toParentId: newParentId }),
-    });
   }
 
   reviveThread(id: string): void {
@@ -5815,6 +5852,11 @@ export class ActorMesh {
   }
 
   deliverScheduledMessage(scheduled: ScheduledMessage): void {
+    scheduled = {
+      ...scheduled,
+      fromId: this.resolveThreadId(scheduled.fromId),
+      toId: this.resolveThreadId(scheduled.toId),
+    };
     const { id: messageId, toId } = scheduled;
     // Heal the only cross-system crash window: the host job is installed
     // before acceptance history is committed so a failed DB transaction can
@@ -5858,6 +5900,14 @@ export class ActorMesh {
     target.requestRun();
   }
 
+  private pendingScheduledMessages(): ScheduledMessage[] {
+    return (this.scheduledMessages?.listMessageDeliveries() ?? []).map((message) => ({
+      ...message,
+      fromId: this.resolveThreadId(message.fromId),
+      toId: this.resolveThreadId(message.toId),
+    }));
+  }
+
   /**
    * Scheduled messages visible to an actor, used by the MCP projection.
    *
@@ -5872,7 +5922,8 @@ export class ActorMesh {
     deliverAt: string;
     body: string;
   }> {
-    return (this.scheduledMessages?.listMessageDeliveries() ?? [])
+    actorId = this.resolveThreadId(actorId);
+    return this.pendingScheduledMessages()
       .filter((message) => message.fromId === actorId || message.toId === actorId)
       .map((message) => ({
         messageId: message.id,

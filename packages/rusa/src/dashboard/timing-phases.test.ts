@@ -4,9 +4,11 @@ import {
   attachDashboardPhaseClock,
   beginDashboardRoutePhase,
   DashboardPhaseClock,
+  dashboardSubstageObserver,
   measureDashboardPhase,
   runDashboardRequestScope,
   startDashboardPhase,
+  startDashboardSubstage,
 } from "./timing-phases.js";
 
 /** A manual clock: phases see exactly the synthetic times the test sets. */
@@ -91,6 +93,52 @@ describe("dashboard phase clock", () => {
 
   it("reports nothing for a request that reached no phase", () => {
     expect(new DashboardPhaseClock(() => 0).durations(10)).toEqual({});
+  });
+});
+
+describe("dashboard request substages (#990)", () => {
+  it("keeps the first substage interval and revocation flag, clipped at the terminal", () => {
+    const { clock, at } = manualClock();
+    at(0);
+    clock.authRevocation(true);
+    const endAdapter = clock.startSubstage("authAdapterMs");
+    at(40);
+    endAdapter();
+    // A second attempt of the same substage never replaces the first.
+    clock.authRevocation(false);
+    const second = clock.startSubstage("authAdapterMs");
+    at(90);
+    second();
+    clock.startSubstage("codecMs");
+    at(130);
+
+    expect(clock.substages(110)).toEqual({ authAdapterMs: 40, codecMs: 20, authRevocation: true });
+    // Phases are untouched by substages.
+    expect(clock.durations(110)).toEqual({});
+  });
+
+  it("leaves unreached substages absent and ignores one opened after the terminal", () => {
+    const { clock, at } = manualClock();
+    at(50);
+    clock.startSubstage("identityMs");
+    expect(clock.substages(20)).toEqual({});
+    expect(new DashboardPhaseClock(() => 0).substages(10)).toEqual({});
+  });
+
+  it("returns a snapshot that a later callback cannot change", () => {
+    const { clock, at } = manualClock();
+    at(0);
+    const endCodec = clock.startSubstage("codecMs");
+    at(10);
+    const recorded = clock.substages(10);
+    at(500);
+    endCodec();
+    expect(recorded).toEqual({ codecMs: 10 });
+  });
+
+  it("is a no-op outside a timed request", () => {
+    expect(() => startDashboardSubstage("codecMs")()).not.toThrow();
+    expect(dashboardSubstageObserver()).toBeUndefined();
   });
 });
 

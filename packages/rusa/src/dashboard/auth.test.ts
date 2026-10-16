@@ -23,6 +23,11 @@ import {
   STREAM_IDLE_MS,
 } from "./auth.js";
 import { DASHBOARD_IDENTITY_CLAIM_ERROR, DashboardIdentityResolver } from "./identity.js";
+import {
+  attachDashboardPhaseClock,
+  DashboardPhaseClock,
+  runDashboardRequestScope,
+} from "./timing-phases.js";
 
 const config = {
   email: "owner@example.com",
@@ -409,6 +414,96 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect((await post("/api/auth/session", cookie)).status).toBe(401);
     expect((await post("/api/auth/refresh", cookie)).status).toBe(401);
     expect(principals.getUser(user.id)?.identity).toEqual(user.identity);
+  });
+
+  /** Run `fn` as a timed request whose substage clock advances only when the test says. */
+  const timedRequest = async <T>(fn: (advance: (ms: number) => void) => Promise<T>) => {
+    let clockNow = 0;
+    const clock = new DashboardPhaseClock(() => clockNow);
+    const result = await runDashboardRequestScope(async () => {
+      attachDashboardPhaseClock(clock);
+      return fn((ms) => {
+        clockNow += ms;
+      });
+    });
+    return { result, substages: clock.substages(clockNow) };
+  };
+  /** Each successive adapter attempt takes the next synthetic delay. */
+  const slowAdapter = (advance: (ms: number) => void, ...delays: number[]) => {
+    const verify = firebase.verifySessionCookie.getMockImplementation();
+    if (!verify) throw new Error("Expected the synthetic adapter");
+    for (const ms of delays) {
+      firebase.verifySessionCookie.mockImplementationOnce(async (value, check) => {
+        advance(ms);
+        return verify(value, check);
+      });
+    }
+  };
+
+  it("times the request's own adapter attempt, revocation flag and identity (#990)", async () => {
+    const cookie = await login();
+    const cold = await timedRequest(async (advance) => {
+      slowAdapter(advance, 30);
+      return auth.authorize(authRequest(cookie), authResponse());
+    });
+    expect(cold.result).toBe(true);
+    expect(cold.substages).toEqual({ authAdapterMs: 30, authRevocation: true, identityMs: 0 });
+    // Inside the revocation window the adapter verifies without the network check.
+    const warm = await timedRequest(async (advance) => {
+      slowAdapter(advance, 2);
+      return auth.authorize(authRequest(cookie), authResponse());
+    });
+    expect(warm.substages).toEqual({ authAdapterMs: 2, authRevocation: false, identityMs: 0 });
+  });
+
+  it("times a transient fallback, and a rejected attempt without one (#990)", async () => {
+    const cookie = await login();
+    unreachable = true;
+    const outageRequest = await timedRequest(async (advance) => {
+      slowAdapter(advance, 40, 7);
+      return auth.authorize(authRequest(cookie), authResponse());
+    });
+    expect(outageRequest.result).toBe(true);
+    expect(firebase.verifySessionCookie.mock.calls.slice(-2).map(([, check]) => check)).toEqual([
+      true,
+      false,
+    ]);
+    expect(outageRequest.substages).toEqual({
+      authAdapterMs: 40,
+      authFallbackMs: 7,
+      authRevocation: true,
+      identityMs: 0,
+    });
+    unreachable = false;
+
+    const response = authResponse();
+    const rejected = await timedRequest(async (advance) => {
+      slowAdapter(advance, 12);
+      return auth.authorize(authRequest(`${SESSION_COOKIE}=not-a-session`), response);
+    });
+    expect(rejected.result).toBe(false);
+    expect(response.writeHead).toHaveBeenCalledWith(401, expect.anything());
+    // The rejected attempt is still measured; admission and identity never ran.
+    expect(rejected.substages).toEqual({ authAdapterMs: 12, authRevocation: true });
+  });
+
+  it("never lets a stream recheck amend the timed request that opened it (#990)", async () => {
+    const cookie = await login();
+    vi.useFakeTimers();
+    const res = new EventEmitter() as ServerResponse;
+    res.end = vi.fn(() => res);
+    const stream = await timedRequest(async () => {
+      auth.guardStream({ headers: { cookie } } as IncomingMessage, res);
+      // The recheck runs inside the request's async context, as a real
+      // interval created during that request does.
+      firebase.verifySessionCookie.mockClear();
+      now += 60_000;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(firebase.verifySessionCookie).toHaveBeenCalledWith(expect.any(String), true);
+    });
+    res.emit("close");
+    expect(res.end).not.toHaveBeenCalled();
+    expect(stream.substages).toEqual({});
   });
 
   it("records the Google account id only from the verified ID token at sign-in", async () => {

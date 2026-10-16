@@ -64,6 +64,7 @@ import type { ActorRecord } from "./actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
   CAPABILITY_ADMIN_CAPABILITY,
+  OBLIGATIONS_ADMIN_CAPABILITY,
   seedConfiguredActorGrants,
 } from "./administrative-capabilities.js";
 import type { AtIo } from "./at-queue.js";
@@ -604,9 +605,9 @@ function setup(
 
   const rawSpawn = mesh.spawn.bind(mesh);
   const testMesh = mesh as unknown as ActorMesh & {
-    spawn: (req: Partial<SpawnRequest> & { charter: string; parentId: string }) => string;
+    spawn: (req: Partial<SpawnRequest> & { charter: string; parentId: string | null }) => string;
   };
-  testMesh.spawn = (req: Partial<SpawnRequest> & { charter: string; parentId: string }) =>
+  testMesh.spawn = (req: Partial<SpawnRequest> & { charter: string; parentId: string | null }) =>
     rawSpawn({
       modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
       ...req,
@@ -1905,6 +1906,7 @@ describe("ActorMesh", () => {
       );
 
     mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
+    mesh.actorStarted("root");
 
     // The shape a real root produced on 2026-08-30: create the parent, then
     // nest a child under it. Both move root's head, and the first head is
@@ -1927,7 +1929,7 @@ describe("ActorMesh", () => {
 
   it("says nothing when a run leaves its head where it found it", async () => {
     const inboxStore = createMemoryInboxStore();
-    const { mesh, tick } = setup({ inboxStore });
+    const { mesh, tick, logs } = setup({ inboxStore });
     const headEntries = () =>
       inboxStore.entries.filter(
         (entry) =>
@@ -1936,6 +1938,7 @@ describe("ActorMesh", () => {
       );
 
     mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
+    mesh.actorStarted("root");
     mesh.deliverReadyHeadAttention("root", { id: "b", intent: null }, "a");
     mesh.deliverReadyHeadAttention("root", { id: "a", intent: null }, "b");
     mesh.finishInboxRun("root");
@@ -1944,11 +1947,12 @@ describe("ActorMesh", () => {
     // Churned and settled back: waking an actor about the head it already had
     // is the noise this collapse exists to remove.
     expect(headEntries()).toHaveLength(0);
+    expect(logs).toContain("ready-head attention for root suppressed at run end: net a -> a");
   });
 
   it("says nothing when a run ends with no ready head at all", async () => {
     const inboxStore = createMemoryInboxStore();
-    const { mesh, tick } = setup({ inboxStore });
+    const { mesh, tick, logs } = setup({ inboxStore });
     const headEntries = () =>
       inboxStore.entries.filter(
         (entry) =>
@@ -1957,6 +1961,7 @@ describe("ActorMesh", () => {
       );
 
     mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
+    mesh.actorStarted("root");
     mesh.deliverReadyHeadAttention("root", { id: "parent", intent: null }, null);
     // Filing a question owned by the operator under it leaves root waiting with
     // nothing ready — there is no obligation to point it at.
@@ -1965,6 +1970,7 @@ describe("ActorMesh", () => {
     await tick();
 
     expect(headEntries()).toHaveLength(0);
+    expect(logs).toContain("ready-head attention for root suppressed at run end: net none -> none");
   });
 
   it("delivers immediately when no run is open", async () => {
@@ -5585,6 +5591,28 @@ describe("ActorMesh", () => {
     expect(mesh.activeCapabilitiesFor("worker-thread")).toEqual(["chat-write:spaces/AAQA29JwOwg"]);
   });
 
+  it("grants channel-scoped slack-write by its base capability (#1003)", () => {
+    const { mesh, registry } = setup({
+      grantableCapabilities: new Set(["slack-write"]),
+    });
+    registry.upsert({
+      id: "worker-thread",
+      charter: "doc-toolkit steward",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+
+    // The mount path already aggregates `slack-write:<channel>` rows by base;
+    // the grant path has to accept them for that mount to be reachable.
+    mesh.grantCapability("worker-thread", "slack-write:*", "root");
+    mesh.grantCapability("worker-thread", "slack-write:C0123456789", "root");
+    expect(mesh.activeCapabilitiesFor("worker-thread")).toEqual([
+      "slack-write:*",
+      "slack-write:C0123456789",
+    ]);
+  });
+
   it("a parent grants an allow-listed secret to its DIRECT child, audited with peerId = grantor", async () => {
     const events: MeshEventInput[] = [];
     const { mesh } = setup({
@@ -5817,6 +5845,27 @@ describe("ActorMesh", () => {
     await expect(
       mesh.revokeCapability("ghost-grantee", "understanding-write", "root")
     ).rejects.toThrow("unknown thread id: ghost-grantee");
+  });
+
+  it("reserves obligations-admin grant and revoke for the authenticated operator boundary (#1003)", async () => {
+    const { mesh, capabilityGrants } = setup({
+      grantableCapabilities: new Set([OBLIGATIONS_ADMIN_CAPABILITY]),
+    });
+    const child = mesh.spawn({ charter: "child", parentId: "root" });
+
+    expect(() => mesh.grantCapability(child, OBLIGATIONS_ADMIN_CAPABILITY, "root")).toThrow(
+      /authenticated operator/
+    );
+    capabilityGrants.grant({
+      actorId: child,
+      capability: OBLIGATIONS_ADMIN_CAPABILITY,
+      grantedBy: "operator:test",
+      grantedAt: "2026-10-16T05:30:00.000Z",
+    });
+    await expect(
+      mesh.revokeCapability(child, OBLIGATIONS_ADMIN_CAPABILITY, "root")
+    ).rejects.toThrow(/authenticated operator/);
+    expect(mesh.hasActiveCapability(child, OBLIGATIONS_ADMIN_CAPABILITY)).toBe(true);
   });
 
   it("a parent cannot grant a non-allow-listed capability, even to its direct child", async () => {
@@ -8151,14 +8200,13 @@ describe("ActorMesh", () => {
     expect(registry.get(steward)?.handles?.some((h) => h.id === worker)).toBe(true);
   });
 
-  it("reparentThread rejects root, self, unknown, non-active parent, and cycles", async () => {
+  it("reparentThread rejects self, unknown, non-active parent, and cycles", async () => {
     const { mesh, registry } = setup();
     const a = mesh.spawn({ charter: "a", parentId: "root" });
     const b = mesh.spawn({ charter: "b", parentId: a }); // b is a's child
 
-    expect(() => mesh.reparentThread("root", a)).toThrow(
-      /Cannot give the top-level thread root a parent/
-    );
+    // A top-level actor may move, but never beneath its own forest.
+    expect(() => mesh.reparentThread("root", a)).toThrow(/cycle/);
     expect(() => mesh.reparentThread(a, a)).toThrow(/to itself/);
     expect(() => mesh.reparentThread(a, "non-existent")).toThrow(/unknown parent/);
     expect(() => mesh.reparentThread("non-existent", a)).toThrow(/unknown thread/);
@@ -10439,6 +10487,28 @@ describe("ActorMesh", () => {
         )
       ).toThrow(/audit write failed/);
       expect(scheduler.listMessageDeliveries()).toEqual([]);
+    });
+
+    it("#1005 retains and delivers a pre-import scheduled message addressed to root", () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, scheduledMessages } = setup({ rootId: "imported-uuid", inboxStore });
+      const message = {
+        id: "pre-import-message",
+        toId: "root",
+        fromId: "root",
+        body: "keep",
+        deliverAt: new Date(Date.now() + 100_000).toISOString(),
+      };
+      scheduledMessages.scheduleMessageDelivery(message);
+      mesh.reconcilePendingDeliveries();
+      expect(scheduledMessages.listMessageDeliveries()).toEqual([message]);
+      mesh.deliverScheduledMessage(message);
+      expect(inboxStore.entries).toContainEqual(
+        expect.objectContaining({
+          actorId: "imported-uuid",
+          payload: expect.objectContaining({ messageId: message.id, fromId: "imported-uuid" }),
+        })
+      );
     });
 
     it("boot reconciliation keeps live recipients and removes jobs for inactive recipients", () => {
@@ -14413,7 +14483,7 @@ describe("accountRun token accounting (#443)", () => {
     });
   });
 
-  describe("single top-level actor guard (#550)", () => {
+  describe("actor forests (#1003)", () => {
     const dummyActor = (id: string): MeshActor => ({
       id,
       requestRun: () => {},
@@ -14422,79 +14492,486 @@ describe("accountRun token accounting (#443)", () => {
       preemptForResponsive: () => ({ preempted: false }),
       isRunning: false,
     });
-
-    it("refuses to adopt a second parentless actor, leaving the repository unchanged", () => {
-      const { mesh, registry } = setup();
-      const before = registry.list();
-
-      expect(() =>
-        mesh.adopt(
-          {
-            id: "second",
-            charter: "second",
-            parentId: null,
-            executionConfig: { unsandboxed: true },
-            status: "active",
-            createdAt: "2026-01-01T00:00:00.000Z",
-          },
-          dummyActor("second")
-        )
-      ).toThrow("Cannot add second as a second top-level actor: root is already top-level");
-
-      expect(registry.list()).toEqual(before);
-      expect(mesh.isLiveActor("second")).toBe(false);
+    const topLevel = (id: string): ActorRecord => ({
+      id,
+      charter: id,
+      parentId: null,
+      executionConfig: { unsandboxed: true },
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
     });
 
-    it("counts a retired parentless actor as the top-level one", () => {
+    it("adopts a second parentless actor alongside the first", () => {
       const { mesh, registry } = setup();
-      registry.patch("root", { status: "retired" });
-      expect(registry.get("root")?.status).toBe("retired");
 
-      expect(() =>
-        mesh.adopt(
-          {
-            id: "second",
-            charter: "second",
-            parentId: null,
-            executionConfig: { unsandboxed: true },
-            status: "active",
-            createdAt: "2026-01-01T00:00:00.000Z",
-          },
-          dummyActor("second")
-        )
-      ).toThrow(/second top-level actor: root/);
+      mesh.adopt(topLevel("second"), dummyActor("second"));
+
+      expect(
+        registry
+          .list()
+          .filter((a) => a.parentId === null)
+          .map((a) => a.id)
+          .sort()
+      ).toEqual(["root", "second"]);
+      expect(mesh.isLiveActor("second")).toBe(true);
     });
 
-    it("re-adopts the top-level actor itself and adopts actors with a parent", () => {
+    it("re-adopts a top-level actor without duplicating it", () => {
       const { mesh, registry } = setup();
-      mesh.adopt(
-        {
-          id: "root",
-          charter: "root",
-          parentId: null,
-          executionConfig: { unsandboxed: true },
-          status: "active",
-          createdAt: "2026-01-01T00:00:00.000Z",
-          title: "Root again",
-        },
-        dummyActor("root")
-      );
-      mesh.adopt(
-        {
-          id: "child",
-          charter: "child",
-          parentId: "root",
-          status: "active",
-          createdAt: "2026-01-01T00:00:00.000Z",
-        },
-        dummyActor("child")
-      );
+      mesh.adopt({ ...topLevel("root"), title: "Root again" }, dummyActor("root"));
 
       expect(registry.list().filter((a) => a.parentId === null)).toHaveLength(1);
-      expect(registry.get("child")?.parentId).toBe("root");
       expect(registry.get("root")?.title).toBe("Root again");
+    });
+
+    it("moves a top-level actor and its subtree beneath another forest", () => {
+      const { mesh, registry } = setup();
+      registry.upsert(topLevel("other"));
+      const otherChild = mesh.spawn({ charter: "other child", parentId: "other" });
+      const target = mesh.spawn({ charter: "target", parentId: "root" });
+
+      mesh.reparentThread("other", target);
+
+      expect(registry.get("other")?.parentId).toBe(target);
+      expect(registry.get(otherChild)?.parentId).toBe("other");
+      expect(mesh.isAncestorOf("root", otherChild)).toBe(true);
+      expect(registry.get(target)?.handles?.some((h) => h.id === "other")).toBe(true);
+    });
+
+    it("detaches an actor to top level; the former ancestors lose reach at once", () => {
+      const events: MeshEventInput[] = [];
+      const { mesh, registry } = setup({ events: (e) => events.push(e) });
+      const steward = mesh.spawn({ charter: "steward", parentId: "root" });
+      const worker = mesh.spawn({ charter: "worker", parentId: steward });
+      const grandchild = mesh.spawn({ charter: "grandchild", parentId: worker });
+      const handlesBefore = registry.get(steward)?.handles;
+
+      mesh.reparentThread(worker, null);
+
+      expect(registry.get(worker)?.parentId).toBeNull();
+      expect(registry.get(grandchild)?.parentId).toBe(worker);
+      expect(mesh.isAncestorOf(steward, worker)).toBe(false);
+      expect(mesh.isAncestorOf("root", grandchild)).toBe(false);
+      // Handles are a graph, ownership is the tree: detaching leaves them alone.
+      expect(registry.get(steward)?.handles).toEqual(handlesBefore);
+      expect(events.filter((e) => e.kind === "actor_reparented").at(-1)).toMatchObject({
+        actorId: worker,
+        payload: JSON.stringify({ fromParentId: steward, toParentId: null }),
+      });
+    });
+
+    it("refuses to detach a top-level actor or move a non-active one", () => {
+      const { mesh, registry } = setup();
+      const a = mesh.spawn({ charter: "a", parentId: "root" });
+      const b = mesh.spawn({ charter: "b", parentId: "root" });
+
+      expect(() => mesh.reparentThread("root", null)).toThrow(/already top-level/);
+      registry.patch(b, { status: "retired" });
+      expect(() => mesh.reparentThread(b, a)).toThrow(/non-active thread/);
+      expect(() => mesh.reparentThread(b, null)).toThrow(/non-active thread/);
+      expect(registry.get(b)?.parentId).toBe("root");
     });
   });
 });
 
 const TEST_USER_ID = "00000000-0000-4000-8000-000000000001";
+
+/**
+ * #1071: an owner that is only *queued* has no run of its own in flight, so
+ * nothing it is doing can have caused a head transition, and nothing will read
+ * a buffered one until the queue drains. These cases drive the real migrated
+ * SQLite obligation and inbox repositories through the production listener
+ * wiring (start.ts) into a real mesh, `RunManager` and `Actor`, queued behind
+ * either the mesh concurrency cap or `ProviderPacer` via `submitPoolGate`.
+ */
+describe("ready-head attention while the owner is only queued (#1071)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  type QueueKind = "capacity" | "pacing";
+
+  function harness(queue: QueueKind | "none") {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    let clock = Date.parse("2026-10-15T00:00:00.000Z");
+    const repo = new ObligationRepository(db, undefined, () => clock);
+    const inbox = new SqliteInboxRepository(db);
+    const blocker = deferredProvider();
+    const owned = deferredProvider();
+    const pacers = new Map<string, ProviderPacer>();
+    const pacerFor = (lane: string): ProviderPacer => {
+      let pacer = pacers.get(lane);
+      if (!pacer) {
+        pacer = new ProviderPacer(0);
+        pacers.set(lane, pacer);
+      }
+      return pacer;
+    };
+
+    const fixture = setup({
+      inboxStore: inbox,
+      maxConcurrent: queue === "capacity" ? 1 : 4,
+      obligations: {
+        findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
+        get: (id) => repo.get(id),
+        latestReassignment: (id) => repo.latestReassignment(id),
+      },
+      providerGate:
+        queue === "pacing"
+          ? (fn, candidates, request) =>
+              submitPoolGate(
+                fn,
+                candidates.map((candidate) => ({
+                  config: candidate,
+                  lane: candidate.provider,
+                  pacer: pacerFor(candidate.provider),
+                })),
+                {
+                  responsive: request.responsive,
+                  threadId: request.threadId,
+                  enqueueNormal: request.enqueueNormal,
+                  onSelected: request.onSelected
+                    ? (selection) =>
+                        request.onSelected?.({
+                          provider: selection.candidate.provider,
+                          lane: selection.lane,
+                          model: selection.candidate.model ?? "",
+                          effort: selection.candidate.effort,
+                          declaredIndex: selection.declaredIndex,
+                          eligibleAt: selection.eligibleAt,
+                          responsive: selection.responsive,
+                        })
+                    : undefined,
+                }
+              )
+          : undefined,
+      createActor: (ctx) =>
+        new Actor({
+          id: ctx.record.id,
+          cwd: `/tmp/${ctx.record.id}`,
+          modelConfig: [
+            ctx.record.charter === "blocker"
+              ? { provider: "blocker", model: "m" }
+              : { provider: "paced", model: "m" },
+          ],
+          resolveProvider: () =>
+            ctx.record.charter === "blocker" ? blocker.provider : owned.provider,
+          mcpServers: [],
+          loadSessionId: () => undefined,
+          saveSessionId: () => {},
+          buildPrompt: () => ({ prompt: "Work from your inbox." }),
+          gate: ctx.gate,
+          beforeRun: ctx.beforeRun,
+          admitRun: ctx.admitRun,
+          lifecycle: ctx.lifecycle,
+          onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+          onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+          debounceMs: DEBOUNCE,
+        }),
+    });
+    const { mesh, registry, tick } = fixture;
+    repo.setActorExists((id) => registry.get(id)?.status === "active");
+    repo.setPrincipalKind((id) =>
+      id.startsWith("system:")
+        ? "system"
+        : id === TEST_USER_ID
+          ? "user"
+          : registry.get(id)
+            ? "actor"
+            : undefined
+    );
+    // The production sinks, as start.ts installs them.
+    repo.setReadyHeadListener(({ ownerId, epoch, head, previousHeadId, sequence }) =>
+      mesh.deliverReadyHeadAttention(
+        ownerId,
+        head === null
+          ? null
+          : { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
+        previousHeadId,
+        sequence,
+        epoch
+      )
+    );
+    repo.setResponsiveReadyListener((obligation, actingPrincipal) =>
+      mesh.deliverResponsiveReadyAttention(
+        obligation.ownerId,
+        { id: obligation.id, intent: obligation.intent, readyCount: obligation.readyCount },
+        actingPrincipal === obligation.ownerId
+      )
+    );
+
+    const owner = mesh.spawn({
+      charter: "owner",
+      parentId: "root",
+      modelConfig: { provider: "paced", model: "m" },
+    });
+    const starts: Array<{ responsive: boolean; unhandled: string[] }> = [];
+    mesh.lifecycleFor(owner).add({
+      onStart: (event) => {
+        starts.push({
+          responsive: event.responsive,
+          unhandled: inbox
+            .list(owner, { status: "unhandled" })
+            .entries.map(
+              (entry) => (entry.payload as { obligationId?: string }).obligationId ?? ""
+            ),
+        });
+      },
+    });
+
+    const rowsFor = (obligationId: string) =>
+      inbox
+        .list(owner, { status: "all", limit: 100 })
+        .entries.filter(
+          (entry) => (entry.payload as { obligationId?: string }).obligationId === obligationId
+        );
+    const settle = async () => {
+      await tick();
+      await vi.advanceTimersByTimeAsync(0);
+    };
+
+    /** Deliver, start and handle the first ready episode, then leave the owner idle. */
+    const handleFirstEpisode = async (obligationId: string) => {
+      await settle();
+      const [first] = rowsFor(obligationId);
+      expect(first).toBeDefined();
+      inbox.markHandled(owner, [first.id]);
+      owned.releaseAll();
+      await settle();
+      expect(mesh.activeRunState(owner)).toBeNull();
+      starts.length = 0;
+    };
+
+    /** Put the owner into an ordinary run that is queued and has not started. */
+    const queueOwner = async () => {
+      if (queue === "capacity") {
+        const slot = mesh.spawn({
+          charter: "blocker",
+          parentId: "root",
+          modelConfig: { provider: "blocker", model: "m" },
+        });
+        mesh.sendMessage(slot, "hold the only slot", "root");
+        await settle();
+        expect(mesh.activeRunState(slot)?.phase).toBe("running");
+      } else {
+        // Hold the owner's lane well past anything these cases tick through,
+        // so an ordinary run waits in provider pacing until a case releases
+        // it. Set here, not at construction: every start resets the lane clock.
+        pacerFor("paced").deferUntil(Date.now() + 60_000);
+      }
+      mesh.sendMessage(owner, "ordinary work", "root");
+      await settle();
+      expect(mesh.activeRunState(owner)?.phase).toBe("queued");
+      expect(starts).toEqual([]);
+    };
+
+    return {
+      db,
+      repo,
+      inbox,
+      mesh,
+      owner,
+      starts,
+      blocker,
+      owned,
+      rowsFor,
+      settle,
+      handleFirstEpisode,
+      queueOwner,
+      advanceClock: (ms: number) => {
+        clock += ms;
+      },
+    };
+  }
+
+  /** A parent owned by the owner, waiting on one child owned by the user. */
+  function blockedParent(
+    h: ReturnType<typeof harness>,
+    responsiveness: "explicit" | "inherited"
+  ): { parentId: string } {
+    const anchor =
+      responsiveness === "inherited"
+        ? h.repo.create({
+            ownerId: TEST_USER_ID,
+            title: "Responsive anchor",
+            responsive: true,
+            creatorId: TEST_USER_ID,
+          })
+        : null;
+    const parent = h.repo.create({
+      parentId: anchor?.id ?? null,
+      ownerId: h.owner,
+      title: "Responsive parent",
+      intent: "act on the answer",
+      responsive: responsiveness === "explicit" ? true : null,
+      creatorId: TEST_USER_ID,
+    });
+    expect(h.repo.get(parent.id)?.effectiveResponsive).toBe(true);
+    return { parentId: parent.id };
+  }
+
+  const queuedCases = (["capacity", "pacing"] as const).flatMap((queue) =>
+    (["explicit", "inherited"] as const).flatMap((responsiveness) =>
+      (["done", "cancelled"] as const).map((release) => ({ queue, responsiveness, release }))
+    )
+  );
+
+  it.each(
+    queuedCases
+  )("delivers one immediate responsive row and one responsive start: $queue queue, $responsiveness responsiveness, final child $release", async ({
+    queue,
+    responsiveness,
+    release,
+  }) => {
+    const h = harness(queue);
+    const { parentId } = blockedParent(h, responsiveness);
+    await h.handleFirstEpisode(parentId);
+
+    const child = h.repo.create({
+      parentId,
+      ownerId: TEST_USER_ID,
+      title: "Question for the user",
+      creatorId: h.owner,
+    });
+    expect(h.repo.get(parentId)?.status).toBe("waiting");
+    await h.queueOwner();
+
+    h.repo.setTerminalStatus(child.id, release, "answered", null, TEST_USER_ID);
+    const parent = h.repo.get(parentId);
+    expect(parent?.status).toBe("ready");
+    expect(parent?.readyCount).toBe(2);
+
+    // Immediately after release, before any scheduler turn: exactly one
+    // durable, unhandled, responsive row for the new episode.
+    const fresh = () => h.rowsFor(parentId).filter((entry) => entry.handledAt === null);
+    expect(fresh()).toHaveLength(1);
+    expect(fresh()[0].payload.priority).toBe("responsive");
+
+    // The queued ordinary opportunity gives way to exactly one responsive run.
+    await h.settle();
+    expect(h.starts.map((start) => start.responsive)).toEqual([true]);
+    expect(h.mesh.activeRunState(h.owner)?.phase).toBe("running");
+    if (queue === "capacity") expect(h.blocker.pending()).toBe(1);
+
+    // The cancelled queue's lifecycle has ended, and so has the responsive
+    // run: neither adds a second row for the same episode.
+    h.owned.releaseAll();
+    h.blocker.releaseAll();
+    await h.settle();
+    expect(fresh()).toHaveLength(1);
+    expect(h.rowsFor(parentId)).toHaveLength(2);
+    expect(h.starts.map((start) => start.responsive)).toEqual([true]);
+    expect(h.mesh.activeRunState(h.owner)).toBeNull();
+    h.db.close();
+  });
+
+  it("keeps buffering a head transition that lands during a running own run until it settles", async () => {
+    const h = harness("none");
+    const { parentId } = blockedParent(h, "explicit");
+    await h.handleFirstEpisode(parentId);
+    const child = h.repo.create({
+      parentId,
+      ownerId: TEST_USER_ID,
+      title: "Question for the user",
+      creatorId: h.owner,
+    });
+
+    h.mesh.sendMessage(h.owner, "ordinary work", "root");
+    await h.settle();
+    expect(h.mesh.activeRunState(h.owner)?.phase).toBe("running");
+
+    h.repo.setTerminalStatus(child.id, "done", "answered", null, TEST_USER_ID);
+    expect(h.rowsFor(parentId)).toHaveLength(1);
+
+    h.owned.releaseAll();
+    await h.settle();
+    const fresh = h.rowsFor(parentId).filter((entry) => entry.handledAt === null);
+    expect(fresh).toHaveLength(1);
+    expect(fresh[0].payload.priority).toBe("responsive");
+    h.owned.releaseAll();
+    await h.settle();
+    expect(h.rowsFor(parentId)).toHaveLength(2);
+    h.db.close();
+  });
+
+  it("delivers one row at once to an owner outside any run, unchanged", async () => {
+    const h = harness("none");
+    const { parentId } = blockedParent(h, "explicit");
+    await h.handleFirstEpisode(parentId);
+    const child = h.repo.create({
+      parentId,
+      ownerId: TEST_USER_ID,
+      title: "Question for the user",
+      creatorId: h.owner,
+    });
+
+    h.repo.setTerminalStatus(child.id, "done", "answered", null, TEST_USER_ID);
+    expect(h.rowsFor(parentId).filter((entry) => entry.handledAt === null)).toHaveLength(1);
+    await h.settle();
+    expect(h.starts.map((start) => start.responsive)).toEqual([true]);
+    h.owned.releaseAll();
+    await h.settle();
+    expect(h.rowsFor(parentId)).toHaveLength(2);
+    h.db.close();
+  });
+
+  /** A daily cron obligation whose first episode was handled and completed. */
+  async function completedCron(h: ReturnType<typeof harness>) {
+    const recurring = h.repo.create({
+      ownerId: h.owner,
+      title: "Daily sweep",
+      recurrence: { policy: "cron", cronExpr: "0 3 * * *" },
+      creatorId: TEST_USER_ID,
+    });
+    await h.handleFirstEpisode(recurring.id);
+    h.repo.setTerminalStatus(recurring.id, "done", "swept", null, h.owner);
+    expect(h.repo.get(recurring.id)?.status).toBe("scheduled");
+    // Advance the repository clock to the next 03:00Z occurrence.
+    h.advanceClock(3 * 60 * 60 * 1000);
+    return recurring.id;
+  }
+
+  it("announces a cron re-ready to an idle owner", async () => {
+    const h = harness("none");
+    const recurringId = await completedCron(h);
+
+    h.repo.wakeScheduled(recurringId, "system:mesh");
+    expect(h.repo.get(recurringId)?.status).toBe("ready");
+    expect(h.rowsFor(recurringId).filter((entry) => entry.handledAt === null)).toHaveLength(1);
+    await h.settle();
+    expect(h.starts).toHaveLength(1);
+    expect(h.starts[0].unhandled).toContain(recurringId);
+    h.owned.releaseAll();
+    await h.settle();
+    h.db.close();
+  });
+
+  it.each([
+    "capacity",
+    "pacing",
+  ] as const)("hands a cron re-ready that lands while the owner is %s-queued to that queued run when it starts", async (queue) => {
+    const h = harness(queue);
+    const recurringId = await completedCron(h);
+    await h.queueOwner();
+
+    h.repo.wakeScheduled(recurringId, "system:mesh");
+    expect(h.repo.get(recurringId)?.status).toBe("ready");
+    // Durable at once, not held for the end of a run that has not started.
+    expect(h.rowsFor(recurringId).filter((entry) => entry.handledAt === null)).toHaveLength(1);
+
+    // Free the queue: the pacing deferral elapses, or the slot holder ends.
+    if (queue === "pacing") await vi.advanceTimersByTimeAsync(60_000);
+    else h.blocker.releaseAll();
+    await h.settle();
+    expect(h.starts).toHaveLength(1);
+    expect(h.starts[0].unhandled).toContain(recurringId);
+
+    // The run that started with it does not announce it again at settlement.
+    h.owned.releaseAll();
+    await h.settle();
+    expect(h.rowsFor(recurringId)).toHaveLength(2);
+    h.owned.releaseAll();
+    await h.settle();
+    h.db.close();
+  });
+});

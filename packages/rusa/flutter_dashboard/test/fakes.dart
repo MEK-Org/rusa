@@ -384,6 +384,30 @@ class FakeApi extends DashboardApi {
   /// preview rather than empty: the route reads the same field the list clipped,
   /// so it cannot answer with less than the list already carried.
   final charters = <String, String>{};
+  final briefs = <String, String?>{};
+  final briefGenerations = <String, int?>{};
+  final briefUpdatedAts = <String, String?>{};
+  final briefRevisions = <String, List<BriefRevision>>{};
+
+  @override
+  Future<
+    ({
+      String charter,
+      bool briefMode,
+      String? brief,
+      int? briefGeneration,
+      String? briefUpdatedAt,
+      List<BriefRevision> briefRevisions,
+    })
+  >
+  fetchActorInfo(String threadId) async => (
+    charter: await fetchCharter(threadId),
+    briefMode: briefs.containsKey(threadId),
+    brief: briefs[threadId],
+    briefGeneration: briefGenerations[threadId],
+    briefUpdatedAt: briefUpdatedAts[threadId],
+    briefRevisions: briefRevisions[threadId] ?? const [],
+  );
   final charterCalls = <String>[];
   Object? charterError;
 
@@ -765,7 +789,15 @@ class FakeApi extends DashboardApi {
   final reparentCalls = <({String id, String? parentId})>[];
   final reassignCalls = <({String id, String ownerId, String? message})>[];
   final fetchObligationsCalls =
-      <({String? ownerId, String? status, String? queue, bool? rootsOnly})>[];
+      <
+        ({
+          String? ownerId,
+          String? status,
+          String? queue,
+          bool? rootsOnly,
+          bool ancestors,
+        })
+      >[];
 
   /// When set, pages are cut to this many rows, or fewer if the request asked
   /// for fewer, in [obligationsResult] order, like the server's page limit.
@@ -787,12 +819,14 @@ class FakeApi extends DashboardApi {
     bool? rootsOnly,
     int? limit,
     int? offset,
+    bool ancestors = false,
   }) async {
     fetchObligationsCalls.add((
       ownerId: ownerId,
       status: status,
       queue: queue,
       rootsOnly: rootsOnly,
+      ancestors: ancestors,
     ));
     var list = obligationsResult;
     if (ownerId != null) {
@@ -831,7 +865,26 @@ class FakeApi extends DashboardApi {
       obligations: list,
       total: total,
       hasMore: list.length < total,
+      ancestors: ancestors ? _pageAncestors(list) : const [],
     );
+  }
+
+  /// Mirrors the server's `ancestors=true`: each row's ancestors in
+  /// [obligationsResult], once each and none that is a row.
+  List<ObligationDto> _pageAncestors(List<ObligationDto> rows) {
+    final byId = {for (final o in obligationsResult) o.id: o};
+    final seen = {for (final o in rows) o.id};
+    final out = <ObligationDto>[];
+    for (final row in rows) {
+      var parentId = row.parentId;
+      while (parentId != null && seen.add(parentId)) {
+        final parent = byId[parentId];
+        if (parent == null) break;
+        out.add(parent);
+        parentId = parent.parentId;
+      }
+    }
+    return out;
   }
 
   /// Holds every obligation detail request until completed.

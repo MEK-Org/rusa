@@ -7,6 +7,7 @@ import '../store.dart';
 import '../theme.dart';
 import '../util.dart';
 import 'header.dart';
+import 'obligation_ancestor_path.dart';
 import 'obligation_dialogs.dart';
 import 'obligation_snooze.dart';
 import 'obligation_status.dart';
@@ -29,6 +30,7 @@ class ObligationRow extends StatelessWidget {
     this.contentPadding = const EdgeInsets.all(16),
     this.showKindChip = true,
     this.trailing,
+    this.ancestors = const [],
   });
 
   final ObligationDto obligation;
@@ -52,6 +54,15 @@ class ObligationRow extends StatelessWidget {
   /// Optional widget at the trailing edge of the title row, as a reference
   /// card's header action (e.g. an inbox entry's dismiss).
   final Widget? trailing;
+
+  /// Root first, parent last: drawn as a path above the title when set
+  /// (#1076), each ancestor opening its own obligation as the row does.
+  final List<ObligationDto> ancestors;
+
+  void _open(String id) {
+    store.setFocusedObligationId(id);
+    onSelectView?.call(DashboardView.work);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -277,15 +288,16 @@ class ObligationRow extends StatelessWidget {
     );
 
     return InkWell(
-      onTap: () {
-        store.setFocusedObligationId(obligation.id);
-        onSelectView?.call(DashboardView.work);
-      },
+      onTap: () => _open(obligation.id),
       child: Padding(
         padding: contentPadding,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (ancestors.isNotEmpty) ...[
+              ObligationAncestorPath(ancestors: ancestors, onOpen: _open),
+              const SizedBox(height: 4),
+            ],
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [

@@ -12,9 +12,11 @@ import {
 } from "./timing.js";
 import {
   beginDashboardRoutePhase,
+  dashboardSubstageObserver,
   measureDashboardPhase,
   runDashboardRequestScope,
   startDashboardPhase,
+  startDashboardSubstage,
 } from "./timing-phases.js";
 import { beginDashboardRequestTiming } from "./timing-server.js";
 
@@ -103,7 +105,8 @@ describe.skipIf(process.env.RUSA_BENCH_DASHBOARD_TIMING !== "1")(
         const response = new BenchResponse();
         if (timings) {
           // The instrumented arm pays for the request scope and every phase
-          // boundary a typical authenticated JSON read crosses (#935).
+          // boundary a typical authenticated JSON read crosses (#935), plus
+          // the auth and codec substage boundaries (#990).
           await runDashboardRequestScope(async () => {
             beginDashboardRequestTiming(
               response as unknown as ServerResponse,
@@ -111,11 +114,20 @@ describe.skipIf(process.env.RUSA_BENCH_DASHBOARD_TIMING !== "1")(
               "GET",
               timings
             );
-            await measureDashboardPhase("auth", async () => true);
+            await measureDashboardPhase("auth", async () => {
+              const observer = dashboardSubstageObserver();
+              observer?.authRevocation(false);
+              const endAdapter = observer?.startSubstage("authAdapterMs");
+              await null;
+              endAdapter?.();
+              observer?.startSubstage("identityMs")();
+              return true;
+            });
             beginDashboardRoutePhase();
             await measureDashboardPhase("enrichment", async () => null);
             const endSerialization = startDashboardPhase("serialization");
             endSerialization();
+            startDashboardSubstage("codecMs")();
             response.writeHead(200);
             response.end(BODY);
           });
@@ -158,7 +170,7 @@ describe.skipIf(process.env.RUSA_BENCH_DASHBOARD_TIMING !== "1")(
           p95DeltaMs: instrumentedP95Ms - baselineP95Ms,
           baselineMaxMs: percentile(baseline, 1),
           instrumentedMaxMs: percentile(instrumented, 1),
-          note: "Includes request scope, phase boundaries, UUID/header/response wrapper/enqueue and next-turn SQLite flush against retained timing rows; it is not an end-to-end dashboard-load latency claim.",
+          note: "Includes request scope, phase and substage boundaries, event-loop utilization reads, UUID/header/response wrapper/enqueue and next-turn SQLite flush against retained timing rows; it is not an end-to-end dashboard-load latency claim.",
         })
       );
       expect(baseline).toHaveLength(SAMPLES * BATCH_SIZE);

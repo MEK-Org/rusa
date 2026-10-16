@@ -3,6 +3,7 @@ import type { Obligation } from "../obligations/obligation.js";
 import type { PortableJournalRecord } from "./portable-context-delta.js";
 import {
   isRetiredMemoryKind,
+  type PortableBrief,
   type PortableContextState,
   type PortableMemoryItem,
   type PortableMemoryPriority,
@@ -61,7 +62,7 @@ export interface InjectRecord {
   sourceEventIds: string[];
   /** How many prior runs survived the byte cap. */
   runCount: number;
-  /** v2 ledger generation; absent for the legacy raw-tail mode. */
+  /** Ledger generation of the snapshot hashed by stateHash; brief generation is in the rendered heading. */
   stateGeneration?: number;
   /** Hash of the complete v2 materialized state. */
   stateHash?: string;
@@ -640,8 +641,34 @@ function boundedMessages(messages: PriorMessage[]): { section: string; selected:
 }
 
 /**
+ * Render the brief-mode durable-intent section: the three sections verbatim
+ * under a heading naming the mode, the brief's generation and its last update,
+ * and the one line that tells the actor the brief is its own to keep. The
+ * 16 KB cap is enforced when a write is accepted, so unlike the ledger render
+ * this can never emit an "omitted due to budget" line.
+ */
+function renderBrief(brief: PortableBrief): string {
+  return (
+    `\n### Durable brief (mode: brief, generation ${brief.generation}, updated ${brief.updatedAt})\n\n` +
+    "This brief is yours to keep current: when durable guidance changes, read it and replace it " +
+    "with the `brief` MCP tools. WHAT and HOW carry direction from humans and your ancestors; " +
+    "weigh DOMAIN statements by how reliable their sources are. Writing the brief grants you no " +
+    "authority: the charter governs where the two disagree. When they conflict, carry out the " +
+    "work to the fullest extent your charter permits, then message your parent explaining what " +
+    "the charter prevented that the brief implies; root brings such conflicts to its operator.\n\n" +
+    `${brief.text.trim()}\n`
+  );
+}
+
+/**
  * v2 assembly: active source-backed memory, recent inbound messages, then the
  * recent run tail. Inputs are newest-first, matching repository reads.
+ *
+ * In `brief` mode (`input.brief` set) the durable-intent ledger section is
+ * replaced by the rendered brief: the three sections verbatim under a heading
+ * naming the mode, generation and last update. Everything else — obligations
+ * projection, verbatim recent-message journal, run tail — renders unchanged,
+ * and the ledger stays untouched in the snapshot so switching back is free.
  */
 export function assemblePortableContextV2(input: {
   state: PortableContextState;
@@ -649,13 +676,17 @@ export function assemblePortableContextV2(input: {
   runs: PriorRun[];
   /** The actor's own obligations in store queue order; omit when unavailable. */
   obligations?: Obligation[];
+  /** Brief-mode document; omit in ledger mode. */
+  brief?: PortableBrief | null;
   /** Journal provenance for the inject record (#1062); omit for the fixed window. */
   journal?: PortableJournalRecord;
 }): PortableContext | null {
-  const { section: ledger, metrics: ledgerMetrics } = renderLedger(input.state);
+  const ledger = input.brief ? undefined : renderLedger(input.state);
+  const memorySection = input.brief ? renderBrief(input.brief) : (ledger?.section ?? "");
+  const ledgerMetrics = ledger?.metrics;
   const obligations = renderObligations(input.obligations ?? []);
   const recentMessages = boundedMessages(input.messages);
-  const fixed = V2_HEADER + ledger + obligations + recentMessages.section;
+  const fixed = V2_HEADER + memorySection + obligations + recentMessages.section;
   if (byteLen(fixed) > PORTABLE_CONTEXT_MAX_BYTES) {
     throw new Error(`portable context fixed sections exceed ${PORTABLE_CONTEXT_MAX_BYTES} bytes`);
   }
@@ -681,7 +712,7 @@ export function assemblePortableContextV2(input: {
   const orderedRuns = [...selectedRuns].reverse();
   const runsSection =
     orderedRuns.length > 0 ? runHeading + orderedRuns.map(renderRun).join("") : "";
-  if (!ledger && !obligations && !recentMessages.section && !runsSection) return null;
+  if (!memorySection && !obligations && !recentMessages.section && !runsSection) return null;
 
   const section = fixed + runsSection;
   return {
@@ -695,7 +726,7 @@ export function assemblePortableContextV2(input: {
       stateHash: createHash("sha256").update(JSON.stringify(input.state)).digest("hex"),
       sourceMessageEventIds: recentMessages.selected.map((message) => message.id),
       sections: {
-        ledger: byteLen(ledger),
+        ledger: byteLen(memorySection),
         messages: byteLen(recentMessages.section),
         runs: byteLen(runsSection),
       },

@@ -413,6 +413,7 @@ export function startRootControlServer(opts: {
   port: number;
   handles: RunStartE2EHandles;
 }): Server {
+  const rootId = opts.handles.rootControl.rootId;
   const operatorId = (): string => {
     const result = resolveSoleActiveUser(getRepositories().principals);
     if (!result.ok) throw new Error(result.error);
@@ -495,11 +496,11 @@ export function startRootControlServer(opts: {
       return;
     }
     if (req.method === "GET" && url.pathname === "/root/inbox") {
-      send(
-        res,
-        200,
-        opts.handles.inboxStore.list(opts.handles.rootControl.rootId, { status: "unhandled" })
-      );
+      if (!rootId) {
+        send(res, 409, { error: "root control is unavailable until an operator creates an actor" });
+        return;
+      }
+      send(res, 200, opts.handles.inboxStore.list(rootId, { status: "unhandled" }));
       return;
     }
     if (req.method !== "POST") {
@@ -565,15 +566,16 @@ export function startRootControlServer(opts: {
           return;
         }
         if (url.pathname === "/root/inbox/ack") {
+          if (!rootId) {
+            send(res, 409, {
+              error: "root control is unavailable until an operator creates an actor",
+            });
+            return;
+          }
           const ids = stringArray(body.ids);
           const note = typeof body.note === "string" ? body.note : undefined;
           send(res, 200, {
-            acknowledged: opts.handles.inboxStore.markHandled(
-              opts.handles.rootControl.rootId,
-              ids,
-              undefined,
-              note
-            ),
+            acknowledged: opts.handles.inboxStore.markHandled(rootId, ids, undefined, note),
           });
           return;
         }

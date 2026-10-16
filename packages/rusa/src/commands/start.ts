@@ -29,7 +29,8 @@ import {
 import type { ActorRecord, ExecutionConfig, PortableContextConfig } from "../actor/actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
-  bootstrapCapabilitiesFor,
+  defaultGrantRecipient,
+  OBLIGATIONS_ADMIN_CAPABILITY,
   seedConfiguredActorGrants,
 } from "../actor/administrative-capabilities.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
@@ -73,11 +74,7 @@ import {
   HaltSwitch,
   parseHaltCommand,
 } from "../actor/halt-switch.js";
-import {
-  DEFAULT_ROOT_CHARTER,
-  generateHandle,
-  resolveRootHandle,
-} from "../actor/handle-generator.js";
+import { generateHandle, resolveRootHandle } from "../actor/handle-generator.js";
 import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
 import type { InboxChatContextSources } from "../actor/inbox-chat-context.js";
@@ -94,6 +91,7 @@ import {
   type RunAbandonedPayload,
   runEndPayload,
 } from "../actor/mesh-events.js";
+import { OperatorActorControl } from "../actor/operator-actor-control.js";
 import { type ActorWakeScheduler, DefaultOsScheduler } from "../actor/os-scheduler.js";
 import {
   assemblePortableContext,
@@ -104,6 +102,7 @@ import {
   portableContextMaxMessages,
   portableContextMaxRuns,
 } from "../actor/portable-context.js";
+import { seedPortableBriefState } from "../actor/portable-context-brief.js";
 import {
   describeCompaction,
   GeminiPortableContextCompactor,
@@ -126,13 +125,12 @@ import {
 } from "../actor/provider-pacer.js";
 import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-throttle-status.js";
 import { ShadowResponsiveInterruptionClassifier } from "../actor/responsive-interruption.js";
-import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
 import {
   RootModelConfigStartupError,
   resolveRootBootModelConfig,
+  seedRootModelConfig,
 } from "../actor/root-model-config.js";
-import { buildRootPrompt } from "../actor/root-prompt.js";
 import { createRunAccounting, projectActorRunLaunchConfig } from "../actor/run-accounting.js";
 import {
   ensureWakeToken,
@@ -147,6 +145,7 @@ import {
   sweepOrphanedWorkspaces,
   unattributedCheckouts,
 } from "../actor/workspace-sweep.js";
+import { avatarCachePath } from "../avatar/avatars.js";
 import { GoogleCalendarClientProvider } from "../calendar/calendar-client.js";
 import { GchatClient, loadGchatIdentity } from "../chat/gchat-client.js";
 import { GchatOAuth } from "../chat/gchat-oauth.js";
@@ -166,11 +165,14 @@ import type { DashboardAuth } from "../dashboard/auth.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { DashboardTimingRecorder } from "../dashboard/timing.js";
-import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import {
-  finishDeferredRootSessionImport,
-  importLegacyActorState,
-} from "../db/legacy-actor-import.js";
+  ConfiguredActorImportError,
+  type ConfiguredActorImportResult,
+  importConfiguredActor,
+  planConfiguredActorImport,
+} from "../db/configured-actor-import.js";
+import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import { importLegacyActorState } from "../db/legacy-actor-import.js";
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
@@ -188,12 +190,8 @@ import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitop
 import { resolveMeshGitIdentity } from "../gitops/mesh-git-identity.js";
 import { getRemoteUrl, initEmptyBareRepo } from "../gitops/worktree.js";
 import { AGENT_EXEC_MCP_NAME, createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
-import {
-  CHAT_READ_MCP_NAME,
-  CHAT_WRITE_MCP_NAME,
-  createChatReadMcpServer,
-  createChatWriteMcpServer,
-} from "../mcp/chat-mcp.js";
+import { BRIEF_MCP_NAME, createBriefMcpServer } from "../mcp/brief-mcp.js";
+import { CHAT_READ_MCP_NAME, createChatReadMcpServer } from "../mcp/chat-mcp.js";
 import {
   createDashboardTimingMcpServer,
   DASHBOARD_TIMING_MCP_NAME,
@@ -216,12 +214,7 @@ import type { PnpmHardlinksToolDeps } from "../mcp/pnpm-hardlinks-mcp.js";
 import { createPnpmInstallMcpServer, PNPM_INSTALL_MCP_NAME } from "../mcp/pnpm-install-mcp.js";
 import { createQuotaMcpServer, createQuotaService, QUOTA_MCP_NAME } from "../mcp/quota-mcp.js";
 import { createRepoMcpServer, REPO_MCP_NAME } from "../mcp/repo-mcp.js";
-import {
-  createSlackReadMcpServer,
-  createSlackWriteMcpServer,
-  SLACK_READ_MCP_NAME,
-  SLACK_WRITE_MCP_NAME,
-} from "../mcp/slack-mcp.js";
+import { createSlackReadMcpServer, SLACK_READ_MCP_NAME } from "../mcp/slack-mcp.js";
 import { resolveStampedAuthor, stampAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer, TRACKER_MCP_NAME } from "../mcp/tracker-mcp.js";
 import {
@@ -269,7 +262,7 @@ import {
   ingestKimiHostModels,
   populateModelCatalogsFromDb,
 } from "../providers/model-catalog.js";
-import type { RawProviderModelConfig } from "../providers/model-config.js";
+import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import {
   describeModelConfigEntry,
   describeModelConfigPool,
@@ -310,6 +303,7 @@ import {
 import { type MissedQuotaWindow, MissedQuotaWindowDetector } from "../quota/missed-windows.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import { resolveReference } from "../references/resolve.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
@@ -689,7 +683,8 @@ export interface RunStartE2EHandles {
   triggerQuotaThrottleTick?: () => Promise<void>;
   /** Test-only read of the latest quota throttle status. */
   getThrottle?: (provider: string) => QuotaThrottleStatus | null;
-  root: MeshActor;
+  /** The imported configured actor; undefined when an empty store booted with none (#1003). */
+  root: MeshActor | undefined;
   rootControl: RootControlService;
   externalRoot: ExternalRootDriver | null;
   inboxStore: InboxRepository;
@@ -745,6 +740,12 @@ export interface RunStartOptions {
   noDashboardServer?: boolean;
   /** Raw `--profile` CLI flag; validated into a {@link ConfigProfile} by loadConfig. */
   profile?: string;
+  /**
+   * Raw `--import-actor` CLI flag: the operator's explicit choice of which
+   * existing actor `rootActor` describes, consulted only while the one-time
+   * configured-actor import has not completed (#1002).
+   */
+  importActor?: string;
   e2e?: RunStartE2EHooks;
 }
 
@@ -779,6 +780,24 @@ export function rootExecutionIntent(params: { e2eMode: boolean }): {
   return params.e2eMode
     ? { sandbox: true, executionConfig: {} }
     : { sandbox: false, executionConfig: { unsandboxed: true } };
+}
+
+/**
+ * The builder `sandbox` flag for the configured actor, read from the execution
+ * config stored on its row (#1002) so the two cannot disagree once the import
+ * has made the row authoritative: the same deployment mapping as every worker.
+ * The e2e harness keeps the exception {@link rootExecutionIntent} describes
+ * and sandboxes its root whatever the row says.
+ */
+export function configuredActorSandbox(params: {
+  e2eMode: boolean;
+  executionConfig?: ExecutionConfig;
+  sandboxMode?: RusaConfig["sandbox"];
+}): boolean {
+  if (params.e2eMode) return true;
+  return (
+    params.executionConfig?.unsandboxed !== true && params.sandboxMode !== "container-boundary"
+  );
 }
 
 export function shouldBindDashboardServer(params: {
@@ -884,7 +903,7 @@ export function readUnfoldedLedgerSources(
  */
 function assemblePortableInjection(
   id: string,
-  mode: "tail" | "ledger",
+  mode: "tail" | "ledger" | "brief",
   store: PortableContextStore,
   journal: PortableJournalMode = "window",
   onDeltaFallback: (error: unknown) => void = () => {}
@@ -893,13 +912,22 @@ function assemblePortableInjection(
   const runs = repositories.actorRuns
     .listRecentCompleted(id, portableContextMaxRuns())
     .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
-  if (mode !== "ledger") {
+  // Tail remains a run-only renderer. Do not load a snapshot or query messages
+  // and obligations before selecting this established path.
+  if (mode === "tail") {
     const portable = assemblePortableContext(runs);
     return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
   }
-  const state = store.load(id);
+
+  let state = store.load(id);
+  // Seed before the first brief-mode prompt, so the first brief-mode run
+  // renders the empty brief sections rather than the old ledger.
+  if (mode === "brief" && state.brief === null) {
+    state = seedPortableBriefState(state, new Date().toISOString());
+    store.save(state);
+  }
   // Read-through only. The prompt shows work state; it never authors it
-  // — the obligation store stays the sole lifecycle authority .
+  // — the obligation store stays the sole lifecycle authority.
   const obligations = repositories.obligations.listOwned(id);
   const windowJournal = () => ({
     messages: repositories.meshChat
@@ -917,7 +945,8 @@ function assemblePortableInjection(
   // plus the unchanged runs window. A failed or truncated read falls back to the
   // recent window, so the actor starts with its newest messages still visible.
   const selectJournal = () => {
-    if (journal !== "delta") return windowJournal();
+    // Brief writes do not advance the ledger fold cursor; keep their recent window.
+    if (mode !== "ledger" || journal !== "delta") return windowJournal();
     try {
       const unfolded = readUnfoldedLedgerSources(id, state.lastFoldedSourceId);
       const delta = selectDeltaJournal({
@@ -954,6 +983,7 @@ function assemblePortableInjection(
     runs: selected.runs,
     obligations,
     journal: selected.journal,
+    ...(mode === "brief" ? { brief: state.brief } : {}),
   });
   return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
 }
@@ -1000,10 +1030,11 @@ export async function compactPortableContext(input: {
       messages: page.sources,
       now: (input.now ?? (() => new Date().toISOString()))(),
     });
-    state = result.state;
+    // A brief may have committed while the fold awaited the model, including
+    // through another connection. Preserve it inside the store's write lock.
+    state = input.store.saveFolded(result.state);
     quarantinedOperations.push(...result.quarantined);
     operations += result.operations;
-    input.store.save(state);
     folded += page.sources.length;
     foldedSelf += page.sources.filter((source) => source.kind === "run_yielded").length;
     bytes += page.sources.reduce(
@@ -1154,9 +1185,6 @@ async function composeStart(
   const rootActor = config.rootActor;
   configureCodexAuthBroker(codexAuthBrokerConfigured(config));
   const errorSink = resolveErrorSink(config);
-  if (!rootActor) {
-    throw new Error("config loader returned no rootActor after validating root configuration");
-  }
   // Config is parsed: its credentials join the scrub set (which `bootLog` shares
   // through the same closure) and its configured level takes effect.
   const configSecretEntries = collectConfigSecretEntries(config);
@@ -1331,14 +1359,6 @@ async function composeStart(
     getRepositories().meshChat
   );
 
-  // Capture the disposable audit projection while this startup unquestionably
-  // owns an open DB handle. Some boot paths cross asynchronous probes before
-  // the subscription store is constructed; tests and multi-instance shutdowns
-  // may close the shared handle during that gap.
-  const eventSubscriptionAudit = getRepositories().meshEvents.listByKinds(
-    ["event_source_subscribed", "event_source_unsubscribed"],
-    { bodyKinds: [] }
-  );
   const configuredRoots = configuredRootEventSources(config);
 
   // #1645 ready-head attention. Attached here, immediately after initDb, rather
@@ -1432,12 +1452,6 @@ async function composeStart(
     log.warn("mesh_git_identity_missing", { gap: meshGitIdentity.gap });
   }
 
-  // The root's configured identity : the display handle every
-  // root-identity surface (signing byline, dashboard, avatar, commitment
-  // ledger) routes through. Defaults to today's root-actor when
-  // `rootActor.handle` is unset, so an instance with no config is unchanged.
-  const rootHandle = resolveRootHandle(config);
-
   // ── MCP tools: tracker (gh) + chat (gchat) + understanding (read), served
   // in-process over loopback ──
   const baseIssueClient = getIssueClient();
@@ -1521,66 +1535,253 @@ async function composeStart(
   getRepositories().setInboxListenerErrorHandler((error) => {
     log.warn("inbox_listener_failed", { err: error });
   });
-  const rootId = resolveRootActorId(actors);
-  // The root's durable pool lives on its actor record, where `set_actor_model`
-  // writes it, and wins over the scalar `rootActor` file tuple once it exists.
-  // The file seeds only a record with no pool. Resolved before any server is
-  // bound so an unrunnable persisted pool stops boot with nothing to unwind.
-  // The file tuple itself was validated by the config loader; what is checked
-  // here is the pool root will actually run on, instantiated entry by entry
-  // the way worker spawn preflights its own pool.
-  const rootBootstrapTuple: RawProviderModelConfig = {
-    provider: rootActor.provider,
-    model: rootActor.model,
-    ...(rootActor.effort === undefined ? {} : { effort: rootActor.effort }),
+  const workersDir = join(mcHome, "workers");
+  const rootBootstrapTuple: RawProviderModelConfig | undefined = rootActor
+    ? {
+        provider: rootActor.provider,
+        model: rootActor.model,
+        ...(rootActor.effort === undefined ? {} : { effort: rootActor.effort }),
+      }
+    : undefined;
+  const rootPreflight = (entry: ProviderModelConfig) => {
+    resolveProvider(config, entry.provider, entry.model, entry.effort);
   };
-  let rootBootModelConfig: ReturnType<typeof resolveRootBootModelConfig>;
+  const rootIntent = rootExecutionIntent({ e2eMode: Boolean(opts?.e2e) });
+  // ── Configured-actor import (#1002) ── `rootActor` describes one actor, and
+  // it is read for that actor exactly once: the import resolves which actor it
+  // is (refusing ambiguous state unless the operator names one), fills only
+  // what that actor genuinely lacks, and records the binding in a receipt. Every
+  // later boot finds the actor through the receipt and runs it from its own
+  // row; config edits or removal never reach it again. Resolved before any
+  // server is bound so a refusal stops boot with nothing to unwind.
+  let configuredImport: ConfiguredActorImportResult;
   try {
-    rootBootModelConfig = resolveRootBootModelConfig({
-      config,
+    const configuredPlan = planConfiguredActorImport({
+      hasConfiguration: rootActor !== undefined,
       actors,
-      rootId,
-      bootstrap: rootBootstrapTuple,
-      portable: rootActor.context?.type === "portable",
-      preflight: (entry) => resolveProvider(config, entry.provider, entry.model, entry.effort),
+      receipts: getRepositories().legacyImportReceipts,
+      workersDir,
+      selectedActorId: opts?.importActor,
+      legacyRootSession: legacyActorImport.deferredRootSessionId !== undefined,
+    });
+    // Import retired JSON against the old identity first; the configured import
+    // then moves all durable state together. Receipt-backed importers archive
+    // a stale source unread on subsequent boots.
+    // An empty store has no root, so no config-implied legacy row can match.
+    const legacyRootId =
+      configuredPlan.kind === "adopt"
+        ? (configuredPlan.previousActorId ?? configuredPlan.actorId)
+        : configuredPlan.kind === "none"
+          ? ""
+          : configuredPlan.actorId;
+    const legacyEventSubscriptionImport = importLegacyEventSubscriptionState({
+      mcHome,
+      db: database,
+      repositories: getRepositories(),
+      rootId: legacyRootId,
+    });
+    if (legacyEventSubscriptionImport.importedSubscriptions > 0) {
+      log.info("legacy_event_subscriptions_imported", {
+        subscriptions: legacyEventSubscriptionImport.importedSubscriptions,
+      });
+    } else if (legacyEventSubscriptionImport.backupFiles.length > 0) {
+      // A source file still present after the receipt committed is stale by
+      // construction — a failed archive rename, or one restored by hand. It is
+      // archived unread rather than replayed, and saying so is what stops an
+      // operator concluding the file they put back took effect. `warn`, not
+      // `info`: nothing is broken, but a document someone placed there did not
+      // become state, and the backup path is where to find it.
+      log.warn("legacy_event_subscriptions_archived_unread", {
+        backups: legacyEventSubscriptionImport.backupFiles,
+      });
+    }
+    const legacyHostJobImport = importLegacyHostJobState({
+      mcHome,
+      db: database,
+      repositories: getRepositories(),
+    });
+    if (legacyHostJobImport.importedJobs > 0) {
+      log.info("legacy_host_jobs_imported", { jobs: legacyHostJobImport.importedJobs });
+    } else if (legacyHostJobImport.backupFiles.length > 0) {
+      // A source file still present after the receipt committed is stale by
+      // construction — a failed archive rename, or one restored by hand. It is
+      // archived unread rather than replayed, and saying so is what stops an
+      // operator concluding the file they put back took effect. `warn`, not
+      // `info`: nothing is broken, but a document someone placed there did not
+      // become state, and the backup path is where to find it.
+      log.warn("legacy_host_jobs_archived_unread", { backups: legacyHostJobImport.backupFiles });
+    }
+    const legacyPortableContextImport = importLegacyPortableContextState({
+      mcHome,
+      db: database,
+      repositories: getRepositories(),
+    });
+    if (legacyPortableContextImport.importedSnapshots > 0) {
+      log.info("legacy_portable_context_imported", {
+        snapshots: legacyPortableContextImport.importedSnapshots,
+      });
+    } else if (legacyPortableContextImport.backupFiles.length > 0) {
+      // A source directory still present after the receipt committed is stale by
+      // construction — a failed archive rename, or one restored by hand. It is
+      // archived unread rather than replayed, and saying so is what stops an
+      // operator concluding the snapshots they put back took effect. `warn`, not
+      // `info`: nothing is broken, but memory someone placed there did not become
+      // state, and the backup path is where to find it.
+      log.warn("legacy_portable_context_archived_unread", {
+        backups: legacyPortableContextImport.backupFiles,
+      });
+    }
+    configuredImport = importConfiguredActor({
+      db: database,
+      actors,
+      receipts: getRepositories().legacyImportReceipts,
+      seed:
+        rootActor && rootBootstrapTuple
+          ? {
+              charter: rootActor.charter,
+              context: rootActor.context,
+              handle: resolveRootHandle(config),
+              avatarPath: rootActor.avatar,
+              executionConfig: rootIntent.executionConfig,
+              sessionId: legacyActorImport.deferredRootSessionId,
+              modelConfig: (portable, actorId) =>
+                seedRootModelConfig({
+                  config,
+                  rootId: actorId,
+                  bootstrap: rootBootstrapTuple,
+                  portable,
+                  preflight: rootPreflight,
+                }),
+            }
+          : undefined,
+      workersDir,
+      avatarCachePath: avatarCachePath("root"),
+      selectedActorId: opts?.importActor,
+      legacyRootSession: legacyActorImport.deferredRootSessionId !== undefined,
+      idgen: () => {
+        if (configuredPlan.kind === "none") {
+          throw new Error("an empty store mints no configured actor");
+        }
+        return configuredPlan.actorId;
+      },
     });
   } catch (err) {
-    if (err instanceof RootModelConfigStartupError) {
+    if (err instanceof ConfiguredActorImportError) {
+      log.error("configured_actor_import_refused", {
+        error: err.name,
+        reason: err.message,
+        action: err.action,
+        candidates: err.candidates,
+      });
+    } else if (err instanceof RootModelConfigStartupError) {
       log.error("root_model_config_invalid", {
         error: err.name,
-        rootId,
         reason: err.message,
         action: err.action,
       });
     }
     throw err;
   }
-  const rootModelConfigDescription = describeModelConfigPool(rootBootModelConfig.modelConfig);
-  log.info("root_model_config_resolved", {
-    rootId,
-    source: rootBootModelConfig.source,
-    modelConfig: rootModelConfigDescription,
-  });
-  // Every boot before #333 wrote the file tuple onto the row, so an upgraded
-  // database already carries a pool and the file stops steering root from
-  // here on. Say so whenever the two differ: a healthy boot on a model the
-  // operator just edited away from would otherwise be the only signal.
-  const configuredRootDescription = describeModelConfigPool([rootBootstrapTuple]);
-  if (
-    rootBootModelConfig.source === "persisted" &&
-    rootModelConfigDescription !== configuredRootDescription
-  ) {
-    log.warn("root_model_config_file_ignored", {
-      rootId,
-      configured: configuredRootDescription,
-      persisted: rootModelConfigDescription,
-      action:
-        "root's model is durable on its actor record after bootstrap; change it with set_actor_model, or clear the root row's model_config in the actors table to seed it from rootActor again",
+  const rootId = configuredImport.actorId;
+  // Capture the disposable audit projection while this startup unquestionably
+  // owns an open DB handle. Some boot paths cross asynchronous probes before
+  // the subscription store is constructed; tests and multi-instance shutdowns
+  // may close the shared handle during that gap.
+  const eventSubscriptionAudit = getRepositories().meshEvents.listByKinds(
+    ["event_source_subscribed", "event_source_unsubscribed"],
+    { bodyKinds: [] }
+  );
+  if (configuredImport.plan.kind === "none") {
+    // Q1 of #1003: an empty store boots the service and dashboard with no
+    // actor; the first actor is the operator's to create, never config's.
+    if (!configuredImport.plan.recorded) {
+      log.info("configured_actor_import_empty", {
+        action: "no actor was synthesized; config.yaml's rootActor is not read again",
+      });
+    }
+  } else if (configuredImport.plan.kind !== "completed") {
+    log.info("configured_actor_imported", {
+      actorId: rootId,
+      plan: configuredImport.plan.kind,
+      selected: configuredImport.plan.kind === "adopt" && configuredImport.plan.selected,
+      filled: configuredImport.filled,
+      avatarImported: configuredImport.avatarImported,
     });
+  }
+  if (configuredImport.avatarMissing !== undefined) {
+    log.warn("configured_actor_avatar_missing", {
+      actorId: rootId,
+      path: configuredImport.avatarMissing,
+      action: `rootActor.avatar named no file, and the import does not read it again; copy the image to ${avatarCachePath("root")} or upload one from the dashboard`,
+    });
+  }
+  const importedRoot = rootId === undefined ? undefined : actors.get(rootId);
+  if (rootId !== undefined && !importedRoot) {
+    throw new Error(`configured actor ${rootId} has no actor record after its import`);
+  }
+  // The configured actor's display handle: what every root-identity surface
+  // (signing byline, dashboard, avatar, commitment ledger) routes through.
+  // Stored on its row by the import, so a later `rootActor.handle` edit does
+  // not rename it.
+  const rootHandle =
+    rootId === undefined ? undefined : (importedRoot?.displayHandle ?? generateHandle(rootId));
+  // The root's durable pool lives on its actor record, where `set_actor_model`
+  // writes it. The import seeded it from the `rootActor` tuple if the record
+  // had none; from here on the file never steers it. Resolved before any
+  // server is bound so an unrunnable persisted pool stops boot with nothing to
+  // unwind. What is checked here is the pool root will actually run on,
+  // instantiated entry by entry the way worker spawn preflights its own pool.
+  let rootBootModelConfig: ReturnType<typeof resolveRootBootModelConfig> | undefined;
+  let rootModelConfigDescription: string | undefined;
+  if (rootId !== undefined && importedRoot?.status === "active") {
+    try {
+      rootBootModelConfig = resolveRootBootModelConfig({
+        config,
+        actors,
+        rootId,
+        portable: importedRoot.context?.type === "portable",
+        preflight: rootPreflight,
+      });
+    } catch (err) {
+      if (err instanceof RootModelConfigStartupError) {
+        log.error("root_model_config_invalid", {
+          error: err.name,
+          rootId,
+          reason: err.message,
+          action: err.action,
+        });
+      }
+      throw err;
+    }
+    const rootModelConfigSeeded = configuredImport.filled.includes("modelConfig");
+    rootModelConfigDescription = describeModelConfigPool(rootBootModelConfig.modelConfig);
+    log.info("root_model_config_resolved", {
+      rootId,
+      source: rootModelConfigSeeded ? "bootstrap" : rootBootModelConfig.source,
+      modelConfig: rootModelConfigDescription,
+    });
+    // The file tuple stops steering root once its pool is durable. Say so
+    // whenever the two differ: a healthy boot on a model the operator just
+    // edited away from would otherwise be the only signal.
+    const configuredRootDescription = rootBootstrapTuple
+      ? describeModelConfigPool([rootBootstrapTuple])
+      : undefined;
+    if (
+      configuredRootDescription &&
+      !rootModelConfigSeeded &&
+      rootModelConfigDescription !== configuredRootDescription
+    ) {
+      log.warn("root_model_config_file_ignored", {
+        rootId,
+        configured: configuredRootDescription,
+        persisted: rootModelConfigDescription,
+        action:
+          "root's model is durable on its actor record; change it with set_actor_model. config.yaml's rootActor tuple is read only by the one-time configured-actor import",
+      });
+    }
   }
   const inboxStore = getRepositories().inbox;
   const modelScrapesStore = getRepositories().modelScrapes;
-  const workersDir = join(mcHome, "workers");
   mkdirSync(workersDir, { recursive: true });
   // Boot-time sweep of the workspaces of actors that have retired. Retirement
   // deletes both of an actor's directories, so what survives to here is either a
@@ -1645,6 +1846,7 @@ async function composeStart(
     config,
     workersDir,
     scrapeStore: quotaScrapesStore,
+    logger: log,
   });
   let webhookSilenceDetector: WebhookSilenceDetector | null = null;
   const servers: Record<string, () => McpServer> = {
@@ -1679,6 +1881,17 @@ async function composeStart(
       : errorSink?.kind === "slack" && slackClient
         ? (text: string) => slackClient.send(errorSink.target, text).then(() => {})
         : null;
+  // A brief write's new citations resolve through the same resolver and
+  // clients the dashboard uses; nothing here widens what they can read (#954).
+  const resolveBriefCitation = (ref: string) =>
+    resolveReference(ref, {
+      meshChat: getRepositories().meshChat,
+      inbox: getRepositories().inbox,
+      resolveActorId: (id) => (id === "root" ? (rootId ?? id) : id),
+      chatClient: chatClient ?? undefined,
+      slackClient: slackClient ?? undefined,
+      issueClient,
+    });
   if (chatClient) {
     const workDir = join(mcHome, "root-agent");
     // This root-owned server runs on the local leader; follower placement is
@@ -1780,7 +1993,7 @@ async function composeStart(
         ? completionMatcherGit.isAncestor(ancestor, descendant)
         : Promise.reject(new Error("local checkout unavailable")),
     repository: completionMatcherRepository,
-    instanceName: rootHandle,
+    instanceName: rootHandle ?? "rusa",
     onClosedUnmerged: (obligation, matcher) =>
       completionMatcherClosedUnmergedSink?.(obligation.ownerId, obligation.id, matcher.setAt),
     log: (message) => log.warn("completion_matcher_warning", { message }),
@@ -1852,7 +2065,9 @@ async function composeStart(
   // Emergency brake: the single source of truth is the sentinel file. Halt by
   // hand (`touch ~/.rusa/HALT`), by chat (`/halt`), or pull the plug.
   const haltSwitch = new HaltSwitch(join(mcHome, "HALT"));
-  const rootProviderName = rootActor.provider;
+  // The configured actor's own pool head, not the `rootActor` file tuple; an
+  // empty store has none, so a provider-less halt check names no provider.
+  const rootProviderName = rootBootModelConfig?.modelConfig[0]?.provider;
   const isProviderHalted = (providerName?: string, modelName?: string) =>
     haltSwitch.isHalted(providerName ?? rootProviderName, modelName);
   if (haltSwitch.hasActiveHalt()) {
@@ -2245,31 +2460,10 @@ async function composeStart(
   // registers the glass-goals `understanding-write` server (claude FS isolation
   // ISSUE_NUM having landed); grantable-servers.test.ts locks the contents.
   const capabilityGrants = getRepositories().capabilityGrants;
-  // Explicit subscription ownership and its tombstones are durable in SQLite;
+  // Explicit ownership and its tombstones are durable in SQLite;
   // `event-subscriptions.json` is only a legacy source, imported once and then
-  // archived. The config-implied seed is rebuilt in memory below, so nothing
-  // here recreates a JSON source of truth.
-  const legacyEventSubscriptionImport = importLegacyEventSubscriptionState({
-    mcHome,
-    db: database,
-    repositories: getRepositories(),
-    rootId,
-  });
-  if (legacyEventSubscriptionImport.importedSubscriptions > 0) {
-    log.info("legacy_event_subscriptions_imported", {
-      subscriptions: legacyEventSubscriptionImport.importedSubscriptions,
-    });
-  } else if (legacyEventSubscriptionImport.backupFiles.length > 0) {
-    // A source file still present after the receipt committed is stale by
-    // construction — a failed archive rename, or one restored by hand. It is
-    // archived unread rather than replayed, and saying so is what stops an
-    // operator concluding the file they put back took effect. `warn`, not
-    // `info`: nothing is broken, but a document someone placed there did not
-    // become state, and the backup path is where to find it.
-    log.warn("legacy_event_subscriptions_archived_unread", {
-      backups: legacyEventSubscriptionImport.backupFiles,
-    });
-  }
+  // archived. Config-implied ownership is resolved afresh at boot for the
+  // oldest active parentless actor, independently of the configured import.
   const persistentEventSourceOwners = getRepositories().eventSourceOwners;
   warnMissingConfiguredEventSubscriptionsAtBoot(
     persistentEventSourceOwners,
@@ -2279,58 +2473,24 @@ async function composeStart(
   // Host-plane host-jobs capability : durable per-actor job records, keyed
   // the same way capabilityGrants/event source owners are. Durable in SQLite;
   // `host-jobs.json` is only a legacy source, imported once and then archived.
-  const legacyHostJobImport = importLegacyHostJobState({
-    mcHome,
-    db: database,
-    repositories: getRepositories(),
-  });
-  if (legacyHostJobImport.importedJobs > 0) {
-    log.info("legacy_host_jobs_imported", { jobs: legacyHostJobImport.importedJobs });
-  } else if (legacyHostJobImport.backupFiles.length > 0) {
-    // A source file still present after the receipt committed is stale by
-    // construction — a failed archive rename, or one restored by hand. It is
-    // archived unread rather than replayed, and saying so is what stops an
-    // operator concluding the file they put back took effect. `warn`, not
-    // `info`: nothing is broken, but a document someone placed there did not
-    // become state, and the backup path is where to find it.
-    log.warn("legacy_host_jobs_archived_unread", { backups: legacyHostJobImport.backupFiles });
-  }
   const hostJobStore = getRepositories().hostJobs;
   // Portable-context snapshots are authoritative memory: the ledger item
   // ids, statuses, priorities, generation counter and `lastFoldedSourceId` in
   // one were minted by a model fold and cannot be rebuilt from the messages and
   // run outputs they were folded from. Durable in SQLite; `portable-context/`
   // is only a legacy source, imported once and then archived.
-  const legacyPortableContextImport = importLegacyPortableContextState({
-    mcHome,
-    db: database,
-    repositories: getRepositories(),
-  });
-  if (legacyPortableContextImport.importedSnapshots > 0) {
-    log.info("legacy_portable_context_imported", {
-      snapshots: legacyPortableContextImport.importedSnapshots,
-    });
-  } else if (legacyPortableContextImport.backupFiles.length > 0) {
-    // A source directory still present after the receipt committed is stale by
-    // construction — a failed archive rename, or one restored by hand. It is
-    // archived unread rather than replayed, and saying so is what stops an
-    // operator concluding the snapshots they put back took effect. `warn`, not
-    // `info`: nothing is broken, but memory someone placed there did not become
-    // state, and the backup path is where to find it.
-    log.warn("legacy_portable_context_archived_unread", {
-      backups: legacyPortableContextImport.backupFiles,
-    });
-  }
-  const portableContextStore: PortableContextStore = getRepositories().portableContext;
+  const portableContextStore = getRepositories().portableContext;
   const e2eInstance = new E2EInstanceManager({
     mcHome,
     workersDir,
-    handleForId: (id) => (id === rootId ? rootHandle : generateHandle(id)),
+    handleForId: (id) =>
+      id === rootId && rootHandle !== undefined ? rootHandle : generateHandle(id),
   });
+  let impliedOwnerId = defaultGrantRecipient(actors.list())?.id;
   const rootSourceSync = reconcileEventSources(
     persistentEventSourceOwners,
     configuredRoots,
-    rootId,
+    impliedOwnerId,
     () => new Date().toISOString()
   );
   const eventSourceOwners = rootSourceSync.store;
@@ -2368,12 +2528,11 @@ async function composeStart(
   // ── Host-maintenance tools (#549) ── `update` and `pnpm-hardlinks` used to be
   // mounted on the configured root's tool set by id. They are now ordinary
   // grantable capabilities (named after their servers) registered through
-  // `buildGrantableServers`, so a grant row — seeded for the configured actor
-  // at boot, grantable/revocable like any other — is what puts them on an
-  // endpoint; the handlers re-check the grant live. The `update` tool is
-  // best-effort: if the deploy checkout can't be resolved, the mesh still boots
-  // without it. Its drainer self-excludes the CALLER's run (whoever holds the
-  // grant), not a fixed root id.
+  // `buildGrantableServers`: an explicit durable grant, not topology or import
+  // identity, puts one on an endpoint, and the handlers re-check it live. The
+  // `update` tool is best-effort: if the deploy checkout can't be resolved, the
+  // mesh still boots without it. Its drainer self-excludes the CALLER's run
+  // (whoever holds the grant), not a fixed root id.
   const followerTriggerStore = new FollowerUpdateTriggerStore(
     join(mcHome, "data", "follower-update-trigger.json")
   );
@@ -2522,7 +2681,8 @@ async function composeStart(
       store: hostJobStore,
       // Same handle-derivation the mesh itself uses (see `handleForId` below) —
       // threaded through, never re-derived.
-      handleForId: (id) => (id === rootId ? rootHandle : generateHandle(id)),
+      handleForId: (id) =>
+        id === rootId && rootHandle !== undefined ? rootHandle : generateHandle(id),
       mcHome,
       // `mesh` is assigned below; safe because this closure only runs once an
       // actor actually calls a host-jobs tool, well after `mesh` exists —
@@ -2571,6 +2731,9 @@ async function composeStart(
     // mapping the pnpm-install and root wiring use for actor roots.
     actorRootFor: (actorId) =>
       actorId === rootId ? join(mcHome, "root-agent") : join(workersDir, actorId),
+    actorHandleFor: (actorId) =>
+      actors.get(actorId)?.displayHandle ??
+      (actorId === rootId && rootHandle !== undefined ? rootHandle : generateHandle(actorId)),
     // File tools run on the leader. Recheck placement at each call so a
     // follower-hosted actor cannot read a stale leader-side workdir.
     fileToolsAvailableForActor: (actorId) =>
@@ -2595,26 +2758,7 @@ async function composeStart(
   // provider at run start. A live grant updates it synchronously, which is the
   // latest boundary every provider CLI can reliably consume MCP configuration.
   const liveWorkerMcp = new Map<string, McpServerSpec[]>();
-  const rootMcp: McpServerSpec[] = [];
-  const rootGrantedMcp: McpServerSpec[] = [];
   const refreshLiveActorMcp = (actorId: string): void => {
-    if (actorId === rootId) {
-      for (const spec of rootGrantedMcp) {
-        const index = rootMcp.indexOf(spec);
-        if (index >= 0) rootMcp.splice(index, 1);
-      }
-      rootGrantedMcp.length = 0;
-      rootGrantedMcp.push(
-        ...mountGrantedServers(
-          rootId,
-          mesh.activeCapabilitiesFor(rootId),
-          grantableServers,
-          mcpHttp
-        )
-      );
-      rootMcp.push(...rootGrantedMcp);
-      return;
-    }
     const workerMcp = liveWorkerMcp.get(actorId);
     if (!workerMcp) return;
     const mounted = mountGrantedServers(
@@ -2634,6 +2778,7 @@ async function composeStart(
   const teardownActorMcp = (actorId: string) => {
     liveWorkerMcp.delete(actorId);
     void mcpHttp.removeServer(actorId);
+    void mcpHttp.removeServer(`${actorId}:${BRIEF_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${INBOX_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${OBLIGATIONS_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${MESH_CHAT_MCP_NAME}`);
@@ -2753,6 +2898,7 @@ async function composeStart(
     log: emitMeshRoutingLog,
   });
   const eventManager = new EventManager({
+    importedActorId: rootId,
     inboxStore,
     resolver: eventSourceResolver,
     log: emitMeshRoutingLog,
@@ -2793,13 +2939,14 @@ async function composeStart(
   const supportedVoiceCatalog = buildSupportedVoiceCatalog(credentialValidSupportedVoices, {
     availableProviders: availableVoiceProviders,
   });
-  // The mesh-wide Chat Room roster (#663): read by every dashboard, changed
-  // only through the root-seeded `room-admin` tools. An actor without a stored
-  // voice speaks with the instance default, so that is what collisions compare.
+  // The mesh-wide Chat Room roster (#663): explicit durable membership only.
+  // The configured import never creates a participant or a room-admin grant;
+  // an existing stored binding or explicit operator-provisioned authority is
+  // required. An actor without a stored voice speaks with the instance default,
+  // so that is what collisions compare.
   const chatRoom = new ChatRoomService({
     store: getRepositories().chatRoom,
     actors,
-    rootId,
     voices: () => supportedVoiceCatalog,
     defaultVoice: googleVoiceConfig(
       canonicalSupportedVoiceName(config.voice?.voiceName ?? DEFAULT_VOICE_NAME) ??
@@ -3154,15 +3301,17 @@ async function composeStart(
     // agent-exec endpoint itself, so they have no server factory either; the
     // mesh and the endpoint both consult the grant rows directly. The
     // host-global names listed here (`update`, `pnpm-hardlinks`, `model-admin`,
-    // `room-admin`)
-    // are stripped by the mesh: it never grants one, and only the seed below
-    // creates their rows. `obligation-responsive` (#1026) likewise mounts
-    // nothing: each worker's obligations server reads the grant per call.
+    // `room-admin`) are stripped by the mesh: it never grants one, so a
+    // durable row from the default bootstrap is required. `obligation-responsive` (#1026) and
+    // `obligations-admin` (#1003) likewise mount nothing: each worker's
+    // obligations server reads the binding per call; the latter is changed only
+    // through the authenticated operator boundary.
     grantableCapabilities: new Set([
       ...grantableServers.keys(),
       SECRET_CAPABILITY_BASE,
       COMPUTER_USE_CAPABILITY,
       OBLIGATION_RESPONSIVE_CAPABILITY,
+      OBLIGATIONS_ADMIN_CAPABILITY,
       ...ADMINISTRATIVE_CAPABILITIES,
     ]),
     secretsDir: secretsDirPath(mcHome),
@@ -3255,7 +3404,8 @@ async function composeStart(
     },
     isHalted: isProviderHalted,
     isShuttingDown: () => gracefulShutdown.isShuttingDown(),
-    handleForId: (id) => (id === rootId ? rootHandle : generateHandle(id)),
+    handleForId: (id) =>
+      id === rootId && rootHandle !== undefined ? rootHandle : generateHandle(id),
     onRunReturned: (actorId, { notifyingParent }) => {
       // Consume-or-flush: surface a pending git-bridge deliverable to the parent
       // only on a successful parent-triggered return; on any other finish still
@@ -3322,11 +3472,28 @@ async function composeStart(
     createActor: (ctx) => {
       const id = ctx.record.id;
       const rec = ctx.record;
+      // Default authority is provisioned as durable rows for the oldest active
+      // top-level actor (#1087), independently of the optional config import.
+      // Use the fixed default set: host tool availability never adds authority.
+      // Existing active AND revoked rows survive the atomic, insert-only seed.
+      if (defaultGrantRecipient(actors.list())?.id === id) {
+        const seeded = database.transaction(() =>
+          seedConfiguredActorGrants(capabilityGrants, id)
+        )();
+        if (seeded.length > 0) {
+          log.info("bootstrap_capabilities_seeded", { actorId: id, capabilities: seeded });
+        }
+      }
+      // The configured import only preserves this legacy workdir mapping. It
+      // grants no construction path, prompt, tools, or authority: every
+      // active record below takes the same ordinary durable construction path.
+      const configuredWorkdir = id === rootId ? join(mcHome, "root-agent") : undefined;
+      const actorWorkdir = configuredWorkdir ?? join(workersDir, id);
       // Provider/tier: run on the pool the spawn declared (e.g. a claude worker, or a
       // stronger model for review), earliest-available first. Resolve every declared
       // candidate before registering MCP servers so a resolution failure can't leave
       // an inert endpoint mounted. A record without a pool (legacy/adopted) falls back
-      // to the root provider.
+      // to the head of the configured actor's boot pool.
       //
       // A class-bound actor whose class is missing or invalid also arrives with no
       // pool, but only at rehydration — a spawn validates its class first. The
@@ -3335,13 +3502,9 @@ async function composeStart(
       // resolves again the dispatch boundary hands it the real pool (#626). Report
       // it here so a restart surfaces the broken binding without waiting for a wake.
       mesh.reportModelClassFailure(id);
-      const modelConfigPool: readonly RawProviderModelConfig[] = rec.modelConfig ?? [
-        {
-          provider: rootActor.provider,
-          model: rootActor.model,
-          effort: rootActor.effort,
-        },
-      ];
+      const modelConfigPool: readonly RawProviderModelConfig[] =
+        rec.modelConfig ??
+        (rootBootModelConfig ? [rootBootModelConfig.modelConfig[0] as ProviderModelConfig] : []);
       try {
         for (const candidate of modelConfigPool) {
           resolveProvider(config, candidate.provider, candidate.model, candidate.effort);
@@ -3373,6 +3536,10 @@ async function composeStart(
         // capability (#549), so an ungranted worker sees none of them.
         const meshUrl = mcpHttp.addServer(id, () =>
           createAgentExecMcpServer(mesh, id, rootId, osScheduler, {
+            // Controller operations stay available to the one imported actor,
+            // but the imported identity itself adds no authority. The service
+            // enforces its empty-forest refusal when no such actor exists.
+            ...(id === rootId ? { rootControl } : {}),
             onWrite: () => {
               mesh.markUnkillable(id);
             },
@@ -3400,6 +3567,7 @@ async function composeStart(
             resolveOwner: (raw) =>
               resolveObligationOwner(actors, raw, getRepositories().principals),
             canManage: (callerId, obligation) =>
+              mesh.hasActiveCapability(callerId, OBLIGATIONS_ADMIN_CAPABILITY) ||
               canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
             canSetResponsive: () => mesh.hasActiveCapability(id, OBLIGATION_RESPONSIVE_CAPABILITY),
             recordEvent: (event) => mesh.recordEvent(event),
@@ -3412,7 +3580,13 @@ async function composeStart(
           createMeshChatMcpServer(getRepositories().meshChat, id)
         );
         const pnpmInstallUrl = mcpHttp.addServer(`${id}:${PNPM_INSTALL_MCP_NAME}`, () =>
-          createPnpmInstallMcpServer({ actorRootFor: (actorId) => join(workersDir, actorId) }, id)
+          createPnpmInstallMcpServer(
+            {
+              actorRootFor: (actorId) =>
+                actorId === rootId ? join(mcHome, "root-agent") : join(workersDir, actorId),
+            },
+            id
+          )
         );
         const repoUrl = mcpHttp.addServer(`${id}:${REPO_MCP_NAME}`, () =>
           createRepoMcpServer(id, issueClient, {
@@ -3428,6 +3602,7 @@ async function composeStart(
             },
             onWrite: () => webhookSilenceDetector?.recordOutboundWrite(),
             instanceId: rootHandle,
+            actorHandle: actors.get(id)?.displayHandle ?? generateHandle(id),
             getRunSelection: () => activeRunSelections.get(id),
             // Mechanically add the creator as an exact-resource subscriber for
             // the created issue/PR: follow-up events route here additively
@@ -3466,7 +3641,7 @@ async function composeStart(
         if (chatClient) {
           const chatReadUrl = mcpHttp.addServer(`${id}:${CHAT_READ_MCP_NAME}`, () =>
             createChatReadMcpServer(chatClient, {
-              workDir: join(workersDir, id),
+              workDir: actorWorkdir,
               fileToolsAvailable: () =>
                 actors.get(id)?.executionConfig?.executionTarget === undefined,
             })
@@ -3476,7 +3651,7 @@ async function composeStart(
         if (slackClient) {
           const slackReadUrl = mcpHttp.addServer(`${id}:${SLACK_READ_MCP_NAME}`, () =>
             createSlackReadMcpServer(slackClient, {
-              workDir: join(workersDir, id),
+              workDir: actorWorkdir,
               fileToolsAvailable: () =>
                 actors.get(id)?.executionConfig?.executionTarget === undefined,
             })
@@ -3494,6 +3669,17 @@ async function composeStart(
           { name: PNPM_INSTALL_MCP_NAME, url: pnpmInstallUrl },
         ];
 
+        if (rec.context?.type === "portable" && rec.context.mode === "brief") {
+          const briefUrl = mcpHttp.addServer(`${id}:${BRIEF_MCP_NAME}`, () =>
+            createBriefMcpServer({
+              actorId: id,
+              store: portableContextStore,
+              resolveCitation: resolveBriefCitation,
+            })
+          );
+          workerMcp.push({ name: BRIEF_MCP_NAME, url: briefUrl });
+        }
+
         // Mount any capabilities granted to this actor (by id) on top of the default
         // worker set (ISSUE_NUM, phase 1a). A granted-but-not-mountable capability (none
         // registered) is skipped safely. Parameterized capabilities (e.g. chat-write:spaces/AAAA)
@@ -3506,7 +3692,7 @@ async function composeStart(
         // whole scope (which repos to clone, how many PRs) lives in its charter, and
         // it clones whatever it needs in here itself — so it never touches the live
         // dev trees or collides with other actors.
-        const cwd = join(workersDir, id);
+        const cwd = actorWorkdir;
         mkdirSync(cwd, { recursive: true });
 
         // Workers request managed sandboxed execution by default (#465, #550).
@@ -3518,7 +3704,13 @@ async function composeStart(
         // The flag selects inner sandboxing; container-boundary mode relies on its
         // deployment boundary. The Actor derives the sandbox (rooted at cwd, git+gh);
         // each provider mounts its own auth dir rw (see providerWritableStateDirs).
-        const sandbox = config.sandbox !== "container-boundary";
+        const sandbox = configuredActorSandbox({
+          // E2E's forced sandboxing is only the imported actor's harness
+          // exception. Ordinary workers retain their stored deployment intent.
+          e2eMode: id === rootId && Boolean(opts?.e2e),
+          executionConfig: rec.executionConfig,
+          sandboxMode: config.sandbox,
+        });
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
         let localActor: Actor | undefined;
@@ -3532,8 +3724,15 @@ async function composeStart(
           resolveProvider: (selected) =>
             resolveProvider(config, selected.provider, selected.model, selected.effort),
           mcpServers: workerMcp,
+          // E2E preserves the external-driver transport for the imported actor,
+          // but its durable construction and tool surface stay ordinary.
+          isE2eRoot: id === rootId && Boolean(opts?.e2e),
           isComputerUseAdmitted: computerUseAdmission.isAdmitted,
-          addDirs: [],
+          // Keep the legacy configured workspace available to the imported
+          // record. This is a stored workspace mapping, not a privileged
+          // construction or tool path; every actor otherwise receives its
+          // durable grants through mountGrantedServers above.
+          addDirs: id === rootId ? addDirs : [],
           sandbox,
           prepareUnderstandingMount: understandingMountEnabled
             ? async () => {
@@ -3586,7 +3785,7 @@ async function composeStart(
                 r.charter,
                 {
                   threadId: id,
-                  parentId: r.parentId ?? rootId,
+                  parentId: r.parentId,
                   handles,
                   understandingMountEnabled,
                   gitIdentity: meshGitIdentity,
@@ -3597,6 +3796,36 @@ async function composeStart(
               injectRecord: injection?.injectRecord,
             };
           },
+          // Pool recovery remains a durable actor behavior of the imported
+          // actor, not an alternate authority-bearing construction path.
+          ...(id === rootId
+            ? {
+                classifyExhaustion,
+                onPoolFallback: ({ runId, attempt, failed, next, remainingAfter, skipReason }) => {
+                  runLogger(id, runId).warn("run_pool_fallback", {
+                    attempt,
+                    failed: describeModelConfigEntry(failed),
+                    next: describeModelConfigEntry(next),
+                    remainingAfter,
+                    ...(skipReason ? { skipReason } : {}),
+                  });
+                },
+                recoveryEligibility: (entry: RawProviderModelConfig) => {
+                  if (isProviderHalted(entry.provider, entry.model)) {
+                    return { eligible: false, reason: "halted" as const };
+                  }
+                  const now = Date.now();
+                  const lane = providerThrottleKey(entry.provider, config);
+                  if (candidateReportedExhausted(lane, entry.model, now)) {
+                    return { eligible: false, reason: "exhausted" as const };
+                  }
+                  if (candidatePacerFor(lane, entry.model).quote(now) > now) {
+                    return { eligible: false, reason: "pacing" as const };
+                  }
+                  return { eligible: true };
+                },
+              }
+            : {}),
           // No worker-side fallback : fallbacks are root-only. A worker's
           // quota exhaustion is not something it self-heals out of — it's a
           // signal to the worker's parent, who judges what happens next (see
@@ -3652,13 +3881,49 @@ async function composeStart(
             `actor ${id} requests executionTarget ${JSON.stringify(ctx.executionTarget)} but this runtime has no remote placement support`
           );
         }
+        const externalRoot =
+          id === rootId && opts?.e2e?.rootDriver === "external"
+            ? new ExternalRootDriver(id, undefined, (state) =>
+                mesh.actorRuntimeStateChanged(id, state)
+              )
+            : null;
         const actor = constructActorFromInvocation({
           actorOptions,
-          driver: createWorkerActor ? (options) => createWorkerActor(ctx, options) : undefined,
+          driver: externalRoot
+            ? () => externalRoot
+            : createWorkerActor
+              ? (options) => createWorkerActor(ctx, options)
+              : undefined,
         });
         addRunLifecycleListeners(ctx.lifecycle, id, modelConfigPool[0]);
         if (actor instanceof Actor) localActor = actor;
         liveWorkerMcp.set(id, workerMcp);
+        if (id === rootId) {
+          configuredRootActor = actor;
+          configuredExternalRoot = externalRoot;
+          if (externalRoot) rootControl.recordDriverAttached("e2e-controller");
+          if (externalRoot) {
+            console.log(
+              `[root] driver=external tools=${workerMcp.map((server) => server.name).join(",")}`
+            );
+          } else {
+            const rootContext = actors.get(id)?.context;
+            const sessionDescription =
+              rootContext?.type === "portable"
+                ? `portable/${rootContext.mode} (stateless)`
+                : (actors.get(id)?.sessionId ?? "(new)");
+            console.log(
+              `[root] model_config=${rootModelConfigDescription ?? describeModelConfigPool(modelConfigPool)} (${rootBootModelConfig?.source ?? "durable"}) session=${sessionDescription} tools=${workerMcp.map((server) => server.name).join(",")}`
+            );
+          }
+        }
+        // An empty instance has nobody to receive implied sources at boot.
+        // Initialize that same in-memory layer after successful first creation
+        // so ingress works immediately, without a restart or durable seed rows.
+        if (impliedOwnerId === undefined && defaultGrantRecipient(actors.list())?.id === id) {
+          rootSourceSync.seedImpliedOwner(id);
+          impliedOwnerId = id;
+        }
         return actor;
       } catch (err) {
         teardownActorMcp(id);
@@ -3742,7 +4007,7 @@ async function composeStart(
 
   const rootControl = new RootControlService({
     mesh,
-    rootId: rootId,
+    rootId: importedRoot?.status === "active" ? rootId : undefined,
     providers: Object.keys(config.providers),
     resolveModelConfig: (input) => resolveModelClasses(modelClasses, input),
   });
@@ -3752,6 +4017,9 @@ async function composeStart(
     log: (m) => console.warn(m),
     proberTarget: config.webhook?.proberTarget,
     probe: async (repo, issueNumber) => {
+      if (rootId === undefined || rootHandle === undefined) {
+        throw new Error("no imported actor to sign the webhook-silence probe");
+      }
       const stamp = stampAuthor(rootId, repo, issueNumber, rootHandle);
       await issueClient.postComment(
         repo,
@@ -3829,318 +4097,6 @@ async function composeStart(
       ),
   });
 
-  // ── Root actor ──
-  const rootAgentDir = join(mcHome, "root-agent");
-  mkdirSync(rootAgentDir, { recursive: true });
-  const rootMeshUrl = mcpHttp.addServer(rootId, () =>
-    createAgentExecMcpServer(mesh, rootId, rootId, osScheduler, {
-      rootControl,
-      modelClasses,
-      validateModelClass: (input) => validateModelConfigPool(config, input, { portable: true }),
-      onWrite: () => {
-        mesh.markUnkillable(rootId);
-      },
-      getFollowers: () => (followerHub ? followerHub.list() : []),
-      chatRoom,
-      voices: () => supportedVoiceCatalog,
-    })
-  );
-  const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
-    createInboxMcpServer(inboxStore, rootId, {
-      select: inboxSelectFor(rootId),
-      selected: () => mesh.selectedInboxEntries(rootId),
-      onHandled: () => mesh.inboxHandled(rootId),
-      assertHandleable: (entryIds) => mesh.assertInboxEntriesHandleable(rootId, entryIds),
-      isVoiceSessionActive: () => voiceService?.hasActiveSession(rootId) ?? false,
-      chatContext: inboxChatContextSources(),
-      openQuestions: inboxOpenQuestionSources(),
-    })
-  );
-  const rootMeshChatUrl = mcpHttp.addServer(`${rootId}:${MESH_CHAT_MCP_NAME}`, () =>
-    createMeshChatMcpServer(getRepositories().meshChat, rootId)
-  );
-  const rootObligationsUrl = mcpHttp.addServer(`${rootId}:${OBLIGATIONS_MCP_NAME}`, () =>
-    createObligationsMcpServer(getRepositories().obligations, rootId, {
-      canSetResponsive: () => true,
-      canManage: () => true,
-      resolveOwner: (raw) => resolveObligationOwner(actors, raw, getRepositories().principals),
-      recordEvent: (event) => mesh.recordEvent(event),
-      validateCompletionMatcher,
-      evaluateCompletionMatcher: (obligationId) =>
-        completionMatcherEvaluator.evaluate(obligationId),
-    })
-  );
-  const rootPnpmInstallUrl = mcpHttp.addServer(`${rootId}:${PNPM_INSTALL_MCP_NAME}`, () =>
-    createPnpmInstallMcpServer(
-      {
-        actorRootFor: (actorId) => (actorId === rootId ? rootAgentDir : join(workersDir, actorId)),
-      },
-      rootId
-    )
-  );
-  const rootRepoUrl = mcpHttp.addServer(`${rootId}:${REPO_MCP_NAME}`, () =>
-    createRepoMcpServer(rootId, issueClient, {
-      onWrite: () => webhookSilenceDetector?.recordOutboundWrite(),
-      instanceId: rootHandle,
-    })
-  );
-  const rootTrackerUrl = mcpHttp.addServer(`${rootId}:${TRACKER_MCP_NAME}`, () =>
-    createTrackerMcpServer(rootId, issueClient, {
-      gitBridge: config.gitBridge ? { port: gitBridgePort } : undefined,
-      onWrite: () => webhookSilenceDetector?.recordOutboundWrite(),
-      instanceId: rootHandle,
-      actorHandle: rootHandle,
-      getRunSelection: () => activeRunSelections.get(rootId),
-      // Uniform rule : the root gets mechanical additive subscriptions for what
-      // it creates too.
-      onResourceCreated: (resource) => {
-        mechanicallySubscribeCreatedResource(mesh, configuredRoots, resource, rootId);
-      },
-    })
-  );
-  const rootDashboardTimingUrl = mcpHttp.addServer(`${rootId}:${DASHBOARD_TIMING_MCP_NAME}`, () =>
-    createDashboardTimingMcpServer(dashboardTimings)
-  );
-
-  const cc = chatClient;
-  let allowedSpaces: string[] = [];
-  if (config.chat) {
-    if (config.chat.gchat === "all") {
-      allowedSpaces = ["*"];
-      console.log(`[mesh] root chat capability scoped to all spaces`);
-    } else if (Array.isArray(config.chat.gchat)) {
-      allowedSpaces = config.chat.gchat;
-      console.log(`[mesh] root chat capability scoped to ${allowedSpaces.length} space(s)`);
-    } else if (config.chat.gchat === undefined) {
-      allowedSpaces = ["*"];
-      console.log(`[mesh] root chat capability unrestricted (gchat absent from config)`);
-    }
-  }
-
-  const rootChatUrl =
-    config.chat && cc
-      ? mcpHttp.addServer(`${rootId}:${CHAT_WRITE_MCP_NAME}`, () =>
-          createChatWriteMcpServer(rootId, cc, {
-            allowedSpaces,
-            actorHandle: rootHandle,
-            getRunSelection: () => activeRunSelections.get(rootId),
-            onWrite: (actorId) => {
-              mesh.markUnkillable(actorId);
-            },
-            workDir: rootAgentDir,
-            selectedInboxEntries: () => selectedInboxEntriesForActor(rootId),
-            logger: log,
-          })
-        )
-      : undefined;
-
-  const rootSlackUrl =
-    slackClient && config.slack
-      ? mcpHttp.addServer(`${rootId}:${SLACK_WRITE_MCP_NAME}`, () =>
-          createSlackWriteMcpServer(slackClient, "all", {
-            actorHandle: rootHandle,
-            getRunSelection: () => activeRunSelections.get(rootId),
-            workDir: rootAgentDir,
-            onWrite: () => mesh.markUnkillable(rootId),
-            selectedInboxEntries: () => selectedInboxEntriesForActor(rootId),
-            logger: log,
-          })
-        )
-      : undefined;
-
-  rootMcp.push(
-    ...sharedMcp,
-    { name: TRACKER_MCP_NAME, url: rootTrackerUrl },
-    { name: REPO_MCP_NAME, url: rootRepoUrl },
-    { name: AGENT_EXEC_MCP_NAME, url: rootMeshUrl },
-    { name: INBOX_MCP_NAME, url: rootInboxUrl },
-    { name: OBLIGATIONS_MCP_NAME, url: rootObligationsUrl },
-    { name: MESH_CHAT_MCP_NAME, url: rootMeshChatUrl },
-    { name: PNPM_INSTALL_MCP_NAME, url: rootPnpmInstallUrl },
-    { name: DASHBOARD_TIMING_MCP_NAME, url: rootDashboardTimingUrl }
-  );
-  if (rootChatUrl) {
-    rootMcp.push({ name: CHAT_WRITE_MCP_NAME, url: rootChatUrl });
-  }
-  if (rootSlackUrl) rootMcp.push({ name: SLACK_WRITE_MCP_NAME, url: rootSlackUrl });
-  refreshLiveActorMcp(rootId);
-
-  const externalRoot =
-    opts?.e2e?.rootDriver === "external"
-      ? new ExternalRootDriver(rootId, undefined, (state) =>
-          mesh.actorRuntimeStateChanged(rootId, state)
-        )
-      : null;
-  const rootLifecycle = mesh.lifecycleFor(rootId);
-  addRunLifecycleListeners(rootLifecycle, rootId, rootBootModelConfig.modelConfig[0]);
-  let root: MeshActor;
-  const rootComputerUseAdmission = createComputerUseAdmission(() =>
-    mesh.hasActiveCapability(rootId, COMPUTER_USE_CAPABILITY)
-  );
-  const { sandbox: rootSandboxed, executionConfig: rootExecutionConfig } = rootExecutionIntent({
-    e2eMode: Boolean(opts?.e2e),
-  });
-  const rootActorOptions: ActorOptions = {
-    id: rootId,
-    cwd: rootAgentDir,
-    // Root's declared pool is whatever its record carries: the persisted
-    // ordered pool after a restart, or the configured tuple on first boot
-    // (#333). `set_actor_model` can still move it (#199 amend gaps 1-2),
-    // so resolution reads the live entry rather than freezing the boot-time
-    // pool. An exhausted root invocation then proceeds through the remaining
-    // entries of this same ordered pool.
-    modelConfig: [...rootBootModelConfig.modelConfig],
-    resolveProvider: (selected) =>
-      resolveProvider(config, selected.provider, selected.model, selected.effort),
-    mcpServers: rootMcp,
-    addDirs,
-    sandbox: rootSandboxed,
-    isE2eRoot: Boolean(opts?.e2e),
-    loadSessionId: () =>
-      actors.get(rootId)?.context?.type === "portable"
-        ? undefined
-        : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
-    saveSessionId: (id) => {
-      if (actors.get(rootId)?.context?.type === "portable") return;
-      actors.patch(rootId, { sessionId: id });
-    },
-    buildPrompt: () => {
-      const record = actors.get(rootId);
-      if (!record) return { prompt: "No active root thread record." };
-      const injection = assembleConfiguredPortableInjection(
-        record,
-        portableContextApiKey,
-        portableContextStore,
-        portableJournalModeFor(rootId),
-        (error) => warnDeltaFallback(rootId, error)
-      );
-      return {
-        prompt: buildRootPrompt(
-          rootActor.charter,
-          injection?.priorContext,
-          rootHandle,
-          meshGitIdentity,
-          activeQueuePolicy
-        ),
-        injectRecord: injection?.injectRecord,
-      };
-    },
-    lifecycle: rootLifecycle,
-    classifyExhaustion,
-    onPoolFallback: ({ runId, attempt, failed, next, remainingAfter, skipReason }) => {
-      // A pool is capped at validation time and these fields are configured
-      // tuple labels/counts only: retain a compact diagnostic without placing
-      // provider output (which can echo prompts) in observability logs.
-      runLogger(rootId, runId).warn("run_pool_fallback", {
-        attempt,
-        failed: describeModelConfigEntry(failed),
-        next: describeModelConfigEntry(next),
-        remainingAfter,
-        ...(skipReason ? { skipReason } : {}),
-      });
-    },
-    recoveryEligibility: (entry) => {
-      if (isProviderHalted(entry.provider, entry.model)) {
-        return { eligible: false, reason: "halted" };
-      }
-      const now = Date.now();
-      const lane = providerThrottleKey(entry.provider, config);
-      // #655: name a coordinator-known-empty lane `exhausted` rather than the
-      // `pacing` its deferred pacer would report — the operator can then tell
-      // a known-zero lane from a transiently hot one.
-      if (candidateReportedExhausted(lane, entry.model, now)) {
-        return { eligible: false, reason: "exhausted" };
-      }
-      if (candidatePacerFor(lane, entry.model).quote(now) > now) {
-        return { eligible: false, reason: "pacing" };
-      }
-      return { eligible: true };
-    },
-    // Responsive human wakes bypass normal pacing/concurrency; background root
-    // wakes use the same normal scheduling path as workers.
-    // Root shares the workers' durable-work predicate at both boundaries, so
-    // work handled while its queued run awaits async onQueued is refused at
-    // final admission instead of launching a provider with an empty inbox.
-    beforeRun: (): boolean => mesh.prepareRun(rootId) && mesh.hasRunnableInbox(rootId),
-    admitRun: ({ responsive }): boolean =>
-      mesh.hasRunnableInbox(rootId) &&
-      (responsive || !(voiceService?.hasActiveSession(rootId) ?? false)),
-    isComputerUseAdmitted: rootComputerUseAdmission.isAdmitted,
-    gate: (fn, candidates, responsive) =>
-      computerUseLock.gateAfterProvider(
-        rootId,
-        responsive,
-        (start) => mesh.gateRun(start, candidates, responsive, rootId),
-        fn,
-        rootComputerUseAdmission.shouldLock,
-        () => root.preemptForResponsive?.(),
-        () => root.requestRun?.()
-      ),
-    onQueuedRunCancelled: () => mesh.clearSelection(rootId),
-    onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
-    onProviderAttempt: (attempt) => {
-      activeRunSelections.set(rootId, {
-        provider: attempt.providerName,
-        model: attempt.model,
-        effort: attempt.effort,
-      });
-    },
-    onFirstChunk: () =>
-      mesh.recordEvent({
-        kind: "run_first_chunk",
-        actorId: rootId,
-      }),
-    onCoalesceAborted: (count, ageMs) => {
-      mesh.recordEvent({
-        kind: "run_coalesced",
-        actorId: rootId,
-        detail: `count=${count} age=${ageMs}ms`,
-      });
-    },
-    log: makeFirehose(rootId), // firehose → dashboard SSE / `rusa logs --actor`
-  };
-  root = constructActorFromInvocation({
-    actorOptions: rootActorOptions,
-    driver: externalRoot ? () => externalRoot : undefined,
-  });
-  const rootRecord: ActorRecord = {
-    id: rootId,
-    charter: rootActor.charter ?? DEFAULT_ROOT_CHARTER,
-    parentId: null,
-    executionConfig: rootExecutionConfig,
-    // Persisted pool preserved verbatim (validated, same order), or the
-    // configured tuple seeding a record that had none. Adoption merges onto
-    // the existing row, which is what keeps a persisted pool's `modelClass`.
-    modelConfig: rootBootModelConfig.modelConfig,
-    context: rootActor.context,
-    sessionId:
-      rootActor.context?.type === "portable"
-        ? undefined
-        : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
-    status: "active",
-    createdAt: actors.get(rootId)?.createdAt ?? new Date().toISOString(),
-  };
-  mesh.adopt(rootRecord, root);
-  // ── Compatibility seeding (#549) ── The configured actor's former implicit
-  // authority becomes explicit grant rows, seeded ONCE per (actor, capability):
-  // a pair with any existing row — active or revoked — is left alone, so a
-  // revocation survives restarts and topology never re-derives authority. This
-  // is the single remaining place the configured id feeds authority, and it
-  // runs after adoption because grants are keyed on the actor row. Only the
-  // host-maintenance servers this boot actually built are seeded (a host
-  // without a resolvable deploy checkout has no `update` server); a later boot
-  // that can mount one seeds that pair then.
-  const seededGrants = seedConfiguredActorGrants(
-    capabilityGrants,
-    rootId,
-    undefined,
-    bootstrapCapabilitiesFor(new Set(grantableServers.keys()))
-  );
-  if (seededGrants.length > 0) {
-    log.info("bootstrap_capabilities_seeded", { actorId: rootId, capabilities: seededGrants });
-    refreshLiveActorMcp(rootId);
-  }
-  if (legacyActorImport.deferredRootSessionId) finishDeferredRootSessionImport(mcHome);
   // A lifted halt can reopen a lane that unclaimed work is waiting on, and
   // replaying nothing would otherwise leave the admission list unscanned.
   const resumeAfterHalt = (): string[] => {
@@ -4181,27 +4137,18 @@ async function composeStart(
     );
     haltExpiryTimer.unref?.();
   };
-  if (externalRoot) {
-    rootControl.recordDriverAttached("e2e-controller");
-    console.log(`[root] driver=external tools=${rootMcp.map((u) => u.name).join(",")}`);
-  } else {
-    const rootContext = rootActor.context;
-    const sessionDescription =
-      rootContext?.type === "portable"
-        ? `portable/${rootContext.mode} (stateless)`
-        : (actors.get(rootId)?.sessionId ?? "(new)");
-    console.log(
-      `[root] model_config=${rootModelConfigDescription} (${rootBootModelConfig.source}) session=${sessionDescription} tools=${rootMcp.map((u) => u.name).join(",")}`
-    );
-  }
 
-  // Restore live actors from records the actor repository persisted across the last
-  // restart. Must run after the root is adopted (so a worker's parent is live
-  // before the worker). Retired threads stay dead; rehydration never wakes an
-  // actor by itself. Message-trigger reconciliation runs immediately after
-  // rehydration, replaying any `send_message` trigger claimed by a run that
-  // never completed (drain or hard kill). Cron wakes and GitHub events remain
-  // outside this path by design.
+  // Rehydrate every active record through the ordinary durable constructor.
+  // Import identity does not select an authority-bearing tool surface or an
+  // alternate construction path (#1003).
+  let configuredRootActor: MeshActor | undefined;
+  let configuredExternalRoot: ExternalRootDriver | null = null;
+
+  // Restore persisted active actors. Retired threads stay dead; rehydration
+  // never wakes an actor by itself. Message-trigger reconciliation runs
+  // immediately after it, replaying any `send_message` trigger claimed by a
+  // run that never completed (drain or hard kill). Cron wakes and GitHub
+  // events remain outside this path by design.
   mesh.rehydrateAll();
   mesh.reconcilePendingDeliveries();
   mesh.reconcileInbox();
@@ -4474,8 +4421,10 @@ async function composeStart(
           meshChat: getRepositories().meshChat,
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,
+          resolveActorId: (id) => (id === "root" ? (rootId ?? id) : id),
           actorRuns: getRepositories().actorRuns,
           runPrompts: getRepositories().runPrompts,
+          portableContext: getRepositories().portableContext,
           inboxFocus: getRepositories().inboxFocus,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,
@@ -4538,10 +4487,12 @@ async function composeStart(
             return entries.length > 0 ? entries : null;
           },
           rootControl,
-          // The configured root identity  — display handle + avatar
-          // override — so the dashboard shows this instance's own identity
-          // instead of the default root-actor.
-          rootIdentity: { id: rootId, handle: rootHandle, avatarPath: rootActor.avatar },
+          operatorActors: new OperatorActorControl(mesh, capabilityGrants),
+          // The configured actor's identity, so the dashboard shows this
+          // instance's own handle instead of the default root-actor. Both the
+          // handle and the image (cached under `avatars/root.png`) are the
+          // actor's own since its import; `rootActor` is no longer read.
+          rootIdentity: { id: rootId, handle: rootHandle },
           // On-demand avatar generation  reuses the same key the
           // walkie-talkie transcription/TTS calls above already gate on.
           geminiApiKey,
@@ -5216,7 +5167,8 @@ async function composeStart(
   // before this append; if this process dies between them, the next boot retries
   // the same deterministic inbox id before adding its own distinct wake. A
   // corrupt evidence file is retained and produces its own unknown-evidence wake.
-  if (shouldAppendServiceBootWake({ e2eMode })) {
+  // An empty store has no actor to wake (#1003).
+  if (rootId !== undefined && shouldAppendServiceBootWake({ e2eMode })) {
     try {
       appendServiceBootWakes({
         lifecycle: serviceLifecycleStore,
@@ -5257,9 +5209,9 @@ async function composeStart(
     coordinatorPacerQuote: (provider) => pacerFor(provider).quote(),
     triggerQuotaThrottleTick: tickQuotaThrottle,
     getThrottle: (provider) => quotaThrottleStatuses.get(provider as QuotaThrottleProvider) ?? null,
-    root,
+    root: configuredRootActor,
     rootControl,
-    externalRoot,
+    externalRoot: configuredExternalRoot,
     inboxStore,
     emitGitHubEvent: onEvent,
     emitSystemDiskCheck: () => diskAlert?.check() ?? Promise.resolve(),

@@ -5,6 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ActorMesh } from "../actor/actor-mesh.js";
+import type { OperatorActorControl } from "../actor/operator-actor-control.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { AvatarGenerationCoordinator } from "../avatar/avatars.js";
 import type { DashboardAuthConfig, DashboardConfig } from "../config/types.js";
@@ -149,9 +150,11 @@ export interface DashboardMeshRefs {
   obligations?: ObligationRepository;
   /** Durable actor inbox, exposed read-only through the dashboard data API. */
   inbox?: InboxRepository;
+  resolveActorId?: DashboardDataDeps["resolveActorId"];
   /** Completed selection intervals used to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
   runPrompts?: RunPromptRepository;
+  portableContext?: DashboardDataDeps["portableContext"];
   /** Durable per-entry obligation associations for activity correlation. */
   inboxFocus?: InboxFocusRepository;
   emitter: MeshEventEmitter;
@@ -159,6 +162,8 @@ export interface DashboardMeshRefs {
   mesh?: ActorMesh;
   /** Root-authorized commands for dashboard operator actions. */
   rootControl?: RootControlService;
+  /** The authenticated operator's actor-forest boundary (#1003). */
+  operatorActors?: OperatorActorControl;
   /** Read-only emergency-brake state (HALT sentinel) → top-level `halted` flag. */
   isHalted?: () => boolean;
   /** Same sentinel's structured scope/expiry → top-level `halt`; see `DashboardDataDeps`. */
@@ -659,12 +664,15 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           meshChat: options.mesh.meshChat,
           obligations: options.mesh.obligations,
           inbox: options.mesh.inbox,
+          resolveActorId: options.mesh.resolveActorId,
           actorRuns: options.mesh.actorRuns,
           runPrompts: options.mesh.runPrompts,
+          portableContext: options.mesh.portableContext,
           inboxFocus: options.mesh.inboxFocus,
           sseHub,
           mesh: options.mesh.mesh,
           rootControl: options.mesh.rootControl,
+          operatorActors: options.mesh.operatorActors,
           isHalted: options.mesh.isHalted,
           haltSnapshot: options.mesh.haltSnapshot,
           schedulerHealth: options.mesh.schedulerHealth,

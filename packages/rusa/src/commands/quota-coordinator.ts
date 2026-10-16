@@ -346,6 +346,7 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
       config,
       workersDir: join(mcHome, "workers"),
       scrapeStore: store,
+      logger: log,
     });
     const collection = probeOff
       ? undefined

@@ -5,6 +5,7 @@ import {
   type ProviderModelConfig,
 } from "../providers/model-config.js";
 import type { ActorHandle, ActorRecord, ContextConfig } from "./actor-record.js";
+import { defaultGrantRecipient } from "./administrative-capabilities.js";
 
 /**
  * UUID string format representing a durable user principal ID.
@@ -30,7 +31,7 @@ export interface RootControlMesh {
   spawn(request: {
     executionTarget?: string;
     charter: string;
-    parentId: string;
+    parentId: string | null;
     modelConfig: ModelConfigInput;
     context?: ContextConfig;
     conversationId?: string;
@@ -51,7 +52,6 @@ export interface RootControlMesh {
   retire(id: string, opts?: { force?: boolean; forceQueued?: boolean }): void;
   interrupt(id: string, by: string): { interrupted: boolean; status?: string };
   runNow(id: string, source?: string): { queued: boolean };
-  reparentThread(id: string, newParentId: string): void;
   recordEvent(event: {
     kind: "root_control_action";
     actorId: string;
@@ -79,15 +79,20 @@ export interface RootControlOptions {
  * provenance rather than masquerading as the logical actor.
  */
 export class RootControlService {
-  readonly rootId: string;
+  get rootId(): string | undefined {
+    return this.options.rootId ?? defaultGrantRecipient(this.options.mesh.list())?.id;
+  }
   readonly providers: string[];
 
   constructor(private readonly options: RootControlOptions) {
-    this.rootId = options.rootId ?? "root";
     this.providers = [...new Set(options.providers ?? [])].sort();
   }
 
   spawnChild(request: RootChildRequest, principal: RootControlPrincipal): string {
+    const rootId = this.rootId;
+    if (rootId === undefined && principal === "root-llm") {
+      throw new Error("only an authenticated operator may create a top-level actor");
+    }
     const charter = request.charter?.trim();
     if (!charter) throw new Error("charter is required");
     // Resolve named model classes first: the provider allowlist below, the
@@ -122,7 +127,7 @@ export class RootControlService {
         ? { executionTarget: request.executionTarget }
         : {}),
       charter,
-      parentId: this.rootId,
+      parentId: rootId ?? null,
       // Keep the original declaration for mesh.spawn. Root control uses the
       // resolved snapshot above only for its provider allowlist; mesh is the
       // authoritative resolution/validation boundary and derives provenance
@@ -132,10 +137,16 @@ export class RootControlService {
       conversationId: optionalTrimmed(request.conversationId),
       title: optionalTrimmed(request.title),
     });
-    this.record(principal, "spawn_child", id, {
-      modelConfig: pool,
-      context: normalizeContext(request.context),
-    });
+    this.record(
+      principal,
+      "spawn_child",
+      id,
+      {
+        modelConfig: pool,
+        context: normalizeContext(request.context),
+      },
+      rootId ?? id
+    );
     return id;
   }
 
@@ -146,9 +157,10 @@ export class RootControlService {
     deliverAt?: string,
     sessionId?: string
   ): void {
+    const rootId = this.requireRootId();
     const text = body.trim();
     if (!text) throw new Error("message body is required");
-    const result = this.options.mesh.sendMessage(toId, text, this.rootId, sessionId, deliverAt);
+    const result = this.options.mesh.sendMessage(toId, text, rootId, sessionId, deliverAt);
     if (!result.delivered) {
       if (!result.status) {
         throw new Error(`unknown thread id: ${toId}`);
@@ -159,6 +171,7 @@ export class RootControlService {
   }
 
   grantHandle(holderId: string, handle: ActorHandle, principal: RootControlPrincipal): void {
+    this.requireRootId();
     this.options.mesh.grantHandle(holderId, handle);
     this.record(principal, "grant_handle", handle.id, { holderId });
   }
@@ -177,7 +190,8 @@ export class RootControlService {
     principal: RootControlPrincipal,
     opts: { force?: boolean; forceQueued?: boolean } = {}
   ): void {
-    if (id === this.rootId || !this.options.mesh.isAncestorOf(this.rootId, id)) {
+    const rootId = this.requireRootId();
+    if (id === rootId || !this.options.mesh.isAncestorOf(rootId, id)) {
       throw new Error("root control may only retire root descendants");
     }
     this.options.mesh.retire(id, { force: opts.force, forceQueued: opts.forceQueued });
@@ -193,7 +207,8 @@ export class RootControlService {
     id: string,
     principal: RootControlPrincipal
   ): { interrupted: boolean; status?: string } {
-    if (id !== this.rootId && !this.options.mesh.isAncestorOf(this.rootId, id)) {
+    const rootId = this.requireRootId();
+    if (id !== rootId && !this.options.mesh.isAncestorOf(rootId, id)) {
       throw new Error("root control may only interrupt root descendants");
     }
     const result = this.options.mesh.interrupt(id, principal);
@@ -202,7 +217,8 @@ export class RootControlService {
   }
 
   runNowChild(id: string, principal: RootControlPrincipal): { queued: boolean } {
-    if (id !== this.rootId && !this.options.mesh.isAncestorOf(this.rootId, id)) {
+    const rootId = this.requireRootId();
+    if (id !== rootId && !this.options.mesh.isAncestorOf(rootId, id)) {
       throw new Error("root control may only run root descendants");
     }
     const result = this.options.mesh.runNow(id, principal);
@@ -210,44 +226,33 @@ export class RootControlService {
     return result;
   }
 
-  /**
-   * Reorganize one live branch with the root's authority. The mesh remains the
-   * validation authority for root/self/cycle and active-parent guards; root
-   * control narrows the transport to its own hierarchy and records the human
-   * principal exactly like its other dashboard actions.
-   */
-  reparentChild(id: string, newParentId: string, principal: RootControlPrincipal): void {
-    if (
-      id === this.rootId ||
-      !this.options.mesh.isAncestorOf(this.rootId, id) ||
-      (newParentId !== this.rootId && !this.options.mesh.isAncestorOf(this.rootId, newParentId))
-    ) {
-      throw new Error("root control may only reparent root descendants");
-    }
-    this.options.mesh.reparentThread(id, newParentId);
-    this.record(principal, "reparent_child", id, { newParentId });
-  }
-
   listChildren(): ActorRecord[] {
-    return this.options.mesh.list().filter((record) => record.parentId === this.rootId);
+    const rootId = this.requireRootId();
+    return this.options.mesh.list().filter((record) => record.parentId === rootId);
   }
 
   recordDriverAttached(principal: RootControlPrincipal): void {
-    this.record(principal, "attach_driver", this.rootId);
+    this.record(principal, "attach_driver", this.requireRootId());
   }
 
   private record(
     principal: RootControlPrincipal,
     action: string,
     targetId: string,
-    metadata: Record<string, unknown> = {}
+    metadata: Record<string, unknown> = {},
+    actorId: string = this.requireRootId()
   ): void {
     this.options.mesh.recordEvent({
       kind: "root_control_action",
-      actorId: this.rootId,
+      actorId,
       detail: `${principal} ${action}`,
       payload: JSON.stringify({ principal, action, targetId, ...metadata }),
     });
+  }
+
+  private requireRootId(): string {
+    if (this.rootId) return this.rootId;
+    throw new Error("root control is unavailable until an operator creates an actor");
   }
 }
 

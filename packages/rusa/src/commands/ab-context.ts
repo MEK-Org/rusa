@@ -684,10 +684,12 @@ async function runProviderContextABBody(
   });
   const handles = await ready;
   const { mesh } = handles;
+  const rootId = handles.rootControl.rootId;
+  if (!rootId) throw new Error("ab-context requires an imported root actor");
 
   // Adopt the rig's own holder BEFORE spawning the arms — see RIG_HOLDER_ID for why the
   // arms must not be root's DIRECT children (an issue).
-  adoptRigHolder(mesh, handles.rootControl.rootId);
+  adoptRigHolder(mesh, rootId);
 
   const chosenProvider = opts.provider?.trim();
   if (!chosenProvider) {
