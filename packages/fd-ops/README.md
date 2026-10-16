@@ -27,3 +27,40 @@ A failed build does not fail `pnpm install`. Instead `loadFdOps()` throws
 pathname fallback. This package's own tests fail when the addon is missing, so
 CI catches a broken build, and the Docker image build fails unless the addon
 loads.
+
+## Consumer boundary
+
+This package has no production consumer yet. Slice 1 of #1013 will port
+`packages/rusa/src/mcp/workdir-path.ts`; it must not be described as already
+using this addon.
+
+The current `workdir-path.ts` boundaries show where the later port must make
+its decisions:
+
+- `openat` replaces the `/proc/self/fd/<fd>/<name>` opens in
+  `openParentInWorkdir`, `openInWorkdir`, and the exclusive destination open in
+  `streamNewFileInWorkdir`. It always adds `O_NONBLOCK`, so a planted FIFO
+  cannot stall the JS thread even if a caller forgets that flag.
+- `fstatat` is retained by the accepted #1013 helper contract for a no-follow
+  name check and name-to-held-descriptor `dev`/`ino` revalidation. Its `mode`
+  may classify the named entry, but it must not replace `fstat` on the opened
+  descriptor when deciding whether the bytes are a regular file.
+- `unlinkat` is the descriptor-relative counterpart for the current
+  `unlinkIfSame` cleanup. `linkat` has no current call site: the eventual
+  Slice-1 design may use it only if it adds a verified temp-to-final,
+  no-overwrite publish step. That design is not part of this helper PR.
+
+The primitive calls are synchronous by design: each is one bounded
+descriptor-relative syscall that either returns a descriptor or fails. The
+later consumer keeps file reads, writes, and network transfers asynchronous;
+adding a speculative Node-API async wrapper here would add callback and
+descriptor-lifetime machinery without making the follow-up transfer I/O safer.
+`O_NONBLOCK` makes an adversarial FIFO fail the later regular-file check rather
+than stalling the JS thread during that single open.
+
+If `loadFdOps()` fails, Slice 1 must keep refusal fail-closed and surface
+`ERR_FD_OPS_UNAVAILABLE` through its operator-visible file-capability/status
+path. The integration test for that signal, and the real moved-parent,
+replacement, and symlink-swap containment cases, belong at the later
+`workdir-path.ts` seam. The tests here establish only the native primitive
+contract; they are not a substitute for that end-to-end proof.

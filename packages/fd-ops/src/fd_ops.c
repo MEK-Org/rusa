@@ -8,6 +8,7 @@
 // returned descriptors are plain integers, usable with Node's fd-based fs calls.
 #define NAPI_VERSION 8
 #include <node_api.h>
+#include <uv.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -22,46 +23,19 @@
 #define O_NOFOLLOW_ANY 0
 #endif
 
-static const char *errno_code(int err) {
-  switch (err) {
-  case EACCES: return "EACCES";
-  case EAGAIN: return "EAGAIN";
-  case EBADF: return "EBADF";
-  case EBUSY: return "EBUSY";
-  case EEXIST: return "EEXIST";
-  case EINTR: return "EINTR";
-  case EINVAL: return "EINVAL";
-  case EIO: return "EIO";
-  case EISDIR: return "EISDIR";
-  case ELOOP: return "ELOOP";
-  case EMFILE: return "EMFILE";
-  case EMLINK: return "EMLINK";
-  case ENAMETOOLONG: return "ENAMETOOLONG";
-  case ENFILE: return "ENFILE";
-  case ENOENT: return "ENOENT";
-  case ENOSPC: return "ENOSPC";
-  case ENOTDIR: return "ENOTDIR";
-  case ENXIO: return "ENXIO";
-  case EOPNOTSUPP: return "EOPNOTSUPP";
-  case EPERM: return "EPERM";
-  case EROFS: return "EROFS";
-  case ETXTBSY: return "ETXTBSY";
-  case EXDEV: return "EXDEV";
-  default: return "UNKNOWN";
-  }
-}
-
 // Throw an Error shaped like Node's own fs errors: "<CODE>: <text>, <syscall>"
 // with code, errno (negative, as libuv reports it) and syscall properties.
 static void throw_errno(napi_env env, int err, const char *syscall) {
-  const char *code = errno_code(err);
+  int uv_err = uv_translate_sys_error(err);
+  const char *code = uv_err_name(uv_err);
+  if (code == NULL) code = "UNKNOWN";
   char message[256];
   snprintf(message, sizeof message, "%s: %s, %s", code, strerror(err), syscall);
   napi_value msg, code_value, error, errno_value, syscall_value;
   napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &msg);
   napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &code_value);
   napi_create_error(env, code_value, msg, &error);
-  napi_create_int32(env, -err, &errno_value);
+  napi_create_int32(env, uv_err, &errno_value);
   napi_set_named_property(env, error, "errno", errno_value);
   napi_create_string_utf8(env, syscall, NAPI_AUTO_LENGTH, &syscall_value);
   napi_set_named_property(env, error, "syscall", syscall_value);
@@ -128,12 +102,12 @@ static void get_args(napi_env env, napi_callback_info info, size_t want, napi_va
   for (size_t i = argc; i < want; i++) napi_get_undefined(env, &argv[i]);
 }
 
-// openat(dirfd, name, flags, mode = 0) -> fd. O_NOFOLLOW (and O_NOFOLLOW_ANY
-// where the platform has it) and O_CLOEXEC are always added.
+// openat(dirfd, name, flags, mode = 0666) -> fd. O_NOFOLLOW (and O_NOFOLLOW_ANY
+// where the platform has it), O_CLOEXEC, and O_NONBLOCK are always added.
 static napi_value fd_openat(napi_env env, napi_callback_info info) {
   napi_value argv[4];
   get_args(env, info, 4, argv);
-  int32_t dirfd, flags, mode = 0;
+  int32_t dirfd, flags, mode = 0666;
   if (!get_fd(env, argv[0], "dirfd", &dirfd) ||
       !get_int(env, argv[2], "flags", INT32_MIN, &flags)) {
     return NULL;
@@ -143,7 +117,9 @@ static napi_value fd_openat(napi_env env, napi_callback_info info) {
   if (mode_type != napi_undefined && !get_int(env, argv[3], "mode", 0, &mode)) return NULL;
   char *name = get_component(env, argv[1]);
   if (name == NULL) return NULL;
-  int fd = openat(dirfd, name, flags | O_NOFOLLOW | O_NOFOLLOW_ANY | O_CLOEXEC, (mode_t)mode);
+  int fd = openat(dirfd, name,
+                  flags | O_NOFOLLOW | O_NOFOLLOW_ANY | O_CLOEXEC | O_NONBLOCK,
+                  (mode_t)mode);
   int err = errno;
   free(name);
   if (fd < 0) {

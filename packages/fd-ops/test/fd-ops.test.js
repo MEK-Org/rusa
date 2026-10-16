@@ -105,6 +105,23 @@ describe("@rusa/fd-ops", () => {
     assert.equal(readAll(handle), "hello");
   });
 
+  test("openat defaults an omitted create mode to Node's 0o666", () => {
+    const dir = scratch("default-mode");
+    const previousUmask = process.umask(0);
+    try {
+      const handle = track(
+        fd.openat(
+          openDir(dir),
+          "created",
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL
+        )
+      );
+      assert.equal(fstatSync(handle).mode & 0o777, 0o666);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
   test("refuses anything but a single downward path component, before any syscall", () => {
     const dir = openDir(scratch("names"));
     for (const name of ["", ".", "..", "a/b", "/etc", "a\0b"]) {
@@ -314,8 +331,25 @@ describe("@rusa/fd-ops", () => {
     assert.equal(readFileSync(join(outside, "keep"), "utf8"), "kept");
   });
 
-  test("a FIFO opens non-blocking and reports as non-regular", () => {
+  test("openat forces a FIFO non-blocking in a bounded child", () => {
     const dir = scratch("fifo");
+    execFileSync("mkfifo", [join(dir, "pipe")]);
+    const script = [
+      'import { closeSync, constants, openSync } from "node:fs";',
+      `import { loadFdOps } from ${JSON.stringify(new URL("../index.js", import.meta.url).href)};`,
+      `const held = openSync(${JSON.stringify(dir)}, constants.O_RDONLY | constants.O_DIRECTORY);`,
+      'const handle = loadFdOps().openat(held, "pipe", constants.O_RDONLY);',
+      "closeSync(handle); closeSync(held);",
+    ].join(" ");
+    const output = execFileSync(process.execPath, ["--input-type=module", "--eval", script], {
+      encoding: "utf8",
+      timeout: 1_000,
+    });
+    assert.equal(output, "");
+  });
+
+  test("a non-blocking FIFO is still reported as non-regular", () => {
+    const dir = scratch("fifo-type");
     execFileSync("mkfifo", [join(dir, "pipe")]);
     const handle = track(
       fd.openat(openDir(dir), "pipe", constants.O_RDONLY | constants.O_NONBLOCK)
@@ -336,6 +370,16 @@ describe("@rusa/fd-ops", () => {
     assert.equal(error.syscall, "openat");
     assert.equal(error.errno, -osConstants.errno.ENOENT);
     assert.match(error.message, /^ENOENT: .*, openat$/);
+  });
+
+  test("uses Node's libuv mapping for native errno names", () => {
+    const source = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../src/fd_ops.c"),
+      "utf8"
+    );
+    assert.match(source, /#include <uv\.h>/);
+    assert.match(source, /uv_translate_sys_error\(err\)/);
+    assert.match(source, /uv_err_name\(uv_err\)/);
   });
 
   test("descriptors are close-on-exec", { skip: process.platform !== "linux" }, () => {

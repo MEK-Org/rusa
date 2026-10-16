@@ -13,7 +13,10 @@ export interface FdStat {
  * the syscall carry Node-style `code`, `errno` and `syscall` properties.
  */
 export interface FdOps {
-  /** `openat` with `O_NOFOLLOW`, `O_CLOEXEC` and, on macOS, `O_NOFOLLOW_ANY` added. */
+  /**
+   * `openat` with `O_NOFOLLOW`, `O_CLOEXEC`, `O_NONBLOCK` and, on macOS,
+   * `O_NOFOLLOW_ANY` added. An omitted create mode is `0o666` before umask.
+   */
   openat(dirfd: number, name: string, flags: number, mode?: number): number;
   /** `fstatat` with `AT_SYMLINK_NOFOLLOW`. */
   fstatat(dirfd: number, name: string): FdStat;
