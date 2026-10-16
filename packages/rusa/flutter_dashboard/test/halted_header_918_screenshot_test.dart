@@ -1,8 +1,10 @@
 // Screenshot harness for #918's header HALTED indicator. The header widget is
 // unchanged; what changes is the `halted` flag `/api/mesh/threads` reports.
-// After `/halt provider:codex model:m1` then a bare `/resume`, staging has
-// deleted its HALT file and reports false, while #918 keeps the hold in force
-// and reports true (start.test.ts asserts the server side). Run:
+// After a bare chat `/resume`, staging has deleted its HALT file and nothing
+// else can hold a lane, so it reports false. Here a mesh-origin hold set with
+// `set_availability_hold` stays in force through that `/resume`, so #918
+// reports true (start.test.ts's origin test asserts the server side). Chat
+// `/halt` holds are released by the same `/resume` and report false. Run:
 //
 //   flutter test test/halted_header_918_screenshot_test.dart
 //

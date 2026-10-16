@@ -480,6 +480,12 @@ describe("haltIndicator", () => {
       holds: [hold("codex", "gpt-5.5"), hold("openrouter", "gpt-5.5-mini")],
       snapshot: null,
     },
+    {
+      name: "distinct lanes whose provider and model names join alike",
+      brake: null,
+      holds: [hold("kimi", "xm"), hold("kimix", "m"), hold("kimixm")],
+      snapshot: null,
+    },
   ])("reports $name exactly or not at all", ({ brake, holds, snapshot }) => {
     const indicator = haltIndicator({ state: () => brake }, () => holds);
 

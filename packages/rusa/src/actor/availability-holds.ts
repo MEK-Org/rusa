@@ -201,10 +201,11 @@ export function haltIndicator(
 
 function holdsAsHaltState(holds: AvailabilityHold[]): HaltState | null {
   // Chat and the mesh may hold one scope in two rows; the lane is a single
-  // entry, bound by the latest expiry any origin set on it.
+  // entry, bound by the latest expiry any origin set on it. The key keeps the
+  // provider/model boundary, so `kimi`/`xm` and `kimix`/`m` stay two lanes.
   const lanes = new Map<string, AvailabilityHold>();
   for (const hold of holds) {
-    const key = `${hold.provider}${hold.model ?? ""}`;
+    const key = JSON.stringify([hold.provider, hold.model ?? null]);
     const existing = lanes.get(key);
     if (!existing || expiryRank(hold.expiry) > expiryRank(existing.expiry)) lanes.set(key, hold);
   }
