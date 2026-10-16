@@ -156,11 +156,16 @@ export const HALT_SYNTAX_HELP =
 
 /** The `/resume` forms, quoted back when one fails to parse. */
 export const RESUME_SYNTAX_HELP =
-  "Valid syntax: `/resume` (release the global halt; holds stay in force)," +
-  " `/resume provider:<p>[,<p2>]` (every hold on those providers)," +
-  " `/resume provider:<p> model:<m>[,<m2>]` (only those model holds).";
+  "Valid syntax: `/resume` (release the global halt and every hold placed from chat)," +
+  " `/resume provider:<p>[,<p2>]` (every chat hold on those providers)," +
+  " `/resume provider:<p> model:<m>[,<m2>]` (only those chat model holds)." +
+  " Mesh-instituted holds stay in force; clear them from the dashboard or the hold tools.";
 
-/** A parsed `/resume`: no scope releases only the global halt. */
+/**
+ * A parsed `/resume`. No scope releases the global halt and every chat-origin
+ * hold; a scope releases only matching chat-origin holds. Mesh-origin holds
+ * survive both (#918 comment 6204340124).
+ */
 export interface ResumeCommand {
   providers?: string[];
   models?: string[];

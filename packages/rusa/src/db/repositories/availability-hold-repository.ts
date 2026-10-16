@@ -169,13 +169,16 @@ export class AvailabilityHoldRepository {
   }
 
   /**
-   * Stored holds ordered by provider, then provider-wide before model rows.
-   * Pass `now` to see only holds still active at that instant.
+   * Stored holds ordered by provider, then provider-wide before model rows,
+   * then chat before mesh. Pass `now` to see only holds still active at that
+   * instant; as in {@link isHeld}, expired rows are then skipped unparsed.
    */
   list(options: { now?: number } = {}): AvailabilityHold[] {
-    const holds = this.selectAll().map(toHold).sort(compareHolds);
     const { now } = options;
-    return now === undefined ? holds : holds.filter((hold) => isActive(hold, now));
+    const rows = this.selectAll();
+    const kept =
+      now === undefined ? rows : rows.filter((row) => isActiveAt(row.expiry ?? undefined, now));
+    return kept.map(toHold).sort(compareHolds);
   }
 
   /**
@@ -208,14 +211,13 @@ export class AvailabilityHoldRepository {
 
 function compareHolds(a: AvailabilityHold, b: AvailabilityHold): number {
   if (a.provider !== b.provider) return a.provider < b.provider ? -1 : 1;
-  if (a.model === b.model) return 0;
-  if (a.model === undefined) return -1;
-  if (b.model === undefined) return 1;
-  return a.model < b.model ? -1 : 1;
-}
-
-function isActive(hold: AvailabilityHold, now: number): boolean {
-  return isActiveAt(hold.expiry, now);
+  if (a.model !== b.model) {
+    if (a.model === undefined) return -1;
+    if (b.model === undefined) return 1;
+    return a.model < b.model ? -1 : 1;
+  }
+  if (a.origin === b.origin) return 0;
+  return a.origin < b.origin ? -1 : 1;
 }
 
 function isActiveAt(expiry: string | undefined, now: number): boolean {

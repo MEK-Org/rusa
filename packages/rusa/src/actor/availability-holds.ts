@@ -223,7 +223,9 @@ function holdsAsHaltState(holds: AvailabilityHold[]): HaltState | null {
       : distinct.every((hold) => hold.model) &&
         distinct.length === providers.length * models.length;
   if (!product) return null;
-  const reason = distinct.every((hold) => hold.reason === first.reason) ? first.reason : "";
+  // Every active row counts toward the shared reason, not just the row that
+  // binds its lane, so two origins on one lane that disagree show none.
+  const reason = holds.every((hold) => hold.reason === first.reason) ? first.reason : "";
   return {
     ...(reason ? { reason } : {}),
     providers,

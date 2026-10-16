@@ -5086,9 +5086,16 @@ async function composeStart(
           ];
           if (expired > 0) lines.push(`Also removed ${expired} expired hold record(s).`);
           if (remaining.length) {
-            lines.push(
-              `Still held:\n${holdLines(remaining)}\n(Mesh-instituted holds stay in force until cleared from the dashboard or the hold tools.)`
+            const still = remaining.map(
+              (hold) =>
+                `• ${describeHold(hold)}${hold.origin === "mesh" ? " (mesh-instituted)" : ""}`
             );
+            lines.push(`Still held:\n${still.join("\n")}`);
+            if (remaining.some((hold) => hold.origin === "mesh")) {
+              lines.push(
+                "Mesh-instituted holds stay in force until cleared from the dashboard or the hold tools."
+              );
+            }
           }
           if (haltSwitch.hasActiveHalt()) {
             lines.push("The global halt is still in place; bare /resume releases it.");

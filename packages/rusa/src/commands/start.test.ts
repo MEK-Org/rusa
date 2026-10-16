@@ -4558,7 +4558,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       "Released availability holds:\n• codex (all models), until cleared — chat /halt from Operator\n"
     );
     expect(lastReply()).toContain(
-      "Still held:\n• codex (all models), until cleared — mesh codex\n(Mesh-instituted holds stay in force"
+      "Still held:\n• codex (all models), until cleared — mesh codex (mesh-instituted)\n" +
+        "Mesh-instituted holds stay in force"
     );
     expect(rows()).toEqual([
       "antigravity:*:chat",
@@ -4598,6 +4599,17 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(lastReply()).toContain("No availability hold in force matched");
     expect(held("antigravity")).toBe(true);
 
+    // A scoped /resume marks which remaining holds the mesh instituted, and
+    // points at the dashboard only when one of them did.
+    await message("/halt provider:claude", "messages/origin-halt-claude-again");
+    await message("/resume provider:claude model:claude-sonnet-5", "messages/origin-resume-sonnet");
+    expect(lastReply()).toContain(
+      "Still held:\n" +
+        "• claude (all models), until cleared — chat /halt from Operator\n" +
+        "• claude model claude-sonnet-5, until cleared — mesh sonnet (mesh-instituted)\n" +
+        "Mesh-instituted holds stay in force"
+    );
+
     // The authorized MCP/UI clear releases every origin on the scope.
     expect(
       (await call("clear_availability_hold", { provider: "antigravity" })).isError
@@ -4613,6 +4625,21 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(held("codex")).toBe(false);
     expect(getRepositories().availabilityHolds.list()).toEqual([]);
     expect(dashboardMesh()?.isHalted?.()).toBe(false);
+
+    // With only chat holds left, the reply does not send the operator to the
+    // dashboard: /resume can release everything still held.
+    await message("/halt provider:codex", "messages/origin-halt-codex-chat-only");
+    await message(
+      "/resume provider:codex model:claude-sonnet-5",
+      "messages/origin-resume-chat-only"
+    );
+    expect(lastReply()).toContain(
+      "Still held:\n• codex (all models), until cleared — chat /halt from Operator"
+    );
+    expect(lastReply()).not.toContain("Mesh-instituted");
+    await message("/resume provider:codex", "messages/origin-resume-codex-chat-only");
+    expect(lastReply()).not.toContain("Still held");
+    expect(getRepositories().availabilityHolds.list()).toEqual([]);
     clearProviderModelCatalog();
   });
 

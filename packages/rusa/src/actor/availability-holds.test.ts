@@ -501,6 +501,18 @@ describe("haltIndicator", () => {
 
     expect(indicator.haltSnapshot()).toEqual({ providers: ["claude", "codex"], until: UNTIL });
   });
+
+  it.each([
+    { name: "chat row first", order: ["chat", "mesh"] as const },
+    { name: "mesh row first", order: ["mesh", "chat"] as const },
+  ])("omits a reason two origins on one lane do not share: $name", ({ order }) => {
+    const reasons = { chat: "chat /halt", mesh: "mesh outage" };
+    const indicator = haltIndicator({ state: () => null }, () =>
+      order.map((origin) => ({ ...hold("codex"), origin, reason: reasons[origin] }))
+    );
+
+    expect(indicator.haltSnapshot()).toEqual({ providers: ["codex"], until: UNTIL });
+  });
 });
 
 describe("describeHold", () => {

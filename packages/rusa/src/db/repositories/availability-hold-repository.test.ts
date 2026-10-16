@@ -286,7 +286,9 @@ describe("AvailabilityHoldRepository", () => {
 
     expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(false);
     expect(holds.isHeld("codex", "gpt-5.5", NOW)).toBe(true);
-    // Listing still reads every row, so the bad one is reported, not hidden.
+    // An active-only listing skips it the same way; the full listing still
+    // reads every row, so the bad one is reported, not hidden.
+    expect(holds.list({ now: NOW }).map((hold) => hold.provider)).toEqual(["codex"]);
     expect(() => holds.list()).toThrow(/invalid availability hold scope/);
   });
 
@@ -338,13 +340,12 @@ describe("AvailabilityHoldRepository", () => {
         { origin: "chat" },
         { origin: "mesh" },
       ]);
-      expect(
-        holds
-          .list()
-          .map((hold) => hold.origin)
-          .sort()
-      ).toEqual(["chat", "mesh"]);
-      expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(true);
+      // Rows sharing a scope order chat before mesh, whatever the write order.
+      expect(holds.list().map((hold) => hold.origin)).toEqual(["chat", "mesh"]);
+      expect(holds.clear({ provider: "kimi" }).map((hold) => hold.origin)).toEqual([
+        "chat",
+        "mesh",
+      ]);
     });
 
     it("replaces only the same origin's row on the same scope", () => {
