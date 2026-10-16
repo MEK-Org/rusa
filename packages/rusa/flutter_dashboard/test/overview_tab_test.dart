@@ -191,6 +191,101 @@ void main() {
     });
   });
 
+  for (final (name, sender, recipient, profile, expected) in [
+    (
+      'viewing human',
+      testUserPrincipalId,
+      '11111111-1111-4111-8111-111111111111',
+      'Alex Example',
+      'Alex Example → ember-familiar',
+    ),
+    (
+      'human without a profile name',
+      testUserPrincipalId,
+      '11111111-1111-4111-8111-111111111111',
+      null,
+      'Operator → ember-familiar',
+    ),
+    (
+      'actor to human',
+      '11111111-1111-4111-8111-111111111111',
+      testUserPrincipalId,
+      'Alex Example',
+      'ember-familiar → Alex Example',
+    ),
+    (
+      'unknown sender',
+      '22222222-2222-4222-8222-222222222222',
+      '11111111-1111-4111-8111-111111111111',
+      'Alex Example',
+      'Unknown actor → ember-familiar',
+    ),
+  ]) {
+    testWidgets('Recent Activity resolves mesh participants: $name', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        const actor = '11111111-1111-4111-8111-111111111111';
+        const ref = 'mesh:messages/activity-message';
+        final api = FakeApi()
+          ..threadsResult = const [
+            ThreadDto(
+              id: actor,
+              handle: 'ember-familiar',
+              parentId: null,
+              status: 'active',
+              provider: 'codex',
+              model: 'example-model',
+              charterPreview: 'A synthetic actor',
+              createdAt: '2026-01-01T00:00:00Z',
+            ),
+          ]
+          ..referencesResult = {
+            ref: ReferenceDto(
+              ref: ref,
+              scheme: 'mesh',
+              title: '$sender → $recipient',
+              entity: {
+                'type': 'mesh_message',
+                'senderId': sender,
+                'recipientId': recipient,
+              },
+            ),
+          }
+          ..recentActivityResult = const [
+            RecentActivityItem(
+              id: 'activity-message',
+              kind: 'handled_inbox',
+              time: '2026-09-23T14:21:37.000Z',
+              actorId: actor,
+              sourceKind: 'MESH CHAT',
+              referenceKey: ref,
+              addressedNote: 'Replied to the message',
+            ),
+          ];
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          operatorDisplayName: profile,
+        );
+        await store.init();
+        addTearDown(store.dispose);
+        await store.refreshRecentActivity(deferUntilPostFrame: false);
+        await tester.binding.setSurfaceSize(const Size(1500, 1400));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text(expected), findsOneWidget);
+        expect(find.textContaining(actor), findsNothing);
+        expect(find.text(testUserPrincipalId), findsNothing);
+        expect(find.text('22222222-2222-4222-8222-222222222222'), findsNothing);
+        expect(tester.takeException(), isNull);
+      });
+    });
+  }
+
   testWidgets('Recent Activity renders terminal obligation transitions', (
     tester,
   ) async {
