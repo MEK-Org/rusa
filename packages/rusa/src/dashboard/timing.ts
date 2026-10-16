@@ -2,8 +2,11 @@ import { randomUUID } from "node:crypto";
 import type { MeshEvent, MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import {
   DASHBOARD_SERVER_PHASES,
+  DASHBOARD_SERVER_SUBSTAGE_INTERVALS,
   type DashboardServerPhase,
   type DashboardServerPhaseDurations,
+  type DashboardServerSubstageInterval,
+  type DashboardServerSubstages,
 } from "./timing-phases.js";
 
 /** Stored in the existing append-only log; no migration or dashboard UI change. */
@@ -14,6 +17,12 @@ const RETENTION_BOUNDARY_SLACK_MS = 60_000;
 export const DASHBOARD_TIMING_MAX_QUEUE = 512;
 export const DASHBOARD_TIMING_MAX_CLIENT_IDS = 32;
 export const DASHBOARD_TIMING_MAX_CLIENT_BODY_BYTES = 8 * 1024;
+/**
+ * Fixed request duration at or above which a population's substages are also
+ * summarized as its tail (#990). It matches the list endpoint's 300 ms SLO and
+ * stays comparable across windows, unlike a population's own percentile.
+ */
+export const DASHBOARD_TIMING_TAIL_THRESHOLD_MS = 300;
 /** Retention maintenance is intentionally not on every post-response batch. */
 export const DASHBOARD_TIMING_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 /** Bound a hot dashboard's count overshoot without a delete on every flush. */
@@ -126,6 +135,11 @@ export interface DashboardTimingPayload {
    * phases are absent, and records that predate phases have none.
    */
   phases?: DashboardServerPhaseDurations;
+  /**
+   * v2 server request rows only (#990), outside `phases` and without a version
+   * bump so a reader that predates it still keeps the row.
+   */
+  substages?: DashboardServerSubstages;
   /** v2 server request rows only. */
   method?: DashboardTimingMethod;
   /** v2 server request rows only. */
@@ -197,6 +211,31 @@ function isPhaseDurations(value: unknown): value is DashboardServerPhaseDuration
     ([phase, ms]) =>
       DASHBOARD_SERVER_PHASES.includes(phase as DashboardServerPhase) && isIntegerMilliseconds(ms)
   );
+}
+
+/**
+ * Validate `substages` on its own: `null` when malformed, so the caller drops
+ * only this field and the row keeps its place in every population.
+ */
+function parseSubstages(value: unknown): DashboardServerSubstages | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const result: DashboardServerSubstages = {};
+  for (const [key, measured] of Object.entries(value)) {
+    if (DASHBOARD_SERVER_SUBSTAGE_INTERVALS.includes(key as DashboardServerSubstageInterval)) {
+      if (!isIntegerMilliseconds(measured)) return null;
+      result[key as DashboardServerSubstageInterval] = measured;
+    } else if (key === "authRevocation") {
+      if (typeof measured !== "boolean") return null;
+      result.authRevocation = measured;
+    } else if (key === "loopBusyPct") {
+      if (typeof measured !== "number" || !Number.isInteger(measured)) return null;
+      if (measured < 0 || measured > 100) return null;
+      result.loopBusyPct = measured;
+    } else {
+      return null;
+    }
+  }
+  return result;
 }
 
 /** Fixed path templates only: request URLs and query strings never become telemetry. */
@@ -298,7 +337,13 @@ export function parseDashboardClientTiming(input: unknown): DashboardClientTimin
   };
 }
 
-function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
+interface ParsedTiming {
+  payload: DashboardTimingPayload;
+  /** The row carried `substages` that failed validation; only that field was dropped. */
+  unreadableSubstages: boolean;
+}
+
+function parsePayload(event: MeshEvent): ParsedTiming | null {
   if (event.kind !== DASHBOARD_TIMING_EVENT_KIND || typeof event.payload !== "string") return null;
   try {
     const value = JSON.parse(event.payload) as Record<string, unknown>;
@@ -313,6 +358,7 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
     const phases = value.phases;
     const method = value.method;
     const terminal = value.terminal;
+    const rawSubstages = value.substages;
     const isRequestRow =
       value.v === 2 &&
       value.source === "server" &&
@@ -360,7 +406,9 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
     ) {
       return null;
     }
-    return {
+    const substages =
+      rawSubstages === undefined || !isRequestRow ? undefined : parseSubstages(rawSubstages);
+    const payload: DashboardTimingPayload = {
       v: isRequestRow ? 2 : 1,
       source: value.source,
       label: value.label,
@@ -382,11 +430,15 @@ function parsePayload(event: MeshEvent): DashboardTimingPayload | null {
         : {}),
       ...(operation ? { operation: operation as DashboardTimingOperation } : {}),
       ...(phases ? { phases: { ...(phases as DashboardServerPhaseDurations) } } : {}),
+      ...(substages ? { substages } : {}),
       durationMs,
       status,
       bytes,
       outcome,
     };
+    // Substages are only written on v2 request rows; anywhere else they are
+    // as unreadable as a malformed object, and equally never cost the row.
+    return { payload, unreadableSubstages: rawSubstages !== undefined && !substages };
   } catch {
     return null;
   }
@@ -443,6 +495,8 @@ export class DashboardTimingRecorder {
     status: number | null;
     bytes: number | null;
     phases?: DashboardServerPhaseDurations;
+    /** Written only with `request`: lifecycle rows are not request observations. */
+    substages?: DashboardServerSubstages;
     /** Present together on request observations; stream lifecycle rows omit both. */
     request?: { method: DashboardTimingMethod; terminal: DashboardTimingTerminal };
   }): void {
@@ -454,6 +508,9 @@ export class DashboardTimingRecorder {
       ...(input.operation ? { operation: input.operation } : {}),
       ...(input.requestId ? { requestId: input.requestId } : {}),
       ...(input.phases && Object.keys(input.phases).length > 0 ? { phases: input.phases } : {}),
+      ...(input.request && input.substages && Object.keys(input.substages).length > 0
+        ? { substages: input.substages }
+        : {}),
       durationMs: input.durationMs == null ? null : Math.round(input.durationMs),
       status: input.status,
       bytes: input.bytes,
@@ -513,10 +570,11 @@ export class DashboardTimingRecorder {
       since,
       DASHBOARD_TIMING_MAX_RECORDS
     );
-    const allRows = events.flatMap((event) => {
-      const payload = parsePayload(event);
-      return payload ? [{ event, payload }] : [];
+    const parsed = events.flatMap((event) => {
+      const timing = parsePayload(event);
+      return timing ? [{ event, ...timing }] : [];
     });
+    const allRows = parsed.map(({ event, payload }) => ({ event, payload }));
     const rows =
       opts.label === undefined
         ? allRows
@@ -550,6 +608,7 @@ export class DashboardTimingRecorder {
           opts.since.getTime() <=
           this.now().getTime() - DASHBOARD_TIMING_RETENTION_MS + RETENTION_BOUNDARY_SLACK_MS,
         unreadableRecords: events.length - allRows.length,
+        unreadableSubstages: parsed.filter((timing) => timing.unreadableSubstages).length,
       },
     };
   }
@@ -616,7 +675,46 @@ export interface DashboardTimingGroup {
 /** One population of server request observations, never mixed with another. */
 export interface DashboardTimingPopulation extends DashboardTimingDistribution {
   count: number;
+  /**
+   * Substages over this population (#990), present only when at least one of
+   * its rows carried them. Coverage denominators are this population's count.
+   */
+  substages?: DashboardSubstageDistributions;
+  /**
+   * The same substages over only this population's rows whose request
+   * duration reached `thresholdMs`. Conditioning on the same rows is what
+   * lets a slow request's substages be compared; marginal percentiles are
+   * never subtracted.
+   */
+  tail?: {
+    thresholdMs: number;
+    count: number;
+    substages: DashboardSubstageDistributions;
+  };
 }
+
+/** Percent-unit distribution, kept apart from milliseconds. */
+export interface DashboardPercentDistribution {
+  p50Pct: number | null;
+  p95Pct: number | null;
+  p99Pct: number | null;
+  maxPct: number | null;
+  coverage: DashboardRequestCoverage;
+}
+
+/**
+ * Per-substage distributions over one cohort. A substage no row measured is
+ * omitted; coverage says how many of the cohort's rows measured each one.
+ * `authFallbackMs` coverage counts the rows whose fallback ran.
+ */
+export type DashboardSubstageDistributions = Partial<
+  Record<DashboardServerSubstageInterval, DashboardPhaseDistribution>
+> & {
+  /** Event-loop busy share over each request's start-to-terminal window; context only. */
+  loopBusyPct?: DashboardPercentDistribution;
+  /** Rows whose first adapter attempt requested the revocation check. */
+  authRevocation?: { requested: number; coverage: DashboardRequestCoverage };
+};
 
 /**
  * Server request observations for one fixed label, operation and method,
@@ -654,6 +752,8 @@ export interface DashboardTimingWindow {
   retentionLimited: boolean;
   /** Rows read that failed validation and are excluded from every figure. */
   unreadableRecords: number;
+  /** Rows whose malformed `substages` alone was dropped; each still counts everywhere else. */
+  unreadableSubstages: number;
 }
 
 export interface DashboardTimingSummary {
@@ -826,12 +926,65 @@ function serverPhaseGroups(
     );
 }
 
+function substageDistributions(
+  cohort: Array<DashboardServerSubstages | undefined>
+): DashboardSubstageDistributions {
+  const result: DashboardSubstageDistributions = {};
+  for (const substage of DASHBOARD_SERVER_SUBSTAGE_INTERVALS) {
+    const values = cohort.flatMap((substages) =>
+      substages?.[substage] === undefined ? [] : [substages[substage]]
+    );
+    if (values.length === 0) continue;
+    result[substage] = {
+      ...distribution(values),
+      coverage: coverage(values.length, cohort.length),
+    };
+  }
+  const busy = cohort.flatMap((substages) =>
+    substages?.loopBusyPct === undefined ? [] : [substages.loopBusyPct]
+  );
+  if (busy.length > 0) {
+    const { p50Ms, p95Ms, p99Ms, maxMs } = distribution(busy);
+    result.loopBusyPct = {
+      p50Pct: p50Ms,
+      p95Pct: p95Ms,
+      p99Pct: p99Ms,
+      maxPct: maxMs,
+      coverage: coverage(busy.length, cohort.length),
+    };
+  }
+  const revocation = cohort.flatMap((substages) =>
+    substages?.authRevocation === undefined ? [] : [substages.authRevocation]
+  );
+  if (revocation.length > 0) {
+    result.authRevocation = {
+      requested: revocation.filter(Boolean).length,
+      coverage: coverage(revocation.length, cohort.length),
+    };
+  }
+  return result;
+}
+
 function population(payloads: DashboardTimingPayload[]): DashboardTimingPopulation {
+  const durations = distribution(
+    payloads.flatMap((payload) => (payload.durationMs === null ? [] : [payload.durationMs]))
+  );
+  // Aggregates without substages keep exactly their pre-#990 shape.
+  if (!payloads.some((payload) => payload.substages))
+    return { count: payloads.length, ...durations };
+  const tail = payloads.filter(
+    (payload) =>
+      payload.durationMs !== null && payload.durationMs >= DASHBOARD_TIMING_TAIL_THRESHOLD_MS
+  );
   return {
     count: payloads.length,
-    ...distribution(
-      payloads.flatMap((payload) => (payload.durationMs === null ? [] : [payload.durationMs]))
-    ),
+    ...durations,
+    substages: substageDistributions(payloads.map((payload) => payload.substages)),
+    tail: {
+      thresholdMs: DASHBOARD_TIMING_TAIL_THRESHOLD_MS,
+      count: tail.length,
+      substages: substageDistributions(tail.map((payload) => payload.substages)),
+    },
   };
 }
 

@@ -3,7 +3,11 @@ import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import type { DashboardTimingRecorder } from "./timing.js";
-import { beginDashboardRoutePhase, runDashboardRequestScope } from "./timing-phases.js";
+import {
+  beginDashboardRoutePhase,
+  runDashboardRequestScope,
+  startDashboardSubstage,
+} from "./timing-phases.js";
 import { beginDashboardRequestTiming } from "./timing-server.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -42,6 +46,23 @@ class TestResponse extends EventEmitter {
   /** The connection goes away before `end`: abort, client timeout or drop. */
   closeEarly(): void {
     this.emit("close");
+  }
+}
+
+/** The socket drains after the handoff: `finish` arrives `drainMs` after `end`. */
+class DrainingResponse extends TestResponse {
+  constructor(private readonly drainMs: number) {
+    super();
+  }
+
+  override end(_chunk?: string | Buffer): this {
+    this.headersSent = true;
+    setTimeout(() => {
+      this.writableFinished = true;
+      this.emit("finish");
+      this.emit("close");
+    }, this.drainMs);
+    return this;
   }
 }
 
@@ -268,5 +289,99 @@ describe("dashboard timing server wrapper", () => {
       2,
       expect.objectContaining({ label: "mesh_obligation_detail" })
     );
+  });
+
+  it("measures local handoff-to-finish, and none for a close before finish (#990)", async () => {
+    const recordServer = vi.fn();
+    const recorder = { recordServer } as unknown as DashboardTimingRecorder;
+    const drained = new DrainingResponse(40);
+    beginDashboardRequestTiming(
+      drained as unknown as ServerResponse,
+      "/api/mesh/obligations",
+      "GET",
+      recorder
+    );
+    drained.writeHead(200);
+    drained.end("{}");
+    await vi.waitFor(() => expect(recordServer).toHaveBeenCalledTimes(1));
+    const finished = recordServer.mock.calls[0][0];
+    expect(finished.substages.finishMs).toBeGreaterThanOrEqual(35);
+    expect(finished.substages.finishMs).toBeLessThanOrEqual(finished.durationMs);
+
+    // Handed off but closed before finish: the drain never completed.
+    const closed = new DrainingResponse(1_000);
+    beginDashboardRequestTiming(
+      closed as unknown as ServerResponse,
+      "/api/mesh/obligations",
+      "GET",
+      recorder
+    );
+    closed.writeHead(200);
+    closed.end("{}");
+    closed.closeEarly();
+    const premature = recordServer.mock.calls[1][0];
+    expect(premature.request.terminal).toBe("closed_before_finish");
+    expect(premature.substages).not.toHaveProperty("finishMs");
+  });
+
+  it("keeps a recorded row unchanged when a callback arrives after close (#990)", async () => {
+    const recordServer = vi.fn();
+    const response = new TestResponse();
+    let endCodec: () => void = () => {};
+    await runDashboardRequestScope(async () => {
+      beginDashboardRequestTiming(
+        response as unknown as ServerResponse,
+        "/api/mesh/obligations",
+        "GET",
+        { recordServer } as unknown as DashboardTimingRecorder
+      );
+      endCodec = startDashboardSubstage("codecMs");
+      await sleep(20);
+      response.closeEarly();
+    });
+    const recorded = structuredClone(recordServer.mock.calls[0][0]);
+    // Clipped at the close, like a phase.
+    expect(recorded.substages.codecMs).toBeGreaterThanOrEqual(15);
+    expect(recorded.substages.codecMs).toBeLessThanOrEqual(recorded.durationMs);
+    await sleep(30);
+    endCodec();
+    expect(recordServer).toHaveBeenCalledTimes(1);
+    expect(recordServer.mock.calls[0][0]).toEqual(recorded);
+  });
+
+  it("reports the loop busy share over the request as an integer percent (#990)", async () => {
+    const recordServer = vi.fn();
+    const recorder = { recordServer } as unknown as DashboardTimingRecorder;
+    const busy = new TestResponse();
+    beginDashboardRequestTiming(
+      busy as unknown as ServerResponse,
+      "/api/mesh/threads",
+      "GET",
+      recorder
+    );
+    const until = performance.now() + 60;
+    while (performance.now() < until) {
+      // Synchronous work holds the loop for the whole request.
+    }
+    busy.end("{}");
+
+    const idle = new TestResponse();
+    beginDashboardRequestTiming(
+      idle as unknown as ServerResponse,
+      "/api/mesh/threads",
+      "GET",
+      recorder
+    );
+    await sleep(60);
+    idle.end("{}");
+
+    const [busyPct, idlePct] = recordServer.mock.calls.map(([row]) => row.substages.loopBusyPct);
+    for (const pct of [busyPct, idlePct]) {
+      expect(Number.isInteger(pct)).toBe(true);
+      expect(pct).toBeGreaterThanOrEqual(0);
+      expect(pct).toBeLessThanOrEqual(100);
+    }
+    expect(busyPct).toBeGreaterThanOrEqual(90);
+    expect(idlePct).toBeLessThanOrEqual(50);
   });
 });

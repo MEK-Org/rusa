@@ -67,7 +67,11 @@ import {
 import { selectPrioritizedInboxItem } from "./inbox-selection.js";
 import type { SseHub } from "./sse.js";
 import type { DashboardTimingRecorder } from "./timing.js";
-import { measureDashboardPhase, startDashboardPhase } from "./timing-phases.js";
+import {
+  measureDashboardPhase,
+  startDashboardPhase,
+  startDashboardSubstage,
+} from "./timing-phases.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {
@@ -526,9 +530,18 @@ function negotiateEncoding(req: IncomingMessage | undefined): Encoding | undefin
   return ENCODINGS.find((encoding) => (weights.get(encoding) ?? wildcard) > 0);
 }
 
-function compress(encoding: Encoding, payload: Buffer): Promise<Buffer> {
+/** `onCodecDone` runs when the codec callback arrives, before its continuation. */
+function compress(
+  encoding: Encoding,
+  payload: Buffer,
+  onCodecDone: () => void = () => {}
+): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const done = (err: Error | null, out: Buffer) => (err ? reject(err) : resolve(out));
+    const done = (err: Error | null, out: Buffer) => {
+      onCodecDone();
+      if (err) reject(err);
+      else resolve(out);
+    };
     if (encoding === "gzip") {
       gzip(payload, done);
       return;
@@ -574,7 +587,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   // Off the event loop: zlib's async form runs on the threadpool, so a 2 MB
   // body costs this request latency and not every concurrent one.
   const endCompression = startDashboardPhase("compression");
-  compress(encoding, payload).then(
+  compress(encoding, payload, startDashboardSubstage("codecMs")).then(
     (compressed) => {
       endCompression();
       if (res.writableEnded) return;

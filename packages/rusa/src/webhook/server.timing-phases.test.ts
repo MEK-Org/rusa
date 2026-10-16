@@ -216,6 +216,39 @@ describe("dashboard server phase timing", () => {
     );
   });
 
+  it("ends codec time at the callback and keeps finish apart, on the same row (#990)", async () => {
+    delays.compression = 40;
+    const detail = await get("/api/mesh/obligations/phase-fixture");
+    expect(detail.headers.get("content-encoding")).toBe("br");
+    delays.compression = 0;
+    // Small replies are never compressed, so they have no codec substage.
+    await get("/api/quota");
+    await phaseGroups(2);
+
+    const rows = events
+      .listByKindSince(DASHBOARD_TIMING_EVENT_KIND, "2026-01-01T00:00:00.000Z", 100)
+      .map((event) => JSON.parse(event.payload ?? "{}"));
+    const compressed = rows.find((row) => row.label === "mesh_obligation_detail");
+    const plain = rows.find((row) => row.label === "mesh_quota");
+    expect(compressed.substages.codecMs).toBeGreaterThanOrEqual(35);
+    // The continuation gap is a same-row difference, never a percentile subtraction.
+    expect(compressed.substages.codecMs).toBeLessThanOrEqual(compressed.phases.compression);
+    expect(compressed.substages.finishMs).toBeGreaterThanOrEqual(0);
+    expect(compressed.substages.loopBusyPct).toBeGreaterThanOrEqual(0);
+    expect(plain.substages).not.toHaveProperty("codecMs");
+    expect(plain.substages.finishMs).toBeGreaterThanOrEqual(0);
+
+    const population = timings
+      .summary({ since: new Date(Date.now() - 60_000) })
+      .serverPopulations.find((group) => group.label === "mesh_obligation_detail");
+    expect(population?.method).toBe("GET");
+    expect(population?.finishedSuccess.substages?.codecMs?.coverage).toEqual({
+      numerator: 1,
+      denominator: 1,
+      state: "full",
+    });
+  });
+
   it("leaves auth absent when the dashboard runs without an auth boundary", async () => {
     server.close();
     const handler = createDashboardRequestHandler({ port: 0, serveUi: false }, {

@@ -18,6 +18,7 @@ import {
   DashboardIdentityClaimError,
   DashboardIdentityResolver,
 } from "./identity.js";
+import { type DashboardSubstageObserver, dashboardSubstageObserver } from "./timing-phases.js";
 
 export const SESSION_COOKIE = "__Host-rusa_session";
 export const SESSION_MS = 5 * 24 * 60 * 60 * 1000;
@@ -161,23 +162,45 @@ export class DashboardAuth {
     }
   }
 
+  /**
+   * `observer` is passed only by a request's own authorization, so a stream
+   * recheck or session refresh that inherits a timed request's async context
+   * never amends that request's timing row.
+   */
   private async verify(
     cookie: string,
-    forceRevocation = false
+    forceRevocation = false,
+    observer?: DashboardSubstageObserver
   ): Promise<{ token: DecodedIdToken; principal: UserPrincipal }> {
     const key = createHash("sha256").update(cookie).digest("hex");
     const checkedAt = this.revocations.get(key);
     const checkRevoked =
       forceRevocation || checkedAt === undefined || this.now() - checkedAt >= REVOCATION_MS;
+    observer?.authRevocation(checkRevoked);
+    const endAdapter = observer?.startSubstage("authAdapterMs");
     // Signature/project/expiry verification is never cached by this layer.
-    const token = await this.firebase.verifySessionCookie(cookie, checkRevoked).catch((error) => {
-      // Firebase being unreachable is not a revocation: signature, expiry, and admission
-      // still gate the request locally, and the revocation check resumes next window.
-      if (!checkRevoked || !isTransient(error)) throw error;
-      return this.firebase.verifySessionCookie(cookie, false);
-    });
-    this.admitted(token);
-    const principal = this.identities.resolve(token);
+    const token = await this.firebase.verifySessionCookie(cookie, checkRevoked).then(
+      (verified) => {
+        endAdapter?.();
+        return verified;
+      },
+      (error) => {
+        endAdapter?.();
+        // Firebase being unreachable is not a revocation: signature, expiry, and admission
+        // still gate the request locally, and the revocation check resumes next window.
+        if (!checkRevoked || !isTransient(error)) throw error;
+        const endFallback = observer?.startSubstage("authFallbackMs");
+        return this.firebase.verifySessionCookie(cookie, false).finally(() => endFallback?.());
+      }
+    );
+    const endIdentity = observer?.startSubstage("identityMs");
+    let principal: UserPrincipal;
+    try {
+      this.admitted(token);
+      principal = this.identities.resolve(token);
+    } finally {
+      endIdentity?.();
+    }
     if (checkRevoked) {
       // Renewal issues a fresh cookie on every navigation, so entries expire rather than
       // accumulate; a failed attempt also counts, so an outage costs one call per window.
@@ -193,7 +216,7 @@ export class DashboardAuth {
     try {
       const cookie = sessionCookie(req);
       if (!cookie) throw new Error("unauthorized");
-      const { principal } = await this.verify(cookie);
+      const { principal } = await this.verify(cookie, false, dashboardSubstageObserver());
       if (
         !["GET", "HEAD", "OPTIONS"].includes(req.method ?? "") &&
         (!isSameOrigin(req) || !this.csrf.verify(req, cookie))

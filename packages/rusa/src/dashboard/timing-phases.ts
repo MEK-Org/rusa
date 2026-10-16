@@ -32,11 +32,62 @@ export const DASHBOARD_SERVER_PHASES = [
 export type DashboardServerPhase = (typeof DASHBOARD_SERVER_PHASES)[number];
 export type DashboardServerPhaseDurations = Partial<Record<DashboardServerPhase, number>>;
 
+/**
+ * Fixed substages of one server request (#990), stored apart from `phases` so
+ * a reader that predates them keeps the row. Each interval is milliseconds:
+ *
+ * - `authAdapterMs`: the first session-cookie verification attempt, from call
+ *   until it settles, resolved or rejected.
+ * - `authFallbackMs`: the non-revocation retry after a transient failure of a
+ *   revocation attempt; present only when that retry ran.
+ * - `identityMs`: synchronous admission and durable identity resolution.
+ * - `codecMs`: compression dispatch until the codec callback arrives. The rest
+ *   of `compression` on the same row is continuation delivery.
+ * - `finishMs`: local handoff of the last body chunk until `finish`. It is not
+ *   client receipt or network transit.
+ *
+ * Only the request's own authorization reports auth substages; stream
+ * rechecks and session refresh never do. A substage a request never reached
+ * is absent, not zero; one still open at the terminal is clipped there.
+ */
+export const DASHBOARD_SERVER_SUBSTAGE_INTERVALS = [
+  "authAdapterMs",
+  "authFallbackMs",
+  "identityMs",
+  "codecMs",
+  "finishMs",
+] as const;
+
+export type DashboardServerSubstageInterval = (typeof DASHBOARD_SERVER_SUBSTAGE_INTERVALS)[number];
+
+export interface DashboardServerSubstages
+  extends Partial<Record<DashboardServerSubstageInterval, number>> {
+  /** Whether the first adapter attempt requested the revocation check. */
+  authRevocation?: boolean;
+  /**
+   * Integer percent (0–100) of the request's start-to-terminal wall time in
+   * which the event loop was running any JavaScript, not only this request's.
+   * Context only: neither a high nor a low value names the cause of a wait.
+   */
+  loopBusyPct?: number;
+}
+
+/** What a request's own authorization reports into its timing row. */
+export interface DashboardSubstageObserver {
+  /** Open the substage once; a later open of the same substage is ignored. */
+  startSubstage(substage: DashboardServerSubstageInterval): () => void;
+  authRevocation(requested: boolean): void;
+}
+
 type Interval = [start: number, end: number | undefined];
 
+const noop = () => {};
+
 /** Per-request phase intervals; reported once, after the response finishes. */
-export class DashboardPhaseClock {
+export class DashboardPhaseClock implements DashboardSubstageObserver {
   private readonly intervals = new Map<DashboardServerPhase, Interval[]>();
+  private readonly substageIntervals = new Map<DashboardServerSubstageInterval, Interval>();
+  private revocation: boolean | undefined;
   private endRoute: (() => void) | undefined;
   private routeStarted = false;
 
@@ -53,6 +104,36 @@ export class DashboardPhaseClock {
     return () => {
       if (interval[1] === undefined) interval[1] = this.clock();
     };
+  }
+
+  startSubstage(substage: DashboardServerSubstageInterval): () => void {
+    if (this.substageIntervals.has(substage)) return noop;
+    const interval: Interval = [this.clock(), undefined];
+    this.substageIntervals.set(substage, interval);
+    return () => {
+      if (interval[1] === undefined) interval[1] = this.clock();
+    };
+  }
+
+  authRevocation(requested: boolean): void {
+    this.revocation ??= requested;
+  }
+
+  /**
+   * Interval substages reached so far, clipped at the terminal like phases.
+   * The caller snapshots the result; a callback arriving after the row was
+   * recorded cannot change it.
+   */
+  substages(endedAt: number = this.clock()): DashboardServerSubstages {
+    const result: DashboardServerSubstages = {};
+    for (const substage of DASHBOARD_SERVER_SUBSTAGE_INTERVALS) {
+      const interval = this.substageIntervals.get(substage);
+      if (!interval || interval[0] > endedAt) continue;
+      const end = Math.min(interval[1] ?? endedAt, endedAt);
+      result[substage] = Math.round(Math.max(0, end - interval[0]));
+    }
+    if (this.revocation !== undefined) result.authRevocation = this.revocation;
+    return result;
   }
 
   /** The route phase has one interval, opened at post-auth dispatch. */
@@ -113,11 +194,23 @@ export function attachDashboardPhaseClock(clock: DashboardPhaseClock): void {
   if (scope) scope.clock = clock;
 }
 
-const noop = () => {};
-
 /** Open a phase interval for the current request; a no-op outside a timed request. */
 export function startDashboardPhase(phase: DashboardServerPhase): () => void {
   return requestScope.getStore()?.clock?.start(phase) ?? noop;
+}
+
+/** Open a substage interval for the current request; a no-op outside a timed request. */
+export function startDashboardSubstage(substage: DashboardServerSubstageInterval): () => void {
+  return requestScope.getStore()?.clock?.startSubstage(substage) ?? noop;
+}
+
+/**
+ * The current request's substage observer, captured once by the caller and
+ * passed explicitly. Work that merely inherits the request's async context,
+ * such as a stream's periodic recheck, must not find it on its own.
+ */
+export function dashboardSubstageObserver(): DashboardSubstageObserver | undefined {
+  return requestScope.getStore()?.clock;
 }
 
 export async function measureDashboardPhase<T>(
