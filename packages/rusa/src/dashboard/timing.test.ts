@@ -720,6 +720,37 @@ describe("dashboard timing recorder", () => {
     });
   });
 
+  it("reads an empty substages object as absent, keeping the pre-#990 shape (#990)", () => {
+    const recorder = new DashboardTimingRecorder(events);
+    events.record({
+      kind: DASHBOARD_TIMING_EVENT_KIND,
+      actorId: null,
+      detail: "synthetic",
+      payload: JSON.stringify({
+        v: 2,
+        source: "server",
+        label: "mesh_obligations",
+        method: "GET",
+        terminal: "finished",
+        durationMs: 400,
+        status: 200,
+        bytes: 1,
+        outcome: null,
+        substages: {},
+      }),
+    });
+
+    const summary = recorder.summary({ since: new Date(Date.now() - 60_000) });
+    expect(summary.window).toMatchObject({ unreadableRecords: 0, unreadableSubstages: 0 });
+    expect(summary.serverPopulations[0].finishedSuccess).toEqual({
+      count: 1,
+      p50Ms: 400,
+      p95Ms: 400,
+      p99Ms: 400,
+      maxMs: 400,
+    });
+  });
+
   it("writes substages only on request rows and never empty (#990)", () => {
     const recorder = new DashboardTimingRecorder(events);
     recorder.recordServer({

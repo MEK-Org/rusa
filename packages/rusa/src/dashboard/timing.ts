@@ -408,6 +408,8 @@ function parsePayload(event: MeshEvent): ParsedTiming | null {
     }
     const substages =
       rawSubstages === undefined || !isRequestRow ? undefined : parseSubstages(rawSubstages);
+    // Writers never store an empty object; read one as absent, not as measured.
+    const measured = substages && Object.keys(substages).length > 0 ? substages : undefined;
     const payload: DashboardTimingPayload = {
       v: isRequestRow ? 2 : 1,
       source: value.source,
@@ -430,7 +432,7 @@ function parsePayload(event: MeshEvent): ParsedTiming | null {
         : {}),
       ...(operation ? { operation: operation as DashboardTimingOperation } : {}),
       ...(phases ? { phases: { ...(phases as DashboardServerPhaseDurations) } } : {}),
-      ...(substages ? { substages } : {}),
+      ...(measured ? { substages: measured } : {}),
       durationMs,
       status,
       bytes,

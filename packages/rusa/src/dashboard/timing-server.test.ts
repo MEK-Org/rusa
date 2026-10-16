@@ -324,6 +324,32 @@ describe("dashboard timing server wrapper", () => {
     expect(premature.substages).not.toHaveProperty("finishMs");
   });
 
+  it("starts finish at the first end, not a repeated no-op end (#990)", async () => {
+    const recordServer = vi.fn();
+    const recorder = { recordServer } as unknown as DashboardTimingRecorder;
+    const drained = new DrainingResponse(40);
+    // A second end on an ended ServerResponse hands off nothing.
+    const firstEnd = drained.end.bind(drained);
+    let ended = false;
+    drained.end = (chunk?: string | Buffer) => {
+      if (!ended) firstEnd(chunk);
+      ended = true;
+      return drained;
+    };
+    beginDashboardRequestTiming(
+      drained as unknown as ServerResponse,
+      "/api/mesh/obligations",
+      "GET",
+      recorder
+    );
+    drained.writeHead(200);
+    drained.end("{}");
+    await sleep(25);
+    drained.end();
+    await vi.waitFor(() => expect(recordServer).toHaveBeenCalledTimes(1));
+    expect(recordServer.mock.calls[0][0].substages.finishMs).toBeGreaterThanOrEqual(35);
+  });
+
   it("keeps a recorded row unchanged when a callback arrives after close (#990)", async () => {
     const recordServer = vi.fn();
     const response = new TestResponse();

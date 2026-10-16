@@ -48,7 +48,8 @@ function trackResponse(
   response.end = (...args: unknown[]) => {
     phases.finishRoute();
     add(args[0], typeof args[1] === "string" && Buffer.isEncoding(args[1]) ? args[1] : undefined);
-    endedAt = performance.now();
+    // First wins: a repeated end on an ended response hands off nothing.
+    endedAt ??= performance.now();
     return originalEnd(...args);
   };
   return { bytes: () => bytes, endedAt: () => endedAt };
