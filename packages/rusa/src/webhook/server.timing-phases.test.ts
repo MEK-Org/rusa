@@ -25,15 +25,30 @@ import { InMemoryActorRepository } from "../repositories/in-memory-actor-reposit
 import { createDashboardRequestHandler } from "./server.js";
 
 // Each fake stage sleeps for a fixed, synthetic delay so its phase is visible.
-const delays = vi.hoisted(() => ({ auth: 0, compression: 0, enrichment: 0, history: 0 }));
+// `continuation` holds the loop after the codec callback returns, so the
+// promise continuation runs measurably later than the callback itself.
+const delays = vi.hoisted(() => ({
+  auth: 0,
+  compression: 0,
+  continuation: 0,
+  enrichment: 0,
+  history: 0,
+}));
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 vi.mock("node:zlib", async (importOriginal) => {
   const zlib = await importOriginal<typeof import("node:zlib")>();
   const delayed =
-    <Args extends unknown[]>(compress: (...args: Args) => void) =>
-    (...args: Args) => {
-      setTimeout(() => compress(...args), delays.compression);
+    (compress: (...args: unknown[]) => void) =>
+    (...args: unknown[]) => {
+      const callback = args.at(-1) as (...result: unknown[]) => void;
+      const holdAfterCallback = (...result: unknown[]) => {
+        callback(...result);
+        // Microtasks queued by the callback cannot run until this returns.
+        const until = performance.now() + delays.continuation;
+        while (performance.now() < until) {}
+      };
+      setTimeout(() => compress(...args.slice(0, -1), holdAfterCallback), delays.compression);
     };
   return {
     ...zlib,
@@ -50,7 +65,7 @@ describe("dashboard server phase timing", () => {
   let origin: string;
 
   beforeEach(async () => {
-    Object.assign(delays, { auth: 0, compression: 0, enrichment: 0, history: 0 });
+    Object.assign(delays, { auth: 0, compression: 0, continuation: 0, enrichment: 0, history: 0 });
     db = new Database(":memory:");
     runMigrations(db);
     events = new MeshEventRepository(db);
@@ -218,9 +233,10 @@ describe("dashboard server phase timing", () => {
 
   it("ends codec time at the callback and keeps finish apart, on the same row (#990)", async () => {
     delays.compression = 40;
+    delays.continuation = 30;
     const detail = await get("/api/mesh/obligations/phase-fixture");
     expect(detail.headers.get("content-encoding")).toBe("br");
-    delays.compression = 0;
+    Object.assign(delays, { compression: 0, continuation: 0 });
     // Small replies are never compressed, so they have no codec substage.
     await get("/api/quota");
     await phaseGroups(2);
@@ -232,7 +248,8 @@ describe("dashboard server phase timing", () => {
     const plain = rows.find((row) => row.label === "mesh_quota");
     expect(compressed.substages.codecMs).toBeGreaterThanOrEqual(35);
     // The continuation gap is a same-row difference, never a percentile subtraction.
-    expect(compressed.substages.codecMs).toBeLessThanOrEqual(compressed.phases.compression);
+    // A stop moved into `.then()` would absorb the 30 ms hold and close this gap.
+    expect(compressed.phases.compression - compressed.substages.codecMs).toBeGreaterThanOrEqual(25);
     expect(compressed.substages.finishMs).toBeGreaterThanOrEqual(0);
     expect(compressed.substages.loopBusyPct).toBeGreaterThanOrEqual(0);
     expect(plain.substages).not.toHaveProperty("codecMs");
