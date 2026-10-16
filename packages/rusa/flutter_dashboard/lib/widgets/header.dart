@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:rxdart/rxdart.dart';
 
 import '../breakpoints.dart';
 import '../models.dart';
@@ -392,15 +393,25 @@ class MeshHeader extends StatelessWidget {
                             detail == null) ...[
                           SizedBox(width: compact ? 6 : 10),
                           StreamBuilder<bool>(
-                            stream: store.actorsStale,
-                            initialData: store.actorsStale.valueOrNull ?? false,
-                            builder: (_, staleSnap) => ActorTreeControls(
+                            stream: Rx.combineLatest3(
+                              store.halted,
+                              store.schedulerWarning,
+                              store.actorsStale,
+                              _phoneStatusBadgeShown,
+                            ),
+                            initialData: _phoneStatusBadgeShown(
+                              store.halted.valueOrNull ?? false,
+                              store.schedulerWarning.valueOrNull,
+                              store.actorsStale.valueOrNull ?? false,
+                            ),
+                            builder: (_, badgeSnap) => ActorTreeControls(
                               store: store,
-                              // The cached badge takes the same narrow phone
-                              // row. Keep recovery reachable while shedding
-                              // only the redundant Retired label in that state.
+                              // Halted, scheduler and cached badges take the
+                              // same narrow phone row. Keep recovery reachable
+                              // while shedding only the redundant Retired label
+                              // whenever one of them is shown.
                               compact:
-                                  compactControls || (staleSnap.data ?? false),
+                                  compactControls || (badgeSnap.data ?? false),
                             ),
                           ),
                         ],
@@ -968,7 +979,9 @@ class _ProviderQuotaRing extends StatelessWidget {
       }
     }
     final scrapedAt =
-        weeklyWindow?.scrapedAt ?? sessionWindow?.scrapedAt ?? provider.scrapedAt;
+        weeklyWindow?.scrapedAt ??
+        sessionWindow?.scrapedAt ??
+        provider.scrapedAt;
     final effectiveThrottle =
         throttle ?? (label == null ? provider.throttle : null);
     final tooltipWidget = QuotaTooltip(
@@ -1182,6 +1195,14 @@ String _haltExpiryFormat(DateTime until, DateTime now) {
       ? 'today ${DateFormat('h:mm a').format(until)}'
       : DateFormat('EEE MMM d, h:mm a').format(until);
 }
+
+/// Whether the phone header row is showing a halted, scheduler or cached
+/// badge, mirroring the conditions those badges render under.
+bool _phoneStatusBadgeShown(
+  bool halted,
+  List<String>? schedulerIssues,
+  bool actorsStale,
+) => halted || (schedulerIssues?.isNotEmpty ?? false) || actorsStale;
 
 /// The engaged-emergency-brake indicator: a solid red pause icon and a bold
 /// "Halted" label — the only status the header surfaces (issue #412), shown

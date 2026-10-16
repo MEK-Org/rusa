@@ -64,7 +64,8 @@ void main() {
   testWidgets(
     'renders the simplified antler/tree mark upper-left in desktop header with bounds and crop margins',
     (tester) async {
-      final api = FakeApi()..threadsResult = [makeThread('root', created: 't0')];
+      final api = FakeApi()
+        ..threadsResult = [makeThread('root', created: 't0')];
       final store = DashboardStore(api: api, stream: FakeStream());
       await tester.runAsync(store.init);
 
@@ -92,18 +93,26 @@ void main() {
       expect(headerRect.height, 71.0);
 
       // The 70px brand row containing the mark.
-      final brandRow = find.ancestor(of: mark, matching: find.byType(SizedBox)).first;
+      final brandRow = find
+          .ancestor(of: mark, matching: find.byType(SizedBox))
+          .first;
       final brandRowRect = tester.getRect(brandRow);
       expect(brandRowRect.height, 70.0);
 
       // Artwork box constraint is 22px high and preserves 193:241 aspect ratio.
       expect(svgRect.height, 22.0);
-      expect(svgRect.height / svgRect.width, moreOrLessEquals(193 / 241, epsilon: 0.01));
+      expect(
+        svgRect.height / svgRect.width,
+        moreOrLessEquals(193 / 241, epsilon: 0.01),
+      );
 
       // BrandMark footprint: vertical footprint is 32px (22 + 2*5 padding),
       // horizontal footprint is ~37.47px (22 * 241 / 193 + 2*5).
       expect(markRect.height, 32.0);
-      expect(markRect.width, moreOrLessEquals(22 * 241 / 193 + 10, epsilon: 0.1));
+      expect(
+        markRect.width,
+        moreOrLessEquals(22 * 241 / 193 + 10, epsilon: 0.1),
+      );
 
       // Visual breathing room / crop-compensation margins:
       // Artwork has 5px internal clearance from the BrandMark container on all sides.
@@ -125,7 +134,10 @@ void main() {
 
       // Spacing to RUSA wordmark (10px container gap + 5px internal padding = 15px artwork gap).
       expect(textRect.left - markRect.right, 10.0);
-      expect(textRect.left - svgRect.right, moreOrLessEquals(15.0, epsilon: 0.1));
+      expect(
+        textRect.left - svgRect.right,
+        moreOrLessEquals(15.0, epsilon: 0.1),
+      );
 
       // Upper-left: mark sits strictly left of the wordmark.
       expect(markRect.left, lessThan(textRect.left));
@@ -137,7 +149,8 @@ void main() {
   testWidgets(
     'renders the simplified antler/tree mark in phone drawer with proper bounds and spacing',
     (tester) async {
-      final api = FakeApi()..threadsResult = [makeThread('root', created: 't0')];
+      final api = FakeApi()
+        ..threadsResult = [makeThread('root', created: 't0')];
       final store = DashboardStore(api: api, stream: FakeStream());
       await tester.runAsync(store.init);
 
@@ -146,7 +159,10 @@ void main() {
 
       final drawer = find.byType(MobileNavDrawer);
       expect(drawer, findsOneWidget);
-      final mark = find.descendant(of: drawer, matching: find.byType(BrandMark));
+      final mark = find.descendant(
+        of: drawer,
+        matching: find.byType(BrandMark),
+      );
       expect(mark, findsOneWidget);
       final svg = find.descendant(of: mark, matching: find.byType(SvgPicture));
       expect(svg, findsOneWidget);
@@ -160,11 +176,17 @@ void main() {
 
       // Artwork box constraint is 22px high and preserves 193:241 aspect ratio.
       expect(svgRect.height, 22.0);
-      expect(svgRect.height / svgRect.width, moreOrLessEquals(193 / 241, epsilon: 0.01));
+      expect(
+        svgRect.height / svgRect.width,
+        moreOrLessEquals(193 / 241, epsilon: 0.01),
+      );
 
       // BrandMark footprint in drawer.
       expect(markRect.height, 32.0);
-      expect(markRect.width, moreOrLessEquals(22 * 241 / 193 + 10, epsilon: 0.1));
+      expect(
+        markRect.width,
+        moreOrLessEquals(22 * 241 / 193 + 10, epsilon: 0.1),
+      );
 
       // In the drawer, outer padding is (15, 15, 20, 11) to compensate for 5px mark padding,
       // landing the artwork at exactly 20px from drawer top and left edges.
@@ -175,10 +197,15 @@ void main() {
 
       // Spacing to RUSA wordmark (10px container gap, ~15px artwork clearance).
       expect(textRect.left - markRect.right, 10.0);
-      expect(textRect.left - svgRect.right, moreOrLessEquals(15.0, epsilon: 0.1));
+      expect(
+        textRect.left - svgRect.right,
+        moreOrLessEquals(15.0, epsilon: 0.1),
+      );
 
       // Mark sits cleanly above the divider.
-      final divider = find.descendant(of: drawer, matching: find.byType(Divider)).first;
+      final divider = find
+          .descendant(of: drawer, matching: find.byType(Divider))
+          .first;
       final dividerRect = tester.getRect(divider);
       expect(markRect.bottom, lessThan(dividerRect.top));
 
@@ -246,12 +273,18 @@ void main() {
         expect(find.byIcon(Icons.warning_amber_rounded), findsOneWidget);
         expect(find.text('Halted'), findsNothing);
         expect(find.text('Scheduler'), findsNothing);
+        // The status badges claim the Retired label's room; the switch and
+        // the hold recovery control stay reachable.
+        expect(find.text('Retired'), findsNothing);
+        expect(find.byType(Switch), findsOneWidget);
 
         for (final finder in [
           find.byIcon(Icons.menu),
           find.text('RUSA'),
           find.byIcon(Icons.pause_circle_filled),
           find.byIcon(Icons.warning_amber_rounded),
+          find.byTooltip('Clear availability holds'),
+          find.byType(Switch),
         ]) {
           final rect = tester.getRect(finder);
           expect(rect.left, greaterThanOrEqualTo(headerRect.left));
