@@ -80,21 +80,22 @@ function errorCode(fn) {
 /** Walk `names` from `rootFd` one directory at a time, the way a confined caller does. */
 function walk(rootFd, names) {
   let dir = rootFd;
-  for (const name of names) {
-    const next = fd.openat(dir, name, DIR_FLAGS);
+  try {
+    for (const name of names) {
+      const next = fd.openat(dir, name, DIR_FLAGS);
+      if (dir !== rootFd) closeSync(dir);
+      dir = next;
+    }
+  } catch (err) {
     if (dir !== rootFd) closeSync(dir);
-    dir = next;
+    throw err;
   }
   return track(dir);
 }
 
 describe("@rusa/fd-ops", () => {
-  test("exports the four primitives and O_NOFOLLOW_ANY", () => {
-    for (const name of ["openat", "fstatat", "linkat", "unlinkat"]) {
-      assert.equal(typeof fd[name], "function", name);
-    }
-    assert.equal(typeof fd.O_NOFOLLOW_ANY, "number");
-    if (process.platform !== "darwin") assert.equal(fd.O_NOFOLLOW_ANY, 0);
+  test("exports exactly the four primitives", () => {
+    assert.deepEqual(Object.keys(fd).sort(), ["fstatat", "linkat", "openat", "unlinkat"]);
   });
 
   test("openat reads a file relative to a held directory", () => {
@@ -148,6 +149,54 @@ describe("@rusa/fd-ops", () => {
       errorCode(() => fd.openat(3, 7, 0)),
       "ERR_INVALID_ARG_TYPE"
     );
+
+    // Numbers that ToInt32 would wrap or truncate onto a usable value, and
+    // negative descriptors such as AT_FDCWD (-100 on Linux, -2 on macOS),
+    // which would resolve against the process working directory.
+    const held = openDir(scratch("numbers"));
+    const missing = "fd-ops-no-such-entry";
+    for (const bad of [Number.NaN, Infinity, 1.5, held + 2 ** 32, -1, -2, -100]) {
+      const label = String(bad);
+      assert.equal(
+        errorCode(() => fd.openat(bad, missing, DIR_FLAGS)),
+        "ERR_OUT_OF_RANGE",
+        label
+      );
+      assert.equal(
+        errorCode(() => fd.fstatat(bad, missing)),
+        "ERR_OUT_OF_RANGE",
+        label
+      );
+      assert.equal(
+        errorCode(() => fd.unlinkat(bad, missing)),
+        "ERR_OUT_OF_RANGE",
+        label
+      );
+      assert.equal(
+        errorCode(() => fd.linkat(bad, missing, held, missing)),
+        "ERR_OUT_OF_RANGE",
+        label
+      );
+      assert.equal(
+        errorCode(() => fd.linkat(held, missing, bad, missing)),
+        "ERR_OUT_OF_RANGE",
+        label
+      );
+    }
+    for (const bad of [Number.NaN, 0.5, 2 ** 32]) {
+      assert.equal(
+        errorCode(() => fd.openat(held, missing, bad)),
+        "ERR_OUT_OF_RANGE",
+        String(bad)
+      );
+    }
+    for (const bad of [Number.NaN, 0.5, -1, 2 ** 32]) {
+      assert.equal(
+        errorCode(() => fd.openat(held, missing, constants.O_RDONLY, bad)),
+        "ERR_OUT_OF_RANGE",
+        String(bad)
+      );
+    }
   });
 
   test("never follows a final symlink, whether opened as a file or a directory", () => {

@@ -11,6 +11,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,16 +68,33 @@ static void throw_errno(napi_env env, int err, const char *syscall) {
   napi_throw(env, error);
 }
 
-static bool get_int(napi_env env, napi_value value, const char *what, int32_t *out) {
+// Read an integer argument from min to INT32_MAX. napi_get_value_int32 applies
+// ToInt32, which turns NaN, infinities and fractions into some integer and wraps
+// large values, so read the double and refuse anything it would have changed.
+static bool get_int(napi_env env, napi_value value, const char *what, double min, int32_t *out) {
   napi_valuetype type;
+  double number;
+  char message[96];
   if (napi_typeof(env, value, &type) != napi_ok || type != napi_number ||
-      napi_get_value_int32(env, value, out) != napi_ok) {
-    char message[64];
+      napi_get_value_double(env, value, &number) != napi_ok) {
     snprintf(message, sizeof message, "%s must be an integer", what);
     napi_throw_type_error(env, "ERR_INVALID_ARG_TYPE", message);
     return false;
   }
+  if (!(number >= min && number <= INT32_MAX) || number != (double)(int32_t)number) {
+    snprintf(message, sizeof message, "%s must be an integer from %.0f to %d", what, min,
+             INT32_MAX);
+    napi_throw_range_error(env, "ERR_OUT_OF_RANGE", message);
+    return false;
+  }
+  *out = (int32_t)number;
   return true;
+}
+
+// A directory descriptor must be a real one. A negative value is refused before
+// any syscall: AT_FDCWD would resolve the name against the working directory.
+static bool get_fd(napi_env env, napi_value value, const char *what, int32_t *out) {
+  return get_int(env, value, what, 0, out);
 }
 
 // Read one path component. It must be non-empty, contain no '/' or NUL, and not
@@ -116,18 +134,16 @@ static napi_value fd_openat(napi_env env, napi_callback_info info) {
   napi_value argv[4];
   get_args(env, info, 4, argv);
   int32_t dirfd, flags, mode = 0;
-  if (!get_int(env, argv[0], "dirfd", &dirfd) || !get_int(env, argv[2], "flags", &flags)) {
+  if (!get_fd(env, argv[0], "dirfd", &dirfd) ||
+      !get_int(env, argv[2], "flags", INT32_MIN, &flags)) {
     return NULL;
   }
   napi_valuetype mode_type;
   napi_typeof(env, argv[3], &mode_type);
-  if (mode_type != napi_undefined && !get_int(env, argv[3], "mode", &mode)) return NULL;
+  if (mode_type != napi_undefined && !get_int(env, argv[3], "mode", 0, &mode)) return NULL;
   char *name = get_component(env, argv[1]);
   if (name == NULL) return NULL;
-  int fd;
-  do {
-    fd = openat(dirfd, name, flags | O_NOFOLLOW | O_NOFOLLOW_ANY | O_CLOEXEC, (mode_t)mode);
-  } while (fd < 0 && errno == EINTR);
+  int fd = openat(dirfd, name, flags | O_NOFOLLOW | O_NOFOLLOW_ANY | O_CLOEXEC, (mode_t)mode);
   int err = errno;
   free(name);
   if (fd < 0) {
@@ -151,14 +167,13 @@ static void set_number(napi_env env, napi_value object, const char *key, double 
   napi_set_named_property(env, object, key, v);
 }
 
-// fstatat(dirfd, name) -> { dev, ino, mode, nlink, size } without following a
-// final symlink. dev and ino are bigints, to compare with
+// fstatat(dirfd, name) -> { dev, ino, mode } without following a final symlink. dev and ino are bigints, to compare with
 // fs.fstatSync(fd, { bigint: true }).
 static napi_value fd_fstatat(napi_env env, napi_callback_info info) {
   napi_value argv[2];
   get_args(env, info, 2, argv);
   int32_t dirfd;
-  if (!get_int(env, argv[0], "dirfd", &dirfd)) return NULL;
+  if (!get_fd(env, argv[0], "dirfd", &dirfd)) return NULL;
   char *name = get_component(env, argv[1]);
   if (name == NULL) return NULL;
   struct stat st;
@@ -174,8 +189,6 @@ static napi_value fd_fstatat(napi_env env, napi_callback_info info) {
   set_bigint(env, result, "dev", (uint64_t)st.st_dev);
   set_bigint(env, result, "ino", (uint64_t)st.st_ino);
   set_number(env, result, "mode", (double)st.st_mode);
-  set_number(env, result, "nlink", (double)st.st_nlink);
-  set_number(env, result, "size", (double)st.st_size);
   return result;
 }
 
@@ -186,8 +199,8 @@ static napi_value fd_linkat(napi_env env, napi_callback_info info) {
   napi_value argv[4];
   get_args(env, info, 4, argv);
   int32_t olddirfd, newdirfd;
-  if (!get_int(env, argv[0], "olddirfd", &olddirfd) ||
-      !get_int(env, argv[2], "newdirfd", &newdirfd)) {
+  if (!get_fd(env, argv[0], "olddirfd", &olddirfd) ||
+      !get_fd(env, argv[2], "newdirfd", &newdirfd)) {
     return NULL;
   }
   char *oldname = get_component(env, argv[1]);
@@ -214,7 +227,7 @@ static napi_value fd_unlinkat(napi_env env, napi_callback_info info) {
   napi_value argv[2];
   get_args(env, info, 2, argv);
   int32_t dirfd;
-  if (!get_int(env, argv[0], "dirfd", &dirfd)) return NULL;
+  if (!get_fd(env, argv[0], "dirfd", &dirfd)) return NULL;
   char *name = get_component(env, argv[1]);
   if (name == NULL) return NULL;
   int rc = unlinkat(dirfd, name, 0);
@@ -238,8 +251,5 @@ NAPI_MODULE_INIT() {
   export_function(env, exports, "fstatat", fd_fstatat);
   export_function(env, exports, "linkat", fd_linkat);
   export_function(env, exports, "unlinkat", fd_unlinkat);
-  napi_value nofollow_any;
-  napi_create_int32(env, O_NOFOLLOW_ANY, &nofollow_any);
-  napi_set_named_property(env, exports, "O_NOFOLLOW_ANY", nofollow_any);
   return exports;
 }

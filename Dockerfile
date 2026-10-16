@@ -86,6 +86,10 @@ COPY --chown=node:node third_party/glass_goals_devkit/packages/goals-types ./thi
 # Install deps fresh in the image to rebuild better-sqlite3 against Node 24 ABI
 RUN pnpm install --frozen-lockfile
 
+# A failed fd-ops build only warns during install, so assert here that the
+# addon loads; the image always has the C toolchain it needs.
+RUN node --input-type=module -e "(await import('./packages/fd-ops/index.js')).loadFdOps()"
+
 # Copy the rest of the application source code (excluding those in .dockerignore)
 COPY --chown=node:node . .
 

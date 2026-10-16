@@ -2,14 +2,15 @@ export interface FdStat {
   dev: bigint;
   ino: bigint;
   mode: number;
-  nlink: number;
-  size: number;
 }
 
 /**
  * Each call takes one directory descriptor and one path component: non-empty,
- * without `/` or NUL, and not `.` or `..`. Nothing follows a symlink. Errors
- * carry Node-style `code`, `errno` and `syscall` properties.
+ * without `/` or NUL, and not `.` or `..`. Nothing follows a symlink. A
+ * descriptor must be a non-negative integer (so never `AT_FDCWD`), and flags and
+ * mode must be integers that fit in 32 bits; anything else throws
+ * `ERR_INVALID_ARG_TYPE` or `ERR_OUT_OF_RANGE` before any syscall. Errors from
+ * the syscall carry Node-style `code`, `errno` and `syscall` properties.
  */
 export interface FdOps {
   /** `openat` with `O_NOFOLLOW`, `O_CLOEXEC` and, on macOS, `O_NOFOLLOW_ANY` added. */
@@ -20,8 +21,6 @@ export interface FdOps {
   linkat(olddirfd: number, oldname: string, newdirfd: number, newname: string): void;
   /** `unlinkat` of a non-directory entry; a symlink is removed itself. */
   unlinkat(dirfd: number, name: string): void;
-  /** The platform's `O_NOFOLLOW_ANY`, or 0 where it has none. */
-  readonly O_NOFOLLOW_ANY: number;
 }
 
 export function loadFdOps(): FdOps;

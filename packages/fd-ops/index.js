@@ -4,18 +4,22 @@ const require = createRequire(import.meta.url);
 
 let addon;
 let loadError;
-try {
-  addon = require("./build/Release/fd_ops.node");
-} catch (err) {
-  loadError = err;
-}
 
 /**
  * The descriptor-relative primitives, or a thrown `ERR_FD_OPS_UNAVAILABLE`
  * when the native addon did not build or load. Callers refuse the file
- * operation on that error; there is no pathname fallback.
+ * operation on that error; there is no pathname fallback. The addon is loaded
+ * on the first call, so importing this module never loads native code, and the
+ * outcome is kept for later calls.
  */
 export function loadFdOps() {
+  if (addon === undefined && loadError === undefined) {
+    try {
+      addon = require("./build/Release/fd_ops.node");
+    } catch (err) {
+      loadError = err;
+    }
+  }
   if (addon) return addon;
   throw Object.assign(
     new Error(

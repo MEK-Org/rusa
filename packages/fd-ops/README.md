@@ -18,10 +18,12 @@ installs the workspace needs a C toolchain:
   not yet been verified on a Mac.
 
 The first build also downloads Node's headers for the running Node version
-into node-gyp's cache. Rebuild after changing Node major versions:
+into node-gyp's cache. Every `pnpm install` recompiles the addon, so there is no
+separate `build` script; to rebuild without a full install, run
 `pnpm --filter @rusa/fd-ops rebuild`.
 
 A failed build does not fail `pnpm install`. Instead `loadFdOps()` throws
 `ERR_FD_OPS_UNAVAILABLE`, and callers refuse the file operation. There is no
 pathname fallback. This package's own tests fail when the addon is missing, so
-CI catches a broken build.
+CI catches a broken build, and the Docker image build fails unless the addon
+loads.
