@@ -38,7 +38,8 @@ FROM node:24-slim AS runtime
 
 # Install system runtime dependencies:
 # - git (needed by the git-bridge)
-# - python3, make, g++ (needed for rebuilding better-sqlite3 native bindings)
+# - python3, make, g++ (needed for rebuilding better-sqlite3 native bindings and
+#   for building the @rusa/fd-ops addon from source)
 # (Do NOT install bwrap - under this profile, the container itself is the sandbox boundary)
 RUN apt-get update && apt-get install -y \
     curl \
@@ -74,6 +75,9 @@ USER node
 # Copy manifests to cache dependency resolution step
 COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY --chown=node:node packages/rusa/package.json ./packages/rusa/
+# The fd-ops addon compiles from source during install, so its sources must be
+# present here too.
+COPY --chown=node:node packages/fd-ops ./packages/fd-ops
 # The root prepare script runs during install and compiles the devkit packages,
 # so their sources and tsconfig must be present here, not just package.json.
 COPY --chown=node:node third_party/glass_goals_devkit/packages/goals-core ./third_party/glass_goals_devkit/packages/goals-core

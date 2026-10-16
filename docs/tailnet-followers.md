@@ -51,7 +51,10 @@ and `spawn_thread`.
 
 ## Mac setup
 
-Requires Node 20.19+ and pnpm. Clone the repository with its submodules:
+Requires Node 20.19+ and pnpm, plus the Xcode Command Line Tools
+(`xcode-select --install`): `pnpm install` compiles the `@rusa/fd-ops` native
+addon from source (see [its README](../packages/fd-ops/README.md); not yet
+verified on a Mac). Clone the repository with its submodules:
 
 ```sh
 git clone --recurse-submodules https://github.com/MEK-Org/rusa.git rusa-follower

@@ -1,0 +1,18 @@
+{
+  "name": "@rusa/fd-ops",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "binding.gyp",
+    "src",
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "install": "node-gyp rebuild || echo '@rusa/fd-ops: native build failed; descriptor-relative file operations will be refused (see packages/fd-ops/README.md)' >&2",
+    "test": "node --test test/*.test.js"
+  }
+}
