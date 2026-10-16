@@ -90,7 +90,7 @@ export interface ConfiguredActorImportOptions {
   db: Database.Database;
   actors: ActorRepository;
   receipts: Pick<LegacyImportReceiptRepository, "actorFor" | "has" | "record" | "rowCount">;
-  seed: ConfiguredActorSeed;
+  seed?: ConfiguredActorSeed;
   /** Directory holding spawned actors' workspaces, used as identity evidence. */
   workersDir: string;
   /** Where the configured actor's image is cached. */
@@ -165,6 +165,8 @@ export function planConfiguredActorImport(options: {
   workersDir: string;
   selectedActorId?: string;
   legacyRootSession?: boolean;
+  /** Absent configuration binds no new actor, even beside an existing forest. */
+  hasConfiguration?: boolean;
   idgen?: () => string;
 }): ConfiguredActorImportPlan {
   const { actors, receipts, selectedActorId } = options;
@@ -207,7 +209,7 @@ export function planConfiguredActorImport(options: {
         [actorId]
       );
     }
-    if (record.status !== "active") {
+    if (record.status !== "active" && options.hasConfiguration !== false) {
       throw new ConfiguredActorImportError(
         `the imported configured actor ${actorId} is retired`,
         "startup will not revive a retired actor or create a replacement for it; restore a backup taken before the retirement",
@@ -219,6 +221,16 @@ export function planConfiguredActorImport(options: {
     // forest, and restart must reconstruct the persisted tree as it stands
     // rather than demanding that an import-time parentlessness survive (#1003).
     return { kind: "completed", actorId };
+  }
+
+  if (options.hasConfiguration === false) {
+    if (selectedActorId !== undefined) {
+      throw new ConfiguredActorImportError(
+        "--import-actor requires rootActor configuration",
+        "drop --import-actor when no configured actor is being imported"
+      );
+    }
+    return { kind: "none", recorded: false };
   }
 
   const parentless = records.filter((record) => record.parentId === null);
@@ -375,7 +387,10 @@ function workspaceFindings(candidate: ActorRecord, workersDir: string): string[]
 export function importConfiguredActor(
   options: ConfiguredActorImportOptions
 ): ConfiguredActorImportResult {
-  const plan = planConfiguredActorImport(options);
+  const plan = planConfiguredActorImport({
+    ...options,
+    hasConfiguration: options.seed !== undefined,
+  });
   if (plan.kind === "completed") {
     return { plan, actorId: plan.actorId, filled: [], avatarImported: false };
   }
@@ -391,6 +406,7 @@ export function importConfiguredActor(
   }
 
   const { actors, seed } = options;
+  if (!seed) throw new Error("configured actor import requires configuration");
   const now = options.now ?? (() => new Date().toISOString());
   const existing =
     plan.kind === "adopt" ? actors.get(plan.previousActorId ?? plan.actorId) : undefined;

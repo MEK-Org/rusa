@@ -454,7 +454,7 @@ export interface RusaConfig {
    */
   jevMode?: "shadow" | "active";
   webhook: WebhookConfig;
-  /** Explicit provider/model selection for the root actor. */
+  /** Optional legacy configured-actor import; fresh instances create actors through the dashboard. */
   rootActor?: RootActorConfig;
   /** Google Chat inbound/outbound integration (optional; disabled if absent). */
   chat?: ChatConfig;

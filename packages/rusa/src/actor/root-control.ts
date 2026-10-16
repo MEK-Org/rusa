@@ -5,6 +5,7 @@ import {
   type ProviderModelConfig,
 } from "../providers/model-config.js";
 import type { ActorHandle, ActorRecord, ContextConfig } from "./actor-record.js";
+import { defaultGrantRecipient } from "./administrative-capabilities.js";
 
 /**
  * UUID string format representing a durable user principal ID.
@@ -30,7 +31,7 @@ export interface RootControlMesh {
   spawn(request: {
     executionTarget?: string;
     charter: string;
-    parentId: string;
+    parentId: string | null;
     modelConfig: ModelConfigInput;
     context?: ContextConfig;
     conversationId?: string;
@@ -78,16 +79,20 @@ export interface RootControlOptions {
  * provenance rather than masquerading as the logical actor.
  */
 export class RootControlService {
-  readonly rootId: string | undefined;
+  get rootId(): string | undefined {
+    return this.options.rootId ?? defaultGrantRecipient(this.options.mesh.list())?.id;
+  }
   readonly providers: string[];
 
   constructor(private readonly options: RootControlOptions) {
-    this.rootId = options.rootId;
     this.providers = [...new Set(options.providers ?? [])].sort();
   }
 
   spawnChild(request: RootChildRequest, principal: RootControlPrincipal): string {
-    const rootId = this.requireRootId();
+    const rootId = this.rootId;
+    if (rootId === undefined && principal === "root-llm") {
+      throw new Error("only an authenticated operator may create a top-level actor");
+    }
     const charter = request.charter?.trim();
     if (!charter) throw new Error("charter is required");
     // Resolve named model classes first: the provider allowlist below, the
@@ -122,7 +127,7 @@ export class RootControlService {
         ? { executionTarget: request.executionTarget }
         : {}),
       charter,
-      parentId: rootId,
+      parentId: rootId ?? null,
       // Keep the original declaration for mesh.spawn. Root control uses the
       // resolved snapshot above only for its provider allowlist; mesh is the
       // authoritative resolution/validation boundary and derives provenance
@@ -132,10 +137,16 @@ export class RootControlService {
       conversationId: optionalTrimmed(request.conversationId),
       title: optionalTrimmed(request.title),
     });
-    this.record(principal, "spawn_child", id, {
-      modelConfig: pool,
-      context: normalizeContext(request.context),
-    });
+    this.record(
+      principal,
+      "spawn_child",
+      id,
+      {
+        modelConfig: pool,
+        context: normalizeContext(request.context),
+      },
+      rootId ?? id
+    );
     return id;
   }
 
@@ -228,12 +239,12 @@ export class RootControlService {
     principal: RootControlPrincipal,
     action: string,
     targetId: string,
-    metadata: Record<string, unknown> = {}
+    metadata: Record<string, unknown> = {},
+    actorId: string = this.requireRootId()
   ): void {
-    const rootId = this.requireRootId();
     this.options.mesh.recordEvent({
       kind: "root_control_action",
-      actorId: rootId,
+      actorId,
       detail: `${principal} ${action}`,
       payload: JSON.stringify({ principal, action, targetId, ...metadata }),
     });

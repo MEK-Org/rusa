@@ -187,6 +187,7 @@ class DashboardApi {
       },
       body: jsonEncode({
         'charter': charter,
+        'contextMode': 'brief',
         'title': ?title,
         'provider': ?provider,
         'model': ?model,

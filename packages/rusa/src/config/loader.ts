@@ -227,49 +227,55 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   if (!parsed.providers || Object.keys(parsed.providers).length === 0) {
     throw new Error("config.yaml: at least one provider is required");
   }
-  if (!parsed.rootActor) {
-    throw new Error("config.yaml: rootActor must specify an explicit provider and model");
-  }
-  if (parsed.rootActor.context !== undefined) {
-    try {
-      parsed.rootActor.context = resolveContextConfig(parsed.rootActor.context);
-    } catch (err) {
+  if (parsed.rootActor !== undefined) {
+    if (
+      !parsed.rootActor ||
+      typeof parsed.rootActor !== "object" ||
+      Array.isArray(parsed.rootActor)
+    ) {
+      throw new Error("config.yaml: rootActor must be a mapping when set");
+    }
+    if (parsed.rootActor.context !== undefined) {
+      try {
+        parsed.rootActor.context = resolveContextConfig(parsed.rootActor.context);
+      } catch (err) {
+        throw new Error(
+          `config.yaml: rootActor.context: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+    const rootActor = parsed.rootActor;
+    if ("fallbackModel" in rootActor) {
       throw new Error(
-        `config.yaml: rootActor.context: ${err instanceof Error ? err.message : String(err)}`
+        "config.yaml: rootActor.fallbackModel has been removed; for portable roots (context.type: portable), configure the ordered root model pool with set_actor_model instead. Native-session roots do not support multi-entry model pools."
       );
     }
-  }
-  const rootActor = parsed.rootActor;
-  if ("fallbackModel" in rootActor) {
-    throw new Error(
-      "config.yaml: rootActor.fallbackModel has been removed; for portable roots (context.type: portable), configure the ordered root model pool with set_actor_model instead. Native-session roots do not support multi-entry model pools."
-    );
-  }
-  const provider = rootActor.provider?.trim();
-  if (!provider) throw new Error("config.yaml: rootActor.provider must be a non-empty string");
-  const capabilityName = providerCapabilityName(provider, parsed);
-  if (capabilityName === "agy" && rootActor.effort === undefined) {
-    const { effort: parsedEffort } = normalizeModelEffortSelection(
-      capabilityName,
-      rootActor.model,
-      undefined
-    );
-    if (parsedEffort === undefined) {
-      console.warn(
-        `[migration] defaulting omitted config rootActor effort to "high" for antigravity model "${rootActor.model || ""}"`
+    const provider = rootActor.provider?.trim();
+    if (!provider) throw new Error("config.yaml: rootActor.provider must be a non-empty string");
+    const capabilityName = providerCapabilityName(provider, parsed);
+    if (capabilityName === "agy" && rootActor.effort === undefined) {
+      const { effort: parsedEffort } = normalizeModelEffortSelection(
+        capabilityName,
+        rootActor.model,
+        undefined
       );
-      rootActor.effort = "high";
+      if (parsedEffort === undefined) {
+        console.warn(
+          `[migration] defaulting omitted config rootActor effort to "high" for antigravity model "${rootActor.model || ""}"`
+        );
+        rootActor.effort = "high";
+      }
     }
+    const [selection] = validateModelConfigPool(
+      parsed,
+      { provider, model: rootActor.model, effort: rootActor.effort },
+      { portable: rootActor.context?.type === "portable" }
+    );
+    if (!selection) throw new Error("config.yaml: rootActor requires one provider/model entry");
+    rootActor.provider = selection.provider;
+    rootActor.model = selection.model;
+    rootActor.effort = selection.effort;
   }
-  const [selection] = validateModelConfigPool(
-    parsed,
-    { provider, model: rootActor.model, effort: rootActor.effort },
-    { portable: rootActor.context?.type === "portable" }
-  );
-  if (!selection) throw new Error("config.yaml: rootActor requires one provider/model entry");
-  rootActor.provider = selection.provider;
-  rootActor.model = selection.model;
-  rootActor.effort = selection.effort;
   if (parsed.understanding?.rootNodeId !== undefined) {
     if (
       typeof parsed.understanding.rootNodeId !== "string" ||

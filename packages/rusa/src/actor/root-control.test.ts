@@ -35,17 +35,37 @@ function setup(extra: Partial<RootControlOptions> = {}) {
 }
 
 describe("RootControlService", () => {
-  it("refuses root-controlled mutations when an empty store has no root actor", () => {
+  it("refuses actor-controlled bootstrap when an empty store has no root actor", () => {
     const { mesh, events, service } = setup({ rootId: undefined });
 
     expect(() =>
       service.spawnChild(
         { charter: "do not synthesize a parent", modelConfig: { provider: "agy", model: "flash" } },
-        "e2e-controller"
+        "root-llm"
       )
-    ).toThrow(/unavailable until an operator creates an actor/);
+    ).toThrow(/authenticated.*operator/);
     expect(mesh.spawn).not.toHaveBeenCalled();
     expect(events).toEqual([]);
+  });
+
+  it("lets an operator create the first parentless actor, then creates children under it", () => {
+    const actors = new InMemoryActorRepository();
+    const mesh = new ActorMesh({
+      actors,
+      idgen: (() => {
+        let n = 0;
+        return () => `actor-${++n}`;
+      })(),
+      createActor: () => ({ run: vi.fn() }) as unknown as Actor,
+    });
+    const service = new RootControlService({ mesh, providers: ["agy"] });
+    const request = { charter: "start here", modelConfig: { provider: "agy", model: "flash" } };
+    const first = service.spawnChild(request, "e2e-controller");
+    const second = service.spawnChild(request, "e2e-controller");
+    expect(actors.get(first)?.parentId).toBeNull();
+    expect(actors.get(second)?.parentId).toBe(first);
+    expect(actors.get(first)?.handles).toContainEqual({ id: second });
+    expect(service.rootId).toBe(first);
   });
 
   it("spawns under root and records the external principal without changing ownership", () => {

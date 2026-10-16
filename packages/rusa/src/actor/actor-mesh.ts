@@ -173,8 +173,8 @@ export interface SpawnRequest {
   executionTarget?: string;
   /** What the new actor owns — authored by the spawning message (B.5). */
   charter: string;
-  /** The spawning actor's id (becomes the child's parent + gets a handle to the child). */
-  parentId: string;
+  /** Parent actor, or null for a top-level actor created by the operator. */
+  parentId: string | null;
   /**
    * The child's declared provider/model/effort pool — a single entry or a
    * bounded, non-empty, portable-only-above-length-one array (design MEK-Org/rusa#169).
@@ -3261,7 +3261,7 @@ export class ActorMesh {
       throw new Error("modelConfig must declare at least one provider/model entry");
     }
     const id = this.idgen();
-    const parentId = this.resolveThreadId(req.parentId);
+    const parentId = req.parentId === null ? null : this.resolveThreadId(req.parentId);
     // Store provenance only when the caller declared a class in modelConfig.
     // The validation gate resolves that reference to this concrete snapshot;
     // an explicit tuple/pool cannot attach an arbitrary class label.
@@ -3300,7 +3300,7 @@ export class ActorMesh {
     // Spawning grants the parent a handle to the child, so it can message it.
     // No role — the parent authored the charter, so the child's charter is the
     // truthful label (resolved at prompt time).
-    this.grantHandle(parentId, { id });
+    if (parentId !== null) this.grantHandle(parentId, { id });
     let actor: MeshActor;
     try {
       // `record.executionConfig.executionTarget` is `req.executionTarget`, so the placement a
@@ -3308,7 +3308,7 @@ export class ActorMesh {
       // other construction input.
       actor = this.runs.instantiate(record);
     } catch (err) {
-      this.revokeHandle(parentId, id);
+      if (parentId !== null) this.revokeHandle(parentId, id);
       this.actors.patch(id, { status: "retired" });
       throw err;
     }

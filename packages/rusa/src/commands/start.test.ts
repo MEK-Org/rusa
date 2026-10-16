@@ -6778,6 +6778,113 @@ describe("runStart webhook event routing (Phase 4)", () => {
       }
     };
 
+    it("boots without rootActor and creates the first actor through operator control (#1087)", async () => {
+      rmSync(join(homeDir, "threads.json"));
+      clearLegacyConfiguredGrants();
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+        })
+      );
+      let firstId = "";
+      await new Promise<void>((resolve, reject) => {
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              shutdownFn = handles.shutdown;
+              expect(handles.mesh.list()).toEqual([]);
+              firstId = handles.rootControl.spawnChild(
+                {
+                  charter: "first actor",
+                  modelConfig: {
+                    provider: "antigravity",
+                    model: "Gemini 3.7 Flash",
+                    effort: "high",
+                  },
+                  context: { type: "portable", mode: "brief" },
+                },
+                "e2e-controller"
+              );
+              expect(getRepositories().actors.get(firstId)).toMatchObject({
+                parentId: null,
+                context: { type: "portable", mode: "brief" },
+              });
+              expect(getRepositories().capabilityGrants.activeFor(firstId)).toContain(
+                "capability-admin"
+              );
+              getRepositories().capabilityGrants.revoke(
+                firstId,
+                "capability-admin",
+                "2026-10-16T00:00:00Z"
+              );
+              resolve();
+            },
+          },
+        }).catch(reject);
+      });
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      const restarted = await boot({
+        inspect: () => {
+          expect(getRepositories().capabilityGrants.activeFor(firstId)).not.toContain(
+            "capability-admin"
+          );
+          expect(getRepositories().actors.get(firstId)?.context).toEqual({
+            type: "portable",
+            mode: "brief",
+          });
+        },
+      });
+      expect(restarted.live).toEqual([firstId]);
+      expect(restarted.importedActor).toBeUndefined();
+    });
+
+    it("boots an existing forest without rootActor and grants only its oldest active top-level actor (#1087)", async () => {
+      clearLegacyConfiguredGrants();
+      rmSync(join(homeDir, "threads.json"));
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+        })
+      );
+      initDb(homeDir);
+      const actors = getRepositories().actors;
+      const record = (
+        id: string,
+        parentId: string | null,
+        createdAt: string,
+        status: "active" | "retired" = "active"
+      ) => ({
+        id,
+        parentId,
+        createdAt,
+        status,
+        charter: id,
+        modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
+      });
+      actors.upsert(record("later", null, "2026-01-03T00:00:00Z"));
+      actors.upsert(record("retired", null, "2026-01-01T00:00:00Z", "retired"));
+      actors.upsert(record("oldest", null, "2026-01-02T00:00:00Z"));
+      actors.upsert(record("child", "oldest", "2026-01-01T00:00:00Z"));
+      closeDb();
+      const state = await boot({
+        inspect: () => {
+          expect(getRepositories().capabilityGrants.activeFor("oldest").sort()).toEqual(
+            [...CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES].sort()
+          );
+          for (const id of ["later", "retired", "child"]) {
+            expect(getRepositories().capabilityGrants.activeFor(id)).toEqual([]);
+          }
+        },
+      });
+      expect(state.importedActor).toBeUndefined();
+      expect(state.live).toEqual(["child", "later", "oldest"]);
+    });
+
     it("boots an empty store without synthesizing an actor, even beside legacy rootActor syntax (#1003)", async () => {
       // A fresh install: no legacy registry, only the legacy rootActor syntax.
       rmSync(join(homeDir, "threads.json"));
@@ -6834,83 +6941,91 @@ describe("runStart webhook event routing (Phase 4)", () => {
       writeRootActorConfig({ charter: "edited charter", handle: "renamed-familiar" });
       expect(await boot()).toEqual(first);
 
-      // Removing the optional keys leaves only the required tuple behind.
-      writeRootActorConfig({});
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+        })
+      );
       expect(await boot()).toEqual(first);
     });
 
-    it("does not manufacture grants when a host capability becomes mountable on a later boot", async () => {
-      clearLegacyConfiguredGrants();
-      writeRootActorConfig({ charter: "configured charter" });
+    it("ignores a retired imported actor when booting without rootActor (#1087)", async () => {
+      const first = await boot();
+      const importedId = first.importedActor;
+      if (!importedId) throw new Error("configured actor was not imported");
+      withMeshDb((db) => {
+        const actors = new SqliteActorRepository(db);
+        actors.patch(importedId, { status: "retired" });
+        actors.upsert({
+          id: "replacement",
+          parentId: null,
+          charter: "replacement actor",
+          status: "active",
+          createdAt: "2026-10-16T00:00:00Z",
+          modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
+        });
+      });
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+        })
+      );
+      const restarted = await boot({
+        inspect: () => {
+          expect(getRepositories().capabilityGrants.activeFor("replacement")).toContain(
+            "capability-admin"
+          );
+        },
+      });
+      expect(restarted.live).toEqual(["replacement"]);
+      expect(restarted.root?.status).toBe("retired");
+    });
 
-      // First boot cannot resolve the deploy checkout, so `update` is not
-      // registered as a mountable server. The second boot can register it.
-      // Neither transition may derive a grant from imported identity.
+    it("keeps default grants fixed across tool availability changes and preserves revocation (#1087)", async () => {
+      clearLegacyConfiguredGrants();
       serviceInstanceMock.resolveRepoRoot.mockImplementation(() => {
         throw new Error("fixture: deploy checkout unavailable");
       });
       const first = await boot();
-      const importedActor = first.importedActor;
-      if (!importedActor) throw new Error("configured actor was not imported");
-
-      expect(
+      const actorId = first.importedActor;
+      if (!actorId) throw new Error("configured actor was not imported");
+      const grants = () =>
         withMeshDb((db) =>
           db
             .prepare(
-              "SELECT capability, granted_by, revoked_at FROM capability_grants WHERE actor_id = ?"
+              "SELECT capability, granted_by, granted_at, revoked_at FROM capability_grants WHERE actor_id = ? ORDER BY capability"
             )
-            .all(importedActor)
-        )
-      ).toEqual([]);
+            .all(actorId)
+        );
+      const initial = grants();
+      expect(initial).toHaveLength(CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES.length);
+      withMeshDb((db) =>
+        db
+          .prepare(
+            "UPDATE capability_grants SET revoked_at = ? WHERE actor_id = ? AND capability = 'update'"
+          )
+          .run("2026-10-16T00:01:00.000Z", actorId)
+      );
+      const revoked = grants();
 
       serviceInstanceMock.resolveRepoRoot.mockImplementation(
         serviceInstanceMock.actualResolveRepoRoot
       );
-      let mountableOnSecondBoot: string[] = [];
       await boot({
         inspect: (mesh) => {
-          mountableOnSecondBoot = (
-            mesh.get(importedActor) as unknown as { opts: { mcpServers: Array<{ name: string }> } }
-          ).opts.mcpServers.map((server) => server.name);
+          const mcp = (
+            mesh.get(actorId) as unknown as { opts: { mcpServers: Array<{ name: string }> } }
+          ).opts.mcpServers;
+          expect(mcp.map((server) => server.name)).not.toContain("update");
         },
       });
-      expect(mountableOnSecondBoot).not.toContain("update");
-      expect(
-        withMeshDb((db) =>
-          db
-            .prepare(
-              "SELECT capability, granted_by, revoked_at FROM capability_grants WHERE actor_id = ?"
-            )
-            .all(importedActor)
-        )
-      ).toEqual([]);
-
-      // A durable revoked row must remain revoked after that mountability
-      // transition; import identity is never a source for a new grant.
-      withMeshDb((db) =>
-        db
-          .prepare(
-            `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
-             VALUES (?, 'update', 'operator', '2026-10-16T00:00:00.000Z', '2026-10-16T00:01:00.000Z')`
-          )
-          .run(importedActor)
-      );
+      expect(grants()).toEqual(revoked);
       await boot();
-      expect(
-        withMeshDb((db) =>
-          db
-            .prepare(
-              "SELECT capability, granted_by, revoked_at FROM capability_grants WHERE actor_id = ?"
-            )
-            .all(importedActor)
-        )
-      ).toEqual([
-        {
-          capability: "update",
-          granted_by: "operator",
-          revoked_at: "2026-10-16T00:01:00.000Z",
-        },
-      ]);
+      expect(grants()).toEqual(revoked);
     });
 
     it("rehydrates forest descendants with retained state and normal delivery after restart (#1003)", async () => {
@@ -9491,7 +9606,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       logCapture.lines.length = 0;
     });
 
-    it("rehydrates the imported actor with the same ordinary MCP baseline as a worker", async () => {
+    it("rehydrates ordinary actors with their baseline and durable default grants", async () => {
       clearLegacyConfiguredGrants();
       withWorker("set-worker");
       const { mesh, root } = await boot();
@@ -9509,6 +9624,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "pnpm-hardlinks",
+        "update",
       ]);
       expect(workerServers.map((server) => server.name)).toEqual([
         "tracker",
@@ -9562,6 +9679,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "pnpm-hardlinks",
+        "update",
       ]);
       expect(mcpServersOf(workerOf(mesh, "chat-set-worker")).map((server) => server.name)).toEqual([
         "tracker",

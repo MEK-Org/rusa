@@ -605,9 +605,9 @@ function setup(
 
   const rawSpawn = mesh.spawn.bind(mesh);
   const testMesh = mesh as unknown as ActorMesh & {
-    spawn: (req: Partial<SpawnRequest> & { charter: string; parentId: string }) => string;
+    spawn: (req: Partial<SpawnRequest> & { charter: string; parentId: string | null }) => string;
   };
-  testMesh.spawn = (req: Partial<SpawnRequest> & { charter: string; parentId: string }) =>
+  testMesh.spawn = (req: Partial<SpawnRequest> & { charter: string; parentId: string | null }) =>
     rawSpawn({
       modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
       ...req,

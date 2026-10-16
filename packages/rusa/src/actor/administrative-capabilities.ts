@@ -1,5 +1,6 @@
 import { PNPM_HARDLINKS_MCP_NAME } from "../mcp/pnpm-hardlinks-mcp.js";
 import { UPDATE_MCP_NAME } from "../mcp/update-mcp.js";
+import type { ActorRecord } from "./actor-record.js";
 import type { CapabilityGrantStore } from "./capability-grants.js";
 
 /**
@@ -7,8 +8,9 @@ import type { CapabilityGrantStore } from "./capability-grants.js";
  * grant-derived capabilities (#549) — not a property of the distinguished root
  * actor. Each name covers exactly one existing administrative surface; none of
  * them is a catch-all "root" marker, and holding one confers nothing about the
- * others. Topology (`parentId === null`) and the literal `root` address grant
- * none of these.
+ * others. Only durable grant rows authorize these operations. The default
+ * bootstrap resolves the oldest active parentless actor (#1087), while the
+ * literal `root` address itself grants nothing.
  *
  * Every operation that names a target actor is scoped to the holder's own
  * subtree (itself included); the mesh enforces that boundary, not the tool
@@ -44,8 +46,8 @@ export const ACTOR_ADMIN_CAPABILITY = "actor-admin";
  * Manage membership of the one mesh-wide voice Chat Room (#663): add or remove
  * participants, and give an added actor an unused voice when its own collides.
  * The room has no subtree to scope to, so this is host-global like the
- * model-class registry: seeded once to the configured actor and never granted
- * through the mesh, which is what keeps room membership root-managed.
+ * model-class registry: included in the default bootstrap set and never granted
+ * through the mesh. Room membership itself remains explicit.
  */
 export const ROOM_ADMIN_CAPABILITY = "room-admin";
 
@@ -110,8 +112,8 @@ export const HOST_GLOBAL_CAPABILITIES: ReadonlySet<string> = new Set([
 
 /**
  * Everything the configured actor held implicitly before administration became
- * grant-derived. Startup no longer seeds it (#1003); rows an earlier boot
- * seeded stand, and #1087 owns any new default provisioning.
+ * grant-derived. The default bootstrap provisions this fixed set for the
+ * oldest active parentless actor; existing active or revoked rows stand.
  */
 export const CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES: readonly string[] = [
   ...ADMINISTRATIVE_CAPABILITIES,
@@ -138,11 +140,11 @@ export function bootstrapCapabilitiesFor(mountable: ReadonlySet<string>): string
 export const CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR = "system:bootstrap";
 
 /**
- * Seed the configured actor's administrative grants exactly once per
+ * Insert the default administrative grants exactly once per
  * (actor, capability) pair. A pair that already has a row — active OR revoked —
  * is left alone, so a revocation survives every later boot: the seed is a
- * one-time import of the access the configured actor already had, never a
- * standing source of authority. Returns the capabilities this call granted.
+ * materialization of defaults into durable rows. Returns the capabilities
+ * this call granted. The caller resolves which actor receives the defaults.
  */
 export function seedConfiguredActorGrants(
   store: CapabilityGrantStore,
@@ -168,4 +170,13 @@ export function seedConfiguredActorGrants(
     seeded.push(capability);
   }
   return seeded;
+}
+
+/** Default grants go to the oldest live top-level actor (#1087). Ties use its stable id. */
+export function defaultGrantRecipient(records: readonly ActorRecord[]): ActorRecord | undefined {
+  return records
+    .filter((record) => record.parentId === null && record.status === "active")
+    .sort(
+      (a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || a.id.localeCompare(b.id)
+    )[0];
 }

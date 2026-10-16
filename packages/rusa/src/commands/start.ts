@@ -29,7 +29,9 @@ import {
 import type { ActorRecord, ExecutionConfig, PortableContextConfig } from "../actor/actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
+  defaultGrantRecipient,
   OBLIGATIONS_ADMIN_CAPABILITY,
+  seedConfiguredActorGrants,
 } from "../actor/administrative-capabilities.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
 import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
@@ -1183,9 +1185,6 @@ async function composeStart(
   const rootActor = config.rootActor;
   configureCodexAuthBroker(codexAuthBrokerConfigured(config));
   const errorSink = resolveErrorSink(config);
-  if (!rootActor) {
-    throw new Error("config loader returned no rootActor after validating root configuration");
-  }
   // Config is parsed: its credentials join the scrub set (which `bootLog` shares
   // through the same closure) and its configured level takes effect.
   const configSecretEntries = collectConfigSecretEntries(config);
@@ -1537,11 +1536,13 @@ async function composeStart(
     log.warn("inbox_listener_failed", { err: error });
   });
   const workersDir = join(mcHome, "workers");
-  const rootBootstrapTuple: RawProviderModelConfig = {
-    provider: rootActor.provider,
-    model: rootActor.model,
-    ...(rootActor.effort === undefined ? {} : { effort: rootActor.effort }),
-  };
+  const rootBootstrapTuple: RawProviderModelConfig | undefined = rootActor
+    ? {
+        provider: rootActor.provider,
+        model: rootActor.model,
+        ...(rootActor.effort === undefined ? {} : { effort: rootActor.effort }),
+      }
+    : undefined;
   const rootPreflight = (entry: ProviderModelConfig) => {
     resolveProvider(config, entry.provider, entry.model, entry.effort);
   };
@@ -1556,6 +1557,7 @@ async function composeStart(
   let configuredImport: ConfiguredActorImportResult;
   try {
     const configuredPlan = planConfiguredActorImport({
+      hasConfiguration: rootActor !== undefined,
       actors,
       receipts: getRepositories().legacyImportReceipts,
       workersDir,
@@ -1633,22 +1635,25 @@ async function composeStart(
       db: database,
       actors,
       receipts: getRepositories().legacyImportReceipts,
-      seed: {
-        charter: rootActor.charter,
-        context: rootActor.context,
-        handle: resolveRootHandle(config),
-        avatarPath: rootActor.avatar,
-        executionConfig: rootIntent.executionConfig,
-        sessionId: legacyActorImport.deferredRootSessionId,
-        modelConfig: (portable, actorId) =>
-          seedRootModelConfig({
-            config,
-            rootId: actorId,
-            bootstrap: rootBootstrapTuple,
-            portable,
-            preflight: rootPreflight,
-          }),
-      },
+      seed:
+        rootActor && rootBootstrapTuple
+          ? {
+              charter: rootActor.charter,
+              context: rootActor.context,
+              handle: resolveRootHandle(config),
+              avatarPath: rootActor.avatar,
+              executionConfig: rootIntent.executionConfig,
+              sessionId: legacyActorImport.deferredRootSessionId,
+              modelConfig: (portable, actorId) =>
+                seedRootModelConfig({
+                  config,
+                  rootId: actorId,
+                  bootstrap: rootBootstrapTuple,
+                  portable,
+                  preflight: rootPreflight,
+                }),
+            }
+          : undefined,
       workersDir,
       avatarCachePath: avatarCachePath("root"),
       selectedActorId: opts?.importActor,
@@ -1728,7 +1733,7 @@ async function composeStart(
   // instantiated entry by entry the way worker spawn preflights its own pool.
   let rootBootModelConfig: ReturnType<typeof resolveRootBootModelConfig> | undefined;
   let rootModelConfigDescription: string | undefined;
-  if (rootId !== undefined && importedRoot) {
+  if (rootId !== undefined && importedRoot?.status === "active") {
     try {
       rootBootModelConfig = resolveRootBootModelConfig({
         config,
@@ -1758,8 +1763,14 @@ async function composeStart(
     // The file tuple stops steering root once its pool is durable. Say so
     // whenever the two differ: a healthy boot on a model the operator just
     // edited away from would otherwise be the only signal.
-    const configuredRootDescription = describeModelConfigPool([rootBootstrapTuple]);
-    if (!rootModelConfigSeeded && rootModelConfigDescription !== configuredRootDescription) {
+    const configuredRootDescription = rootBootstrapTuple
+      ? describeModelConfigPool([rootBootstrapTuple])
+      : undefined;
+    if (
+      configuredRootDescription &&
+      !rootModelConfigSeeded &&
+      rootModelConfigDescription !== configuredRootDescription
+    ) {
       log.warn("root_model_config_file_ignored", {
         rootId,
         configured: configuredRootDescription,
@@ -3461,6 +3472,18 @@ async function composeStart(
     createActor: (ctx) => {
       const id = ctx.record.id;
       const rec = ctx.record;
+      // Default authority is provisioned as durable rows for the oldest active
+      // top-level actor (#1087), independently of the optional config import.
+      // Use the fixed default set: host tool availability never adds authority.
+      // Existing active AND revoked rows survive the atomic, insert-only seed.
+      if (defaultGrantRecipient(actors.list())?.id === id) {
+        const seeded = database.transaction(() =>
+          seedConfiguredActorGrants(capabilityGrants, id)
+        )();
+        if (seeded.length > 0) {
+          log.info("bootstrap_capabilities_seeded", { actorId: id, capabilities: seeded });
+        }
+      }
       // The configured import only preserves this legacy workdir mapping. It
       // grants no construction path, prompt, tools, or authority: every
       // active record below takes the same ordinary durable construction path.
@@ -3977,7 +4000,7 @@ async function composeStart(
 
   const rootControl = new RootControlService({
     mesh,
-    rootId: rootId,
+    rootId: importedRoot?.status === "active" ? rootId : undefined,
     providers: Object.keys(config.providers),
     resolveModelConfig: (input) => resolveModelClasses(modelClasses, input),
   });
