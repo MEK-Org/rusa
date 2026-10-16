@@ -176,7 +176,11 @@ describe("DbEventSourceOwnerStore (DB-specific)", () => {
       at: "2026-10-16T00:02:00Z",
     });
     expect(removed.droppedDelegations).toEqual([
-      expect.objectContaining({ resource: REPO, actorId: ROOT, unsubscribedAt: "2026-10-16T00:02:00Z" }),
+      expect.objectContaining({
+        resource: REPO,
+        actorId: ROOT,
+        unsubscribedAt: "2026-10-16T00:02:00Z",
+      }),
     ]);
     expect(store.activeForResource(REPO)).toEqual([]);
 

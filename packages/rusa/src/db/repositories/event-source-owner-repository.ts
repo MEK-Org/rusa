@@ -2,9 +2,9 @@ import type Database from "better-sqlite3";
 import {
   activeOwnerConflictMessage,
   type EventResource,
-  type EventSourceOwnershipAuditEvent,
   type EventSourceOwnerStore,
   type EventSourceOwnership,
+  type EventSourceOwnershipAuditEvent,
   isSubResourceOf,
   missingAuditedEventSourceOwnerships,
   resourceKey,
@@ -56,7 +56,12 @@ type RouteMaterializationSnapshot = {
   configuredRoots: string[];
   routes: Array<{
     resource: string;
-    disposition: "materialized" | "existing_active" | "unrouted_tombstone" | "unrouted_missing_audit" | "no_actor";
+    disposition:
+      | "materialized"
+      | "existing_active"
+      | "unrouted_tombstone"
+      | "unrouted_missing_audit"
+      | "no_actor";
   }>;
 };
 
@@ -117,7 +122,9 @@ function parseRouteMaterializationSnapshot(raw: string): RouteMaterializationSna
           }
         })() &&
         typeof route.disposition === "string" &&
-        ROUTE_DISPOSITIONS.has(route.disposition as RouteMaterializationSnapshot["routes"][number]["disposition"])
+        ROUTE_DISPOSITIONS.has(
+          route.disposition as RouteMaterializationSnapshot["routes"][number]["disposition"]
+        )
     )
   ) {
     throw new Error("event-source route materialization receipt has an invalid snapshot");
@@ -280,9 +287,7 @@ export class DbEventSourceOwnerStore implements EventSourceOwnerStore {
       }
 
       const configuredActor = this.db
-        .prepare(
-          `SELECT row_count, actor_id FROM legacy_import_receipts WHERE source = ?`
-        )
+        .prepare(`SELECT row_count, actor_id FROM legacy_import_receipts WHERE source = ?`)
         .get(CONFIGURED_ACTOR_IMPORT_SOURCE) as ConfiguredActorReceiptRow | undefined;
       if (!configuredActor) {
         throw new Error("configured-actor import receipt is missing before route materialization");
@@ -292,7 +297,9 @@ export class DbEventSourceOwnerStore implements EventSourceOwnerStore {
         configuredActor.row_count < 0 ||
         (configuredActor.row_count === 0) !== (configuredActor.actor_id === null)
       ) {
-        throw new Error("configured-actor import receipt is inconsistent before route materialization");
+        throw new Error(
+          "configured-actor import receipt is inconsistent before route materialization"
+        );
       }
 
       const droppedDelegations = this.dropUnanchoredDelegations(configuredRoots, options.at);
@@ -390,7 +397,9 @@ export class DbEventSourceOwnerStore implements EventSourceOwnerStore {
     for (const ownership of this.list()) {
       if (
         !ownership.unsubscribedAt &&
-        !configuredRoots.some((configuredRoot) => isSubResourceOf(ownership.resource, configuredRoot))
+        !configuredRoots.some((configuredRoot) =>
+          isSubResourceOf(ownership.resource, configuredRoot)
+        )
       ) {
         this.unsubscribe(ownership.resource, ownership.actorId, at);
         dropped.push({ ...ownership, unsubscribedAt: at });
