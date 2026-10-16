@@ -156,7 +156,9 @@ export class AvailabilityHolds {
         // takes holds whose expiry fell between `due` and now, which the
         // re-arm below no longer sees as future.
         const fired = this.now();
-        const expired = this.options.repo.list().filter((hold) => {
+        // Keep the same parse boundary as active reads: rows that expired before
+        // this timer's due time cannot be newly released by this wake.
+        const expired = this.options.repo.list({ now: due - 1 }).filter((hold) => {
           if (hold.expiry === undefined) return false;
           const expiry = Date.parse(hold.expiry);
           return expiry >= due && expiry <= fired;

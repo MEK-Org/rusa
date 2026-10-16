@@ -4582,9 +4582,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
     );
     expect(bare).toContain(
       "Availability holds still in force:\n" +
-        "• antigravity (all models), until cleared — mesh agy\n" +
-        "• claude model claude-sonnet-5, until cleared — mesh sonnet\n" +
-        "• codex (all models), until cleared — mesh codex\n" +
+        "• antigravity (all models), until cleared — mesh agy (mesh-instituted)\n" +
+        "• claude model claude-sonnet-5, until cleared — mesh sonnet (mesh-instituted)\n" +
+        "• codex (all models), until cleared — mesh codex (mesh-instituted)\n" +
         "Mesh-instituted holds stay in force"
     );
     expect(rows()).toEqual(["antigravity:*:mesh", "claude:claude-sonnet-5:mesh", "codex:*:mesh"]);
@@ -4593,6 +4593,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(held("claude", "claude-opus-5")).toBe(false);
     expect(held("codex")).toBe(true);
     expect(dashboardMesh()?.isHalted?.()).toBe(true);
+
+    // Bare /halt lists mesh-origin holds alongside its /resume instruction, so
+    // the operator can see that the mesh rows will remain after /resume.
+    await message("/halt", "messages/origin-halt-global");
+    expect(lastReply()).toContain(
+      "Availability holds in force:\n" +
+        "• antigravity (all models), until cleared — mesh agy (mesh-instituted)\n" +
+        "• claude model claude-sonnet-5, until cleared — mesh sonnet (mesh-instituted)\n" +
+        "• codex (all models), until cleared — mesh codex (mesh-instituted)"
+    );
+    expect(lastReply()).toContain("Mesh-instituted holds stay in force");
+    await message("/resume", "messages/origin-resume-global");
 
     // A scoped chat /resume again: nothing chat-origin remains to release.
     await message("/resume provider:antigravity", "messages/origin-resume-agy-again");

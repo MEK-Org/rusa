@@ -4850,12 +4850,18 @@ async function composeStart(
     // set it, else every message in a DM/two-person space and mentions elsewhere.
     // The mode is read per message, so a change governs the next arrival.
     const holdLines = (holds: readonly AvailabilityHold[]) =>
-      holds.map((hold) => `• ${describeHold(hold)}`).join("\n");
+      holds
+        .map(
+          (hold) => `• ${describeHold(hold)}${hold.origin === "mesh" ? " (mesh-instituted)" : ""}`
+        )
+        .join("\n");
     const activeHoldsNote = () => {
       const holds = availabilityHolds.list();
-      return holds.length
-        ? `\nAvailability holds in force:\n${holdLines(holds)}`
-        : "\nNo availability holds are in force.";
+      if (holds.length === 0) return "\nNo availability holds are in force.";
+      const meshNote = holds.some((hold) => hold.origin === "mesh")
+        ? "\nMesh-instituted holds stay in force until cleared from the dashboard or the hold tools."
+        : "";
+      return `\nAvailability holds in force:\n${holdLines(holds)}${meshNote}`;
     };
     const onChat = async (msg: ChatMessage): Promise<void> => {
       if (config.chat?.excludedSpaces?.includes(msg.spaceName)) {
@@ -5086,11 +5092,7 @@ async function composeStart(
           ];
           if (expired > 0) lines.push(`Also removed ${expired} expired hold record(s).`);
           if (remaining.length) {
-            const still = remaining.map(
-              (hold) =>
-                `• ${describeHold(hold)}${hold.origin === "mesh" ? " (mesh-instituted)" : ""}`
-            );
-            lines.push(`Still held:\n${still.join("\n")}`);
+            lines.push(`Still held:\n${holdLines(remaining)}`);
             if (remaining.some((hold) => hold.origin === "mesh")) {
               lines.push(
                 "Mesh-instituted holds stay in force until cleared from the dashboard or the hold tools."

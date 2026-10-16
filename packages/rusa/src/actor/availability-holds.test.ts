@@ -30,6 +30,7 @@ const START = Date.parse("2026-10-05T12:00:00.000Z");
 const HOUR = 60 * 60 * 1000;
 
 describe("AvailabilityHolds", () => {
+  let db: Database.Database;
   let repo: AvailabilityHoldRepository;
   let held: AvailabilityHold[][];
   let released: AvailabilityHold[][];
@@ -37,7 +38,7 @@ describe("AvailabilityHolds", () => {
 
   beforeEach(() => {
     vi.useFakeTimers({ now: START });
-    const db = new Database(":memory:");
+    db = new Database(":memory:");
     runMigrations(db);
     repo = new AvailabilityHoldRepository(db);
     held = [];
@@ -127,6 +128,30 @@ describe("AvailabilityHolds", () => {
     expect(holds.isHeld("claude", "opus")).toBe(true);
     expect(holds.list()).toHaveLength(1);
     expect(repo.list()).toHaveLength(3);
+  });
+
+  it("does not parse an older expired unreadable row when an expiry timer fires", () => {
+    db.prepare(
+      `INSERT INTO availability_holds (scope, origin, expiry, reason, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(
+      "not valid JSON",
+      "mesh",
+      new Date(START - HOUR).toISOString(),
+      "",
+      "root",
+      new Date(START - HOUR).toISOString()
+    );
+    holds.set({
+      provider: "kimi",
+      origin: "mesh",
+      expiry: new Date(START + HOUR).toISOString(),
+      createdBy: "root",
+    });
+
+    vi.advanceTimersByTime(HOUR);
+
+    expect(released.map((batch) => batch.map((hold) => hold.provider))).toEqual([["kimi"]]);
   });
 
   it("reports cleared holds to onReleased, skips it when nothing matched, and cancels their wake", () => {
