@@ -2129,6 +2129,95 @@ describe("dead-reckoned lane estimates (#759)", () => {
     expect(snapshot.providers[0].modelWindows).toEqual([]);
   });
 
+  describe("a dropped model lane overlapping a shown window (#1078)", () => {
+    const WIDE = ["claude-fable-5", "claude-fable-5-1"];
+    const NARROW = ["claude-fable-5"];
+    const point = (models: string[], observedAt: string, percentLeft: number) =>
+      historyPoint({
+        scope: "model",
+        models,
+        label: "Current week (Fable)",
+        observedAt,
+        percentLeft,
+        resetAtIso: RESET,
+      });
+    const reading = (
+      scrapedAt: string,
+      models: string[],
+      percentLeft: number,
+      providerWeekly = true
+    ): ProviderQuotaSnapshot => ({
+      provider: "claude",
+      status: "available",
+      scrapedAt,
+      limits: [
+        ...(providerWeekly ? (providerOnly(scrapedAt).limits ?? []) : []),
+        {
+          label: "Current week (Fable)",
+          kind: "weekly",
+          scope: { provider: "claude", models },
+          percentLeft,
+          resetAtIso: RESET,
+        },
+      ],
+    });
+    // Two parser flaps stored the Fable weekly under the narrower set; every
+    // other reading carried the full set.
+    const flapped = [
+      point(WIDE, at("10:00"), 80),
+      point(NARROW, at("11:00"), 75),
+      point(WIDE, at("12:00"), 70),
+      point(NARROW, at("12:30"), 68),
+      point(WIDE, at("13:00"), 65),
+    ];
+
+    it("serves the shown window alone rather than restoring the flapped lane beside it", async () => {
+      const snapshot = await snapshotAt(at("13:10"), reading(at("13:00"), WIDE, 65), flapped);
+
+      expect(snapshot.providers[0].modelWindows).toEqual([
+        expect.objectContaining({ modelIds: WIDE, usedPercent: 35, estimated: false }),
+      ]);
+
+      // During a flap scrape the narrow lane is the shown one, and the full
+      // lane it overlaps is not restored beside it either.
+      const during = await snapshotAt(
+        at("12:40"),
+        reading(at("12:30"), NARROW, 68),
+        flapped.slice(0, 4)
+      );
+      expect(during.providers[0].modelWindows).toEqual([
+        expect.objectContaining({ modelIds: NARROW, usedPercent: 32, estimated: false }),
+      ]);
+    });
+
+    it("still restores a dropped model lane that shares no model with a shown window", async () => {
+      const snapshot = await snapshotAt(at("13:30"), reading(at("13:00"), ["claude-other-1"], 50), [
+        fablePoint(at("10:00"), 80),
+        fablePoint(at("12:00"), 70),
+      ]);
+
+      expect(snapshot.providers[0].modelWindows).toEqual([
+        expect.objectContaining({ modelIds: ["claude-other-1"], estimated: false }),
+        expect.objectContaining({ modelIds: FABLE, usedPercent: 37.5, estimated: true }),
+      ]);
+    });
+
+    it("still restores a dropped provider lane beside a shown model window", async () => {
+      const snapshot = await snapshotAt(at("13:30"), reading(at("13:00"), WIDE, 65, false), [
+        historyPoint({ observedAt: at("10:00"), percentLeft: 80, resetAtIso: RESET }),
+        historyPoint({ observedAt: at("12:00"), percentLeft: 70, resetAtIso: RESET }),
+        point(WIDE, at("13:00"), 65),
+      ]);
+
+      expect(snapshot.providers[0].windows).toEqual([
+        expect.objectContaining({ id: "weekly", usedPercent: 37.5, estimated: true }),
+      ]);
+      expect(snapshot.providers[0].modelWindows).toEqual([
+        expect.objectContaining({ modelIds: WIDE, estimated: false }),
+      ]);
+    });
+  });
+
   it("keeps estimating inside the window however old the last reading is", async () => {
     const snapshot = await snapshotAt(
       at("12:00", "2026-09-30"),

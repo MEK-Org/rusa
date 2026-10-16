@@ -541,7 +541,8 @@ function latestStateFromHistory(
  * and its window has not reset. A window with nothing to estimate from keeps
  * what it showed before. A dropped lane is estimated only until its last-seen
  * window resets, never into a next window no scrape has shown: that is also
- * when the controller retires a dropped model lane (#588). Nothing here is
+ * when the controller retires a dropped model lane (#588). A dropped model lane
+ * sharing a model with a shown window of its kind is not added. Nothing here is
  * written anywhere.
  *
  * Window ids and history kinds key the same lanes: both are the closed
@@ -628,7 +629,16 @@ function withEstimates(
     if (!window) continue;
     const models = readings.at(-1)?.models ?? [];
     if (readings[0].scope === "provider") windows.push(window);
-    else modelWindows.push({ ...window, modelIds: [...models] });
+    else {
+      // A parser flap can store a narrower model set for a window that is still
+      // shown under its full set (#1078). Restoring that lane would serve the
+      // same window twice, and a single-match lookup such as the Fable ring
+      // reads two matches as unknown; the shown window already covers it.
+      const overlaps = modelWindows.some(
+        (w) => w.id === window.id && w.modelIds.some((id) => models.includes(id))
+      );
+      if (!overlaps) modelWindows.push({ ...window, modelIds: [...models] });
+    }
   }
   const headlineWindow = windows.find((w) => w.headline);
   return {
