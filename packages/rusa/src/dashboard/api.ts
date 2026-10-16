@@ -531,11 +531,7 @@ function negotiateEncoding(req: IncomingMessage | undefined): Encoding | undefin
 }
 
 /** `onCodecDone` runs when the codec callback arrives, before its continuation. */
-function compress(
-  encoding: Encoding,
-  payload: Buffer,
-  onCodecDone: () => void = () => {}
-): Promise<Buffer> {
+function compress(encoding: Encoding, payload: Buffer, onCodecDone: () => void): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const done = (err: Error | null, out: Buffer) => {
       onCodecDone();

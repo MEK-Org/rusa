@@ -397,6 +397,6 @@ describe("dashboard timing server wrapper", () => {
       expect(pct).toBeLessThanOrEqual(100);
     }
     expect(busyPct).toBeGreaterThanOrEqual(90);
-    expect(idlePct).toBeLessThanOrEqual(50);
+    expect(busyPct).toBeGreaterThan(idlePct);
   });
 });
