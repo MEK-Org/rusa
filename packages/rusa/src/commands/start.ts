@@ -3969,6 +3969,7 @@ async function composeStart(
     mesh,
     rootId: rootId,
     providers: Object.keys(config.providers),
+    availabilityHolds,
     resolveModelConfig: (input) => resolveModelClasses(modelClasses, input),
   });
 

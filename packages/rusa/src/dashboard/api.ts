@@ -1011,6 +1011,77 @@ export async function handleMeshApiRequest(
       return true;
     }
 
+    // POST /api/mesh/availability-holds/clear — authenticated operator
+    // recovery for a mesh-held lane. It deliberately routes through root
+    // control rather than an actor endpoint: the hold service performs the
+    // release/replay transition without starting an actor or a model run.
+    if (pathname === "/api/mesh/availability-holds/clear") {
+      const rootControl = deps?.rootControl;
+      if (!rootControl) {
+        sendJson(res, 503, { error: "root control unavailable" });
+        return true;
+      }
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, {
+              error: "provider and optional models (non-empty string[]) are required",
+            });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          const provider = body.provider;
+          const models = body.models;
+          if (
+            typeof provider !== "string" ||
+            !provider.trim() ||
+            !(
+              models === undefined ||
+              (Array.isArray(models) &&
+                models.every((model) => typeof model === "string" && model.trim().length > 0))
+            )
+          ) {
+            sendJson(res, 400, {
+              error: "provider and optional models (non-empty string[]) are required",
+            });
+            return;
+          }
+          const principal = requireOperatorPrincipal(req, res, deps);
+          if (!principal) return;
+          try {
+            const result = rootControl.clearAvailabilityHolds(
+              {
+                provider: provider.trim(),
+                ...(models === undefined
+                  ? {}
+                  : { models: (models as string[]).map((model) => model.trim()) }),
+              },
+              principal
+            );
+            sendJson(res, 200, {
+              released: result.released.map((hold) => ({
+                provider: hold.provider,
+                model: hold.model ?? null,
+                origin: hold.origin,
+                expiry: hold.expiry ?? null,
+              })),
+              expired_removed: result.expired.length,
+            });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
     // POST /api/mesh/admission-queue/reorder — operator reorder of the unclaimed
     // admission list (#570). The body carries the unclaimed order the operator
     // saw; if the live list differs, nothing moves and 409 returns the current

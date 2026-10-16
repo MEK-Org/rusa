@@ -176,6 +176,10 @@ describe("handleMeshApiRequest", () => {
   let deps: DashboardDataDeps;
   let rootSpawns: Array<{ request: unknown; principal: string }>;
   let rootReparents: Array<{ id: string; parentId: string; principal: string }>;
+  let rootHoldClears: Array<{
+    scope: { provider: string; models?: string[] };
+    principal: string;
+  }>;
   let admissionReorders: unknown[];
 
   beforeEach(() => {
@@ -201,6 +205,7 @@ describe("handleMeshApiRequest", () => {
     }).id;
     rootSpawns = [];
     rootReparents = [];
+    rootHoldClears = [];
     admissionReorders = [];
     const mockMesh = {
       sendMessage: (toId: string, body: string, from: string, sessionId: string) => {
@@ -233,6 +238,25 @@ describe("handleMeshApiRequest", () => {
         },
         reparentChild: (id: string, parentId: string, principal: string) => {
           rootReparents.push({ id, parentId, principal });
+        },
+        clearAvailabilityHolds: (
+          scope: { provider: string; models?: string[] },
+          principal: string
+        ) => {
+          rootHoldClears.push({ scope, principal });
+          return {
+            released: [
+              {
+                provider: scope.provider,
+                ...(scope.models?.[0] ? { model: scope.models[0] } : {}),
+                origin: "mesh" as const,
+                reason: "maintenance",
+                createdBy: "root",
+                createdAt: "2026-10-16T00:00:00.000Z",
+              },
+            ],
+            expired: [],
+          };
         },
       } as unknown as RootControlService,
       reorderAdmissionQueue: (request) => {
@@ -1218,6 +1242,61 @@ describe("handleMeshApiRequest", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toBe("parentId is required");
     expect(rootReparents).toEqual([]);
+  });
+
+  it("POST /api/mesh/availability-holds/clear clears through authenticated root control", async () => {
+    const { res } = await call(
+      deps,
+      "POST",
+      "/api/mesh/availability-holds/clear",
+      JSON.stringify({ provider: "codex", models: ["gpt-5.6"] })
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({
+      released: [
+        {
+          provider: "codex",
+          model: "gpt-5.6",
+          origin: "mesh",
+          expiry: null,
+        },
+      ],
+      expired_removed: 0,
+    });
+    expect(rootHoldClears).toEqual([
+      { scope: { provider: "codex", models: ["gpt-5.6"] }, principal: LOCAL_USER },
+    ]);
+  });
+
+  it("POST /api/mesh/availability-holds/clear refuses an unauthenticated request", async () => {
+    const { res } = await call(
+      { ...deps, principals: undefined },
+      "POST",
+      "/api/mesh/availability-holds/clear",
+      JSON.stringify({ provider: "codex" })
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(403);
+    expect(rootHoldClears).toEqual([]);
+  });
+
+  it("POST /api/mesh/availability-holds/clear validates its scope before root control", async () => {
+    const { res } = await call(
+      deps,
+      "POST",
+      "/api/mesh/availability-holds/clear",
+      JSON.stringify({ provider: "codex", models: [""] })
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({
+      error: "provider and optional models (non-empty string[]) are required",
+    });
+    expect(rootHoldClears).toEqual([]);
   });
 
   it("POST /api/mesh/actors forwards a portable context selection ", async () => {

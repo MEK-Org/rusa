@@ -38,6 +38,7 @@ import {
   PORTABLE_CONTEXT_SCHEMA_VERSION,
 } from "../actor/portable-context-state.js";
 import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
+import type { RootControlService } from "../actor/root-control.js";
 import { RootModelConfigStartupError } from "../actor/root-model-config.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
@@ -4354,7 +4355,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(dashboardMesh()?.haltSnapshot?.()).toBeNull();
   });
 
-  it("wires model-admin availability holds into the configured actor's endpoint and run admission (#539)", async () => {
+  it("restores every configured actor lane through operator hold recovery without a model run (#539)", async () => {
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
@@ -4369,19 +4370,21 @@ describe("runStart webhook event routing (Phase 4)", () => {
     );
     let mesh: ActorMesh | undefined;
     let root: Actor | undefined;
+    let rootControl: RootControlService | undefined;
     await new Promise<void>((resolve) => {
       runStart({
         e2e: {
           onReady: (handles) => {
             mesh = handles.mesh;
             root = handles.root as Actor;
+            rootControl = handles.rootControl;
             shutdownFn = handles.shutdown;
             resolve();
           },
         },
       });
     });
-    if (!mesh || !root) throw new Error("mesh or root not ready");
+    if (!mesh || !root || !rootControl) throw new Error("mesh, root, or root control not ready");
     const rootOptions = (
       root as unknown as { opts: { mcpServers: Array<{ name: string; url: string }> } }
     ).opts;
@@ -4407,18 +4410,38 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(JSON.stringify(unconfigured.content)).toContain("not configured");
     expect(getRepositories().availabilityHolds.list()).toEqual([]);
 
+    expect((await call("set_availability_hold", { provider: "claude" })).isError).toBeFalsy();
     expect((await call("set_availability_hold", { provider: "codex" })).isError).toBeFalsy();
     expect(getRepositories().availabilityHolds.list()).toEqual([
+      expect.objectContaining({ provider: "claude", origin: "mesh", createdBy: root.id }),
       expect.objectContaining({ provider: "codex", origin: "mesh", createdBy: root.id }),
     ]);
-    // Every pool entry held: the worker's run is not admitted, and its pool is untouched.
+    // Every configured actor lane is indefinitely mesh-held: neither the root
+    // nor the codex worker is admitted, and both pools remain untouched.
+    expect(mesh.prepareRun(root.id)).toBe(false);
     expect(mesh.prepareRun(workerId)).toBe(false);
     expect(getRepositories().actors.get(workerId)?.modelConfig).toEqual([
       expect.objectContaining({ provider: "codex", model: "gpt-5.5" }),
     ]);
 
-    expect((await call("clear_availability_hold", { provider: "codex" })).isError).toBeFalsy();
+    const operator = "00000000-0000-4000-8000-000000000001" as const;
+    const rootClear = rootControl.clearAvailabilityHolds({ provider: "claude" }, operator);
+    expect(rootClear.released).toEqual([
+      expect.objectContaining({ provider: "claude", origin: "mesh" }),
+    ]);
+    expect(mesh.prepareRun(root.id)).toBe(true);
+    expect(mesh.prepareRun(workerId)).toBe(false);
+
+    const workerClear = rootControl.clearAvailabilityHolds({ provider: "codex" }, operator);
+    expect(workerClear.released).toEqual([
+      expect.objectContaining({ provider: "codex", origin: "mesh" }),
+    ]);
     expect(mesh.prepareRun(workerId)).toBe(true);
+    // A repeat operator clear is safe and does not manufacture a release.
+    expect(rootControl.clearAvailabilityHolds({ provider: "codex" }, operator)).toEqual({
+      released: [],
+      expired: [],
+    });
   });
 
   it("chat /resume releases only chat-origin holds; mesh-origin holds survive for the UI path (#918)", async () => {

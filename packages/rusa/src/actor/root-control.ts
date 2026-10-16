@@ -1,3 +1,4 @@
+import type { AvailabilityHoldScope } from "../db/repositories/availability-hold-repository.js";
 import {
   assertConcreteModelConfig,
   type ConcreteModelConfigInput,
@@ -5,6 +6,7 @@ import {
   type ProviderModelConfig,
 } from "../providers/model-config.js";
 import type { ActorHandle, ActorRecord, ContextConfig } from "./actor-record.js";
+import type { AvailabilityHolds, ClearedHolds } from "./availability-holds.js";
 
 /**
  * UUID string format representing a durable user principal ID.
@@ -65,6 +67,11 @@ export interface RootControlOptions {
   mesh: RootControlMesh;
   rootId?: string;
   providers?: string[];
+  /**
+   * The live durable-hold service. Its release callback restores eligibility
+   * and replays any admission it previously cancelled.
+   */
+  availabilityHolds?: Pick<AvailabilityHolds, "clear">;
   /**
    * Resolves a named model class reference against the runtime database before
    * anything else inspects the request. Wired in by the runtime, which owns the store;
@@ -207,6 +214,29 @@ export class RootControlService {
     }
     const result = this.options.mesh.runNow(id, principal);
     this.record(principal, "run_now_child", id);
+    return result;
+  }
+
+  /**
+   * Clear durable availability holds from the authenticated dashboard control
+   * boundary. This is deliberately independent of any actor MCP endpoint or
+   * model run: the hold service performs the release/replay transition itself.
+   */
+  clearAvailabilityHolds(
+    scope: AvailabilityHoldScope,
+    principal: RootControlPrincipal
+  ): ClearedHolds {
+    const availabilityHolds = this.options.availabilityHolds;
+    if (!availabilityHolds) throw new Error("availability hold recovery is unavailable");
+    const result = availabilityHolds.clear(scope);
+    if (result.released.length + result.expired.length > 0) {
+      this.record(principal, "clear_availability_holds", this.rootId, {
+        provider: scope.provider,
+        models: scope.models ?? [],
+        released: result.released.length,
+        expiredRemoved: result.expired.length,
+      });
+    }
     return result;
   }
 

@@ -347,6 +347,43 @@ describe("RootControlService", () => {
     });
   });
 
+  it("clears availability holds through the hold service and audits an operator mutation", () => {
+    const { mesh, events } = setup();
+    const released = {
+      provider: "codex",
+      origin: "mesh" as const,
+      reason: "maintenance",
+      createdBy: "root",
+      createdAt: "2026-10-16T00:00:00.000Z",
+    };
+    const clear = vi.fn(() => ({ released: [released], expired: [] }));
+    const service = new RootControlService({ mesh, availabilityHolds: { clear } });
+
+    const result = service.clearAvailabilityHolds(
+      { provider: "codex" },
+      "00000000-0000-4000-8000-000000000001"
+    );
+
+    expect(result).toEqual({ released: [released], expired: [] });
+    expect(clear).toHaveBeenCalledWith({ provider: "codex" });
+    expect(mesh.spawn).not.toHaveBeenCalled();
+    expect(mesh.runNow).not.toHaveBeenCalled();
+    expect(JSON.parse(events[0]?.payload ?? "{}")).toMatchObject({
+      action: "clear_availability_holds",
+      targetId: "root",
+      provider: "codex",
+      released: 1,
+      expiredRemoved: 0,
+    });
+  });
+
+  it("refuses availability-hold recovery when the live hold service is absent", () => {
+    const { service } = setup();
+    expect(() =>
+      service.clearAvailabilityHolds({ provider: "codex" }, "00000000-0000-4000-8000-000000000001")
+    ).toThrow("availability hold recovery is unavailable");
+  });
+
   it("reparents a root descendant and audits the new parent", () => {
     const { mesh, events, service } = setup();
 
