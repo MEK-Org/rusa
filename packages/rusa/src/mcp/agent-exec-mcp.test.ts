@@ -458,7 +458,7 @@ describe("administrative capability gating of management tools (#549)", () => {
     expect(dataOf(after)).toMatch(/experiment-admin/);
   });
 
-  it("lets the seeded configured actor manage the Chat Room and hides it from a child (#663)", async () => {
+  it("lets an explicitly granted actor manage explicit Chat Room bindings and hides it from a child (#663)", async () => {
     const { mesh, registry } = setup();
     registry.upsert({
       id: "worker-a",
@@ -482,7 +482,6 @@ describe("administrative capability gating of management tools (#549)", () => {
         transaction: (fn) => fn(),
       },
       actors: registry,
-      rootId: "root",
       voices: () => buildSupportedVoiceCatalog(),
       defaultVoice: googleVoiceConfig("Laomedeia"),
       isHumanPrincipal: () => false,
@@ -497,6 +496,11 @@ describe("administrative capability gating of management tools (#549)", () => {
     const root = await connect(
       createAgentExecMcpServer(mesh, "root", "root", undefined, { chatRoom })
     );
+    const boundRoot = (await root.callTool({
+      name: "add_room_participant",
+      arguments: { actor_id: "root" },
+    })) as CallToolResult;
+    expect(boundRoot.isError).toBeFalsy();
     const added = (await root.callTool({
       name: "add_room_participant",
       arguments: { actor_id: "worker-a" },

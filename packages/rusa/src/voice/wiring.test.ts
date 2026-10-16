@@ -155,14 +155,15 @@ describe("voice provider routing", () => {
         createdAt: "2026-09-30T00:00:00.000Z",
       });
     }
-    new ChatRoomService({
+    const room = new ChatRoomService({
       store: new ChatRoomRepository(db),
       actors,
-      rootId: "root",
       voices: () => buildSupportedVoiceCatalog(),
       defaultVoice: googleVoiceConfig("Laomedeia"),
       isHumanPrincipal: () => false,
-    }).add("actor-b", "root");
+    });
+    room.add("root", "operator");
+    room.add("actor-b", "root");
 
     const service = createVoiceService({
       isHumanRecipient: (id) => id === TEST_USER_ID,

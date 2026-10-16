@@ -414,7 +414,6 @@ export function startRootControlServer(opts: {
   handles: RunStartE2EHandles;
 }): Server {
   const rootId = opts.handles.rootControl.rootId;
-  if (!rootId) throw new Error("root-control server requires an imported root actor");
   const operatorId = (): string => {
     const result = resolveSoleActiveUser(getRepositories().principals);
     if (!result.ok) throw new Error(result.error);
@@ -497,6 +496,10 @@ export function startRootControlServer(opts: {
       return;
     }
     if (req.method === "GET" && url.pathname === "/root/inbox") {
+      if (!rootId) {
+        send(res, 409, { error: "root control is unavailable until an operator creates an actor" });
+        return;
+      }
       send(res, 200, opts.handles.inboxStore.list(rootId, { status: "unhandled" }));
       return;
     }
@@ -563,6 +566,12 @@ export function startRootControlServer(opts: {
           return;
         }
         if (url.pathname === "/root/inbox/ack") {
+          if (!rootId) {
+            send(res, 409, {
+              error: "root control is unavailable until an operator creates an actor",
+            });
+            return;
+          }
           const ids = stringArray(body.ids);
           const note = typeof body.note === "string" ? body.note : undefined;
           send(res, 200, {

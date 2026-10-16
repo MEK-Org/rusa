@@ -536,6 +536,31 @@ describe("runStart webhook event routing (Phase 4)", () => {
   let shutdownFn: (() => Promise<void>) | undefined;
   let requestRunCalls: { actorId: string; reason: string }[] = [];
 
+  // These rows model a pre-existing operator provisioning on the legacy
+  // installation. They are imported once and rekeyed with the actor record;
+  // startup must never manufacture them from `rootActor` identity. Focused
+  // no-grant tests remove this fixture before their first boot.
+  const legacyConfiguredGrants = [
+    "capability-admin",
+    "experiment-admin",
+    "model-admin",
+    "actor-admin",
+    "room-admin",
+    "obligation-responsive",
+    "pnpm-hardlinks",
+    "update",
+    "chat-write:*",
+    "slack-write:*",
+  ].map((capability) => ({
+    actorId: "root",
+    capability,
+    grantedBy: "operator:legacy-fixture",
+    grantedAt: "2026-01-01T00:00:00.000Z",
+  }));
+  const clearLegacyConfiguredGrants = () => {
+    rmSync(join(homeDir, "capability-grants.json"), { force: true });
+  };
+
   beforeEach(() => {
     rootId = "root";
     homeDir = mkdtempSync(join(tmpdir(), "rusa-start-test-"));
@@ -606,6 +631,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
           },
         ],
       }),
+      "utf8"
+    );
+    writeFileSync(
+      join(homeDir, "capability-grants.json"),
+      JSON.stringify({ grants: legacyConfiguredGrants }),
       "utf8"
     );
   });
@@ -3089,6 +3119,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       join(homeDir, "capability-grants.json"),
       JSON.stringify({
         grants: [
+          {
+            actorId: rootId,
+            capability: "capability-admin",
+            grantedBy: "operator:legacy-fixture",
+            grantedAt: "2026-08-07T00:00:00.000Z",
+          },
           {
             actorId: rootId,
             capability: "email-send:startup@example.com",
@@ -6741,6 +6777,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     it("boots an empty store without synthesizing an actor, even beside legacy rootActor syntax (#1003)", async () => {
       // A fresh install: no legacy registry, only the legacy rootActor syntax.
       rmSync(join(homeDir, "threads.json"));
+      clearLegacyConfiguredGrants();
       writeRootActorConfig({ charter: "configured charter", handle: "ember-familiar" });
       const first = await boot();
       expect(first.importedActor).toBeUndefined();
@@ -6796,6 +6833,52 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // Removing the optional keys leaves only the required tuple behind.
       writeRootActorConfig({});
       expect(await boot()).toEqual(first);
+    });
+
+    it("does not manufacture bootstrap grants on import or a later mountable-server boot", async () => {
+      clearLegacyConfiguredGrants();
+      writeRootActorConfig({ charter: "configured charter" });
+      const first = await boot();
+      const importedActor = first.importedActor;
+      if (!importedActor) throw new Error("configured actor was not imported");
+
+      expect(
+        withMeshDb((db) =>
+          db
+            .prepare(
+              "SELECT capability, granted_by, revoked_at FROM capability_grants WHERE actor_id = ?"
+            )
+            .all(importedActor)
+        )
+      ).toEqual([]);
+
+      // `update` is mountable on this fixture's later boot. A durable revoked
+      // row must remain revoked; import identity is never a source for a new
+      // grant, even when a server becomes available after the import.
+      withMeshDb((db) =>
+        db
+          .prepare(
+            `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
+             VALUES (?, 'update', 'operator', '2026-10-16T00:00:00.000Z', '2026-10-16T00:01:00.000Z')`
+          )
+          .run(importedActor)
+      );
+      await boot();
+      expect(
+        withMeshDb((db) =>
+          db
+            .prepare(
+              "SELECT capability, granted_by, revoked_at FROM capability_grants WHERE actor_id = ?"
+            )
+            .all(importedActor)
+        )
+      ).toEqual([
+        {
+          capability: "update",
+          granted_by: "operator",
+          revoked_at: "2026-10-16T00:01:00.000Z",
+        },
+      ]);
     });
 
     it("rehydrates forest descendants with retained state and normal delivery after restart (#1003)", async () => {
@@ -6893,6 +6976,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
 
     it("refuses an ambiguous upgraded home until the operator names the actor", async () => {
+      clearLegacyConfiguredGrants();
       writeFileSync(
         join(homeDir, "threads.json"),
         JSON.stringify({
@@ -7350,6 +7434,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // A fresh store synthesizes no actor (#1003); only a legacy home whose
       // root kept just a session still gets its configured actor minted.
       rmSync(join(homeDir, "threads.json"));
+      clearLegacyConfiguredGrants();
       mkdirSync(join(homeDir, "root-agent"), { recursive: true });
       writeFileSync(
         join(homeDir, "root-agent", "session.json"),
@@ -9372,25 +9457,24 @@ describe("runStart webhook event routing (Phase 4)", () => {
       logCapture.lines.length = 0;
     });
 
-    it("mounts the exact per-actor MCP sets for the root and a rehydrated worker", async () => {
+    it("rehydrates the imported actor with the same ordinary MCP baseline as a worker", async () => {
+      clearLegacyConfiguredGrants();
       withWorker("set-worker");
       const { mesh, root } = await boot();
       const rootServers = mcpServersOf(root);
       const workerServers = mcpServersOf(workerOf(mesh, "set-worker"));
 
       expect(rootServers.map((server) => server.name)).toEqual([
-        "understanding",
-        "quota",
         "tracker",
         "repo",
+        "understanding",
+        "quota",
+        "dashboard-timing",
         "mesh",
         "inbox",
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
-        "dashboard-timing",
-        "pnpm-hardlinks",
-        "update",
       ]);
       expect(workerServers.map((server) => server.name)).toEqual([
         "tracker",
@@ -9423,7 +9507,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     });
 
-    it("adds chat read to both sets and chat write to the root only when chat is configured", async () => {
+    it("adds chat read to each ordinary actor without deriving chat-write from import identity", async () => {
+      clearLegacyConfiguredGrants();
       writeConfig(chatConfig);
       withWorker("chat-set-worker");
       const { mesh, root } = await boot({
@@ -9432,20 +9517,17 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
 
       expect(mcpServersOf(root).map((server) => server.name)).toEqual([
-        "understanding",
-        "quota",
-        "chat-read",
         "tracker",
         "repo",
+        "understanding",
+        "quota",
+        "dashboard-timing",
+        "chat-read",
         "mesh",
         "inbox",
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
-        "dashboard-timing",
-        "chat-write",
-        "pnpm-hardlinks",
-        "update",
       ]);
       expect(mcpServersOf(workerOf(mesh, "chat-set-worker")).map((server) => server.name)).toEqual([
         "tracker",
@@ -9926,6 +10008,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
         join(homeDir, "capability-grants.json"),
         JSON.stringify({
           grants: [
+            {
+              actorId: rootId,
+              capability: "slack-write:*",
+              grantedBy: "operator:legacy-fixture",
+              grantedAt: "2026-10-13T00:00:00.000Z",
+            },
             {
               actorId: "slack-write-worker",
               capability: "slack-write:C1",

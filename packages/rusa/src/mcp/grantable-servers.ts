@@ -85,6 +85,8 @@ export interface GrantableServerDeps {
   logger?: Logger;
   /** Workdir for a grantee actor; confines chat-write attachment `filePath`s. */
   actorRootFor?: (actorId: string) => string;
+  /** Durable display handle for a grantee's externally signed delivery. */
+  actorHandleFor?: (actorId: string) => string;
   /** Whether a grantee's file tools can access the host where it executes. */
   fileToolsAvailableForActor?: (actorId: string) => boolean;
   driveClients: DriveClient;
@@ -212,6 +214,7 @@ export function buildGrantableServers(
       const workDir = deps.actorRootFor?.(selfId);
       return createChatWriteMcpServer(selfId, deps.chatClient, {
         allowedSpaces,
+        actorHandle: deps.actorHandleFor?.(selfId),
         getRunSelection: () => deps.getRunSelectionForActor(selfId),
         onWrite: deps.onChatWrite,
         ...(workDir ? { workDir } : {}),
@@ -228,7 +231,7 @@ export function buildGrantableServers(
       const workDir = deps.actorRootFor?.(selfId);
       const onSlackWrite = deps.onSlackWrite;
       return createSlackWriteMcpServer(deps.slackClient, params.includes("*") ? "all" : params, {
-        actorHandle: generateHandle(selfId),
+        actorHandle: deps.actorHandleFor?.(selfId) ?? generateHandle(selfId),
         getRunSelection: () => deps.getRunSelectionForActor(selfId),
         ...(workDir ? { workDir } : {}),
         ...(onSlackWrite ? { onWrite: () => onSlackWrite(selfId) } : {}),
