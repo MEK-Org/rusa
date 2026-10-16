@@ -1213,6 +1213,7 @@ export function createAgentExecMcpServer(
     const holdView = (hold: AvailabilityHold) => ({
       provider: hold.provider,
       model: hold.model ?? null,
+      origin: hold.origin,
       expiry: hold.expiry ?? null,
       reason: hold.reason,
       created_by: hold.createdBy,
@@ -1237,7 +1238,7 @@ export function createAgentExecMcpServer(
       {
         title: "List active availability holds (root only)",
         description:
-          "List the provider/model availability holds active right now. A row with model null holds the whole provider; expiry null means it lasts until cleared. Expired holds are not listed. Only the configured actor, holding model-admin, has this tool.",
+          "List the provider/model availability holds active right now. A row with model null holds the whole provider; expiry null means it lasts until cleared. `origin` is who instituted the hold: `mesh` rows were placed through these tools, `chat` rows through chat /halt; chat /resume releases only `chat` rows, so a listed `mesh` hold survives it. Expired holds are not listed. Only the configured actor, holding model-admin, has this tool.",
         inputSchema: {},
       },
       async () => {
@@ -1256,7 +1257,7 @@ export function createAgentExecMcpServer(
       {
         title: "Hold a provider or model out of selection (root only)",
         description:
-          "Take a provider lane, or listed models on it, out of model selection without editing any model pool. Selection skips held entries before quota pacing and never falls back to one: an actor whose only unheld entry is paced waits for it. Setting the same scope again replaces its expiry and reason. Queued starts already reserved on a newly held entry are cancelled and replay when the hold is cleared or expires. Holds persist in mesh.db across restarts. Only the configured actor, holding model-admin, has this tool.",
+          "Take a provider lane, or listed models on it, out of model selection without editing any model pool. Selection skips held entries before quota pacing and never falls back to one: an actor whose only unheld entry is paced waits for it. Setting the same scope again replaces its expiry and reason. A scope may also be held through chat /halt at the same time in an independent row; chat /resume releases only the chat row, never this one. Queued starts already reserved on a newly held entry are cancelled and replay when the hold is cleared or expires. Holds persist in mesh.db across restarts. Only the configured actor, holding model-admin, has this tool.",
         inputSchema: {
           ...scopeInput,
           expiry: z
@@ -1275,6 +1276,7 @@ export function createAgentExecMcpServer(
           validateHoldScope?.(provider, models ?? []);
           const stored = availabilityHolds.set({
             provider,
+            origin: "mesh",
             models,
             expiry,
             reason,
@@ -1298,7 +1300,7 @@ export function createAgentExecMcpServer(
       {
         title: "Clear availability holds (root only)",
         description:
-          "Clear holds on a provider. Without models, every hold on the provider is cleared, provider-wide and model-scoped alike; with models, only those model holds are cleared and a provider-wide hold stays. Cleared entries become eligible again from their unchanged pools, and queued starts a hold cancelled replay. Returns { released, expired_removed }: released lists the holds that were still in force (empty when none matched); expired_removed counts matching records that had already expired, which list_availability_holds does not show and whose removal releases nothing. Only the configured actor, holding model-admin, has this tool.",
+          "Clear holds on a provider, whichever origin placed them — chat /halt rows and mesh-instituted rows alike. Without models, every hold on the provider is cleared, provider-wide and model-scoped alike; with models, only those model holds are cleared and a provider-wide hold stays. Cleared entries become eligible again from their unchanged pools, and queued starts a hold cancelled replay. Returns { released, expired_removed }: released lists the holds that were still in force (empty when none matched); expired_removed counts matching records that had already expired, which list_availability_holds does not show and whose removal releases nothing. Only the configured actor, holding model-admin, has this tool.",
         inputSchema: scopeInput,
       },
       async ({ provider, models }) => {

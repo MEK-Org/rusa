@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, statSync } from "node:fs";
 import type {
   AvailabilityHold,
+  AvailabilityHoldOrigin,
   AvailabilityHoldRepository,
   AvailabilityHoldScope,
 } from "../db/repositories/availability-hold-repository.js";
@@ -12,6 +13,7 @@ import type { MeshEventInput } from "./mesh-events.js";
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export interface SetHoldRequest extends AvailabilityHoldScope {
+  origin: AvailabilityHoldOrigin;
   expiry?: string;
   reason?: string;
   createdBy: string;
@@ -34,10 +36,14 @@ export interface ClearedHolds {
 
 /**
  * `silent` skips `onHeld`/`onReleased` for a caller that cancels or replays
- * queued runs itself because it reports how many it touched.
+ * queued runs itself because it reports how many it touched. `origin`
+ * narrows a `clear` to rows that origin instituted; chat `/resume` uses it so
+ * mesh-instituted holds survive, while the authorized MCP/UI clear omits it
+ * and releases every origin on the scope.
  */
 export interface HoldChangeOptions {
   silent?: boolean;
+  origin?: AvailabilityHoldOrigin;
 }
 
 /**
@@ -95,9 +101,26 @@ export class AvailabilityHolds {
    * only those model holds. Holds that were still in force are `released`;
    * matching records that had already expired are removed and returned apart,
    * and alone they release nothing, so `onReleased` does not fire for them.
+   * `options.origin` narrows the clear to rows that origin instituted.
    */
   clear(scope: AvailabilityHoldScope, options: HoldChangeOptions = {}): ClearedHolds {
-    const cleared = this.options.repo.clear(scope);
+    const { origin, ...callbacks } = options;
+    const cleared = this.options.repo.clear(scope, origin === undefined ? {} : { origin });
+    const now = this.now();
+    const released = cleared.filter((hold) => isActiveAt(hold, now));
+    const expired = cleared.filter((hold) => !isActiveAt(hold, now));
+    this.schedule();
+    if (released.length > 0 && !callbacks.silent) this.options.onReleased?.(released);
+    return { released, expired };
+  }
+
+  /**
+   * Clear every hold one origin instituted, whatever its scope — a bare chat
+   * `/resume` releases chat holds across all scopes without naming each.
+   * Mesh-instituted holds stay in force.
+   */
+  clearAll(origin: AvailabilityHoldOrigin, options: HoldChangeOptions = {}): ClearedHolds {
+    const cleared = this.options.repo.clearAll(origin);
     const now = this.now();
     const released = cleared.filter((hold) => isActiveAt(hold, now));
     const expired = cleared.filter((hold) => !isActiveAt(hold, now));
@@ -177,25 +200,40 @@ export function haltIndicator(
 }
 
 function holdsAsHaltState(holds: AvailabilityHold[]): HaltState | null {
-  const [first] = holds;
-  if (!first || holds.some((hold) => hold.expiry !== first.expiry)) return null;
-  const providers = [...new Set(holds.map((hold) => hold.provider))];
-  const models = [...new Set(holds.flatMap((hold) => (hold.model ? [hold.model] : [])))];
-  // Stored scopes are unique, so the holds are the whole product exactly when
+  // Chat and the mesh may hold one scope in two rows; the lane is a single
+  // entry, bound by the latest expiry any origin set on it.
+  const lanes = new Map<string, AvailabilityHold>();
+  for (const hold of holds) {
+    const key = `${hold.provider}${hold.model ?? ""}`;
+    const existing = lanes.get(key);
+    if (!existing || expiryRank(hold.expiry) > expiryRank(existing.expiry)) lanes.set(key, hold);
+  }
+  const distinct = [...lanes.values()];
+  const [first] = distinct;
+  if (!first || distinct.some((hold) => hold.expiry !== first.expiry)) return null;
+  const providers = [...new Set(distinct.map((hold) => hold.provider))];
+  const models = [...new Set(distinct.flatMap((hold) => (hold.model ? [hold.model] : [])))];
+  // The lanes are unique, so the holds are the whole product exactly when
   // every one is provider-wide or every one is model-scoped and they number
   // providers × models.
   const product =
     models.length === 0
-      ? holds.length === providers.length
-      : holds.every((hold) => hold.model) && holds.length === providers.length * models.length;
+      ? distinct.length === providers.length
+      : distinct.every((hold) => hold.model) &&
+        distinct.length === providers.length * models.length;
   if (!product) return null;
-  const reason = holds.every((hold) => hold.reason === first.reason) ? first.reason : "";
+  const reason = distinct.every((hold) => hold.reason === first.reason) ? first.reason : "";
   return {
     ...(reason ? { reason } : {}),
     providers,
     ...(models.length ? { models } : {}),
     ...(first.expiry ? { until: first.expiry } : {}),
   };
+}
+
+/** Indefinite holds outrank any timestamp: the lane is bound by the last expiry. */
+function expiryRank(expiry: string | undefined): number {
+  return expiry === undefined ? Number.POSITIVE_INFINITY : Date.parse(expiry);
 }
 
 /**
@@ -248,9 +286,13 @@ export function importScopedHaltFile(options: ImportScopedHaltFileOptions): Avai
   const raw = readFileSync(file);
   const mtimeMs = statSync(file).mtimeMs;
   const createdAt = new Date(mtimeMs).toISOString();
+  // The imported file is what a scoped chat /halt used to leave behind, and
+  // staging's bare /resume deleted it; importing it as chat-origin preserves
+  // that release path (#918).
   const holds = state.providers.flatMap((provider) =>
     options.repo.set({
       provider,
+      origin: "chat",
       ...(state.models?.length ? { models: state.models } : {}),
       ...(state.until ? { expiry: state.until } : {}),
       reason: state.reason ?? "",

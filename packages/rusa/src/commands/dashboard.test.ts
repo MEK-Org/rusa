@@ -123,7 +123,14 @@ describe("runDashboard", () => {
       expect(mesh?.haltSnapshot()).toBeNull();
 
       mockAvailabilityHolds.list.mockReturnValue([
-        { provider: "codex", expiry: until, reason: "", createdBy: "root", createdAt: until },
+        {
+          provider: "codex",
+          origin: "chat",
+          expiry: until,
+          reason: "",
+          createdBy: "root",
+          createdAt: until,
+        },
       ]);
       expect(mesh?.isHalted()).toBe(true);
       expect(mesh?.haltSnapshot()).toEqual({ providers: ["codex"], until });

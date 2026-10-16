@@ -10,7 +10,7 @@ const CREATED = "2026-10-05T00:00:00.000Z";
  * `availability-hold-repository.test.ts`.
  */
 describe("0057_availability_holds", () => {
-  it("creates an empty hold table with one JSON scope column", () => {
+  it("creates an empty hold table with one JSON scope column and an origin", () => {
     const db = new Database(":memory:");
     availabilityHolds.up(db);
 
@@ -21,6 +21,7 @@ describe("0057_availability_holds", () => {
     }>;
     expect(columns.map(({ name, type, notnull }) => ({ name, type, notnull }))).toEqual([
       { name: "scope", type: "TEXT", notnull: 1 },
+      { name: "origin", type: "TEXT", notnull: 1 },
       { name: "expiry", type: "TEXT", notnull: 0 },
       { name: "reason", type: "TEXT", notnull: 1 },
       { name: "created_by", type: "TEXT", notnull: 1 },
@@ -29,19 +30,24 @@ describe("0057_availability_holds", () => {
     expect(db.prepare("SELECT COUNT(*) AS n FROM availability_holds").get()).toEqual({ n: 0 });
   });
 
-  it("leaves scope shape to the repository and only keeps scope text unique", () => {
+  it("keeps one row per scope and origin, so chat and mesh holds coexist", () => {
     const db = new Database(":memory:");
     availabilityHolds.up(db);
     const insert = db.prepare(
-      `INSERT INTO availability_holds (scope, created_by, created_at) VALUES (?, 'root', '${CREATED}')`
+      `INSERT INTO availability_holds (scope, origin, created_by, created_at)
+       VALUES (?, ?, 'root', '${CREATED}')`
     );
 
     // No CHECK or json_* validator: the versioned scope document is validated
     // by AvailabilityHoldRepository, the code that consumes it.
     for (const scope of ["kimi", "{}", '{"provider":"Kimi"}', '{"schemaVersion":2}']) {
-      expect(() => insert.run(scope), scope).not.toThrow();
+      expect(() => insert.run(scope, "chat"), scope).not.toThrow();
     }
-    expect(() => insert.run("kimi")).toThrow(/UNIQUE/);
-    expect(() => insert.run(null)).toThrow(/NOT NULL/);
+    // The same scope may be held through chat and through the mesh at once.
+    expect(() => insert.run("kimi", "mesh")).not.toThrow();
+    // But one origin holds a scope at most once: a repeated set replaces.
+    expect(() => insert.run("kimi", "chat")).toThrow(/UNIQUE/);
+    expect(() => insert.run("{}", "chat")).toThrow(/UNIQUE/);
+    expect(() => insert.run("kimi", null)).toThrow(/NOT NULL/);
   });
 });

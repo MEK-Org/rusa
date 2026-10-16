@@ -3417,6 +3417,7 @@ describe("availability hold tools (#539)", () => {
       {
         provider: "kimi",
         model: null,
+        origin: "mesh",
         expiry: "2026-10-05T18:52:00.000Z",
         reason: "capacity",
         created_by: "root",
@@ -3453,6 +3454,7 @@ describe("availability hold tools (#539)", () => {
     // A record that already expired is counted apart, never reported as released.
     repo.set({
       provider: "kimi",
+      origin: "mesh",
       models: ["kimi-k2"],
       expiry: "2026-10-05T11:00:00Z",
       createdBy: "root",

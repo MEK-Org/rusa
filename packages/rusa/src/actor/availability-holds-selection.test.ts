@@ -66,7 +66,7 @@ describe("availability holds in admission", () => {
     fallback.pacer.deferUntil(Date.now() + 10 * HOUR);
     const pool = [primary, fallback];
     const before = JSON.stringify(pool.map((entry) => entry.config));
-    holds.set({ provider: "kimi", createdBy: "root" });
+    holds.set({ provider: "kimi", origin: "mesh", createdBy: "root" });
 
     const { handle, started } = admit(pool);
     await vi.advanceTimersByTimeAsync(10 * HOUR - 1);
@@ -81,7 +81,7 @@ describe("availability holds in admission", () => {
   it("holds only the named model, leaving the provider's other models eligible", async () => {
     const held = lane({ provider: "codex", model: "gpt-5.5" });
     const sibling = lane({ provider: "codex", model: "gpt-5.5-mini" });
-    holds.set({ provider: "codex", models: ["gpt-5.5"], createdBy: "root" });
+    holds.set({ provider: "codex", origin: "mesh", models: ["gpt-5.5"], createdBy: "root" });
 
     const { handle, started } = admit([held, sibling]);
     await vi.advanceTimersByTimeAsync(0);
@@ -97,6 +97,7 @@ describe("availability holds in admission", () => {
     const before = JSON.stringify(pool.map((entry) => entry.config));
     holds.set({
       provider: "kimi",
+      origin: "mesh",
       expiry: new Date(Date.now() + HOUR).toISOString(),
       createdBy: "root",
     });

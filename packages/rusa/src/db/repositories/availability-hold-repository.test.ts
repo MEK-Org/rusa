@@ -21,7 +21,13 @@ describe("AvailabilityHoldRepository", () => {
   });
 
   it("holds every model on a provider when no models are given", () => {
-    holds.set({ provider: "kimi", expiry: LATER, createdBy: "root", createdAt: CREATED });
+    holds.set({
+      provider: "kimi",
+      origin: "mesh",
+      expiry: LATER,
+      createdBy: "root",
+      createdAt: CREATED,
+    });
 
     expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(true);
     expect(holds.isHeld("kimi", "kimi-k3", NOW)).toBe(true);
@@ -32,6 +38,7 @@ describe("AvailabilityHoldRepository", () => {
   it("holds only the listed models on a model-scoped hold", () => {
     holds.set({
       provider: "codex",
+      origin: "mesh",
       models: ["GPT-5.5", "gpt-5.5-mini"],
       createdBy: "root",
       createdAt: CREATED,
@@ -47,16 +54,28 @@ describe("AvailabilityHoldRepository", () => {
   });
 
   it("keeps an indefinite hold until it is cleared", () => {
-    holds.set({ provider: "claude", createdBy: "root", createdAt: CREATED });
+    holds.set({ provider: "claude", origin: "mesh", createdBy: "root", createdAt: CREATED });
 
     expect(holds.isHeld("claude", "opus", Date.parse("2099-01-01T00:00:00Z"))).toBe(true);
     expect(holds.list()).toEqual([
-      { provider: "claude", reason: "", createdBy: "root", createdAt: CREATED },
+      {
+        provider: "claude",
+        origin: "mesh",
+        reason: "",
+        createdBy: "root",
+        createdAt: CREATED,
+      },
     ]);
   });
 
   it("stops holding at expiry without deleting the row", () => {
-    holds.set({ provider: "kimi", expiry: LATER, createdBy: "root", createdAt: CREATED });
+    holds.set({
+      provider: "kimi",
+      origin: "mesh",
+      expiry: LATER,
+      createdBy: "root",
+      createdAt: CREATED,
+    });
     const expiry = Date.parse(LATER);
 
     expect(holds.isHeld("kimi", "kimi-k2", expiry - 1)).toBe(true);
@@ -73,6 +92,7 @@ describe("AvailabilityHoldRepository", () => {
       rows: [
         {
           scope: '{"schemaVersion":1,"provider":"antigravity"}',
+          origin: "mesh",
           expiry: LATER,
           reason: "capacity",
           created_by: "root",
@@ -86,6 +106,7 @@ describe("AvailabilityHoldRepository", () => {
       rows: [
         {
           scope: '{"schemaVersion":1,"provider":"codex","model":"gpt-5.5"}',
+          origin: "mesh",
           expiry: null,
           reason: "",
           created_by: "root",
@@ -102,6 +123,7 @@ describe("AvailabilityHoldRepository", () => {
       rows: [
         {
           scope: '{"schemaVersion":1,"provider":"kimi"}',
+          origin: "mesh",
           expiry: null,
           reason: "outage",
           created_by: "steward",
@@ -118,6 +140,7 @@ describe("AvailabilityHoldRepository", () => {
       rows: [
         {
           scope: '{"schemaVersion":1,"provider":"kimi","model":"kimi-k2"}',
+          origin: "mesh",
           expiry: null,
           reason: "again",
           created_by: "steward",
@@ -126,10 +149,11 @@ describe("AvailabilityHoldRepository", () => {
     },
   ])("set() $name, storing one canonical versioned scope", ({ sets, heldAs, rows }) => {
     let stored: ReturnType<typeof holds.set> = [];
-    for (const hold of sets) stored = holds.set({ createdBy: "root", createdAt: CREATED, ...hold });
+    for (const hold of sets)
+      stored = holds.set({ origin: "mesh", createdBy: "root", createdAt: CREATED, ...hold });
 
     expect(
-      db.prepare("SELECT scope, expiry, reason, created_by FROM availability_holds").all()
+      db.prepare("SELECT scope, origin, expiry, reason, created_by FROM availability_holds").all()
     ).toEqual(rows);
     expect(stored).toEqual(holds.list());
     const [provider, model] = heldAs;
@@ -137,8 +161,20 @@ describe("AvailabilityHoldRepository", () => {
   });
 
   it("lets provider-wide and model-scoped holds coexist", () => {
-    holds.set({ provider: "kimi", expiry: LATER, createdBy: "root", createdAt: CREATED });
-    holds.set({ provider: "kimi", models: ["kimi-k2"], createdBy: "root", createdAt: CREATED });
+    holds.set({
+      provider: "kimi",
+      origin: "mesh",
+      expiry: LATER,
+      createdBy: "root",
+      createdAt: CREATED,
+    });
+    holds.set({
+      provider: "kimi",
+      origin: "mesh",
+      models: ["kimi-k2"],
+      createdBy: "root",
+      createdAt: CREATED,
+    });
 
     expect(holds.list().map((hold) => hold.model ?? "*")).toEqual(["*", "kimi-k2"]);
     // The model hold outlives the bounded provider-wide one.
@@ -147,19 +183,38 @@ describe("AvailabilityHoldRepository", () => {
   });
 
   it("clears listed models and leaves a provider-wide hold in place", () => {
-    holds.set({ provider: "kimi", createdBy: "root", createdAt: CREATED });
-    holds.set({ provider: "kimi", models: ["kimi-k2"], createdBy: "root", createdAt: CREATED });
+    holds.set({ provider: "kimi", origin: "mesh", createdBy: "root", createdAt: CREATED });
+    holds.set({
+      provider: "kimi",
+      origin: "mesh",
+      models: ["kimi-k2"],
+      createdBy: "root",
+      createdAt: CREATED,
+    });
 
     expect(holds.clear({ provider: "kimi", models: ["Kimi-K2"] })).toEqual([
-      { provider: "kimi", model: "kimi-k2", reason: "", createdBy: "root", createdAt: CREATED },
+      {
+        provider: "kimi",
+        model: "kimi-k2",
+        origin: "mesh",
+        reason: "",
+        createdBy: "root",
+        createdAt: CREATED,
+      },
     ]);
     expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(true);
   });
 
   it("clears every hold on a provider when no models are given", () => {
-    holds.set({ provider: "kimi", createdBy: "root", createdAt: CREATED });
-    holds.set({ provider: "kimi", models: ["kimi-k2"], createdBy: "root", createdAt: CREATED });
-    holds.set({ provider: "codex", createdBy: "root", createdAt: CREATED });
+    holds.set({ provider: "kimi", origin: "mesh", createdBy: "root", createdAt: CREATED });
+    holds.set({
+      provider: "kimi",
+      origin: "mesh",
+      models: ["kimi-k2"],
+      createdBy: "root",
+      createdAt: CREATED,
+    });
+    holds.set({ provider: "codex", origin: "mesh", createdBy: "root", createdAt: CREATED });
 
     expect(holds.clear({ provider: "kimi" }).map((hold) => hold.model ?? "*")).toEqual([
       "*",
@@ -177,6 +232,7 @@ describe("AvailabilityHoldRepository", () => {
     runMigrations(first);
     new AvailabilityHoldRepository(first).set({
       provider: "kimi",
+      origin: "mesh",
       expiry: LATER,
       createdBy: "root",
       createdAt: CREATED,
@@ -195,7 +251,8 @@ describe("AvailabilityHoldRepository", () => {
 
   it("refuses to read a stored scope it does not understand", () => {
     const insert = db.prepare(
-      `INSERT INTO availability_holds (scope, created_by, created_at) VALUES (?, 'root', '${CREATED}')`
+      `INSERT INTO availability_holds (scope, origin, created_by, created_at)
+       VALUES (?, 'mesh', 'root', '${CREATED}')`
     );
     for (const scope of [
       "kimi",
@@ -222,10 +279,10 @@ describe("AvailabilityHoldRepository", () => {
 
   it("skips an expired row before reading its scope when checking a lane", () => {
     db.prepare(
-      `INSERT INTO availability_holds (scope, expiry, created_by, created_at)
-       VALUES ('kimi', ?, 'root', ?)`
+      `INSERT INTO availability_holds (scope, origin, expiry, created_by, created_at)
+       VALUES ('kimi', 'mesh', ?, 'root', ?)`
     ).run(new Date(NOW - 1).toISOString(), CREATED);
-    holds.set({ provider: "codex", createdBy: "root", createdAt: CREATED });
+    holds.set({ provider: "codex", origin: "mesh", createdBy: "root", createdAt: CREATED });
 
     expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(false);
     expect(holds.isHeld("codex", "gpt-5.5", NOW)).toBe(true);
@@ -234,15 +291,178 @@ describe("AvailabilityHoldRepository", () => {
   });
 
   it("refuses blank scopes and unparseable timestamps", () => {
-    expect(() => holds.set({ provider: " ", createdBy: "root", createdAt: CREATED })).toThrow(
-      /requires a provider/
-    );
     expect(() =>
-      holds.set({ provider: "kimi", models: [" "], createdBy: "root", createdAt: CREATED })
+      holds.set({ provider: " ", origin: "mesh", createdBy: "root", createdAt: CREATED })
+    ).toThrow(/requires a provider/);
+    expect(() =>
+      holds.set({
+        provider: "kimi",
+        origin: "mesh",
+        models: [" "],
+        createdBy: "root",
+        createdAt: CREATED,
+      })
     ).toThrow(/cannot be blank/);
     expect(() =>
-      holds.set({ provider: "kimi", expiry: "soon", createdBy: "root", createdAt: CREATED })
+      holds.set({
+        provider: "kimi",
+        origin: "mesh",
+        expiry: "soon",
+        createdBy: "root",
+        createdAt: CREATED,
+      })
     ).toThrow(/invalid availability hold expiry/);
     expect(holds.list()).toEqual([]);
+  });
+
+  describe("hold origins (#918 chat vs mesh)", () => {
+    const set = (origin: "chat" | "mesh", extra: Record<string, unknown> = {}) =>
+      holds.set({
+        provider: "kimi",
+        origin,
+        createdBy: origin === "chat" ? "chat:users/operator" : "root",
+        createdAt: CREATED,
+        ...extra,
+      });
+
+    it.each([
+      { name: "mesh hold first, chat hold on the same scope second", first: "mesh" as const },
+      { name: "chat hold first, mesh hold on the same scope second", first: "chat" as const },
+    ])("keeps both rows of one scope in either write order: $name", ({ first }) => {
+      const second = first === "mesh" ? ("chat" as const) : ("mesh" as const);
+      set(first);
+      set(second);
+
+      // One row per origin: the second write must not relabel the first.
+      expect(db.prepare("SELECT origin FROM availability_holds ORDER BY origin").all()).toEqual([
+        { origin: "chat" },
+        { origin: "mesh" },
+      ]);
+      expect(
+        holds
+          .list()
+          .map((hold) => hold.origin)
+          .sort()
+      ).toEqual(["chat", "mesh"]);
+      expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(true);
+    });
+
+    it("replaces only the same origin's row on the same scope", () => {
+      set("mesh", { reason: "outage" });
+      set("mesh", { reason: "still out" });
+
+      expect(holds.list()).toEqual([
+        {
+          provider: "kimi",
+          origin: "mesh",
+          reason: "still out",
+          createdBy: "root",
+          createdAt: CREATED,
+        },
+      ]);
+    });
+
+    it("refuses an origin outside chat|mesh", () => {
+      expect(() =>
+        holds.set({
+          provider: "kimi",
+          origin: "sketchy" as never,
+          createdBy: "x",
+          createdAt: CREATED,
+        })
+      ).toThrow(/invalid availability hold origin/);
+    });
+
+    it("clear({origin}) deletes one origin's rows and leaves the other in force", () => {
+      set("mesh");
+      set("chat");
+
+      expect(holds.clear({ provider: "kimi" }, { origin: "chat" })).toEqual([
+        {
+          provider: "kimi",
+          origin: "chat",
+          reason: "",
+          createdBy: "chat:users/operator",
+          createdAt: CREATED,
+        },
+      ]);
+      // The mesh hold is untouched and still governs selection.
+      expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(true);
+      expect(holds.list().map((hold) => hold.origin)).toEqual(["mesh"]);
+    });
+
+    it("clear without an origin removes every origin on the scope (the admin path)", () => {
+      set("mesh");
+      set("chat");
+
+      expect(holds.clear({ provider: "kimi" })).toHaveLength(2);
+      expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(false);
+    });
+
+    it("clearAll(origin) removes only that origin across every scope", () => {
+      set("chat");
+      set("chat", { models: ["kimi-k2"] });
+      holds.set({
+        provider: "codex",
+        origin: "chat",
+        createdBy: "chat:users/operator",
+        createdAt: CREATED,
+      });
+      holds.set({ provider: "kimi", origin: "mesh", createdBy: "root", createdAt: CREATED });
+
+      const cleared = holds.clearAll("chat");
+      expect(cleared.map((hold) => hold.provider).sort()).toEqual(["codex", "kimi", "kimi"]);
+      expect(holds.list().map((hold) => `${hold.provider}:${hold.origin}`)).toEqual(["kimi:mesh"]);
+      expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(true);
+      expect(holds.isHeld("codex", "gpt-5.5", NOW)).toBe(false);
+    });
+
+    it("keeps expiries independent between the two origins on one scope", () => {
+      set("chat", { expiry: LATER });
+      set("mesh");
+
+      const chatLapse = Date.parse(LATER) + 1;
+      expect(holds.isHeld("kimi", "kimi-k2", chatLapse)).toBe(true);
+      expect(holds.list({ now: chatLapse })).toEqual([
+        {
+          provider: "kimi",
+          origin: "mesh",
+          reason: "",
+          createdBy: "root",
+          createdAt: CREATED,
+        },
+      ]);
+    });
+
+    it("holds a model scope through either origin and clears them independently", () => {
+      holds.set({
+        provider: "kimi",
+        origin: "mesh",
+        models: ["kimi-k2"],
+        createdBy: "root",
+        createdAt: CREATED,
+      });
+      holds.set({
+        provider: "kimi",
+        origin: "chat",
+        models: ["kimi-k2"],
+        createdBy: "chat:users/operator",
+        createdAt: CREATED,
+      });
+
+      expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(true);
+      expect(holds.clear({ provider: "kimi", models: ["kimi-k2"] }, { origin: "chat" })).toEqual([
+        {
+          provider: "kimi",
+          model: "kimi-k2",
+          origin: "chat",
+          reason: "",
+          createdBy: "chat:users/operator",
+          createdAt: CREATED,
+        },
+      ]);
+      // The mesh model hold survives: provider/model overlap stays held.
+      expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(true);
+    });
   });
 });

@@ -10,6 +10,15 @@ import { normalizeModel, normalizeProvider } from "../../actor/halt-switch.js";
  */
 export const AVAILABILITY_HOLD_SCOPE_SCHEMA_VERSION = 1;
 
+/**
+ * Who instituted a hold: `chat` through chat `/halt` (or the imported legacy
+ * HALT file), `mesh` through the hold tools. Chat `/resume` releases only
+ * `chat` rows; the authorized MCP/UI clear releases every origin (#918).
+ */
+export type AvailabilityHoldOrigin = "chat" | "mesh";
+
+const HOLD_ORIGINS: readonly AvailabilityHoldOrigin[] = ["chat", "mesh"];
+
 const scopeDocumentSchema = z
   .object({
     schemaVersion: z.literal(AVAILABILITY_HOLD_SCOPE_SCHEMA_VERSION),
@@ -25,6 +34,7 @@ const scopeDocumentSchema = z
 export interface AvailabilityHold {
   provider: string;
   model?: string;
+  origin: AvailabilityHoldOrigin;
   expiry?: string;
   reason: string;
   createdBy: string;
@@ -38,6 +48,7 @@ export interface AvailabilityHoldScope {
 }
 
 export interface SetAvailabilityHold extends AvailabilityHoldScope {
+  origin: AvailabilityHoldOrigin;
   expiry?: string;
   reason?: string;
   createdBy: string;
@@ -46,13 +57,14 @@ export interface SetAvailabilityHold extends AvailabilityHoldScope {
 
 type AvailabilityHoldRow = {
   scope: string;
+  origin: string;
   expiry: string | null;
   reason: string;
   created_by: string;
   created_at: string;
 };
 
-const COLUMNS = "scope, expiry, reason, created_by, created_at";
+const COLUMNS = "scope, origin, expiry, reason, created_by, created_at";
 
 /**
  * Data access for durable availability holds (`availability_holds`).
@@ -64,25 +76,28 @@ const COLUMNS = "scope, expiry, reason, created_by, created_at";
  * read; expired rows stay until they are cleared. Each row's scope is stored
  * as one versioned JSON document, `{"schemaVersion":1,"provider":…}` or
  * `{"schemaVersion":1,"provider":…,"model":…}`, always serialized the same way
- * so the unique index on `scope` sees a repeated scope. Reads parse and
- * validate every row they touch and throw on a scope they do not understand,
- * including one that is not in that canonical form.
+ * so the unique index sees a repeated scope. A scope holds at most one row per
+ * origin — chat and the mesh may hold it at the same time, each keeping its
+ * own expiry. Reads parse and validate every row they touch and throw on a
+ * scope they do not understand, including one that is not in that canonical
+ * form.
  */
 export class AvailabilityHoldRepository {
   constructor(private readonly db: Database.Database) {}
 
   /**
    * Hold `provider` (every model when `models` is omitted or empty), replacing
-   * any stored hold with the same scope. Returns the stored rows.
+   * any stored hold with the same scope and origin. Returns the stored rows.
    */
   set(hold: SetAvailabilityHold): AvailabilityHold[] {
     const provider = requireProvider(hold.provider);
     const models = normalizeModels(hold.models);
+    const origin = requireOrigin(hold.origin);
     const expiry = hold.expiry === undefined ? null : canonicalTimestamp(hold.expiry, "expiry");
     const createdAt = canonicalTimestamp(hold.createdAt, "createdAt");
     const upsert = this.db.prepare(
-      `INSERT INTO availability_holds (${COLUMNS}) VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT (scope) DO UPDATE SET
+      `INSERT INTO availability_holds (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT (scope, origin) DO UPDATE SET
          expiry = excluded.expiry,
          reason = excluded.reason,
          created_by = excluded.created_by,
@@ -91,9 +106,10 @@ export class AvailabilityHoldRepository {
     return this.db.transaction(() =>
       (models ?? [null]).map((model) => {
         const scope = scopeJson(provider, model);
-        upsert.run(scope, expiry, hold.reason ?? "", hold.createdBy, createdAt);
+        upsert.run(scope, origin, expiry, hold.reason ?? "", hold.createdBy, createdAt);
         return toHold({
           scope,
+          origin,
           expiry,
           reason: hold.reason ?? "",
           created_by: hold.createdBy,
@@ -106,20 +122,48 @@ export class AvailabilityHoldRepository {
   /**
    * Delete stored holds. Without `models`, every hold on the provider goes,
    * whether provider-wide or model-scoped; with `models`, only those model
-   * rows go and a provider-wide hold stays. Returns the deleted rows.
+   * rows go and a provider-wide hold stays. `origin` narrows the delete to
+   * rows that origin instituted — chat `/resume` uses it so mesh-instituted
+   * holds survive; without it, every origin on the scope goes, which is the
+   * authorized MCP/UI clear. Returns the deleted rows.
    */
-  clear(scope: AvailabilityHoldScope): AvailabilityHold[] {
+  clear(
+    scope: AvailabilityHoldScope,
+    options: { origin?: AvailabilityHoldOrigin } = {}
+  ): AvailabilityHold[] {
     const provider = requireProvider(scope.provider);
     const models = normalizeModels(scope.models);
+    const origin = options.origin === undefined ? undefined : requireOrigin(options.origin);
     return this.db.transaction(() => {
       const scopes = models
         ? new Set(models.map((model) => scopeJson(provider, model)))
         : undefined;
       const rows = this.selectAll()
         .map((row) => ({ scope: row.scope, hold: toHold(row) }))
-        .filter((row) => (scopes ? scopes.has(row.scope) : row.hold.provider === provider));
-      const remove = this.db.prepare("DELETE FROM availability_holds WHERE scope = ?");
-      for (const row of rows) remove.run(row.scope);
+        .filter((row) => (scopes ? scopes.has(row.scope) : row.hold.provider === provider))
+        .filter((row) => origin === undefined || row.hold.origin === origin);
+      const remove = this.db.prepare(
+        "DELETE FROM availability_holds WHERE scope = ? AND origin = ?"
+      );
+      for (const row of rows) remove.run(row.scope, row.hold.origin);
+      return rows.map((row) => row.hold).sort(compareHolds);
+    })();
+  }
+
+  /**
+   * Delete every stored hold one origin instituted, whatever its scope. A bare
+   * chat `/resume` releases chat holds across all scopes without naming each.
+   */
+  clearAll(origin: AvailabilityHoldOrigin): AvailabilityHold[] {
+    const required = requireOrigin(origin);
+    return this.db.transaction(() => {
+      const rows = this.selectAll()
+        .map((row) => ({ scope: row.scope, hold: toHold(row) }))
+        .filter((row) => row.hold.origin === required);
+      const remove = this.db.prepare(
+        "DELETE FROM availability_holds WHERE scope = ? AND origin = ?"
+      );
+      for (const row of rows) remove.run(row.scope, required);
       return rows.map((row) => row.hold).sort(compareHolds);
     })();
   }
@@ -217,11 +261,19 @@ function toHold(row: AvailabilityHoldRow): AvailabilityHold {
   return {
     provider: scope.provider,
     ...(scope.model === undefined ? {} : { model: scope.model }),
+    origin: requireOrigin(row.origin),
     ...(row.expiry === null ? {} : { expiry: row.expiry }),
     reason: row.reason,
     createdBy: row.created_by,
     createdAt: row.created_at,
   };
+}
+
+function requireOrigin(origin: string): AvailabilityHoldOrigin {
+  if ((HOLD_ORIGINS as readonly string[]).includes(origin)) {
+    return origin as AvailabilityHoldOrigin;
+  }
+  throw new Error(`invalid availability hold origin ${JSON.stringify(origin)}`);
 }
 
 function requireProvider(provider: string): string {

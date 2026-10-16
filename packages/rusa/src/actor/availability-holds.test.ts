@@ -55,11 +55,17 @@ describe("AvailabilityHolds", () => {
   });
 
   it("stamps the creation time and reports the stored hold to onHeld", () => {
-    const stored = holds.set({ provider: "kimi", reason: "capacity", createdBy: "root" });
+    const stored = holds.set({
+      provider: "kimi",
+      origin: "mesh",
+      reason: "capacity",
+      createdBy: "root",
+    });
 
     expect(stored).toEqual([
       {
         provider: "kimi",
+        origin: "mesh",
         reason: "capacity",
         createdBy: "root",
         createdAt: new Date(START).toISOString(),
@@ -71,11 +77,16 @@ describe("AvailabilityHolds", () => {
 
   it("refuses an expiry that is not in the future", () => {
     expect(() =>
-      holds.set({ provider: "kimi", expiry: new Date(START).toISOString(), createdBy: "root" })
+      holds.set({
+        provider: "kimi",
+        origin: "mesh",
+        expiry: new Date(START).toISOString(),
+        createdBy: "root",
+      })
     ).toThrow(/must be in the future/);
-    expect(() => holds.set({ provider: "kimi", expiry: "tomorrow", createdBy: "root" })).toThrow(
-      /invalid availability hold expiry/
-    );
+    expect(() =>
+      holds.set({ provider: "kimi", origin: "mesh", expiry: "tomorrow", createdBy: "root" })
+    ).toThrow(/invalid availability hold expiry/);
     expect(repo.list()).toEqual([]);
     expect(held).toEqual([]);
   });
@@ -83,21 +94,24 @@ describe("AvailabilityHolds", () => {
   it("wakes at each distinct expiry, following a replaced one, and keeps the expired rows", () => {
     holds.set({
       provider: "codex",
+      origin: "mesh",
       expiry: new Date(START + HOUR).toISOString(),
       createdBy: "root",
     });
     holds.set({
       provider: "kimi",
+      origin: "mesh",
       expiry: new Date(START + HOUR / 2).toISOString(),
       createdBy: "root",
     });
     // Setting the same scope again replaces its expiry; the earlier wake must not fire.
     holds.set({
       provider: "kimi",
+      origin: "mesh",
       expiry: new Date(START + 2 * HOUR).toISOString(),
       createdBy: "root",
     });
-    holds.set({ provider: "claude", createdBy: "root" });
+    holds.set({ provider: "claude", origin: "mesh", createdBy: "root" });
     const releasedProviders = () => released.map((batch) => batch.map((hold) => hold.provider));
 
     vi.advanceTimersByTime(HOUR - 1);
@@ -118,6 +132,7 @@ describe("AvailabilityHolds", () => {
   it("reports cleared holds to onReleased, skips it when nothing matched, and cancels their wake", () => {
     holds.set({
       provider: "kimi",
+      origin: "mesh",
       models: ["kimi-k2"],
       expiry: new Date(START + HOUR).toISOString(),
       createdBy: "root",
@@ -135,10 +150,11 @@ describe("AvailabilityHolds", () => {
   it("removes expired records apart from released holds, and only a released hold fires onReleased", () => {
     holds.set({
       provider: "kimi",
+      origin: "mesh",
       expiry: new Date(START + HOUR).toISOString(),
       createdBy: "root",
     });
-    holds.set({ provider: "codex", models: ["gpt-5.5"], createdBy: "root" });
+    holds.set({ provider: "codex", origin: "mesh", models: ["gpt-5.5"], createdBy: "root" });
     vi.advanceTimersByTime(HOUR);
     released.length = 0;
 
@@ -163,11 +179,13 @@ describe("AvailabilityHolds", () => {
     });
     lagging.set({
       provider: "codex",
+      origin: "mesh",
       expiry: new Date(START + HOUR).toISOString(),
       createdBy: "root",
     });
     lagging.set({
       provider: "kimi",
+      origin: "mesh",
       expiry: new Date(START + HOUR + 10).toISOString(),
       createdBy: "root",
     });
@@ -184,6 +202,7 @@ describe("AvailabilityHolds", () => {
   it("arms the expiry wake for holds stored before startup", () => {
     repo.set({
       provider: "kimi",
+      origin: "mesh",
       expiry: new Date(START + HOUR).toISOString(),
       createdBy: "root",
       createdAt: new Date(START - HOUR).toISOString(),
@@ -196,7 +215,12 @@ describe("AvailabilityHolds", () => {
 
   it("re-arms instead of releasing when an expiry is beyond the longest timer", () => {
     const far = START + 30 * 24 * HOUR;
-    holds.set({ provider: "kimi", expiry: new Date(far).toISOString(), createdBy: "root" });
+    holds.set({
+      provider: "kimi",
+      origin: "mesh",
+      expiry: new Date(far).toISOString(),
+      createdBy: "root",
+    });
 
     vi.advanceTimersByTime(2_147_483_647);
     expect(released).toEqual([]);
@@ -216,10 +240,166 @@ describe("AvailabilityHolds silent changes", () => {
       onHeld: () => calls.push("held"),
       onReleased: () => calls.push("released"),
     });
-    holds.set({ provider: "kimi", createdBy: "root" }, { silent: true });
+    holds.set({ provider: "kimi", origin: "mesh", createdBy: "root" }, { silent: true });
     expect(holds.clear({ provider: "kimi" }, { silent: true }).released).toHaveLength(1);
     expect(calls).toEqual([]);
     holds.stop();
+  });
+});
+
+describe("AvailabilityHolds origins (#918)", () => {
+  let repo: AvailabilityHoldRepository;
+  let released: AvailabilityHold[][];
+  let holds: AvailabilityHolds;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ now: START });
+    const db = new Database(":memory:");
+    runMigrations(db);
+    repo = new AvailabilityHoldRepository(db);
+    released = [];
+    holds = new AvailabilityHolds({
+      repo,
+      onReleased: (cleared) => released.push(cleared),
+    });
+  });
+
+  afterEach(() => {
+    holds.stop();
+    vi.useRealTimers();
+  });
+
+  it("clears one origin on a scope and leaves the other held", () => {
+    holds.set({ provider: "kimi", origin: "mesh", createdBy: "root" });
+    holds.set({ provider: "kimi", origin: "chat", createdBy: "chat:users/operator" });
+
+    const cleared = holds.clear({ provider: "kimi" }, { origin: "chat" });
+
+    expect(cleared.released.map((hold) => hold.origin)).toEqual(["chat"]);
+    expect(cleared.expired).toEqual([]);
+    expect(released).toEqual([cleared.released]);
+    expect(holds.isHeld("kimi", "kimi-k2")).toBe(true);
+    expect(holds.list().map((hold) => hold.origin)).toEqual(["mesh"]);
+  });
+
+  it("fires onReleased only when the cleared origin had an active hold", () => {
+    holds.set({ provider: "kimi", origin: "mesh", createdBy: "root" });
+
+    expect(holds.clear({ provider: "kimi" }, { origin: "chat" })).toEqual({
+      released: [],
+      expired: [],
+    });
+    expect(released).toEqual([]);
+    expect(holds.isHeld("kimi", "kimi-k2")).toBe(true);
+  });
+
+  it("clear without an origin still removes every origin (the authorized admin path)", () => {
+    holds.set({ provider: "kimi", origin: "mesh", createdBy: "root" });
+    holds.set({ provider: "kimi", origin: "chat", createdBy: "chat:users/operator" });
+
+    expect(holds.clear({ provider: "kimi" }).released).toHaveLength(2);
+    expect(holds.isHeld("kimi", "kimi-k2")).toBe(false);
+    expect(released).toHaveLength(1);
+  });
+
+  it("clearAll releases every scope one origin holds, across providers and models", () => {
+    holds.set({ provider: "kimi", origin: "chat", createdBy: "chat:users/operator" });
+    holds.set({
+      provider: "kimi",
+      origin: "chat",
+      models: ["kimi-k2"],
+      createdBy: "chat:users/operator",
+    });
+    holds.set({ provider: "codex", origin: "chat", createdBy: "chat:users/operator" });
+    holds.set({ provider: "kimi", origin: "mesh", createdBy: "root" });
+
+    const cleared = holds.clearAll("chat");
+
+    expect(cleared.released.map((hold) => `${hold.provider}:${hold.model ?? "*"}`).sort()).toEqual([
+      "codex:*",
+      "kimi:*",
+      "kimi:kimi-k2",
+    ]);
+    expect(holds.list().map((hold) => hold.origin)).toEqual(["mesh"]);
+    expect(holds.isHeld("kimi", "kimi-k2")).toBe(true);
+    expect(holds.isHeld("codex", "gpt-5.5")).toBe(false);
+  });
+
+  it("cancels the expiry wake of a cleared origin and re-arms on the rows that remain", () => {
+    holds.set({
+      provider: "kimi",
+      origin: "chat",
+      expiry: new Date(START + HOUR).toISOString(),
+      createdBy: "chat:users/operator",
+    });
+    holds.set({
+      provider: "kimi",
+      origin: "mesh",
+      expiry: new Date(START + 2 * HOUR).toISOString(),
+      createdBy: "root",
+    });
+
+    holds.clear({ provider: "kimi" }, { origin: "chat" });
+    released.length = 0;
+
+    vi.advanceTimersByTime(HOUR);
+    expect(released).toEqual([]);
+    vi.advanceTimersByTime(HOUR);
+    expect(released.map((batch) => batch.map((hold) => hold.origin))).toEqual([["mesh"]]);
+  });
+});
+
+describe("haltIndicator origin handling (#918)", () => {
+  const hold = (provider: string, model: string | undefined, origin: "chat" | "mesh") => ({
+    provider,
+    ...(model ? { model } : {}),
+    origin,
+    expiry: "2026-10-05T13:00:00.000Z",
+    reason: "",
+    createdBy: origin === "chat" ? "chat:users/operator" : "root",
+    createdAt: "2026-10-05T12:00:00.000Z",
+  });
+
+  it("counts a scope held through both origins once when synthesizing the snapshot", () => {
+    const indicator = haltIndicator({ state: () => null }, () => [
+      hold("codex", "gpt-5.5", "chat"),
+      hold("codex", "gpt-5.5", "mesh"),
+    ]);
+
+    // The lane is held either way, and the synthesized scope names it once.
+    expect(indicator.isHalted()).toBe(true);
+    expect(indicator.haltSnapshot()).toEqual({
+      providers: ["codex"],
+      models: ["gpt-5.5"],
+      until: "2026-10-05T13:00:00.000Z",
+    });
+  });
+
+  it("reflects the rows remaining after a chat release: the mesh hold keeps the lane halted", () => {
+    const remaining = [hold("codex", "gpt-5.5", "mesh")];
+    const indicator = haltIndicator({ state: () => null }, () => remaining);
+
+    expect(indicator.isHalted()).toBe(true);
+    expect(indicator.haltSnapshot()).toEqual({
+      providers: ["codex"],
+      models: ["gpt-5.5"],
+      until: "2026-10-05T13:00:00.000Z",
+    });
+  });
+
+  it("binds a scope two origins hold to the later expiry", () => {
+    const indicator = haltIndicator({ state: () => null }, () => [
+      hold("codex", "gpt-5.5", "chat"),
+      { ...hold("codex", "gpt-5.5", "mesh"), expiry: "2026-10-05T14:00:00.000Z" },
+    ]);
+
+    expect(indicator.isHalted()).toBe(true);
+    // The lane frees only when the last origin's hold lapses.
+    expect(indicator.haltSnapshot()).toEqual({
+      providers: ["codex"],
+      models: ["gpt-5.5"],
+      until: "2026-10-05T14:00:00.000Z",
+    });
   });
 });
 
@@ -228,6 +408,7 @@ describe("haltIndicator", () => {
   const hold = (provider: string, model?: string, expiry: string | null = UNTIL) => ({
     provider,
     ...(model ? { model } : {}),
+    origin: "chat" as const,
     ...(expiry ? { expiry } : {}),
     reason: "chat /halt from Operator",
     createdBy: "chat:users/operator",
@@ -318,7 +499,12 @@ describe("haltIndicator", () => {
 
 describe("describeHold", () => {
   it("names provider, model scope, expiry and reason", () => {
-    const base = { reason: "", createdBy: "root", createdAt: "2026-10-05T12:00:00.000Z" };
+    const base = {
+      origin: "mesh" as const,
+      reason: "",
+      createdBy: "root",
+      createdAt: "2026-10-05T12:00:00.000Z",
+    };
     expect(describeHold({ ...base, provider: "kimi" })).toBe("kimi (all models), until cleared");
     expect(
       describeHold({
@@ -372,6 +558,7 @@ describe("importScopedHaltFile", () => {
     const expected = (provider: string) => ({
       provider,
       model: "m1",
+      origin: "chat",
       expiry: until,
       reason: "chat /halt from Operator",
       createdBy: HALT_FILE_IMPORT_CREATOR,

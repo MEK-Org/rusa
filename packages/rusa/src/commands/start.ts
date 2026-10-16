@@ -4999,14 +4999,17 @@ async function composeStart(
             .catch(() => {});
           return;
         }
-        // A scoped `/halt` is a durable availability hold (#539). Holds on
-        // different scopes coexist, and the same scope again replaces its
-        // expiry and reason, so no `/resume` is needed before re-scoping.
+        // A scoped `/halt` is a durable availability hold (#539), chat-origin
+        // so a later chat `/resume` releases it without touching holds the
+        // mesh instituted on the same scope (#918 comment 6204340124). One
+        // scope holds one row per origin; re-scoping the same scope replaces
+        // only the chat row.
         try {
           for (const provider of providers) {
             availabilityHolds.set(
               {
                 provider,
+                origin: "chat",
                 ...(models.length ? { models } : {}),
                 ...(haltCommand.until ? { expiry: haltCommand.until } : {}),
                 reason: `chat /halt from ${who}`,
@@ -5056,15 +5059,17 @@ async function composeStart(
       if (resumeCommand) {
         const scopedProviders = resumeCommand.providers ?? [];
         if (scopedProviders.length > 0) {
-          // A scoped `/resume` releases only matching holds; the global
-          // brake is not a provider's to release.
+          // A scoped `/resume` releases only chat-origin holds matching the
+          // scope; the global brake is not a provider's to release, and
+          // mesh-instituted holds on the same scope stay in force (#918
+          // comment 6204340124).
           const cleared = scopedProviders.map((provider) =>
             availabilityHolds.clear(
               {
                 provider,
                 ...(resumeCommand.models?.length ? { models: resumeCommand.models } : {}),
               },
-              { silent: true }
+              { silent: true, origin: "chat" }
             )
           );
           const active = cleared.flatMap((batch) => batch.released);
@@ -5080,7 +5085,11 @@ async function composeStart(
               : `▶ No availability hold in force matched ${named}; nothing was released.`,
           ];
           if (expired > 0) lines.push(`Also removed ${expired} expired hold record(s).`);
-          if (remaining.length) lines.push(`Still held:\n${holdLines(remaining)}`);
+          if (remaining.length) {
+            lines.push(
+              `Still held:\n${holdLines(remaining)}\n(Mesh-instituted holds stay in force until cleared from the dashboard or the hold tools.)`
+            );
+          }
           if (haltSwitch.hasActiveHalt()) {
             lines.push("The global halt is still in place; bare /resume releases it.");
           }
@@ -5088,22 +5097,29 @@ async function composeStart(
           void cc.send(msg.spaceName, lines.join("\n")).catch(() => {});
           return;
         }
-        // Bare `/resume` releases only the global brake (operator decision,
-        // #918). Every hold stays in force and is listed, so an indefinite
-        // hold is never hidden behind an emergency-brake release.
+        // Bare `/resume` releases the global brake and every hold chat placed,
+        // whatever its scope (operator decision, #918 comment 6204340124).
+        // Mesh-instituted holds stay in force and are listed, so an
+        // indefinite mesh hold is neither cleared nor hidden.
         const wasHalted = haltSwitch.hasActiveHalt();
         haltSwitch.resume();
         if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
         haltExpiryTimer = null;
+        const chatCleared = availabilityHolds.clearAll("chat", { silent: true });
         const resumed = resumeAfterHalt();
         const remaining = availabilityHolds.list();
         const lines = [
           `▶ Resumed${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : " — actors will run on the next trigger"}.`,
           wasHalted ? "Global halt released." : "No global halt was in place.",
-          remaining.length
-            ? `Availability holds still in force:\n${holdLines(remaining)}\nSend /resume provider:<name> to release one.`
-            : "No availability holds are in force.",
         ];
+        if (chatCleared.released.length) {
+          lines.push(`Released availability holds:\n${holdLines(chatCleared.released)}`);
+        }
+        lines.push(
+          remaining.length
+            ? `Availability holds still in force:\n${holdLines(remaining)}\nMesh-instituted holds stay in force until cleared from the dashboard or the hold tools.`
+            : "No availability holds are in force."
+        );
         console.warn(`[mesh] ▶ HALT cleared via chat by ${who}`);
         void cc.send(msg.spaceName, lines.join("\n")).catch(() => {});
         return;
