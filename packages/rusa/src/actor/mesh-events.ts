@@ -33,9 +33,14 @@ export type MeshEventKind =
   | "actor_retired"
   // `actorId` = the revived thread, `payload` = { parentId }.
   | "actor_revived"
-  // The root moved an actor to a new parent (re-org). `actorId` = the moved
-  // actor, `payload` = { parentId }.
+  // An actor's parent edge changed (re-org or detachment). `actorId` = the
+  // moved actor, `payload` = { fromParentId, toParentId }, null meaning top level.
   | "actor_reparented"
+  // An authenticated human operator asked to move an actor through the
+  // operator boundary (#1003), allowed or denied. `actorId` = the actor asked
+  // to move, `payload` = OperatorReparentAudit: { principal, actorId,
+  // fromParentId, toParentId, outcome, reason? }, null meaning top level.
+  | "operator_actor_reparent"
   // The root durably re-scoped an actor by replacing its charter via
   // set_thread_charter (e.g. promoting an elder to a steward). `actorId` = the
   // re-chartered actor, `detail` = a charter excerpt.

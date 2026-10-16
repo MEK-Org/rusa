@@ -561,6 +561,60 @@ describe("administrative capability gating of management tools (#549)", () => {
     return fixture;
   }
 
+  it("reparent_thread detaches a strict descendant and refuses moves outside the subtree (#1003)", async () => {
+    const fixture = subtreeFixture([ACTOR_ADMIN_CAPABILITY]);
+    const { mesh, registry } = fixture;
+    for (const [id, parentId] of [
+      ["grandchild", "steward-child"],
+      ["other-forest", null],
+      ["other-child", "other-forest"],
+    ] as const) {
+      registry.upsert({
+        id,
+        charter: id,
+        parentId,
+        ...(parentId === null ? { executionConfig: { unsandboxed: true } } : {}),
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    const client = await connect(createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root"));
+    const reparent = async (thread_id: string, new_parent_id: string | null) =>
+      (await client.callTool({
+        name: "reparent_thread",
+        arguments: { thread_id, new_parent_id },
+      })) as CallToolResult;
+
+    for (const [thread_id, new_parent_id, reason] of [
+      // Cross-forest destination and an actor outside the caller's subtree.
+      ["steward-child", "other-forest", /subtree/],
+      ["other-child", null, /subtree/],
+      ["sibling", null, /subtree/],
+      // Moving yourself is refused whether attaching or detaching.
+      ["0b2c3d4e-steward", null, /itself/],
+      ["0b2c3d4e-steward", "steward-child", /itself/],
+    ] as const) {
+      const refused = await reparent(thread_id, new_parent_id);
+      expect(refused.isError, `${thread_id} -> ${new_parent_id}`).toBe(true);
+      expect(dataOf(refused)).toMatch(reason);
+    }
+    expect(registry.get("steward-child")?.parentId).toBe("0b2c3d4e-steward");
+    expect(registry.get("other-child")?.parentId).toBe("other-forest");
+
+    // Within the subtree a move still works, and null detaches a descendant.
+    expect((await reparent("grandchild", "0b2c3d4e-steward")).isError).toBeFalsy();
+    expect(registry.get("grandchild")?.parentId).toBe("0b2c3d4e-steward");
+    const detached = await reparent("steward-child", null);
+    expect(detached.isError).toBeFalsy();
+    expect(registry.get("steward-child")?.parentId).toBeNull();
+
+    // The former parent loses administrative reach immediately.
+    const reattach = await reparent("steward-child", "0b2c3d4e-steward");
+    expect(reattach.isError).toBe(true);
+    expect(dataOf(reattach)).toMatch(/subtree/);
+    expect(registry.get("steward-child")?.parentId).toBeNull();
+  });
+
   it("confines wake schedules to the holder's subtree, slot suffixes included", async () => {
     const { mesh } = subtreeFixture([ACTOR_ADMIN_CAPABILITY]);
     const sched = new FakeWakeScheduler();

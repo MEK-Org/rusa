@@ -8156,14 +8156,13 @@ describe("ActorMesh", () => {
     expect(registry.get(steward)?.handles?.some((h) => h.id === worker)).toBe(true);
   });
 
-  it("reparentThread rejects root, self, unknown, non-active parent, and cycles", async () => {
+  it("reparentThread rejects self, unknown, non-active parent, and cycles", async () => {
     const { mesh, registry } = setup();
     const a = mesh.spawn({ charter: "a", parentId: "root" });
     const b = mesh.spawn({ charter: "b", parentId: a }); // b is a's child
 
-    expect(() => mesh.reparentThread("root", a)).toThrow(
-      /Cannot give the top-level thread root a parent/
-    );
+    // A top-level actor may move, but never beneath its own forest.
+    expect(() => mesh.reparentThread("root", a)).toThrow(/cycle/);
     expect(() => mesh.reparentThread(a, a)).toThrow(/to itself/);
     expect(() => mesh.reparentThread(a, "non-existent")).toThrow(/unknown parent/);
     expect(() => mesh.reparentThread("non-existent", a)).toThrow(/unknown thread/);
@@ -14440,7 +14439,7 @@ describe("accountRun token accounting (#443)", () => {
     });
   });
 
-  describe("single top-level actor guard (#550)", () => {
+  describe("actor forests (#1003)", () => {
     const dummyActor = (id: string): MeshActor => ({
       id,
       requestRun: () => {},
@@ -14449,77 +14448,84 @@ describe("accountRun token accounting (#443)", () => {
       preemptForResponsive: () => ({ preempted: false }),
       isRunning: false,
     });
-
-    it("refuses to adopt a second parentless actor, leaving the repository unchanged", () => {
-      const { mesh, registry } = setup();
-      const before = registry.list();
-
-      expect(() =>
-        mesh.adopt(
-          {
-            id: "second",
-            charter: "second",
-            parentId: null,
-            executionConfig: { unsandboxed: true },
-            status: "active",
-            createdAt: "2026-01-01T00:00:00.000Z",
-          },
-          dummyActor("second")
-        )
-      ).toThrow("Cannot add second as a second top-level actor: root is already top-level");
-
-      expect(registry.list()).toEqual(before);
-      expect(mesh.isLiveActor("second")).toBe(false);
+    const topLevel = (id: string): ActorRecord => ({
+      id,
+      charter: id,
+      parentId: null,
+      executionConfig: { unsandboxed: true },
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
     });
 
-    it("counts a retired parentless actor as the top-level one", () => {
+    it("adopts a second parentless actor alongside the first", () => {
       const { mesh, registry } = setup();
-      registry.patch("root", { status: "retired" });
-      expect(registry.get("root")?.status).toBe("retired");
 
-      expect(() =>
-        mesh.adopt(
-          {
-            id: "second",
-            charter: "second",
-            parentId: null,
-            executionConfig: { unsandboxed: true },
-            status: "active",
-            createdAt: "2026-01-01T00:00:00.000Z",
-          },
-          dummyActor("second")
-        )
-      ).toThrow(/second top-level actor: root/);
+      mesh.adopt(topLevel("second"), dummyActor("second"));
+
+      expect(
+        registry
+          .list()
+          .filter((a) => a.parentId === null)
+          .map((a) => a.id)
+          .sort()
+      ).toEqual(["root", "second"]);
+      expect(mesh.isLiveActor("second")).toBe(true);
     });
 
-    it("re-adopts the top-level actor itself and adopts actors with a parent", () => {
+    it("re-adopts a top-level actor without duplicating it", () => {
       const { mesh, registry } = setup();
-      mesh.adopt(
-        {
-          id: "root",
-          charter: "root",
-          parentId: null,
-          executionConfig: { unsandboxed: true },
-          status: "active",
-          createdAt: "2026-01-01T00:00:00.000Z",
-          title: "Root again",
-        },
-        dummyActor("root")
-      );
-      mesh.adopt(
-        {
-          id: "child",
-          charter: "child",
-          parentId: "root",
-          status: "active",
-          createdAt: "2026-01-01T00:00:00.000Z",
-        },
-        dummyActor("child")
-      );
+      mesh.adopt({ ...topLevel("root"), title: "Root again" }, dummyActor("root"));
 
       expect(registry.list().filter((a) => a.parentId === null)).toHaveLength(1);
-      expect(registry.get("child")?.parentId).toBe("root");
       expect(registry.get("root")?.title).toBe("Root again");
+    });
+
+    it("moves a top-level actor and its subtree beneath another forest", () => {
+      const { mesh, registry } = setup();
+      registry.upsert(topLevel("other"));
+      const otherChild = mesh.spawn({ charter: "other child", parentId: "other" });
+      const target = mesh.spawn({ charter: "target", parentId: "root" });
+
+      mesh.reparentThread("other", target);
+
+      expect(registry.get("other")?.parentId).toBe(target);
+      expect(registry.get(otherChild)?.parentId).toBe("other");
+      expect(mesh.isAncestorOf("root", otherChild)).toBe(true);
+      expect(registry.get(target)?.handles?.some((h) => h.id === "other")).toBe(true);
+    });
+
+    it("detaches an actor to top level; the former ancestors lose reach at once", () => {
+      const events: MeshEventInput[] = [];
+      const { mesh, registry } = setup({ events: (e) => events.push(e) });
+      const steward = mesh.spawn({ charter: "steward", parentId: "root" });
+      const worker = mesh.spawn({ charter: "worker", parentId: steward });
+      const grandchild = mesh.spawn({ charter: "grandchild", parentId: worker });
+      const handlesBefore = registry.get(steward)?.handles;
+
+      mesh.reparentThread(worker, null);
+
+      expect(registry.get(worker)?.parentId).toBeNull();
+      expect(registry.get(grandchild)?.parentId).toBe(worker);
+      expect(mesh.isAncestorOf(steward, worker)).toBe(false);
+      expect(mesh.isAncestorOf("root", grandchild)).toBe(false);
+      // Handles are a graph, ownership is the tree: detaching leaves them alone.
+      expect(registry.get(steward)?.handles).toEqual(handlesBefore);
+      expect(events.filter((e) => e.kind === "actor_reparented").at(-1)).toMatchObject({
+        actorId: worker,
+        payload: JSON.stringify({ fromParentId: steward, toParentId: null }),
+      });
+    });
+
+    it("refuses to detach a top-level actor or move a non-active one", () => {
+      const { mesh, registry } = setup();
+      const a = mesh.spawn({ charter: "a", parentId: "root" });
+      const b = mesh.spawn({ charter: "b", parentId: "root" });
+
+      expect(() => mesh.reparentThread("root", null)).toThrow(/already top-level/);
+      registry.patch(b, { status: "retired" });
+      expect(() => mesh.reparentThread(b, a)).toThrow(/non-active thread/);
+      expect(() => mesh.reparentThread(b, null)).toThrow(/non-active thread/);
+      expect(registry.get(b)?.parentId).toBe("root");
     });
   });
 });

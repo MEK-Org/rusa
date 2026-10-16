@@ -19,7 +19,6 @@ function setup(extra: Partial<RootControlOptions> = {}) {
     retire: vi.fn(),
     interrupt: vi.fn(() => ({ interrupted: true })),
     runNow: vi.fn(() => ({ queued: true })),
-    reparentThread: vi.fn(),
     recordEvent: (event) => events.push(event),
     list: vi.fn(() => []),
   };
@@ -345,35 +344,5 @@ describe("RootControlService", () => {
       action: "run_now_child",
       targetId: "child-1",
     });
-  });
-
-  it("reparents a root descendant and audits the new parent", () => {
-    const { mesh, events, service } = setup();
-
-    service.reparentChild("worker-1", "steward-2", "00000000-0000-4000-8000-000000000001");
-
-    expect(mesh.reparentThread).toHaveBeenCalledWith("worker-1", "steward-2");
-    expect(JSON.parse(events[0]?.payload ?? "{}")).toMatchObject({
-      action: "reparent_child",
-      targetId: "worker-1",
-      newParentId: "steward-2",
-      principal: "00000000-0000-4000-8000-000000000001",
-    });
-  });
-
-  it("refuses a root, foreign actor, or foreign destination before asking the mesh to reparent it", () => {
-    const { mesh, service } = setup();
-    vi.mocked(mesh.isAncestorOf).mockImplementation((_, id) => id !== "foreign");
-
-    expect(() =>
-      service.reparentChild("root", "worker-2", "00000000-0000-4000-8000-000000000001")
-    ).toThrow(/root descendants/);
-    expect(() =>
-      service.reparentChild("foreign", "worker-2", "00000000-0000-4000-8000-000000000001")
-    ).toThrow(/root descendants/);
-    expect(() =>
-      service.reparentChild("worker-1", "foreign", "00000000-0000-4000-8000-000000000001")
-    ).toThrow(/root descendants/);
-    expect(mesh.reparentThread).not.toHaveBeenCalled();
   });
 });

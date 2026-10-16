@@ -1345,34 +1345,12 @@ export class ActorMesh {
    * field the record omits keeps its stored value.
    */
   adopt(record: ActorRecord, actor: MeshActor): void {
-    this.assertSingleTopLevel(record);
     const existing = this.actors.get(record.id);
     this.actors.upsert(existing ? { ...existing, ...record } : record);
     this.runs.register(record.id, actor);
     if (actor.lifecycle) this.lifecycles.set(record.id, actor.lifecycle);
     else this.lifecycleFor(record.id);
     this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
-  }
-
-  /**
-   * The running daemon still boots exactly one top-level actor. The repository
-   * can store several parentless actors now (#550), but that is not authority
-   * to create them: until forest boot lands, adoption refuses a second one,
-   * retired or not, as the dropped unique index did. {@link spawn} cannot make
-   * one at all, since it always resolves a parent. The configured-actor
-   * import's refusal of a reparented imported actor belongs to this guard and
-   * goes with it (#1002).
-   */
-  private assertSingleTopLevel(record: ActorRecord): void {
-    if (record.parentId !== null) return;
-    const other = this.actors
-      .list()
-      .find((existing) => existing.parentId === null && existing.id !== record.id);
-    if (other) {
-      throw new Error(
-        `Cannot add ${record.id} as a second top-level actor: ${other.id} is already top-level`
-      );
-    }
   }
 
   /**
@@ -5411,26 +5389,49 @@ export class ActorMesh {
 
   /**
    * Move an actor to a new parent (the re-org primitive — e.g. promote a steward
-   * and reparent workers under it). Root-only at the tool layer. Changes who
-   * receives the actor's reports and failure notices and who may retire it (ownership
-   * is the `parentId` edge), and grants the new parent a handle so it can message
-   * the actor. The actor's own subtree rides along — it stays attached, so the whole
-   * branch moves. Guards: refuses to reparent the root or any existing top-level
-   * boundary, a no-op self-parent, an unknown actor/parent, or a move that would
-   * create a cycle (the new parent must not be the actor or any of its descendants).
-   * Existing handles (incl. the old parent's) are left intact — handles are a graph,
+   * and reparent workers under it), or detach it to top level with `null`.
+   * Changes who receives the actor's reports and failure notices and who may
+   * retire it (ownership is the `parentId` edge), and grants a new parent a
+   * handle so it can message the actor. The actor's own subtree rides along —
+   * it stays attached, so the whole branch moves. Administrative reach is the
+   * live ancestry, so a former parent loses it the moment the edge changes.
+   *
+   * This is the validation authority, not the authorization one: callers decide
+   * who may move what (#1003). Every check runs against the records as they
+   * stand now — the moved actor must be active, a destination must be a
+   * different, known, active actor that is not in the moved actor's subtree
+   * (cycle), and `null` refuses an actor that is already top-level. Existing
+   * handles (incl. the old parent's) are left intact — handles are a graph,
    * ownership is the tree.
    */
-  reparentThread(id: string, newParentId: string): void {
+  reparentThread(id: string, newParentId: string | null): void {
     id = this.resolveThreadId(id);
-    newParentId = this.resolveThreadId(newParentId);
+    if (newParentId !== null) newParentId = this.resolveThreadId(newParentId);
     const record = this.actors.get(id);
     if (!record) {
       throw new Error(`Cannot reparent unknown thread: ${id}`);
     }
-    if (record.parentId == null) {
-      throw new Error(`Cannot give the top-level thread ${id} a parent`);
+    // A retired actor has no live branch to reorganize; reviving is its own act.
+    if (record.status !== "active") {
+      throw new Error(`Cannot reparent non-active thread ${id} (status: ${record.status})`);
     }
+    if (newParentId === null) {
+      if (record.parentId === null) {
+        throw new Error(`Cannot detach ${id}: it is already top-level`);
+      }
+    } else {
+      this.assertReparentDestination(id, newParentId);
+    }
+    this.actors.patch(id, { parentId: newParentId });
+    if (newParentId !== null) this.grantHandle(newParentId, { id }); // the new parent can now message the actor
+    this.recordEvent({
+      kind: "actor_reparented",
+      actorId: id,
+      payload: JSON.stringify({ fromParentId: record.parentId, toParentId: newParentId }),
+    });
+  }
+
+  private assertReparentDestination(id: string, newParentId: string): void {
     if (id === newParentId) {
       throw new Error(`Cannot reparent ${id} to itself`);
     }
@@ -5439,7 +5440,7 @@ export class ActorMesh {
       throw new Error(`Cannot reparent ${id} to unknown parent: ${newParentId}`);
     }
     // The new parent must be live, else the actor's reports would drop into
-    // a retired void (elder ISSUE_NUM rec a).
+    // a retired void.
     if (newParent.status !== "active") {
       throw new Error(
         `Cannot reparent ${id} under non-active parent ${newParentId} (status: ${newParent.status})`
@@ -5447,7 +5448,7 @@ export class ActorMesh {
     }
     // Cycle guard: walk up from the proposed parent; if we reach `id`, the move
     // would make `id` its own ancestor. The visited-set is defensive insurance so a
-    // pre-corrupted cyclic tree can't spin this forever (elder ISSUE_NUM rec b).
+    // pre-corrupted cyclic tree can't spin this forever.
     const seen = new Set<string>();
     for (
       let cursor: string | null | undefined = newParentId;
@@ -5459,13 +5460,6 @@ export class ActorMesh {
       }
       seen.add(cursor);
     }
-    this.actors.patch(id, { parentId: newParentId });
-    this.grantHandle(newParentId, { id }); // the new parent can now message the actor
-    this.recordEvent({
-      kind: "actor_reparented",
-      actorId: id,
-      payload: JSON.stringify({ fromParentId: record.parentId, toParentId: newParentId }),
-    });
   }
 
   reviveThread(id: string): void {

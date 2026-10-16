@@ -90,6 +90,7 @@ import {
   type RunAbandonedPayload,
   runEndPayload,
 } from "../actor/mesh-events.js";
+import { OperatorActorControl } from "../actor/operator-actor-control.js";
 import { type ActorWakeScheduler, DefaultOsScheduler } from "../actor/os-scheduler.js";
 import {
   assemblePortableContext,
@@ -4690,6 +4691,7 @@ async function composeStart(
             return entries.length > 0 ? entries : null;
           },
           rootControl,
+          operatorActors: new OperatorActorControl(mesh),
           // The configured actor's identity, so the dashboard shows this
           // instance's own handle instead of the default root-actor. Both the
           // handle and the image (cached under `avatars/root.png`) are the
