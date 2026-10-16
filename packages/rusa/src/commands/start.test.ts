@@ -6835,9 +6835,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(await boot()).toEqual(first);
     });
 
-    it("does not manufacture bootstrap grants on import or a later mountable-server boot", async () => {
+    it("does not manufacture grants when a host capability becomes mountable on a later boot", async () => {
       clearLegacyConfiguredGrants();
       writeRootActorConfig({ charter: "configured charter" });
+
+      // First boot cannot resolve the deploy checkout, so `update` is not
+      // registered as a mountable server. The second boot can register it.
+      // Neither transition may derive a grant from imported identity.
+      serviceInstanceMock.resolveRepoRoot.mockImplementation(() => {
+        throw new Error("fixture: deploy checkout unavailable");
+      });
       const first = await boot();
       const importedActor = first.importedActor;
       if (!importedActor) throw new Error("configured actor was not imported");
@@ -6852,9 +6859,30 @@ describe("runStart webhook event routing (Phase 4)", () => {
         )
       ).toEqual([]);
 
-      // `update` is mountable on this fixture's later boot. A durable revoked
-      // row must remain revoked; import identity is never a source for a new
-      // grant, even when a server becomes available after the import.
+      serviceInstanceMock.resolveRepoRoot.mockImplementation(
+        serviceInstanceMock.actualResolveRepoRoot
+      );
+      let mountableOnSecondBoot: string[] = [];
+      await boot({
+        inspect: (mesh) => {
+          mountableOnSecondBoot = (
+            mesh.get(importedActor) as unknown as { opts: { mcpServers: Array<{ name: string }> } }
+          ).opts.mcpServers.map((server) => server.name);
+        },
+      });
+      expect(mountableOnSecondBoot).not.toContain("update");
+      expect(
+        withMeshDb((db) =>
+          db
+            .prepare(
+              "SELECT capability, granted_by, revoked_at FROM capability_grants WHERE actor_id = ?"
+            )
+            .all(importedActor)
+        )
+      ).toEqual([]);
+
+      // A durable revoked row must remain revoked after that mountability
+      // transition; import identity is never a source for a new grant.
       withMeshDb((db) =>
         db
           .prepare(
@@ -7908,10 +7936,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     );
 
     const entries = getRepositories().inbox.list(rootId).entries;
-    expect(entries.map((entry) => entry.payload?.messageName)).toEqual([
-      "messages/dm",
-      "messages/pseudo-dm",
-    ]);
+    // Listing is newest-first; when both durable writes share a timestamp,
+    // their UUID tie-breaker is intentionally not a routing contract. The
+    // behavior under test is which conversations are responsive.
+    expect(new Set(entries.map((entry) => entry.payload?.messageName))).toEqual(
+      new Set(["messages/dm", "messages/pseudo-dm"])
+    );
     expect(entries.every((entry) => entry.payload?.priority === "responsive")).toBe(true);
   });
 

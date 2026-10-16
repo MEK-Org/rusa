@@ -2514,12 +2514,11 @@ async function composeStart(
   // ── Host-maintenance tools (#549) ── `update` and `pnpm-hardlinks` used to be
   // mounted on the configured root's tool set by id. They are now ordinary
   // grantable capabilities (named after their servers) registered through
-  // `buildGrantableServers`, so a grant row — seeded for the configured actor
-  // at boot, grantable/revocable like any other — is what puts them on an
-  // endpoint; the handlers re-check the grant live. The `update` tool is
-  // best-effort: if the deploy checkout can't be resolved, the mesh still boots
-  // without it. Its drainer self-excludes the CALLER's run (whoever holds the
-  // grant), not a fixed root id.
+  // `buildGrantableServers`: an explicit durable grant, not topology or import
+  // identity, puts one on an endpoint, and the handlers re-check it live. The
+  // `update` tool is best-effort: if the deploy checkout can't be resolved, the
+  // mesh still boots without it. Its drainer self-excludes the CALLER's run
+  // (whoever holds the grant), not a fixed root id.
   const followerTriggerStore = new FollowerUpdateTriggerStore(
     join(mcHome, "data", "follower-update-trigger.json")
   );
@@ -3288,9 +3287,8 @@ async function composeStart(
     // agent-exec endpoint itself, so they have no server factory either; the
     // mesh and the endpoint both consult the grant rows directly. The
     // host-global names listed here (`update`, `pnpm-hardlinks`, `model-admin`,
-    // `room-admin`)
-    // are stripped by the mesh: it never grants one, and only the seed below
-    // creates their rows. `obligation-responsive` (#1026) and
+    // `room-admin`) are stripped by the mesh: it never grants one, so an
+    // operator-provisioned durable row is required. `obligation-responsive` (#1026) and
     // `obligations-admin` (#1003) likewise mount nothing: each worker's
     // obligations server reads the binding per call; the latter is changed only
     // through the authenticated operator boundary.
@@ -4107,21 +4105,17 @@ async function composeStart(
     haltExpiryTimer.unref?.();
   };
 
-  // Rehydrate every active record through the ordinary durable constructor
-  // before considering the legacy configured-workdir adapter below. In
-  // particular, import identity does not select an authority-bearing tool
-  // surface or an alternate construction path (#1003).
+  // Rehydrate every active record through the ordinary durable constructor.
+  // Import identity does not select an authority-bearing tool surface or an
+  // alternate construction path (#1003).
   let configuredRootActor: MeshActor | undefined;
   let configuredExternalRoot: ExternalRootDriver | null = null;
-  mesh.rehydrateAll();
 
-  // Restore live actors from records the actor repository persisted across the last
-  // restart. Must run after the root is adopted (so a worker's parent is live
-  // before the worker). Retired threads stay dead; rehydration never wakes an
-  // actor by itself. Message-trigger reconciliation runs immediately after
-  // rehydration, replaying any `send_message` trigger claimed by a run that
-  // never completed (drain or hard kill). Cron wakes and GitHub events remain
-  // outside this path by design.
+  // Restore persisted active actors. Retired threads stay dead; rehydration
+  // never wakes an actor by itself. Message-trigger reconciliation runs
+  // immediately after it, replaying any `send_message` trigger claimed by a
+  // run that never completed (drain or hard kill). Cron wakes and GitHub
+  // events remain outside this path by design.
   mesh.rehydrateAll();
   mesh.reconcilePendingDeliveries();
   mesh.reconcileInbox();
