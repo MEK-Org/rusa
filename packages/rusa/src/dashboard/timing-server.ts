@@ -13,7 +13,7 @@ import { attachDashboardPhaseClock, DashboardPhaseClock } from "./timing-phases.
 /**
  * Count only response-body bytes; headers and socket framing are intentionally
  * excluded. The first header write or body write also ends the route phase,
- * and the last body handoff (`end`) is when `finishMs` starts.
+ * and the first body handoff (`end`) is when `finishMs` starts.
  */
 function trackResponse(
   res: ServerResponse,
@@ -37,6 +37,8 @@ function trackResponse(
     return originalWriteHead(...args);
   };
   const add = (chunk: unknown, encoding: BufferEncoding | undefined) => {
+    // After `end`, a repeated `write`/`end` hands off nothing.
+    if (endedAt !== undefined) return;
     if (typeof chunk === "string") bytes += Buffer.byteLength(chunk, encoding);
     else if (Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) bytes += chunk.byteLength;
   };

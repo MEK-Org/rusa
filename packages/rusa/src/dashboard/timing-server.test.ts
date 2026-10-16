@@ -295,40 +295,8 @@ describe("dashboard timing server wrapper", () => {
     const recordServer = vi.fn();
     const recorder = { recordServer } as unknown as DashboardTimingRecorder;
     const drained = new DrainingResponse(40);
-    beginDashboardRequestTiming(
-      drained as unknown as ServerResponse,
-      "/api/mesh/obligations",
-      "GET",
-      recorder
-    );
-    drained.writeHead(200);
-    drained.end("{}");
-    await vi.waitFor(() => expect(recordServer).toHaveBeenCalledTimes(1));
-    const finished = recordServer.mock.calls[0][0];
-    expect(finished.substages.finishMs).toBeGreaterThanOrEqual(35);
-    expect(finished.substages.finishMs).toBeLessThanOrEqual(finished.durationMs);
-
-    // Handed off but closed before finish: the drain never completed.
-    const closed = new DrainingResponse(1_000);
-    beginDashboardRequestTiming(
-      closed as unknown as ServerResponse,
-      "/api/mesh/obligations",
-      "GET",
-      recorder
-    );
-    closed.writeHead(200);
-    closed.end("{}");
-    closed.closeEarly();
-    const premature = recordServer.mock.calls[1][0];
-    expect(premature.request.terminal).toBe("closed_before_finish");
-    expect(premature.substages).not.toHaveProperty("finishMs");
-  });
-
-  it("starts finish at the first end, not a repeated no-op end (#990)", async () => {
-    const recordServer = vi.fn();
-    const recorder = { recordServer } as unknown as DashboardTimingRecorder;
-    const drained = new DrainingResponse(40);
-    // A second end on an ended ServerResponse hands off nothing.
+    // Like a real ServerResponse, a repeated end on an ended response is a
+    // no-op, and a write after end hands off nothing either.
     const firstEnd = drained.end.bind(drained);
     let ended = false;
     drained.end = (chunk?: string | Buffer) => {
@@ -345,9 +313,30 @@ describe("dashboard timing server wrapper", () => {
     drained.writeHead(200);
     drained.end("{}");
     await sleep(25);
-    drained.end();
+    drained.end("ignored-extra");
+    drained.write("more-ignored");
     await vi.waitFor(() => expect(recordServer).toHaveBeenCalledTimes(1));
-    expect(recordServer.mock.calls[0][0].substages.finishMs).toBeGreaterThanOrEqual(35);
+    const finished = recordServer.mock.calls[0][0];
+    // finishMs starts at the first end; the repeated end and post-end write
+    // move nothing and add no body bytes.
+    expect(finished.substages.finishMs).toBeGreaterThanOrEqual(35);
+    expect(finished.substages.finishMs).toBeLessThanOrEqual(finished.durationMs);
+    expect(finished.bytes).toBe(2);
+
+    // Handed off but closed before finish: the drain never completed.
+    const closed = new DrainingResponse(1_000);
+    beginDashboardRequestTiming(
+      closed as unknown as ServerResponse,
+      "/api/mesh/obligations",
+      "GET",
+      recorder
+    );
+    closed.writeHead(200);
+    closed.end("{}");
+    closed.closeEarly();
+    const premature = recordServer.mock.calls[1][0];
+    expect(premature.request.terminal).toBe("closed_before_finish");
+    expect(premature.substages).not.toHaveProperty("finishMs");
   });
 
   it("keeps a recorded row unchanged when a callback arrives after close (#990)", async () => {
