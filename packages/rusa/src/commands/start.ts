@@ -2462,8 +2462,8 @@ async function composeStart(
   const capabilityGrants = getRepositories().capabilityGrants;
   // Explicit ownership and its tombstones are durable in SQLite;
   // `event-subscriptions.json` is only a legacy source, imported once and then
-  // archived. The config-implied seed is rebuilt in memory below, so nothing
-  // here recreates a JSON source of truth.
+  // archived. Config-implied ownership is resolved afresh at boot for the
+  // oldest active parentless actor, independently of the configured import.
   const persistentEventSourceOwners = getRepositories().eventSourceOwners;
   warnMissingConfiguredEventSubscriptionsAtBoot(
     persistentEventSourceOwners,
@@ -2486,10 +2486,11 @@ async function composeStart(
     handleForId: (id) =>
       id === rootId && rootHandle !== undefined ? rootHandle : generateHandle(id),
   });
+  let impliedOwnerId = defaultGrantRecipient(actors.list())?.id;
   const rootSourceSync = reconcileEventSources(
     persistentEventSourceOwners,
     configuredRoots,
-    rootId,
+    impliedOwnerId,
     () => new Date().toISOString()
   );
   const eventSourceOwners = rootSourceSync.store;
@@ -3916,6 +3917,13 @@ async function composeStart(
               `[root] model_config=${rootModelConfigDescription ?? describeModelConfigPool(modelConfigPool)} (${rootBootModelConfig?.source ?? "durable"}) session=${sessionDescription} tools=${workerMcp.map((server) => server.name).join(",")}`
             );
           }
+        }
+        // An empty instance has nobody to receive implied sources at boot.
+        // Initialize that same in-memory layer after successful first creation
+        // so ingress works immediately, without a restart or durable seed rows.
+        if (impliedOwnerId === undefined && defaultGrantRecipient(actors.list())?.id === id) {
+          rootSourceSync.seedImpliedOwner(id);
+          impliedOwnerId = id;
         }
         return actor;
       } catch (err) {

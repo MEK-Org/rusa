@@ -281,30 +281,32 @@ export function parentOf(resource: EventResource): string | undefined {
 export interface EventSourceBootSyncResult {
   store: EventSourceOwnerStore;
   droppedDelegations: EventSourceOwnership[];
+  /** Initialize an empty boot's implied layer after its first actor is created. */
+  seedImpliedOwner(actorId: string): void;
 }
 
 export function reconcileEventSources(
   persistentStore: EventSourceOwnerStore,
   configured: EventResource[],
-  rootId: string | undefined,
+  defaultOwnerId: string | undefined,
   now: () => string
 ): EventSourceBootSyncResult {
   const impliedStore = new InMemoryEventSourceOwnerStore();
   const droppedDelegations: EventSourceOwnership[] = [];
 
-  // An empty store (#1003) has no imported actor to hold the implied rows.
-  for (const resource of configured) {
-    if (rootId === undefined) break;
-    // One active subscriber per resource. We seed implied subscriptions for the root,
-    // but the UnionEventSourceOwnerStore means persistent explicit overrides (if any)
-    // will take precedence if the root later delegates it or drops it.
-    impliedStore.subscribe({
-      resource: resourceKey(resource),
-      actorId: rootId,
-      subscribedBy: rootId,
-      subscribedAt: now(),
-    });
-  }
+  const seedImpliedOwner = (actorId: string) => {
+    for (const resource of configured) {
+      // The chosen default owner receives implied sources. Durable explicit
+      // ownership and per-actor tombstones take precedence in the union.
+      impliedStore.subscribe({
+        resource: resourceKey(resource),
+        actorId,
+        subscribedBy: actorId,
+        subscribedAt: now(),
+      });
+    }
+  };
+  if (defaultOwnerId !== undefined) seedImpliedOwner(defaultOwnerId);
 
   for (const sub of persistentStore.list()) {
     if (sub.unsubscribedAt) continue;
@@ -326,6 +328,7 @@ export function reconcileEventSources(
   return {
     store: new UnionEventSourceOwnerStore(impliedStore, persistentStore),
     droppedDelegations,
+    seedImpliedOwner,
   };
 }
 

@@ -6784,7 +6784,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       writeFileSync(
         join(homeDir, "config.yaml"),
         toYaml({
-          github: { account: "mock-bot" },
+          github: { account: "mock-bot", orgs: [{ org: "first-org" }] },
           providers: { antigravity: { cliCommand: "agy" } },
         })
       );
@@ -6814,6 +6814,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
               expect(getRepositories().capabilityGrants.activeFor(firstId)).toContain(
                 "capability-admin"
               );
+              expect(handles.mesh.listSubscriptions()).toContainEqual(
+                expect.objectContaining({ resource: "github:first-org", actorId: firstId })
+              );
+              expect(getRepositories().eventSourceOwners.list()).toEqual([]);
               getRepositories().capabilityGrants.revoke(
                 firstId,
                 "capability-admin",
@@ -6839,6 +6843,87 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
       expect(restarted.live).toEqual([firstId]);
       expect(restarted.importedActor).toBeUndefined();
+    });
+
+    it("re-resolves implied sources at boot for the oldest active parentless actor (#1087)", async () => {
+      clearLegacyConfiguredGrants();
+      const writeSources = (orgs: string[]) =>
+        writeFileSync(
+          join(homeDir, "config.yaml"),
+          toYaml({
+            github: { account: "mock-bot", orgs: orgs.map((org) => ({ org })) },
+            providers: { antigravity: { cliCommand: "agy" } },
+            rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+          })
+        );
+      writeSources(["first-org", "delegated-org", "released-org"]);
+      const imported = await boot();
+      expect(imported.importedActor).toBeDefined();
+      withMeshDb((db) => {
+        db.prepare("UPDATE actors SET created_at = '2026-01-04T00:00:00Z' WHERE id = ?").run(
+          imported.importedActor
+        );
+        const actors = new SqliteActorRepository(db);
+        const record = (id: string, parentId: string | null, createdAt: string) => ({
+          id,
+          parentId,
+          createdAt,
+          status: "active" as const,
+          charter: id,
+          modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
+        });
+        actors.upsert(record("oldest", null, "2026-01-02T00:00:00Z"));
+        actors.upsert(record("later", null, "2026-01-03T00:00:00Z"));
+        actors.upsert(record("earlier-child", "oldest", "2026-01-01T00:00:00Z"));
+        db.prepare(
+          `INSERT INTO event_source_owners
+           (resource, actor_id, subscribed_by, subscribed_at, unsubscribed_at)
+           VALUES (?, ?, 'operator', '2026-01-01T00:00:00Z', ?)`
+        ).run("github:delegated-org", "earlier-child", null);
+        db.prepare(
+          `INSERT INTO event_source_owners
+           (resource, actor_id, subscribed_by, subscribed_at, unsubscribed_at)
+           VALUES (?, ?, 'operator', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')`
+        ).run("github:released-org", "oldest");
+      });
+      const activeOwners = (mesh: ActorMesh, resource: string) =>
+        mesh
+          .listSubscriptions()
+          .filter((row) => row.resource === resource && !row.unsubscribedAt)
+          .map((row) => row.actorId);
+      await boot({
+        inspect: (mesh) => {
+          expect(activeOwners(mesh, "github:first-org")).toEqual(["oldest"]);
+          expect(activeOwners(mesh, "github:delegated-org")).toEqual(["earlier-child"]);
+          expect(activeOwners(mesh, "github:released-org")).toEqual([]);
+          expect(getRepositories().eventSourceOwners.list()).toHaveLength(2);
+        },
+      });
+      writeSources(["second-org", "delegated-org", "released-org"]);
+      await boot({
+        inspect: (mesh) => {
+          expect(activeOwners(mesh, "github:first-org")).toEqual([]);
+          expect(activeOwners(mesh, "github:second-org")).toEqual(["oldest"]);
+          expect(activeOwners(mesh, "github:delegated-org")).toEqual(["earlier-child"]);
+          expect(activeOwners(mesh, "github:released-org")).toEqual([]);
+          expect(getRepositories().eventSourceOwners.list()).toHaveLength(2);
+        },
+      });
+      withMeshDb((db) => new SqliteActorRepository(db).patch("oldest", { status: "retired" }));
+      writeSources(["first-org", "second-org", "delegated-org", "released-org"]);
+      await boot({
+        inspect: (mesh) => {
+          expect(activeOwners(mesh, "github:first-org")).toEqual(["later"]);
+          expect(activeOwners(mesh, "github:second-org")).toEqual(["later"]);
+          expect(activeOwners(mesh, "github:delegated-org")).toEqual(["earlier-child"]);
+          expect(getRepositories().eventSourceOwners.list()).toHaveLength(2);
+        },
+      });
+      expect(
+        withMeshDb((db) =>
+          db.prepare("SELECT COUNT(*) AS n FROM event_source_route_materialization_receipts").get()
+        )
+      ).toEqual({ n: 0 });
     });
 
     it("boots an existing forest without rootActor and grants only its oldest active top-level actor (#1087)", async () => {
