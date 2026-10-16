@@ -298,16 +298,16 @@ class ActorTreeControls extends StatelessWidget {
         ),
       );
       if (request == null || !context.mounted) return;
-      final result = await store.clearAvailabilityHolds(
+      final released = await store.clearAvailabilityHolds(
         provider: request.provider,
         models: request.models,
       );
       if (!context.mounted) return;
-      final noun = result.released == 1 ? 'hold' : 'holds';
+      final noun = released == 1 ? 'hold' : 'holds';
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            'Cleared ${result.released} active availability $noun.',
+            'Cleared $released active availability $noun.',
           ),
         ),
       );

@@ -31,13 +31,12 @@ void main() {
       base: Uri.parse('http://localhost:3000'),
     );
 
-    final result = await api.clearAvailabilityHolds(
+    final released = await api.clearAvailabilityHolds(
       provider: 'codex',
       models: ['gpt-5.6', 'gpt-5.7'],
     );
 
-    expect(result.released, 2);
-    expect(result.expiredRemoved, 1);
+    expect(released, 2);
   });
 
   test('surfaces a refused hold recovery to the dashboard', () async {

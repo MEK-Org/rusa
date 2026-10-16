@@ -86,7 +86,7 @@ export class AvailabilityHoldRepository {
   constructor(private readonly db: Database.Database) {}
 
   /**
-   * Hold `provider` (every model when `models` is omitted or empty), replacing
+   * Hold `provider` (every model when `models` is omitted), replacing
    * any stored hold with the same scope and origin. Returns the stored rows.
    */
   set(hold: SetAvailabilityHold): AvailabilityHold[] {
@@ -287,10 +287,9 @@ function requireProvider(provider: string): string {
 function normalizeModels(models: string[] | undefined): string[] | undefined {
   if (!models) return undefined;
   const normalized = [...new Set(models.map(normalizeModel).filter(Boolean))];
-  if (models.length > 0 && normalized.length === 0) {
-    throw new Error("availability hold model list cannot be blank");
-  }
-  return normalized.length > 0 ? normalized : undefined;
+  // An empty list is not the omitted list: it must not widen to the provider.
+  if (normalized.length === 0) throw new Error("availability hold model list cannot be blank");
+  return normalized;
 }
 
 function canonicalTimestamp(value: string, field: string): string {

@@ -317,6 +317,30 @@ describe("AvailabilityHoldRepository", () => {
     expect(holds.list()).toEqual([]);
   });
 
+  it("refuses an empty model list instead of widening it to the provider", () => {
+    expect(() =>
+      holds.set({
+        provider: "kimi",
+        origin: "mesh",
+        models: [],
+        createdBy: "root",
+        createdAt: CREATED,
+      })
+    ).toThrow(/cannot be blank/);
+    expect(holds.list()).toEqual([]);
+
+    holds.set({ provider: "kimi", origin: "mesh", createdBy: "root", createdAt: CREATED });
+    holds.set({
+      provider: "kimi",
+      origin: "mesh",
+      models: ["kimi-k2"],
+      createdBy: "root",
+      createdAt: CREATED,
+    });
+    expect(() => holds.clear({ provider: "kimi", models: [] })).toThrow(/cannot be blank/);
+    expect(holds.list()).toHaveLength(2);
+  });
+
   describe("hold origins (#918 chat vs mesh)", () => {
     const set = (origin: "chat" | "mesh", extra: Record<string, unknown> = {}) =>
       holds.set({

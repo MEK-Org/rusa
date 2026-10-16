@@ -851,16 +851,16 @@ class DashboardStore {
   Future<List<String>> fetchRootControlProviders() =>
       _api.fetchRootControlProviders();
 
-  Future<AvailabilityHoldClearResult> clearAvailabilityHolds({
+  Future<int> clearAvailabilityHolds({
     required String provider,
     List<String>? models,
   }) async {
-    final result = await _api.clearAvailabilityHolds(
+    final released = await _api.clearAvailabilityHolds(
       provider: provider,
       models: models,
     );
     await refreshThreads();
-    return result;
+    return released;
   }
 
   Future<void> spawnRootChild({

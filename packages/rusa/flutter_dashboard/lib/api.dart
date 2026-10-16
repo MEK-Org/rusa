@@ -43,24 +43,6 @@ class BriefRevision {
   }
 }
 
-/// The operator-visible receipt from clearing one availability-hold scope.
-class AvailabilityHoldClearResult {
-  const AvailabilityHoldClearResult({
-    required this.released,
-    required this.expiredRemoved,
-  });
-
-  final int released;
-  final int expiredRemoved;
-
-  factory AvailabilityHoldClearResult.fromJson(Map<String, dynamic> json) {
-    return AvailabilityHoldClearResult(
-      released: (json['released'] as List<dynamic>? ?? const []).length,
-      expiredRemoved: json['expired_removed'] as int? ?? 0,
-    );
-  }
-}
-
 /// Most refs one `/api/mesh/references` request may name; mirrors
 /// `MAX_REFERENCE_BATCH` on the server, which refuses a larger batch.
 const int referenceBatchLimit = 20;
@@ -192,7 +174,8 @@ class DashboardApi {
 
   /// Authenticated operator recovery for one held provider/model scope.
   /// The server performs the release/replay transition without starting a run.
-  Future<AvailabilityHoldClearResult> clearAvailabilityHolds({
+  /// Returns how many holds were still in force and are now released.
+  Future<int> clearAvailabilityHolds({
     required String provider,
     List<String>? models,
   }) async {
@@ -211,9 +194,8 @@ class DashboardApi {
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);
     }
-    return AvailabilityHoldClearResult.fromJson(
-      jsonDecode(res.body) as Map<String, dynamic>,
-    );
+    final body = jsonDecode(res.body) as Map<String, dynamic>;
+    return (body['released'] as List<dynamic>? ?? const []).length;
   }
 
   Future<String> spawnRootChild({
