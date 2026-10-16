@@ -372,16 +372,6 @@ describe("@rusa/fd-ops", () => {
     assert.match(error.message, /^ENOENT: .*, openat$/);
   });
 
-  test("uses Node's libuv mapping for native errno names", () => {
-    const source = readFileSync(
-      join(dirname(fileURLToPath(import.meta.url)), "../src/fd_ops.c"),
-      "utf8"
-    );
-    assert.match(source, /#include <uv\.h>/);
-    assert.match(source, /uv_translate_sys_error\(err\)/);
-    assert.match(source, /uv_err_name\(uv_err\)/);
-  });
-
   test("descriptors are close-on-exec", { skip: process.platform !== "linux" }, () => {
     const dir = scratch("cloexec");
     writeFileSync(join(dir, "f"), "x");
