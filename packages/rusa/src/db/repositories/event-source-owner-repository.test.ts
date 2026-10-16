@@ -14,6 +14,7 @@ import {
   testEventSourceOwnerStoreContract,
 } from "../../actor/event-source-owner-store.contract.js";
 import { reconcileEventSources } from "../../actor/event-subscriptions.js";
+import { CONFIGURED_ACTOR_IMPORT_SOURCE } from "../configured-actor-import.js";
 import { runMigrations } from "../migrations/runner.js";
 import { widenToWal } from "../wal.js";
 import { DbEventSourceOwnerStore } from "./event-source-owner-repository.js";
@@ -115,6 +116,160 @@ describe("DbEventSourceOwnerStore (DB-specific)", () => {
     expect(() => store.subscribe(sub({ actorId: ACTOR_B }))).toThrow();
     expect(store.list()).toHaveLength(1);
     expect(store.list()[0]?.actorId).toBe(ACTOR_A);
+  });
+
+  it("leaves an audit-confirmed missing configured owner unrouted", () => {
+    db.prepare(
+      `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
+       VALUES (?, ?, ?, ?)`
+    ).run(CONFIGURED_ACTOR_IMPORT_SOURCE, "2026-10-16T00:00:00Z", 1, ROOT);
+
+    const result = store.materializeConfiguredRoutesV1({
+      configuredRoots: [REPO],
+      auditEvents: [{ kind: "event_source_subscribed", actorId: ACTOR_A, detail: REPO }],
+      at: "2026-10-16T00:01:00Z",
+    });
+
+    expect(result.store.activeForResource(REPO)).toEqual([]);
+    expect(result.unroutedMissingOwnerships).toEqual([{ resource: REPO, actorId: ACTOR_A }]);
+    expect(
+      db
+        .prepare(
+          "SELECT route_count FROM event_source_route_materialization_receipts WHERE version = 1"
+        )
+        .get()
+    ).toEqual({ route_count: 0 });
+  });
+
+  it("materializes a current config route once, then keeps the scope boundary on edits", () => {
+    db.prepare(
+      `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
+       VALUES (?, ?, ?, ?)`
+    ).run(CONFIGURED_ACTOR_IMPORT_SOURCE, "2026-10-16T00:00:00Z", 1, ROOT);
+
+    const first = store.materializeConfiguredRoutesV1({
+      configuredRoots: [REPO],
+      auditEvents: [],
+      at: "2026-10-16T00:01:00Z",
+    });
+    expect(first.routeCount).toBe(1);
+    expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ROOT]);
+    expect(
+      JSON.parse(
+        (
+          db
+            .prepare(
+              "SELECT input_snapshot_json FROM event_source_route_materialization_receipts WHERE version = 1"
+            )
+            .get() as { input_snapshot_json: string }
+        ).input_snapshot_json
+      )
+    ).toMatchObject({
+      version: 1,
+      configuredActorImport: { source: CONFIGURED_ACTOR_IMPORT_SOURCE, rowCount: 1, actorId: ROOT },
+      routes: [{ resource: REPO, disposition: "materialized" }],
+    });
+
+    const removed = store.materializeConfiguredRoutesV1({
+      configuredRoots: [],
+      auditEvents: [],
+      at: "2026-10-16T00:02:00Z",
+    });
+    expect(removed.droppedDelegations).toEqual([
+      expect.objectContaining({ resource: REPO, actorId: ROOT, unsubscribedAt: "2026-10-16T00:02:00Z" }),
+    ]);
+    expect(store.activeForResource(REPO)).toEqual([]);
+
+    const restoredConfig = store.materializeConfiguredRoutesV1({
+      configuredRoots: [REPO],
+      auditEvents: [],
+      at: "2026-10-16T00:03:00Z",
+    });
+    expect(restoredConfig.routeCount).toBe(1);
+    expect(restoredConfig.droppedDelegations).toEqual([]);
+    expect(store.activeForResource(REPO)).toEqual([]);
+  });
+
+  it("records zero routes for an empty configured-actor import", () => {
+    db.prepare(
+      `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
+       VALUES (?, ?, ?, NULL)`
+    ).run(CONFIGURED_ACTOR_IMPORT_SOURCE, "2026-10-16T00:00:00Z", 0);
+
+    const result = store.materializeConfiguredRoutesV1({
+      configuredRoots: [REPO],
+      auditEvents: [],
+      at: "2026-10-16T00:01:00Z",
+    });
+
+    expect(result.routeCount).toBe(0);
+    expect(store.activeForResource(REPO)).toEqual([]);
+    expect(
+      db
+        .prepare(
+          "SELECT route_count FROM event_source_route_materialization_receipts WHERE version = 1"
+        )
+        .get()
+    ).toEqual({ route_count: 0 });
+  });
+
+  it("preserves current active ownership and revocation without recreating either", () => {
+    db.prepare(
+      `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
+       VALUES (?, ?, ?, ?)`
+    ).run(CONFIGURED_ACTOR_IMPORT_SOURCE, "2026-10-16T00:00:00Z", 1, ROOT);
+    store.subscribe(sub({ resource: REPO, actorId: ACTOR_A }));
+
+    expect(
+      store.materializeConfiguredRoutesV1({
+        configuredRoots: [REPO],
+        auditEvents: [],
+        at: "2026-10-16T00:01:00Z",
+      }).routeCount
+    ).toBe(0);
+    expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_A]);
+
+    const tombstonedDb = makeDb();
+    const tombstoned = new DbEventSourceOwnerStore(tombstonedDb);
+    tombstonedDb
+      .prepare(
+        `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
+         VALUES (?, ?, ?, ?)`
+      )
+      .run(CONFIGURED_ACTOR_IMPORT_SOURCE, "2026-10-16T00:00:00Z", 1, ROOT);
+    tombstoned.subscribe(sub({ resource: REPO, actorId: ROOT }));
+    tombstoned.unsubscribe(REPO, ROOT, "2026-10-16T00:00:30Z");
+
+    expect(
+      tombstoned.materializeConfiguredRoutesV1({
+        configuredRoots: [REPO],
+        auditEvents: [],
+        at: "2026-10-16T00:01:00Z",
+      }).routeCount
+    ).toBe(0);
+    expect(tombstoned.activeForResource(REPO)).toEqual([]);
+    tombstonedDb.close();
+  });
+
+  it("rolls back route work when the imported actor cannot own it", () => {
+    db.prepare(
+      `INSERT INTO legacy_import_receipts (source, imported_at, row_count, actor_id)
+       VALUES (?, ?, ?, ?)`
+    ).run(CONFIGURED_ACTOR_IMPORT_SOURCE, "2026-10-16T00:00:00Z", 1, "missing-actor");
+
+    expect(() =>
+      store.materializeConfiguredRoutesV1({
+        configuredRoots: [REPO],
+        auditEvents: [],
+        at: "2026-10-16T00:01:00Z",
+      })
+    ).toThrow();
+    expect(store.list()).toEqual([]);
+    expect(
+      db
+        .prepare("SELECT * FROM event_source_route_materialization_receipts WHERE version = 1")
+        .get()
+    ).toBeUndefined();
   });
 });
 

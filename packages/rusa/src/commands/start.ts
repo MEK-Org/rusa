@@ -53,7 +53,6 @@ import {
   normalizeEventResource,
   parentOf,
   reconcileEventSourceSubscriptions,
-  reconcileEventSources,
   resourceKey,
 } from "../actor/event-subscriptions.js";
 import { COMPACTED_MEMORY_DELTA_EXPERIMENT } from "../actor/experiments.js";
@@ -2479,10 +2478,10 @@ async function composeStart(
   // registers the glass-goals `understanding-write` server (claude FS isolation
   // ISSUE_NUM having landed); grantable-servers.test.ts locks the contents.
   const capabilityGrants = getRepositories().capabilityGrants;
-  // Explicit subscription ownership and its tombstones are durable in SQLite;
+  // Explicit ownership and its tombstones are durable in SQLite;
   // `event-subscriptions.json` is only a legacy source, imported once and then
-  // archived. The config-implied seed is rebuilt in memory below, so nothing
-  // here recreates a JSON source of truth.
+  // archived. The one-time #1003 materializer below makes current effective
+  // config-implied ownership explicit too, then config no longer recreates it.
   const persistentEventSourceOwners = getRepositories().eventSourceOwners;
   warnMissingConfiguredEventSubscriptionsAtBoot(
     persistentEventSourceOwners,
@@ -2505,12 +2504,11 @@ async function composeStart(
     handleForId: (id) =>
       id === rootId && rootHandle !== undefined ? rootHandle : generateHandle(id),
   });
-  const rootSourceSync = reconcileEventSources(
-    persistentEventSourceOwners,
+  const rootSourceSync = persistentEventSourceOwners.materializeConfiguredRoutesV1({
     configuredRoots,
-    rootId,
-    () => new Date().toISOString()
-  );
+    auditEvents: eventSubscriptionAudit,
+    at: new Date().toISOString(),
+  });
   const eventSourceOwners = rootSourceSync.store;
   if (rootSourceSync.droppedDelegations.length > 0) {
     console.log(
