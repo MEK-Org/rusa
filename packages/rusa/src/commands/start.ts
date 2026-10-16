@@ -169,6 +169,7 @@ import {
   type ConfiguredActorImportResult,
   configuredActorCharter,
   importConfiguredActor,
+  planConfiguredActorImport,
 } from "../db/configured-actor-import.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import {
@@ -1373,14 +1374,6 @@ async function composeStart(
     getRepositories().meshChat
   );
 
-  // Capture the disposable audit projection while this startup unquestionably
-  // owns an open DB handle. Some boot paths cross asynchronous probes before
-  // the subscription store is constructed; tests and multi-instance shutdowns
-  // may close the shared handle during that gap.
-  const eventSubscriptionAudit = getRepositories().meshEvents.listByKinds(
-    ["event_source_subscribed", "event_source_unsubscribed"],
-    { bodyKinds: [] }
-  );
   const configuredRoots = configuredRootEventSources(config);
 
   // #1645 ready-head attention. Attached here, immediately after initDb, rather
@@ -1576,6 +1569,76 @@ async function composeStart(
   // server is bound so a refusal stops boot with nothing to unwind.
   let configuredImport: ConfiguredActorImportResult;
   try {
+    const configuredPlan = planConfiguredActorImport({
+      actors,
+      receipts: getRepositories().legacyImportReceipts,
+      workersDir,
+      selectedActorId: opts?.importActor,
+    });
+    // Import retired JSON against the old identity first; the configured import
+    // then moves all durable state together. Receipt-backed importers archive
+    // a stale source unread on subsequent boots.
+    const legacyRootId =
+      configuredPlan.kind === "adopt"
+        ? (configuredPlan.previousActorId ?? configuredPlan.actorId)
+        : configuredPlan.actorId;
+    const legacyEventSubscriptionImport = importLegacyEventSubscriptionState({
+      mcHome,
+      db: database,
+      repositories: getRepositories(),
+      rootId: legacyRootId,
+    });
+    if (legacyEventSubscriptionImport.importedSubscriptions > 0) {
+      log.info("legacy_event_subscriptions_imported", {
+        subscriptions: legacyEventSubscriptionImport.importedSubscriptions,
+      });
+    } else if (legacyEventSubscriptionImport.backupFiles.length > 0) {
+      // A source file still present after the receipt committed is stale by
+      // construction — a failed archive rename, or one restored by hand. It is
+      // archived unread rather than replayed, and saying so is what stops an
+      // operator concluding the file they put back took effect. `warn`, not
+      // `info`: nothing is broken, but a document someone placed there did not
+      // become state, and the backup path is where to find it.
+      log.warn("legacy_event_subscriptions_archived_unread", {
+        backups: legacyEventSubscriptionImport.backupFiles,
+      });
+    }
+    const legacyHostJobImport = importLegacyHostJobState({
+      mcHome,
+      db: database,
+      repositories: getRepositories(),
+    });
+    if (legacyHostJobImport.importedJobs > 0) {
+      log.info("legacy_host_jobs_imported", { jobs: legacyHostJobImport.importedJobs });
+    } else if (legacyHostJobImport.backupFiles.length > 0) {
+      // A source file still present after the receipt committed is stale by
+      // construction — a failed archive rename, or one restored by hand. It is
+      // archived unread rather than replayed, and saying so is what stops an
+      // operator concluding the file they put back took effect. `warn`, not
+      // `info`: nothing is broken, but a document someone placed there did not
+      // become state, and the backup path is where to find it.
+      log.warn("legacy_host_jobs_archived_unread", { backups: legacyHostJobImport.backupFiles });
+    }
+    const legacyPortableContextImport = importLegacyPortableContextState({
+      mcHome,
+      db: database,
+      repositories: getRepositories(),
+    });
+    if (legacyPortableContextImport.importedSnapshots > 0) {
+      log.info("legacy_portable_context_imported", {
+        snapshots: legacyPortableContextImport.importedSnapshots,
+      });
+    } else if (legacyPortableContextImport.backupFiles.length > 0) {
+      // A source directory still present after the receipt committed is stale by
+      // construction — a failed archive rename, or one restored by hand. It is
+      // archived unread rather than replayed, and saying so is what stops an
+      // operator concluding the snapshots they put back took effect. `warn`, not
+      // `info`: nothing is broken, but memory someone placed there did not become
+      // state, and the backup path is where to find it.
+      log.warn("legacy_portable_context_archived_unread", {
+        backups: legacyPortableContextImport.backupFiles,
+      });
+    }
     configuredImport = importConfiguredActor({
       db: database,
       actors,
@@ -1599,6 +1662,7 @@ async function composeStart(
       workersDir,
       avatarCachePath: avatarCachePath("root"),
       selectedActorId: opts?.importActor,
+      idgen: () => configuredPlan.actorId,
     });
   } catch (err) {
     if (err instanceof ConfiguredActorImportError) {
@@ -1618,6 +1682,14 @@ async function composeStart(
     throw err;
   }
   const rootId = configuredImport.actorId;
+  // Capture the disposable audit projection while this startup unquestionably
+  // owns an open DB handle. Some boot paths cross asynchronous probes before
+  // the subscription store is constructed; tests and multi-instance shutdowns
+  // may close the shared handle during that gap.
+  const eventSubscriptionAudit = getRepositories().meshEvents.listByKinds(
+    ["event_source_subscribed", "event_source_unsubscribed"],
+    { bodyKinds: [] }
+  );
   if (configuredImport.plan.kind !== "completed") {
     log.info("configured_actor_imported", {
       actorId: rootId,
@@ -1795,6 +1867,7 @@ async function composeStart(
     resolveReference(ref, {
       meshChat: getRepositories().meshChat,
       inbox: getRepositories().inbox,
+      resolveActorId: (id) => (id === "root" ? rootId : id),
       chatClient: chatClient ?? undefined,
       slackClient: slackClient ?? undefined,
       issueClient,
@@ -2370,27 +2443,6 @@ async function composeStart(
   // `event-subscriptions.json` is only a legacy source, imported once and then
   // archived. The config-implied seed is rebuilt in memory below, so nothing
   // here recreates a JSON source of truth.
-  const legacyEventSubscriptionImport = importLegacyEventSubscriptionState({
-    mcHome,
-    db: database,
-    repositories: getRepositories(),
-    rootId,
-  });
-  if (legacyEventSubscriptionImport.importedSubscriptions > 0) {
-    log.info("legacy_event_subscriptions_imported", {
-      subscriptions: legacyEventSubscriptionImport.importedSubscriptions,
-    });
-  } else if (legacyEventSubscriptionImport.backupFiles.length > 0) {
-    // A source file still present after the receipt committed is stale by
-    // construction — a failed archive rename, or one restored by hand. It is
-    // archived unread rather than replayed, and saying so is what stops an
-    // operator concluding the file they put back took effect. `warn`, not
-    // `info`: nothing is broken, but a document someone placed there did not
-    // become state, and the backup path is where to find it.
-    log.warn("legacy_event_subscriptions_archived_unread", {
-      backups: legacyEventSubscriptionImport.backupFiles,
-    });
-  }
   const persistentEventSourceOwners = getRepositories().eventSourceOwners;
   warnMissingConfiguredEventSubscriptionsAtBoot(
     persistentEventSourceOwners,
@@ -2400,48 +2452,12 @@ async function composeStart(
   // Host-plane host-jobs capability : durable per-actor job records, keyed
   // the same way capabilityGrants/event source owners are. Durable in SQLite;
   // `host-jobs.json` is only a legacy source, imported once and then archived.
-  const legacyHostJobImport = importLegacyHostJobState({
-    mcHome,
-    db: database,
-    repositories: getRepositories(),
-  });
-  if (legacyHostJobImport.importedJobs > 0) {
-    log.info("legacy_host_jobs_imported", { jobs: legacyHostJobImport.importedJobs });
-  } else if (legacyHostJobImport.backupFiles.length > 0) {
-    // A source file still present after the receipt committed is stale by
-    // construction — a failed archive rename, or one restored by hand. It is
-    // archived unread rather than replayed, and saying so is what stops an
-    // operator concluding the file they put back took effect. `warn`, not
-    // `info`: nothing is broken, but a document someone placed there did not
-    // become state, and the backup path is where to find it.
-    log.warn("legacy_host_jobs_archived_unread", { backups: legacyHostJobImport.backupFiles });
-  }
   const hostJobStore = getRepositories().hostJobs;
   // Portable-context snapshots are authoritative memory: the ledger item
   // ids, statuses, priorities, generation counter and `lastFoldedSourceId` in
   // one were minted by a model fold and cannot be rebuilt from the messages and
   // run outputs they were folded from. Durable in SQLite; `portable-context/`
   // is only a legacy source, imported once and then archived.
-  const legacyPortableContextImport = importLegacyPortableContextState({
-    mcHome,
-    db: database,
-    repositories: getRepositories(),
-  });
-  if (legacyPortableContextImport.importedSnapshots > 0) {
-    log.info("legacy_portable_context_imported", {
-      snapshots: legacyPortableContextImport.importedSnapshots,
-    });
-  } else if (legacyPortableContextImport.backupFiles.length > 0) {
-    // A source directory still present after the receipt committed is stale by
-    // construction — a failed archive rename, or one restored by hand. It is
-    // archived unread rather than replayed, and saying so is what stops an
-    // operator concluding the snapshots they put back took effect. `warn`, not
-    // `info`: nothing is broken, but memory someone placed there did not become
-    // state, and the backup path is where to find it.
-    log.warn("legacy_portable_context_archived_unread", {
-      backups: legacyPortableContextImport.backupFiles,
-    });
-  }
   const portableContextStore = getRepositories().portableContext;
   const e2eInstance = new E2EInstanceManager({
     mcHome,
@@ -2875,6 +2891,7 @@ async function composeStart(
     log: emitMeshRoutingLog,
   });
   const eventManager = new EventManager({
+    importedActorId: rootId,
     inboxStore,
     resolver: eventSourceResolver,
     log: emitMeshRoutingLog,
@@ -4606,6 +4623,7 @@ async function composeStart(
           meshChat: getRepositories().meshChat,
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,
+          resolveActorId: (id) => (id === "root" ? rootId : id),
           actorRuns: getRepositories().actorRuns,
           runPrompts: getRepositories().runPrompts,
           portableContext: getRepositories().portableContext,

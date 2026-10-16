@@ -530,8 +530,14 @@ describe("configured-actor import (#1002)", () => {
       writeFileSync(join(home, "workers", id, "e2e-verify"), "synthetic");
 
       const result = run();
-      expect(result.plan).toEqual({ kind: "adopt", actorId: id, selected: false });
-      expect(repositories.legacyImportReceipts.actorFor(CONFIGURED_ACTOR_IMPORT_SOURCE)).toBe(id);
+      expect(result.plan).toEqual(
+        id === "root"
+          ? { kind: "adopt", actorId: "minted-id", previousActorId: "root", selected: false }
+          : { kind: "adopt", actorId: id, selected: false }
+      );
+      expect(repositories.legacyImportReceipts.actorFor(CONFIGURED_ACTOR_IMPORT_SOURCE)).toBe(
+        id === "root" ? "minted-id" : id
+      );
     });
 
     it("refuses a named actor that does not exist or is not top-level", () => {

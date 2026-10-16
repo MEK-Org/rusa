@@ -149,6 +149,7 @@ export interface DashboardMeshRefs {
   obligations?: ObligationRepository;
   /** Durable actor inbox, exposed read-only through the dashboard data API. */
   inbox?: InboxRepository;
+  resolveActorId?: DashboardDataDeps["resolveActorId"];
   /** Completed selection intervals used to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
   runPrompts?: RunPromptRepository;
@@ -660,6 +661,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           meshChat: options.mesh.meshChat,
           obligations: options.mesh.obligations,
           inbox: options.mesh.inbox,
+          resolveActorId: options.mesh.resolveActorId,
           actorRuns: options.mesh.actorRuns,
           runPrompts: options.mesh.runPrompts,
           portableContext: options.mesh.portableContext,

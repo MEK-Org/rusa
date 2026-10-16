@@ -10446,6 +10446,28 @@ describe("ActorMesh", () => {
       expect(scheduler.listMessageDeliveries()).toEqual([]);
     });
 
+    it("#1005 retains and delivers a pre-import scheduled message addressed to root", () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, scheduledMessages } = setup({ rootId: "imported-uuid", inboxStore });
+      const message = {
+        id: "pre-import-message",
+        toId: "root",
+        fromId: "root",
+        body: "keep",
+        deliverAt: new Date(Date.now() + 100_000).toISOString(),
+      };
+      scheduledMessages.scheduleMessageDelivery(message);
+      mesh.reconcilePendingDeliveries();
+      expect(scheduledMessages.listMessageDeliveries()).toEqual([message]);
+      mesh.deliverScheduledMessage(message);
+      expect(inboxStore.entries).toContainEqual(
+        expect.objectContaining({
+          actorId: "imported-uuid",
+          payload: expect.objectContaining({ messageId: message.id, fromId: "imported-uuid" }),
+        })
+      );
+    });
+
     it("boot reconciliation keeps live recipients and removes jobs for inactive recipients", () => {
       const inboxStore = createMemoryInboxStore();
       const { mesh, scheduledMessages } = setup({ inboxStore });

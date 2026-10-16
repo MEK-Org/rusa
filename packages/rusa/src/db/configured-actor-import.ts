@@ -8,6 +8,7 @@ import { ROOT_ACTOR_CHARTER } from "../actor/root-prompt.js";
 import { isReservedWorkerDirectory } from "../actor/workspace-sweep.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
+import { rekeyConfiguredActor } from "./configured-actor-id.js";
 import type { LegacyImportReceiptRepository } from "./repositories/legacy-import-receipt-repository.js";
 
 /**
@@ -18,7 +19,9 @@ import type { LegacyImportReceiptRepository } from "./repositories/legacy-import
  * from `rootActor` in `config.yaml`, so config kept overwriting durable actor
  * state. The import runs exactly once. It resolves which actor the
  * configuration describes, fills only values that actor genuinely lacks, and
- * records the actor id in a receipt. From then on the receipt, not topology,
+ * records the actor id in a receipt. The literal legacy `root` is rekeyed to
+ * a minted UUID with its references in that same transaction; its given handle
+ * is preserved. Already-minted ids stand. From then on the receipt, not topology,
  * names the configured actor, and the actor's own row is authoritative for
  * everything config used to supply. Editing or removing `rootActor` afterwards
  * cannot overwrite that row, replay a grant, revive a retired actor, or mint a
@@ -105,7 +108,7 @@ export type ConfiguredActorImportPlan =
   /** An empty actor table: create the configured actor from config. */
   | { kind: "create"; actorId: string }
   /** An existing actor becomes the imported one; config fills its gaps. */
-  | { kind: "adopt"; actorId: string; selected: boolean };
+  | { kind: "adopt"; actorId: string; previousActorId?: string; selected: boolean };
 
 export interface ConfiguredActorImportResult {
   plan: ConfiguredActorImportPlan;
@@ -163,7 +166,11 @@ export function planConfiguredActorImport(options: {
         "restore the receipt's actor_id in mesh.db's legacy_import_receipts table; startup will not guess which actor it imported"
       );
     }
-    if (selectedActorId !== undefined && selectedActorId !== actorId) {
+    if (
+      selectedActorId !== undefined &&
+      selectedActorId !== actorId &&
+      selectedActorId !== "root"
+    ) {
       throw new ConfiguredActorImportError(
         `--import-actor names ${selectedActorId}, but the configured actor was already imported as ${actorId}`,
         "drop --import-actor; the import ran once and its choice stands",
@@ -222,7 +229,7 @@ export function planConfiguredActorImport(options: {
         parentlessIds
       );
     }
-    return { kind: "adopt", actorId: record.id, selected: true };
+    return adoptionPlan(record.id, true, options.idgen);
   }
 
   if (records.length === 0) {
@@ -250,7 +257,17 @@ export function planConfiguredActorImport(options: {
       parentlessIds
     );
   }
-  return { kind: "adopt", actorId: candidate.id, selected: false };
+  return adoptionPlan(candidate.id, false, options.idgen);
+}
+
+function adoptionPlan(
+  actorId: string,
+  selected: boolean,
+  idgen: () => string = randomUUID
+): ConfiguredActorImportPlan {
+  return actorId === "root"
+    ? { kind: "adopt", previousActorId: actorId, actorId: idgen(), selected }
+    : { kind: "adopt", actorId, selected };
 }
 
 function assertImportable(
@@ -347,7 +364,8 @@ export function importConfiguredActor(
 
   const { actors, seed } = options;
   const now = options.now ?? (() => new Date().toISOString());
-  const existing = plan.kind === "adopt" ? actors.get(plan.actorId) : undefined;
+  const existing =
+    plan.kind === "adopt" ? actors.get(plan.previousActorId ?? plan.actorId) : undefined;
   const filled: string[] = [];
   let record: ActorRecord;
   if (plan.kind === "create") {
@@ -374,7 +392,7 @@ export function importConfiguredActor(
         "restart; nothing was written"
       );
     }
-    record = existing;
+    record = { ...existing, id: plan.actorId };
     // The previous binary rewrote the row's charter from `rootActor.charter`
     // on every boot and stored DEFAULT_ROOT_CHARTER when it was unset, while
     // its prompt actually ran on ROOT_ACTOR_CHARTER. That stored placeholder
@@ -409,6 +427,9 @@ export function importConfiguredActor(
   const avatar = importAvatar(seed.avatarPath, options.avatarCachePath);
 
   options.db.transaction(() => {
+    if (plan.kind === "adopt" && plan.previousActorId !== undefined) {
+      rekeyConfiguredActor(options.db, plan.previousActorId, plan.actorId);
+    }
     if (plan.kind === "create") {
       actors.upsert(record);
     } else if (filled.some((field) => field !== "modelConfig")) {

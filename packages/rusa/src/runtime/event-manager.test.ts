@@ -987,6 +987,37 @@ describe("EventManager", () => {
   });
 
   describe("Stable dedupe IDs and durable idempotency", () => {
+    it("#1005 keeps a migrated root's existing dedupe entry and uses the UUID for new events", async () => {
+      const inbox = new FakeInboxStore();
+      const currentId = "imported-uuid";
+      const oldId = deduplicatedInboxEntryId("replayed-key", "root");
+      inbox.append([
+        {
+          id: oldId,
+          actorId: currentId,
+          source: "github:org/repo",
+          payload: { type: "issues.opened" },
+        },
+      ]);
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
+        resolveRecipients: () => ({ directed: false, ownerIds: [currentId], subscriberIds: [] }),
+      };
+      const em = new EventManager({ inboxStore: inbox, resolver, importedActorId: currentId });
+      const event: RawIntegrationEvent = {
+        sourceType: "timer",
+        rawResource: "github:org/repo",
+        rawPayload: { type: "issues.opened" },
+        idempotencyKey: "replayed-key",
+      };
+      expect((await em.handleExternalEvent(event)).entries).toEqual([]);
+      const added = (await em.handleExternalEvent({ ...event, idempotencyKey: "new-key" })).entries;
+      expect(added).toHaveLength(1);
+      expect(added[0].id).toBe(deduplicatedInboxEntryId("new-key", currentId));
+      expect(inbox.entries.map((entry) => entry.id)).toEqual([oldId, added[0].id]);
+    });
+
     it("generates deterministic 32-hex dedupe IDs via deduplicatedInboxEntryId", () => {
       const id1 = deduplicatedInboxEntryId("key-123", "actor-a");
       const id2 = deduplicatedInboxEntryId("key-123", "actor-a");
@@ -1364,6 +1395,39 @@ describe("EventManager", () => {
       });
       // Obligation terminates the climb; does not fall back to repo-owner
       expect(ownerIds).toEqual([]);
+    });
+
+    it("#1005 recognizes pre-import author stamps only on the same instance", async () => {
+      const inbox = new FakeInboxStore();
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
+        resolveRecipients: () => ({
+          directed: false,
+          ownerIds: ["imported-uuid"],
+          subscriberIds: ["child"],
+        }),
+      };
+      const em = new EventManager({
+        inboxStore: inbox,
+        resolver,
+        importedActorId: "imported-uuid",
+      });
+      const event: RawIntegrationEvent = {
+        sourceType: "timer",
+        rawResource: "github:org/repo",
+        rawPayload: { type: "issue_comment.created" },
+        stampedAuthor: { actorId: "root", instanceId: "same-instance" },
+        instanceId: "same-instance",
+      };
+      expect((await em.handleExternalEvent(event)).entries.map((entry) => entry.actorId)).toEqual([
+        "child",
+      ]);
+      expect(
+        (await em.handleExternalEvent({ ...event, instanceId: "other-instance" })).entries.map(
+          (entry) => entry.actorId
+        )
+      ).toEqual(["imported-uuid", "child"]);
     });
 
     it("suppresses delivery to author matching stampedAuthor", async () => {

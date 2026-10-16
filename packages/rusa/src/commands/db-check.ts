@@ -130,7 +130,12 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
       receipts: repositories.legacyImportReceipts,
       workersDir: join(home, "workers"),
     });
-    const rootId = configuredActorPlan.kind === "create" ? undefined : configuredActorPlan.actorId;
+    const rootId =
+      configuredActorPlan.kind === "create"
+        ? undefined
+        : configuredActorPlan.kind === "adopt"
+          ? (configuredActorPlan.previousActorId ?? configuredActorPlan.actorId)
+          : configuredActorPlan.actorId;
     const subscriptionPlan = planLegacyEventSubscriptionImport({
       mcHome: home,
       repositories,

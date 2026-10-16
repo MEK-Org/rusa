@@ -601,6 +601,8 @@ export class HierarchicalEventSourceResolver implements EventRoutingKernel {
 }
 
 export interface EventManagerOptions {
+  /** The configured actor's durable id, for pre-import root addresses. */
+  importedActorId?: string;
   inboxStore: InboxRepository;
   /**
    * The one routing kernel assembled by the host. EventManager re-exposes it as
@@ -635,11 +637,23 @@ export class EventManager {
    */
   readonly routing: EventRoutingKernel;
   private readonly log?: (message: string) => void;
+  private readonly importedActorId?: string;
 
   constructor(options: EventManagerOptions) {
     this.inboxStore = options.inboxStore;
+    this.importedActorId = options.importedActorId;
     this.routing = options.resolver;
     this.log = options.log;
+  }
+
+  private inboxEntryId(dedupeKey: string, actorId: string): string {
+    // Existing entry ids are citation targets. A redelivered pre-upgrade event
+    // must find that row after its owner moves, rather than minting a duplicate.
+    if (actorId === this.importedActorId && actorId !== "root") {
+      const previousId = deduplicatedInboxEntryId(dedupeKey, "root");
+      if (this.inboxStore.read(actorId, previousId)) return previousId;
+    }
+    return deduplicatedInboxEntryId(dedupeKey, actorId);
   }
 
   /**
@@ -864,7 +878,10 @@ export class EventManager {
     const deliverable = applyAuthorSuppression({
       directed: recipients.directed,
       destinations,
-      stampedAuthor: normalized.stampedAuthor,
+      stampedAuthor:
+        normalized.stampedAuthor?.actorId === "root" && this.importedActorId
+          ? { ...normalized.stampedAuthor, actorId: this.importedActorId }
+          : normalized.stampedAuthor,
       instanceId: normalized.instanceId,
       eventSummary: summary,
       log: this.log,
@@ -876,9 +893,7 @@ export class EventManager {
     // is in both sets. The after-commit wake reads only this, so it never has
     // to route the event again (#632).
     const newItems: InboxAppendInput[] = deliverable.map((actorId) => ({
-      id: normalized.dedupeKey
-        ? deduplicatedInboxEntryId(normalized.dedupeKey, actorId)
-        : undefined,
+      id: normalized.dedupeKey ? this.inboxEntryId(normalized.dedupeKey, actorId) : undefined,
       actorId,
       source: resource,
       deliveredAt: normalized.deliveredAt,
