@@ -468,6 +468,23 @@ describe("RootControlService", () => {
     });
   });
 
+  it("audits no clear-all that found nothing to release", () => {
+    const { mesh, events } = setup();
+    const releaseHalts = vi.fn(() => ({
+      brakeReleased: false,
+      released: [],
+      expired: [],
+      resumed: [],
+    }));
+    const service = new RootControlService({ mesh, rootId: "root", releaseHalts });
+
+    const result = service.clearAllHalts("00000000-0000-4000-8000-000000000001");
+
+    expect(result).toEqual({ brakeReleased: false, released: [], expired: [], resumed: [] });
+    expect(releaseHalts).toHaveBeenCalledTimes(1);
+    expect(events).toHaveLength(0);
+  });
+
   it("refuses to clear all halts when the live release path is absent", () => {
     const { service, events } = setup();
     expect(() => service.clearAllHalts("00000000-0000-4000-8000-000000000001")).toThrow(

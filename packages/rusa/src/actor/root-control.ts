@@ -266,13 +266,17 @@ export class RootControlService {
   /**
    * Release every halt from the authenticated dashboard control boundary: the
    * global brake and each availability hold, whatever its origin. One action,
-   * so it records one event naming the brake and every hold it released.
+   * so it records one event naming the brake and every hold it released; as
+   * with `clearAvailabilityHolds`, a clear that found nothing records none.
    */
   clearAllHalts(principal: RootControlPrincipal): ReleasedHalts {
     const releaseHalts = this.options.releaseHalts;
     if (!releaseHalts) throw new Error("halt recovery is unavailable");
     const rootId = this.requireRootId();
     const result = releaseHalts();
+    if (!result.brakeReleased && result.released.length + result.expired.length === 0) {
+      return result;
+    }
     this.record(principal, "clear_all_halts", rootId, {
       brakeReleased: result.brakeReleased,
       released: result.released.map((hold) => ({
