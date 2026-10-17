@@ -709,6 +709,8 @@ class ThreadsSnapshot {
     this.schedulerWarning,
     this.supportedVoices = const [],
     this.halt,
+    this.haltBrake,
+    this.availabilityHolds,
   });
 
   final bool halted;
@@ -732,6 +734,14 @@ class ThreadsSnapshot {
   /// carries the badge).
   final HaltStatusDto? halt;
 
+  /// The HALT sentinel alone, apart from the holds [halt] folds in: null when
+  /// no brake is engaged (or against an older server).
+  final HaltStatusDto? haltBrake;
+
+  /// Each availability hold in force (#539). Null against an older server
+  /// that predates the field: holds unknown, not none.
+  final List<AvailabilityHoldDto>? availabilityHolds;
+
   factory ThreadsSnapshot.fromJson(Map<String, dynamic> j) => ThreadsSnapshot(
     halted: j['halted'] as bool? ?? false,
     runtimeCursor: j['runtimeCursor'] == null
@@ -749,7 +759,52 @@ class ThreadsSnapshot {
     halt: j['halt'] == null
         ? null
         : HaltStatusDto.fromJson(j['halt'] as Map<String, dynamic>),
+    haltBrake: j['haltBrake'] == null
+        ? null
+        : HaltStatusDto.fromJson(j['haltBrake'] as Map<String, dynamic>),
+    availabilityHolds: (j['availabilityHolds'] as List<dynamic>?)
+        ?.map((e) => AvailabilityHoldDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
   );
+}
+
+/// The `createdBy` the server stamps on holds imported from a HALT file.
+const kHaltFileImportCreator = 'system:halt-file-import';
+
+/// The HALT sentinel and the availability holds in force, reported apart.
+/// `holds` is null against an older server: unknown, not none.
+typedef HaltDetail = ({HaltStatusDto? brake, List<AvailabilityHoldDto>? holds});
+
+/// One availability hold in force (#539): a provider, or one model on it, out
+/// of selection until [expiry] (null = until cleared). [origin] is `chat` for a
+/// scoped chat `/halt`, `mesh` for the hold tools; [createdBy] names who placed
+/// it (an actor id, `chat:<sender>`, or `system:halt-file-import`).
+class AvailabilityHoldDto {
+  const AvailabilityHoldDto({
+    required this.provider,
+    this.model,
+    required this.origin,
+    this.expiry,
+    required this.createdBy,
+    this.createdAt,
+  });
+
+  final String provider;
+  final String? model;
+  final String origin;
+  final String? expiry;
+  final String createdBy;
+  final String? createdAt;
+
+  factory AvailabilityHoldDto.fromJson(Map<String, dynamic> j) =>
+      AvailabilityHoldDto(
+        provider: j['provider'] as String,
+        model: j['model'] as String?,
+        origin: j['origin'] as String? ?? 'mesh',
+        expiry: j['expiry'] as String?,
+        createdBy: j['createdBy'] as String? ?? '',
+        createdAt: j['createdAt'] as String?,
+      );
 }
 
 /// The authoritative halt sentinel's own shape, projected without its reason

@@ -35,6 +35,15 @@ export interface ClearedHolds {
 }
 
 /**
+ * What releasing the halts did: whether the global brake was engaged, the
+ * holds cleared, and the queued runs the release replayed.
+ */
+export interface ReleasedHalts extends ClearedHolds {
+  brakeReleased: boolean;
+  resumed: string[];
+}
+
+/**
  * `silent` skips `onHeld`/`onReleased` for a caller that cancels or replays
  * queued runs itself because it reports how many it touched. `origin`
  * narrows a `clear` to rows that origin instituted; chat `/resume` uses it so
@@ -115,17 +124,19 @@ export class AvailabilityHolds {
   }
 
   /**
-   * Clear every hold one origin instituted, whatever its scope — a bare chat
-   * `/resume` releases chat holds across all scopes without naming each.
-   * Mesh-instituted holds stay in force.
+   * Clear every hold, whatever its scope. `options.origin` narrows the clear
+   * to rows that origin instituted — a bare chat `/resume` releases chat holds
+   * across all scopes without naming each and mesh-instituted holds stay in
+   * force; the dashboard's clear-all omits it and releases every origin.
    */
-  clearAll(origin: AvailabilityHoldOrigin, options: HoldChangeOptions = {}): ClearedHolds {
-    const cleared = this.options.repo.clearAll(origin);
+  clearAll(options: HoldChangeOptions = {}): ClearedHolds {
+    const { origin, ...callbacks } = options;
+    const cleared = this.options.repo.clearAll(origin === undefined ? {} : { origin });
     const now = this.now();
     const released = cleared.filter((hold) => isActiveAt(hold, now));
     const expired = cleared.filter((hold) => !isActiveAt(hold, now));
     this.schedule();
-    if (released.length > 0 && !options.silent) this.options.onReleased?.(released);
+    if (released.length > 0 && !callbacks.silent) this.options.onReleased?.(released);
     return { released, expired };
   }
 
@@ -182,14 +193,22 @@ function isActiveAt(hold: AvailabilityHold, now: number): boolean {
  * when one `HaltState` describes exactly what is held: the brake file alone,
  * the global brake (which covers every hold), or, with no brake, holds that
  * form one providers × models product with one expiry. Anything else reports
- * null rather than a scope that is not held. `activeHolds` returns the holds
- * in force now.
+ * null rather than a scope that is not held. `haltBrake` and `availabilityHolds`
+ * report the two sources apart, so the header can name every hold whatever
+ * their mix. `activeHolds` returns the holds in force now.
  */
 export function haltIndicator(
   haltSwitch: Pick<HaltSwitch, "state">,
   activeHolds: () => AvailabilityHold[]
-): { isHalted: () => boolean; haltSnapshot: () => HaltState | null } {
+): {
+  isHalted: () => boolean;
+  haltSnapshot: () => HaltState | null;
+  haltBrake: () => HaltState | null;
+  availabilityHolds: () => AvailabilityHold[];
+} {
   return {
+    haltBrake: () => haltSwitch.state(),
+    availabilityHolds: activeHolds,
     isHalted: () => haltSwitch.state() !== null || activeHolds().length > 0,
     haltSnapshot: () => {
       const brake = haltSwitch.state();

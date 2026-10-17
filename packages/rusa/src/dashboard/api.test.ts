@@ -8,6 +8,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
+import { haltIndicator } from "../actor/availability-holds.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { OperatorActorControl } from "../actor/operator-actor-control.js";
@@ -23,6 +24,7 @@ import {
   readAvatar,
 } from "../avatar/avatars.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import type { AvailabilityHold } from "../db/repositories/availability-hold-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
@@ -180,6 +182,7 @@ describe("handleMeshApiRequest", () => {
     scope: { provider: string; models?: string[] };
     principal: string;
   }>;
+  let rootHaltClears: string[];
   let operatorReparents: Array<{ id: string; parentId: string | null; principal: string }>;
   let operatorObligationsAdmin: Array<{ id: string; enabled: boolean; principal: string }>;
   let admissionReorders: unknown[];
@@ -207,6 +210,7 @@ describe("handleMeshApiRequest", () => {
     }).id;
     rootSpawns = [];
     rootHoldClears = [];
+    rootHaltClears = [];
     operatorReparents = [];
     operatorObligationsAdmin = [];
     admissionReorders = [];
@@ -256,6 +260,32 @@ describe("handleMeshApiRequest", () => {
               },
             ],
             expired: [],
+          };
+        },
+        clearAllHalts: (principal: string) => {
+          rootHaltClears.push(principal);
+          return {
+            brakeReleased: true,
+            released: [
+              {
+                provider: "kimi",
+                origin: "chat" as const,
+                reason: "chat /halt from operator",
+                createdBy: "chat:users/operator",
+                createdAt: "2026-10-16T00:00:00.000Z",
+              },
+              {
+                provider: "codex",
+                model: "gpt-5.6",
+                origin: "mesh" as const,
+                expiry: "2026-10-18T00:00:00.000Z",
+                reason: "capacity outage",
+                createdBy: "root",
+                createdAt: "2026-10-16T00:00:00.000Z",
+              },
+            ],
+            expired: [],
+            resumed: ["child-1"],
           };
         },
       } as unknown as RootControlService,
@@ -1358,6 +1388,65 @@ describe("handleMeshApiRequest", () => {
     expect(rootHoldClears).toEqual([]);
   });
 
+  it("POST /api/mesh/halts/clear-all releases every halt in one root-control action", async () => {
+    const { res } = await call(deps, "POST", "/api/mesh/halts/clear-all", "");
+    await settled(res);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({
+      brake_released: true,
+      released: [
+        {
+          provider: "kimi",
+          model: null,
+          origin: "chat",
+          expiry: null,
+          createdBy: "chat:users/operator",
+          createdAt: "2026-10-16T00:00:00.000Z",
+        },
+        {
+          provider: "codex",
+          model: "gpt-5.6",
+          origin: "mesh",
+          expiry: "2026-10-18T00:00:00.000Z",
+          createdBy: "root",
+          createdAt: "2026-10-16T00:00:00.000Z",
+        },
+      ],
+      expired_removed: 0,
+      replayed: 1,
+    });
+    expect(res.body).not.toContain("capacity outage");
+    expect(rootHaltClears).toEqual([LOCAL_USER]);
+    expect(rootHoldClears).toEqual([]);
+  });
+
+  it("POST /api/mesh/halts/clear-all refuses an unauthenticated request", async () => {
+    const { res } = await call(
+      { ...deps, principals: undefined },
+      "POST",
+      "/api/mesh/halts/clear-all",
+      ""
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(403);
+    expect(rootHaltClears).toEqual([]);
+  });
+
+  it("POST /api/mesh/halts/clear-all is unavailable without root control", async () => {
+    const { res } = await call(
+      { ...deps, rootControl: undefined },
+      "POST",
+      "/api/mesh/halts/clear-all",
+      ""
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(503);
+    expect(rootHaltClears).toEqual([]);
+  });
+
   it("POST /api/mesh/actors forwards a portable context selection ", async () => {
     const { res } = await call(
       deps,
@@ -2269,6 +2358,75 @@ describe("handleMeshApiRequest", () => {
       const expired = JSON.parse((await call(deps, "GET", "/api/mesh/threads")).res.body);
       expect(expired.halted).toBe(false);
       expect(expired.halt).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/mesh/threads lists the brake and each active hold apart, without reasons (#539)", async () => {
+    actors.upsert(rec("root", null, "active"));
+    const body = async () => JSON.parse((await call(deps, "GET", "/api/mesh/threads")).res.body);
+
+    // A UI-only server reports holds unknown, not none.
+    expect((await body()).availabilityHolds).toBeNull();
+    expect((await body()).haltBrake).toBeNull();
+
+    const dir = mkdtempSync(join(tmpdir(), "mc-api-hold-list-"));
+    try {
+      const sw = new HaltSwitch(join(dir, "HALT"), () => Date.parse("2026-10-04T12:00:00.000Z"));
+      let holds: AvailabilityHold[] = [];
+      deps = { ...deps, ...haltIndicator(sw, () => holds) };
+      expect((await body()).availabilityHolds).toEqual([]);
+
+      // A mix no single scope describes: `halt` reports null, the list names both.
+      holds = [
+        {
+          provider: "codex",
+          origin: "mesh",
+          reason: "capacity incident",
+          createdBy: "root",
+          createdAt: "2026-10-04T11:00:00.000Z",
+        },
+        {
+          provider: "claude",
+          model: "claude-fable-5-1",
+          origin: "chat",
+          expiry: "2026-10-04T17:52:00.000Z",
+          reason: "chat /halt from operator",
+          createdBy: "chat:users/operator",
+          createdAt: "2026-10-04T11:30:00.000Z",
+        },
+      ];
+      sw.halt("private operator note");
+      const mixed = await body();
+      expect(mixed.halted).toBe(true);
+      expect(mixed.halt).toEqual({ scope: "global" });
+      expect(mixed.haltBrake).toEqual({ scope: "global" });
+      expect(mixed.availabilityHolds).toEqual([
+        {
+          provider: "codex",
+          model: null,
+          origin: "mesh",
+          expiry: null,
+          createdBy: "root",
+          createdAt: "2026-10-04T11:00:00.000Z",
+        },
+        {
+          provider: "claude",
+          model: "claude-fable-5-1",
+          origin: "chat",
+          expiry: "2026-10-04T17:52:00.000Z",
+          createdBy: "chat:users/operator",
+          createdAt: "2026-10-04T11:30:00.000Z",
+        },
+      ]);
+      expect(JSON.stringify(mixed.availabilityHolds)).not.toContain("capacity incident");
+
+      sw.resume();
+      const holdsOnly = await body();
+      expect(holdsOnly.haltBrake).toBeNull();
+      expect(holdsOnly.halt).toBeNull();
+      expect(holdsOnly.availabilityHolds).toHaveLength(2);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -17,11 +17,18 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 import { describe, expect, it, vi } from "vitest";
+import { haltIndicator } from "../actor/availability-holds.js";
+import { HaltSwitch } from "../actor/halt-switch.js";
 import type { DashboardDataDeps } from "../dashboard/api.js";
+import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import type { AvailabilityHold } from "../db/repositories/availability-hold-repository.js";
+import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
+import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { QuotaCoordinatorClientHealth } from "../quota/coordinator-client.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";
 import {
   createDashboardRequestHandler,
@@ -184,6 +191,59 @@ describe("static dashboard request handler", () => {
       expect(res1.quota).toEqual({ quota_client_service_connected: 1 });
     } finally {
       await started.close();
+    }
+  });
+
+  it("startDashboardServer passes the brake and the holds through to GET /api/mesh/threads (#1100)", async () => {
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const port = (probe.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const dir = mkdtempSync(join(tmpdir(), "rusa-server-holds-"));
+    const sw = new HaltSwitch(join(dir, "HALT"));
+    const holds: AvailabilityHold[] = [
+      {
+        provider: "codex",
+        origin: "mesh",
+        reason: "capacity incident",
+        createdBy: "root",
+        createdAt: "2026-10-04T11:00:00.000Z",
+      },
+    ];
+    sw.halt("");
+    const started = await startDashboardServer({
+      port,
+      mesh: {
+        actors: new InMemoryActorRepository(),
+        meshEvents: new MeshEventRepository(db),
+        meshChat: new MeshChatRepository(db),
+        emitter: new MeshEventEmitter(),
+        ...haltIndicator(sw, () => holds),
+      },
+    });
+    try {
+      const body = (await (await fetch(`http://127.0.0.1:${port}/api/mesh/threads`)).json()) as {
+        haltBrake?: unknown;
+        availabilityHolds?: unknown;
+      };
+      expect(body.haltBrake).toEqual({ scope: "global" });
+      expect(body.availabilityHolds).toEqual([
+        {
+          provider: "codex",
+          model: null,
+          origin: "mesh",
+          expiry: null,
+          createdBy: "root",
+          createdAt: "2026-10-04T11:00:00.000Z",
+        },
+      ]);
+    } finally {
+      await started.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

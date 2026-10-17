@@ -4523,6 +4523,78 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
   });
 
+  it("operator clear-all releases the brake and every hold's origin in one audited action (#1100)", async () => {
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: { provider: "claude", model: "claude-sonnet-5" },
+      }),
+      "utf8"
+    );
+    let mesh: ActorMesh | undefined;
+    let root: Actor | undefined;
+    let rootControl: RootControlService | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            root = handles.root as Actor;
+            rootControl = handles.rootControl;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh || !root || !rootControl) throw new Error("mesh, root, or root control not ready");
+    const workerId = mesh.spawn({
+      charter: "codex worker",
+      parentId: "root",
+      modelConfig: { provider: "codex", model: "gpt-5.5" },
+    });
+    const halt = new HaltSwitch(join(homeDir, "HALT"));
+    halt.halt("maintenance");
+    const holds = getRepositories().availabilityHolds;
+    const createdAt = new Date().toISOString();
+    holds.set({ provider: "claude", origin: "chat", createdBy: "chat:users/operator", createdAt });
+    holds.set({ provider: "codex", origin: "mesh", createdBy: root.id, createdAt });
+    expect(mesh.prepareRun(root.id)).toBe(false);
+    expect(mesh.prepareRun(workerId)).toBe(false);
+
+    const operator = "00000000-0000-4000-8000-000000000001" as const;
+    const result = rootControl.clearAllHalts(operator);
+
+    expect(result.brakeReleased).toBe(true);
+    expect(result.released.map((hold) => `${hold.provider}:${hold.origin}`)).toEqual([
+      "claude:chat",
+      "codex:mesh",
+    ]);
+    expect(halt.isHalted()).toBe(false);
+    expect(holds.list()).toEqual([]);
+    expect(mesh.prepareRun(root.id)).toBe(true);
+    expect(mesh.prepareRun(workerId)).toBe(true);
+    const audits = getRepositories()
+      .meshEvents.listByKinds(["root_control_action"], { bodyKinds: [] })
+      .map((event) => JSON.parse(event.payload ?? "{}"))
+      .filter((payload) => payload.action === "clear_all_halts");
+    expect(audits).toEqual([
+      expect.objectContaining({
+        principal: operator,
+        brakeReleased: true,
+        released: [
+          { provider: "claude", model: null, origin: "chat" },
+          { provider: "codex", model: null, origin: "mesh" },
+        ],
+      }),
+    ]);
+  });
+
   it("chat /resume releases only chat-origin holds; mesh-origin holds survive for the UI path (#918)", async () => {
     initDb(homeDir);
     const scrapes = getRepositories().modelScrapes;

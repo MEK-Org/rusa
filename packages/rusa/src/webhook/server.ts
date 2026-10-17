@@ -168,6 +168,10 @@ export interface DashboardMeshRefs {
   isHalted?: () => boolean;
   /** Same sentinel's structured scope/expiry → top-level `halt`; see `DashboardDataDeps`. */
   haltSnapshot?: DashboardDataDeps["haltSnapshot"];
+  /** The HALT sentinel alone → top-level `haltBrake`; see `DashboardDataDeps`. */
+  haltBrake?: DashboardDataDeps["haltBrake"];
+  /** Active availability holds → top-level `availabilityHolds`; see `DashboardDataDeps`. */
+  availabilityHolds?: DashboardDataDeps["availabilityHolds"];
   /** Boot-time `at` preflight snapshot → top-level `schedulerWarning`; see `DashboardDataDeps`. */
   schedulerHealth?: DashboardDataDeps["schedulerHealth"];
   /** Read-only snapshot of thread ids whose actor is executing a run right now. */
@@ -675,6 +679,8 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           operatorActors: options.mesh.operatorActors,
           isHalted: options.mesh.isHalted,
           haltSnapshot: options.mesh.haltSnapshot,
+          haltBrake: options.mesh.haltBrake,
+          availabilityHolds: options.mesh.availabilityHolds,
           schedulerHealth: options.mesh.schedulerHealth,
           runningThreadIds: options.mesh.runningThreadIds,
           queuedThreadIds: options.mesh.queuedThreadIds,

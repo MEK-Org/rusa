@@ -39,6 +39,7 @@ import {
   describeHold,
   haltIndicator,
   importScopedHaltFile,
+  type ReleasedHalts,
 } from "../actor/availability-holds.js";
 import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
@@ -188,7 +189,10 @@ import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscript
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
 import { importLegacyPortableContextState } from "../db/legacy-portable-context-import.js";
 import type { PortableLedgerSource } from "../db/repositories/actor-run-repository.js";
-import type { AvailabilityHold } from "../db/repositories/availability-hold-repository.js";
+import type {
+  AvailabilityHold,
+  AvailabilityHoldOrigin,
+} from "../db/repositories/availability-hold-repository.js";
 import type {
   ObligationStatusChange,
   PrerequisiteAttention,
@@ -4084,11 +4088,71 @@ async function composeStart(
     );
   };
 
+  // A lifted halt can reopen a lane that unclaimed work is waiting on, and
+  // replaying nothing would otherwise leave the admission list unscanned.
+  const resumeAfterHalt = (): string[] => {
+    const resumed = mesh.resumeCancelledRuns();
+    mesh.reconcileUnseenInbox();
+    admissionQueue.refresh();
+    return resumed;
+  };
+  availabilityHolds.start();
+  let haltExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+  resources.acquire("halt expiry timer", () => {
+    if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
+    haltExpiryTimer = null;
+  });
+  const scheduleHaltExpiry = (until?: string) => {
+    if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
+    haltExpiryTimer = null;
+    if (!until) return;
+    const delay = Date.parse(until) - Date.now();
+    if (delay <= 0) {
+      resumeAfterHalt();
+      return;
+    }
+    haltExpiryTimer = setTimeout(
+      () => {
+        haltExpiryTimer = null;
+        const state = haltSwitch.state();
+        if (state?.until) {
+          scheduleHaltExpiry(state.until);
+          return;
+        }
+        if (state) return;
+        const resumed = resumeAfterHalt();
+        console.warn(
+          `[mesh] ▶ HALT expired${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : ""}`
+        );
+      },
+      Math.min(delay, 2_147_483_647)
+    );
+    haltExpiryTimer.unref?.();
+  };
+  /**
+   * Release the global brake and the availability holds, then replay what the
+   * halt cancelled. Bare chat `/resume` passes `"chat"`, so mesh-instituted
+   * holds survive it (#918); the dashboard's clear-all omits `origin` and
+   * releases every hold (#1100).
+   */
+  const releaseHalts = (origin?: AvailabilityHoldOrigin): ReleasedHalts => {
+    const brakeReleased = haltSwitch.hasActiveHalt();
+    haltSwitch.resume();
+    if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
+    haltExpiryTimer = null;
+    const cleared = availabilityHolds.clearAll(
+      origin ? { silent: true, origin } : { silent: true }
+    );
+    const resumed = resumeAfterHalt();
+    return { brakeReleased, ...cleared, resumed };
+  };
+
   const rootControl = new RootControlService({
     mesh,
     rootId: importedRoot?.status === "active" ? rootId : undefined,
     providers: Object.keys(config.providers),
     availabilityHolds,
+    releaseHalts: () => releaseHalts(),
     resolveModelConfig: (input) => resolveModelClasses(modelClasses, input),
   });
 
@@ -4176,48 +4240,6 @@ async function composeStart(
         payload
       ),
   });
-
-  // A lifted halt can reopen a lane that unclaimed work is waiting on, and
-  // replaying nothing would otherwise leave the admission list unscanned.
-  const resumeAfterHalt = (): string[] => {
-    const resumed = mesh.resumeCancelledRuns();
-    mesh.reconcileUnseenInbox();
-    admissionQueue.refresh();
-    return resumed;
-  };
-  availabilityHolds.start();
-  let haltExpiryTimer: ReturnType<typeof setTimeout> | null = null;
-  resources.acquire("halt expiry timer", () => {
-    if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
-    haltExpiryTimer = null;
-  });
-  const scheduleHaltExpiry = (until?: string) => {
-    if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
-    haltExpiryTimer = null;
-    if (!until) return;
-    const delay = Date.parse(until) - Date.now();
-    if (delay <= 0) {
-      resumeAfterHalt();
-      return;
-    }
-    haltExpiryTimer = setTimeout(
-      () => {
-        haltExpiryTimer = null;
-        const state = haltSwitch.state();
-        if (state?.until) {
-          scheduleHaltExpiry(state.until);
-          return;
-        }
-        if (state) return;
-        const resumed = resumeAfterHalt();
-        console.warn(
-          `[mesh] ▶ HALT expired${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : ""}`
-        );
-      },
-      Math.min(delay, 2_147_483_647)
-    );
-    haltExpiryTimer.unref?.();
-  };
 
   // Rehydrate every active record through the ordinary durable constructor.
   // Import identity does not select an authority-bearing tool surface or an
@@ -4908,19 +4930,14 @@ async function composeStart(
         // whatever its scope (operator decision, #918 comment 6204340124).
         // Mesh-instituted holds stay in force and are listed, so an
         // indefinite mesh hold is neither cleared nor hidden.
-        const wasHalted = haltSwitch.hasActiveHalt();
-        haltSwitch.resume();
-        if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
-        haltExpiryTimer = null;
-        const chatCleared = availabilityHolds.clearAll("chat", { silent: true });
-        const resumed = resumeAfterHalt();
+        const { brakeReleased, released, resumed } = releaseHalts("chat");
         const remaining = availabilityHolds.list();
         const lines = [
           `▶ Resumed${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : " — actors will run on the next trigger"}.`,
-          wasHalted ? "Global halt released." : "No global halt was in place.",
+          brakeReleased ? "Global halt released." : "No global halt was in place.",
         ];
-        if (chatCleared.released.length) {
-          lines.push(`Released availability holds:\n${holdLines(chatCleared.released)}`);
+        if (released.length) {
+          lines.push(`Released availability holds:\n${holdLines(released)}`);
         }
         lines.push(
           remaining.length
