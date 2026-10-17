@@ -19,6 +19,7 @@ import { configuredModelRefs, resolveWindowModels } from "./model-window-scope.j
 import { extractedNoQuotaValues, parseParsedState, serializeParsedState } from "./parsed-state.js";
 import {
   QUOTA_OBSERVATION_SLOT_MS,
+  type QuotaCycleObservation,
   quotaCycleChanged,
   verifiedQuotaCycleTransition,
 } from "./quota-cycle.js";
@@ -1193,6 +1194,27 @@ export class SharedQuotaStore {
           percentLeft: number;
         }
       | undefined;
+    // Controller state is carried only by a reasoned row, but cycle evidence
+    // must include every durable observation. In particular, an exhausted row
+    // is processed without an interval and is therefore absent from
+    // `previous`; a following positive reading can still prove a refill.
+    const previousActual = this.db
+      .prepare(
+        `SELECT observed_at AS observedAt, percent_left AS percentLeft,
+                reset_at_iso AS resetAtIso
+         FROM quota_observations
+         WHERE provider = ? AND model_scope = ? AND kind = ?
+           AND (observed_at < ? OR (observed_at = ? AND observed_slot < ?))
+         ORDER BY observed_at DESC, observed_slot DESC, rowid DESC LIMIT 1`
+      )
+      .get(
+        observation.provider,
+        observation.modelScope,
+        observation.kind,
+        observation.observedAt,
+        observation.observedAt,
+        observation.slot
+      ) as QuotaCycleObservation | undefined;
     const timeRemainingPct = Math.min(
       100,
       Math.max(0, ((resetMs - observedMs) / observation.windowMs) * 100)
@@ -1214,7 +1236,7 @@ export class SharedQuotaStore {
     // Only this weekly bucket is affected: every other bucket finds its own
     // `previous` row and keeps its memory.
     const verifiedWeeklyCycle =
-      observation.kind === "weekly" && verifiedQuotaCycleTransition(previous, observation);
+      observation.kind === "weekly" && verifiedQuotaCycleTransition(previousActual, observation);
     const cycleChanged =
       verifiedWeeklyCycle || quotaCycleChanged(previous, observation, observation.windowMs);
     const previousObservedMs = previous ? Date.parse(previous.observedAt) : Number.NaN;

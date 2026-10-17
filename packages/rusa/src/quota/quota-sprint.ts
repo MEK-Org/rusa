@@ -148,28 +148,32 @@ export class QuotaSprintRegistry {
   }
 
   /**
-   * The bucket the effective throttle should relax for `provider`, or
-   * undefined when there is no active arm. Ends an arm whose evidence no
-   * longer supports it first, so expiry and invalidation need no command.
+   * Refresh once for a publication, so its policy block and effective election
+   * cannot disagree at an expiry, staleness, or observation boundary.
    */
-  relaxation(provider: string): QuotaThrottleElectionOptions["relax"] {
-    const current = this.refresh(provider);
-    return current?.state === "active"
-      ? { modelScope: current.modelScope, kind: WEEKLY }
-      : undefined;
+  publication(
+    provider: string,
+    nowMs = this.options.now()
+  ): {
+    policy: QuotaSprintCurrent | null;
+    relax: QuotaThrottleElectionOptions["relax"];
+  } {
+    const current = this.refresh(provider, nowMs);
+    return {
+      policy: current ? { ...current.value, state: current.state } : null,
+      relax:
+        current?.state === "active" ? { modelScope: current.modelScope, kind: WEEKLY } : undefined,
+    };
   }
 
-  /** The armed policy as `/v1/throttle` publishes it, after the same refresh. */
-  current(provider: string): QuotaSprintCurrent | null {
-    const current = this.refresh(provider);
-    return current ? { ...current.value, state: current.state } : null;
-  }
-
-  snapshot(provider: string): QuotaSprintSnapshot {
-    const current = this.refresh(provider);
+  snapshot(
+    provider: string,
+    nowMs = this.options.now(),
+    publication = this.publication(provider, nowMs)
+  ): QuotaSprintSnapshot {
+    const policy = publication.policy;
     const entry = this.entry(provider);
     const { mode, generation } = this.options.store.getQuotaReadingMode(provider);
-    const nowMs = this.options.now();
     const { staleAfterMs, hardStaleAfterMs } = this.options.freshness(mode);
     const buckets = this.options.store
       .listLatestLaneObservations(provider, WEEKLY)
@@ -188,14 +192,14 @@ export class QuotaSprintRegistry {
         };
       });
     const notes: string[] = [];
-    if (!current) {
+    if (!policy) {
       notes.push(
         `No sprint is armed for ${provider} in coordinator boot ${this.bootId}, started ` +
           `${this.bootStartedAt}. Sprint policy is held in memory only: any sprint armed ` +
           "before this boot was disarmed when it started and will not resume. Arm again " +
           "deliberately if a sprint is still wanted."
       );
-    } else if (current.state === "suspended_stale") {
+    } else if (policy.state === "suspended_stale") {
       notes.push(
         "The sprint is suspended because the target bucket's latest actual reading is stale; " +
           "ordinary pacing applies until a fresh reading of the same cycle arrives. The " +
@@ -213,7 +217,7 @@ export class QuotaSprintRegistry {
       revision: entry.revision,
       readingMode: { mode, generation },
       buckets,
-      policy: current ? { ...current.value, state: current.state } : null,
+      policy,
       lastEnded: entry.lastEnded?.value ?? null,
       notes,
     };
@@ -382,12 +386,11 @@ export class QuotaSprintRegistry {
    * order from the bound observation, so the first event that happened is the
    * reason reported; a reading taken after the expiry cannot outrank it.
    */
-  private refresh(provider: string): ProviderSprint["current"] {
+  private refresh(provider: string, nowMs = this.options.now()): ProviderSprint["current"] {
     const entry = this.entry(provider);
     const current = entry.current;
     if (!current) return null;
     const policy = current.value;
-    const nowMs = this.options.now();
     const expiresMs = Date.parse(policy.expiresAt);
     const mode = this.options.store.getQuotaReadingMode(provider);
     if (mode.generation !== policy.readingModeGeneration) {

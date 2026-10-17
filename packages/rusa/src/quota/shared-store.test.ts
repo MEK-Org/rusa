@@ -1049,6 +1049,65 @@ describe("SharedQuotaStore persisted controller", () => {
     }
   });
 
+  it("uses the prior actual exhausted observation to verify a weekly refill (#861)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-exhausted-refill-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 3600 });
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T00:00:00.000Z",
+        60,
+        "2030-01-08T00:00:00.000Z"
+      );
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T00:30:00.000Z",
+        58,
+        "2030-01-08T00:00:00.000Z"
+      );
+      recordObservation(store, "claude", "2030-01-01T01:00:00.000Z", 0, "2030-01-08T00:00:00.000Z");
+      const exhausted = store.db
+        .prepare(
+          `SELECT interval_seconds AS interval, processed FROM quota_observations
+           ORDER BY observed_at DESC LIMIT 1`
+        )
+        .get() as { interval: number | null; processed: number };
+      expect(exhausted).toEqual({ interval: null, processed: 1 });
+      const beforeRefill = store.db
+        .prepare(
+          `SELECT interval_seconds AS interval, controller_derivative AS derivative
+           FROM quota_observations WHERE interval_seconds IS NOT NULL
+           ORDER BY observed_at DESC LIMIT 1`
+        )
+        .get() as { interval: number; derivative: number };
+      expect(beforeRefill.interval).toBeGreaterThan(0);
+      expect(beforeRefill.derivative).not.toBe(0);
+
+      // The old deadline has not passed, so only the immediately prior actual
+      // zero reading (not the older reasoned 58% row) proves this refill.
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T02:00:00.000Z",
+        50,
+        "2030-01-15T00:00:00.000Z"
+      );
+      const refilled = store.db
+        .prepare(
+          `SELECT controller_derivative AS derivative, controller_integral AS integral
+           FROM quota_observations ORDER BY observed_at DESC LIMIT 1`
+        )
+        .get() as { derivative: number; integral: number };
+      expect(refilled).toEqual({ derivative: 0, integral: 0 });
+    } finally {
+      store.close();
+    }
+  });
+
   it("zeroes only the verified weekly bucket, durably, and rolls back with its transaction (#861)", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-verified-"));
     roots.push(root);

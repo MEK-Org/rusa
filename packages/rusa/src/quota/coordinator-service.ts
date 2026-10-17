@@ -172,26 +172,25 @@ export class QuotaCoordinatorService {
    */
   private providerThrottle(
     provider: string,
-    nowMs: number
+    nowMs: number,
+    sprint = this.sprints.publication(provider, nowMs)
   ): PublishedThrottleProviderStatus | PublishedThrottleColdStatus {
     const ordinary = this.options.store.getProviderThrottle(provider);
     if (!ordinary) return this.coldThrottle(provider);
-    const policy = this.sprints.current(provider);
-    const relax = this.sprints.relaxation(provider);
-    const effective = relax
-      ? (this.options.store.getProviderThrottle(provider, { relax }) ?? ordinary)
+    const effective = sprint.relax
+      ? (this.options.store.getProviderThrottle(provider, { relax: sprint.relax }) ?? ordinary)
       : ordinary;
     const published = this.publish(provider, effective, nowMs);
-    if (!policy) return published;
+    if (!sprint.policy) return published;
     return {
       ...published,
       sprint: {
-        armId: policy.armId,
-        bucketKey: policy.bucketKey,
-        models: [...policy.models],
-        state: policy.state,
-        expiresAt: policy.expiresAt,
-        ordinary: lanePacing(this.publish(provider, ordinary, nowMs), policy.models),
+        armId: sprint.policy.armId,
+        bucketKey: sprint.policy.bucketKey,
+        models: [...sprint.policy.models],
+        state: sprint.policy.state,
+        expiresAt: sprint.policy.expiresAt,
+        ordinary: lanePacing(this.publish(provider, ordinary, nowMs), sprint.policy.models),
       },
     };
   }
@@ -935,9 +934,10 @@ export class QuotaCoordinatorService {
       return;
     }
     const nowMs = this.nowMs();
-    const snapshot = this.sprints.snapshot(provider);
+    const sprint = this.sprints.publication(provider, nowMs);
+    const snapshot = this.sprints.snapshot(provider, nowMs, sprint);
     const ordinary = this.options.store.getProviderThrottle(provider);
-    const effective = this.providerThrottle(provider, nowMs);
+    const effective = this.providerThrottle(provider, nowMs, sprint);
     const models = snapshot.policy?.models ?? [];
     this.sendJson<QuotaSprintStatusResponse>(res, 200, {
       service: serviceInfo,

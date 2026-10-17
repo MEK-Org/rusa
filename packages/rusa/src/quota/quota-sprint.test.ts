@@ -314,6 +314,29 @@ describe("quota sprint: status, arm and cancel (#861)", () => {
     expect(status.notes).toEqual([]);
   });
 
+  it("reads sprint status and effective pacing from one time-consistent publication", async () => {
+    const h = await harness();
+    seedBehindPace(h.store);
+    await h.arm({ expiresAt: new Date(T0 + 2 * MINUTE).toISOString() });
+
+    // A status request itself reads the clock for service metadata and then
+    // for its publication. A third independent sprint refresh would still be
+    // before expiry, while a fourth would be after it. The status policy and
+    // effective pace must not straddle that boundary.
+    let clockReads = 0;
+    Object.defineProperty(h.clock, "nowMs", {
+      configurable: true,
+      get: () => {
+        clockReads += 1;
+        return clockReads >= 4 ? T0 + 3 * MINUTE : T0 + MINUTE;
+      },
+    });
+    const status = await h.status();
+    expect(status.policy).toMatchObject({ state: "active" });
+    expect(status.pacing.effective.intervalSeconds).toBe(0);
+    expect(clockReads).toBe(2);
+  });
+
   it("replays a lost-response retry, refuses a changed retry, a stale revision and a second arm", async () => {
     const h = await harness();
     seedBehindPace(h.store);
@@ -602,26 +625,65 @@ describe("quota sprint: ending and suspension (#861)", () => {
     expect(during.exhaustedUntil).toBe(new Date(T0 + 30 * MINUTE + 4 * HOUR).toISOString());
   });
 
-  it("a reading-mode generation change disarms and ordinary pacing resumes on the next accepted reading", async () => {
+  it("a manual-bound arm disarms on a generation change and ordinary pacing resumes on the next accepted manual reading", async () => {
     const h = await harness();
     seedBehindPace(h.store);
+    const manual = await h.request(QUOTA_READING_MODE_PATH, "POST", {
+      provider: "claude",
+      mode: "manual",
+    });
+    expect(manual.json.generation).toBe(1);
+    const firstManualAt = new Date(T0 + 10 * MINUTE).toISOString();
+    h.clock.nowMs = T0 + 11 * MINUTE;
+    expect(
+      (
+        await h.request(
+          MANUAL_QUOTA_OBSERVATION_PATH,
+          "POST",
+          {
+            provider: "claude",
+            generation: 1,
+            observation: {
+              provider: "claude",
+              status: "available",
+              scrapedAt: firstManualAt,
+              limits: [
+                {
+                  label: "Weekly",
+                  kind: "weekly",
+                  percentLeft: 57,
+                  resetAtIso: RESET,
+                  scope: { provider: "claude" },
+                },
+              ],
+            },
+          },
+          { "Idempotency-Key": "manual-arm-evidence" }
+        )
+      ).status
+    ).toBe(200);
     await h.arm();
     expect((await h.throttle()).intervalSeconds).toBe(0);
 
     const switched = await h.request(QUOTA_READING_MODE_PATH, "POST", {
       provider: "claude",
-      mode: "manual",
+      mode: "scrape",
     });
-    expect(switched.json.generation).toBe(1);
+    expect(switched.json.generation).toBe(2);
     const status = await h.status();
     expect(status.policy).toBeNull();
     expect(status.lastEnded).toMatchObject({ reason: "reading_mode_changed" });
     expect((await h.throttle()).sprint).toBeUndefined();
-    // Re-arming against the old generation is refused.
-    expect((await h.arm({ requestId: "arm-2", generation: 0 })).json.error.code).toBe(
+    // Re-arming against the manual-bound generation is refused.
+    expect((await h.arm({ requestId: "arm-2", generation: 1 })).json.error.code).toBe(
       "mode_generation_mismatch"
     );
 
+    const manualAgain = await h.request(QUOTA_READING_MODE_PATH, "POST", {
+      provider: "claude",
+      mode: "manual",
+    });
+    expect(manualAgain.json.generation).toBe(3);
     const observedAt = new Date(T0 + 30 * MINUTE).toISOString();
     h.clock.nowMs = T0 + 31 * MINUTE;
     const accepted = await h.request(
@@ -629,7 +691,7 @@ describe("quota sprint: ending and suspension (#861)", () => {
       "POST",
       {
         provider: "claude",
-        generation: 1,
+        generation: 3,
         observation: {
           provider: "claude",
           status: "available",
