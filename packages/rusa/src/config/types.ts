@@ -8,6 +8,22 @@ import type { VoiceDefinition } from "../voice/voice-catalog.js";
 export const DEFAULT_DEPLOY_BRANCH = "master";
 export type SandboxMode = "container-boundary" | "bwrap";
 
+export type InstanceRole = "leader" | "follower";
+
+export interface FollowerPeerConfig {
+  /** URL of the leader instance (e.g. "http://127.0.0.1:8190") */
+  leaderUrl?: string;
+  /** Path to the enrollment token secret file */
+  tokenFile?: string;
+  /** Direct token string (e.g. for testing) */
+  token?: string;
+}
+
+export interface InstanceIdentityConfig {
+  /** Optional stable instance ID */
+  id?: string;
+}
+
 export interface ProviderConfig {
   /** CLI command name, e.g. "claude", "codex", "agy" */
   cliCommand?: string;
@@ -489,6 +505,12 @@ export interface RusaConfig {
   gitBridgeBindHost?: string;
   /** Follower gateway configuration for remote worker placement. Off by default. */
   followers?: FollowerGatewayConfig;
+  /** Instance role: "leader" (default) or "follower". */
+  role?: InstanceRole;
+  /** Peer configuration when operating in follower mode. */
+  peer?: FollowerPeerConfig;
+  /** Stable instance identity configuration. */
+  instance?: InstanceIdentityConfig;
 }
 
 /** Configuration for hosting remote followers on a persistent leader instance. */

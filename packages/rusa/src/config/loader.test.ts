@@ -1583,4 +1583,120 @@ describe("loadConfig observability.logging", () => {
       ).toThrow(/followers\.port must be a valid port integer/);
     });
   });
+
+  describe("instance role and peer configuration (#1019)", () => {
+    it("defaults role to leader when omitted", () => {
+      const config = loadConfig(writeConfig());
+      expect(config.role).toBe("leader");
+    });
+
+    it("accepts explicit role: leader", () => {
+      const config = loadConfig(writeConfig({ role: "leader" }));
+      expect(config.role).toBe("leader");
+    });
+
+    it("rejects unknown role", () => {
+      expect(() => loadConfig(writeConfig({ role: "worker" }))).toThrow(
+        /role must be "leader" or "follower"/
+      );
+    });
+
+    it("rejects peer configuration on leader", () => {
+      expect(() =>
+        loadConfig(
+          writeConfig({
+            role: "leader",
+            peer: { leaderUrl: "http://127.0.0.1:8190", token: "secret" },
+          })
+        )
+      ).toThrow(/leader role cannot configure peer settings/);
+    });
+
+    it("requires peer configuration on follower", () => {
+      expect(() =>
+        loadConfig(
+          writeConfig({
+            role: "follower",
+          })
+        )
+      ).toThrow(/follower role requires peer configuration/);
+    });
+
+    it("rejects invalid leaderUrl on follower", () => {
+      expect(() =>
+        loadConfig(
+          writeConfig({
+            role: "follower",
+            peer: { leaderUrl: "ftp://127.0.0.1:8190", token: "secret" },
+          })
+        )
+      ).toThrow(/peer\.leaderUrl must be a valid http or https URL/);
+    });
+
+    it("requires token or tokenFile on follower peer", () => {
+      expect(() =>
+        loadConfig(
+          writeConfig({
+            role: "follower",
+            peer: { leaderUrl: "http://127.0.0.1:8190" },
+          })
+        )
+      ).toThrow(/peer configuration requires token or tokenFile/);
+    });
+
+    it("forbids followers gateway on follower role", () => {
+      expect(() =>
+        loadConfig(
+          writeConfig({
+            role: "follower",
+            peer: { leaderUrl: "http://127.0.0.1:8190", token: "secret" },
+            followers: {
+              bind: "127.0.0.1",
+              port: 8190,
+              tokenFile: "/path/to/token",
+            },
+          })
+        )
+      ).toThrow(/follower role cannot configure followers gateway/);
+    });
+
+    it("does not require rootActor on follower", () => {
+      const home = mkdtempSync(join(tmpdir(), "rusa-config-follower-"));
+      writeFileSync(
+        join(home, "config.yaml"),
+        toYaml({
+          role: "follower",
+          providers: { codex: { cliCommand: "codex" } },
+          peer: { leaderUrl: "http://127.0.0.1:8190", token: "follower-token" },
+        }),
+        "utf8"
+      );
+      const config = loadConfig(home);
+      expect(config.role).toBe("follower");
+      expect(config.rootActor).toBeUndefined();
+      expect(config.peer?.leaderUrl).toBe("http://127.0.0.1:8190");
+      expect(config.peer?.token).toBe("follower-token");
+    });
+
+    it("honors CLI option overrides for role, leader, tokenFile, instanceId", () => {
+      const home = mkdtempSync(join(tmpdir(), "rusa-config-follower-cli-"));
+      writeFileSync(
+        join(home, "config.yaml"),
+        toYaml({
+          providers: { codex: { cliCommand: "codex" } },
+        }),
+        "utf8"
+      );
+      const config = loadConfig(home, {
+        role: "follower",
+        leader: "https://leader.example.internal:8190",
+        tokenFile: "/tmp/test-token",
+        instanceId: "inst-override-123",
+      });
+      expect(config.role).toBe("follower");
+      expect(config.peer?.leaderUrl).toBe("https://leader.example.internal:8190");
+      expect(config.peer?.tokenFile).toBe("/tmp/test-token");
+      expect(config.instance?.id).toBe("inst-override-123");
+    });
+  });
 });

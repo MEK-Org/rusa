@@ -170,6 +170,7 @@ import {
 import { type ConfigProfile, loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
 import { readJevApiKeyFile } from "../config/jev.js";
 import { secretsDirPath } from "../config/secrets.js";
+import type { InstanceRole } from "../config/types.js";
 import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
 import type { DashboardAuth } from "../dashboard/auth.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
@@ -182,6 +183,7 @@ import {
   planConfiguredActorImport,
 } from "../db/configured-actor-import.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import { type InstanceIdentity, initInstanceIdentity } from "../db/instance-identity.js";
 import { importLegacyActorState } from "../db/legacy-actor-import.js";
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
@@ -317,7 +319,9 @@ import { asGitHubIssue, parseReference } from "../references/reference.js";
 import { resolveReference } from "../references/resolve.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
+import type { FollowerInstance } from "../remote-instances/follower-instance.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
+import type { ProviderFactory } from "../remote-instances/protocol.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 import { constructActorFromInvocation } from "../runtime/actor-invocation.js";
 import {
@@ -385,6 +389,7 @@ import {
   recordAndAnnounceRequestedRestart,
   ServiceLifecycleStore,
 } from "./service-lifecycle.js";
+import { composeFollowerStart } from "./start-follower.js";
 
 // `update` tool bounds . Per-step HARD timeouts so a hung build can't wedge
 // root; a bounded drain so a stuck worker can't block the restart forever.
@@ -744,6 +749,15 @@ export interface RunStartE2EHooks {
   /** Deterministic statfs/clock for the host disk sensor; production reads the real volume. */
   diskAlertDeps?: DiskUsageAlertDeps;
   onReady?: (handles: RunStartE2EHandles) => void;
+  connectPeer?: boolean;
+  /** Exercise follower HTTP command ingestion while retaining E2E shutdown handles. */
+  followerPolling?: boolean;
+  followerProviderFactory?: ProviderFactory;
+  onFollowerReady?: (handles: {
+    instance: FollowerInstance;
+    instanceIdentity: InstanceIdentity;
+    shutdown: () => Promise<void>;
+  }) => void;
 }
 
 export interface RunStartOptions {
@@ -758,6 +772,10 @@ export interface RunStartOptions {
    */
   importActor?: string;
   e2e?: RunStartE2EHooks;
+  role?: string;
+  leader?: string;
+  tokenFile?: string;
+  instanceId?: string;
 }
 
 /**
@@ -1183,6 +1201,10 @@ async function composeStart(
     // throws on an unknown profile, so the cast to the canonical union is safe.
     config = loadConfig(mcHome, {
       profile: opts?.profile as ConfigProfile | undefined,
+      role: opts?.role as InstanceRole | undefined,
+      leader: opts?.leader,
+      tokenFile: opts?.tokenFile,
+      instanceId: opts?.instanceId,
     });
   } catch (err) {
     // No config yet means no config-sourced secrets to scrub against, so this
@@ -1191,6 +1213,11 @@ async function composeStart(
       reason: err instanceof Error ? err.message : String(err),
     });
     process.exit(1);
+    return;
+  }
+
+  if (config.role === "follower") {
+    await composeFollowerStart(config, opts, resources, bootLog);
     return;
   }
   const rootActor = config.rootActor;
@@ -1283,6 +1310,16 @@ async function composeStart(
   const database = initDb(mcHome);
   resources.acquire("database", () => closeDb());
   log.info("database_ready", { home: mcHome });
+  const identity = initInstanceIdentity(database, {
+    role: config.role ?? "leader",
+    configuredInstanceId: config.instance?.id,
+  });
+  log.info("instance_identity_ready", {
+    instanceId: identity.instanceId,
+    bootId: identity.bootId,
+    role: identity.role,
+  });
+  getRepositories(config.role ?? "leader");
   if (!config.auth) getRepositories().principals.ensureImplicitUser(new Date().toISOString());
 
   const modelClasses = getRepositories().modelClasses;

@@ -2,12 +2,16 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import type { InstanceRole } from "../config/types.js";
 import { runMigrations } from "./migrations/runner.js";
-import { Repositories } from "./repositories/index.js";
+import { Repositories, RoleAuthorityError } from "./repositories/index.js";
 import { widenToWal } from "./wal.js";
+
+export { RoleAuthorityError };
 
 let db: Database.Database | null = null;
 let repositories: Repositories | null = null;
+let currentRepositoriesRole: InstanceRole | null = null;
 
 export type TaskStatus = "queued" | "in_progress" | "done" | "blocked";
 
@@ -72,10 +76,17 @@ export function getDb(): Database.Database {
 /**
  * Accessor for the repository layer (mesh events, raw inputs, distillation queue).
  */
-export function getRepositories(): Repositories {
-  if (!repositories) {
-    repositories = new Repositories(getDb());
+export function getRepositories(role: InstanceRole = "leader"): Repositories {
+  if (repositories) {
+    if (currentRepositoriesRole !== null && currentRepositoriesRole !== role) {
+      throw new Error(
+        `Repositories singleton already initialized for role "${currentRepositoriesRole}", cannot access as "${role}"`
+      );
+    }
+    return repositories;
   }
+  repositories = new Repositories(getDb(), role);
+  currentRepositoriesRole = role;
   return repositories;
 }
 
@@ -88,6 +99,7 @@ export function closeDb(): void {
     db = null;
   }
   repositories = null;
+  currentRepositoriesRole = null;
 }
 
 const SQLITE_UTC_DATETIME_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z?$/;
