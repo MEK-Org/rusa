@@ -83,6 +83,7 @@ describe("DefaultOsScheduler", () => {
       deliverAt: "2026-09-04T12:34:56.000Z",
       sessionId: "session-1",
       responsive: true,
+      responsiveReason: "responsive obligation",
     };
 
     scheduler.scheduleMessageDelivery(message);

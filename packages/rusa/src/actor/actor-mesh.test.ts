@@ -383,6 +383,7 @@ function setup(
       body: string;
       sessionId?: string;
       responsive?: boolean;
+      responsiveReason?: string;
     }) => string;
     idgen?: () => string;
     onRunReturned?: ActorMeshOptions["onRunReturned"];
@@ -4346,7 +4347,7 @@ describe("ActorMesh", () => {
   });
 
   it("stamps each message from the sender's current responsive selection", () => {
-    const chat: Array<{ body: string; responsive?: boolean }> = [];
+    const chat: Array<{ body: string; responsive?: boolean; responsiveReason?: string }> = [];
     let selectedResponsive = false;
     let sender = "";
     const inboxStore = createMemoryInboxStore();
@@ -4354,7 +4355,11 @@ describe("ActorMesh", () => {
       inboxStore,
       responsiveForActorMessage: (actorId) => actorId === sender && selectedResponsive,
       recordChat: (message) => {
-        chat.push({ body: message.body, responsive: message.responsive });
+        chat.push({
+          body: message.body,
+          responsive: message.responsive,
+          responsiveReason: message.responsiveReason,
+        });
         return `message-${chat.length}`;
       },
     });
@@ -4377,11 +4382,15 @@ describe("ActorMesh", () => {
     mesh.sendMessage(recipient, "human ingress", TEST_USER_ID, "human-session");
 
     expect(chat).toEqual([
-      { body: "no selection", responsive: false },
-      { body: "ordinary selection", responsive: false },
-      { body: "responsive selection", responsive: true },
-      { body: "selection changed", responsive: false },
-      { body: "human ingress", responsive: true },
+      { body: "no selection", responsive: false, responsiveReason: undefined },
+      { body: "ordinary selection", responsive: false, responsiveReason: undefined },
+      {
+        body: "responsive selection",
+        responsive: true,
+        responsiveReason: "responsive obligation",
+      },
+      { body: "selection changed", responsive: false, responsiveReason: undefined },
+      { body: "human ingress", responsive: true, responsiveReason: "human message" },
     ]);
     expect(inboxStore.entries.map((entry) => entry.payload.priority ?? "normal")).toEqual([
       "normal",
@@ -4390,6 +4399,30 @@ describe("ActorMesh", () => {
       "normal",
       "responsive",
     ]);
+    expect(inboxStore.entries.map((entry) => entry.payload.responsiveReason)).toEqual([
+      undefined,
+      undefined,
+      "responsive obligation",
+      undefined,
+      "human message",
+    ]);
+  });
+
+  it("keeps an immediate stamped message responsive without inbox storage", async () => {
+    const queued: Array<{ actorId: string; responsive: boolean }> = [];
+    let sender = "";
+    const { mesh, tick } = setup({
+      responsiveForActorMessage: (actorId) => actorId === sender,
+      onQueued: (actorId, context) => queued.push({ actorId, responsive: context.responsive }),
+    });
+    const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+    sender = mesh.spawn({ charter: "sender", parentId: "root" });
+    (mesh as unknown as { inboxStore?: InboxRepository }).inboxStore = undefined;
+
+    mesh.sendMessage(recipient, "responsive selection", sender);
+    await tick();
+
+    expect(queued).toContainEqual({ actorId: recipient, responsive: true });
   });
 
   it("deliverWake wakes a live actor (true) with the reason as its prompt", async () => {
@@ -10491,13 +10524,17 @@ describe("ActorMesh", () => {
     it("replays a scheduled message with its send-time responsive stamp", () => {
       let selectedResponsive = true;
       let sender = "";
-      const chat: Array<{ id?: string; responsive?: boolean }> = [];
+      const chat: Array<{ id?: string; responsive?: boolean; responsiveReason?: string }> = [];
       const inboxStore = createMemoryInboxStore();
       const { mesh, scheduledMessages } = setup({
         inboxStore,
         responsiveForActorMessage: (actorId) => actorId === sender && selectedResponsive,
         recordChat: (message) => {
-          chat.push({ id: message.id, responsive: message.responsive });
+          chat.push({
+            id: message.id,
+            responsive: message.responsive,
+            responsiveReason: message.responsiveReason,
+          });
           return message.id ?? "missing-id";
         },
       });
@@ -10514,18 +10551,24 @@ describe("ActorMesh", () => {
       selectedResponsive = false;
 
       const scheduled = scheduledMessages.listForRecipient(recipient)[0];
-      expect(scheduled).toMatchObject({ responsive: true });
+      expect(scheduled).toMatchObject({
+        responsive: true,
+        responsiveReason: "responsive obligation",
+      });
       if (!scheduled) throw new Error("expected scheduled message");
       mesh.deliverScheduledMessage(scheduled);
 
       expect(chat).toEqual([
-        { id: scheduled.id, responsive: true },
-        { id: scheduled.id, responsive: true },
+        { id: scheduled.id, responsive: true, responsiveReason: "responsive obligation" },
+        { id: scheduled.id, responsive: true, responsiveReason: "responsive obligation" },
       ]);
       expect(inboxStore.entries).toContainEqual(
         expect.objectContaining({
           id: scheduled.id,
-          payload: expect.objectContaining({ priority: "responsive" }),
+          payload: expect.objectContaining({
+            priority: "responsive",
+            responsiveReason: "responsive obligation",
+          }),
         })
       );
     });

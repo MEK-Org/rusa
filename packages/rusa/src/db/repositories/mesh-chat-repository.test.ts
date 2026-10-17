@@ -13,7 +13,8 @@ describe("MeshChatRepository.listForActor", () => {
         recipient_id TEXT NOT NULL,
         body TEXT NOT NULL,
         session_id TEXT,
-        responsive INTEGER
+        responsive INTEGER,
+        responsive_reason TEXT
       )
     `);
     const repo = new MeshChatRepository(db);
@@ -59,7 +60,8 @@ describe("MeshChatRepository.listChatByActors", () => {
         recipient_id TEXT NOT NULL,
         body TEXT NOT NULL,
         session_id TEXT,
-        responsive INTEGER
+        responsive INTEGER,
+        responsive_reason TEXT
       )
     `);
     const repo = new MeshChatRepository(db);
@@ -86,7 +88,8 @@ describe("MeshChatRepository.listForSession", () => {
         recipient_id TEXT NOT NULL,
         body TEXT NOT NULL,
         session_id TEXT,
-        responsive INTEGER
+        responsive INTEGER,
+        responsive_reason TEXT
       )
     `);
     const repo = new MeshChatRepository(db);
@@ -141,7 +144,8 @@ describe("MeshChatRepository.record idempotency", () => {
         recipient_id TEXT NOT NULL,
         body TEXT NOT NULL,
         session_id TEXT,
-        responsive INTEGER
+        responsive INTEGER,
+        responsive_reason TEXT
       )
     `);
     const repo = new MeshChatRepository(db);
@@ -170,7 +174,7 @@ describe("MeshChatRepository.record idempotency", () => {
 });
 
 describe("MeshChatRepository responsiveness", () => {
-  it("keeps a legacy NULL distinct from newly stamped true and false rows", () => {
+  it("keeps legacy diagnostics distinct from newly stamped rows", () => {
     const db = new Database(":memory:");
     db.exec(`
       CREATE TABLE mesh_chat (
@@ -180,7 +184,8 @@ describe("MeshChatRepository responsiveness", () => {
         recipient_id TEXT NOT NULL,
         body TEXT NOT NULL,
         session_id TEXT,
-        responsive INTEGER
+        responsive INTEGER,
+        responsive_reason TEXT
       )
     `);
     const repo = new MeshChatRepository(db);
@@ -198,6 +203,7 @@ describe("MeshChatRepository responsiveness", () => {
       recipientId: "worker",
       body: "new priority",
       responsive: true,
+      responsiveReason: "responsive obligation",
     });
     repo.record({
       id: "ordinary",
@@ -208,10 +214,14 @@ describe("MeshChatRepository responsiveness", () => {
       responsive: false,
     });
 
-    expect(repo.listForActor("worker").map((message) => [message.id, message.responsive])).toEqual([
-      ["ordinary", false],
-      ["responsive", true],
-      ["legacy", null],
+    expect(
+      repo
+        .listForActor("worker")
+        .map((message) => [message.id, message.responsive, message.responsiveReason])
+    ).toEqual([
+      ["ordinary", false, null],
+      ["responsive", true, "responsive obligation"],
+      ["legacy", null, null],
     ]);
   });
 });

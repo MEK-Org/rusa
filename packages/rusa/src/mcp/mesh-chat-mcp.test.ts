@@ -13,7 +13,8 @@ async function connect(actorId: string): Promise<Client> {
       recipientId: "worker",
       body: "Please review the PR",
       sessionId: null,
-      responsive: null,
+      responsive: true,
+      responsiveReason: "responsive obligation",
     },
     {
       id: "message-2",
@@ -59,6 +60,10 @@ describe("mesh-chat-read MCP", () => {
     expect(result.content[0]).toMatchObject({
       type: "text",
       text: expect.stringContaining("Please review the PR"),
+    });
+    expect(result.content[0]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("responsive obligation"),
     });
   });
 

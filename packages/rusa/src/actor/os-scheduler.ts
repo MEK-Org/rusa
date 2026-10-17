@@ -74,6 +74,8 @@ export interface ScheduledMessage {
   sessionId?: string;
   /** Send-time priority snapshot; omitted only by pre-#1104 host jobs. */
   responsive?: boolean;
+  /** Optional send-time diagnostic; never a scheduling or authorization input. */
+  responsiveReason?: string;
 }
 
 /** The scheduled-message-facing slice of the host scheduler. */
@@ -316,6 +318,7 @@ export function decodeScheduledMessagePayload(payload: string): ScheduledMessage
       typeof value.deliverAt !== "string" ||
       (value.sessionId !== undefined && typeof value.sessionId !== "string") ||
       (value.responsive !== undefined && typeof value.responsive !== "boolean") ||
+      (value.responsiveReason !== undefined && typeof value.responsiveReason !== "string") ||
       Number.isNaN(Date.parse(value.deliverAt))
     ) {
       throw new Error("invalid scheduled-message payload");
@@ -328,6 +331,9 @@ export function decodeScheduledMessagePayload(payload: string): ScheduledMessage
       deliverAt: value.deliverAt,
       ...(typeof value.sessionId === "string" ? { sessionId: value.sessionId } : {}),
       ...(typeof value.responsive === "boolean" ? { responsive: value.responsive } : {}),
+      ...(typeof value.responsiveReason === "string"
+        ? { responsiveReason: value.responsiveReason }
+        : {}),
     };
   } catch (cause) {
     throw new Error("invalid scheduled-message payload", { cause });
