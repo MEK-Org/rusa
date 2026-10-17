@@ -246,6 +246,7 @@ export function dashboardTimingLabelForRoute(
   const isRead = method === "GET" || method === "HEAD" || method === "OPTIONS";
   if (pathname === "/api/dashboard/timing") return null;
   if (pathname === "/api/health") return null;
+  if (pathname === "/api/mesh/voice/stream") return null;
   if (pathname === "/api/dashboard/config") return "dashboard_config";
   if (pathname === "/api/mesh/threads") return "mesh_threads";
   if (pathname === "/api/mesh/threads/charter") return "mesh_actor_charter";

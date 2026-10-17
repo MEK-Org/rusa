@@ -2,7 +2,7 @@ import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import EventEmitter from "node:events";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { runSubprocess } from "./subprocess-execution.js";
+import { runSubprocess, type SubprocessDuplex } from "./subprocess-execution.js";
 import {
   RUN_CEILING_ABORT_REASON,
   STALL_WATCHDOG_ABORT_REASON,
@@ -23,6 +23,11 @@ vi.mock("node:child_process", () => ({
 
 class MockChild extends EventEmitter {
   pid = 12345;
+  stdin = Object.assign(new EventEmitter(), {
+    destroy: vi.fn(),
+    destroyed: false,
+    write: vi.fn((_record: string, callback: (error?: Error) => void) => callback()),
+  });
   stdout = new EventEmitter();
   stderr = new EventEmitter();
 }
@@ -69,6 +74,78 @@ describe("runSubprocess helper-level unit coverage ", () => {
       exitCode: -1,
     }),
   };
+
+  it("closes duplex stdin on cancellation and detaches the abort listener", async () => {
+    const mockChild = new MockChild();
+    spawnFn.mockReturnValue(mockChild as unknown as ChildProcessWithoutNullStreams);
+    const controller = new AbortController();
+    const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+    const onDuplex = vi.fn();
+    const run = runSubprocess({ ...baseConfig, signal: controller.signal, onDuplex });
+    mockChild.emit("spawn");
+    const transport = onDuplex.mock.calls[0][0];
+    await transport.write("request\n");
+    expect(mockChild.stdin.write).toHaveBeenCalledWith("request\n", expect.any(Function));
+    controller.abort(RUN_CEILING_ABORT_REASON);
+    expect((await run).abortReason).toBe(RUN_CEILING_ABORT_REASON);
+    expect(mockChild.stdin.destroy).toHaveBeenCalled();
+    expect(killSpy).toHaveBeenCalledWith(-12345, "SIGKILL");
+    expect(removeListener).toHaveBeenCalledWith("abort", expect.any(Function));
+    let closed = false;
+    const closing = transport.close().then(() => {
+      closed = true;
+    });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    mockChild.emit("close", null, "SIGKILL");
+    await closing;
+    expect(closed).toBe(true);
+    killSpy.mockClear();
+    await transport.close();
+    expect(killSpy).toHaveBeenCalledWith(-12345, "SIGKILL");
+  });
+
+  it("waits for write callbacks and preserves exit diagnostics after EPIPE", async () => {
+    const mockChild = new MockChild();
+    spawnFn.mockReturnValue(mockChild as unknown as ChildProcessWithoutNullStreams);
+    let writeCallback: ((error?: Error) => void) | undefined;
+    mockChild.stdin.write.mockImplementation((_record, callback) => {
+      writeCallback = callback;
+    });
+    let transport!: SubprocessDuplex;
+    const run = runSubprocess({
+      ...baseConfig,
+      onDuplex: (value) => {
+        transport = value;
+      },
+    });
+    let settled = false;
+    void run.then(() => {
+      settled = true;
+    });
+    mockChild.emit("spawn");
+    let written = false;
+    const writing = transport.write("request\n").then(() => {
+      written = true;
+    });
+    await Promise.resolve();
+    expect(written).toBe(false);
+    expect(writeCallback).toBeTypeOf("function");
+    writeCallback?.();
+    await writing;
+    expect(written).toBe(true);
+
+    const rejected = expect(transport.write("next\n")).rejects.toThrow(/^Subprocess stdin failed$/);
+    const pipeError = Object.assign(new Error("private request contents"), { code: "EPIPE" });
+    writeCallback?.(pipeError);
+    mockChild.stderr.emit("data", Buffer.from("peer diagnostic"));
+    mockChild.stdin.emit("error", pipeError);
+    await rejected;
+    expect(settled).toBe(false);
+    expect(killSpy).not.toHaveBeenCalled();
+    mockChild.emit("close", 2, null);
+    expect(await run).toMatchObject({ success: false, exitCode: 2, output: "peer diagnostic" });
+  });
 
   it("handles timeout fire -> group teardown", async () => {
     vi.useFakeTimers();

@@ -1,5 +1,5 @@
 import { type ChildProcessByStdio, spawn } from "node:child_process";
-import type { Readable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 import { formatSigtermResult, type TerminationAttribution } from "./termination-attribution.js";
 import type { RunResult } from "./types.js";
 
@@ -25,14 +25,16 @@ function describeSpawnRejection(err: unknown): Error {
   );
 }
 
-/**
- * Shared lifecycle for a detached, process-grouped subprocess run.
- *
- * Providers parameterize the parts that differ (stdout/stderr handling, result
- * shaping) while this helper owns the load-bearing mechanics: spawn, group kill,
- * timeout, cancellation listener attach/detach, and settlement ordering.
- */
+export interface SubprocessDuplex {
+  /** Resolves when Node invokes the stdin write callback, without peer acknowledgment. */
+  write(record: string): Promise<void>;
+  /** Close stdin, kill the process group, and await the direct child close event. */
+  close(): Promise<void>;
+}
+
 export interface SubprocessRunConfig {
+  /** Opt into piped stdin. Called after onSpawn, with lifecycle handlers attached. */
+  onDuplex?: (transport: SubprocessDuplex) => void;
   command: string;
   args: string[];
   cwd: string;
@@ -47,8 +49,8 @@ export interface SubprocessRunConfig {
   handleStdoutData?: (data: Buffer, chunks: string[]) => void;
   /** Replace the default raw stderr capture. */
   handleStderrData?: (data: Buffer, chunks: string[]) => void;
-  /** Optional stdout end hook (e.g. flushing a line buffer). */
-  onStdoutEnd?: (chunks: string[]) => void;
+  /** Flush stdout on EOF or termination. Actual pipe EOF may follow our own kill signal. */
+  onStdoutEnd?: (chunks: string[], cause: "eof" | "termination") => void;
   cleanup?: () => void;
   /** Best-effort observation; called only after Node reports a successful spawn. */
   onSpawn?: () => void;
@@ -58,6 +60,13 @@ export interface SubprocessRunConfig {
   buildSpawnErrorResult: (err: Error) => RunResult;
 }
 
+/**
+ * Shared lifecycle for a detached, process-grouped subprocess run.
+ *
+ * Providers parameterize the parts that differ (stdout/stderr handling, result
+ * shaping) while this helper owns the load-bearing mechanics: spawn, group kill,
+ * timeout, cancellation listener attach/detach, and settlement ordering.
+ */
 export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
   return new Promise<RunResult>((resolve) => {
     const chunks: string[] = [];
@@ -73,18 +82,20 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
     // `detached: true` makes the child its own process-group leader so we can
     // signal the whole group with `process.kill(-pid, ...)`, reaping any
     // grandchildren the CLI spawned (interactive shells, subprocesses, etc.).
-    // Typed from the `stdio` triple below: stdin ignored, stdout/stderr piped.
-    let child: ChildProcessByStdio<null, Readable, Readable>;
+    // Stdin is piped only for duplex consumers; stdout/stderr are always piped.
+    let child: ChildProcessByStdio<Writable | null, Readable, Readable>;
     try {
-      child = spawn(config.command, config.args, {
+      const options = {
         cwd: config.cwd,
         env: config.env,
-        stdio: ["ignore", "pipe", "pipe"],
         detached: true,
         // Do NOT pass `timeout:` here — Node's spawn timeout signals only the
         // direct child, leaving the rest of the detached group alive. We own the
         // timeout via `setTimeout` below instead.
-      });
+      };
+      child = config.onDuplex
+        ? spawn(config.command, config.args, { ...options, stdio: ["pipe", "pipe", "pipe"] })
+        : spawn(config.command, config.args, { ...options, stdio: ["ignore", "pipe", "pipe"] });
     } catch (err) {
       // spawn validates command, argv and options synchronously and throws
       // before a process exists: there is no 'error' event coming, no group to
@@ -96,6 +107,8 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
       return;
     }
 
+    const closed = new Promise<void>((resolveClose) => child.once("close", resolveClose));
+
     child.once("spawn", () => {
       try {
         config.onSpawn?.();
@@ -105,6 +118,7 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
     });
 
     const killGroup = () => {
+      child.stdin?.destroy();
       if (child.pid) {
         try {
           process.kill(-child.pid, "SIGKILL");
@@ -140,14 +154,14 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
     // detached group alive) so we can kill the whole group on expiry.
     timer = setTimeout(() => {
       killGroup();
-      config.onStdoutEnd?.(chunks);
+      config.onStdoutEnd?.(chunks, "termination");
       const sigtermResult = formatSigtermResult(chunks.join(""), config.signal);
       settleKilled(config.buildKilledResult, sigtermResult);
     }, config.timeoutMs);
 
     const onAbort = () => {
       killGroup();
-      config.onStdoutEnd?.(chunks);
+      config.onStdoutEnd?.(chunks, "termination");
       const sigtermResult = formatSigtermResult(chunks.join(""), config.signal);
       settleKilled(config.buildKilledResult, sigtermResult);
     };
@@ -172,7 +186,7 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
     if (config.onStdoutEnd) {
       const onEnd = config.onStdoutEnd;
       child.stdout.on("end", () => {
-        onEnd(chunks);
+        onEnd(chunks, "eof");
       });
     }
 
@@ -192,10 +206,41 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
       settle(config.buildSpawnErrorResult(err));
     });
 
+    if (config.onDuplex) {
+      // The write callback rejects the write. Consume stream errors separately
+      // while leaving exit/stderr attribution to the child's close event.
+      child.stdin?.on("error", () => {});
+      child.once("spawn", () => {
+        if (settled) return;
+        try {
+          config.onDuplex?.({
+            write: (record) =>
+              new Promise<void>((resolveWrite, rejectWrite) => {
+                const stdin = child.stdin;
+                if (!stdin || stdin.destroyed) {
+                  rejectWrite(new Error("Subprocess stdin closed"));
+                  return;
+                }
+                stdin.write(record, (error) =>
+                  error ? rejectWrite(new Error("Subprocess stdin failed")) : resolveWrite()
+                );
+              }),
+            close: () => {
+              killGroup();
+              return closed;
+            },
+          });
+        } catch {
+          killGroup();
+          settle(config.buildSpawnErrorResult(new Error("Subprocess duplex setup failed")));
+        }
+      });
+    }
+
     child.on("close", (code, signal) => {
       // Check if the process was terminated by a kill signal from our paths.
       if (signal === "SIGTERM" || signal === "SIGKILL") {
-        config.onStdoutEnd?.(chunks);
+        config.onStdoutEnd?.(chunks, "termination");
         const sigtermResult = formatSigtermResult(chunks.join(""), config.signal);
         settleKilled((sig) => config.buildSignalResult(sig, signal), sigtermResult);
         return;
