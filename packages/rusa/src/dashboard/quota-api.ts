@@ -542,8 +542,8 @@ function latestStateFromHistory(
  * what it showed before. A dropped lane is estimated only until its last-seen
  * window resets, never into a next window no scrape has shown: that is also
  * when the controller retires a dropped model lane (#588). A dropped model lane
- * sharing a model with a shown window of its kind is not added. Nothing here is
- * written anywhere.
+ * whose models are a subset or superset of a shown window of its kind is not
+ * added. Nothing here is written anywhere.
  *
  * Window ids and history kinds key the same lanes: both are the closed
  * `QuotaWindowKind` set, validated where a scrape is parsed and where the
@@ -630,12 +630,18 @@ function withEstimates(
     const models = readings.at(-1)?.models ?? [];
     if (readings[0].scope === "provider") windows.push(window);
     else {
-      // A parser flap can store a narrower model set for a window that is still
-      // shown under its full set (#1078). Restoring that lane would serve the
-      // same window twice, and a single-match lookup such as the Fable ring
-      // reads two matches as unknown; the shown window already covers it.
+      // A parser flap can store an alternate narrower or wider model set for a
+      // window that is still shown (#1078). When one model set is a subset of
+      // the other for the same window kind, it represents an alias of the same
+      // quota window rather than distinct partially overlapping lanes ([a,b]
+      // vs [b,c]). Restoring that lane would serve the same window twice, and
+      // a single-match lookup such as the Fable ring reads two matches as
+      // unknown; the shown window already covers it.
       const overlaps = modelWindows.some(
-        (w) => w.id === window.id && w.modelIds.some((id) => models.includes(id))
+        (w) =>
+          w.id === window.id &&
+          (models.every((id) => w.modelIds.includes(id)) ||
+            w.modelIds.every((id) => models.includes(id)))
       );
       if (!overlaps) modelWindows.push({ ...window, modelIds: [...models] });
     }

@@ -2188,6 +2188,35 @@ describe("dead-reckoned lane estimates (#759)", () => {
       expect(during.providers[0].modelWindows).toEqual([
         expect.objectContaining({ modelIds: NARROW, usedPercent: 32, estimated: false }),
       ]);
+
+      // When both lanes are dropped from the newest scrape, the earlier lane in
+      // history order is restored and suppresses the overlapping later lane.
+      const bothDropped = await snapshotAt(at("13:30"), providerOnly(at("13:30")), flapped);
+      expect(bothDropped.providers[0].modelWindows).toEqual([
+        expect.objectContaining({ modelIds: WIDE, usedPercent: 37.5, estimated: true }),
+      ]);
+    });
+
+    it("still restores a dropped model lane that only partially overlaps a shown window", async () => {
+      // Partially overlapping distinct model lanes ([a, b] vs [b, c]) are not
+      // subsets of each other and must not suppress each other.
+      const snapshot = await snapshotAt(
+        at("13:30"),
+        reading(at("13:00"), ["model-b", "model-c"], 50),
+        [
+          point(["model-a", "model-b"], at("10:00"), 80),
+          point(["model-a", "model-b"], at("12:00"), 70),
+        ]
+      );
+
+      expect(snapshot.providers[0].modelWindows).toEqual([
+        expect.objectContaining({ modelIds: ["model-b", "model-c"], estimated: false }),
+        expect.objectContaining({
+          modelIds: ["model-a", "model-b"],
+          usedPercent: 37.5,
+          estimated: true,
+        }),
+      ]);
     });
 
     it("still restores a dropped model lane that shares no model with a shown window", async () => {
