@@ -1,7 +1,18 @@
 import Database from "better-sqlite3";
-import { describe, expect, it } from "vitest";
-import { getInstanceIdentity, initInstanceIdentity } from "./instance-identity.js";
+import { describe, expect, it, vi } from "vitest";
+import {
+  defaultInstanceId,
+  getInstanceIdentity,
+  initInstanceIdentity,
+} from "./instance-identity.js";
 import { runMigrations } from "./migrations/runner.js";
+
+const osMock = vi.hoisted(() => ({ hostname: undefined as string | undefined }));
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  const hostname = () => osMock.hostname ?? actual.hostname();
+  return { ...actual, default: { ...actual, hostname }, hostname };
+});
 
 describe("instance-identity", () => {
   it("initializes new identity on first boot and reads it back", () => {
@@ -130,5 +141,18 @@ describe("instance-identity", () => {
         VALUES (2, 'node-2', 'follower', 'now', 'boot-2', 'now')
       `).run();
     }).toThrow();
+  });
+});
+
+describe("defaultInstanceId", () => {
+  it("fits the 64-character enrollment ID pattern for any hostname", () => {
+    try {
+      for (const host of ["h".repeat(64), "a.very.long.fqdn.".repeat(4), ""]) {
+        osMock.hostname = host;
+        expect(defaultInstanceId()).toMatch(/^[a-zA-Z0-9_-]{1,64}$/);
+      }
+    } finally {
+      osMock.hostname = undefined;
+    }
   });
 });

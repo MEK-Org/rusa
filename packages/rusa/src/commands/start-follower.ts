@@ -6,6 +6,7 @@ import { closeDb, getRepositories, initDb } from "../db/index.js";
 import { initInstanceIdentity } from "../db/instance-identity.js";
 import type { Logger } from "../observability/logger.js";
 import { createLogger } from "../observability/logger.js";
+import { assertBwrapAvailable, setSandboxLogger } from "../providers/sandbox.js";
 import {
   FollowerEventAcceptanceFailedError,
   type FollowerEventBatch,
@@ -66,6 +67,18 @@ export async function composeFollowerStart(
     secrets: () => [token],
     context: { component: "follower" },
   });
+  // As on the leader: sandbox-layer records carry this logger's scrubbing, and
+  // a host that cannot sandbox actors fails before mesh.db binds an identity.
+  setSandboxLogger(log.child({ component: "sandbox" }));
+  if (config.sandbox !== "container-boundary") {
+    try {
+      assertBwrapAvailable();
+    } catch (err) {
+      log.error("sandbox_unavailable", { sandbox: config.sandbox ?? "bwrap", err });
+      process.exit(1);
+      return;
+    }
+  }
 
   // 1. Open local database and initialize instance identity (#1019)
   const database = initDb(mcHome);

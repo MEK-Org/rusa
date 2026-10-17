@@ -1685,6 +1685,7 @@ describe("loadConfig observability.logging", () => {
         toYaml({
           providers: { codex: { cliCommand: "codex" } },
           peers: [{ type: "leader", url: "http://127.0.0.1:8190", token: "follower-token" }],
+          instance: { id: "follower-a" },
         }),
         "utf8"
       );
@@ -1730,6 +1731,7 @@ describe("loadConfig observability.logging", () => {
         toYaml({
           providers: { codex: { cliCommand: "codex" } },
           peers: [{ id: "leader-a", ...LEADER }],
+          instance: { id: "follower-a" },
         }),
         "utf8"
       );
@@ -1744,6 +1746,58 @@ describe("loadConfig observability.logging", () => {
       ]);
       expect(() => loadConfig(writeConfig(), { tokenFile: "/tmp/test-token" })).toThrow(
         /--token-file requires --leader or a configured leader peer entry/
+      );
+    });
+
+    it("rejects a non-list peers value even when --leader is given", () => {
+      const peers = { id: "follower-a", type: "follower" };
+      expect(() =>
+        loadConfig(writeConfig({ peers }), {
+          leader: "http://127.0.0.1:8190",
+          instanceId: "follower-a",
+        })
+      ).toThrow(/peers must be a list when set/);
+    });
+
+    it("rejects unknown keys on peers entries", () => {
+      expect(() =>
+        loadConfig(
+          writeConfig({
+            peers: [{ ...LEADER, token: undefined, token_file: "/tmp/t" }],
+            instance: { id: "follower-a" },
+          })
+        )
+      ).toThrow(/peers\[0\]\.token_file is not a supported peer key/);
+      expect(() =>
+        loadConfig(
+          writeConfig({
+            peers: [{ id: "follower-a", type: "follower", leaderUrl: "http://x" }],
+            followers: GATEWAY,
+          })
+        )
+      ).toThrow(/peers\[0\]\.leaderUrl is not a supported peer key/);
+    });
+
+    it("requires instance.id on a follower, from config or --instance-id", () => {
+      expect(() => loadConfig(writeConfig({ peers: [LEADER] }))).toThrow(
+        /a follower \(peers has a leader entry\) requires instance\.id \(or --instance-id\)/
+      );
+      expect(
+        loadConfig(writeConfig({ peers: [LEADER] }), { instanceId: "follower-a" }).instance
+      ).toEqual({ id: "follower-a" });
+    });
+
+    it("rejects an instance.id the follower gateway would refuse at enrollment", () => {
+      for (const id of ["mac-mini.tailnet.example", "has space", "x".repeat(65)]) {
+        expect(() => loadConfig(writeConfig({ instance: { id } }))).toThrow(
+          /instance\.id must be 1-64 letters, digits, "_" or "-"/
+        );
+        expect(() => loadConfig(writeConfig({ peers: [LEADER] }), { instanceId: id })).toThrow(
+          /instance\.id must be 1-64 letters, digits, "_" or "-"/
+        );
+      }
+      expect(loadConfig(writeConfig({ instance: { id: "x".repeat(64) } })).instance?.id).toBe(
+        "x".repeat(64)
       );
     });
   });

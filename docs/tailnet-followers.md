@@ -43,6 +43,10 @@ peers:
     type: follower
 ```
 
+A `rusa start` follower (one whose `peers` has a `leader` entry) must set
+`instance.id` (or pass `--instance-id`) to the ID listed here; it refuses to
+start without one, since a generated ID could never match the allowlist.
+
 The follower entries are a required allowlist: the leader refuses to start a
 gateway without at least one, and refuses enrollment (HTTP 403, logged as
 `follower_register_rejected` with reason `not_allowlisted`) from any instance

@@ -32,7 +32,10 @@ function normalizeInstanceId(id: string): string {
 }
 
 export function defaultInstanceId(): string {
-  const host = hostname().replace(/[^a-zA-Z0-9_-]/g, "-");
+  // Fit the 64-character instance ID limit with room for "-" and the suffix.
+  const host = hostname()
+    .replace(/[^a-zA-Z0-9_-]/g, "-")
+    .slice(0, 55);
   const suffix = randomUUID().slice(0, 8);
   return host.length > 0 ? `${host}-${suffix}` : `inst-${suffix}`;
 }

@@ -182,6 +182,13 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
         throw new Error("config.yaml: instance.id must be a non-empty string when set");
       }
       parsed.instance.id = parsed.instance.id.trim();
+      // mesh.db binds this ID on first boot, so refuse one a leader's follower
+      // gateway would reject before it is persisted.
+      if (!PEER_ID_PATTERN.test(parsed.instance.id)) {
+        throw new Error(
+          'config.yaml: instance.id must be 1-64 letters, digits, "_" or "-" (the instance ID followers enroll with)'
+        );
+      }
     }
   }
 
@@ -199,6 +206,11 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   if (parsed.followers !== undefined && allowlist.length === 0) {
     throw new Error(
       'config.yaml: followers gateway requires at least one peers entry with type: follower; only listed follower instance IDs may enroll (e.g. peers: [{ id: "<follower instance id>", type: follower }])'
+    );
+  }
+  if (role === "follower" && parsed.instance?.id === undefined) {
+    throw new Error(
+      "config.yaml: a follower (peers has a leader entry) requires instance.id (or --instance-id) matching a follower entry in the leader's peers allowlist"
     );
   }
 
@@ -824,6 +836,9 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
 /** Instance IDs a follower sends at enrollment; the follower gateway's own check. */
 const PEER_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
 
+/** Keys a `peers` entry may carry; follower entries are further limited to type/id. */
+const PEER_KEYS = new Set(["type", "id", "url", "token", "tokenFile"]);
+
 /**
  * This instance's local role, derived from `peers`: a `leader` entry makes it a
  * follower; otherwise it is a leader (#1024).
@@ -854,7 +869,10 @@ function applyLeaderShorthand(
   leader: string | undefined,
   tokenFile: string | undefined
 ): void {
-  const peers: unknown[] = Array.isArray(rawParsed.peers) ? [...rawParsed.peers] : [];
+  if (rawParsed.peers !== undefined && !Array.isArray(rawParsed.peers)) {
+    throw new Error("config.yaml: peers must be a list when set");
+  }
+  const peers: unknown[] = rawParsed.peers ? [...rawParsed.peers] : [];
   const index = peers.findIndex(
     (peer) => isPlainObject(peer) && (peer as { type?: unknown }).type === "leader"
   );
@@ -891,6 +909,11 @@ function validatePeers(parsed: RusaConfig): void {
     }
     if (peer.type !== "leader" && peer.type !== "follower") {
       throw new Error(`${at}.type must be "leader" or "follower"`);
+    }
+    for (const key of Object.keys(peer)) {
+      if (!PEER_KEYS.has(key)) {
+        throw new Error(`${at}.${key} is not a supported peer key`);
+      }
     }
     if (peer.id !== undefined || peer.type === "follower") {
       if (typeof peer.id !== "string" || !PEER_ID_PATTERN.test(peer.id.trim())) {

@@ -53,6 +53,19 @@ interface RunPromptRow {
   prompt: string;
 }
 
+// The real bwrap preflight runs unless a test makes it fail.
+const sandboxMock = vi.hoisted(() => ({ bwrapMissing: false }));
+vi.mock("../providers/sandbox.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../providers/sandbox.js")>();
+  return {
+    ...actual,
+    assertBwrapAvailable: () => {
+      if (sandboxMock.bwrapMissing) throw new Error("bubblewrap (bwrap) is required");
+      actual.assertBwrapAvailable();
+    },
+  };
+});
+
 const originalHome = process.env.RUSA_HOME;
 const tempDirs: string[] = [];
 
@@ -201,6 +214,26 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     expect(id2?.role).toBe("follower");
     expect(id2?.bootId).not.toBe(bootId1);
     db2.close();
+  }, 20_000);
+
+  it("fails a follower boot without bwrap before mesh.db binds an identity or enrollment starts", async () => {
+    const home = makeTempHome();
+    process.env.RUSA_HOME = home;
+    writeConfigFile(home, {
+      providers: { codex: { cliCommand: "codex" } },
+      peers: [{ type: "leader", url: "http://127.0.0.1:1", token: "test-follower-token" }],
+      instance: { id: "worker-node-no-bwrap" },
+    });
+    const onFollowerReady = vi.fn();
+    sandboxMock.bwrapMissing = true;
+    try {
+      await runStart({ e2e: { onFollowerReady } });
+    } finally {
+      sandboxMock.bwrapMissing = false;
+    }
+    expect(process.exit).toHaveBeenCalledWith(1);
+    expect(onFollowerReady).not.toHaveBeenCalled();
+    expect(existsSync(join(home, "data", "mesh.db"))).toBe(false);
   });
 
   it("enforces follower role authority: blocks global control writes while recording execution via follower composition", async () => {
