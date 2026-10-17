@@ -2737,6 +2737,19 @@ export async function handleMeshApiRequest(
     const matchedTerminalHistoryIds = new Set<number>();
     const completedFocuses = deps.actorRuns?.listRecentCompletedFocuses(limit * 2) ?? [];
     const handledItems: Array<Record<string, unknown>> = [];
+    const activityEntries: Array<{
+      entry: InboxEntry;
+      source: string;
+      referenceKey?: string;
+      sourceKind: string;
+      handledAt: string;
+      selectedRun: (typeof completedFocuses)[number] | undefined;
+      entryObligationIds: Set<string>;
+      externalRef: string | null | undefined;
+      matchedTerminal: (typeof terminalHistory)[number] | undefined;
+    }> = [];
+    const displayIds = new Set<string>(terminalHistory.map((history) => history.obligationId));
+    const externalRefs = new Set<string>();
 
     // Each card carries the key of the reference it stands for and its
     // actor's id, never the reference or the actor themselves: the client
@@ -2825,17 +2838,8 @@ export async function handleMeshApiRequest(
       if (source.startsWith("obligation:")) {
         entryObligationIds.add(source.slice("obligation:".length));
       }
-      const externallyLinked = refs.githubWorkRef
-        ? (deps.obligations?.findByExternalRef(refs.githubWorkRef) ?? null)
-        : null;
-      if (externallyLinked) entryObligationIds.add(externallyLinked.id);
-      const entryObligations = deps.obligations
-        ? [...entryObligationIds]
-            .map((obligationId) => deps.obligations?.get(obligationId) ?? null)
-            .filter((obligation): obligation is Obligation => obligation !== null)
-        : [];
-      let linkedObligation: string | null =
-        selectedRun && entryObligations[0] ? `Obligation: ${entryObligations[0].title}` : null;
+      for (const obligationId of entryObligationIds) displayIds.add(obligationId);
+      if (refs.githubWorkRef) externalRefs.add(refs.githubWorkRef);
 
       // A source link alone is not enough: a recurring obligation can be
       // handled in one run and transition terminal in a later one. Fold only a
@@ -2850,27 +2854,62 @@ export async function handleMeshApiRequest(
               history.timestamp <= selectedRun.endedAt
           )
         : undefined;
-      if (matchedTerminal) {
-        matchedTerminalHistoryIds.add(matchedTerminal.id);
-        const terminalObligation = deps.obligations?.get(matchedTerminal.obligationId);
+      if (matchedTerminal) displayIds.add(matchedTerminal.obligationId);
+      activityEntries.push({
+        entry,
+        source,
+        ...(referenceKey ? { referenceKey } : {}),
+        sourceKind,
+        handledAt,
+        selectedRun,
+        entryObligationIds,
+        externalRef: refs.githubWorkRef,
+        matchedTerminal,
+      });
+    }
+
+    // Recent Activity never projects scheduling priority/responsiveness. The
+    // display repository batches direct ids and preserves the old NOCASE,
+    // unordered-LIMIT external-reference winner for every requested ref.
+    const activityDisplay = deps.obligations?.listActivityDisplay(
+      [...displayIds],
+      [...externalRefs]
+    );
+    for (const activity of activityEntries) {
+      const externallyLinked = activity.externalRef
+        ? (activityDisplay?.byExternalRef.get(activity.externalRef) ?? null)
+        : null;
+      if (externallyLinked) activity.entryObligationIds.add(externallyLinked.id);
+      const entryObligations = [...activity.entryObligationIds]
+        .map((obligationId) => activityDisplay?.byId.get(obligationId) ?? null)
+        .filter((obligation): obligation is Obligation => obligation !== null);
+      let linkedObligation: string | null =
+        activity.selectedRun && entryObligations[0]
+          ? `Obligation: ${entryObligations[0].title}`
+          : null;
+      if (activity.matchedTerminal) {
+        matchedTerminalHistoryIds.add(activity.matchedTerminal.id);
+        const terminalObligation = activityDisplay?.byId.get(activity.matchedTerminal.obligationId);
         if (terminalObligation) {
-          linkedObligation = `Obligation ${matchedTerminal.after.status}: ${terminalObligation.title}`;
+          linkedObligation = `Obligation ${activity.matchedTerminal.after.status}: ${terminalObligation.title}`;
         }
       }
 
-      const summary = typeof entry.payload?.type === "string" ? entry.payload.type : source;
-
+      const summary =
+        typeof activity.entry.payload?.type === "string"
+          ? activity.entry.payload.type
+          : activity.source;
       handledItems.push({
-        id: `inbox_${entry.id}`,
+        id: `inbox_${activity.entry.id}`,
         kind: "handled_inbox",
-        time: handledAt,
-        actorId: entry.actorId,
-        sourceKind,
-        sourceRef: source,
-        ...(referenceKey ? { referenceKey } : {}),
+        time: activity.handledAt,
+        actorId: activity.entry.actorId,
+        sourceKind: activity.sourceKind,
+        sourceRef: activity.source,
+        ...(activity.referenceKey ? { referenceKey: activity.referenceKey } : {}),
         summary,
-        handledTime: handledAt,
-        addressedNote: entry.handledNote ?? "Handled without comment",
+        handledTime: activity.handledAt,
+        addressedNote: activity.entry.handledNote ?? "Handled without comment",
         ...(linkedObligation ? { linkedObligation } : {}),
       });
     }
@@ -2880,7 +2919,7 @@ export async function handleMeshApiRequest(
       if (matchedTerminalHistoryIds.has(h.id)) {
         continue;
       }
-      const ob = deps.obligations ? deps.obligations.get(h.obligationId) : null;
+      const ob = activityDisplay?.byId.get(h.obligationId) ?? null;
       const status = (h.after.status ?? ob?.status ?? "done") as "done" | "cancelled";
       obligationItems.push({
         id: `obligation_history_${h.id}`,
