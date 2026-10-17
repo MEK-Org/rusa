@@ -167,10 +167,16 @@ import {
   type SystemChatSubscriptionLapseEvent,
   WorkspaceEventsSubscriber,
 } from "../chat/workspace-events.js";
-import { type ConfigProfile, loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
+import {
+  type ConfigProfile,
+  followerAllowlistOf,
+  instanceRoleOf,
+  loadConfig,
+  type RusaConfig,
+  resolveHome,
+} from "../config/index.js";
 import { readJevApiKeyFile } from "../config/jev.js";
 import { secretsDirPath } from "../config/secrets.js";
-import type { InstanceRole } from "../config/types.js";
 import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
 import type { DashboardAuth } from "../dashboard/auth.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
@@ -772,9 +778,11 @@ export interface RunStartOptions {
    */
   importActor?: string;
   e2e?: RunStartE2EHooks;
-  role?: string;
+  /** Raw `--leader` CLI flag: shorthand for the single `leader` peer entry's url. */
   leader?: string;
+  /** Raw `--token-file` CLI flag: shorthand for the `leader` peer entry's tokenFile. */
   tokenFile?: string;
+  /** Raw `--instance-id` CLI flag. */
   instanceId?: string;
 }
 
@@ -1201,7 +1209,6 @@ async function composeStart(
     // throws on an unknown profile, so the cast to the canonical union is safe.
     config = loadConfig(mcHome, {
       profile: opts?.profile as ConfigProfile | undefined,
-      role: opts?.role as InstanceRole | undefined,
       leader: opts?.leader,
       tokenFile: opts?.tokenFile,
       instanceId: opts?.instanceId,
@@ -1216,7 +1223,8 @@ async function composeStart(
     return;
   }
 
-  if (config.role === "follower") {
+  const role = instanceRoleOf(config);
+  if (role === "follower") {
     await composeFollowerStart(config, opts, resources, bootLog);
     return;
   }
@@ -1311,7 +1319,7 @@ async function composeStart(
   resources.acquire("database", () => closeDb());
   log.info("database_ready", { home: mcHome });
   const identity = initInstanceIdentity(database, {
-    role: config.role ?? "leader",
+    role,
     configuredInstanceId: config.instance?.id,
   });
   log.info("instance_identity_ready", {
@@ -1319,7 +1327,7 @@ async function composeStart(
     bootId: identity.bootId,
     role: identity.role,
   });
-  getRepositories(config.role ?? "leader");
+  getRepositories(role);
   if (!config.auth) getRepositories().principals.ensureImplicitUser(new Date().toISOString());
 
   const modelClasses = getRepositories().modelClasses;
@@ -2975,13 +2983,20 @@ async function composeStart(
         `Failed to read follower tokenFile '${tokenFile}': ${err instanceof Error ? err.message : String(err)}`
       );
     }
-    followerHub = new FollowerHub(token, { logger: log, triggerStore: followerTriggerStore });
+    // Only the follower instance IDs listed in peers may enroll (#1024).
+    const allowedFollowerIds = followerAllowlistOf(config);
+    followerHub = new FollowerHub(token, {
+      logger: log,
+      triggerStore: followerTriggerStore,
+      allowedFollowerIds,
+    });
     await followerHub.listen(config.followers.bind, config.followers.port);
     const hub = followerHub;
     resources.acquire("follower gateway", () => hub.close());
     log.info("follower_gateway_started", {
       bind: config.followers.bind,
       port: config.followers.port,
+      allowedFollowerIds,
     });
   }
 

@@ -7,6 +7,10 @@ import type { Migration } from "./types.js";
  * Each rusa instance (leader or follower) records its stable identity, role,
  * and current boot identity in its local mesh.db. The stable instance_id survives
  * process restart while boot_id is minted fresh on every boot.
+ *
+ * `role` is not configured directly: it is derived from config.yaml `peers`
+ * (a `leader` entry makes the instance a follower, #1024) and recorded so a
+ * database first booted as one role refuses to boot as the other.
  */
 export const instanceIdentity: Migration = {
   id: "0061_instance_identity",

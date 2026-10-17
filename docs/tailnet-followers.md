@@ -30,14 +30,23 @@ are strictly refused.
 
 ## Persistent leader configuration (`rusa start`)
 
-In `config.yaml`, configure the `followers:` block:
+In `config.yaml`, configure the `followers:` block and list every follower
+allowed to enroll as a `peers` entry of type `follower`:
 
 ```yaml
 followers:
   bind: 100.x.y.z        # Tailscale IPv4 (100.64.0.0/10) or 127.0.0.1. Refuses 0.0.0.0.
   port: 8290
   tokenFile: /absolute/private/path/enrollment-token
+peers:
+  - id: <follower-name>  # the follower's --id (or its instance ID); required
+    type: follower
 ```
+
+The follower entries are a required allowlist: the leader refuses to start a
+gateway without at least one, and refuses enrollment (HTTP 403, logged as
+`follower_register_rejected` with reason `not_allowlisted`) from any instance
+ID not listed, even when it presents the valid enrollment token.
 
 Generate the enrollment token if needed:
 ```sh

@@ -152,12 +152,8 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     process.env.RUSA_HOME = home;
 
     writeConfigFile(home, {
-      role: "follower",
       providers: { codex: { cliCommand: "codex" } },
-      peer: {
-        leaderUrl: "http://127.0.0.1:8190",
-        token: "test-follower-token",
-      },
+      peers: [{ type: "leader", url: "http://127.0.0.1:8190", token: "test-follower-token" }],
       instance: {
         id: "worker-node-alpha",
       },
@@ -349,81 +345,50 @@ describe("shared startup, role authority, and local database (#1019)", () => {
   });
 
   it("validates conflicting and invalid configurations before side effects", async () => {
-    // 1. Follower lacking peer config
-    const home1 = makeTempHome();
-    writeConfigFile(home1, {
-      role: "follower",
-      providers: { codex: { cliCommand: "codex" } },
-    });
-    expect(() => loadConfig(home1)).toThrow(/follower role requires peer configuration/);
-    process.env.RUSA_HOME = home1;
-    await runStart();
-    expect(process.exit).toHaveBeenCalledWith(1);
-    expect(existsSync(join(home1, "data", "mesh.db"))).toBe(false);
-
-    // 2. Follower configuring followers gateway
-    const home2 = makeTempHome();
-    writeConfigFile(home2, {
-      role: "follower",
-      providers: { codex: { cliCommand: "codex" } },
-      peer: { leaderUrl: "http://127.0.0.1:8190", token: "secret" },
-      followers: {
-        bind: "127.0.0.1",
-        port: 8190,
-        tokenFile: "/path/to/token",
+    const leader = { type: "leader", url: "http://127.0.0.1:8190", token: "secret" };
+    const gateway = { bind: "127.0.0.1", port: 8190, tokenFile: "/path/to/token" };
+    const rootActor = { provider: "codex", model: "gpt-5.6-sol" };
+    const cases: Array<{ config: Record<string, unknown>; error: RegExp }> = [
+      // Removed top-level role key
+      { config: { role: "follower" }, error: /top-level role and peer are not supported/ },
+      // Follower configuring followers gateway
+      {
+        config: { peers: [leader], followers: gateway },
+        error: /a follower \(peers has a leader entry\) cannot configure followers gateway/,
       },
-    });
-    expect(() => loadConfig(home2)).toThrow(/follower role cannot configure followers gateway/);
-    process.env.RUSA_HOME = home2;
-    await runStart();
-    expect(process.exit).toHaveBeenCalledWith(1);
-    expect(existsSync(join(home2, "data", "mesh.db"))).toBe(false);
-
-    // 3. Leader configuring peer
-    const home3 = makeTempHome();
-    writeConfigFile(home3, {
-      role: "leader",
-      providers: { codex: { cliCommand: "codex" } },
-      rootActor: { provider: "codex", model: "gpt-5.6-sol" },
-      peer: { leaderUrl: "http://127.0.0.1:8190", token: "secret" },
-    });
-    expect(() => loadConfig(home3)).toThrow(/leader role cannot configure peer settings/);
-    process.env.RUSA_HOME = home3;
-    await runStart();
-    expect(process.exit).toHaveBeenCalledWith(1);
-    expect(existsSync(join(home3, "data", "mesh.db"))).toBe(false);
-
-    // 4. Unknown role
-    const home4 = makeTempHome();
-    writeConfigFile(home4, {
-      role: "satellite",
-      providers: { codex: { cliCommand: "codex" } },
-      rootActor: { provider: "codex", model: "gpt-5.6-sol" },
-    });
-    expect(() => loadConfig(home4)).toThrow(/role must be "leader" or "follower"/);
-    process.env.RUSA_HOME = home4;
-    await runStart();
-    expect(process.exit).toHaveBeenCalledWith(1);
-    expect(existsSync(join(home4, "data", "mesh.db"))).toBe(false);
-
-    // 5. Follower configuring both token and tokenFile
-    const home5 = makeTempHome();
-    writeConfigFile(home5, {
-      role: "follower",
-      providers: { codex: { cliCommand: "codex" } },
-      peer: {
-        leaderUrl: "http://127.0.0.1:8190",
-        token: "inline-token",
-        tokenFile: "/path/to/token",
+      // Leader entry alongside follower entries
+      {
+        config: { rootActor, peers: [leader, { id: "follower-a", type: "follower" }] },
+        error: /cannot contain both a leader entry and follower entries/,
       },
-    });
-    expect(() => loadConfig(home5)).toThrow(
-      /cannot configure both peer\.token and peer\.tokenFile/
-    );
-    process.env.RUSA_HOME = home5;
-    await runStart();
-    expect(process.exit).toHaveBeenCalledWith(1);
-    expect(existsSync(join(home5, "data", "mesh.db"))).toBe(false);
+      // More than one leader
+      { config: { peers: [leader, { ...leader }] }, error: /at most one leader entry/ },
+      // True peers are not supported yet
+      {
+        config: { rootActor, peers: [{ id: "other", type: "peer" }] },
+        error: /type peer is not supported yet/,
+      },
+      // Followers gateway without the required follower allowlist
+      {
+        config: { rootActor, github: { account: "x" }, followers: gateway },
+        error: /followers gateway requires at least one peers entry with type: follower/,
+      },
+      // Leader entry configuring both token and tokenFile
+      {
+        config: { peers: [{ ...leader, tokenFile: "/path/to/token" }] },
+        error: /cannot configure both token and tokenFile/,
+      },
+    ];
+    for (const { config, error } of cases) {
+      const home = makeTempHome();
+      writeConfigFile(home, { providers: { codex: { cliCommand: "codex" } }, ...config });
+      expect(() => loadConfig(home)).toThrow(error);
+      process.env.RUSA_HOME = home;
+      vi.mocked(process.exit).mockClear();
+      await runStart();
+      expect(process.exit).toHaveBeenCalledWith(1);
+      expect(existsSync(join(home, "data", "mesh.db"))).toBe(false);
+    }
   });
 
   it("executes actor through runStart follower composition with synthetic peer, recording local execution state and draining cleanly on shutdown", async () => {
@@ -590,12 +555,8 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     const leaderUrl = `http://127.0.0.1:${port}`;
 
     writeConfigFile(home, {
-      role: "follower",
       providers: { codex: { cliCommand: "follower-codex" } },
-      peer: {
-        leaderUrl,
-        token: "token-synthetic-xyz",
-      },
+      peers: [{ type: "leader", url: leaderUrl, token: "token-synthetic-xyz" }],
       instance: {
         id: "follower-node-synthetic",
       },
@@ -872,9 +833,8 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     await new Promise<void>((resolve) => leaderServer.listen(0, "127.0.0.1", resolve));
     const port = (leaderServer.address() as AddressInfo).port;
     writeConfigFile(home, {
-      role: "follower",
       providers: { codex: { cliCommand: "codex" } },
-      peer: { leaderUrl: `http://127.0.0.1:${port}`, token: "token-synthetic-fence" },
+      peers: [{ type: "leader", url: `http://127.0.0.1:${port}`, token: "token-synthetic-fence" }],
       instance: { id: "follower-node-fence" },
     });
 
@@ -1035,12 +995,8 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     const leaderUrl = `http://127.0.0.1:${port}`;
 
     writeConfigFile(home, {
-      role: "follower",
       providers: { codex: { cliCommand: "codex" } },
-      peer: {
-        leaderUrl,
-        token: "token-synthetic-drain",
-      },
+      peers: [{ type: "leader", url: leaderUrl, token: "token-synthetic-drain" }],
       instance: {
         id: "follower-node-drain",
       },
@@ -1254,9 +1210,8 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     await new Promise<void>((resolve) => leaderServer.listen(0, "127.0.0.1", resolve));
     const port = (leaderServer.address() as AddressInfo).port;
     writeConfigFile(home, {
-      role: "follower",
       providers: { codex: { cliCommand: "codex" } },
-      peer: { leaderUrl: `http://127.0.0.1:${port}`, token: "token-accounting-fault" },
+      peers: [{ type: "leader", url: `http://127.0.0.1:${port}`, token: "token-accounting-fault" }],
       instance: { id: "follower-node-accounting-fault" },
     });
 

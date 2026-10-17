@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { resolveHome } from "../config/loader.js";
+import { leaderPeerOf, resolveHome } from "../config/loader.js";
 import type { RusaConfig } from "../config/types.js";
 import { closeDb, getRepositories, initDb } from "../db/index.js";
 import { initInstanceIdentity } from "../db/instance-identity.js";
@@ -28,11 +28,12 @@ export class FollowerHttpError extends Error {
 }
 
 function resolveFollowerToken(config: RusaConfig): string {
-  if (config.peer?.token?.trim()) {
-    return config.peer.token.trim();
+  const leader = leaderPeerOf(config);
+  if (leader?.token?.trim()) {
+    return leader.token.trim();
   }
-  if (config.peer?.tokenFile?.trim()) {
-    const file = config.peer.tokenFile.trim();
+  if (leader?.tokenFile?.trim()) {
+    const file = leader.tokenFile.trim();
     if (!existsSync(file)) {
       throw new Error(`Follower peer token file not found at: ${file}`);
     }
@@ -42,7 +43,7 @@ function resolveFollowerToken(config: RusaConfig): string {
     }
     return content;
   }
-  throw new Error("Follower role requires peer.token or peer.tokenFile");
+  throw new Error("A follower's leader peer entry requires token or tokenFile");
 }
 
 export async function composeFollowerStart(
@@ -53,9 +54,9 @@ export async function composeFollowerStart(
 ): Promise<void> {
   const mcHome = resolveHome();
   const token = resolveFollowerToken(config);
-  const rawLeaderUrl = config.peer?.leaderUrl;
+  const rawLeaderUrl = leaderPeerOf(config)?.url;
   if (!rawLeaderUrl) {
-    throw new Error("config.yaml: peer.leaderUrl is required for follower role");
+    throw new Error("config.yaml: a follower's leader peer entry requires url");
   }
   const leaderUrl = new URL(rawLeaderUrl);
 

@@ -8816,6 +8816,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         followers: { bind: "127.0.0.1", port, tokenFile },
+        peers: [{ id: "mac-mini", type: "follower" }],
       }),
       "utf8"
     );

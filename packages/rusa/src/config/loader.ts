@@ -25,6 +25,7 @@ import {
   type GitHubConfig,
   type GitHubOrgConfig,
   type InstanceRole,
+  type PeerConfig,
   type QuotaThrottleConfig,
   type RusaConfig,
 } from "./types.js";
@@ -54,11 +55,9 @@ export interface LoadConfigOptions {
    * compile-time set the CLI passes in.
    */
   profile?: ConfigProfile;
-  /** Explicit instance role (leader or follower), overriding config.yaml. */
-  role?: InstanceRole;
-  /** Leader URL for follower peer connection, overriding config.yaml. */
+  /** `--leader`: URL of the single `leader` peer entry, overriding or creating it. */
   leader?: string;
-  /** Token file for follower peer connection, overriding config.yaml. */
+  /** `--token-file`: token file of the single `leader` peer entry, overriding config.yaml. */
   tokenFile?: string;
   /** Override local instance ID. */
   instanceId?: string;
@@ -149,23 +148,13 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   if (options?.profile !== undefined) {
     rawParsed.profile = options.profile;
   }
-  if (options?.role !== undefined) {
-    rawParsed.role = options.role;
+  if ("role" in rawParsed || "peer" in rawParsed) {
+    throw new Error(
+      "config.yaml: top-level role and peer are not supported; describe instance relationships with peers (a leader entry makes this instance a follower)"
+    );
   }
-  if (options?.leader !== undefined) {
-    rawParsed.peer = {
-      ...(rawParsed.peer && typeof rawParsed.peer === "object" ? rawParsed.peer : {}),
-      leaderUrl: options.leader,
-    };
-  }
-  if (options?.tokenFile !== undefined) {
-    rawParsed.peer = {
-      ...(rawParsed.peer && typeof rawParsed.peer === "object" ? rawParsed.peer : {}),
-      tokenFile: options.tokenFile,
-    };
-    if (rawParsed.peer && typeof rawParsed.peer === "object") {
-      delete (rawParsed.peer as Record<string, unknown>).token;
-    }
+  if (options?.leader !== undefined || options?.tokenFile !== undefined) {
+    applyLeaderShorthand(rawParsed, options.leader, options.tokenFile);
   }
   if (options?.instanceId !== undefined) {
     rawParsed.instance = {
@@ -176,12 +165,9 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
 
   const parsed = applyProfile(rawParsed);
 
-  // Validate role & peer configuration before side effects
-  const role = parsed.role ?? "leader";
-  if (role !== "leader" && role !== "follower") {
-    throw new Error('config.yaml: role must be "leader" or "follower"');
-  }
-  parsed.role = role;
+  // Validate peer relationships before side effects
+  validatePeers(parsed);
+  const role = instanceRoleOf(parsed);
 
   if (parsed.instance !== undefined) {
     if (
@@ -199,66 +185,28 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     }
   }
 
-  if (parsed.role === "follower") {
-    if (
-      parsed.peer === undefined ||
-      typeof parsed.peer !== "object" ||
-      parsed.peer === null ||
-      Array.isArray(parsed.peer)
-    ) {
-      throw new Error("config.yaml: follower role requires peer configuration");
-    }
-    if (typeof parsed.peer.leaderUrl !== "string" || !parsed.peer.leaderUrl.trim()) {
-      throw new Error("config.yaml: peer.leaderUrl must be a non-empty URL string");
-    }
-    parsed.peer.leaderUrl = parsed.peer.leaderUrl.trim();
-    try {
-      const u = new URL(parsed.peer.leaderUrl);
-      if (u.protocol !== "http:" && u.protocol !== "https:") {
-        throw new Error();
-      }
-    } catch {
-      throw new Error("config.yaml: peer.leaderUrl must be a valid http or https URL");
-    }
-    if (!parsed.peer.token && !parsed.peer.tokenFile) {
-      throw new Error("config.yaml: peer configuration requires token or tokenFile");
-    }
-    if (parsed.peer.token && parsed.peer.tokenFile) {
-      throw new Error(
-        "config.yaml: cannot configure both peer.token and peer.tokenFile; choose one"
-      );
-    }
-    if (parsed.peer.token !== undefined) {
-      if (typeof parsed.peer.token !== "string" || !parsed.peer.token.trim()) {
-        throw new Error("config.yaml: peer.token must be a non-empty string when set");
-      }
-      parsed.peer.token = parsed.peer.token.trim();
-    }
-    if (parsed.peer.tokenFile !== undefined) {
-      if (typeof parsed.peer.tokenFile !== "string" || !parsed.peer.tokenFile.trim()) {
-        throw new Error("config.yaml: peer.tokenFile must be a non-empty string when set");
-      }
-      const rawTokenFile = parsed.peer.tokenFile.trim();
-      parsed.peer.tokenFile =
-        rawTokenFile === "~" || rawTokenFile.startsWith("~/")
-          ? join(homedir(), rawTokenFile.slice(2))
-          : rawTokenFile;
-    }
-    if (parsed.followers !== undefined) {
-      throw new Error("config.yaml: follower role cannot configure followers gateway");
-    }
-  } else {
-    // role is leader
-    if (parsed.peer !== undefined) {
-      throw new Error("config.yaml: leader role cannot configure peer settings");
-    }
+  if (role === "follower" && parsed.followers !== undefined) {
+    throw new Error(
+      "config.yaml: a follower (peers has a leader entry) cannot configure followers gateway"
+    );
+  }
+  const allowlist = followerAllowlistOf(parsed);
+  if (allowlist.length > 0 && parsed.followers === undefined) {
+    throw new Error(
+      "config.yaml: peers follower entries require the followers gateway (followers.bind/port/tokenFile)"
+    );
+  }
+  if (parsed.followers !== undefined && allowlist.length === 0) {
+    throw new Error(
+      'config.yaml: followers gateway requires at least one peers entry with type: follower; only listed follower instance IDs may enroll (e.g. peers: [{ id: "<follower instance id>", type: follower }])'
+    );
   }
 
   validateDashboardAuth(parsed.auth);
   resolveErrorSink(parsed);
 
   // Basic validation & defaulting
-  if (parsed.role !== "follower" && !parsed.github) {
+  if (role !== "follower" && !parsed.github) {
     throw new Error("config.yaml: github configuration is required");
   }
   if (parsed.github) {
@@ -873,6 +821,140 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
  * quickstart). Warns — without ever logging a value — when both are set, as a
  * migration nudge to remove the inline copy.
  */
+/** Instance IDs a follower sends at enrollment; the follower gateway's own check. */
+const PEER_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+
+/**
+ * This instance's local role, derived from `peers`: a `leader` entry makes it a
+ * follower; otherwise it is a leader (#1024).
+ */
+export function instanceRoleOf(config: Pick<RusaConfig, "peers">): InstanceRole {
+  return leaderPeerOf(config) ? "follower" : "leader";
+}
+
+/** The single configured `leader` peer entry, if this instance is a follower. */
+export function leaderPeerOf(config: Pick<RusaConfig, "peers">): PeerConfig | undefined {
+  return config.peers?.find((peer) => peer.type === "leader");
+}
+
+/** Follower instance IDs a leader allows to enroll through its gateway. */
+export function followerAllowlistOf(config: Pick<RusaConfig, "peers">): string[] {
+  return (config.peers ?? [])
+    .filter((peer) => peer.type === "follower")
+    .map((peer) => peer.id as string);
+}
+
+/**
+ * `--leader` / `--token-file` are shorthand for one `leader` peer entry: they
+ * override the configured leader entry's url/tokenFile, or create the entry
+ * when none exists. Other entries are left for {@link validatePeers} to judge.
+ */
+function applyLeaderShorthand(
+  rawParsed: RusaConfig,
+  leader: string | undefined,
+  tokenFile: string | undefined
+): void {
+  const peers: unknown[] = Array.isArray(rawParsed.peers) ? [...rawParsed.peers] : [];
+  const index = peers.findIndex(
+    (peer) => isPlainObject(peer) && (peer as { type?: unknown }).type === "leader"
+  );
+  if (index < 0 && leader === undefined) {
+    throw new Error("--token-file requires --leader or a configured leader peer entry");
+  }
+  const entry: Record<string, unknown> =
+    index >= 0 ? { ...(peers[index] as Record<string, unknown>) } : { type: "leader" };
+  if (leader !== undefined) entry.url = leader;
+  if (tokenFile !== undefined) {
+    entry.tokenFile = tokenFile;
+    delete entry.token;
+  }
+  if (index >= 0) peers[index] = entry;
+  else peers.push(entry);
+  rawParsed.peers = peers as PeerConfig[];
+}
+
+function validatePeers(parsed: RusaConfig): void {
+  if (parsed.peers === undefined) return;
+  if (!Array.isArray(parsed.peers)) {
+    throw new Error("config.yaml: peers must be a list when set");
+  }
+  const seenIds = new Set<string>();
+  let leaders = 0;
+  let followers = 0;
+  parsed.peers.forEach((peer, index) => {
+    const at = `config.yaml: peers[${index}]`;
+    if (!isPlainObject(peer)) throw new Error(`${at} must be a mapping`);
+    if (peer.type === "peer") {
+      throw new Error(
+        `${at}: type peer is not supported yet; cross-instance peers are tracked in #1101`
+      );
+    }
+    if (peer.type !== "leader" && peer.type !== "follower") {
+      throw new Error(`${at}.type must be "leader" or "follower"`);
+    }
+    if (peer.id !== undefined || peer.type === "follower") {
+      if (typeof peer.id !== "string" || !PEER_ID_PATTERN.test(peer.id.trim())) {
+        throw new Error(
+          `${at}.id must be an instance ID of 1-64 letters, digits, "_" or "-"${peer.type === "follower" ? " (required on follower entries)" : ""}`
+        );
+      }
+      peer.id = peer.id.trim();
+      if (seenIds.has(peer.id)) throw new Error(`${at}.id duplicates ${JSON.stringify(peer.id)}`);
+      seenIds.add(peer.id);
+    }
+    if (peer.type === "follower") {
+      followers++;
+      for (const key of ["url", "token", "tokenFile"] as const) {
+        if (peer[key] !== undefined) {
+          throw new Error(
+            `${at}.${key} is not used on a follower entry; the leader's followers gateway holds the enrollment token`
+          );
+        }
+      }
+      return;
+    }
+    leaders++;
+    if (typeof peer.url !== "string" || !peer.url.trim()) {
+      throw new Error(`${at}.url must be the leader's http or https URL`);
+    }
+    peer.url = peer.url.trim();
+    try {
+      const u = new URL(peer.url);
+      if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error();
+    } catch {
+      throw new Error(`${at}.url must be a valid http or https URL`);
+    }
+    if (peer.token !== undefined && peer.tokenFile !== undefined) {
+      throw new Error(`${at}: cannot configure both token and tokenFile; choose one`);
+    }
+    if (peer.token === undefined && peer.tokenFile === undefined) {
+      throw new Error(`${at}: a leader entry requires token or tokenFile`);
+    }
+    if (peer.token !== undefined) {
+      if (typeof peer.token !== "string" || !peer.token.trim()) {
+        throw new Error(`${at}.token must be a non-empty string when set`);
+      }
+      peer.token = peer.token.trim();
+    }
+    if (peer.tokenFile !== undefined) {
+      if (typeof peer.tokenFile !== "string" || !peer.tokenFile.trim()) {
+        throw new Error(`${at}.tokenFile must be a non-empty string when set`);
+      }
+      const rawTokenFile = peer.tokenFile.trim();
+      peer.tokenFile =
+        rawTokenFile === "~" || rawTokenFile.startsWith("~/")
+          ? join(homedir(), rawTokenFile.slice(2))
+          : rawTokenFile;
+    }
+  });
+  if (leaders > 1) throw new Error("config.yaml: peers may contain at most one leader entry");
+  if (leaders > 0 && followers > 0) {
+    throw new Error(
+      "config.yaml: peers cannot contain both a leader entry and follower entries; chained followers are not supported"
+    );
+  }
+}
+
 function warnDuplicateSecret(inlineName: string, secretFilename: string, term = "key"): void {
   console.warn(
     `[config] ${inlineName} is set inline in config.yaml AND ${SECRETS_DIRNAME}/${secretFilename} exists — the secrets file wins. Remove the inline ${term}.`
