@@ -25,17 +25,29 @@ import {
   manualQuotaObservationProblem,
   type PublishedThrottleColdStatus,
   type PublishedThrottleLaneStatus,
+  type PublishedThrottleProviderStatus,
   publishedThrottle,
   QUOTA_READING_MODE_PATH,
+  QUOTA_SPRINT_PATH,
   type QuotaCoordinatorError,
   type QuotaCoordinatorErrorResponse,
   type QuotaCoordinatorPathMismatchError,
   type QuotaCoordinatorServiceInfo,
   type QuotaReadingModeResponse,
   type QuotaReadyScrapeStatus,
+  type QuotaSprintActionResponse,
+  type QuotaSprintArmRequest,
+  type QuotaSprintCancelRequest,
+  type QuotaSprintLanePacing,
+  type QuotaSprintStatusResponse,
 } from "./coordinator-protocol.js";
+import { QuotaSprintRegistry } from "./quota-sprint.js";
 import { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION } from "./schema-guard.js";
-import type { QuotaReadingMode, SharedQuotaStore } from "./shared-store.js";
+import type {
+  PersistedQuotaProviderStatus,
+  QuotaReadingMode,
+  SharedQuotaStore,
+} from "./shared-store.js";
 
 /** The GET-only read surface. */
 export const SERVED_ROUTES = [
@@ -55,11 +67,19 @@ export const SERVED_ROUTES = [
  */
 export const WRITE_ROUTES = [QUOTA_READING_MODE_PATH, MANUAL_QUOTA_OBSERVATION_PATH] as const;
 
+/**
+ * Operator routes that serve both a GET status read and a POST action (#861).
+ * Declared apart from both sets above for the same reason: the methods each
+ * path allows are enumerated, never inferred.
+ */
+export const READ_WRITE_ROUTES = [QUOTA_SPRINT_PATH] as const;
+
 /** True for a path this service routes, read or write; the metric label set. */
 function isRoutedPath(pathname: string): boolean {
   return (
     (SERVED_ROUTES as readonly string[]).includes(pathname) ||
-    (WRITE_ROUTES as readonly string[]).includes(pathname)
+    (WRITE_ROUTES as readonly string[]).includes(pathname) ||
+    (READ_WRITE_ROUTES as readonly string[]).includes(pathname)
   );
 }
 
@@ -105,6 +125,8 @@ export interface QuotaCoordinatorServiceOptions {
    */
   collectionStats?: () => Record<string, Readonly<QuotaCollectionStats>>;
   logger?: Logger;
+  /** Fixed boot ID for tests; a fresh random one per process otherwise. */
+  bootId?: string;
 }
 
 export class QuotaCoordinatorService {
@@ -117,6 +139,7 @@ export class QuotaCoordinatorService {
   private readonly manualHardStaleAfterMs: number;
   private readonly metrics: QuotaMetrics;
   private readonly log: Logger;
+  private readonly sprints: QuotaSprintRegistry;
 
   constructor(readonly options: QuotaCoordinatorServiceOptions) {
     this.metrics = options.metrics ?? nullQuotaMetrics;
@@ -129,6 +152,62 @@ export class QuotaCoordinatorService {
     // move the other's fail-safe (#690).
     this.manualHardStaleAfterMs =
       options.manualHardStaleAfterMs ?? DEFAULT_MANUAL_HARD_STALE_AFTER_MS;
+    this.sprints = new QuotaSprintRegistry({
+      store: options.store,
+      now: () => this.nowMs(),
+      freshness: (mode) => this.freshnessThresholds(mode),
+      bootId: options.bootId,
+    });
+  }
+
+  private nowMs(): number {
+    return this.options.now ? this.options.now() : Date.now();
+  }
+
+  /**
+   * One provider's published lane, cold when nothing is stored. While a sprint
+   * is armed (#861) the lane values are the effective ones: the target weekly
+   * bucket enters the governing election with zero delay, unless its evidence
+   * has gone stale, and the `sprint` block carries the ordinary decision.
+   */
+  private providerThrottle(
+    provider: string,
+    nowMs: number
+  ): PublishedThrottleProviderStatus | PublishedThrottleColdStatus {
+    const ordinary = this.options.store.getProviderThrottle(provider);
+    if (!ordinary) return this.coldThrottle(provider);
+    const policy = this.sprints.current(provider);
+    const relax = this.sprints.relaxation(provider);
+    const effective = relax
+      ? (this.options.store.getProviderThrottle(provider, { relax }) ?? ordinary)
+      : ordinary;
+    const published = this.publish(provider, effective, nowMs);
+    if (!policy) return published;
+    return {
+      ...published,
+      sprint: {
+        armId: policy.armId,
+        bucketKey: policy.bucketKey,
+        models: [...policy.models],
+        state: policy.state,
+        expiresAt: policy.expiresAt,
+        ordinary: lanePacing(this.publish(provider, ordinary, nowMs), policy.models),
+      },
+    };
+  }
+
+  private publish(
+    provider: string,
+    stored: PersistedQuotaProviderStatus,
+    nowMs: number
+  ): PublishedThrottleProviderStatus {
+    const { mode } = this.options.store.getQuotaReadingMode(provider);
+    return publishedThrottle(stored, {
+      maxIntervalSeconds: this.maxIntervalSeconds,
+      ...this.freshnessThresholds(mode),
+      nowMs,
+      mode,
+    });
   }
 
   private freshnessThresholds(mode: "manual" | "scrape" | undefined) {
@@ -396,6 +475,26 @@ export class QuotaCoordinatorService {
       return;
     }
 
+    if (pathname === QUOTA_SPRINT_PATH) {
+      if (req.method === "GET") {
+        this.sprintStatus(url, res, serviceInfo);
+      } else if (req.method === "POST") {
+        await this.sprintAction(req, res, serviceInfo);
+      } else {
+        this.sendError(
+          res,
+          405,
+          {
+            code: "method_not_allowed",
+            message: `Method ${req.method} not allowed on ${pathname}; only GET and POST are permitted`,
+            retryable: false,
+          },
+          { Allow: "GET, POST" }
+        );
+      }
+      return;
+    }
+
     // Per §5.2 and Criterion 7: every v1 path other than the two write routes
     // above is a GET. Any other method returns 405, and no GET path reads a body.
     if (pathname.startsWith("/v1/")) {
@@ -438,26 +537,9 @@ export class QuotaCoordinatorService {
           return;
         }
 
-        const stored = this.options.store.getProviderThrottle(provider);
-        if (!stored) {
-          this.sendJson(res, 200, {
-            service: serviceInfo,
-            ...this.coldThrottle(provider),
-          });
-          return;
-        }
-
-        const { mode } = this.options.store.getQuotaReadingMode(provider);
-        const published = publishedThrottle(stored, {
-          maxIntervalSeconds: this.maxIntervalSeconds,
-          ...this.freshnessThresholds(mode),
-          nowMs,
-          mode,
-        });
-
         this.sendJson(res, 200, {
           service: serviceInfo,
-          ...published,
+          ...this.providerThrottle(provider, nowMs),
         });
         return;
       }
@@ -466,16 +548,7 @@ export class QuotaCoordinatorService {
       // provider, cold lanes included (criterion 16).
       const providersMap: Record<string, PublishedThrottleLaneStatus> = {};
       for (const p of this.configuredProviders) {
-        const stored = this.options.store.getProviderThrottle(p);
-        const { mode } = this.options.store.getQuotaReadingMode(p);
-        providersMap[p] = stored
-          ? publishedThrottle(stored, {
-              maxIntervalSeconds: this.maxIntervalSeconds,
-              ...this.freshnessThresholds(mode),
-              nowMs,
-              mode,
-            })
-          : this.coldThrottle(p);
+        providersMap[p] = this.providerThrottle(p, nowMs);
       }
 
       this.sendJson(res, 200, {
@@ -845,4 +918,177 @@ export class QuotaCoordinatorService {
     }[result.result];
     this.sendError(res, failure.status, { ...failure, retryable: false });
   }
+
+  /** `quota-sprint status`: one provider's sprint policy beside its actual readings. */
+  private sprintStatus(
+    url: URL,
+    res: http.ServerResponse,
+    serviceInfo: QuotaCoordinatorServiceInfo
+  ): void {
+    const provider = this.configuredProvider(url.searchParams.get("provider")?.trim() ?? "");
+    if (!provider) {
+      this.sendError(res, 404, {
+        code: "provider_unknown",
+        message: "Query parameter ?provider= is missing or not configured on this coordinator",
+        retryable: false,
+      });
+      return;
+    }
+    const nowMs = this.nowMs();
+    const snapshot = this.sprints.snapshot(provider);
+    const ordinary = this.options.store.getProviderThrottle(provider);
+    const effective = this.providerThrottle(provider, nowMs);
+    const models = snapshot.policy?.models ?? [];
+    this.sendJson<QuotaSprintStatusResponse>(res, 200, {
+      service: serviceInfo,
+      provider,
+      ...snapshot,
+      pacing:
+        ordinary && "intervalSeconds" in effective
+          ? {
+              ordinary: lanePacing(this.publish(provider, ordinary, nowMs), models),
+              effective: lanePacing(effective, models),
+            }
+          : null,
+    });
+  }
+
+  /** `quota-sprint arm|cancel`: change one provider's in-memory sprint policy. */
+  private async sprintAction(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    serviceInfo: QuotaCoordinatorServiceInfo
+  ): Promise<void> {
+    let body: unknown;
+    try {
+      body = await this.readJsonBody(req);
+    } catch (error) {
+      this.sendError(res, 400, {
+        code: "invalid_request",
+        message: error instanceof Error ? error.message : String(error),
+        retryable: false,
+      });
+      return;
+    }
+    const request = body as Record<string, unknown> | null;
+    if (typeof request !== "object" || request === null || Array.isArray(request)) {
+      this.sendError(res, 400, {
+        code: "invalid_request",
+        message: "Body must be a sprint action object",
+        retryable: false,
+      });
+      return;
+    }
+    const provider = this.configuredProvider(request.provider);
+    if (!provider) {
+      this.sendError(res, 404, {
+        code: "provider_unknown",
+        message: "Provider is missing or not configured on this coordinator",
+        retryable: false,
+      });
+      return;
+    }
+    const problem = sprintRequestProblem(request);
+    if (problem !== null) {
+      this.sendError(res, 400, { code: "invalid_request", message: problem, retryable: false });
+      return;
+    }
+    const action = request.action as "arm" | "cancel";
+    const result =
+      action === "arm"
+        ? this.sprints.arm({ ...(request as unknown as QuotaSprintArmRequest), provider })
+        : this.sprints.cancel({ ...(request as unknown as QuotaSprintCancelRequest), provider });
+    if (!result.ok) {
+      this.sendError(res, result.status, result.error);
+      return;
+    }
+    if (!result.duplicate) {
+      this.log.info("quota_sprint_changed", {
+        provider,
+        action,
+        ...this.sprints.retained(provider),
+      });
+    }
+    this.sendJson<QuotaSprintActionResponse>(res, 200, {
+      service: serviceInfo,
+      provider,
+      action,
+      boot: { id: this.sprints.bootId, startedAt: this.sprints.bootStartedAt },
+      duplicate: result.duplicate,
+      ...this.sprints.retained(provider),
+    });
+  }
+}
+
+/**
+ * The lane holding a sprint's target: the provider lane for a provider bucket,
+ * otherwise the model lane with exactly the target's models. A model lane the
+ * status no longer publishes falls back to the provider lane, which still binds.
+ */
+function lanePacing(
+  status: PublishedThrottleProviderStatus,
+  models: readonly string[]
+): QuotaSprintLanePacing {
+  const lane =
+    models.length === 0
+      ? status
+      : (status.modelLanes?.find(
+          (candidate) =>
+            candidate.models.length === models.length &&
+            candidate.models.every((model, index) => model === models[index])
+        ) ?? status);
+  return {
+    intervalSeconds: lane.intervalSeconds,
+    uncappedIntervalSeconds: lane.uncappedIntervalSeconds,
+    governingBucketKey: lane.governingBucketKey,
+    capped: lane.capped,
+    expired: lane.expired,
+    exhaustedUntil: lane.exhaustedUntil,
+    stale: lane.freshness.stale,
+    hardStale: lane.freshness.hardStale,
+  };
+}
+
+const SPRINT_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const UTC_INSTANT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z$/;
+
+function isInstant(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+/** The shape problem with a sprint action body, or null when it is well formed. */
+function sprintRequestProblem(request: Record<string, unknown>): string | null {
+  if (request.action !== "arm" && request.action !== "cancel") {
+    return "action must be arm or cancel";
+  }
+  if (typeof request.bootId !== "string" || !request.bootId) {
+    return "bootId must be the boot ID that status reported";
+  }
+  if (!Number.isSafeInteger(request.revision) || (request.revision as number) < 0) {
+    return "revision must be the integer revision that status reported";
+  }
+  if (request.action === "cancel") {
+    return typeof request.armId === "string" && SPRINT_ID_PATTERN.test(request.armId)
+      ? null
+      : "armId must name the arm to cancel";
+  }
+  if (typeof request.requestId !== "string" || !SPRINT_ID_PATTERN.test(request.requestId)) {
+    return "requestId must be 1-128 characters of letters, digits, '.', '_', ':' or '-'";
+  }
+  if (typeof request.bucket !== "string" || !request.bucket) {
+    return "bucket must be a weekly bucket key that status reported";
+  }
+  if (!isInstant(request.cycleAnchor)) {
+    return "cycleAnchor must be the bucket's observed reset instant";
+  }
+  if (!Number.isSafeInteger(request.generation)) {
+    return "generation must be the reading-mode generation that status reported";
+  }
+  if (!isInstant(request.expiresAt) || !UTC_INSTANT_PATTERN.test(request.expiresAt)) {
+    return "expiresAt must be an explicit UTC instant, such as 2026-10-20T12:00:00Z";
+  }
+  if (request.confirmResetUsable !== true) {
+    return "confirmResetUsable must be true: the operator confirms one reset is usable";
+  }
+  return null;
 }

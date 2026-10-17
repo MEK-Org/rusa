@@ -21,7 +21,10 @@ import {
   type PublishedThrottleCollectionResponse,
   type PublishedThrottleProviderStatus,
   type PublishedThrottleResponse,
+  QUOTA_SPRINT_PATH,
   type QuotaFreshness,
+  type QuotaSprintArmRequest,
+  type QuotaSprintCancelRequest,
   validateProtocolMajor,
 } from "./coordinator-protocol.js";
 
@@ -843,7 +846,52 @@ export class QuotaCoordinatorClient {
       generation: request.generation,
       observation: request.snapshot,
     });
+    return this.operatorRequest(
+      "manual reading write",
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      payload,
+      { "idempotency-key": request.idempotencyKey }
+    );
+  }
 
+  /**
+   * Read one provider's sprint status (#861). Like the manual write, the answer
+   * comes back verbatim so the operator command can check the protocol minor
+   * and report the service's own envelope.
+   */
+  getSprintStatus(provider: string): Promise<ManualReadingResult> {
+    return this.operatorRequest(
+      "sprint status read",
+      `${QUOTA_SPRINT_PATH}?provider=${encodeURIComponent(provider)}`,
+      "GET"
+    );
+  }
+
+  /** Arm or cancel one provider's sprint (#861); the answer comes back verbatim. */
+  postSprintAction(
+    request: QuotaSprintArmRequest | QuotaSprintCancelRequest
+  ): Promise<ManualReadingResult> {
+    return this.operatorRequest(
+      `sprint ${request.action}`,
+      QUOTA_SPRINT_PATH,
+      "POST",
+      JSON.stringify(request)
+    );
+  }
+
+  /**
+   * One operator request over the socket. Any HTTP response is returned as
+   * sent; only a transport failure or timeout is reported as not reached. It
+   * never touches the read path's connection state or backoff.
+   */
+  private operatorRequest(
+    label: string,
+    path: string,
+    method: "GET" | "POST",
+    payload?: string,
+    headers: Record<string, string> = {}
+  ): Promise<ManualReadingResult> {
     return new Promise((resolve) => {
       let settled = false;
       let deadlineTimer: NodeJS.Timeout | undefined;
@@ -859,22 +907,23 @@ export class QuotaCoordinatorClient {
 
       const fail = (err: unknown): void => {
         const error = err instanceof Error ? err.message : String(err);
-        this.options.logger?.warn(
-          `[quota-client] Coordinator manual reading write failed: ${error}`
-        );
+        this.options.logger?.warn(`[quota-client] Coordinator ${label} failed: ${error}`);
         finish({ reached: false, error });
       };
 
       const req = http.request(
         {
           socketPath: this.options.socketPath,
-          path: MANUAL_QUOTA_OBSERVATION_PATH,
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "content-length": Buffer.byteLength(payload),
-            "idempotency-key": request.idempotencyKey,
-          },
+          path,
+          method,
+          headers:
+            payload === undefined
+              ? headers
+              : {
+                  "content-type": "application/json",
+                  "content-length": Buffer.byteLength(payload),
+                  ...headers,
+                },
         },
         (res) => {
           let data = "";
@@ -893,7 +942,7 @@ export class QuotaCoordinatorClient {
 
       const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
       deadlineTimer = setTimeout(() => {
-        req.destroy(new Error(`coordinator manual reading write timed out after ${timeoutMs}ms`));
+        req.destroy(new Error(`coordinator ${label} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       deadlineTimer.unref?.();
 

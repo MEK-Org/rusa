@@ -17,7 +17,11 @@ import {
 import type { PublishedScrapeOutcome } from "./coordinator-protocol.js";
 import { configuredModelRefs, resolveWindowModels } from "./model-window-scope.js";
 import { extractedNoQuotaValues, parseParsedState, serializeParsedState } from "./parsed-state.js";
-import { QUOTA_OBSERVATION_SLOT_MS, quotaCycleChanged } from "./quota-cycle.js";
+import {
+  QUOTA_OBSERVATION_SLOT_MS,
+  quotaCycleChanged,
+  verifiedQuotaCycleTransition,
+} from "./quota-cycle.js";
 import {
   assertQuotaSchemaVersion,
   QUOTA_SCHEMA_VERSION,
@@ -181,6 +185,22 @@ export interface QuotaControllerResetResult {
   clearedDecisions: number;
   /** Canonical observations still stored for the provider; the reset never removes one. */
   observations: number;
+}
+
+export interface QuotaThrottleElectionOptions {
+  /**
+   * One bucket whose ordinary decision enters the governing election as zero
+   * delay (#861): an armed sprint's target. Every other bucket, the published
+   * per-bucket decisions and the exhaustion gate are unchanged.
+   */
+  relax?: { modelScope: string; kind: QuotaWindowKind };
+}
+
+/** The newest observation of one lane, as the sprint policy reads it (#861). */
+export interface QuotaLaneObservation extends CanonicalQuotaObservation {
+  modelScope: string;
+  models: string[];
+  key: string;
 }
 
 export interface PersistedQuotaBucketStatus {
@@ -407,7 +427,7 @@ function resolveManualModelScopes(
   return { limits: kept, dropped };
 }
 
-function bucketKey(provider: string, models: readonly string[], kind: string): string {
+export function bucketKey(provider: string, models: readonly string[], kind: string): string {
   return models.length === 0 ? `${provider}:${kind}` : `${provider}[${models.join(",")}]:${kind}`;
 }
 
@@ -1187,7 +1207,16 @@ export class SharedQuotaStore {
     // `QUOTA_KD_SECONDS_SQUARED_PER_POINT` and `QUOTA_DERIVATIVE_TAU_SECONDS`
     // share an 1800 s constant, so the misread relaxes the interval across
     // roughly half an hour of subsequent observations.
-    const cycleChanged = quotaCycleChanged(previous, observation, observation.windowMs);
+    //
+    // A verified new weekly cycle (#861) goes one step further and also drops
+    // the prior actuator period, so a redemption or natural rollover does not
+    // unwind the old week's interval across the new week's first observations.
+    // Only this weekly bucket is affected: every other bucket finds its own
+    // `previous` row and keeps its memory.
+    const verifiedWeeklyCycle =
+      observation.kind === "weekly" && verifiedQuotaCycleTransition(previous, observation);
+    const cycleChanged =
+      verifiedWeeklyCycle || quotaCycleChanged(previous, observation, observation.windowMs);
     const previousObservedMs = previous ? Date.parse(previous.observedAt) : Number.NaN;
     const dtSeconds = Number.isFinite(previousObservedMs)
       ? Math.max(1, (observedMs - previousObservedMs) / 1000)
@@ -1224,9 +1253,12 @@ export class SharedQuotaStore {
       integral = Math.max(candidateIntegral, Math.min(previousIntegral, lowerBound));
     }
     const uncappedCandidate = Math.max(0, rawInterval(integral));
-    // A rollover resets the controller memory, not the actuator. This resumes
-    // from the last reasoned period rather than treating the exhaustion wait as one.
-    const previousInterval = previous?.intervalSeconds ?? 0;
+    // An unverified rollover resets the controller memory, not the actuator.
+    // This resumes from the last reasoned period rather than treating the
+    // exhaustion wait as one. A verified weekly cycle starts the actuator from
+    // zero too; the new row then carries that baseline, so a restart cannot
+    // resurrect the old week's period.
+    const previousInterval = verifiedWeeklyCycle ? 0 : (previous?.intervalSeconds ?? 0);
     // Ingestion produces one durable observation per actual scrape/manual POST;
     // cache reads and collection ticks only see the already-persisted state, so
     // `dtSeconds` here is the elapsed time between persisted observations, not
@@ -1426,14 +1458,65 @@ export class SharedQuotaStore {
   }
 
   /**
+   * The newest observation of every lane of `kind` for a provider, one per
+   * model scope, provider scope first. A row whose stored scope does not
+   * decode is not evidence for any lane and is left out.
+   */
+  listLatestLaneObservations(provider: string, kind: QuotaWindowKind): QuotaLaneObservation[] {
+    const rows = this.db
+      .prepare(
+        `SELECT provider, model_scope AS modelScope, kind, label,
+                observed_at AS observedAt, percent_left AS percentLeft,
+                reset_at_iso AS resetAtIso, window_ms AS windowMs
+         FROM quota_observations o
+         WHERE provider = ? AND kind = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM quota_observations newer
+             WHERE newer.provider = o.provider AND newer.model_scope = o.model_scope
+               AND newer.kind = o.kind
+               AND (newer.observed_at > o.observed_at OR
+                    (newer.observed_at = o.observed_at AND newer.rowid > o.rowid))
+           )
+         ORDER BY model_scope ASC`
+      )
+      .all(provider, kind) as Array<CanonicalQuotaObservation & { modelScope: string }>;
+    return rows.flatMap((row): QuotaLaneObservation[] => {
+      const models = parseModelScopeKey(row.modelScope);
+      if (models === null) return [];
+      return [{ ...row, models, key: bucketKey(provider, models, row.kind) }];
+    });
+  }
+
+  /** Observations of one lane at or after `sinceIso`, oldest first. */
+  listLaneObservationsSince(
+    provider: string,
+    modelScope: string,
+    kind: QuotaWindowKind,
+    sinceIso: string
+  ): CanonicalQuotaObservation[] {
+    return this.db
+      .prepare(
+        `SELECT provider, kind, label, observed_at AS observedAt,
+                percent_left AS percentLeft, reset_at_iso AS resetAtIso, window_ms AS windowMs
+         FROM quota_observations
+         WHERE provider = ? AND model_scope = ? AND kind = ? AND observed_at >= ?
+         ORDER BY observed_at ASC, rowid ASC`
+      )
+      .all(provider, modelScope, kind, sinceIso) as CanonicalQuotaObservation[];
+  }
+
+  /**
    * The provider-wide lane's persisted status, with one `modelLanes` entry per
    * model scope that has reasoned evidence (#588). Each lane is elected from
    * its own rows only: a model-scoped reading never enters the provider
    * lane's governing election, and the provider's rows never enter a model
    * lane's. Combining them for a concrete candidate is the client's job.
    */
-  getProviderThrottle(provider: string): PersistedQuotaProviderStatus | null {
-    const status = this.scopeThrottle(provider, PROVIDER_SCOPE_KEY);
+  getProviderThrottle(
+    provider: string,
+    options: QuotaThrottleElectionOptions = {}
+  ): PersistedQuotaProviderStatus | null {
+    const status = this.scopeThrottle(provider, PROVIDER_SCOPE_KEY, [], options.relax);
     if (!status) return null;
     const scopes = this.db
       .prepare(
@@ -1446,7 +1529,7 @@ export class SharedQuotaStore {
     for (const { modelScope } of scopes) {
       const models = parseModelScopeKey(modelScope);
       if (!models || models.length === 0) continue;
-      const lane = this.scopeThrottle(provider, modelScope, models);
+      const lane = this.scopeThrottle(provider, modelScope, models, options.relax);
       if (lane) modelLanes.push({ ...lane, models });
     }
     return modelLanes.length > 0 ? { ...status, modelLanes } : status;
@@ -1455,7 +1538,8 @@ export class SharedQuotaStore {
   private scopeThrottle(
     provider: string,
     modelScope: string,
-    models: readonly string[] = []
+    models: readonly string[] = [],
+    relax?: QuotaThrottleElectionOptions["relax"]
   ): Omit<PersistedQuotaProviderStatus, "modelLanes"> | null {
     const reasoned = this.db
       .prepare(
@@ -1524,7 +1608,16 @@ export class SharedQuotaStore {
     // then ages the lane by that bucket (it is governing), which is the slower
     // direction (§5.7) and lasts until the controller reasons the newest rows or
     // the next scrape lands.
-    const eligibleReasoned = currentScrapeReasoned.length > 0 ? currentScrapeReasoned : reasoned;
+    //
+    // A relaxed bucket (#861) enters the election with zero even-spread delay.
+    // Only the election sees that: `buckets` below keeps the ordinary decision.
+    const eligibleReasoned = (
+      currentScrapeReasoned.length > 0 ? currentScrapeReasoned : reasoned
+    ).map((row) =>
+      relax && relax.modelScope === modelScope && relax.kind === row.kind
+        ? { ...row, intervalSeconds: 0, uncappedIntervalSeconds: 0 }
+        : row
+    );
     // Ties break on kind so one set of rows always elects the same bucket.
     eligibleReasoned.sort(
       (a, b) =>
