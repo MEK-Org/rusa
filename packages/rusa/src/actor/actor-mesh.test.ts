@@ -3041,6 +3041,7 @@ describe("ActorMesh", () => {
         recipientId: "source",
         body: "first durable memo",
         sessionId: "walkie-session",
+        responsive: null,
       },
       {
         id: "two",
@@ -3049,6 +3050,7 @@ describe("ActorMesh", () => {
         recipientId: "00000000-0000-4000-8000-000000000001",
         body: "second durable reply",
         sessionId: "walkie-session",
+        responsive: null,
       },
     ];
     const transferLogs: Array<Record<string, unknown>> = [];

@@ -232,6 +232,7 @@ describe("chat context on selection", () => {
           recipientId: "actor-a",
           body: "third",
           sessionId: null,
+          responsive: null,
         },
         {
           id: "m2",
@@ -240,6 +241,7 @@ describe("chat context on selection", () => {
           recipientId: "peer",
           body: "second",
           sessionId: null,
+          responsive: null,
         },
         {
           id: "m1",
@@ -248,6 +250,7 @@ describe("chat context on selection", () => {
           recipientId: "actor-a",
           body: "first",
           sessionId: null,
+          responsive: null,
         },
       ];
       const calls: unknown[] = [];
@@ -303,6 +306,7 @@ describe("chat context on selection", () => {
                 recipientId: "actor-a",
                 body: "hi",
                 sessionId: "s",
+                responsive: null,
               },
             ],
           },

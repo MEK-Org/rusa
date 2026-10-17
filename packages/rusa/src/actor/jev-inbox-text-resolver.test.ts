@@ -32,6 +32,7 @@ function deps(row: ReturnType<typeof entry> | null = entry()) {
         recipientId: "actor",
         body: "real mesh text",
         sessionId: null,
+        responsive: null,
       })),
     },
     issueClient: {

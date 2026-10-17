@@ -14,6 +14,7 @@ function message(index: number, body = `body ${index}`): MeshChat {
     recipientId: index % 2 === 0 ? "actor-a" : "00000000-0000-4000-8000-000000000001",
     body,
     sessionId: "session-a",
+    responsive: null,
   };
 }
 
