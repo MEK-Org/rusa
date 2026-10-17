@@ -296,7 +296,10 @@ class MeshHeader extends StatelessWidget {
                                     letterSpacing: 0.5,
                                   ),
                                 ),
-                              if (!compact) const SizedBox(width: 10),
+                              // Keep the narrow phone halt chip distinct from
+                              // the RUSA wordmark instead of running the two
+                              // visual boundaries together.
+                              SizedBox(width: compact ? 8 : 10),
                               StreamBuilder<bool>(
                                 stream: store.halted,
                                 initialData: store.halted.valueOrNull ?? false,
@@ -1559,85 +1562,83 @@ class _HaltedBadge extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final clearAll = onClearAll;
-    final badge = _badge();
-    if (clearAll == null) return badge;
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        badge,
-        IconButton(
-          key: const ValueKey('halt-clear-all'),
-          tooltip: 'Clear all halts',
-          onPressed: clearAll,
-          icon: const Icon(Icons.close, size: 16),
-          color: MeshColors.statusHalted,
-          padding: EdgeInsets.zero,
-          visualDensity: VisualDensity.compact,
-          constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-        ),
-      ],
-    );
-  }
-
-  Widget _badge() {
-    return Tooltip(
-      ignorePointer: true,
-      richMessage: WidgetSpan(
-        // Evaluated when the tooltip opens, so a passed expiry reads as passed
-        // on an idle page; the overlay's DefaultTextStyle supplies the style.
-        child: Builder(
-          builder: (context) => Text(
-            haltDetailTooltipText(
-              halt: halt,
-              brake: brake,
-              holds: holds,
-              handleOf: handleOf,
-              now: now?.call(),
-            ),
-          ),
+    return Container(
+      key: const ValueKey('halted-chip'),
+      padding: EdgeInsets.symmetric(horizontal: compact ? 6 : 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: MeshColors.statusHalted.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(
+          color: MeshColors.statusHalted.withValues(alpha: 0.5),
         ),
       ),
-      excludeFromSemantics: true,
-      child: Semantics(
-        // Announce the status first, and use this explicit label instead of
-        // merging the visible child text at an implementation-defined suffix.
-        excludeSemantics: true,
-        label:
-            'Halted. ${haltDetailSemanticsText(halt: halt, brake: brake, holds: holds, handleOf: handleOf)}',
-        child: Container(
-          padding: EdgeInsets.symmetric(
-            horizontal: compact ? 6 : 10,
-            vertical: 4,
-          ),
-          decoration: BoxDecoration(
-            color: MeshColors.statusHalted.withValues(alpha: 0.12),
-            borderRadius: BorderRadius.circular(4),
-            border: Border.all(
-              color: MeshColors.statusHalted.withValues(alpha: 0.5),
-            ),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.pause_circle_filled,
-                color: MeshColors.statusHalted,
-                size: 14,
-              ),
-              if (!compact) ...[
-                const SizedBox(width: 8),
-                Text(
-                  'Halted',
-                  style: kMonoStyle.copyWith(
-                    color: MeshColors.statusHalted,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w700,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Tooltip(
+            ignorePointer: true,
+            richMessage: WidgetSpan(
+              // Evaluated when the tooltip opens, so a passed expiry reads
+              // as passed on an idle page; the overlay's DefaultTextStyle
+              // supplies the style.
+              child: Builder(
+                builder: (context) => Text(
+                  haltDetailTooltipText(
+                    halt: halt,
+                    brake: brake,
+                    holds: holds,
+                    handleOf: handleOf,
+                    now: now?.call(),
                   ),
                 ),
-              ],
-            ],
+              ),
+            ),
+            excludeFromSemantics: true,
+            child: Semantics(
+              // Announce the status first, and use this explicit label
+              // instead of merging visible child text at an
+              // implementation-defined suffix. The clear button remains a
+              // separately labelled control inside the same chip boundary.
+              excludeSemantics: true,
+              label:
+                  'Halted. ${haltDetailSemanticsText(halt: halt, brake: brake, holds: holds, handleOf: handleOf)}',
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(
+                    Icons.pause_circle_filled,
+                    color: MeshColors.statusHalted,
+                    size: 14,
+                  ),
+                  if (!compact) ...[
+                    const SizedBox(width: 8),
+                    Text(
+                      'Halted',
+                      style: kMonoStyle.copyWith(
+                        color: MeshColors.statusHalted,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
           ),
-        ),
+          if (clearAll != null) ...[
+            SizedBox(width: compact ? 2 : 4),
+            IconButton(
+              key: const ValueKey('halt-clear-all'),
+              tooltip: 'Clear all halts',
+              onPressed: clearAll,
+              icon: const Icon(Icons.close, size: 16),
+              color: MeshColors.statusHalted,
+              padding: EdgeInsets.zero,
+              visualDensity: VisualDensity.compact,
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+            ),
+          ],
+        ],
       ),
     );
   }

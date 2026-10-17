@@ -219,6 +219,46 @@ void main() {
 
     final clearAll = find.byKey(const ValueKey('halt-clear-all'));
 
+    testWidgets('the clear-all control is within the Halted chip boundary', (
+      tester,
+    ) async {
+      final store = await _store(tester, holds: const [_codexWide]);
+      await pumpHeader(tester, store);
+
+      final chip = find.byKey(const ValueKey('halted-chip'));
+      expect(chip, findsOneWidget);
+      expect(find.descendant(of: chip, matching: clearAll), findsOneWidget);
+    });
+
+    testWidgets('the narrow phone chip leaves space after the RUSA wordmark', (
+      tester,
+    ) async {
+      final store = await _store(tester, holds: const [_codexWide]);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 390,
+              child: MeshHeader(
+                store: store,
+                selected: DashboardView.actors,
+                onSelect: (_) {},
+                onMenuTap: () {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+
+      final chip = find.byKey(const ValueKey('halted-chip'));
+      expect(chip, findsOneWidget);
+      expect(
+        tester.getTopLeft(chip).dx,
+        greaterThan(tester.getTopRight(find.text('RUSA')).dx),
+      );
+    });
+
     testWidgets('the ✕ lists the brake and every hold before releasing', (
       tester,
     ) async {
