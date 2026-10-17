@@ -1069,6 +1069,17 @@ describe("SharedQuotaStore persisted controller", () => {
         58,
         "2030-01-08T00:00:00.000Z"
       );
+      // Keep a high actuator baseline close to the exhausted reading. The
+      // refill below is only five minutes later, so it cannot shed this
+      // baseline through the ordinary slew limit; only a verified new cycle
+      // may start it from zero.
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T00:55:00.000Z",
+        57,
+        "2030-01-08T00:00:00.000Z"
+      );
       recordObservation(store, "claude", "2030-01-01T01:00:00.000Z", 0, "2030-01-08T00:00:00.000Z");
       const exhausted = store.db
         .prepare(
@@ -1084,25 +1095,35 @@ describe("SharedQuotaStore persisted controller", () => {
            ORDER BY observed_at DESC LIMIT 1`
         )
         .get() as { interval: number; derivative: number };
-      expect(beforeRefill.interval).toBeGreaterThan(0);
+      expect(beforeRefill.interval).toBeGreaterThan(2 * QUOTA_MAX_SLEW_SECONDS);
       expect(beforeRefill.derivative).not.toBe(0);
 
       // The old deadline has not passed, so only the immediately prior actual
-      // zero reading (not the older reasoned 58% row) proves this refill.
+      // zero reading (not the older reasoned 57% row) proves this refill. A
+      // new reading is only one point above the older reasoned row, so that
+      // row cannot prove a refill. With the actual zero evidence, the
+      // verified transition starts the actuator from zero; the first interval
+      // is consequently limited by a two-reference-step slew. The old
+      // reasoned-row evidence would retain the old 3600-second baseline.
       recordObservation(
         store,
         "claude",
-        "2030-01-01T02:00:00.000Z",
-        50,
+        "2030-01-01T01:05:00.000Z",
+        58,
         "2030-01-15T00:00:00.000Z"
       );
       const refilled = store.db
         .prepare(
-          `SELECT controller_derivative AS derivative, controller_integral AS integral
+          `SELECT controller_derivative AS derivative, controller_integral AS integral,
+                  interval_seconds AS interval
            FROM quota_observations ORDER BY observed_at DESC LIMIT 1`
         )
-        .get() as { derivative: number; integral: number };
-      expect(refilled).toEqual({ derivative: 0, integral: 0 });
+        .get() as { derivative: number; integral: number; interval: number };
+      expect(refilled).toEqual({
+        derivative: 0,
+        integral: 0,
+        interval: 2 * QUOTA_MAX_SLEW_SECONDS,
+      });
     } finally {
       store.close();
     }
