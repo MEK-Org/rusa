@@ -7,7 +7,7 @@ import {
 } from "../providers/model-config.js";
 import type { ActorHandle, ActorRecord, ContextConfig } from "./actor-record.js";
 import { defaultGrantRecipient } from "./administrative-capabilities.js";
-import type { AvailabilityHolds, ClearedHolds } from "./availability-holds.js";
+import type { AvailabilityHolds, ClearedHolds, ReleasedHalts } from "./availability-holds.js";
 
 /**
  * UUID string format representing a durable user principal ID.
@@ -72,6 +72,12 @@ export interface RootControlOptions {
    * and replays any admission it previously cancelled.
    */
   availabilityHolds?: Pick<AvailabilityHolds, "clear">;
+  /**
+   * Releases the global brake and every availability hold of every origin,
+   * then replays what the halt cancelled — the bare-`/resume` path without
+   * its chat-origin narrowing.
+   */
+  releaseHalts?: () => ReleasedHalts;
   /**
    * Resolves a named model class reference against the runtime database before
    * anything else inspects the request. Wired in by the runtime, which owns the store;
@@ -254,6 +260,29 @@ export class RootControlService {
         expiredRemoved: result.expired.length,
       });
     }
+    return result;
+  }
+
+  /**
+   * Release every halt from the authenticated dashboard control boundary: the
+   * global brake and each availability hold, whatever its origin. One action,
+   * so it records one event naming the brake and every hold it released.
+   */
+  clearAllHalts(principal: RootControlPrincipal): ReleasedHalts {
+    const releaseHalts = this.options.releaseHalts;
+    if (!releaseHalts) throw new Error("halt recovery is unavailable");
+    const rootId = this.requireRootId();
+    const result = releaseHalts();
+    this.record(principal, "clear_all_halts", rootId, {
+      brakeReleased: result.brakeReleased,
+      released: result.released.map((hold) => ({
+        provider: hold.provider,
+        model: hold.model ?? null,
+        origin: hold.origin,
+      })),
+      expiredRemoved: result.expired.length,
+      replayed: result.resumed.length,
+    });
     return result;
   }
 

@@ -151,19 +151,21 @@ export class AvailabilityHoldRepository {
   }
 
   /**
-   * Delete every stored hold one origin instituted, whatever its scope. A bare
-   * chat `/resume` releases chat holds across all scopes without naming each.
+   * Delete every stored hold, whatever its scope. `origin` narrows the delete
+   * to rows that origin instituted: a bare chat `/resume` releases chat holds
+   * across all scopes without naming each, while the dashboard's clear-all
+   * omits it and removes every origin. Returns the deleted rows.
    */
-  clearAll(origin: AvailabilityHoldOrigin): AvailabilityHold[] {
-    const required = requireOrigin(origin);
+  clearAll(options: { origin?: AvailabilityHoldOrigin } = {}): AvailabilityHold[] {
+    const origin = options.origin === undefined ? undefined : requireOrigin(options.origin);
     return this.db.transaction(() => {
       const rows = this.selectAll()
         .map((row) => ({ scope: row.scope, hold: toHold(row) }))
-        .filter((row) => row.hold.origin === required);
+        .filter((row) => origin === undefined || row.hold.origin === origin);
       const remove = this.db.prepare(
         "DELETE FROM availability_holds WHERE scope = ? AND origin = ?"
       );
-      for (const row of rows) remove.run(row.scope, required);
+      for (const row of rows) remove.run(row.scope, row.hold.origin);
       return rows.map((row) => row.hold).sort(compareHolds);
     })();
   }

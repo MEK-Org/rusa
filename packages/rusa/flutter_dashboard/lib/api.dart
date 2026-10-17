@@ -198,6 +198,26 @@ class DashboardApi {
     return (body['released'] as List<dynamic>? ?? const []).length;
   }
 
+  /// Authenticated operator recovery for every halt at once (#1100): the HALT
+  /// brake and each availability hold of every origin, released by one
+  /// server-side action. Returns whether the brake was engaged and how many
+  /// holds in force were released.
+  Future<({bool brakeReleased, int released})> clearAllHalts() async {
+    final uri = _u('/api/mesh/halts/clear-all');
+    final res = await _client.post(
+      uri,
+      headers: {'Accept': 'application/json'},
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+    final body = jsonDecode(res.body) as Map<String, dynamic>;
+    return (
+      brakeReleased: body['brake_released'] as bool? ?? false,
+      released: (body['released'] as List<dynamic>? ?? const []).length,
+    );
+  }
+
   Future<String> spawnRootChild({
     required String charter,
     String? title,

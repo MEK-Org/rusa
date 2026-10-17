@@ -35,6 +35,15 @@ export interface ClearedHolds {
 }
 
 /**
+ * What releasing the halts did: whether the global brake was engaged, the
+ * holds cleared, and the queued runs the release replayed.
+ */
+export interface ReleasedHalts extends ClearedHolds {
+  brakeReleased: boolean;
+  resumed: string[];
+}
+
+/**
  * `silent` skips `onHeld`/`onReleased` for a caller that cancels or replays
  * queued runs itself because it reports how many it touched. `origin`
  * narrows a `clear` to rows that origin instituted; chat `/resume` uses it so
@@ -115,17 +124,19 @@ export class AvailabilityHolds {
   }
 
   /**
-   * Clear every hold one origin instituted, whatever its scope — a bare chat
-   * `/resume` releases chat holds across all scopes without naming each.
-   * Mesh-instituted holds stay in force.
+   * Clear every hold, whatever its scope. `options.origin` narrows the clear
+   * to rows that origin instituted — a bare chat `/resume` releases chat holds
+   * across all scopes without naming each and mesh-instituted holds stay in
+   * force; the dashboard's clear-all omits it and releases every origin.
    */
-  clearAll(origin: AvailabilityHoldOrigin, options: HoldChangeOptions = {}): ClearedHolds {
-    const cleared = this.options.repo.clearAll(origin);
+  clearAll(options: HoldChangeOptions = {}): ClearedHolds {
+    const { origin, ...callbacks } = options;
+    const cleared = this.options.repo.clearAll(origin === undefined ? {} : { origin });
     const now = this.now();
     const released = cleared.filter((hold) => isActiveAt(hold, now));
     const expired = cleared.filter((hold) => !isActiveAt(hold, now));
     this.schedule();
-    if (released.length > 0 && !options.silent) this.options.onReleased?.(released);
+    if (released.length > 0 && !callbacks.silent) this.options.onReleased?.(released);
     return { released, expired };
   }
 

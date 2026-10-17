@@ -51,8 +51,10 @@ Future<DashboardStore> _store(
   HaltStatusDto? halt,
   HaltStatusDto? brake,
   List<AvailabilityHoldDto>? holds,
+  FakeApi? api,
 }) async {
-  final api = FakeApi()
+  api ??= FakeApi();
+  api
     ..halted = halt != null || brake != null || (holds?.isNotEmpty ?? false)
     ..halt = halt
     ..haltBrake = brake
@@ -193,6 +195,110 @@ void main() {
         find.textContaining('• claude-fable-5-1 on claude: expires'),
         findsOneWidget,
       );
+    });
+  });
+
+  group('clear-all', () {
+    Future<void> pumpHeader(WidgetTester tester, DashboardStore store) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 1100,
+              child: MeshHeader(
+                store: store,
+                selected: DashboardView.actors,
+                onSelect: (_) {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+    }
+
+    final clearAll = find.byKey(const ValueKey('halt-clear-all'));
+
+    testWidgets('the ✕ lists the brake and every hold before releasing', (
+      tester,
+    ) async {
+      final api = FakeApi();
+      final store = await _store(
+        tester,
+        api: api,
+        halt: const HaltStatusDto(scope: 'global'),
+        brake: const HaltStatusDto(scope: 'global'),
+        holds: [_codexWide, _fableHold('2099-01-01T00:00:00.000Z')],
+      );
+      await pumpHeader(tester, store);
+
+      await tester.tap(clearAll);
+      await tester.pumpAndSettle();
+      expect(find.text('Clear all halts?'), findsOneWidget);
+      expect(
+        find.text('• HALT brake. Halt scope: all providers.'),
+        findsOneWidget,
+      );
+      expect(
+        find.text('• codex, all models: until cleared. Set by root-handle.'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('• claude-fable-5-1 on claude: expires'),
+        findsOneWidget,
+      );
+
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(find.text('Clear all halts?'), findsNothing);
+      expect(api.clearAllHaltsCalls, 0);
+
+      await tester.tap(clearAll);
+      await tester.pumpAndSettle();
+      await tester.runAsync(() async {
+        await tester.tap(find.byKey(const ValueKey('halt-clear-all-confirm')));
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      });
+      await tester.pumpAndSettle();
+      expect(api.clearAllHaltsCalls, 1);
+      expect(
+        find.text('Released the HALT brake and 2 availability holds.'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a refused clear-all is reported, not swallowed', (
+      tester,
+    ) async {
+      final api = FakeApi()..clearAllHaltsError = Exception('403');
+      final store = await _store(tester, api: api, holds: const [_codexWide]);
+      await pumpHeader(tester, store);
+
+      await tester.tap(clearAll);
+      await tester.pumpAndSettle();
+      expect(find.textContaining('HALT brake'), findsNothing);
+      await tester.runAsync(() async {
+        await tester.tap(find.byKey(const ValueKey('halt-clear-all-confirm')));
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      });
+      await tester.pumpAndSettle();
+      expect(api.clearAllHaltsCalls, 1);
+      expect(
+        find.text('Could not clear halts: Exception: 403'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('an older server without the holds field shows no ✕', (
+      tester,
+    ) async {
+      final store = await _store(
+        tester,
+        halt: const HaltStatusDto(scope: 'global'),
+      );
+      await pumpHeader(tester, store);
+      expect(find.text('Halted'), findsOneWidget);
+      expect(clearAll, findsNothing);
     });
   });
 

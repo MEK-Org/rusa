@@ -1,7 +1,8 @@
 // Screenshot harness for #539's availability holds on the header and quota
 // rings, on synthetic fixtures: a provider-wide Codex hold an actor placed
 // with the hold tools, and a chat `/halt` on the Fable model with an expiry.
-// Their scopes differ, so the folded `halt` is null. Run:
+// Their scopes differ, so the folded `halt` is null. The clear-all scenes add
+// the global HALT brake and open the ✕'s confirmation (#1100). Run:
 //
 //   flutter test test/availability_holds_539_screenshot_test.dart
 //
@@ -135,6 +136,7 @@ void main() {
     required String name,
     required Size size,
     bool drawer = false,
+    bool brake = false,
     Future<void> Function()? reveal,
   }) async {
     final api = FakeApi()
@@ -143,7 +145,9 @@ void main() {
         makeThread('root', created: 't0').copyWith(handle: 'steward'),
       ]
       ..quotaResult = _quota(now);
+    if (brake) api.halt = const HaltStatusDto(scope: 'global');
     api.availabilityHolds = _holds(now); // after-only
+    if (brake) api.haltBrake = const HaltStatusDto(scope: 'global'); // after-only
     final store = DashboardStore(api: api, stream: FakeStream());
     await tester.runAsync(() async {
       await store.init();
@@ -234,6 +238,32 @@ void main() {
         await tester.longPress(find.byIcon(Icons.pause_circle_filled).first);
         await tester.pump();
       },
+    );
+  });
+
+  Future<void> openClearAll(WidgetTester tester) async {
+    await tester.tap(find.byKey(const ValueKey('halt-clear-all'))); // after-only
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+  }
+
+  testWidgets('wide: the clear-all confirmation', (tester) async {
+    await scene(
+      tester,
+      name: 'clear_all_confirm_wide',
+      size: const Size(1400, 600),
+      brake: true,
+      reveal: () => openClearAll(tester),
+    );
+  });
+
+  testWidgets('phone: the clear-all confirmation', (tester) async {
+    await scene(
+      tester,
+      name: 'clear_all_confirm_phone',
+      size: const Size(390, 700),
+      brake: true,
+      reveal: () => openClearAll(tester),
     );
   });
 

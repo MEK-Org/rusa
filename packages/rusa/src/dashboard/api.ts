@@ -1135,6 +1135,32 @@ export async function handleMeshApiRequest(
       return true;
     }
 
+    // POST /api/mesh/halts/clear-all — the header's clear-all control (#1100).
+    // One authenticated root-control action releases the HALT brake and every
+    // availability hold of every origin, and records one audit event; the
+    // dashboard never fans out the scoped route above. No body is read.
+    if (pathname === "/api/mesh/halts/clear-all") {
+      const rootControl = deps?.rootControl;
+      if (!rootControl) {
+        sendJson(res, 503, { error: "root control unavailable" });
+        return true;
+      }
+      const principal = requireOperatorPrincipal(req, res, deps);
+      if (!principal) return true;
+      try {
+        const result = rootControl.clearAllHalts(principal);
+        sendJson(res, 200, {
+          brake_released: result.brakeReleased,
+          released: result.released.map(holdJson),
+          expired_removed: result.expired.length,
+          replayed: result.resumed.length,
+        });
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return true;
+    }
+
     // POST /api/mesh/admission-queue/reorder — operator reorder of the unclaimed
     // admission list (#570). The body carries the unclaimed order the operator
     // saw; if the live list differs, nothing moves and 409 returns the current

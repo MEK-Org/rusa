@@ -315,18 +315,31 @@ class MeshHeader extends StatelessWidget {
                                           stream: store.haltDetail,
                                           initialData:
                                               store.haltDetail.valueOrNull,
-                                          builder: (_, detailSnap) =>
-                                              _HaltedBadge(
-                                                halt: statusSnap.data,
-                                                brake: detailSnap.data?.brake,
-                                                holds: detailSnap.data?.holds,
-                                                handleOf: (id) => store
-                                                    .actor(id)
-                                                    ?.thread
-                                                    .handle,
-                                                compact: compact,
-                                                now: haltTooltipNow,
-                                              ),
+                                          builder: (context, detailSnap) {
+                                            String? handleOf(String id) =>
+                                                store.actor(id)?.thread.handle;
+                                            final detail = detailSnap.data;
+                                            return _HaltedBadge(
+                                              halt: statusSnap.data,
+                                              brake: detail?.brake,
+                                              holds: detail?.holds,
+                                              handleOf: handleOf,
+                                              compact: compact,
+                                              now: haltTooltipNow,
+                                              // Only a server that reports
+                                              // the holds apart has the
+                                              // clear-all route (#1100).
+                                              onClearAll: detail?.holds == null
+                                                  ? null
+                                                  : () => clearAllHaltsFlow(
+                                                      context,
+                                                      store: store,
+                                                      detail: detail!,
+                                                      handleOf: handleOf,
+                                                      now: haltTooltipNow,
+                                                    ),
+                                            );
+                                          },
                                         );
                                       },
                                     ),
@@ -1384,6 +1397,117 @@ String _holdExpiryText(
       : 'expiry passed ${_haltExpiryFormat(until, local)}';
 }
 
+/// The header ✕ (#1100): confirm what will be released — the brake, then
+/// each hold with its scope, expiry and setter — and only then ask the server
+/// to release all of it in one action.
+Future<void> clearAllHaltsFlow(
+  BuildContext context, {
+  required DashboardStore store,
+  required HaltDetail detail,
+  String? Function(String id)? handleOf,
+  DateTime Function()? now,
+}) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (_) => RepaintBoundary(
+      key: const ValueKey('halt-clear-all-dialog'),
+      child: ClearAllHaltsDialog(
+        brake: detail.brake,
+        holds: detail.holds ?? const [],
+        handleOf: handleOf,
+        now: now?.call(),
+      ),
+    ),
+  );
+  if (confirmed != true || !context.mounted) return;
+  final messenger = ScaffoldMessenger.of(context);
+  try {
+    final result = await store.clearAllHalts();
+    final noun = result.released == 1 ? 'hold' : 'holds';
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(
+          result.brakeReleased
+              ? 'Released the HALT brake and ${result.released} availability $noun.'
+              : 'Released ${result.released} availability $noun.',
+        ),
+      ),
+    );
+  } catch (err) {
+    messenger.showSnackBar(
+      SnackBar(content: Text('Could not clear halts: $err')),
+    );
+  }
+}
+
+/// Lists everything the clear-all releases before it does: releasing a hold
+/// placed for a provider outage re-enables a lane that may still be down, so
+/// the operator sees each one first.
+class ClearAllHaltsDialog extends StatelessWidget {
+  const ClearAllHaltsDialog({
+    super.key,
+    this.brake,
+    this.holds = const [],
+    this.handleOf,
+    this.now,
+  });
+
+  final HaltStatusDto? brake;
+  final List<AvailabilityHoldDto> holds;
+  final String? Function(String id)? handleOf;
+  final DateTime? now;
+
+  @override
+  Widget build(BuildContext context) {
+    final brake = this.brake;
+    return AlertDialog(
+      title: const Text('Clear all halts?'),
+      content: SizedBox(
+        width: 440,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('This releases:'),
+              const SizedBox(height: 8),
+              if (brake != null)
+                Text(
+                  '• HALT brake. '
+                  '${haltTooltipText(brake, now: now).replaceAll('\n', ' ')}',
+                ),
+              for (final hold in holds)
+                Text(
+                  '• ${availabilityHoldText(hold, now: now, handleOf: handleOf)}',
+                ),
+              const SizedBox(height: 12),
+              Text(
+                'Released lanes are selectable again at once, including any '
+                'held for a provider outage.',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          key: const ValueKey('halt-clear-all-confirm'),
+          style: FilledButton.styleFrom(
+            backgroundColor: MeshColors.statusHalted,
+          ),
+          onPressed: () => Navigator.pop(context, true),
+          child: const Text('Clear all'),
+        ),
+      ],
+    );
+  }
+}
+
 /// Same-day expiries read as a time; later ones carry the weekday and date.
 String _haltExpiryFormat(DateTime until, DateTime now) {
   final sameDay =
@@ -1415,6 +1539,7 @@ class _HaltedBadge extends StatelessWidget {
     this.handleOf,
     this.compact = false,
     this.now,
+    this.onClearAll,
   });
 
   final HaltStatusDto? halt;
@@ -1427,8 +1552,34 @@ class _HaltedBadge extends StatelessWidget {
   final bool compact;
   final DateTime Function()? now;
 
+  /// Opens the clear-all confirmation (#1100); null hides the ✕, as against
+  /// an older server without the route.
+  final VoidCallback? onClearAll;
+
   @override
   Widget build(BuildContext context) {
+    final clearAll = onClearAll;
+    final badge = _badge();
+    if (clearAll == null) return badge;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        badge,
+        IconButton(
+          key: const ValueKey('halt-clear-all'),
+          tooltip: 'Clear all halts',
+          onPressed: clearAll,
+          icon: const Icon(Icons.close, size: 16),
+          color: MeshColors.statusHalted,
+          padding: EdgeInsets.zero,
+          visualDensity: VisualDensity.compact,
+          constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+        ),
+      ],
+    );
+  }
+
+  Widget _badge() {
     return Tooltip(
       ignorePointer: true,
       richMessage: WidgetSpan(

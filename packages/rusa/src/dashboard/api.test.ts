@@ -182,6 +182,7 @@ describe("handleMeshApiRequest", () => {
     scope: { provider: string; models?: string[] };
     principal: string;
   }>;
+  let rootHaltClears: string[];
   let operatorReparents: Array<{ id: string; parentId: string | null; principal: string }>;
   let operatorObligationsAdmin: Array<{ id: string; enabled: boolean; principal: string }>;
   let admissionReorders: unknown[];
@@ -209,6 +210,7 @@ describe("handleMeshApiRequest", () => {
     }).id;
     rootSpawns = [];
     rootHoldClears = [];
+    rootHaltClears = [];
     operatorReparents = [];
     operatorObligationsAdmin = [];
     admissionReorders = [];
@@ -258,6 +260,32 @@ describe("handleMeshApiRequest", () => {
               },
             ],
             expired: [],
+          };
+        },
+        clearAllHalts: (principal: string) => {
+          rootHaltClears.push(principal);
+          return {
+            brakeReleased: true,
+            released: [
+              {
+                provider: "kimi",
+                origin: "chat" as const,
+                reason: "chat /halt from operator",
+                createdBy: "chat:users/operator",
+                createdAt: "2026-10-16T00:00:00.000Z",
+              },
+              {
+                provider: "codex",
+                model: "gpt-5.6",
+                origin: "mesh" as const,
+                expiry: "2026-10-18T00:00:00.000Z",
+                reason: "capacity outage",
+                createdBy: "root",
+                createdAt: "2026-10-16T00:00:00.000Z",
+              },
+            ],
+            expired: [],
+            resumed: ["child-1"],
           };
         },
       } as unknown as RootControlService,
@@ -1358,6 +1386,65 @@ describe("handleMeshApiRequest", () => {
       error: "provider and optional models (non-empty string[]) are required",
     });
     expect(rootHoldClears).toEqual([]);
+  });
+
+  it("POST /api/mesh/halts/clear-all releases every halt in one root-control action", async () => {
+    const { res } = await call(deps, "POST", "/api/mesh/halts/clear-all", "");
+    await settled(res);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({
+      brake_released: true,
+      released: [
+        {
+          provider: "kimi",
+          model: null,
+          origin: "chat",
+          expiry: null,
+          createdBy: "chat:users/operator",
+          createdAt: "2026-10-16T00:00:00.000Z",
+        },
+        {
+          provider: "codex",
+          model: "gpt-5.6",
+          origin: "mesh",
+          expiry: "2026-10-18T00:00:00.000Z",
+          createdBy: "root",
+          createdAt: "2026-10-16T00:00:00.000Z",
+        },
+      ],
+      expired_removed: 0,
+      replayed: 1,
+    });
+    expect(res.body).not.toContain("capacity outage");
+    expect(rootHaltClears).toEqual([LOCAL_USER]);
+    expect(rootHoldClears).toEqual([]);
+  });
+
+  it("POST /api/mesh/halts/clear-all refuses an unauthenticated request", async () => {
+    const { res } = await call(
+      { ...deps, principals: undefined },
+      "POST",
+      "/api/mesh/halts/clear-all",
+      ""
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(403);
+    expect(rootHaltClears).toEqual([]);
+  });
+
+  it("POST /api/mesh/halts/clear-all is unavailable without root control", async () => {
+    const { res } = await call(
+      { ...deps, rootControl: undefined },
+      "POST",
+      "/api/mesh/halts/clear-all",
+      ""
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(503);
+    expect(rootHaltClears).toEqual([]);
   });
 
   it("POST /api/mesh/actors forwards a portable context selection ", async () => {

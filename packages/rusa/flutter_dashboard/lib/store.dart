@@ -871,6 +871,14 @@ class DashboardStore {
     return released;
   }
 
+  /// Release the brake and every availability hold (#1100), then refresh the
+  /// snapshot so the badge and rings drop what was released.
+  Future<({bool brakeReleased, int released})> clearAllHalts() async {
+    final result = await _api.clearAllHalts();
+    await refreshThreads();
+    return result;
+  }
+
   Future<void> spawnRootChild({
     required String charter,
     String? title,
