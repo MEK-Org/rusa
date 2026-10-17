@@ -60,6 +60,16 @@ describe("buildE2EConfig", () => {
     expect(loaded.observability?.diskAlert).toEqual({ enabled: false });
   });
 
+  it("preserves the explicitly selected deployment boundary", () => {
+    expect(buildE2EConfig({ scratchPath: "/scratch" }).sandbox).toBe("bwrap");
+    expect(
+      buildE2EConfig({
+        scratchPath: "/scratch",
+        baseConfig: { sandbox: "container-boundary" } as RusaConfig,
+      }).sandbox
+    ).toBe("container-boundary");
+  });
+
   it("uses an explicit fake root by default and threads a supplied selection", () => {
     const bare = buildE2EConfig({ scratchPath: "/some/scratch", baseConfig: null });
     expect(bare.rootActor).toEqual({ provider: "fake", model: "fake-model" });

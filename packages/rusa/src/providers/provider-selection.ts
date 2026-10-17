@@ -24,6 +24,7 @@ export const PROVIDER_CAPABILITIES = {
   kimi: {},
   copilot: {},
   fake: {},
+  openrouter: {},
 } as const satisfies Readonly<Record<string, ProviderCapability>>;
 
 export type ProviderCommand = keyof typeof PROVIDER_CAPABILITIES;

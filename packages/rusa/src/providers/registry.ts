@@ -5,6 +5,7 @@ import { CodexProvider } from "./codex.js";
 import { CopilotProvider } from "./copilot.js";
 import { FakeProvider } from "./fake-provider.js";
 import { KimiProvider } from "./kimi.js";
+import { OpenRouterProvider } from "./openrouter/provider.js";
 import {
   isProviderCommand,
   type ProviderCommand,
@@ -42,6 +43,9 @@ const providerAdapters = {
   },
   kimi: { create: (name, config, model) => new KimiProvider(name, config, model) },
   copilot: { create: (name, config, model) => new CopilotProvider(name, config, model) },
+  openrouter: {
+    create: (name, config, model, effort) => new OpenRouterProvider(name, config, model, effort),
+  },
   fake: { create: (name) => new FakeProvider(undefined, name) },
 } satisfies Readonly<Record<ProviderCommand, ProviderAdapter>>;
 

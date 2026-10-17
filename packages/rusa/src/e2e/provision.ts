@@ -91,6 +91,7 @@ export function buildE2EConfig(opts: {
       ...(base?.providers ?? { antigravity: { cliCommand: "agy" } }),
       fake: { cliCommand: "fake" },
     },
+    sandbox: base?.sandbox ?? "bwrap",
     geminiApiKey: base?.geminiApiKey ?? "MISSING",
     ...(e2eVoice ? { voice: e2eVoice } : {}),
     // Required by the schema; the e2e instance never starts a webhook server.

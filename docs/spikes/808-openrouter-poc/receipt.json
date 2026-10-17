@@ -1,0 +1,218 @@
+{
+  "actorId": "f8092ca5-a36c-416a-a248-018ce4e79f86",
+  "model": "openai/gpt-4.1-mini",
+  "nonce": "openrouter-1792259751651",
+  "reply": {
+    "spaceName": "spaces/e2e-dm",
+    "text": "pong nonce openrouter-1792259751651\n\n_brisk-cavapoo (openai/gpt-4.1-mini)_"
+  },
+  "settled": {
+    "success": 1,
+    "payload": "{\"runId\":\"5f06fa85-f7ef-4597-bd0c-6b5f230efa83\",\"model\":\"openai/gpt-4.1-mini\"}"
+  },
+  "observedAt": "2026-10-17T17:56:00.484Z",
+  "hostMode": "container-boundary (explicit host execution, no worker sandbox claim)",
+  "keyUsageAfterAllPrototypeAttemptsUSD": 0.149956,
+  "inferenceUsage": [
+    {
+      "success": true,
+      "requests": [
+        {
+          "requestedModel": "openai/gpt-4.1-mini",
+          "reportedModel": "openai/gpt-4.1-mini",
+          "usage": {
+            "input": 19912,
+            "output": 21,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 19933,
+            "cost": {
+              "input": 0.007964800000000001,
+              "output": 3.3600000000000004e-5,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0.007998400000000001
+            }
+          }
+        },
+        {
+          "requestedModel": "openai/gpt-4.1-mini",
+          "reportedModel": "openai/gpt-4.1-mini",
+          "usage": {
+            "input": 333,
+            "output": 45,
+            "cacheRead": 19840,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 20218,
+            "cost": {
+              "input": 0.0001332,
+              "output": 7.2e-5,
+              "cacheRead": 0.001984,
+              "cacheWrite": 0,
+              "total": 0.0021892
+            }
+          }
+        },
+        {
+          "requestedModel": "openai/gpt-4.1-mini",
+          "reportedModel": "openai/gpt-4.1-mini",
+          "usage": {
+            "input": 516,
+            "output": 30,
+            "cacheRead": 20096,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 20642,
+            "cost": {
+              "input": 0.00020640000000000003,
+              "output": 4.8e-5,
+              "cacheRead": 0.0020096000000000003,
+              "cacheWrite": 0,
+              "total": 0.0022640000000000004
+            }
+          }
+        },
+        {
+          "requestedModel": "openai/gpt-4.1-mini",
+          "reportedModel": "openai/gpt-4.1-mini",
+          "usage": {
+            "input": 325,
+            "output": 55,
+            "cacheRead": 20480,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 20860,
+            "cost": {
+              "input": 0.00013000000000000002,
+              "output": 8.800000000000001e-5,
+              "cacheRead": 0.0020480000000000003,
+              "cacheWrite": 0,
+              "total": 0.0022660000000000002
+            }
+          }
+        },
+        {
+          "requestedModel": "openai/gpt-4.1-mini",
+          "reportedModel": "openai/gpt-4.1-mini",
+          "usage": {
+            "input": 168,
+            "output": 72,
+            "cacheRead": 20736,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 20976,
+            "cost": {
+              "input": 6.720000000000001e-5,
+              "output": 0.00011520000000000001,
+              "cacheRead": 0.0020736,
+              "cacheWrite": 0,
+              "total": 0.002256
+            }
+          }
+        },
+        {
+          "requestedModel": "openai/gpt-4.1-mini",
+          "reportedModel": "openai/gpt-4.1-mini",
+          "usage": {
+            "input": 196,
+            "output": 31,
+            "cacheRead": 20864,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 21091,
+            "cost": {
+              "input": 7.840000000000001e-5,
+              "output": 4.9600000000000006e-5,
+              "cacheRead": 0.0020864,
+              "cacheWrite": 0,
+              "total": 0.0022144
+            }
+          }
+        }
+      ]
+    },
+    {
+      "success": true,
+      "requests": [
+        {
+          "requestedModel": "openai/gpt-4.1-mini",
+          "reportedModel": "openai/gpt-4.1-mini",
+          "usage": {
+            "input": 20603,
+            "output": 25,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 20628,
+            "cost": {
+              "input": 0.0082412,
+              "output": 4e-5,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0.0082812
+            }
+          }
+        },
+        {
+          "requestedModel": "openai/gpt-4.1-mini",
+          "reportedModel": "openai/gpt-4.1-mini",
+          "usage": {
+            "input": 387,
+            "output": 30,
+            "cacheRead": 20480,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 20897,
+            "cost": {
+              "input": 0.00015480000000000002,
+              "output": 4.8e-5,
+              "cacheRead": 0.0020480000000000003,
+              "cacheWrite": 0,
+              "total": 0.0022508000000000003
+            }
+          }
+        },
+        {
+          "requestedModel": "openai/gpt-4.1-mini",
+          "reportedModel": "openai/gpt-4.1-mini",
+          "usage": {
+            "input": 284,
+            "output": 119,
+            "cacheRead": 20736,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 21139,
+            "cost": {
+              "input": 0.00011360000000000001,
+              "output": 0.00019040000000000002,
+              "cacheRead": 0.0020736,
+              "cacheWrite": 0,
+              "total": 0.0023776
+            }
+          }
+        },
+        {
+          "requestedModel": "openai/gpt-4.1-mini",
+          "reportedModel": "openai/gpt-4.1-mini",
+          "usage": {
+            "input": 333,
+            "output": 45,
+            "cacheRead": 20864,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 21242,
+            "cost": {
+              "input": 0.0001332,
+              "output": 7.2e-5,
+              "cacheRead": 0.0020864,
+              "cacheWrite": 0,
+              "total": 0.0022916
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
