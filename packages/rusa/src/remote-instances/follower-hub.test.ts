@@ -31,7 +31,11 @@ function captureLogger(
   return logger;
 }
 
-async function setup(options?: { logger?: Logger; triggerStore?: FollowerUpdateTriggerStore }) {
+async function setup(options?: {
+  logger?: Logger;
+  triggerStore?: FollowerUpdateTriggerStore;
+  allowedFollowerIds?: string[];
+}) {
   const token = randomBytes(32).toString("hex");
   const hub = new FollowerHub(token, options);
   hubs.push(hub);
@@ -1024,6 +1028,33 @@ describe("follower protocol window (#719)", () => {
         },
       },
     ]);
+  });
+
+  it("refuses a validly authenticated follower whose instance ID is not allowlisted", async () => {
+    const records: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const h = await setup({ logger: captureLogger(records), allowedFollowerIds: ["listed"] });
+    const refused = await h.post("/register", identity("unlisted", N));
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toEqual({
+      error: "Follower instance ID is not in the leader's peers allowlist",
+    });
+    expect(h.hub.list()).toEqual([]);
+    // Without a session, every other control request is refused too.
+    expect((await h.post("/poll", { id: "unlisted", session: "" })).status).toBe(410);
+    expect(records.filter((r) => r.event === "follower_register_rejected")).toEqual([
+      {
+        event: "follower_register_rejected",
+        fields: {
+          reason: "not_allowlisted",
+          followerId: "unlisted",
+          protocolVersion: N,
+          commitSha: oldSha,
+        },
+      },
+    ]);
+    const listed = await h.post("/register", identity("listed", N));
+    expect(listed.status).toBe(200);
+    expect(h.hub.list()).toEqual([expect.objectContaining({ id: "listed" })]);
   });
 
   it("logs every other register rejection with the same identifying fields", async () => {

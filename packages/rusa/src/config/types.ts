@@ -8,6 +8,41 @@ import type { VoiceDefinition } from "../voice/voice-catalog.js";
 export const DEFAULT_DEPLOY_BRANCH = "master";
 export type SandboxMode = "container-boundary" | "bwrap";
 
+/**
+ * This instance's local role, derived from {@link RusaConfig.peers}: an
+ * instance with a `leader` peer entry is a follower, otherwise it is a leader.
+ */
+export type InstanceRole = "leader" | "follower";
+
+/**
+ * The relationship a configured peer instance has to this one. `peer` (a true
+ * peer that can message actors across instances) is reserved and rejected
+ * until its protocol exists (#1101).
+ */
+export type PeerType = "leader" | "follower" | "peer";
+
+/** One configured relationship with another rusa instance. */
+export interface PeerConfig {
+  /**
+   * The other instance's stable instance ID. Required on `follower` entries,
+   * where the leader's follower entries are the enrollment allowlist; optional
+   * and informational on a `leader` entry.
+   */
+  id?: string;
+  type: PeerType;
+  /** `leader` only: URL of the leader's follower gateway (e.g. "http://127.0.0.1:8190"). */
+  url?: string;
+  /** `leader` only: path to the enrollment token secret file. */
+  tokenFile?: string;
+  /** `leader` only: the enrollment token itself (e.g. for testing). */
+  token?: string;
+}
+
+export interface InstanceIdentityConfig {
+  /** Optional stable instance ID */
+  id?: string;
+}
+
 export interface ProviderConfig {
   /** CLI command name, e.g. "claude", "codex", "agy" */
   cliCommand?: string;
@@ -489,6 +524,15 @@ export interface RusaConfig {
   gitBridgeBindHost?: string;
   /** Follower gateway configuration for remote worker placement. Off by default. */
   followers?: FollowerGatewayConfig;
+  /**
+   * Configured relationships with other rusa instances. At most one `leader`
+   * entry, never alongside `follower` entries. A `leader` entry makes this
+   * instance a follower; on a leader, `follower` entries are the required
+   * allowlist of instance IDs that may enroll through the `followers` gateway.
+   */
+  peers?: PeerConfig[];
+  /** Stable instance identity configuration. */
+  instance?: InstanceIdentityConfig;
 }
 
 /** Configuration for hosting remote followers on a persistent leader instance. */

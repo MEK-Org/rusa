@@ -108,12 +108,28 @@ program
     "--import-actor <id>",
     "Name the existing actor that config.yaml's rootActor describes, when startup reports it cannot tell; read only until that one-time import completes"
   )
+  .option(
+    "--leader <url>",
+    "Shorthand for a single leader peer entry: run as a follower of this leader URL"
+  )
+  .option("--token-file <path>", "Enrollment token file for the leader peer entry")
+  .option("--instance-id <id>", "Override local instance ID")
   .action(
-    async (opts: { deployOnMergeBranch?: string; profile?: string; importActor?: string }) => {
+    async (opts: {
+      deployOnMergeBranch?: string;
+      profile?: string;
+      importActor?: string;
+      leader?: string;
+      tokenFile?: string;
+      instanceId?: string;
+    }) => {
       await runStart({
         deployOnMergeBranch: opts.deployOnMergeBranch,
         profile: opts.profile,
         importActor: opts.importActor,
+        leader: opts.leader,
+        tokenFile: opts.tokenFile,
+        instanceId: opts.instanceId,
       });
     }
   );

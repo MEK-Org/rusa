@@ -167,7 +167,14 @@ import {
   type SystemChatSubscriptionLapseEvent,
   WorkspaceEventsSubscriber,
 } from "../chat/workspace-events.js";
-import { type ConfigProfile, loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
+import {
+  type ConfigProfile,
+  followerAllowlistOf,
+  instanceRoleOf,
+  loadConfig,
+  type RusaConfig,
+  resolveHome,
+} from "../config/index.js";
 import { readJevApiKeyFile } from "../config/jev.js";
 import { secretsDirPath } from "../config/secrets.js";
 import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
@@ -182,6 +189,7 @@ import {
   planConfiguredActorImport,
 } from "../db/configured-actor-import.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import { type InstanceIdentity, initInstanceIdentity } from "../db/instance-identity.js";
 import { importLegacyActorState } from "../db/legacy-actor-import.js";
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
@@ -317,7 +325,9 @@ import { asGitHubIssue, parseReference } from "../references/reference.js";
 import { resolveReference } from "../references/resolve.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
+import type { FollowerInstance } from "../remote-instances/follower-instance.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
+import type { ProviderFactory } from "../remote-instances/protocol.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 import { constructActorFromInvocation } from "../runtime/actor-invocation.js";
 import {
@@ -385,6 +395,7 @@ import {
   recordAndAnnounceRequestedRestart,
   ServiceLifecycleStore,
 } from "./service-lifecycle.js";
+import { composeFollowerStart } from "./start-follower.js";
 
 // `update` tool bounds . Per-step HARD timeouts so a hung build can't wedge
 // root; a bounded drain so a stuck worker can't block the restart forever.
@@ -744,6 +755,15 @@ export interface RunStartE2EHooks {
   /** Deterministic statfs/clock for the host disk sensor; production reads the real volume. */
   diskAlertDeps?: DiskUsageAlertDeps;
   onReady?: (handles: RunStartE2EHandles) => void;
+  connectPeer?: boolean;
+  /** Exercise follower HTTP command ingestion while retaining E2E shutdown handles. */
+  followerPolling?: boolean;
+  followerProviderFactory?: ProviderFactory;
+  onFollowerReady?: (handles: {
+    instance: FollowerInstance;
+    instanceIdentity: InstanceIdentity;
+    shutdown: () => Promise<void>;
+  }) => void;
 }
 
 export interface RunStartOptions {
@@ -758,6 +778,12 @@ export interface RunStartOptions {
    */
   importActor?: string;
   e2e?: RunStartE2EHooks;
+  /** Raw `--leader` CLI flag: shorthand for the single `leader` peer entry's url. */
+  leader?: string;
+  /** Raw `--token-file` CLI flag: shorthand for the `leader` peer entry's tokenFile. */
+  tokenFile?: string;
+  /** Raw `--instance-id` CLI flag. */
+  instanceId?: string;
 }
 
 /**
@@ -1183,6 +1209,9 @@ async function composeStart(
     // throws on an unknown profile, so the cast to the canonical union is safe.
     config = loadConfig(mcHome, {
       profile: opts?.profile as ConfigProfile | undefined,
+      leader: opts?.leader,
+      tokenFile: opts?.tokenFile,
+      instanceId: opts?.instanceId,
     });
   } catch (err) {
     // No config yet means no config-sourced secrets to scrub against, so this
@@ -1191,6 +1220,12 @@ async function composeStart(
       reason: err instanceof Error ? err.message : String(err),
     });
     process.exit(1);
+    return;
+  }
+
+  const role = instanceRoleOf(config);
+  if (role === "follower") {
+    await composeFollowerStart(config, opts, resources, bootLog);
     return;
   }
   const rootActor = config.rootActor;
@@ -1283,6 +1318,16 @@ async function composeStart(
   const database = initDb(mcHome);
   resources.acquire("database", () => closeDb());
   log.info("database_ready", { home: mcHome });
+  const identity = initInstanceIdentity(database, {
+    role,
+    configuredInstanceId: config.instance?.id,
+  });
+  log.info("instance_identity_ready", {
+    instanceId: identity.instanceId,
+    bootId: identity.bootId,
+    role: identity.role,
+  });
+  getRepositories(role);
   if (!config.auth) getRepositories().principals.ensureImplicitUser(new Date().toISOString());
 
   const modelClasses = getRepositories().modelClasses;
@@ -2938,13 +2983,20 @@ async function composeStart(
         `Failed to read follower tokenFile '${tokenFile}': ${err instanceof Error ? err.message : String(err)}`
       );
     }
-    followerHub = new FollowerHub(token, { logger: log, triggerStore: followerTriggerStore });
+    // Only the follower instance IDs listed in peers may enroll (#1024).
+    const allowedFollowerIds = followerAllowlistOf(config);
+    followerHub = new FollowerHub(token, {
+      logger: log,
+      triggerStore: followerTriggerStore,
+      allowedFollowerIds,
+    });
     await followerHub.listen(config.followers.bind, config.followers.port);
     const hub = followerHub;
     resources.acquire("follower gateway", () => hub.close());
     log.info("follower_gateway_started", {
       bind: config.followers.bind,
       port: config.followers.port,
+      allowedFollowerIds,
     });
   }
 

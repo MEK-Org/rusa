@@ -12,6 +12,7 @@ import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import type { MeshEventInput } from "../actor/mesh-events.js";
 import { type ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import type { Repositories } from "../db/repositories/index.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { LogFields, Logger } from "../observability/logger.js";
@@ -52,6 +53,7 @@ export function createHarness(options: {
   obligations?: ActorMeshOptions["obligations"];
   responsiveInterruption?: ActorMeshOptions["responsiveInterruption"];
   responsiveInterruptionMode?: ActorMeshOptions["responsiveInterruptionMode"];
+  repositories?: Repositories;
 }) {
   const promptEvents: ActorLifecyclePromptEvent[] = [];
   const actors = new InMemoryActorRepository();
@@ -62,7 +64,8 @@ export function createHarness(options: {
     options.cwd,
     false,
     (event) => queueMicrotask(() => remote.receive(structuredClone(event))),
-    options.providerFactory ?? createProvider
+    options.providerFactory ?? createProvider,
+    { repositories: options.repositories }
   );
   // Exercise the same instance commands without opening a port in unit tests.
   const wire = (instance: RemoteInstance) => {

@@ -13,6 +13,7 @@ export const createProvider: ProviderFactory = (bridge, options, selected) => ({
       messages: string[];
     };
     const sessionId = run.session?.id ?? randomUUID();
+    run.onPromptLaunched?.(run.prompt);
     run.onChunk?.(`Actor provider running in PID ${process.pid}\n`);
     await delay(Number(options.delayMs ?? 25), undefined, { signal: run.signal });
     const report = {

@@ -2,25 +2,48 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { ComputerUseLock } from "../actor/computer-use-lock.js";
+import type { Repositories } from "../db/repositories/index.js";
 import { createActorRuntime } from "./actor-runtime.js";
 import { createProvider } from "./configured-provider.js";
 import type { FollowerActorCommand, FollowerEvent } from "./follower-hub.js";
 import type { ProviderFactory } from "./protocol.js";
+
+export interface FollowerInstanceOptions {
+  requireReconciliation?: boolean;
+  repositories?: Repositories;
+  /** Provider executable/settings belong to this host, never the leader Bootstrap. */
+  providerOptions?: Record<string, unknown>;
+}
 
 /** Execution half of an instance: many ordinary Actors, one Node process. */
 export class FollowerInstance {
   private actors = new Map<string, ReturnType<typeof createActorRuntime>>();
   private stopped = false;
   private draining = false;
+  private reconciled: boolean;
+  private readonly repositories?: Repositories;
+  private readonly providerOptions?: Record<string, unknown>;
   private readonly computerUseLock = new ComputerUseLock();
 
   constructor(
     private readonly home: string,
     private readonly sandbox: boolean,
     private readonly emit: (event: FollowerEvent) => void,
-    private readonly providerFactory: ProviderFactory = createProvider
+    private readonly providerFactory: ProviderFactory = createProvider,
+    options?: FollowerInstanceOptions
   ) {
     mkdirSync(home, { recursive: true });
+    this.reconciled = options?.requireReconciliation !== true;
+    this.repositories = options?.repositories;
+    this.providerOptions = options?.providerOptions;
+  }
+
+  get isReconciled(): boolean {
+    return this.reconciled;
+  }
+
+  markReconciled(): void {
+    this.reconciled = true;
   }
 
   get actorIds(): string[] {
@@ -29,6 +52,9 @@ export class FollowerInstance {
 
   dispatch({ actorId, message }: FollowerActorCommand): void {
     if (this.stopped) return;
+    if (!this.reconciled) {
+      throw new Error("Follower instance is not reconciled with leader; dispatch refused");
+    }
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(actorId)) throw new Error("Invalid actor ID");
     if (message.type !== "init") {
       this.actors.get(actorId)?.dispatch(message);
@@ -56,7 +82,8 @@ export class FollowerInstance {
             message: { type: "exit", code: 0, signal: null },
           });
         },
-        this.computerUseLock
+        this.computerUseLock,
+        this.repositories
       );
       this.actors.set(actorId, actor);
     }
@@ -66,6 +93,7 @@ export class FollowerInstance {
         ...message.bootstrap,
         id: actorId,
         cwd,
+        providerOptions: this.providerOptions ?? message.bootstrap.providerOptions,
         actorOptions: { ...message.bootstrap.actorOptions, addDirs: [], sandbox: this.sandbox },
       },
     });
