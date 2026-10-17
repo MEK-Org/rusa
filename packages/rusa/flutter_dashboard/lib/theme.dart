@@ -43,6 +43,10 @@ abstract final class MeshColors {
   /// The matching tooltip warning: a darker caramel so the text remains
   /// legible against the tooltip surface.
   static const quotaTooltipStaleWarning = Color(0xFFC79A3C);
+
+  /// A ring tooltip's availability-hold lines (#539): the [statusHalted] red
+  /// darkened so it stays legible against the light tooltip surface.
+  static const quotaTooltipHeld = Color(0xFFB91C1C);
 }
 
 /// Per-kind chip colors, lifted verbatim from the mockup's `.inline-kind-chip`

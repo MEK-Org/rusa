@@ -19,6 +19,10 @@ import {
   uploadAvatar,
 } from "../avatar/avatars.js";
 import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
+import type {
+  AvailabilityHold,
+  AvailabilityHoldOrigin,
+} from "../db/repositories/availability-hold-repository.js";
 import type { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
@@ -125,6 +129,18 @@ export interface DashboardDataDeps {
    * expired one: the sentinel layer already retires `until` past its time.
    */
   haltSnapshot?: () => HaltState | null;
+  /**
+   * The HALT sentinel alone, without the holds `haltSnapshot` folds in.
+   * Surfaced as `haltBrake` beside `availabilityHolds`, so the header can
+   * name the brake and each hold even when no single scope describes them.
+   */
+  haltBrake?: () => HaltState | null;
+  /**
+   * The availability holds in force now (#539), surfaced as
+   * `availabilityHolds` for the header tooltip and the quota rings. Absent
+   * (a UI-only server) reports `null`: holds unknown, not none.
+   */
+  availabilityHolds?: () => AvailabilityHold[];
   /**
    * Read-only snapshot of both host-scheduler preflights: crontab/crond and
    * `at`/`atrm`/`atd`/`atq`. Surfaced as the top-level `schedulerWarning`
@@ -461,6 +477,30 @@ function haltSnapshotJson(state: HaltState | null | undefined): {
     ...(state.providers?.length ? { providers: state.providers } : {}),
     ...(state.models?.length ? { models: state.models } : {}),
     ...(state.until ? { until: state.until } : {}),
+  };
+}
+
+/**
+ * One active availability hold for the header tooltip and the quota rings:
+ * its scope, origin, expiry and who placed it. Like the halt snapshot, the
+ * reason stays server-side. A null `model` is provider-wide; a null `expiry`
+ * is indefinite.
+ */
+function holdJson(hold: AvailabilityHold): {
+  provider: string;
+  model: string | null;
+  origin: AvailabilityHoldOrigin;
+  expiry: string | null;
+  createdBy: string;
+  createdAt: string;
+} {
+  return {
+    provider: hold.provider,
+    model: hold.model ?? null,
+    origin: hold.origin,
+    expiry: hold.expiry ?? null,
+    createdBy: hold.createdBy,
+    createdAt: hold.createdAt,
   };
 }
 
@@ -2429,6 +2469,8 @@ export async function handleMeshApiRequest(
     sendJson(res, 200, {
       halted: deps.isHalted?.() ?? false,
       halt: haltSnapshotJson(deps.haltSnapshot?.()),
+      haltBrake: haltSnapshotJson(deps.haltBrake?.()),
+      availabilityHolds: deps.availabilityHolds ? deps.availabilityHolds().map(holdJson) : null,
       schedulerWarning: schedulerHealth && !schedulerHealth.ok ? schedulerHealth.issues : null,
       runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
       threads,

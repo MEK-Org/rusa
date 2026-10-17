@@ -182,14 +182,22 @@ function isActiveAt(hold: AvailabilityHold, now: number): boolean {
  * when one `HaltState` describes exactly what is held: the brake file alone,
  * the global brake (which covers every hold), or, with no brake, holds that
  * form one providers × models product with one expiry. Anything else reports
- * null rather than a scope that is not held. `activeHolds` returns the holds
- * in force now.
+ * null rather than a scope that is not held. `haltBrake` and `availabilityHolds`
+ * report the two sources apart, so the header can name every hold whatever
+ * their mix. `activeHolds` returns the holds in force now.
  */
 export function haltIndicator(
   haltSwitch: Pick<HaltSwitch, "state">,
   activeHolds: () => AvailabilityHold[]
-): { isHalted: () => boolean; haltSnapshot: () => HaltState | null } {
+): {
+  isHalted: () => boolean;
+  haltSnapshot: () => HaltState | null;
+  haltBrake: () => HaltState | null;
+  availabilityHolds: () => AvailabilityHold[];
+} {
   return {
+    haltBrake: () => haltSwitch.state(),
+    availabilityHolds: activeHolds,
     isHalted: () => haltSwitch.state() !== null || activeHolds().length > 0,
     haltSnapshot: () => {
       const brake = haltSwitch.state();

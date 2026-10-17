@@ -311,10 +311,22 @@ class MeshHeader extends StatelessWidget {
                                         // The structured status rides the same
                                         // snapshot as the bool; a null here only
                                         // means an older server without the field.
-                                        return _HaltedBadge(
-                                          halt: statusSnap.data,
-                                          compact: compact,
-                                          now: haltTooltipNow,
+                                        return StreamBuilder<HaltDetail>(
+                                          stream: store.haltDetail,
+                                          initialData:
+                                              store.haltDetail.valueOrNull,
+                                          builder: (_, detailSnap) =>
+                                              _HaltedBadge(
+                                                halt: statusSnap.data,
+                                                brake: detailSnap.data?.brake,
+                                                holds: detailSnap.data?.holds,
+                                                handleOf: (id) => store
+                                                    .actor(id)
+                                                    ?.thread
+                                                    .handle,
+                                                compact: compact,
+                                                now: haltTooltipNow,
+                                              ),
                                         );
                                       },
                                     ),
@@ -766,12 +778,18 @@ class QuotaIndicators extends StatelessWidget {
         builder: (_, refreshingSnap) => StreamBuilder<bool>(
           stream: store.quotaStale,
           initialData: store.quotaStale.valueOrNull ?? false,
-          builder: (_, staleSnap) => _QuotaHeaderStrip(
-            snapshot: snap.data,
-            quotaProviders: quotaProviders,
-            refreshing: refreshingSnap.data ?? false,
-            cacheStale: staleSnap.data ?? false,
-            axis: axis,
+          builder: (_, staleSnap) => StreamBuilder<HaltDetail>(
+            stream: store.haltDetail,
+            initialData: store.haltDetail.valueOrNull,
+            builder: (_, detailSnap) => _QuotaHeaderStrip(
+              snapshot: snap.data,
+              quotaProviders: quotaProviders,
+              refreshing: refreshingSnap.data ?? false,
+              cacheStale: staleSnap.data ?? false,
+              axis: axis,
+              holds: detailSnap.data?.holds ?? const [],
+              handleOf: (id) => store.actor(id)?.thread.handle,
+            ),
           ),
         ),
       ),
@@ -786,11 +804,17 @@ class _QuotaHeaderStrip extends StatelessWidget {
     this.refreshing = false,
     this.cacheStale = false,
     this.axis = Axis.horizontal,
+    this.holds = const [],
+    this.handleOf,
   });
 
   final QuotaSnapshotDto? snapshot;
   final Map<String, QuotaProviderConfig> quotaProviders;
   final Axis axis;
+
+  /// The availability holds in force (#539), marked on the rings they cover.
+  final List<AvailabilityHoldDto> holds;
+  final String? Function(String id)? handleOf;
 
   /// True while a background SWR revalidation is in flight (ISSUE_NUM ask 4). The
   /// strip keeps rendering its last-known reading throughout — never a
@@ -827,6 +851,11 @@ class _QuotaHeaderStrip extends StatelessWidget {
           sessionWindow: entry.config.sessionWindow == null
               ? null
               : _findWindow(entry.provider, entry.config.sessionWindow!),
+          holds: [
+            for (final hold in holds)
+              if (hold.provider == entry.provider!.provider) hold,
+          ],
+          handleOf: handleOf,
         ),
         // #752: Fable rides the Claude reading but has its own weekly
         // allocation, so it gets its own ring beside Claude's. It is shown
@@ -841,6 +870,14 @@ class _QuotaHeaderStrip extends StatelessWidget {
             label: 'Fable',
             throttle: fableThrottle(entry.provider!),
             showThrottle: true,
+            holds: [
+              for (final hold in holds)
+                if (hold.provider == 'claude' &&
+                    (hold.model == null || kFableModelIds.contains(hold.model)))
+                  hold,
+            ],
+            fullyHeldByAny: true,
+            handleOf: handleOf,
           ),
       ],
     ];
@@ -942,6 +979,9 @@ class _ProviderQuotaRing extends StatelessWidget {
     this.label,
     this.throttle,
     this.showThrottle = true,
+    this.holds = const [],
+    this.fullyHeldByAny = false,
+    this.handleOf,
   });
 
   final ProviderQuotaDto provider;
@@ -962,6 +1002,15 @@ class _ProviderQuotaRing extends StatelessWidget {
   /// Whether the tooltip carries the provider's launch pacing. A model ring
   /// leaves it out: that pacing is provider-wide, not the model's.
   final bool showThrottle;
+
+  /// The availability holds covering this ring (#539). A provider-wide hold
+  /// marks it held outright; a hold on some of its models marks it in part.
+  final List<AvailabilityHoldDto> holds;
+
+  /// Whether any of [holds] holds the whole ring: the Fable ring is one
+  /// model, so a hold on Fable holds all of it.
+  final bool fullyHeldByAny;
+  final String? Function(String id)? handleOf;
 
   /// How the strip this ring belongs to is laid out. Stacked in the drawer the
   /// row has a real width to fit inside, so the label gives way first; in the
@@ -1016,8 +1065,15 @@ class _ProviderQuotaRing extends StatelessWidget {
       staleFor: staleFor,
       staleCheckedAt: fetchedAt,
       now: now,
+      holdRows: [
+        for (final hold in holds)
+          'Held: ${availabilityHoldText(hold, now: now, handleOf: handleOf)}',
+      ],
     );
     final tooltip = tooltipWidget.toPlainText(now);
+    final fullyHeld =
+        holds.isNotEmpty &&
+        (fullyHeldByAny || holds.any((hold) => hold.model == null));
     return Tooltip(
       richMessage: WidgetSpan(child: tooltipWidget),
       excludeFromSemantics: true,
@@ -1065,6 +1121,31 @@ class _ProviderQuotaRing extends StatelessWidget {
                         key: ValueKey('quota-ring-stale-warning'),
                         size: 10,
                         color: MeshColors.quotaStaleWarning,
+                      ),
+                    ),
+                  if (holds.isNotEmpty)
+                    // A header-coloured backing lifts the marker off the
+                    // ring's arc, whatever colour the reading draws it in.
+                    Positioned(
+                      right: 0,
+                      top: 0,
+                      child: DecoratedBox(
+                        decoration: const BoxDecoration(
+                          color: MeshColors.bgSecondary,
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(
+                          fullyHeld
+                              ? Icons.pause_circle_filled
+                              : Icons.pause_circle_outline,
+                          key: ValueKey(
+                            fullyHeld
+                                ? 'quota-ring-held'
+                                : 'quota-ring-held-in-part',
+                          ),
+                          size: 11,
+                          color: MeshColors.statusHalted,
+                        ),
                       ),
                     ),
                 ],
@@ -1209,6 +1290,100 @@ String _haltDescription(
   return '$label: $scope.\n$expiry';
 }
 
+/// The badge tooltip once the server reports the brake and holds apart
+/// (#539): the brake's scope, then each hold's scope, expiry and who placed
+/// it, whatever their mix. Against an older server ([holds] null) it is
+/// [haltTooltipText] over the folded [halt].
+String haltDetailTooltipText({
+  HaltStatusDto? halt,
+  HaltStatusDto? brake,
+  List<AvailabilityHoldDto>? holds,
+  String? Function(String id)? handleOf,
+  DateTime? now,
+}) {
+  if (holds == null || (brake == null && holds.isEmpty)) {
+    return haltTooltipText(halt, now: now);
+  }
+  return [
+    if (brake != null) haltTooltipText(brake, now: now),
+    if (holds.isNotEmpty) ...[
+      'Availability holds:',
+      for (final hold in holds)
+        '• ${availabilityHoldText(hold, now: now, handleOf: handleOf)}',
+    ],
+  ].join('\n');
+}
+
+/// [haltDetailTooltipText] with clock-stable expiries, as
+/// [haltSemanticsText] is to [haltTooltipText].
+String haltDetailSemanticsText({
+  HaltStatusDto? halt,
+  HaltStatusDto? brake,
+  List<AvailabilityHoldDto>? holds,
+  String? Function(String id)? handleOf,
+}) {
+  if (holds == null || (brake == null && holds.isEmpty)) {
+    return haltSemanticsText(halt);
+  }
+  return [
+    if (brake != null) haltSemanticsText(brake),
+    if (holds.isNotEmpty) ...[
+      'Availability holds:',
+      for (final hold in holds)
+        availabilityHoldText(hold, handleOf: handleOf, reported: true),
+    ],
+  ].join('\n');
+}
+
+/// One hold as the badge and ring tooltips name it: scope, expiry and who
+/// placed it, e.g. `codex, all models: until cleared. Set by root.` With
+/// [reported], the expiry is the clock-stable UTC fact the accessible label
+/// uses rather than a relative one.
+String availabilityHoldText(
+  AvailabilityHoldDto hold, {
+  DateTime? now,
+  String? Function(String id)? handleOf,
+  bool reported = false,
+}) {
+  final scope = hold.model == null
+      ? '${hold.provider}, all models'
+      : '${hold.model} on ${hold.provider}';
+  return '$scope: ${_holdExpiryText(hold, now: now, reported: reported)}. '
+      '${availabilityHoldSetter(hold, handleOf: handleOf)}.';
+}
+
+/// Who placed [hold] (#539): the importer, the chat operator, or the actor
+/// that called the hold tools, by handle when the dashboard knows it.
+String availabilityHoldSetter(
+  AvailabilityHoldDto hold, {
+  String? Function(String id)? handleOf,
+}) {
+  if (hold.createdBy == kHaltFileImportCreator) {
+    return 'Imported from a HALT file';
+  }
+  if (hold.origin == 'chat') return 'Set from chat';
+  final handle = handleOf?.call(hold.createdBy);
+  return 'Set by ${handle ?? hold.createdBy}';
+}
+
+String _holdExpiryText(
+  AvailabilityHoldDto hold, {
+  DateTime? now,
+  bool reported = false,
+}) {
+  final expiry = hold.expiry == null ? null : DateTime.tryParse(hold.expiry!);
+  if (expiry == null) return 'until cleared';
+  if (reported) {
+    return 'reported expiry '
+        "${DateFormat('EEE MMM d, y, h:mm a').format(expiry.toUtc())} UTC";
+  }
+  final until = expiry.toLocal();
+  final local = (now ?? DateTime.now()).toLocal();
+  return until.isAfter(local)
+      ? 'expires ${_haltExpiryFormat(until, local)}'
+      : 'expiry passed ${_haltExpiryFormat(until, local)}';
+}
+
 /// Same-day expiries read as a time; later ones carry the weekday and date.
 String _haltExpiryFormat(DateTime until, DateTime now) {
   final sameDay =
@@ -1233,9 +1408,22 @@ bool _phoneStatusBadgeShown(
 /// solely while an active halt exists. The tooltip names the authoritative
 /// scope and expiry from the same snapshot that raised the badge (#906).
 class _HaltedBadge extends StatelessWidget {
-  const _HaltedBadge({this.halt, this.compact = false, this.now});
+  const _HaltedBadge({
+    this.halt,
+    this.brake,
+    this.holds,
+    this.handleOf,
+    this.compact = false,
+    this.now,
+  });
 
   final HaltStatusDto? halt;
+
+  /// The brake and each hold apart (#539); [holds] null means an older
+  /// server, which leaves the tooltip to [halt] alone.
+  final HaltStatusDto? brake;
+  final List<AvailabilityHoldDto>? holds;
+  final String? Function(String id)? handleOf;
   final bool compact;
   final DateTime Function()? now;
 
@@ -1247,7 +1435,15 @@ class _HaltedBadge extends StatelessWidget {
         // Evaluated when the tooltip opens, so a passed expiry reads as passed
         // on an idle page; the overlay's DefaultTextStyle supplies the style.
         child: Builder(
-          builder: (context) => Text(haltTooltipText(halt, now: now?.call())),
+          builder: (context) => Text(
+            haltDetailTooltipText(
+              halt: halt,
+              brake: brake,
+              holds: holds,
+              handleOf: handleOf,
+              now: now?.call(),
+            ),
+          ),
         ),
       ),
       excludeFromSemantics: true,
@@ -1255,7 +1451,8 @@ class _HaltedBadge extends StatelessWidget {
         // Announce the status first, and use this explicit label instead of
         // merging the visible child text at an implementation-defined suffix.
         excludeSemantics: true,
-        label: 'Halted. ${haltSemanticsText(halt)}',
+        label:
+            'Halted. ${haltDetailSemanticsText(halt: halt, brake: brake, holds: holds, handleOf: handleOf)}',
         child: Container(
           padding: EdgeInsets.symmetric(
             horizontal: compact ? 6 : 10,

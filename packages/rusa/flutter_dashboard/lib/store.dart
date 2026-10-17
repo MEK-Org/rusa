@@ -350,6 +350,10 @@ class DashboardStore {
   );
   final _halted = BehaviorSubject<bool>.seeded(false);
   final _haltStatus = BehaviorSubject<HaltStatusDto?>.seeded(null);
+  final _haltDetail = BehaviorSubject<HaltDetail>.seeded((
+    brake: null,
+    holds: null,
+  ));
   final _schedulerWarning = BehaviorSubject<List<String>?>.seeded(null);
   final _supportedVoices = BehaviorSubject<List<SupportedVoiceDto>>.seeded(
     const [],
@@ -446,6 +450,10 @@ class DashboardStore {
   ValueStream<ActorStateSnapshot> get actorStates => _actorStates.stream;
   ValueStream<bool> get halted => _halted.stream;
   ValueStream<HaltStatusDto?> get haltStatus => _haltStatus.stream;
+
+  /// The brake and each availability hold apart (#539), from the same
+  /// snapshot as [halted]: what the header tooltip and quota rings name.
+  ValueStream<HaltDetail> get haltDetail => _haltDetail.stream;
   ValueStream<List<String>?> get schedulerWarning => _schedulerWarning.stream;
   ValueStream<List<SupportedVoiceDto>> get supportedVoices =>
       _supportedVoices.stream;
@@ -1978,6 +1986,7 @@ class DashboardStore {
       _runtimeRetryDelay = _kRuntimeRetryInitial;
       _halted.add(snap.halted);
       _haltStatus.add(snap.halt);
+      _haltDetail.add((brake: snap.haltBrake, holds: snap.availabilityHolds));
       _schedulerWarning.add(snap.schedulerWarning);
       _supportedVoices.add(snap.supportedVoices);
       _updateActorStatesFromThreads(snap.threads);
@@ -2167,6 +2176,7 @@ class DashboardStore {
       _runSelections.close(),
       _halted.close(),
       _haltStatus.close(),
+      _haltDetail.close(),
       _schedulerWarning.close(),
       _supportedVoices.close(),
       _showRetired.close(),

@@ -116,7 +116,16 @@ describe("runDashboard", () => {
       await runDashboard();
       const mesh = (
         mockWebhookServerModule.startDashboardServer.mock.calls as unknown as Array<
-          [{ mesh: { isHalted: () => boolean; haltSnapshot: () => unknown } }]
+          [
+            {
+              mesh: {
+                isHalted: () => boolean;
+                haltSnapshot: () => unknown;
+                haltBrake: () => unknown;
+                availabilityHolds: () => unknown[];
+              };
+            },
+          ]
         >
       )[0]?.[0].mesh;
       expect(mesh?.isHalted()).toBe(false);
@@ -134,6 +143,9 @@ describe("runDashboard", () => {
       ]);
       expect(mesh?.isHalted()).toBe(true);
       expect(mesh?.haltSnapshot()).toEqual({ providers: ["codex"], until });
+      // The header tooltip and the rings read the same holds, one by one.
+      expect(mesh?.availabilityHolds()).toEqual([expect.objectContaining({ provider: "codex" })]);
+      expect(mesh?.haltBrake()).toBeNull();
       // Only holds in force now count; the repository is asked with a clock.
       expect(mockAvailabilityHolds.list).toHaveBeenLastCalledWith({ now: expect.any(Number) });
     } finally {

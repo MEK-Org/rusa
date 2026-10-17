@@ -8,6 +8,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
+import { haltIndicator } from "../actor/availability-holds.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { OperatorActorControl } from "../actor/operator-actor-control.js";
@@ -23,6 +24,7 @@ import {
   readAvatar,
 } from "../avatar/avatars.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import type { AvailabilityHold } from "../db/repositories/availability-hold-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
@@ -2269,6 +2271,75 @@ describe("handleMeshApiRequest", () => {
       const expired = JSON.parse((await call(deps, "GET", "/api/mesh/threads")).res.body);
       expect(expired.halted).toBe(false);
       expect(expired.halt).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/mesh/threads lists the brake and each active hold apart, without reasons (#539)", async () => {
+    actors.upsert(rec("root", null, "active"));
+    const body = async () => JSON.parse((await call(deps, "GET", "/api/mesh/threads")).res.body);
+
+    // A UI-only server reports holds unknown, not none.
+    expect((await body()).availabilityHolds).toBeNull();
+    expect((await body()).haltBrake).toBeNull();
+
+    const dir = mkdtempSync(join(tmpdir(), "mc-api-hold-list-"));
+    try {
+      const sw = new HaltSwitch(join(dir, "HALT"), () => Date.parse("2026-10-04T12:00:00.000Z"));
+      let holds: AvailabilityHold[] = [];
+      deps = { ...deps, ...haltIndicator(sw, () => holds) };
+      expect((await body()).availabilityHolds).toEqual([]);
+
+      // A mix no single scope describes: `halt` reports null, the list names both.
+      holds = [
+        {
+          provider: "codex",
+          origin: "mesh",
+          reason: "capacity incident",
+          createdBy: "root",
+          createdAt: "2026-10-04T11:00:00.000Z",
+        },
+        {
+          provider: "claude",
+          model: "claude-fable-5-1",
+          origin: "chat",
+          expiry: "2026-10-04T17:52:00.000Z",
+          reason: "chat /halt from operator",
+          createdBy: "chat:users/operator",
+          createdAt: "2026-10-04T11:30:00.000Z",
+        },
+      ];
+      sw.halt("private operator note");
+      const mixed = await body();
+      expect(mixed.halted).toBe(true);
+      expect(mixed.halt).toEqual({ scope: "global" });
+      expect(mixed.haltBrake).toEqual({ scope: "global" });
+      expect(mixed.availabilityHolds).toEqual([
+        {
+          provider: "codex",
+          model: null,
+          origin: "mesh",
+          expiry: null,
+          createdBy: "root",
+          createdAt: "2026-10-04T11:00:00.000Z",
+        },
+        {
+          provider: "claude",
+          model: "claude-fable-5-1",
+          origin: "chat",
+          expiry: "2026-10-04T17:52:00.000Z",
+          createdBy: "chat:users/operator",
+          createdAt: "2026-10-04T11:30:00.000Z",
+        },
+      ]);
+      expect(JSON.stringify(mixed.availabilityHolds)).not.toContain("capacity incident");
+
+      sw.resume();
+      const holdsOnly = await body();
+      expect(holdsOnly.haltBrake).toBeNull();
+      expect(holdsOnly.halt).toBeNull();
+      expect(holdsOnly.availabilityHolds).toHaveLength(2);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -214,6 +214,8 @@ class FakeApi extends DashboardApi {
   Completer<DashboardConfigDto>? dashboardConfigGate;
   bool halted = false;
   HaltStatusDto? halt;
+  HaltStatusDto? haltBrake;
+  List<AvailabilityHoldDto>? availabilityHolds;
   List<String>? schedulerWarning;
   RuntimeCursor? runtimeCursor;
   int threadsCallCount = 0;
@@ -276,6 +278,8 @@ class FakeApi extends DashboardApi {
     return ThreadsSnapshot(
       halted: halted,
       halt: halt,
+      haltBrake: haltBrake,
+      availabilityHolds: availabilityHolds,
       schedulerWarning: schedulerWarning,
       threads: threadsResult,
       runtimeCursor: runtimeCursor,
