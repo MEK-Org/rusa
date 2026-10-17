@@ -10,11 +10,17 @@ import { assertBwrapAvailable, setSandboxLogger } from "../providers/sandbox.js"
 import {
   FollowerEventAcceptanceFailedError,
   type FollowerEventBatch,
+  FollowerEventParkedError,
   FollowerEventQueue,
+  type FollowerEventTransferSender,
+  httpEventTransferSender,
 } from "../remote-instances/follower-event-queue.js";
 import type { FollowerCommand, FollowerEvent } from "../remote-instances/follower-hub.js";
 import { FollowerInstance } from "../remote-instances/follower-instance.js";
-import { INSTANCE_PROTOCOL_VERSION } from "../remote-instances/protocol.js";
+import {
+  type EventTransferCapability,
+  INSTANCE_PROTOCOL_VERSION,
+} from "../remote-instances/protocol.js";
 import type { ResourceScope } from "../runtime/resource-scope.js";
 import type { RunStartOptions } from "./start.js";
 
@@ -102,9 +108,30 @@ export async function composeFollowerStart(
   let stopped = false;
   let leaderToken: string | undefined;
   let session = "";
+  /** Event transfer as advertised by the current registration; absent from older leaders. */
+  let eventTransfer: FollowerEventTransferSender | undefined;
   const generation = randomUUID();
+  // Shutdown cancels the pending poll and any backoff, then joins the loop.
+  const stopPolling = new AbortController();
+  let polling: Promise<void> | undefined;
 
-  function request(path: string, body: object | string): Promise<Response> {
+  function pause(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        stopPolling.signal.removeEventListener("abort", done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      stopPolling.signal.addEventListener("abort", done, { once: true });
+    });
+  }
+
+  function request(
+    path: string,
+    body: object | string,
+    signal: AbortSignal = AbortSignal.timeout(25_000)
+  ): Promise<Response> {
     const headers: Record<string, string> = {
       authorization: `Bearer ${token}`,
       "content-type": "application/json",
@@ -119,12 +146,12 @@ export async function composeFollowerStart(
         typeof body === "string"
           ? body
           : JSON.stringify({ id: identity.instanceId, session, ...body }),
-      signal: AbortSignal.timeout(25_000),
+      signal,
     });
   }
 
-  async function post<T>(path: string, body: object): Promise<T> {
-    const response = await request(path, body);
+  async function post<T>(path: string, body: object, signal?: AbortSignal): Promise<T> {
+    const response = await request(path, body, signal);
     if (!response.ok) {
       throw new FollowerHttpError(`Leader ${path}: HTTP ${response.status}`, response.status);
     }
@@ -151,8 +178,23 @@ export async function composeFollowerStart(
     // neither an authentication retry nor an incarnation fence.
     if (stopped || !session) return;
     try {
-      await eventQueue.flush(postEvents, { id: identity.instanceId, session });
+      await eventQueue.flush(postEvents, { id: identity.instanceId, session }, eventTransfer);
     } catch (err) {
+      if (err instanceof FollowerEventParkedError) {
+        // Retrying cannot change the outcome; a new registration or capability
+        // does, and the next poll flushes. Later events wait behind this one.
+        if (!err.repeated) {
+          log.warn("follower_event_parked", {
+            reason: err.reason,
+            eventId: err.eventId,
+            eventType: err.eventType,
+            eventBytes: err.eventBytes,
+            limitBytes: err.limitBytes,
+            eventTransfer: eventTransfer?.capability,
+          });
+        }
+        return;
+      }
       log.warn("follower_event_flush_failed", { err });
       if (err instanceof FollowerHttpError && err.status === 410) {
         session = "";
@@ -230,6 +272,7 @@ export async function composeFollowerStart(
         session: string;
         protocolVersion: number;
         leaderToken?: string;
+        eventTransfer?: EventTransferCapability;
       }>("/register", {
         platform: process.platform,
         pid: process.pid,
@@ -256,6 +299,14 @@ export async function composeFollowerStart(
       }
       session = reg.session;
       if (reg.leaderToken) leaderToken = reg.leaderToken;
+      eventTransfer = httpEventTransferSender(
+        reg.eventTransfer,
+        (fragment) => request("/events/transfer", fragment),
+        (message, status) => new FollowerHttpError(message, status)
+      );
+      // A registration answered after shutdown began still holds a leader
+      // session. Keep it for the peer disposer to unregister; start nothing.
+      if (stopped) return false;
       instance.markReconciled();
       log.info("follower_registered_and_reconciled", {
         leader: leaderUrl.origin,
@@ -273,6 +324,10 @@ export async function composeFollowerStart(
 
   resources.acquire("followerPeer", async () => {
     stopped = true;
+    // Join the loop before unregistering: no poll answered after this point
+    // dispatches, and a registration still in flight has recorded its session.
+    stopPolling.abort();
+    await polling;
     if (session) {
       await post("/unregister", {}).catch(() => {});
     }
@@ -290,13 +345,14 @@ export async function composeFollowerStart(
   });
 
   const startPolling = () => {
-    void (async () => {
+    polling = (async () => {
       let backoffMs = 500;
       while (!stopped) {
         if (!session) {
           const ok = await registerWithLeader();
+          if (stopped) break;
           if (!ok) {
-            await new Promise((r) => setTimeout(r, backoffMs));
+            await pause(backoffMs);
             backoffMs = Math.min(backoffMs * 2, 10_000);
             continue;
           }
@@ -304,9 +360,12 @@ export async function composeFollowerStart(
         }
         try {
           if (eventQueue.hasPending && !eventQueue.isFlushing) void flush();
-          const commands = await post<FollowerCommand[]>("/poll", {
-            parkedEvent: eventQueue.parkedHead ?? null,
-          });
+          const commands = await post<FollowerCommand[]>(
+            "/poll",
+            { parkedEvent: eventQueue.parkedHead ?? null },
+            AbortSignal.any([AbortSignal.timeout(25_000), stopPolling.signal])
+          );
+          if (stopped) break;
           for (const command of commands) {
             if ("actorId" in command) {
               instance.dispatch(command);
@@ -326,12 +385,13 @@ export async function composeFollowerStart(
             }
           }
         } catch (err) {
+          if (stopped) break;
           if (err instanceof FollowerHttpError && err.status === 410) {
             log.info("follower_session_expired", { leader: leaderUrl.origin });
             session = "";
           } else {
             log.warn("follower_poll_error", { err });
-            await new Promise((r) => setTimeout(r, 1000));
+            await pause(1000);
           }
         }
       }

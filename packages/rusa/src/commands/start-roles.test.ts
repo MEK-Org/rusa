@@ -1,5 +1,5 @@
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +14,12 @@ import type { RunOptions } from "../providers/types.js";
 import type { FollowerCommand } from "../remote-instances/follower-hub.js";
 import { FollowerInstance } from "../remote-instances/follower-instance.js";
 import { createHarness, waitUntil } from "../remote-instances/harness.js";
-import { INSTANCE_PROTOCOL_VERSION, type ProviderFactory } from "../remote-instances/protocol.js";
+import {
+  EVENT_TRANSFER_CAPABILITY,
+  type EventTransferFragment,
+  INSTANCE_PROTOCOL_VERSION,
+  type ProviderFactory,
+} from "../remote-instances/protocol.js";
 import { runStart } from "./start.js";
 
 interface SyntheticRequestMessage {
@@ -77,6 +82,36 @@ function makeTempHome(): string {
 
 function writeConfigFile(home: string, config: Record<string, unknown>): void {
   writeFileSync(join(home, "config.yaml"), toYaml(config), "utf8");
+}
+
+type SyntheticRoute = (path: string, body: Record<string, unknown>, res: ServerResponse) => void;
+
+/** A synthetic leader over real HTTP; held responses are closed with it. */
+async function startSyntheticLeader(route: SyntheticRoute) {
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk;
+    });
+    req.on("end", () => {
+      const path = new URL(req.url ?? "/", `http://${req.headers.host}`).pathname;
+      route(path, raw ? (JSON.parse(raw) as Record<string, unknown>) : {}, res);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return {
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.closeAllConnections();
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  };
+}
+
+function replyJson(res: ServerResponse, body: unknown, status = 200): void {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
 }
 
 let originalExit: typeof process.exit;
@@ -1318,4 +1353,185 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     });
     db.close();
   });
+  it("sends an event over the HTTP envelope through the leader's advertised transfer, ahead of later events", async () => {
+    const home = makeTempHome();
+    process.env.RUSA_HOME = home;
+    // An update command is the smallest leader input that makes this entry
+    // point emit an event; a 9 MiB id makes its update_status event larger
+    // than one /events request may carry.
+    const oversizedId = "u".repeat(9 * 1024 * 1024);
+    const delivered: { route: string; updateId: unknown }[] = [];
+    const fragments = new Map<string, Buffer[]>();
+    let polled = false;
+    const leader = await startSyntheticLeader((path, body, res) => {
+      if (path === "/register") {
+        return replyJson(res, {
+          session: "transfer-session",
+          protocolVersion: INSTANCE_PROTOCOL_VERSION,
+          eventTransfer: EVENT_TRANSFER_CAPABILITY,
+        });
+      }
+      if (path === "/poll") {
+        const commands: FollowerCommand[] = polled
+          ? []
+          : [
+              { type: "update", updateId: oversizedId },
+              { type: "update", updateId: "after-oversized" },
+            ];
+        polled = true;
+        return replyJson(res, commands);
+      }
+      if (path === "/events") {
+        for (const event of body.events as SyntheticEvent[]) {
+          delivered.push({ route: "events", updateId: event.message?.updateId });
+        }
+        return replyJson(res, {});
+      }
+      if (path === "/events/transfer") {
+        const fragment = body as unknown as EventTransferFragment;
+        const parts = fragments.get(fragment.transferId) ?? [];
+        parts.push(Buffer.from(fragment.data, "base64"));
+        fragments.set(fragment.transferId, parts);
+        const bytes = Buffer.concat(parts);
+        if (bytes.length < fragment.totalBytes) {
+          return replyJson(res, { status: "fragment", receivedBytes: bytes.length });
+        }
+        const event = JSON.parse(bytes.toString("utf8")) as SyntheticEvent;
+        delivered.push({ route: "transfer", updateId: event.message?.updateId });
+        return replyJson(res, { status: "complete" });
+      }
+      replyJson(res, {});
+    });
+    writeConfigFile(home, {
+      providers: { codex: { cliCommand: "codex" } },
+      peers: [{ type: "leader", url: leader.url, token: "token-synthetic-transfer" }],
+      instance: { id: "follower-node-transfer" },
+    });
+
+    let shutdown: (() => Promise<void>) | undefined;
+    await runStart({
+      e2e: {
+        connectPeer: true,
+        followerPolling: true,
+        onFollowerReady: (handles) => {
+          shutdown = handles.shutdown;
+        },
+      },
+    });
+
+    await waitUntil(() => delivered.length >= 2);
+    expect(delivered).toEqual([
+      { route: "transfer", updateId: oversizedId },
+      { route: "events", updateId: "after-oversized" },
+    ]);
+    await shutdown?.();
+    await leader.close();
+  }, 20_000);
+
+  it("dispatches nothing from a poll answered after shutdown begins", async () => {
+    const home = makeTempHome();
+    process.env.RUSA_HOME = home;
+    let heldPoll: ServerResponse | undefined;
+    let unregistered = false;
+    const leader = await startSyntheticLeader((path, _body, res) => {
+      if (path === "/register") {
+        return replyJson(res, {
+          session: "late-poll-session",
+          protocolVersion: INSTANCE_PROTOCOL_VERSION,
+        });
+      }
+      if (path === "/poll") {
+        heldPoll = res;
+        return;
+      }
+      if (path === "/unregister") {
+        // Answer the poll held since before shutdown, while it awaits this.
+        const init: FollowerCommand = {
+          actorId: "actor-late-poll",
+          message: {
+            type: "init",
+            bootstrap: {
+              id: "actor-late-poll",
+              cwd: home,
+              modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+            },
+          },
+        };
+        if (heldPoll?.writable) replyJson(heldPoll, [init]);
+        setTimeout(() => {
+          unregistered = true;
+          replyJson(res, {});
+        }, 50);
+        return;
+      }
+      replyJson(res, {});
+    });
+    writeConfigFile(home, {
+      providers: { codex: { cliCommand: "codex" } },
+      peers: [{ type: "leader", url: leader.url, token: "token-synthetic-late-poll" }],
+      instance: { id: "follower-node-late-poll" },
+    });
+
+    let handles: { instance: FollowerInstance; shutdown: () => Promise<void> } | undefined;
+    await runStart({
+      e2e: {
+        connectPeer: true,
+        followerPolling: true,
+        onFollowerReady: (ready) => {
+          handles = ready;
+        },
+      },
+    });
+    await waitUntil(() => heldPoll !== undefined);
+    const dispatch = vi.spyOn(handles?.instance as FollowerInstance, "dispatch");
+
+    await handles?.shutdown();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(unregistered).toBe(true);
+    expect(dispatch).not.toHaveBeenCalled();
+    await leader.close();
+  }, 20_000);
+
+  it("unregisters a registration that completes after shutdown begins", async () => {
+    const home = makeTempHome();
+    process.env.RUSA_HOME = home;
+    let heldRegister: ServerResponse | undefined;
+    const unregisteredSessions: unknown[] = [];
+    const leader = await startSyntheticLeader((path, body, res) => {
+      if (path === "/register") {
+        heldRegister = res;
+        return;
+      }
+      if (path === "/unregister") unregisteredSessions.push(body.session);
+      replyJson(res, path === "/poll" ? [] : {});
+    });
+    writeConfigFile(home, {
+      providers: { codex: { cliCommand: "codex" } },
+      peers: [{ type: "leader", url: leader.url, token: "token-synthetic-late-register" }],
+      instance: { id: "follower-node-late-register" },
+    });
+
+    let shutdown: (() => Promise<void>) | undefined;
+    await runStart({
+      e2e: {
+        connectPeer: false,
+        followerPolling: true,
+        onFollowerReady: (ready) => {
+          shutdown = ready.shutdown;
+        },
+      },
+    });
+    await waitUntil(() => heldRegister !== undefined);
+
+    const closing = shutdown?.();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    replyJson(heldRegister as ServerResponse, {
+      session: "late-register-session",
+      protocolVersion: INSTANCE_PROTOCOL_VERSION,
+    });
+    await closing;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(unregisteredSessions).toEqual(["late-register-session"]);
+    await leader.close();
+  }, 20_000);
 });
