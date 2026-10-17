@@ -579,6 +579,12 @@ export interface RetireCleanup {
 export interface ActorMeshOptions {
   actors: ActorRepository;
   principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
+  /**
+   * The effective responsive state of an actor's currently selected inbox
+   * obligation. The host owns this projection: actors cannot provide a
+   * message priority themselves.
+   */
+  responsiveForActorMessage?: (actorId: string) => boolean;
   /** This account/subtree's root id. Also backs the grandfathered `"root"` address alias. */
   rootId?: string;
   /** Builds a live Actor for a thread record (resolves provider/cwd/mcp/session). */
@@ -718,6 +724,7 @@ export interface ActorMeshOptions {
     recipientId: string;
     body: string;
     sessionId?: string;
+    responsive?: boolean;
   }) => string;
   /**
    * Durable store of per-actor capability grants (ISSUE_NUM, phase 1a). Defaults to an
@@ -944,7 +951,9 @@ export class ActorMesh {
     recipientId: string;
     body: string;
     sessionId?: string;
+    responsive?: boolean;
   }) => string;
+  private readonly responsiveForActorMessage?: (actorId: string) => boolean;
   readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
   private readonly experiments: ExperimentEnrollmentStore;
@@ -1153,6 +1162,7 @@ export class ActorMesh {
     ];
     this.events = opts.events ?? NOOP_MESH_EVENT_SINK;
     this.recordChat = opts.recordChat;
+    this.responsiveForActorMessage = opts.responsiveForActorMessage;
     this.voiceTransferLog = opts.voiceTransferLogger ?? nullLogger;
     this.scheduledMessages = opts.scheduledMessages;
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
@@ -1184,6 +1194,7 @@ export class ActorMesh {
     toId: string;
     body: string;
     sessionId?: string;
+    responsive: boolean;
     isDrop: boolean;
   }): string | undefined {
     const fromId = this.resolveThreadId(opts.fromId);
@@ -1194,6 +1205,7 @@ export class ActorMesh {
       toId,
       body: opts.body,
       sessionId: opts.sessionId,
+      responsive: opts.responsive,
     });
 
     this.recordEvent({
@@ -1222,6 +1234,7 @@ export class ActorMesh {
     toId: string;
     body: string;
     sessionId?: string;
+    responsive: boolean;
   }): string | undefined {
     if (!this.recordChat) return undefined;
     try {
@@ -1231,6 +1244,7 @@ export class ActorMesh {
         recipientId: opts.toId,
         body: opts.body,
         sessionId: opts.sessionId,
+        responsive: opts.responsive,
       });
     } catch (err) {
       this.log(`recordChat failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -1242,6 +1256,10 @@ export class ActorMesh {
   recordScheduledMessageSent(opts: ScheduledMessage): string | undefined {
     const fromId = this.resolveThreadId(opts.fromId);
     const toId = this.resolveThreadId(opts.toId);
+    // Jobs written before #1104 have no stamp. Preserve the old treatment of
+    // a pending human message only for that legacy shape; every new job has an
+    // explicit snapshot and never re-derives responsiveness at delivery.
+    const responsive = opts.responsive ?? this.principals?.getUser(fromId) !== undefined;
     if (!this.recordChat) {
       throw new Error("Scheduled message acceptance requires durable chat storage");
     }
@@ -1251,6 +1269,7 @@ export class ActorMesh {
       recipientId: toId,
       body: opts.body,
       sessionId: opts.sessionId,
+      responsive,
     });
     const event = {
       id: `${opts.id}:sent`,
@@ -4272,12 +4291,19 @@ export class ActorMesh {
     fromId = this.resolveThreadId(fromId);
     const humanSender = this.principals?.getUser(fromId);
     if (humanSender?.disabledAt) throw new Error("Message sender is disabled");
+    // An immutable creation-time snapshot. Actor tools provide neither a
+    // priority nor an obligation id; only the host can project their active
+    // run's selected obligation. Human ingress follows this same path.
+    const responsive =
+      humanSender !== undefined || this.responsiveForActorMessage?.(fromId) === true;
 
     const humanRecipient = this.principals?.getUser(toId);
     if (humanRecipient) {
       if (humanRecipient.disabledAt) throw new Error("Message recipient is disabled");
       if (deliverAt) throw new Error("Scheduled delivery requires an agent recipient");
-      if (!this.recordMessageEmitted({ fromId, toId, body, sessionId, isDrop: false })) {
+      if (
+        !this.recordMessageEmitted({ fromId, toId, body, sessionId, responsive, isDrop: false })
+      ) {
         throw new Error("User message delivery requires durable chat storage");
       }
       return { delivered: true };
@@ -4323,6 +4349,7 @@ export class ActorMesh {
         body,
         deliverAt,
         sessionId,
+        responsive,
       };
       this.scheduledMessages.scheduleMessageDelivery(pending);
       try {
@@ -4352,6 +4379,7 @@ export class ActorMesh {
       toId,
       body,
       sessionId,
+      responsive,
       isDrop: !target,
     });
     if (!target) {
@@ -4366,7 +4394,7 @@ export class ActorMesh {
           source: `mesh:${fromId}`,
           payload: {
             type: options.voice ? VOICE_INBOX_PAYLOAD_TYPE : "mesh.message",
-            ...(humanSender ? { priority: "responsive" as const } : {}),
+            ...(responsive ? { priority: "responsive" as const } : {}),
             messageId,
             fromId,
             sessionId,
@@ -4452,6 +4480,7 @@ export class ActorMesh {
           fromId: SCHEDULER_SENDER_ID,
           toId: resolvedId,
           body: reason,
+          responsive: isResponsive,
           isDrop: false,
         })
       : undefined;
@@ -5858,6 +5887,10 @@ export class ActorMesh {
       toId: this.resolveThreadId(scheduled.toId),
     };
     const { id: messageId, toId } = scheduled;
+    // See recordScheduledMessageSent: this fallback exists exclusively for a
+    // pre-#1104 pending human job whose payload cannot carry a durable stamp.
+    const responsive =
+      scheduled.responsive ?? this.principals?.getUser(scheduled.fromId) !== undefined;
     // Heal the only cross-system crash window: the host job is installed
     // before acceptance history is committed so a failed DB transaction can
     // still be rolled back by cancelling the job. If the process dies between
@@ -5884,6 +5917,7 @@ export class ActorMesh {
           source: `mesh:${scheduled.fromId}`,
           payload: {
             type: "mesh.scheduled_message",
+            ...(responsive ? { priority: "responsive" as const } : {}),
             messageId,
             fromId: scheduled.fromId,
             sessionId: scheduled.sessionId,
@@ -5897,7 +5931,7 @@ export class ActorMesh {
 
     const target = this.runs.liveActor(toId);
     if (!target) throw new Error(`scheduled delivery target ${toId} is not available`);
-    target.requestRun();
+    target.requestRun(responsive ? { priority: "responsive" } : {});
   }
 
   private pendingScheduledMessages(): ScheduledMessage[] {

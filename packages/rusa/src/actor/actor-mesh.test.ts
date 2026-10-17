@@ -375,12 +375,14 @@ function setup(
     isHalted?: ActorMeshOptions["isHalted"];
     isShuttingDown?: () => boolean;
     events?: MeshEventSink;
+    responsiveForActorMessage?: ActorMeshOptions["responsiveForActorMessage"];
     recordChat?: (opts: {
       id?: string;
       senderId: string;
       recipientId: string;
       body: string;
       sessionId?: string;
+      responsive?: boolean;
     }) => string;
     idgen?: () => string;
     onRunReturned?: ActorMeshOptions["onRunReturned"];
@@ -474,6 +476,7 @@ function setup(
     isHalted: opts.isHalted,
     isShuttingDown: opts.isShuttingDown,
     events: opts.events,
+    responsiveForActorMessage: opts.responsiveForActorMessage,
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore,
     completedFocusEntryCounts: opts.completedFocusEntryCounts,
@@ -3038,6 +3041,7 @@ describe("ActorMesh", () => {
         recipientId: "source",
         body: "first durable memo",
         sessionId: "walkie-session",
+        responsive: null,
       },
       {
         id: "two",
@@ -3046,6 +3050,7 @@ describe("ActorMesh", () => {
         recipientId: "00000000-0000-4000-8000-000000000001",
         body: "second durable reply",
         sessionId: "walkie-session",
+        responsive: null,
       },
     ];
     const transferLogs: Array<Record<string, unknown>> = [];
@@ -4338,6 +4343,53 @@ describe("ActorMesh", () => {
     const { mesh, logs } = setup();
     expect(mesh.sendMessage("ghost", "hi", "root")).toEqual({ delivered: false });
     expect(logs.some((l) => l.includes("dropped"))).toBe(true);
+  });
+
+  it("stamps each message from the sender's current responsive selection", () => {
+    const chat: Array<{ body: string; responsive?: boolean }> = [];
+    let selectedResponsive = false;
+    let sender = "";
+    const inboxStore = createMemoryInboxStore();
+    const { mesh } = setup({
+      inboxStore,
+      responsiveForActorMessage: (actorId) => actorId === sender && selectedResponsive,
+      recordChat: (message) => {
+        chat.push({ body: message.body, responsive: message.responsive });
+        return `message-${chat.length}`;
+      },
+    });
+    const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+    sender = mesh.spawn({ charter: "sender", parentId: "root" });
+
+    // No selected obligation and an ordinary selected obligation both stay normal.
+    mesh.sendMessage(recipient, "no selection", sender);
+    selectedResponsive = false;
+    mesh.sendMessage(recipient, "ordinary selection", sender);
+
+    // A subsequent send observes the current selection, not the sender identity
+    // or an earlier message's priority.
+    selectedResponsive = true;
+    mesh.sendMessage(recipient, "responsive selection", sender);
+    selectedResponsive = false;
+    mesh.sendMessage(recipient, "selection changed", sender);
+
+    // A human ingress remains responsive through the same stamped delivery path.
+    mesh.sendMessage(recipient, "human ingress", TEST_USER_ID, "human-session");
+
+    expect(chat).toEqual([
+      { body: "no selection", responsive: false },
+      { body: "ordinary selection", responsive: false },
+      { body: "responsive selection", responsive: true },
+      { body: "selection changed", responsive: false },
+      { body: "human ingress", responsive: true },
+    ]);
+    expect(inboxStore.entries.map((entry) => entry.payload.priority ?? "normal")).toEqual([
+      "normal",
+      "normal",
+      "responsive",
+      "normal",
+      "responsive",
+    ]);
   });
 
   it("deliverWake wakes a live actor (true) with the reason as its prompt", async () => {
@@ -10434,6 +10486,78 @@ describe("ActorMesh", () => {
       expect(chatRows).toHaveLength(1);
       expect(events.filter((event) => event.kind === "message_sent")).toHaveLength(1);
       expect(events.filter((event) => event.kind === "message_received")).toHaveLength(0);
+    });
+
+    it("replays a scheduled message with its send-time responsive stamp", () => {
+      let selectedResponsive = true;
+      let sender = "";
+      const chat: Array<{ id?: string; responsive?: boolean }> = [];
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, scheduledMessages } = setup({
+        inboxStore,
+        responsiveForActorMessage: (actorId) => actorId === sender && selectedResponsive,
+        recordChat: (message) => {
+          chat.push({ id: message.id, responsive: message.responsive });
+          return message.id ?? "missing-id";
+        },
+      });
+      const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+      sender = mesh.spawn({ charter: "sender", parentId: "root" });
+
+      mesh.sendMessage(
+        recipient,
+        "frozen at send",
+        sender,
+        undefined,
+        new Date(Date.now() + 100_000).toISOString()
+      );
+      selectedResponsive = false;
+
+      const scheduled = scheduledMessages.listForRecipient(recipient)[0];
+      expect(scheduled).toMatchObject({ responsive: true });
+      if (!scheduled) throw new Error("expected scheduled message");
+      mesh.deliverScheduledMessage(scheduled);
+
+      expect(chat).toEqual([
+        { id: scheduled.id, responsive: true },
+        { id: scheduled.id, responsive: true },
+      ]);
+      expect(inboxStore.entries).toContainEqual(
+        expect.objectContaining({
+          id: scheduled.id,
+          payload: expect.objectContaining({ priority: "responsive" }),
+        })
+      );
+    });
+
+    it("keeps a pre-#1104 pending human message responsive", () => {
+      const chat: Array<{ id?: string; responsive?: boolean }> = [];
+      const inboxStore = createMemoryInboxStore();
+      const { mesh } = setup({
+        inboxStore,
+        recordChat: (message) => {
+          chat.push({ id: message.id, responsive: message.responsive });
+          return message.id ?? "missing-id";
+        },
+      });
+      const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+      const legacy: ScheduledMessage = {
+        id: "legacy-human-message",
+        toId: recipient,
+        fromId: TEST_USER_ID,
+        body: "pending before the responsive stamp",
+        deliverAt: new Date(Date.now() + 100_000).toISOString(),
+      };
+
+      mesh.deliverScheduledMessage(legacy);
+
+      expect(chat).toEqual([{ id: legacy.id, responsive: true }]);
+      expect(inboxStore.entries).toContainEqual(
+        expect.objectContaining({
+          id: legacy.id,
+          payload: expect.objectContaining({ priority: "responsive" }),
+        })
+      );
     });
 
     it("does not write chat or audit state when the host rejects the job", () => {

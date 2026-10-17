@@ -13,6 +13,7 @@ async function connect(actorId: string): Promise<Client> {
       recipientId: "worker",
       body: "Please review the PR",
       sessionId: null,
+      responsive: null,
     },
     {
       id: "message-2",
@@ -21,6 +22,7 @@ async function connect(actorId: string): Promise<Client> {
       recipientId: "root",
       body: "Review complete",
       sessionId: null,
+      responsive: null,
     },
   ];
   const server = createMeshChatMcpServer(

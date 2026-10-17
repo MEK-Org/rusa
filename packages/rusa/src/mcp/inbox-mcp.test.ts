@@ -309,6 +309,7 @@ describe("inbox MCP server", () => {
                 recipientId: "actor-a",
                 body: "which PR?",
                 sessionId: null,
+                responsive: null,
               },
               {
                 id: "m1",
@@ -317,6 +318,7 @@ describe("inbox MCP server", () => {
                 recipientId: "peer",
                 body: "PR #643 is up",
                 sessionId: null,
+                responsive: null,
               },
             ],
           },
