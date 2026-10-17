@@ -15,6 +15,7 @@ import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import { QuotaCollectionLoop } from "./coordinator-collection.js";
 import { QuotaCoordinatorService } from "./coordinator-service.js";
 import {
+  modelScopeKey,
   QUOTA_ACTUATOR_SMOOTHING,
   QUOTA_DERIVATIVE_TAU_SECONDS,
   QUOTA_INTEGRAL_TIME_SECONDS,
@@ -886,7 +887,7 @@ describe("SharedQuotaStore persisted controller", () => {
     }
   });
 
-  it("keeps exhaustion out of throttle decisions and resumes from the prior period", () => {
+  it("keeps exhaustion out of throttle decisions and resumes a non-weekly lane from the prior period", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-controller-"));
     roots.push(root);
     const store = new SharedQuotaStore(join(root, "shared.db"));
@@ -897,19 +898,28 @@ describe("SharedQuotaStore persisted controller", () => {
         "claude",
         "2030-01-01T00:00:00.000Z",
         50,
-        "2030-01-08T00:00:00.000Z"
+        "2030-01-08T00:00:00.000Z",
+        "other"
       );
       recordObservation(
         store,
         "claude",
         "2030-01-01T01:00:00.000Z",
         100,
-        "2030-01-08T00:00:00.000Z"
+        "2030-01-08T00:00:00.000Z",
+        "other"
       );
       const beforeExhaustion = store.getProviderThrottle("claude");
       expect(beforeExhaustion?.intervalSeconds).toBeGreaterThan(0);
 
-      recordObservation(store, "claude", "2030-01-07T23:00:00.000Z", 0, "2030-01-08T00:00:00.000Z");
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-07T23:00:00.000Z",
+        0,
+        "2030-01-08T00:00:00.000Z",
+        "other"
+      );
       const exhausted = store.getProviderThrottle("claude");
       expect(exhausted?.intervalSeconds).toBe(beforeExhaustion?.intervalSeconds);
       expect(store.getExhaustedUntil("claude", Date.parse("2030-01-07T23:30:00.000Z"))).toBe(
@@ -928,13 +938,316 @@ describe("SharedQuotaStore persisted controller", () => {
         "claude",
         "2030-01-08T00:05:00.000Z",
         100,
-        "2030-01-15T00:00:00.000Z"
+        "2030-01-15T00:00:00.000Z",
+        "other"
       );
       const rolledOver = store.getProviderThrottle("claude");
       expect(rolledOver?.intervalSeconds).toBeGreaterThan(0);
       expect(rolledOver?.intervalSeconds).toBeLessThan(beforeExhaustion?.intervalSeconds ?? 0);
       const decisions = store.listHistorySince("claude", "2030-01-01T00:00:00.000Z");
       expect(decisions.find((point) => point.percentLeft === 0)?.intervalSeconds).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps exhaustion out of throttle decisions and starts a verified weekly rollover from zero", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-controller-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 3600 });
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T00:00:00.000Z",
+        50,
+        "2030-01-08T00:00:00.000Z"
+      );
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T01:00:00.000Z",
+        49,
+        "2030-01-08T00:00:00.000Z"
+      );
+      const beforeExhaustion = store.getProviderThrottle("claude");
+      expect(beforeExhaustion?.intervalSeconds).toBeGreaterThan(0);
+
+      recordObservation(store, "claude", "2030-01-07T23:00:00.000Z", 0, "2030-01-08T00:00:00.000Z");
+      expect(store.getProviderThrottle("claude")?.intervalSeconds).toBe(
+        beforeExhaustion?.intervalSeconds
+      );
+
+      // Past the old deadline, with a later one and real headroom: a verified
+      // new cycle (#861). The old week's period is not carried into it.
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-08T00:05:00.000Z",
+        100,
+        "2030-01-15T00:00:00.000Z"
+      );
+      const rolledOver = store.getProviderThrottle("claude");
+      expect(rolledOver?.intervalSeconds).toBe(0);
+      const newest = store.db
+        .prepare(
+          `SELECT controller_derivative AS d, controller_integral AS i FROM quota_observations
+           ORDER BY observed_at DESC LIMIT 1`
+        )
+        .get() as { d: number; i: number };
+      expect(newest).toEqual({ d: 0, i: 0 });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps a moved weekly deadline's period: only a verified cycle zeroes the actuator (#861)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-moved-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 3600 });
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T00:00:00.000Z",
+        50,
+        "2030-01-08T00:00:00.000Z"
+      );
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T01:00:00.000Z",
+        49,
+        "2030-01-08T00:00:00.000Z"
+      );
+      const before = store.getProviderThrottle("claude")?.intervalSeconds ?? 0;
+      expect(before).toBeGreaterThan(0);
+      // The deadline moves three hours later with no refill and the old one
+      // not yet passed: a cycle boundary for the derivative and integral, but
+      // no verified new cycle, so the actuator resumes from its period.
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T01:30:00.000Z",
+        48.5,
+        "2030-01-08T03:00:00.000Z"
+      );
+      const moved = store.db
+        .prepare(
+          `SELECT controller_derivative AS d, controller_integral AS i,
+                  interval_seconds AS interval
+           FROM quota_observations ORDER BY observed_at DESC LIMIT 1`
+        )
+        .get() as { d: number; i: number; interval: number };
+      expect(moved.d).toBe(0);
+      expect(moved.i).toBe(0);
+      expect(moved.interval).toBeGreaterThan(0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("uses the prior actual exhausted observation to verify a weekly refill (#861)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-exhausted-refill-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 3600 });
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T00:00:00.000Z",
+        60,
+        "2030-01-08T00:00:00.000Z"
+      );
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T00:30:00.000Z",
+        58,
+        "2030-01-08T00:00:00.000Z"
+      );
+      // Keep a high actuator baseline close to the exhausted reading. The
+      // refill below is only five minutes later, so it cannot shed this
+      // baseline through the ordinary slew limit; only a verified new cycle
+      // may start it from zero.
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T00:55:00.000Z",
+        57,
+        "2030-01-08T00:00:00.000Z"
+      );
+      recordObservation(store, "claude", "2030-01-01T01:00:00.000Z", 0, "2030-01-08T00:00:00.000Z");
+      const exhausted = store.db
+        .prepare(
+          `SELECT interval_seconds AS interval, processed FROM quota_observations
+           ORDER BY observed_at DESC LIMIT 1`
+        )
+        .get() as { interval: number | null; processed: number };
+      expect(exhausted).toEqual({ interval: null, processed: 1 });
+      const beforeRefill = store.db
+        .prepare(
+          `SELECT interval_seconds AS interval, controller_derivative AS derivative
+           FROM quota_observations WHERE interval_seconds IS NOT NULL
+           ORDER BY observed_at DESC LIMIT 1`
+        )
+        .get() as { interval: number; derivative: number };
+      expect(beforeRefill.interval).toBeGreaterThan(2 * QUOTA_MAX_SLEW_SECONDS);
+      expect(beforeRefill.derivative).not.toBe(0);
+
+      // The old deadline has not passed, so only the immediately prior actual
+      // zero reading (not the older reasoned 57% row) proves this refill. A
+      // new reading is only one point above the older reasoned row, so that
+      // row cannot prove a refill. With the actual zero evidence, the
+      // verified transition starts the actuator from zero; the first interval
+      // is consequently limited by a two-reference-step slew. The old
+      // reasoned-row evidence would retain the old 3600-second baseline.
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T01:05:00.000Z",
+        58,
+        "2030-01-15T00:00:00.000Z"
+      );
+      const refilled = store.db
+        .prepare(
+          `SELECT controller_derivative AS derivative, controller_integral AS integral,
+                  interval_seconds AS interval
+           FROM quota_observations ORDER BY observed_at DESC LIMIT 1`
+        )
+        .get() as { derivative: number; integral: number; interval: number };
+      expect(refilled).toEqual({
+        derivative: 0,
+        integral: 0,
+        interval: 2 * QUOTA_MAX_SLEW_SECONDS,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("zeroes only the verified weekly bucket, durably, and rolls back with its transaction (#861)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-verified-"));
+    roots.push(root);
+    const path = join(root, "shared.db");
+    const record = (target: SharedQuotaStore, at: string, weeklyLeft: number, reset: string) => {
+      const state: ProviderQuotaSnapshot = {
+        provider: "claude",
+        status: "available",
+        scrapedAt: at,
+        limits: [
+          {
+            label: "Weekly",
+            kind: "weekly",
+            scope: "provider",
+            percentLeft: weeklyLeft,
+            resetAtIso: reset,
+          },
+          {
+            label: "Five hour",
+            kind: "five_hour",
+            scope: "provider",
+            percentLeft: 45,
+            resetAtIso: "2030-01-01T04:00:00.000Z",
+          },
+        ],
+      };
+      const id = target.recordRaw({ provider: "claude", scrapedAt: at, rawOutput: "raw" });
+      target.recordParsed(id, state, state);
+    };
+    const latest = (target: SharedQuotaStore, kind: string) =>
+      target.db
+        .prepare(
+          `SELECT interval_seconds AS interval, controller_integral AS i, processed
+           FROM quota_observations WHERE kind = ? ORDER BY observed_at DESC LIMIT 1`
+        )
+        .get(kind) as { interval: number | null; i: number | null; processed: number };
+    const store = new SharedQuotaStore(path);
+    try {
+      store.configureController({ maxIntervalSeconds: 3600 });
+      record(store, "2030-01-01T00:00:00.000Z", 50, "2030-01-08T00:00:00.000Z");
+      record(store, "2030-01-01T01:00:00.000Z", 49, "2030-01-08T00:00:00.000Z");
+      const fiveHourBefore = latest(store, "five_hour");
+      expect(fiveHourBefore.interval).toBeGreaterThan(0);
+
+      // A redemption refill mid-cycle, whose controller step fails: the whole
+      // advance rolls back and nothing is half-applied.
+      store.setMetrics({
+        counter: (metric) => {
+          if (metric.includes("controller")) throw new Error("metrics sink down");
+        },
+        histogram: () => {},
+        gauge: () => {},
+      });
+      expect(() =>
+        record(store, "2030-01-01T01:30:00.000Z", 100, "2030-01-08T01:30:00.000Z")
+      ).toThrow("metrics sink down");
+      expect(latest(store, "weekly")).toMatchObject({ interval: null, processed: 0 });
+      expect(store.getProviderThrottle("claude")?.governingBucketKey).toBeDefined();
+    } finally {
+      store.close();
+    }
+
+    // A fresh connection (a restarted coordinator) finishes the step.
+    const reopened = new SharedQuotaStore(path);
+    try {
+      reopened.configureController({ maxIntervalSeconds: 3600 });
+      expect(latest(reopened, "weekly")).toMatchObject({ interval: 0, i: 0, processed: 1 });
+      // The other window's memory is its own and is not cleared.
+      expect(latest(reopened, "five_hour").interval).toBeGreaterThan(0);
+      expect(latest(reopened, "five_hour").i).not.toBe(0);
+    } finally {
+      reopened.close();
+    }
+    const again = new SharedQuotaStore(path);
+    try {
+      expect(latest(again, "weekly")).toMatchObject({ interval: 0, i: 0 });
+    } finally {
+      again.close();
+    }
+  });
+
+  it("relaxes one bucket for the election only (#861)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-relax-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 3600 });
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T00:00:00.000Z",
+        50,
+        "2030-01-08T00:00:00.000Z"
+      );
+      recordObservation(
+        store,
+        "claude",
+        "2030-01-01T01:00:00.000Z",
+        49,
+        "2030-01-08T00:00:00.000Z"
+      );
+      const ordinary = store.getProviderThrottle("claude");
+      expect(ordinary?.governingBucketKey).toBe("claude:weekly");
+      expect(ordinary?.intervalSeconds).toBeGreaterThan(0);
+      const relaxed = store.getProviderThrottle("claude", {
+        relax: { modelScope: "", kind: "weekly" },
+      });
+      expect(relaxed?.intervalSeconds).toBe(0);
+      expect(relaxed?.uncappedIntervalSeconds).toBe(0);
+      expect(relaxed?.buckets).toEqual(ordinary?.buckets);
+      // A relaxation naming another lane or window changes nothing here.
+      expect(
+        store.getProviderThrottle("claude", { relax: { modelScope: "", kind: "session" } })
+      ).toEqual(ordinary);
+      expect(
+        store.getProviderThrottle("claude", {
+          relax: { modelScope: modelScopeKey(["claude-fable-5-1"]), kind: "weekly" },
+        })
+      ).toEqual(ordinary);
     } finally {
       store.close();
     }
@@ -1085,7 +1398,10 @@ describe("SharedQuotaStore retention and indexing", () => {
       expect(claudeThrottle?.intervalSeconds).toBeGreaterThan(0);
       expect(claudeThrottle?.governingBucketKey).toBe("claude:weekly");
 
-      // Adding a fresh observation at `evalTime` computes derivative against the preserved controller memory
+      // A fresh observation at `evalTime` is reasoned against the preserved
+      // controller memory. It lands after that row's reset with a later one, a
+      // verified new weekly cycle (#861), so it starts from zero rather than
+      // unwinding the preserved 3600 s period.
       recordObservation(
         store,
         "claude",
@@ -1095,7 +1411,8 @@ describe("SharedQuotaStore retention and indexing", () => {
         "weekly"
       );
       const freshClaudeThrottle = store.getProviderThrottle("claude");
-      expect(freshClaudeThrottle?.intervalSeconds).toBeGreaterThan(0);
+      expect(freshClaudeThrottle?.governingBucketKey).toBe("claude:weekly");
+      expect(freshClaudeThrottle?.intervalSeconds).toBe(0);
     } finally {
       store.close();
     }

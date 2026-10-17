@@ -18,6 +18,11 @@ import { runQuickstart, runQuickstartConfigure, runQuickstartSeed } from "./comm
 import { runQuotaBackup, runQuotaBackupList, runQuotaRestore } from "./commands/quota-backup.js";
 import { runQuotaCoordinator } from "./commands/quota-coordinator.js";
 import { runQuotaPacingReset } from "./commands/quota-pacing-reset.js";
+import {
+  runQuotaSprintArm,
+  runQuotaSprintCancel,
+  runQuotaSprintStatus,
+} from "./commands/quota-sprint.js";
 import { runReport } from "./commands/report.js";
 import { runServiceRestart, runServiceStatus, runServiceStop } from "./commands/service-control.js";
 import { runStart } from "./commands/start.js";
@@ -511,6 +516,99 @@ program
       databasePath: opts.database,
     });
   });
+
+const quotaSprint = program
+  .command("quota-sprint")
+  .description(
+    "Operator weekly sprint: relax one weekly bucket's even-spread pacing until expiry (held in coordinator memory; a restart disarms it)"
+  );
+
+quotaSprint
+  .command("status")
+  .description("Show the sprint policy, the weekly buckets' latest actual readings and pacing")
+  .requiredOption("--provider <name>", "Provider lane (claude, codex, agy, kimi)")
+  .option("--home <path>", "Override RUSA_HOME")
+  .option("--socket <path>", "Override the coordinator socket")
+  .action(async (opts: { provider: string; home?: string; socket?: string }) => {
+    process.exitCode = await runQuotaSprintStatus({
+      provider: opts.provider,
+      home: opts.home,
+      socketPath: opts.socket,
+    });
+  });
+
+quotaSprint
+  .command("arm")
+  .description("Arm one weekly sprint; every precondition must match the current status")
+  .requiredOption("--provider <name>", "Provider lane (claude, codex, agy, kimi)")
+  .requiredOption("--boot <id>", "Coordinator boot ID from status")
+  .requiredOption("--revision <n>", "Sprint revision from status")
+  .requiredOption("--bucket <key>", "Weekly bucket key from status")
+  .requiredOption("--cycle-anchor <iso>", "The bucket's cycle anchor from status")
+  .requiredOption("--generation <n>", "Reading-mode generation from status")
+  .requiredOption("--expires-at <iso>", "UTC expiry, no later than the weekly reset")
+  .requiredOption("--request-id <id>", "Unique ID; repeat it to retry a lost response safely")
+  .option("--confirm-reset-usable", "Confirm one provider reset is usable", false)
+  .option("--home <path>", "Override RUSA_HOME")
+  .option("--socket <path>", "Override the coordinator socket")
+  .action(
+    async (opts: {
+      provider: string;
+      boot: string;
+      revision: string;
+      bucket: string;
+      cycleAnchor: string;
+      generation: string;
+      expiresAt: string;
+      requestId: string;
+      confirmResetUsable: boolean;
+      home?: string;
+      socket?: string;
+    }) => {
+      process.exitCode = await runQuotaSprintArm({
+        provider: opts.provider,
+        bootId: opts.boot,
+        revision: opts.revision,
+        bucket: opts.bucket,
+        cycleAnchor: opts.cycleAnchor,
+        generation: opts.generation,
+        expiresAt: opts.expiresAt,
+        requestId: opts.requestId,
+        confirmResetUsable: opts.confirmResetUsable,
+        home: opts.home,
+        socketPath: opts.socket,
+      });
+    }
+  );
+
+quotaSprint
+  .command("cancel")
+  .description("Cancel the armed sprint; ordinary pacing applies to the same cycle at once")
+  .requiredOption("--provider <name>", "Provider lane (claude, codex, agy, kimi)")
+  .requiredOption("--boot <id>", "Coordinator boot ID from status")
+  .requiredOption("--revision <n>", "Sprint revision from status")
+  .requiredOption("--arm-id <id>", "The arm to cancel")
+  .option("--home <path>", "Override RUSA_HOME")
+  .option("--socket <path>", "Override the coordinator socket")
+  .action(
+    async (opts: {
+      provider: string;
+      boot: string;
+      revision: string;
+      armId: string;
+      home?: string;
+      socket?: string;
+    }) => {
+      process.exitCode = await runQuotaSprintCancel({
+        provider: opts.provider,
+        bootId: opts.boot,
+        revision: opts.revision,
+        armId: opts.armId,
+        home: opts.home,
+        socketPath: opts.socket,
+      });
+    }
+  );
 
 const understanding = program
   .command("understanding")
