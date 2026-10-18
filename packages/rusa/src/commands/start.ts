@@ -29,6 +29,7 @@ import {
 import type { ActorRecord, ExecutionConfig, PortableContextConfig } from "../actor/actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
+  defaultActorBootstrapCapabilities,
   defaultGrantRecipient,
   OBLIGATIONS_ADMIN_CAPABILITY,
   seedConfiguredActorGrants,
@@ -3565,11 +3566,17 @@ async function composeStart(
       const rec = ctx.record;
       // Default authority is provisioned as durable rows for the oldest active
       // top-level actor (#1087), independently of the optional config import.
-      // Use the fixed default set: host tool availability never adds authority.
+      // Use the fixed administrative set plus configured communication scopes;
+      // host tool availability never adds authority.
       // Existing active AND revoked rows survive the atomic, insert-only seed.
       if (defaultGrantRecipient(actors.list())?.id === id) {
         const seeded = database.transaction(() =>
-          seedConfiguredActorGrants(capabilityGrants, id)
+          seedConfiguredActorGrants(
+            capabilityGrants,
+            id,
+            undefined,
+            defaultActorBootstrapCapabilities(config)
+          )
         )();
         if (seeded.length > 0) {
           log.info("bootstrap_capabilities_seeded", { actorId: id, capabilities: seeded });

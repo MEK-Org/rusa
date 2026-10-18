@@ -2807,6 +2807,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
   });
 
   it("mounts the actor-bound obligations MCP for root and rehydrated workers", async () => {
+    clearLegacyConfiguredGrants();
     writeFileSync(
       join(homeDir, "threads.json"),
       JSON.stringify({
@@ -2872,6 +2873,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       title: "ordinary",
       ownerId: worker.id,
     });
+    const descendant = getRepositories().obligations.create({
+      title: "descendant",
+      ownerId: worker.id,
+      parentId: ordinary.id,
+    });
     expect(
       (await call(worker as Actor, "mark_obligation_responsive", { id: ordinary.id })).isError
     ).toBe(true);
@@ -2880,10 +2886,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
       (await call(root, "mark_obligation_responsive", { id: ordinary.id })).isError
     ).toBeFalsy();
     expect(getRepositories().obligations.require(ordinary.id).effectiveResponsive).toBe(true);
+    expect(getRepositories().obligations.require(descendant.id).effectiveResponsive).toBe(true);
 
-    // The configured actor gets no cross-owner authority from its import or
-    // rootActor config. An explicit durable operator binding is checked for
-    // every mutation, including after this already-open endpoint is revoked.
+    // The default recipient's cross-owner authority is a durable bootstrap
+    // binding, checked on every call, including after revocation.
     const human = getRepositories().principals.createUser({
       email: "obligation-owner@example.com",
       createdAt: "2026-10-16T05:30:00.000Z",
@@ -2892,13 +2898,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
       title: "human-owned",
       ownerId: human.id,
     });
-    expect(getRepositories().capabilityGrants.activeFor(rootId)).not.toContain(
+    expect(getRepositories().capabilityGrants.activeFor(rootId)).toContain(
       OBLIGATIONS_ADMIN_CAPABILITY
     );
     expect(
       (await call(root, "set_checkpoint", { id: humanOwned.id, checkpoint: "before grant" }))
         .isError
-    ).toBe(true);
+    ).toBeFalsy();
     getRepositories().capabilityGrants.grant({
       actorId: rootId,
       capability: OBLIGATIONS_ADMIN_CAPABILITY,
@@ -10277,7 +10283,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     });
 
-    it("adds chat read to each ordinary actor without deriving chat-write from import identity", async () => {
+    it("adds chat read to every actor and configured chat write only to the default recipient", async () => {
       clearLegacyConfiguredGrants();
       writeConfig(chatConfig);
       withWorker("chat-set-worker");
@@ -10298,6 +10304,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "chat-write",
         "pnpm-hardlinks",
         "update",
       ]);
@@ -10316,13 +10323,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
       ]);
     });
 
-    it("upgrades a staging-shaped root without Chat or Slack write until it grants them explicitly", async () => {
+    it("restores configured Chat and Slack write automatically on a staging-shaped upgrade", async () => {
       // Staging's boot seeded only the administrative and host-maintenance rows;
       // Chat and Slack write were direct configured-actor mounts with no row.
       writeFileSync(
         join(homeDir, "capability-grants.json"),
         JSON.stringify({
-          grants: CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES.map((capability) => ({
+          grants: CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES.filter(
+            (capability) => !["obligations-admin", "obligation-responsive"].includes(capability)
+          ).map((capability) => ({
             actorId: rootId,
             capability,
             grantedBy: CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR,
@@ -10344,35 +10353,177 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
       const startSpy = vi.spyOn(SlackSocketSource.prototype, "start").mockResolvedValue(undefined);
       const closeSpy = vi.spyOn(SlackSocketSource.prototype, "close").mockResolvedValue(undefined);
+      const chatClient = new FakeChatClient();
+      const slackClient = new SlackClient("xoxb-synthetic-bot-token");
+      const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: "1791849600.000100" });
+      Object.defineProperty(slackClient, "web", { value: { chat: { postMessage } } });
       try {
         const { mesh, root } = await boot({
-          chatClient: new FakeChatClient(),
+          chatClient,
           chatSource: new FakeChatSource(),
-          slackClient: new SlackClient("xoxb-synthetic-bot-token"),
+          slackClient,
         });
         if (!root) throw new Error("configured actor missing");
         const names = () => mcpServersOf(root).map((server) => server.name);
 
         expect([...mesh.activeCapabilitiesFor(root.id)].sort()).toEqual(
-          [...CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES].sort()
+          [...CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES, "chat-write:*", "slack-write:*"].sort()
         );
         expect(names()).toContain("chat-read");
-        expect(names()).not.toContain("chat-write");
-        expect(names()).not.toContain("slack-write");
-
-        // The documented restore: root, holding its imported capability-admin
-        // row, grants itself each write surface; both mount live.
-        mesh.grantCapability(root.id, "chat-write:*", root.id);
-        mesh.grantCapability(root.id, "slack-write:*", root.id);
-
-        expect(mesh.activeCapabilitiesFor(root.id)).toEqual(
-          expect.arrayContaining(["chat-write:*", "slack-write:*"])
-        );
         expect(names()).toEqual(expect.arrayContaining(["chat-write", "slack-write"]));
+        for (const [serverName, args] of [
+          ["chat-write", { spaceName: "spaces/A", text: "automatic Chat write" }],
+          ["slack-write", { channel: "C1", text: "automatic Slack write" }],
+        ] as const) {
+          const url = mcpServersOf(root).find((server) => server.name === serverName)?.url;
+          if (!url) throw new Error(`${serverName} missing`);
+          const client = new Client({ name: "default-write", version: "0.0.0" });
+          await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+          try {
+            expect(
+              (await client.callTool({ name: "send_message", arguments: args })).isError
+            ).toBeFalsy();
+          } finally {
+            await client.close();
+          }
+        }
+        expect(chatClient.sent).toHaveLength(1);
+        expect(postMessage).toHaveBeenCalledOnce();
       } finally {
         startSpy.mockRestore();
         closeSpy.mockRestore();
       }
+    });
+
+    it("provisions root-free first creation, scoped writes and obligation authority, preserving revocations on restart", async () => {
+      clearLegacyConfiguredGrants();
+      rmSync(join(homeDir, "threads.json"));
+      writeConfig({
+        rootActor: undefined,
+        chat: { ...chatConfig.chat, gchat: ["spaces/A"] },
+      });
+      const chatClient = new FakeChatClient();
+      const options = { chatClient, chatSource: new FakeChatSource() };
+      const handles = await boot(options);
+      expect(handles.mesh.list()).toEqual([]);
+      const firstId = handles.rootControl.spawnChild(
+        {
+          charter: "first actor",
+          modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+        },
+        "e2e-controller"
+      );
+      const first = workerOf(handles.mesh, firstId);
+      const laterId = handles.mesh.spawn({
+        charter: "unrelated parentless actor",
+        parentId: null,
+        modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      });
+      expect(getRepositories().capabilityGrants.activeFor(laterId)).toEqual([]);
+      expect(
+        mcpServersOf(workerOf(handles.mesh, laterId)).map((server) => server.name)
+      ).not.toContain("chat-write");
+      const call = async (
+        actor: Actor,
+        serverName: string,
+        name: string,
+        args: Record<string, unknown>
+      ) => {
+        const url = mcpServersOf(actor).find((server) => server.name === serverName)?.url;
+        if (!url) throw new Error(`${serverName} missing`);
+        const client = new Client({ name: "default-authority", version: "0.0.0" });
+        await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+        try {
+          return await client.callTool({ name, arguments: args });
+        } finally {
+          await client.close();
+        }
+      };
+      expect(
+        (
+          await call(first, "chat-write", "send_message", {
+            spaceName: "spaces/A",
+            text: "allowed",
+          })
+        ).isError
+      ).toBeFalsy();
+      expect(
+        (
+          await call(first, "chat-write", "send_message", {
+            spaceName: "spaces/B",
+            text: "refused",
+          })
+        ).isError
+      ).toBe(true);
+      expect(chatClient.sent).toHaveLength(1);
+      const human = getRepositories().principals.createUser({
+        email: "default-owner@example.com",
+        createdAt: "2026-10-18T00:00:00Z",
+      });
+      expect(
+        (
+          await call(first, "obligations", "create_obligation", {
+            title: "human responsive work",
+            owner_id: human.id,
+            responsive: true,
+          })
+        ).isError
+      ).toBeFalsy();
+      expect(
+        (
+          await call(workerOf(handles.mesh, laterId), "obligations", "create_obligation", {
+            title: "refused responsive work",
+            owner_id: laterId,
+            responsive: true,
+          })
+        ).isError
+      ).toBe(true);
+      const seeded = getRepositories()
+        .capabilityGrants.list()
+        .filter((grant) => grant.actorId === firstId);
+      expect(seeded.every((grant) => grant.grantedBy === CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR)).toBe(
+        true
+      );
+      await handles.mesh.revokeCapability(firstId, "chat-write:spaces/A", firstId);
+      expect(mcpServersOf(first).map((server) => server.name)).not.toContain("chat-write");
+      getRepositories().capabilityGrants.revoke(
+        firstId,
+        "obligation-responsive",
+        "2026-10-18T00:00:00Z"
+      );
+      const revoked = getRepositories().capabilityGrants.list();
+      await handles.shutdown();
+      shutdownFn = undefined;
+      const restarted = await boot(options);
+      expect(getRepositories().capabilityGrants.list()).toEqual(revoked);
+      expect(
+        mcpServersOf(workerOf(restarted.mesh, firstId)).map((server) => server.name)
+      ).not.toContain("chat-write");
+      expect(
+        (
+          await call(workerOf(restarted.mesh, firstId), "obligations", "create_obligation", {
+            title: "still refused",
+            owner_id: firstId,
+            responsive: true,
+          })
+        ).isError
+      ).toBe(true);
+      // Moving the first actor below another changes the default recipient on
+      // restart; its existing rows, including revocations, remain authoritative.
+      getRepositories().actors.patch(firstId, { parentId: laterId });
+      await restarted.shutdown();
+      shutdownFn = undefined;
+      await boot(options);
+      expect(getRepositories().capabilityGrants.activeFor(laterId)).toEqual(
+        expect.arrayContaining([
+          "chat-write:spaces/A",
+          "obligations-admin",
+          "obligation-responsive",
+        ])
+      );
+      expect(getRepositories().capabilityGrants.activeFor(firstId)).not.toContain(
+        "chat-write:spaces/A"
+      );
     });
 
     it("records the same run accounting, events and logs for root and worker runs", async () => {

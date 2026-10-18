@@ -1,3 +1,5 @@
+import type { RusaConfig } from "../config/types.js";
+import { OBLIGATION_RESPONSIVE_CAPABILITY } from "../mcp/obligations-mcp.js";
 import { PNPM_HARDLINKS_MCP_NAME } from "../mcp/pnpm-hardlinks-mcp.js";
 import { UPDATE_MCP_NAME } from "../mcp/update-mcp.js";
 import type { ActorRecord } from "./actor-record.js";
@@ -55,14 +57,14 @@ export const ROOM_ADMIN_CAPABILITY = "room-admin";
  * Manage obligations regardless of their owner or actor-tree position. This is
  * deliberately distinct from actor administration: it lets a named actor work
  * human-owned and orphan-owned obligations, but grants no lifecycle, model, or
- * capability authority. An authenticated operator provisions it directly;
- * configuration and the configured-actor import never seed it (#1003).
+ * capability authority. The default bootstrap provisions the oldest active
+ * parentless actor; further bindings require an authenticated operator.
  */
 export const OBLIGATIONS_ADMIN_CAPABILITY = "obligations-admin";
 
 /**
- * Capabilities whose durable rows are changed only through an authenticated
- * operator boundary. Keeping this separate from host-global capabilities is
+ * Beyond the default bootstrap, these durable rows are changed only through an
+ * authenticated operator boundary. Keeping this separate from host-global capabilities is
  * intentional: obligations administration has no host-wide side effect, but
  * an actor-facing grantor must not bootstrap cross-owner obligation reach.
  */
@@ -99,9 +101,8 @@ export const HOST_MAINTENANCE_CAPABILITIES: ReadonlySet<string> = new Set([
  * registry, and managing the mesh-wide Chat Room roster. The subtree boundary that bounds every other delegation cannot
  * bound these, so the mesh never grants one — not downward, and not to the
  * grantor itself, which is the path by which a delegated `capability-admin`
- * holder would otherwise widen into host authority. Startup no longer seeds
- * one and no operator path creates one yet (#1087), so only an existing row
- * authorizes it; a holder may revoke it from itself, and that revocation is
+ * holder would otherwise widen into host authority. The default bootstrap
+ * seeds these rows; a holder may revoke one from itself, and that revocation is
  * deliberately one-way from inside the mesh.
  */
 export const HOST_GLOBAL_CAPABILITIES: ReadonlySet<string> = new Set([
@@ -117,23 +118,24 @@ export const HOST_GLOBAL_CAPABILITIES: ReadonlySet<string> = new Set([
  */
 export const CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES: readonly string[] = [
   ...ADMINISTRATIVE_CAPABILITIES,
+  OBLIGATIONS_ADMIN_CAPABILITY,
+  OBLIGATION_RESPONSIVE_CAPABILITY,
   ...HOST_MAINTENANCE_CAPABILITIES,
 ];
 
-/**
- * The subset of the bootstrap set whose FIRST insertion this boot should
- * perform: every administrative capability (they gate tools on the agent-exec
- * endpoint, which always exists) plus only those host-maintenance servers the
- * wiring managed to build, so a host whose deploy checkout can't be resolved
- * never gets an `update` row written on its behalf. This governs insertion
- * only. Seeding is non-destructive by design, so a row seeded by an earlier
- * boot stays active on a later boot that cannot mount its server; that row is
- * inert until the server is mountable again.
- */
-export function bootstrapCapabilitiesFor(mountable: ReadonlySet<string>): string[] {
-  return CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES.filter(
-    (capability) => ADMINISTRATIVE_CAPABILITIES.has(capability) || mountable.has(capability)
-  );
+/** Preserve the former root's configured communication writes as ordinary grants. */
+export function defaultActorBootstrapCapabilities(
+  config: Pick<RusaConfig, "chat" | "slack">
+): string[] {
+  const capabilities = [...CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES];
+  if (config.chat) {
+    const spaces = config.chat.gchat;
+    capabilities.push(
+      ...(Array.isArray(spaces) ? spaces : ["*"]).map((space) => `chat-write:${space}`)
+    );
+  }
+  if (config.slack) capabilities.push("slack-write:*");
+  return capabilities;
 }
 
 /** The `grantedBy` recorded on a seeded row, so the audit view shows its provenance. */
