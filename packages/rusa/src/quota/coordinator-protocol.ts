@@ -12,8 +12,12 @@ export const COORDINATOR_PROTOCOL_MAJOR = 1;
 // keeps its provider-only behavior. Minor 3 adds each scrape's outcome to
 // history (#759), so a reader can see a scrape that left no window row; an
 // older reader of a minor-2 service sees rows only. Minor 4 adds the immutable
-// build revision captured when the coordinator process starts (#852).
-export const COORDINATOR_PROTOCOL_MINOR = 4;
+// build revision captured when the coordinator process starts (#852). Minor 5
+// adds the operator weekly sprint route and the `sprint` block on a throttle
+// lane (#861); an older reader keeps consuming the effective `intervalSeconds`.
+export const COORDINATOR_PROTOCOL_MINOR = 5;
+/** The first protocol minor that serves {@link QUOTA_SPRINT_PATH}. */
+export const QUOTA_SPRINT_PROTOCOL_MINOR = 5;
 /** Routine provider probe cache TTL: one scrape per provider per ~30 minutes (#690). */
 export const QUOTA_PROBE_TTL_MS = 30 * 60 * 1000;
 export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
@@ -73,6 +77,12 @@ export const HISTORY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
  */
 export const QUOTA_READING_MODE_PATH = "/v1/quota/reading-mode";
 export const MANUAL_QUOTA_OBSERVATION_PATH = "/v1/quota/observations";
+/**
+ * The operator weekly sprint (#861): GET reads one provider's policy status,
+ * POST arms or cancels it. Like the two write routes, the socket's file mode
+ * is its whole authorization.
+ */
+export const QUOTA_SPRINT_PATH = "/v1/quota/sprint";
 
 export interface QuotaCoordinatorServiceInfo {
   protocolMajor: number;
@@ -114,10 +124,140 @@ export interface PublishedThrottleProviderStatus {
    * freshness and stale widening. Omitted when the provider reports none.
    */
   modelLanes?: PublishedThrottleModelLaneStatus[];
+  /**
+   * Present only while an operator sprint is armed (minor 5, #861). The
+   * top-level and model-lane values are then the effective ones; this block
+   * names the policy and carries the ordinary decision it relaxed.
+   */
+  sprint?: PublishedThrottleSprint;
+}
+
+/** The armed sprint as a throttle reader sees it. */
+export interface PublishedThrottleSprint {
+  armId: string;
+  bucketKey: string;
+  /** Empty for the provider-wide lane; otherwise the target model lane's models. */
+  models: string[];
+  state: QuotaSprintState;
+  expiresAt: string;
+  /** The ordinary decision of the lane holding the target bucket. */
+  ordinary: QuotaSprintLanePacing;
+}
+
+/** One lane's pacing decision, as the sprint status reports it. */
+export interface QuotaSprintLanePacing {
+  intervalSeconds: number;
+  uncappedIntervalSeconds: number;
+  governingBucketKey: string | null;
+  capped: boolean;
+  expired: boolean;
+  exhaustedUntil: string | null;
+  stale: boolean;
+  hardStale: boolean;
+}
+
+/**
+ * `active` relaxes the target bucket; `suspended_stale` keeps the arm but
+ * applies ordinary pacing until fresh evidence for the bound cycle arrives.
+ * Suspension never extends the expiry.
+ */
+export type QuotaSprintState = "active" | "suspended_stale";
+
+/** Why a sprint arm ended. Every reason is final: an arm never resumes. */
+export type QuotaSprintEndReason =
+  | "cancelled"
+  | "expired"
+  | "exhausted"
+  | "new_cycle"
+  | "deadline_moved"
+  | "cycle_ambiguous"
+  | "reading_mode_changed"
+  | "model_scope_changed";
+
+export interface QuotaSprintPolicy {
+  armId: string;
+  requestId: string;
+  provider: string;
+  bucketKey: string;
+  models: string[];
+  readingModeGeneration: number;
+  /** The weekly reset deadline and the observation the arm was bound to. */
+  cycleAnchor: { resetAtIso: string; observedAt: string; percentLeft: number };
+  armedAt: string;
+  expiresAt: string;
+}
+
+export interface QuotaSprintCurrent extends QuotaSprintPolicy {
+  state: QuotaSprintState;
+}
+
+export interface QuotaSprintEnded extends QuotaSprintPolicy {
+  reason: QuotaSprintEndReason;
+  endedAt: string;
+  message: string;
+}
+
+/** One canonical weekly bucket an operator can arm, with its latest actual reading. */
+export interface QuotaSprintBucket {
+  key: string;
+  models: string[];
+  /** The bucket's latest stored observation, unchanged by any policy. */
+  latest: { observedAt: string; percentLeft: number; resetAtIso: string | null };
+  /** The value `arm` must echo as its cycle anchor, or null when there is none. */
+  cycleAnchor: string | null;
+  freshness: { ageMs: number; stale: boolean; hardStale: boolean };
+}
+
+export interface QuotaSprintStatusResponse {
+  service: QuotaCoordinatorServiceInfo;
+  provider: string;
+  boot: { id: string; startedAt: string };
+  revision: number;
+  readingMode: { mode: "manual" | "scrape"; generation: number };
+  buckets: QuotaSprintBucket[];
+  /** Null while the provider has no stored throttle yet. */
+  pacing: { ordinary: QuotaSprintLanePacing; effective: QuotaSprintLanePacing } | null;
+  policy: QuotaSprintCurrent | null;
+  lastEnded: QuotaSprintEnded | null;
+  notes: string[];
+}
+
+export interface QuotaSprintActionResponse {
+  service: QuotaCoordinatorServiceInfo;
+  provider: string;
+  action: "arm" | "cancel";
+  boot: { id: string; startedAt: string };
+  revision: number;
+  /** True when this request repeated one already applied; nothing changed. */
+  duplicate: boolean;
+  policy: QuotaSprintCurrent | null;
+  lastEnded: QuotaSprintEnded | null;
+}
+
+export interface QuotaSprintArmRequest {
+  action: "arm";
+  provider: string;
+  bootId: string;
+  revision: number;
+  bucket: string;
+  cycleAnchor: string;
+  generation: number;
+  requestId: string;
+  expiresAt: string;
+  /** The operator's confirmation that one provider reset is usable. */
+  confirmResetUsable: true;
+}
+
+export interface QuotaSprintCancelRequest {
+  action: "cancel";
+  provider: string;
+  bootId: string;
+  revision: number;
+  armId: string;
 }
 
 export interface PublishedThrottleModelLaneStatus
-  extends Omit<PublishedThrottleProviderStatus, "modelLanes"> {
+  extends Omit<PublishedThrottleProviderStatus, "modelLanes" | "sprint"> {
   /** Canonical configured model IDs this lane's windows apply to. */
   models: string[];
 }
@@ -235,6 +375,14 @@ export type QuotaCoordinatorErrorCode =
   | "mode_generation_mismatch"
   | "stale_observation"
   | "idempotency_conflict"
+  | "sprint_boot_mismatch"
+  | "sprint_revision_conflict"
+  | "sprint_already_armed"
+  | "sprint_bucket_unknown"
+  | "sprint_evidence_unusable"
+  | "sprint_cycle_mismatch"
+  | "sprint_expiry_invalid"
+  | "sprint_arm_not_current"
   | "internal_error";
 
 export interface QuotaCoordinatorError {

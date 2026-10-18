@@ -89,6 +89,31 @@ interface ObligationRow {
   matcher_closed_unmerged_at: string | null;
 }
 
+/**
+ * The deliberately small, non-scheduling obligation shape consumed by a
+ * recent-activity card. Activity is an audit/display surface: it must not
+ * materialize the recursive priority/responsiveness projection merely to
+ * render a title, owner, terminal status, or external-reference key.
+ */
+export type ActivityDisplayObligation = Pick<
+  Obligation,
+  "id" | "ownerId" | "title" | "status" | "externalRef"
+>;
+
+interface ActivityDisplayObligationRow {
+  id: string;
+  owner_id: string;
+  title: string | null;
+  status: string;
+  external_ref: string | null;
+}
+
+export interface ActivityDisplayLookup {
+  byId: ReadonlyMap<string, ActivityDisplayObligation>;
+  /** Keys retain the caller's spelling; matching stays NOCASE like `findByExternalRef`. */
+  byExternalRef: ReadonlyMap<string, ActivityDisplayObligation>;
+}
+
 interface ObligationArtifactRow {
   id: string;
   obligation_id: string;
@@ -537,6 +562,17 @@ function toObligation(row: ObligationRow): Obligation {
     nextReadyAt: row.next_ready_at,
     snoozedUntil: row.snoozed_until,
     hasCompletionHistory: row.has_completion_history === 1,
+  };
+}
+
+function toActivityDisplayObligation(row: ActivityDisplayObligationRow): ActivityDisplayObligation {
+  assertObligationStatus(row.status);
+  return {
+    id: row.id,
+    ownerId: validateEntityId(row.owner_id),
+    title: row.title,
+    status: row.status,
+    externalRef: row.external_ref === null ? null : parseExternalRef(row.external_ref),
   };
 }
 
@@ -2168,6 +2204,67 @@ export class ObligationRepository {
       total,
       hasMore: rows.length > limit,
     };
+  }
+
+  /**
+   * Bounded display lookup for recent activity. This intentionally omits the
+   * effective-priority/responsiveness CTE: none of those scheduling fields
+   * affects the activity response. Direct ids and external-reference winners
+   * are fetched separately so the latter keeps `findByExternalRef`'s exact
+   * NOCASE + unordered-LIMIT winner semantics.
+   */
+  listActivityDisplay(
+    ids: readonly string[],
+    externalRefs: readonly string[]
+  ): ActivityDisplayLookup {
+    const byId = new Map<string, ActivityDisplayObligation>();
+    const byExternalRef = new Map<string, ActivityDisplayObligation>();
+    const uniqueIds = [...new Set(ids)];
+    const uniqueRefs = [...new Set(externalRefs)];
+    // Keep each display read comfortably below SQLite's bind limit even if a
+    // malformed historical entry carries many associations.
+    const batchSize = 400;
+    const project = `id, owner_id, title, status, external_ref`;
+
+    for (let offset = 0; offset < uniqueIds.length; offset += batchSize) {
+      const batch = uniqueIds.slice(offset, offset + batchSize);
+      const rows = this.db
+        .prepare(
+          `SELECT ${project} FROM obligations WHERE id IN (${batch.map(() => "?").join(", ")})`
+        )
+        .all(...batch) as ActivityDisplayObligationRow[];
+      for (const row of rows) {
+        const obligation = toActivityDisplayObligation(row);
+        byId.set(obligation.id, obligation);
+      }
+    }
+
+    for (let offset = 0; offset < uniqueRefs.length; offset += batchSize) {
+      const batch = uniqueRefs.slice(offset, offset + batchSize);
+      const values = batch.map(() => "(?, ?)").join(", ");
+      const args = batch.flatMap((ref, ordinal) => [ref, ordinal]);
+      const rows = this.db
+        .prepare(
+          `WITH requested(ref, ordinal) AS (VALUES ${values})
+           SELECT requested.ref AS lookup_ref, obligation.${project}
+           FROM requested
+           JOIN obligations AS obligation ON obligation.id = (
+             SELECT id
+             FROM obligations
+             WHERE external_ref = requested.ref COLLATE NOCASE
+             LIMIT 1
+           )
+           ORDER BY requested.ordinal`
+        )
+        .all(...args) as Array<ActivityDisplayObligationRow & { lookup_ref: string }>;
+      for (const row of rows) {
+        const obligation = toActivityDisplayObligation(row);
+        byId.set(obligation.id, obligation);
+        byExternalRef.set(row.lookup_ref, obligation);
+      }
+    }
+
+    return { byId, byExternalRef };
   }
 
   get(id: string): Obligation | null {

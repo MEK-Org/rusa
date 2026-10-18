@@ -20,10 +20,16 @@ import {
   ProtocolMismatchError,
   publishedThrottle,
   QUOTA_READING_MODE_PATH,
+  QUOTA_SPRINT_PATH,
   scrapeStaleAfterMs,
   validateProtocolMajor,
 } from "./coordinator-protocol.js";
-import { QuotaCoordinatorService, SERVED_ROUTES, WRITE_ROUTES } from "./coordinator-service.js";
+import {
+  QuotaCoordinatorService,
+  READ_WRITE_ROUTES,
+  SERVED_ROUTES,
+  WRITE_ROUTES,
+} from "./coordinator-service.js";
 import { QUOTA_SCHEMA_VERSION, SchemaVersionRefusalError } from "./schema-guard.js";
 import { type PersistedQuotaProviderStatus, SharedQuotaStore } from "./shared-store.js";
 
@@ -154,6 +160,22 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
         expect(res.status, `Expected 405 for ${method} on ${writeRoute}`).toBe(405);
         expect(res.headers.allow).toBe("POST");
       }
+    }
+
+    // The sprint route (#861) is the one path that both reads and writes: GET
+    // is its status, POST its arm/cancel. It is declared as its own set, apart
+    // from the other two, so neither rule above silently covers it.
+    expect([...READ_WRITE_ROUTES]).toEqual([QUOTA_SPRINT_PATH]);
+    for (const route of READ_WRITE_ROUTES) {
+      expect(route.startsWith("/v1/")).toBe(true);
+      expect((SERVED_ROUTES as readonly string[]).includes(route)).toBe(false);
+      expect((WRITE_ROUTES as readonly string[]).includes(route)).toBe(false);
+      for (const method of ["PUT", "PATCH", "DELETE"]) {
+        const res = await makeRequest(socketPath, route, method);
+        expect(res.status, `Expected 405 for ${method} on ${route}`).toBe(405);
+        expect(res.headers.allow).toBe("GET, POST");
+      }
+      expect((await makeRequest(socketPath, `${route}?provider=claude`)).status).toBe(200);
     }
   });
 

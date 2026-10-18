@@ -176,6 +176,10 @@ describe("handleMeshApiRequest", () => {
   let LOCAL_USER: string;
   let deps: DashboardDataDeps;
   let rootSpawns: Array<{ request: unknown; principal: string }>;
+  let rootHoldClears: Array<{
+    scope: { provider: string; models?: string[] };
+    principal: string;
+  }>;
   let operatorReparents: Array<{ id: string; parentId: string | null; principal: string }>;
   let operatorObligationsAdmin: Array<{ id: string; enabled: boolean; principal: string }>;
   let admissionReorders: unknown[];
@@ -202,6 +206,7 @@ describe("handleMeshApiRequest", () => {
       createdAt: "2026-06-21T00:00:00.000Z",
     }).id;
     rootSpawns = [];
+    rootHoldClears = [];
     operatorReparents = [];
     operatorObligationsAdmin = [];
     admissionReorders = [];
@@ -234,6 +239,25 @@ describe("handleMeshApiRequest", () => {
           rootSpawns.push({ request, principal });
           return UUID_A;
         },
+        clearAvailabilityHolds: (
+          scope: { provider: string; models?: string[] },
+          principal: string
+        ) => {
+          rootHoldClears.push({ scope, principal });
+          return {
+            released: [
+              {
+                provider: scope.provider,
+                ...(scope.models?.[0] ? { model: scope.models[0] } : {}),
+                origin: "mesh" as const,
+                reason: "maintenance",
+                createdBy: "root",
+                createdAt: "2026-10-16T00:00:00.000Z",
+              },
+            ],
+            expired: [],
+          };
+        },
       } as unknown as RootControlService,
       operatorActors: {
         reparent: (id: string, parentId: string | null, principal: string) => {
@@ -252,6 +276,136 @@ describe("handleMeshApiRequest", () => {
   });
 
   describe("GET /api/mesh/recent-activity (#664)", () => {
+    it("uses only the display lookup for activity association and terminal folding (#990)", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      obligations.create({ id: "direct", ownerId: UUID_A, title: "Direct history" });
+      obligations.create({
+        id: "external-earlier",
+        ownerId: UUID_A,
+        title: "Earlier external history",
+        externalRef: "github:MEK-Org/rusa/issues/990",
+      });
+      obligations.setTerminalStatus(
+        "external-earlier",
+        "done",
+        "Earlier external history",
+        "mesh:messages/external-history",
+        UUID_A
+      );
+      obligations.create({
+        id: "external",
+        ownerId: UUID_A,
+        title: "External winner",
+        externalRef: "github:MEK-Org/rusa/issues/990",
+      });
+      inbox.append([
+        {
+          id: "direct-entry",
+          actorId: UUID_A,
+          source: "obligation:direct",
+          payload: { type: "obligation.ready_head", obligationId: "direct" },
+        },
+        {
+          id: "external-entry",
+          actorId: UUID_A,
+          source: "github:MEK-Org/rusa/issues/990",
+          payload: { type: "issue_comment.created" },
+        },
+        {
+          id: "missing-entry",
+          actorId: UUID_A,
+          source: "obligation:missing",
+          payload: { type: "obligation.ready_head", obligationId: "missing" },
+        },
+      ]);
+      inbox.markHandled(
+        UUID_A,
+        ["direct-entry", "external-entry", "missing-entry"],
+        new Date("2026-09-26T03:15:00.000Z"),
+        "Addressed"
+      );
+      obligations.setTerminalStatus(
+        "direct",
+        "done",
+        "Finished here",
+        "mesh:messages/direct-resolution",
+        UUID_A
+      );
+
+      const display = vi.spyOn(obligations, "listActivityDisplay");
+      const schedulerGet = vi.spyOn(obligations, "get");
+      const schedulerFind = vi.spyOn(obligations, "findByExternalRef");
+      const activityDeps = {
+        ...deps,
+        actorRuns: {
+          listRecentCompletedFocuses: () => [
+            {
+              actorId: UUID_A,
+              startedAt: "2020-01-01T00:00:00.000Z",
+              endedAt: "2030-01-01T00:00:00.000Z",
+              entryIds: ["direct-entry", "external-entry", "missing-entry"],
+              primaryObligationId: "direct",
+            },
+          ],
+        },
+      } as unknown as DashboardDataDeps;
+
+      const { res } = await call(activityDeps, "GET", "/api/mesh/recent-activity?limit=10");
+      const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
+
+      expect(display).toHaveBeenCalledTimes(1);
+      expect(display).toHaveBeenCalledWith(expect.arrayContaining(["direct", "missing"]), [
+        "github:MEK-Org/rusa/issues/990",
+      ]);
+      expect(schedulerGet).not.toHaveBeenCalled();
+      expect(schedulerFind).not.toHaveBeenCalled();
+      expect(items.find((item) => item.id === "inbox_direct-entry")).toMatchObject({
+        linkedObligation: "Obligation done: Direct history",
+      });
+      expect(items.find((item) => item.id === "inbox_external-entry")).toMatchObject({
+        linkedObligation: "Obligation done: Earlier external history",
+      });
+      expect(
+        items.find(
+          (item) =>
+            typeof item.id === "string" &&
+            item.id.startsWith("obligation_history_") &&
+            item.obligationId === "external-earlier"
+        )
+      ).toBeUndefined();
+      expect(items.find((item) => item.id === "inbox_missing-entry")).not.toHaveProperty(
+        "linkedObligation"
+      );
+
+      // The old lookup's unordered external-ref LIMIT is intentional API
+      // behavior today. This shim verifies the selected external-reference
+      // winner only; because it invokes this route's current two-pass loop,
+      // it cannot establish parity with the pre-change folding order.
+      const legacyObligations = Object.create(obligations) as ObligationRepository;
+      Object.defineProperty(legacyObligations, "listActivityDisplay", {
+        value: (ids: readonly string[], refs: readonly string[]) => ({
+          byId: new Map(
+            ids.flatMap((id) => {
+              const obligation = obligations.get(id);
+              return obligation ? [[id, obligation] as const] : [];
+            })
+          ),
+          byExternalRef: new Map(
+            refs.flatMap((ref) => {
+              const obligation = obligations.findByExternalRef(ref);
+              return obligation ? [[ref, obligation] as const] : [];
+            })
+          ),
+        }),
+      });
+      const { res: legacyRes } = await call(
+        { ...activityDeps, obligations: legacyObligations },
+        "GET",
+        "/api/mesh/recent-activity?limit=10"
+      );
+      expect(items).toEqual(JSON.parse(legacyRes.body).items);
+    });
+
     it("retains each handled entry and folds only a terminal transition from the same selected run", async () => {
       actors.upsert(rec(UUID_A, "root", "active"));
       actors.upsert(rec(UUID_B, "root", "active"));
@@ -1277,6 +1431,61 @@ describe("handleMeshApiRequest", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toBe("parentId is required (null detaches to top level)");
     expect(operatorReparents).toEqual([]);
+  });
+
+  it("POST /api/mesh/availability-holds/clear clears through authenticated root control", async () => {
+    const { res } = await call(
+      deps,
+      "POST",
+      "/api/mesh/availability-holds/clear",
+      JSON.stringify({ provider: "codex", models: ["gpt-5.6"] })
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({
+      released: [
+        {
+          provider: "codex",
+          model: "gpt-5.6",
+          origin: "mesh",
+          expiry: null,
+        },
+      ],
+      expired_removed: 0,
+    });
+    expect(rootHoldClears).toEqual([
+      { scope: { provider: "codex", models: ["gpt-5.6"] }, principal: LOCAL_USER },
+    ]);
+  });
+
+  it("POST /api/mesh/availability-holds/clear refuses an unauthenticated request", async () => {
+    const { res } = await call(
+      { ...deps, principals: undefined },
+      "POST",
+      "/api/mesh/availability-holds/clear",
+      JSON.stringify({ provider: "codex" })
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(403);
+    expect(rootHoldClears).toEqual([]);
+  });
+
+  it("POST /api/mesh/availability-holds/clear validates its scope before root control", async () => {
+    const { res } = await call(
+      deps,
+      "POST",
+      "/api/mesh/availability-holds/clear",
+      JSON.stringify({ provider: "codex", models: [] })
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({
+      error: "provider and optional models (non-empty string[]) are required",
+    });
+    expect(rootHoldClears).toEqual([]);
   });
 
   it("POST /api/mesh/actors forwards a portable context selection ", async () => {

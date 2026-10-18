@@ -56,3 +56,49 @@ export function quotaCycleChanged(
   const quotaRefilled = next.percentLeft - previous.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
   return resetMoved || quotaRefilled;
 }
+
+/** A reading with the instant it was taken, as the verified-transition rule needs. */
+export interface QuotaCycleObservation extends QuotaCycleReading {
+  observedAt: string;
+}
+
+/**
+ * Whether `next` proves that a new weekly cycle began after `previous`, the
+ * reading before it on the same lane (#861). This is deliberately stricter
+ * than {@link quotaCycleChanged}, which is a conservative "no longer
+ * comparable" signal: a reset deadline that merely moved satisfies that, but
+ * not this. Proof needs real headroom on a valid future deadline in `next`,
+ * plus one of:
+ *
+ *  1. a refill larger than {@link QUOTA_REFILL_EPSILON_POINTS}; or
+ *  2. the old deadline had passed when `next` was observed, and `next` carries
+ *     a later one.
+ *
+ * Nothing an operator says can satisfy it; only a newer actual reading can.
+ */
+export function verifiedQuotaCycleTransition(
+  previous: QuotaCycleObservation | null | undefined,
+  next: QuotaCycleObservation
+): boolean {
+  if (!previous) return false;
+  const previousObservedMs = Date.parse(previous.observedAt);
+  const nextObservedMs = Date.parse(next.observedAt);
+  const nextResetMs = next.resetAtIso ? Date.parse(next.resetAtIso) : Number.NaN;
+  if (
+    !Number.isFinite(previousObservedMs) ||
+    !Number.isFinite(nextObservedMs) ||
+    nextObservedMs <= previousObservedMs ||
+    next.percentLeft <= 0 ||
+    !Number.isFinite(nextResetMs) ||
+    nextResetMs <= nextObservedMs
+  ) {
+    return false;
+  }
+  if (next.percentLeft - previous.percentLeft > QUOTA_REFILL_EPSILON_POINTS) return true;
+  const previousResetMs = previous.resetAtIso ? Date.parse(previous.resetAtIso) : Number.NaN;
+  return (
+    Number.isFinite(previousResetMs) &&
+    nextObservedMs >= previousResetMs &&
+    nextResetMs > previousResetMs
+  );
+}

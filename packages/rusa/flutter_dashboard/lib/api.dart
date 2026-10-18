@@ -172,6 +172,32 @@ class DashboardApi {
         .toList();
   }
 
+  /// Authenticated operator recovery for one held provider/model scope.
+  /// The server performs the release/replay transition without starting a run.
+  /// Returns how many holds were still in force and are now released.
+  Future<int> clearAvailabilityHolds({
+    required String provider,
+    List<String>? models,
+  }) async {
+    final uri = _u('/api/mesh/availability-holds/clear');
+    final res = await _client.post(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'provider': provider,
+        'models': ?models,
+      }),
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+    final body = jsonDecode(res.body) as Map<String, dynamic>;
+    return (body['released'] as List<dynamic>? ?? const []).length;
+  }
+
   Future<String> spawnRootChild({
     required String charter,
     String? title,

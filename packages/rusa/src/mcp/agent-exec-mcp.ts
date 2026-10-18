@@ -8,6 +8,7 @@ import {
   MODEL_ADMIN_CAPABILITY,
   ROOM_ADMIN_CAPABILITY,
 } from "../actor/administrative-capabilities.js";
+import type { AvailabilityHolds } from "../actor/availability-holds.js";
 import { CONTEXT_SELECTIONS, resolveContextSelection } from "../actor/context-selection.js";
 import {
   type EventResource,
@@ -17,6 +18,7 @@ import {
 import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
+import type { AvailabilityHold } from "../db/repositories/availability-hold-repository.js";
 import type { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
@@ -117,9 +119,11 @@ export function createAgentExecMcpServer(
   mesh: ActorMesh,
   selfId: string,
   /**
-   * The configured actor's id. Used ONLY to route the configured actor's own
-   * spawn/send through `rootControl` for attribution; it grants no authority
-   * (#549) — every management tool below is gated by an active capability.
+   * The configured actor's id. Used to route the configured actor's own
+   * spawn/send through `rootControl` for attribution, and to confine the
+   * availability hold tools to that actor (#539). It grants no authority on
+   * its own (#549): every management tool below is gated by an active
+   * capability.
    */
   rootId: string | undefined,
   wakeScheduler?: ActorWakeScheduler,
@@ -134,6 +138,17 @@ export function createAgentExecMcpServer(
     modelClasses?: Pick<ModelClassRepository, "list" | "upsert" | "delete">;
     /** Config-aware concrete tuple validation at the management boundary. */
     validateModelClass?: (input: ConcreteModelConfigInput) => ProviderModelConfig[];
+    /**
+     * Durable provider/model availability holds (#539). The hold tools mount
+     * only when this is wired AND the endpoint is the configured actor AND it
+     * holds `model-admin`; no grant opens them to any other actor.
+     */
+    availabilityHolds?: Pick<AvailabilityHolds, "list" | "set" | "clear">;
+    /**
+     * Refuse a hold scope no run could meet: an unconfigured provider or a
+     * model its catalog does not list. Throws with the operator-facing reason.
+     */
+    validateHoldScope?: (provider: string, models: readonly string[]) => void;
     /** List of connected followers available for remote placement. */
     getFollowers?: () => FollowerInfo[];
     /**
@@ -1185,6 +1200,134 @@ export function createAgentExecMcpServer(
         }
       );
     }
+  }
+
+  // ── Availability holds (#539) ── Readiness, not applicability: a hold takes
+  // a provider lane, or some of its models, out of selection without editing
+  // any pool, so it is host-global model policy like the class registry. The
+  // operator ruled these tools root-only: they mount for the configured actor
+  // alone, which must also hold `model-admin`, so no grant to any other actor
+  // (model-admin included) can open them.
+  if (selfId === rootId && holds(MODEL_ADMIN_CAPABILITY) && options?.availabilityHolds) {
+    const availabilityHolds = options.availabilityHolds;
+    const validateHoldScope = options.validateHoldScope;
+    const assertModelAdmin = () => assertCapability(MODEL_ADMIN_CAPABILITY);
+    const holdView = (hold: AvailabilityHold) => ({
+      provider: hold.provider,
+      model: hold.model ?? null,
+      origin: hold.origin,
+      expiry: hold.expiry ?? null,
+      reason: hold.reason,
+      created_by: hold.createdBy,
+      created_at: hold.createdAt,
+    });
+    const scopeInput = {
+      provider: z
+        .string()
+        .min(1)
+        .describe("Provider lane, e.g. 'kimi' or 'codex' (case-insensitive; 'agy' = antigravity)."),
+      models: z
+        .array(z.string().min(1))
+        .min(1)
+        .optional()
+        .describe(
+          "Model slugs on that provider. Omit to cover the whole provider; each listed model is its own hold."
+        ),
+    };
+
+    server.registerTool(
+      "list_availability_holds",
+      {
+        title: "List active availability holds (root only)",
+        description:
+          "List the provider/model availability holds active right now. A row with model null holds the whole provider; expiry null means it lasts until cleared. `origin` is who instituted the hold: `mesh` rows were placed through these tools, `chat` rows through chat /halt; chat /resume releases only `chat` rows, so a listed `mesh` hold survives it. Expired holds are not listed. Only the configured actor, holding model-admin, has this tool.",
+        inputSchema: {},
+      },
+      async () => {
+        const denied = assertModelAdmin();
+        if (denied) return denied;
+        try {
+          return toolOk(availabilityHolds.list().map(holdView));
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
+
+    server.registerTool(
+      "set_availability_hold",
+      {
+        title: "Hold a provider or model out of selection (root only)",
+        description:
+          "Take a provider lane, or listed models on it, out of model selection without editing any model pool. Selection skips held entries before quota pacing and never falls back to one: an actor whose only unheld entry is paced waits for it. Setting the same scope again replaces its expiry and reason. A scope may also be held through chat /halt at the same time in an independent row; chat /resume releases only the chat row, never this one. Queued starts already reserved on a newly held entry are cancelled and replay when the hold is cleared or expires. Holds persist in mesh.db across restarts. Only the configured actor, holding model-admin, has this tool.",
+        inputSchema: {
+          ...scopeInput,
+          expiry: z
+            .string()
+            .optional()
+            .describe(
+              "ISO-8601 timestamp, in the future, when the hold lapses. Omit to hold until cleared."
+            ),
+          reason: z.string().optional().describe("Why the entry is unavailable, for operators."),
+        },
+      },
+      async ({ provider, models, expiry, reason }) => {
+        const denied = assertModelAdmin();
+        if (denied) return denied;
+        try {
+          validateHoldScope?.(provider, models ?? []);
+          const stored = availabilityHolds.set({
+            provider,
+            origin: "mesh",
+            models,
+            expiry,
+            reason,
+            createdBy: selfId,
+          });
+          mesh.recordEvent({
+            kind: "root_control_action",
+            actorId: selfId,
+            detail: `${MODEL_ADMIN_CAPABILITY} set_availability_hold`,
+            payload: JSON.stringify(stored.map(holdView)),
+          });
+          return toolOk(stored.map(holdView));
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
+
+    server.registerTool(
+      "clear_availability_hold",
+      {
+        title: "Clear availability holds (root only)",
+        description:
+          "Clear holds on a provider, whichever origin placed them — chat /halt rows and mesh-instituted rows alike. Without models, every hold on the provider is cleared, provider-wide and model-scoped alike; with models, only those model holds are cleared and a provider-wide hold stays. Cleared entries become eligible again from their unchanged pools, and queued starts a hold cancelled replay. Returns { released, expired_removed }: released lists the holds that were still in force (empty when none matched); expired_removed counts matching records that had already expired, which list_availability_holds does not show and whose removal releases nothing. Only the configured actor, holding model-admin, has this tool.",
+        inputSchema: scopeInput,
+      },
+      async ({ provider, models }) => {
+        const denied = assertModelAdmin();
+        if (denied) return denied;
+        try {
+          const { released, expired } = availabilityHolds.clear({ provider, models });
+          const result = {
+            released: released.map(holdView),
+            expired_removed: expired.length,
+          };
+          if (released.length + expired.length > 0) {
+            mesh.recordEvent({
+              kind: "root_control_action",
+              actorId: selfId,
+              detail: `${MODEL_ADMIN_CAPABILITY} clear_availability_hold`,
+              payload: JSON.stringify(result),
+            });
+          }
+          return toolOk(result);
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
   }
 
   // ── Experiment enrollment (#394) ── Rollout state, not actor configuration:

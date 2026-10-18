@@ -20,8 +20,10 @@ export interface HaltCommand {
  * so they can target providers, models, and/or expire at a requested datetime.
  *
  *  - by hand on the box:   `touch ~/.rusa/HALT`  /  `rm ~/.rusa/HALT`
- *  - by chat command:      `/halt` / `/resume` are matched mechanically at the
- *    chat-ingestion edge and just create/remove this same file
+ *  - by chat command:      bare `/halt` and `/resume` are matched mechanically
+ *    at the chat-ingestion edge and create/remove this same file. Scoped
+ *    `/halt provider:…` writes a durable availability hold instead (#539), and
+ *    startup imports a provider-scoped file into one.
  *  - super-fallback:       pull the VM plug
  *
  * Enforcement is in every actor's `beforeRun`: a halted run is skipped, and a
@@ -152,18 +154,52 @@ export const HALT_SYNTAX_HELP =
   " `model:` always needs a `provider:`). Any form also takes" +
   " `until:<ISO-8601 timestamp>`.";
 
+/** The `/resume` forms, quoted back when one fails to parse. */
+export const RESUME_SYNTAX_HELP =
+  "Valid syntax: `/resume` (release the global halt and every hold placed from chat)," +
+  " `/resume provider:<p>[,<p2>]` (every chat hold on those providers)," +
+  " `/resume provider:<p> model:<m>[,<m2>]` (only those chat model holds)." +
+  " Mesh-instituted holds stay in force; clear them from the dashboard or the hold tools.";
+
+/**
+ * A parsed `/resume`. No scope releases the global halt and every chat-origin
+ * hold; a scope releases only matching chat-origin holds. Mesh-origin holds
+ * survive both (#918 comment 6204340124).
+ */
+export interface ResumeCommand {
+  providers?: string[];
+  models?: string[];
+}
+
 /** Parse `/halt` atoms without involving an actor/LLM. */
 export function parseHaltCommand(text: string): HaltCommand | null {
   const match = text.trim().match(/^\/(?:halt|pause)(?:\s+(.*))?$/i);
   if (!match) return null;
-  const tail = match[1]?.trim();
+  return parseScopeAtoms(match[1], "halt", true);
+}
+
+/** Parse `/resume` atoms and the bare `/continue` alias without involving an actor/LLM. */
+export function parseResumeCommand(text: string): ResumeCommand | null {
+  const trimmed = text.trim();
+  if (/^\/continue$/i.test(trimmed)) return {};
+  const match = trimmed.match(/^\/resume(?:\s+(.*))?$/i);
+  if (!match) return null;
+  return parseScopeAtoms(match[1], "resume", false);
+}
+
+function parseScopeAtoms(
+  text: string | undefined,
+  command: "halt" | "resume",
+  allowUntil: boolean
+): HaltCommand {
+  const tail = text?.trim();
   if (!tail) return {};
 
   const result: HaltCommand = {};
   for (const atom of tail.split(/\s+/)) {
     const separator = atom.indexOf(":");
     if (separator <= 0 || separator === atom.length - 1) {
-      throw new Error(`invalid halt option "${atom}"`);
+      throw new Error(`invalid ${command} option "${atom}"`);
     }
     const key = atom.slice(0, separator).toLowerCase();
     const value = atom.slice(separator + 1);
@@ -175,26 +211,26 @@ export function parseHaltCommand(text: string): HaltCommand | null {
       const models = value.split(",").map(normalizeModel).filter(Boolean);
       if (models.length === 0) throw new Error("model list cannot be empty");
       result.models = [...new Set(models)];
-    } else if (key === "until") {
+    } else if (key === "until" && allowUntil) {
       const timestamp = Date.parse(value);
       if (!Number.isFinite(timestamp)) throw new Error(`invalid halt datetime "${value}"`);
       result.until = new Date(timestamp).toISOString();
     } else {
-      throw new Error(`unknown halt option "${key}"`);
+      throw new Error(`unknown ${command} option "${key}"`);
     }
   }
   if (result.models?.length && !result.providers?.length) {
-    throw new Error("model-scoped halt requires a provider");
+    throw new Error(`model-scoped ${command} requires a provider`);
   }
   return result;
 }
 
-function normalizeProvider(provider: string): string {
+export function normalizeProvider(provider: string): string {
   const normalized = provider.trim().toLowerCase();
   return normalized === "agy" ? "antigravity" : normalized;
 }
 
-function normalizeModel(model: string): string {
+export function normalizeModel(model: string): string {
   return model.trim().toLowerCase();
 }
 

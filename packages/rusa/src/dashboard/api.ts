@@ -23,6 +23,7 @@ import type { InboxFocusRepository } from "../db/repositories/inbox-focus-reposi
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import {
+  type ActivityDisplayObligation,
   MAX_OBLIGATION_PAGE_LIMIT,
   type ObligationQueue,
   type ObligationRepository,
@@ -1015,6 +1016,78 @@ export async function handleMeshApiRequest(
               principal
             );
             sendJson(res, 201, { id });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/availability-holds/clear — authenticated operator
+    // recovery for a mesh-held lane. It deliberately routes through root
+    // control rather than an actor endpoint: the hold service performs the
+    // release/replay transition without starting an actor or a model run.
+    if (pathname === "/api/mesh/availability-holds/clear") {
+      const rootControl = deps?.rootControl;
+      if (!rootControl) {
+        sendJson(res, 503, { error: "root control unavailable" });
+        return true;
+      }
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, {
+              error: "provider and optional models (non-empty string[]) are required",
+            });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          const provider = body.provider;
+          const models = body.models;
+          if (
+            typeof provider !== "string" ||
+            !provider.trim() ||
+            !(
+              models === undefined ||
+              (Array.isArray(models) &&
+                models.length > 0 &&
+                models.every((model) => typeof model === "string" && model.trim().length > 0))
+            )
+          ) {
+            sendJson(res, 400, {
+              error: "provider and optional models (non-empty string[]) are required",
+            });
+            return;
+          }
+          const principal = requireOperatorPrincipal(req, res, deps);
+          if (!principal) return;
+          try {
+            const result = rootControl.clearAvailabilityHolds(
+              {
+                provider: provider.trim(),
+                ...(models === undefined
+                  ? {}
+                  : { models: (models as string[]).map((model) => model.trim()) }),
+              },
+              principal
+            );
+            sendJson(res, 200, {
+              released: result.released.map((hold) => ({
+                provider: hold.provider,
+                model: hold.model ?? null,
+                origin: hold.origin,
+                expiry: hold.expiry ?? null,
+              })),
+              expired_removed: result.expired.length,
+            });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
           }
@@ -2665,6 +2738,18 @@ export async function handleMeshApiRequest(
     const matchedTerminalHistoryIds = new Set<number>();
     const completedFocuses = deps.actorRuns?.listRecentCompletedFocuses(limit * 2) ?? [];
     const handledItems: Array<Record<string, unknown>> = [];
+    const activityEntries: Array<{
+      entry: InboxEntry;
+      source: string;
+      referenceKey?: string;
+      sourceKind: string;
+      handledAt: string;
+      selectedRun: (typeof completedFocuses)[number] | undefined;
+      entryObligationIds: Set<string>;
+      externalRef: string | null | undefined;
+    }> = [];
+    const displayIds = new Set<string>(terminalHistory.map((history) => history.obligationId));
+    const externalRefs = new Set<string>();
 
     // Each card carries the key of the reference it stands for and its
     // actor's id, never the reference or the actor themselves: the client
@@ -2753,52 +2838,77 @@ export async function handleMeshApiRequest(
       if (source.startsWith("obligation:")) {
         entryObligationIds.add(source.slice("obligation:".length));
       }
-      const externallyLinked = refs.githubWorkRef
-        ? (deps.obligations?.findByExternalRef(refs.githubWorkRef) ?? null)
-        : null;
-      if (externallyLinked) entryObligationIds.add(externallyLinked.id);
-      const entryObligations = deps.obligations
-        ? [...entryObligationIds]
-            .map((obligationId) => deps.obligations?.get(obligationId) ?? null)
-            .filter((obligation): obligation is Obligation => obligation !== null)
-        : [];
-      let linkedObligation: string | null =
-        selectedRun && entryObligations[0] ? `Obligation: ${entryObligations[0].title}` : null;
+      for (const obligationId of entryObligationIds) displayIds.add(obligationId);
+      if (refs.githubWorkRef) externalRefs.add(refs.githubWorkRef);
 
+      activityEntries.push({
+        entry,
+        source,
+        ...(referenceKey ? { referenceKey } : {}),
+        sourceKind,
+        handledAt,
+        selectedRun,
+        entryObligationIds,
+        externalRef: refs.githubWorkRef,
+      });
+    }
+
+    // Recent Activity never projects scheduling priority/responsiveness. The
+    // display repository batches direct ids and preserves the old NOCASE,
+    // unordered-LIMIT external-reference winner for every requested ref.
+    const activityDisplay = deps.obligations?.listActivityDisplay(
+      [...displayIds],
+      [...externalRefs]
+    );
+    for (const activity of activityEntries) {
+      const externallyLinked = activity.externalRef
+        ? (activityDisplay?.byExternalRef.get(activity.externalRef) ?? null)
+        : null;
+      if (externallyLinked) activity.entryObligationIds.add(externallyLinked.id);
       // A source link alone is not enough: a recurring obligation can be
       // handled in one run and transition terminal in a later one. Fold only a
       // transition observed inside the completed run that selected this exact
-      // entry, preserving later/unrelated terminal changes as their own cards.
+      // entry, after every direct and external-reference association is known.
+      const selectedRun = activity.selectedRun;
       const matchedTerminal = selectedRun
         ? terminalHistory.find(
             (history) =>
-              entryObligationIds.has(history.obligationId) &&
-              history.actingPrincipal === entry.actorId &&
+              activity.entryObligationIds.has(history.obligationId) &&
+              history.actingPrincipal === activity.entry.actorId &&
               history.timestamp >= selectedRun.startedAt &&
               history.timestamp <= selectedRun.endedAt
           )
         : undefined;
+      const entryObligations = [...activity.entryObligationIds]
+        .map((obligationId) => activityDisplay?.byId.get(obligationId) ?? null)
+        .filter((obligation): obligation is ActivityDisplayObligation => obligation !== null);
+      let linkedObligation: string | null =
+        activity.selectedRun && entryObligations[0]
+          ? `Obligation: ${entryObligations[0].title}`
+          : null;
       if (matchedTerminal) {
         matchedTerminalHistoryIds.add(matchedTerminal.id);
-        const terminalObligation = deps.obligations?.get(matchedTerminal.obligationId);
+        const terminalObligation = activityDisplay?.byId.get(matchedTerminal.obligationId);
         if (terminalObligation) {
           linkedObligation = `Obligation ${matchedTerminal.after.status}: ${terminalObligation.title}`;
         }
       }
 
-      const summary = typeof entry.payload?.type === "string" ? entry.payload.type : source;
-
+      const summary =
+        typeof activity.entry.payload?.type === "string"
+          ? activity.entry.payload.type
+          : activity.source;
       handledItems.push({
-        id: `inbox_${entry.id}`,
+        id: `inbox_${activity.entry.id}`,
         kind: "handled_inbox",
-        time: handledAt,
-        actorId: entry.actorId,
-        sourceKind,
-        sourceRef: source,
-        ...(referenceKey ? { referenceKey } : {}),
+        time: activity.handledAt,
+        actorId: activity.entry.actorId,
+        sourceKind: activity.sourceKind,
+        sourceRef: activity.source,
+        ...(activity.referenceKey ? { referenceKey: activity.referenceKey } : {}),
         summary,
-        handledTime: handledAt,
-        addressedNote: entry.handledNote ?? "Handled without comment",
+        handledTime: activity.handledAt,
+        addressedNote: activity.entry.handledNote ?? "Handled without comment",
         ...(linkedObligation ? { linkedObligation } : {}),
       });
     }
@@ -2808,7 +2918,7 @@ export async function handleMeshApiRequest(
       if (matchedTerminalHistoryIds.has(h.id)) {
         continue;
       }
-      const ob = deps.obligations ? deps.obligations.get(h.obligationId) : null;
+      const ob = activityDisplay?.byId.get(h.obligationId) ?? null;
       const status = (h.after.status ?? ob?.status ?? "done") as "done" | "cancelled";
       obligationItems.push({
         id: `obligation_history_${h.id}`,

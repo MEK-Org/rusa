@@ -2,7 +2,11 @@
  * @vitest-environment node
  */
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { AvailabilityHold } from "../db/repositories/availability-hold-repository.js";
 
 const openMock = vi.hoisted(() => {
   const fn = vi.fn(() => Promise.resolve());
@@ -31,6 +35,9 @@ const mockPrincipals = vi.hoisted(() => ({ ensureImplicitUser: vi.fn() }));
 const mockReceipts = vi.hoisted(() => ({
   actorFor: vi.fn((_source: string): string | undefined => undefined),
 }));
+const mockAvailabilityHolds = vi.hoisted(() => ({
+  list: vi.fn((_options?: { now?: number }): AvailabilityHold[] => []),
+}));
 
 const mockDbModule = vi.hoisted(() => ({
   initDb: vi.fn(() => ({})),
@@ -44,6 +51,7 @@ const mockDbModule = vi.hoisted(() => ({
     principals: mockPrincipals,
     referenceCache: mockReferenceCacheRepo,
     legacyImportReceipts: mockReceipts,
+    availabilityHolds: mockAvailabilityHolds,
   })),
 }));
 
@@ -75,6 +83,7 @@ describe("runDashboard", () => {
     vi.clearAllMocks();
     mockConfigLoader.loadConfig.mockReturnValue(mockConfig);
     mockConfigLoader.resolveHome.mockReturnValue("/tmp/test-mc-home");
+    mockAvailabilityHolds.list.mockReturnValue([]);
   });
 
   afterEach(() => {
@@ -99,6 +108,39 @@ describe("runDashboard", () => {
     expect(openMock.default).toHaveBeenCalledWith("http://localhost:8080");
   });
 
+  it("reports active availability holds in the header as `rusa start` does (#539)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "dashboard-holds-"));
+    mockConfigLoader.resolveHome.mockReturnValue(home);
+    const until = "2099-01-01T00:00:00.000Z";
+    try {
+      await runDashboard();
+      const mesh = (
+        mockWebhookServerModule.startDashboardServer.mock.calls as unknown as Array<
+          [{ mesh: { isHalted: () => boolean; haltSnapshot: () => unknown } }]
+        >
+      )[0]?.[0].mesh;
+      expect(mesh?.isHalted()).toBe(false);
+      expect(mesh?.haltSnapshot()).toBeNull();
+
+      mockAvailabilityHolds.list.mockReturnValue([
+        {
+          provider: "codex",
+          origin: "chat",
+          expiry: until,
+          reason: "",
+          createdBy: "root",
+          createdAt: until,
+        },
+      ]);
+      expect(mesh?.isHalted()).toBe(true);
+      expect(mesh?.haltSnapshot()).toEqual({ providers: ["codex"], until });
+      // Only holds in force now count; the repository is asked with a clock.
+      expect(mockAvailabilityHolds.list).toHaveBeenLastCalledWith({ now: expect.any(Number) });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("never invokes the legacy actor state importer", async () => {
     await runDashboard();
 
@@ -119,6 +161,7 @@ describe("runDashboard", () => {
       principals: mockPrincipals,
       referenceCache: mockReferenceCacheRepo,
       legacyImportReceipts: mockReceipts,
+      availabilityHolds: mockAvailabilityHolds,
     });
 
     await runDashboard();
@@ -146,6 +189,7 @@ describe("runDashboard", () => {
       principals: mockPrincipals,
       referenceCache: mockReferenceCacheRepo,
       legacyImportReceipts: mockReceipts,
+      availabilityHolds: mockAvailabilityHolds,
     });
 
     await runDashboard();

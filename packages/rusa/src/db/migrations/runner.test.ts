@@ -111,6 +111,7 @@ describe("Database Migration System", () => {
       "0053_chat_room_participants",
       "0055_run_prompts",
       "0056_actor_execution_config",
+      "0057_availability_holds",
       "0058_user_google_account_id",
       "0059_obligation_completion_matchers",
       "0060_configured_actor_import",
@@ -125,6 +126,7 @@ describe("Database Migration System", () => {
     expect(tableNames).not.toContain("obligation_ready_heads");
     expect(tableNames).toContain("chat_room_participants");
     expect(tableNames).toContain("obligation_completion_matchers");
+    expect(tableNames).toContain("availability_holds");
     expect(tableNames).toContain("portable_brief_revisions");
 
     const meshEventsColumns = (

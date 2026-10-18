@@ -50,6 +50,7 @@ import { obligationSnooze } from "./0052_obligation_snooze.js";
 import { chatRoomParticipants } from "./0053_chat_room_participants.js";
 import { runPrompts } from "./0055_run_prompts.js";
 import { actorExecutionConfig } from "./0056_actor_execution_config.js";
+import { availabilityHolds } from "./0057_availability_holds.js";
 import { userGoogleAccountId } from "./0058_user_google_account_id.js";
 import { obligationCompletionMatchers } from "./0059_obligation_completion_matchers.js";
 import { configuredActorImport } from "./0060_configured_actor_import.js";
@@ -116,6 +117,7 @@ export const migrations: Migration[] = [
   chatRoomParticipants,
   runPrompts,
   actorExecutionConfig,
+  availabilityHolds,
   userGoogleAccountId,
   obligationCompletionMatchers,
   configuredActorImport,

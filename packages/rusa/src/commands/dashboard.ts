@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import openBrowser from "open";
+import { haltIndicator } from "../actor/availability-holds.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle, resolveRootHandle } from "../actor/handle-generator.js";
 import { loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
@@ -96,10 +97,13 @@ ${"━".repeat(26)}
       // the SSE endpoint is available (it will carry events only if this process
       // recorded them, which it does not — viewing is via the JSON endpoints).
       emitter: new MeshEventEmitter(),
-      // Read-only: stat the shared HALT sentinel. No live actors here, so
-      // `runningThreadIds` is intentionally omitted → every thread reads idle.
-      isHalted: () => haltSwitch.hasActiveHalt(),
-      haltSnapshot: () => haltSwitch.state(),
+      // Read-only: stat the shared HALT sentinel and read the availability
+      // holds in mesh.db, as `rusa start` reports them (#539). No live actors
+      // here, so `runningThreadIds` is intentionally omitted → every thread
+      // reads idle.
+      ...haltIndicator(haltSwitch, () =>
+        getRepositories().availabilityHolds.list({ now: Date.now() })
+      ),
       geminiApiKey: config.geminiApiKey,
       rootIdentity,
     },

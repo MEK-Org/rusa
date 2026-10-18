@@ -20,17 +20,21 @@ const _weekMs = 604800000;
 
 String _iso(DateTime t) => t.toUtc().toIso8601String();
 
-QuotaWindowDto _claudeWeekly({required DateTime now, double used = 40}) =>
-    QuotaWindowDto(
-      id: 'weekly',
-      label: 'Current week (all models)',
-      usedPercent: used,
-      status: 'available',
-      headline: true,
-      windowMs: _weekMs,
-      resetAtIso: _iso(now.add(const Duration(days: 3))),
-      scrapedAt: _iso(now.subtract(const Duration(minutes: 5))),
-    );
+QuotaWindowDto _claudeWeekly({
+  required DateTime now,
+  double used = 40,
+  Duration scrapedAgo = const Duration(minutes: 5),
+  Duration resetIn = const Duration(days: 3),
+}) => QuotaWindowDto(
+  id: 'weekly',
+  label: 'Current week (all models)',
+  usedPercent: used,
+  status: 'available',
+  headline: true,
+  windowMs: _weekMs,
+  resetAtIso: _iso(now.add(resetIn)),
+  scrapedAt: _iso(now.subtract(scrapedAgo)),
+);
 
 QuotaWindowDto _claudeSession({required DateTime now}) => QuotaWindowDto(
   id: 'session',
@@ -66,8 +70,10 @@ QuotaSnapshotDto _snapshot({
   required List<QuotaWindowDto> claudeWindows,
   List<QuotaWindowDto> modelWindows = const [],
   bool withCodex = true,
+  DateTime? fetchedAt,
 }) => QuotaSnapshotDto(
-  generatedAt: '2026-09-28T14:00:00.000Z',
+  // The server stamps each `/api/quota` response at request time (#1055).
+  generatedAt: _iso(fetchedAt ?? DateTime.now()),
   providers: [
     ProviderQuotaDto(
       provider: 'claude',
@@ -118,6 +124,29 @@ Future<DashboardStore> _pumpRings(
   return store;
 }
 
+/// Paints a snapshot restored from the browser cache that no live fetch has
+/// confirmed yet, as on a cold load before the first refresh lands.
+Future<DashboardStore> _pumpCachedRings(
+  WidgetTester tester,
+  QuotaSnapshotDto snapshot,
+) async {
+  final store = DashboardStore(
+    api: FakeApi(),
+    stream: FakeStream(),
+    quotaCache: FakeQuotaCache(snapshot),
+  );
+  await tester.pumpWidget(
+    MaterialApp(
+      home: Scaffold(body: QuotaIndicators(store: store)),
+    ),
+  );
+  await tester.pump(const Duration(milliseconds: 250));
+  return store;
+}
+
+double _stripOpacity(WidgetTester tester) =>
+    tester.widget<AnimatedOpacity>(find.byType(AnimatedOpacity)).opacity;
+
 Finder _staleWarning(String name) => find.descendant(
   of: _ringTooltip(name),
   matching: find.byKey(const ValueKey('quota-ring-stale-warning')),
@@ -150,6 +179,104 @@ double? _outerRingValue(WidgetTester tester, String name) => tester
     .value;
 
 void main() {
+  group('Scrape warning at fetch time (#1055)', () {
+    testWidgets('a live fetch warns only for a scrape already overdue', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final now = DateTime.now();
+        var store = await _pumpRings(
+          tester,
+          _snapshot(claudeWindows: [_claudeWeekly(now: now)], fetchedAt: now),
+        );
+        expect(_staleWarning('Claude'), findsNothing);
+        expect(_stripOpacity(tester), 1.0);
+        await store.dispose();
+
+        store = await _pumpRings(
+          tester,
+          _snapshot(
+            claudeWindows: [
+              _claudeWeekly(now: now, scrapedAgo: const Duration(hours: 3)),
+            ],
+            fetchedAt: now,
+          ),
+        );
+        expect(_staleWarning('Claude'), findsOneWidget);
+        expect(_stripOpacity(tester), 1.0);
+        await store.dispose();
+      });
+    });
+
+    testWidgets('an idle cache dims without inventing a scrape warning', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final fetchedAt = DateTime.now().subtract(const Duration(hours: 3));
+        final store = await _pumpCachedRings(
+          tester,
+          _snapshot(
+            claudeWindows: [_claudeWeekly(now: fetchedAt)],
+            fetchedAt: fetchedAt,
+          ),
+        );
+        // Healthy when fetched three hours ago: the wall-clock age of the
+        // cache alone is not a scrape problem.
+        expect(_staleWarning('Claude'), findsNothing);
+        expect(_stripOpacity(tester), 0.55);
+        await store.dispose();
+      });
+    });
+
+    testWidgets('an idle cache keeps a warning that was due at fetch', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final fetchedAt = DateTime.now().subtract(const Duration(hours: 3));
+        final store = await _pumpCachedRings(
+          tester,
+          _snapshot(
+            claudeWindows: [
+              _claudeWeekly(
+                now: fetchedAt,
+                scrapedAgo: const Duration(hours: 3),
+              ),
+            ],
+            fetchedAt: fetchedAt,
+          ),
+        );
+        expect(_staleWarning('Claude'), findsOneWidget);
+        expect(_stripOpacity(tester), 0.55);
+        await store.dispose();
+      });
+    });
+
+    testWidgets('a window that reset since the fetch draws empty, unwarned', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final fetchedAt = DateTime.now().subtract(const Duration(hours: 3));
+        final store = await _pumpCachedRings(
+          tester,
+          _snapshot(
+            claudeWindows: [
+              _claudeWeekly(
+                now: fetchedAt,
+                scrapedAgo: const Duration(hours: 3),
+                resetIn: const Duration(hours: 1),
+              ),
+            ],
+            fetchedAt: fetchedAt,
+          ),
+        );
+        // Overdue at fetch, but the reset is judged at the real now.
+        expect(_outerRingValue(tester, 'Claude'), 0.0);
+        expect(_staleWarning('Claude'), findsNothing);
+        await store.dispose();
+      });
+    });
+  });
+
   group('Fable header ring (#752)', () {
     testWidgets('shows Claude and Fable weekly readings on separate rings', (
       tester,

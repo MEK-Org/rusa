@@ -83,11 +83,20 @@ bool ringShowsValue(QuotaWindowDto? window, DateTime? now) =>
 
 /// The age of the oldest reading behind a ring still showing a value, when it
 /// is more than [kQuotaReadingStaleAfter] old; null while every one is recent.
-Duration? staleReadingAge(Iterable<QuotaWindowDto?> windows, DateTime now) {
+///
+/// [checkedAt] is when the snapshot was fetched (#1055): a reading counts as
+/// stale only if it was already overdue then, so an idle browser cache never
+/// manufactures a scrape warning. Whether a ring still shows a value is judged
+/// at the real [now].
+Duration? staleReadingAge(
+  Iterable<QuotaWindowDto?> windows,
+  DateTime now, {
+  DateTime? checkedAt,
+}) {
   Duration? oldest;
   for (final window in windows) {
     if (!ringShowsValue(window, now)) continue;
-    final age = readingAge(window, now);
+    final age = readingAge(window, checkedAt ?? now);
     if (age == null || age <= kQuotaReadingStaleAfter) continue;
     if (oldest == null || age > oldest) oldest = age;
   }
@@ -183,6 +192,7 @@ class QuotaTooltip extends StatelessWidget {
     this.scrapedAt,
     this.showThrottle = true,
     this.staleFor,
+    this.staleCheckedAt,
     this.now,
   });
 
@@ -192,6 +202,9 @@ class QuotaTooltip extends StatelessWidget {
   final String? scrapedAt;
   final bool showThrottle;
   final Duration? staleFor;
+
+  /// When the snapshot behind [windows] was fetched; see [staleReadingAge].
+  final DateTime? staleCheckedAt;
   final DateTime? now;
 
   List<String> _buildWindowRows(DateTime currentTime) {
@@ -275,7 +288,7 @@ class QuotaTooltip extends StatelessWidget {
 
   Duration? _staleAge(DateTime currentTime) {
     if (staleFor != null) return staleFor;
-    return staleReadingAge(windows, currentTime);
+    return staleReadingAge(windows, currentTime, checkedAt: staleCheckedAt);
   }
 
   Widget _buildLastReadWidget(DateTime currentTime) {

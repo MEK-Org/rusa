@@ -93,9 +93,10 @@ assertion covers only that directory. The current probe sets `NODE_COMPILE_CACHE
 to a directory inside each launch root and asserts that Pi creates it before
 cleanup. The documented version command writes its cache under
 `$probe_dir/version-compile-cache`, removed with the setup prefix.
-`cache-contained-receipt.jsonl` records the current 30-record probe against the
-supervisor from staging `bacefb9f`. All three cache-presence and launch-cleanup
-assertions pass.
+`startup-isolation-receipt.jsonl` records the current 31-record probe against the
+supervisor built from staging `ef54a3c0`. All three cache-presence and launch-cleanup
+assertions pass. The [historical cache receipt](https://github.com/MEK-Org/rusa/blob/ef54a3c0ce6acf93b538ce94adf3b8757209b4e7/docs/spikes/808-pi-offline/cache-contained-receipt.jsonl)
+records the previous three-scenario probe.
 
 The [historical isolation receipt](https://github.com/MEK-Org/rusa/blob/bacefb9fe5be37b726b27265cbfbe4b4c7aeed7d/docs/spikes/808-pi-offline/isolation-receipt.jsonl)
 predates this environment change and used the supervisor from staging `8009e5bd`. A
@@ -110,15 +111,35 @@ startup settings and runtime project trust. The launched `dist/bundle/cli.js`
 contains the same ordering in `dist/bundle/chunks/chunk-3YAHQSW6.js`.
 The unbundled `dist/migrations.js` calls
 `migrateExtensionSystem(cwd)`, which can rename project `.pi/commands` to
-`.pi/prompts` before resource discovery. The current empty/poison-settings
-fixtures do not exercise that migration. Project startup writes remain a
-separate isolation proof; discovery-disable flags alone do not establish it.
+`.pi/prompts` before resource discovery. This fixture follows the source finding
+reported in [#808](https://github.com/MEK-Org/rusa/issues/808#issuecomment-6231245069).
+The `untrusted-poison` scenario exercises this with a synthetic
+`cwd/.pi/commands/marker.md` alongside its conflicting settings. Despite
+`--no-approve` and all the discovery-disable flags,
+startup removes `commands/` and creates `prompts/` containing the exact marker
+bytes. Each complete stdout line parses as JSON, and the buffer is empty after
+termination, so no partial stdout tail remains. Stderr contains exactly
+`Migrated Project commands/ → prompts/` followed by a newline. The other two
+scenarios require empty stderr. The first migration run failed the old
+empty-stderr assertion; the current assertion records this observed notice.
+
+The migration scenario also seeds `HOME/.pi/agent/commands/marker.md`. With
+`PI_CODING_AGENT_DIR` pointing elsewhere, that ambient marker remains unchanged
+and no adjacent `prompts/` appears. Source inspection of pinned Pi 0.99.2
+(`dist/migrations.js`, `migrateExtensionSystem`) shows that Global migration
+targets the explicit `PI_CODING_AGENT_DIR`. The probe owns that directory and
+seeds it without a `commands/` directory; this fixture does not distinguish
+Global migration running from being skipped. No credential or executable
+fixture is used.
+
+A production design still needs an explicit workspace/configuration boundary;
+discovery-disable flags alone do not provide it.
 
 | Scenario | Conflicting settings | Initial compaction | After RPC disable |
 | --- | --- | --- | --- |
 | baseline | none outside explicit agent directory | false | false |
-| untrusted-poison | HOME/.pi/agent and cwd/.pi, with --no-approve | false | false |
-| trusted-control | same files, with --approve | true | true |
+| untrusted-poison | HOME/.pi/agent and cwd/.pi, plus synthetic legacy command files, with --no-approve | false | false |
+| trusted-control | same conflicting settings, with --approve | true | true |
 
 Poison files enable compaction and request a conflicting model/provider. All
 scenarios explicitly disable warming/retry and pin the requested CLI model.
@@ -131,9 +152,10 @@ intentional or an upstream bug is unknown. A change in this pinned observation
 should fail the probe and require review.
 Production admission must verify effective state rather than trust success alone.
 
-These assertions cover only the reported model and compaction setting. They do
+The state assertions cover only the reported model and compaction setting. They do
 not establish complete configuration/credential isolation, denied extra tools,
 network isolation, native MCP readiness/authorization, descendant containment,
 inference behavior, budgets or accounting. Startup reads project settings before
-runtime trust handling; this probe does not establish which startup side effects
-are possible. #808 and its paid-test/registration gates remain open.
+runtime trust handling. The migration fixture proves one startup write, not an
+exhaustive inventory of startup side effects.
+#808 and its paid-test/registration gates remain open.

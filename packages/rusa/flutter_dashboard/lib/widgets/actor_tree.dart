@@ -163,7 +163,16 @@ class ActorTree extends StatelessWidget {
               ? const CachedHierarchyBadge()
               : const SizedBox.shrink(),
         ),
-        ActorTreeControls(store: store),
+        StreamBuilder<bool>(
+          stream: store.actorsStale,
+          initialData: store.actorsStale.valueOrNull ?? false,
+          builder: (_, snap) => ActorTreeControls(
+            store: store,
+            // The cached badge shares this narrow row. Keep recovery reachable
+            // while shedding only the redundant Retired label in that state.
+            compact: snap.data ?? false,
+          ),
+        ),
       ],
     ),
   );
@@ -241,7 +250,7 @@ class CachedHierarchyBadge extends StatelessWidget {
   }
 }
 
-/// The right-side actor tree controls: Spawn actor button + Show-Retired toggle.
+/// The right-side actor tree controls: spawn, hold recovery, and retired toggle.
 /// Displayed in the tree's header row on desktop, and relocated to the app-level
 /// header on mobile (#516).
 class ActorTreeControls extends StatelessWidget {
@@ -277,6 +286,39 @@ class ActorTreeControls extends StatelessWidget {
     }
   }
 
+  Future<void> _showAvailabilityHoldClearDialog(BuildContext context) async {
+    try {
+      final providers = await store.fetchRootControlProviders();
+      if (!context.mounted) return;
+      final request = await showDialog<_ClearAvailabilityHoldsRequest>(
+        context: context,
+        builder: (_) => RepaintBoundary(
+          key: const ValueKey('availability-hold-clear-dialog'),
+          child: _ClearAvailabilityHoldsDialog(providers: providers),
+        ),
+      );
+      if (request == null || !context.mounted) return;
+      final released = await store.clearAvailabilityHolds(
+        provider: request.provider,
+        models: request.models,
+      );
+      if (!context.mounted) return;
+      final noun = released == 1 ? 'hold' : 'holds';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Cleared $released active availability $noun.',
+          ),
+        ),
+      );
+    } catch (err) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not clear availability holds: $err')),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Row(
@@ -287,6 +329,12 @@ class ActorTreeControls extends StatelessWidget {
           constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
           icon: const Icon(Icons.add, size: 20),
           onPressed: () => _showSpawnDialog(context),
+        ),
+        IconButton(
+          tooltip: 'Clear availability holds',
+          constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+          icon: const Icon(Icons.restart_alt, size: 20),
+          onPressed: () => _showAvailabilityHoldClearDialog(context),
         ),
         StreamBuilder<bool>(
           stream: store.showRetired,
@@ -332,6 +380,120 @@ class ActorTreeControls extends StatelessWidget {
               ),
             );
           },
+        ),
+      ],
+    );
+  }
+}
+
+class _ClearAvailabilityHoldsRequest {
+  const _ClearAvailabilityHoldsRequest({required this.provider, this.models});
+
+  final String provider;
+  final List<String>? models;
+}
+
+class _ClearAvailabilityHoldsDialog extends StatefulWidget {
+  const _ClearAvailabilityHoldsDialog({required this.providers});
+
+  final List<String> providers;
+
+  @override
+  State<_ClearAvailabilityHoldsDialog> createState() =>
+      _ClearAvailabilityHoldsDialogState();
+}
+
+class _ClearAvailabilityHoldsDialogState
+    extends State<_ClearAvailabilityHoldsDialog> {
+  final _formKey = GlobalKey<FormState>();
+  final _models = TextEditingController();
+  String? _provider;
+
+  @override
+  void initState() {
+    super.initState();
+    _provider = widget.providers.firstOrNull;
+  }
+
+  @override
+  void dispose() {
+    _models.dispose();
+    super.dispose();
+  }
+
+  List<String>? _selectedModels() {
+    final value = _models.text.trim();
+    if (value.isEmpty) return null;
+    return value.split(',').map((model) => model.trim()).toList();
+  }
+
+  String? _validateModels(String? value) {
+    final trimmed = value?.trim() ?? '';
+    if (trimmed.isEmpty) return null;
+    if (trimmed.split(',').any((model) => model.trim().isEmpty)) {
+      return 'Models must be comma-separated non-empty names';
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Clear availability holds'),
+      content: SizedBox(
+        width: 440,
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Restore a held provider or selected model lanes.'),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<String>(
+                initialValue: _provider,
+                decoration: const InputDecoration(labelText: 'Provider'),
+                items: widget.providers
+                    .map(
+                      (provider) => DropdownMenuItem(
+                        value: provider,
+                        child: Text(provider),
+                      ),
+                    )
+                    .toList(),
+                onChanged: (value) => setState(() => _provider = value),
+                validator: (value) =>
+                    value == null ? 'Provider is required' : null,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _models,
+                decoration: const InputDecoration(
+                  labelText: 'Models (optional, comma-separated)',
+                ),
+                validator: _validateModels,
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () {
+            if (!_formKey.currentState!.validate()) return;
+            Navigator.pop(
+              context,
+              _ClearAvailabilityHoldsRequest(
+                provider: _provider!,
+                models: _selectedModels(),
+              ),
+            );
+          },
+          child: const Text('Clear'),
         ),
       ],
     );

@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
@@ -42,6 +43,7 @@ import {
   PORTABLE_CONTEXT_SCHEMA_VERSION,
 } from "../actor/portable-context-state.js";
 import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
+import type { RootControlService } from "../actor/root-control.js";
 import { RootModelConfigStartupError } from "../actor/root-model-config.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
@@ -311,6 +313,11 @@ class MockIssueClient implements Partial<IssueClient> {
       draft: false,
     };
   }
+}
+
+/** Whether a durable availability hold covers `provider` (and `model`) right now. */
+function held(provider: string, model?: string): boolean {
+  return getRepositories().availabilityHolds.isHeld(provider, model, Date.now());
 }
 
 describe("start command tests", () => {
@@ -4263,7 +4270,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(chatClient.sent.at(-1)?.text ?? "").toContain("Resumed");
   });
 
-  it("handles scoped/timed halt commands mechanically and requires resume before replacement", async () => {
+  it("imports a scoped HALT file at startup, then handles scoped/timed halt commands as coexisting durable holds (#539)", async () => {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
     const config = {
@@ -4283,9 +4290,20 @@ describe("runStart webhook event routing (Phase 4)", () => {
       geminiApiKey: "fake-gemini-key",
     };
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+    const until = new Date(Date.now() + 60_000).toISOString();
+    // A provider-scoped HALT file from before #539.
+    writeFileSync(
+      join(homeDir, "HALT"),
+      `${JSON.stringify({ reason: "chat /halt from Operator", providers: ["codex"], until })}\n`
+    );
+    const startDashboardServerSpy = vi
+      .spyOn(webhookServer, "startDashboardServer")
+      .mockResolvedValue({ close: vi.fn(async () => {}) });
+    onTestFinished(() => startDashboardServerSpy.mockRestore());
     const readyPromise = new Promise<void>((resolve) => {
       runStart({
         e2e: {
+          dashboard: true,
           chatClient,
           chatSource,
           onReady: (handles) => {
@@ -4307,20 +4325,436 @@ describe("runStart webhook event routing (Phase 4)", () => {
         mentionsSelf: false,
         isDirectMessage: true,
       });
-    const until = new Date(Date.now() + 60_000).toISOString();
+    const lastReply = () => chatClient.sent.at(-1)?.text ?? "";
+    const halt = new HaltSwitch(join(homeDir, "HALT"));
+
+    // Startup imported the scoped file as a hold and archived it.
+    expect(existsSync(join(homeDir, "HALT"))).toBe(false);
+    expect(readdirSync(homeDir).filter((name) => name.startsWith("HALT.imported-"))).toHaveLength(
+      1
+    );
+    expect(held("codex")).toBe(true);
+    expect(held("claude")).toBe(false);
+    const imported = getRepositories().meshEvents.listByKinds(["availability_hold_imported"], {
+      bodyKinds: [],
+    });
+    expect(imported.map((event) => event.detail)).toEqual([
+      `HALT file imported as hold on codex until ${until}`,
+    ]);
 
     await message(`/halt provider:claude,codex until:${until}`, "messages/halt-1");
-    const halt = new HaltSwitch(join(homeDir, "HALT"));
-    expect(halt.isHalted("claude")).toBe(true);
-    expect(halt.isHalted("codex")).toBe(true);
-    expect(halt.isHalted("antigravity")).toBe(false);
+    expect(lastReply()).toContain(`Halted providers claude, codex until ${until}`);
+    // A scoped halt is a durable hold, not the HALT file.
+    expect(existsSync(join(homeDir, "HALT"))).toBe(false);
+    expect(held("claude")).toBe(true);
+    expect(held("codex")).toBe(true);
+    expect(held("antigravity")).toBe(false);
+    expect(getRepositories().availabilityHolds.list()).toEqual([
+      expect.objectContaining({
+        provider: "claude",
+        expiry: until,
+        reason: "chat /halt from Operator",
+        createdBy: "chat:users/operator",
+      }),
+      expect.objectContaining({ provider: "codex", expiry: until }),
+    ]);
+    // The header names a scoped halt as it did when that was the HALT file
+    // (#908): these holds are exactly one providers × expiry scope.
+    const dashboardMesh = () => startDashboardServerSpy.mock.calls[0]?.[0].mesh;
+    expect(dashboardMesh()?.isHalted?.()).toBe(true);
+    expect(dashboardMesh()?.haltSnapshot?.()).toEqual({
+      reason: "chat /halt from Operator",
+      providers: ["claude", "codex"],
+      until,
+    });
 
+    // Holds coexist: another scope needs no /resume first.
     await message("/halt provider:antigravity", "messages/halt-2");
-    expect(chatClient.sent.at(-1)?.text).toContain("Cannot halt while a current halt");
-    expect(halt.isHalted("antigravity")).toBe(false);
+    expect(lastReply()).toContain("Halted provider antigravity.");
+    expect(held("antigravity")).toBe(true);
 
+    // Bare /halt is the global brake and reports the holds alongside it.
+    await message("/halt", "messages/halt-global");
+    expect(lastReply()).toContain("Halted all actor runs.");
+    expect(lastReply()).toContain("Availability holds in force:");
+    expect(lastReply()).toContain(
+      "• antigravity (all models), until cleared — chat /halt from Operator"
+    );
+    expect(lastReply()).toContain(`• claude (all models), until ${until}`);
+    expect(halt.isHalted()).toBe(true);
+    await message("/halt", "messages/halt-global-again");
+    expect(lastReply()).toContain("The global halt is already in place.");
+    expect(lastReply()).toContain(`• codex (all models), until ${until}`);
+
+    // A scoped /resume releases only its holds and leaves the brake alone.
+    await message("/resume provider:codex", "messages/resume-codex");
+    expect(lastReply()).toContain(
+      `Released availability holds:\n• codex (all models), until ${until}`
+    );
+    expect(lastReply()).toContain("The global halt is still in place");
+    expect(held("codex")).toBe(false);
+    expect(held("claude")).toBe(true);
+    expect(halt.isHalted()).toBe(true);
+    await message("/resume provider:codex", "messages/resume-codex-again");
+    expect(lastReply()).toContain("No availability hold in force matched provider:codex");
+
+    // Bare /resume releases the global brake and every hold chat placed —
+    // including the imported HALT-file hold, which is chat-origin — while
+    // mesh-origin holds would stay in force (operator decision, #918
+    // comments 6000743198 and 6204340124; every hold here is chat-origin).
     await message("/resume", "messages/resume");
+    const resumed = lastReply();
+    expect(resumed).toContain("Resumed");
+    expect(resumed).toContain("Global halt released.");
+    expect(resumed).toContain("• antigravity (all models), until cleared");
+    expect(resumed).toContain(`• claude (all models), until ${until}`);
+    expect(resumed).not.toContain("Still held");
     expect(halt.isHalted()).toBe(false);
+    expect(held("antigravity")).toBe(false);
+    expect(held("claude")).toBe(false);
+    // Nothing keeps the header halted once every chat-origin hold is released.
+    expect(dashboardMesh()?.isHalted?.()).toBe(false);
+    expect(dashboardMesh()?.haltSnapshot?.()).toBeNull();
+    expect(getRepositories().availabilityHolds.list()).toEqual([]);
+
+    // With no brake and no chat hold left, bare /resume says so plainly.
+    await message("/resume", "messages/resume-no-brake");
+    expect(lastReply()).toContain("No global halt was in place.");
+    expect(lastReply()).toContain("No availability holds are in force.");
+
+    await message("/resume model:x", "messages/resume-bad");
+    expect(lastReply()).toContain(
+      "Resume command rejected: model-scoped resume requires a provider"
+    );
+    expect(lastReply()).toContain("/resume provider:");
+
+    await message("/resume provider:antigravity,claude", "messages/resume-rest");
+    expect(lastReply()).toContain("No availability hold in force matched");
+    expect(dashboardMesh()?.isHalted?.()).toBe(false);
+    expect(dashboardMesh()?.haltSnapshot?.()).toBeNull();
+  });
+
+  it("restores every configured actor lane through operator hold recovery without a model run (#539)", async () => {
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: { provider: "claude", model: "claude-sonnet-5" },
+      }),
+      "utf8"
+    );
+    let mesh: ActorMesh | undefined;
+    let root: Actor | undefined;
+    let rootControl: RootControlService | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            root = handles.root as Actor;
+            rootControl = handles.rootControl;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh || !root || !rootControl) throw new Error("mesh, root, or root control not ready");
+    const rootOptions = (
+      root as unknown as { opts: { mcpServers: Array<{ name: string; url: string }> } }
+    ).opts;
+    const meshUrl = rootOptions.mcpServers.find((server) => server.name === "mesh")?.url;
+    if (!meshUrl) throw new Error("root mesh server missing");
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const client = new Client({ name: "test", version: "0.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(meshUrl)));
+      try {
+        return (await client.callTool({ name, arguments: args })) as CallToolResult;
+      } finally {
+        await client.close();
+      }
+    };
+    const workerId = mesh.spawn({
+      charter: "codex worker",
+      parentId: "root",
+      modelConfig: { provider: "codex", model: "gpt-5.5" },
+    });
+
+    const unconfigured = await call("set_availability_hold", { provider: "kimi" });
+    expect(unconfigured.isError).toBe(true);
+    expect(JSON.stringify(unconfigured.content)).toContain("not configured");
+    expect(getRepositories().availabilityHolds.list()).toEqual([]);
+
+    expect((await call("set_availability_hold", { provider: "claude" })).isError).toBeFalsy();
+    expect((await call("set_availability_hold", { provider: "codex" })).isError).toBeFalsy();
+    expect(getRepositories().availabilityHolds.list()).toEqual([
+      expect.objectContaining({ provider: "claude", origin: "mesh", createdBy: root.id }),
+      expect.objectContaining({ provider: "codex", origin: "mesh", createdBy: root.id }),
+    ]);
+    // Every configured actor lane is indefinitely mesh-held: neither the root
+    // nor the codex worker is admitted, and both pools remain untouched.
+    expect(mesh.prepareRun(root.id)).toBe(false);
+    expect(mesh.prepareRun(workerId)).toBe(false);
+    expect(getRepositories().actors.get(workerId)?.modelConfig).toEqual([
+      expect.objectContaining({ provider: "codex", model: "gpt-5.5" }),
+    ]);
+
+    const operator = "00000000-0000-4000-8000-000000000001" as const;
+    const rootClear = rootControl.clearAvailabilityHolds({ provider: "claude" }, operator);
+    expect(rootClear.released).toEqual([
+      expect.objectContaining({ provider: "claude", origin: "mesh" }),
+    ]);
+    expect(mesh.prepareRun(root.id)).toBe(true);
+    expect(mesh.prepareRun(workerId)).toBe(false);
+
+    const workerClear = rootControl.clearAvailabilityHolds({ provider: "codex" }, operator);
+    expect(workerClear.released).toEqual([
+      expect.objectContaining({ provider: "codex", origin: "mesh" }),
+    ]);
+    expect(mesh.prepareRun(workerId)).toBe(true);
+    // A repeat operator clear is safe and does not manufacture a release.
+    expect(rootControl.clearAvailabilityHolds({ provider: "codex" }, operator)).toEqual({
+      released: [],
+      expired: [],
+    });
+  });
+
+  it("chat /resume releases only chat-origin holds; mesh-origin holds survive for the UI path (#918)", async () => {
+    initDb(homeDir);
+    const scrapes = getRepositories().modelScrapes;
+    const scrapeId = scrapes.recordRaw({
+      provider: "claude",
+      scrapedAt: new Date().toISOString(),
+      rawOutput: "recorded claude model list",
+    });
+    scrapes.recordParsed(scrapeId, [
+      { displayLabel: "Claude Sonnet 5", identifier: "claude-sonnet-5", passable: true },
+    ]);
+    closeDb();
+    const chatClient = new FakeChatClient();
+    const chatSource = new FakeChatSource();
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          antigravity: { cliCommand: "agy" },
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: { provider: "claude", model: "claude-sonnet-5" },
+        chat: {
+          projectId: "test",
+          subscription: "test",
+          pubsubKeyPath: "/dev/null",
+          gchat: "all",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+    let mesh: ActorMesh | undefined;
+    let root: Actor | undefined;
+    const startDashboardServerSpy = vi
+      .spyOn(webhookServer, "startDashboardServer")
+      .mockResolvedValue({ close: vi.fn(async () => {}) });
+    onTestFinished(() => startDashboardServerSpy.mockRestore());
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          dashboard: true,
+          chatClient,
+          chatSource,
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            root = handles.root as Actor;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh || !root) throw new Error("mesh or root not ready");
+    const meshUrl = (
+      root as unknown as { opts: { mcpServers: Array<{ name: string; url: string }> } }
+    ).opts.mcpServers.find((server) => server.name === "mesh")?.url;
+    if (!meshUrl) throw new Error("root mesh server missing");
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const client = new Client({ name: "test", version: "0.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(meshUrl)));
+      try {
+        return (await client.callTool({ name, arguments: args })) as CallToolResult;
+      } finally {
+        await client.close();
+      }
+    };
+    const message = (text: string, name: string) =>
+      chatSource.emit({
+        name,
+        spaceName: "spaces/test",
+        spaceType: "DIRECT_MESSAGE",
+        senderName: "users/operator",
+        senderDisplayName: "Operator",
+        text,
+        mentionsSelf: false,
+        isDirectMessage: true,
+      });
+    const lastReply = () => chatClient.sent.at(-1)?.text ?? "";
+    const rows = () =>
+      getRepositories()
+        .availabilityHolds.list()
+        .map((hold) => `${hold.provider}:${hold.model ?? "*"}:${hold.origin}`)
+        .sort();
+    const dashboardMesh = () => startDashboardServerSpy.mock.calls[0]?.[0].mesh;
+    const until = new Date(Date.now() + 60_000).toISOString();
+
+    // Mesh first, then chat on the same scope: both rows coexist.
+    expect(
+      (await call("set_availability_hold", { provider: "codex", reason: "mesh codex" })).isError
+    ).toBeFalsy();
+    await message("/halt provider:codex", "messages/origin-halt-codex");
+    expect(rows()).toEqual(["codex:*:chat", "codex:*:mesh"]);
+
+    // Chat first, then mesh on the same scope: the write order must not matter.
+    await message("/halt provider:antigravity", "messages/origin-halt-agy");
+    expect(
+      (await call("set_availability_hold", { provider: "antigravity", reason: "mesh agy" })).isError
+    ).toBeFalsy();
+    expect(rows()).toEqual([
+      "antigravity:*:chat",
+      "antigravity:*:mesh",
+      "codex:*:chat",
+      "codex:*:mesh",
+    ]);
+
+    // Provider/model overlap: a mesh model hold under a chat provider-wide
+    // hold on the same lane, with independent expiry.
+    expect(
+      (
+        await call("set_availability_hold", {
+          provider: "claude",
+          models: ["claude-sonnet-5"],
+          reason: "mesh sonnet",
+        })
+      ).isError
+    ).toBeFalsy();
+    await message(`/halt provider:claude until:${until}`, "messages/origin-halt-claude");
+    expect(rows()).toEqual([
+      "antigravity:*:chat",
+      "antigravity:*:mesh",
+      "claude:*:chat",
+      "claude:claude-sonnet-5:mesh",
+      "codex:*:chat",
+      "codex:*:mesh",
+    ]);
+    expect(dashboardMesh()?.isHalted?.()).toBe(true);
+
+    // A scoped chat /resume clears only the chat row on that scope; the mesh
+    // hold stays in force and the reply names it under "Still held".
+    await message("/resume provider:codex", "messages/origin-resume-codex");
+    expect(lastReply()).toContain(
+      "Released availability holds:\n• codex (all models), until cleared — chat /halt from Operator\n"
+    );
+    expect(lastReply()).toContain(
+      "Still held:\n• codex (all models), until cleared — mesh codex (mesh-instituted)\n" +
+        "Mesh-instituted holds stay in force"
+    );
+    expect(rows()).toEqual([
+      "antigravity:*:chat",
+      "antigravity:*:mesh",
+      "claude:*:chat",
+      "claude:claude-sonnet-5:mesh",
+      "codex:*:mesh",
+    ]);
+    expect(held("codex")).toBe(true);
+
+    // Bare /resume with no brake in place: every chat-origin hold goes,
+    // every mesh-origin hold stays, and the header keeps reporting held.
+    await message("/resume", "messages/origin-resume-bare");
+    const bare = lastReply();
+    expect(bare).toContain("No global halt was in place.");
+    expect(bare).toContain(
+      "Released availability holds:\n" +
+        "• antigravity (all models), until cleared — chat /halt from Operator\n" +
+        `• claude (all models), until ${until} — chat /halt from Operator\n`
+    );
+    expect(bare).toContain(
+      "Availability holds still in force:\n" +
+        "• antigravity (all models), until cleared — mesh agy (mesh-instituted)\n" +
+        "• claude model claude-sonnet-5, until cleared — mesh sonnet (mesh-instituted)\n" +
+        "• codex (all models), until cleared — mesh codex (mesh-instituted)\n" +
+        "Mesh-instituted holds stay in force"
+    );
+    expect(rows()).toEqual(["antigravity:*:mesh", "claude:claude-sonnet-5:mesh", "codex:*:mesh"]);
+    expect(held("antigravity")).toBe(true);
+    expect(held("claude", "claude-sonnet-5")).toBe(true);
+    expect(held("claude", "claude-opus-5")).toBe(false);
+    expect(held("codex")).toBe(true);
+    expect(dashboardMesh()?.isHalted?.()).toBe(true);
+
+    // Bare /halt lists mesh-origin holds alongside its /resume instruction, so
+    // the operator can see that the mesh rows will remain after /resume.
+    await message("/halt", "messages/origin-halt-global");
+    expect(lastReply()).toContain(
+      "Availability holds in force:\n" +
+        "• antigravity (all models), until cleared — mesh agy (mesh-instituted)\n" +
+        "• claude model claude-sonnet-5, until cleared — mesh sonnet (mesh-instituted)\n" +
+        "• codex (all models), until cleared — mesh codex (mesh-instituted)"
+    );
+    expect(lastReply()).toContain("Mesh-instituted holds stay in force");
+    await message("/resume", "messages/origin-resume-global");
+
+    // A scoped chat /resume again: nothing chat-origin remains to release.
+    await message("/resume provider:antigravity", "messages/origin-resume-agy-again");
+    expect(lastReply()).toContain("No availability hold in force matched");
+    expect(held("antigravity")).toBe(true);
+
+    // A scoped /resume marks which remaining holds the mesh instituted, and
+    // points at the dashboard only when one of them did.
+    await message("/halt provider:claude", "messages/origin-halt-claude-again");
+    await message("/resume provider:claude model:claude-sonnet-5", "messages/origin-resume-sonnet");
+    expect(lastReply()).toContain(
+      "Still held:\n" +
+        "• claude (all models), until cleared — chat /halt from Operator\n" +
+        "• claude model claude-sonnet-5, until cleared — mesh sonnet (mesh-instituted)\n" +
+        "Mesh-instituted holds stay in force"
+    );
+
+    // The authorized MCP/UI clear releases every origin on the scope.
+    expect(
+      (await call("clear_availability_hold", { provider: "antigravity" })).isError
+    ).toBeFalsy();
+    expect(held("antigravity")).toBe(false);
+    const listed = await call("list_availability_holds", {});
+    expect(JSON.stringify(listed.content)).toContain("claude");
+    expect(JSON.stringify(listed.content)).not.toContain("antigravity");
+
+    expect((await call("clear_availability_hold", { provider: "claude" })).isError).toBeFalsy();
+    expect((await call("clear_availability_hold", { provider: "codex" })).isError).toBeFalsy();
+    expect(held("claude", "claude-sonnet-5")).toBe(false);
+    expect(held("codex")).toBe(false);
+    expect(getRepositories().availabilityHolds.list()).toEqual([]);
+    expect(dashboardMesh()?.isHalted?.()).toBe(false);
+
+    // With only chat holds left, the reply does not send the operator to the
+    // dashboard: /resume can release everything still held.
+    await message("/halt provider:codex", "messages/origin-halt-codex-chat-only");
+    await message(
+      "/resume provider:codex model:claude-sonnet-5",
+      "messages/origin-resume-chat-only"
+    );
+    expect(lastReply()).toContain(
+      "Still held:\n• codex (all models), until cleared — chat /halt from Operator"
+    );
+    expect(lastReply()).not.toContain("Mesh-instituted");
+    await message("/resume provider:codex", "messages/origin-resume-codex-chat-only");
+    expect(lastReply()).not.toContain("Still held");
+    expect(getRepositories().availabilityHolds.list()).toEqual([]);
+    clearProviderModelCatalog();
   });
 
   async function startClaudeChatHaltService() {
@@ -4400,8 +4834,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const idleAck = chatClient.sent.at(-1)?.text ?? "";
     expect(idleAck).toContain("Halted");
     expect(idleAck).not.toContain("rejected");
-    expect(halt.isHalted("claude", "claude-opus-5")).toBe(true);
-    await message("/resume", "messages/resume-idle");
+    expect(held("claude", "claude-opus-5")).toBe(true);
+    await message("/resume provider:claude", "messages/resume-idle");
     expect(halt.isHalted()).toBe(false);
 
     // A transposed suffix: no run can ever be launched on this name, so a hold
@@ -4414,7 +4848,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(typoAck).toContain("closest: claude-sonnet-5");
     // No hold at all: not on the misspelling, not on anything.
     expect(halt.isHalted()).toBe(false);
-    expect(halt.isHalted("claude", "claude-sonnet-5-hihg")).toBe(false);
+    expect(held("claude", "claude-sonnet-5-hihg")).toBe(false);
 
     // #630's sharp end. The refusal never took the single sentinel, so the
     // corrected halt lands immediately --- with no /resume in between.
@@ -4422,9 +4856,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const correctAck = chatClient.sent.at(-1)?.text ?? "";
     expect(correctAck).toContain("Halted");
     expect(correctAck).not.toContain("rejected");
-    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(true);
+    expect(held("claude", "claude-sonnet-5")).toBe(true);
 
-    await message("/resume", "messages/resume-correct");
+    await message("/resume provider:claude", "messages/resume-correct");
     expect(halt.isHalted()).toBe(false);
 
     // A comma list is refused whole. Holding the half that matched would leave
@@ -4438,7 +4872,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(partialAck).toContain("claude-sonnet-5-hihg");
     expect(partialAck).toContain("No hold was placed");
     expect(halt.isHalted()).toBe(false);
-    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(false);
+    expect(held("claude", "claude-sonnet-5")).toBe(false);
 
     // Catalog membership is checked per requested provider/model pair. Codex
     // has no recorded catalog, but Claude's catalog used to make this union
@@ -4452,13 +4886,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(mixedAck).toContain("codex:claude-sonnet-5");
     expect(mixedAck).toContain("No model catalog is recorded for codex");
     expect(halt.isHalted()).toBe(false);
-    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(false);
-    expect(halt.isHalted("codex", "claude-sonnet-5")).toBe(false);
+    expect(held("claude", "claude-sonnet-5")).toBe(false);
+    expect(held("codex", "claude-sonnet-5")).toBe(false);
 
     await message("/halt provider:claude model:claude-sonnet-5", "messages/halt-after-mixed");
     expect(chatClient.sent.at(-1)?.text ?? "").toContain("Halted");
-    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(true);
-    await message("/resume", "messages/resume-after-mixed");
+    expect(held("claude", "claude-sonnet-5")).toBe(true);
+    await message("/resume provider:claude", "messages/resume-after-mixed");
     expect(halt.isHalted()).toBe(false);
 
     clearProviderModelCatalog();
@@ -4482,7 +4916,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     await message("/halt provider:claude", "messages/halt-provider-wide");
     expect(chatClient.sent.at(-1)?.text ?? "").toContain("Halted");
-    expect(halt.isHalted("claude")).toBe(true);
+    expect(held("claude")).toBe(true);
   });
 
   it("answers an unparseable /halt with the syntax it accepts", async () => {

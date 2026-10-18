@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -19,6 +19,10 @@ for (const scenario of ["baseline", "untrusted-poison", "trusted-control"]) {
   let buffer = "";
   let stderr = "";
   const responses = [];
+  const migrationLine = "Migrated Project commands/ → prompts/";
+  const hasMigrationFixture = scenario === "untrusted-poison";
+  const cwd = join(root, "work");
+  const marker = "Synthetic migration marker. No prompt or credential.\n";
   const commands = [
     { id: "state", type: "get_state" },
     { id: "levels", type: "get_available_thinking_levels" },
@@ -75,14 +79,18 @@ for (const scenario of ["baseline", "untrusted-poison", "trusted-control"]) {
       await writeFile(join(root, "home/.pi/agent/settings.json"), settings(true));
       await writeFile(join(root, "work/.pi/settings.json"), settings(true));
     }
-    console.log(
-      JSON.stringify({ scenario, command: node, args, env, cwd: join(root, "work"), commands })
-    );
+    if (hasMigrationFixture) {
+      for (const dir of ["work/.pi/commands", "home/.pi/agent/commands"]) {
+        await mkdir(join(root, dir), { recursive: true });
+        await writeFile(join(root, dir, "marker.md"), marker);
+      }
+    }
+    console.log(JSON.stringify({ scenario, command: node, args, env, cwd, commands }));
     const result = await runSubprocess({
       command: node,
       args,
       env,
-      cwd: join(root, "work"),
+      cwd,
       timeoutMs: 20000,
       onDuplex(t) {
         transport = t;
@@ -145,7 +153,21 @@ for (const scenario of ["baseline", "untrusted-poison", "trusted-control"]) {
     }
     assert.deepEqual(responses[1].data.levels, ["off", "minimal", "low", "medium", "high"]);
     assert.equal(result.output, "SIGKILL");
-    assert.equal(stderr, "");
+    assert.equal(stderr, hasMigrationFixture ? `${migrationLine}\n` : "");
+    assert.equal(buffer, "");
+    if (hasMigrationFixture) {
+      await assert.rejects(access(join(root, "work/.pi/commands")), { code: "ENOENT" });
+      assert.equal(await readFile(join(root, "work/.pi/prompts/marker.md"), "utf8"), marker);
+      assert.equal(await readFile(join(root, "home/.pi/agent/commands/marker.md"), "utf8"), marker);
+      await assert.rejects(access(join(root, "home/.pi/agent/prompts")), { code: "ENOENT" });
+      console.log(
+        JSON.stringify({
+          scenario,
+          projectCommands: "renamed-to-prompts-marker-preserved",
+          ambientCommands: "unchanged-no-prompts",
+        })
+      );
+    }
     // Pi calls enableCompileCache() before main. Its cache belongs to this launch.
     await access(env.NODE_COMPILE_CACHE);
     console.log(JSON.stringify({ scenario, compileCache: "present-inside-launch" }));
