@@ -1399,10 +1399,13 @@ describe("shared startup, role authority, and local database (#1019)", () => {
         const event = JSON.parse(bytes.toString("utf8")) as SyntheticEvent;
         // Verify the 9 MiB payload in this test-local sink without passing the
         // raw 9 MiB string into delivered assertions or runner diffs.
-        const matchesOversized = event.message?.updateId === oversizedId;
+        const rawId = event.message?.updateId;
+        const matchesOversized = rawId === oversizedId;
         delivered.push({
           route: "transfer",
-          updateId: matchesOversized ? "oversized-matched" : event.message?.updateId,
+          updateId: matchesOversized
+            ? "oversized-matched"
+            : `mismatch(len=${typeof rawId === "string" ? rawId.length : "non-string"})`,
         });
         return replyJson(res, { status: "complete" });
       }
@@ -1563,6 +1566,9 @@ describe("shared startup, role authority, and local database (#1019)", () => {
       expect(unregisteredSessions).toEqual(["late-register-session"]);
     } finally {
       try {
+        if (heldRegister && !heldRegister.writableEnded) {
+          heldRegister.destroy();
+        }
         await shutdown?.();
       } finally {
         await leader.close().catch(() => {});
