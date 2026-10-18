@@ -1397,7 +1397,13 @@ describe("shared startup, role authority, and local database (#1019)", () => {
           return replyJson(res, { status: "fragment", receivedBytes: bytes.length });
         }
         const event = JSON.parse(bytes.toString("utf8")) as SyntheticEvent;
-        delivered.push({ route: "transfer", updateId: event.message?.updateId });
+        // Verify the 9 MiB payload in this test-local sink without passing the
+        // raw 9 MiB string into delivered assertions or runner diffs.
+        const matchesOversized = event.message?.updateId === oversizedId;
+        delivered.push({
+          route: "transfer",
+          updateId: matchesOversized ? "oversized-matched" : event.message?.updateId,
+        });
         return replyJson(res, { status: "complete" });
       }
       replyJson(res, {});
@@ -1406,27 +1412,42 @@ describe("shared startup, role authority, and local database (#1019)", () => {
       providers: { codex: { cliCommand: "codex" } },
       peers: [{ type: "leader", url: leader.url, token: "token-synthetic-transfer" }],
       instance: { id: "follower-node-transfer" },
+      observability: { logging: { level: "error" } },
     });
 
+    const prevLogLevel = process.env.RUSA_LOG_LEVEL;
+    process.env.RUSA_LOG_LEVEL = "error";
     let shutdown: (() => Promise<void>) | undefined;
-    await runStart({
-      e2e: {
-        connectPeer: true,
-        followerPolling: true,
-        onFollowerReady: (handles) => {
-          shutdown = handles.shutdown;
+    try {
+      await runStart({
+        e2e: {
+          connectPeer: true,
+          followerPolling: true,
+          onFollowerReady: (handles) => {
+            shutdown = handles.shutdown;
+          },
         },
-      },
-    });
+      });
 
-    await waitUntil(() => delivered.length >= 2);
-    expect(delivered).toEqual([
-      { route: "transfer", updateId: oversizedId },
-      { route: "events", updateId: "after-oversized" },
-    ]);
-    await shutdown?.();
-    await leader.close();
-  }, 20_000);
+      // 20s bounded wait deadline provides a 10s explicit margin under the 30s outer timeout.
+      await waitUntil(() => delivered.length >= 2, 20_000);
+      expect(delivered).toEqual([
+        { route: "transfer", updateId: "oversized-matched" },
+        { route: "events", updateId: "after-oversized" },
+      ]);
+    } finally {
+      if (prevLogLevel !== undefined) {
+        process.env.RUSA_LOG_LEVEL = prevLogLevel;
+      } else {
+        delete process.env.RUSA_LOG_LEVEL;
+      }
+      try {
+        await shutdown?.();
+      } finally {
+        await leader.close().catch(() => {});
+      }
+    }
+  }, 30_000);
 
   it("dispatches nothing from a poll answered after shutdown begins", async () => {
     const home = makeTempHome();
@@ -1473,23 +1494,30 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     });
 
     let handles: { instance: FollowerInstance; shutdown: () => Promise<void> } | undefined;
-    await runStart({
-      e2e: {
-        connectPeer: true,
-        followerPolling: true,
-        onFollowerReady: (ready) => {
-          handles = ready;
+    try {
+      await runStart({
+        e2e: {
+          connectPeer: true,
+          followerPolling: true,
+          onFollowerReady: (ready) => {
+            handles = ready;
+          },
         },
-      },
-    });
-    await waitUntil(() => heldPoll !== undefined);
-    const dispatch = vi.spyOn(handles?.instance as FollowerInstance, "dispatch");
+      });
+      await waitUntil(() => heldPoll !== undefined, 10_000);
+      const dispatch = vi.spyOn(handles?.instance as FollowerInstance, "dispatch");
 
-    await handles?.shutdown();
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(unregistered).toBe(true);
-    expect(dispatch).not.toHaveBeenCalled();
-    await leader.close();
+      await handles?.shutdown();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(unregistered).toBe(true);
+      expect(dispatch).not.toHaveBeenCalled();
+    } finally {
+      try {
+        await handles?.shutdown();
+      } finally {
+        await leader.close().catch(() => {});
+      }
+    }
   }, 20_000);
 
   it("unregisters a registration that completes after shutdown begins", async () => {
@@ -1512,26 +1540,33 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     });
 
     let shutdown: (() => Promise<void>) | undefined;
-    await runStart({
-      e2e: {
-        connectPeer: false,
-        followerPolling: true,
-        onFollowerReady: (ready) => {
-          shutdown = ready.shutdown;
+    try {
+      await runStart({
+        e2e: {
+          connectPeer: false,
+          followerPolling: true,
+          onFollowerReady: (ready) => {
+            shutdown = ready.shutdown;
+          },
         },
-      },
-    });
-    await waitUntil(() => heldRegister !== undefined);
+      });
+      await waitUntil(() => heldRegister !== undefined, 10_000);
 
-    const closing = shutdown?.();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    replyJson(heldRegister as ServerResponse, {
-      session: "late-register-session",
-      protocolVersion: INSTANCE_PROTOCOL_VERSION,
-    });
-    await closing;
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(unregisteredSessions).toEqual(["late-register-session"]);
-    await leader.close();
+      const closing = shutdown?.();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      replyJson(heldRegister as ServerResponse, {
+        session: "late-register-session",
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      });
+      await closing;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(unregisteredSessions).toEqual(["late-register-session"]);
+    } finally {
+      try {
+        await shutdown?.();
+      } finally {
+        await leader.close().catch(() => {});
+      }
+    }
   }, 20_000);
 });
