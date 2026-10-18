@@ -3,6 +3,7 @@ import { type ChatWakeMode, chatWakeModeFromConfig } from "../chat/wake-mode.js"
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
+import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { MESH_SYSTEM } from "../mcp/stamp.js";
 import {
   isBlockingObligationStatus,
@@ -507,10 +508,7 @@ function describeRetirementBlockers(target: string, blockers: RetirementBlockers
  * controller. Their scope is enforced by the surface that mints them, not by
  * ancestry, since none of them is a node in the tree to begin with.
  */
-function isTrustedControlPrincipal(
-  by: string,
-  principals?: import("../db/repositories/principal-repository.js").PrincipalRepository
-): boolean {
+function isTrustedControlPrincipal(by: string, principals?: PrincipalRepository): boolean {
   return (
     by === "root-llm" ||
     by === "e2e-controller" ||
@@ -578,7 +576,7 @@ export interface RetireCleanup {
 
 export interface ActorMeshOptions {
   actors: ActorRepository;
-  principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
+  principals?: PrincipalRepository;
   /**
    * The effective responsive state of an actor's currently selected inbox
    * obligation. The host owns this projection: actors cannot provide a
@@ -906,7 +904,7 @@ interface ActiveInterruptionSuppression {
 
 export class ActorMesh {
   readonly actors: ActorRepository;
-  readonly principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
+  readonly principals?: PrincipalRepository;
   private readonly createActor: ActorFactory;
   private readonly validateSpawn?: (req: SpawnRequest) => ProviderModelConfig[];
   private readonly supportsExecutionTarget?: (target: string) => boolean;
