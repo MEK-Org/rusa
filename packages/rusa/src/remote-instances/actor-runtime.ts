@@ -9,7 +9,7 @@ import {
 import { composeHostContextIntoPrompt, portableContextMaxRuns } from "../actor/portable-context.js";
 import { projectActorRunLaunchConfig } from "../actor/run-accounting.js";
 import type { ActorRunMode } from "../actor/trigger-runner.js";
-import type { Repositories } from "../db/repositories/index.js";
+import type { FollowerRepositories } from "../db/repositories/index.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, McpServerSpec } from "../providers/types.js";
 import {
@@ -32,7 +32,7 @@ export function createActorRuntime(
   send: (message: ActorEvent) => void,
   onClosed: () => void,
   computerUseLock?: ComputerUseLock,
-  repositories?: Repositories
+  repositories?: FollowerRepositories
 ) {
   let actor: Actor | undefined;
   let sequence = 0;
@@ -174,52 +174,34 @@ export function createActorRuntime(
       mcpServers,
       isComputerUseAdmitted: () => currentRunComputerUse,
       debounceMs: bootstrap.actorOptions?.debounceMs ?? 10,
-      loadSessionId: () => {
-        // Leader-selected context owns native-session policy. A host-local
-        // portable snapshot is additive prompt material, never a reason to
-        // discard a session the leader explicitly configured as native.
-        if (snapshot?.record?.context?.type === "portable") {
-          return undefined;
-        }
-        return sessionId;
-      },
+      loadSessionId: () => sessionId,
       saveSessionId: (id) => {
         sessionId = id;
         send({ type: "session", sessionId: id });
       },
       buildPrompt: () => {
         const baseBuild = snapshot.promptBuild ?? { prompt: snapshot.prompt };
-        if (!repositories) return baseBuild;
-
-        const localState = repositories.portableContext.find(bootstrap.id);
-        const localRuns = repositories.actorRuns
-          .listRecentCompleted(bootstrap.id, portableContextMaxRuns())
-          .map((run) => ({
-            id: run.id,
-            ts: run.endedAt ?? run.startedAt,
-            body: run.output,
-          }));
-
-        if (localState || localRuns.length > 0) {
-          const { prompt, portable } = composeHostContextIntoPrompt({
-            basePrompt: baseBuild.prompt,
-            localState,
-            localRuns,
-          });
-
-          if (portable) {
-            return {
-              ...baseBuild,
-              prompt,
-              // This is the exact, bounded host contribution inserted above;
-              // retaining a leader record here would claim its bytes/hash for
-              // different text delivered by this follower.
-              injectRecord: portable.record,
-            };
-          }
-        }
-
-        return baseBuild;
+        // Host-local runs are prompt memory only for a portable actor. A native
+        // actor's history is its leader-selected provider session.
+        if (!repositories || snapshot.record.context?.type !== "portable") return baseBuild;
+        const { prompt, portable } = composeHostContextIntoPrompt({
+          basePrompt: baseBuild.prompt,
+          localRuns: repositories.actorRuns
+            .listRecentCompleted(bootstrap.id, portableContextMaxRuns())
+            .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output })),
+          // Follower run ids are the leader's actor_run ids, so the leader's
+          // inject record names exactly which of these runs it already rendered.
+          representedRunIds: baseBuild.injectRecord?.sourceEventIds ?? [],
+        });
+        if (!portable) return baseBuild;
+        return {
+          ...baseBuild,
+          prompt,
+          // This is the exact, bounded host contribution appended above;
+          // retaining a leader record here would claim its bytes/hash for
+          // different text delivered by this follower.
+          injectRecord: portable.record,
+        };
       },
       prepareUnderstandingMount: () => request<string | undefined>({ op: "prepareMount" }).result,
       beforeRun: async ({ mode }) => {
@@ -233,9 +215,7 @@ export function createActorRuntime(
             op: "beforeRun",
             mode,
           }).result;
-          // An admission reply may omit sessionId; omission retains the
-          // leader-selected native session instead of clearing it.
-          if (reply.sessionId !== undefined) sessionId = reply.sessionId;
+          sessionId = reply.sessionId;
           return reply.allowed;
         } catch (err) {
           if (

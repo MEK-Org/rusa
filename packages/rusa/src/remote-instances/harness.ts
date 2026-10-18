@@ -12,7 +12,7 @@ import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import type { MeshEventInput } from "../actor/mesh-events.js";
 import { type ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
 import { runMigrations } from "../db/migrations/runner.js";
-import type { Repositories } from "../db/repositories/index.js";
+import type { FollowerRepositories } from "../db/repositories/index.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { LogFields, Logger } from "../observability/logger.js";
@@ -53,7 +53,7 @@ export function createHarness(options: {
   obligations?: ActorMeshOptions["obligations"];
   responsiveInterruption?: ActorMeshOptions["responsiveInterruption"];
   responsiveInterruptionMode?: ActorMeshOptions["responsiveInterruptionMode"];
-  repositories?: Repositories;
+  repositories?: FollowerRepositories;
 }) {
   const promptEvents: ActorLifecyclePromptEvent[] = [];
   const actors = new InMemoryActorRepository();

@@ -4,13 +4,16 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import type { InstanceRole } from "../config/types.js";
 import { runMigrations } from "./migrations/runner.js";
-import { Repositories, RoleAuthorityError } from "./repositories/index.js";
+import {
+  createFollowerRepositories,
+  type FollowerRepositories,
+  Repositories,
+} from "./repositories/index.js";
 import { widenToWal } from "./wal.js";
-
-export { RoleAuthorityError };
 
 let db: Database.Database | null = null;
 let repositories: Repositories | null = null;
+let followerRepositories: FollowerRepositories | null = null;
 let currentRepositoriesRole: InstanceRole | null = null;
 
 export type TaskStatus = "queued" | "in_progress" | "done" | "blocked";
@@ -75,17 +78,29 @@ export function getDb(): Database.Database {
 
 /**
  * Accessor for the repository layer (mesh events, raw inputs, distillation queue).
+ *
+ * A leader gets the full aggregate. A follower gets only its host-local
+ * execution capabilities ({@link FollowerRepositories}); one process binds one
+ * role, so asking for the other afterwards is a wiring error.
  */
-export function getRepositories(role: InstanceRole = "leader"): Repositories {
-  if (repositories) {
-    if (currentRepositoriesRole !== null && currentRepositoriesRole !== role) {
-      throw new Error(
-        `Repositories singleton already initialized for role "${currentRepositoriesRole}", cannot access as "${role}"`
-      );
-    }
-    return repositories;
+export function getRepositories(): Repositories;
+export function getRepositories(role: "leader"): Repositories;
+export function getRepositories(role: "follower"): FollowerRepositories;
+export function getRepositories(role: InstanceRole): Repositories | FollowerRepositories;
+export function getRepositories(
+  role: InstanceRole = "leader"
+): Repositories | FollowerRepositories {
+  if (currentRepositoriesRole !== null && currentRepositoriesRole !== role) {
+    throw new Error(
+      `Repositories singleton already initialized for role "${currentRepositoriesRole}", cannot access as "${role}"`
+    );
   }
-  repositories = new Repositories(getDb(), role);
+  if (role === "follower") {
+    if (!followerRepositories) followerRepositories = createFollowerRepositories(getDb());
+    currentRepositoriesRole = role;
+    return followerRepositories;
+  }
+  if (!repositories) repositories = new Repositories(getDb());
   currentRepositoriesRole = role;
   return repositories;
 }
@@ -99,6 +114,7 @@ export function closeDb(): void {
     db = null;
   }
   repositories = null;
+  followerRepositories = null;
   currentRepositoriesRole = null;
 }
 

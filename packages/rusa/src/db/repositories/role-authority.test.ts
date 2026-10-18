@@ -1,355 +1,146 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { closeDb, getDb, getRepositories, initDb } from "../index.js";
 import { runMigrations } from "../migrations/runner.js";
-import { Repositories, RoleAuthorityError } from "./index.js";
+import { ActorRunRepository } from "./actor-run-repository.js";
+import { createFollowerRepositories, Repositories } from "./index.js";
 
-describe("role-gated repository authority (#1019)", () => {
-  it("allows leader role to write to both global control and local execution repositories", () => {
-    const db = new Database(":memory:");
-    db.pragma("foreign_keys = ON");
-    runMigrations(db);
+const migrated = () => {
+  const db = new Database(":memory:");
+  db.pragma("foreign_keys = ON");
+  runMigrations(db);
+  return db;
+};
 
-    const repos = new Repositories(db, "leader");
+/** Every object reachable from `root` through own data properties and prototypes. */
+function reachable(root: unknown): unknown[] {
+  const seen = new Set<unknown>();
+  const walk = (value: unknown) => {
+    if ((typeof value !== "object" && typeof value !== "function") || value === null) return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    for (const key of Reflect.ownKeys(value)) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+      if (descriptor && "value" in descriptor) walk(descriptor.value);
+    }
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== Function.prototype) walk(proto);
+  };
+  walk(root);
+  return [...seen];
+}
 
-    db.prepare("INSERT INTO actors (id, charter, created_at) VALUES (?, ?, ?)").run(
-      "actor-1",
-      "charter 1",
-      new Date().toISOString()
+describe("follower repository authority (#1019)", () => {
+  afterEach(() => closeDb());
+
+  it("returns only the host-local run capabilities, with no global repository or database handle reachable", () => {
+    const db = migrated();
+    const follower = createFollowerRepositories(db);
+
+    expect(Object.keys(follower).sort()).toEqual(["actorRuns", "runPrompts"]);
+    expect(Object.getPrototypeOf(follower)).toBe(Object.prototype);
+    expect(Object.isFrozen(follower)).toBe(true);
+    expect(Object.isFrozen(follower.actorRuns)).toBe(true);
+    expect(Object.isFrozen(follower.runPrompts)).toBe(true);
+    expect(Reflect.ownKeys(follower.actorRuns).sort()).toEqual([
+      "abandon",
+      "abandonOpen",
+      "complete",
+      "listRecentCompleted",
+      "start",
+    ]);
+    expect(Reflect.ownKeys(follower.runPrompts)).toEqual(["recordForActor"]);
+
+    // Negative authority: the global aggregate's members and the old raw escape
+    // hatches are absent, and nothing reachable is a repository or the database.
+    const untyped = follower as unknown as Record<string, unknown>;
+    for (const name of Reflect.ownKeys(new Repositories(db)).map(String))
+      if (name !== "actorRuns" && name !== "runPrompts")
+        expect(untyped[name], name).toBeUndefined();
+    for (const name of ["db", "role", "rawObligations", "rawSqliteInbox", "portableContext"])
+      expect(untyped[name], name).toBeUndefined();
+    for (const value of reachable(follower)) {
+      expect(value).not.toBeInstanceOf(Database);
+      expect(value).not.toBeInstanceOf(ActorRunRepository);
+    }
+    expect(() => Object.assign(untyped, { obligations: {} })).toThrow(TypeError);
+    expect(() => Object.assign(follower.actorRuns, { getById: () => undefined })).toThrow(
+      TypeError
     );
-
-    // Leader can create obligations (global control)
-    const ob = repos.obligations.create({
-      title: "Test leader obligation",
-      ownerId: "system:mesh",
-    });
-    expect(ob.id).toBeDefined();
-
-    // Leader can grant capabilities (global control)
-    repos.capabilityGrants.grant({
-      actorId: "actor-1",
-      capability: "test-cap",
-      grantedBy: "system",
-      grantedAt: new Date().toISOString(),
-    });
-
-    // Leader can write local execution state
-    repos.actorRuns.start({
-      id: "run-leader-1",
-      actorId: "actor-1",
-      startedAt: new Date().toISOString(),
-      modelConfig: {
-        version: 1,
-        provider: "antigravity",
-        model: "gemini",
-      },
-    });
-    const run = repos.actorRuns.getById("run-leader-1");
-    expect(run?.actorId).toBe("actor-1");
+    db.close();
   });
 
-  it("blocks follower role from mutating global control tables while allowing reads", () => {
-    const db = new Database(":memory:");
-    db.pragma("foreign_keys = ON");
-    runMigrations(db);
+  it("writes host-local runs and prompts that read back from the follower database", () => {
+    const db = migrated();
+    const follower = createFollowerRepositories(db);
+    const modelConfig = { version: 1 as const, provider: "claude", model: "sonnet" };
 
-    // Seed an obligation as leader first
-    const leaderRepos = new Repositories(db, "leader");
-    const seeded = leaderRepos.obligations.create({
-      title: "Seeded obligation",
-      ownerId: "system:mesh",
+    follower.actorRuns.start({
+      id: "run-1",
+      actorId: "actor-1",
+      startedAt: "2026-10-18T08:00:00.000Z",
+      modelConfig,
     });
-
-    // Now construct follower repositories over the same DB
-    const followerRepos = new Repositories(db, "follower");
-
-    // Follower CAN read obligations
-    const readOb = followerRepos.obligations.get(seeded.id);
-    expect(readOb?.id).toBe(seeded.id);
-
-    // Follower CANNOT create obligations
-    expect(() => {
-      followerRepos.obligations.create({
-        title: "Follower forbidden obligation",
-        ownerId: "system:mesh",
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT change obligation terminal status
-    expect(() => {
-      followerRepos.obligations.setTerminalStatus(
-        seeded.id,
-        "done",
-        new Date().toISOString(),
-        "system:mesh",
-        "finished"
-      );
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT set obligation snooze
-    expect(() => {
-      followerRepos.obligations.setSnooze(
-        seeded.id,
-        new Date(Date.now() + 60_000).toISOString(),
-        "system:mesh"
-      );
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT upsert actors (global entity)
-    expect(() => {
-      followerRepos.actors.upsert({
-        id: "forbidden-actor",
-        charter: "forbidden charter",
-        parentId: null,
-        status: "active",
-        createdAt: new Date().toISOString(),
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT create principals (global identity)
-    expect(() => {
-      followerRepos.principals.createUser({
-        email: "forbidden@example.test",
-        createdAt: new Date().toISOString(),
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT mutate model classes
-    expect(() => {
-      followerRepos.modelClasses.upsert(
-        "forbidden-class",
-        [{ provider: "codex", model: "gpt" }],
-        new Date().toISOString()
-      );
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT mutate chat room
-    expect(() => {
-      followerRepos.chatRoom.add({
-        actorId: "actor-2",
-        addedBy: "system:mesh",
-        addedAt: new Date().toISOString(),
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT record mesh chat directly
-    expect(() => {
-      followerRepos.meshChat.record({
-        id: "chat-1",
-        senderId: "actor-2",
-        recipientId: "actor-1",
-        body: "test chat",
-        ts: new Date().toISOString(),
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT record mesh events
-    expect(() => {
-      followerRepos.meshEvents.record({
-        kind: "test_event",
-        actorId: "actor-2",
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT record raw inputs for distillation
-    expect(() => {
-      followerRepos.rawInputs.insert({
-        id: "input-1",
-        platform: "github",
-        providerEventId: "ev-1",
-        repo: "MEK-Org/rusa",
-        issueNumber: 1,
-        prNumber: null,
-        author: "tester",
-        content: "test input",
-        metadata: null,
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT record quota scrapes
-    expect(() => {
-      followerRepos.quotaScrapes.recordRaw({
-        provider: "claude",
-        scrapedAt: new Date().toISOString(),
-        rawOutput: "{}",
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT record model scrapes
-    expect(() => {
-      followerRepos.modelScrapes.recordRaw({
-        provider: "claude",
-        scrapedAt: new Date().toISOString(),
-        rawOutput: "{}",
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT enroll in experiments
-    expect(() => {
-      followerRepos.experimentEnrollments.enroll({
-        actorId: "actor-2",
-        experiment: "test-exp",
-        enrolledAt: new Date().toISOString(),
-        enrolledBy: "system:mesh",
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT grant capabilities
-    expect(() => {
-      followerRepos.capabilityGrants.grant({
-        actorId: "actor-2",
-        capability: "forbidden-cap",
-        grantedBy: "system",
-        grantedAt: new Date().toISOString(),
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT institute mesh availability holds
-    expect(() => {
-      followerRepos.availabilityHolds.set({
-        provider: "claude",
-        origin: "mesh",
-        createdBy: "system:mesh",
-        createdAt: new Date().toISOString(),
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT subscribe to event source ownership
-    expect(() => {
-      followerRepos.eventSourceOwners.subscribe({
-        actorId: "actor-2",
-        resource: "github:MEK-Org/rusa",
-        subscribedBy: "system:mesh",
-        subscribedAt: new Date().toISOString(),
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT append inbox items
-    expect(() => {
-      followerRepos.inbox.append([
-        {
-          actorId: "actor-2",
-          source: "test",
-          payload: { type: "test" },
-        },
-      ]);
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT call internal obligation priority or completion mutators
-    expect(() => {
-      followerRepos.obligations.setPriorityInternal(seeded.id, 100, "system:mesh");
-    }).toThrow(RoleAuthorityError);
-
-    expect(() => {
-      followerRepos.obligations.movePriorityInternal(seeded.id, null, null, "system:mesh");
-    }).toThrow(RoleAuthorityError);
-
-    expect(() => {
-      followerRepos.obligations.inheritRetiringActorObligationsInternal(
-        "actor-1",
-        "actor-2",
-        "system:mesh"
-      );
-    }).toThrow(RoleAuthorityError);
-
-    expect(() => {
-      followerRepos.obligations.satisfyCompletionMatcher(
-        seeded.id,
-        { kind: "pr_merged", target: "1024", setAt: new Date().toISOString() },
-        { resolutionRef: "github:MEK-Org/rusa/pulls/1024", note: "merged" }
-      );
-    }).toThrow(RoleAuthorityError);
-
-    expect(() => {
-      followerRepos.obligations.recordCompletionMatcherClosedUnmerged(seeded.id, {
-        kind: "pr_merged",
-        target: "1024",
-        setAt: new Date().toISOString(),
-      });
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT mutate event source owners via setConfig
-    expect(() => {
-      followerRepos.eventSourceOwners.setConfig(
-        "github:MEK-Org/rusa",
-        JSON.stringify({ filter: "all" })
-      );
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT replace inbox entries
-    expect(() => {
-      (
-        followerRepos.inbox as unknown as { replaceEntries: (entries: unknown[]) => void }
-      ).replaceEntries([
-        {
-          id: "inbox-1",
-          actorId: "actor-2",
-          source: "test",
-          payload: {},
-          deliveredAt: new Date().toISOString(),
-          seenAt: null,
-          handledAt: null,
-          handledNote: null,
-        },
-      ]);
-    }).toThrow(RoleAuthorityError);
-
-    // Follower CANNOT mutate referenceCache
-    expect(() => {
-      followerRepos.referenceCache.set({
-        ref: "github:MEK-Org/rusa/pulls/1024",
-        document_version: 1,
-        entity_json: "{}",
-        fetched_at: new Date().toISOString(),
-        refresh_after: new Date().toISOString(),
-      });
-    }).toThrow(RoleAuthorityError);
-
-    expect(() => {
-      followerRepos.referenceCache.delete("github:MEK-Org/rusa/pulls/1024");
-    }).toThrow(RoleAuthorityError);
-
-    // Verify seeded state is completely unchanged
-    const finalOb = followerRepos.obligations.get(seeded.id);
-    expect(finalOb).toEqual(readOb);
-  });
-
-  it("allows follower role to write and read instance-owned local execution state", () => {
-    const db = new Database(":memory:");
-    db.pragma("foreign_keys = ON");
-    runMigrations(db);
-
-    const followerRepos = new Repositories(db, "follower");
-
-    // Follower writes local actor run
-    followerRepos.actorRuns.start({
-      id: "run-follower-1",
-      actorId: "actor-follower-1",
-      startedAt: new Date().toISOString(),
-      modelConfig: {
-        version: 1,
-        provider: "claude",
-        model: "sonnet",
-      },
-    });
-
-    // Follower reads local actor run
-    const run = followerRepos.actorRuns.getById("run-follower-1");
-    expect(run?.actorId).toBe("actor-follower-1");
-
-    // Follower records completion
-    followerRepos.actorRuns.complete("run-follower-1", {
-      endedAt: new Date().toISOString(),
+    follower.runPrompts.recordForActor("actor-1", "run-1", "Prompt for run 1");
+    follower.actorRuns.complete("run-1", {
+      endedAt: "2026-10-18T08:01:00.000Z",
       success: true,
       exitCode: 0,
-      output: "Done cleanly",
+      output: "Run 1 output",
     });
 
-    const completed = followerRepos.actorRuns.getById("run-follower-1");
-    expect(completed?.outcome).toBe("completed");
+    expect(follower.actorRuns.listRecentCompleted("actor-1", 5).map((run) => run.id)).toEqual([
+      "run-1",
+    ]);
+    expect(db.prepare("SELECT id, actor_id, outcome, output FROM actor_runs").all()).toEqual([
+      { id: "run-1", actor_id: "actor-1", outcome: "completed", output: "Run 1 output" },
+    ]);
+    expect(db.prepare("SELECT run_id, prompt FROM run_prompts").all()).toEqual([
+      { run_id: "run-1", prompt: "Prompt for run 1" },
+    ]);
+    db.close();
+  });
 
-    // Follower records run prompt
-    followerRepos.runPrompts.record("run-follower-1", "Test prompt text");
-    const retained = followerRepos.runPrompts.getById("run-follower-1");
-    expect(retained?.prompt).toBe("Test prompt text");
+  it("binds one role per process at the getRepositories boundary, leaving the leader aggregate unchanged", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rusa-role-authority-"));
+    try {
+      initDb(dir);
+      const follower = getRepositories("follower");
+      expect(Object.keys(follower).sort()).toEqual(["actorRuns", "runPrompts"]);
+      expect(getRepositories("follower")).toBe(follower);
+      expect(() => getRepositories("leader")).toThrow(
+        /already initialized for role "follower", cannot access as "leader"/
+      );
+      expect(() => getRepositories()).toThrow(/cannot access as "leader"/);
+      closeDb();
+
+      initDb(dir);
+      const leader = getRepositories();
+      expect(leader).toBeInstanceOf(Repositories);
+      expect(getRepositories("leader")).toBe(leader);
+      expect(leader.obligations).toBeDefined();
+      expect(leader.actorRuns).toBeInstanceOf(ActorRunRepository);
+      expect(() => getRepositories("follower")).toThrow(/cannot access as "follower"/);
+      expect(getDb()).toBeInstanceOf(Database);
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not bind a role when the database is unavailable", () => {
+    closeDb();
+    expect(() => getRepositories("follower")).toThrow();
+    const dir = mkdtempSync(join(tmpdir(), "rusa-role-authority-"));
+    try {
+      initDb(dir);
+      expect(getRepositories()).toBeInstanceOf(Repositories);
+    } finally {
+      closeDb();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

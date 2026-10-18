@@ -6,10 +6,12 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
+import type { PromptBuild } from "../actor/actor.js";
+import { assemblePortableContext, PORTABLE_CONTEXT_MAX_BYTES } from "../actor/portable-context.js";
 import { loadConfig } from "../config/index.js";
-import { closeDb, getRepositories, initDb } from "../db/index.js";
+import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { getInstanceIdentity, type InstanceIdentity } from "../db/instance-identity.js";
-import { RoleAuthorityError } from "../db/repositories/index.js";
+import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type { RunOptions } from "../providers/types.js";
 import type { FollowerCommand } from "../remote-instances/follower-hub.js";
 import { FollowerInstance } from "../remote-instances/follower-instance.js";
@@ -30,6 +32,9 @@ interface SyntheticRequestMessage {
     mode?: string;
     [key: string]: unknown;
   };
+  /** Set on `runStart`. */
+  runId?: string;
+  injectRecord?: { sourceEventIds: string[] };
   [key: string]: unknown;
 }
 
@@ -122,6 +127,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Accounting-fault tests spy on the repository prototype the follower's
+  // frozen capabilities delegate to; later tests must see the real writer.
+  vi.restoreAllMocks();
   process.exit = originalExit;
   closeDb();
   if (originalHome !== undefined) {
@@ -276,44 +284,17 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     initDb(home);
 
     const repos = getRepositories("follower");
+    const untyped = repos as unknown as Record<string, unknown>;
 
-    // Global control writes are forbidden on follower
+    // The follower gets its run capabilities only; global control is absent.
+    expect(Object.keys(repos).sort()).toEqual(["actorRuns", "runPrompts"]);
+    expect(untyped.obligations).toBeUndefined();
+    expect(untyped.actors).toBeUndefined();
+    expect(untyped.principals).toBeUndefined();
+    expect(untyped.capabilityGrants).toBeUndefined();
     expect(() => {
-      repos.obligations.create({
-        title: "Forbidden follower obligation",
-        ownerId: "system:mesh",
-      });
-    }).toThrow(RoleAuthorityError);
-
-    expect(() => {
-      repos.obligations.setSnooze("ob-1", new Date().toISOString(), "system:mesh");
-    }).toThrow(RoleAuthorityError);
-
-    expect(() => {
-      repos.actors.upsert({
-        id: "actor-forbidden",
-        charter: "charter",
-        parentId: null,
-        status: "active",
-        createdAt: new Date().toISOString(),
-      });
-    }).toThrow(RoleAuthorityError);
-
-    expect(() => {
-      repos.principals.createUser({
-        email: "forbidden@example.test",
-        createdAt: new Date().toISOString(),
-      });
-    }).toThrow(RoleAuthorityError);
-
-    expect(() => {
-      repos.capabilityGrants.grant({
-        actorId: "actor-1",
-        capability: "test",
-        grantedBy: "system",
-        grantedAt: new Date().toISOString(),
-      });
-    }).toThrow(RoleAuthorityError);
+      (untyped.obligations as { create: () => void }).create();
+    }).toThrow(TypeError);
 
     // Follower actor execution writes execution state (actorRuns and runPrompts)
     // through the follower composition rather than direct repo writes
@@ -333,8 +314,9 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     expect(run.outcome).toBe("completed");
     expect(run.success).toBe(true);
 
-    const promptRecord = repos.runPrompts.getById(run.id);
-    expect(promptRecord).not.toBeNull();
+    const promptRecord = getDb()
+      .prepare("SELECT prompt FROM run_prompts WHERE run_id = ?")
+      .get(run.id) as RunPromptRow | undefined;
     expect(promptRecord?.prompt).toContain("Execute via follower composition");
 
     await h.close();
@@ -380,7 +362,7 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     const home = makeTempHome();
     initDb(home);
     const repos = getRepositories("follower");
-    vi.spyOn(repos.actorRuns, "start").mockImplementation(() => {
+    vi.spyOn(ActorRunRepository.prototype, "start").mockImplementation(() => {
       throw new Error("synthetic local database write failure");
     });
 
@@ -477,6 +459,41 @@ describe("shared startup, role authority, and local database (#1019)", () => {
         }
       | undefined;
 
+    // The leader's prompt for each admitted run. From run 2 it has run 1's
+    // terminal and carries its own portable section: run 1 is larger than the
+    // budget, so the leader renders it tail-truncated at its own timestamp and
+    // names it by run id in the inject record (#1024).
+    const leaderInstructions = [
+      "# Synthetic leader worker instructions and tools",
+      "Leader charter: manage distributed tasks.",
+      "## Charter notes",
+      "---",
+      "Begin by listing work from the durable inbox.",
+    ].join("\n");
+    const run1Output = `Synthetic run 1 opening ${"x".repeat(PORTABLE_CONTEXT_MAX_BYTES)} Synthetic run 1 closing`;
+    const runStarts = () =>
+      eventsReceived.flatMap((e) =>
+        e.actorId === "actor-synthetic-1" && e.message?.type === "runStart" ? [e.message] : []
+      );
+    const leaderBuilds: PromptBuild[] = [];
+    const nextLeaderBuild = (): PromptBuild => {
+      const run1Id = runStarts()[0]?.runId;
+      const leaderSection =
+        leaderBuilds.length >= 1 && typeof run1Id === "string"
+          ? assemblePortableContext([
+              { id: run1Id, ts: "2026-10-18T09:00:00.000Z", body: run1Output },
+            ])
+          : null;
+      const build: PromptBuild = leaderSection
+        ? {
+            prompt: `${leaderInstructions}\n\n---\n${leaderSection.section}`,
+            injectRecord: leaderSection.record,
+          }
+        : { prompt: leaderInstructions };
+      leaderBuilds.push(build);
+      return build;
+    };
+
     const leaderServer = createServer((req, res) => {
       const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
       let raw = "";
@@ -545,7 +562,7 @@ describe("shared startup, role authority, and local database (#1019)", () => {
                     message: {
                       type: "reply",
                       requestId: reqId,
-                      value: { allowed: true },
+                      value: { allowed: true, sessionId: "leader-native-session" },
                     },
                   });
                 } else if (op === "prepareMount") {
@@ -569,22 +586,10 @@ describe("shared startup, role authority, and local database (#1019)", () => {
                           charter: "Synthetic follower test charter",
                           status: "active",
                           createdAt: new Date().toISOString(),
-                          context: { type: "native" },
+                          context: { type: "portable", mode: "tail" },
                         },
-                        prompt: [
-                          "# Synthetic leader worker instructions and tools",
-                          "Leader charter: manage distributed tasks.",
-                          "",
-                          "## Portable context (mesh-managed)",
-                          "",
-                          "You were started fresh for this run. The mesh preserved durable intent and a",
-                          "bounded recent journal below. Active durable items remain in force until a newer",
-                          "source explicitly supersedes or resolves them. Re-derive external state with tools.",
-                          "",
-                          "### Durable intent",
-                          "- [MUST] [constraint] Leader policy: preserve mesh protocol",
-                          '  Source leader-coordinator at 2026-10-12T10:00:00.000Z: "preserve mesh protocol"',
-                        ].join("\n"),
+                        prompt: "",
+                        promptBuild: nextLeaderBuild(),
                         selected: { provider: "codex", model: "gpt-5.6-sol" },
                       },
                     },
@@ -630,45 +635,6 @@ describe("shared startup, role authority, and local database (#1019)", () => {
       },
     });
 
-    // Pre-seed host-local portable context memory in follower local database (#1019)
-    initDb(home);
-    const preRepos = getRepositories();
-    preRepos.actors.upsert({
-      id: "actor-synthetic-1",
-      charter: "Synthetic follower test charter",
-      parentId: null,
-      status: "active",
-      createdAt: new Date().toISOString(),
-    });
-    preRepos.portableContext.save({
-      schemaVersion: 4,
-      actorId: "actor-synthetic-1",
-      generation: 1,
-      updatedAt: "2026-10-12T12:00:00.000Z",
-      lastFoldedSourceId: null,
-      brief: null,
-      compactor: null,
-      items: [
-        {
-          id: "mem-host-1",
-          kind: "constraint",
-          priority: "must",
-          status: "active",
-          statement: "Host-local boundary: preserve private workdir mount",
-          evidence: [
-            {
-              eventId: "ev-host-1",
-              sender: "host-manager",
-              ts: "2026-10-12T12:00:00.000Z",
-              quote: "preserve private workdir mount",
-            },
-          ],
-          updatedAt: "2026-10-12T12:00:00.000Z",
-        },
-      ],
-    });
-    closeDb();
-
     const observedPrompts: string[] = [];
     const observedSessionIds: Array<string | undefined> = [];
     const observedProviderOptions: Array<Record<string, unknown>> = [];
@@ -686,7 +652,7 @@ describe("shared startup, role authority, and local database (#1019)", () => {
           run.onPromptLaunched?.(run.prompt);
           return {
             success: true,
-            output: `Synthetic run ${runCount} output`,
+            output: runCount === 1 ? run1Output : `Synthetic run ${runCount} output`,
             exitCode: 0,
             sessionId: `sess-mock-run-${runCount}`,
             model: selected?.model,
@@ -745,41 +711,55 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     expect(observedProviderOptions[0]).toMatchObject({
       providers: { codex: { cliCommand: "follower-codex" } },
     });
-    // Leader instructions/tools remain leader-authoritative
-    expect(observedPrompts[0]).toContain("Synthetic leader worker instructions and tools");
-    expect(observedPrompts[0]).toContain("Leader charter: manage distributed tasks.");
-    // Preexisting leader portable section remains intact
-    expect(observedPrompts[0]).toContain("Leader policy: preserve mesh protocol");
-    // Host-owned memory is additive and observed directly at the adapter alongside leader context
-    expect(observedPrompts[0]).toContain("## Portable context (mesh-managed)");
-    expect(observedPrompts[0]).toContain("### Durable intent");
-    expect(observedPrompts[0]).toContain("Host-local boundary: preserve private workdir mount");
-    // A host-local portable row augments the prompt but cannot override the
-    // leader-selected native session policy.
+    // No prior run anywhere: the leader prompt is used byte for byte.
+    expect(observedPrompts[0]).toBe(leaderBuilds[0].prompt);
+    expect(runStarts()[0]?.injectRecord).toBeUndefined();
+    // Host context augments the prompt but never the leader-selected session.
     expect(observedSessionIds[0]).toBe("leader-native-session");
 
-    // Run 2: Next run includes prior run output from local actor_runs alongside leader context
-    pollCommands.push({
-      actorId: "actor-synthetic-1",
-      message: { type: "wake" },
-    });
+    const wakeAndComplete = async (runs: number) => {
+      pollCommands.push({ actorId: "actor-synthetic-1", message: { type: "wake" } });
+      await waitUntil(() => observedPrompts.length === runs);
+      await waitUntil(
+        () =>
+          eventsReceived.filter(
+            (e) =>
+              e.actorId === "actor-synthetic-1" &&
+              e.message?.type === "request" &&
+              e.message?.request?.op === "complete"
+          ).length === runs
+      );
+    };
+    const count = (haystack: string, needle: string) => haystack.split(needle).length - 1;
 
-    await waitUntil(() => observedPrompts.length === 2);
-    await waitUntil(
-      () =>
-        eventsReceived.filter(
-          (e) =>
-            e.actorId === "actor-synthetic-1" &&
-            e.message?.type === "request" &&
-            e.message?.request?.op === "complete"
-        ).length === 2
-    );
+    // Run 2: the leader renders run 1 truncated, so its text differs from the
+    // follower's row. The follower recognizes it by run id, not by heading or
+    // body text, and adds nothing: the leader build is used byte for byte.
+    await wakeAndComplete(2);
+    const [run1Id, run2Id] = runStarts().map((event) => event.runId);
+    expect(leaderBuilds[1].injectRecord?.sourceEventIds).toEqual([run1Id]);
+    expect(leaderBuilds[1].prompt).not.toContain("Synthetic run 1 opening");
+    expect(observedPrompts[1]).toBe(leaderBuilds[1].prompt);
+    expect(count(observedPrompts[1], "Synthetic run 1 closing")).toBe(1);
+    expect(runStarts()[1]?.injectRecord).toEqual(leaderBuilds[1].injectRecord);
 
-    expect(observedPrompts[1]).toContain("Synthetic leader worker instructions and tools");
-    expect(observedPrompts[1]).toContain("Leader policy: preserve mesh protocol");
-    expect(observedPrompts[1]).toContain("Host-local boundary: preserve private workdir mount");
-    expect(observedPrompts[1]).toContain("### Recent run outcomes");
-    expect(observedPrompts[1]).toContain("Synthetic run 1 output");
+    // Run 3: run 2's terminal has not reached this leader's prompt, so it is
+    // genuinely local. The follower reads it back from its own mesh.db and
+    // appends it once after the unchanged leader prompt.
+    await wakeAndComplete(3);
+    expect(leaderBuilds[2].injectRecord?.sourceEventIds).toEqual([run1Id]);
+    expect(observedPrompts[2].startsWith(leaderBuilds[2].prompt)).toBe(true);
+    expect(count(observedPrompts[2], "Synthetic run 1 closing")).toBe(1);
+    expect(count(observedPrompts[2], "Synthetic run 2 output")).toBe(1);
+    expect(runStarts()[2]?.injectRecord?.sourceEventIds).toEqual([run2Id]);
+    expect(
+      Buffer.byteLength(observedPrompts[2], "utf8") - Buffer.byteLength(leaderBuilds[2].prompt)
+    ).toBeLessThanOrEqual(PORTABLE_CONTEXT_MAX_BYTES + "\n\n---\n".length);
+    expect(observedSessionIds).toEqual([
+      "leader-native-session",
+      "leader-native-session",
+      "leader-native-session",
+    ]);
     expect(pollRequests).toBeGreaterThan(3);
 
     await handles.shutdown();
@@ -802,26 +782,23 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     const runs = db
       .prepare("SELECT * FROM actor_runs WHERE actor_id = ? ORDER BY started_at ASC")
       .all("actor-synthetic-1") as ActorRunRow[];
-    expect(runs).toHaveLength(2);
-    expect(runs[0].outcome).toBe("completed");
-    expect(runs[0].success).toBe(1);
-    expect(runs[0].output).toBe("Synthetic run 1 output");
-    expect(runs[1].outcome).toBe("completed");
-    expect(runs[1].success).toBe(1);
-    expect(runs[1].output).toBe("Synthetic run 2 output");
+    expect(runs.map((run) => [run.id, run.outcome, run.success, run.output])).toEqual([
+      [run1Id, "completed", 1, run1Output],
+      [run2Id, "completed", 1, "Synthetic run 2 output"],
+      [runStarts()[2]?.runId, "completed", 1, "Synthetic run 3 output"],
+    ]);
 
     const prompts = db
       .prepare("SELECT * FROM run_prompts ORDER BY created_at ASC")
       .all() as RunPromptRow[];
-    expect(prompts).toHaveLength(2);
-    expect(prompts[0].prompt).toContain("Host-local boundary: preserve private workdir mount");
-    expect(prompts[1].prompt).toContain("Synthetic run 1 output");
+    expect(prompts.map((row) => row.prompt)).toEqual(observedPrompts);
 
-    const contextRow = db
-      .prepare("SELECT snapshot FROM portable_context_snapshots WHERE actor_id = ?")
-      .get("actor-synthetic-1") as { snapshot: string } | undefined;
-    expect(contextRow).toBeDefined();
-    expect(contextRow?.snapshot).toContain("Host-local boundary: preserve private workdir mount");
+    // Host context is derived from actor_runs; no local portable snapshot is written.
+    expect(
+      db
+        .prepare("SELECT 1 FROM portable_context_snapshots WHERE actor_id = ?")
+        .get("actor-synthetic-1")
+    ).toBeUndefined();
 
     db.close();
   }, 20_000);
@@ -1316,11 +1293,9 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     });
     if (!followerHandles) throw new Error("followerHandles not initialized");
     const handles = followerHandles;
-    const complete = vi
-      .spyOn(getRepositories("follower").actorRuns, "complete")
-      .mockImplementation(() => {
-        throw new Error("synthetic terminal accounting write failure");
-      });
+    const complete = vi.spyOn(ActorRunRepository.prototype, "complete").mockImplementation(() => {
+      throw new Error("synthetic terminal accounting write failure");
+    });
 
     handles.instance.dispatch({
       actorId: "actor-accounting-fault",

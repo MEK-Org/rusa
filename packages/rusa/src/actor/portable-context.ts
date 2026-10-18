@@ -752,77 +752,29 @@ function tailToBytes(s: string, maxBytes: number): string {
 }
 
 /**
- * Composes host-local portable context (durable intent memory and prior run
- * outcomes) into a base prompt (from leader instructions or charter).
+ * Composes a follower's host-local prior runs into a leader-built prompt (#1019).
  *
- * If the base prompt does not yet have a portable context section, the full
- * assembled portable context is appended.
- *
- * If the base prompt already contains a leader-authoritative portable context
- * section (e.g. `## Portable context`), leader instructions/tools and preexisting
- * leader context remain intact, while one independently bounded host-owned
- * portable section is composed additively beside it.
+ * The leader prompt is authoritative and is kept byte-for-byte as the prefix:
+ * leader instructions, the charter and any leader-admitted portable section are
+ * never searched, split or reordered. Runs the leader already rendered are
+ * identified by their stable actor_run ids (the leader inject record's
+ * `sourceEventIds`, taken before its rendering or truncation), never by matching
+ * prompt text. Only the remaining host runs are assembled, under the normal
+ * portable byte budget, into one section appended after the leader prompt; the
+ * returned record describes exactly those appended bytes.
  */
 export function composeHostContextIntoPrompt(input: {
   basePrompt: string;
-  localState?: PortableContextState | null;
-  localRuns?: PriorRun[];
+  localRuns: PriorRun[];
+  /** Actor_run ids the leader prompt already represents; empty when it injected none. */
+  representedRunIds: readonly string[];
 }): { prompt: string; portable: PortableContext | null } {
-  // A leader-supplied prompt is authoritative.  Only contribute host rows that
-  // are not already rendered there, then use the normal assembler as the single
-  // budgeting/redaction boundary.  In particular, do not render raw rows below:
-  // its returned section and record must describe exactly the host contribution.
-  const localState = input.localState
-    ? {
-        ...input.localState,
-        items: input.localState.items.filter(
-          (item) => !item.statement.trim() || !input.basePrompt.includes(item.statement)
-        ),
-      }
-    : null;
-  const runs = (input.localRuns ?? []).filter(
-    (run) => !run.body?.trim() || !input.basePrompt.includes(run.body.trim())
+  const represented = new Set(input.representedRunIds);
+  const portable = assemblePortableContext(
+    input.localRuns.filter((run) => !represented.has(run.id))
   );
-  const portable = localState
-    ? assemblePortableContextV2({
-        state: localState,
-        messages: [],
-        runs,
-      })
-    : runs.length > 0
-      ? assemblePortableContext(runs)
-      : null;
-
-  if (!portable) {
-    return { prompt: input.basePrompt, portable: null };
-  }
-
+  if (!portable) return { prompt: input.basePrompt, portable: null };
   const base = input.basePrompt;
-  const hasV2 = base.includes("## Portable context");
-  const hasV1 = base.includes("## Recent activity");
-
-  if (!hasV2 && !hasV1) {
-    return {
-      prompt: `${base.trim()}\n\n---\n${portable.section.trim()}\n`,
-      portable,
-    };
-  }
-
-  // Insert the complete bounded section as a sibling of the leader's section.
-  // Structural boundaries keep it within portable context without depending on
-  // a particular prose preamble, while the record remains a faithful receipt
-  // for the exact bytes added by this host.
-  const headingIdx = hasV2
-    ? base.indexOf("## Portable context")
-    : base.indexOf("## Recent activity");
-  const candidates = [
-    base.indexOf("\n## ", headingIdx + 1),
-    base.indexOf("\nBegin by listing work from the durable inbox.", headingIdx + 1),
-  ].filter((index) => index !== -1);
-  const insertAt = candidates.length > 0 ? Math.min(...candidates) : base.length;
-  const before = base.slice(0, insertAt).trimEnd();
-  const after = base.slice(insertAt).trimStart();
-  const separator = portable.section.endsWith("\n") ? "\n" : "\n\n";
-  const prompt = `${before}\n\n${portable.section}${after ? `${separator}${after}` : ""}`;
-  return { prompt, portable };
+  const separator = base === "" ? "" : base.endsWith("\n") ? "\n---\n" : "\n\n---\n";
+  return { prompt: `${base}${separator}${portable.section}`, portable };
 }

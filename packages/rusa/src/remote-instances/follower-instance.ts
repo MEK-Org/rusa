@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { ComputerUseLock } from "../actor/computer-use-lock.js";
-import type { Repositories } from "../db/repositories/index.js";
+import type { FollowerRepositories } from "../db/repositories/index.js";
 import { createActorRuntime } from "./actor-runtime.js";
 import { createProvider } from "./configured-provider.js";
 import type { FollowerActorCommand, FollowerEvent } from "./follower-hub.js";
@@ -10,7 +10,7 @@ import type { ProviderFactory } from "./protocol.js";
 
 export interface FollowerInstanceOptions {
   requireReconciliation?: boolean;
-  repositories?: Repositories;
+  repositories?: FollowerRepositories;
   /** Provider executable/settings belong to this host, never the leader Bootstrap. */
   providerOptions?: Record<string, unknown>;
 }
@@ -21,7 +21,7 @@ export class FollowerInstance {
   private stopped = false;
   private draining = false;
   private reconciled: boolean;
-  private readonly repositories?: Repositories;
+  private readonly repositories?: FollowerRepositories;
   private readonly providerOptions?: Record<string, unknown>;
   private readonly computerUseLock = new ComputerUseLock();
 
@@ -93,7 +93,10 @@ export class FollowerInstance {
         ...message.bootstrap,
         id: actorId,
         cwd,
-        providerOptions: this.providerOptions ?? message.bootstrap.providerOptions,
+        providerOptions:
+          this.providerOptions !== undefined || message.bootstrap.providerOptions !== undefined
+            ? { ...message.bootstrap.providerOptions, ...this.providerOptions }
+            : undefined,
         actorOptions: { ...message.bootstrap.actorOptions, addDirs: [], sandbox: this.sandbox },
       },
     });

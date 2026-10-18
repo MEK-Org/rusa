@@ -1084,167 +1084,136 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
   });
 
   describe("composeHostContextIntoPrompt", () => {
-    it("returns basePrompt unchanged when there is no host memory or runs", () => {
-      const basePrompt = "# Leader instructions\nDo work.";
-      const res = composeHostContextIntoPrompt({ basePrompt });
-      expect(res.prompt).toBe(basePrompt);
-      expect(res.portable).toBeNull();
-    });
-
-    it("appends full portable context section when basePrompt has no portable context", () => {
-      const basePrompt = "# Leader instructions\nDo work.";
-      const state = {
-        ...emptyPortableContextState("actor-host"),
-        items: [
-          {
-            id: "mem-1",
-            kind: "constraint" as const,
-            priority: "must" as const,
-            status: "active" as const,
-            statement: "Host constraint 1",
-            evidence: [],
-            updatedAt: "2026-10-12T00:00:00.000Z",
-          },
-        ],
-      };
-      const res = composeHostContextIntoPrompt({
-        basePrompt,
-        localState: state,
-        localRuns: [run("run-1", "Run 1 output")],
-      });
-      expect(res.portable).not.toBeNull();
-      expect(res.prompt).toContain("# Leader instructions\nDo work.");
-      expect(res.prompt).toContain("## Portable context (mesh-managed)");
-      expect(res.prompt).toContain("Host constraint 1");
-      expect(res.prompt).toContain("Run 1 output");
-    });
-
-    it("composes host memory additively into preexisting leader portable section", () => {
-      const basePrompt = [
+    /** A leader prompt in the worker layout: instructions, charter, its own section, trailer. */
+    const leaderPrompt = (charter: string, leaderSection?: string) =>
+      [
         "# Leader instructions and tools",
-        "Charter: lead worker.",
         "",
-        "## Portable context (mesh-managed)",
+        "---",
+        "## Your charter",
         "",
-        "You were started fresh for this run. The mesh preserved durable intent and a",
-        "bounded recent journal below. Active durable items remain in force until a newer",
-        "source explicitly supersedes or resolves them. Re-derive external state with tools.",
-        "",
-        "### Durable intent",
-        "- [MUST] [constraint] Leader constraint 1",
+        charter,
+        ...(leaderSection ? ["", "---", leaderSection.trim()] : []),
         "",
         "Begin by listing work from the durable inbox.",
       ].join("\n");
+    const count = (haystack: string, needle: string) => haystack.split(needle).length - 1;
 
-      const state = {
-        ...emptyPortableContextState("actor-host"),
-        items: [
-          {
-            id: "mem-1",
-            kind: "constraint" as const,
-            priority: "must" as const,
-            status: "active" as const,
-            statement: "Host-only constraint 2",
-            evidence: [],
-            updatedAt: "2026-10-12T00:00:00.000Z",
-          },
-        ],
-      };
+    it("returns the leader prompt unchanged when every host run is already represented", () => {
+      const basePrompt = leaderPrompt("Do work.");
+      expect(
+        composeHostContextIntoPrompt({ basePrompt, localRuns: [], representedRunIds: [] })
+      ).toEqual({ prompt: basePrompt, portable: null });
+      expect(
+        composeHostContextIntoPrompt({
+          basePrompt,
+          localRuns: [run("run-1", "Run 1 output")],
+          representedRunIds: ["run-1"],
+        })
+      ).toEqual({ prompt: basePrompt, portable: null });
+    });
+
+    it("does not re-add a run the leader rendered truncated, identified by run id (#1024)", () => {
+      // The leader's own assembler tail-truncates a run larger than the budget;
+      // its inject record still names the run, before and independent of that.
+      const large = run(
+        "run-large",
+        `Opening analysis ${"x".repeat(PORTABLE_CONTEXT_MAX_BYTES)} closing summary`,
+        "2026-10-18T08:00:00.000Z"
+      );
+      const leader = assemble([large]);
+      expect(leader.record.sourceEventIds).toEqual(["run-large"]);
+      const basePrompt = leaderPrompt("Do work.", leader.section);
+      expect(basePrompt).not.toContain(large.body ?? "");
 
       const res = composeHostContextIntoPrompt({
         basePrompt,
-        localState: state,
-        localRuns: [run("run-host-1", "Host run output 1")],
+        localRuns: [large],
+        representedRunIds: leader.record.sourceEventIds,
       });
 
-      expect(res.portable).not.toBeNull();
-      // Leader instructions/tools remain leader-authoritative
-      expect(res.prompt).toContain("# Leader instructions and tools");
-      expect(res.prompt).toContain("Charter: lead worker.");
-      // Leader durable intent remains intact
-      expect(res.prompt).toContain("Leader constraint 1");
-      // Unique host memory is composed under ### Durable intent
-      expect(res.prompt).toContain("Host-only constraint 2");
-      // Unique host prior runs are composed under ### Recent run outcomes
-      expect(res.prompt).toContain("### Recent run outcomes");
-      expect(res.prompt).toContain("Host run output 1");
-      // Trailing inbox guidance preserved
-      expect(res.prompt).toContain("Begin by listing work from the durable inbox.");
+      expect(res).toEqual({ prompt: basePrompt, portable: null });
+      expect(count(res.prompt, "### Run 2026-10-18T08:00:00.000Z")).toBe(1);
     });
 
-    it("places a bounded host section structurally when the leader preamble differs", () => {
-      const basePrompt = [
-        "# Leader instructions",
-        "",
-        "## Portable context (mesh-managed)",
-        "Leader-owned preamble without the historical literal sentence.",
-        "",
-        "Begin by listing work from the durable inbox.",
-      ].join("\n");
-      const state = {
-        ...emptyPortableContextState("actor-host"),
-        items: [
-          {
-            id: "mem-structural",
-            kind: "constraint" as const,
-            priority: "must" as const,
-            status: "active" as const,
-            statement: "Host structural contribution",
-            evidence: [],
-            updatedAt: "2026-10-12T00:00:00.000Z",
-          },
-        ],
-      };
-
-      const res = composeHostContextIntoPrompt({ basePrompt, localState: state });
-      if (!res.portable) throw new Error("expected host portable contribution");
-      expect(res.prompt.indexOf("Host structural contribution")).toBeLessThan(
-        res.prompt.indexOf("Begin by listing work from the durable inbox.")
+    it("adds a genuinely local prior run exactly once, within the portable budget (#1024)", () => {
+      const shared = run(
+        "run-shared",
+        "Run executed here and admitted by the leader",
+        "2026-10-18T07:00:00.000Z"
       );
-      expect(res.prompt).toContain(res.portable.section);
-    });
-
-    it("uses the bounded assembled section and matching record for large multibyte host content", () => {
-      const basePrompt = [
-        "# Leader instructions",
-        "",
-        "## Portable context (mesh-managed)",
-        "Leader policy remains intact.",
-        "",
-        "Begin by listing work from the durable inbox.",
-      ].join("\n");
-      const state = {
-        ...emptyPortableContextState("actor-host"),
-        items: [
-          {
-            id: "mem-large",
-            kind: "constraint" as const,
-            priority: "must" as const,
-            status: "active" as const,
-            statement: `Large host memory ${"🚀".repeat(9_000)}`,
-            evidence: [],
-            updatedAt: "2026-10-12T00:00:00.000Z",
-          },
-        ],
-      };
+      const local = run(
+        "run-local",
+        "Run whose terminal has not reached the leader",
+        "2026-10-18T08:00:00.000Z"
+      );
+      const leader = assemble([shared]);
+      const basePrompt = leaderPrompt("Do work.", leader.section);
 
       const res = composeHostContextIntoPrompt({
         basePrompt,
-        localState: state,
-        localRuns: [run("run-large", `Large host run ${"漢".repeat(14_000)}`)],
+        // Newest first, as listRecentCompleted returns them.
+        localRuns: [local, shared],
+        representedRunIds: leader.record.sourceEventIds,
       });
-      if (!res.portable) throw new Error("expected host portable contribution");
+      if (!res.portable) throw new Error("expected a host contribution");
 
-      // The adapter receives the exact bounded bytes described by the host record;
-      // raw local rows never bypass the assembler in the existing-heading branch.
-      expect(Buffer.byteLength(res.portable.section, "utf8")).toBe(res.portable.record.bytes);
-      expect(res.portable.record.bytes).toBeLessThanOrEqual(PORTABLE_CONTEXT_MAX_BYTES);
-      expect(res.portable.record.hash).toBe(
-        createHash("sha256").update(res.portable.section, "utf8").digest("hex")
+      expect(res.prompt.startsWith(basePrompt)).toBe(true);
+      expect(res.prompt.slice(basePrompt.length)).toBe(`\n\n---\n${res.portable.section}`);
+      expect(count(res.prompt, shared.body ?? "")).toBe(1);
+      expect(count(res.prompt, local.body ?? "")).toBe(1);
+      expect(res.portable.record.sourceEventIds).toEqual(["run-local"]);
+      expect(res.portable.record.bytes).toBe(Buffer.byteLength(res.portable.section, "utf8"));
+
+      // Many large host runs stay inside the same bound.
+      const many = Array.from({ length: 30 }, (_, index) =>
+        run(
+          `run-${index}`,
+          `Host run ${index} ${"漢".repeat(4_000)}`,
+          `2026-10-18T0${index % 10}:00:00.000Z`
+        )
       );
-      expect(res.prompt).toContain(res.portable.section);
-      expect(res.prompt).toContain("Leader policy remains intact.");
-      expect(res.prompt).toContain("Begin by listing work from the durable inbox.");
+      const bounded = composeHostContextIntoPrompt({
+        basePrompt,
+        localRuns: many,
+        representedRunIds: [],
+      });
+      if (!bounded.portable) throw new Error("expected a host contribution");
+      expect(bounded.portable.record.bytes).toBeLessThanOrEqual(PORTABLE_CONTEXT_MAX_BYTES);
+      expect(bounded.portable.record.hash).toBe(
+        createHash("sha256").update(bounded.portable.section, "utf8").digest("hex")
+      );
+    });
+
+    it("composes identically whatever the charter or leader run text says (#1024)", () => {
+      const local = run("run-local", "Local findings to keep", "2026-10-18T08:00:00.000Z");
+      // A leader run body with its own markdown structure, as real run outputs have.
+      const leader = assemble([
+        run(
+          "run-leader",
+          "Summary\n\n## Findings\n\n---\n\n# Next action\nShip it.",
+          "2026-10-18T07:00:00.000Z"
+        ),
+      ]);
+      const charters = [
+        "Work on tasks.",
+        // Reworded, with headings, rules, the trailer phrase and the local run's text.
+        "## Mission\n\n---\nLocal findings to keep\n## Recent activity\nBegin by listing work from the durable inbox.",
+      ];
+      const results = charters.map((charter) => {
+        const basePrompt = leaderPrompt(charter, leader.section);
+        const res = composeHostContextIntoPrompt({
+          basePrompt,
+          localRuns: [local],
+          representedRunIds: leader.record.sourceEventIds,
+        });
+        if (!res.portable) throw new Error("expected a host contribution");
+        // The leader prompt, including its whole section, is the untouched prefix.
+        expect(res.prompt.startsWith(basePrompt)).toBe(true);
+        expect(res.prompt).toContain(leader.section.trim());
+        return { suffix: res.prompt.slice(basePrompt.length), record: res.portable.record };
+      });
+      expect(results[1]).toEqual(results[0]);
     });
   });
 });

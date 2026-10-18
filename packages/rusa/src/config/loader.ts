@@ -833,6 +833,45 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
  * quickstart). Warns — without ever logging a value — when both are set, as a
  * migration nudge to remove the inline copy.
  */
+function warnDuplicateSecret(inlineName: string, secretFilename: string, term = "key"): void {
+  console.warn(
+    `[config] ${inlineName} is set inline in config.yaml AND ${SECRETS_DIRNAME}/${secretFilename} exists — the secrets file wins. Remove the inline ${term}.`
+  );
+}
+
+function applySecretFiles(parsed: RusaConfig, mcHome: string): void {
+  const fileElevenLabsKey = readHostSecret(ELEVENLABS_API_KEY_SECRET_FILENAME, mcHome);
+  if (fileElevenLabsKey) {
+    if (parsed.elevenlabsApiKey) {
+      warnDuplicateSecret("elevenlabsApiKey", ELEVENLABS_API_KEY_SECRET_FILENAME);
+    }
+    parsed.elevenlabsApiKey = fileElevenLabsKey;
+  }
+  const fileGeminiKey = readHostSecret(GEMINI_API_KEY_SECRET_FILENAME, mcHome);
+  if (fileGeminiKey) {
+    if (parsed.geminiApiKey) {
+      warnDuplicateSecret("geminiApiKey", GEMINI_API_KEY_SECRET_FILENAME);
+    }
+    parsed.geminiApiKey = fileGeminiKey;
+  }
+
+  const fileMistralKey = readHostSecret(MISTRAL_API_KEY_SECRET_FILENAME, mcHome);
+  if (fileMistralKey) {
+    if (parsed.mistralApiKey) {
+      warnDuplicateSecret("mistralApiKey", MISTRAL_API_KEY_SECRET_FILENAME);
+    }
+    parsed.mistralApiKey = fileMistralKey;
+  }
+
+  const fileWebhookSecret = readHostSecret(WEBHOOK_SECRET_FILENAME, mcHome);
+  if (fileWebhookSecret && parsed.webhook) {
+    if (parsed.webhook.secret) {
+      warnDuplicateSecret("webhook.secret", WEBHOOK_SECRET_FILENAME, "value");
+    }
+    parsed.webhook.secret = fileWebhookSecret;
+  }
+}
+
 /** Instance IDs a follower sends at enrollment; the follower gateway's own check. */
 const PEER_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
 
@@ -975,45 +1014,6 @@ function validatePeers(parsed: RusaConfig): void {
     throw new Error(
       "config.yaml: peers cannot contain both a leader entry and follower entries; chained followers are not supported"
     );
-  }
-}
-
-function warnDuplicateSecret(inlineName: string, secretFilename: string, term = "key"): void {
-  console.warn(
-    `[config] ${inlineName} is set inline in config.yaml AND ${SECRETS_DIRNAME}/${secretFilename} exists — the secrets file wins. Remove the inline ${term}.`
-  );
-}
-
-function applySecretFiles(parsed: RusaConfig, mcHome: string): void {
-  const fileElevenLabsKey = readHostSecret(ELEVENLABS_API_KEY_SECRET_FILENAME, mcHome);
-  if (fileElevenLabsKey) {
-    if (parsed.elevenlabsApiKey) {
-      warnDuplicateSecret("elevenlabsApiKey", ELEVENLABS_API_KEY_SECRET_FILENAME);
-    }
-    parsed.elevenlabsApiKey = fileElevenLabsKey;
-  }
-  const fileGeminiKey = readHostSecret(GEMINI_API_KEY_SECRET_FILENAME, mcHome);
-  if (fileGeminiKey) {
-    if (parsed.geminiApiKey) {
-      warnDuplicateSecret("geminiApiKey", GEMINI_API_KEY_SECRET_FILENAME);
-    }
-    parsed.geminiApiKey = fileGeminiKey;
-  }
-
-  const fileMistralKey = readHostSecret(MISTRAL_API_KEY_SECRET_FILENAME, mcHome);
-  if (fileMistralKey) {
-    if (parsed.mistralApiKey) {
-      warnDuplicateSecret("mistralApiKey", MISTRAL_API_KEY_SECRET_FILENAME);
-    }
-    parsed.mistralApiKey = fileMistralKey;
-  }
-
-  const fileWebhookSecret = readHostSecret(WEBHOOK_SECRET_FILENAME, mcHome);
-  if (fileWebhookSecret && parsed.webhook) {
-    if (parsed.webhook.secret) {
-      warnDuplicateSecret("webhook.secret", WEBHOOK_SECRET_FILENAME, "value");
-    }
-    parsed.webhook.secret = fileWebhookSecret;
   }
 }
 

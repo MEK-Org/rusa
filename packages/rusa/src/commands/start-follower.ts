@@ -384,14 +384,18 @@ export async function composeFollowerStart(
               });
             }
           }
+          backoffMs = 500;
         } catch (err) {
           if (stopped) break;
           if (err instanceof FollowerHttpError && err.status === 410) {
             log.info("follower_session_expired", { leader: leaderUrl.origin });
             session = "";
           } else {
-            log.warn("follower_poll_error", { err });
-            await pause(1000);
+            // As in the retained follower entry point: back off exponentially
+            // while the leader keeps failing polls, and reset on the next success.
+            log.warn("follower_poll_error", { err, retryInMs: backoffMs });
+            await pause(backoffMs);
+            backoffMs = Math.min(backoffMs * 2, 10_000);
           }
         }
       }

@@ -3,7 +3,6 @@ import type { CapabilityGrantStore } from "../../actor/capability-grants.js";
 import type { ExperimentEnrollmentStore } from "../../actor/experiments.js";
 import type { HostJobStore } from "../../actor/host-job-store.js";
 import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
-import type { InstanceRole } from "../../config/types.js";
 import type { ActorRepository } from "../../repositories/actor-repository.js";
 import type { InboxRepository } from "../../repositories/inbox-repository.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
@@ -34,116 +33,36 @@ import {
   SqliteInboxRepository,
 } from "./sqlite-inbox-repository.js";
 
-export class RoleAuthorityError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "RoleAuthorityError";
-  }
+/**
+ * The host-local execution capabilities a follower instance writes and reads
+ * (#1019): its own run accounting and retained prompts. Global coordination
+ * state (actors, obligations, inbox, principals, grants) belongs to the leader
+ * and is absent here, not guarded: each member is a frozen object of bound
+ * methods, so neither a repository instance nor its database handle is
+ * reachable from follower services.
+ */
+export interface FollowerRepositories {
+  readonly actorRuns: Pick<
+    ActorRunRepository,
+    "start" | "complete" | "abandon" | "abandonOpen" | "listRecentCompleted"
+  >;
+  readonly runPrompts: Pick<RunPromptRepository, "recordForActor">;
 }
 
-const OBLIGATION_MUTATING_METHODS = new Set([
-  "create",
-  "addPrerequisite",
-  "removePrerequisite",
-  "setExternalRef",
-  "setCheckpoint",
-  "reparent",
-  "reassign",
-  "reorder",
-  "attachArtifact",
-  "setCompletionMatcher",
-  "setRecurrence",
-  "setTerminalStatus",
-  "markResponsive",
-  "reconcileScheduledObligations",
-  "activateScheduled",
-  "wakeScheduled",
-  "setSnooze",
-  "expireDueSnoozes",
-  "setPriorityInternal",
-  "movePriorityInternal",
-  "inheritRetiringActorObligationsInternal",
-  "satisfyCompletionMatcher",
-  "recordCompletionMatcherClosedUnmerged",
-]);
-
-const ACTOR_MUTATING_METHODS = new Set(["upsert", "setModelSelection", "patch"]);
-
-const PRINCIPAL_MUTATING_METHODS = new Set([
-  "ensureActorPrincipal",
-  "createUser",
-  "ensureImplicitUser",
-  "bindExternalIdentity",
-  "claimUnboundUserByEmail",
-  "updateEmail",
-  "setRootActor",
-  "setDisabled",
-  "recordAuthentication",
-  "setGoogleAccountId",
-]);
-
-const MODEL_CLASS_MUTATING_METHODS = new Set(["upsert", "delete"]);
-
-const AVAILABILITY_HOLD_MUTATING_METHODS = new Set(["set", "clear", "clearAll"]);
-
-const CAPABILITY_GRANT_MUTATING_METHODS = new Set(["grant", "revoke"]);
-
-const CHAT_ROOM_MUTATING_METHODS = new Set(["add", "remove"]);
-
-const EVENT_SOURCE_OWNER_MUTATING_METHODS = new Set([
-  "subscribe",
-  "unsubscribe",
-  "restore",
-  "setConfig",
-]);
-
-const EVENT_SOURCE_SUBSCRIPTION_MUTATING_METHODS = new Set(["subscribe", "unsubscribe"]);
-
-const EXPERIMENT_ENROLLMENT_MUTATING_METHODS = new Set(["enroll", "unenroll"]);
-
-const INBOX_MUTATING_METHODS = new Set([
-  "append",
-  "markHandled",
-  "markSeen",
-  "selectPrioritizedUnhandled",
-  "pruneHandled",
-  "replaceEntries",
-]);
-
-const INBOX_FOCUS_MUTATING_METHODS = new Set(["recordSelection"]);
-
-const MESH_CHAT_MUTATING_METHODS = new Set(["record"]);
-
-const MESH_EVENT_MUTATING_METHODS = new Set(["record", "pruneKind"]);
-
-const RAW_INPUT_MUTATING_METHODS = new Set(["insert", "resetDistillation", "markProcessed"]);
-
-const QUOTA_SCRAPE_MUTATING_METHODS = new Set(["recordRaw", "recordParsed", "recordParseError"]);
-
-const MODEL_SCRAPE_MUTATING_METHODS = new Set(["recordRaw", "recordParsed", "recordParseError"]);
-
-const LEGACY_IMPORT_RECEIPT_MUTATING_METHODS = new Set(["record"]);
-
-const REFERENCE_CACHE_MUTATING_METHODS = new Set(["set", "delete"]);
-
-function guardRoleAuthority<T extends object>(
-  target: T,
-  blockedMethodNames: Set<string>,
-  role: InstanceRole,
-  repoName: string
-): T {
-  if (role === "leader") return target;
-  return new Proxy(target, {
-    get(obj, prop, receiver) {
-      if (typeof prop === "string" && blockedMethodNames.has(prop)) {
-        return (..._args: unknown[]) => {
-          throw new RoleAuthorityError(
-            `Role authority violation: follower role cannot execute "${repoName}.${prop}"`
-          );
-        };
-      }
-      return Reflect.get(obj, prop, receiver);
-    },
+export function createFollowerRepositories(db: Database.Database): FollowerRepositories {
+  const runs = new ActorRunRepository(db);
+  const prompts = new RunPromptRepository(db);
+  return Object.freeze({
+    actorRuns: Object.freeze({
+      start: (opts) => runs.start(opts),
+      complete: (id, opts) => runs.complete(id, opts),
+      abandon: (id, reason, endedAt) => runs.abandon(id, reason, endedAt),
+      abandonOpen: (reason, endedAt) => runs.abandonOpen(reason, endedAt),
+      listRecentCompleted: (actorId, limit) => runs.listRecentCompleted(actorId, limit),
+    } satisfies FollowerRepositories["actorRuns"]),
+    runPrompts: Object.freeze({
+      recordForActor: (actorId, runId, prompt) => prompts.recordForActor(actorId, runId, prompt),
+    } satisfies FollowerRepositories["runPrompts"]),
   });
 }
 
@@ -156,7 +75,6 @@ function guardRoleAuthority<T extends object>(
  *  - maintenance — the distillation work queue
  */
 export class Repositories {
-  readonly role: InstanceRole;
   readonly runPrompts: RunPromptRepository;
   readonly actorRuns: ActorRunRepository;
   readonly actors: ActorRepository;
@@ -178,147 +96,47 @@ export class Repositories {
    * without widening the abstract contract every other caller sees.
    */
   private readonly sqliteInbox: SqliteInboxRepository;
-  private readonly rawSqliteInbox: SqliteInboxRepository;
   readonly inboxFocus: InboxFocusRepository;
   readonly meshChat: MeshChatRepository;
   readonly quotaScrapes: QuotaScrapeRepository;
   readonly modelScrapes: ModelScrapeRepository;
   readonly modelClasses: ModelClassRepository;
   readonly obligations: ObligationRepository;
-  private readonly rawObligations: ObligationRepository;
   readonly portableContext: DbPortableContextStore;
   readonly principals: PrincipalRepository;
   readonly referenceCache: ReferenceCacheRepository;
 
-  constructor(db: Database.Database, role: InstanceRole = "leader") {
-    this.role = role;
+  constructor(db: Database.Database) {
     this.runPrompts = new RunPromptRepository(db);
     this.actorRuns = new ActorRunRepository(db);
     // Constructed before the actor repository, which writes an actor's principal
     // in the same transaction as the actor row.
-    this.principals = guardRoleAuthority(
-      new PrincipalRepository(db),
-      PRINCIPAL_MUTATING_METHODS,
-      role,
-      "principals"
-    );
+    this.principals = new PrincipalRepository(db);
     // Constructed before the actor repository, which resolves a class-bound
     // actor's pool from the live class row on every read.
-    this.modelClasses = guardRoleAuthority(
-      new ModelClassRepository(db),
-      MODEL_CLASS_MUTATING_METHODS,
-      role,
-      "modelClasses"
-    );
-    this.actors = guardRoleAuthority(
-      new SqliteActorRepository(db, this.principals, this.modelClasses),
-      ACTOR_MUTATING_METHODS,
-      role,
-      "actors"
-    );
-    this.availabilityHolds = guardRoleAuthority(
-      new AvailabilityHoldRepository(db),
-      AVAILABILITY_HOLD_MUTATING_METHODS,
-      role,
-      "availabilityHolds"
-    );
-    this.capabilityGrants = guardRoleAuthority(
-      new DbCapabilityGrantStore(db),
-      CAPABILITY_GRANT_MUTATING_METHODS,
-      role,
-      "capabilityGrants"
-    );
-    this.chatRoom = guardRoleAuthority(
-      new ChatRoomRepository(db),
-      CHAT_ROOM_MUTATING_METHODS,
-      role,
-      "chatRoom"
-    );
-    this.eventSourceOwners = guardRoleAuthority(
-      new DbEventSourceOwnerStore(db),
-      EVENT_SOURCE_OWNER_MUTATING_METHODS,
-      role,
-      "eventSourceOwners"
-    );
-    this.experimentEnrollments = guardRoleAuthority(
-      new DbExperimentEnrollmentStore(db),
-      EXPERIMENT_ENROLLMENT_MUTATING_METHODS,
-      role,
-      "experimentEnrollments"
-    );
-    this.eventSourceSubscriptions = guardRoleAuthority(
-      new DbEventSourceSubscriptionStore(db),
-      EVENT_SOURCE_SUBSCRIPTION_MUTATING_METHODS,
-      role,
-      "eventSourceSubscriptions"
-    );
+    this.modelClasses = new ModelClassRepository(db);
+    this.actors = new SqliteActorRepository(db, this.principals, this.modelClasses);
+    this.availabilityHolds = new AvailabilityHoldRepository(db);
+    this.capabilityGrants = new DbCapabilityGrantStore(db);
+    this.chatRoom = new ChatRoomRepository(db);
+    this.eventSourceOwners = new DbEventSourceOwnerStore(db);
+    this.experimentEnrollments = new DbExperimentEnrollmentStore(db);
+    this.eventSourceSubscriptions = new DbEventSourceSubscriptionStore(db);
     this.hostJobs = new DbHostJobStore(db);
-    this.legacyImportReceipts = guardRoleAuthority(
-      new LegacyImportReceiptRepository(db),
-      LEGACY_IMPORT_RECEIPT_MUTATING_METHODS,
-      role,
-      "legacyImportReceipts"
-    );
-    this.meshEvents = guardRoleAuthority(
-      new MeshEventRepository(db),
-      MESH_EVENT_MUTATING_METHODS,
-      role,
-      "meshEvents"
-    );
-    this.rawInputs = guardRoleAuthority(
-      new RawInputRepository(db),
-      RAW_INPUT_MUTATING_METHODS,
-      role,
-      "rawInputs"
-    );
+    this.legacyImportReceipts = new LegacyImportReceiptRepository(db);
+    this.meshEvents = new MeshEventRepository(db);
+    this.rawInputs = new RawInputRepository(db);
     this.maintenance = new MaintenanceRepository(db);
-    this.rawSqliteInbox = new SqliteInboxRepository(db);
-    this.sqliteInbox = guardRoleAuthority(
-      this.rawSqliteInbox,
-      INBOX_MUTATING_METHODS,
-      role,
-      "inbox"
-    );
+    this.sqliteInbox = new SqliteInboxRepository(db);
     this.inbox = this.sqliteInbox;
-    this.inboxFocus = guardRoleAuthority(
-      new InboxFocusRepository(db),
-      INBOX_FOCUS_MUTATING_METHODS,
-      role,
-      "inboxFocus"
-    );
-    this.meshChat = guardRoleAuthority(
-      new MeshChatRepository(db),
-      MESH_CHAT_MUTATING_METHODS,
-      role,
-      "meshChat"
-    );
-    this.quotaScrapes = guardRoleAuthority(
-      new QuotaScrapeRepository(db),
-      QUOTA_SCRAPE_MUTATING_METHODS,
-      role,
-      "quotaScrapes"
-    );
-    this.modelScrapes = guardRoleAuthority(
-      new ModelScrapeRepository(db),
-      MODEL_SCRAPE_MUTATING_METHODS,
-      role,
-      "modelScrapes"
-    );
-    this.rawObligations = new ObligationRepository(db);
-    this.rawObligations.setPrincipalKind((principalId) => this.principals.get(principalId)?.kind);
-    this.obligations = guardRoleAuthority(
-      this.rawObligations,
-      OBLIGATION_MUTATING_METHODS,
-      role,
-      "obligations"
-    );
+    this.inboxFocus = new InboxFocusRepository(db);
+    this.meshChat = new MeshChatRepository(db);
+    this.quotaScrapes = new QuotaScrapeRepository(db);
+    this.modelScrapes = new ModelScrapeRepository(db);
+    this.obligations = new ObligationRepository(db);
+    this.obligations.setPrincipalKind((principalId) => this.principals.get(principalId)?.kind);
     this.portableContext = new DbPortableContextStore(db);
-    this.referenceCache = guardRoleAuthority(
-      new ReferenceCacheRepository(db),
-      REFERENCE_CACHE_MUTATING_METHODS,
-      role,
-      "referenceCache"
-    );
+    this.referenceCache = new ReferenceCacheRepository(db);
   }
 
   /**
@@ -330,11 +148,11 @@ export class Repositories {
    * through the write boundary.
    */
   setActorExists(probe: (actorId: string) => boolean): void {
-    this.rawObligations.setActorExists(probe);
+    this.obligations.setActorExists(probe);
   }
 
   setOsScheduler(scheduler: ObligationActivationScheduler): void {
-    this.rawObligations.setOsScheduler(scheduler);
+    this.obligations.setOsScheduler(scheduler);
   }
 
   /**
@@ -343,7 +161,7 @@ export class Repositories {
    * a listener that throws is contained and unrecorded.
    */
   setInboxListenerErrorHandler(handler: InboxListenerErrorHandler): void {
-    this.rawSqliteInbox.setListenerErrorHandler(handler);
+    this.sqliteInbox.setListenerErrorHandler(handler);
   }
 }
 
