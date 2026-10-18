@@ -8,6 +8,10 @@ export interface MeshChat {
   recipientId: string;
   body: string;
   sessionId: string | null;
+  /** NULL is a pre-#1104 row whose delivery predates the durable stamp. */
+  responsive: boolean | null;
+  /** Optional send-time diagnostic; absent on historic and ordinary rows. */
+  responsiveReason?: string | null;
 }
 
 export interface MeshChatListOptions {
@@ -31,6 +35,8 @@ interface MeshChatRow {
   recipient_id: string;
   body: string;
   session_id: string | null;
+  responsive: number | null;
+  responsive_reason?: string | null;
 }
 
 /** Append-only data access for the `mesh_chat` table. */
@@ -45,12 +51,15 @@ export class MeshChatRepository {
     recipientId: string;
     body: string;
     sessionId?: string | null;
+    responsive?: boolean;
+    responsiveReason?: string;
   }): string {
     const id = opts.id ?? randomUUID();
     this.db
       .prepare(
-        `INSERT OR IGNORE INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id)
-         VALUES (?, ?, ?, ?, ?, ?)`
+        `INSERT OR IGNORE INTO mesh_chat
+           (id, ts, sender_id, recipient_id, body, session_id, responsive, responsive_reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -58,7 +67,9 @@ export class MeshChatRepository {
         opts.senderId,
         opts.recipientId,
         opts.body,
-        opts.sessionId ?? null
+        opts.sessionId ?? null,
+        opts.responsive === undefined ? null : Number(opts.responsive),
+        opts.responsiveReason ?? null
       );
     return id;
   }
@@ -184,5 +195,7 @@ function toMeshChat(row: MeshChatRow): MeshChat {
     recipientId: row.recipient_id,
     body: row.body,
     sessionId: row.session_id,
+    responsive: row.responsive === null ? null : row.responsive === 1,
+    responsiveReason: row.responsive_reason ?? null,
   };
 }

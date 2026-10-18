@@ -1,7 +1,29 @@
 // Synthetic peer only. No Pi imports, credentials, network or model requests.
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 
 const mode = process.argv[2];
+if (process.env.PI_CODING_AGENT_DIR) {
+  const settings = JSON.parse(
+    await readFile(join(process.env.PI_CODING_AGENT_DIR, "settings.json"), "utf8")
+  );
+  if (settings.cacheWarming !== "off") process.exit(77);
+  // Provider includes its generated admission extension before model argv.
+  const extensionIndex = process.argv.lastIndexOf("-e");
+  const extension = await import(process.argv[extensionIndex + 1]);
+  const mcp = JSON.parse(await readFile(join(process.env.PI_CODING_AGENT_DIR, "mcp.json"), "utf8"));
+  extension.default({
+    on: (_event, callback) => {
+      globalThis.admit = callback;
+    },
+    getAllTools: () =>
+      Object.keys(mcp.mcpServers).map((name) => ({
+        name: `mcp__${name.replace(/[^A-Za-z0-9_]/g, "_")}__fixture`,
+      })),
+  });
+  await globalThis.admit();
+}
 const emit = (record) => process.stdout.write(`${JSON.stringify(record)}\n`);
 const lines = createInterface({ input: process.stdin });
 // Remain alive after settlement so the host must perform cleanup.

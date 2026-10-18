@@ -256,6 +256,9 @@ export function validateModelConfigPool(
         `modelConfig entry for provider "${providerName}" is missing a model — omitted/blank models are not allowed, since that would silently select the provider's default`
       );
     }
+    if (providerCapabilityName(providerName, config) === "openrouter" && !opts.portable) {
+      throw new Error("OpenRouter prototype requires portable context");
+    }
     const selection = validateProviderSelection(config, providerName, requestedModel, entry.effort);
     const identity = JSON.stringify([
       providerCapabilityName(providerName, config),

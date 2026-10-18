@@ -12,7 +12,9 @@ describe("MeshChatRepository.listForActor", () => {
         sender_id TEXT NOT NULL,
         recipient_id TEXT NOT NULL,
         body TEXT NOT NULL,
-        session_id TEXT
+        session_id TEXT,
+        responsive INTEGER,
+        responsive_reason TEXT
       )
     `);
     const repo = new MeshChatRepository(db);
@@ -57,7 +59,9 @@ describe("MeshChatRepository.listChatByActors", () => {
         sender_id TEXT NOT NULL,
         recipient_id TEXT NOT NULL,
         body TEXT NOT NULL,
-        session_id TEXT
+        session_id TEXT,
+        responsive INTEGER,
+        responsive_reason TEXT
       )
     `);
     const repo = new MeshChatRepository(db);
@@ -83,7 +87,9 @@ describe("MeshChatRepository.listForSession", () => {
         sender_id TEXT NOT NULL,
         recipient_id TEXT NOT NULL,
         body TEXT NOT NULL,
-        session_id TEXT
+        session_id TEXT,
+        responsive INTEGER,
+        responsive_reason TEXT
       )
     `);
     const repo = new MeshChatRepository(db);
@@ -137,7 +143,9 @@ describe("MeshChatRepository.record idempotency", () => {
         sender_id TEXT NOT NULL,
         recipient_id TEXT NOT NULL,
         body TEXT NOT NULL,
-        session_id TEXT
+        session_id TEXT,
+        responsive INTEGER,
+        responsive_reason TEXT
       )
     `);
     const repo = new MeshChatRepository(db);
@@ -162,5 +170,58 @@ describe("MeshChatRepository.record idempotency", () => {
     expect(secondId).toBe("delivery-1");
     expect(repo.listForActor("worker")).toHaveLength(1);
     expect(repo.listForActor("worker")[0]?.body).toBe("first body wins");
+  });
+});
+
+describe("MeshChatRepository responsiveness", () => {
+  it("keeps legacy diagnostics distinct from newly stamped rows", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE mesh_chat (
+        id TEXT PRIMARY KEY,
+        ts TEXT NOT NULL,
+        sender_id TEXT NOT NULL,
+        recipient_id TEXT NOT NULL,
+        body TEXT NOT NULL,
+        session_id TEXT,
+        responsive INTEGER,
+        responsive_reason TEXT
+      )
+    `);
+    const repo = new MeshChatRepository(db);
+    repo.record({
+      id: "legacy",
+      ts: "2026-10-17T00:00:00.000Z",
+      senderId: "operator",
+      recipientId: "worker",
+      body: "old",
+    });
+    repo.record({
+      id: "responsive",
+      ts: "2026-10-17T00:01:00.000Z",
+      senderId: "actor",
+      recipientId: "worker",
+      body: "new priority",
+      responsive: true,
+      responsiveReason: "responsive obligation",
+    });
+    repo.record({
+      id: "ordinary",
+      ts: "2026-10-17T00:02:00.000Z",
+      senderId: "actor",
+      recipientId: "worker",
+      body: "new normal",
+      responsive: false,
+    });
+
+    expect(
+      repo
+        .listForActor("worker")
+        .map((message) => [message.id, message.responsive, message.responsiveReason])
+    ).toEqual([
+      ["ordinary", false, null],
+      ["responsive", true, "responsive obligation"],
+      ["legacy", null, null],
+    ]);
   });
 });

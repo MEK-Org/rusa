@@ -82,6 +82,8 @@ describe("DefaultOsScheduler", () => {
       body: "quotes: ' & form=data\nsecond line",
       deliverAt: "2026-09-04T12:34:56.000Z",
       sessionId: "session-1",
+      responsive: true,
+      responsiveReason: "responsive obligation",
     };
 
     scheduler.scheduleMessageDelivery(message);
@@ -112,6 +114,11 @@ describe("DefaultOsScheduler", () => {
         Buffer.from(JSON.stringify({ schemaVersion: 2, ...message })).toString("base64url")
       )
     ).toThrow(/invalid scheduled-message payload/);
+
+    const legacy = decodeScheduledMessagePayload(
+      Buffer.from(JSON.stringify({ schemaVersion: 1, ...message })).toString("base64url")
+    );
+    expect(legacy).not.toHaveProperty("responsive");
   });
 
   it("fails visibly when an owned host job has a missing or corrupt payload", () => {

@@ -1,3 +1,4 @@
+import { isAbsolute } from "node:path";
 import type { RusaConfig } from "../config/types.js";
 import { isAntigravityGeminiModel, validateModelPin } from "./model-catalog.js";
 import {
@@ -24,6 +25,7 @@ export const PROVIDER_CAPABILITIES = {
   kimi: {},
   copilot: {},
   fake: {},
+  openrouter: {},
 } as const satisfies Readonly<Record<string, ProviderCapability>>;
 
 export type ProviderCommand = keyof typeof PROVIDER_CAPABILITIES;
@@ -63,6 +65,23 @@ export function validateProviderSelection(
     );
   }
   const capabilityName = providerCapabilityName(providerName, config);
+  const poc = providerConfig.openrouterPoc;
+  if (
+    capabilityName === "openrouter" &&
+    (process.env.RUSA_OPENROUTER_POC !== "1" ||
+      !poc ||
+      !model?.trim() ||
+      ![
+        poc.nodePath,
+        poc.piPath,
+        poc.apiKeyPath,
+        ...(poc.artifactDir === undefined ? [] : [poc.artifactDir]),
+      ].every((path) => typeof path === "string" && isAbsolute(path)))
+  ) {
+    throw new Error(
+      "OpenRouter prototype requires RUSA_OPENROUTER_POC=1, explicit paths and model"
+    );
+  }
   const selection = normalizeModelEffortSelection(capabilityName, model, effort);
   if (model !== undefined && !selection.model) {
     throw new Error(

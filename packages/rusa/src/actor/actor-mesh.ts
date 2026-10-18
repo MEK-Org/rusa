@@ -3,6 +3,7 @@ import { type ChatWakeMode, chatWakeModeFromConfig } from "../chat/wake-mode.js"
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
+import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { MESH_SYSTEM } from "../mcp/stamp.js";
 import {
   isBlockingObligationStatus,
@@ -507,10 +508,7 @@ function describeRetirementBlockers(target: string, blockers: RetirementBlockers
  * controller. Their scope is enforced by the surface that mints them, not by
  * ancestry, since none of them is a node in the tree to begin with.
  */
-function isTrustedControlPrincipal(
-  by: string,
-  principals?: import("../db/repositories/principal-repository.js").PrincipalRepository
-): boolean {
+function isTrustedControlPrincipal(by: string, principals?: PrincipalRepository): boolean {
   return (
     by === "root-llm" ||
     by === "e2e-controller" ||
@@ -578,7 +576,13 @@ export interface RetireCleanup {
 
 export interface ActorMeshOptions {
   actors: ActorRepository;
-  principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
+  principals?: PrincipalRepository;
+  /**
+   * The effective responsive state of an actor's currently selected inbox
+   * obligation. The host owns this projection: actors cannot provide a
+   * message priority themselves.
+   */
+  responsiveForActorMessage?: (actorId: string) => boolean;
   /** This account/subtree's root id. Also backs the grandfathered `"root"` address alias. */
   rootId?: string;
   /** Builds a live Actor for a thread record (resolves provider/cwd/mcp/session). */
@@ -718,6 +722,8 @@ export interface ActorMeshOptions {
     recipientId: string;
     body: string;
     sessionId?: string;
+    responsive?: boolean;
+    responsiveReason?: string;
   }) => string;
   /**
    * Durable store of per-actor capability grants (ISSUE_NUM, phase 1a). Defaults to an
@@ -898,7 +904,7 @@ interface ActiveInterruptionSuppression {
 
 export class ActorMesh {
   readonly actors: ActorRepository;
-  readonly principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
+  readonly principals?: PrincipalRepository;
   private readonly createActor: ActorFactory;
   private readonly validateSpawn?: (req: SpawnRequest) => ProviderModelConfig[];
   private readonly supportsExecutionTarget?: (target: string) => boolean;
@@ -944,7 +950,10 @@ export class ActorMesh {
     recipientId: string;
     body: string;
     sessionId?: string;
+    responsive?: boolean;
+    responsiveReason?: string;
   }) => string;
+  private readonly responsiveForActorMessage?: (actorId: string) => boolean;
   readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
   private readonly experiments: ExperimentEnrollmentStore;
@@ -1153,6 +1162,7 @@ export class ActorMesh {
     ];
     this.events = opts.events ?? NOOP_MESH_EVENT_SINK;
     this.recordChat = opts.recordChat;
+    this.responsiveForActorMessage = opts.responsiveForActorMessage;
     this.voiceTransferLog = opts.voiceTransferLogger ?? nullLogger;
     this.scheduledMessages = opts.scheduledMessages;
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
@@ -1184,6 +1194,8 @@ export class ActorMesh {
     toId: string;
     body: string;
     sessionId?: string;
+    responsive: boolean;
+    responsiveReason?: string;
     isDrop: boolean;
   }): string | undefined {
     const fromId = this.resolveThreadId(opts.fromId);
@@ -1194,6 +1206,8 @@ export class ActorMesh {
       toId,
       body: opts.body,
       sessionId: opts.sessionId,
+      responsive: opts.responsive,
+      responsiveReason: opts.responsiveReason,
     });
 
     this.recordEvent({
@@ -1222,6 +1236,8 @@ export class ActorMesh {
     toId: string;
     body: string;
     sessionId?: string;
+    responsive: boolean;
+    responsiveReason?: string;
   }): string | undefined {
     if (!this.recordChat) return undefined;
     try {
@@ -1231,6 +1247,8 @@ export class ActorMesh {
         recipientId: opts.toId,
         body: opts.body,
         sessionId: opts.sessionId,
+        responsive: opts.responsive,
+        responsiveReason: opts.responsiveReason,
       });
     } catch (err) {
       this.log(`recordChat failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -1238,7 +1256,7 @@ export class ActorMesh {
     }
   }
 
-  /** Persist the chat row and sent event when a scheduled message is accepted. */
+  /** Persist the chat row and sent event when a normalized scheduled message is accepted. */
   recordScheduledMessageSent(opts: ScheduledMessage): string | undefined {
     const fromId = this.resolveThreadId(opts.fromId);
     const toId = this.resolveThreadId(opts.toId);
@@ -1251,6 +1269,8 @@ export class ActorMesh {
       recipientId: toId,
       body: opts.body,
       sessionId: opts.sessionId,
+      responsive: opts.responsive,
+      responsiveReason: opts.responsiveReason,
     });
     const event = {
       id: `${opts.id}:sent`,
@@ -4272,12 +4292,32 @@ export class ActorMesh {
     fromId = this.resolveThreadId(fromId);
     const humanSender = this.principals?.getUser(fromId);
     if (humanSender?.disabledAt) throw new Error("Message sender is disabled");
+    // An immutable creation-time snapshot. Actor tools provide neither a
+    // priority nor an obligation id; only the host can project their active
+    // run's selected obligation. Human ingress follows this same path.
+    const responsive =
+      humanSender !== undefined || this.responsiveForActorMessage?.(fromId) === true;
+    const responsiveReason = humanSender
+      ? "human message"
+      : responsive
+        ? "responsive obligation"
+        : undefined;
 
     const humanRecipient = this.principals?.getUser(toId);
     if (humanRecipient) {
       if (humanRecipient.disabledAt) throw new Error("Message recipient is disabled");
       if (deliverAt) throw new Error("Scheduled delivery requires an agent recipient");
-      if (!this.recordMessageEmitted({ fromId, toId, body, sessionId, isDrop: false })) {
+      if (
+        !this.recordMessageEmitted({
+          fromId,
+          toId,
+          body,
+          sessionId,
+          responsive,
+          responsiveReason,
+          isDrop: false,
+        })
+      ) {
         throw new Error("User message delivery requires durable chat storage");
       }
       return { delivered: true };
@@ -4323,6 +4363,8 @@ export class ActorMesh {
         body,
         deliverAt,
         sessionId,
+        responsive,
+        ...(responsiveReason ? { responsiveReason } : {}),
       };
       this.scheduledMessages.scheduleMessageDelivery(pending);
       try {
@@ -4352,6 +4394,8 @@ export class ActorMesh {
       toId,
       body,
       sessionId,
+      responsive,
+      responsiveReason,
       isDrop: !target,
     });
     if (!target) {
@@ -4366,7 +4410,8 @@ export class ActorMesh {
           source: `mesh:${fromId}`,
           payload: {
             type: options.voice ? VOICE_INBOX_PAYLOAD_TYPE : "mesh.message",
-            ...(humanSender ? { priority: "responsive" as const } : {}),
+            ...(responsive ? { priority: "responsive" as const } : {}),
+            ...(responsiveReason ? { responsiveReason } : {}),
             messageId,
             fromId,
             sessionId,
@@ -4375,7 +4420,8 @@ export class ActorMesh {
       ]);
       this.introduceMessageSender(toId, fromId);
     }
-    this.dispatch(toId);
+    if (this.inboxStore) this.dispatch(toId);
+    else target.requestRun(responsive ? { priority: "responsive" } : {});
     return { delivered: true };
   }
 
@@ -4452,6 +4498,7 @@ export class ActorMesh {
           fromId: SCHEDULER_SENDER_ID,
           toId: resolvedId,
           body: reason,
+          responsive: isResponsive,
           isDrop: false,
         })
       : undefined;
@@ -5851,12 +5898,22 @@ export class ActorMesh {
     }
   }
 
-  deliverScheduledMessage(scheduled: ScheduledMessage): void {
-    scheduled = {
+  private normalizeScheduledMessage(scheduled: ScheduledMessage): ScheduledMessage & {
+    responsive: boolean;
+  } {
+    const fromId = this.resolveThreadId(scheduled.fromId);
+    return {
       ...scheduled,
-      fromId: this.resolveThreadId(scheduled.fromId),
+      fromId,
       toId: this.resolveThreadId(scheduled.toId),
+      // Jobs written before #1104 have no stamp. Preserve the former human
+      // treatment only for that historical shape; every new job is explicit.
+      responsive: scheduled.responsive ?? this.principals?.getUser(fromId) !== undefined,
     };
+  }
+
+  deliverScheduledMessage(scheduled: ScheduledMessage): void {
+    scheduled = this.normalizeScheduledMessage(scheduled);
     const { id: messageId, toId } = scheduled;
     // Heal the only cross-system crash window: the host job is installed
     // before acceptance history is committed so a failed DB transaction can
@@ -5884,6 +5941,8 @@ export class ActorMesh {
           source: `mesh:${scheduled.fromId}`,
           payload: {
             type: "mesh.scheduled_message",
+            ...(scheduled.responsive ? { priority: "responsive" as const } : {}),
+            ...(scheduled.responsiveReason ? { responsiveReason: scheduled.responsiveReason } : {}),
             messageId,
             fromId: scheduled.fromId,
             sessionId: scheduled.sessionId,
@@ -5897,7 +5956,7 @@ export class ActorMesh {
 
     const target = this.runs.liveActor(toId);
     if (!target) throw new Error(`scheduled delivery target ${toId} is not available`);
-    target.requestRun();
+    target.requestRun(scheduled.responsive ? { priority: "responsive" } : {});
   }
 
   private pendingScheduledMessages(): ScheduledMessage[] {

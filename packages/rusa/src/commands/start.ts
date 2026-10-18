@@ -3239,6 +3239,20 @@ async function composeStart(
     supportedVoices: credentialValidSupportedVoices,
     actors,
     principals: getRepositories().principals,
+    // The inbox focus belongs to the active run, and effective responsiveness
+    // is read at send time. Actor tools receive no priority or obligation
+    // input, so neither can be forged or retained after the run ends.
+    responsiveForActorMessage: (actorId) => {
+      const runId = runAccounting.activeRunId(actorId);
+      if (!runId) return false;
+      const primaryObligationId =
+        getRepositories().inboxFocus.getByRunId(runId)?.primaryObligationId;
+      return (
+        primaryObligationId !== null &&
+        primaryObligationId !== undefined &&
+        getRepositories().obligations.get(primaryObligationId)?.effectiveResponsive === true
+      );
+    },
     rootId,
     // Placement exists when an e2e worker-construction override or the follower
     // gateway is wired. Unknown or disconnected targets fail closed.

@@ -2281,6 +2281,111 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(returnRejections(direct)).toEqual([]);
   }, 10_000);
 
+  it("stamps an actor message from its selected obligation's inherited responsiveness", async () => {
+    let mesh: ActorMesh | undefined;
+    let root: Actor | undefined;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            root = handles.root as Actor;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh || !root) throw new Error("mesh not ready");
+
+    type LiveActorOptions = { mcpServers: Array<{ name: string; url: string }> };
+    const actorOf = (id: string) => {
+      const actor = mesh?.get(id) as Actor | undefined;
+      if (!actor) throw new Error(`worker missing: ${id}`);
+      return actor;
+    };
+    const urlOf = (actor: Actor, server: string) => {
+      const url = (actor as unknown as { opts: LiveActorOptions }).opts.mcpServers.find(
+        (entry) => entry.name === server
+      )?.url;
+      if (!url) throw new Error(`${server} MCP server missing`);
+      return url;
+    };
+    const call = async (url: string, name: string, args: Record<string, unknown>) => {
+      const client = new Client({ name: "message-priority-dogfood", version: "0.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+      try {
+        return await client.callTool({ name, arguments: args });
+      } finally {
+        await client.close();
+      }
+    };
+    const payloadOf = (result: Awaited<ReturnType<typeof call>>): Record<string, unknown> => {
+      const [first] = result.content as Array<{ type: string; text?: string }>;
+      return JSON.parse(first?.text ?? "{}") as Record<string, unknown>;
+    };
+    const liveMesh = mesh;
+    const spawn = (charter: string) =>
+      liveMesh.spawn({
+        charter,
+        parentId: rootId,
+        modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      });
+    const sender = spawn("selected sender");
+    const recipient = spawn("recipient");
+    const responsiveParent = getRepositories().obligations.create({
+      title: "responsive parent",
+      ownerId: sender,
+      responsive: true,
+    });
+    const selected = getRepositories().obligations.create({
+      title: "inherited selected work",
+      ownerId: sender,
+      parentId: responsiveParent.id,
+    });
+    expect(getRepositories().obligations.require(selected.id).effectiveResponsive).toBe(true);
+
+    const runId = await startLifecycleRun(actorOf(sender), {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    const inboxUrl = urlOf(actorOf(sender), "inbox");
+    const senderInbox = payloadOf(await call(inboxUrl, "list", { status: "unhandled" })) as {
+      entries: Array<{ id: string; payload: { obligationId?: string } }>;
+    };
+    const selectedEntry = senderInbox.entries.find(
+      (entry) => entry.payload.obligationId === selected.id
+    );
+    if (!selectedEntry) throw new Error("selected obligation inbox entry missing");
+    expect(
+      (
+        await call(inboxUrl, "select", {
+          entry_ids: [selectedEntry.id],
+        })
+      ).isError
+    ).toBeFalsy();
+
+    expect(
+      (
+        await call(urlOf(actorOf(sender), "mesh"), "send_message", {
+          thread_id: recipient,
+          body: "derived from selection",
+        })
+      ).isError
+    ).toBeFalsy();
+    const received = getRepositories()
+      .inbox.list(recipient)
+      .entries.find((entry) => entry.payload.type === "mesh.message");
+    expect(received?.payload.priority).toBe("responsive");
+    expect(
+      getRepositories().meshChat.getById(String(received?.payload.messageId))?.responsive
+    ).toBe(true);
+
+    getRepositories().obligations.setTerminalStatus(selected.id, "done", null, null, sender);
+    await endLifecycleRun(actorOf(sender), runId, { success: true, output: "", exitCode: 0 });
+  }, 10_000);
+
   describe("root pool fallback is root-only ", () => {
     it("wires exhaustion classification only for root actors", async () => {
       const config = {
