@@ -219,7 +219,7 @@ void main() {
 
     final clearAll = find.byKey(const ValueKey('halt-clear-all'));
 
-    testWidgets('the clear-all control is within the Halted chip boundary', (
+    testWidgets('the clear-all control is within the Halted chip boundary with compact height and symmetric padding', (
       tester,
     ) async {
       final store = await _store(tester, holds: const [_codexWide]);
@@ -228,6 +228,21 @@ void main() {
       final chip = find.byKey(const ValueKey('halted-chip'));
       expect(chip, findsOneWidget);
       expect(find.descendant(of: chip, matching: clearAll), findsOneWidget);
+      expect(tester.getSize(chip).height, lessThanOrEqualTo(28));
+
+      final pauseIcon = find.descendant(
+        of: chip,
+        matching: find.byIcon(Icons.pause_circle_filled),
+      );
+      final closeIcon = find.descendant(
+        of: chip,
+        matching: find.byIcon(Icons.close),
+      );
+      final leftPadding =
+          tester.getTopLeft(pauseIcon).dx - tester.getTopLeft(chip).dx;
+      final rightPadding =
+          tester.getTopRight(chip).dx - tester.getTopRight(closeIcon).dx;
+      expect(leftPadding, equals(rightPadding));
     });
 
     testWidgets('the narrow phone chip leaves space after the RUSA wordmark', (

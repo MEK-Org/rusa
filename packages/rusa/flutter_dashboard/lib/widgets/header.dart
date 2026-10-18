@@ -1564,7 +1564,6 @@ class _HaltedBadge extends StatelessWidget {
     final clearAll = onClearAll;
     return Container(
       key: const ValueKey('halted-chip'),
-      padding: EdgeInsets.symmetric(horizontal: compact ? 6 : 10, vertical: 4),
       decoration: BoxDecoration(
         color: MeshColors.statusHalted.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(4),
@@ -1602,42 +1601,57 @@ class _HaltedBadge extends StatelessWidget {
               excludeSemantics: true,
               label:
                   'Halted. ${haltDetailSemanticsText(halt: halt, brake: brake, holds: holds, handleOf: handleOf)}',
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(
-                    Icons.pause_circle_filled,
-                    color: MeshColors.statusHalted,
-                    size: 14,
-                  ),
-                  if (!compact) ...[
-                    const SizedBox(width: 8),
-                    Text(
-                      'Halted',
-                      style: kMonoStyle.copyWith(
-                        color: MeshColors.statusHalted,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w700,
-                      ),
+              child: Padding(
+                padding: EdgeInsets.only(
+                  left: compact ? 6 : 10,
+                  top: 4,
+                  bottom: 4,
+                  right: clearAll != null ? (compact ? 2 : 4) : (compact ? 6 : 10),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.pause_circle_filled,
+                      color: MeshColors.statusHalted,
+                      size: 14,
                     ),
+                    if (!compact) ...[
+                      const SizedBox(width: 8),
+                      Text(
+                        'Halted',
+                        style: kMonoStyle.copyWith(
+                          color: MeshColors.statusHalted,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
                   ],
-                ],
+                ),
               ),
             ),
           ),
-          if (clearAll != null) ...[
-            SizedBox(width: compact ? 2 : 4),
-            IconButton(
-              key: const ValueKey('halt-clear-all'),
-              tooltip: 'Clear all halts',
-              onPressed: clearAll,
-              icon: const Icon(Icons.close, size: 16),
-              color: MeshColors.statusHalted,
-              padding: EdgeInsets.zero,
-              visualDensity: VisualDensity.compact,
-              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+          if (clearAll != null)
+            Padding(
+              padding: EdgeInsets.only(right: compact ? 3 : 7),
+              child: IconButton(
+                key: const ValueKey('halt-clear-all'),
+                tooltip: 'Clear all halts',
+                onPressed: clearAll,
+                icon: const Icon(Icons.close, size: 14),
+                color: MeshColors.statusHalted,
+                padding: EdgeInsets.zero,
+                visualDensity: VisualDensity.compact,
+                style: IconButton.styleFrom(
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  fixedSize: const Size(20, 20),
+                  minimumSize: const Size(20, 20),
+                  padding: EdgeInsets.zero,
+                ),
+                constraints: const BoxConstraints.tightFor(width: 20, height: 20),
+              ),
             ),
-          ],
         ],
       ),
     );
