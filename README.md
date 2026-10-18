@@ -103,6 +103,27 @@ whole mesh respects one global concurrency cap however many actors are live.
 Actor runs are sandboxed with **bubblewrap** (`apt install bubblewrap` on a
 host install); `rusa start` fails fast if the host can't sandbox.
 
+### Default capability grants
+
+The oldest active parentless actor receives durable administrative and host
+maintenance grants, obligation administration and responsive authority, and
+configured communication writes. When Chat is configured, `chat.gchat: all`
+or an omitted `gchat` seeds `chat-write:*`; an explicit list seeds one
+`chat-write:<space>` per space, and an empty list seeds none. Configured Slack
+seeds `slack-write:*`.
+
+Provisioning is insert-only: existing active grants and revocations survive
+restart. Unlike the former root's implicit Chat scope, narrowing `chat.gchat`
+does not remove an older grant. Explicitly revoke broader or removed
+`chat-write` pairs, including `chat-write:*`, when narrowing authority. Removing
+an integration leaves its grants stored but inert while its client is absent;
+re-enabling it can make those active grants usable again.
+
+Changing which actor is the oldest active parentless actor seeds the new
+recipient without revoking the former recipient's grants. If a move is meant
+to transfer authority, explicitly revoke the former recipient's grants too.
+Other actors receive no defaults merely for being parentless or descendants.
+
 ### Memory
 
 Rusa keeps three tiers of memory, deliberately separated:

@@ -2902,17 +2902,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       OBLIGATIONS_ADMIN_CAPABILITY
     );
     expect(
-      (await call(root, "set_checkpoint", { id: humanOwned.id, checkpoint: "before grant" }))
+      (await call(root, "set_checkpoint", { id: humanOwned.id, checkpoint: "bootstrap authority" }))
         .isError
-    ).toBeFalsy();
-    getRepositories().capabilityGrants.grant({
-      actorId: rootId,
-      capability: OBLIGATIONS_ADMIN_CAPABILITY,
-      grantedBy: "operator:synthetic",
-      grantedAt: "2026-10-16T05:30:00.000Z",
-    });
-    expect(
-      (await call(root, "set_checkpoint", { id: humanOwned.id, checkpoint: "after grant" })).isError
     ).toBeFalsy();
     getRepositories().capabilityGrants.revoke(
       rootId,
