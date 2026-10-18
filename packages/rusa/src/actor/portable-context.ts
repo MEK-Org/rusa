@@ -752,26 +752,39 @@ function tailToBytes(s: string, maxBytes: number): string {
 }
 
 /**
+ * The read window of a newest-first run list, as `PromptBuild.readRunIds`
+ * carries it: every id, oldest first, whatever a budget later keeps (#1024).
+ */
+export function portableReadWindow(runs: readonly PriorRun[]): string[] {
+  return runs.map((run) => run.id).reverse();
+}
+
+/**
  * Composes a follower's host-local prior runs into a leader-built prompt (#1019).
  *
  * The leader prompt is authoritative and is kept byte-for-byte as the prefix:
  * leader instructions, the charter and any leader-admitted portable section are
- * never searched, split or reordered. Runs the leader already rendered are
- * identified by their stable actor_run ids (the leader inject record's
- * `sourceEventIds`, taken before its rendering or truncation), never by matching
- * prompt text. Only the remaining host runs are assembled, under the normal
- * portable byte budget, into one section appended after the leader prompt; the
- * returned record describes exactly those appended bytes.
+ * never searched, split or reordered. Runs the leader already had are identified
+ * by their stable actor_run ids, never by matching prompt text: the leader's
+ * read window (`PromptBuild.readRunIds`) lists every run it read before budget
+ * selection, so a run it read and dropped for budget stays dropped (#1024).
+ * Only the remaining host runs are assembled, under the normal portable byte
+ * budget, into one section appended after the leader prompt; the returned record
+ * describes exactly those appended bytes.
+ *
+ * The guarantee is bounded by that window. A host run older than the leader's
+ * window is appended even if the leader once acknowledged it: absence from a
+ * bounded read is not proof a terminal never reached the leader.
  */
 export function composeHostContextIntoPrompt(input: {
   basePrompt: string;
   localRuns: PriorRun[];
-  /** Actor_run ids the leader prompt already represents; empty when it injected none. */
-  representedRunIds: readonly string[];
+  /** Every actor_run id the leader read for this prompt, rendered or dropped. */
+  leaderReadRunIds: readonly string[];
 }): { prompt: string; portable: PortableContext | null } {
-  const represented = new Set(input.representedRunIds);
+  const leaderRead = new Set(input.leaderReadRunIds);
   const portable = assemblePortableContext(
-    input.localRuns.filter((run) => !represented.has(run.id))
+    input.localRuns.filter((run) => !leaderRead.has(run.id))
   );
   if (!portable) return { prompt: input.basePrompt, portable: null };
   const base = input.basePrompt;

@@ -184,14 +184,20 @@ export function createActorRuntime(
         // Host-local runs are prompt memory only for a portable actor. A native
         // actor's history is its leader-selected provider session.
         if (!repositories || snapshot.record.context?.type !== "portable") return baseBuild;
+        // Without the leader's read window this follower cannot tell a run the
+        // leader dropped for budget from one it never saw. Rendered ids would
+        // misfile every dropped run as local, so an older leader's prompt is
+        // used unchanged and host history waits for the leader upgrade.
+        const leaderReadRunIds = baseBuild.readRunIds;
+        if (!leaderReadRunIds) return baseBuild;
         const { prompt, portable } = composeHostContextIntoPrompt({
           basePrompt: baseBuild.prompt,
           localRuns: repositories.actorRuns
             .listRecentCompleted(bootstrap.id, portableContextMaxRuns())
             .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output })),
           // Follower run ids are the leader's actor_run ids, so the leader's
-          // inject record names exactly which of these runs it already rendered.
-          representedRunIds: baseBuild.injectRecord?.sourceEventIds ?? [],
+          // read window names exactly which of these runs it already had.
+          leaderReadRunIds,
         });
         if (!portable) return baseBuild;
         return {

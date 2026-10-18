@@ -17,7 +17,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
-import { Actor, type ActorOptions } from "../actor/actor.js";
+import { Actor, type ActorOptions, type PromptBuild } from "../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
 import {
   type ActorFactoryContext,
@@ -36,7 +36,7 @@ import { COMPACTED_MEMORY_DELTA_EXPERIMENT } from "../actor/experiments.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
-import type { InjectRecord } from "../actor/portable-context.js";
+import { type InjectRecord, PORTABLE_CONTEXT_MAX_BYTES } from "../actor/portable-context.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
 import {
   emptyPortableContextState,
@@ -5026,7 +5026,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         opts: {
           loadSessionId: () => string | undefined;
           saveSessionId: (id: string) => void;
-          buildPrompt: () => { prompt: string; injectRecord?: { runCount: number } };
+          buildPrompt: () => PromptBuild;
         };
       }
     ).opts;
@@ -5042,6 +5042,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
       readdirSync(rootAgentDir).some((name) => name.startsWith("session.json.imported-"))
     ).toBe(true);
 
+    // A follower receives this build as JSON (#1024). With no runs to inject
+    // there is no inject record, but the explicit empty read window survives
+    // serialization, so a follower can tell "read none" from an older leader.
+    const first = JSON.parse(JSON.stringify(actorOpts.buildPrompt())) as PromptBuild;
+    expect(first.injectRecord).toBeUndefined();
+    expect(first).toHaveProperty("readRunIds", []);
+
     const runId = await startLifecycleRun(rootActor as Actor, {
       provider: "antigravity",
       model: "Gemini 3.7 Flash",
@@ -5055,6 +5062,30 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const built = actorOpts.buildPrompt();
     expect(built.prompt).toContain("PORTABLE_ROOT_CONTEXT_MARKER");
     expect(built.injectRecord?.runCount).toBe(1);
+    // The read window is additive: an older follower that ignores it still
+    // receives the same prompt and rendered-run record as before.
+    const { readRunIds, ...legacy } = JSON.parse(JSON.stringify(built)) as PromptBuild;
+    expect(readRunIds).toEqual([runId]);
+    expect(legacy).toEqual({ prompt: built.prompt, injectRecord: built.injectRecord });
+    expect(legacy.injectRecord?.sourceEventIds).toEqual([runId]);
+
+    // A newer run that fills the budget alone pushes the first out of the
+    // rendered section, but not out of the read window: the window is taken
+    // before budget selection, so a follower still knows the leader had it.
+    const largeRunId = await startLifecycleRun(rootActor as Actor, {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    await endLifecycleRun(rootActor as Actor, largeRunId, {
+      success: true,
+      output: `LARGE_RUN ${"x".repeat(PORTABLE_CONTEXT_MAX_BYTES)}`,
+      exitCode: 0,
+    });
+    const dropped = actorOpts.buildPrompt();
+    expect(dropped.prompt).not.toContain("PORTABLE_ROOT_CONTEXT_MARKER");
+    expect(dropped.injectRecord?.sourceEventIds).toEqual([largeRunId]);
+    expect(dropped.readRunIds).toEqual([runId, largeRunId]);
   });
 
   it("seeds brief mode without a Gemini key and retains its window before and after delta enrollment", async () => {

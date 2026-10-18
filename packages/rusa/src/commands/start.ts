@@ -111,6 +111,7 @@ import {
   PORTABLE_CONTEXT_FOLD_MAX_PAGES,
   portableContextMaxMessages,
   portableContextMaxRuns,
+  portableReadWindow,
 } from "../actor/portable-context.js";
 import { seedPortableBriefState } from "../actor/portable-context-brief.js";
 import {
@@ -926,11 +927,19 @@ export function readUnfoldedLedgerSources(
   return { sources, truncated: true };
 }
 
+interface PortableInjection {
+  /** The rendered prefix; absent when there is nothing to inject (e.g. a first run). */
+  priorContext?: string;
+  injectRecord?: InjectRecord;
+  /** Every actor_run id read for this prompt, oldest first; the follower's `PromptBuild.readRunIds`. */
+  readRunIds: string[];
+}
+
 /**
  * Assemble a portable-context (design ISSUE_NUM) actor's
  * stateless prefix from its own durable recent run outputs, plus the per-run inject
- * record that rides on the run's `run_start` event. Returns undefined when there's
- * nothing injectable yet (e.g. the actor's first run).
+ * record that rides on the run's `run_start` event. When there's nothing injectable
+ * yet (e.g. the actor's first run) only the read window is returned.
  *
  * Lifted out of the worker's `buildPrompt` callback so that callback stays a thin
  * composition seam. Deliberately NOT pushed into `buildWorkerPrompt` (Operator's PR
@@ -944,16 +953,21 @@ function assemblePortableInjection(
   store: PortableContextStore,
   journal: PortableJournalMode = "window",
   onDeltaFallback: (error: unknown) => void = () => {}
-): { priorContext: string; injectRecord: InjectRecord } | undefined {
+): PortableInjection {
   const repositories = getRepositories();
   const runs = repositories.actorRuns
     .listRecentCompleted(id, portableContextMaxRuns())
     .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
+  // The read window is every run read above, before any budget selection, so a
+  // follower can tell a run this prompt dropped from one it never saw (#1024).
+  const readRunIds = portableReadWindow(runs);
   // Tail remains a run-only renderer. Do not load a snapshot or query messages
   // and obligations before selecting this established path.
   if (mode === "tail") {
     const portable = assemblePortableContext(runs);
-    return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
+    return portable
+      ? { priorContext: portable.section, injectRecord: portable.record, readRunIds }
+      : { readRunIds };
   }
 
   let state = store.load(id);
@@ -1022,7 +1036,9 @@ function assemblePortableInjection(
     journal: selected.journal,
     ...(mode === "brief" ? { brief: state.brief } : {}),
   });
-  return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
+  return portable
+    ? { priorContext: portable.section, injectRecord: portable.record, readRunIds }
+    : { readRunIds };
 }
 
 function assembleConfiguredPortableInjection(
@@ -1031,7 +1047,7 @@ function assembleConfiguredPortableInjection(
   store: PortableContextStore,
   journal: PortableJournalMode = "window",
   onDeltaFallback?: (error: unknown) => void
-): { priorContext: string; injectRecord: InjectRecord } | undefined {
+): PortableInjection | undefined {
   if (record.context?.type !== "portable") return undefined;
   if (record.context.mode === "ledger" && !apiKey) {
     throw new Error("portable context ledger mode requires geminiApiKey");
@@ -3925,6 +3941,7 @@ async function composeStart(
                 injection?.priorContext
               ),
               injectRecord: injection?.injectRecord,
+              readRunIds: injection?.readRunIds,
             };
           },
           // Pool recovery remains a durable actor behavior of the imported

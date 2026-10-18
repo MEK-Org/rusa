@@ -7,7 +7,11 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import type { PromptBuild } from "../actor/actor.js";
-import { assemblePortableContext, PORTABLE_CONTEXT_MAX_BYTES } from "../actor/portable-context.js";
+import {
+  assemblePortableContext,
+  PORTABLE_CONTEXT_MAX_BYTES,
+  portableReadWindow,
+} from "../actor/portable-context.js";
 import { loadConfig } from "../config/index.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { getInstanceIdentity, type InstanceIdentity } from "../db/instance-identity.js";
@@ -462,7 +466,9 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     // The leader's prompt for each admitted run. From run 2 it has run 1's
     // terminal and carries its own portable section: run 1 is larger than the
     // budget, so the leader renders it tail-truncated at its own timestamp and
-    // names it by run id in the inject record (#1024).
+    // names it by run id in the inject record (#1024). Each build reaches the
+    // follower as JSON through the real /poll reply, where an explicit empty
+    // read window and a missing one must stay distinct.
     const leaderInstructions = [
       "# Synthetic leader worker instructions and tools",
       "Leader charter: manage distributed tasks.",
@@ -478,18 +484,21 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     const leaderBuilds: PromptBuild[] = [];
     const nextLeaderBuild = (): PromptBuild => {
       const run1Id = runStarts()[0]?.runId;
-      const leaderSection =
-        leaderBuilds.length >= 1 && typeof run1Id === "string"
-          ? assemblePortableContext([
-              { id: run1Id, ts: "2026-10-18T09:00:00.000Z", body: run1Output },
-            ])
-          : null;
+      const index = leaderBuilds.length;
+      // Build 1 reads nothing; builds 2-4 have read only run 1, and build 4 is
+      // an older leader without a read window; build 5 has lost its history.
+      const leaderRead =
+        index >= 1 && index <= 3 && typeof run1Id === "string"
+          ? [{ id: run1Id, ts: "2026-10-18T09:00:00.000Z", body: run1Output }]
+          : [];
+      const leaderSection = assemblePortableContext(leaderRead);
       const build: PromptBuild = leaderSection
         ? {
             prompt: `${leaderInstructions}\n\n---\n${leaderSection.section}`,
             injectRecord: leaderSection.record,
           }
         : { prompt: leaderInstructions };
+      if (index !== 3) build.readRunIds = portableReadWindow(leaderRead);
       leaderBuilds.push(build);
       return build;
     };
@@ -755,11 +764,38 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     expect(
       Buffer.byteLength(observedPrompts[2], "utf8") - Buffer.byteLength(leaderBuilds[2].prompt)
     ).toBeLessThanOrEqual(PORTABLE_CONTEXT_MAX_BYTES + "\n\n---\n".length);
-    expect(observedSessionIds).toEqual([
-      "leader-native-session",
-      "leader-native-session",
-      "leader-native-session",
+
+    // Run 4: an older leader sends no read window. Its rendered ids cannot
+    // separate runs it dropped from local ones, so the follower adds nothing
+    // and the leader prompt and record are used byte for byte.
+    await wakeAndComplete(4);
+    expect(leaderBuilds[3]).not.toHaveProperty("readRunIds");
+    expect(leaderBuilds[3].injectRecord?.sourceEventIds).toEqual([run1Id]);
+    expect(observedPrompts[3]).toBe(leaderBuilds[3].prompt);
+    expect(count(observedPrompts[3], "Synthetic run 2 output")).toBe(0);
+    expect(count(observedPrompts[3], "Synthetic run 3 output")).toBe(0);
+    expect(runStarts()[3]?.injectRecord).toEqual(leaderBuilds[3].injectRecord);
+
+    // Run 5: an explicit empty window means the leader read no runs, so every
+    // host run is local and appended once, newest first within the budget.
+    await wakeAndComplete(5);
+    const run4Id = runStarts()[3]?.runId;
+    expect(leaderBuilds[4]).toEqual({ prompt: leaderInstructions, readRunIds: [] });
+    expect(observedPrompts[4].startsWith(`${leaderInstructions}\n\n---\n`)).toBe(true);
+    for (const output of [
+      "Synthetic run 2 output",
+      "Synthetic run 3 output",
+      "Synthetic run 4 output",
+    ])
+      expect(count(observedPrompts[4], output)).toBe(1);
+    // Run 1 alone fills a budget, so it is the oldest run the cap drops.
+    expect(count(observedPrompts[4], "Synthetic run 1 closing")).toBe(0);
+    expect(runStarts()[4]?.injectRecord?.sourceEventIds).toEqual([
+      run2Id,
+      runStarts()[2]?.runId,
+      run4Id,
     ]);
+    expect(observedSessionIds).toEqual(Array(5).fill("leader-native-session"));
     expect(pollRequests).toBeGreaterThan(3);
 
     await handles.shutdown();
@@ -786,6 +822,8 @@ describe("shared startup, role authority, and local database (#1019)", () => {
       [run1Id, "completed", 1, run1Output],
       [run2Id, "completed", 1, "Synthetic run 2 output"],
       [runStarts()[2]?.runId, "completed", 1, "Synthetic run 3 output"],
+      [runStarts()[3]?.runId, "completed", 1, "Synthetic run 4 output"],
+      [runStarts()[4]?.runId, "completed", 1, "Synthetic run 5 output"],
     ]);
 
     const prompts = db
