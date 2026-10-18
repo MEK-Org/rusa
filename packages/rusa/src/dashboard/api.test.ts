@@ -362,17 +362,25 @@ describe("handleMeshApiRequest", () => {
       expect(items.find((item) => item.id === "inbox_direct-entry")).toMatchObject({
         linkedObligation: "Obligation done: Direct history",
       });
-      expect(items.find((item) => item.id === "inbox_external-entry")).toHaveProperty(
-        "linkedObligation"
-      );
+      expect(items.find((item) => item.id === "inbox_external-entry")).toMatchObject({
+        linkedObligation: "Obligation done: Earlier external history",
+      });
+      expect(
+        items.find(
+          (item) =>
+            typeof item.id === "string" &&
+            item.id.startsWith("obligation_history_") &&
+            item.obligationId === "external-earlier"
+        )
+      ).toBeUndefined();
       expect(items.find((item) => item.id === "inbox_missing-entry")).not.toHaveProperty(
         "linkedObligation"
       );
 
       // The old lookup's unordered external-ref LIMIT is intentional API
-      // behavior today. Compare the complete route response against it with
-      // both a terminal and live row sharing this reference, rather than
-      // silently choosing a new winner while batching display reads.
+      // behavior today. This shim verifies the selected external-reference
+      // winner only; because it invokes this route's current two-pass loop,
+      // it cannot establish parity with the pre-change folding order.
       const legacyObligations = Object.create(obligations) as ObligationRepository;
       Object.defineProperty(legacyObligations, "listActivityDisplay", {
         value: (ids: readonly string[], refs: readonly string[]) => ({

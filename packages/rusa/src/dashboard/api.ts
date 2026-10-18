@@ -23,6 +23,7 @@ import type { InboxFocusRepository } from "../db/repositories/inbox-focus-reposi
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import {
+  type ActivityDisplayObligation,
   MAX_OBLIGATION_PAGE_LIMIT,
   type ObligationQueue,
   type ObligationRepository,
@@ -2746,7 +2747,6 @@ export async function handleMeshApiRequest(
       selectedRun: (typeof completedFocuses)[number] | undefined;
       entryObligationIds: Set<string>;
       externalRef: string | null | undefined;
-      matchedTerminal: (typeof terminalHistory)[number] | undefined;
     }> = [];
     const displayIds = new Set<string>(terminalHistory.map((history) => history.obligationId));
     const externalRefs = new Set<string>();
@@ -2841,20 +2841,6 @@ export async function handleMeshApiRequest(
       for (const obligationId of entryObligationIds) displayIds.add(obligationId);
       if (refs.githubWorkRef) externalRefs.add(refs.githubWorkRef);
 
-      // A source link alone is not enough: a recurring obligation can be
-      // handled in one run and transition terminal in a later one. Fold only a
-      // transition observed inside the completed run that selected this exact
-      // entry, preserving later/unrelated terminal changes as their own cards.
-      const matchedTerminal = selectedRun
-        ? terminalHistory.find(
-            (history) =>
-              entryObligationIds.has(history.obligationId) &&
-              history.actingPrincipal === entry.actorId &&
-              history.timestamp >= selectedRun.startedAt &&
-              history.timestamp <= selectedRun.endedAt
-          )
-        : undefined;
-      if (matchedTerminal) displayIds.add(matchedTerminal.obligationId);
       activityEntries.push({
         entry,
         source,
@@ -2864,7 +2850,6 @@ export async function handleMeshApiRequest(
         selectedRun,
         entryObligationIds,
         externalRef: refs.githubWorkRef,
-        matchedTerminal,
       });
     }
 
@@ -2880,18 +2865,32 @@ export async function handleMeshApiRequest(
         ? (activityDisplay?.byExternalRef.get(activity.externalRef) ?? null)
         : null;
       if (externallyLinked) activity.entryObligationIds.add(externallyLinked.id);
+      // A source link alone is not enough: a recurring obligation can be
+      // handled in one run and transition terminal in a later one. Fold only a
+      // transition observed inside the completed run that selected this exact
+      // entry, after every direct and external-reference association is known.
+      const selectedRun = activity.selectedRun;
+      const matchedTerminal = selectedRun
+        ? terminalHistory.find(
+            (history) =>
+              activity.entryObligationIds.has(history.obligationId) &&
+              history.actingPrincipal === activity.entry.actorId &&
+              history.timestamp >= selectedRun.startedAt &&
+              history.timestamp <= selectedRun.endedAt
+          )
+        : undefined;
       const entryObligations = [...activity.entryObligationIds]
         .map((obligationId) => activityDisplay?.byId.get(obligationId) ?? null)
-        .filter((obligation): obligation is Obligation => obligation !== null);
+        .filter((obligation): obligation is ActivityDisplayObligation => obligation !== null);
       let linkedObligation: string | null =
         activity.selectedRun && entryObligations[0]
           ? `Obligation: ${entryObligations[0].title}`
           : null;
-      if (activity.matchedTerminal) {
-        matchedTerminalHistoryIds.add(activity.matchedTerminal.id);
-        const terminalObligation = activityDisplay?.byId.get(activity.matchedTerminal.obligationId);
+      if (matchedTerminal) {
+        matchedTerminalHistoryIds.add(matchedTerminal.id);
+        const terminalObligation = activityDisplay?.byId.get(matchedTerminal.obligationId);
         if (terminalObligation) {
-          linkedObligation = `Obligation ${activity.matchedTerminal.after.status}: ${terminalObligation.title}`;
+          linkedObligation = `Obligation ${matchedTerminal.after.status}: ${terminalObligation.title}`;
         }
       }
 
