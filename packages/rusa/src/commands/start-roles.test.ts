@@ -729,7 +729,8 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     const handles = followerHandles;
 
     expect(registeredHeaders?.authorization).toBe("Bearer token-synthetic-xyz");
-    expect(registeredBody?.instanceId).toBe("follower-node-synthetic");
+    expect(registeredBody?.id).toBe("follower-node-synthetic");
+    expect(registeredBody).not.toHaveProperty("instanceId");
     expect(registeredBody).not.toHaveProperty("bootId");
     expect(handles.instanceIdentity.instanceId).toBe("follower-node-synthetic");
     expect(handles.instanceIdentity.role).toBe("follower");

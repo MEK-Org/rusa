@@ -271,7 +271,6 @@ export async function composeFollowerStart(
         pid: process.pid,
         generation,
         protocolVersion: INSTANCE_PROTOCOL_VERSION,
-        instanceId: identity.instanceId,
       });
       if (reg.protocolVersion !== INSTANCE_PROTOCOL_VERSION) {
         log.warn("follower_protocol_mismatch", {
