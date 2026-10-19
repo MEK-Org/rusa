@@ -24,6 +24,7 @@ import {
   DEFAULT_DEPLOY_BRANCH,
   type GitHubConfig,
   type GitHubOrgConfig,
+  type InstanceIdentity,
   type InstanceRole,
   type PeerConfig,
   type QuotaThrottleConfig,
@@ -182,8 +183,7 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
         throw new Error("config.yaml: instance.id must be a non-empty string when set");
       }
       parsed.instance.id = parsed.instance.id.trim();
-      // mesh.db binds this ID on first boot, so refuse one a leader's follower
-      // gateway would reject before it is persisted.
+      // Refuse an ID a leader's follower gateway would reject at enrollment.
       if (!PEER_ID_PATTERN.test(parsed.instance.id)) {
         throw new Error(
           'config.yaml: instance.id must be 1-64 letters, digits, "_" or "-" (the instance ID followers enroll with)'
@@ -884,6 +884,21 @@ const PEER_KEYS = new Set(["type", "id", "url", "token", "tokenFile"]);
  */
 export function instanceRoleOf(config: Pick<RusaConfig, "peers">): InstanceRole {
   return leaderPeerOf(config) ? "follower" : "leader";
+}
+
+/**
+ * This instance's identity from config (#1019). {@link loadConfig} has already
+ * refused a follower without `instance.id`.
+ */
+export function instanceIdentityOf(
+  config: Pick<RusaConfig, "peers" | "instance">
+): InstanceIdentity {
+  const instanceId = config.instance?.id;
+  if (instanceRoleOf(config) === "leader") return { role: "leader", instanceId };
+  if (instanceId === undefined) {
+    throw new Error("A follower requires instance.id; loadConfig validates this");
+  }
+  return { role: "follower", instanceId };
 }
 
 /** The single configured `leader` peer entry, if this instance is a follower. */

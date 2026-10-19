@@ -115,7 +115,6 @@ describe("Database Migration System", () => {
       "0058_user_google_account_id",
       "0059_obligation_completion_matchers",
       "0060_configured_actor_import",
-      "0061_instance_identity",
       "0062_portable_brief_revisions",
     ]);
 
@@ -129,7 +128,6 @@ describe("Database Migration System", () => {
     expect(tableNames).toContain("obligation_completion_matchers");
     expect(tableNames).toContain("availability_holds");
     expect(tableNames).toContain("portable_brief_revisions");
-    expect(tableNames).toContain("instance_identity");
 
     const meshEventsColumns = (
       db.prepare("PRAGMA table_info(mesh_events)").all() as Array<{ name: string }>

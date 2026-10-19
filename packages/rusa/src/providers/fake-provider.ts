@@ -73,6 +73,9 @@ export class FakeProvider implements CodingProvider {
 
   async run(opts: RunOptions): Promise<RunResult> {
     this.calls.push(opts);
+    // Real providers report the launched prompt once their process spawns; a
+    // scripted responder reports its own.
+    if (!this.responder) opts.onPromptLaunched?.(opts.prompt);
     let override = (await this.responder?.(opts)) ?? {};
 
     // For e2e hydration: allow the system prompt or messages to script the output.

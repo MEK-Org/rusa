@@ -12,9 +12,8 @@ import {
   PORTABLE_CONTEXT_MAX_BYTES,
   portableReadWindow,
 } from "../actor/portable-context.js";
-import { loadConfig } from "../config/index.js";
+import { type InstanceIdentity, loadConfig } from "../config/index.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
-import { getInstanceIdentity, type InstanceIdentity } from "../db/instance-identity.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type { RunOptions } from "../providers/types.js";
 import type { FollowerCommand } from "../remote-instances/follower-hub.js";
@@ -46,11 +45,6 @@ interface SyntheticEvent {
   eventId: string;
   actorId: string;
   message?: SyntheticRequestMessage;
-}
-
-interface InstanceIdentityRow {
-  instance_id: string;
-  role: string;
 }
 
 interface ActorRunRow {
@@ -150,64 +144,84 @@ afterEach(() => {
 });
 
 describe("shared startup, role authority, and local database (#1019)", () => {
-  it("initializes mesh.db and writes stable instance identity on leader boot", async () => {
+  it("keeps a leader's config identity across real restarts and persists its local runs and prompts", async () => {
     const home = makeTempHome();
     process.env.RUSA_HOME = home;
 
     writeConfigFile(home, {
-      providers: { codex: { cliCommand: "codex" } },
-      rootActor: { provider: "codex", model: "gpt-5.6-sol" },
+      providers: { fake: {} },
       github: { account: "test-account" },
       webhook: { port: 9742, secret: "secret" },
+      instance: { id: "leader-node-alpha" },
     });
-
-    // First leader boot
-    const ready1 = new Promise<void>((resolve) => {
-      void runStart({
-        e2e: {
-          onReady: async (handles) => {
-            await handles.shutdown();
-            resolve();
-          },
-        },
-      });
-    });
-    await ready1;
 
     const dbPath = join(home, "data", "mesh.db");
-    expect(existsSync(dbPath)).toBe(true);
+    const runRows = (actorId: string) =>
+      getDb()
+        .prepare(
+          "SELECT r.id, r.outcome, p.prompt FROM actor_runs r JOIN run_prompts p ON p.run_id = r.id WHERE r.actor_id = ?"
+        )
+        .all(actorId) as Array<{ id: string; outcome: string; prompt: string }>;
 
-    const db1 = new Database(dbPath);
-    const id1 = getInstanceIdentity(db1);
-    expect(id1).not.toBeNull();
-    expect(id1?.role).toBe("leader");
-    expect(id1?.instanceId).toBeTruthy();
-    expect(id1?.bootId).toBeTruthy();
-    db1.close();
-
-    // Restart leader over same database
-    const ready2 = new Promise<void>((resolve) => {
+    // Boot 1: run one local worker to completion, then shut down.
+    let workerId = "";
+    let firstRuns: Array<{ id: string; outcome: string; prompt: string }> = [];
+    await new Promise<void>((resolve, reject) => {
       void runStart({
         e2e: {
           onReady: async (handles) => {
+            try {
+              expect(handles.instanceIdentity).toEqual({
+                role: "leader",
+                instanceId: "leader-node-alpha",
+              });
+              workerId = handles.mesh.spawn({
+                charter: "Leader local persistence fixture",
+                parentId: null,
+                modelConfig: { provider: "fake", model: "fake-model" },
+              });
+              expect(handles.mesh.deliverWake(workerId, "record a local run")).toBe(true);
+              await waitUntil(() => runRows(workerId).some((run) => run.outcome === "completed"));
+              firstRuns = runRows(workerId);
+              await handles.shutdown();
+              resolve();
+            } catch (error) {
+              reject(error);
+            }
+          },
+        },
+      });
+    });
+    expect(firstRuns.length).toBeGreaterThanOrEqual(1);
+    expect(firstRuns[0]?.prompt).toContain("Leader local persistence fixture");
+
+    // Boot 2 over the same home: the same identity, and boot 1's records survive.
+    let secondIdentity: InstanceIdentity | undefined;
+    let secondRuns: typeof firstRuns = [];
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: async (handles) => {
+            secondIdentity = handles.instanceIdentity;
+            secondRuns = runRows(workerId);
             await handles.shutdown();
             resolve();
           },
         },
       });
     });
-    await ready2;
+    expect(secondIdentity).toEqual({ role: "leader", instanceId: "leader-node-alpha" });
+    expect(secondRuns).toEqual(firstRuns);
 
-    const db2 = new Database(dbPath);
-    const id2 = getInstanceIdentity(db2);
-    expect(id2).not.toBeNull();
-    expect(id2?.instanceId).toBe(id1?.instanceId);
-    expect(id2?.role).toBe("leader");
-    expect(id2?.bootId).not.toBe(id1?.bootId);
-    db2.close();
-  }, 20_000);
+    // Identity lives in config only; mesh.db holds no identity table.
+    const db = new Database(dbPath);
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE name = 'instance_identity'").get()
+    ).toBeUndefined();
+    db.close();
+  }, 30_000);
 
-  it("initializes mesh.db and writes stable instance identity on follower boot without rootActor", async () => {
+  it("keeps a follower's config identity across real restarts without rootActor", async () => {
     const home = makeTempHome();
     process.env.RUSA_HOME = home;
 
@@ -219,51 +233,32 @@ describe("shared startup, role authority, and local database (#1019)", () => {
       },
     });
 
-    let followerShutdown: (() => Promise<void>) | undefined;
-    await runStart({
-      e2e: {
-        connectPeer: false,
-        onFollowerReady: (handles) => {
-          expect(handles.instanceIdentity.instanceId).toBe("worker-node-alpha");
-          expect(handles.instanceIdentity.role).toBe("follower");
-          followerShutdown = handles.shutdown;
+    for (let boot = 0; boot < 2; boot++) {
+      let followerShutdown: (() => Promise<void>) | undefined;
+      await runStart({
+        e2e: {
+          connectPeer: false,
+          onFollowerReady: (handles) => {
+            expect(handles.instanceIdentity).toEqual({
+              role: "follower",
+              instanceId: "worker-node-alpha",
+            });
+            followerShutdown = handles.shutdown;
+          },
         },
-      },
-    });
-    if (followerShutdown) await followerShutdown();
+      });
+      expect(followerShutdown).toBeDefined();
+      if (followerShutdown) await followerShutdown();
+    }
 
-    const dbPath = join(home, "data", "mesh.db");
-    expect(existsSync(dbPath)).toBe(true);
-
-    const db1 = new Database(dbPath);
-    const id1 = getInstanceIdentity(db1);
-    expect(id1?.instanceId).toBe("worker-node-alpha");
-    expect(id1?.role).toBe("follower");
-    const bootId1 = id1?.bootId;
-    db1.close();
-
-    // Second boot of follower
-    await runStart({
-      e2e: {
-        connectPeer: false,
-        onFollowerReady: (handles) => {
-          expect(handles.instanceIdentity.instanceId).toBe("worker-node-alpha");
-          expect(handles.instanceIdentity.role).toBe("follower");
-          followerShutdown = handles.shutdown;
-        },
-      },
-    });
-    if (followerShutdown) await followerShutdown();
-
-    const db2 = new Database(dbPath);
-    const id2 = getInstanceIdentity(db2);
-    expect(id2?.instanceId).toBe("worker-node-alpha");
-    expect(id2?.role).toBe("follower");
-    expect(id2?.bootId).not.toBe(bootId1);
-    db2.close();
+    const db = new Database(join(home, "data", "mesh.db"));
+    expect(
+      db.prepare("SELECT name FROM sqlite_master WHERE name = 'instance_identity'").get()
+    ).toBeUndefined();
+    db.close();
   }, 20_000);
 
-  it("fails a follower boot without bwrap before mesh.db binds an identity or enrollment starts", async () => {
+  it("fails a follower boot without bwrap before mesh.db opens or enrollment starts", async () => {
     const home = makeTempHome();
     process.env.RUSA_HOME = home;
     writeConfigFile(home, {
@@ -689,6 +684,7 @@ describe("shared startup, role authority, and local database (#1019)", () => {
 
     expect(registeredHeaders?.authorization).toBe("Bearer token-synthetic-xyz");
     expect(registeredBody?.instanceId).toBe("follower-node-synthetic");
+    expect(registeredBody).not.toHaveProperty("bootId");
     expect(handles.instanceIdentity.instanceId).toBe("follower-node-synthetic");
     expect(handles.instanceIdentity.role).toBe("follower");
     expect(handles.instance.isReconciled).toBe(true);
@@ -808,12 +804,6 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     const dbPath = join(home, "data", "mesh.db");
     expect(existsSync(dbPath)).toBe(true);
     const db = new Database(dbPath);
-
-    const idRow = db.prepare("SELECT * FROM instance_identity WHERE singleton = 1").get() as
-      | InstanceIdentityRow
-      | undefined;
-    expect(idRow?.instance_id).toBe("follower-node-synthetic");
-    expect(idRow?.role).toBe("follower");
 
     const runs = db
       .prepare("SELECT * FROM actor_runs WHERE actor_id = ? ORDER BY started_at ASC")

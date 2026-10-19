@@ -171,6 +171,8 @@ import {
 import {
   type ConfigProfile,
   followerAllowlistOf,
+  type InstanceIdentity,
+  instanceIdentityOf,
   instanceRoleOf,
   loadConfig,
   type RusaConfig,
@@ -190,7 +192,6 @@ import {
   planConfiguredActorImport,
 } from "../db/configured-actor-import.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
-import { type InstanceIdentity, initInstanceIdentity } from "../db/instance-identity.js";
 import { importLegacyActorState } from "../db/legacy-actor-import.js";
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
@@ -698,6 +699,8 @@ export function createStartRetireCleanups(
 /** Live handles the e2e runner uses to drive a started mesh in-process. */
 export interface RunStartE2EHandles {
   mesh: ActorMesh;
+  /** This leader's identity as read from config (#1019). */
+  instanceIdentity: InstanceIdentity;
   /** Read-only synchronization signal for the production coordinator client. */
   coordinatorAppliedInterval: (provider: string) => number | undefined;
   /** Test-only read of the production pacer's next normal-start quote. */
@@ -1334,15 +1337,8 @@ async function composeStart(
   const database = initDb(mcHome);
   resources.acquire("database", () => closeDb());
   log.info("database_ready", { home: mcHome });
-  const identity = initInstanceIdentity(database, {
-    role,
-    configuredInstanceId: config.instance?.id,
-  });
-  log.info("instance_identity_ready", {
-    instanceId: identity.instanceId,
-    bootId: identity.bootId,
-    role: identity.role,
-  });
+  const identity = instanceIdentityOf(config);
+  log.info("instance_identity_ready", { instanceId: identity.instanceId, role: identity.role });
   getRepositories(role);
   if (!config.auth) getRepositories().principals.ensureImplicitUser(new Date().toISOString());
 
@@ -5480,6 +5476,7 @@ async function composeStart(
   // runner live handles so it can inject events and tear down deterministically.
   opts?.e2e?.onReady?.({
     mesh,
+    instanceIdentity: identity,
     coordinatorAppliedInterval: (provider) =>
       quotaCoordinatorClient?.getLastAppliedInterval(provider),
     coordinatorPacerQuote: (provider) => pacerFor(provider).quote(),

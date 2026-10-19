@@ -39,9 +39,21 @@ export interface PeerConfig {
 }
 
 export interface InstanceIdentityConfig {
-  /** Optional stable instance ID */
+  /**
+   * This instance's stable ID. Config is its only source: nothing is generated
+   * or persisted, so it stays the same across restarts exactly as long as the
+   * config does. Required on a follower, whose leader allowlists it.
+   */
   id?: string;
 }
+
+/**
+ * Who this instance is, read from config alone (#1019): its derived role and
+ * configured ID. A follower always has an ID; a leader has one only if set.
+ */
+export type InstanceIdentity =
+  | { role: "leader"; instanceId?: string }
+  | { role: "follower"; instanceId: string };
 
 export interface ProviderConfig {
   /** CLI command name, e.g. "claude", "codex", "agy" */

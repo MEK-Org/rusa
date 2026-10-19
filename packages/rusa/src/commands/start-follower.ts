@@ -1,9 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { leaderPeerOf, resolveHome } from "../config/loader.js";
+import { instanceIdentityOf, leaderPeerOf, resolveHome } from "../config/loader.js";
 import type { RusaConfig } from "../config/types.js";
 import { closeDb, getRepositories, initDb } from "../db/index.js";
-import { initInstanceIdentity } from "../db/instance-identity.js";
 import type { Logger } from "../observability/logger.js";
 import { createLogger } from "../observability/logger.js";
 import { assertBwrapAvailable, setSandboxLogger } from "../providers/sandbox.js";
@@ -74,7 +73,7 @@ export async function composeFollowerStart(
     context: { component: "follower" },
   });
   // As on the leader: sandbox-layer records carry this logger's scrubbing, and
-  // a host that cannot sandbox actors fails before mesh.db binds an identity.
+  // a host that cannot sandbox actors fails before mesh.db opens.
   setSandboxLogger(log.child({ component: "sandbox" }));
   if (config.sandbox !== "container-boundary") {
     try {
@@ -86,21 +85,15 @@ export async function composeFollowerStart(
     }
   }
 
-  // 1. Open local database and initialize instance identity (#1019)
-  const database = initDb(mcHome);
+  // 1. Open the local database; identity comes from config alone (#1019)
+  initDb(mcHome);
   resources.acquire("database", () => closeDb());
   log.info("database_ready", { home: mcHome });
 
-  const identity = initInstanceIdentity(database, {
-    role: "follower",
-    configuredInstanceId: config.instance?.id,
-  });
+  const identity = instanceIdentityOf(config);
+  if (identity.role !== "follower") throw new Error("Follower start requires a leader peer");
   const repos = getRepositories("follower");
-  log.info("instance_identity_ready", {
-    instanceId: identity.instanceId,
-    bootId: identity.bootId,
-    role: identity.role,
-  });
+  log.info("instance_identity_ready", { instanceId: identity.instanceId, role: identity.role });
 
   // 2. Setup FollowerInstance with requireReconciliation = true
   const eventQueue = new FollowerEventQueue();
@@ -279,7 +272,6 @@ export async function composeFollowerStart(
         generation,
         protocolVersion: INSTANCE_PROTOCOL_VERSION,
         instanceId: identity.instanceId,
-        bootId: identity.bootId,
       });
       if (reg.protocolVersion !== INSTANCE_PROTOCOL_VERSION) {
         log.warn("follower_protocol_mismatch", {
