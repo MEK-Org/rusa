@@ -103,26 +103,24 @@ whole mesh respects one global concurrency cap however many actors are live.
 Actor runs are sandboxed with **bubblewrap** (`apt install bubblewrap` on a
 host install); `rusa start` fails fast if the host can't sandbox.
 
-### Default capability grants
+### Default actor permissions
 
-The oldest active parentless actor receives durable administrative and host
-maintenance grants, obligation administration and responsive authority, and
-configured communication writes. When Chat is configured, `chat.gchat: all`
-or an omitted `gchat` seeds `chat-write:*`; an explicit list seeds one
-`chat-write:<space>` per space, and an empty list seeds none. Configured Slack
-seeds `slack-write:*`.
+On startup, the oldest active parentless actor receives the former root's
+administrative and host maintenance permissions, obligation administration and
+responsive authority, and configured communication writes **in memory only**.
+An empty instance assigns these defaults when its first actor is created.
+When Chat is configured, `chat.gchat: all` or an omitted `gchat` allows all
+spaces; an explicit list limits default writes to those spaces, and an empty
+list allows none. Configured Slack permits writes to all channels.
 
-Provisioning is insert-only: existing active grants and revocations survive
-restart. Unlike the former root's implicit Chat scope, narrowing `chat.gchat`
-does not remove an older grant. Explicitly revoke broader or removed
-`chat-write` pairs, including `chat-write:*`, when narrowing authority. Removing
-an integration leaves its grants stored but inert while its client is absent;
-re-enabling it can make those active grants usable again.
-
-Changing which actor is the oldest active parentless actor seeds the new
-recipient without revoking the former recipient's grants. If a move is meant
-to transfer authority, explicitly revoke the former recipient's grants too.
-Other actors receive no defaults merely for being parentless or descendants.
+Defaults are recomputed from configuration and the selected actor at each
+startup. They create no durable grant rows, and revoking an explicit grant
+does not remove a permission supplied by the default role. Other actors gain
+no default authority merely from being parentless or descendants. Explicit
+operator and actor grants remain independently durable and revocable.
+Legacy `system:bootstrap` rows stay visible in the grant audit but no longer
+authorize access, so they cannot retain a former default's permissions or an
+obsolete communication scope after restart.
 
 ### Memory
 

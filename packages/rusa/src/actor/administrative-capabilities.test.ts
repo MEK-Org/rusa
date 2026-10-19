@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ChatConfig } from "../config/types.js";
 import {
   ACTOR_ADMIN_CAPABILITY,
@@ -11,6 +11,7 @@ import {
   MODEL_ADMIN_CAPABILITY,
   ROOM_ADMIN_CAPABILITY,
   seedConfiguredActorGrants,
+  withDefaultActorCapabilities,
 } from "./administrative-capabilities.js";
 import { InMemoryCapabilityGrantStore } from "./capability-grants.js";
 
@@ -91,6 +92,73 @@ describe("administrative capabilities", () => {
     const store = new InMemoryCapabilityGrantStore();
     seedConfiguredActorGrants(store, "configured");
     expect(store.activeFor("other-parentless")).toEqual([]);
+  });
+});
+
+describe("in-memory default actor authority", () => {
+  it("supplies defaults without changing the durable grant audit", () => {
+    const store = new InMemoryCapabilityGrantStore();
+    const grant = vi.spyOn(store, "grant");
+    const revoke = vi.spyOn(store, "revoke");
+    const effective = withDefaultActorCapabilities(store, () => "default", ["capability-admin"]);
+    expect(effective.activeFor("default")).toEqual(["capability-admin"]);
+    expect(effective.activeFor("other")).toEqual([]);
+    expect(effective.list()).toEqual([]);
+    expect(grant).not.toHaveBeenCalled();
+    expect(revoke).not.toHaveBeenCalled();
+  });
+
+  it("ignores legacy default rows while preserving independent explicit grants and revocations", () => {
+    const store = new InMemoryCapabilityGrantStore();
+    seedConfiguredActorGrants(store, "former-default");
+    const effective = withDefaultActorCapabilities(store, () => "default", ["capability-admin"]);
+    expect(effective.activeFor("former-default")).toEqual([]);
+    effective.grant({
+      actorId: "former-default",
+      capability: "capability-admin",
+      grantedBy: "operator",
+      grantedAt: "2026-01-01T00:00:00Z",
+    });
+    expect(effective.activeFor("former-default")).toEqual(["capability-admin"]);
+    effective.revoke("former-default", "capability-admin", "2026-01-02T00:00:00Z");
+    expect(effective.activeFor("former-default")).toEqual([]);
+    expect(effective.list()).toEqual(store.list());
+    expect(store.list()).toHaveLength(CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES.length);
+    // An explicit revocation never removes role-derived authority.
+    effective.grant({
+      actorId: "default",
+      capability: "capability-admin",
+      grantedBy: "operator",
+      grantedAt: "2026-01-01T00:00:00Z",
+    });
+    effective.revoke("default", "capability-admin", "2026-01-02T00:00:00Z");
+    expect(effective.activeFor("default")).toEqual(["capability-admin"]);
+  });
+
+  it("recomputes selection and configured scope without carrying default authority forward", () => {
+    const store = new InMemoryCapabilityGrantStore();
+    seedConfiguredActorGrants(store, "oldest", undefined, ["chat-write:*"]);
+    const before = store.list();
+    const boot = (id: string, space: string) =>
+      withDefaultActorCapabilities(
+        store,
+        () => id,
+        defaultActorBootstrapCapabilities({
+          chat: {
+            projectId: "test",
+            subscription: "test",
+            pubsubKeyPath: "/dev/null",
+            gchat: [space],
+          },
+        })
+      );
+    expect(boot("oldest", "spaces/A").activeFor("oldest")).toContain("chat-write:spaces/A");
+    const restarted = boot("replacement", "spaces/B");
+    expect(restarted.activeFor("oldest")).toEqual([]);
+    expect(restarted.activeFor("replacement")).toContain("chat-write:spaces/B");
+    expect(restarted.activeFor("replacement")).not.toContain("chat-write:*");
+    expect(restarted.activeFor("replacement")).not.toContain("chat-write:spaces/A");
+    expect(store.list()).toEqual(before);
   });
 });
 

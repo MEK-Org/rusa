@@ -32,7 +32,7 @@ import {
   defaultActorBootstrapCapabilities,
   defaultGrantRecipient,
   OBLIGATIONS_ADMIN_CAPABILITY,
-  seedConfiguredActorGrants,
+  withDefaultActorCapabilities,
 } from "../actor/administrative-capabilities.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
 import {
@@ -2565,6 +2565,7 @@ async function composeStart(
       id === rootId && rootHandle !== undefined ? rootHandle : generateHandle(id),
   });
   let impliedOwnerId = defaultGrantRecipient(actors.list())?.id;
+  let defaultActorId = impliedOwnerId;
   const rootSourceSync = reconcileEventSources(
     persistentEventSourceOwners,
     configuredRoots,
@@ -3292,7 +3293,11 @@ async function composeStart(
     withTransaction: (fn) => getDb().transaction(fn)(),
     completedFocusEntryCounts: (actorId, excludeRunId) =>
       getRepositories().actorRuns.completedFocusEntryCounts(actorId, excludeRunId),
-    capabilityGrants,
+    capabilityGrants: withDefaultActorCapabilities(
+      capabilityGrants,
+      () => defaultActorId,
+      defaultActorBootstrapCapabilities(config)
+    ),
     // Experiment enrollments (#394): the durable, actor-id-keyed rollout state
     // behind `enroll_actor_experiment`. SQLite-backed so an enrollment survives
     // a restart; the registry of legal experiment names stays in code.
@@ -3393,8 +3398,8 @@ async function composeStart(
     // agent-exec endpoint itself, so they have no server factory either; the
     // mesh and the endpoint both consult the grant rows directly. The
     // host-global names listed here (`update`, `pnpm-hardlinks`, `model-admin`,
-    // `room-admin`) are stripped by the mesh: it never grants one, so a
-    // durable row from the default bootstrap is required. `obligation-responsive` (#1026) and
+    // `room-admin`) are stripped by the mesh: it never grants one, so the
+    // in-memory default role or an explicit durable grant is required. `obligation-responsive` (#1026) and
     // `obligations-admin` (#1003) likewise mount nothing: each worker's
     // obligations server reads the binding per call; the latter is changed only
     // through the authenticated operator boundary.
@@ -3564,23 +3569,11 @@ async function composeStart(
     createActor: (ctx) => {
       const id = ctx.record.id;
       const rec = ctx.record;
-      // Default authority is provisioned as durable rows for the oldest active
-      // top-level actor (#1087), independently of the optional config import.
-      // Use the fixed administrative set plus configured communication scopes;
-      // host tool availability never adds authority.
-      // Existing active AND revoked rows survive the atomic, insert-only seed.
-      if (defaultGrantRecipient(actors.list())?.id === id) {
-        const seeded = database.transaction(() =>
-          seedConfiguredActorGrants(
-            capabilityGrants,
-            id,
-            undefined,
-            defaultActorBootstrapCapabilities(config)
-          )
-        )();
-        if (seeded.length > 0) {
-          log.info("bootstrap_capabilities_seeded", { actorId: id, capabilities: seeded });
-        }
+      // An empty instance selects its first top-level actor in memory, just as
+      // startup selects the oldest active parentless actor. No default grants
+      // are written, and an unrelated actor receives no role-derived authority.
+      if (defaultActorId === undefined && defaultGrantRecipient(actors.list())?.id === id) {
+        defaultActorId = id;
       }
       // The configured import only preserves this legacy workdir mapping. It
       // grants no construction path, prompt, tools, or authority: every
@@ -4017,9 +4010,7 @@ async function composeStart(
             );
           }
         }
-        // An empty instance has nobody to receive implied sources at boot.
-        // Initialize that same in-memory layer after successful first creation
-        // so ingress works immediately, without a restart or durable seed rows.
+        // Implied event ownership begins only after successful construction.
         if (impliedOwnerId === undefined && defaultGrantRecipient(actors.list())?.id === id) {
           rootSourceSync.seedImpliedOwner(id);
           impliedOwnerId = id;

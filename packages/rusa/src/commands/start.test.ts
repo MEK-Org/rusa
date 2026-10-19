@@ -2888,8 +2888,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(getRepositories().obligations.require(ordinary.id).effectiveResponsive).toBe(true);
     expect(getRepositories().obligations.require(descendant.id).effectiveResponsive).toBe(true);
 
-    // The default recipient's cross-owner authority is a durable bootstrap
-    // binding, checked on every call, including after revocation.
+    // The default recipient has role-derived cross-owner authority; explicit
+    // durable revocation does not remove that implicit permission.
     const human = getRepositories().principals.createUser({
       email: "obligation-owner@example.com",
       createdAt: "2026-10-16T05:30:00.000Z",
@@ -2898,9 +2898,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       title: "human-owned",
       ownerId: human.id,
     });
-    expect(getRepositories().capabilityGrants.activeFor(rootId)).toContain(
-      OBLIGATIONS_ADMIN_CAPABILITY
-    );
+    expect(mesh.hasActiveCapability(rootId, OBLIGATIONS_ADMIN_CAPABILITY)).toBe(true);
     expect(
       (await call(root, "set_checkpoint", { id: humanOwned.id, checkpoint: "bootstrap authority" }))
         .isError
@@ -2913,7 +2911,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(
       (await call(root, "set_checkpoint", { id: humanOwned.id, checkpoint: "after revoke" }))
         .isError
-    ).toBe(true);
+    ).toBeFalsy();
   });
 
   it("wires lifecycle abandonment through both production actor factories", async () => {
@@ -7347,9 +7345,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
                 parentId: null,
                 context: { type: "portable", mode: "brief" },
               });
-              expect(getRepositories().capabilityGrants.activeFor(firstId)).toContain(
-                "capability-admin"
-              );
+              expect(handles.mesh.hasActiveCapability(firstId, "capability-admin")).toBe(true);
+              expect(getRepositories().capabilityGrants.list()).toEqual([]);
               expect(handles.mesh.listSubscriptions()).toContainEqual(
                 expect.objectContaining({ resource: "github:first-org", actorId: firstId })
               );
@@ -7367,10 +7364,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       await shutdownFn?.();
       shutdownFn = undefined;
       const restarted = await boot({
-        inspect: () => {
-          expect(getRepositories().capabilityGrants.activeFor(firstId)).not.toContain(
-            "capability-admin"
-          );
+        inspect: (mesh) => {
+          expect(mesh.hasActiveCapability(firstId, "capability-admin")).toBe(true);
+          expect(getRepositories().capabilityGrants.list()).toEqual([]);
           expect(getRepositories().actors.get(firstId)?.context).toEqual({
             type: "portable",
             mode: "brief",
@@ -7488,13 +7484,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
       actors.upsert(record("child", "oldest", "2026-01-01T00:00:00Z"));
       closeDb();
       const state = await boot({
-        inspect: () => {
-          expect(getRepositories().capabilityGrants.activeFor("oldest").sort()).toEqual(
+        inspect: (mesh) => {
+          expect(mesh.activeCapabilitiesFor("oldest").sort()).toEqual(
             [...CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES].sort()
           );
           for (const id of ["later", "retired", "child"]) {
-            expect(getRepositories().capabilityGrants.activeFor(id)).toEqual([]);
+            expect(mesh.activeCapabilitiesFor(id)).toEqual([]);
           }
+          expect(getRepositories().capabilityGrants.list()).toEqual([]);
         },
       });
       expect(state.importedActor).toBeUndefined();
@@ -7591,17 +7588,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
         })
       );
       const restarted = await boot({
-        inspect: () => {
-          expect(getRepositories().capabilityGrants.activeFor("replacement")).toContain(
-            "capability-admin"
-          );
+        inspect: (mesh) => {
+          expect(mesh.hasActiveCapability("replacement", "capability-admin")).toBe(true);
         },
       });
       expect(restarted.live).toEqual(["replacement"]);
       expect(restarted.root?.status).toBe("retired");
     });
 
-    it("keeps default grants fixed across tool availability changes and preserves revocation (#1087)", async () => {
+    it("keeps implicit defaults independent of tool availability without writing grants (#1115)", async () => {
       clearLegacyConfiguredGrants();
       serviceInstanceMock.resolveRepoRoot.mockImplementation(() => {
         throw new Error("fixture: deploy checkout unavailable");
@@ -7618,15 +7613,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
             .all(actorId)
         );
       const initial = grants();
-      expect(initial).toHaveLength(CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES.length);
-      withMeshDb((db) =>
-        db
-          .prepare(
-            "UPDATE capability_grants SET revoked_at = ? WHERE actor_id = ? AND capability = 'update'"
-          )
-          .run("2026-10-16T00:01:00.000Z", actorId)
-      );
-      const revoked = grants();
+      expect(initial).toEqual([]);
 
       serviceInstanceMock.resolveRepoRoot.mockImplementation(
         serviceInstanceMock.actualResolveRepoRoot
@@ -7636,12 +7623,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
           const mcp = (
             mesh.get(actorId) as unknown as { opts: { mcpServers: Array<{ name: string }> } }
           ).opts.mcpServers;
-          expect(mcp.map((server) => server.name)).not.toContain("update");
+          expect(mcp.map((server) => server.name)).toContain("update");
         },
       });
-      expect(grants()).toEqual(revoked);
+      expect(grants()).toEqual(initial);
       await boot();
-      expect(grants()).toEqual(revoked);
+      expect(grants()).toEqual(initial);
     });
 
     it("rehydrates forest descendants with retained state and normal delivery after restart (#1003)", async () => {
@@ -10222,7 +10209,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       logCapture.lines.length = 0;
     });
 
-    it("rehydrates ordinary actors with their baseline and durable default grants", async () => {
+    it("rehydrates ordinary actors with their baseline and implicit default permissions", async () => {
       clearLegacyConfiguredGrants();
       withWorker("set-worker");
       const { mesh, root } = await boot();
@@ -10386,7 +10373,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       }
     });
 
-    it("provisions root-free first creation, scoped writes and obligation authority, preserving revocations on restart", async () => {
+    it("provides root-free scoped writes and obligation authority in memory across restart", async () => {
       clearLegacyConfiguredGrants();
       rmSync(join(homeDir, "threads.json"));
       writeConfig({
@@ -10469,52 +10456,63 @@ describe("runStart webhook event routing (Phase 4)", () => {
           })
         ).isError
       ).toBe(true);
-      const seeded = getRepositories()
-        .capabilityGrants.list()
-        .filter((grant) => grant.actorId === firstId);
-      expect(seeded.every((grant) => grant.grantedBy === CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR)).toBe(
-        true
-      );
+      expect(getRepositories().capabilityGrants.list()).toEqual([]);
       await handles.mesh.revokeCapability(firstId, "chat-write:spaces/A", firstId);
-      expect(mcpServersOf(first).map((server) => server.name)).not.toContain("chat-write");
-      getRepositories().capabilityGrants.revoke(
-        firstId,
-        "obligation-responsive",
-        "2026-10-18T00:00:00Z"
-      );
-      const revoked = getRepositories().capabilityGrants.list();
+      expect(mcpServersOf(first).map((server) => server.name)).toContain("chat-write");
+      // An explicit grant on an ordinary actor remains separately revocable.
+      const childId = handles.mesh.spawn({
+        charter: "explicit grant recipient",
+        parentId: firstId,
+        modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      });
+      handles.mesh.grantCapability(childId, "chat-write:spaces/A", firstId);
+      expect(handles.mesh.activeCapabilitiesFor(childId)).toEqual(["chat-write:spaces/A"]);
+      await handles.mesh.revokeCapability(childId, "chat-write:spaces/A", firstId);
+      expect(handles.mesh.activeCapabilitiesFor(childId)).toEqual([]);
+      expect(
+        mcpServersOf(workerOf(handles.mesh, childId)).map((server) => server.name)
+      ).not.toContain("chat-write");
+      const explicitRows = getRepositories().capabilityGrants.list();
+      expect(explicitRows).toHaveLength(1);
+      expect(explicitRows[0]).toMatchObject({
+        actorId: childId,
+        capability: "chat-write:spaces/A",
+        grantedBy: firstId,
+        revokedAt: expect.any(String),
+      });
       await handles.shutdown();
       shutdownFn = undefined;
       const restarted = await boot(options);
-      expect(getRepositories().capabilityGrants.list()).toEqual(revoked);
+      expect(getRepositories().capabilityGrants.list()).toEqual(explicitRows);
       expect(
         mcpServersOf(workerOf(restarted.mesh, firstId)).map((server) => server.name)
-      ).not.toContain("chat-write");
+      ).toContain("chat-write");
       expect(
         (
           await call(workerOf(restarted.mesh, firstId), "obligations", "create_obligation", {
-            title: "still refused",
+            title: "still allowed by role",
             owner_id: firstId,
             responsive: true,
           })
         ).isError
-      ).toBe(true);
-      // Moving the first actor below another changes the default recipient on
-      // restart; its existing rows, including revocations, remain authoritative.
+      ).toBeFalsy();
+      // A different oldest parentless actor is selected on the next startup.
       getRepositories().actors.patch(firstId, { parentId: laterId });
       await restarted.shutdown();
       shutdownFn = undefined;
-      await boot(options);
-      expect(getRepositories().capabilityGrants.activeFor(laterId)).toEqual(
+      const changed = await boot(options);
+      expect(changed.mesh.activeCapabilitiesFor(laterId)).toEqual(
         expect.arrayContaining([
           "chat-write:spaces/A",
           "obligations-admin",
           "obligation-responsive",
         ])
       );
-      expect(getRepositories().capabilityGrants.activeFor(firstId)).not.toContain(
-        "chat-write:spaces/A"
-      );
+      expect(changed.mesh.activeCapabilitiesFor(firstId)).toEqual([]);
+      expect(
+        mcpServersOf(workerOf(changed.mesh, firstId)).map((server) => server.name)
+      ).not.toContain("chat-write");
+      expect(getRepositories().capabilityGrants.list()).toEqual(explicitRows);
     });
 
     it("records the same run accounting, events and logs for root and worker runs", async () => {
