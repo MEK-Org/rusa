@@ -208,6 +208,9 @@ class FakeApi extends DashboardApi {
   List<SupportedVoiceDto> supportedVoices = const [];
   QuotaSnapshotDto? quotaResult;
   QuotaHistoryDto? quotaHistoryResult;
+  InboxMetricsDto? inboxMetricsResult;
+  Object? inboxMetricsError;
+  int inboxMetricsCallCount = 0;
   Object? quotaError;
   Object? quotaHistoryError;
   DashboardConfigDto? dashboardConfigResult;
@@ -522,6 +525,22 @@ class FakeApi extends DashboardApi {
     if (err != null) throw err;
     return quotaHistoryResult ??
         const QuotaHistoryDto(generatedAt: '', historySince: '', history: []);
+  }
+
+  @override
+  Future<InboxMetricsDto> fetchInboxMetrics() async {
+    inboxMetricsCallCount++;
+    final err = inboxMetricsError;
+    if (err != null) throw err;
+    final result = inboxMetricsResult;
+    if (result == null) {
+      throw DashboardApiException(
+        Uri.parse('/api/mesh/inbox-metrics'),
+        503,
+        '{"error":"inbox metrics unavailable"}',
+      );
+    }
+    return result;
   }
 
   @override

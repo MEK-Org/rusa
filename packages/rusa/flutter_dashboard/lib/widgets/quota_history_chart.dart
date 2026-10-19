@@ -101,16 +101,22 @@ class QuotaHistoryChart extends StatelessWidget {
     super.key,
     required this.history,
     this.isStale = false,
+    this.sharedRange,
   });
 
   final QuotaHistoryDto history;
   final bool isStale;
 
+  /// The range shared by every Overview chart (#1018); defaults to the
+  /// history's own bounds.
+  final ({DateTime start, DateTime end})? sharedRange;
+
   @override
   Widget build(BuildContext context) {
-    final (:start, :end, phrase: range, title: _) = quotaHistoryRangeOf(
-      history,
-    );
+    final own = quotaHistoryRangeOf(history);
+    final start = sharedRange?.start ?? own.start;
+    final end = sharedRange?.end ?? own.end;
+    final range = own.phrase;
     final visible = history.history
         .where(
           (series) =>

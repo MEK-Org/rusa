@@ -14,6 +14,7 @@ import { DbEventSourceSubscriptionStore } from "./event-source-subscription-repo
 import { DbExperimentEnrollmentStore } from "./experiment-enrollment-repository.js";
 import { DbHostJobStore } from "./host-job-repository.js";
 import { InboxFocusRepository } from "./inbox-focus-repository.js";
+import { InboxMetricRepository } from "./inbox-metric-repository.js";
 import { LegacyImportReceiptRepository } from "./legacy-import-receipt-repository.js";
 import { MaintenanceRepository } from "./maintenance-repository.js";
 import { MeshChatRepository } from "./mesh-chat-repository.js";
@@ -97,6 +98,7 @@ export class Repositories {
    */
   private readonly sqliteInbox: SqliteInboxRepository;
   readonly inboxFocus: InboxFocusRepository;
+  readonly inboxMetrics: InboxMetricRepository;
   readonly meshChat: MeshChatRepository;
   readonly quotaScrapes: QuotaScrapeRepository;
   readonly modelScrapes: ModelScrapeRepository;
@@ -130,6 +132,7 @@ export class Repositories {
     this.sqliteInbox = new SqliteInboxRepository(db);
     this.inbox = this.sqliteInbox;
     this.inboxFocus = new InboxFocusRepository(db);
+    this.inboxMetrics = new InboxMetricRepository(db);
     this.meshChat = new MeshChatRepository(db);
     this.quotaScrapes = new QuotaScrapeRepository(db);
     this.modelScrapes = new ModelScrapeRepository(db);

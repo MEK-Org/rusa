@@ -24,6 +24,7 @@ import type {
   AvailabilityHoldOrigin,
 } from "../db/repositories/availability-hold-repository.js";
 import type { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
+import type { InboxMetricRepository } from "../db/repositories/inbox-metric-repository.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import {
@@ -101,6 +102,8 @@ export interface DashboardDataDeps {
    * the operator clearing an entry the actor should not have to answer (#66).
    */
   inbox?: InboxRepository;
+  /** Per-minute inbox backlog summaries for the Overview charts (#1018). */
+  inboxMetrics?: Pick<InboxMetricRepository, "window">;
   /** Completed selection intervals used only to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
   runPrompts?: RunPromptRepository;
@@ -2662,6 +2665,18 @@ export async function handleMeshApiRequest(
         viewerScope()
       )
     );
+    return true;
+  }
+
+  // GET /api/mesh/inbox-metrics — prior three days of per-minute inbox backlog
+  // statistics across every live actor. Actor inboxes are shared mesh data
+  // for every admitted viewer, and only aggregates leave the server.
+  if (pathname === "/api/mesh/inbox-metrics") {
+    if (!deps.inboxMetrics) {
+      sendJson(res, 503, { error: "inbox metrics unavailable" });
+      return true;
+    }
+    sendJson(res, 200, deps.inboxMetrics.window());
     return true;
   }
 

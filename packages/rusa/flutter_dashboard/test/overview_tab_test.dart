@@ -1453,7 +1453,9 @@ void main() {
       (tester) async {
         await tester.runAsync(() async {
           final store = await bootQueued();
-          await tester.binding.setSurfaceSize(const Size(1500, 1400));
+          // Wide enough that the work column, beside the charts (#1018),
+          // clears _kQueuedFocusColumnMinWidth.
+          await tester.binding.setSurfaceSize(const Size(2600, 1400));
           addTearDown(() => tester.binding.setSurfaceSize(null));
           await tester.pumpWidget(_app(store));
           await tester.pump();

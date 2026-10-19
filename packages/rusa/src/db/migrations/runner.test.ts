@@ -117,6 +117,7 @@ describe("Database Migration System", () => {
       "0060_configured_actor_import",
       "0062_portable_brief_revisions",
       "0063_mesh_chat_responsive",
+      "0064_inbox_metric_snapshots",
     ]);
 
     const tableNames = (

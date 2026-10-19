@@ -12,6 +12,7 @@ import '../theme.dart';
 import '../util.dart';
 import 'avatar.dart';
 import 'header.dart';
+import 'inbox_metrics_chart.dart';
 import 'inbox_item_row.dart';
 import 'obligation_card.dart';
 import 'obligation_status.dart';
@@ -42,6 +43,11 @@ class _OverviewTabState extends State<OverviewTab> {
   /// Re-renders queued cards' relative "Runs in ~N min" labels as time passes
   /// between snapshots; idle while nothing is queued.
   Timer? _startLabelTick;
+
+  /// Re-reads the inbox chart. The store requests it at most once a minute,
+  /// the inbox sampling rate, so this tick only bounds the lag.
+  Timer? _inboxMetricsPoll;
+  static const _inboxMetricsPollTick = Duration(seconds: 15);
 
   /// The viewer's queue sections and the projection of the shared obligation
   /// store this tab subscribes to (#992). The store outlives the tab, so a
@@ -98,6 +104,11 @@ class _OverviewTabState extends State<OverviewTab> {
   void initState() {
     super.initState();
     widget.store.refreshQuotaHistory();
+    _pollInboxMetrics();
+    _inboxMetricsPoll = Timer.periodic(
+      _inboxMetricsPollTick,
+      (_) => _pollInboxMetrics(),
+    );
     _watchQueue();
     if (widget.trackNavigation) {
       unawaited(_trackedRefresh());
@@ -125,8 +136,11 @@ class _OverviewTabState extends State<OverviewTab> {
   void dispose() {
     _viewerPrincipalSub?.cancel();
     _startLabelTick?.cancel();
+    _inboxMetricsPoll?.cancel();
     super.dispose();
   }
+
+  void _pollInboxMetrics() => unawaited(widget.store.pollInboxMetrics());
 
   void _navigateToActor(String actorId) {
     widget.store.clickActor(actorId);
@@ -137,46 +151,61 @@ class _OverviewTabState extends State<OverviewTab> {
   Widget build(BuildContext context) {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(20),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _buildQueueAndCharts(),
-          const SizedBox(height: 20),
-          _buildRunningWorkersSection(),
-          const SizedBox(height: 20),
-          _buildQueuedActorsSection(),
-          const SizedBox(height: 20),
-          _buildRecentActivitySection(),
-        ],
-      ),
+      child: _buildWorkAndCharts(),
     );
   }
 
-  /// The existing dashboard breakpoint keeps the operator's queue beside the
-  /// quota chart when there is room, while preserving a readable queue-first
-  /// flow on phone-sized displays.
-  Widget _buildQueueAndCharts() {
+  /// Wide screens put the work sections in the left column and every chart in
+  /// the right (#1018); phone-sized displays stack the work first, then the
+  /// charts.
+  Widget _buildWorkAndCharts() {
     return LayoutBuilder(
       builder: (context, constraints) {
-        final queue = _buildMyQueueSection();
-        final charts = _buildQuotaPoolsCard();
+        final work = [
+          _buildMyQueueSection(),
+          _buildRunningWorkersSection(),
+          _buildQueuedActorsSection(),
+          _buildRecentActivitySection(),
+        ];
+        final charts = [_buildQuotaPoolsCard(), _buildInboxMetricsCard()];
+        Widget column(List<Widget> sections) => Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            for (var i = 0; i < sections.length; i++) ...[
+              if (i > 0) const SizedBox(height: 20),
+              sections[i],
+            ],
+          ],
+        );
         if (constraints.maxWidth < kNarrowBreakpoint) {
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [queue, const SizedBox(height: 20), charts],
-          );
+          return column([...work, ...charts]);
         }
         return Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Expanded(child: queue),
+            Expanded(child: column(work)),
             const SizedBox(width: 20),
-            Expanded(child: charts),
+            Expanded(child: column(charts)),
           ],
         );
       },
     );
   }
+
+  /// Every Overview chart repaints when any chart payload changes, since
+  /// each one moves the shared range.
+  Stream<void> get _chartPayloads => Rx.merge<Object?>([
+    widget.store.quotaHistory,
+    widget.store.quotaHistoryStale,
+    widget.store.inboxMetrics,
+    widget.store.inboxMetricsStale,
+  ]);
+
+  /// The one range every Overview chart draws, ending at the newest payload.
+  ({DateTime start, DateTime end}) get _chartRange => overviewChartRange([
+    ?widget.store.quotaHistory.valueOrNull?.generatedAt,
+    ?widget.store.inboxMetrics.valueOrNull?.generatedAt,
+  ]);
 
   /// Section title row: icon + title (ellipsizes first) + optional trailing
   /// counter, so long titles don't push a fixed-width counter off-screen at
@@ -210,12 +239,8 @@ class _OverviewTabState extends State<OverviewTab> {
 
   /// Quota pacing over the history range, backed by durable provider scrapes.
   Widget _buildQuotaPoolsCard() {
-    return StreamBuilder<List<Object?>>(
-      stream: Rx.combineLatest2<QuotaHistoryDto?, bool, List<Object?>>(
-        widget.store.quotaHistory,
-        widget.store.quotaHistoryStale,
-        (history, stale) => [history, stale],
-      ),
+    return StreamBuilder<void>(
+      stream: _chartPayloads,
       builder: (context, snap) {
         final history = widget.store.quotaHistory.valueOrNull;
         final stale = widget.store.quotaHistoryStale.valueOrNull ?? false;
@@ -256,7 +281,61 @@ class _OverviewTabState extends State<OverviewTab> {
                   style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
                 )
               else
-                QuotaHistoryChart(history: history, isStale: stale),
+                QuotaHistoryChart(
+                  history: history,
+                  isStale: stale,
+                  sharedRange: _chartRange,
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  /// Cross-actor inbox backlog over the shared range (#1018).
+  Widget _buildInboxMetricsCard() {
+    return StreamBuilder<void>(
+      stream: _chartPayloads,
+      builder: (context, snap) {
+        final metrics = widget.store.inboxMetrics.valueOrNull;
+        final stale = widget.store.inboxMetricsStale.valueOrNull ?? false;
+        final range = _chartRange;
+        return Container(
+          key: const Key('overview-inbox-metrics'),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: MeshColors.bgSecondary,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: MeshColors.border),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _sectionHeader(
+                Icons.inbox_outlined,
+                MeshColors.accent,
+                'Inboxes — Prior '
+                '${kOverviewChartWindow.inDays} Days',
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'Median and max across live actors, sampled each minute.',
+                style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
+              ),
+              const SizedBox(height: 14),
+              if (metrics == null)
+                const Text(
+                  'Inbox metrics unavailable.',
+                  style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
+                )
+              else
+                InboxMetricsChart(
+                  metrics: metrics,
+                  start: range.start,
+                  end: range.end,
+                  isStale: stale,
+                ),
             ],
           ),
         );
@@ -1350,11 +1429,15 @@ class _OverviewTabState extends State<OverviewTab> {
                           color: MeshColors.textMuted,
                         ),
                         const SizedBox(width: 5),
-                        Text(
-                          item.linkedObligation!,
-                          style: kMonoStyle.copyWith(
-                            color: MeshColors.textMuted,
-                            fontSize: 10.5,
+                        Flexible(
+                          child: Text(
+                            item.linkedObligation!,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: kMonoStyle.copyWith(
+                              color: MeshColors.textMuted,
+                              fontSize: 10.5,
+                            ),
                           ),
                         ),
                       ],
@@ -1553,11 +1636,15 @@ class _OverviewTabState extends State<OverviewTab> {
                           color: MeshColors.textMuted,
                         ),
                         const SizedBox(width: 5),
-                        Text(
-                          'Resolution: ${item.resolutionRef!}',
-                          style: kMonoStyle.copyWith(
-                            color: MeshColors.textMuted,
-                            fontSize: 10.5,
+                        Flexible(
+                          child: Text(
+                            'Resolution: ${item.resolutionRef!}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: kMonoStyle.copyWith(
+                              color: MeshColors.textMuted,
+                              fontSize: 10.5,
+                            ),
                           ),
                         ),
                       ],
