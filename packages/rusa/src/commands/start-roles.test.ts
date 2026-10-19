@@ -183,9 +183,6 @@ describe("shared startup, role authority, and local database (#1019)", () => {
               expect(handles.mesh.deliverWake(workerId, "record a local run")).toBe(true);
               await waitUntil(() => runRows(workerId).some((run) => run.outcome === "completed"));
               firstRuns = runRows(workerId);
-            } catch (error) {
-              reject(error);
-              throw error;
             } finally {
               await handles.shutdown();
             }
@@ -228,7 +225,7 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     db.close();
   }, 30_000);
 
-  it("releases leader startup resources when the E2E driver fails before shutdown", async () => {
+  it("releases leader startup resources before propagating an E2E driver failure", async () => {
     const home = makeTempHome();
     process.env.RUSA_HOME = home;
     writeConfigFile(home, {
@@ -251,9 +248,22 @@ describe("shared startup, role authority, and local database (#1019)", () => {
       },
     });
 
+    // This is the same continuation the restart fixtures use (`start.catch(reject)`):
+    // it must not observe the original driver failure until runStart has closed its
+    // resource scope.
+    const failureAfterDisposal = start.then(
+      () => {
+        throw new Error("leader start unexpectedly completed");
+      },
+      (error) => {
+        expect(() => getDb()).toThrow("Database not initialized");
+        return error;
+      }
+    );
+
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const finishesPromptly = Promise.race([
-      start,
+      failureAfterDisposal,
       new Promise<never>((_, reject) => {
         timeout = setTimeout(
           () => reject(new Error("leader cleanup did not finish promptly")),
@@ -263,8 +273,7 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     ]).finally(() => {
       if (timeout) clearTimeout(timeout);
     });
-    await expect(finishesPromptly).rejects.toBe(failure);
-    expect(() => getDb()).toThrow("Database not initialized");
+    await expect(finishesPromptly).resolves.toBe(failure);
   });
 
   it("keeps a follower's config identity across real restarts without rootActor", async () => {
