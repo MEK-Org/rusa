@@ -72,8 +72,13 @@ The rest of #808 remains open. A production adapter needs the following evidence
    429, 5xx, stream failure, cancellation and timeout.
 5. Prove process cleanup, yield, restart and model-switch portable continuity with
    production supervisor integration. The synthetic subprocess tests prove direct-child
-   closure after settlement and EOF before settlement. They do not prove descendant cleanup,
-   sandbox or filesystem isolation, in-flight cancellation or real harness continuity.
+   closure after settlement and EOF before settlement. Existing
+   `process-group-kill.test.ts` proves live-grandchild abort cleanup through Copilot;
+   `sandbox-process-group-kill.test.ts` covers abort when bwrap is available.
+   The Linux duplex-close case in `process-group-kill.test.ts` adds termination evidence
+   for one ready same-group grandchild through the shared supervisor.
+   Escaped process groups, sandbox/filesystem isolation, real Pi in-flight cancellation
+   and harness continuity remain unproven.
 6. After operator provisioning and routing/data-policy review, run the separate
    capped synthetic smoke test. Record the executable version, adapter head,
    actual emitted records and spend. Durable accounting and its schema review
@@ -101,4 +106,28 @@ The two cases assert successful settlement and the exact EOF-before-settlement
 error. Each has a 10 s test timeout around a 3 s fallback deadline, so a missing
 EOF listener fails with the deadline reason. The peer stays alive after settlement
 and after closing stdout so direct-child cleanup is exercised. Sandbox reuse,
-descendant cleanup verification and real Pi compatibility remain open.
+escaped-descendant containment and real Pi compatibility remain open.
+
+## Linux descendant termination fixture
+
+Run `pnpm exec vitest run src/providers/process-group-kill.test.ts` from
+`packages/rusa`. The duplex-close case starts the synthetic Node parent in
+`src/providers/fixtures/process-tree.mjs` through the shared supervisor. That
+parent forks one grandchild without detaching it. The grandchild reports readiness
+over IPC; the parent then reports both PIDs over stdout. The case checks that both
+processes are running before explicit duplex close, then checks termination within
+2 s. The supervisor's 5 s deadline bounds failure; readiness triggers close
+immediately. The fixture supplies an empty child environment and makes no
+inference requests.
+
+This Linux-only case uses `/proc/<pid>/stat`. Missing entries and zombie state
+mean terminated. An orphan zombie may remain until PID 1 reaps it; the case does
+not claim grandchild reaping. Failure cleanup kills surviving synthetic PIDs.
+This proves one cooperative same-group topology, not containment of descendants
+that detach into another process group, a process namespace, sandbox policy, or
+behavior of Pi's own subprocesses. Non-Linux platforms skip this case.
+
+Verification on 2026-10-17: replacing the supervisor's negative-PID group signal
+with a positive direct-child PID makes the duplex-close case fail at the
+descendant termination assertion. Failure cleanup removes surviving fixture
+processes. Restoring the group signal restores passing behavior.
