@@ -167,7 +167,7 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     let workerId = "";
     let firstRuns: Array<{ id: string; outcome: string; prompt: string }> = [];
     await new Promise<void>((resolve, reject) => {
-      void runStart({
+      const start = runStart({
         e2e: {
           onReady: async (handles) => {
             try {
@@ -183,14 +183,17 @@ describe("shared startup, role authority, and local database (#1019)", () => {
               expect(handles.mesh.deliverWake(workerId, "record a local run")).toBe(true);
               await waitUntil(() => runRows(workerId).some((run) => run.outcome === "completed"));
               firstRuns = runRows(workerId);
-              await handles.shutdown();
-              resolve();
             } catch (error) {
               reject(error);
+              throw error;
+            } finally {
+              await handles.shutdown();
             }
+            resolve();
           },
         },
       });
+      void start.catch(reject);
     });
     expect(firstRuns.length).toBeGreaterThanOrEqual(1);
     expect(firstRuns[0]?.prompt).toContain("Leader local persistence fixture");
@@ -198,17 +201,21 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     // Boot 2 over the same home: the same identity, and boot 1's records survive.
     let secondIdentity: InstanceIdentity | undefined;
     let secondRuns: typeof firstRuns = [];
-    await new Promise<void>((resolve) => {
-      void runStart({
+    await new Promise<void>((resolve, reject) => {
+      const start = runStart({
         e2e: {
           onReady: async (handles) => {
-            secondIdentity = handles.instanceIdentity;
-            secondRuns = runRows(workerId);
-            await handles.shutdown();
+            try {
+              secondIdentity = handles.instanceIdentity;
+              secondRuns = runRows(workerId);
+            } finally {
+              await handles.shutdown();
+            }
             resolve();
           },
         },
       });
+      void start.catch(reject);
     });
     expect(secondIdentity).toEqual({ role: "leader", instanceId: "leader-node-alpha" });
     expect(secondRuns).toEqual(firstRuns);
@@ -220,6 +227,45 @@ describe("shared startup, role authority, and local database (#1019)", () => {
     ).toBeUndefined();
     db.close();
   }, 30_000);
+
+  it("releases leader startup resources when the E2E driver fails before shutdown", async () => {
+    const home = makeTempHome();
+    process.env.RUSA_HOME = home;
+    writeConfigFile(home, {
+      providers: { fake: {} },
+      github: { account: "test-account" },
+      webhook: { port: 9742, secret: "secret" },
+      instance: { id: "leader-failed-driver" },
+    });
+
+    const failure = new Error("forced leader e2e driver failure");
+    const start = runStart({
+      e2e: {
+        onReady: async (handles) => {
+          expect(handles.instanceIdentity).toEqual({
+            role: "leader",
+            instanceId: "leader-failed-driver",
+          });
+          throw failure;
+        },
+      },
+    });
+
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const finishesPromptly = Promise.race([
+      start,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("leader cleanup did not finish promptly")),
+          1_000
+        );
+      }),
+    ]).finally(() => {
+      if (timeout) clearTimeout(timeout);
+    });
+    await expect(finishesPromptly).rejects.toBe(failure);
+    expect(() => getDb()).toThrow("Database not initialized");
+  });
 
   it("keeps a follower's config identity across real restarts without rootActor", async () => {
     const home = makeTempHome();

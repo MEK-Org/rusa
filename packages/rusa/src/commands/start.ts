@@ -758,7 +758,12 @@ export interface RunStartE2EHooks {
   quotaApi?: QuotaApiDeps;
   /** Deterministic statfs/clock for the host disk sensor; production reads the real volume. */
   diskAlertDeps?: DiskUsageAlertDeps;
-  onReady?: (handles: RunStartE2EHandles) => void;
+  /**
+   * Drives a fully composed leader in an E2E fixture. The composition awaits
+   * this callback so a fixture failure follows the same resource cleanup path
+   * as a startup failure.
+   */
+  onReady?: (handles: RunStartE2EHandles) => void | Promise<void>;
   connectPeer?: boolean;
   /** Exercise follower HTTP command ingestion while retaining E2E shutdown handles. */
   followerPolling?: boolean;
@@ -5474,7 +5479,7 @@ async function composeStart(
 
   // E2E: now that every edge is wired and shutdown exists, hand the driving
   // runner live handles so it can inject events and tear down deterministically.
-  opts?.e2e?.onReady?.({
+  await opts?.e2e?.onReady?.({
     mesh,
     instanceIdentity: identity,
     coordinatorAppliedInterval: (provider) =>
