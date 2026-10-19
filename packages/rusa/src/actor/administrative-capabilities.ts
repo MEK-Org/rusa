@@ -1,3 +1,5 @@
+import type { RusaConfig } from "../config/types.js";
+import { OBLIGATION_RESPONSIVE_CAPABILITY } from "../mcp/obligations-mcp.js";
 import { PNPM_HARDLINKS_MCP_NAME } from "../mcp/pnpm-hardlinks-mcp.js";
 import { UPDATE_MCP_NAME } from "../mcp/update-mcp.js";
 import type { ActorRecord } from "./actor-record.js";
@@ -8,8 +10,8 @@ import type { CapabilityGrantStore } from "./capability-grants.js";
  * grant-derived capabilities (#549) — not a property of the distinguished root
  * actor. Each name covers exactly one existing administrative surface; none of
  * them is a catch-all "root" marker, and holding one confers nothing about the
- * others. Only durable grant rows authorize these operations. The default
- * bootstrap resolves the oldest active parentless actor (#1087), while the
+ * others. Explicit durable grants and the default actor’s in-memory capabilities authorize
+ * these operations. Startup resolves the oldest active parentless actor, while the
  * literal `root` address itself grants nothing.
  *
  * Every operation that names a target actor is scoped to the holder's own
@@ -46,7 +48,7 @@ export const ACTOR_ADMIN_CAPABILITY = "actor-admin";
  * Manage membership of the one mesh-wide voice Chat Room (#663): add or remove
  * participants, and give an added actor an unused voice when its own collides.
  * The room has no subtree to scope to, so this is host-global like the
- * model-class registry: included in the default bootstrap set and never granted
+ * model-class registry: included in the in-memory default set and never granted
  * through the mesh. Room membership itself remains explicit.
  */
 export const ROOM_ADMIN_CAPABILITY = "room-admin";
@@ -55,14 +57,14 @@ export const ROOM_ADMIN_CAPABILITY = "room-admin";
  * Manage obligations regardless of their owner or actor-tree position. This is
  * deliberately distinct from actor administration: it lets a named actor work
  * human-owned and orphan-owned obligations, but grants no lifecycle, model, or
- * capability authority. An authenticated operator provisions it directly;
- * configuration and the configured-actor import never seed it (#1003).
+ * capability authority. The in-memory default role belongs to the oldest active
+ * parentless actor; further bindings require an authenticated operator.
  */
 export const OBLIGATIONS_ADMIN_CAPABILITY = "obligations-admin";
 
 /**
- * Capabilities whose durable rows are changed only through an authenticated
- * operator boundary. Keeping this separate from host-global capabilities is
+ * Beyond the in-memory default role, these durable rows are changed only through an
+ * authenticated operator boundary. Keeping this separate from host-global capabilities is
  * intentional: obligations administration has no host-wide side effect, but
  * an actor-facing grantor must not bootstrap cross-owner obligation reach.
  */
@@ -99,10 +101,9 @@ export const HOST_MAINTENANCE_CAPABILITIES: ReadonlySet<string> = new Set([
  * registry, and managing the mesh-wide Chat Room roster. The subtree boundary that bounds every other delegation cannot
  * bound these, so the mesh never grants one — not downward, and not to the
  * grantor itself, which is the path by which a delegated `capability-admin`
- * holder would otherwise widen into host authority. Startup no longer seeds
- * one and no operator path creates one yet (#1087), so only an existing row
- * authorizes it; a holder may revoke it from itself, and that revocation is
- * deliberately one-way from inside the mesh.
+ * holder would otherwise widen into host authority. The default actor
+ * holds these in memory. Explicit durable grants remain independently
+ * revocable; revocation does not remove role-derived authority.
  */
 export const HOST_GLOBAL_CAPABILITIES: ReadonlySet<string> = new Set([
   MODEL_ADMIN_CAPABILITY,
@@ -112,35 +113,70 @@ export const HOST_GLOBAL_CAPABILITIES: ReadonlySet<string> = new Set([
 
 /**
  * Everything the configured actor held implicitly before administration became
- * grant-derived. The default bootstrap provisions this fixed set for the
- * oldest active parentless actor; existing active or revoked rows stand.
+ * grant-derived. The default role supplies this fixed set in memory for the
+ * oldest active parentless actor, independently of explicit durable grants.
  */
 export const CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES: readonly string[] = [
   ...ADMINISTRATIVE_CAPABILITIES,
+  OBLIGATIONS_ADMIN_CAPABILITY,
+  OBLIGATION_RESPONSIVE_CAPABILITY,
   ...HOST_MAINTENANCE_CAPABILITIES,
 ];
 
-/**
- * The subset of the bootstrap set whose FIRST insertion this boot should
- * perform: every administrative capability (they gate tools on the agent-exec
- * endpoint, which always exists) plus only those host-maintenance servers the
- * wiring managed to build, so a host whose deploy checkout can't be resolved
- * never gets an `update` row written on its behalf. This governs insertion
- * only. Seeding is non-destructive by design, so a row seeded by an earlier
- * boot stays active on a later boot that cannot mount its server; that row is
- * inert until the server is mountable again.
- */
-export function bootstrapCapabilitiesFor(mountable: ReadonlySet<string>): string[] {
-  return CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES.filter(
-    (capability) => ADMINISTRATIVE_CAPABILITIES.has(capability) || mountable.has(capability)
-  );
+/** The former root’s implicit permissions, including configured communication scope. */
+export function defaultActorBootstrapCapabilities(
+  config: Pick<RusaConfig, "chat" | "slack">
+): string[] {
+  const capabilities = [...CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES];
+  if (config.chat) {
+    const spaces = config.chat.gchat;
+    capabilities.push(
+      ...(Array.isArray(spaces) ? spaces : ["*"]).map((space) => `chat-write:${space}`)
+    );
+  }
+  if (config.slack) capabilities.push("slack-write:*");
+  return capabilities;
 }
 
-/** The `grantedBy` recorded on a seeded row, so the audit view shows its provenance. */
+/** Legacy default-row provenance; retained rows remain inspectable but grant no authority. */
 export const CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR = "system:bootstrap";
 
 /**
- * Insert the default administrative grants exactly once per
+ * Supply role-derived authority without materializing it in the grant store.
+ * The composition point selects the recipient at boot (or first creation on an
+ * empty instance). Explicit grants remain independent and revocable. Old
+ * bootstrap rows remain in the audit view but cannot preserve a former
+ * recipient's authority or a removed configured communication scope.
+ */
+export function withDefaultActorCapabilities(
+  store: CapabilityGrantStore,
+  recipient: () => string | undefined,
+  capabilities: readonly string[]
+): CapabilityGrantStore {
+  return {
+    grant: (grant) => store.grant(grant),
+    revoke: (actorId, capability, at) => store.revoke(actorId, capability, at),
+    list: () => store.list(),
+    activeFor: (actorId) =>
+      [
+        ...new Set([
+          ...store
+            .list()
+            .filter(
+              (grant) =>
+                grant.actorId === actorId &&
+                !grant.revokedAt &&
+                grant.grantedBy !== CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR
+            )
+            .map((grant) => grant.capability),
+          ...(actorId === recipient() ? capabilities : []),
+        ]),
+      ].sort(),
+  };
+}
+
+/**
+ * Legacy fixture helper: insert the former default grants exactly once per
  * (actor, capability) pair. A pair that already has a row — active OR revoked —
  * is left alone, so a revocation survives every later boot: the seed is a
  * materialization of defaults into durable rows. Returns the capabilities

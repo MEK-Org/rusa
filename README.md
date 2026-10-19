@@ -103,6 +103,25 @@ whole mesh respects one global concurrency cap however many actors are live.
 Actor runs are sandboxed with **bubblewrap** (`apt install bubblewrap` on a
 host install); `rusa start` fails fast if the host can't sandbox.
 
+### Default actor permissions
+
+On startup, the oldest active parentless actor receives the former root's
+administrative and host maintenance permissions, obligation administration and
+responsive authority, and configured communication writes **in memory only**.
+An empty instance assigns these defaults when its first actor is created.
+When Chat is configured, `chat.gchat: all` or an omitted `gchat` allows all
+spaces; an explicit list limits default writes to those spaces, and an empty
+list allows none. Configured Slack permits writes to all channels.
+
+Defaults are recomputed from configuration and the selected actor at each
+startup. They create no durable grant rows, and revoking an explicit grant
+does not remove a permission supplied by the default role. Other actors gain
+no default authority merely from being parentless or descendants. Explicit
+operator and actor grants remain independently durable and revocable.
+Legacy `system:bootstrap` rows stay visible in the grant audit but no longer
+authorize access, so they cannot retain a former default's permissions or an
+obsolete communication scope after restart.
+
 ### Memory
 
 Rusa keeps three tiers of memory, deliberately separated:
