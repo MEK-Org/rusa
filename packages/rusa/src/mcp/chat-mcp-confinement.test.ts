@@ -1,44 +1,14 @@
 import { execFileSync } from "node:child_process";
-import {
-  mkdirSync,
-  mkdtempSync,
-  realpathSync,
-  renameSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FakeChatClient } from "../chat/fake.js";
 import { createChatWriteMcpServer } from "./chat-mcp.js";
-
-// One-shot hook run right after realpath resolves to `path`: the attachment
-// target has been validated, and the hook lands a swap before the bytes are
-// read (#832).
-const afterResolve = vi.hoisted(() => ({
-  path: undefined as string | undefined,
-  run: undefined as (() => void) | undefined,
-}));
-vi.mock("node:fs/promises", async () => {
-  const actual = (await vi.importActual<typeof import("node:fs")>("node:fs")).promises;
-  const realpath = async (...args: Parameters<typeof actual.realpath>) => {
-    const resolved = await actual.realpath(...args);
-    if (afterResolve.path !== undefined && resolved === afterResolve.path) {
-      const run = afterResolve.run;
-      afterResolve.path = undefined;
-      afterResolve.run = undefined;
-      run?.();
-    }
-    return resolved;
-  };
-  return { ...actual, default: { ...actual, realpath }, realpath };
-});
 
 async function connect(server: McpServer): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -99,8 +69,6 @@ describe.each(callSites)("Chat $name disk reads (#832)", ({ call }) => {
   });
 
   afterEach(() => {
-    afterResolve.path = undefined;
-    afterResolve.run = undefined;
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -108,37 +76,6 @@ describe.each(callSites)("Chat $name disk reads (#832)", ({ call }) => {
     expect(fake.uploadedAttachments).toEqual([]);
     expect(fake.sent).toEqual([]);
   }
-
-  it("refuses a final-component symlink swapped in after validation", async () => {
-    const target = join(workDir, "report.txt");
-    writeFileSync(target, "inside");
-    afterResolve.path = target;
-    afterResolve.run = () => {
-      rmSync(target);
-      symlinkSync(join(outside, "report.txt"), target);
-    };
-
-    const res = (await call(client, "report.txt")) as CallToolResult;
-    expect(res.isError).toBe(true);
-    expect(textOf(res)).toContain("access denied");
-    expectNothingUploaded();
-  });
-
-  it("refuses an ancestor directory swapped for an outside symlink after validation", async () => {
-    const sub = join(workDir, "sub");
-    mkdirSync(sub);
-    writeFileSync(join(sub, "report.txt"), "inside");
-    afterResolve.path = join(sub, "report.txt");
-    afterResolve.run = () => {
-      renameSync(sub, join(workDir, "sub-moved"));
-      symlinkSync(outside, sub);
-    };
-
-    const res = (await call(client, "sub/report.txt")) as CallToolResult;
-    expect(res.isError).toBe(true);
-    expect(textOf(res)).toContain("access denied");
-    expectNothingUploaded();
-  });
 
   it.skipIf(process.platform !== "linux")(
     "refuses a FIFO without blocking on it",

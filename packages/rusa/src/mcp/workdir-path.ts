@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { type FileHandle, lstat, open, realpath, stat, unlink } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { type FileHandle, lstat, open, realpath, unlink } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 function isContained(parent: string, child: string): boolean {
   const rel = relative(parent, child);
@@ -34,8 +34,7 @@ export async function resolveAttachmentPath(workDir: string, filePath: string): 
  * Resolve a download destination inside the calling actor's workdir. The
  * parent directory must already exist and realpath inside the workdir, so a
  * symlinked directory cannot redirect the write elsewhere. This only
- * validates the name; write it with {@link streamNewFileInWorkdir}, which holds
- * the boundary at the open itself.
+ * validates the name; write it with {@link streamNewFileInWorkdir}.
  */
 export async function resolveDownloadPath(
   workDir: string,
@@ -54,113 +53,48 @@ export async function resolveDownloadPath(
 }
 
 /**
- * Open the parent directory of a resolved path by walking it from the
- * filesystem root one component at a time, each relative to the previous
- * directory's descriptor and without following symlinks. The path was
- * realpath'd, so it has no legitimate symlinks; one that appears in any
- * component, whether inside the workdir or above the workdir root, was swapped
- * in after resolution and is refused rather than followed out of the root. Node
- * has no openat, so lookups go through Linux's `/proc/self/fd`; without it this
- * fails closed rather than falling back to a pathname open. Returns the parent
- * handle with the final component's name, for {@link inDir}.
+ * Open a path already confined by {@link resolveAttachmentPath} or
+ * {@link resolveDownloadPath}, rechecking that it still names a location inside
+ * the workdir. This is an ordinary pathname open: confinement is checked at
+ * resolution, and a directory renamed or replaced while a call is in flight is
+ * outside what this boundary promises.
  */
-async function openParentInWorkdir(
-  workDir: string,
-  confinedPath: string
-): Promise<{ dir: FileHandle; name: string }> {
-  const realRoot = await realpath(workDir);
-  if (!isContained(realRoot, confinedPath)) {
-    throw new Error("access denied: path resolves outside the actor workdir");
-  }
-  const names = confinedPath.split(sep).filter(Boolean);
-  const name = names.pop();
-  if (name === undefined) throw new Error("access denied: path names no file");
-  let dir = await open(sep, DIR_FLAGS);
-  try {
-    const anchor = await stat(`/proc/self/fd/${dir.fd}`).catch(() => undefined);
-    const fsRoot = await dir.stat();
-    if (anchor?.dev !== fsRoot.dev || anchor?.ino !== fsRoot.ino) {
-      throw new Error("workdir file I/O needs Linux /proc/self/fd; refusing to open by pathname");
-    }
-    for (const component of names) {
-      const next = await open(inDir(dir, component), DIR_FLAGS).catch((err) => {
-        throw refusedSwap(err, false);
-      });
-      const parent = dir;
-      dir = next;
-      await parent.close();
-    }
-    return { dir, name };
-  } catch (err) {
-    await dir.close();
-    throw err;
-  }
-}
-
-const DIR_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
-
-/** `name` inside the directory `dir` holds open, independent of its current pathname. */
-function inDir(dir: FileHandle, name: string): string {
-  return `/proc/self/fd/${dir.fd}/${name}`;
-}
-
-function refusedSwap(err: unknown, last: boolean): unknown {
-  const code = (err as NodeJS.ErrnoException).code;
-  if (code === "ELOOP" || (!last && code === "ENOTDIR")) {
-    return Object.assign(
-      new Error("access denied: a path component changed to a symlink after resolution"),
-      { code }
-    );
-  }
-  return err;
-}
-
 async function openInWorkdir(
   workDir: string,
   confinedPath: string,
   flags: number,
   mode?: number
 ): Promise<FileHandle> {
-  const { dir, name } = await openParentInWorkdir(workDir, confinedPath);
-  try {
-    return await open(inDir(dir, name), flags, mode).catch((err) => {
-      throw refusedSwap(err, true);
-    });
-  } finally {
-    await dir.close();
+  const realRoot = await realpath(workDir);
+  if (!isContained(realRoot, confinedPath)) {
+    throw new Error("access denied: path resolves outside the actor workdir");
   }
+  return open(confinedPath, flags, mode);
 }
 
 /**
  * Stream data into a new file at a {@link resolveDownloadPath} target, computing
  * sha256 without buffering the whole payload. The client supplies a response
  * already bounded at its download limit; this helper owns only confined,
- * safe artifact publication. It opens the destination file exclusively (`O_EXCL`)
- * through the parent directory descriptor. On failure, the source stream is
- * cancelled and partial output is unlinked via `unlinkIfSame` through the same
- * directory descriptor. Callers operate within their actor workdir and must
- * not concurrently replace destination pathnames during an active download.
+ * safe artifact publication. It opens the destination exclusively (`O_EXCL`),
+ * so an existing file is never overwritten. On failure, the source stream is
+ * cancelled and partial output is unlinked while that pathname still names the
+ * file this call created.
  */
 export async function streamNewFileInWorkdir(
   workDir: string,
   path: string,
   stream: ReadableStream<Uint8Array> | null
 ): Promise<{ bytes: number; sha256: string }> {
-  let dir: FileHandle | undefined;
   let handle: FileHandle | undefined;
-  let name = "";
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   try {
-    const parent = await openParentInWorkdir(workDir, path);
-    dir = parent.dir;
-    name = parent.name;
-    handle = await open(
-      inDir(dir, name),
+    handle = await openInWorkdir(
+      workDir,
+      path,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
       0o666
-    ).catch((err) => {
-      throw refusedSwap(err, true);
-    });
+    );
     const hash = createHash("sha256");
     let bytesWritten = 0;
     if (stream) {
@@ -184,20 +118,19 @@ export async function streamNewFileInWorkdir(
   } catch (err) {
     await reader?.cancel().catch(() => {});
     if (!reader) await stream?.cancel().catch(() => {});
-    if (dir && handle) await unlinkIfSame(dir, name, handle);
+    if (handle) await unlinkIfSame(path, handle);
     throw err;
   } finally {
     reader?.releaseLock();
     await handle?.close().catch(() => {});
-    await dir?.close().catch(() => {});
   }
 }
 
-/** Unlink `name` in `dir` only while it is still the file `handle` has open. */
-async function unlinkIfSame(dir: FileHandle, name: string, handle: FileHandle): Promise<void> {
+/** Unlink `path` only while it is still the file `handle` has open. */
+async function unlinkIfSame(path: string, handle: FileHandle): Promise<void> {
   try {
-    const [opened, current] = await Promise.all([handle.stat(), lstat(inDir(dir, name))]);
-    if (opened.dev === current.dev && opened.ino === current.ino) await unlink(inDir(dir, name));
+    const [opened, current] = await Promise.all([handle.stat(), lstat(path)]);
+    if (opened.dev === current.dev && opened.ino === current.ino) await unlink(path);
   } catch (_) {}
 }
 
@@ -205,10 +138,10 @@ const READ_CHUNK_BYTES = 64 * 1024;
 
 /**
  * Read a confined file with a hard byte bound at the read itself, so the cap
- * holds even if the file grows or is replaced after it was resolved. The
- * handle is opened within the workdir without following any symlink and
- * nonblocking (a FIFO cannot stall the open), then must be a regular file; at
- * most `maxBytes + 1` bytes are ever read. `noun` names the file in the size
+ * holds even if the file grows after it was resolved. The handle is opened
+ * without following a final-component symlink and nonblocking (a FIFO cannot
+ * stall the open), then must be a regular file; at most `maxBytes + 1` bytes
+ * are ever read. `noun` names the file in the size
  * error, so each caller keeps its existing wording.
  */
 export async function readBoundedRegularFile(
