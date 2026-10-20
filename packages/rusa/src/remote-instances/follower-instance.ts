@@ -66,6 +66,8 @@ export class FollowerInstance {
 
   dispatch({ actorId, message }: FollowerActorCommand): void {
     if (this.stopped) return;
+    // Commands, `fileOp` included, only arrive through `/poll`: `rusa start`
+    // reconciles before its first poll and standalone follower.js never needs to.
     if (!this.reconciled) {
       throw new Error("Follower instance is not reconciled with leader; dispatch refused");
     }

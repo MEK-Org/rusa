@@ -917,6 +917,44 @@ describe("sandbox bwrap args", () => {
       return { home, mcHome, actorDir, gchatDir: join(home, ".config", "gchat") };
     }
 
+    // Every in-sandbox path at which the host dir is visible: its own path
+    // (through the read-only root) plus each bind that maps an ancestor or the
+    // dir itself onto a different target.
+    function viewsOf(args: string[], dir: string): string[] {
+      const views = new Set([dir]);
+      for (let i = 0; i < args.length; i += 1) {
+        if (args[i] !== "--bind" && args[i] !== "--ro-bind") continue;
+        const [source, target] = [args[i + 1], args[i + 2]];
+        if (dir === source || dir.startsWith(`${source}/`)) {
+          views.add(target + dir.slice(source.length));
+        }
+      }
+      return [...views];
+    }
+
+    // bwrap applies mounts in argument order, so the last mount at or above a
+    // path decides what the worker sees there.
+    function lastCoveringMount(args: string[], path: string): string[] | undefined {
+      let last: string[] | undefined;
+      for (let i = 0; i < args.length; i += 1) {
+        const op = args[i];
+        const target =
+          op === "--tmpfs"
+            ? args[i + 1]
+            : op === "--bind" || op === "--ro-bind"
+              ? args[i + 2]
+              : undefined;
+        if (target && (path === target || path.startsWith(`${target}/`))) last = [op, target];
+      }
+      return last;
+    }
+
+    function expectEveryViewShadowed(args: string[], dir: string): void {
+      for (const view of viewsOf(args, dir)) {
+        expect(lastCoveringMount(args, view)).toEqual(["--tmpfs", view]);
+      }
+    }
+
     it("tmpfs-shadows the host's real ~/.config/gchat dir for real workers", async () => {
       const { actorDir, gchatDir } = makeWorkerHome();
       mkdirSync(gchatDir, { recursive: true, mode: 0o700 });
@@ -999,26 +1037,39 @@ describe("sandbox bwrap args", () => {
       const { buildActorBwrapArgs } = await import("./sandbox.js");
       const { args } = buildActorBwrapArgs(actorDir, "antigravity");
 
-      // bwrap applies mounts in argument order, so the last mount at or above
-      // each credential dir decides what the worker sees. A later bind of an
-      // ancestor (here the writable ~/.gemini) would expose the host dir again.
-      const lastCoveringMount = (dir: string) => {
-        let last: string[] | undefined;
-        for (let i = 0; i < args.length; i += 1) {
-          const op = args[i];
-          const target =
-            op === "--tmpfs"
-              ? args[i + 1]
-              : op === "--bind" || op === "--ro-bind"
-                ? args[i + 2]
-                : undefined;
-          if (target && (dir === target || dir.startsWith(`${target}/`))) last = [op, target];
-        }
-        return last;
-      };
+      // A later bind of an ancestor (here the writable ~/.gemini) would expose
+      // the host dir again.
       expect(args).toContain(join(home, ".gemini"));
-      expect(lastCoveringMount(configuredDir)).toEqual(["--tmpfs", configuredDir]);
-      expect(lastCoveringMount(gchatDir)).toEqual(["--tmpfs", gchatDir]);
+      expectEveryViewShadowed(args, configuredDir);
+      expectEveryViewShadowed(args, gchatDir);
+      warnSpy.mockRestore();
+    });
+
+    it("also shadows a configured dir where a provider bind projects it elsewhere (#1013)", async () => {
+      const { home, actorDir, gchatDir } = makeWorkerHome();
+      mkdirSync(gchatDir, { recursive: true, mode: 0o700 });
+      // kimi binds the host ~/.kimi-code/credentials onto /tmp/kimi-home/credentials,
+      // so a credential dir inside it is also visible under that second path.
+      const configuredDir = join(home, ".kimi-code", "credentials", "google-creds");
+      mkdirSync(configuredDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(configuredDir, "drive-token.json"), '{"refresh_token":"x"}', {
+        mode: 0o600,
+      });
+      mockLoadConfig.mockReturnValue({
+        github: { account: "test" },
+        providers: {},
+        webhook: { port: 9742, secret: "secret" },
+        gitBridge: false,
+        chat: { gchatConfigDir: configuredDir },
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const { args } = buildActorBwrapArgs(actorDir, "kimi");
+
+      expect(viewsOf(args, configuredDir)).toContain("/tmp/kimi-home/credentials/google-creds");
+      expectEveryViewShadowed(args, configuredDir);
+      expectEveryViewShadowed(args, gchatDir);
       warnSpy.mockRestore();
     });
 

@@ -488,6 +488,13 @@ function injectWorkerGithubCredential(args: string[], mcHome: string): string | 
  * `drive-token.json`, `calendar-token.json`, etc. from the sandbox. It is
  * fail-closed in the sense that a bwrap failure to apply the shadow aborts the
  * spawn; there is no opt-out or fallback that leaves the real dir visible.
+ *
+ * bwrap applies mounts in argument order, so this must run after every mount
+ * it shadows. A configured dir can sit inside a writable provider bind, which
+ * may also project it to a second path (kimi binds `~/.kimi-code/credentials`
+ * onto `/tmp/kimi-home/credentials`), so each such view is shadowed too. A
+ * configured dir that instead contains a writable bind (say `~/.gemini`) blanks
+ * it, so the worker fails closed rather than leaking.
  */
 function injectGoogleCredentialShadow(args: string[]): void {
   const dirs = new Set([join(getHostConfigDir(), "gchat")]);
@@ -500,13 +507,24 @@ function injectGoogleCredentialShadow(args: string[]): void {
     // already loaded config before any actor could spawn.
   }
 
+  const views = new Set<string>();
   for (const dir of dirs) {
     // Only shadow a directory that exists on the host. If it does not, there is
     // nothing to hide there, and creating a synthetic mountpoint would be inert.
     if (!existsSync(dir)) continue;
-    ensureTargetParentDirs(args, dir);
-    args.push("--dir", dir);
-    args.push("--tmpfs", dir);
+    views.add(dir);
+    for (let i = 0; i < args.length; i += 1) {
+      if (args[i] !== "--bind" && args[i] !== "--ro-bind") continue;
+      const [source, target] = [args[i + 1], args[i + 2]];
+      if (dir === source || dir.startsWith(`${source}/`)) {
+        views.add(target + dir.slice(source.length));
+      }
+    }
+  }
+  for (const view of views) {
+    ensureTargetParentDirs(args, view);
+    args.push("--dir", view);
+    args.push("--tmpfs", view);
   }
 }
 
@@ -950,15 +968,6 @@ function buildMeshActorBwrapArgs(o: {
       args.push("--bind", join(actorState, path), join(hostState, path));
     }
   }
-  if (mcHome && isWorkerActor) {
-    // Google user-OAuth token shadow : same real-workers-only guard as
-    // the gh credential split. Root and the E2E root-agent double keep host
-    // visibility of the real `~/.config/gchat` dir. bwrap applies mounts in
-    // argument order, so this follows every in-place writable bind above: a
-    // configured dir inside one of them (say `~/.gemini/google-creds`) would
-    // otherwise be bound back in (#1013). Later mounts target `/tmp` or mask more.
-    injectGoogleCredentialShadow(args);
-  }
   // Topology guard (not secrecy): the root's real agy mcp_config carries the chat
   // server; a sandboxed worker must report to its parent, not talk to humans. Pin
   // the per-invocation config over both known paths (after the rw ~/.gemini bind,
@@ -1169,6 +1178,13 @@ function buildMeshActorBwrapArgs(o: {
   }
   args.push("--chdir", realActorDir);
   injectGitBridgeEnv(args);
+  if (mcHome && isWorkerActor) {
+    // Google user-OAuth token shadow : same real-workers-only guard as
+    // the gh credential split. Root and the E2E root-agent double keep host
+    // visibility of the real `~/.config/gchat` dir. Last, so no later mount can
+    // bind a credential dir back in (#1013).
+    injectGoogleCredentialShadow(args);
+  }
 
   return { args, commandPrefix, tempPaths };
 }
