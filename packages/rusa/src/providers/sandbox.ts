@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { hostJobAuditArtifactDir } from "../actor/host-job-audit-artifact.js";
+import { defaultGchatConfigDir } from "../chat/gchat-oauth.js";
 import { loadConfig } from "../config/loader.js";
 import { assertSecretContainment, SECRETS_DIRNAME } from "../config/secrets.js";
 import { DbCapabilityGrantStore } from "../db/repositories/capability-grant-repository.js";
@@ -497,7 +498,8 @@ function injectWorkerGithubCredential(args: string[], mcHome: string): string | 
  * it, so the worker fails closed rather than leaking.
  */
 function injectGoogleCredentialShadow(args: string[]): void {
-  const dirs = new Set([join(getHostConfigDir(), "gchat")]);
+  // The Google clients default to ~/.config/gchat whatever XDG_CONFIG_HOME says.
+  const dirs = new Set([join(getHostConfigDir(), "gchat"), defaultGchatConfigDir()]);
   try {
     const configured = loadConfig().chat?.gchatConfigDir;
     if (configured) dirs.add(realpathIfExists(resolve(configured)));

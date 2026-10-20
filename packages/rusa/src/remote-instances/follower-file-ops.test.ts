@@ -111,7 +111,6 @@ describe("follower file operations (#1013)", () => {
       "this follower has no Google Drive credentials: missing drive-token.json"
     );
     const none = createFollowerFileOps({ credentialDir: credentials(), driveClient: () => drive });
-    await expect(run(workDir, driveOp)).rejects.toThrow("missing drive-token.json");
     await expect(none(workDir, driveOp)).rejects.toThrow(
       "this follower has no Google Drive credentials: missing client.json, drive-token.json"
     );

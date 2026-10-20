@@ -1085,6 +1085,21 @@ describe("sandbox bwrap args", () => {
       warnSpy.mockRestore();
     });
 
+    it("shadows ~/.config/gchat even when XDG_CONFIG_HOME points elsewhere (#1013)", async () => {
+      const { home, actorDir, gchatDir } = makeWorkerHome();
+      // The Google clients default to ~/.config/gchat regardless of XDG_CONFIG_HOME.
+      process.env.XDG_CONFIG_HOME = join(home, "xdg");
+      mkdirSync(gchatDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(gchatDir, "drive-token.json"), '{"refresh_token":"x"}', { mode: 0o600 });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const { args } = buildActorBwrapArgs(actorDir, "antigravity");
+
+      expectShadowed(args, [gchatDir]);
+      warnSpy.mockRestore();
+    });
+
     it("is inert when the host has no ~/.config/gchat dir", async () => {
       const { actorDir, gchatDir } = makeWorkerHome();
       // Intentionally do not create gchatDir.
