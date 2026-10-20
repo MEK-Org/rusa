@@ -284,7 +284,7 @@ export function seedBriefText(): string {
   return "## WHAT\n\n## HOW\n\n## DOMAIN\n";
 }
 
-/** Seed the brief at generation 0 on the first brief-mode prompt, leaving ledger fields untouched. */
+/** Seed at generation 0 on first tool use or brief-mode prompt, leaving ledger fields untouched. */
 export function seedPortableBriefState(
   state: PortableContextState,
   now: string

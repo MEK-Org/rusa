@@ -10313,6 +10313,122 @@ describe("runStart webhook event routing (Phase 4)", () => {
       logCapture.lines.length = 0;
     });
 
+    it("lets every context mode prepare a shadow brief while ledger prompts stay active", async () => {
+      const { mesh, root } = await boot();
+      expect(mcpServersOf(root).filter((server) => server.name === "brief")).toHaveLength(1);
+
+      let ledgerId = "";
+      for (const context of [
+        { type: "native" },
+        { type: "portable", mode: "tail" },
+        { type: "portable", mode: "ledger" },
+        { type: "portable", mode: "brief" },
+      ] as const) {
+        const id = mesh.spawn({
+          charter: "Synthetic shadow brief worker",
+          parentId: rootId,
+          modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+          context,
+        });
+        const servers = mcpServersOf(workerOf(mesh, id)).filter(
+          (server) => server.name === "brief"
+        );
+        expect(servers).toHaveLength(1);
+        const url = servers[0]?.url;
+        if (!url) throw new Error("brief MCP missing");
+        const client = new Client({ name: "shadow-brief", version: "0.0.0" });
+        await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+        try {
+          expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual([
+            "read",
+            "replace",
+          ]);
+          expect((await client.callTool({ name: "read", arguments: {} })).isError).not.toBe(true);
+          expect(mesh.actors.get(id)?.context).toEqual(context);
+        } finally {
+          await client.close();
+        }
+        if (context.type === "portable" && context.mode === "ledger") ledgerId = id;
+      }
+
+      const messageId = getRepositories().meshChat.record({
+        senderId: rootId,
+        recipientId: ledgerId,
+        body: "Keep the palette small.",
+      });
+      const store = getRepositories().portableContext;
+      const ledger = {
+        ...store.load(ledgerId),
+        generation: 7,
+        lastFoldedSourceId: messageId,
+        items: [
+          {
+            id: "ledger-rule",
+            kind: "decision" as const,
+            priority: "must" as const,
+            status: "active" as const,
+            statement: "The existing ledger remains active.",
+            evidence: [
+              {
+                eventId: messageId,
+                sender: rootId,
+                ts: "2026-10-20T00:00:00Z",
+                quote: "Keep the palette small.",
+              },
+            ],
+            updatedAt: "2026-10-20T00:00:00Z",
+          },
+        ],
+      };
+      store.save(ledger);
+      let actor = workerOf(mesh, ledgerId);
+      const buildPrompt = () => (actor as unknown as { opts: ActorOptions }).opts.buildPrompt();
+      const beforePrompt = buildPrompt().prompt;
+      const briefUrl = mcpServersOf(actor).find((server) => server.name === "brief")?.url;
+      if (!briefUrl) throw new Error("brief MCP missing");
+      const client = new Client({ name: "shadow-write", version: "0.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(briefUrl)));
+      const text = `## WHAT\n\n## HOW\nKeep the palette small. [mesh:messages/${messageId}]\n\n## DOMAIN\n`;
+      try {
+        const result = await client.callTool({
+          name: "replace",
+          arguments: { text, expected_generation: 0 },
+        });
+        expect(result.isError).not.toBe(true);
+      } finally {
+        await client.close();
+      }
+      const written = store.load(ledgerId);
+      expect(written).toEqual({
+        ...ledger,
+        brief: { text, generation: 1, updatedAt: expect.any(String) },
+      });
+      expect(store.listBriefRevisions(ledgerId, 10)).toEqual([
+        expect.objectContaining({ generation: 1, actingPrincipal: ledgerId, after: text }),
+      ]);
+      expect(mesh.actors.get(ledgerId)?.context).toEqual({ type: "portable", mode: "ledger" });
+      expect(beforePrompt).toContain("The existing ledger remains active.");
+      expect(buildPrompt().prompt).toBe(beforePrompt);
+
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      const restarted = await boot();
+      actor = workerOf(restarted.mesh, ledgerId);
+      expect(getRepositories().portableContext.load(ledgerId)).toEqual(written);
+      expect(getRepositories().portableContext.listBriefRevisions(ledgerId, 10)).toHaveLength(1);
+      expect(restarted.mesh.actors.get(ledgerId)?.context).toEqual({
+        type: "portable",
+        mode: "ledger",
+      });
+      expect(buildPrompt().prompt).toBe(beforePrompt);
+
+      // A later explicit mode switch uses the prepared brief, without reseeding it.
+      restarted.mesh.actors.patch(ledgerId, { context: { type: "portable", mode: "brief" } });
+      expect(buildPrompt().prompt).toContain(text.trim());
+      expect(buildPrompt().prompt).not.toContain("The existing ledger remains active.");
+      expect(getRepositories().portableContext.load(ledgerId)).toEqual(written);
+    });
+
     it("rehydrates ordinary actors with their baseline and implicit default permissions", async () => {
       clearLegacyConfiguredGrants();
       withWorker("set-worker");
@@ -10331,6 +10447,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "brief",
         "pnpm-hardlinks",
         "update",
       ]);
@@ -10345,6 +10462,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "brief",
       ]);
       // Every worker endpoint is the worker's own; none is shared with root.
       const rootUrls = new Set(rootServers.map((server) => server.url));
@@ -10386,6 +10504,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "brief",
         "chat-write",
         "pnpm-hardlinks",
         "update",
@@ -10402,6 +10521,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "brief",
       ]);
     });
 

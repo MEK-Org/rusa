@@ -3835,16 +3835,16 @@ async function composeStart(
           { name: PNPM_INSTALL_MCP_NAME, url: pnpmInstallUrl },
         ];
 
-        if (rec.context?.type === "portable" && rec.context.mode === "brief") {
-          const briefUrl = mcpHttp.addServer(`${id}:${BRIEF_MCP_NAME}`, () =>
-            createBriefMcpServer({
-              actorId: id,
-              store: portableContextStore,
-              resolveCitation: resolveBriefCitation,
-            })
-          );
-          workerMcp.push({ name: BRIEF_MCP_NAME, url: briefUrl });
-        }
+        // Every actor can refine a shadow brief before selecting brief mode.
+        // The context selection alone decides which memory its prompt renders.
+        const briefUrl = mcpHttp.addServer(`${id}:${BRIEF_MCP_NAME}`, () =>
+          createBriefMcpServer({
+            actorId: id,
+            store: portableContextStore,
+            resolveCitation: resolveBriefCitation,
+          })
+        );
+        workerMcp.push({ name: BRIEF_MCP_NAME, url: briefUrl });
 
         // Mount any capabilities granted to this actor (by id) on top of the default
         // worker set (ISSUE_NUM, phase 1a). A granted-but-not-mountable capability (none
