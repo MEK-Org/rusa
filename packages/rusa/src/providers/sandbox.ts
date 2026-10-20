@@ -515,9 +515,13 @@ function injectGoogleCredentialShadow(args: string[]): void {
     views.add(dir);
     for (let i = 0; i < args.length; i += 1) {
       if (args[i] !== "--bind" && args[i] !== "--ro-bind") continue;
-      const [source, target] = [args[i + 1], args[i + 2]];
-      if (dir === source || dir.startsWith(`${source}/`)) {
-        views.add(target + dir.slice(source.length));
+      const target = args[i + 2];
+      // bwrap resolves a bind source's symlinks, and `dir` is already resolved,
+      // so compare against both spellings of the source.
+      for (const source of new Set([args[i + 1], realpathIfExists(args[i + 1])])) {
+        if (dir === source || dir.startsWith(`${source}/`)) {
+          views.add(target + dir.slice(source.length));
+        }
       }
     }
   }
