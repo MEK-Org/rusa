@@ -143,6 +143,28 @@ void main() {
       await store.dispose();
     });
 
+    testWidgets('a failed inbox fetch retries on the next tick', (
+      tester,
+    ) async {
+      final api = FakeApi()
+        ..inboxMetricsError = DashboardApiException(Uri(), 500, 'boom');
+      final store = DashboardStore(api: api, stream: FakeStream());
+
+      await store.pollInboxMetrics();
+      await tester.pump(const Duration(seconds: 15));
+      api
+        ..inboxMetricsError = null
+        ..inboxMetricsResult = _metrics([_point(_start)]);
+      await store.pollInboxMetrics();
+      expect(api.inboxMetricsCallCount, 2);
+      expect(store.inboxMetrics.value?.points, hasLength(1));
+      // A success restores the once-a-minute gate.
+      await tester.pump(const Duration(seconds: 15));
+      await store.pollInboxMetrics();
+      expect(api.inboxMetricsCallCount, 2);
+      await store.dispose();
+    });
+
     test(
       '503 is unavailable; other failures keep the window as cached',
       () async {

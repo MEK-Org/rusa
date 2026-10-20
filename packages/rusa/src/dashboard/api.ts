@@ -2669,8 +2669,10 @@ export async function handleMeshApiRequest(
   }
 
   // GET /api/mesh/inbox-metrics — prior three days of per-minute inbox backlog
-  // statistics across every live actor. Actor inboxes are shared mesh data
-  // for every admitted viewer, and only aggregates leave the server.
+  // statistics across every live actor. Every viewer receives the same
+  // aggregates over every unhandled entry, including entries the per-entry
+  // routes hide from other viewers (#590); only medians and maxima leave the
+  // server.
   if (pathname === "/api/mesh/inbox-metrics") {
     if (!deps.inboxMetrics) {
       sendJson(res, 503, { error: "inbox metrics unavailable" });

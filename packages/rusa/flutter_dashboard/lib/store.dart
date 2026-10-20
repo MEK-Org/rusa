@@ -956,31 +956,37 @@ class DashboardStore {
   }
 
   /// Re-reads the inbox window at most once a minute, its sampling rate,
-  /// however often the Overview ticks or remounts (#1018). Quota history is
-  /// not polled (#26); the shared chart range still moves with this payload.
+  /// however often the Overview ticks or remounts (#1018). The cooldown starts
+  /// with the request, so overlapping ticks share one fetch; a failed fetch
+  /// ends it, so the next tick retries. Quota history is not polled (#26); the
+  /// shared chart range still moves with this payload.
   Future<void> pollInboxMetrics() async {
     if (_inboxMetricsCooldown?.isActive ?? false) return;
-    _inboxMetricsCooldown = Timer(inboxMetricsRefreshInterval, () {});
-    await refreshInboxMetrics();
+    final cooldown = Timer(inboxMetricsRefreshInterval, () {});
+    _inboxMetricsCooldown = cooldown;
+    if (!await refreshInboxMetrics()) cooldown.cancel();
   }
 
   /// Per-minute inbox backlog (#1018). A 503 means the server has no
   /// collector; any other failure keeps the last window, marked cached.
-  Future<void> refreshInboxMetrics() async {
+  /// Returns whether the server answered.
+  Future<bool> refreshInboxMetrics() async {
     try {
       final metrics = await _api.fetchInboxMetrics();
       _inboxMetrics.add(metrics);
       _inboxMetricsStale.add(false);
+      return true;
     } on DashboardApiException catch (e) {
       if (e.status == 503) {
         _inboxMetrics.add(null);
         _inboxMetricsStale.add(false);
-        return;
+        return true;
       }
       if (_inboxMetrics.valueOrNull != null) _inboxMetricsStale.add(true);
     } catch (e) {
       if (_inboxMetrics.valueOrNull != null) _inboxMetricsStale.add(true);
     }
+    return false;
   }
 
   /// Replace the normalized actor-state snapshot from one authoritative server

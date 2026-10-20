@@ -36,10 +36,10 @@ export class InboxMetricRepository {
   constructor(private readonly db: Database.Database) {}
 
   /**
-   * Records the current minute's sample unless one exists, then prunes
-   * samples older than the window. Returns the new point, or null when this
-   * minute was already sampled. The live population and every inbox are read
-   * in one statement, so the sample is one consistent instant.
+   * Records the current minute's sample unless one exists; a new sample also
+   * prunes samples older than the window. Returns the new point, or null when
+   * this minute was already sampled. The live population and every inbox are
+   * read in one statement, so the sample is one consistent instant.
    */
   sampleIfDue(nowMs = Date.now()): InboxMetricPoint | null {
     const minute = new Date(minuteFloor(nowMs)).toISOString();
@@ -78,7 +78,7 @@ export class InboxMetricRepository {
         );
       return next;
     })();
-    this.prune(nowMs);
+    if (point) this.prune(nowMs);
     return point;
   }
 

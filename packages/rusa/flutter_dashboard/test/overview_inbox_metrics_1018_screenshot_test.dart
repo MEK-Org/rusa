@@ -5,9 +5,10 @@
 //
 // It writes `screenshots/1018_overview_<viewport>_after.png`, tall enough to
 // show the whole Overview. The inbox window has a six-hour unsampled outage
-// and a retirement that drops the live population from 9 to 7 actors. The
-// `_before` images come from the base commit with the same fixture minus the
-// inbox payload, which the base API cannot express.
+// and a retirement that drops the live population from 9 to 7 actors; the
+// queued actor carries a focus card. The `_before` images come from the base
+// commit with the same fixture minus the inbox payload, which the base API
+// cannot express.
 import 'dart:io';
 import 'dart:math' as math;
 
@@ -104,6 +105,13 @@ FakeApi _api() => FakeApi()
       runState: RunState.queued,
       queuePosition: 0,
       title: 'Docs sweep',
+      // A focus card shows where queued work lands beside, or below, its
+      // actor at this width.
+      selectedObligation: makeObligation(
+        'ob-docs',
+        ownerId: 'w3',
+        intent: 'Refresh the setup guide screenshots',
+      ),
     ),
   ]
   ..obligationsResult = [
@@ -156,6 +164,10 @@ void main() {
           await tester.pump(const Duration(milliseconds: 50));
         }
         expect(find.text('Approve the inbox chart schema'), findsOneWidget);
+        expect(
+          find.text('Refresh the setup guide screenshots'),
+          findsOneWidget,
+        );
         expect(tester.takeException(), isNull);
         final name = _suffix.isEmpty ? 'after' : _suffix;
         await captureBoundary(

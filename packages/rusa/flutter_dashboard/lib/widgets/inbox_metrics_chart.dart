@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import '../models.dart';
 import '../theme.dart';
+import 'chart_frame.dart';
 
 /// Every Overview chart spans the same prior three days (#1018).
 const kOverviewChartWindow = Duration(days: 3);
@@ -187,7 +188,7 @@ class InboxMetricsChart extends StatelessWidget {
           ),
           const SizedBox(height: 8),
         ],
-        _InboxChartSection(
+        ChartSection(
           title: 'Inbox Size',
           subtitle:
               'Unhandled entries per live actor, sampled each minute. Seen or '
@@ -208,9 +209,10 @@ class InboxMetricsChart extends StatelessWidget {
             max: (p) => p.inboxSizeMax,
           ),
           isStale: isStale,
+          legend: _legend,
         ),
         const SizedBox(height: 16),
-        _InboxChartSection(
+        ChartSection(
           title: 'Oldest Inbox Item',
           subtitle:
               'How long each live actor\'s oldest unhandled entry has waited. '
@@ -230,6 +232,7 @@ class InboxMetricsChart extends StatelessWidget {
             max: (p) => p.oldestAgeSecondsMax,
           ),
           isStale: isStale,
+          legend: _legend,
         ),
         const SizedBox(height: 10),
         _CoverageNote(points: inRange, start: start, end: end, range: range),
@@ -238,136 +241,14 @@ class InboxMetricsChart extends StatelessWidget {
   }
 }
 
-class _InboxChartSection extends StatelessWidget {
-  const _InboxChartSection({
-    required this.title,
-    required this.subtitle,
-    required this.semanticsLabel,
-    required this.chartKey,
-    required this.endLabelKey,
-    required this.painter,
-    required this.isStale,
-  });
-
-  final String title;
-  final String subtitle;
-  final String semanticsLabel;
-  final Key chartKey;
-  final Key endLabelKey;
-  final CustomPainter painter;
-  final bool isStale;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Text(
-          title,
-          style: const TextStyle(
-            color: MeshColors.textPrimary,
-            fontSize: 13,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-        const SizedBox(height: 2),
-        Text(
-          subtitle,
-          style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
-        ),
-        const SizedBox(height: 8),
-        Semantics(
-          label: semanticsLabel,
-          child: Container(
-            height: 220,
-            decoration: BoxDecoration(
-              color: MeshColors.bgTertiary,
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(
-                color: MeshColors.border.withValues(alpha: 0.5),
-              ),
-            ),
-            padding: const EdgeInsets.fromLTRB(8, 8, 8, 2),
-            child: Stack(
-              children: [
-                CustomPaint(
-                  key: chartKey,
-                  painter: painter,
-                  size: Size.infinite,
-                ),
-                Positioned(
-                  right: 0,
-                  bottom: 0,
-                  child: Text(
-                    isStale ? 'cached' : 'now',
-                    key: endLabelKey,
-                    style: kMonoStyle.copyWith(
-                      color: MeshColors.textMuted,
-                      fontSize: 9,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 10),
-        const Wrap(
-          spacing: 18,
-          runSpacing: 8,
-          children: [
-            _LegendItem(label: 'Median', color: kInboxMedianColor),
-            _LegendItem(label: 'Max', color: kInboxMaxColor, dashed: true),
-          ],
-        ),
-      ],
-    );
-  }
-}
-
-class _LegendItem extends StatelessWidget {
-  const _LegendItem({
-    required this.label,
-    required this.color,
-    this.dashed = false,
-  });
-
-  final String label;
-  final Color color;
-  final bool dashed;
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        SizedBox(
-          width: 18,
-          height: 3,
-          child: dashed
-              ? Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    for (var i = 0; i < 3; i++)
-                      Container(width: 4, height: 3, color: color),
-                  ],
-                )
-              : DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: color,
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-        ),
-        const SizedBox(width: 6),
-        Text(
-          label,
-          style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
-        ),
-      ],
-    );
-  }
-}
+const _legend = Wrap(
+  spacing: 18,
+  runSpacing: 8,
+  children: [
+    ChartLegendItem(label: 'Median', color: kInboxMedianColor),
+    ChartLegendItem(label: 'Max', color: kInboxMaxColor, dashed: true),
+  ],
+);
 
 /// How much of the range was sampled and how many live actors were
 /// summarized, so outages and population changes are not mistaken for an
@@ -430,49 +311,19 @@ class InboxMetricChartPainter extends CustomPainter {
   final double? Function(InboxMetricPointDto point) median;
   final double? Function(InboxMetricPointDto point) max;
 
-  static const _left = 42.0;
-  static const _right = 10.0;
-  static const _top = 10.0;
-  static const _bottom = 27.0;
-
   @override
   void paint(Canvas canvas, Size size) {
-    final plot = Rect.fromLTRB(
-      _left,
-      _top,
-      size.width - _right,
-      size.height - _bottom,
-    );
+    final plot = chartPlotRect(size);
     if (plot.width <= 0 || plot.height <= 0) return;
 
-    final gridPaint = Paint()
-      ..color = MeshColors.border.withValues(alpha: 0.7)
-      ..strokeWidth = 1;
+    final gridPaint = chartGridPaint();
     for (var quarter = 0; quarter <= 4; quarter++) {
       final value = axis.top * quarter / 4;
       final y = plot.bottom - axis.fractionOf(value) * plot.height;
       canvas.drawLine(Offset(plot.left, y), Offset(plot.right, y), gridPaint);
-      _paintLabel(
-        canvas,
-        axis.label(value),
-        Offset(0, y - 7),
-        width: _left - 6,
-        align: TextAlign.right,
-      );
+      paintChartValueLabel(canvas, axis.label(value), y);
     }
-    for (var quarter = 0; quarter <= 4; quarter++) {
-      final x = plot.left + (quarter / 4) * plot.width;
-      canvas.drawLine(Offset(x, plot.top), Offset(x, plot.bottom), gridPaint);
-    }
-    final span = end.difference(start);
-    _paintLabel(canvas, _agoLabel(span), Offset(plot.left, plot.bottom + 7));
-    _paintLabel(
-      canvas,
-      _agoLabel(Duration(milliseconds: span.inMilliseconds ~/ 2)),
-      Offset(plot.center.dx - 28, plot.bottom + 7),
-      width: 56,
-      align: TextAlign.center,
-    );
+    paintChartTimeAxis(canvas, plot, start, end, gridPaint);
 
     double yFor(double value) =>
         plot.bottom - axis.fractionOf(value) * plot.height;
@@ -542,28 +393,4 @@ Path _dash(Path path) {
     }
   }
   return dashed;
-}
-
-void _paintLabel(
-  Canvas canvas,
-  String text,
-  Offset offset, {
-  double width = 40,
-  TextAlign align = TextAlign.left,
-}) {
-  final painter = TextPainter(
-    text: TextSpan(
-      text: text,
-      style: kMonoStyle.copyWith(color: MeshColors.textMuted, fontSize: 9),
-    ),
-    textDirection: TextDirection.ltr,
-    textAlign: align,
-  )..layout(maxWidth: width);
-  painter.paint(canvas, offset);
-}
-
-String _agoLabel(Duration duration) {
-  final hours = duration.inHours;
-  if (hours >= 24 && hours % 24 == 0) return '${hours ~/ 24}d ago';
-  return '${hours}h ago';
 }
