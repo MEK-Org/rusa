@@ -188,18 +188,14 @@ void main() {
     expect(find.textContaining('Gen '), findsNothing);
   });
 
-  testWidgets('Info names every context mode the server reports', (
+  // Ledger, brief and native are named above; tail is the one mode left, and
+  // like ledger it keeps the brief as a shadow.
+  testWidgets('Info names tail mode and keeps its brief a shadow', (
     tester,
   ) async {
-    for (final (mode, label) in [
-      ('tail', 'Tail'),
-      ('ledger', 'Ledger'),
-      ('native', 'Native'),
-      ('brief', 'Brief'),
-    ]) {
-      await _openInfo(tester, mode: mode, mobile: false);
-      expect(find.text('Context mode: $label'), findsOneWidget);
-      await tester.pumpWidget(const SizedBox.shrink());
-    }
+    await _openInfo(tester, mode: 'tail', mobile: false);
+    expect(find.text('Context mode: Tail'), findsOneWidget);
+    expect(find.text('Shadow · not active'), findsOneWidget);
+    expect(find.text('Active'), findsNothing);
   });
 }
