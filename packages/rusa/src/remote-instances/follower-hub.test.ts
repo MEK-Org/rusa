@@ -10,6 +10,7 @@ import { FollowerEventQueue } from "./follower-event-queue.js";
 import { type FollowerEvent, FollowerHub } from "./follower-hub.js";
 import { FollowerUpdateTriggerStore } from "./follower-update-trigger-store.js";
 import { FOLLOWER_HTTP_BODY_LIMIT_BYTES, INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
+import { FILE_OP_TIMEOUT_MS, RemoteInstance } from "./remote-instance.js";
 
 const hubs: FollowerHub[] = [];
 afterEach(async () => {
@@ -1207,5 +1208,30 @@ describe("follower file operations (#1013)", () => {
     );
     await h.register("mac", "mac-process-b");
     await pending;
+  });
+
+  it("rejects a file operation the follower never answers, and ignores a late answer", async () => {
+    vi.useFakeTimers();
+    try {
+      const remote = new RemoteInstance("mac", "darwin", 1);
+      const pending = remote.fileOp("mac-actor", operation);
+      const timedOut = expect(pending).rejects.toThrow(
+        "Follower mac did not finish the file operation within 30 minutes; the file may still appear at the destination"
+      );
+      const command = remote.commands.find((c) => "actorId" in c && c.message.type === "fileOp");
+      await vi.advanceTimersByTimeAsync(FILE_OP_TIMEOUT_MS);
+      await timedOut;
+      // A result after the deadline settles nothing and does not throw.
+      remote.receive({
+        actorId: "mac-actor",
+        message: {
+          type: "fileOpResult",
+          requestId: (command as { message: { requestId: string } }).message.requestId,
+          result,
+        },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

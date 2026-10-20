@@ -980,8 +980,9 @@ describe("sandbox bwrap args", () => {
     it("also shadows a configured non-default chat.gchatConfigDir for real workers (#1013)", async () => {
       const { home, actorDir, gchatDir } = makeWorkerHome();
       mkdirSync(gchatDir, { recursive: true, mode: 0o700 });
-      // A follower may hold its own Google credentials anywhere its config says.
-      const configuredDir = join(home, "elsewhere", "google-creds");
+      // A follower may hold its own Google credentials anywhere its config says,
+      // including inside a provider state dir the sandbox later binds writable.
+      const configuredDir = join(home, ".gemini", "google-creds");
       mkdirSync(configuredDir, { recursive: true, mode: 0o700 });
       writeFileSync(join(configuredDir, "drive-token.json"), '{"refresh_token":"x"}', {
         mode: 0o600,
@@ -998,15 +999,26 @@ describe("sandbox bwrap args", () => {
       const { buildActorBwrapArgs } = await import("./sandbox.js");
       const { args } = buildActorBwrapArgs(actorDir, "antigravity");
 
-      const tmpfsTargets = args.filter((_, i) => args[i - 1] === "--tmpfs");
-      expect(tmpfsTargets).toContain(configuredDir);
-      expect(tmpfsTargets).toContain(gchatDir);
-      for (let i = 0; i < args.length; i += 1) {
-        if (args[i] === "--bind" || args[i] === "--ro-bind") {
-          expect(args[i + 1]).not.toBe(configuredDir);
-          expect(args[i + 2]).not.toBe(configuredDir);
+      // bwrap applies mounts in argument order, so the last mount at or above
+      // each credential dir decides what the worker sees. A later bind of an
+      // ancestor (here the writable ~/.gemini) would expose the host dir again.
+      const lastCoveringMount = (dir: string) => {
+        let last: string[] | undefined;
+        for (let i = 0; i < args.length; i += 1) {
+          const op = args[i];
+          const target =
+            op === "--tmpfs"
+              ? args[i + 1]
+              : op === "--bind" || op === "--ro-bind"
+                ? args[i + 2]
+                : undefined;
+          if (target && (dir === target || dir.startsWith(`${target}/`))) last = [op, target];
         }
-      }
+        return last;
+      };
+      expect(args).toContain(join(home, ".gemini"));
+      expect(lastCoveringMount(configuredDir)).toEqual(["--tmpfs", configuredDir]);
+      expect(lastCoveringMount(gchatDir)).toEqual(["--tmpfs", gchatDir]);
       warnSpy.mockRestore();
     });
 

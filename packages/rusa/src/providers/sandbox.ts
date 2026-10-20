@@ -923,10 +923,6 @@ function buildMeshActorBwrapArgs(o: {
   // both keep the host's real gh credential unconditionally.
   if (mcHome && isWorkerActor) {
     ghWrapperDir = injectWorkerGithubCredential(args, mcHome);
-    // Google user-OAuth token shadow : same real-workers-only guard as
-    // the gh credential split. Root and the E2E root-agent double keep host
-    // visibility of the real `~/.config/gchat` dir.
-    injectGoogleCredentialShadow(args);
     // Host-secrets masking : same real-workers-only guard as the gh
     // credential split above — root (unsandboxed in production) and the E2E
     // root-agent test double keep host visibility.
@@ -953,6 +949,15 @@ function buildMeshActorBwrapArgs(o: {
     ]) {
       args.push("--bind", join(actorState, path), join(hostState, path));
     }
+  }
+  if (mcHome && isWorkerActor) {
+    // Google user-OAuth token shadow : same real-workers-only guard as
+    // the gh credential split. Root and the E2E root-agent double keep host
+    // visibility of the real `~/.config/gchat` dir. bwrap applies mounts in
+    // argument order, so this follows every in-place writable bind above: a
+    // configured dir inside one of them (say `~/.gemini/google-creds`) would
+    // otherwise be bound back in (#1013). Later mounts target `/tmp` or mask more.
+    injectGoogleCredentialShadow(args);
   }
   // Topology guard (not secrecy): the root's real agy mcp_config carries the chat
   // server; a sandboxed worker must report to its parent, not talk to humans. Pin

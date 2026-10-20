@@ -403,11 +403,15 @@ the leader (space and folder grants, the attachment byte limit and Drive read
 events stay there). The leader then sends the follower a protocol-9 `fileOp`
 command, and the follower calls Google with its own credentials, writing a new
 file inside that actor's working directory. Those credentials are the
-follower's `client.json` plus `token.json` (Chat) or `drive-token.json` (Drive)
-in its `chat.gchatConfigDir`, or `~/.config/gchat` if that is unset. A follower
+follower's `client.json` plus `token.json` (Chat) or `drive-token.json` (Drive).
+A follower started by `rusa start` reads them from its `chat.gchatConfigDir`, or
+`~/.config/gchat` if that is unset. The standalone `follower.js` build loads no
+config, so it always reads `~/.config/gchat`. A follower
 without them refuses and names the missing files, and the tool returns that
-refusal unchanged. A v8 follower's actors keep the "(see #812)" refusal, as
-does Slack. Uploads and sending files from a follower are not portable yet.
+refusal unchanged. A download the follower has not answered within 30 minutes
+fails the tool call, though the file may still appear afterwards. A v8
+follower's actors keep the "(see #812)" refusal, as does Slack. Uploads and
+sending files from a follower are not portable yet.
 A bwrap-sandboxed worker sees both the default and the configured credential
 directory as empty. An unsandboxed follower, which includes every macOS
 follower, gives its actors no such mask. Desktop capture/control and macOS permissions remain

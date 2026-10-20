@@ -16,8 +16,18 @@ import type {
 } from "./protocol.js";
 import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
-/** First protocol whose followers run `fileOp` (#1013). */
+/**
+ * First protocol whose followers run `fileOp` (#1013). A capability floor, so
+ * it stays 9 when `INSTANCE_PROTOCOL_VERSION` moves on.
+ */
 export const FILE_OP_PROTOCOL_VERSION = 9;
+
+/**
+ * How long the leader waits for a follower's `fileOpResult`. Generous enough
+ * for a 1 GiB download on a slow link; it exists so a command lost in transit
+ * or a stalled provider stream fails the tool call instead of hanging it.
+ */
+export const FILE_OP_TIMEOUT_MS = 30 * 60_000;
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
@@ -47,6 +57,7 @@ interface PendingFileOp {
   actorId: string;
   resolve: (result: FollowerFileOperationResult) => void;
   reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 export const ACTIVE_UPDATE_PHASES = new Set<FollowerUpdateStatusPhase>([
@@ -248,7 +259,8 @@ export class RemoteInstance {
    * Has this follower run one provider download for an actor it hosts
    * (#1013). Undefined when the follower predates `fileOp`; the caller keeps
    * its refusal. Settles on the follower's `fileOpResult`, or rejects when
-   * this generation closes.
+   * this generation closes or the deadline passes. A result after the
+   * deadline is ignored.
    */
   fileOp(
     actorId: string,
@@ -257,7 +269,16 @@ export class RemoteInstance {
     if (this.protocolVersion < FILE_OP_PROTOCOL_VERSION) return undefined;
     const requestId = randomUUID();
     const result = new Promise<FollowerFileOperationResult>((resolve, reject) => {
-      this.fileOps.set(requestId, { actorId, resolve, reject });
+      const timer = setTimeout(() => {
+        this.fileOps.delete(requestId);
+        reject(
+          new Error(
+            `Follower ${this.id} did not finish the file operation within ${FILE_OP_TIMEOUT_MS / 60_000} minutes; the file may still appear at the destination`
+          )
+        );
+      }, FILE_OP_TIMEOUT_MS);
+      timer.unref?.();
+      this.fileOps.set(requestId, { actorId, resolve, reject, timer });
     });
     this.commands.push({ actorId, message: { type: "fileOp", requestId, operation } });
     this.flush();
@@ -268,6 +289,7 @@ export class RemoteInstance {
     const pending = this.fileOps.get(message.requestId);
     if (!pending || pending.actorId !== actorId) return;
     this.fileOps.delete(message.requestId);
+    clearTimeout(pending.timer);
     if (typeof message.error === "string") {
       pending.reject(new Error(message.error));
       return;
@@ -348,8 +370,10 @@ export class RemoteInstance {
     for (const host of [...this.hosts.values()])
       host.receive({ type: "exit", code: -1, signal: null });
     this.commands.length = 0;
-    for (const pending of this.fileOps.values())
+    for (const pending of this.fileOps.values()) {
+      clearTimeout(pending.timer);
       pending.reject(new Error(`Follower ${this.id} disconnected during a file operation`));
+    }
     this.fileOps.clear();
   }
 }

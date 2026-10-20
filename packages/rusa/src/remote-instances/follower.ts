@@ -92,7 +92,8 @@ const instance = new FollowerInstance(
   values.sandbox === "bwrap",
   (event) => emit(event.actorId, event.message, event.eventId),
   undefined,
-  // This follower's own Google credentials, never the leader's (#1013).
+  // This follower's own Google credentials, never the leader's (#1013). This
+  // entry point loads no config, so they are always in the default directory.
   { fileOps: createFollowerFileOps({ credentialDir: defaultGchatConfigDir() }) }
 );
 // A registration can renew after an HTTP fault. It identifies this running
