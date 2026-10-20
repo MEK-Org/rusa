@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { type FileHandle, lstat, open, realpath, unlink } from "node:fs/promises";
+import { type FileHandle, open, realpath, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 function isContained(parent: string, child: string): boolean {
@@ -54,10 +54,11 @@ export async function resolveDownloadPath(
 
 /**
  * Open a path already confined by {@link resolveAttachmentPath} or
- * {@link resolveDownloadPath}, rechecking that it still names a location inside
- * the workdir. This is an ordinary pathname open: confinement is checked at
- * resolution, and a directory renamed or replaced while a call is in flight is
- * outside what this boundary promises.
+ * {@link resolveDownloadPath}. Confinement is decided at resolution; the
+ * lexical check here only refuses a caller that skipped the resolver and passed
+ * a path outside the workdir. It does not re-resolve symlinks, and a directory
+ * renamed or replaced while a call is in flight is outside what this boundary
+ * promises.
  */
 async function openInWorkdir(
   workDir: string,
@@ -77,9 +78,8 @@ async function openInWorkdir(
  * sha256 without buffering the whole payload. The client supplies a response
  * already bounded at its download limit; this helper owns only confined,
  * safe artifact publication. It opens the destination exclusively (`O_EXCL`),
- * so an existing file is never overwritten. On failure, the source stream is
- * cancelled and partial output is unlinked while that pathname still names the
- * file this call created.
+ * so an existing file or symlink there is never overwritten or followed. On
+ * failure, the source stream is cancelled and the partial file is unlinked.
  */
 export async function streamNewFileInWorkdir(
   workDir: string,
@@ -92,7 +92,7 @@ export async function streamNewFileInWorkdir(
     handle = await openInWorkdir(
       workDir,
       path,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
       0o666
     );
     const hash = createHash("sha256");
@@ -118,7 +118,7 @@ export async function streamNewFileInWorkdir(
   } catch (err) {
     await reader?.cancel().catch(() => {});
     if (!reader) await stream?.cancel().catch(() => {});
-    if (handle) await unlinkIfSame(path, handle);
+    if (handle) await unlink(path).catch(() => {});
     throw err;
   } finally {
     reader?.releaseLock();
@@ -126,23 +126,16 @@ export async function streamNewFileInWorkdir(
   }
 }
 
-/** Unlink `path` only while it is still the file `handle` has open. */
-async function unlinkIfSame(path: string, handle: FileHandle): Promise<void> {
-  try {
-    const [opened, current] = await Promise.all([handle.stat(), lstat(path)]);
-    if (opened.dev === current.dev && opened.ino === current.ino) await unlink(path);
-  } catch (_) {}
-}
-
 const READ_CHUNK_BYTES = 64 * 1024;
 
 /**
  * Read a confined file with a hard byte bound at the read itself, so the cap
  * holds even if the file grows after it was resolved. The handle is opened
- * without following a final-component symlink and nonblocking (a FIFO cannot
- * stall the open), then must be a regular file; at most `maxBytes + 1` bytes
- * are ever read. `noun` names the file in the size
- * error, so each caller keeps its existing wording.
+ * nonblocking (a FIFO cannot stall the open) and must be a regular file; at
+ * most `maxBytes + 1` bytes are ever read. `O_NOFOLLOW` refuses a
+ * final-component symlink from a caller that passes an unresolved name; the
+ * tool paths pass realpath'd names and do not depend on it. `noun` names the
+ * file in the size error, so each caller keeps its existing wording.
  */
 export async function readBoundedRegularFile(
   workDir: string,

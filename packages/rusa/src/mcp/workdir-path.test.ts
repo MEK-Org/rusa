@@ -160,6 +160,16 @@ describe("streamNewFileInWorkdir", () => {
     expect(cancel).toHaveBeenCalled();
     expect(readFileSync(destination, "utf-8")).toBe("original");
   });
+
+  it("refuses a destination that is a dangling symlink without creating its target", async () => {
+    const dir = workdir();
+    symlinkSync(join(dir, "target.bin"), join(dir, "link.bin"));
+    const destination = await resolveDownloadPath(dir, "link.bin");
+    await expect(
+      streamNewFileInWorkdir(dir, destination, streamFrom([Buffer.from("data")]))
+    ).rejects.toMatchObject({ code: "EEXIST" });
+    expect(existsSync(join(dir, "target.bin"))).toBe(false);
+  });
 });
 
 describe("openBoundedRegularFile and exactFileStream", () => {
