@@ -1836,16 +1836,13 @@ export class SharedQuotaStore {
       | undefined;
     if (latest) {
       const latestResetMs = Date.parse(latest.resetAtIso);
-      const endMoved = quotaCycleChanged(
-        { percentLeft: candidate.percentLeft, resetAtIso: latest.resetAtIso },
-        candidate,
-        latest.windowMs
-      );
+      const endMoved = Math.abs(resetMs - latestResetMs) > quotaResetToleranceMs(latest.windowMs);
       const refilled = candidate.percentLeft - latest.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
       // A refill or a passed deadline is a new cycle, from a scrape or a
-      // manual reading alike. A deadline edited after it already passed, with
-      // no refill, therefore starts a new period at the old end: a documented
-      // limitation, not guarded (#1123).
+      // manual reading alike. A deadline edited after, or within the tolerance
+      // before, its old end, with no refill, therefore starts a new period at
+      // the old end or at this reading if earlier: a documented limitation,
+      // not guarded (#1123).
       const deadlinePassed = observedMs >= latestResetMs - quotaResetToleranceMs(latest.windowMs);
       const newCycle = endMoved && (refilled || deadlinePassed);
       if (Number.isFinite(latestResetMs) && !newCycle) {

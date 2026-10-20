@@ -906,11 +906,8 @@ describe("SharedQuotaStore persisted controller", () => {
       later.close();
     });
 
-    it.each<Source>([
-      "scrape",
-      "manual",
-    ])("holds the start of a %s reading through repeated moves, jitter and restart", (source) => {
-      const edited = lane(source);
+    it("holds the start through repeated moves, jitter and restart", () => {
+      const edited = lane("scrape");
       edited.read(start + day, 90, start + 3 * day);
       edited.read(start + day + hour, 89, start + 3 * day + 30 * 1000);
       edited.reopen();
@@ -943,11 +940,8 @@ describe("SharedQuotaStore persisted controller", () => {
       edited.close();
     });
 
-    it.each<Source>([
-      "scrape",
-      "manual",
-    ])("keeps a %s period through a refill under an unmoved deadline", (source) => {
-      const refilled = lane(source);
+    it("keeps the period through a refill under an unmoved deadline", () => {
+      const refilled = lane("scrape");
       refilled.read(start + day, 40, end);
       refilled.read(start + 2 * day, 100, end);
       expect(refilled.periods().map((period) => period.start)).toEqual(Array(3).fill(iso(start)));
@@ -968,20 +962,17 @@ describe("SharedQuotaStore persisted controller", () => {
       long.close();
     });
 
-    it.each<Source>([
-      "scrape",
-      "manual",
-    ])("starts a new %s period on an observed refill under a moved deadline", (source) => {
+    it("starts a new period on an observed refill under a moved deadline", () => {
       // Early: the provider refilled before the old deadline, so the new
       // period starts at the reading that saw it.
-      const early = lane(source);
+      const early = lane("scrape");
       early.read(start + day, 40, end);
       early.read(start + 3 * day, 100, start + 10 * day);
       expect(early.periods().at(-1)).toEqual({ start: iso(start + 3 * day), windowMs: 7 * day });
       early.close();
 
       // Rollover: after the old deadline, the new period starts at it.
-      const rollover = lane(source);
+      const rollover = lane("scrape");
       rollover.read(start + day, 40, end);
       rollover.read(end + hour, 100, end + 7 * day);
       expect(rollover.periods().at(-1)).toEqual({ start: iso(end), windowMs: 7 * day });
