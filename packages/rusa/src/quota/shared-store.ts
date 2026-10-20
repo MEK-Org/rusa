@@ -19,8 +19,10 @@ import { configuredModelRefs, resolveWindowModels } from "./model-window-scope.j
 import { extractedNoQuotaValues, parseParsedState, serializeParsedState } from "./parsed-state.js";
 import {
   QUOTA_OBSERVATION_SLOT_MS,
+  QUOTA_REFILL_EPSILON_POINTS,
   type QuotaCycleObservation,
   quotaCycleChanged,
+  quotaResetToleranceMs,
   verifiedQuotaCycleTransition,
 } from "./quota-cycle.js";
 import {
@@ -1798,15 +1800,16 @@ export class SharedQuotaStore {
   }
 
   /**
-   * Derive one lane's window duration at the persistence seam. A material
-   * reset change starts the next window, so the latest stored cycle is the
-   * previous window and this one's length is the distance between ends. That cycle
-   * ended at its reset, or at the latest by this reading if the provider reset
-   * early. Before the store has seen a prior end, the first reading is the only
-   * honest lower bound for the start. Tiny reset changes are display jitter:
-   * retain the current cycle's stored duration. Five-hour lanes keep their
-   * standard 5h denominator (#924 item 6): a session starts on first use, so
-   * the gap between successive ends includes idle time.
+   * Derive one lane's window duration at the persistence seam. Every stored
+   * row carries its period start as `reset_at_iso - window_ms`. A moved end
+   * edits the current period and keeps that start (#1123), unless the reading
+   * shows a new cycle, a refill or a passed deadline, from either source: then
+   * this period starts where the previous one ended, at its reset or at the
+   * latest by this reading if the provider reset early.
+   * Before the store has seen a prior end, the first reading is the only
+   * honest lower bound for the start. Five-hour lanes keep their standard 5h
+   * denominator (#924 item 6): a session starts on first use, so the gap
+   * between successive ends includes idle time.
    */
   private windowMsForCandidate(
     candidate: Pick<
@@ -1823,24 +1826,30 @@ export class SharedQuotaStore {
 
     const latest = this.db
       .prepare(
-        `SELECT reset_at_iso AS resetAtIso, window_ms AS windowMs
+        `SELECT reset_at_iso AS resetAtIso, window_ms AS windowMs, percent_left AS percentLeft
          FROM quota_observations
          WHERE provider = ? AND model_scope = ? AND kind = ? AND reset_at_iso IS NOT NULL
          ORDER BY observed_at DESC, rowid DESC LIMIT 1`
       )
       .get(candidate.provider, candidate.modelScope, candidate.kind) as
-      | { resetAtIso: string; windowMs: number }
+      | { resetAtIso: string; windowMs: number; percentLeft: number }
       | undefined;
     if (latest) {
-      // Only a moved end starts the next window; a refill under the same end
-      // stays in the current one.
-      const endMoved = quotaCycleChanged(
-        { percentLeft: candidate.percentLeft, resetAtIso: latest.resetAtIso },
-        candidate,
-        latest.windowMs
-      );
-      if (!endMoved) return latest.windowMs;
-      const previousEndMs = Math.min(Date.parse(latest.resetAtIso), observedMs);
+      const latestResetMs = Date.parse(latest.resetAtIso);
+      const endMoved = Math.abs(resetMs - latestResetMs) > quotaResetToleranceMs(latest.windowMs);
+      const refilled = candidate.percentLeft - latest.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
+      // A refill or a passed deadline is a new cycle, from a scrape or a
+      // manual reading alike. A deadline edited after, or within the tolerance
+      // before, its old end, with no refill, therefore starts a new period at
+      // the old end or at this reading if earlier: a documented limitation,
+      // not guarded (#1123).
+      const deadlinePassed = observedMs >= latestResetMs - quotaResetToleranceMs(latest.windowMs);
+      const newCycle = endMoved && (refilled || deadlinePassed);
+      if (Number.isFinite(latestResetMs) && !newCycle) {
+        const startMs = Math.min(latestResetMs - latest.windowMs, observedMs);
+        return resetMs - startMs;
+      }
+      const previousEndMs = Math.min(latestResetMs, observedMs);
       if (Number.isFinite(previousEndMs)) return resetMs - previousEndMs;
     }
 

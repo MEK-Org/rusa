@@ -695,7 +695,8 @@ describe("SharedQuotaStore persisted controller", () => {
         80,
         new Date(firstEnd).toISOString()
       );
-      // A sub-hour reset correction is one cycle, so it preserves the stored 6d length.
+      // A sub-hour reset correction is one cycle, so it keeps the stored start
+      // and the 6d window grows by the correction.
       recordObservation(
         store,
         "claude",
@@ -719,7 +720,7 @@ describe("SharedQuotaStore persisted controller", () => {
       const windows = store
         .listCanonicalSince("claude", "2030-01-01T00:00:00.000Z")
         .map((row) => row.windowMs);
-      expect(windows).toEqual([6 * 24 * hour, 6 * 24 * hour, 24 * hour]);
+      expect(windows).toEqual([6 * 24 * hour, 6 * 24 * hour + 30 * 60 * 1000, 24 * hour]);
 
       // The established seven-day and five-hour shapes are unchanged when
       // their own reset evidence says so.
@@ -816,6 +817,190 @@ describe("SharedQuotaStore persisted controller", () => {
     } finally {
       store.close();
     }
+  });
+
+  describe("keeps a period's start when its deadline is edited (#1123)", () => {
+    const hour = 60 * 60 * 1000;
+    const day = 24 * hour;
+    const start = Date.parse("2030-01-01T00:00:00.000Z");
+    const end = start + 7 * day;
+    const iso = (ms: number) => new Date(ms).toISOString();
+    type Source = "scrape" | "manual";
+
+    // Each lane opens with a full 7d reading, so its period starts at `start`.
+    function lane(source: Source) {
+      const root = mkdtempSync(join(tmpdir(), `rusa-quota-preserve-start-${source}-`));
+      roots.push(root);
+      const file = join(root, "shared.db");
+      let store = new SharedQuotaStore(file);
+      const generation =
+        source === "manual"
+          ? store.setQuotaReadingMode("codex", "manual", iso(start)).generation
+          : undefined;
+      const read = (observedMs: number, percentLeft: number, resetMs: number) => {
+        if (generation === undefined) {
+          recordObservation(store, "codex", iso(observedMs), percentLeft, iso(resetMs));
+          return;
+        }
+        const result = store.recordManualObservation({
+          snapshot: {
+            provider: "codex",
+            status: "available",
+            scrapedAt: iso(observedMs),
+            limits: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                scope: "provider",
+                percentLeft,
+                resetAtIso: iso(resetMs),
+              },
+            ],
+          },
+          generation,
+          idempotencyKey: `reading-${observedMs}`,
+          acceptedAt: iso(observedMs),
+        });
+        expect(result).toMatchObject({ result: "accepted" });
+      };
+      read(start, 100, end);
+      return {
+        read,
+        reopen: () => {
+          store.close();
+          store = new SharedQuotaStore(file);
+        },
+        // The period start every row carries, and its stored length.
+        periods: () =>
+          store.listCanonicalSince("codex", iso(start)).map((row) => ({
+            start: iso(Date.parse(row.resetAtIso ?? "") - row.windowMs),
+            windowMs: row.windowMs,
+          })),
+        bucket: () => {
+          store.advancePendingController({ maxIntervalSeconds: 3600 }, "codex");
+          return store.getProviderThrottle("codex")?.buckets[0];
+        },
+        close: () => store.close(),
+      };
+    }
+
+    it.each<Source>([
+      "scrape",
+      "manual",
+    ])("moves only the deadline of a %s reading's period, so pace reads the spare quota", (source) => {
+      // 5% used after 0.35d, then the deadline moves to day 2: 82.5% of the
+      // period's time remains against 95% of quota, an error of -12.5.
+      const earlier = lane(source);
+      earlier.read(start + 0.35 * day, 95, start + 2 * day);
+      expect(earlier.periods().at(-1)).toEqual({ start: iso(start), windowMs: 2 * day });
+      const bucket = earlier.bucket();
+      expect(bucket?.timeRemainingPct).toBeCloseTo(82.5, 8);
+      expect(bucket?.error).toBeCloseTo(-12.5, 8);
+      earlier.close();
+
+      // The deadline moves to 2d after that reading instead: 85.106% remains.
+      const later = lane(source);
+      later.read(start + 0.35 * day, 95, start + 2.35 * day);
+      expect(later.periods().at(-1)).toEqual({ start: iso(start), windowMs: 2.35 * day });
+      expect(later.bucket()?.error).toBeCloseTo((2 / 2.35) * 100 - 95, 8);
+      later.close();
+    });
+
+    it("holds the start through repeated moves, jitter and restart", () => {
+      const edited = lane("scrape");
+      edited.read(start + day, 90, start + 3 * day);
+      edited.read(start + day + hour, 89, start + 3 * day + 30 * 1000);
+      edited.reopen();
+      edited.read(start + 2 * day, 80, start + 9 * day);
+      edited.read(start + 2.5 * day, 75, start + 4 * day);
+      expect(edited.periods().map((period) => period.start)).toEqual(Array(5).fill(iso(start)));
+      expect(edited.periods().at(-1)?.windowMs).toBe(4 * day);
+      edited.close();
+    });
+
+    it.each<Source>([
+      "scrape",
+      "manual",
+    ])("ends a %s period at its passed deadline without a refill", (source) => {
+      // Just inside the final jitter tolerance, and just after the old
+      // deadline: either source's passed deadline is the cycle evidence.
+      for (const observedMs of [end - 30 * 60 * 1000, end + 5 * 60 * 1000]) {
+        const passed = lane(source);
+        passed.read(start + day, 40, end);
+        passed.read(observedMs, 40, observedMs + day);
+        expect(passed.periods().at(-1)?.start).toBe(iso(Math.min(end, observedMs)));
+        passed.close();
+      }
+
+      // Just outside the tolerance, the deadline has not passed: an edit.
+      const edited = lane(source);
+      edited.read(start + day, 40, end);
+      edited.read(end - 2 * hour, 40, end + day);
+      expect(edited.periods().at(-1)).toEqual({ start: iso(start), windowMs: 8 * day });
+      edited.close();
+    });
+
+    it("keeps the period through a refill under an unmoved deadline", () => {
+      const refilled = lane("scrape");
+      refilled.read(start + day, 40, end);
+      refilled.read(start + 2 * day, 100, end);
+      expect(refilled.periods().map((period) => period.start)).toEqual(Array(3).fill(iso(start)));
+      expect(refilled.periods().at(-1)?.windowMs).toBe(7 * day);
+      refilled.close();
+    });
+
+    it("keeps the start once the period's earlier rows age out", () => {
+      // A period stretched past retention: accepting the day-35 reading prunes
+      // the rows that opened it, and the start rides on the latest survivor.
+      const long = lane("manual");
+      long.read(start + day, 90, start + 40 * day);
+      long.read(start + 20 * day, 70, start + 40 * day);
+      long.read(start + 35 * day, 50, start + 40 * day);
+      expect(long.periods()).toEqual(Array(2).fill({ start: iso(start), windowMs: 40 * day }));
+      long.read(start + 36 * day, 45, start + 45 * day);
+      expect(long.periods().at(-1)).toEqual({ start: iso(start), windowMs: 45 * day });
+      long.close();
+    });
+
+    it("starts a new period on an observed refill under a moved deadline", () => {
+      // Early: the provider refilled before the old deadline, so the new
+      // period starts at the reading that saw it.
+      const early = lane("scrape");
+      early.read(start + day, 40, end);
+      early.read(start + 3 * day, 100, start + 10 * day);
+      expect(early.periods().at(-1)).toEqual({ start: iso(start + 3 * day), windowMs: 7 * day });
+      early.close();
+
+      // Rollover: after the old deadline, the new period starts at it.
+      const rollover = lane("scrape");
+      rollover.read(start + day, 40, end);
+      rollover.read(end + hour, 100, end + 7 * day);
+      expect(rollover.periods().at(-1)).toEqual({ start: iso(end), windowMs: 7 * day });
+      rollover.close();
+    });
+
+    it("reads an unseen early provider reset as a deadline edit", () => {
+      // Known limitation: the provider reset at day 2 and the refill was spent
+      // before the next scrape, so nothing distinguishes it from an edit that
+      // moved the deadline to day 9. The start is held and pace reads spare
+      // quota; no nominal cap overrides the observed deadline.
+      const unseen = lane("scrape");
+      unseen.read(start + day, 90, end);
+      unseen.read(start + 3 * day, 85, start + 9 * day);
+      expect(unseen.periods().at(-1)).toEqual({ start: iso(start), windowMs: 9 * day });
+      unseen.close();
+    });
+
+    it("reads a deadline edited after it passed as a new period", () => {
+      // Known limitation: the old deadline passed with no refill before the
+      // edit was recorded, so the period re-anchors at the old end, as #1123
+      // first reported but narrowed to late edits. No guard.
+      const late = lane("manual");
+      late.read(start + day, 40, end);
+      late.read(end + 2 * hour, 38, end + 2 * day);
+      expect(late.periods().at(-1)).toEqual({ start: iso(end), windowMs: 2 * day });
+      late.close();
+    });
   });
 
   it("keeps five-hour lanes at 5h across an idle gap between sessions", () => {
