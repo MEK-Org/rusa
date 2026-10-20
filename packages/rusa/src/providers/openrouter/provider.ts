@@ -9,7 +9,7 @@ import type { CodingProvider, RunOptions, RunResult } from "../types.js";
 import { mcpAdmissionExtension } from "./mcp-admission.js";
 import { PiRpcInvocation, type PiRpcOutcome } from "./pi-rpc.js";
 
-/** Local end-to-end prototype. Fresh Pi process, portable context, MCP-only tools.
+/** Local end-to-end prototype. Fresh Pi process, portable context, built-in and MCP tools.
  * Worker launches use the shared actor bwrap boundary with isolated Pi state.
  * Usage stays in an artifact, outside subscription accounting and quota pacing.
  */
@@ -99,7 +99,6 @@ export class OpenRouterProvider implements CodingProvider {
         "--mode",
         "rpc",
         "--no-session",
-        "--no-builtin-tools",
         "--no-extensions",
         "-e",
         "builtin:mcp",
