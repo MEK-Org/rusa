@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 
 import '../models.dart';
 import '../theme.dart';
@@ -119,6 +120,14 @@ class QuotaHistoryChart extends StatelessWidget {
     final end = sharedRange?.end ?? own.end;
     final range =
         'prior ${(end.difference(start).inMinutes / (24 * 60)).round()} days';
+    // History is fetched once (#26) while the shared end keeps moving with the
+    // inbox charts, so once its readings stop a minute or more short of the
+    // range's end, the end label says where they stop instead of "now".
+    final dataEnd = end.difference(own.end) >= const Duration(minutes: 1)
+        ? DateFormat('HH:mm').format(own.end.toLocal())
+        : null;
+    final asOfLabel = dataEnd == null ? null : 'as of $dataEnd';
+    final asOfNote = dataEnd == null ? '' : ' Readings end at $dataEnd.';
     final visible = history.history
         .where(
           (series) =>
@@ -178,7 +187,7 @@ class QuotaHistoryChart extends StatelessWidget {
 
     final cachedNote = isStale
         ? ' Cached snapshot as of ${history.generatedAt}.'
-        : '';
+        : asOfNote;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -217,6 +226,7 @@ class QuotaHistoryChart extends StatelessWidget {
             empty: 'No controller decisions recorded in the $range.',
           ),
           isStale: isStale,
+          endLabel: asOfLabel,
         ),
         const SizedBox(height: 16),
         ChartSection(
@@ -241,6 +251,7 @@ class QuotaHistoryChart extends StatelessWidget {
             empty: 'No throttle decisions recorded in the $range.',
           ),
           isStale: isStale,
+          endLabel: asOfLabel,
         ),
       ],
     );

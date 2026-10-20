@@ -7,12 +7,15 @@ import {
 
 const at = "2026-10-19T12:00:00.000Z";
 
-function sample(unhandledCount: number, oldestDeliveredAt: string | null): InboxMetricActorSample {
-  return { unhandledCount, oldestDeliveredAt };
+function sample(
+  sharedCount: number,
+  oldestSharedDeliveredAt: string | null
+): InboxMetricActorSample {
+  return { sharedCount, oldestSharedDeliveredAt };
 }
 
 describe("aggregateInboxMetricSamples", () => {
-  it("computes cross-actor median and max with known-empty actors contributing zero", () => {
+  it("computes cross-actor median and max with actors lacking shared entries as zero", () => {
     expect(
       aggregateInboxMetricSamples(at, [
         sample(0, null),
@@ -51,10 +54,10 @@ describe("aggregateInboxMetricSamples", () => {
 
   it("rejects an inconsistent sample before it can corrupt a chart", () => {
     expect(() => aggregateInboxMetricSamples(at, [sample(1, null)])).toThrow(
-      "oldestDeliveredAt is required"
+      "oldestSharedDeliveredAt is required"
     );
     expect(() => aggregateInboxMetricSamples(at, [sample(0, at)])).toThrow(
-      "must be null for an empty inbox"
+      "must be null without a shared entry"
     );
     expect(() => aggregateInboxMetricSamples(at, [sample(1, "2026-10-19T12:00:01.000Z")])).toThrow(
       "at or before observedAt"

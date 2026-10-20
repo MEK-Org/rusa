@@ -31,15 +31,31 @@ function toPoint(row: SnapshotRow): InboxMetricPoint {
   };
 }
 
+/** One unhandled inbox row, as the statistics classify it. */
+export interface InboxMetricEntry {
+  actorId: string;
+  source: string;
+  payload: unknown;
+}
+
 /** Per-minute inbox backlog summaries behind the Overview inbox charts (#1018). */
 export class InboxMetricRepository {
-  constructor(private readonly db: Database.Database) {}
+  /**
+   * @param humanChatClassifier Returns, once per sample, the dashboard's #590
+   *   classification against the shared scope: true for an entry no viewer but
+   *   its own human may see. Such an entry is left out of every size and age
+   *   before the sample is stored.
+   */
+  constructor(
+    private readonly db: Database.Database,
+    private readonly humanChatClassifier: () => (entry: InboxMetricEntry) => boolean
+  ) {}
 
   /**
    * Records the current minute's sample unless one exists; a new sample also
    * prunes samples older than the window. Returns the new point, or null when
    * this minute was already sampled. The live population and every inbox are
-   * read in one statement, so the sample is one consistent instant.
+   * read in one transaction, so the sample is one consistent instant.
    */
   sampleIfDue(nowMs = Date.now()): InboxMetricPoint | null {
     const minute = new Date(minuteFloor(nowMs)).toISOString();
@@ -49,16 +65,37 @@ export class InboxMetricRepository {
         .prepare("SELECT 1 FROM inbox_metric_snapshots WHERE minute = ?")
         .get(minute);
       if (existing) return null;
-      const samples = this.db
+      // Every live actor, with its unhandled entries oldest first. An actor
+      // with an empty inbox appears once, with no entry.
+      const rows = this.db
         .prepare(`
-          SELECT count(e.id) AS unhandledCount, min(e.delivered_at) AS oldestDeliveredAt
+          SELECT a.id AS actorId, e.source, e.delivered_at AS deliveredAt, e.payload_json AS payloadJson
           FROM actors a
           LEFT JOIN actor_inbox_entries e
             ON e.actor_id = a.id AND e.handled_at IS NULL AND e.delivered_at <= ?
           WHERE a.retired_at IS NULL OR a.retired_at > ?
-          GROUP BY a.id
+          ORDER BY a.id, e.delivered_at, e.id
         `)
-        .all(observedAt, observedAt) as InboxMetricActorSample[];
+        .all(observedAt, observedAt) as Array<{
+        actorId: string;
+        source: string | null;
+        deliveredAt: string | null;
+        payloadJson: string | null;
+      }>;
+      const isHumanChat = this.humanChatClassifier();
+      const byActor = new Map<string, InboxMetricActorSample>();
+      for (const { actorId, source, deliveredAt, payloadJson } of rows) {
+        let sample = byActor.get(actorId);
+        if (!sample) {
+          sample = { sharedCount: 0, oldestSharedDeliveredAt: null };
+          byActor.set(actorId, sample);
+        }
+        if (source === null || deliveredAt === null || payloadJson === null) continue;
+        if (isHumanChat({ actorId, source, payload: JSON.parse(payloadJson) })) continue;
+        sample.sharedCount += 1;
+        sample.oldestSharedDeliveredAt ??= deliveredAt;
+      }
+      const samples = [...byActor.values()];
       const next = { minute, observedAt, ...aggregateInboxMetricSamples(observedAt, samples) };
       this.db
         .prepare(`

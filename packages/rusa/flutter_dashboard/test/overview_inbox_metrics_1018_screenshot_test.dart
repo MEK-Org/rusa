@@ -9,6 +9,10 @@
 // queued actor carries a focus card. The `_before` images come from the base
 // commit with the same fixture minus the inbox payload, which the base API
 // cannot express.
+//
+// `1018_overview_wide_aged_<suffix>.png` is an Overview left open two hours:
+// quota history was fetched once at 10:00 (#26) while the inbox window has
+// kept refreshing to 12:00.
 import 'dart:io';
 import 'dart:math' as math;
 
@@ -30,14 +34,15 @@ final _start = _end.subtract(const Duration(days: 3));
 
 String _iso(DateTime at) => at.toIso8601String();
 
-QuotaHistoryDto _quotaHistory() {
+QuotaHistoryDto _quotaHistory({Duration age = Duration.zero}) {
+  final generatedAt = _end.subtract(age);
   QuotaHistorySeriesDto series(String provider, double phase) =>
       QuotaHistorySeriesDto(
         provider: provider,
         windowId: 'weekly',
         label: 'Weekly',
         points: [
-          for (var hour = 0; hour <= 72; hour += 2)
+          for (var hour = 0; hour <= 72 - age.inHours; hour += 2)
             QuotaHistoryPointDto(
               observedAt: _iso(_start.add(Duration(hours: hour))),
               remainingPercent: 80 - hour / 2,
@@ -47,8 +52,8 @@ QuotaHistoryDto _quotaHistory() {
         ],
       );
   return QuotaHistoryDto(
-    generatedAt: _iso(_end),
-    historySince: _iso(_start),
+    generatedAt: _iso(generatedAt),
+    historySince: _iso(generatedAt.subtract(const Duration(days: 3))),
     history: [series('claude', 0), series('codex', 2)],
   );
 }
@@ -84,7 +89,7 @@ InboxMetricsDto _inboxMetrics() {
   );
 }
 
-FakeApi _api() => FakeApi()
+FakeApi _api({Duration quotaAge = Duration.zero}) => FakeApi()
   ..threadsResult = [
     makeThread('root', runState: RunState.idle, title: 'Steward'),
     makeThread(
@@ -127,18 +132,25 @@ FakeApi _api() => FakeApi()
       status: 'waiting',
     ),
   ]
-  ..quotaHistoryResult = _quotaHistory()
+  ..quotaHistoryResult = _quotaHistory(age: quotaAge)
   ..inboxMetricsResult = _inboxMetrics();
 
 void main() {
   setUpAll(loadFonts);
 
-  const sizes = [('wide', Size(1180, 1500)), ('phone', Size(390, 3300))];
+  const sizes = [
+    ('wide', Size(1180, 1500), Duration.zero),
+    ('phone', Size(390, 3300), Duration.zero),
+    ('wide_aged', Size(1180, 1500), Duration(hours: 2)),
+  ];
 
-  for (final (viewport, size) in sizes) {
+  for (final (viewport, size, quotaAge) in sizes) {
     testWidgets('#1018 overview $viewport', (tester) async {
       await tester.runAsync(() async {
-        final store = DashboardStore(api: _api(), stream: FakeStream());
+        final store = DashboardStore(
+          api: _api(quotaAge: quotaAge),
+          stream: FakeStream(),
+        );
         await store.init();
         addTearDown(store.dispose);
         tester.view

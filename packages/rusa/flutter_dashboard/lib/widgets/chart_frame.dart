@@ -76,8 +76,8 @@ String _agoLabel(Duration duration) {
   return '${hours}h ago';
 }
 
-/// One plot: heading, plain-English subtitle, the canvas with its "now" (or
-/// "cached") end label, and the plot's [legend] beneath it.
+/// One plot: heading, plain-English subtitle, the canvas with its end label
+/// ("now", "cached", or [endLabel]), and the plot's [legend] beneath it.
 class ChartSection extends StatelessWidget {
   const ChartSection({
     super.key,
@@ -89,6 +89,7 @@ class ChartSection extends StatelessWidget {
     required this.painter,
     required this.isStale,
     required this.legend,
+    this.endLabel,
   });
 
   final String title;
@@ -99,6 +100,9 @@ class ChartSection extends StatelessWidget {
   final CustomPainter painter;
   final bool isStale;
   final Widget legend;
+
+  /// Replaces "now" when the plotted data ends before the range does.
+  final String? endLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -142,7 +146,7 @@ class ChartSection extends StatelessWidget {
                   right: 0,
                   bottom: 0,
                   child: Text(
-                    isStale ? 'cached' : 'now',
+                    isStale ? 'cached' : endLabel ?? 'now',
                     key: endLabelKey,
                     style: kMonoStyle.copyWith(
                       color: MeshColors.textMuted,

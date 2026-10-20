@@ -5,8 +5,12 @@ import {
   INBOX_METRIC_MAX_POINTS,
   INBOX_METRIC_WINDOW_MS,
 } from "../../dashboard/inbox-metrics.js";
+import type { InboxPayload } from "../../repositories/inbox-repository.js";
 import { runMigrations } from "../migrations/runner.js";
-import { InboxMetricRepository } from "./inbox-metric-repository.js";
+import type { InboxMetricRepository } from "./inbox-metric-repository.js";
+import { Repositories } from "./index.js";
+import type { MeshChatRepository } from "./mesh-chat-repository.js";
+import type { PrincipalRepository } from "./principal-repository.js";
 import { SqliteInboxRepository } from "./sqlite-inbox-repository.js";
 
 const MINUTE = INBOX_METRIC_INTERVAL_MS;
@@ -17,41 +21,76 @@ describe("#1018 inbox metric snapshots", () => {
   let db: Database.Database;
   let inbox: SqliteInboxRepository;
   let metrics: InboxMetricRepository;
+  let meshChat: MeshChatRepository;
+  let principals: PrincipalRepository;
 
-  function addActor(id: string, retiredAt: number | null = null): void {
+  /** Only one actor may lack a parent; every actor also has its principal. */
+  function addActor(id: string, parentId: string | null = null): void {
     db.prepare(
-      "INSERT INTO actors (id, charter, parent_id, created_at, retired_at) VALUES (?, 'fixture', NULL, ?, ?)"
-    ).run(id, iso(t0 - 60 * MINUTE), retiredAt === null ? null : iso(retiredAt));
+      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES (?, 'fixture', ?, ?)"
+    ).run(id, parentId, iso(t0 - 60 * MINUTE));
+    principals.ensureActorPrincipal(id, iso(t0 - 60 * MINUTE));
   }
 
-  function deliver(actorId: string, deliveredAtMs: number): string {
+  function append(
+    actorId: string,
+    deliveredAtMs: number,
+    source: string,
+    payload: InboxPayload
+  ): string {
     const [entry] = inbox.append([
-      {
-        actorId,
-        source: "mesh:fixture",
-        deliveredAt: new Date(deliveredAtMs),
-        payload: { type: "mesh.message", messageId: `m-${deliveredAtMs}`, fromId: "fixture" },
-      },
+      { actorId, source, deliveredAt: new Date(deliveredAtMs), payload },
     ]);
     if (!entry) throw new Error("fixture delivery was not appended");
     return entry.id;
+  }
+
+  /** A message from another actor: shared mesh traffic every viewer may see. */
+  function deliver(actorId: string, deliveredAtMs: number): string {
+    const messageId = meshChat.record({
+      ts: iso(deliveredAtMs),
+      senderId: "peer",
+      recipientId: actorId,
+      body: "fixture",
+    });
+    return append(actorId, deliveredAtMs, "mesh:peer", {
+      type: "mesh.message",
+      messageId,
+      fromId: "peer",
+    });
+  }
+
+  /** A human's chat message: private to that human's conversation (#590). */
+  function deliverFromHuman(actorId: string, deliveredAtMs: number, userId: string): string {
+    const messageId = meshChat.record({
+      ts: iso(deliveredAtMs),
+      senderId: userId,
+      recipientId: actorId,
+      body: "private",
+    });
+    return append(actorId, deliveredAtMs, `mesh:${userId}`, {
+      type: "mesh.message",
+      messageId,
+      fromId: userId,
+    });
   }
 
   beforeEach(() => {
     db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
     runMigrations(db);
+    const repos = new Repositories(db);
     inbox = new SqliteInboxRepository(db);
-    metrics = new InboxMetricRepository(db);
+    metrics = repos.inboxMetrics;
+    meshChat = repos.meshChat;
+    principals = repos.principals;
+    principals.ensureActorPrincipal("peer", iso(t0 - 60 * MINUTE));
   });
   afterEach(() => db.close());
 
   it("summarizes live actors with known-empty inboxes as zero size and zero age", () => {
-    // Only one actor may lack a parent, so the fixture root is the empty inbox.
     addActor("empty");
-    db.prepare(
-      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES ('busy', 'fixture', 'empty', ?), ('older', 'fixture', 'empty', ?), ('one', 'fixture', 'empty', ?)"
-    ).run(iso(t0), iso(t0), iso(t0));
+    for (const id of ["busy", "older", "one"]) addActor(id, "empty");
     deliver("busy", t0 - 4 * MINUTE);
     deliver("busy", t0 - 1 * MINUTE);
     deliver("older", t0 - 10 * MINUTE);
@@ -95,11 +134,88 @@ describe("#1018 inbox metric snapshots", () => {
     });
   });
 
+  it("leaves human-chat messages out of every size and age, before the sample is stored", () => {
+    const user = principals.createUser({ email: "a@example.test", createdAt: iso(t0) });
+    addActor("root");
+    for (const id of ["mixed", "only-human", "legacy"]) addActor(id, "root");
+    deliver("mixed", t0 - 4 * MINUTE);
+    deliver("legacy", t0 - 2 * MINUTE);
+    const at = (minutes: number) => t0 + minutes * MINUTE;
+    // The shared entries alone, `minutes` after t0: sizes 0, 1, 0, 1 and ages
+    // 0, 240 + 60m, 0, 120 + 60m seconds.
+    const sharedOnly = (minutes: number) => ({
+      actorCount: 4,
+      inboxSizeMedian: 0.5,
+      inboxSizeMax: 1,
+      oldestAgeSecondsMedian: (120 + 60 * minutes) / 2,
+      oldestAgeSecondsMax: 240 + 60 * minutes,
+    });
+    expect(metrics.sampleIfDue(at(0))).toMatchObject(sharedOnly(0));
+
+    // Adding: each hidden message is older than anything shared in its inbox.
+    const hidden = [
+      deliverFromHuman("mixed", t0 - 50 * MINUTE, user.id),
+      deliverFromHuman("only-human", t0 - 40 * MINUTE, user.id),
+      // A legacy pointer whose canonical message is gone: its sender hint decides.
+      append("legacy", t0 - 30 * MINUTE, `mesh:${user.id}`, {
+        type: "mesh.message",
+        messageId: "missing",
+      }),
+    ];
+    expect(metrics.sampleIfDue(at(1))).toMatchObject(sharedOnly(1));
+
+    // Changing: seeing them moves nothing.
+    for (const id of ["mixed", "only-human", "legacy"])
+      inbox.markSeen(id, new Date(at(1) + 10_000));
+    expect(metrics.sampleIfDue(at(2))).toMatchObject(sharedOnly(2));
+
+    // Removing: neither does handling them.
+    const [mixed, onlyHuman, legacy] = hidden as [string, string, string];
+    inbox.markHandled("mixed", [mixed], new Date(at(2) + 10_000));
+    inbox.markHandled("only-human", [onlyHuman], new Date(at(2) + 10_000));
+    inbox.markHandled("legacy", [legacy], new Date(at(2) + 10_000));
+    expect(metrics.sampleIfDue(at(3))).toMatchObject(sharedOnly(3));
+
+    // An older actor-to-actor message does count: sizes 0, 1, 1, 1 and ages
+    // 0, 480, 1440, 360.
+    deliver("only-human", t0 - 20 * MINUTE);
+    expect(metrics.sampleIfDue(at(4))).toMatchObject({
+      inboxSizeMedian: 1,
+      inboxSizeMax: 1,
+      oldestAgeSecondsMedian: 420,
+      oldestAgeSecondsMax: 1440,
+    });
+    const stored = db
+      .prepare(
+        "SELECT inbox_size_median, oldest_age_seconds_max FROM inbox_metric_snapshots ORDER BY minute"
+      )
+      .all() as Array<{ inbox_size_median: number; oldest_age_seconds_max: number }>;
+    expect(stored.map((row) => row.inbox_size_median)).toEqual([0.5, 0.5, 0.5, 0.5, 1]);
+    expect(stored.map((row) => row.oldest_age_seconds_max)).toEqual([240, 300, 360, 420, 1440]);
+  });
+
+  it("counts an actor holding only human-chat messages as zero size and zero age", () => {
+    const user = principals.createUser({ email: "a@example.test", createdAt: iso(t0) });
+    addActor("root");
+    addActor("worker", "root");
+    deliverFromHuman("root", t0 - 5 * MINUTE, user.id);
+    deliverFromHuman("worker", t0 - 9 * MINUTE, user.id);
+
+    // Live actors with no shared entry are observed zeros, not a missing population.
+    expect(metrics.sampleIfDue(t0)).toEqual({
+      minute: iso(t0),
+      observedAt: iso(t0),
+      actorCount: 2,
+      inboxSizeMedian: 0,
+      inboxSizeMax: 0,
+      oldestAgeSecondsMedian: 0,
+      oldestAgeSecondsMax: 0,
+    });
+  });
+
   it("drops retired actors from the population from the minute they retire", () => {
     addActor("root");
-    db.prepare(
-      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES ('worker', 'fixture', 'root', ?)"
-    ).run(iso(t0));
+    addActor("worker", "root");
     deliver("worker", t0 - 9 * MINUTE);
 
     expect(metrics.sampleIfDue(t0)).toMatchObject({ actorCount: 2, inboxSizeMax: 1 });

@@ -4,17 +4,24 @@ export const INBOX_METRIC_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 /** Minute positions in one window, both endpoints included. */
 export const INBOX_METRIC_MAX_POINTS = INBOX_METRIC_WINDOW_MS / INBOX_METRIC_INTERVAL_MS + 1;
 
-/** One live actor's durable inbox at the sampling instant. */
+/**
+ * One live actor's durable inbox at the sampling instant, leaving out messages
+ * from human chats, which every viewer but their own human is shown nothing of
+ * (#590). Only the remaining shared entries are counted or aged.
+ */
 export interface InboxMetricActorSample {
-  unhandledCount: number;
-  /** Null exactly when the inbox is known empty. */
-  oldestDeliveredAt: string | null;
+  sharedCount: number;
+  /** Delivery of the oldest shared entry; null exactly when there is none. */
+  oldestSharedDeliveredAt: string | null;
 }
 
 /** Cross-actor statistics for one sampled minute. */
 export interface InboxMetricAggregate {
   actorCount: number;
-  /** Null only when no live actor existed: there is no population to summarize. */
+  /**
+   * Sizes and ages cover shared entries only. Null only when no live actor
+   * existed: there is no population to summarize.
+   */
   inboxSizeMedian: number | null;
   inboxSizeMax: number | null;
   oldestAgeSecondsMedian: number | null;
@@ -55,8 +62,10 @@ function median(values: readonly number[]): number {
 }
 
 /**
- * Computes one minute's cross-actor inbox statistics. A known-empty inbox is
- * an observed zero size and zero age. These are statistics across actors at
+ * Computes one minute's cross-actor inbox statistics. An actor with no shared
+ * entry, whether its inbox is empty or holds only human-chat messages, is an
+ * observed zero size and zero age, so adding, changing or handling such a
+ * message never moves either statistic. These are statistics across actors at
  * one instant, not over every inbox entry or over time.
  */
 export function aggregateInboxMetricSamples(
@@ -69,26 +78,26 @@ export function aggregateInboxMetricSamples(
   const counts: number[] = [];
   const ages: number[] = [];
   for (const sample of samples) {
-    if (!Number.isInteger(sample.unhandledCount) || sample.unhandledCount < 0) {
-      throw new Error("unhandledCount must be a non-negative integer");
+    if (!Number.isInteger(sample.sharedCount) || sample.sharedCount < 0) {
+      throw new Error("sharedCount must be a non-negative integer");
     }
-    if (sample.unhandledCount === 0) {
-      if (sample.oldestDeliveredAt !== null) {
-        throw new Error("oldestDeliveredAt must be null for an empty inbox");
+    if (sample.sharedCount === 0) {
+      if (sample.oldestSharedDeliveredAt !== null) {
+        throw new Error("oldestSharedDeliveredAt must be null without a shared entry");
       }
       counts.push(0);
       ages.push(0);
       continue;
     }
-    if (sample.oldestDeliveredAt === null) {
-      throw new Error("oldestDeliveredAt is required for a non-empty inbox");
+    if (sample.oldestSharedDeliveredAt === null) {
+      throw new Error("oldestSharedDeliveredAt is required with a shared entry");
     }
-    const oldestDeliveredAtMs = Date.parse(sample.oldestDeliveredAt);
-    if (!Number.isFinite(oldestDeliveredAtMs) || oldestDeliveredAtMs > observedAtMs) {
-      throw new Error("oldestDeliveredAt must be at or before observedAt");
+    const oldestMs = Date.parse(sample.oldestSharedDeliveredAt);
+    if (!Number.isFinite(oldestMs) || oldestMs > observedAtMs) {
+      throw new Error("oldestSharedDeliveredAt must be at or before observedAt");
     }
-    counts.push(sample.unhandledCount);
-    ages.push((observedAtMs - oldestDeliveredAtMs) / 1000);
+    counts.push(sample.sharedCount);
+    ages.push((observedAtMs - oldestMs) / 1000);
   }
 
   const populated = samples.length > 0;

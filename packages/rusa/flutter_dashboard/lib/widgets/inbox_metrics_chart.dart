@@ -191,12 +191,14 @@ class InboxMetricsChart extends StatelessWidget {
         ChartSection(
           title: 'Inbox Size',
           subtitle:
-              'Unhandled entries per live actor, sampled each minute. Seen or '
-              'selected entries count until handled; an empty inbox counts as '
+              'Unhandled entries per live actor, sampled each minute, not '
+              'counting messages from human chats. Seen or selected entries '
+              'count until handled; an inbox with no other entry counts as '
               'zero.',
           semanticsLabel:
-              'Inbox size over the $range: median and max across live actors '
-              'each minute.$cachedNote',
+              'Inbox size over the $range, not counting messages from human '
+              'chats: median and max across live actors each minute.'
+              '$cachedNote',
           chartKey: const Key('inbox-size-chart'),
           endLabelKey: const Key('inbox-size-end-label'),
           painter: InboxMetricChartPainter(
@@ -215,11 +217,13 @@ class InboxMetricsChart extends StatelessWidget {
         ChartSection(
           title: 'Oldest Inbox Item',
           subtitle:
-              'How long each live actor\'s oldest unhandled entry has waited. '
-              'An empty inbox counts as zero.',
+              'How long each live actor\'s oldest unhandled entry has waited, '
+              'not counting messages from human chats. An inbox with no other '
+              'entry counts as zero.',
           semanticsLabel:
-              'Oldest inbox item age over the $range: median and max across '
-              'live actors each minute.$cachedNote',
+              'Oldest inbox item age over the $range, not counting messages '
+              'from human chats: median and max across live actors each '
+              'minute.$cachedNote',
           chartKey: const Key('inbox-oldest-chart'),
           endLabelKey: const Key('inbox-oldest-end-label'),
           painter: InboxMetricChartPainter(

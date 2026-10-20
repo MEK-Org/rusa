@@ -5337,8 +5337,10 @@ async function composeStart(
   sweepRunMaterial();
   everyInterval("run material retention", sweepRunMaterial, RUN_MATERIAL_SWEEP_INTERVAL_MS);
   // Inbox backlog for the Overview charts (#1018): one sample per UTC minute.
-  // Ticking four times a minute keeps each sample near its minute's start and
-  // means a late timer delays a sample rather than skipping its minute.
+  // Each tick samples only the current minute, if not yet sampled. Ticking
+  // four times a minute keeps a sample near its minute's start, and a timer up
+  // to 45 s late still lands in its minute; a minute with no tick, such as
+  // while the host is down, stays a gap.
   const sampleInboxMetrics = () => {
     try {
       getRepositories().inboxMetrics.sampleIfDue();

@@ -1521,6 +1521,31 @@ void main() {
       });
     });
 
+    testWidgets(
+      'desktop cards beside the charts keep the inbox item, below the header',
+      (tester) async {
+        await tester.runAsync(() async {
+          final store = await bootQueued();
+          // An ordinary desktop window: the work column beside the charts
+          // (#1018) is narrower than _kQueuedFocusColumnMinWidth.
+          await tester.binding.setSurfaceSize(const Size(1500, 1400));
+          addTearDown(() => tester.binding.setSurfaceSize(null));
+          await tester.pumpWidget(_app(store));
+          await tester.pump();
+          await tester.pump();
+
+          final handle = tester.getRect(find.text(reservedHandle));
+          final inbox = tester.getRect(find.text('Queued inbox content'));
+          expect(inbox.top, greaterThan(handle.bottom));
+          final charts = find.byKey(const Key('overview-inbox-metrics'));
+          expect(charts, findsOneWidget);
+          expect(tester.getRect(charts).left, greaterThan(inbox.right));
+          expect(tester.takeException(), isNull);
+          await store.dispose();
+        });
+      },
+    );
+
     testWidgets('quotes a future estimate relative to now', (tester) async {
       await tester.runAsync(() async {
         final api = FakeApi()

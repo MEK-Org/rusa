@@ -3304,7 +3304,8 @@ describe("handleMeshApiRequest", () => {
   it("GET /api/mesh/inbox-metrics serves only the aggregate window, and 503 when unwired", async () => {
     expect((await call(deps, "GET", "/api/mesh/inbox-metrics")).res.statusCode).toBe(503);
 
-    const metrics = new InboxMetricRepository(db);
+    // The route serves stored points as-is; which entries count is the repository's test.
+    const metrics = new InboxMetricRepository(db, () => () => false);
     const sampled = metrics.sampleIfDue();
     const { res } = await call(
       { ...deps, inboxMetrics: metrics },

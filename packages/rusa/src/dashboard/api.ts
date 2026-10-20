@@ -73,6 +73,7 @@ import { getDashboardRequestPrincipal } from "./auth.js";
 import {
   type HumanChatScope,
   humanChatViewer,
+  inboxEntryHiddenFrom,
   resolveHumanChatScope,
   viewingUserPrincipalId,
 } from "./human-chat-scope.js";
@@ -2669,10 +2670,10 @@ export async function handleMeshApiRequest(
   }
 
   // GET /api/mesh/inbox-metrics — prior three days of per-minute inbox backlog
-  // statistics across every live actor. Every viewer receives the same
-  // aggregates over every unhandled entry, including entries the per-entry
-  // routes hide from other viewers (#590); only medians and maxima leave the
-  // server.
+  // statistics across every live actor; only medians and maxima leave the
+  // server, the same for every viewer. Sizes and ages leave out human-chat
+  // messages, which the per-entry routes hide from other viewers (#590), so no
+  // statistic reveals that one arrived or when.
   if (pathname === "/api/mesh/inbox-metrics") {
     if (!deps.inboxMetrics) {
       sendJson(res, 503, { error: "inbox metrics unavailable" });
@@ -2905,29 +2906,12 @@ export async function handleMeshApiRequest(
       if (!entry.handledAt) continue;
 
       const source = entry.source;
-      const { messageId, fromId } = entry.payload as { messageId?: unknown; fromId?: unknown };
+      const { messageId } = entry.payload as { messageId?: unknown };
       let referenceKey: string | undefined;
       if (typeof messageId === "string") {
         // A human's message is that human's conversation with the actor.
-        // Another viewer is shown nothing of it — not that it exists — and a
-        // legacy pointer gets its sender from the canonical mesh source. The
-        // inbox row is always the recipient's. Payload/source are hints only:
-        // the local canonical record remains the #590 visibility authority.
-        const sourceSender =
-          source.startsWith("mesh:") && source !== "mesh:unknown"
-            ? source.slice("mesh:".length)
-            : undefined;
-        const senderId = typeof fromId === "string" ? fromId : sourceSender;
-        if (senderId && !chatScope.canSee(senderId, entry.actorId)) continue;
-        const reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
-          meshChat: deps.meshChat,
-        });
-        if (
-          reference.entity?.type === "mesh_message" &&
-          !chatScope.canSee(reference.entity.senderId, reference.entity.recipientId)
-        ) {
-          continue;
-        }
+        // Another viewer is shown nothing of it — not that it exists.
+        if (inboxEntryHiddenFrom(entry, deps.meshChat, chatScope)) continue;
         referenceKey = `mesh:messages/${messageId}`;
       } else if (source.startsWith("github:") || source.startsWith("slack:")) {
         // Canonical external reference: resolve key after first paint.

@@ -3,6 +3,8 @@ import type { CapabilityGrantStore } from "../../actor/capability-grants.js";
 import type { ExperimentEnrollmentStore } from "../../actor/experiments.js";
 import type { HostJobStore } from "../../actor/host-job-store.js";
 import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
+import { inboxEntryHiddenFrom, sharedChatScope } from "../../dashboard/human-chat-scope.js";
+import type { PrincipalRef } from "../../principals/principal-ref.js";
 import type { ActorRepository } from "../../repositories/actor-repository.js";
 import type { InboxRepository } from "../../repositories/inbox-repository.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
@@ -132,8 +134,18 @@ export class Repositories {
     this.sqliteInbox = new SqliteInboxRepository(db);
     this.inbox = this.sqliteInbox;
     this.inboxFocus = new InboxFocusRepository(db);
-    this.inboxMetrics = new InboxMetricRepository(db);
     this.meshChat = new MeshChatRepository(db);
+    this.inboxMetrics = new InboxMetricRepository(db, () => {
+      // One sample asks about the same few principals once per entry.
+      const kinds = new Map<string, PrincipalRef | undefined>();
+      const scope = sharedChatScope({
+        get: (id) => {
+          if (!kinds.has(id)) kinds.set(id, this.principals.get(id));
+          return kinds.get(id);
+        },
+      });
+      return (entry) => inboxEntryHiddenFrom(entry, this.meshChat, scope);
+    });
     this.quotaScrapes = new QuotaScrapeRepository(db);
     this.modelScrapes = new ModelScrapeRepository(db);
     this.obligations = new ObligationRepository(db);
