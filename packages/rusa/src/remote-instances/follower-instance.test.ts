@@ -10,7 +10,8 @@ import { ProviderPacer } from "../actor/provider-pacer.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { ClaudeProvider } from "../providers/claude.js";
-import { FollowerInstance } from "./follower-instance.js";
+import type { FollowerEvent } from "./follower-hub.js";
+import { type FollowerFileOps, FollowerInstance } from "./follower-instance.js";
 import { createHarness, waitUntil } from "./harness.js";
 import type { ActorEvent, LeaderCommand, ProviderFactory } from "./protocol.js";
 
@@ -2588,5 +2589,121 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
     });
     expect(h.mesh.activeRunState(id)).toEqual({ actorId: id, phase: "running" });
     expect(() => h.mesh.retire(id)).toThrow(/cannot retire/);
+  });
+});
+
+describe("follower file operations (#1013)", () => {
+  const stubProvider: ProviderFactory = () => ({
+    name: "test-provider",
+    providerName: "test-provider",
+    run: async () => ({ success: true, exitCode: 0, output: "" }),
+    stop: () => {},
+  });
+  const operation = {
+    kind: "driveFileDownload" as const,
+    fileId: "file-1",
+    destinationPath: "out.bin",
+  };
+
+  const hostedFollower = (fileOps?: FollowerFileOps) => {
+    const home = mkdtempSync(join(tmpdir(), "rusa-follower-fileop-"));
+    dirs.push(home);
+    const events: FollowerEvent[] = [];
+    const follower = new FollowerInstance(
+      home,
+      false,
+      (event) => events.push(event),
+      stubProvider,
+      {
+        ...(fileOps ? { fileOps } : {}),
+      }
+    );
+    follower.dispatch({
+      actorId: "actor-1",
+      message: { type: "init", bootstrap: { id: "actor-1", cwd: home } },
+    });
+    onTestFinished(() => follower.close());
+    const resultFor = async (requestId: string) => {
+      await waitUntil(() =>
+        events.some((e) => e.message.type === "fileOpResult" && e.message.requestId === requestId)
+      );
+      return events.find(
+        (e) => e.message.type === "fileOpResult" && e.message.requestId === requestId
+      );
+    };
+    return { home, follower, resultFor };
+  };
+
+  it("runs an operation for a hosted actor inside that actor's working directory", async () => {
+    const calls: Array<[string, unknown]> = [];
+    const { home, follower, resultFor } = hostedFollower(async (workDir, op) => {
+      calls.push([workDir, op]);
+      return { path: join(workDir, "out.bin"), bytes: 3, sha256: "a".repeat(64) };
+    });
+    follower.dispatch({
+      actorId: "actor-1",
+      message: { type: "fileOp", requestId: "r1", operation },
+    });
+
+    expect(await resultFor("r1")).toEqual({
+      eventId: expect.any(String),
+      actorId: "actor-1",
+      message: {
+        type: "fileOpResult",
+        requestId: "r1",
+        result: {
+          path: join(home, "workers", "actor-1", "out.bin"),
+          bytes: 3,
+          sha256: "a".repeat(64),
+        },
+      },
+    });
+    expect(calls).toEqual([[join(home, "workers", "actor-1"), operation]]);
+  });
+
+  it("refuses an actor this follower does not host", async () => {
+    const fileOps = vi.fn<FollowerFileOps>();
+    const { follower, resultFor } = hostedFollower(fileOps);
+    follower.dispatch({
+      actorId: "actor-2",
+      message: { type: "fileOp", requestId: "r2", operation },
+    });
+
+    expect((await resultFor("r2"))?.message).toEqual({
+      type: "fileOpResult",
+      requestId: "r2",
+      error: "this follower does not host actor actor-2",
+    });
+    expect(fileOps).not.toHaveBeenCalled();
+  });
+
+  it("refuses every operation when it has no file executor", async () => {
+    const { follower, resultFor } = hostedFollower();
+    follower.dispatch({
+      actorId: "actor-1",
+      message: { type: "fileOp", requestId: "r3", operation },
+    });
+
+    expect((await resultFor("r3"))?.message).toEqual({
+      type: "fileOpResult",
+      requestId: "r3",
+      error: "this follower cannot run file operations",
+    });
+  });
+
+  it("returns the executor's refusal unchanged", async () => {
+    const { follower, resultFor } = hostedFollower(async () => {
+      throw new Error("this follower has no Google Drive credentials: missing drive-token.json");
+    });
+    follower.dispatch({
+      actorId: "actor-1",
+      message: { type: "fileOp", requestId: "r4", operation },
+    });
+
+    expect((await resultFor("r4"))?.message).toEqual({
+      type: "fileOpResult",
+      requestId: "r4",
+      error: "this follower has no Google Drive credentials: missing drive-token.json",
+    });
   });
 });

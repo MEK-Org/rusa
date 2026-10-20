@@ -476,29 +476,38 @@ function injectWorkerGithubCredential(args: string[], mcHome: string): string | 
 
 /**
  * Google user-OAuth token shadow for sandboxed workers . The codebase
- * centralizes all Google user tokens (Chat, Gmail, Drive, Calendar) under the
- * single `~/.config/gchat` directory, so that is the only host path we shadow.
- * Workers have no legitimate need for raw Google tokens; chat/calendar/drive
- * access is mediated by capability-gated MCP servers on the host plane.
+ * centralizes all Google user tokens (Chat, Gmail, Drive, Calendar) under one
+ * directory: `~/.config/gchat`, or the configured `chat.gchatConfigDir`. We
+ * shadow both, since a follower holds its own Google credentials wherever its
+ * config says (#1013). Workers have no legitimate need for raw Google tokens;
+ * chat/calendar/drive access is mediated by capability-gated MCP servers on
+ * the host plane.
  *
- * We `--tmpfs`-shadow the directory after ensuring the mount point exists. This
- * hides any real `token.json`, `client.json`, `gmail-token.json`,
+ * We `--tmpfs`-shadow each directory after ensuring the mount point exists.
+ * This hides any real `token.json`, `client.json`, `gmail-token.json`,
  * `drive-token.json`, `calendar-token.json`, etc. from the sandbox. It is
  * fail-closed in the sense that a bwrap failure to apply the shadow aborts the
  * spawn; there is no opt-out or fallback that leaves the real dir visible.
  */
 function injectGoogleCredentialShadow(args: string[]): void {
-  const gchatConfigDir = join(getHostConfigDir(), "gchat");
+  const dirs = new Set([join(getHostConfigDir(), "gchat")]);
+  try {
+    const configured = loadConfig().chat?.gchatConfigDir;
+    if (configured) dirs.add(realpathIfExists(resolve(configured)));
+  } catch {
+    // Config not found/invalid: the default shadow still applies, matching
+    // injectWorkerGithubCredential's discipline. In production the service
+    // already loaded config before any actor could spawn.
+  }
 
-  // Only shadow if the directory actually exists on the host. If it does not,
-  // there is nothing to hide at the default path, and creating a synthetic
-  // mountpoint would be inert. A configured non-default `gchatConfigDir` is
-  // out of scope for this sandbox-level shadow (residual noted in ISSUE_NUM).
-  if (!existsSync(gchatConfigDir)) return;
-
-  ensureTargetParentDirs(args, gchatConfigDir);
-  args.push("--dir", gchatConfigDir);
-  args.push("--tmpfs", gchatConfigDir);
+  for (const dir of dirs) {
+    // Only shadow a directory that exists on the host. If it does not, there is
+    // nothing to hide there, and creating a synthetic mountpoint would be inert.
+    if (!existsSync(dir)) continue;
+    ensureTargetParentDirs(args, dir);
+    args.push("--dir", dir);
+    args.push("--tmpfs", dir);
+  }
 }
 
 /**

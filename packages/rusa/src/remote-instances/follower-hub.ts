@@ -17,6 +17,8 @@ import type { FollowerUpdateTriggerStore } from "./follower-update-trigger-store
 import { isFullCommitSha, isSafeFollowerBranch } from "./follower-update-validation.js";
 import type {
   ActorEvent,
+  FollowerFileOperation,
+  FollowerFileOperationResult,
   FollowerParkedEvent,
   FollowerUpdateCommand,
   FollowerUpdateStatus,
@@ -352,6 +354,21 @@ export class FollowerHub {
         if (route.actorId === actorId) this.routes.delete(key);
     });
     return host;
+  }
+  /**
+   * Has the follower hosting an actor run one provider download for it
+   * (#1013). Undefined when that follower predates `fileOp`.
+   */
+  fileOp(
+    followerId: string,
+    actorId: string,
+    operation: FollowerFileOperation
+  ): Promise<FollowerFileOperationResult> | undefined {
+    const follower = this.followers.get(followerId);
+    if (!follower) {
+      return Promise.reject(new Error(`Follower ${followerId} is not connected`));
+    }
+    return follower.fileOp(actorId, operation);
   }
   stopActor(followerId: string, actorId: string): void {
     const follower = this.followers.get(followerId);

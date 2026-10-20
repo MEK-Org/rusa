@@ -977,6 +977,39 @@ describe("sandbox bwrap args", () => {
       expect(tmpfsTargets).not.toContain(gchatDir);
     });
 
+    it("also shadows a configured non-default chat.gchatConfigDir for real workers (#1013)", async () => {
+      const { home, actorDir, gchatDir } = makeWorkerHome();
+      mkdirSync(gchatDir, { recursive: true, mode: 0o700 });
+      // A follower may hold its own Google credentials anywhere its config says.
+      const configuredDir = join(home, "elsewhere", "google-creds");
+      mkdirSync(configuredDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(configuredDir, "drive-token.json"), '{"refresh_token":"x"}', {
+        mode: 0o600,
+      });
+      mockLoadConfig.mockReturnValue({
+        github: { account: "test" },
+        providers: {},
+        webhook: { port: 9742, secret: "secret" },
+        gitBridge: false,
+        chat: { gchatConfigDir: configuredDir },
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const { args } = buildActorBwrapArgs(actorDir, "antigravity");
+
+      const tmpfsTargets = args.filter((_, i) => args[i - 1] === "--tmpfs");
+      expect(tmpfsTargets).toContain(configuredDir);
+      expect(tmpfsTargets).toContain(gchatDir);
+      for (let i = 0; i < args.length; i += 1) {
+        if (args[i] === "--bind" || args[i] === "--ro-bind") {
+          expect(args[i + 1]).not.toBe(configuredDir);
+          expect(args[i + 2]).not.toBe(configuredDir);
+        }
+      }
+      warnSpy.mockRestore();
+    });
+
     it("is inert when the host has no ~/.config/gchat dir", async () => {
       const { actorDir, gchatDir } = makeWorkerHome();
       // Intentionally do not create gchatDir.

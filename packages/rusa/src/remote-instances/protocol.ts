@@ -90,7 +90,11 @@ export interface FollowerParkedEvent {
 // of the queued report. Pre- and post-#725 v8 followers share a version, so the
 // fallback lives until v8 leaves the window, not at the next bump. It is tagged
 // `pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8`.
-export const INSTANCE_PROTOCOL_VERSION = 8;
+//
+// v9 (#1013) adds the `fileOp` command and its `fileOpResult` event. The leader
+// sends `fileOp` only to a v9 follower; a v8 follower's actors keep the
+// file-tool refusal.
+export const INSTANCE_PROTOCOL_VERSION = 9;
 /** Oldest follower protocol the leader still admits; see the rule above. */
 export const OLDEST_FOLLOWER_PROTOCOL_VERSION = INSTANCE_PROTOCOL_VERSION - 1;
 export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
@@ -178,6 +182,30 @@ export type Request =
    */
   | { op: "providerAttempt"; attempt: RawProviderModelConfig };
 
+/**
+ * A provider download a follower runs for one of its own actors (#1013). The
+ * leader has already authorized it; the follower calls the provider with its
+ * own credentials and writes inside that actor's working directory.
+ */
+export type FollowerFileOperation =
+  | {
+      kind: "chatAttachmentDownload";
+      resourceName: string;
+      destinationPath: string;
+      /** The leader's byte limit for this actor; the follower also applies its own. */
+      maxBytes: number;
+    }
+  | { kind: "driveFileDownload"; fileId: string; destinationPath: string };
+
+export interface FollowerFileOperationResult {
+  /** Absolute path on the follower. */
+  path: string;
+  bytes: number;
+  sha256: string;
+  name?: string;
+  contentType?: string;
+}
+
 export type LeaderCommand =
   | { type: "init"; bootstrap: Bootstrap }
   /** Replace the follower Actor's next-run pool without resetting its runtime. */
@@ -202,7 +230,9 @@ export type LeaderCommand =
   | { type: "resumeCancelled"; nudge: RunNudge }
   | { type: "unkillable" }
   | { type: "stop" }
-  | { type: "reply"; requestId: number; value?: unknown; error?: string };
+  | { type: "reply"; requestId: number; value?: unknown; error?: string }
+  /** v9: run one provider download for this actor; answered by `fileOpResult`. */
+  | { type: "fileOp"; requestId: string; operation: FollowerFileOperation };
 
 export type ActorEvent =
   | { type: "ready"; pid: number }
@@ -234,7 +264,14 @@ export type ActorEvent =
   | { type: "abandoned"; abandon: RunAbandon }
   | { type: "coalesced"; count: number; ageMs: number }
   | { type: "log"; chunk: string }
-  | { type: "fatal"; error: string };
+  | { type: "fatal"; error: string }
+  /** v9: the outcome of a `fileOp`; exactly one of result or error. */
+  | {
+      type: "fileOpResult";
+      requestId: string;
+      result?: FollowerFileOperationResult;
+      error?: string;
+    };
 
 export type FollowerUpdateStatusPhase =
   | "pending"
