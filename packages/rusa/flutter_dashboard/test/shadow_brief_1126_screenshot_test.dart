@@ -84,7 +84,13 @@ Future<FakeApi> _openInfo(
     api = FakeApi()
       ..threadsResult = [
         makeThread(_parentId, created: 't0'),
-        makeThread(_actorId, parent: _parentId, created: 't1'),
+        // A set work state exercises the title-only placement below.
+        makeThread(
+          _actorId,
+          parent: _parentId,
+          commitmentKind: 'running',
+          created: 't1',
+        ),
       ]
       ..charters[_actorId] = _charter
       ..contextModes[_actorId] = mode;

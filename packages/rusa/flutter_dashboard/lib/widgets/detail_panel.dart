@@ -888,8 +888,6 @@ class _InfoViewState extends State<_InfoView> {
                 ),
               if (_contextMode != null)
                 _meta('Context mode', _modeLabel(_contextMode!)),
-              if (actor.commitmentKind != null)
-                _meta('Work state', actor.commitmentKind!),
               if (actor.waitingOn != null)
                 _meta('Waiting on', actor.waitingOn!),
               if (actor.ownerExpectsRetirement != null)
