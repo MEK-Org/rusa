@@ -1282,6 +1282,296 @@ describe("SharedQuotaStore persisted controller", () => {
   });
 });
 
+describe("SharedQuotaStore remaining-quota reference (#1123)", () => {
+  const minute = 60 * 1000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  const iso = (ms: number) => new Date(ms).toISOString();
+  // A weekly lane paced against a deadline six days out, then moved to two
+  // days from a reading that still has 95% left and no refill.
+  const t0 = Date.parse("2030-03-01T00:00:00.000Z");
+  const oldReset = t0 + 6 * day;
+  const moved = t0 + hour;
+  const newReset = moved + 2 * day;
+
+  interface LaneRow extends ReasonedRow {
+    percentLeft: number;
+    windowMs: number;
+    reference: number | null;
+  }
+  function laneRows(store: SharedQuotaStore, provider = "codex"): LaneRow[] {
+    return store.db
+      .prepare(
+        `SELECT observed_at AS observedAt, percent_left AS percentLeft, window_ms AS windowMs,
+                reference_start_percent AS reference, controller_error AS error,
+                controller_integral AS integral, controller_derivative AS derivative,
+                uncapped_interval_seconds AS uncapped, interval_seconds AS interval
+         FROM quota_observations WHERE provider = ? AND kind = 'weekly'
+         ORDER BY observed_at ASC, rowid ASC`
+      )
+      .all(provider) as LaneRow[];
+  }
+  function openStore(name: string, path?: string): { store: SharedQuotaStore; path: string } {
+    let file = path;
+    if (!file) {
+      const root = mkdtempSync(join(tmpdir(), `rusa-quota-reference-${name}-`));
+      roots.push(root);
+      file = join(root, "shared.db");
+    }
+    const store = new SharedQuotaStore(file);
+    store.configureController({ maxIntervalSeconds: 36000 });
+    return { store, path: file };
+  }
+  /** Two readings against the old deadline, so the lane holds a period to inherit. */
+  function paced(store: SharedQuotaStore): void {
+    recordObservation(store, "codex", iso(t0), 96, iso(oldReset));
+    recordObservation(store, "codex", iso(t0 + 30 * minute), 95.5, iso(oldReset));
+  }
+  /** Remaining quota that exactly follows a reference starting at `start` at `fromMs`. */
+  const onPlan = (start: number, fromMs: number, endMs: number, atMs: number) =>
+    (start * (endMs - atMs)) / (endMs - fromMs);
+
+  it("starts a moved deadline's reference at the quota left, not at a full window", () => {
+    const { store } = openStore("moved");
+    try {
+      paced(store);
+      const inherited = laneRows(store).at(-1)?.interval ?? 0;
+      expect(inherited).toBeGreaterThan(0);
+      recordObservation(store, "codex", iso(moved), 95, iso(newReset));
+      const anchor = laneRows(store).at(-1) as LaneRow;
+      // The stored window is the real two-day horizon, and the reference
+      // starts from the 95% that was left, so pacing begins on plan.
+      expect(anchor.windowMs).toBe(2 * day);
+      expect(anchor.reference).toBe(95);
+      expect(anchor.error).toBe(0);
+      expect(anchor.integral).toBe(0);
+      expect(anchor.derivative).toBe(0);
+      // Not a verified cycle, so the inherited period carries over and only
+      // the actuator's smoothing moves it.
+      expect(anchor.interval).toBeGreaterThan(0);
+      expect(anchor.interval).toBeLessThan(inherited);
+      expect(store.getProviderThrottle("codex")?.buckets[0]?.timeRemainingPct).toBe(100);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("settles the inherited period on an on-plan burn-down after the move", () => {
+    const { store } = openStore("settle");
+    try {
+      paced(store);
+      recordObservation(store, "codex", iso(moved), 95, iso(newReset));
+      for (let step = 1; step <= 6; step += 1) {
+        const at = moved + step * 30 * minute;
+        recordObservation(store, "codex", iso(at), onPlan(95, moved, newReset, at), iso(newReset));
+      }
+      const after = laneRows(store).slice(2);
+      for (const row of after) {
+        expect(row.reference).toBe(95);
+        expect(row.windowMs).toBe(2 * day);
+        expect(Math.abs(row.error)).toBeLessThan(1e-9);
+      }
+      // Error stays at zero, so the period inherited from the old deadline
+      // only decays: each step is lower, and it ends near zero.
+      const intervals = after.map((row) => row.interval);
+      for (let k = 1; k < intervals.length; k += 1)
+        expect(intervals[k]).toBeLessThan(intervals[k - 1]);
+      expect(intervals.at(-1)).toBeLessThan(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("re-anchors on earlier and later deadlines, but not on unchanged ones or +30s jitter", () => {
+    const { store } = openStore("moves");
+    try {
+      paced(store);
+      recordObservation(store, "codex", iso(moved), 95, iso(newReset));
+      // Unchanged and +30s jitter stay in this window and keep its reference.
+      recordObservation(store, "codex", iso(moved + 30 * minute), 94.5, iso(newReset));
+      recordObservation(store, "codex", iso(moved + hour), 94, iso(newReset + 30 * 1000));
+      // A later deadline, with the moved one still ahead: anchored afresh.
+      const later = moved + 2 * hour;
+      const laterReset = later + 4 * day;
+      recordObservation(store, "codex", iso(later), 93, iso(laterReset));
+      // An earlier one: anchored afresh again.
+      const earlier = moved + 3 * hour;
+      const earlierReset = earlier + day;
+      recordObservation(store, "codex", iso(earlier), 92, iso(earlierReset));
+      expect(
+        laneRows(store)
+          .slice(2)
+          .map(({ windowMs, reference }) => ({ windowMs, reference }))
+      ).toEqual([
+        { windowMs: 2 * day, reference: 95 },
+        { windowMs: 2 * day, reference: 95 },
+        { windowMs: 2 * day, reference: 95 },
+        { windowMs: 4 * day, reference: 93 },
+        { windowMs: day, reference: 92 },
+      ]);
+      const [, , , jitter, laterRow, earlierRow] = laneRows(store).slice(1);
+      expect(jitter.error).toBeCloseTo(
+        ((newReset + 30 * 1000 - (moved + hour)) / (2 * day)) * 95 - 94,
+        9
+      );
+      expect(laterRow.error).toBe(0);
+      expect(earlierRow.error).toBe(0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("anchors tiny and exhausted quota at what is left", () => {
+    const { store } = openStore("tiny");
+    try {
+      recordObservation(store, "codex", iso(t0), 1, iso(oldReset));
+      recordObservation(store, "codex", iso(moved), 0.4, iso(newReset));
+      const at = moved + 30 * minute;
+      recordObservation(store, "codex", iso(at), onPlan(0.4, moved, newReset, at), iso(newReset));
+      const tiny = laneRows(store).slice(1);
+      expect(tiny.map((row) => row.reference)).toEqual([0.4, 0.4]);
+      expect(tiny[0].error).toBe(0);
+      expect(Math.abs(tiny[1].error)).toBeLessThan(1e-12);
+    } finally {
+      store.close();
+    }
+    const exhausted = openStore("exhausted").store;
+    try {
+      recordObservation(exhausted, "codex", iso(t0), 1, iso(oldReset));
+      recordObservation(exhausted, "codex", iso(moved), 0, iso(newReset));
+      // A rounding-sized rise is not a refill: the window keeps its empty
+      // reference, so the reading reads as spare quota rather than overspend.
+      recordObservation(exhausted, "codex", iso(moved + 30 * minute), 1, iso(newReset));
+      const [, zero, after] = laneRows(exhausted);
+      expect(zero).toMatchObject({ reference: 0, error: null, interval: null });
+      expect(after.reference).toBe(0);
+      expect(after.error).toBe(-1);
+    } finally {
+      exhausted.close();
+    }
+  });
+
+  it("returns to a full-window reference on a refill and on a natural rollover", () => {
+    const { store } = openStore("refill");
+    try {
+      paced(store);
+      recordObservation(store, "codex", iso(moved), 95, iso(newReset));
+      // A 100% refill under the unchanged deadline is new quota: full reference.
+      const refill = moved + 30 * minute;
+      recordObservation(store, "codex", iso(refill), 100, iso(newReset));
+      // A refill that also moves the deadline is a full window as well.
+      const both = moved + hour;
+      recordObservation(store, "codex", iso(both), 30, iso(newReset));
+      recordObservation(
+        store,
+        "codex",
+        iso(both + 30 * minute),
+        100,
+        iso(both + 30 * minute + 7 * day)
+      );
+      const [refillRow, drained, movedRefill] = laneRows(store).slice(3);
+      expect(refillRow).toMatchObject({ reference: null, windowMs: 2 * day });
+      expect(refillRow.error).toBeCloseTo(((newReset - refill) / (2 * day)) * 100 - 100, 9);
+      expect(drained.reference).toBeNull();
+      expect(movedRefill).toMatchObject({ reference: null, windowMs: 7 * day, error: 0 });
+    } finally {
+      store.close();
+    }
+    const rollover = openStore("rollover").store;
+    try {
+      recordObservation(rollover, "codex", iso(t0), 90, iso(newReset));
+      recordObservation(rollover, "codex", iso(moved), 95, iso(t0 + 3 * day));
+      // The anchored deadline passes and the next one arrives: a new cycle
+      // from that end with the full-window reference, as before.
+      const next = t0 + 3 * day + 10 * minute;
+      recordObservation(rollover, "codex", iso(next), 100, iso(t0 + 10 * day));
+      const row = laneRows(rollover).at(-1) as LaneRow;
+      expect(row).toMatchObject({ reference: null, windowMs: 7 * day });
+      expect(row.error).toBeCloseTo(((t0 + 10 * day - next) / (7 * day)) * 100 - 100, 9);
+    } finally {
+      rollover.close();
+    }
+  });
+
+  it("keeps the cold-start reference full", () => {
+    const { store } = openStore("cold");
+    try {
+      recordObservation(store, "codex", iso(moved), 95, iso(newReset));
+      expect(laneRows(store)[0]).toMatchObject({ reference: null, windowMs: 2 * day, error: 5 });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps the anchor across a restart and after its row is pruned", () => {
+    const opened = openStore("durable");
+    const first = opened.store;
+    paced(first);
+    // An operator deadline five weeks out, so the window outlives retention.
+    const farReset = moved + 35 * day;
+    recordObservation(first, "codex", iso(moved), 95, iso(farReset));
+    recordObservation(
+      first,
+      "codex",
+      iso(moved + day),
+      onPlan(95, moved, farReset, moved + day),
+      iso(farReset)
+    );
+    first.close();
+
+    const { store } = openStore("durable", opened.path);
+    try {
+      const restarted = moved + 2 * day;
+      recordObservation(
+        store,
+        "codex",
+        iso(restarted),
+        onPlan(95, moved, farReset, restarted),
+        iso(farReset)
+      );
+      expect(laneRows(store).at(-1)?.reference).toBe(95);
+      // Retention removes the anchoring reading and every one before it.
+      const pruneAt = moved + QUOTA_OBSERVATION_RETENTION_MS + 12 * hour;
+      expect(store.pruneObservations(pruneAt)).toBe(3);
+      expect(laneRows(store)[0]?.observedAt).toBe(iso(moved + day));
+      // The surviving rows carry the original anchor; a later reading does
+      // not become a replacement anchor at its own lower percent.
+      const late = moved + 31 * day;
+      recordObservation(
+        store,
+        "codex",
+        iso(late),
+        onPlan(95, moved, farReset, late),
+        iso(farReset)
+      );
+      const row = laneRows(store).at(-1) as LaneRow;
+      expect(row).toMatchObject({ reference: 95, windowMs: 35 * day });
+      expect(Math.abs(row.error)).toBeLessThan(1e-9);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("adds the column to a database created before it, as a full-window reference", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-quota-reference-legacy-"));
+    roots.push(root);
+    const path = join(root, "shared.db");
+    const legacy = new SharedQuotaStore(path);
+    recordObservation(legacy, "codex", iso(t0), 96, iso(oldReset));
+    legacy.db.exec("ALTER TABLE quota_observations DROP COLUMN reference_start_percent");
+    legacy.close();
+    const { store } = openStore("legacy", path);
+    try {
+      expect(store.db.pragma("user_version", { simple: true })).toBe(QUOTA_SCHEMA_VERSION);
+      expect(laneRows(store)[0]?.reference).toBeNull();
+      recordObservation(store, "codex", iso(moved), 95, iso(newReset));
+      expect(laneRows(store).at(-1)?.reference).toBe(95);
+    } finally {
+      store.close();
+    }
+  });
+});
+
 describe("SharedQuotaStore retention and indexing", () => {
   it("prunes observations older than 30 days while protecting the latest reasoned row per (provider, kind)", () => {
     expect(QUOTA_OBSERVATION_RETENTION_MS).toBe(30 * 24 * 60 * 60 * 1000);

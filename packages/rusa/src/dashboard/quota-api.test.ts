@@ -121,6 +121,64 @@ describe("buildQuotaSnapshot stored window lengths", () => {
     });
     expect(snapshot.providers[0]?.windows[0]?.windowMs).toBe(6 * day);
   });
+  it("shows a moved deadline's actual horizon, not its pacing reference (#1123)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-quota-api-reference-"));
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 36000 });
+      const day = 24 * 60 * 60 * 1000;
+      const iso = (ms: number) => new Date(ms).toISOString();
+      const t0 = Date.parse("2030-03-01T00:00:00.000Z");
+      const moved = t0 + 60 * 60 * 1000;
+      const reading = (atMs: number, percentLeft: number, resetMs: number) => {
+        const state: ProviderQuotaSnapshot = {
+          provider: "codex",
+          status: "available",
+          scrapedAt: iso(atMs),
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              scope: "provider",
+              percentLeft,
+              resetAtIso: iso(resetMs),
+            },
+          ],
+        };
+        store.recordParsed(
+          store.recordRaw({ provider: "codex", scrapedAt: iso(atMs), rawOutput: "raw" }),
+          state,
+          state
+        );
+      };
+      reading(t0, 96, t0 + 6 * day);
+      // The deadline moves to two days out with 95% left: the reference starts
+      // at 95%, while the window every reader sees stays two days long.
+      reading(moved, 95, moved + 2 * day);
+      const deps: QuotaApiDeps = {
+        getQuota: async () =>
+          store.getLatestSnapshot("codex") ?? { provider: "codex", status: "unknown" },
+        providers: ["codex"],
+        now: () => moved + 60 * 1000,
+        getThrottle: (provider) => store.getProviderThrottle(provider),
+        listHistory: (provider, sinceIso) => store.listHistorySince(provider, sinceIso),
+      };
+      const snapshot = await buildQuotaSnapshot(deps);
+      expect(snapshot.providers[0].windows).toEqual([
+        expect.objectContaining({ id: "weekly", windowMs: 2 * day, usedPercent: 5 }),
+      ]);
+      expect(snapshot.providers[0].throttle?.buckets).toEqual([
+        expect.objectContaining({ timeRemainingPct: 100, percentLeft: 95, error: 0 }),
+      ]);
+      // The dashboard plots the error as remaining minus reference.
+      const last = buildQuotaHistorySnapshot(deps).history[0]?.points.at(-1);
+      expect(last?.remainingPercent).toBe(95);
+      expect(Math.abs(last?.error ?? Number.NaN)).toBe(0);
+    } finally {
+      store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 function fakeReq(method: string): IncomingMessage {

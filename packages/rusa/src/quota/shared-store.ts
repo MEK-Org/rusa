@@ -19,6 +19,7 @@ import { configuredModelRefs, resolveWindowModels } from "./model-window-scope.j
 import { extractedNoQuotaValues, parseParsedState, serializeParsedState } from "./parsed-state.js";
 import {
   QUOTA_OBSERVATION_SLOT_MS,
+  QUOTA_REFILL_EPSILON_POINTS,
   type QuotaCycleObservation,
   quotaCycleChanged,
   verifiedQuotaCycleTransition,
@@ -262,6 +263,12 @@ interface StoredObservation extends CanonicalQuotaObservation {
   modelScope: string;
   slot: number;
   processed: number;
+  /**
+   * Remaining quota the pacing reference starts from at the window's start
+   * (`resetAtIso - windowMs`), in percent. Null is a full window, 100%. See
+   * `windowForCandidate` for when it is set.
+   */
+  referenceStartPercent: number | null;
 }
 
 interface ReasonedObservation {
@@ -608,6 +615,7 @@ export class SharedQuotaStore {
         controller_integral REAL,
         uncapped_interval_seconds REAL,
         interval_seconds REAL,
+        reference_start_percent REAL,
         PRIMARY KEY(provider, model_scope, kind, observed_slot)
       );
       CREATE INDEX IF NOT EXISTS idx_quota_observations_provider_time
@@ -706,6 +714,12 @@ export class SharedQuotaStore {
     );
     if (!columns.has("controller_integral")) {
       this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
+    }
+    // Nullable and additive, so the schema version does not move: a build
+    // without the column still opens the file and writes null, which reads as
+    // the full-window reference it always used.
+    if (!columns.has("reference_start_percent")) {
+      this.db.exec("ALTER TABLE quota_observations ADD COLUMN reference_start_percent REAL");
     }
   }
 
@@ -1143,7 +1157,8 @@ export class SharedQuotaStore {
           `SELECT provider, model_scope AS modelScope, kind, label,
                   observed_at AS observedAt, observed_slot AS slot,
                   percent_left AS percentLeft, reset_at_iso AS resetAtIso,
-                  window_ms AS windowMs, processed
+                  window_ms AS windowMs, processed,
+                  reference_start_percent AS referenceStartPercent
            FROM quota_observations
            WHERE processed = 0 AND (? IS NULL OR provider = ?)
            ORDER BY observed_at ASC, rowid ASC`
@@ -1219,7 +1234,11 @@ export class SharedQuotaStore {
       100,
       Math.max(0, ((resetMs - observedMs) / observation.windowMs) * 100)
     );
-    const error = timeRemainingPct - observation.percentLeft;
+    // Even pacing spends the quota the window started with in proportion to
+    // the time left. That is 100% unless the deadline moved mid-window, when
+    // the window starts from the quota that was left at that reading.
+    const referencePct = (timeRemainingPct * (observation.referenceStartPercent ?? 100)) / 100;
+    const error = referencePct - observation.percentLeft;
     // A cycle boundary is anything that makes the previous error incomparable
     // to this one: the reset instant moved, or remaining quota rose (see
     // `quotaCycleChanged`). A refill with an unmoved reset matters on its own:
@@ -1736,7 +1755,7 @@ export class SharedQuotaStore {
         slot: Math.floor(observedMs / SLOT_MS),
         percentLeft: limit.percentLeft,
         resetAtIso: limit.resetAtIso ?? null,
-        windowMs: this.windowMsForCandidate({
+        ...this.windowForCandidate({
           provider,
           modelScope,
           kind,
@@ -1751,7 +1770,8 @@ export class SharedQuotaStore {
           `SELECT provider, model_scope AS modelScope, kind, label,
                   observed_at AS observedAt, observed_slot AS slot,
                   percent_left AS percentLeft, reset_at_iso AS resetAtIso,
-                  window_ms AS windowMs, processed
+                  window_ms AS windowMs, processed,
+                  reference_start_percent AS referenceStartPercent
            FROM quota_observations
            WHERE provider = ? AND model_scope = ? AND kind = ? AND observed_slot = ?`
         )
@@ -1773,14 +1793,15 @@ export class SharedQuotaStore {
         .prepare(
           `INSERT INTO quota_observations
             (provider, model_scope, kind, observed_slot, label, observed_at,
-             percent_left, reset_at_iso, window_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             percent_left, reset_at_iso, window_ms, reference_start_percent)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(provider, model_scope, kind, observed_slot) DO UPDATE SET
              label = excluded.label,
              observed_at = excluded.observed_at,
              percent_left = excluded.percent_left,
              reset_at_iso = excluded.reset_at_iso,
-             window_ms = excluded.window_ms`
+             window_ms = excluded.window_ms,
+             reference_start_percent = excluded.reference_start_percent`
         )
         .run(
           provider,
@@ -1791,57 +1812,82 @@ export class SharedQuotaStore {
           candidate.observedAt,
           candidate.percentLeft,
           candidate.resetAtIso,
-          candidate.windowMs
+          candidate.windowMs,
+          candidate.referenceStartPercent
         );
       observed("recorded");
     }
   }
 
   /**
-   * Derive one lane's window duration at the persistence seam. A material
-   * reset change starts the next window, so the latest stored cycle is the
-   * previous window and this one's length is the distance between ends. That cycle
-   * ended at its reset, or at the latest by this reading if the provider reset
-   * early. Before the store has seen a prior end, the first reading is the only
+   * Derive one lane's window at the persistence seam: its duration, and the
+   * remaining quota its pacing reference starts from. A material reset change
+   * starts the next window, so the latest stored cycle is the previous window
+   * and this one's length is the distance between ends. That cycle ended at
+   * its reset, or at the latest by this reading if the provider reset early.
+   * Before the store has seen a prior end, the first reading is the only
    * honest lower bound for the start. Tiny reset changes are display jitter:
-   * retain the current cycle's stored duration. Five-hour lanes keep their
+   * retain the current cycle's stored window. Five-hour lanes keep their
    * standard 5h denominator (#924 item 6): a session starts on first use, so
    * the gap between successive ends includes idle time.
+   *
+   * `windowMs` stays the actual time horizon, because the dashboard shows it.
+   * The reference is separate (#1123). A deadline that moves while the old one
+   * is still ahead, with no refill, re-anchors the window at this reading
+   * without returning any quota, so the reference starts from this reading's
+   * percent rather than from a full window. Every later row of the window
+   * carries that value forward, as it does `windowMs`, so a restart reads it
+   * back and retention never has to find the anchoring row. A refill, a
+   * passed deadline and a cold start keep the full-window reference (null).
    */
-  private windowMsForCandidate(
+  private windowForCandidate(
     candidate: Pick<
       StoredObservation,
       "provider" | "modelScope" | "kind" | "observedAt" | "percentLeft" | "resetAtIso"
     >
-  ): number {
+  ): Pick<StoredObservation, "windowMs" | "referenceStartPercent"> {
+    const full = (windowMs: number) => ({ windowMs, referenceStartPercent: null });
     if (candidate.kind === "session" || candidate.kind === "five_hour")
-      return quotaWindowMs(candidate.kind);
+      return full(quotaWindowMs(candidate.kind));
     const observedMs = Date.parse(candidate.observedAt);
     const resetMs = candidate.resetAtIso ? Date.parse(candidate.resetAtIso) : Number.NaN;
     if (!Number.isFinite(observedMs) || !Number.isFinite(resetMs) || resetMs <= observedMs)
-      return quotaWindowMs(candidate.kind);
+      return full(quotaWindowMs(candidate.kind));
 
     const latest = this.db
       .prepare(
-        `SELECT reset_at_iso AS resetAtIso, window_ms AS windowMs
+        `SELECT reset_at_iso AS resetAtIso, window_ms AS windowMs, percent_left AS percentLeft,
+                reference_start_percent AS referenceStartPercent
          FROM quota_observations
          WHERE provider = ? AND model_scope = ? AND kind = ? AND reset_at_iso IS NOT NULL
          ORDER BY observed_at DESC, rowid DESC LIMIT 1`
       )
       .get(candidate.provider, candidate.modelScope, candidate.kind) as
-      | { resetAtIso: string; windowMs: number }
+      | (Pick<StoredObservation, "windowMs" | "percentLeft" | "referenceStartPercent"> & {
+          resetAtIso: string;
+        })
       | undefined;
     if (latest) {
+      const refilled = candidate.percentLeft - latest.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
       // Only a moved end starts the next window; a refill under the same end
-      // stays in the current one.
+      // stays in the current one, against a full window's reference again.
       const endMoved = quotaCycleChanged(
         { percentLeft: candidate.percentLeft, resetAtIso: latest.resetAtIso },
         candidate,
         latest.windowMs
       );
-      if (!endMoved) return latest.windowMs;
-      const previousEndMs = Math.min(Date.parse(latest.resetAtIso), observedMs);
-      if (Number.isFinite(previousEndMs)) return resetMs - previousEndMs;
+      if (!endMoved)
+        return refilled
+          ? full(latest.windowMs)
+          : { windowMs: latest.windowMs, referenceStartPercent: latest.referenceStartPercent };
+      const latestResetMs = Date.parse(latest.resetAtIso);
+      const previousEndMs = Math.min(latestResetMs, observedMs);
+      if (Number.isFinite(previousEndMs)) {
+        const windowMs = resetMs - previousEndMs;
+        return observedMs < latestResetMs && !refilled
+          ? { windowMs, referenceStartPercent: candidate.percentLeft }
+          : full(windowMs);
+      }
     }
 
     const earliest = this.db
@@ -1854,6 +1900,6 @@ export class SharedQuotaStore {
       | { observedAt: string }
       | undefined;
     const firstObservedMs = earliest ? Date.parse(earliest.observedAt) : observedMs;
-    return resetMs - Math.min(observedMs, firstObservedMs);
+    return full(resetMs - Math.min(observedMs, firstObservedMs));
   }
 }

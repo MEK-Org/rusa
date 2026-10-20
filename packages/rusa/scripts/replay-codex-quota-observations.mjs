@@ -18,6 +18,7 @@ const OBSERVATION_COLUMNS = [
   "controller_integral",
   "uncapped_interval_seconds",
   "interval_seconds",
+  "reference_start_percent",
 ];
 
 function usage() {

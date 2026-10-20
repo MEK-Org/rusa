@@ -121,8 +121,10 @@ export interface QuotaHistoryPointDto {
   /** 0–100 quota remaining. This intentionally falls as quota is consumed. */
   remainingPercent: number;
   /**
-   * Pace controller error (remainingPercent - timeRemainingPct) in percentage points,
-   * centered at 0. Positive = surplus quota / additional quota to burn, negative = underwater / burning fast.
+   * Pace controller error (remainingPercent - pacing reference) in percentage points,
+   * centered at 0. The reference is timeRemainingPct of the quota the window started with:
+   * 100% unless the deadline moved mid-window, when it is the quota left at that reading.
+   * Positive = surplus quota / additional quota to burn, negative = underwater / burning fast.
    * Null when resetAtIso is unavailable for this reading.
    */
   error?: number | null;
