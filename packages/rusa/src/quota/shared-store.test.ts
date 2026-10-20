@@ -1551,13 +1551,17 @@ describe("SharedQuotaStore remaining-quota reference (#1123)", () => {
     try {
       recordObservation(exhausted, "codex", iso(t0), 1, iso(oldReset));
       recordObservation(exhausted, "codex", iso(moved), 0, iso(newReset));
-      // A rounding-sized rise is not a refill: the window keeps its empty
-      // reference, so the reading reads as spare quota rather than overspend.
+      // Any rise under the same deadline keeps the empty reference, so it reads
+      // as spare quota rather than overspend. A full refill is no exception:
+      // the lane stays unpaced until the deadline next moves.
       recordObservation(exhausted, "codex", iso(moved + 30 * minute), 1, iso(newReset));
-      const [, zero, after] = laneRows(exhausted);
+      recordObservation(exhausted, "codex", iso(moved + hour), 100, iso(newReset));
+      const [, zero, after, refilled] = laneRows(exhausted);
       expect(zero).toMatchObject({ reference: 0, error: null, interval: null });
       expect(after.reference).toBe(0);
       expect(after.error).toBe(-1);
+      expect(refilled.reference).toBe(0);
+      expect(refilled.error).toBe(-100);
     } finally {
       exhausted.close();
     }

@@ -1241,7 +1241,7 @@ export class SharedQuotaStore {
     // A cycle boundary is anything that makes the previous error incomparable
     // to this one: the reset instant moved, or remaining quota rose (see
     // `quotaCycleChanged`). A refill with an unmoved reset matters on its own:
-    // error is `timeRemainingPct - percentLeft`, so the refill makes the error
+    // error is `referencePct - percentLeft`, so the refill makes the error
     // fall sharply, and read as genuine progress rather than the discontinuity
     // it is, that fall does not merely spike:
     // `QUOTA_KD_SECONDS_SQUARED_PER_POINT` and `QUOTA_DERIVATIVE_TAU_SECONDS`
@@ -1837,7 +1837,9 @@ export class SharedQuotaStore {
    * refill anchors at 100, which paces as a full window does. Every later row
    * of the window carries that value forward, as it does `windowMs`, so a
    * restart reads it back and retention never has to find the anchoring row.
-   * A refill under an unchanged deadline keeps the window's reference; a
+   * A refill under an unchanged deadline keeps the window's reference, so
+   * after a low anchor the refilled quota reads as spare down to the old
+   * trajectory and the lane is not paced until the deadline next moves. A
    * passed deadline and a cold start keep the full-window reference (null).
    */
   private windowForCandidate(
