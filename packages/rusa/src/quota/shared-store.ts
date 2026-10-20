@@ -19,6 +19,7 @@ import { configuredModelRefs, resolveWindowModels } from "./model-window-scope.j
 import { extractedNoQuotaValues, parseParsedState, serializeParsedState } from "./parsed-state.js";
 import {
   QUOTA_OBSERVATION_SLOT_MS,
+  QUOTA_REFILL_EPSILON_POINTS,
   type QuotaCycleObservation,
   quotaCycleChanged,
   verifiedQuotaCycleTransition,
@@ -288,6 +289,9 @@ interface StoredScrapeRow {
   parsed_state: string | null;
   parse_error: string | null;
 }
+
+/** Which ingestion path produced an observation: a provider scrape or a manual reading. */
+type ObservationSource = "scrape" | "manual";
 
 interface ScrapePermit {
   provider: string;
@@ -790,7 +794,7 @@ export class SharedQuotaStore {
       this.db
         .prepare("UPDATE quota_scrapes SET parsed_state = ?, parse_error = NULL WHERE id = ?")
         .run(serializeParsedState(inferredState), id);
-      this.insertObservations(inferredParsed, scrape?.scraped_at, scrape?.provider);
+      this.insertObservations(inferredParsed, scrape?.scraped_at, scrape?.provider, "scrape");
     })();
     // Judge the parser's own read: a failed read that carried an earlier
     // reading forward is not a clean parse (#775).
@@ -926,7 +930,7 @@ export class SharedQuotaStore {
         idempotencyKey: input.idempotencyKey,
         generation: input.generation,
       };
-      this.insertObservations(state, observedAt, provider);
+      this.insertObservations(state, observedAt, provider, "manual");
       this.db
         .prepare(
           `INSERT INTO quota_scrapes (id, provider, scraped_at, raw_output, parsed_state)
@@ -1686,7 +1690,8 @@ export class SharedQuotaStore {
   private insertObservations(
     state: ProviderQuotaSnapshot,
     storedObservedAt: string | undefined,
-    storedProvider: string | undefined
+    storedProvider: string | undefined,
+    source: ObservationSource
   ): void {
     const fallbackObservedAt = state.scrapedAt ?? storedObservedAt;
     if (!fallbackObservedAt || !Number.isFinite(Date.parse(fallbackObservedAt))) return;
@@ -1736,14 +1741,17 @@ export class SharedQuotaStore {
         slot: Math.floor(observedMs / SLOT_MS),
         percentLeft: limit.percentLeft,
         resetAtIso: limit.resetAtIso ?? null,
-        windowMs: this.windowMsForCandidate({
-          provider,
-          modelScope,
-          kind,
-          observedAt,
-          percentLeft: limit.percentLeft,
-          resetAtIso: limit.resetAtIso ?? null,
-        }),
+        windowMs: this.windowMsForCandidate(
+          {
+            provider,
+            modelScope,
+            kind,
+            observedAt,
+            percentLeft: limit.percentLeft,
+            resetAtIso: limit.resetAtIso ?? null,
+          },
+          source
+        ),
         processed: 0,
       };
       const existing = this.db
@@ -1798,21 +1806,22 @@ export class SharedQuotaStore {
   }
 
   /**
-   * Derive one lane's window duration at the persistence seam. A material
-   * reset change starts the next window, so the latest stored cycle is the
-   * previous window and this one's length is the distance between ends. That cycle
-   * ended at its reset, or at the latest by this reading if the provider reset
-   * early. Before the store has seen a prior end, the first reading is the only
-   * honest lower bound for the start. Tiny reset changes are display jitter:
-   * retain the current cycle's stored duration. Five-hour lanes keep their
-   * standard 5h denominator (#924 item 6): a session starts on first use, so
-   * the gap between successive ends includes idle time.
+   * Derive one lane's window duration at the persistence seam. Every stored
+   * row carries its period start as `reset_at_iso - window_ms`. A moved end
+   * edits the current period and keeps that start (#1123), unless the reading
+   * shows a new cycle: then this period starts where the previous one ended,
+   * at its reset or at the latest by this reading if the provider reset early.
+   * Before the store has seen a prior end, the first reading is the only
+   * honest lower bound for the start. Five-hour lanes keep their standard 5h
+   * denominator (#924 item 6): a session starts on first use, so the gap
+   * between successive ends includes idle time.
    */
   private windowMsForCandidate(
     candidate: Pick<
       StoredObservation,
       "provider" | "modelScope" | "kind" | "observedAt" | "percentLeft" | "resetAtIso"
-    >
+    >,
+    source: ObservationSource
   ): number {
     if (candidate.kind === "session" || candidate.kind === "five_hour")
       return quotaWindowMs(candidate.kind);
@@ -1823,24 +1832,35 @@ export class SharedQuotaStore {
 
     const latest = this.db
       .prepare(
-        `SELECT reset_at_iso AS resetAtIso, window_ms AS windowMs
+        `SELECT reset_at_iso AS resetAtIso, window_ms AS windowMs, percent_left AS percentLeft
          FROM quota_observations
          WHERE provider = ? AND model_scope = ? AND kind = ? AND reset_at_iso IS NOT NULL
          ORDER BY observed_at DESC, rowid DESC LIMIT 1`
       )
       .get(candidate.provider, candidate.modelScope, candidate.kind) as
-      | { resetAtIso: string; windowMs: number }
+      | { resetAtIso: string; windowMs: number; percentLeft: number }
       | undefined;
     if (latest) {
-      // Only a moved end starts the next window; a refill under the same end
-      // stays in the current one.
+      const latestResetMs = Date.parse(latest.resetAtIso);
       const endMoved = quotaCycleChanged(
         { percentLeft: candidate.percentLeft, resetAtIso: latest.resetAtIso },
         candidate,
         latest.windowMs
       );
-      if (!endMoved) return latest.windowMs;
-      const previousEndMs = Math.min(Date.parse(latest.resetAtIso), observedMs);
+      const refilled = candidate.percentLeft - latest.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
+      // A refill is a new cycle whoever reports it. A manual reading's
+      // deadline may be a pacing target the operator set (#924), so its
+      // passing proves nothing. A scraped deadline is the provider's own reset,
+      // so passing it is a rollover, within the tolerance that tells a moved
+      // end from jitter so a clock trailing the provider is not an edit.
+      const skewMs = Math.min(60 * 60 * 1000, latest.windowMs * 0.05);
+      const deadlinePassed = source === "scrape" && observedMs >= latestResetMs - skewMs;
+      const newCycle = endMoved && (refilled || deadlinePassed);
+      if (Number.isFinite(latestResetMs) && !newCycle) {
+        const startMs = Math.min(latestResetMs - latest.windowMs, observedMs);
+        return resetMs - startMs;
+      }
+      const previousEndMs = Math.min(latestResetMs, observedMs);
       if (Number.isFinite(previousEndMs)) return resetMs - previousEndMs;
     }
 
