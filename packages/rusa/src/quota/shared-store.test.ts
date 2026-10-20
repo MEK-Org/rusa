@@ -786,12 +786,7 @@ describe("SharedQuotaStore persisted controller", () => {
         "manual",
         new Date(firstObserved).toISOString()
       );
-      const submit = (
-        observedMs: number,
-        resetMs: number,
-        percentLeft: number,
-        idempotencyKey: string
-      ) =>
+      const submit = (observedMs: number, resetMs: number, idempotencyKey: string) =>
         store.recordManualObservation({
           snapshot: {
             provider: "claude",
@@ -802,7 +797,7 @@ describe("SharedQuotaStore persisted controller", () => {
                 label: "Weekly",
                 kind: "weekly",
                 scope: "provider",
-                percentLeft,
+                percentLeft: 90,
                 resetAtIso: new Date(resetMs).toISOString(),
               },
             ],
@@ -811,22 +806,14 @@ describe("SharedQuotaStore persisted controller", () => {
           idempotencyKey,
           acceptedAt: new Date(observedMs).toISOString(),
         });
-      expect(submit(firstObserved, firstEnd, 90, "first")).toMatchObject({ result: "accepted" });
-      // A manual deadline that has passed is no rollover by itself: the
-      // operator may have set it, so the next one extends the same period.
+      expect(submit(firstObserved, firstEnd, "first")).toMatchObject({ result: "accepted" });
       const nextObserved = firstEnd + 5 * 60 * 1000;
-      expect(submit(nextObserved, firstEnd + 24 * hour, 90, "next")).toMatchObject({
-        result: "accepted",
-      });
-      // A refill is a new cycle. The provider reset early, so it starts at
-      // this reading rather than at the extended deadline.
-      const refillObserved = nextObserved + hour;
-      expect(submit(refillObserved, refillObserved + 24 * hour, 100, "refill")).toMatchObject({
+      expect(submit(nextObserved, firstEnd + 24 * hour, "next")).toMatchObject({
         result: "accepted",
       });
       expect(
         store.listCanonicalSince("claude", "2030-01-01T00:00:00.000Z").map((row) => row.windowMs)
-      ).toEqual([6 * 24 * hour, 7 * 24 * hour, 24 * hour]);
+      ).toEqual([6 * 24 * hour, 24 * hour]);
     } finally {
       store.close();
     }
@@ -934,28 +921,51 @@ describe("SharedQuotaStore persisted controller", () => {
       edited.close();
     });
 
-    it("ends a scraped period at its deadline but never at a manual one alone", () => {
-      // Just inside the final jitter tolerance and just after the old deadline,
-      // with no refill. The provider's own deadline passing is its rollover; a
-      // manual deadline may be a target the operator set, so the period goes on.
-      const justBefore = end - 30 * 60 * 1000;
-      const justAfter = end + 5 * 60 * 1000;
-      for (const observedMs of [justBefore, justAfter]) {
-        const scraped = lane("scrape");
-        scraped.read(start + day, 40, end);
-        scraped.read(observedMs, 40, observedMs + day);
-        expect(scraped.periods().at(-1)?.start).toBe(iso(Math.min(end, observedMs)));
-        scraped.close();
-
-        const manual = lane("manual");
-        manual.read(start + day, 40, end);
-        manual.read(observedMs, 40, observedMs + day);
-        expect(manual.periods().at(-1)).toEqual({
-          start: iso(start),
-          windowMs: observedMs + day - start,
-        });
-        manual.close();
+    it.each<Source>([
+      "scrape",
+      "manual",
+    ])("ends a %s period at its passed deadline without a refill", (source) => {
+      // Just inside the final jitter tolerance, and just after the old
+      // deadline: either source's passed deadline is the cycle evidence.
+      for (const observedMs of [end - 30 * 60 * 1000, end + 5 * 60 * 1000]) {
+        const passed = lane(source);
+        passed.read(start + day, 40, end);
+        passed.read(observedMs, 40, observedMs + day);
+        expect(passed.periods().at(-1)?.start).toBe(iso(Math.min(end, observedMs)));
+        passed.close();
       }
+
+      // Just outside the tolerance, the deadline has not passed: an edit.
+      const edited = lane(source);
+      edited.read(start + day, 40, end);
+      edited.read(end - 2 * hour, 40, end + day);
+      expect(edited.periods().at(-1)).toEqual({ start: iso(start), windowMs: 8 * day });
+      edited.close();
+    });
+
+    it.each<Source>([
+      "scrape",
+      "manual",
+    ])("keeps a %s period through a refill under an unmoved deadline", (source) => {
+      const refilled = lane(source);
+      refilled.read(start + day, 40, end);
+      refilled.read(start + 2 * day, 100, end);
+      expect(refilled.periods().map((period) => period.start)).toEqual(Array(3).fill(iso(start)));
+      expect(refilled.periods().at(-1)?.windowMs).toBe(7 * day);
+      refilled.close();
+    });
+
+    it("keeps the start once the period's earlier rows age out", () => {
+      // A period stretched past retention: accepting the day-35 reading prunes
+      // the rows that opened it, and the start rides on the latest survivor.
+      const long = lane("manual");
+      long.read(start + day, 90, start + 40 * day);
+      long.read(start + 20 * day, 70, start + 40 * day);
+      long.read(start + 35 * day, 50, start + 40 * day);
+      expect(long.periods()).toEqual(Array(2).fill({ start: iso(start), windowMs: 40 * day }));
+      long.read(start + 36 * day, 45, start + 45 * day);
+      expect(long.periods().at(-1)).toEqual({ start: iso(start), windowMs: 45 * day });
+      long.close();
     });
 
     it.each<Source>([
@@ -988,6 +998,17 @@ describe("SharedQuotaStore persisted controller", () => {
       unseen.read(start + 3 * day, 85, start + 9 * day);
       expect(unseen.periods().at(-1)).toEqual({ start: iso(start), windowMs: 9 * day });
       unseen.close();
+    });
+
+    it("reads a deadline edited after it passed as a new period", () => {
+      // Known limitation: the old deadline passed with no refill before the
+      // edit was recorded, so the period re-anchors at the old end, as #1123
+      // first reported but narrowed to late edits. No guard.
+      const late = lane("manual");
+      late.read(start + day, 40, end);
+      late.read(end + 2 * hour, 38, end + 2 * day);
+      expect(late.periods().at(-1)).toEqual({ start: iso(end), windowMs: 2 * day });
+      late.close();
     });
   });
 
