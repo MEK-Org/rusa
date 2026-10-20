@@ -19,7 +19,6 @@ import { configuredModelRefs, resolveWindowModels } from "./model-window-scope.j
 import { extractedNoQuotaValues, parseParsedState, serializeParsedState } from "./parsed-state.js";
 import {
   QUOTA_OBSERVATION_SLOT_MS,
-  QUOTA_REFILL_EPSILON_POINTS,
   type QuotaCycleObservation,
   quotaCycleChanged,
   verifiedQuotaCycleTransition,
@@ -1833,11 +1832,12 @@ export class SharedQuotaStore {
    *
    * `windowMs` stays the actual time horizon, because the dashboard shows it.
    * The reference is separate (#1123). A deadline that moves while the old one
-   * is still ahead, with no refill, re-anchors the window at this reading
-   * without returning any quota, so the reference starts from this reading's
-   * percent rather than from a full window. Every later row of the window
-   * carries that value forward, as it does `windowMs`, so a restart reads it
-   * back and retention never has to find the anchoring row. A refill, a
+   * is still ahead re-anchors the window at this reading, so the reference
+   * starts from this reading's percent rather than from a full window; a full
+   * refill anchors at 100, which paces as a full window does. Every later row
+   * of the window carries that value forward, as it does `windowMs`, so a
+   * restart reads it back and retention never has to find the anchoring row.
+   * A refill under an unchanged deadline keeps the window's reference; a
    * passed deadline and a cold start keep the full-window reference (null).
    */
   private windowForCandidate(
@@ -1856,35 +1856,33 @@ export class SharedQuotaStore {
 
     const latest = this.db
       .prepare(
-        `SELECT reset_at_iso AS resetAtIso, window_ms AS windowMs, percent_left AS percentLeft,
+        `SELECT reset_at_iso AS resetAtIso, window_ms AS windowMs,
                 reference_start_percent AS referenceStartPercent
          FROM quota_observations
          WHERE provider = ? AND model_scope = ? AND kind = ? AND reset_at_iso IS NOT NULL
          ORDER BY observed_at DESC, rowid DESC LIMIT 1`
       )
       .get(candidate.provider, candidate.modelScope, candidate.kind) as
-      | (Pick<StoredObservation, "windowMs" | "percentLeft" | "referenceStartPercent"> & {
+      | (Pick<StoredObservation, "windowMs" | "referenceStartPercent"> & {
           resetAtIso: string;
         })
       | undefined;
     if (latest) {
-      const refilled = candidate.percentLeft - latest.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
       // Only a moved end starts the next window; a refill under the same end
-      // stays in the current one, against a full window's reference again.
+      // stays in the current one and keeps its reference, so a rise in quota
+      // always reads as spare.
       const endMoved = quotaCycleChanged(
         { percentLeft: candidate.percentLeft, resetAtIso: latest.resetAtIso },
         candidate,
         latest.windowMs
       );
       if (!endMoved)
-        return refilled
-          ? full(latest.windowMs)
-          : { windowMs: latest.windowMs, referenceStartPercent: latest.referenceStartPercent };
+        return { windowMs: latest.windowMs, referenceStartPercent: latest.referenceStartPercent };
       const latestResetMs = Date.parse(latest.resetAtIso);
       const previousEndMs = Math.min(latestResetMs, observedMs);
       if (Number.isFinite(previousEndMs)) {
         const windowMs = resetMs - previousEndMs;
-        return observedMs < latestResetMs && !refilled
+        return observedMs < latestResetMs
           ? { windowMs, referenceStartPercent: candidate.percentLeft }
           : full(windowMs);
       }

@@ -1102,9 +1102,11 @@ describe("SharedQuotaStore persisted controller", () => {
       // zero reading (not the older reasoned 57% row) proves this refill. A
       // new reading is only one point above the older reasoned row, so that
       // row cannot prove a refill. With the actual zero evidence, the
-      // verified transition starts the actuator from zero; the first interval
-      // is consequently limited by a two-reference-step slew. The old
-      // reasoned-row evidence would retain the old 3600-second baseline.
+      // verified transition starts the actuator from zero. The deadline also
+      // moved while the old one was still ahead, so the reference starts at
+      // the 58% left (#1123) and the reading is on plan: the interval stays
+      // at zero. The old reasoned-row evidence would retain the old
+      // 3600-second baseline and only slew it down.
       recordObservation(
         store,
         "claude",
@@ -1122,7 +1124,7 @@ describe("SharedQuotaStore persisted controller", () => {
       expect(refilled).toEqual({
         derivative: 0,
         integral: 0,
-        interval: 2 * QUOTA_MAX_SLEW_SECONDS,
+        interval: 0,
       });
     } finally {
       store.close();
@@ -1561,15 +1563,16 @@ describe("SharedQuotaStore remaining-quota reference (#1123)", () => {
     }
   });
 
-  it("returns to a full-window reference on a refill and on a natural rollover", () => {
+  it("keeps the reference through a refill, anchors a moved one, and is full after rollover", () => {
     const { store } = openStore("refill");
     try {
       paced(store);
       recordObservation(store, "codex", iso(moved), 95, iso(newReset));
-      // A 100% refill under the unchanged deadline is new quota: full reference.
+      // A 100% refill under the unchanged deadline stays in the window and keeps
+      // its reference, so the new quota reads as spare.
       const refill = moved + 30 * minute;
       recordObservation(store, "codex", iso(refill), 100, iso(newReset));
-      // A refill that also moves the deadline is a full window as well.
+      // A full refill that also moves the deadline anchors at 100: a full window.
       const both = moved + hour;
       recordObservation(store, "codex", iso(both), 30, iso(newReset));
       recordObservation(
@@ -1580,12 +1583,23 @@ describe("SharedQuotaStore remaining-quota reference (#1123)", () => {
         iso(both + 30 * minute + 7 * day)
       );
       const [refillRow, drained, movedRefill] = laneRows(store).slice(3);
-      expect(refillRow).toMatchObject({ reference: null, windowMs: 2 * day });
-      expect(refillRow.error).toBeCloseTo(((newReset - refill) / (2 * day)) * 100 - 100, 9);
-      expect(drained.reference).toBeNull();
-      expect(movedRefill).toMatchObject({ reference: null, windowMs: 7 * day, error: 0 });
+      expect(refillRow).toMatchObject({ reference: 95, windowMs: 2 * day });
+      expect(refillRow.error).toBeCloseTo(((newReset - refill) / (2 * day)) * 95 - 100, 9);
+      expect(drained.reference).toBe(95);
+      expect(movedRefill).toMatchObject({ reference: 100, windowMs: 7 * day, error: 0 });
     } finally {
       store.close();
+    }
+    // A partial rise that also moves the deadline anchors at what it left,
+    // so the new window starts on plan rather than 40 points behind.
+    const partial = openStore("partial-refill").store;
+    try {
+      paced(partial);
+      recordObservation(partial, "codex", iso(moved), 30, iso(oldReset));
+      recordObservation(partial, "codex", iso(moved + 30 * minute), 60, iso(newReset));
+      expect(laneRows(partial).at(-1)).toMatchObject({ reference: 60, error: 0 });
+    } finally {
+      partial.close();
     }
     const rollover = openStore("rollover").store;
     try {
