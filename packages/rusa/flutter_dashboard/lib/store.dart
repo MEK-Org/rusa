@@ -407,6 +407,7 @@ class DashboardStore {
   final _quotaHistoryStale = BehaviorSubject<bool>.seeded(false);
   final _inboxMetricsStale = BehaviorSubject<bool>.seeded(false);
   Timer? _inboxMetricsCooldown;
+  bool _inboxMetricsInFlight = false;
   static const inboxMetricsRefreshInterval = Duration(minutes: 1);
   final _dashboardConfig = BehaviorSubject<DashboardConfigDto?>.seeded(null);
   final _error = BehaviorSubject<String?>.seeded(null);
@@ -957,14 +958,19 @@ class DashboardStore {
 
   /// Re-reads the inbox window at most once a minute, its sampling rate,
   /// however often the Overview ticks or remounts (#1018). The cooldown starts
-  /// with the request, so overlapping ticks share one fetch; a failed fetch
-  /// ends it, so the next tick retries. Quota history is not polled (#26); the
-  /// shared chart range still moves with this payload.
+  /// with the request, and no tick starts another until it settles, so an
+  /// older response never lands over a newer one; a failed fetch ends the
+  /// cooldown, so the next tick retries. Quota history is not polled (#26);
+  /// the shared chart range still moves with this payload.
   Future<void> pollInboxMetrics() async {
+    if (_inboxMetricsInFlight) return;
     if (_inboxMetricsCooldown?.isActive ?? false) return;
     final cooldown = Timer(inboxMetricsRefreshInterval, () {});
     _inboxMetricsCooldown = cooldown;
-    if (!await refreshInboxMetrics()) cooldown.cancel();
+    _inboxMetricsInFlight = true;
+    final answered = await refreshInboxMetrics();
+    _inboxMetricsInFlight = false;
+    if (!answered) cooldown.cancel();
   }
 
   /// Per-minute inbox backlog (#1018). A 503 means the server has no

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/api.dart';
@@ -182,6 +184,28 @@ void main() {
       await tester.pump(const Duration(seconds: 15));
       await store.pollInboxMetrics();
       expect(api.inboxMetricsCallCount, 2);
+      await store.dispose();
+    });
+
+    testWidgets('a fetch still pending after a minute is not overlapped', (
+      tester,
+    ) async {
+      final slow = Completer<InboxMetricsDto>();
+      final api = FakeApi()..inboxMetricsGate = slow;
+      final store = DashboardStore(api: api, stream: FakeStream());
+
+      final first = store.pollInboxMetrics();
+      await tester.pump(const Duration(seconds: 61));
+      api.inboxMetricsResult = _metrics([_point(_start), _point(_end)]);
+      await store.pollInboxMetrics();
+      expect(api.inboxMetricsCallCount, 1);
+      slow.complete(_metrics([_point(_start)]));
+      await first;
+      expect(store.inboxMetrics.value?.points, hasLength(1));
+      // Settling past the minute frees the next tick at once.
+      await store.pollInboxMetrics();
+      expect(api.inboxMetricsCallCount, 2);
+      expect(store.inboxMetrics.value?.points, hasLength(2));
       await store.dispose();
     });
 

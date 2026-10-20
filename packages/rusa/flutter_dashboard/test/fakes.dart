@@ -211,6 +211,7 @@ class FakeApi extends DashboardApi {
   InboxMetricsDto? inboxMetricsResult;
   Object? inboxMetricsError;
   int inboxMetricsCallCount = 0;
+  Completer<InboxMetricsDto>? inboxMetricsGate;
   Object? quotaError;
   Object? quotaHistoryError;
   DashboardConfigDto? dashboardConfigResult;
@@ -530,6 +531,11 @@ class FakeApi extends DashboardApi {
   @override
   Future<InboxMetricsDto> fetchInboxMetrics() async {
     inboxMetricsCallCount++;
+    final gate = inboxMetricsGate;
+    if (gate != null) {
+      inboxMetricsGate = null;
+      return gate.future;
+    }
     final err = inboxMetricsError;
     if (err != null) throw err;
     final result = inboxMetricsResult;
