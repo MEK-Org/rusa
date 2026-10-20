@@ -149,7 +149,8 @@ Future<void> _capture(
 
     switch (step) {
       case _Step.before:
-        expect(find.text('Brief'), findsNothing);
+        // The section is always shown since #1126; before any write it is empty.
+        expect(find.text('No brief yet.'), findsOneWidget);
       case _Step.after:
         expect(find.text('Brief'), findsOneWidget);
         expect(find.text('Gen 2'), findsOneWidget);

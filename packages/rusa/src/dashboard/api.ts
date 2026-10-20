@@ -2294,24 +2294,21 @@ export async function handleMeshApiRequest(
       sendJson(res, 404, { error: "thread not found" });
       return true;
     }
-    const briefMode = thread.context?.type === "portable" && thread.context.mode === "brief";
-    const brief = briefMode ? deps.portableContext?.load(thread.id).brief : null;
+    // Every actor can keep a brief (#1122), but only brief mode renders it, so
+    // the brief is served in every mode next to the mode that decides whether
+    // it is in effect. A record without a context selection runs natively.
+    const contextMode = thread.context?.type === "portable" ? thread.context.mode : "native";
+    const brief = deps.portableContext?.load(thread.id).brief;
     sendJson(res, 200, {
       id: thread.id,
       charter: thread.charter,
-      ...(briefMode
-        ? {
-            briefMode: true,
-            brief: brief?.text ?? null,
-            briefGeneration: brief?.generation ?? null,
-            briefUpdatedAt: brief?.updatedAt ?? null,
-            // The latest ten accepted writes, newest first; the history table
-            // keeps every one, this is only the view's page.
-            briefRevisions: brief
-              ? (deps.portableContext?.listBriefRevisions(thread.id, 10) ?? [])
-              : [],
-          }
-        : {}),
+      contextMode,
+      brief: brief?.text ?? null,
+      briefGeneration: brief?.generation ?? null,
+      briefUpdatedAt: brief?.updatedAt ?? null,
+      // The latest ten accepted writes, newest first; the history table keeps
+      // every one, this is only the view's page.
+      briefRevisions: brief ? (deps.portableContext?.listBriefRevisions(thread.id, 10) ?? []) : [],
     });
     return true;
   }

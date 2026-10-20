@@ -130,12 +130,12 @@ class DashboardApi {
   ///
   /// The thread list carries only a clipped preview, since it is the same field
   /// for every actor on every poll. The whole text is fetched here, for the one
-  /// actor whose detail panel is open, together with a brief-mode actor's
-  /// current brief and its latest ten accepted writes.
+  /// actor whose detail panel is open, together with its context mode and its
+  /// brief (in effect only in brief mode) with the latest ten accepted writes.
   Future<
     ({
       String charter,
-      bool briefMode,
+      String contextMode,
       String? brief,
       int? briefGeneration,
       String? briefUpdatedAt,
@@ -154,7 +154,7 @@ class DashboardApi {
 
     return (
       charter: json['charter'] as String? ?? '',
-      briefMode: json['briefMode'] == true,
+      contextMode: json['contextMode'] as String? ?? 'native',
       brief: json['brief'] as String?,
       briefGeneration: json['briefGeneration'] as int?,
       briefUpdatedAt: json['briefUpdatedAt'] as String?,

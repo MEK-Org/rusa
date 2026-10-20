@@ -588,7 +588,10 @@ class _InfoViewState extends State<_InfoView> {
   /// The full charter once it arrives. Null means "still the preview".
   String? _charter;
   String? _brief;
-  bool _briefMode = false;
+
+  /// The mode the server reports, which alone decides whether the brief is in
+  /// effect. Null until the fetch lands, so no section claims a mode early.
+  String? _contextMode;
   int? _briefGeneration;
   String? _briefUpdatedAt;
   List<BriefRevision> _briefRevisions = const [];
@@ -644,7 +647,7 @@ class _InfoViewState extends State<_InfoView> {
       setState(() {
         _charter = null;
         _brief = null;
-        _briefMode = false;
+        _contextMode = null;
         _briefGeneration = null;
         _briefUpdatedAt = null;
         _briefRevisions = const [];
@@ -660,7 +663,7 @@ class _InfoViewState extends State<_InfoView> {
       }
       setState(() {
         _charter = info.charter;
-        _briefMode = info.briefMode;
+        _contextMode = info.contextMode;
         _brief = info.brief;
         _briefGeneration = info.briefGeneration;
         _briefUpdatedAt = info.briefUpdatedAt;
@@ -719,6 +722,28 @@ class _InfoViewState extends State<_InfoView> {
             ),
     );
   }
+
+  /// Native, Tail, Ledger or Brief; an unrecognised mode is shown as sent.
+  static String _modeLabel(String mode) => switch (mode) {
+    'native' => 'Native',
+    'tail' => 'Tail',
+    'ledger' => 'Ledger',
+    'brief' => 'Brief',
+    _ => mode,
+  };
+
+  Widget _briefBadge(String text, Color color) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+    decoration: BoxDecoration(
+      color: color.withValues(alpha: 0.12),
+      borderRadius: BorderRadius.circular(4),
+      border: Border.all(color: color.withValues(alpha: 0.4)),
+    ),
+    child: Text(
+      text,
+      style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600),
+    ),
+  );
 
   Widget _documentBox(Widget child) => Container(
     width: double.infinity,
@@ -822,6 +847,8 @@ class _InfoViewState extends State<_InfoView> {
     final stagedPool = showPool && staged != null && !listEquals(staged, pool)
         ? staged
         : null;
+    final hasBrief = _brief != null && _brief!.isNotEmpty;
+    final briefActive = _contextMode == 'brief';
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(24, 20, 24, 24),
       child: Column(
@@ -859,6 +886,8 @@ class _InfoViewState extends State<_InfoView> {
                       ? '${actor.effort ?? "default"} → ${actor.desiredEffort ?? "default"} (applies after next run)'
                       : (actor.effort ?? "default"),
                 ),
+              if (_contextMode != null)
+                _meta('Context mode', _modeLabel(_contextMode!)),
               if (actor.commitmentKind != null)
                 _meta('Work state', actor.commitmentKind!),
               if (actor.waitingOn != null)
@@ -889,66 +918,75 @@ class _InfoViewState extends State<_InfoView> {
               ),
             ],
           ],
-          if (_briefMode) ...[
+          if (_contextMode != null) ...[
             const SizedBox(height: 24),
             Row(
               children: [
-                const Text(
-                  'Brief',
-                  style: TextStyle(
-                    color: MeshColors.textPrimary,
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                if (_briefGeneration != null) ...[
-                  const SizedBox(width: 8),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 6,
-                      vertical: 2,
-                    ),
-                    decoration: BoxDecoration(
-                      color: MeshColors.bgSecondary,
-                      borderRadius: BorderRadius.circular(4),
-                      border: Border.all(color: MeshColors.border),
-                    ),
-                    child: Text(
-                      'Gen $_briefGeneration',
-                      style: const TextStyle(
-                        color: MeshColors.accent,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                ],
-                if (_briefUpdatedAt != null && _briefUpdatedAt!.isNotEmpty) ...[
-                  const SizedBox(width: 8),
-                  Expanded(
-                    // Generation zero records the seed time; later generations
-                    // record accepted writes. Both are persisted updates.
-                    child: Align(
-                      alignment: Alignment.centerLeft,
-                      child: InkWell(
-                        key: const ValueKey('brief-history-time'),
-                        onTap: _briefRevisions.isEmpty
-                            ? null
-                            : () => _showBriefHistory(context),
-                        child: Text(
-                          'updated ${formatTs(_briefUpdatedAt!)}',
-                          style: const TextStyle(
-                            color: MeshColors.textMuted,
-                            fontSize: 11,
-                          ),
-                          overflow: TextOverflow.ellipsis,
+                Expanded(
+                  // A wrap, so a narrow screen moves the time to its own line
+                  // instead of clipping it behind the badges.
+                  child: Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      const Text(
+                        'Brief',
+                        style: TextStyle(
+                          color: MeshColors.textPrimary,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
                         ),
                       ),
-                    ),
+                      if (hasBrief)
+                        briefActive
+                            ? _briefBadge('Active', MeshColors.statusActive)
+                            : _briefBadge(
+                                'Shadow · not active',
+                                MeshColors.statusIdle,
+                              ),
+                      if (_briefGeneration != null)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: MeshColors.bgSecondary,
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(color: MeshColors.border),
+                          ),
+                          child: Text(
+                            'Gen $_briefGeneration',
+                            style: const TextStyle(
+                              color: MeshColors.accent,
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      // Generation zero records the seed time; later
+                      // generations record accepted writes. Both are persisted
+                      // updates.
+                      if (_briefUpdatedAt != null &&
+                          _briefUpdatedAt!.isNotEmpty)
+                        InkWell(
+                          key: const ValueKey('brief-history-time'),
+                          onTap: _briefRevisions.isEmpty
+                              ? null
+                              : () => _showBriefHistory(context),
+                          child: Text(
+                            'updated ${formatTs(_briefUpdatedAt!)}',
+                            style: const TextStyle(
+                              color: MeshColors.textMuted,
+                              fontSize: 11,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                    ],
                   ),
-                ] else ...[
-                  const Spacer(),
-                ],
+                ),
                 if (_briefRevisions.isNotEmpty) ...[
                   const SizedBox(width: 8),
                   IconButton(
@@ -965,6 +1003,18 @@ class _InfoViewState extends State<_InfoView> {
                 ],
               ],
             ),
+            if (hasBrief && !briefActive) ...[
+              const SizedBox(height: 8),
+              Text(
+                'This actor runs in ${_modeLabel(_contextMode!)} mode. Its '
+                'brief is saved and can evolve, but takes effect only in '
+                'Brief mode.',
+                style: const TextStyle(
+                  color: MeshColors.textSecondary,
+                  fontSize: 13,
+                ),
+              ),
+            ],
             const SizedBox(height: 12),
             _documentBox(
               _brief == null || _brief!.isEmpty

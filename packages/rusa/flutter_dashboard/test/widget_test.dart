@@ -714,7 +714,7 @@ void main() {
       for (var i = 0; i < 10; i++) {
         await tester.pump(const Duration(milliseconds: 100));
       }
-      expect(find.text('Brief'), findsNothing);
+      expect(find.text('No brief yet.'), findsOneWidget);
       await tester.tap(find.text('a-handle'));
       for (var i = 0; i < 10; i++) {
         await tester.pump(const Duration(milliseconds: 100));
@@ -726,7 +726,7 @@ void main() {
       for (var i = 0; i < 10; i++) {
         await tester.pump(const Duration(milliseconds: 100));
       }
-      expect(find.text('Brief'), findsNothing);
+      expect(find.text('No brief yet.'), findsOneWidget);
       expect(find.text('Updated purpose'), findsNothing);
       await store.dispose();
     });

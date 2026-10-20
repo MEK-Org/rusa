@@ -2268,7 +2268,16 @@ describe("handleMeshApiRequest", () => {
 
     const { res } = await call(deps, "GET", `/api/mesh/threads/charter?id=${UUID_A}`);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ id: UUID_A, charter: long });
+    // No context selection is a native actor; without a brief the section reads empty.
+    expect(JSON.parse(res.body)).toEqual({
+      id: UUID_A,
+      charter: long,
+      contextMode: "native",
+      brief: null,
+      briefGeneration: null,
+      briefUpdatedAt: null,
+      briefRevisions: [],
+    });
   });
 
   it("serves only the selected brief actor's current brief and its latest ten writes", async () => {
@@ -2306,7 +2315,7 @@ describe("handleMeshApiRequest", () => {
 
     const body = await read();
     expect(body).toMatchObject({
-      briefMode: true,
+      contextMode: "brief",
       brief: brief(12),
       briefGeneration: 12,
       briefUpdatedAt: "2026-10-10T13:12:00.000Z",
@@ -2330,7 +2339,7 @@ describe("handleMeshApiRequest", () => {
     load.mockClear();
     listBriefRevisions.mockClear();
     expect(await read()).toMatchObject({
-      briefMode: true,
+      contextMode: "brief",
       brief: null,
       briefGeneration: null,
       briefUpdatedAt: null,
@@ -2338,15 +2347,27 @@ describe("handleMeshApiRequest", () => {
     });
     expect(listBriefRevisions).not.toHaveBeenCalled();
 
-    actors.upsert({
-      ...rec(UUID_A, null, "active"),
-      context: { type: "portable", mode: "ledger" },
-    });
-    load.mockClear();
-    const ledger = await read();
-    expect(ledger).not.toHaveProperty("brief");
-    expect(ledger).not.toHaveProperty("briefRevisions");
-    expect(load).not.toHaveBeenCalled();
+    // Outside brief mode the saved brief is a readable shadow, served the same
+    // way and labelled with the mode that actually renders the prompt.
+    for (const context of [
+      { type: "portable", mode: "ledger" },
+      { type: "portable", mode: "tail" },
+      { type: "native" },
+    ] as const) {
+      actors.upsert({ ...rec(UUID_B, null, "active"), context });
+      const shadow = JSON.parse(
+        (await call(deps, "GET", `/api/mesh/threads/charter?id=${UUID_B}`)).res.body
+      );
+      expect(shadow).toMatchObject({
+        contextMode: context.type === "native" ? "native" : context.mode,
+        brief: brief(99),
+        briefGeneration: 1,
+        briefUpdatedAt: "2026-10-10T12:30:00.000Z",
+      });
+      expect(shadow).not.toHaveProperty("briefMode");
+      expect(shadow.briefRevisions.map((r: { generation: number }) => r.generation)).toEqual([1]);
+    }
+    expect(store.load(UUID_B).brief?.generation).toBe(1);
   });
 
   it("GET /api/mesh/threads/charter 404s for an unknown or missing id", async () => {
