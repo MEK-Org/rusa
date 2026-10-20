@@ -15,7 +15,9 @@ const kInboxMedianColor = MeshColors.accent;
 const kInboxMaxColor = MeshColors.statusIdle;
 
 /// One time range for every Overview chart, so all of them end at the same
-/// instant: the newest `generatedAt` among the payloads on screen.
+/// instant: the newest `generatedAt` among the payloads on screen. The start
+/// is floored to the minute so a mid-minute end still keeps the oldest
+/// sampled minute, which the server floors the same way.
 ({DateTime start, DateTime end}) overviewChartRange(
   Iterable<String> generatedAts,
 ) {
@@ -25,7 +27,15 @@ const kInboxMaxColor = MeshColors.statusIdle;
     if (at != null && (end == null || at.isAfter(end))) end = at;
   }
   final shared = end ?? DateTime.now().toUtc();
-  return (start: shared.subtract(kOverviewChartWindow), end: shared);
+  const minuteMs = 60 * 1000;
+  final startMs = shared.subtract(kOverviewChartWindow).millisecondsSinceEpoch;
+  return (
+    start: DateTime.fromMillisecondsSinceEpoch(
+      startMs - startMs % minuteMs,
+      isUtc: true,
+    ),
+    end: shared,
+  );
 }
 
 /// Where one statistic lands on a plot: the connected runs of minutes.
@@ -91,15 +101,17 @@ class InboxMetricAxis {
 
   /// Inbox sizes: whole-entry steps of 1, 2 or 5 × 10ⁿ.
   factory InboxMetricAxis.count(double highest) {
-    var step = 1.0;
-    while (step * 4 < highest) {
-      final magnitude = math
-          .pow(10, (math.log(step) / math.ln10).floor())
-          .toDouble();
-      final mantissa = step / magnitude;
-      step = (mantissa < 2 ? 2 : (mantissa < 5 ? 5 : 10)) * magnitude;
+    var mantissa = 1;
+    var decade = 1.0;
+    while (mantissa * decade * 4 < highest) {
+      if (mantissa == 5) {
+        mantissa = 1;
+        decade *= 10;
+      } else {
+        mantissa = mantissa == 1 ? 2 : 5;
+      }
     }
-    return InboxMetricAxis(step * 4, (v) => v.round().toString());
+    return InboxMetricAxis(mantissa * decade * 4, (v) => v.round().toString());
   }
 
   /// Ages: steps from a ladder of familiar durations.

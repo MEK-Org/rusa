@@ -113,10 +113,30 @@ void main() {
     expect(range.start, DateTime.utc(2026, 10, 16, 12));
   });
 
+  test('a mid-minute payload keeps the oldest sampled minute in range', () {
+    final end = _end.add(const Duration(seconds: 5));
+    final range = overviewChartRange([end.toIso8601String()]);
+    expect(range.end, end);
+    expect(range.start, DateTime.utc(2026, 10, 16, 12));
+    final segments = traceInboxMetric(
+      [_point(DateTime.utc(2026, 10, 16, 12))],
+      start: range.start,
+      end: range.end,
+      plot: const Rect.fromLTWH(0, 0, 100, 100),
+      intervalSeconds: 60,
+      valueOf: (p) => p.inboxSizeMedian,
+      yFor: (_) => 0,
+    ).segments;
+    expect(segments, hasLength(1));
+  });
+
   test('axes start at zero and cover the max', () {
     expect(InboxMetricAxis.count(0).top, 4);
     expect(InboxMetricAxis.count(9).top, 20);
     expect(InboxMetricAxis.count(130).top, 200);
+    expect(InboxMetricAxis.count(4001).top, 8000);
+    expect(InboxMetricAxis.count(5000).top, 8000);
+    expect(InboxMetricAxis.count(50000).top, 80000);
     expect(InboxMetricAxis.age(0).top, 240);
     expect(InboxMetricAxis.age(5000).top, 4 * 1800);
     expect(InboxMetricAxis.age(40 * 86400).top, 4 * 14 * 86400);
