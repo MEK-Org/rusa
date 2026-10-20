@@ -1421,6 +1421,116 @@ describe("SharedQuotaStore remaining-quota reference (#1123)", () => {
     }
   });
 
+  it("keeps the reference through repeated jitter that drifts past one tolerance", () => {
+    const { store } = openStore("drift");
+    try {
+      paced(store);
+      recordObservation(store, "codex", iso(moved), 95, iso(newReset));
+      // Each reading moves the reset 50 minutes from the one before, inside the
+      // one-hour tolerance, so none is a new window, though the total drift of
+      // 150 minutes is beyond one tolerance.
+      const drift = [1, 2, 3].map((step) => ({
+        at: moved + step * 30 * minute,
+        reset: newReset + step * 50 * minute,
+      }));
+      for (const { at, reset } of drift)
+        recordObservation(store, "codex", iso(at), onPlan(95, moved, newReset, at), iso(reset));
+      const rows = laneRows(store).slice(2);
+      expect(rows.map(({ windowMs, reference }) => ({ windowMs, reference }))).toEqual(
+        Array(4).fill({ windowMs: 2 * day, reference: 95 })
+      );
+      // Same window, so the controller keeps its memory: errors are against the
+      // retained window and original reference, and the integral is not reset.
+      drift.forEach(({ at, reset }, k) => {
+        const timeRemainingPct = Math.min(100, ((reset - at) / (2 * day)) * 100);
+        expect(rows[k + 1].error).toBeCloseTo(
+          (timeRemainingPct * 95) / 100 - onPlan(95, moved, newReset, at),
+          9
+        );
+        expect(rows[k + 1].integral).toBeGreaterThan(rows[k].integral);
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("falls back to the full reference after an older build writes null, until the next re-anchor", () => {
+    const opened = openStore("mixed");
+    const first = opened.store;
+    paced(first);
+    recordObservation(first, "codex", iso(moved), 95, iso(newReset));
+    const anchoredAt = moved + 30 * minute;
+    recordObservation(
+      first,
+      "codex",
+      iso(anchoredAt),
+      onPlan(95, moved, newReset, anchoredAt),
+      iso(newReset)
+    );
+    first.close();
+
+    // An older build opens the upgraded file and writes with its own named
+    // columns, the statement staging uses, which leaves the new column out.
+    const older = new Database(opened.path);
+    const olderWrite = older.prepare(
+      `INSERT INTO quota_observations
+        (provider, model_scope, kind, observed_slot, label, observed_at,
+         percent_left, reset_at_iso, window_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(provider, model_scope, kind, observed_slot) DO UPDATE SET
+         label = excluded.label,
+         observed_at = excluded.observed_at,
+         percent_left = excluded.percent_left,
+         reset_at_iso = excluded.reset_at_iso,
+         window_ms = excluded.window_ms`
+    );
+    const write = (atMs: number, percentLeft: number) =>
+      olderWrite.run(
+        "codex",
+        "",
+        "weekly",
+        Math.floor(atMs / (5 * minute)),
+        "weekly limit",
+        iso(atMs),
+        percentLeft,
+        iso(newReset),
+        2 * day
+      );
+    // Overwriting a slot that already has a reference leaves the reference.
+    write(anchoredAt + minute, onPlan(95, moved, newReset, anchoredAt + minute));
+    // A new slot gets null.
+    const olderAt = moved + hour;
+    write(olderAt, onPlan(95, moved, newReset, olderAt));
+    older.close();
+
+    const { store } = openStore("mixed", opened.path);
+    try {
+      expect(store.db.pragma("user_version", { simple: true })).toBe(QUOTA_SCHEMA_VERSION);
+      const [overwritten, olderRow] = laneRows(store).slice(3);
+      expect(overwritten.reference).toBe(95);
+      expect(olderRow.reference).toBeNull();
+      // The newer build carries that null forward, so this window paces
+      // against a full reference again, as it did before #1123, and reads
+      // on-plan use as overspend. Not equivalent, only the previous behaviour.
+      const fallbackAt = moved + 90 * minute;
+      const fallbackPct = onPlan(95, moved, newReset, fallbackAt);
+      recordObservation(store, "codex", iso(fallbackAt), fallbackPct, iso(newReset));
+      const fallback = laneRows(store).at(-1) as LaneRow;
+      expect(fallback).toMatchObject({ reference: null, windowMs: 2 * day });
+      expect(fallback.error).toBeCloseTo(
+        ((newReset - fallbackAt) / (2 * day)) * 100 - fallbackPct,
+        9
+      );
+      expect(fallback.error).toBeGreaterThan(4);
+      // The next genuine re-anchor sets a reference again.
+      const next = moved + 2 * hour;
+      recordObservation(store, "codex", iso(next), 93, iso(next + day));
+      expect(laneRows(store).at(-1)).toMatchObject({ reference: 93, windowMs: day, error: 0 });
+    } finally {
+      store.close();
+    }
+  });
+
   it("anchors tiny and exhausted quota at what is left", () => {
     const { store } = openStore("tiny");
     try {
