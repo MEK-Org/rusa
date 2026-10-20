@@ -2,12 +2,19 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import type { InstanceRole } from "../config/types.js";
 import { runMigrations } from "./migrations/runner.js";
-import { Repositories } from "./repositories/index.js";
+import {
+  createFollowerRepositories,
+  type FollowerRepositories,
+  Repositories,
+} from "./repositories/index.js";
 import { widenToWal } from "./wal.js";
 
 let db: Database.Database | null = null;
 let repositories: Repositories | null = null;
+let followerRepositories: FollowerRepositories | null = null;
+let currentRepositoriesRole: InstanceRole | null = null;
 
 export type TaskStatus = "queued" | "in_progress" | "done" | "blocked";
 
@@ -71,11 +78,30 @@ export function getDb(): Database.Database {
 
 /**
  * Accessor for the repository layer (mesh events, raw inputs, distillation queue).
+ *
+ * A leader gets the full aggregate. A follower gets only its host-local
+ * execution capabilities ({@link FollowerRepositories}); one process binds one
+ * role, so asking for the other afterwards is a wiring error.
  */
-export function getRepositories(): Repositories {
-  if (!repositories) {
-    repositories = new Repositories(getDb());
+export function getRepositories(): Repositories;
+export function getRepositories(role: "leader"): Repositories;
+export function getRepositories(role: "follower"): FollowerRepositories;
+export function getRepositories(role: InstanceRole): Repositories | FollowerRepositories;
+export function getRepositories(
+  role: InstanceRole = "leader"
+): Repositories | FollowerRepositories {
+  if (currentRepositoriesRole !== null && currentRepositoriesRole !== role) {
+    throw new Error(
+      `Repositories singleton already initialized for role "${currentRepositoriesRole}", cannot access as "${role}"`
+    );
   }
+  if (role === "follower") {
+    if (!followerRepositories) followerRepositories = createFollowerRepositories(getDb());
+    currentRepositoriesRole = role;
+    return followerRepositories;
+  }
+  if (!repositories) repositories = new Repositories(getDb());
+  currentRepositoriesRole = role;
   return repositories;
 }
 
@@ -88,6 +114,8 @@ export function closeDb(): void {
     db = null;
   }
   repositories = null;
+  followerRepositories = null;
+  currentRepositoriesRole = null;
 }
 
 const SQLITE_UTC_DATETIME_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z?$/;

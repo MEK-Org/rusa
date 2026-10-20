@@ -65,6 +65,13 @@ export interface FollowerHubOptions {
   triggerStore?: FollowerUpdateTriggerStore;
   /** Replaces the default event-transfer receiver and its limits; for tests. */
   eventTransfers?: EventTransferReceiver;
+  /**
+   * Follower instance IDs allowed to enroll; any other ID is refused even with
+   * a valid enrollment token. `rusa start` always passes the leader's `peers`
+   * follower entries (#1024); omitting it leaves enrollment token-only, which
+   * only harnesses and tests do.
+   */
+  allowedFollowerIds?: Iterable<string>;
 }
 
 function isFollowerEvent(event: unknown): event is FollowerEvent {
@@ -185,6 +192,7 @@ export class FollowerHub {
     });
   });
   private origin = "";
+  private readonly allowedFollowerIds?: ReadonlySet<string>;
   constructor(
     private readonly token: string,
     opts?: FollowerHubOptions
@@ -194,6 +202,7 @@ export class FollowerHub {
     this.sweep.unref();
     this.eventTransfers = opts?.eventTransfers ?? new EventTransferReceiver();
     this.triggerStore = opts?.triggerStore;
+    if (opts?.allowedFollowerIds) this.allowedFollowerIds = new Set(opts.allowedFollowerIds);
     if (this.triggerStore) {
       this.reconciler = new FollowerUpdateReconciler(this.triggerStore, this, {
         logger: this.log,
@@ -555,6 +564,11 @@ export class FollowerHub {
       ) {
         rejectRegistration("invalid_identity");
         throw new Error("Invalid follower identity");
+      }
+      if (this.allowedFollowerIds && !this.allowedFollowerIds.has(body.id)) {
+        rejectRegistration("not_allowlisted");
+        reply(res, 403, { error: "Follower instance ID is not in the leader's peers allowlist" });
+        return;
       }
       const existing = this.followers.get(body.id);
       const superseded = this.supersededGenerations.get(body.id);

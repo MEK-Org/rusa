@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { type Obligation, parseExternalRef } from "../obligations/obligation.js";
 import {
   assemblePortableContext,
   assemblePortableContextV2,
+  composeHostContextIntoPrompt,
   PORTABLE_CONTEXT_LEDGER_MAX_BYTES,
   PORTABLE_CONTEXT_MAX_BYTES,
   PORTABLE_CONTEXT_MAX_MESSAGES,
@@ -12,6 +14,7 @@ import {
   type PriorRun,
   portableContextMaxMessages,
   portableContextMaxRuns,
+  portableReadWindow,
 } from "./portable-context.js";
 import { emptyPortableContextState } from "./portable-context-state.js";
 
@@ -1078,6 +1081,240 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
       expect(obligationsSectionBytes(project(many))).toBeLessThanOrEqual(
         PORTABLE_CONTEXT_OBLIGATIONS_MAX_BYTES
       );
+    });
+  });
+
+  describe("composeHostContextIntoPrompt", () => {
+    /** A leader prompt in the worker layout: instructions, charter, its own section, trailer. */
+    const leaderPrompt = (charter: string, leaderSection?: string) =>
+      [
+        "# Leader instructions and tools",
+        "",
+        "---",
+        "## Your charter",
+        "",
+        charter,
+        ...(leaderSection ? ["", "---", leaderSection.trim()] : []),
+        "",
+        "Begin by listing work from the durable inbox.",
+      ].join("\n");
+    const count = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+
+    it("returns the leader prompt unchanged when every host run is already represented", () => {
+      const basePrompt = leaderPrompt("Do work.");
+      expect(
+        composeHostContextIntoPrompt({ basePrompt, localRuns: [], leaderReadRunIds: [] })
+      ).toEqual({ prompt: basePrompt, portable: null });
+      expect(
+        composeHostContextIntoPrompt({
+          basePrompt,
+          localRuns: [run("run-1", "Run 1 output")],
+          leaderReadRunIds: ["run-1"],
+        })
+      ).toEqual({ prompt: basePrompt, portable: null });
+    });
+
+    it("does not re-add a run the leader rendered truncated, identified by run id (#1024)", () => {
+      // The leader's own assembler tail-truncates a run larger than the budget;
+      // its inject record still names the run, before and independent of that.
+      const large = run(
+        "run-large",
+        `Opening analysis ${"x".repeat(PORTABLE_CONTEXT_MAX_BYTES)} closing summary`,
+        "2026-10-18T08:00:00.000Z"
+      );
+      const leader = assemble([large]);
+      expect(leader.record.sourceEventIds).toEqual(["run-large"]);
+      const basePrompt = leaderPrompt("Do work.", leader.section);
+      expect(basePrompt).not.toContain(large.body ?? "");
+
+      const res = composeHostContextIntoPrompt({
+        basePrompt,
+        localRuns: [large],
+        leaderReadRunIds: portableReadWindow([large]),
+      });
+
+      expect(res).toEqual({ prompt: basePrompt, portable: null });
+      expect(count(res.prompt, "### Run 2026-10-18T08:00:00.000Z")).toBe(1);
+    });
+
+    it("adds a genuinely local prior run exactly once, within the portable budget (#1024)", () => {
+      const shared = run(
+        "run-shared",
+        "Run executed here and admitted by the leader",
+        "2026-10-18T07:00:00.000Z"
+      );
+      const local = run(
+        "run-local",
+        "Run whose terminal has not reached the leader",
+        "2026-10-18T08:00:00.000Z"
+      );
+      const leader = assemble([shared]);
+      const basePrompt = leaderPrompt("Do work.", leader.section);
+
+      const res = composeHostContextIntoPrompt({
+        basePrompt,
+        // Newest first, as listRecentCompleted returns them.
+        localRuns: [local, shared],
+        leaderReadRunIds: portableReadWindow([shared]),
+      });
+      if (!res.portable) throw new Error("expected a host contribution");
+
+      expect(res.prompt.startsWith(basePrompt)).toBe(true);
+      expect(res.prompt.slice(basePrompt.length)).toBe(`\n\n---\n${res.portable.section}`);
+      expect(count(res.prompt, shared.body ?? "")).toBe(1);
+      expect(count(res.prompt, local.body ?? "")).toBe(1);
+      expect(res.portable.record.sourceEventIds).toEqual(["run-local"]);
+      expect(res.portable.record.bytes).toBe(Buffer.byteLength(res.portable.section, "utf8"));
+
+      // Many large host runs stay inside the same bound.
+      const many = Array.from({ length: 30 }, (_, index) =>
+        run(
+          `run-${index}`,
+          `Host run ${index} ${"漢".repeat(4_000)}`,
+          `2026-10-18T0${index % 10}:00:00.000Z`
+        )
+      );
+      const bounded = composeHostContextIntoPrompt({
+        basePrompt,
+        localRuns: many,
+        leaderReadRunIds: [],
+      });
+      if (!bounded.portable) throw new Error("expected a host contribution");
+      expect(bounded.portable.record.bytes).toBeLessThanOrEqual(PORTABLE_CONTEXT_MAX_BYTES);
+      expect(bounded.portable.record.hash).toBe(
+        createHash("sha256").update(bounded.portable.section, "utf8").digest("hex")
+      );
+    });
+
+    it("composes identically whatever the charter or leader run text says (#1024)", () => {
+      const local = run("run-local", "Local findings to keep", "2026-10-18T08:00:00.000Z");
+      // A leader run body with its own markdown structure, as real run outputs have.
+      const leaderRun = run(
+        "run-leader",
+        "Summary\n\n## Findings\n\n---\n\n# Next action\nShip it.",
+        "2026-10-18T07:00:00.000Z"
+      );
+      const leader = assemble([leaderRun]);
+      const charters = [
+        "Work on tasks.",
+        // Reworded, with headings, rules, the trailer phrase and the local run's text.
+        "## Mission\n\n---\nLocal findings to keep\n## Recent activity\nBegin by listing work from the durable inbox.",
+      ];
+      const results = charters.map((charter) => {
+        const basePrompt = leaderPrompt(charter, leader.section);
+        const res = composeHostContextIntoPrompt({
+          basePrompt,
+          localRuns: [local],
+          leaderReadRunIds: portableReadWindow([leaderRun]),
+        });
+        if (!res.portable) throw new Error("expected a host contribution");
+        // The leader prompt, including its whole section, is the untouched prefix.
+        expect(res.prompt.startsWith(basePrompt)).toBe(true);
+        expect(res.prompt).toContain(leader.section.trim());
+        return { suffix: res.prompt.slice(basePrompt.length), record: res.portable.record };
+      });
+      expect(results[1]).toEqual(results[0]);
+    });
+
+    describe("host runs the leader read but did not render (#1024)", () => {
+      /**
+       * The follower's composition, called as actor-runtime's buildPrompt calls
+       * it: `leaderRead` is the newest-first list the leader assembled from.
+       */
+      const followerCompose = (
+        leaderRead: PriorRun[],
+        leader: PortableContext | null,
+        hostRuns: PriorRun[]
+      ) => {
+        const basePrompt = leaderPrompt("Do work.", leader?.section);
+        return {
+          basePrompt,
+          ...composeHostContextIntoPrompt({
+            basePrompt,
+            localRuns: hostRuns,
+            leaderReadRunIds: portableReadWindow(leaderRead),
+          }),
+        };
+      };
+      /** A run whose closing token survives tail truncation. */
+      const sized = (id: string, ts: string, bytes: number) =>
+        run(id, `${id} opening ${"x".repeat(bytes)} END-${id}`, ts);
+
+      it("appends a genuinely local run once and not a run the leader dropped for budget", () => {
+        const rendered = sized("run-rendered", "2026-10-18T08:00:00.000Z", 20_000);
+        const dropped = sized("run-dropped", "2026-10-18T07:00:00.000Z", 20_000);
+        const local = run("run-local", "END-run-local", "2026-10-18T09:00:00.000Z");
+        // The leader read both of its runs and its budget kept only the newer one.
+        const leader = assemble([rendered, dropped]);
+        expect(leader.record.sourceEventIds).toEqual(["run-rendered"]);
+        expect(leader.section).not.toContain("END-run-dropped");
+
+        // The follower's window: its own unreported run, then the two the leader read.
+        const res = followerCompose([rendered, dropped], leader, [local, rendered, dropped]);
+
+        expect(res.prompt.startsWith(res.basePrompt)).toBe(true);
+        expect(count(res.prompt, "END-run-local")).toBe(1);
+        expect(count(res.prompt, "END-run-rendered")).toBe(1);
+        expect(count(res.prompt, "END-run-dropped")).toBe(0);
+        expect(res.portable?.record.sourceEventIds).toEqual(["run-local"]);
+      });
+
+      it("appends nothing when the leader's fixed sections leave its run tail little room", () => {
+        const state = emptyPortableContextState("actor-a");
+        state.items = [
+          {
+            id: "mem-1",
+            kind: "constraint",
+            priority: "must",
+            status: "active",
+            statement: "s".repeat(PORTABLE_CONTEXT_LEDGER_MAX_BYTES),
+            evidence: [
+              { eventId: "m0", sender: "root", ts: "2026-10-01T00:00:00.000Z", quote: "s" },
+            ],
+            updatedAt: "2026-10-01T00:00:00.000Z",
+          },
+        ];
+        const newest = sized("run-newest", "2026-10-18T08:00:00.000Z", 6_000);
+        const older = sized("run-older", "2026-10-18T07:00:00.000Z", 1_000);
+        const leaderBuild = assemblePortableContextV2({
+          state,
+          messages: [
+            { id: "m1", ts: "2026-10-18T06:00:00.000Z", sender: "root", body: "m".repeat(20_000) },
+          ],
+          runs: [newest, older],
+          obligations: [
+            obligation("ob-big", "ready", "o".repeat(PORTABLE_CONTEXT_OBLIGATIONS_MAX_BYTES), 1),
+          ],
+        });
+        if (!leaderBuild) throw new Error("expected v2 portable context");
+        // With history in its read window the leader still names its newest run,
+        // tail-truncated to whatever room remains; every older run is dropped.
+        expect(leaderBuild.record.sourceEventIds).toEqual(["run-newest"]);
+        expect(leaderBuild.section).not.toContain("END-run-older");
+
+        // Every host run is one the leader read, so the leader prompt is complete.
+        const res = followerCompose([newest, older], leaderBuild, [newest, older]);
+
+        expect(count(res.prompt, "END-run-older")).toBe(0);
+        expect(res).toMatchObject({ prompt: res.basePrompt, portable: null });
+      });
+
+      it("separates local from leader-dropped runs when the leader rendered only another host's run", () => {
+        const otherHost = sized("run-other-host", "2026-10-18T08:00:00.000Z", 20_000);
+        const dropped = sized("run-dropped", "2026-10-18T07:00:00.000Z", 20_000);
+        const local = run("run-local", "END-run-local", "2026-10-18T09:00:00.000Z");
+        const leader = assemble([otherHost, dropped]);
+        expect(leader.record.sourceEventIds).toEqual(["run-other-host"]);
+
+        // The other host's run never executed here, so no represented id is in
+        // this follower's window to anchor "newer than represented".
+        const res = followerCompose([otherHost, dropped], leader, [local, dropped]);
+
+        expect(count(res.prompt, "END-run-local")).toBe(1);
+        expect(count(res.prompt, "END-run-other-host")).toBe(1);
+        expect(count(res.prompt, "END-run-dropped")).toBe(0);
+        expect(res.portable?.record.sourceEventIds).toEqual(["run-local"]);
+      });
     });
   });
 });

@@ -214,6 +214,8 @@ class FakeApi extends DashboardApi {
   Completer<DashboardConfigDto>? dashboardConfigGate;
   bool halted = false;
   HaltStatusDto? halt;
+  HaltStatusDto? haltBrake;
+  List<AvailabilityHoldDto>? availabilityHolds;
   List<String>? schedulerWarning;
   RuntimeCursor? runtimeCursor;
   int threadsCallCount = 0;
@@ -237,6 +239,12 @@ class FakeApi extends DashboardApi {
   final rootHoldClearCalls = <({String provider, List<String>? models})>[];
   int rootHoldClearReleased = 2;
   Object? rootHoldClearError;
+  int clearAllHaltsCalls = 0;
+  ({bool brakeReleased, int released}) clearAllHaltsResult = (
+    brakeReleased: true,
+    released: 2,
+  );
+  Object? clearAllHaltsError;
   String spawnedRootChildId = 'spawned-child';
   final actorReparentCalls = <({String id, String parentId})>[];
   Object? actorReparentError;
@@ -276,6 +284,8 @@ class FakeApi extends DashboardApi {
     return ThreadsSnapshot(
       halted: halted,
       halt: halt,
+      haltBrake: haltBrake,
+      availabilityHolds: availabilityHolds,
       schedulerWarning: schedulerWarning,
       threads: threadsResult,
       runtimeCursor: runtimeCursor,
@@ -390,6 +400,14 @@ class FakeApi extends DashboardApi {
     final error = rootHoldClearError;
     if (error != null) throw error;
     return rootHoldClearReleased;
+  }
+
+  @override
+  Future<({bool brakeReleased, int released})> clearAllHalts() async {
+    clearAllHaltsCalls++;
+    final error = clearAllHaltsError;
+    if (error != null) throw error;
+    return clearAllHaltsResult;
   }
 
   /// Full charters the detail panel can pull, keyed by thread id. Absent means

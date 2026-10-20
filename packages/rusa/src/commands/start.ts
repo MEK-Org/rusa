@@ -40,6 +40,7 @@ import {
   describeHold,
   haltIndicator,
   importScopedHaltFile,
+  type ReleasedHalts,
 } from "../actor/availability-holds.js";
 import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
@@ -112,6 +113,7 @@ import {
   PORTABLE_CONTEXT_FOLD_MAX_PAGES,
   portableContextMaxMessages,
   portableContextMaxRuns,
+  portableReadWindow,
 } from "../actor/portable-context.js";
 import { seedPortableBriefState } from "../actor/portable-context-brief.js";
 import {
@@ -168,7 +170,16 @@ import {
   type SystemChatSubscriptionLapseEvent,
   WorkspaceEventsSubscriber,
 } from "../chat/workspace-events.js";
-import { type ConfigProfile, loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
+import {
+  type ConfigProfile,
+  followerAllowlistOf,
+  type InstanceIdentity,
+  instanceIdentityOf,
+  instanceRoleOf,
+  loadConfig,
+  type RusaConfig,
+  resolveHome,
+} from "../config/index.js";
 import { readJevApiKeyFile } from "../config/jev.js";
 import { secretsDirPath } from "../config/secrets.js";
 import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
@@ -189,7 +200,10 @@ import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscript
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
 import { importLegacyPortableContextState } from "../db/legacy-portable-context-import.js";
 import type { PortableLedgerSource } from "../db/repositories/actor-run-repository.js";
-import type { AvailabilityHold } from "../db/repositories/availability-hold-repository.js";
+import type {
+  AvailabilityHold,
+  AvailabilityHoldOrigin,
+} from "../db/repositories/availability-hold-repository.js";
 import type {
   ObligationStatusChange,
   PrerequisiteAttention,
@@ -318,7 +332,9 @@ import { asGitHubIssue, parseReference } from "../references/reference.js";
 import { resolveReference } from "../references/resolve.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
+import type { FollowerInstance } from "../remote-instances/follower-instance.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
+import type { ProviderFactory } from "../remote-instances/protocol.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 import { constructActorFromInvocation } from "../runtime/actor-invocation.js";
 import {
@@ -386,6 +402,7 @@ import {
   recordAndAnnounceRequestedRestart,
   ServiceLifecycleStore,
 } from "./service-lifecycle.js";
+import { composeFollowerStart } from "./start-follower.js";
 
 // `update` tool bounds . Per-step HARD timeouts so a hung build can't wedge
 // root; a bounded drain so a stuck worker can't block the restart forever.
@@ -687,6 +704,8 @@ export function createStartRetireCleanups(
 /** Live handles the e2e runner uses to drive a started mesh in-process. */
 export interface RunStartE2EHandles {
   mesh: ActorMesh;
+  /** This leader's identity as read from config (#1019). */
+  instanceIdentity: InstanceIdentity;
   /** Read-only synchronization signal for the production coordinator client. */
   coordinatorAppliedInterval: (provider: string) => number | undefined;
   /** Test-only read of the production pacer's next normal-start quote. */
@@ -744,7 +763,21 @@ export interface RunStartE2EHooks {
   quotaApi?: QuotaApiDeps;
   /** Deterministic statfs/clock for the host disk sensor; production reads the real volume. */
   diskAlertDeps?: DiskUsageAlertDeps;
-  onReady?: (handles: RunStartE2EHandles) => void;
+  /**
+   * Drives a fully composed leader in an E2E fixture. The composition awaits
+   * this callback so a fixture failure follows the same resource cleanup path
+   * as a startup failure.
+   */
+  onReady?: (handles: RunStartE2EHandles) => void | Promise<void>;
+  connectPeer?: boolean;
+  /** Exercise follower HTTP command ingestion while retaining E2E shutdown handles. */
+  followerPolling?: boolean;
+  followerProviderFactory?: ProviderFactory;
+  onFollowerReady?: (handles: {
+    instance: FollowerInstance;
+    instanceIdentity: InstanceIdentity;
+    shutdown: () => Promise<void>;
+  }) => void;
 }
 
 export interface RunStartOptions {
@@ -759,6 +792,12 @@ export interface RunStartOptions {
    */
   importActor?: string;
   e2e?: RunStartE2EHooks;
+  /** Raw `--leader` CLI flag: shorthand for the single `leader` peer entry's url. */
+  leader?: string;
+  /** Raw `--token-file` CLI flag: shorthand for the `leader` peer entry's tokenFile. */
+  tokenFile?: string;
+  /** Raw `--instance-id` CLI flag. */
+  instanceId?: string;
 }
 
 /**
@@ -901,11 +940,19 @@ export function readUnfoldedLedgerSources(
   return { sources, truncated: true };
 }
 
+interface PortableInjection {
+  /** The rendered prefix; absent when there is nothing to inject (e.g. a first run). */
+  priorContext?: string;
+  injectRecord?: InjectRecord;
+  /** Every actor_run id read for this prompt, oldest first; the follower's `PromptBuild.readRunIds`. */
+  readRunIds: string[];
+}
+
 /**
  * Assemble a portable-context (design ISSUE_NUM) actor's
  * stateless prefix from its own durable recent run outputs, plus the per-run inject
- * record that rides on the run's `run_start` event. Returns undefined when there's
- * nothing injectable yet (e.g. the actor's first run).
+ * record that rides on the run's `run_start` event. When there's nothing injectable
+ * yet (e.g. the actor's first run) only the read window is returned.
  *
  * Lifted out of the worker's `buildPrompt` callback so that callback stays a thin
  * composition seam. Deliberately NOT pushed into `buildWorkerPrompt` (Operator's PR
@@ -919,16 +966,21 @@ function assemblePortableInjection(
   store: PortableContextStore,
   journal: PortableJournalMode = "window",
   onDeltaFallback: (error: unknown) => void = () => {}
-): { priorContext: string; injectRecord: InjectRecord } | undefined {
+): PortableInjection {
   const repositories = getRepositories();
   const runs = repositories.actorRuns
     .listRecentCompleted(id, portableContextMaxRuns())
     .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
+  // The read window is every run read above, before any budget selection, so a
+  // follower can tell a run this prompt dropped from one it never saw (#1024).
+  const readRunIds = portableReadWindow(runs);
   // Tail remains a run-only renderer. Do not load a snapshot or query messages
   // and obligations before selecting this established path.
   if (mode === "tail") {
     const portable = assemblePortableContext(runs);
-    return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
+    return portable
+      ? { priorContext: portable.section, injectRecord: portable.record, readRunIds }
+      : { readRunIds };
   }
 
   let state = store.load(id);
@@ -997,7 +1049,9 @@ function assemblePortableInjection(
     journal: selected.journal,
     ...(mode === "brief" ? { brief: state.brief } : {}),
   });
-  return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
+  return portable
+    ? { priorContext: portable.section, injectRecord: portable.record, readRunIds }
+    : { readRunIds };
 }
 
 function assembleConfiguredPortableInjection(
@@ -1006,7 +1060,7 @@ function assembleConfiguredPortableInjection(
   store: PortableContextStore,
   journal: PortableJournalMode = "window",
   onDeltaFallback?: (error: unknown) => void
-): { priorContext: string; injectRecord: InjectRecord } | undefined {
+): PortableInjection | undefined {
   if (record.context?.type !== "portable") return undefined;
   if (record.context.mode === "ledger" && !apiKey) {
     throw new Error("portable context ledger mode requires geminiApiKey");
@@ -1184,6 +1238,9 @@ async function composeStart(
     // throws on an unknown profile, so the cast to the canonical union is safe.
     config = loadConfig(mcHome, {
       profile: opts?.profile as ConfigProfile | undefined,
+      leader: opts?.leader,
+      tokenFile: opts?.tokenFile,
+      instanceId: opts?.instanceId,
     });
   } catch (err) {
     // No config yet means no config-sourced secrets to scrub against, so this
@@ -1192,6 +1249,12 @@ async function composeStart(
       reason: err instanceof Error ? err.message : String(err),
     });
     process.exit(1);
+    return;
+  }
+
+  const role = instanceRoleOf(config);
+  if (role === "follower") {
+    await composeFollowerStart(config, opts, resources, bootLog);
     return;
   }
   const rootActor = config.rootActor;
@@ -1284,6 +1347,9 @@ async function composeStart(
   const database = initDb(mcHome);
   resources.acquire("database", () => closeDb());
   log.info("database_ready", { home: mcHome });
+  const identity = instanceIdentityOf(config);
+  log.info("instance_identity_ready", { instanceId: identity.instanceId, role: identity.role });
+  getRepositories(role);
   if (!config.auth) getRepositories().principals.ensureImplicitUser(new Date().toISOString());
 
   const modelClasses = getRepositories().modelClasses;
@@ -2940,13 +3006,20 @@ async function composeStart(
         `Failed to read follower tokenFile '${tokenFile}': ${err instanceof Error ? err.message : String(err)}`
       );
     }
-    followerHub = new FollowerHub(token, { logger: log, triggerStore: followerTriggerStore });
+    // Only the follower instance IDs listed in peers may enroll (#1024).
+    const allowedFollowerIds = followerAllowlistOf(config);
+    followerHub = new FollowerHub(token, {
+      logger: log,
+      triggerStore: followerTriggerStore,
+      allowedFollowerIds,
+    });
     await followerHub.listen(config.followers.bind, config.followers.port);
     const hub = followerHub;
     resources.acquire("follower gateway", () => hub.close());
     log.info("follower_gateway_started", {
       bind: config.followers.bind,
       port: config.followers.port,
+      allowedFollowerIds,
     });
   }
 
@@ -3762,16 +3835,16 @@ async function composeStart(
           { name: PNPM_INSTALL_MCP_NAME, url: pnpmInstallUrl },
         ];
 
-        if (rec.context?.type === "portable" && rec.context.mode === "brief") {
-          const briefUrl = mcpHttp.addServer(`${id}:${BRIEF_MCP_NAME}`, () =>
-            createBriefMcpServer({
-              actorId: id,
-              store: portableContextStore,
-              resolveCitation: resolveBriefCitation,
-            })
-          );
-          workerMcp.push({ name: BRIEF_MCP_NAME, url: briefUrl });
-        }
+        // Every actor can refine a shadow brief before selecting brief mode.
+        // The context selection alone decides which memory its prompt renders.
+        const briefUrl = mcpHttp.addServer(`${id}:${BRIEF_MCP_NAME}`, () =>
+          createBriefMcpServer({
+            actorId: id,
+            store: portableContextStore,
+            resolveCitation: resolveBriefCitation,
+          })
+        );
+        workerMcp.push({ name: BRIEF_MCP_NAME, url: briefUrl });
 
         // Mount any capabilities granted to this actor (by id) on top of the default
         // worker set (ISSUE_NUM, phase 1a). A granted-but-not-mountable capability (none
@@ -3887,6 +3960,7 @@ async function composeStart(
                 injection?.priorContext
               ),
               injectRecord: injection?.injectRecord,
+              readRunIds: injection?.readRunIds,
             };
           },
           // Pool recovery remains a durable actor behavior of the imported
@@ -4096,11 +4170,71 @@ async function composeStart(
     );
   };
 
+  // A lifted halt can reopen a lane that unclaimed work is waiting on, and
+  // replaying nothing would otherwise leave the admission list unscanned.
+  const resumeAfterHalt = (): string[] => {
+    const resumed = mesh.resumeCancelledRuns();
+    mesh.reconcileUnseenInbox();
+    admissionQueue.refresh();
+    return resumed;
+  };
+  availabilityHolds.start();
+  let haltExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+  resources.acquire("halt expiry timer", () => {
+    if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
+    haltExpiryTimer = null;
+  });
+  const scheduleHaltExpiry = (until?: string) => {
+    if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
+    haltExpiryTimer = null;
+    if (!until) return;
+    const delay = Date.parse(until) - Date.now();
+    if (delay <= 0) {
+      resumeAfterHalt();
+      return;
+    }
+    haltExpiryTimer = setTimeout(
+      () => {
+        haltExpiryTimer = null;
+        const state = haltSwitch.state();
+        if (state?.until) {
+          scheduleHaltExpiry(state.until);
+          return;
+        }
+        if (state) return;
+        const resumed = resumeAfterHalt();
+        console.warn(
+          `[mesh] ▶ HALT expired${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : ""}`
+        );
+      },
+      Math.min(delay, 2_147_483_647)
+    );
+    haltExpiryTimer.unref?.();
+  };
+  /**
+   * Release the global brake and the availability holds, then replay what the
+   * halt cancelled. Bare chat `/resume` passes `"chat"`, so mesh-instituted
+   * holds survive it (#918); the dashboard's clear-all omits `origin` and
+   * releases every hold (#1100).
+   */
+  const releaseHalts = (origin?: AvailabilityHoldOrigin): ReleasedHalts => {
+    const brakeReleased = haltSwitch.hasActiveHalt();
+    haltSwitch.resume();
+    if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
+    haltExpiryTimer = null;
+    const cleared = availabilityHolds.clearAll(
+      origin ? { silent: true, origin } : { silent: true }
+    );
+    const resumed = resumeAfterHalt();
+    return { brakeReleased, ...cleared, resumed };
+  };
+
   const rootControl = new RootControlService({
     mesh,
     rootId: importedRoot?.status === "active" ? rootId : undefined,
     providers: Object.keys(config.providers),
     availabilityHolds,
+    releaseHalts: () => releaseHalts(),
     resolveModelConfig: (input) => resolveModelClasses(modelClasses, input),
   });
 
@@ -4188,48 +4322,6 @@ async function composeStart(
         payload
       ),
   });
-
-  // A lifted halt can reopen a lane that unclaimed work is waiting on, and
-  // replaying nothing would otherwise leave the admission list unscanned.
-  const resumeAfterHalt = (): string[] => {
-    const resumed = mesh.resumeCancelledRuns();
-    mesh.reconcileUnseenInbox();
-    admissionQueue.refresh();
-    return resumed;
-  };
-  availabilityHolds.start();
-  let haltExpiryTimer: ReturnType<typeof setTimeout> | null = null;
-  resources.acquire("halt expiry timer", () => {
-    if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
-    haltExpiryTimer = null;
-  });
-  const scheduleHaltExpiry = (until?: string) => {
-    if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
-    haltExpiryTimer = null;
-    if (!until) return;
-    const delay = Date.parse(until) - Date.now();
-    if (delay <= 0) {
-      resumeAfterHalt();
-      return;
-    }
-    haltExpiryTimer = setTimeout(
-      () => {
-        haltExpiryTimer = null;
-        const state = haltSwitch.state();
-        if (state?.until) {
-          scheduleHaltExpiry(state.until);
-          return;
-        }
-        if (state) return;
-        const resumed = resumeAfterHalt();
-        console.warn(
-          `[mesh] ▶ HALT expired${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : ""}`
-        );
-      },
-      Math.min(delay, 2_147_483_647)
-    );
-    haltExpiryTimer.unref?.();
-  };
 
   // Rehydrate every active record through the ordinary durable constructor.
   // Import identity does not select an authority-bearing tool surface or an
@@ -4920,19 +5012,14 @@ async function composeStart(
         // whatever its scope (operator decision, #918 comment 6204340124).
         // Mesh-instituted holds stay in force and are listed, so an
         // indefinite mesh hold is neither cleared nor hidden.
-        const wasHalted = haltSwitch.hasActiveHalt();
-        haltSwitch.resume();
-        if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
-        haltExpiryTimer = null;
-        const chatCleared = availabilityHolds.clearAll("chat", { silent: true });
-        const resumed = resumeAfterHalt();
+        const { brakeReleased, released, resumed } = releaseHalts("chat");
         const remaining = availabilityHolds.list();
         const lines = [
           `▶ Resumed${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : " — actors will run on the next trigger"}.`,
-          wasHalted ? "Global halt released." : "No global halt was in place.",
+          brakeReleased ? "Global halt released." : "No global halt was in place.",
         ];
-        if (chatCleared.released.length) {
-          lines.push(`Released availability holds:\n${holdLines(chatCleared.released)}`);
+        if (released.length) {
+          lines.push(`Released availability holds:\n${holdLines(released)}`);
         }
         lines.push(
           remaining.length
@@ -5421,8 +5508,9 @@ async function composeStart(
 
   // E2E: now that every edge is wired and shutdown exists, hand the driving
   // runner live handles so it can inject events and tear down deterministically.
-  opts?.e2e?.onReady?.({
+  await opts?.e2e?.onReady?.({
     mesh,
+    instanceIdentity: identity,
     coordinatorAppliedInterval: (provider) =>
       quotaCoordinatorClient?.getLastAppliedInterval(provider),
     coordinatorPacerQuote: (provider) => pacerFor(provider).quote(),

@@ -24,6 +24,9 @@ import {
   DEFAULT_DEPLOY_BRANCH,
   type GitHubConfig,
   type GitHubOrgConfig,
+  type InstanceIdentity,
+  type InstanceRole,
+  type PeerConfig,
   type QuotaThrottleConfig,
   type RusaConfig,
 } from "./types.js";
@@ -53,6 +56,12 @@ export interface LoadConfigOptions {
    * compile-time set the CLI passes in.
    */
   profile?: ConfigProfile;
+  /** `--leader`: URL of the single `leader` peer entry, overriding or creating it. */
+  leader?: string;
+  /** `--token-file`: token file of the single `leader` peer entry, overriding config.yaml. */
+  tokenFile?: string;
+  /** Override local instance ID. */
+  instanceId?: string;
 }
 
 export const QUICKSTART_PROFILE = {
@@ -140,89 +149,159 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   if (options?.profile !== undefined) {
     rawParsed.profile = options.profile;
   }
+  if ("role" in rawParsed || "peer" in rawParsed) {
+    throw new Error(
+      "config.yaml: top-level role and peer are not supported; describe instance relationships with peers (a leader entry makes this instance a follower)"
+    );
+  }
+  if (options?.leader !== undefined || options?.tokenFile !== undefined) {
+    applyLeaderShorthand(rawParsed, options.leader, options.tokenFile);
+  }
+  if (options?.instanceId !== undefined) {
+    rawParsed.instance = {
+      ...(rawParsed.instance && typeof rawParsed.instance === "object" ? rawParsed.instance : {}),
+      id: options.instanceId,
+    };
+  }
 
   const parsed = applyProfile(rawParsed);
+
+  // Validate peer relationships before side effects
+  validatePeers(parsed);
+  const role = instanceRoleOf(parsed);
+
+  if (parsed.instance !== undefined) {
+    if (
+      typeof parsed.instance !== "object" ||
+      parsed.instance === null ||
+      Array.isArray(parsed.instance)
+    ) {
+      throw new Error("config.yaml: instance must be a mapping when set");
+    }
+    if (parsed.instance.id !== undefined) {
+      if (typeof parsed.instance.id !== "string" || !parsed.instance.id.trim()) {
+        throw new Error("config.yaml: instance.id must be a non-empty string when set");
+      }
+      parsed.instance.id = parsed.instance.id.trim();
+      // Refuse an ID a leader's follower gateway would reject at enrollment.
+      if (!PEER_ID_PATTERN.test(parsed.instance.id)) {
+        throw new Error(
+          'config.yaml: instance.id must be 1-64 letters, digits, "_" or "-" (the instance ID followers enroll with)'
+        );
+      }
+    }
+  }
+
+  if (role === "follower" && parsed.followers !== undefined) {
+    throw new Error(
+      "config.yaml: a follower (peers has a leader entry) cannot configure followers gateway"
+    );
+  }
+  const allowlist = followerAllowlistOf(parsed);
+  if (allowlist.length > 0 && parsed.followers === undefined) {
+    throw new Error(
+      "config.yaml: peers follower entries require the followers gateway (followers.bind/port/tokenFile)"
+    );
+  }
+  if (parsed.followers !== undefined && allowlist.length === 0) {
+    throw new Error(
+      'config.yaml: followers gateway requires at least one peers entry with type: follower; only listed follower instance IDs may enroll (e.g. peers: [{ id: "<follower instance id>", type: follower }])'
+    );
+  }
+  if (role === "follower" && parsed.instance?.id === undefined) {
+    throw new Error(
+      "config.yaml: a follower (peers has a leader entry) requires instance.id (or --instance-id) matching a follower entry in the leader's peers allowlist"
+    );
+  }
+
   validateDashboardAuth(parsed.auth);
   resolveErrorSink(parsed);
 
   // Basic validation & defaulting
-  if (parsed.github && !parsed.github.account) {
-    parsed.github.account = "quickstart-user";
+  if (role !== "follower" && !parsed.github) {
+    throw new Error("config.yaml: github configuration is required");
   }
-  rejectRemovedGitHubPollingKeys(parsed.github);
-  if (parsed.github.workerTokenPath !== undefined) {
-    if (
-      typeof parsed.github.workerTokenPath !== "string" ||
-      !parsed.github.workerTokenPath.trim()
-    ) {
-      throw new Error("config.yaml: github.workerTokenPath must be a non-empty string when set");
+  if (parsed.github) {
+    if (!parsed.github.account) {
+      parsed.github.account = "quickstart-user";
     }
-    parsed.github.workerTokenPath = parsed.github.workerTokenPath.trim();
-  }
-  if (parsed.github.repos !== undefined) {
-    if (
-      !Array.isArray(parsed.github.repos) ||
-      parsed.github.repos.some(
-        (repo) =>
-          typeof repo !== "string" || !repo.trim() || !/^[^/\s]+\/[^/\s]+$/.test(repo.trim())
-      )
-    ) {
-      throw new Error(
-        "config.yaml: github.repos must be an array of repository names in owner/name format when set"
-      );
-    }
-    parsed.github.repos = parsed.github.repos.map((repo) => repo.trim());
-  }
-  if (parsed.github.orgs !== undefined) {
-    if (!Array.isArray(parsed.github.orgs)) {
-      throw new Error("config.yaml: github.orgs must be an array of org objects when set");
-    }
-    const validatedOrgs: GitHubOrgConfig[] = [];
-    for (const item of parsed.github.orgs) {
-      if (typeof item === "object" && item !== null && !Array.isArray(item)) {
-        const record = item as unknown as Record<string, unknown>;
-        const orgName = record.org;
-
-        if (typeof orgName !== "string" || !orgName.trim() || !/^[^/\s]+$/.test(orgName.trim())) {
-          throw new Error(
-            "config.yaml: github.orgs org object must specify a valid organization name without slashes"
-          );
-        }
-
-        let excludedRepos: string[] | undefined;
-        if (record.excludedRepos !== undefined) {
-          if (
-            !Array.isArray(record.excludedRepos) ||
-            record.excludedRepos.some(
-              (repo) =>
-                typeof repo !== "string" || !repo.trim() || !/^[^/\s]+\/[^/\s]+$/.test(repo.trim())
-            )
-          ) {
-            throw new Error(
-              "config.yaml: github.orgs excludedRepos must be an array of repository names in owner/name format when set"
-            );
-          }
-          excludedRepos = record.excludedRepos.map((repo) => (repo as string).trim());
-          if (
-            excludedRepos.some(
-              (repo) => repo.split("/")[0]?.toLowerCase() !== orgName.trim().toLowerCase()
-            )
-          ) {
-            throw new Error(
-              "config.yaml: github.orgs excludedRepos entries must belong to their configured organization"
-            );
-          }
-        }
-
-        validatedOrgs.push({
-          org: orgName.trim(),
-          ...(excludedRepos ? { excludedRepos } : {}),
-        });
-      } else {
-        throw new Error("config.yaml: github.orgs entries must be org objects");
+    rejectRemovedGitHubPollingKeys(parsed.github);
+    if (parsed.github.workerTokenPath !== undefined) {
+      if (
+        typeof parsed.github.workerTokenPath !== "string" ||
+        !parsed.github.workerTokenPath.trim()
+      ) {
+        throw new Error("config.yaml: github.workerTokenPath must be a non-empty string when set");
       }
+      parsed.github.workerTokenPath = parsed.github.workerTokenPath.trim();
     }
-    parsed.github.orgs = validatedOrgs;
+    if (parsed.github.repos !== undefined) {
+      if (
+        !Array.isArray(parsed.github.repos) ||
+        parsed.github.repos.some(
+          (repo) =>
+            typeof repo !== "string" || !repo.trim() || !/^[^/\s]+\/[^/\s]+$/.test(repo.trim())
+        )
+      ) {
+        throw new Error(
+          "config.yaml: github.repos must be an array of repository names in owner/name format when set"
+        );
+      }
+      parsed.github.repos = parsed.github.repos.map((repo) => repo.trim());
+    }
+    if (parsed.github.orgs !== undefined) {
+      if (!Array.isArray(parsed.github.orgs)) {
+        throw new Error("config.yaml: github.orgs must be an array of org objects when set");
+      }
+      const validatedOrgs: GitHubOrgConfig[] = [];
+      for (const item of parsed.github.orgs) {
+        if (typeof item === "object" && item !== null && !Array.isArray(item)) {
+          const record = item as unknown as Record<string, unknown>;
+          const orgName = record.org;
+
+          if (typeof orgName !== "string" || !orgName.trim() || !/^[^/\s]+$/.test(orgName.trim())) {
+            throw new Error(
+              "config.yaml: github.orgs org object must specify a valid organization name without slashes"
+            );
+          }
+
+          let excludedRepos: string[] | undefined;
+          if (record.excludedRepos !== undefined) {
+            if (
+              !Array.isArray(record.excludedRepos) ||
+              record.excludedRepos.some(
+                (repo) =>
+                  typeof repo !== "string" ||
+                  !repo.trim() ||
+                  !/^[^/\s]+\/[^/\s]+$/.test(repo.trim())
+              )
+            ) {
+              throw new Error(
+                "config.yaml: github.orgs excludedRepos must be an array of repository names in owner/name format when set"
+              );
+            }
+            excludedRepos = record.excludedRepos.map((repo) => (repo as string).trim());
+            if (
+              excludedRepos.some(
+                (repo) => repo.split("/")[0]?.toLowerCase() !== orgName.trim().toLowerCase()
+              )
+            ) {
+              throw new Error(
+                "config.yaml: github.orgs excludedRepos entries must belong to their configured organization"
+              );
+            }
+          }
+
+          validatedOrgs.push({
+            org: orgName.trim(),
+            ...(excludedRepos ? { excludedRepos } : {}),
+          });
+        } else {
+          throw new Error("config.yaml: github.orgs entries must be org objects");
+        }
+      }
+      parsed.github.orgs = validatedOrgs;
+    }
   }
   if (!parsed.providers || Object.keys(parsed.providers).length === 0) {
     throw new Error("config.yaml: at least one provider is required");
@@ -790,6 +869,166 @@ function applySecretFiles(parsed: RusaConfig, mcHome: string): void {
       warnDuplicateSecret("webhook.secret", WEBHOOK_SECRET_FILENAME, "value");
     }
     parsed.webhook.secret = fileWebhookSecret;
+  }
+}
+
+/** Instance IDs a follower sends at enrollment; the follower gateway's own check. */
+const PEER_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+
+/** Keys a `peers` entry may carry; follower entries are further limited to type/id. */
+const PEER_KEYS = new Set(["type", "id", "url", "token", "tokenFile"]);
+
+/**
+ * This instance's local role, derived from `peers`: a `leader` entry makes it a
+ * follower; otherwise it is a leader (#1024).
+ */
+export function instanceRoleOf(config: Pick<RusaConfig, "peers">): InstanceRole {
+  return leaderPeerOf(config) ? "follower" : "leader";
+}
+
+/**
+ * This instance's identity from config (#1019). {@link loadConfig} has already
+ * refused a follower without `instance.id`.
+ */
+export function instanceIdentityOf(
+  config: Pick<RusaConfig, "peers" | "instance">
+): InstanceIdentity {
+  const instanceId = config.instance?.id;
+  if (instanceRoleOf(config) === "leader") return { role: "leader", instanceId };
+  if (instanceId === undefined) {
+    throw new Error("A follower requires instance.id; loadConfig validates this");
+  }
+  return { role: "follower", instanceId };
+}
+
+/** The single configured `leader` peer entry, if this instance is a follower. */
+export function leaderPeerOf(config: Pick<RusaConfig, "peers">): PeerConfig | undefined {
+  return config.peers?.find((peer) => peer.type === "leader");
+}
+
+/** Follower instance IDs a leader allows to enroll through its gateway. */
+export function followerAllowlistOf(config: Pick<RusaConfig, "peers">): string[] {
+  return (config.peers ?? [])
+    .filter((peer) => peer.type === "follower")
+    .map((peer) => peer.id as string);
+}
+
+/**
+ * `--leader` / `--token-file` are shorthand for one `leader` peer entry: they
+ * override the configured leader entry's url/tokenFile, or create the entry
+ * when none exists. Other entries are left for {@link validatePeers} to judge.
+ */
+function applyLeaderShorthand(
+  rawParsed: RusaConfig,
+  leader: string | undefined,
+  tokenFile: string | undefined
+): void {
+  if (rawParsed.peers !== undefined && !Array.isArray(rawParsed.peers)) {
+    throw new Error("config.yaml: peers must be a list when set");
+  }
+  const peers: unknown[] = rawParsed.peers ? [...rawParsed.peers] : [];
+  const index = peers.findIndex(
+    (peer) => isPlainObject(peer) && (peer as { type?: unknown }).type === "leader"
+  );
+  if (index < 0 && leader === undefined) {
+    throw new Error("--token-file requires --leader or a configured leader peer entry");
+  }
+  const entry: Record<string, unknown> =
+    index >= 0 ? { ...(peers[index] as Record<string, unknown>) } : { type: "leader" };
+  if (leader !== undefined) entry.url = leader;
+  if (tokenFile !== undefined) {
+    entry.tokenFile = tokenFile;
+    delete entry.token;
+  }
+  if (index >= 0) peers[index] = entry;
+  else peers.push(entry);
+  rawParsed.peers = peers as PeerConfig[];
+}
+
+function validatePeers(parsed: RusaConfig): void {
+  if (parsed.peers === undefined) return;
+  if (!Array.isArray(parsed.peers)) {
+    throw new Error("config.yaml: peers must be a list when set");
+  }
+  const seenIds = new Set<string>();
+  let leaders = 0;
+  let followers = 0;
+  parsed.peers.forEach((peer, index) => {
+    const at = `config.yaml: peers[${index}]`;
+    if (!isPlainObject(peer)) throw new Error(`${at} must be a mapping`);
+    if (peer.type === "peer") {
+      throw new Error(
+        `${at}: type peer is not supported yet; cross-instance peers are tracked in #1101`
+      );
+    }
+    if (peer.type !== "leader" && peer.type !== "follower") {
+      throw new Error(`${at}.type must be "leader" or "follower"`);
+    }
+    for (const key of Object.keys(peer)) {
+      if (!PEER_KEYS.has(key)) {
+        throw new Error(`${at}.${key} is not a supported peer key`);
+      }
+    }
+    if (peer.id !== undefined || peer.type === "follower") {
+      if (typeof peer.id !== "string" || !PEER_ID_PATTERN.test(peer.id.trim())) {
+        throw new Error(
+          `${at}.id must be an instance ID of 1-64 letters, digits, "_" or "-"${peer.type === "follower" ? " (required on follower entries)" : ""}`
+        );
+      }
+      peer.id = peer.id.trim();
+      if (seenIds.has(peer.id)) throw new Error(`${at}.id duplicates ${JSON.stringify(peer.id)}`);
+      seenIds.add(peer.id);
+    }
+    if (peer.type === "follower") {
+      followers++;
+      for (const key of ["url", "token", "tokenFile"] as const) {
+        if (peer[key] !== undefined) {
+          throw new Error(
+            `${at}.${key} is not used on a follower entry; the leader's followers gateway holds the enrollment token`
+          );
+        }
+      }
+      return;
+    }
+    leaders++;
+    if (typeof peer.url !== "string" || !peer.url.trim()) {
+      throw new Error(`${at}.url must be the leader's http or https URL`);
+    }
+    peer.url = peer.url.trim();
+    try {
+      const u = new URL(peer.url);
+      if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error();
+    } catch {
+      throw new Error(`${at}.url must be a valid http or https URL`);
+    }
+    if (peer.token !== undefined && peer.tokenFile !== undefined) {
+      throw new Error(`${at}: cannot configure both token and tokenFile; choose one`);
+    }
+    if (peer.token === undefined && peer.tokenFile === undefined) {
+      throw new Error(`${at}: a leader entry requires token or tokenFile`);
+    }
+    if (peer.token !== undefined) {
+      if (typeof peer.token !== "string" || !peer.token.trim()) {
+        throw new Error(`${at}.token must be a non-empty string when set`);
+      }
+      peer.token = peer.token.trim();
+    }
+    if (peer.tokenFile !== undefined) {
+      if (typeof peer.tokenFile !== "string" || !peer.tokenFile.trim()) {
+        throw new Error(`${at}.tokenFile must be a non-empty string when set`);
+      }
+      const rawTokenFile = peer.tokenFile.trim();
+      peer.tokenFile =
+        rawTokenFile === "~" || rawTokenFile.startsWith("~/")
+          ? join(homedir(), rawTokenFile.slice(2))
+          : rawTokenFile;
+    }
+  });
+  if (leaders > 1) throw new Error("config.yaml: peers may contain at most one leader entry");
+  if (leaders > 0 && followers > 0) {
+    throw new Error(
+      "config.yaml: peers cannot contain both a leader entry and follower entries; chained followers are not supported"
+    );
   }
 }
 

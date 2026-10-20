@@ -52,6 +52,15 @@ export interface PromptBuild {
   prompt: string;
   /** Portable-context inject record for this run, or undefined when nothing was injected. */
   injectRecord?: InjectRecord;
+  /**
+   * Portable actors only: every actor_run id read for this prompt's run
+   * history (at most the portable run window), oldest first, captured before
+   * budget selection (#1024). Unlike
+   * `injectRecord.sourceEventIds` it includes runs dropped for budget, and it
+   * is set even when nothing was injected: `[]` means no runs were read, while
+   * absent means unknown (a native actor, or a leader that predates the field).
+   */
+  readRunIds?: string[];
 }
 
 /**

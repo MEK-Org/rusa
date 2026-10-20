@@ -14,6 +14,7 @@ import {
   FollowerEventQueue,
   FollowerEventTransferRetryError,
   type FollowerEventTransferSender,
+  httpEventTransferSender,
 } from "./follower-event-queue.js";
 import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
 import { FollowerInstance } from "./follower-instance.js";
@@ -21,7 +22,6 @@ import { isFullCommitSha } from "./follower-update-validation.js";
 import { executeFollowerUpdate, FollowerBuildRunner } from "./follower-updater.js";
 import {
   type EventTransferCapability,
-  type EventTransferReply,
   type FollowerUpdateCommand,
   INSTANCE_PROTOCOL_VERSION,
 } from "./protocol.js";
@@ -123,27 +123,6 @@ async function post<T>(path: string, body: object): Promise<T> {
   if (!response.ok)
     throw new FollowerHttpError(`Leader ${path}: HTTP ${response.status}`, response.status);
   return (await response.json()) as T;
-}
-const TRANSFER_STATUSES = new Set(["fragment", "complete", "restart", "busy", "refused"]);
-function transferSender(capability: EventTransferCapability): FollowerEventTransferSender {
-  return {
-    capability,
-    send: async (fragment) => {
-      const response = await request("/events/transfer", fragment);
-      // A transfer answer is in the body whatever its HTTP status; anything
-      // else is a transport failure retried like an ordinary batch.
-      const reply = (await response.json().catch(() => undefined)) as
-        | EventTransferReply
-        | undefined;
-      if (response.status !== 410 && TRANSFER_STATUSES.has(reply?.status as string)) {
-        return reply as EventTransferReply;
-      }
-      throw new FollowerHttpError(
-        `Leader /events/transfer: HTTP ${response.status}`,
-        response.status
-      );
-    },
-  };
 }
 function emit(actorId: string, message: FollowerEvent["message"], eventId?: string): void {
   if (stopped) return;
@@ -261,10 +240,11 @@ async function run(): Promise<void> {
         }
         leaderToken = registration.leaderToken;
         session = registration.session;
-        eventTransfer =
-          registration.eventTransfer?.version === 1
-            ? transferSender(registration.eventTransfer)
-            : undefined;
+        eventTransfer = httpEventTransferSender(
+          registration.eventTransfer,
+          (fragment) => request("/events/transfer", fragment),
+          (message, status) => new FollowerHttpError(message, status)
+        );
         backoffMs = 500;
         log.info("follower_registered", {
           leader: leader.origin,

@@ -194,6 +194,7 @@ class QuotaTooltip extends StatelessWidget {
     this.staleFor,
     this.staleCheckedAt,
     this.now,
+    this.holdRows = const [],
   });
 
   final String providerName;
@@ -206,6 +207,10 @@ class QuotaTooltip extends StatelessWidget {
   /// When the snapshot behind [windows] was fetched; see [staleReadingAge].
   final DateTime? staleCheckedAt;
   final DateTime? now;
+
+  /// The availability holds on this ring (#539), one line each, shown under
+  /// the heading so a held provider says so before its numbers.
+  final List<String> holdRows;
 
   List<String> _buildWindowRows(DateTime currentTime) {
     final rows = <String>[];
@@ -366,7 +371,7 @@ class QuotaTooltip extends StatelessWidget {
   /// Plain-text representation of this tooltip for screen readers and tests.
   String toPlainText([DateTime? at]) {
     final currentTime = at ?? now ?? DateTime.now();
-    final lines = <String>[providerName, ''];
+    final lines = <String>[providerName, '', ...holdRows];
     final rows = _buildWindowRows(currentTime);
     for (final text in rows) {
       lines.add(text);
@@ -407,6 +412,17 @@ class QuotaTooltip extends StatelessWidget {
             style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
           ),
           const SizedBox(height: 6),
+          for (final text in holdRows) ...[
+            Text(
+              text,
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: MeshColors.quotaTooltipHeld,
+              ),
+            ),
+            const SizedBox(height: 2),
+          ],
           for (final text in windowRows) ...[
             Text(
               text,

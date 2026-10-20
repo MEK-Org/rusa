@@ -33,7 +33,7 @@ it("requires opt-in paths and portable context, and refuses effort for the PoC",
     providers: {
       openrouter: {
         cliCommand: "openrouter",
-        openrouterPoc: { nodePath: "/node", piPath: "/pi", apiKeyPath: "/key" },
+        openrouterPoc: {},
       },
     },
   } as unknown as RusaConfig;

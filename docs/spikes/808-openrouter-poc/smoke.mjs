@@ -11,9 +11,7 @@ import { assertOwnedListeners } from "./ownership.mjs";
 
 const require = createRequire(resolve("packages/rusa/package.json"));
 const Database = require("better-sqlite3");
-const [nodePath, piPath, apiKeyPath, model = "openai/gpt-4.1-mini"] = process.argv.slice(2);
-if (!nodePath || !piPath || !apiKeyPath)
-  throw new Error("usage: node smoke.mjs NODE PI_JS KEY_FILE [MODEL]");
+const [piCommand = "pi", model = "openai/gpt-4.1-mini"] = process.argv.slice(2);
 for (const key of [
   "GIT_AUTHOR_NAME",
   "GIT_AUTHOR_EMAIL",
@@ -37,9 +35,7 @@ await writeFile(
       openrouter: {
         cliCommand: "openrouter",
         openrouterPoc: {
-          nodePath: resolve(nodePath),
-          piPath: resolve(piPath),
-          apiKeyPath: resolve(apiKeyPath),
+          piCommand,
           artifactDir: join(root, "artifacts"),
         },
       },

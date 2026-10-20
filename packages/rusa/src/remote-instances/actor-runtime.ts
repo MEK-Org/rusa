@@ -6,7 +6,10 @@ import {
   type RunStartHandle,
   RunStartStaleProviderError,
 } from "../actor/concurrency-limiter.js";
+import { composeHostContextIntoPrompt, portableContextMaxRuns } from "../actor/portable-context.js";
+import { projectActorRunLaunchConfig } from "../actor/run-accounting.js";
 import type { ActorRunMode } from "../actor/trigger-runner.js";
+import type { FollowerRepositories } from "../db/repositories/index.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, McpServerSpec } from "../providers/types.js";
 import {
@@ -28,12 +31,17 @@ export function createActorRuntime(
   createProvider: ProviderFactory,
   send: (message: ActorEvent) => void,
   onClosed: () => void,
-  computerUseLock?: ComputerUseLock
+  computerUseLock?: ComputerUseLock,
+  repositories?: FollowerRepositories
 ) {
   let actor: Actor | undefined;
   let sequence = 0;
   let stopping = false;
   let activeGates = 0;
+  // A gate releases as soon as the provider returns, but terminal persistence
+  // happens immediately afterwards in Actor.executeTurn. Keep the runtime
+  // owned until that local accounting has completed during shutdown.
+  let terminalAccountingPending = false;
   let closed = false;
   let sessionId: string | undefined;
   // `beforeRun` belongs to the same serialized Actor opportunity as its later
@@ -60,7 +68,7 @@ export function createActorRuntime(
   let interruptedAdmission = false;
   const mcpServers: McpServerSpec[] = [];
   function finishClose(): void {
-    if (stopping && !closed && activeGates === 0) {
+    if (stopping && !closed && activeGates === 0 && !terminalAccountingPending) {
       closed = true;
       onClosed();
     }
@@ -69,6 +77,19 @@ export function createActorRuntime(
     number,
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
   >();
+
+  function reportLocalAccountingFailure(
+    phase: "start" | "prompt" | "terminal",
+    runId: string,
+    error: unknown
+  ): void {
+    send({
+      type: "error",
+      error: `Local ${phase} accounting failed for run ${runId}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    });
+  }
 
   function request<T>(payload: Request): { id: number; result: Promise<T> } {
     const id = ++sequence;
@@ -158,7 +179,36 @@ export function createActorRuntime(
         sessionId = id;
         send({ type: "session", sessionId: id });
       },
-      buildPrompt: () => snapshot.promptBuild ?? { prompt: snapshot.prompt },
+      buildPrompt: () => {
+        const baseBuild = snapshot.promptBuild ?? { prompt: snapshot.prompt };
+        // Host-local runs are prompt memory only for a portable actor. A native
+        // actor's history is its leader-selected provider session.
+        if (!repositories || snapshot.record.context?.type !== "portable") return baseBuild;
+        // Without the leader's read window this follower cannot tell a run the
+        // leader dropped for budget from one it never saw. Rendered ids would
+        // misfile every dropped run as local, so an older leader's prompt is
+        // used unchanged and host history waits for the leader upgrade.
+        const leaderReadRunIds = baseBuild.readRunIds;
+        if (!leaderReadRunIds) return baseBuild;
+        const { prompt, portable } = composeHostContextIntoPrompt({
+          basePrompt: baseBuild.prompt,
+          localRuns: repositories.actorRuns
+            .listRecentCompleted(bootstrap.id, portableContextMaxRuns())
+            .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output })),
+          // Follower run ids are the leader's actor_run ids, so the leader's
+          // read window names exactly which of these runs it already had.
+          leaderReadRunIds,
+        });
+        if (!portable) return baseBuild;
+        return {
+          ...baseBuild,
+          prompt,
+          // This is the exact, bounded host contribution appended above;
+          // retaining a leader record here would claim its bytes/hash for
+          // different text delivered by this follower.
+          injectRecord: portable.record,
+        };
+      },
       prepareUnderstandingMount: () => request<string | undefined>({ op: "prepareMount" }).result,
       beforeRun: async ({ mode }) => {
         currentRunComputerUse = false;
@@ -297,38 +347,83 @@ export function createActorRuntime(
               mode: event.mode,
               runId: event.runId,
             }),
-          onStart: (event) =>
+          onStart: (event) => {
+            terminalAccountingPending = true;
+            if (repositories) {
+              try {
+                const launchConfig = projectActorRunLaunchConfig(event.selected);
+                repositories.actorRuns.start({
+                  id: event.runId,
+                  actorId: bootstrap.id,
+                  modelConfig: launchConfig,
+                });
+              } catch (error) {
+                reportLocalAccountingFailure("start", event.runId, error);
+              }
+            }
             send({
               type: "runStart",
               responsive: event.responsive,
               injectRecord: event.injectRecord,
               selected: event.selected,
               runId: event.runId,
-            }),
-          onPrompt: (event) =>
+            });
+          },
+          onPrompt: (event) => {
             send({
               type: "runPrompt",
               runId: event.runId,
               prompt: event.prompt,
-            }),
+            });
+            if (repositories) {
+              try {
+                repositories.runPrompts.recordForActor(bootstrap.id, event.runId, event.prompt);
+              } catch (error) {
+                reportLocalAccountingFailure("prompt", event.runId, error);
+              }
+            }
+          },
           onError: (event) =>
             send({
               type: "error",
               error: event.error instanceof Error ? event.error.message : String(event.error),
             }),
           onEnd: (event) => {
-            if (event.terminal.kind === "abandoned") {
-              send({
-                type: "abandoned",
-                abandon: {
-                  reason: event.terminal.reason,
-                  started: event.terminal.started,
-                },
-              });
-              return;
+            try {
+              if (event.terminal.kind === "abandoned") {
+                if (repositories && event.terminal.started) {
+                  try {
+                    repositories.actorRuns.abandon(event.runId, event.terminal.reason);
+                  } catch (error) {
+                    reportLocalAccountingFailure("terminal", event.runId, error);
+                  }
+                }
+                send({
+                  type: "abandoned",
+                  abandon: {
+                    reason: event.terminal.reason,
+                    started: event.terminal.started,
+                  },
+                });
+                return;
+              }
+              if (repositories) {
+                try {
+                  repositories.actorRuns.complete(event.runId, {
+                    success: event.terminal.result.success,
+                    exitCode: event.terminal.result.exitCode,
+                    output: event.terminal.result.output,
+                  });
+                } catch (error) {
+                  reportLocalAccountingFailure("terminal", event.runId, error);
+                }
+              }
+              if (!stopping)
+                return request<void>({ op: "complete", result: event.terminal.result }).result;
+            } finally {
+              terminalAccountingPending = false;
+              finishClose();
             }
-            if (!stopping)
-              return request<void>({ op: "complete", result: event.terminal.result }).result;
           },
         },
       ]),

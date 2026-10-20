@@ -8,37 +8,32 @@ run settlement before shutting down the instance.
 
 This is an explicit host-execution prototype, not production activation. Set
 `RUSA_OPENROUTER_POC=1` and configure `providers.openrouter.openrouterPoc` with
-absolute `nodePath`, `piPath` and `apiKeyPath`. The adapter refuses sandbox
-requests and native session resumes. Config/spawn/model-change admission requires
-portable context, explicit paths and the opt-in environment flag. Effort is
-unsupported in this PoC. The E2E runner uses an explicitly selected
-`container-boundary` deployment, so Pi runs on the host. Do not deploy this
-prototype as a sandboxed-worker implementation.
+optional `piCommand` (default `pi`), absolute `authDir` (default Pi's normal
+`PI_CODING_AGENT_DIR` or `~/.pi/agent`) and optional absolute `artifactDir`.
+Launch the globally installed Pi, then run `/login openrouter`. The adapter validates the
+OpenRouter entry and exposes the existing
+`auth.json` through a read-only bind for workers or a symlink for unsandboxed
+launches. The whole saved profile is visible to Pi, including other provider
+entries. Run settings, MCP configuration and cwd remain isolated. Missing or
+unsupported login produces an authentication-required
+error. Command-based API key entries are unsupported. No mesh key file or
+`OPENROUTER_API_KEY` is supplied. The operator's auth file is never modified.
+
+Worker runs use the shared bwrap launcher. Native session resumes and computer
+use remain unsupported; portable context and the opt-in flag are required.
+The executable must be available on the service PATH, or `piCommand` must name
+its installed path. Its Node runtime must also be on PATH.
 
 ## Run
 
-Install repository dependencies with `pnpm install`. Follow the pinned Pi 0.99.2
-and Node 22.19.0 download, integrity and dependency setup in
-[the offline receipt](../808-pi-offline/README.md#pins-and-setup). Keep that runtime
-prefix for this smoke; the service's Node installation does not change.
-
-Provision a dedicated capped OpenRouter inference key and make its file mode
-`600`. The script reads the key only inside the adapter and never prints it.
-This is a paid, opt-in test. Check the key's cap and remaining balance before
-running it. No paid request runs in CI.
-
-From the repository root:
+Install repository dependencies with `pnpm install` and install Pi globally.
+Authenticate by launching `pi`. The following smoke is a paid, opt-in test using
+that provider account; no paid request runs in CI.
 
 ```sh
 pnpm --filter rusa exec tsup
-# Export GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, GIT_COMMITTER_NAME and
-# GIT_COMMITTER_EMAIL using the operator-approved identity for the disposable
-# scratch commit. No existing Git identity configuration is changed.
-node docs/spikes/808-openrouter-poc/smoke.mjs \
-  /absolute/pinned-node/bin/node \
-  /absolute/pi-package/dist/bundle/cli.js \
-  /absolute/private-openrouter-key \
-  openai/gpt-4.1-mini
+# Supply the operator-approved Git identity variables for the scratch commit.
+node docs/spikes/808-openrouter-poc/smoke.mjs pi openai/gpt-4.1-mini
 ```
 
 The script uses loopback ports 8323–8327. It creates a private base config and
@@ -63,7 +58,7 @@ and logs remain available for inspection; remove that disposable root when done.
 The provider registry and normal model-selection path resolve `openrouter`.
 Each invocation starts a fresh supervised Pi RPC process, validates its exact
 model/session state using the existing protocol implementation and passes only
-the inference key plus temporary runtime settings in its child environment.
+the existing saved login plus temporary runtime settings.
 Pi starts in an empty temporary cwd to avoid migrating actor project files.
 Only native MCP support is loaded. `--no-builtin-tools` disables filesystem and
 shell tools while retaining granted MCP tools. `--no-tools` would disable MCP
@@ -77,12 +72,18 @@ that setting no usage files are written, and the actor cwd is never used for art
 There are no schema changes and no entries in reset-window quota pacing.
 
 Production checkpoints should be decided against this working implementation.
-Remaining work includes worker sandbox/secret-grant integration, model/runtime
-provisioning, richer MCP admission and authorization failure handling, admission
+Remaining work includes model/runtime provisioning, richer MCP admission and
+authorization failure handling, admission
 budget controls, durable cost accounting, improved error diagnostics, portable
 context behavior across real tasks and broader tool/process containment. The
 prototype has a 120-second invocation ceiling and disables automatic retries,
-compaction and cache warming (`cacheWarming: "off"`); the provider-side key cap remains the spend authority.
+compaction and cache warming (`cacheWarming: "off"`); account-side limits remain
+external to this prototype. Provider invocation permissions and cross-provider
+credential isolation are
+deferred to a broader design discussion. Per the
+[operator ruling](https://github.com/MEK-Org/rusa/pull/1112#issuecomment-6266285746),
+this prototype uses the same provider-use standard as existing providers,
+without an OpenRouter-only grant or mixed-profile rejection.
 
 ## Observed results
 

@@ -1,16 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import type { ProviderConfig } from "../../config/types.js";
+import { buildActorBwrapArgs, buildActorBwrapCommand, teardownFlutterOverlay } from "../sandbox.js";
 import { runSubprocess, type SubprocessDuplex } from "../subprocess-execution.js";
 import type { CodingProvider, RunOptions, RunResult } from "../types.js";
 import { mcpAdmissionExtension } from "./mcp-admission.js";
 import { PiRpcInvocation, type PiRpcOutcome } from "./pi-rpc.js";
 
 /** Local end-to-end prototype. Fresh Pi process, portable context, MCP-only tools.
- * Requires host execution; refuses sandbox requests until the launch boundary
- * is integrated. This is not a sandbox implementation.
+ * Worker launches use the shared actor bwrap boundary with isolated Pi state.
  * Usage stays in an artifact, outside subscription accounting and quota pacing.
  */
 export class OpenRouterProvider implements CodingProvider {
@@ -23,22 +23,9 @@ export class OpenRouterProvider implements CodingProvider {
   ) {}
 
   async run(opts: RunOptions): Promise<RunResult> {
-    const config = this.config.openrouterPoc;
-    if (process.env.RUSA_OPENROUTER_POC !== "1" || !config || !this.model) {
-      throw new Error(
-        "OpenRouter prototype requires RUSA_OPENROUTER_POC=1, explicit paths and model"
-      );
-    }
-    if (opts.sandbox || opts.session?.id || opts.computerUse) {
-      throw new Error("OpenRouter prototype supports fresh host runs only");
-    }
-    const keyStat = await stat(config.apiKeyPath);
-    if (!keyStat.isFile() || (keyStat.mode & 0o077) !== 0) {
-      throw new Error("OpenRouter key must be a private file (mode 600 or stricter)");
-    }
-    const key = (await readFile(config.apiKeyPath, "utf8")).trim();
-    if (!key) throw new Error("OpenRouter key file is empty");
-    const root = await mkdtemp(join(tmpdir(), "rusa-openrouter-"));
+    const tempPaths: string[] = opts.sandbox?.understandingMount
+      ? [opts.sandbox.understandingMount]
+      : [];
     let transport: SubprocessDuplex | undefined;
     let invocation: PiRpcInvocation | undefined;
     let outcome: Promise<PiRpcOutcome> | undefined;
@@ -47,10 +34,40 @@ export class OpenRouterProvider implements CodingProvider {
       return { success: false, output: reason, exitCode: 1 };
     };
     try {
+      const config = this.config.openrouterPoc;
+      if (process.env.RUSA_OPENROUTER_POC !== "1" || !config || !this.model) {
+        throw new Error(
+          "OpenRouter prototype requires RUSA_OPENROUTER_POC=1, explicit paths and model"
+        );
+      }
+      if (opts.session?.id || opts.computerUse) {
+        throw new Error("OpenRouter prototype supports fresh runs without computer use only");
+      }
+      const authDir =
+        config.authDir ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+      const authPath = resolve(authDir, "auth.json");
+      try {
+        const auth = JSON.parse(await readFile(authPath, "utf8"));
+        const entry = auth?.openrouter;
+        const key =
+          entry?.type === "oauth"
+            ? entry.access
+            : entry?.type === "api_key"
+              ? entry.key
+              : undefined;
+        if (typeof key !== "string" || !key.trim() || key.startsWith("!")) throw new Error();
+      } catch {
+        throw new Error("OpenRouter authentication required: launch pi and run /login openrouter");
+      }
+      const root = await mkdtemp(join(tmpdir(), "rusa-openrouter-"));
+      tempPaths.push(root);
       const agent = join(root, "agent");
       const work = join(root, "work");
       await mkdir(agent, { mode: 0o700 });
       await mkdir(work, { mode: 0o700 });
+      // Unsandboxed Pi uses the operator-managed profile directly. Workers receive
+      // a read-only bind below, never a copied credential or secret-file grant.
+      if (!opts.sandbox) await symlink(authPath, join(agent, "auth.json"));
       await writeFile(
         join(agent, "settings.json"),
         JSON.stringify({
@@ -79,7 +96,6 @@ export class OpenRouterProvider implements CodingProvider {
         { mode: 0o600 }
       );
       const args = [
-        config.piPath,
         "--mode",
         "rpc",
         "--no-session",
@@ -99,11 +115,37 @@ export class OpenRouterProvider implements CodingProvider {
         "--model",
         this.model,
       ];
+      let command = config.piCommand ?? "pi";
+      let spawnArgs = args;
+      if (opts.sandbox) {
+        const sandbox = buildActorBwrapArgs(
+          opts.sandbox.worktreePath,
+          undefined,
+          undefined,
+          opts.sandbox.isE2eRoot,
+          opts.sandbox.understandingMount
+        );
+        tempPaths.push(...sandbox.tempPaths);
+        // The shared launcher shadows host /tmp. Rebind only this invocation's
+        // private state, then override its actor cwd to avoid Pi migrations.
+        sandbox.args.push(
+          "--bind",
+          root,
+          root,
+          "--ro-bind",
+          authPath,
+          join(agent, "auth.json"),
+          "--chdir",
+          work
+        );
+        spawnArgs = buildActorBwrapCommand(sandbox, command, args);
+        command = "bwrap";
+      }
       const processResult = await runSubprocess({
-        command: config.nodePath,
-        args,
+        command,
+        args: spawnArgs,
         cwd: work,
-        // The model receives only its inference key and actor-bound MCP URLs.
+        // Pi receives the operator-managed login and actor-bound MCP URLs.
         // Empty cwd avoids Pi startup migration of the actor workspace.
         env: {
           HOME: root,
@@ -111,7 +153,7 @@ export class OpenRouterProvider implements CodingProvider {
           NODE_COMPILE_CACHE: join(root, "cache"),
           PI_SKIP_VERSION_CHECK: "1",
           PI_TELEMETRY: "0",
-          OPENROUTER_API_KEY: key,
+          PATH: process.env.PATH,
         },
         timeoutMs: Math.min(opts.timeoutMs ?? 120_000, 120_000),
         signal: opts.signal,
@@ -164,7 +206,8 @@ export class OpenRouterProvider implements CodingProvider {
       };
     } finally {
       await transport?.close();
-      await rm(root, { recursive: true, force: true });
+      if (opts.sandbox) teardownFlutterOverlay(opts.sandbox.worktreePath);
+      await Promise.all(tempPaths.map((path) => rm(path, { recursive: true, force: true })));
     }
   }
 }

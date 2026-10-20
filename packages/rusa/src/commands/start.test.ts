@@ -17,7 +17,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
-import { Actor, type ActorOptions } from "../actor/actor.js";
+import { Actor, type ActorOptions, type PromptBuild } from "../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
 import {
   type ActorFactoryContext,
@@ -36,7 +36,7 @@ import { COMPACTED_MEMORY_DELTA_EXPERIMENT } from "../actor/experiments.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
-import type { InjectRecord } from "../actor/portable-context.js";
+import { type InjectRecord, PORTABLE_CONTEXT_MAX_BYTES } from "../actor/portable-context.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
 import {
   emptyPortableContextState,
@@ -4623,6 +4623,78 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
   });
 
+  it("operator clear-all releases the brake and every hold's origin in one audited action (#1100)", async () => {
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: { provider: "claude", model: "claude-sonnet-5" },
+      }),
+      "utf8"
+    );
+    let mesh: ActorMesh | undefined;
+    let root: Actor | undefined;
+    let rootControl: RootControlService | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            root = handles.root as Actor;
+            rootControl = handles.rootControl;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh || !root || !rootControl) throw new Error("mesh, root, or root control not ready");
+    const workerId = mesh.spawn({
+      charter: "codex worker",
+      parentId: "root",
+      modelConfig: { provider: "codex", model: "gpt-5.5" },
+    });
+    const halt = new HaltSwitch(join(homeDir, "HALT"));
+    halt.halt("maintenance");
+    const holds = getRepositories().availabilityHolds;
+    const createdAt = new Date().toISOString();
+    holds.set({ provider: "claude", origin: "chat", createdBy: "chat:users/operator", createdAt });
+    holds.set({ provider: "codex", origin: "mesh", createdBy: root.id, createdAt });
+    expect(mesh.prepareRun(root.id)).toBe(false);
+    expect(mesh.prepareRun(workerId)).toBe(false);
+
+    const operator = "00000000-0000-4000-8000-000000000001" as const;
+    const result = rootControl.clearAllHalts(operator);
+
+    expect(result.brakeReleased).toBe(true);
+    expect(result.released.map((hold) => `${hold.provider}:${hold.origin}`)).toEqual([
+      "claude:chat",
+      "codex:mesh",
+    ]);
+    expect(halt.isHalted()).toBe(false);
+    expect(holds.list()).toEqual([]);
+    expect(mesh.prepareRun(root.id)).toBe(true);
+    expect(mesh.prepareRun(workerId)).toBe(true);
+    const audits = getRepositories()
+      .meshEvents.listByKinds(["root_control_action"], { bodyKinds: [] })
+      .map((event) => JSON.parse(event.payload ?? "{}"))
+      .filter((payload) => payload.action === "clear_all_halts");
+    expect(audits).toEqual([
+      expect.objectContaining({
+        principal: operator,
+        brakeReleased: true,
+        released: [
+          { provider: "claude", model: null, origin: "chat" },
+          { provider: "codex", model: null, origin: "mesh" },
+        ],
+      }),
+    ]);
+  });
+
   it("chat /resume releases only chat-origin holds; mesh-origin holds survive for the UI path (#918)", async () => {
     initDb(homeDir);
     const scrapes = getRepositories().modelScrapes;
@@ -5126,7 +5198,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         opts: {
           loadSessionId: () => string | undefined;
           saveSessionId: (id: string) => void;
-          buildPrompt: () => { prompt: string; injectRecord?: { runCount: number } };
+          buildPrompt: () => PromptBuild;
         };
       }
     ).opts;
@@ -5142,6 +5214,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
       readdirSync(rootAgentDir).some((name) => name.startsWith("session.json.imported-"))
     ).toBe(true);
 
+    // A follower receives this build as JSON (#1024). With no runs to inject
+    // there is no inject record, but the explicit empty read window survives
+    // serialization, so a follower can tell "read none" from an older leader.
+    const first = JSON.parse(JSON.stringify(actorOpts.buildPrompt())) as PromptBuild;
+    expect(first.injectRecord).toBeUndefined();
+    expect(first).toHaveProperty("readRunIds", []);
+
     const runId = await startLifecycleRun(rootActor as Actor, {
       provider: "antigravity",
       model: "Gemini 3.7 Flash",
@@ -5155,6 +5234,30 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const built = actorOpts.buildPrompt();
     expect(built.prompt).toContain("PORTABLE_ROOT_CONTEXT_MARKER");
     expect(built.injectRecord?.runCount).toBe(1);
+    // The read window is additive: an older follower that ignores it still
+    // receives the same prompt and rendered-run record as before.
+    const { readRunIds, ...legacy } = JSON.parse(JSON.stringify(built)) as PromptBuild;
+    expect(readRunIds).toEqual([runId]);
+    expect(legacy).toEqual({ prompt: built.prompt, injectRecord: built.injectRecord });
+    expect(legacy.injectRecord?.sourceEventIds).toEqual([runId]);
+
+    // A newer run that fills the budget alone pushes the first out of the
+    // rendered section, but not out of the read window: the window is taken
+    // before budget selection, so a follower still knows the leader had it.
+    const largeRunId = await startLifecycleRun(rootActor as Actor, {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    await endLifecycleRun(rootActor as Actor, largeRunId, {
+      success: true,
+      output: `LARGE_RUN ${"x".repeat(PORTABLE_CONTEXT_MAX_BYTES)}`,
+      exitCode: 0,
+    });
+    const dropped = actorOpts.buildPrompt();
+    expect(dropped.prompt).not.toContain("PORTABLE_ROOT_CONTEXT_MARKER");
+    expect(dropped.injectRecord?.sourceEventIds).toEqual([largeRunId]);
+    expect(dropped.readRunIds).toEqual([runId, largeRunId]);
   });
 
   it("seeds brief mode without a Gemini key and retains its window before and after delta enrollment", async () => {
@@ -8905,6 +9008,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         followers: { bind: "127.0.0.1", port, tokenFile },
+        peers: [{ id: "mac-mini", type: "follower" }],
       }),
       "utf8"
     );
@@ -10209,6 +10313,122 @@ describe("runStart webhook event routing (Phase 4)", () => {
       logCapture.lines.length = 0;
     });
 
+    it("lets every context mode prepare a shadow brief while ledger prompts stay active", async () => {
+      const { mesh, root } = await boot();
+      expect(mcpServersOf(root).filter((server) => server.name === "brief")).toHaveLength(1);
+
+      let ledgerId = "";
+      for (const context of [
+        { type: "native" },
+        { type: "portable", mode: "tail" },
+        { type: "portable", mode: "ledger" },
+        { type: "portable", mode: "brief" },
+      ] as const) {
+        const id = mesh.spawn({
+          charter: "Synthetic shadow brief worker",
+          parentId: rootId,
+          modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+          context,
+        });
+        const servers = mcpServersOf(workerOf(mesh, id)).filter(
+          (server) => server.name === "brief"
+        );
+        expect(servers).toHaveLength(1);
+        const url = servers[0]?.url;
+        if (!url) throw new Error("brief MCP missing");
+        const client = new Client({ name: "shadow-brief", version: "0.0.0" });
+        await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+        try {
+          expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual([
+            "read",
+            "replace",
+          ]);
+          expect((await client.callTool({ name: "read", arguments: {} })).isError).not.toBe(true);
+          expect(mesh.actors.get(id)?.context).toEqual(context);
+        } finally {
+          await client.close();
+        }
+        if (context.type === "portable" && context.mode === "ledger") ledgerId = id;
+      }
+
+      const messageId = getRepositories().meshChat.record({
+        senderId: rootId,
+        recipientId: ledgerId,
+        body: "Keep the palette small.",
+      });
+      const store = getRepositories().portableContext;
+      const ledger = {
+        ...store.load(ledgerId),
+        generation: 7,
+        lastFoldedSourceId: messageId,
+        items: [
+          {
+            id: "ledger-rule",
+            kind: "decision" as const,
+            priority: "must" as const,
+            status: "active" as const,
+            statement: "The existing ledger remains active.",
+            evidence: [
+              {
+                eventId: messageId,
+                sender: rootId,
+                ts: "2026-10-20T00:00:00Z",
+                quote: "Keep the palette small.",
+              },
+            ],
+            updatedAt: "2026-10-20T00:00:00Z",
+          },
+        ],
+      };
+      store.save(ledger);
+      let actor = workerOf(mesh, ledgerId);
+      const buildPrompt = () => (actor as unknown as { opts: ActorOptions }).opts.buildPrompt();
+      const beforePrompt = buildPrompt().prompt;
+      const briefUrl = mcpServersOf(actor).find((server) => server.name === "brief")?.url;
+      if (!briefUrl) throw new Error("brief MCP missing");
+      const client = new Client({ name: "shadow-write", version: "0.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(briefUrl)));
+      const text = `## WHAT\n\n## HOW\nKeep the palette small. [mesh:messages/${messageId}]\n\n## DOMAIN\n`;
+      try {
+        const result = await client.callTool({
+          name: "replace",
+          arguments: { text, expected_generation: 0 },
+        });
+        expect(result.isError).not.toBe(true);
+      } finally {
+        await client.close();
+      }
+      const written = store.load(ledgerId);
+      expect(written).toEqual({
+        ...ledger,
+        brief: { text, generation: 1, updatedAt: expect.any(String) },
+      });
+      expect(store.listBriefRevisions(ledgerId, 10)).toEqual([
+        expect.objectContaining({ generation: 1, actingPrincipal: ledgerId, after: text }),
+      ]);
+      expect(mesh.actors.get(ledgerId)?.context).toEqual({ type: "portable", mode: "ledger" });
+      expect(beforePrompt).toContain("The existing ledger remains active.");
+      expect(buildPrompt().prompt).toBe(beforePrompt);
+
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      const restarted = await boot();
+      actor = workerOf(restarted.mesh, ledgerId);
+      expect(getRepositories().portableContext.load(ledgerId)).toEqual(written);
+      expect(getRepositories().portableContext.listBriefRevisions(ledgerId, 10)).toHaveLength(1);
+      expect(restarted.mesh.actors.get(ledgerId)?.context).toEqual({
+        type: "portable",
+        mode: "ledger",
+      });
+      expect(buildPrompt().prompt).toBe(beforePrompt);
+
+      // A later explicit mode switch uses the prepared brief, without reseeding it.
+      restarted.mesh.actors.patch(ledgerId, { context: { type: "portable", mode: "brief" } });
+      expect(buildPrompt().prompt).toContain(text.trim());
+      expect(buildPrompt().prompt).not.toContain("The existing ledger remains active.");
+      expect(getRepositories().portableContext.load(ledgerId)).toEqual(written);
+    });
+
     it("rehydrates ordinary actors with their baseline and implicit default permissions", async () => {
       clearLegacyConfiguredGrants();
       withWorker("set-worker");
@@ -10227,6 +10447,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "brief",
         "pnpm-hardlinks",
         "update",
       ]);
@@ -10241,6 +10462,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "brief",
       ]);
       // Every worker endpoint is the worker's own; none is shared with root.
       const rootUrls = new Set(rootServers.map((server) => server.url));
@@ -10282,6 +10504,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "brief",
         "chat-write",
         "pnpm-hardlinks",
         "update",
@@ -10298,6 +10521,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "obligations",
         "mesh-chat-read",
         "pnpm-install",
+        "brief",
       ]);
     });
 

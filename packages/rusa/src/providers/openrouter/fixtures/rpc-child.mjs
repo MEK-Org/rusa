@@ -1,4 +1,7 @@
 // Synthetic peer only. No Pi imports, credentials, network or model requests.
+
+import assert from "node:assert/strict";
+import { accessSync, readFileSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -9,6 +12,11 @@ if (process.env.PI_CODING_AGENT_DIR) {
     await readFile(join(process.env.PI_CODING_AGENT_DIR, "settings.json"), "utf8")
   );
   if (settings.cacheWarming !== "off") process.exit(77);
+  const auth = JSON.parse(
+    await readFile(join(process.env.PI_CODING_AGENT_DIR, "auth.json"), "utf8")
+  );
+  assert.equal(auth.openrouter.key ?? auth.openrouter.access, "synthetic-not-a-real-key");
+  assert.equal(process.env.OPENROUTER_API_KEY, undefined);
   // Provider includes its generated admission extension before model argv.
   const extensionIndex = process.argv.lastIndexOf("-e");
   const extension = await import(process.argv[extensionIndex + 1]);
@@ -30,6 +38,19 @@ const lines = createInterface({ input: process.stdin });
 setInterval(() => {}, 1000);
 lines.on("line", (line) => {
   const command = JSON.parse(line);
+  if (command.type === "prompt" && command.message.startsWith("sandbox-probe:")) {
+    const probe = JSON.parse(command.message.slice("sandbox-probe:".length));
+    assert.throws(() =>
+      writeFileSync(join(process.env.PI_CODING_AGENT_DIR, "auth.json"), "changed")
+    );
+    assert.equal(process.cwd(), join(process.env.HOME, "work"));
+    assert.equal(readFileSync(probe.ownFile, "utf8"), "own");
+    writeFileSync(probe.ownFile, "updated");
+    assert.throws(() => accessSync(probe.siblingFile));
+    assert.throws(() => accessSync(probe.secretFile));
+    assert.equal(readFileSync(probe.hostFile, "utf8"), "private");
+    assert.throws(() => writeFileSync(probe.hostFile, "changed"));
+  }
   const data =
     command.type === "get_state"
       ? {

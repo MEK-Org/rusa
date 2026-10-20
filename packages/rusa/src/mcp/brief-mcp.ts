@@ -48,7 +48,7 @@ export interface BriefMcpDeps {
 export const BRIEF_CITATION_DEADLINE_MS = 15_000;
 
 /**
- * A brief-mode actor's own brief, read and replaced by the actor itself (#954).
+ * An actor's own brief, read and replaced by the actor itself (#954, #1121).
  *
  * The server is mounted per actor, so identity is the mount, never an argument:
  * an actor can read and replace only its own brief. `replace` is a
@@ -65,8 +65,8 @@ export function createBriefMcpServer(deps: BriefMcpDeps): McpServer {
   const server = createMcpServer({ name: BRIEF_MCP_NAME, version: "0.1.0" });
   const now = deps.now ?? (() => new Date().toISOString());
 
-  // Prompt assembly seeds the brief before the first brief-mode run; seeding
-  // here too keeps the tools total for an actor whose mode just switched.
+  // Seed on first tool use so actors in any mode can prepare a shadow brief.
+  // Brief-mode prompt assembly also seeds actors that have not used the tools.
   const currentBrief = (): PortableBrief => {
     const state = deps.store.load(deps.actorId);
     if (state.brief) return state.brief;
@@ -81,7 +81,8 @@ export function createBriefMcpServer(deps: BriefMcpDeps): McpServer {
       title: "Read your brief",
       description:
         "Read your current portable brief, its generation, and when it was last changed. " +
-        "Pass the generation to replace.",
+        "Pass the generation to replace. In other context modes this is a shadow brief: " +
+        "you can refine it before switching to brief mode; reading or writing it does not switch modes.",
       inputSchema: {},
     },
     async () => {

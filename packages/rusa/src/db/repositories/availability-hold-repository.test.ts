@@ -424,7 +424,7 @@ describe("AvailabilityHoldRepository", () => {
       expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(false);
     });
 
-    it("clearAll(origin) removes only that origin across every scope", () => {
+    it("clearAll({ origin }) removes only that origin across every scope", () => {
       set("chat");
       set("chat", { models: ["kimi-k2"] });
       holds.set({
@@ -435,11 +435,25 @@ describe("AvailabilityHoldRepository", () => {
       });
       holds.set({ provider: "kimi", origin: "mesh", createdBy: "root", createdAt: CREATED });
 
-      const cleared = holds.clearAll("chat");
+      const cleared = holds.clearAll({ origin: "chat" });
       expect(cleared.map((hold) => hold.provider).sort()).toEqual(["codex", "kimi", "kimi"]);
       expect(holds.list().map((hold) => `${hold.provider}:${hold.origin}`)).toEqual(["kimi:mesh"]);
       expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(true);
       expect(holds.isHeld("codex", "gpt-5.5", NOW)).toBe(false);
+    });
+
+    it("clearAll() without an origin removes every origin across every scope", () => {
+      set("chat");
+      set("mesh");
+      set("mesh", { models: ["kimi-k2"], expiry: LATER });
+      holds.set({ provider: "codex", origin: "mesh", createdBy: "root", createdAt: CREATED });
+
+      const cleared = holds.clearAll();
+      expect(cleared.map((hold) => `${hold.provider}:${hold.model ?? "*"}:${hold.origin}`)).toEqual(
+        ["codex:*:mesh", "kimi:*:chat", "kimi:*:mesh", "kimi:kimi-k2:mesh"]
+      );
+      expect(holds.list()).toEqual([]);
+      expect(holds.isHeld("kimi", "kimi-k2", NOW)).toBe(false);
     });
 
     it("keeps expiries independent between the two origins on one scope", () => {

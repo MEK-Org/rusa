@@ -114,7 +114,7 @@ export const portableContextStateSchema = z.object({
   ...portableContextStateFields,
   /** Durable mesh_chat or actor_runs id; never a mesh_events cursor after v3 writes. */
   lastFoldedSourceId: z.string().min(1).nullable(),
-  /** The brief-mode document; null until the actor is switched to brief mode. */
+  /** The actor's brief or shadow brief; null until first tool use or brief-mode prompt. */
   brief: portableBriefSchema.nullable(),
 });
 export type PortableContextState = z.infer<typeof portableContextStateSchema>;

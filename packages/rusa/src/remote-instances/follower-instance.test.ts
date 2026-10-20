@@ -445,6 +445,54 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
     follower.close();
   });
 
+  it("merges follower providerOptions with leader bootstrap, preserving leader metadata while overriding configured keys (#1024)", async () => {
+    let capturedOptions: Record<string, unknown> | undefined;
+    const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-options-"));
+    dirs.push(cwd);
+    const follower = new FollowerInstance(
+      cwd,
+      false,
+      () => {},
+      (_bridge, options) => {
+        capturedOptions = options;
+        return {
+          name: "test-provider",
+          providerName: "test-provider",
+          run: async () => ({ success: true, exitCode: 0, output: "" }),
+          stop: () => {},
+        };
+      },
+      {
+        providerOptions: {
+          cliCommand: "/custom/bin/provider",
+          localSetting: 42,
+        },
+      }
+    );
+    follower.dispatch({
+      actorId: "actor-provider-test",
+      message: {
+        type: "init",
+        bootstrap: {
+          id: "actor-provider-test",
+          cwd,
+          providerOptions: {
+            name: "leader-model-metadata",
+            cliCommand: "/default/bin/provider",
+            leaderSetting: "preserved",
+          },
+        },
+      },
+    });
+    expect(capturedOptions).toEqual({
+      name: "leader-model-metadata",
+      cliCommand: "/custom/bin/provider",
+      localSetting: 42,
+      leaderSetting: "preserved",
+    });
+    follower.close();
+  });
+
   it("hosts multiple Actors in one PID and retires one without stopping its sibling", async () => {
     const h = setup();
     const first = h.spawn("First charter");
@@ -490,6 +538,35 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
     expect(
       JSON.parse(h.messages.filter((m) => m.fromId === second).at(-1)?.body ?? "{}").resumed
     ).toBe(true);
+  });
+
+  it("clears a prior native session when admission reply omits sessionId (#1024)", async () => {
+    const h = setup({ delayMs: 25 });
+    const actorId = h.spawn("Session test");
+    await waitUntil(() => h.events.filter((e) => e.event.type === "result").length === 1);
+    const initialSession = h.actors.get(actorId)?.sessionId;
+    expect(initialSession).toBeTruthy();
+
+    // Verify normal resume preserves the session
+    h.mesh.sendMessage(actorId, "Resume", "root");
+    await waitUntil(() => h.events.filter((e) => e.event.type === "result").length === 2);
+    expect(h.actors.get(actorId)?.sessionId).toBe(initialSession);
+    const resumedReport = JSON.parse(
+      h.messages.filter((m) => m.fromId === actorId).at(-1)?.body ?? "{}"
+    );
+    expect(resumedReport.resumed).toBe(true);
+
+    // Leader clears session on its side (e.g. reset or portable context) so admission omits sessionId
+    h.actors.patch(actorId, { sessionId: undefined });
+
+    h.mesh.sendMessage(actorId, "Fresh start after session clear", "root");
+    await waitUntil(() => h.events.filter((e) => e.event.type === "result").length === 3);
+    const clearedReport = JSON.parse(
+      h.messages.filter((m) => m.fromId === actorId).at(-1)?.body ?? "{}"
+    );
+    expect(clearedReport.resumed).toBe(false);
+    expect(clearedReport.sessionId).not.toBe(initialSession);
+    expect(h.actors.get(actorId)?.sessionId).toBe(clearedReport.sessionId);
   });
 
   it("contains initialization failure to the actor without closing the instance", async () => {

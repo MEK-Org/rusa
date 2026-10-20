@@ -34,6 +34,39 @@ import {
 } from "./sqlite-inbox-repository.js";
 
 /**
+ * The host-local execution capabilities a follower instance writes and reads
+ * (#1019): its own run accounting and retained prompts. Global coordination
+ * state (actors, obligations, inbox, principals, grants) belongs to the leader
+ * and is absent here, not guarded: each member is a frozen object of bound
+ * methods, so neither a repository instance nor its database handle is
+ * reachable from follower services.
+ */
+export interface FollowerRepositories {
+  readonly actorRuns: Pick<
+    ActorRunRepository,
+    "start" | "complete" | "abandon" | "abandonOpen" | "listRecentCompleted"
+  >;
+  readonly runPrompts: Pick<RunPromptRepository, "recordForActor">;
+}
+
+export function createFollowerRepositories(db: Database.Database): FollowerRepositories {
+  const runs = new ActorRunRepository(db);
+  const prompts = new RunPromptRepository(db);
+  return Object.freeze({
+    actorRuns: Object.freeze({
+      start: (opts) => runs.start(opts),
+      complete: (id, opts) => runs.complete(id, opts),
+      abandon: (id, reason, endedAt) => runs.abandon(id, reason, endedAt),
+      abandonOpen: (reason, endedAt) => runs.abandonOpen(reason, endedAt),
+      listRecentCompleted: (actorId, limit) => runs.listRecentCompleted(actorId, limit),
+    } satisfies FollowerRepositories["actorRuns"]),
+    runPrompts: Object.freeze({
+      recordForActor: (actorId, runId, prompt) => prompts.recordForActor(actorId, runId, prompt),
+    } satisfies FollowerRepositories["runPrompts"]),
+  });
+}
+
+/**
  * Aggregate of the entity repositories the actor mesh + the retained
  * `understanding/` subsystem use. The v2 orchestrator/dashboard repositories
  * were removed in the legacy cleanup ; only these three remain:

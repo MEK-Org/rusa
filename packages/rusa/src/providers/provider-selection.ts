@@ -71,10 +71,9 @@ export function validateProviderSelection(
     (process.env.RUSA_OPENROUTER_POC !== "1" ||
       !poc ||
       !model?.trim() ||
+      (poc.piCommand !== undefined && !poc.piCommand.trim()) ||
       ![
-        poc.nodePath,
-        poc.piPath,
-        poc.apiKeyPath,
+        ...(poc.authDir === undefined ? [] : [poc.authDir]),
         ...(poc.artifactDir === undefined ? [] : [poc.artifactDir]),
       ].every((path) => typeof path === "string" && isAbsolute(path)))
   ) {

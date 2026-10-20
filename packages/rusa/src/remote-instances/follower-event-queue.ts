@@ -40,6 +40,36 @@ export interface FollowerEventTransferSender {
   send(fragment: EventTransferFragment): Promise<EventTransferReply>;
 }
 
+const TRANSFER_STATUSES = new Set(["fragment", "complete", "restart", "busy", "refused"]);
+
+/**
+ * The `/events/transfer` sender for a registration's advertised capability, or
+ * undefined when that leader advertised none this follower speaks. Both
+ * follower entry points post fragments through it.
+ */
+export function httpEventTransferSender(
+  capability: EventTransferCapability | undefined,
+  post: (fragment: EventTransferFragment) => Promise<Response>,
+  httpError: (message: string, status: number) => Error
+): FollowerEventTransferSender | undefined {
+  if (capability?.version !== 1) return undefined;
+  return {
+    capability,
+    send: async (fragment) => {
+      const response = await post(fragment);
+      // A transfer answer is in the body whatever its HTTP status; anything
+      // else is a transport failure retried like an ordinary batch.
+      const reply = (await response.json().catch(() => undefined)) as
+        | EventTransferReply
+        | undefined;
+      if (response.status !== 410 && TRANSFER_STATUSES.has(reply?.status as string)) {
+        return reply as EventTransferReply;
+      }
+      throw httpError(`Leader /events/transfer: HTTP ${response.status}`, response.status);
+    },
+  };
+}
+
 interface PendingTransfer {
   event: QueuedEvent;
   transferId: string;

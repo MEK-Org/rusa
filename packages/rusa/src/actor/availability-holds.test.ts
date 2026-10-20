@@ -338,7 +338,7 @@ describe("AvailabilityHolds origins (#918)", () => {
     holds.set({ provider: "codex", origin: "chat", createdBy: "chat:users/operator" });
     holds.set({ provider: "kimi", origin: "mesh", createdBy: "root" });
 
-    const cleared = holds.clearAll("chat");
+    const cleared = holds.clearAll({ origin: "chat" });
 
     expect(cleared.released.map((hold) => `${hold.provider}:${hold.model ?? "*"}`).sort()).toEqual([
       "codex:*",
@@ -347,6 +347,23 @@ describe("AvailabilityHolds origins (#918)", () => {
     ]);
     expect(holds.list().map((hold) => hold.origin)).toEqual(["mesh"]);
     expect(holds.isHeld("kimi", "kimi-k2")).toBe(true);
+    expect(holds.isHeld("codex", "gpt-5.5")).toBe(false);
+  });
+
+  it("clearAll without an origin releases every origin's holds", () => {
+    holds.set({ provider: "kimi", origin: "chat", createdBy: "chat:users/operator" });
+    holds.set({ provider: "kimi", origin: "mesh", createdBy: "root" });
+    holds.set({ provider: "codex", origin: "mesh", models: ["gpt-5.5"], createdBy: "root" });
+
+    const cleared = holds.clearAll();
+
+    expect(cleared.released.map((hold) => `${hold.provider}:${hold.origin}`).sort()).toEqual([
+      "codex:mesh",
+      "kimi:chat",
+      "kimi:mesh",
+    ]);
+    expect(holds.list()).toEqual([]);
+    expect(holds.isHeld("kimi", "kimi-k2")).toBe(false);
     expect(holds.isHeld("codex", "gpt-5.5")).toBe(false);
   });
 

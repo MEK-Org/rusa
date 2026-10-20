@@ -23,7 +23,12 @@ Gemini rewrite, its retry and failure accounting, and its scheduler hook are
 removed. Writes are validated synchronously, and a rejected write tells the
 actor why, in the same turn.
 
-The `ledger` mode is unchanged.
+Every actor receives these tools, including actors in native, tail and ledger
+context modes ([#1121](https://github.com/MEK-Org/rusa/issues/1121)). Outside
+brief mode, the document is a shadow brief the actor can refine before
+switching. Reading or replacing it does not change the actor's context mode.
+Ledger compaction continues, and the prompt still uses the selected mode;
+only an explicit switch to brief mode injects the prepared document.
 
 Brief is selected like the other portable modes. Any actor that may spawn can
 pass `context_mode: "brief"` to `spawn_thread` for its own child, and the
@@ -49,16 +54,15 @@ The `brief` MCP server is mounted per actor (`<actor-id>:brief`) and built with
 that actor's id. No tool takes an actor id, so an actor can read and replace
 only its own brief. The id the server was built with is also the recorded
 writer (`acting_principal`) of every accepted write; the caller cannot supply
-it. Workers and the root mount the server when their context is
-`{ type: "portable", mode: "brief" }`.
+it. Workers and the root mount the server in every context mode.
 
 ## 3. Tools
 
 ### `read`
 
 No arguments. Returns `{ text, generation, updatedAt }` for the caller's brief.
-If the actor has just switched to brief mode and has no brief yet, the seed is
-stored first (generation 0) and returned. The seed contains only the three
+If the actor has no brief yet, the seed is stored first (generation 0) and
+returned. The seed contains only the three
 empty section headings; the actor adds cited statements as it works.
 
 ### `replace`

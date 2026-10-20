@@ -421,4 +421,75 @@ describe("RootControlService", () => {
       service.clearAvailabilityHolds({ provider: "codex" }, "00000000-0000-4000-8000-000000000001")
     ).toThrow("availability hold recovery is unavailable");
   });
+
+  it("clears every halt in one release and audits it as one operator action", () => {
+    const { mesh, events } = setup();
+    const chatHold = {
+      provider: "kimi",
+      origin: "chat" as const,
+      reason: "chat /halt",
+      createdBy: "chat:users/operator",
+      createdAt: "2026-10-16T00:00:00.000Z",
+    };
+    const meshHold = {
+      provider: "codex",
+      model: "gpt-5.5",
+      origin: "mesh" as const,
+      reason: "capacity outage",
+      createdBy: "root",
+      createdAt: "2026-10-16T00:00:00.000Z",
+    };
+    const releaseHalts = vi.fn(() => ({
+      brakeReleased: true,
+      released: [chatHold, meshHold],
+      expired: [],
+      resumed: ["child-1"],
+    }));
+    const service = new RootControlService({ mesh, rootId: "root", releaseHalts });
+
+    const result = service.clearAllHalts("00000000-0000-4000-8000-000000000001");
+
+    expect(result.released).toEqual([chatHold, meshHold]);
+    expect(releaseHalts).toHaveBeenCalledTimes(1);
+    expect(mesh.spawn).not.toHaveBeenCalled();
+    expect(mesh.runNow).not.toHaveBeenCalled();
+    expect(events).toHaveLength(1);
+    expect(JSON.parse(events[0]?.payload ?? "{}")).toEqual({
+      principal: "00000000-0000-4000-8000-000000000001",
+      action: "clear_all_halts",
+      targetId: "root",
+      brakeReleased: true,
+      released: [
+        { provider: "kimi", model: null, origin: "chat" },
+        { provider: "codex", model: "gpt-5.5", origin: "mesh" },
+      ],
+      expiredRemoved: 0,
+      replayed: 1,
+    });
+  });
+
+  it("audits no clear-all that found nothing to release", () => {
+    const { mesh, events } = setup();
+    const releaseHalts = vi.fn(() => ({
+      brakeReleased: false,
+      released: [],
+      expired: [],
+      resumed: [],
+    }));
+    const service = new RootControlService({ mesh, rootId: "root", releaseHalts });
+
+    const result = service.clearAllHalts("00000000-0000-4000-8000-000000000001");
+
+    expect(result).toEqual({ brakeReleased: false, released: [], expired: [], resumed: [] });
+    expect(releaseHalts).toHaveBeenCalledTimes(1);
+    expect(events).toHaveLength(0);
+  });
+
+  it("refuses to clear all halts when the live release path is absent", () => {
+    const { service, events } = setup();
+    expect(() => service.clearAllHalts("00000000-0000-4000-8000-000000000001")).toThrow(
+      "halt recovery is unavailable"
+    );
+    expect(events).toHaveLength(0);
+  });
 });

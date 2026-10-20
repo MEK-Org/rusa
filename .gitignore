@@ -41,3 +41,6 @@ firebase-debug.log
 ui-debug.log
 # Decoy state roots from host-job-runner.test.ts, left behind if a run is killed.
 .host-job-symlink-target-*/
+
+# Synthetic OpenRouter executable roots, cleaned after normal fixture runs.
+.openrouter-host-probe-*/

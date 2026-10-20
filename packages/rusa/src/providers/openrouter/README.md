@@ -62,9 +62,10 @@ The rest of #808 remains open. A production adapter needs the following evidence
    Prove this with a poisoned environment and a real offline harness invocation.
 2. Supply actor-bound MCP endpoints and fail readiness if any required endpoint
    cannot connect. Prove granted calls work and ungranted calls are refused.
-3. Resolve inference credentials through the existing actor secret grant. Model
-   access to its own capped inference key is part of the threat model. Verify
-   cross-actor isolation and credential redaction in actual process output.
+3. Provider invocation permissions and cross-provider credential isolation are a
+   separate design question. PR #1112 follows the existing providers, with no
+   OpenRouter-only invocation grant or profile restriction, per the
+   [operator ruling](https://github.com/MEK-Org/rusa/pull/1112#issuecomment-6266285746).
 4. Add opt-in configuration, exact model/capability validation and budget admission.
    Missing, expired or exhausted budget must block even responsive starts, while
    allowing another available pool entry. A prepaid balance does not enter quota
@@ -102,3 +103,32 @@ error. Each has a 10 s test timeout around a 3 s fallback deadline, so a missing
 EOF listener fails with the deadline reason. The peer stays alive after settlement
 and after closing stdout so direct-child cleanup is exercised. Sandbox reuse,
 descendant cleanup verification and real Pi compatibility remain open.
+
+
+## Worker sandbox prototype
+
+The opt-in adapter supports fresh worker runs through the shared actor bwrap
+launcher. The invocation's private Pi state is rebound after the shared `/tmp`
+shadow, and Pi starts in its empty working directory. Actor-bound MCP settings,
+admission checks, the minimal child environment and RPC supervision also apply
+inside bwrap. Native-session resume and computer use remain unsupported.
+
+`provider.test.ts` runs a synthetic RPC peer through real bwrap when available.
+It checks writable actor files, hidden sibling files and ungranted secrets,
+a visible read-only host file, isolated Pi cwd, synthetic inference-key delivery,
+and successful RPC settlement. This does not establish real Pi inference or
+complete the remaining production requirements above.
+
+Worker launches use the operator-managed Pi login without a provider-use grant,
+matching the existing providers. Model selection follows the ordinary runtime
+path. This PR adds no shared-launcher credential masks and accepts saved profiles
+containing other provider entries. Broader invocation permissions and credential
+isolation are deferred by the
+[operator ruling](https://github.com/MEK-Org/rusa/pull/1112#issuecomment-6266285746).
+
+The adapter binds the existing `auth.json` read-only into isolated Pi state for
+bwrap workers, without copying credentials or supplying a key environment
+variable. Unsandboxed launches reference that file through a symlink. The whole
+profile is visible to Pi; settings, MCP configuration and cwd stay isolated.
+The synthetic worker test launches without any provider grant, accepts a mixed
+profile, and verifies that the bound login rejects writes.
