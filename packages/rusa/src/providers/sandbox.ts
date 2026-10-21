@@ -499,7 +499,10 @@ function injectWorkerGithubCredential(args: string[], mcHome: string): string | 
  */
 function injectGoogleCredentialShadow(args: string[]): void {
   // The Google clients default to ~/.config/gchat whatever XDG_CONFIG_HOME says.
-  const dirs = new Set([join(getHostConfigDir(), "gchat"), defaultGchatConfigDir()]);
+  // Every dir is resolved so it can be matched against resolved bind sources.
+  const dirs = new Set(
+    [join(getHostConfigDir(), "gchat"), defaultGchatConfigDir()].map(realpathIfExists)
+  );
   try {
     const configured = loadConfig().chat?.gchatConfigDir;
     if (configured) dirs.add(realpathIfExists(resolve(configured)));

@@ -1085,6 +1085,26 @@ describe("sandbox bwrap args", () => {
       warnSpy.mockRestore();
     });
 
+    it("shadows a provider projection of a default dir behind a symlinked XDG_CONFIG_HOME (#1013)", async () => {
+      const { home, actorDir } = makeWorkerHome();
+      // XDG_CONFIG_HOME is a symlink into the writable ~/.kimi-code/credentials
+      // bind, so only the resolved default dir starts with that bind's source.
+      const kimiCreds = join(home, ".kimi-code", "credentials");
+      const realDir = join(kimiCreds, "gchat");
+      mkdirSync(realDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(realDir, "drive-token.json"), '{"refresh_token":"x"}', { mode: 0o600 });
+      symlinkSync(kimiCreds, join(home, "xdg"));
+      process.env.XDG_CONFIG_HOME = join(home, "xdg");
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const { args } = buildActorBwrapArgs(actorDir, "kimi");
+
+      expect(args).toContain(kimiCreds);
+      expectShadowed(args, [realDir, "/tmp/kimi-home/credentials/gchat"]);
+      warnSpy.mockRestore();
+    });
+
     it("shadows ~/.config/gchat even when XDG_CONFIG_HOME points elsewhere (#1013)", async () => {
       const { home, actorDir, gchatDir } = makeWorkerHome();
       // The Google clients default to ~/.config/gchat regardless of XDG_CONFIG_HOME.
