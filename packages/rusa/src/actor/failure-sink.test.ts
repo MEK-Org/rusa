@@ -388,7 +388,11 @@ describe("routeRunFailure", () => {
 
       const body = toParent[0]?.body ?? "";
       expect(classifyCalls).toBe(0);
-      expect(body).toContain("provider capacity unavailable: codex/gpt-5");
+      expect(body).toContain(
+        "provider run codex/gpt-5 failed: a temporary provider capacity rejection was reported."
+      );
+      expect(body).toContain("[terminal provider capacity: Selected model is at capacity.]");
+      expect(body.toLowerCase()).not.toContain("no quota exhaustion");
       expect(body).toContain("Selected model is at capacity.");
       expect(body).not.toContain("quota exhausted");
     });

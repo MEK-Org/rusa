@@ -1164,6 +1164,80 @@ describe("Actor", () => {
       "Temporary capacity exhaustion does not infer a quota reset timer. Retry only through the existing declared pool when a candidate is eligible."
     );
     expect(seen[0]?.output).not.toContain("No quota exhaustion or reset was inferred.");
+
+    const notices: string[] = [];
+    await routeRunFailure(
+      {
+        actors: { get: () => ({ id: "actor-1", parentId: "supervisor-1" }) as ActorRecord },
+        sendToParent: (_to, body) => {
+          notices.push(body);
+        },
+        postToErrorChat: null,
+        rootId: "root",
+        log: () => {},
+      },
+      "actor-1",
+      seen[0] as RunResult,
+      "primary:primary-model"
+    );
+
+    const notice = notices[0] ?? "";
+    expect(notice).toContain("a temporary provider capacity rejection was reported");
+    expect(notice).toContain(
+      "model pool exhausted: all 2 configured pool entries reported provider capacity/quota exhaustion."
+    );
+    expect(notice).toContain(
+      "Attempted in order: primary:primary-model -> fallback:fallback-model."
+    );
+    expect(notice).toContain("Terminal provider capacity reason: Selected model is at capacity.");
+    expect(notice.toLowerCase()).not.toContain("no quota exhaustion");
+  });
+
+  it("does not attribute a later pool entry's capacity rejection to a quota-exhausted primary", async () => {
+    const primary = new FakeProvider(
+      () => ({ success: false, output: "Rate limit reached: quota exhausted", exitCode: 1 }),
+      "primary-model"
+    );
+    const second = new FakeProvider(
+      () => ({
+        success: false,
+        output: "[terminal provider capacity: Selected model is at capacity.]",
+        exitCode: 1,
+        failure: { kind: "provider-capacity" as const, message: "Selected model is at capacity." },
+      }),
+      "second-model"
+    );
+    const third = new FakeProvider(
+      () => ({ success: false, output: "binary not found", exitCode: 127 }),
+      "third-model"
+    );
+    const seen: RunResult[] = [];
+    const actor = makeActor(
+      {
+        modelConfig: [
+          { provider: "primary", model: "primary-model" },
+          { provider: "second", model: "second-model" },
+          { provider: "third", model: "third-model" },
+        ],
+        resolveProvider: (entry) =>
+          entry.provider === "second" ? second : entry.provider === "third" ? third : primary,
+        classifyExhaustion: async (result) => ({
+          exhausted:
+            result.output.includes("quota exhausted") ||
+            result.failure?.kind === "provider-capacity",
+        }),
+        onRunEnd: (result) => seen.push(result),
+      },
+      primary
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(seen[0]?.failure).toBeUndefined();
+    expect(seen[0]?.output).toContain("primary primary:primary-model exhausted;");
+    expect(seen[0]?.output).not.toContain("temporarily unavailable");
+    expect(seen[0]?.output).toContain("binary not found");
   });
 
   it("preserves both primary capacity reason and resolver failure diagnostic when recovery preparation fails", async () => {

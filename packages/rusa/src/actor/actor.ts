@@ -275,7 +275,7 @@ export function formatPoolRecoveryFailure(input: {
   primaryName: string;
   recoveryEntry: string;
   recoveryOutput: string;
-  /** A structured adapter reason for temporary capacity, never a quota reading. */
+  /** The primary's own temporary-capacity reason, never a quota reading. */
   primaryCapacityReason?: string;
 }): string {
   if (input.primaryCapacityReason) {
@@ -283,7 +283,7 @@ export function formatPoolRecoveryFailure(input: {
       `primary ${input.primaryName} was temporarily unavailable; recovery onto pool entry ${input.recoveryEntry} failed for an unrelated reason.`,
       "",
       `Terminal provider capacity reason: ${input.primaryCapacityReason}`,
-      "No quota exhaustion or reset was inferred. The recovery error below explains only why recovery was unavailable.",
+      "That capacity rejection is not a quota reading and implies no reset timer. The recovery error below explains only why recovery was unavailable.",
       "",
       `--- pool entry ${input.recoveryEntry} (recovery failed) ---`,
       input.recoveryOutput,
@@ -1078,6 +1078,8 @@ export class Actor {
     let lastResult = result;
     const attempted: RawProviderModelConfig[] = [selected];
     const skipped: PoolSkippedEntry[] = [];
+    const primaryCapacityReason =
+      result.failure?.kind === "provider-capacity" ? result.failure.message : undefined;
     let capacityFailure = result.failure?.kind === "provider-capacity" ? result.failure : undefined;
 
     for (const [index, entry] of chain.entries()) {
@@ -1129,7 +1131,7 @@ export class Actor {
             primaryName,
             recoveryEntry: describeModelConfigEntry(entry),
             recoveryOutput: err instanceof Error ? err.message : String(err),
-            primaryCapacityReason: capacityFailure?.message,
+            primaryCapacityReason,
           }),
           exitCode: lastResult.exitCode || 1,
           sessionId: lastResult.sessionId,
@@ -1154,7 +1156,7 @@ export class Actor {
             primaryName,
             recoveryEntry: describeModelConfigEntry(entry),
             recoveryOutput: recoveryResult.output,
-            primaryCapacityReason: capacityFailure?.message,
+            primaryCapacityReason,
           }),
         };
       }

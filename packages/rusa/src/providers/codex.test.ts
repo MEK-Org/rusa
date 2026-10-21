@@ -13,6 +13,7 @@ import {
   codexRolloutResumable,
   extractCodexSessionModel,
   extractNewestCodexSessionId,
+  isCodexAuthFailure,
   overrideTomlModel,
   parseCodexModel,
   stripMcpServersFromToml,
@@ -1231,7 +1232,6 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
         line({
           type: "turn.failed",
           error: {
-            codex_error_info: "server_overloaded",
             message: "Selected model is at capacity. Please try a different model.",
           },
         }),
@@ -1254,7 +1254,6 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       exitCode: 1,
       stdout: line({
         type: "error",
-        codex_error_info: "server_overloaded",
         message: "Selected model is at capacity. Please try a different model.",
       }),
     });
@@ -1268,7 +1267,7 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
         message: "Selected model is at capacity. Please try a different model.",
       },
     });
-    expect(result.output).not.toContain('"codex_error_info"');
+    expect(result.output).not.toContain('"type":"error"');
   });
 
   it("keeps ordinary successful assistant output free of a terminal failure", async () => {
@@ -1312,7 +1311,6 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       stdout:
         line({
           type: "error",
-          codex_error_info: "server_overloaded",
           message: "Selected model is at capacity. Please try a different model.",
         }) +
         line({
@@ -1340,12 +1338,21 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
   });
 
   it("surfaces a terminal authentication failure even if an earlier transient capacity error occurred", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const { result } = await runWithStream({
       exitCode: 1,
       stdout:
         line({
+          type: "item.completed",
+          item: {
+            id: "item_1",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Progress before the failure." }],
+          },
+        }) +
+        line({
           type: "error",
-          codex_error_info: "server_overloaded",
           message: "Selected model is at capacity. Please try a different model.",
         }) +
         line({
@@ -1358,8 +1365,12 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       success: false,
     });
     expect(result.failure).toBeUndefined();
-    expect(result.output).toContain("Authentication failed: token expired");
-    expect(result.output).not.toContain("[terminal provider capacity");
+    expect(result.output).toBe(
+      "Progress before the failure.\n\n[terminal error: Authentication failed: token expired]"
+    );
+    expect(isCodexAuthFailure(result.output)).toBe(true);
+    expect(errSpy.mock.calls.flat().join("\n")).toContain("AUTHENTICATION ALARM");
+    errSpy.mockRestore();
   });
 
   it("preserves an unrelated terminal failure without misclassifying as capacity when a transient capacity error was retried", async () => {
@@ -1367,8 +1378,16 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       exitCode: 1,
       stdout:
         line({
+          type: "item.completed",
+          item: {
+            id: "item_1",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Progress before the failure." }],
+          },
+        }) +
+        line({
           type: "error",
-          codex_error_info: "server_overloaded",
           message: "Selected model is at capacity. Please try a different model.",
         }) +
         line({
@@ -1383,7 +1402,8 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
       success: false,
     });
     expect(result.failure).toBeUndefined();
-    expect(result.output).toContain("tool failed: process crashed with SIGSEGV");
-    expect(result.output).not.toContain("[terminal provider capacity");
+    expect(result.output).toBe(
+      "Progress before the failure.\n\n[terminal error: tool failed: process crashed with SIGSEGV]"
+    );
   });
 });

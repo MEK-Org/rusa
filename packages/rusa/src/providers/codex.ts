@@ -51,49 +51,33 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 /** Capability lifetime past a run's worst case (a resume attempt, then a fresh one). */
 const AUTH_LEASE_GRACE_MS = 5 * 60 * 1000;
 const CODEX_TERMINAL_REASON_BUDGET = 300;
-const CODEX_SERVER_OVERLOADED = "server_overloaded";
+/**
+ * Codex's `ServerOverloaded` error text. `codex exec --json` serializes `error`
+ * and `turn.failed` as `{ message }` only (exec_events.rs `ThreadErrorEvent`,
+ * codex-cli 0.163.0), so this upstream-fixed message is the sole capacity
+ * evidence on the interface the adapter reads.
+ */
+const CODEX_SERVER_OVERLOADED_MESSAGE = "Selected model is at capacity.";
 
 /** A session/conversation UUID as it appears in codex rollout filenames + `session_meta.payload.id`. */
 const SESSION_UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
-interface CodexTerminalCapacityFailure {
-  kind: "provider-capacity";
+/** The bounded, sanitized message of the latest `error`/`turn.failed` event. */
+interface CodexTerminalError {
   message: string;
+  /** Upstream's `ServerOverloaded` text: eligible for declared-pool recovery, not a quota reading. */
+  capacity: boolean;
 }
 
-/**
- * Codex's JSONL terminal events explicitly identify a temporarily unavailable
- * model with `codex_error_info: "server_overloaded"`. Keep that structured
- * evidence distinct from textual quota inference: capacity is eligible for the
- * declared pool's recovery path, but says nothing about a quota reset.
- */
-function codexTerminalCapacityFailure(
-  event: Record<string, unknown>
-): CodexTerminalCapacityFailure | undefined {
-  const error = isRecord(event.error) ? event.error : undefined;
-  const info = error?.codex_error_info ?? event.codex_error_info;
-  if (info !== CODEX_SERVER_OVERLOADED) return undefined;
-  const message = error?.message ?? event.message;
-  if (typeof message !== "string" || !message.trim()) return undefined;
+function codexTerminalError(message: string): CodexTerminalError {
   return {
-    kind: "provider-capacity",
     message: clipFailureDiagnostic(sanitizeFailureText(message), CODEX_TERMINAL_REASON_BUDGET),
+    capacity: message.trimStart().startsWith(CODEX_SERVER_OVERLOADED_MESSAGE),
   };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function formatTerminalCapacityReason(failure: CodexTerminalCapacityFailure): string {
-  return `[terminal provider capacity: ${failure.message}]`;
-}
-
-function appendTerminalCapacityReason(
-  output: string,
-  failure: CodexTerminalCapacityFailure
-): string {
-  const reason = formatTerminalCapacityReason(failure);
+function appendTerminalError(output: string, error: CodexTerminalError): string {
+  const reason = `[${error.capacity ? "terminal provider capacity" : "terminal error"}: ${error.message}]`;
   return output ? `${output}\n\n${reason}` : reason;
 }
 
@@ -544,7 +528,7 @@ export class CodexProvider implements CodingProvider {
       // firing while tool results are suppressed.
       let lineBuffer = "";
       const assistantTexts: string[] = [];
-      let lastObservedCapacityFailure: CodexTerminalCapacityFailure | undefined;
+      let lastTerminalError: CodexTerminalError | undefined;
       const tick = () => opts.onChunk?.("");
       const itemText = (item: { content?: unknown; text?: unknown }): string => {
         if (typeof item.text === "string") return item.text;
@@ -693,16 +677,14 @@ export class CodexProvider implements CodingProvider {
           case "turn.started":
           case "turn.completed":
             tick();
-            // A new turn started or completed; any prior transient capacity error is not terminal to this turn
-            lastObservedCapacityFailure = undefined;
+            // Later turn progress means an earlier error was retried, not terminal.
+            lastTerminalError = undefined;
             return;
           case "turn.failed": {
             const error = json.error as { message?: unknown } | undefined;
-            const cap = codexTerminalCapacityFailure(json);
-            lastObservedCapacityFailure = cap;
-            opts.onChunk?.(
-              formatLiveError(cap?.message ?? String(error?.message ?? "turn failed"))
-            );
+            const message = String(error?.message ?? "turn failed");
+            lastTerminalError = codexTerminalError(message);
+            opts.onChunk?.(formatLiveError(message));
             return;
           }
           case "error": {
@@ -711,9 +693,8 @@ export class CodexProvider implements CodingProvider {
             // "Reconnecting..." noise is not actionable in the live view.
             if (message.startsWith("Reconnecting")) tick();
             else {
-              const cap = codexTerminalCapacityFailure(json);
-              lastObservedCapacityFailure = cap;
-              opts.onChunk?.(formatLiveError(cap?.message ?? message));
+              lastTerminalError = codexTerminalError(message);
+              opts.onChunk?.(formatLiveError(message));
             }
             return;
           }
@@ -780,32 +761,20 @@ export class CodexProvider implements CodingProvider {
             processLine(lineBuffer);
             lineBuffer = "";
           }
-          // If the exit is non-zero, check whether the raw output or assistant text
-          // indicates an auth failure. An auth failure is an operational credential issue
-          // that must NEVER be masked by a prior transient capacity event.
-          const authFailure =
-            exitCode !== 0 &&
-            (isCodexAuthFailure(output) || isCodexAuthFailure(assistantTexts.join("\n")));
-
-          // Terminal capacity failure is only recognized if the process failed non-zero,
-          // it is NOT an auth failure, and the final failure condition was indeed capacity.
-          const terminalCapacityFailure =
-            exitCode !== 0 && !authFailure ? lastObservedCapacityFailure : undefined;
-
-          // A structured terminal capacity event is the actionable failure;
-          // without assistant text, returning the raw JSONL would turn a
-          // bounded diagnostic back into an unbounded transcript.
-          // When not a terminal capacity failure, fall back to effectiveOutput(output)
-          // so raw error streams (auth, network, command, unclassified errors) survive.
-          const baseOutput = terminalCapacityFailure
-            ? assistantTexts.join("\n")
-            : effectiveOutput(output);
+          const terminalError = exitCode !== 0 ? lastTerminalError : undefined;
+          // Auth reaching only stderr must not be masked as capacity.
+          const capacity = terminalError?.capacity === true && !isCodexAuthFailure(output);
+          const progress = assistantTexts.join("\n");
+          // Assistant progress alone would hide why the run failed, so the
+          // bounded terminal cause follows it. A capacity cause replaces the raw
+          // JSONL even without progress; any other cause keeps the raw stream,
+          // which already carries it.
           const outputText =
-            exitCode !== 0 && terminalCapacityFailure
-              ? appendTerminalCapacityReason(baseOutput, terminalCapacityFailure)
-              : baseOutput;
+            terminalError && (capacity || progress)
+              ? appendTerminalError(progress, { ...terminalError, capacity })
+              : effectiveOutput(output);
           // Auth-fail alarm: if the run fails with an auth error, alert the operator.
-          if (authFailure) {
+          if (exitCode !== 0 && isCodexAuthFailure(outputText)) {
             console.error("\n=======================================================");
             console.error(
               "🚨 CODE PROMPT AUTHENTICATION ALARM: Codex subactor run failed due to auth error."
@@ -819,8 +788,8 @@ export class CodexProvider implements CodingProvider {
             success: exitCode === 0,
             output: outputText,
             exitCode,
-            ...(exitCode !== 0 && terminalCapacityFailure
-              ? { failure: terminalCapacityFailure }
+            ...(terminalError && capacity
+              ? { failure: { kind: "provider-capacity" as const, message: terminalError.message } }
               : {}),
           });
         },

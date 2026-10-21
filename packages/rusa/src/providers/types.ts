@@ -134,7 +134,7 @@ export interface RunFailure {
    */
   stage?: "provider-selection";
   /**
-   * A provider's structured terminal event established temporary model capacity
+   * A provider's terminal error event established temporary model capacity
    * unavailability. This is not a quota reading or reset signal.
    */
   kind?: "provider-capacity";
