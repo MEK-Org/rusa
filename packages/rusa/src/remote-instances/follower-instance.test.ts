@@ -1540,7 +1540,8 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
   });
 
   it("re-adopts a running actor after a same-process leader rehydration (#963)", async () => {
-    const { factory, release } = releasableCapabilityProvider();
+    const held = releasableCapabilityProvider();
+    const factory = vi.fn(held.factory);
     const h = setup({ providerFactory: factory });
     const charter = "Retained across sessionless rehydration";
     const id = h.spawn(charter);
@@ -1561,8 +1562,11 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
       })
     ).not.toThrow();
     expect(h.follower.actorIds).toEqual([id]);
+    // Reconnect dispatch reaches the retained Actor rather than constructing a
+    // second provider/runtime under the same actor id.
+    expect(factory).toHaveBeenCalledTimes(1);
 
-    release(charter);
+    held.release(charter);
   });
 
   // Issue #679 regressions
