@@ -218,6 +218,7 @@ export function describeCompaction(summary: PortableContextCompactionSummary): s
 export interface PortableContextCompactor {
   compact(input: {
     actorId: string;
+    runId?: string;
     state: PortableContextState;
     messages: PortableLedgerSource[];
     now: string;
@@ -560,6 +561,7 @@ export class GeminiPortableContextCompactor implements PortableContextCompactor 
 
   async compact(input: {
     actorId: string;
+    runId?: string;
     state: PortableContextState;
     messages: PortableLedgerSource[];
     now: string;
@@ -567,77 +569,82 @@ export class GeminiPortableContextCompactor implements PortableContextCompactor 
     if (input.messages.length === 0) return { state: input.state, quarantined: [], operations: 0 };
     const client = getGeminiClient(this.apiKey);
     const response = await withGeminiRetry(() =>
-      generateGeminiContent(client, "portable_compaction", {
-        model: this.model,
-        contents: compactorPrompt(input.state, input.messages, input.actorId),
-        config: {
-          temperature: 0,
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              operations: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    // Only what the ledger still honors. `resolve` stays in the
-                    // parsed enum below and is deliberately absent here: the
-                    // parse enum decides what a stray operation COSTS (one
-                    // quarantined op, not a discarded batch), while this enum
-                    // decides what the model can emit at all. Since ISSUE_NUM no
-                    // authorable kind is resolvable, so every `resolve` this
-                    // schema permitted could only ever become a quarantine —
-                    // including the invented-item-id class in ISSUE_NUM, which was
-                    // a `resolve` naming an item the same batch had just added
-                    // and whose server-minted id the model never saw.
-                    action: { type: Type.STRING, enum: ["add", "update", "supersede"] },
-                    itemId: { type: Type.STRING },
-                    kind: {
-                      type: Type.STRING,
-                      // Only what the compactor may author. The persisted enum
-                      // is wider and stays that way — see portable-context-state.ts.
-                      enum: ["constraint", "decision", "rationale"],
+      generateGeminiContent(
+        client,
+        "portable_compaction",
+        {
+          model: this.model,
+          contents: compactorPrompt(input.state, input.messages, input.actorId),
+          config: {
+            temperature: 0,
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                operations: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      // Only what the ledger still honors. `resolve` stays in the
+                      // parsed enum below and is deliberately absent here: the
+                      // parse enum decides what a stray operation COSTS (one
+                      // quarantined op, not a discarded batch), while this enum
+                      // decides what the model can emit at all. Since ISSUE_NUM no
+                      // authorable kind is resolvable, so every `resolve` this
+                      // schema permitted could only ever become a quarantine —
+                      // including the invented-item-id class in ISSUE_NUM, which was
+                      // a `resolve` naming an item the same batch had just added
+                      // and whose server-minted id the model never saw.
+                      action: { type: Type.STRING, enum: ["add", "update", "supersede"] },
+                      itemId: { type: Type.STRING },
+                      kind: {
+                        type: Type.STRING,
+                        // Only what the compactor may author. The persisted enum
+                        // is wider and stays that way — see portable-context-state.ts.
+                        enum: ["constraint", "decision", "rationale"],
+                      },
+                      priority: { type: Type.STRING, enum: ["must", "should", "background"] },
+                      statement: { type: Type.STRING },
+                      sourceEventId: { type: Type.STRING },
+                      quote: { type: Type.STRING },
                     },
-                    priority: { type: Type.STRING, enum: ["must", "should", "background"] },
-                    statement: { type: Type.STRING },
-                    sourceEventId: { type: Type.STRING },
-                    quote: { type: Type.STRING },
+                    required: [
+                      "action",
+                      "itemId",
+                      "kind",
+                      "priority",
+                      "statement",
+                      "sourceEventId",
+                      "quote",
+                    ],
                   },
-                  required: [
-                    "action",
-                    "itemId",
-                    "kind",
-                    "priority",
-                    "statement",
-                    "sourceEventId",
-                    "quote",
-                  ],
                 },
               },
+              required: ["operations"],
             },
-            required: ["operations"],
+            systemInstruction:
+              "Maintain a general-purpose actor's durable intent ledger. The actor may perform software work, " +
+              "research, physical design, analysis, content creation, or coordination. Extract only information " +
+              "that must survive after recent conversation is gone: explicit constraints, decisions, and the " +
+              "rationale behind them. Ignore transient status requests, greetings, and routine task steps. " +
+              "This ledger does NOT hold work state. Commitments, tasks, and unresolved questions live in the " +
+              "actor's obligation store, which only the actor may write; never record one here, and never record " +
+              "that one was completed, cancelled or reassigned. Record the durable constraint or decision such a " +
+              "message establishes, if any, and otherwise emit nothing for it. " +
+              "A source with origin `self` is this actor's own recorded outcome of a past run, not a transient " +
+              "status request: fold the durable constraint or decision it reveals, not the task it reports on. " +
+              "Use add for new durable facts, update for refinements, and supersede when a newer message replaces " +
+              "an existing item. For add, itemId must be an " +
+              "empty string. For other actions use an existing item id. Every operation must cite one NEW source " +
+              "event and quote an exact non-empty substring from its body. A replacement generally needs both a " +
+              "supersede operation for the old item and an add operation for the new one. Return no operations " +
+              "when the messages contain no durable memory.",
+            httpOptions: { timeout: 60_000 },
           },
-          systemInstruction:
-            "Maintain a general-purpose actor's durable intent ledger. The actor may perform software work, " +
-            "research, physical design, analysis, content creation, or coordination. Extract only information " +
-            "that must survive after recent conversation is gone: explicit constraints, decisions, and the " +
-            "rationale behind them. Ignore transient status requests, greetings, and routine task steps. " +
-            "This ledger does NOT hold work state. Commitments, tasks, and unresolved questions live in the " +
-            "actor's obligation store, which only the actor may write; never record one here, and never record " +
-            "that one was completed, cancelled or reassigned. Record the durable constraint or decision such a " +
-            "message establishes, if any, and otherwise emit nothing for it. " +
-            "A source with origin `self` is this actor's own recorded outcome of a past run, not a transient " +
-            "status request: fold the durable constraint or decision it reveals, not the task it reports on. " +
-            "Use add for new durable facts, update for refinements, and supersede when a newer message replaces " +
-            "an existing item. For add, itemId must be an " +
-            "empty string. For other actions use an existing item id. Every operation must cite one NEW source " +
-            "event and quote an exact non-empty substring from its body. A replacement generally needs both a " +
-            "supersede operation for the old item and an add operation for the new one. Return no operations " +
-            "when the messages contain no durable memory.",
-          httpOptions: { timeout: 60_000 },
         },
-      })
+        { actorId: input.actorId, runId: input.runId }
+      )
     );
     const parsed = compactionResponseSchema.parse(JSON.parse(await extractGeminiText(response)));
     return applyCompactionOperations({

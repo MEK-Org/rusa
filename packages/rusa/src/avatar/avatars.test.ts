@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateHandle } from "../actor/handle-generator.js";
+import { configureGeminiUsage } from "../observability/gemini-usage.js";
+import { createLogger, nullLogger } from "../observability/logger.js";
 import {
   AvatarGenerationCoordinator,
   type AvatarGenerationEvent,
@@ -208,6 +210,12 @@ describe("with an isolated RUSA_HOME", () => {
   });
 
   it("generateAvatarForce supports root actor avatar generation", async () => {
+    const durableRootId = "root-uuid";
+    const lines: string[] = [];
+    configureGeminiUsage(
+      createLogger({ format: "json", destination: { write: (line) => lines.push(line) } }),
+      "/synthetic/root-avatar"
+    );
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -222,10 +230,16 @@ describe("with an isolated RUSA_HOME", () => {
     } as unknown as Response);
 
     try {
-      await generateAvatarForce("root", { apiKey: "key" });
+      await generateAvatarForce(durableRootId, { apiKey: "key", rootId: durableRootId });
       expect(readAvatar("root")?.body.equals(PNG_BYTES)).toBe(true);
+      expect(JSON.parse(lines[0] ?? "{}").usage).toMatchObject({
+        purpose: "avatar_generation",
+        actorId: durableRootId,
+        runId: null,
+      });
     } finally {
       fetchMock.mockRestore();
+      configureGeminiUsage(nullLogger, "/synthetic/test");
     }
   });
 
@@ -329,6 +343,11 @@ describe("with an isolated RUSA_HOME", () => {
   });
 
   it("generateAvatarOnce fetches with imageSize: '512' and aspectRatio: '1:1'", async () => {
+    const lines: string[] = [];
+    configureGeminiUsage(
+      createLogger({ format: "json", destination: { write: (line) => lines.push(line) } }),
+      "/synthetic/avatar"
+    );
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -365,8 +384,14 @@ describe("with an isolated RUSA_HOME", () => {
       expect(cached).not.toBeNull();
       expect(cached?.contentType).toBe("image/png");
       expect(cached?.body.toString()).toBe("fake-png-bytes");
+      expect(JSON.parse(lines[0] ?? "{}").usage).toMatchObject({
+        purpose: "avatar_generation",
+        actorId: UUID,
+        runId: null,
+      });
     } finally {
       fetchMock.mockRestore();
+      configureGeminiUsage(nullLogger, "/synthetic/test");
     }
   });
 

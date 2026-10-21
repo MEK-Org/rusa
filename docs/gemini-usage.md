@@ -45,13 +45,26 @@ million selected attempts; narrow the window if that cap is reached.
 ## What the numbers mean
 
 Records contain only `version`, UTC `occurredAt`, opaque `instanceId`, random
-process-boot `processId`, PID, unique `attemptId`, stable `purpose`, requested and
-returned model, API outcome, usage completeness, stream partial flag and counts.
+process-boot `processId`, PID, unique `attemptId`, stable `purpose`, nullable
+`actorId` and `runId`, requested and returned model, API outcome, usage
+completeness, stream partial flag and counts.
 Instance identity is a hash of the host and resolved instance home; the home and
 hostname are not written. The start and coordinator entrypoints reuse their
 logger for level/format and redaction; standalone in-repository callers use the
 normal logger defaults. `model` is the API's `modelVersion` when returned,
 otherwise the requested model; `requestedModel` preserves the requested alias.
+
+`actorId` and `runId` are recorded only when the caller already has them in
+scope; a non-null run id always has a non-null actor id. Absent attribution is
+represented as `null`, including in legacy v1 records that predate these
+fields. Under each purpose/model group, the report
+breaks out actor calls (including an explicit interrupted-call count), measured
+completed-call input/output sums and input-per-call max/p50/p90
+(using nearest-rank percentiles);
+the explicit `unattributed` bucket holds null actor ids. JSON includes each
+actor's distinct non-null run ids, while the text report omits them. These are
+mesh-internal identifiers: exports remain operator-private and must not be
+posted publicly without redaction.
 
 The API's [usage metadata](https://ai.google.dev/api/generate-content#UsageMetadata)
 and [token counting guide](https://ai.google.dev/gemini-api/docs/generate-content/tokens)

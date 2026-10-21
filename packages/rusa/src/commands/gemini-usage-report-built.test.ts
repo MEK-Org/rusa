@@ -17,6 +17,7 @@ import { createLogger } from ${JSON.stringify(join(process.cwd(), "src/observabi
 const log = createLogger({ format: "json", level: "info", secrets: ["synthetic-sensitive-value"] });
 configureGeminiUsage(log, process.argv[2]);
 for (const purpose of GEMINI_USAGE_PURPOSES) await observeGeminiRequest(purpose, "fixture-model", async () => ({ usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 20, thoughtsTokenCount: 5, cachedContentTokenCount: 40, toolUsePromptTokenCount: 2, totalTokenCount: 127 }, text: "PRIVATE BODY" }));
+await observeGeminiRequest("portable_compaction", "fixture-model", async () => ({ usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 20, thoughtsTokenCount: 5, cachedContentTokenCount: 40, toolUsePromptTokenCount: 2, totalTokenCount: 127 } }), { actorId: "actor-fixture", runId: "run-fixture" });
 await observeGeminiRequest("quota_parse", "fixture-model", async () => ({}));
 try { await observeGeminiRequest("quota_parse", "fixture-model", async () => { throw new Error("PRIVATE ERROR"); }); } catch {}
 const partial = beginGeminiAttempt("speech_synthesis", "fixture-model");
@@ -74,7 +75,7 @@ log.info("credential_probe", { apiKey: "synthetic-sensitive-value", promptTokenC
     expect(report.instances).toHaveLength(2);
     expect(report.processes).toHaveLength(2);
     expect(report.groups).toHaveLength(10);
-    expect(report.duplicates).toBe(13);
+    expect(report.duplicates).toBe(14);
     expect(report.knownGaps).toEqual(["earlier rotation unavailable"]);
     expect(report.groups.find((g) => g.purpose === "quota_parse")).toMatchObject({
       calls: 6,
@@ -86,6 +87,27 @@ log.info("credential_probe", { apiKey: "synthetic-sensitive-value", promptTokenC
       calls: 4,
       totals: { input: { sum: 200 }, output: { sum: 50 } },
       partialObservations: { input: { sum: 100 }, output: { sum: 24 } },
+    });
+    expect(report.groups.find((g) => g.purpose === "portable_compaction")).toMatchObject({
+      calls: 4,
+      actors: [
+        {
+          actorId: "actor-fixture",
+          runIds: ["run-fixture"],
+          calls: 2,
+          input: { sum: 200, measured: 2, missing: 0 },
+          output: { sum: 50, measured: 2, missing: 0 },
+          inputPerCall: { max: 100, p50: 100, p90: 100 },
+        },
+        {
+          actorId: null,
+          runIds: [],
+          calls: 2,
+          input: { sum: 200, measured: 2, missing: 0 },
+          output: { sum: 50, measured: 2, missing: 0 },
+          inputPerCall: { max: 100, p50: 100, p90: 100 },
+        },
+      ],
     });
     expect(report.sources.every((s) => s.logFrom && s.logTo && s.invalidUsage === 0)).toBe(true);
     const textArgs = args.slice(0, -1);
