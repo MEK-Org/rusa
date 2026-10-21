@@ -4,6 +4,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { defaultGchatConfigDir } from "../chat/gchat-oauth.js";
 import { resolveRepoRoot } from "../commands/service-instance.js";
 import { createLogger } from "../observability/logger.js";
 import { GitRunner } from "../update/runner.js";
@@ -16,6 +17,7 @@ import {
   type FollowerEventTransferSender,
   httpEventTransferSender,
 } from "./follower-event-queue.js";
+import { createFollowerFileOps } from "./follower-file-ops.js";
 import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { isFullCommitSha } from "./follower-update-validation.js";
@@ -85,8 +87,14 @@ try {
   );
 }
 
-const instance = new FollowerInstance(root, values.sandbox === "bwrap", (event) =>
-  emit(event.actorId, event.message, event.eventId)
+const instance = new FollowerInstance(
+  root,
+  values.sandbox === "bwrap",
+  (event) => emit(event.actorId, event.message, event.eventId),
+  undefined,
+  // This follower's own Google credentials, never the leader's (#1013). This
+  // entry point loads no config, so they are always in the default directory.
+  { fileOps: createFollowerFileOps({ credentialDir: defaultGchatConfigDir() }) }
 );
 // A registration can renew after an HTTP fault. It identifies this running
 // process, not its short-lived server session or the reusable enrollment token.

@@ -334,7 +334,11 @@ import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import type { FollowerInstance } from "../remote-instances/follower-instance.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
-import type { ProviderFactory } from "../remote-instances/protocol.js";
+import type {
+  FollowerFileOperation,
+  FollowerFileOperationResult,
+  ProviderFactory,
+} from "../remote-instances/protocol.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 import { constructActorFromInvocation } from "../runtime/actor-invocation.js";
 import {
@@ -2803,6 +2807,16 @@ async function composeStart(
     { selectedInboxEntries: (actorId) => mesh.selectedInboxEntries(actorId) },
     inboxStore
   );
+  // A follower-hosted actor's downloads run on its follower, with that
+  // follower's credentials (#1013). Undefined keeps the tool's refusal.
+  const followerFileOpFor = (
+    actorId: string,
+    operation: FollowerFileOperation
+  ): Promise<FollowerFileOperationResult> | undefined => {
+    const target = actors.get(actorId)?.executionConfig?.executionTarget;
+    if (target === undefined || !followerHub) return undefined;
+    return followerHub.fileOp(target, actorId, operation);
+  };
   const grantableServers = buildGrantableServers({
     // The nightly-report producer  writes the run-journal / rendered reports /
     // index.json instance-side under <mcHome>/iu-distiller/reports/ — colocated with the
@@ -2883,6 +2897,7 @@ async function composeStart(
     // follower-hosted actor cannot read a stale leader-side workdir.
     fileToolsAvailableForActor: (actorId) =>
       actors.get(actorId)?.executionConfig?.executionTarget === undefined,
+    followerFileOpForActor: followerFileOpFor,
     driveClients,
     hostMaintenance: { updateToolDepsFor, pnpmHardlinks: pnpmHardlinksDeps },
     onDriveRead: (actorId, observation) =>
@@ -3810,6 +3825,7 @@ async function composeStart(
               workDir: actorWorkdir,
               fileToolsAvailable: () =>
                 actors.get(id)?.executionConfig?.executionTarget === undefined,
+              followerFileOp: (operation) => followerFileOpFor(id, operation),
             })
           );
           perActorShared.push({ name: CHAT_READ_MCP_NAME, url: chatReadUrl });

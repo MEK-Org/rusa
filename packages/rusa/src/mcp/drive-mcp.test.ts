@@ -7,7 +7,12 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it, vi } from "vitest";
 import { type DriveClient, GoogleDriveClient } from "../drive/drive-client.js";
-import { createDriveReadMcpServer, type DriveReadObservation } from "./drive-mcp.js";
+import type { FollowerFileOperation } from "../remote-instances/protocol.js";
+import {
+  createDriveReadMcpServer,
+  type DriveReadMcpOptions,
+  type DriveReadObservation,
+} from "./drive-mcp.js";
 
 function fakeDriveClient() {
   const calls: Array<{ method: string; id: string; recursive?: boolean; mimeType?: string }> = [];
@@ -69,6 +74,7 @@ async function connect(
     onRead?: (actorId: string, observation: DriveReadObservation) => void;
     workDir?: string;
     fileToolsAvailable?: boolean | (() => boolean);
+    followerFileOp?: DriveReadMcpOptions["followerFileOp"];
   } = {}
 ) {
   const server = createDriveReadMcpServer("actor-1", driveClient, {
@@ -76,6 +82,7 @@ async function connect(
     onRead: options.onRead,
     workDir: options.workDir,
     fileToolsAvailable: options.fileToolsAvailable,
+    followerFileOp: options.followerFileOp,
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -395,6 +402,106 @@ describe("drive-read MCP server", () => {
         "Drive file tools are unavailable for follower-hosted actors"
       );
       rmSync(workDir, { recursive: true, force: true });
+    });
+
+    it("keeps the refusal when the actor's follower cannot run file operations", async () => {
+      const fake = fakeDriveClient();
+      const client = await connect(fake.client, [], {
+        fileToolsAvailable: false,
+        followerFileOp: () => undefined,
+      });
+
+      const result = (await client.callTool({
+        name: "download_file",
+        arguments: { fileId: "file-1", destinationPath: "out.bin" },
+      })) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain(
+        "Drive file tools are unavailable for follower-hosted actors (see #812)"
+      );
+      expect(fake.calls.map((call) => call.method)).not.toContain("downloadFileStream");
+    });
+
+    it("authorizes on the leader, then has the actor's follower stream the file into its own root", async () => {
+      const fake = fakeDriveClient();
+      const onRead = vi.fn();
+      const operations: FollowerFileOperation[] = [];
+      const client = await connect(fake.client, ["allowed-folder"], {
+        onRead,
+        fileToolsAvailable: false,
+        followerFileOp: (operation) => {
+          operations.push(operation);
+          return Promise.resolve({
+            path: "/follower/workers/actor-1/out.bin",
+            bytes: 16,
+            sha256: "a".repeat(64),
+            contentType: "application/pdf",
+          });
+        },
+      });
+
+      const result = (await client.callTool({
+        name: "download_file",
+        arguments: { fileId: "file-1", destinationPath: "out.bin" },
+      })) as CallToolResult;
+
+      expect(result.isError).toBeFalsy();
+      expect(operations).toEqual([
+        { kind: "driveFileDownload", fileId: "file-1", destinationPath: "out.bin" },
+      ]);
+      expect(JSON.parse(textOf(result))).toEqual({
+        path: "/follower/workers/actor-1/out.bin",
+        bytes: 16,
+        sha256: "a".repeat(64),
+        contentType: "application/vnd.google-apps.document",
+        name: "Mock File",
+      });
+      // The leader read metadata to authorize; the bytes never crossed it.
+      expect(fake.calls.map((call) => call.method)).toEqual(["getFileMetadata"]);
+      expect(onRead).toHaveBeenCalledWith("actor-1", {
+        operation: "download_file",
+        fileId: "file-1",
+      });
+    });
+
+    it("refuses an out-of-folder file before asking the follower", async () => {
+      const fake = fakeDriveClient();
+      const followerFileOp = vi.fn();
+      const client = await connect(fake.client, ["allowed-folder"], {
+        fileToolsAvailable: false,
+        followerFileOp,
+      });
+
+      const result = (await client.callTool({
+        name: "download_file",
+        arguments: { fileId: "unauthorized-file", destinationPath: "out.bin" },
+      })) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("does not belong to allowed folders");
+      expect(followerFileOp).not.toHaveBeenCalled();
+    });
+
+    it("surfaces a follower refusal unchanged", async () => {
+      const fake = fakeDriveClient();
+      const client = await connect(fake.client, [], {
+        fileToolsAvailable: false,
+        followerFileOp: () =>
+          Promise.reject(
+            new Error("this follower has no Google Drive credentials: missing drive-token.json")
+          ),
+      });
+
+      const result = (await client.callTool({
+        name: "download_file",
+        arguments: { fileId: "file-1", destinationPath: "out.bin" },
+      })) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain(
+        "this follower has no Google Drive credentials: missing drive-token.json"
+      );
     });
   });
 });

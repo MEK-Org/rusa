@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { defaultGchatConfigDir } from "../chat/gchat-oauth.js";
 import { instanceIdentityOf, leaderPeerOf, resolveHome } from "../config/loader.js";
 import type { RusaConfig } from "../config/types.js";
 import { closeDb, getRepositories, initDb } from "../db/index.js";
@@ -14,6 +15,7 @@ import {
   type FollowerEventTransferSender,
   httpEventTransferSender,
 } from "../remote-instances/follower-event-queue.js";
+import { createFollowerFileOps } from "../remote-instances/follower-file-ops.js";
 import type { FollowerCommand, FollowerEvent } from "../remote-instances/follower-hub.js";
 import { FollowerInstance } from "../remote-instances/follower-instance.js";
 import {
@@ -217,6 +219,10 @@ export async function composeFollowerStart(
       // Provider executable settings are host-local. The leader still owns
       // the admitted provider/model tuple carried in each actor Bootstrap.
       providerOptions: { providers: config.providers },
+      // This follower's own Google credentials, never the leader's (#1013).
+      fileOps: createFollowerFileOps({
+        credentialDir: config.chat?.gchatConfigDir ?? defaultGchatConfigDir(),
+      }),
     }
   );
   resources.acquire("followerInstance", async () => {

@@ -327,7 +327,7 @@ not require actor coordination or interrupt running actors prematurely.
 
 Follower nodes report their active git `commitSha`, process generation, and
 `protocolVersion` upon enrollment via `POST /register`.
-- Enrollment admits a follower whose `protocolVersion` is the leader's `INSTANCE_PROTOCOL_VERSION` (N, currently 8) or the previous one (N−1). An N−1 follower is fully admitted and runs normally until the update reconciler moves it to the leader's build; the registration reply echoes the follower's own version, which is the protocol that session speaks. Anything else fails closed with HTTP 409. Every refusal of an authenticated, parseable register request logs `follower_register_rejected` with the follower id, `protocolVersion`, `commitSha` and reason; a 401 or unparseable body carries no trustworthy identity, so only the follower's own registration-failure log records it.
+- Enrollment admits a follower whose `protocolVersion` is the leader's `INSTANCE_PROTOCOL_VERSION` (N, currently 9) or the previous one (N−1). An N−1 follower is fully admitted and runs normally until the update reconciler moves it to the leader's build; the registration reply echoes the follower's own version, which is the protocol that session speaks. Anything else fails closed with HTTP 409. Every refusal of an authenticated, parseable register request logs `follower_register_rejected` with the follower id, `protocolVersion`, `commitSha` and reason; a 401 or unparseable body carries no trustworthy identity, so only the follower's own registration-failure log records it.
 - Release order is leader first, then followers. Each protocol bump therefore keeps N−1 working (the leader handles any changed v(N−1) shape and does not send a v(N−1) follower a command it cannot parse) and drops N−2. The rule sits next to the constant in `protocol.ts`.
 - Update commands can specify an explicit full SHA-1/SHA-256 `targetSha`. The follower rejects an invalid branch or a target outside the fetched branch before checkout. Enrollment is the sole protocol-compatibility fence; a command cannot override it.
 
@@ -395,6 +395,25 @@ Retirement interrupts/closes only that Actor; instance shutdown closes all actor
 Local files stay on the follower. Media/file transfer, leader-local repository
 URL rewrites, host-job tools, Understanding mounts, provider/model changes and
 interrupt/preemption are not portable yet. Start with local file tasks and the
-ordinary inbox/mesh tools. Desktop capture/control and macOS permissions remain
+ordinary inbox/mesh tools.
+
+The one file path that is portable is downloading (#1013). A follower-hosted
+actor's Chat `download_attachment` and Drive `download_file` still authorize on
+the leader (space and folder grants, the attachment byte limit and Drive read
+events stay there). The leader then sends the follower a protocol-9 `fileOp`
+command, and the follower calls Google with its own credentials, writing a new
+file inside that actor's working directory. Those credentials are the
+follower's `client.json` plus `token.json` (Chat) or `drive-token.json` (Drive).
+A follower started by `rusa start` reads them from its `chat.gchatConfigDir`, or
+`~/.config/gchat` if that is unset. The standalone `follower.js` build loads no
+config, so it always reads `~/.config/gchat`. A follower
+without them refuses and names the missing files, and the tool returns that
+refusal unchanged. A download the follower has not answered within 30 minutes
+fails the tool call, though the file may still appear afterwards. A v8
+follower's actors keep the "(see #812)" refusal, as does Slack. Uploads and
+sending files from a follower are not portable yet.
+A bwrap-sandboxed worker sees both the default and the configured credential
+directory as empty. An unsandboxed follower, which includes every macOS
+follower, gives its actors no such mask. Desktop capture/control and macOS permissions remain
 separate work. The leader may send provider configuration, but provider secrets
 and account authentication should be provisioned locally on the follower.

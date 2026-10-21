@@ -21,6 +21,7 @@ import { FakeChatClient } from "../chat/fake.js";
 import { GchatClient } from "../chat/gchat-client.js";
 import { MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES } from "../chat/types.js";
 import type { Logger } from "../observability/logger.js";
+import type { FollowerFileOperation } from "../remote-instances/protocol.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import {
   createChatReadMcpServer,
@@ -649,6 +650,95 @@ describe("chat MCP server", () => {
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain("Chat file tools are unavailable for follower-hosted actors");
     rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("keeps the refusal when the actor's follower cannot run file operations", async () => {
+    const fake = new FakeChatClient();
+    const client = await connect(
+      createChatReadMcpServer(fake, { fileToolsAvailable: false, followerFileOp: () => undefined })
+    );
+
+    const res = (await client.callTool({
+      name: "download_attachment",
+      arguments: {
+        resourceName: "spaces/A/messages/M1/attachments/ATT1",
+        destinationPath: "out.bin",
+      },
+    })) as CallToolResult;
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(
+      "Chat file tools are unavailable for follower-hosted actors (see #812)"
+    );
+  });
+
+  it("has a follower-hosted actor's follower stream the attachment under the leader's cap", async () => {
+    const fake = new FakeChatClient();
+    const download = vi.spyOn(fake, "downloadAttachmentStream");
+    const operations: FollowerFileOperation[] = [];
+    const client = await connect(
+      createChatReadMcpServer(fake, {
+        allowedSpaces: ["spaces/A"],
+        maxAttachmentBytes: 1234,
+        fileToolsAvailable: false,
+        followerFileOp: (operation) => {
+          operations.push(operation);
+          return Promise.resolve({
+            path: "/follower/workers/actor-1/spec.pdf",
+            bytes: 26,
+            sha256: "b".repeat(64),
+            name: "spec.pdf",
+            contentType: "application/pdf",
+          });
+        },
+      })
+    );
+
+    const res = (await client.callTool({
+      name: "download_attachment",
+      arguments: {
+        resourceName: "spaces/A/messages/M1/attachments/ATT1",
+        destinationPath: "spec.pdf",
+      },
+    })) as CallToolResult;
+    expect(res.isError).toBeFalsy();
+    expect(operations).toEqual([
+      {
+        kind: "chatAttachmentDownload",
+        resourceName: "spaces/A/messages/M1/attachments/ATT1",
+        destinationPath: "spec.pdf",
+        maxBytes: 1234,
+      },
+    ]);
+    expect(JSON.parse(textOf(res))).toEqual({
+      path: "/follower/workers/actor-1/spec.pdf",
+      bytes: 26,
+      sha256: "b".repeat(64),
+      contentType: "application/pdf",
+      name: "spec.pdf",
+    });
+    expect(download).not.toHaveBeenCalled();
+  });
+
+  it("refuses an ungranted space before asking the follower", async () => {
+    const followerFileOp = vi.fn();
+    const client = await connect(
+      createChatReadMcpServer(new FakeChatClient(), {
+        allowedSpaces: ["spaces/A"],
+        fileToolsAvailable: false,
+        followerFileOp,
+      })
+    );
+
+    const res = (await client.callTool({
+      name: "download_attachment",
+      arguments: {
+        resourceName: "spaces/B/messages/M1/attachments/ATT1",
+        destinationPath: "out.bin",
+      },
+    })) as CallToolResult;
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("access denied: space spaces/B is not in allowed spaces");
+    expect(followerFileOp).not.toHaveBeenCalled();
   });
 
   it("supports inline contentBase64 uploads in send_message", async () => {
