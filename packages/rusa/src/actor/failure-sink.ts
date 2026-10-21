@@ -228,7 +228,12 @@ export async function routeRunFailure(
   // A caught exception's own message says what went wrong; its stack does not,
   // and a long one would push the message out of the budget. Output (the stack,
   // or an ordinary CLI exit's own text) is the fallback only without a message.
-  const message = result.failure?.message.trim() ? result.failure.message : undefined;
+  // A capacity failure's output already carries its reason plus any pool
+  // aggregate (attempted/skipped entries), so it stays the diagnostic.
+  const message =
+    result.failure?.kind !== "provider-capacity" && result.failure?.message.trim()
+      ? result.failure.message
+      : undefined;
   const diagnostic = clipFailureDiagnostic(sanitizeFailureText(message ?? result.output ?? ""));
   const exitDesc = result.abortReason
     ? `exit ${result.exitCode}, ${result.abortReason}`
@@ -236,7 +241,13 @@ export async function routeRunFailure(
   const summary = `(${exitDesc})${diagnostic ? `\n\n${diagnostic}` : ""}`;
 
   let leadLine: string | undefined;
-  if (result.failure?.stage === "provider-selection") {
+  if (result.failure?.kind === "provider-capacity") {
+    // Pool attempts may also include genuine quota exhaustion, so this names
+    // only the capacity observation and denies nothing about other attempts.
+    leadLine =
+      `provider run ${providerLabel ?? "unknown provider/model"} failed: a temporary provider capacity rejection was reported. ` +
+      "That rejection is not a quota reading and implies no reset timer.";
+  } else if (result.failure?.stage === "provider-selection") {
     // Established at the resolver boundary: nothing ran, so nothing exhausted.
     leadLine = `could not prepare ${providerLabel ?? "the configured provider/model"}.\nProvider was not invoked.`;
   } else if (deps.classify) {

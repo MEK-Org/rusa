@@ -25,6 +25,11 @@ export async function classifyRunExhaustion(
   geminiApiKey?: string
 ): Promise<ExhaustionClassification> {
   if (result.success) return { exhausted: false };
+  // The Codex adapter establishes this from upstream's fixed capacity message on
+  // the latest terminal error event. It is enough to permit recovery through the
+  // already-declared pool, but is not a quota observation and must not be
+  // reclassified from text remotely.
+  if (result.failure?.kind === "provider-capacity") return { exhausted: true };
   const output = (result.output ?? "").trim();
   if (!output) return { exhausted: false };
 
