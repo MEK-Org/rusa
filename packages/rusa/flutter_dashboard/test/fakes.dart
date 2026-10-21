@@ -417,6 +417,10 @@ class FakeApi extends DashboardApi {
   /// so it cannot answer with less than the list already carried.
   final charters = <String, String>{};
   final briefs = <String, String?>{};
+
+  /// Context mode per thread; absent reads as brief mode when a brief is set,
+  /// which is the only mode the earlier route served one in, and native otherwise.
+  final contextModes = <String, String>{};
   final briefGenerations = <String, int?>{};
   final briefUpdatedAts = <String, String?>{};
   final briefRevisions = <String, List<BriefRevision>>{};
@@ -425,7 +429,7 @@ class FakeApi extends DashboardApi {
   Future<
     ({
       String charter,
-      bool briefMode,
+      String contextMode,
       String? brief,
       int? briefGeneration,
       String? briefUpdatedAt,
@@ -434,7 +438,9 @@ class FakeApi extends DashboardApi {
   >
   fetchActorInfo(String threadId) async => (
     charter: await fetchCharter(threadId),
-    briefMode: briefs.containsKey(threadId),
+    contextMode:
+        contextModes[threadId] ??
+        (briefs.containsKey(threadId) ? 'brief' : 'native'),
     brief: briefs[threadId],
     briefGeneration: briefGenerations[threadId],
     briefUpdatedAt: briefUpdatedAts[threadId],

@@ -280,6 +280,11 @@ exist (§4).
 
 ## 7. Dashboard (Option B)
 
+- The Info tab shows the actor's context mode (Native, Tail, Ledger or Brief)
+  and always shows the Brief section. In brief mode the header says `Active`.
+  In any other mode a saved brief says `Shadow · not active`, with a line saying
+  it takes effect only in Brief mode. Viewing it does not change the mode
+  ([#1126](https://github.com/MEK-Org/rusa/issues/1126)).
 - The Info tab's Brief header shows every persisted generation, including
   generation 0, and `updated <time>` (seed time at zero, accepted-write time
   thereafter). A null brief says "No brief yet." Statements render as separate

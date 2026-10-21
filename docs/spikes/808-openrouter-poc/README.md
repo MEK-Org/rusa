@@ -60,9 +60,9 @@ Each invocation starts a fresh supervised Pi RPC process, validates its exact
 model/session state using the existing protocol implementation and passes only
 the existing saved login plus temporary runtime settings.
 Pi starts in an empty temporary cwd to avoid migrating actor project files.
-Only native MCP support is loaded. `--no-builtin-tools` disables filesystem and
-shell tools while retaining granted MCP tools. `--no-tools` would disable MCP
-as well and therefore does not work for this proof.
+Pi's built-in filesystem and shell tools remain enabled alongside granted MCP
+tools. Worker launches use the shared actor Bubblewrap boundary. Only the native
+MCP extension and generated admission extension are loaded.
 
 Deadline/cancellation and settlement use the existing process-group supervisor;
 the provider awaits direct-child close and removes the temporary launch tree.

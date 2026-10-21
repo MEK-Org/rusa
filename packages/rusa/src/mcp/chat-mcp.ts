@@ -14,6 +14,10 @@ import {
 } from "../chat/types.js";
 import type { Logger } from "../observability/logger.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
+import type {
+  FollowerFileOperation,
+  FollowerFileOperationResult,
+} from "../remote-instances/protocol.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { appendVisibleActorSignature, formatVisibleActorSignature } from "./actor-signature.js";
 import { toolError, toolOk } from "./result.js";
@@ -41,6 +45,13 @@ export interface ChatReadMcpOptions {
   maxAttachmentBytes?: number;
   workDir?: string;
   fileToolsAvailable?: boolean | (() => boolean);
+  /**
+   * Runs a download on the follower hosting this actor (#1013). Returns
+   * undefined when that follower cannot run file operations.
+   */
+  followerFileOp?: (
+    operation: FollowerFileOperation
+  ) => Promise<FollowerFileOperationResult> | undefined;
 }
 
 function requireWorkDir(options: ChatReadMcpOptions): string {
@@ -48,14 +59,23 @@ function requireWorkDir(options: ChatReadMcpOptions): string {
   return options.workDir;
 }
 
-function requireFileToolsAvailable(options: ChatReadMcpOptions): void {
+function fileToolsAvailable(options: ChatReadMcpOptions): boolean {
   const available =
     typeof options.fileToolsAvailable === "function"
       ? options.fileToolsAvailable()
       : options.fileToolsAvailable;
-  if (available === false) {
+  return available !== false;
+}
+
+function followerFileOp(
+  options: ChatReadMcpOptions,
+  operation: FollowerFileOperation
+): Promise<FollowerFileOperationResult> {
+  const pending = options.followerFileOp?.(operation);
+  if (!pending) {
     throw new Error("Chat file tools are unavailable for follower-hosted actors (see #812)");
   }
+  return pending;
 }
 
 /** Read-only Google Chat tools, mounted for root or granted to space-scoped actors. */
@@ -144,7 +164,7 @@ export function createChatReadMcpServer(
         destinationPath: z
           .string()
           .describe(
-            "New file path inside your working directory for the streamed attachment. Unavailable for follower-hosted actors (see #812)."
+            "New file path inside your working directory for the streamed attachment. A follower-hosted actor's follower writes it there with its own Chat credentials."
           ),
       },
     },
@@ -175,7 +195,21 @@ export function createChatReadMcpServer(
           MAX_CHAT_ATTACHMENT_DOWNLOAD_BYTES
         );
 
-        requireFileToolsAvailable(options ?? {});
+        if (!fileToolsAvailable(options ?? {})) {
+          const result = await followerFileOp(options ?? {}, {
+            kind: "chatAttachmentDownload",
+            resourceName,
+            destinationPath,
+            maxBytes: fileLimit,
+          });
+          return toolOk({
+            path: result.path,
+            bytes: result.bytes,
+            sha256: result.sha256,
+            contentType: result.contentType,
+            name: result.name,
+          });
+        }
         const workDir = requireWorkDir(options ?? {});
         const target = await resolveDownloadPath(workDir, destinationPath);
         const { resp, name, contentType } = await chatClient.downloadAttachmentStream(

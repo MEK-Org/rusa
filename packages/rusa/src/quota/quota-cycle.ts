@@ -19,6 +19,16 @@ export const QUOTA_REFILL_EPSILON_POINTS = 2;
  */
 export const QUOTA_OBSERVATION_SLOT_MS = 5 * 60 * 1000;
 
+/**
+ * How far a window's reset instant may move between readings and still be the
+ * same instant: display jitter, not a new deadline. It is also how far ahead of
+ * a passed deadline a reading may be taken and still count as past it, so a
+ * clock trailing the provider's by less than this is not mistaken for an edit.
+ */
+export function quotaResetToleranceMs(windowMs: number): number {
+  return Math.min(60 * 60 * 1000, windowMs * 0.05);
+}
+
 /** One reading of a window, as far as its cycle identity goes. */
 export interface QuotaCycleReading {
   percentLeft: number;
@@ -51,8 +61,7 @@ export function quotaCycleChanged(
   const nextResetMs = next.resetAtIso ? Date.parse(next.resetAtIso) : Number.NaN;
   const resetMoved =
     previous.resetAtIso != null &&
-    Math.abs(Date.parse(previous.resetAtIso) - nextResetMs) >
-      Math.min(60 * 60 * 1000, windowMs * 0.05);
+    Math.abs(Date.parse(previous.resetAtIso) - nextResetMs) > quotaResetToleranceMs(windowMs);
   const quotaRefilled = next.percentLeft - previous.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
   return resetMoved || quotaRefilled;
 }

@@ -917,6 +917,32 @@ describe("sandbox bwrap args", () => {
       return { home, mcHome, actorDir, gchatDir: join(home, ".config", "gchat") };
     }
 
+    // bwrap applies mounts in argument order, so the last mount at or above a
+    // path decides what the worker sees there.
+    function lastCoveringMount(args: string[], path: string): string[] | undefined {
+      let last: string[] | undefined;
+      for (let i = 0; i < args.length; i += 1) {
+        const op = args[i];
+        const target =
+          op === "--tmpfs"
+            ? args[i + 1]
+            : op === "--bind" || op === "--ro-bind"
+              ? args[i + 2]
+              : undefined;
+        if (target && (path === target || path.startsWith(`${target}/`))) last = [op, target];
+      }
+      return last;
+    }
+
+    // Each in-sandbox path at which a host credential dir is visible is listed
+    // explicitly, so these tests do not share a blind spot with the projection
+    // logic they check.
+    function expectShadowed(args: string[], views: string[]): void {
+      for (const view of views) {
+        expect(lastCoveringMount(args, view)).toEqual(["--tmpfs", view]);
+      }
+    }
+
     it("tmpfs-shadows the host's real ~/.config/gchat dir for real workers", async () => {
       const { actorDir, gchatDir } = makeWorkerHome();
       mkdirSync(gchatDir, { recursive: true, mode: 0o700 });
@@ -975,6 +1001,123 @@ describe("sandbox bwrap args", () => {
 
       const tmpfsTargets = args.filter((_, i) => args[i - 1] === "--tmpfs");
       expect(tmpfsTargets).not.toContain(gchatDir);
+    });
+
+    it("also shadows a configured non-default chat.gchatConfigDir for real workers (#1013)", async () => {
+      const { home, actorDir, gchatDir } = makeWorkerHome();
+      mkdirSync(gchatDir, { recursive: true, mode: 0o700 });
+      // A follower may hold its own Google credentials anywhere its config says,
+      // including inside a provider state dir the sandbox later binds writable.
+      const configuredDir = join(home, ".gemini", "google-creds");
+      mkdirSync(configuredDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(configuredDir, "drive-token.json"), '{"refresh_token":"x"}', {
+        mode: 0o600,
+      });
+      mockLoadConfig.mockReturnValue({
+        github: { account: "test" },
+        providers: {},
+        webhook: { port: 9742, secret: "secret" },
+        gitBridge: false,
+        chat: { gchatConfigDir: configuredDir },
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const { args } = buildActorBwrapArgs(actorDir, "antigravity");
+
+      // A later bind of an ancestor (here the writable ~/.gemini) would expose
+      // the host dir again.
+      expect(args).toContain(join(home, ".gemini"));
+      expectShadowed(args, [configuredDir, gchatDir]);
+      warnSpy.mockRestore();
+    });
+
+    it("also shadows a configured dir where a provider bind projects it elsewhere (#1013)", async () => {
+      const { home, actorDir, gchatDir } = makeWorkerHome();
+      mkdirSync(gchatDir, { recursive: true, mode: 0o700 });
+      // kimi binds the host ~/.kimi-code/credentials onto /tmp/kimi-home/credentials,
+      // so a credential dir inside it is also visible under that second path.
+      const configuredDir = join(home, ".kimi-code", "credentials", "google-creds");
+      mkdirSync(configuredDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(configuredDir, "drive-token.json"), '{"refresh_token":"x"}', {
+        mode: 0o600,
+      });
+      mockLoadConfig.mockReturnValue({
+        github: { account: "test" },
+        providers: {},
+        webhook: { port: 9742, secret: "secret" },
+        gitBridge: false,
+        chat: { gchatConfigDir: configuredDir },
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const { args } = buildActorBwrapArgs(actorDir, "kimi");
+
+      expectShadowed(args, [configuredDir, "/tmp/kimi-home/credentials/google-creds", gchatDir]);
+      warnSpy.mockRestore();
+    });
+
+    it("shadows a provider projection of a configured dir behind a symlinked ancestor (#1013)", async () => {
+      const { home, actorDir, gchatDir } = makeWorkerHome();
+      mkdirSync(gchatDir, { recursive: true, mode: 0o700 });
+      // ~/.kimi-code is a symlink, so the resolved configured dir no longer
+      // starts with the unresolved bind source ~/.kimi-code/credentials.
+      const realKimi = join(home, "real-kimi");
+      const realDir = join(realKimi, "credentials", "google-creds");
+      mkdirSync(realDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(realDir, "drive-token.json"), '{"refresh_token":"x"}', { mode: 0o600 });
+      symlinkSync(realKimi, join(home, ".kimi-code"));
+      mockLoadConfig.mockReturnValue({
+        github: { account: "test" },
+        providers: {},
+        webhook: { port: 9742, secret: "secret" },
+        gitBridge: false,
+        chat: { gchatConfigDir: join(home, ".kimi-code", "credentials", "google-creds") },
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const { args } = buildActorBwrapArgs(actorDir, "kimi");
+
+      expect(args).toContain(join(home, ".kimi-code", "credentials"));
+      expectShadowed(args, [realDir, "/tmp/kimi-home/credentials/google-creds", gchatDir]);
+      warnSpy.mockRestore();
+    });
+
+    it("shadows a provider projection of a default dir behind a symlinked XDG_CONFIG_HOME (#1013)", async () => {
+      const { home, actorDir } = makeWorkerHome();
+      // XDG_CONFIG_HOME is a symlink into the writable ~/.kimi-code/credentials
+      // bind, so only the resolved default dir starts with that bind's source.
+      const kimiCreds = join(home, ".kimi-code", "credentials");
+      const realDir = join(kimiCreds, "gchat");
+      mkdirSync(realDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(realDir, "drive-token.json"), '{"refresh_token":"x"}', { mode: 0o600 });
+      symlinkSync(kimiCreds, join(home, "xdg"));
+      process.env.XDG_CONFIG_HOME = join(home, "xdg");
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const { args } = buildActorBwrapArgs(actorDir, "kimi");
+
+      expect(args).toContain(kimiCreds);
+      expectShadowed(args, [realDir, "/tmp/kimi-home/credentials/gchat"]);
+      warnSpy.mockRestore();
+    });
+
+    it("shadows ~/.config/gchat even when XDG_CONFIG_HOME points elsewhere (#1013)", async () => {
+      const { home, actorDir, gchatDir } = makeWorkerHome();
+      // The Google clients default to ~/.config/gchat regardless of XDG_CONFIG_HOME.
+      process.env.XDG_CONFIG_HOME = join(home, "xdg");
+      mkdirSync(gchatDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(gchatDir, "drive-token.json"), '{"refresh_token":"x"}', { mode: 0o600 });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const { args } = buildActorBwrapArgs(actorDir, "antigravity");
+
+      expectShadowed(args, [gchatDir]);
+      warnSpy.mockRestore();
     });
 
     it("is inert when the host has no ~/.config/gchat dir", async () => {

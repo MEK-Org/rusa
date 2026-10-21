@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { hostJobAuditArtifactDir } from "../actor/host-job-audit-artifact.js";
+import { defaultGchatConfigDir } from "../chat/gchat-oauth.js";
 import { loadConfig } from "../config/loader.js";
 import { assertSecretContainment, SECRETS_DIRNAME } from "../config/secrets.js";
 import { DbCapabilityGrantStore } from "../db/repositories/capability-grant-repository.js";
@@ -476,29 +477,64 @@ function injectWorkerGithubCredential(args: string[], mcHome: string): string | 
 
 /**
  * Google user-OAuth token shadow for sandboxed workers . The codebase
- * centralizes all Google user tokens (Chat, Gmail, Drive, Calendar) under the
- * single `~/.config/gchat` directory, so that is the only host path we shadow.
- * Workers have no legitimate need for raw Google tokens; chat/calendar/drive
- * access is mediated by capability-gated MCP servers on the host plane.
+ * centralizes all Google user tokens (Chat, Gmail, Drive, Calendar) under one
+ * directory: `~/.config/gchat`, or the configured `chat.gchatConfigDir`. We
+ * shadow both, since a follower holds its own Google credentials wherever its
+ * config says (#1013). Workers have no legitimate need for raw Google tokens;
+ * chat/calendar/drive access is mediated by capability-gated MCP servers on
+ * the host plane.
  *
- * We `--tmpfs`-shadow the directory after ensuring the mount point exists. This
- * hides any real `token.json`, `client.json`, `gmail-token.json`,
+ * We `--tmpfs`-shadow each directory after ensuring the mount point exists.
+ * This hides any real `token.json`, `client.json`, `gmail-token.json`,
  * `drive-token.json`, `calendar-token.json`, etc. from the sandbox. It is
  * fail-closed in the sense that a bwrap failure to apply the shadow aborts the
  * spawn; there is no opt-out or fallback that leaves the real dir visible.
+ *
+ * bwrap applies mounts in argument order, so this must run after every mount
+ * it shadows. A configured dir can sit inside a writable provider bind, which
+ * may also project it to a second path (kimi binds `~/.kimi-code/credentials`
+ * onto `/tmp/kimi-home/credentials`), so each such view is shadowed too. A
+ * configured dir that instead contains a writable bind (say `~/.gemini`) blanks
+ * it, so the worker fails closed rather than leaking.
  */
 function injectGoogleCredentialShadow(args: string[]): void {
-  const gchatConfigDir = join(getHostConfigDir(), "gchat");
+  // The Google clients default to ~/.config/gchat whatever XDG_CONFIG_HOME says.
+  // Every dir is resolved so it can be matched against resolved bind sources.
+  const dirs = new Set(
+    [join(getHostConfigDir(), "gchat"), defaultGchatConfigDir()].map(realpathIfExists)
+  );
+  try {
+    const configured = loadConfig().chat?.gchatConfigDir;
+    if (configured) dirs.add(realpathIfExists(resolve(configured)));
+  } catch {
+    // Config not found/invalid: the default shadow still applies, matching
+    // injectWorkerGithubCredential's discipline. In production the service
+    // already loaded config before any actor could spawn.
+  }
 
-  // Only shadow if the directory actually exists on the host. If it does not,
-  // there is nothing to hide at the default path, and creating a synthetic
-  // mountpoint would be inert. A configured non-default `gchatConfigDir` is
-  // out of scope for this sandbox-level shadow (residual noted in ISSUE_NUM).
-  if (!existsSync(gchatConfigDir)) return;
-
-  ensureTargetParentDirs(args, gchatConfigDir);
-  args.push("--dir", gchatConfigDir);
-  args.push("--tmpfs", gchatConfigDir);
+  const views = new Set<string>();
+  for (const dir of dirs) {
+    // Only shadow a directory that exists on the host. If it does not, there is
+    // nothing to hide there, and creating a synthetic mountpoint would be inert.
+    if (!existsSync(dir)) continue;
+    views.add(dir);
+    for (let i = 0; i < args.length; i += 1) {
+      if (args[i] !== "--bind" && args[i] !== "--ro-bind") continue;
+      const target = args[i + 2];
+      // bwrap resolves a bind source's symlinks, and `dir` is already resolved,
+      // so compare against both spellings of the source.
+      for (const source of new Set([args[i + 1], realpathIfExists(args[i + 1])])) {
+        if (dir === source || dir.startsWith(`${source}/`)) {
+          views.add(target + dir.slice(source.length));
+        }
+      }
+    }
+  }
+  for (const view of views) {
+    ensureTargetParentDirs(args, view);
+    args.push("--dir", view);
+    args.push("--tmpfs", view);
+  }
 }
 
 /**
@@ -914,10 +950,6 @@ function buildMeshActorBwrapArgs(o: {
   // both keep the host's real gh credential unconditionally.
   if (mcHome && isWorkerActor) {
     ghWrapperDir = injectWorkerGithubCredential(args, mcHome);
-    // Google user-OAuth token shadow : same real-workers-only guard as
-    // the gh credential split. Root and the E2E root-agent double keep host
-    // visibility of the real `~/.config/gchat` dir.
-    injectGoogleCredentialShadow(args);
     // Host-secrets masking : same real-workers-only guard as the gh
     // credential split above — root (unsandboxed in production) and the E2E
     // root-agent test double keep host visibility.
@@ -1155,6 +1187,13 @@ function buildMeshActorBwrapArgs(o: {
   }
   args.push("--chdir", realActorDir);
   injectGitBridgeEnv(args);
+  if (mcHome && isWorkerActor) {
+    // Google user-OAuth token shadow : same real-workers-only guard as
+    // the gh credential split. Root and the E2E root-agent double keep host
+    // visibility of the real `~/.config/gchat` dir. Last, so no later mount can
+    // bind a credential dir back in (#1013).
+    injectGoogleCredentialShadow(args);
+  }
 
   return { args, commandPrefix, tempPaths };
 }

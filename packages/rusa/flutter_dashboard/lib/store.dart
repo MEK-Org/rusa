@@ -1554,7 +1554,7 @@ class DashboardStore {
   Future<
     ({
       String charter,
-      bool briefMode,
+      String contextMode,
       String? brief,
       int? briefGeneration,
       String? briefUpdatedAt,

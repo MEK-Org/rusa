@@ -327,9 +327,9 @@ export function createSlackReadMcpServer(
           fileId,
           Math.min(options.maxFileBytes ?? MAX_SLACK_DOWNLOAD_BYTES, MAX_SLACK_DOWNLOAD_BYTES)
         );
-        // Opened only now, once Slack has answered, and walked from the root so
-        // a directory swapped during the fetch cannot redirect the write. A
-        // failed or oversized stream unlinks the partial file.
+        // Opened only now, once Slack has answered, so a refused download
+        // leaves no file behind. A failed or oversized stream unlinks the
+        // partial file.
         const { bytes, sha256 } = await streamNewFileInWorkdir(workDir, target, body);
         return toolOk({
           path: target,

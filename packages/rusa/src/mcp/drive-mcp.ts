@@ -1,6 +1,10 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { DriveClient, DriveFileMetadata } from "../drive/drive-client.js";
+import type {
+  FollowerFileOperation,
+  FollowerFileOperationResult,
+} from "../remote-instances/protocol.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 import { resolveDownloadPath, streamNewFileInWorkdir } from "./workdir-path.js";
@@ -20,6 +24,13 @@ export interface DriveReadMcpOptions {
   onRead?: (actorId: string, observation: DriveReadObservation) => void;
   workDir?: string;
   fileToolsAvailable?: boolean | (() => boolean);
+  /**
+   * Runs a download on the follower hosting this actor (#1013). Returns
+   * undefined when that follower cannot run file operations.
+   */
+  followerFileOp?: (
+    operation: FollowerFileOperation
+  ) => Promise<FollowerFileOperationResult> | undefined;
 }
 
 function requireWorkDir(options: DriveReadMcpOptions): string {
@@ -27,14 +38,23 @@ function requireWorkDir(options: DriveReadMcpOptions): string {
   return options.workDir;
 }
 
-function requireFileToolsAvailable(options: DriveReadMcpOptions): void {
+function fileToolsAvailable(options: DriveReadMcpOptions): boolean {
   const available =
     typeof options.fileToolsAvailable === "function"
       ? options.fileToolsAvailable()
       : options.fileToolsAvailable;
-  if (available === false) {
+  return available !== false;
+}
+
+function followerFileOp(
+  options: DriveReadMcpOptions,
+  operation: FollowerFileOperation
+): Promise<FollowerFileOperationResult> {
+  const pending = options.followerFileOp?.(operation);
+  if (!pending) {
     throw new Error("Drive file tools are unavailable for follower-hosted actors (see #812)");
   }
+  return pending;
 }
 
 /** Read-only Google Drive tools whose authorization is enforced at the server boundary. */
@@ -118,7 +138,7 @@ export function createDriveReadMcpServer(
         destinationPath: z
           .string()
           .describe(
-            "New file path inside your working directory for the streamed file. Unavailable for follower-hosted actors (see #812)."
+            "New file path inside your working directory for the streamed file. A follower-hosted actor's follower writes it there with its own Drive credentials."
           ),
       },
     },
@@ -126,7 +146,22 @@ export function createDriveReadMcpServer(
       try {
         const authorizedMeta = await checkFileAccess(fileId);
 
-        requireFileToolsAvailable(options);
+        if (!fileToolsAvailable(options)) {
+          const meta = authorizedMeta ?? (await client.getFileMetadata(fileId));
+          const result = await followerFileOp(options, {
+            kind: "driveFileDownload",
+            fileId,
+            destinationPath,
+          });
+          options.onRead?.(actorId, { operation: "download_file", fileId });
+          return toolOk({
+            path: result.path,
+            bytes: result.bytes,
+            sha256: result.sha256,
+            contentType: meta.mimeType || result.contentType || "application/octet-stream",
+            name: meta.name,
+          });
+        }
         const workDir = requireWorkDir(options);
         const target = await resolveDownloadPath(workDir, destinationPath);
         const meta = authorizedMeta ?? (await client.getFileMetadata(fileId));

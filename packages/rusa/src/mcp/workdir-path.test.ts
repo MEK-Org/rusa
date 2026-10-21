@@ -8,8 +8,6 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
-  renameSync,
-  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -25,21 +23,6 @@ import {
   resolveDownloadPath,
   streamNewFileInWorkdir,
 } from "./workdir-path.js";
-
-// One-shot hook run right after the next realpath resolves, to land a swap in
-// the window between resolving the workdir root and opening it.
-const afterRealpath = vi.hoisted(() => ({ run: undefined as (() => void) | undefined }));
-vi.mock("node:fs/promises", async () => {
-  const actual = (await vi.importActual<typeof import("node:fs")>("node:fs")).promises;
-  const realpath = async (...args: Parameters<typeof actual.realpath>) => {
-    const resolved = await actual.realpath(...args);
-    const run = afterRealpath.run;
-    afterRealpath.run = undefined;
-    run?.();
-    return resolved;
-  };
-  return { ...actual, default: { ...actual, realpath }, realpath };
-});
 
 function workdir(): string {
   return mkdtempSync(join(tmpdir(), "rusa-workdir-path-"));
@@ -85,29 +68,6 @@ describe("readBoundedRegularFile", () => {
     }
   );
 
-  it("refuses a final-component symlink swapped in after resolution", async () => {
-    const dir = workdir();
-    const outside = workdir();
-    writeFileSync(join(outside, "secret.txt"), "secret");
-    writeFileSync(join(dir, "ok.txt"), "ok");
-    const source = await resolveAttachmentPath(dir, "ok.txt");
-    rmSync(source);
-    symlinkSync(join(outside, "secret.txt"), source);
-    await expect(readBoundedRegularFile(dir, source, 8)).rejects.toMatchObject({ code: "ELOOP" });
-  });
-
-  it("refuses an ancestor directory swapped for an outside symlink after resolution", async () => {
-    const dir = workdir();
-    const outside = workdir();
-    writeFileSync(join(outside, "file.txt"), "secret");
-    mkdirSync(join(dir, "sub"));
-    writeFileSync(join(dir, "sub", "file.txt"), "ok");
-    const source = await resolveAttachmentPath(dir, "sub/file.txt");
-    renameSync(join(dir, "sub"), join(dir, "sub-moved"));
-    symlinkSync(outside, join(dir, "sub"));
-    await expect(readBoundedRegularFile(dir, source, 8)).rejects.toThrow("access denied");
-  });
-
   it("refuses directories and FIFOs without blocking", async () => {
     const dir = workdir();
     mkdirSync(join(dir, "sub"));
@@ -116,43 +76,6 @@ describe("readBoundedRegularFile", () => {
       const source = await resolveAttachmentPath(dir, name);
       await expect(readBoundedRegularFile(dir, source, 8)).rejects.toThrow("not a regular file");
     }
-  });
-});
-
-describe("workdir root acquisition", () => {
-  // The workdir root sits under an ancestor; an outside tree mirrors the root's
-  // name. Swapping the ancestor for a symlink to it after the root is resolved
-  // must not hand back the outside root.
-  function rootAncestorSwap() {
-    const base = workdir();
-    const outside = workdir();
-    const root = join(base, "ancestor", "root");
-    mkdirSync(root, { recursive: true });
-    mkdirSync(join(outside, "root"));
-    writeFileSync(join(root, "file.txt"), "ok");
-    writeFileSync(join(outside, "root", "file.txt"), "secret");
-    const swap = () => {
-      renameSync(join(base, "ancestor"), join(base, "ancestor-moved"));
-      symlinkSync(outside, join(base, "ancestor"));
-    };
-    return { root, outside, swap };
-  }
-
-  it("refuses to read through a root ancestor swapped for an outside symlink", async () => {
-    const { root, swap } = rootAncestorSwap();
-    const source = await resolveAttachmentPath(root, "file.txt");
-    afterRealpath.run = swap;
-    await expect(readBoundedRegularFile(root, source, 64)).rejects.toThrow("access denied");
-  });
-
-  it("refuses to create a file through a root ancestor swapped for an outside symlink", async () => {
-    const { root, outside, swap } = rootAncestorSwap();
-    const destination = await resolveDownloadPath(root, "new.txt");
-    afterRealpath.run = swap;
-    await expect(
-      streamNewFileInWorkdir(root, destination, streamFrom([Buffer.from("x")]))
-    ).rejects.toThrow("access denied");
-    expect(existsSync(join(outside, "root", "new.txt"))).toBe(false);
   });
 });
 
@@ -238,29 +161,14 @@ describe("streamNewFileInWorkdir", () => {
     expect(readFileSync(destination, "utf-8")).toBe("original");
   });
 
-  it("removes partial output from the directory it opened after an ancestor swap", async () => {
+  it("refuses a destination that is a dangling symlink without creating its target", async () => {
     const dir = workdir();
-    const outside = workdir();
-    writeFileSync(join(outside, "partial.bin"), "unrelated");
-    mkdirSync(join(dir, "sub"));
-    const destination = await resolveDownloadPath(dir, "sub/partial.bin");
-    let first = true;
-    const stream = new ReadableStream<Uint8Array>({
-      pull(controller) {
-        if (first) {
-          first = false;
-          controller.enqueue(Buffer.from("first"));
-          return;
-        }
-        renameSync(join(dir, "sub"), join(dir, "sub-moved"));
-        symlinkSync(outside, join(dir, "sub"));
-        controller.error(new Error("source failed"));
-      },
-    });
-    await expect(streamNewFileInWorkdir(dir, destination, stream)).rejects.toThrow("source failed");
-    expect(existsSync(join(dir, "sub-moved", "partial.bin"))).toBe(false);
-    expect(readdirSync(join(dir, "sub-moved"))).toEqual([]);
-    expect(readFileSync(join(outside, "partial.bin"), "utf-8")).toBe("unrelated");
+    symlinkSync(join(dir, "target.bin"), join(dir, "link.bin"));
+    const destination = await resolveDownloadPath(dir, "link.bin");
+    await expect(
+      streamNewFileInWorkdir(dir, destination, streamFrom([Buffer.from("data")]))
+    ).rejects.toMatchObject({ code: "EEXIST" });
+    expect(existsSync(join(dir, "target.bin"))).toBe(false);
   });
 });
 

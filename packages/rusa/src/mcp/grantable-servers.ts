@@ -7,6 +7,10 @@ import type { GmailClient } from "../email/gmail-client.js";
 import type { Logger } from "../observability/logger.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { McpServerSpec } from "../providers/types.js";
+import type {
+  FollowerFileOperation,
+  FollowerFileOperationResult,
+} from "../remote-instances/protocol.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import type { SlackClient } from "../slack/slack-client.js";
 import {
@@ -89,6 +93,11 @@ export interface GrantableServerDeps {
   actorHandleFor?: (actorId: string) => string;
   /** Whether a grantee's file tools can access the host where it executes. */
   fileToolsAvailableForActor?: (actorId: string) => boolean;
+  /** Runs a download on a follower-hosted grantee's follower; undefined keeps the refusal (#1013). */
+  followerFileOpForActor?: (
+    actorId: string,
+    operation: FollowerFileOperation
+  ) => Promise<FollowerFileOperationResult> | undefined;
   driveClients: DriveClient;
   onDriveRead?: (actorId: string, observation: DriveReadObservation) => void;
   /**
@@ -197,6 +206,12 @@ export function buildGrantableServers(
           ...(workDir ? { workDir } : {}),
           ...(deps.fileToolsAvailableForActor
             ? { fileToolsAvailable: () => deps.fileToolsAvailableForActor?.(selfId) ?? false }
+            : {}),
+          ...(deps.followerFileOpForActor
+            ? {
+                followerFileOp: (operation: FollowerFileOperation) =>
+                  deps.followerFileOpForActor?.(selfId, operation),
+              }
             : {}),
         });
       },
