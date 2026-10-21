@@ -1539,6 +1539,36 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
     ).not.toThrow();
   });
 
+  it("re-adopts a running actor after a same-process leader rehydration (#963)", async () => {
+    const held = releasableCapabilityProvider();
+    const factory = vi.fn(held.factory);
+    const h = setup({ providerFactory: factory });
+    const charter = "Retained across sessionless rehydration";
+    const id = h.spawn(charter);
+    await waitUntil(() => h.runtime(id).isRunning);
+
+    // The old leader-side channel is gone, but the same follower process still
+    // holds its running runtime. A replacement handle with no saved provider
+    // session must therefore be allowed to adopt it rather than create it.
+    h.remote.close();
+    await h.runtime(id).exited;
+    expect(() =>
+      h.follower.dispatch({
+        actorId: id,
+        message: {
+          type: "init",
+          bootstrap: { id, cwd: "/ignored-leader-path", reconnect: true },
+        },
+      })
+    ).not.toThrow();
+    expect(h.follower.actorIds).toEqual([id]);
+    // Reconnect dispatch reaches the retained Actor rather than constructing a
+    // second provider/runtime under the same actor id.
+    expect(factory).toHaveBeenCalledTimes(1);
+
+    held.release(charter);
+  });
+
   // Issue #679 regressions
   it("rebinds and dispatches pending durable work after lease flap following remote_run_end without remote_attach_after_close", async () => {
     const h = setup();
