@@ -236,10 +236,19 @@ function outputCount(counts: GeminiCounts): number | null {
 function actorKey(actorId: string | null): string {
   return JSON.stringify(actorId);
 }
-function percentile(samples: number[], fraction: number): number | null {
-  if (samples.length === 0) return null;
-  const ordered = [...samples].sort((a, b) => a - b);
-  return ordered[Math.ceil(ordered.length * fraction) - 1] ?? null;
+function inputPerCall(samples: number[]): InputPerCall {
+  if (samples.length === 0) return { max: null, p50: null, p90: null };
+  // The accumulator is private to this actor and is no longer needed after
+  // finalization. Sort once without spreading it into a call: one actor can
+  // legitimately own every sample in the report's one-million-attempt limit.
+  samples.sort((a, b) => a - b);
+  const nearestRank = (fraction: number) =>
+    samples[Math.ceil(samples.length * fraction) - 1] ?? null;
+  return {
+    max: samples.at(-1) ?? null,
+    p50: nearestRank(0.5),
+    p90: nearestRank(0.9),
+  };
 }
 function finalizeActor(actor: UsageActorAccumulator): UsageActor {
   return {
@@ -248,11 +257,7 @@ function finalizeActor(actor: UsageActorAccumulator): UsageActor {
     calls: actor.calls,
     input: actor.input,
     output: actor.output,
-    inputPerCall: {
-      max: actor.inputSamples.length === 0 ? null : Math.max(...actor.inputSamples),
-      p50: percentile(actor.inputSamples, 0.5),
-      p90: percentile(actor.inputSamples, 0.9),
-    },
+    inputPerCall: inputPerCall(actor.inputSamples),
   };
 }
 function bounds(coverage: SourceCoverage, kind: "log" | "usage", time: string): void {
