@@ -1401,9 +1401,15 @@ export async function handleMeshApiRequest(
         sendJson(res, 503, { error: "operator actor control unavailable" });
         return true;
       }
-      const actorId = decodeURIComponent(retireActorMatch[1]);
       const principal = requireOperatorPrincipal(req, res, deps);
       if (!principal) return true;
+      let actorId: string;
+      try {
+        actorId = decodeURIComponent(retireActorMatch[1]);
+      } catch {
+        sendJson(res, 400, { error: "malformed actor id" });
+        return true;
+      }
       try {
         operatorActors.retire(actorId, principal);
         sendJson(res, 200, { ok: true });
