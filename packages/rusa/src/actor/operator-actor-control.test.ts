@@ -10,6 +10,7 @@ import {
   OperatorActorControl,
   type OperatorObligationsAdminAudit,
   type OperatorReparentAudit,
+  type OperatorRetireAudit,
 } from "./operator-actor-control.js";
 
 const OPERATOR = "00000000-0000-4000-8000-000000000001";
@@ -53,12 +54,17 @@ function setup() {
     events
       .filter((event) => event.kind === "operator_obligations_admin")
       .map((event) => JSON.parse(event.payload ?? "{}") as OperatorObligationsAdminAudit);
+  const retirementAudits = (): OperatorRetireAudit[] =>
+    events
+      .filter((event) => event.kind === "operator_actor_retire")
+      .map((event) => JSON.parse(event.payload ?? "{}") as OperatorRetireAudit);
   return {
     actors,
     events,
     grants,
     audits,
     obligationAudits,
+    retirementAudits,
     control: new OperatorActorControl(mesh, grants, () => "2026-10-16T05:30:00.000Z"),
   };
 }
@@ -152,6 +158,30 @@ describe("OperatorActorControl (#1003)", () => {
     expect(actors.get("worker")?.parentId).toBe("steward");
     expect(audits()).toEqual([
       expect.objectContaining({ principal: "root-llm", actorId: "worker", outcome: "denied" }),
+    ]);
+  });
+
+  it("retires a detached actor through the authenticated operator boundary and audits it", () => {
+    const { actors, events, retirementAudits, control } = setup();
+
+    control.reparent("worker", null, OPERATOR);
+    control.retire("worker", OPERATOR);
+
+    expect(actors.get("worker")?.status).toBe("retired");
+    expect(retirementAudits()).toEqual([{ principal: OPERATOR, actorId: "worker", outcome: "ok" }]);
+    expect(events.filter((event) => event.kind === "operator_actor_retire")).toHaveLength(1);
+  });
+
+  it("refuses and audits root-LLM and already-retired operator retirement requests", () => {
+    const { actors, retirementAudits, control } = setup();
+    actors.patch("other-child", { status: "retired" });
+
+    expect(() => control.retire("worker", "root-llm")).toThrow(/human operator/);
+    expect(() => control.retire("other-child", OPERATOR)).toThrow(/not active/);
+    expect(actors.get("worker")?.status).toBe("active");
+    expect(retirementAudits()).toEqual([
+      expect.objectContaining({ principal: "root-llm", actorId: "worker", outcome: "denied" }),
+      expect.objectContaining({ principal: OPERATOR, actorId: "other-child", outcome: "denied" }),
     ]);
   });
 

@@ -25,6 +25,15 @@ export interface OperatorObligationsAdminAudit {
   reason?: string;
 }
 
+/** An authenticated human operator's request to retire an actor. */
+export interface OperatorRetireAudit {
+  principal: string;
+  actorId: string;
+  outcome: "ok" | "denied";
+  /** Why a denied retirement was refused by the mesh at mutation time. */
+  reason?: string;
+}
+
 /** Durable readback returned after the operator action commits. */
 export interface ObligationsAdminBinding {
   actorId: string;
@@ -34,9 +43,10 @@ export interface ObligationsAdminBinding {
 
 export interface OperatorActorControlMesh {
   reparentThread(id: string, newParentId: string | null): void;
+  retire(id: string): void;
   resolveActorId(id: string): string;
   recordEvent(event: {
-    kind: "operator_actor_reparent" | "operator_obligations_admin";
+    kind: "operator_actor_reparent" | "operator_obligations_admin" | "operator_actor_retire";
     actorId: string;
     detail?: string;
     payload?: string;
@@ -87,6 +97,47 @@ export class OperatorActorControl {
     }
     try {
       this.mesh.reparentThread(canonicalActorId, canonicalParentId);
+    } catch (err) {
+      audit("denied", err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+    audit("ok");
+  }
+
+  /**
+   * The authenticated operator may retire any active actor, including one
+   * detached from every actor-owned subtree (#1085). The operator boundary
+   * checks that the target is active immediately before the synchronous mesh
+   * mutation; the mesh remains the lifecycle authority for all run, work,
+   * message, and subscription retirement guards.
+   */
+  retire(actorId: string, principal: RootControlPrincipal): void {
+    const canonicalActorId = this.mesh.resolveActorId(actorId);
+    const audit = (outcome: OperatorRetireAudit["outcome"], reason?: string) =>
+      this.recordRetirement({
+        principal,
+        actorId: canonicalActorId,
+        outcome,
+        ...(reason !== undefined ? { reason } : {}),
+      });
+    if (principal === "root-llm") {
+      const reason = "only an authenticated human operator may use the operator retire boundary";
+      audit("denied", reason);
+      throw new Error(reason);
+    }
+    const target = this.mesh.list().find((record) => record.id === canonicalActorId);
+    if (!target) {
+      const reason = `unknown actor: ${canonicalActorId}`;
+      audit("denied", reason);
+      throw new Error(reason);
+    }
+    if (target.status !== "active") {
+      const reason = `cannot retire actor ${canonicalActorId}: actor is not active`;
+      audit("denied", reason);
+      throw new Error(reason);
+    }
+    try {
+      this.mesh.retire(canonicalActorId);
     } catch (err) {
       audit("denied", err instanceof Error ? err.message : String(err));
       throw err;
@@ -161,6 +212,15 @@ export class OperatorActorControl {
       kind: "operator_obligations_admin",
       actorId: audit.actorId,
       detail: `${audit.principal} ${audit.enabled ? "enabled" : "revoked"} obligations-admin: ${audit.outcome}`,
+      payload: JSON.stringify(audit),
+    });
+  }
+
+  private recordRetirement(audit: OperatorRetireAudit): void {
+    this.mesh.recordEvent({
+      kind: "operator_actor_retire",
+      actorId: audit.actorId,
+      detail: `${audit.principal} retire ${audit.outcome}`,
       payload: JSON.stringify(audit),
     });
   }
