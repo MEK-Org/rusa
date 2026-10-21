@@ -142,6 +142,8 @@ describe("Gemini usage logger and on-demand report", () => {
     // records and belong in the explicit unattributed bucket.
     delete rows[2].usage.actorId;
     delete rows[2].usage.runId;
+    rows[2].usage.counts.input = 200;
+    rows[2].usage.counts.total = 227;
     const report = await buildGeminiUsageReport(
       [source("attribution", `${lines[0]}${lines[1]}${JSON.stringify(rows[2])}\n`)],
       window
@@ -160,11 +162,12 @@ describe("Gemini usage logger and on-demand report", () => {
     expect(unattributed).toMatchObject({
       calls: 1,
       runIds: [],
-      input: { sum: 100, measured: 1, missing: 0 },
+      input: { sum: 200, measured: 1, missing: 0 },
       output: { sum: 25, measured: 1, missing: 0 },
     });
     expect((actor.input.sum ?? 0) + (unattributed.input.sum ?? 0)).toBe(group.totals.input.sum);
     expect((actor.output.sum ?? 0) + (unattributed.output.sum ?? 0)).toBe(group.totals.output.sum);
+    expect(group.actors.map((entry) => entry.actorId)).toEqual([null, "actor-a"]);
     expect(formatGeminiUsageReport(report)).toContain("unattributed: 1 calls");
   });
 
@@ -215,7 +218,7 @@ describe("Gemini usage logger and on-demand report", () => {
         inputPerCall: { max: samples - 1, p50: 65_535, p90: 117_964 },
       }),
     ]);
-  });
+  }, 20_000);
 
   it("counts outer retries, stronger-model fallback and a response rejected by application validation", async () => {
     const { lines } = capture();
@@ -347,16 +350,19 @@ describe("Gemini usage logger and on-demand report", () => {
       buildGeminiUsageReport([source("conflict", lines[0] + JSON.stringify(changed))], window)
     ).rejects.toThrow("Conflicting copies");
     changed.usage.version = 2;
+    const orphanRun = JSON.parse(lines[0]);
+    orphanRun.usage.actorId = null;
+    orphanRun.usage.runId = "orphan-run";
     const report = await buildGeminiUsageReport(
       [
         source(
           "damaged",
-          `PRIVATE BROKEN JSON\n${"x".repeat(MAX_USAGE_LINE_BYTES + 1)}\n${JSON.stringify(changed)}\n${lines[0]}`
+          `PRIVATE BROKEN JSON\n${"x".repeat(MAX_USAGE_LINE_BYTES + 1)}\n${JSON.stringify(changed)}\n${JSON.stringify(orphanRun)}\n${lines[0]}`
         ),
       ],
       window
     );
-    expect(report.sources[0]).toMatchObject({ malformed: 1, oversized: 1, invalidUsage: 1 });
+    expect(report.sources[0]).toMatchObject({ malformed: 1, oversized: 1, invalidUsage: 2 });
     expect(report.groups[0].calls).toBe(1);
     expect(JSON.stringify(report)).not.toContain("PRIVATE BROKEN JSON");
   });

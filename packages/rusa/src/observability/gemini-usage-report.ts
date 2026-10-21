@@ -105,6 +105,7 @@ function parseUsage(value: unknown): GeminiUsageRecord | null {
     !occurredAt ||
     actorId === undefined ||
     runId === undefined ||
+    (actorId === null && runId !== null) ||
     !GEMINI_USAGE_PURPOSES.includes(r.purpose) ||
     !["response", "error", "cancelled"].includes(r.outcome) ||
     !["complete", "partial", "missing"].includes(r.usage) ||
@@ -201,22 +202,10 @@ function totals(): Totals {
 function addCounts(target: Totals, counts: GeminiCounts): void {
   const values = {
     ...counts,
-    output:
-      counts.response !== null && counts.thinking !== null
-        ? counts.response + counts.thinking
-        : null,
+    output: outputCount(counts),
   };
-  for (const key of Object.keys(values) as (keyof Totals)[]) {
-    const value = values[key];
-    if (value === null) {
-      target[key].missing++;
-      continue;
-    }
-    const sum = (target[key].sum ?? 0) + value;
-    if (!Number.isSafeInteger(sum)) throw new Error("Usage aggregate exceeds safe integer range");
-    target[key].sum = sum;
-    target[key].measured++;
-  }
+  for (const key of Object.keys(values) as (keyof Totals)[])
+    addMeasurement(target[key], values[key]);
 }
 function addMeasurement(target: Measurement, value: number | null): void {
   if (value === null) {
@@ -233,9 +222,6 @@ function outputCount(counts: GeminiCounts): number | null {
     ? counts.response + counts.thinking
     : null;
 }
-function actorKey(actorId: string | null): string {
-  return JSON.stringify(actorId);
-}
 function inputPerCall(samples: number[]): InputPerCall {
   if (samples.length === 0) return { max: null, p50: null, p90: null };
   // The accumulator is private to this actor and is no longer needed after
@@ -249,6 +235,13 @@ function inputPerCall(samples: number[]): InputPerCall {
     p50: nearestRank(0.5),
     p90: nearestRank(0.9),
   };
+}
+function compareActors(a: UsageActor, b: UsageActor): number {
+  const byInput = (b.input.sum ?? -1) - (a.input.sum ?? -1);
+  if (byInput) return byInput;
+  if (a.actorId === null) return b.actorId === null ? 0 : 1;
+  if (b.actorId === null) return -1;
+  return a.actorId.localeCompare(b.actorId);
 }
 function finalizeActor(actor: UsageActorAccumulator): UsageActor {
   return {
@@ -293,7 +286,7 @@ export async function buildGeminiUsageReport(
   };
   const seen = new Map<string, string>();
   const groups = new Map<string, UsageGroup>();
-  const actors = new Map<string, Map<string, UsageActorAccumulator>>();
+  const actors = new Map<string, Map<string | null, UsageActorAccumulator>>();
   const instances = new Set<string>();
   const processes = new Set<string>();
   for (const source of sources) {
@@ -374,8 +367,7 @@ export async function buildGeminiUsageReport(
         actorGroups = new Map();
         actors.set(key, actorGroups);
       }
-      const keyForActor = actorKey(record.actorId);
-      let actor = actorGroups.get(keyForActor);
+      let actor = actorGroups.get(record.actorId);
       if (!actor) {
         actor = {
           actorId: record.actorId,
@@ -385,7 +377,7 @@ export async function buildGeminiUsageReport(
           output: { sum: null, measured: 0, missing: 0 },
           inputSamples: [],
         };
-        actorGroups.set(keyForActor, actor);
+        actorGroups.set(record.actorId, actor);
       }
       actor.calls++;
       if (record.runId !== null) actor.runIds.add(record.runId);
@@ -408,9 +400,7 @@ export async function buildGeminiUsageReport(
   report.groups = [...groups.entries()]
     .map(([key, group]) => ({
       ...group,
-      actors: [...(actors.get(key)?.values() ?? [])]
-        .map(finalizeActor)
-        .sort((a, b) => (a.actorId ?? "\uffff").localeCompare(b.actorId ?? "\uffff")),
+      actors: [...(actors.get(key)?.values() ?? [])].map(finalizeActor).sort(compareActors),
     }))
     .sort(
       (a, b) =>

@@ -110,7 +110,9 @@ export function beginGeminiAttempt(
   const logger = usageLogger;
   const instance = instanceId;
   const actorId = usageIdentifier(attribution?.actorId);
-  const runId = usageIdentifier(attribution?.runId);
+  // A run always belongs to an actor. Do not create an orphan run id when a
+  // caller only has instance-level context.
+  const runId = actorId === null ? null : usageIdentifier(attribution?.runId);
   let counts = geminiCounts(undefined);
   let model = requestedModel;
   let finished = false;

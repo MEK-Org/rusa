@@ -55,8 +55,9 @@ normal logger defaults. `model` is the API's `modelVersion` when returned,
 otherwise the requested model; `requestedModel` preserves the requested alias.
 
 `actorId` and `runId` are recorded only when the caller already has them in
-scope; absent attribution is represented as `null`, including in legacy v1
-records that predate these fields. Under each purpose/model group, the report
+scope; a non-null run id always has a non-null actor id. Absent attribution is
+represented as `null`, including in legacy v1 records that predate these
+fields. Under each purpose/model group, the report
 breaks out actor calls, measured input/output sums and input-per-call max/p50/p90
 (using nearest-rank percentiles);
 the explicit `unattributed` bucket holds null actor ids. JSON includes each

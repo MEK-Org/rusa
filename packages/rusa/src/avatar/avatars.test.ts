@@ -210,6 +210,11 @@ describe("with an isolated RUSA_HOME", () => {
   });
 
   it("generateAvatarForce supports root actor avatar generation", async () => {
+    const lines: string[] = [];
+    configureGeminiUsage(
+      createLogger({ format: "json", destination: { write: (line) => lines.push(line) } }),
+      "/synthetic/root-avatar"
+    );
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -226,8 +231,14 @@ describe("with an isolated RUSA_HOME", () => {
     try {
       await generateAvatarForce("root", { apiKey: "key" });
       expect(readAvatar("root")?.body.equals(PNG_BYTES)).toBe(true);
+      expect(JSON.parse(lines[0] ?? "{}").usage).toMatchObject({
+        purpose: "avatar_generation",
+        actorId: "root",
+        runId: null,
+      });
     } finally {
       fetchMock.mockRestore();
+      configureGeminiUsage(nullLogger, "/synthetic/test");
     }
   });
 
