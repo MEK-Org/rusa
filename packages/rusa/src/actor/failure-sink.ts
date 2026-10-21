@@ -236,7 +236,11 @@ export async function routeRunFailure(
   const summary = `(${exitDesc})${diagnostic ? `\n\n${diagnostic}` : ""}`;
 
   let leadLine: string | undefined;
-  if (result.failure?.stage === "provider-selection") {
+  if (result.failure?.kind === "provider-capacity") {
+    leadLine =
+      `provider capacity unavailable: ${providerLabel ?? "unknown provider/model"}. ` +
+      "The provider reported a temporary capacity rejection; no quota exhaustion or reset was inferred.";
+  } else if (result.failure?.stage === "provider-selection") {
     // Established at the resolver boundary: nothing ran, so nothing exhausted.
     leadLine = `could not prepare ${providerLabel ?? "the configured provider/model"}.\nProvider was not invoked.`;
   } else if (deps.classify) {

@@ -1215,6 +1215,79 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
     expect(result.output).toContain("usage limit reached");
   });
 
+  it("preserves a terminal Codex capacity rejection after assistant progress", async () => {
+    const { result, live } = await runWithStream({
+      exitCode: 1,
+      stdout:
+        line({
+          type: "item.completed",
+          item: {
+            id: "item_1",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "I inspected the current implementation." }],
+          },
+        }) +
+        line({
+          type: "turn.failed",
+          error: {
+            codex_error_info: "server_overloaded",
+            message: "Selected model is at capacity. Please try a different model.",
+          },
+        }),
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      output:
+        "I inspected the current implementation.\n\n[terminal provider capacity: Selected model is at capacity. Please try a different model.]",
+      failure: {
+        kind: "provider-capacity",
+        message: "Selected model is at capacity. Please try a different model.",
+      },
+    });
+    expect(live.join("")).toContain("Selected model is at capacity");
+  });
+
+  it("preserves a pre-progress terminal Codex capacity rejection without raw JSONL", async () => {
+    const { result } = await runWithStream({
+      exitCode: 1,
+      stdout: line({
+        type: "error",
+        codex_error_info: "server_overloaded",
+        message: "Selected model is at capacity. Please try a different model.",
+      }),
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      output:
+        "[terminal provider capacity: Selected model is at capacity. Please try a different model.]",
+      failure: {
+        kind: "provider-capacity",
+        message: "Selected model is at capacity. Please try a different model.",
+      },
+    });
+    expect(result.output).not.toContain('"codex_error_info"');
+  });
+
+  it("keeps ordinary successful assistant output free of a terminal failure", async () => {
+    const { result } = await runWithStream({
+      stdout: line({
+        type: "item.completed",
+        item: {
+          id: "item_1",
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "All done." }],
+        },
+      }),
+    });
+
+    expect(result).toMatchObject({ success: true, output: "All done." });
+    expect(result.failure).toBeUndefined();
+  });
+
   it("does not forward the rendered stderr stream to live output", async () => {
     const { result, live } = await runWithStream({
       stderr: "Thinking...\nrunning `cargo build`...\n",

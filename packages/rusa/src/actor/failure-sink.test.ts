@@ -360,6 +360,39 @@ describe("routeRunFailure", () => {
       expect(body).toContain("boom");
     });
 
+    it("names a structured temporary provider-capacity rejection without fabricating quota exhaustion", async () => {
+      let classifyCalls = 0;
+      const { deps, toParent } = makeDeps(
+        { w1: { id: "w1", parentId: "root" } },
+        {
+          classify: async () => {
+            classifyCalls++;
+            return { exhausted: true };
+          },
+        }
+      );
+      await routeRunFailure(
+        deps,
+        "w1",
+        {
+          success: false,
+          output: "[terminal provider capacity: Selected model is at capacity.]",
+          exitCode: 1,
+          failure: {
+            kind: "provider-capacity",
+            message: "Selected model is at capacity.",
+          },
+        },
+        "codex/gpt-5"
+      );
+
+      const body = toParent[0]?.body ?? "";
+      expect(classifyCalls).toBe(0);
+      expect(body).toContain("provider capacity unavailable: codex/gpt-5");
+      expect(body).toContain("Selected model is at capacity.");
+      expect(body).not.toContain("quota exhausted");
+    });
+
     it("labels a non-exhausted provider run failure", async () => {
       const { deps, toParent } = makeDeps(
         { w1: { id: "w1", parentId: "root" } },

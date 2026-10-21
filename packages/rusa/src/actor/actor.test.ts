@@ -1028,6 +1028,86 @@ describe("Actor", () => {
     expect(seen[0]?.output).toBe("ordinary failure");
   });
 
+  it("recovers a typed temporary provider-capacity rejection through the declared next pool entry", async () => {
+    const primary = new FakeProvider(
+      () => ({
+        success: false,
+        output: "[terminal provider capacity: Selected model is at capacity.]",
+        exitCode: 1,
+        failure: { kind: "provider-capacity" as const, message: "Selected model is at capacity." },
+      }),
+      "primary-model"
+    );
+    const fallback = new FakeProvider(() => ({ success: true, output: "recovered", exitCode: 0 }));
+    const seen: RunResult[] = [];
+    const actor = makeActor(
+      {
+        modelConfig: [
+          { provider: "primary", model: "primary-model" },
+          { provider: "fallback", model: "fallback-model" },
+        ],
+        resolveProvider: (entry) => (entry.provider === "fallback" ? fallback : primary),
+        classifyExhaustion: async (result) =>
+          result.failure?.kind === "provider-capacity" ? { exhausted: true } : { exhausted: false },
+        onRunEnd: (result) => seen.push(result),
+      },
+      primary
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(primary.calls).toHaveLength(1);
+    expect(fallback.calls).toHaveLength(1);
+    expect(seen).toMatchObject([{ success: true, output: "recovered" }]);
+  });
+
+  it("keeps a typed temporary provider-capacity reason visible when no configured fallback is eligible", async () => {
+    const primary = new FakeProvider(
+      () => ({
+        success: false,
+        output: "[terminal provider capacity: Selected model is at capacity.]",
+        exitCode: 1,
+        failure: { kind: "provider-capacity" as const, message: "Selected model is at capacity." },
+      }),
+      "primary-model"
+    );
+    const unavailableFallback = new FakeProvider(
+      () => ({ success: true, output: "must not run", exitCode: 0 }),
+      "fallback-model"
+    );
+    const seen: RunResult[] = [];
+    const actor = makeActor(
+      {
+        modelConfig: [
+          { provider: "primary", model: "primary-model" },
+          { provider: "fallback", model: "fallback-model" },
+        ],
+        resolveProvider: (entry) => (entry.provider === "fallback" ? unavailableFallback : primary),
+        classifyExhaustion: async (result) =>
+          result.failure?.kind === "provider-capacity" ? { exhausted: true } : { exhausted: false },
+        recoveryEligibility: (entry) =>
+          entry.provider === "fallback"
+            ? { eligible: false, reason: "halted" }
+            : { eligible: true },
+        onRunEnd: (result) => seen.push(result),
+      },
+      primary
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(seen[0]).toMatchObject({
+      success: false,
+      failure: { kind: "provider-capacity", message: "Selected model is at capacity." },
+    });
+    expect(seen[0]?.output).toContain("Selected model is at capacity.");
+    expect(seen[0]?.output.toLowerCase()).not.toContain("quota exhausted");
+    expect(seen[0]?.output).toContain("fallback:fallback-model (halted)");
+    expect(unavailableFallback.calls).toHaveLength(0);
+  });
+
   it("recovers through a later configured pool entry in order with intact tuples", async () => {
     const primary = new FakeProvider(
       () => ({ success: false, output: "quota exhausted first", exitCode: 1 }),
