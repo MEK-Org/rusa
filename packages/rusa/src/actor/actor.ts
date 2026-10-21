@@ -1133,7 +1133,6 @@ export class Actor {
           }),
           exitCode: lastResult.exitCode || 1,
           sessionId: lastResult.sessionId,
-          ...(capacityFailure ? { failure: capacityFailure } : {}),
         };
       }
       attempted.push(entry);
@@ -1150,13 +1149,13 @@ export class Actor {
         // lead the output with the exhaustion that actually caused this run.
         return {
           ...recoveryResult,
+          failure: undefined,
           output: formatPoolRecoveryFailure({
             primaryName,
             recoveryEntry: describeModelConfigEntry(entry),
             recoveryOutput: recoveryResult.output,
             primaryCapacityReason: capacityFailure?.message,
           }),
-          ...(capacityFailure ? { failure: capacityFailure } : {}),
         };
       }
       failed = entry;
@@ -1228,7 +1227,9 @@ export function formatPoolExhaustedFailure(input: {
   if (input.capacityReason) {
     const totalConfigured = input.attempted.length + (input.skipped?.length ?? 0);
     const lines = [
-      `model pool recovery unavailable: ${input.attempted.length} of ${totalConfigured} configured pool ${totalConfigured === 1 ? "entry" : "entries"} reported temporary provider capacity unavailability.`,
+      input.skipped && input.skipped.length > 0
+        ? `model pool exhausted: ${input.attempted.length} of ${totalConfigured} configured pool ${totalConfigured === 1 ? "entry" : "entries"} reported provider capacity/quota exhaustion; ${input.skipped.length} skipped as currently ineligible.`
+        : `model pool exhausted: all ${input.attempted.length} configured pool ${input.attempted.length === 1 ? "entry" : "entries"} reported provider capacity/quota exhaustion.`,
       `Terminal provider capacity reason: ${input.capacityReason}`,
     ];
     if (input.attempted.length > 0) {
@@ -1242,7 +1243,7 @@ export function formatPoolExhaustedFailure(input: {
       );
     }
     lines.push(
-      "No quota exhaustion or reset was inferred. Retry only through the existing declared pool when a candidate is eligible."
+      "Temporary capacity exhaustion does not infer a quota reset timer. Retry only through the existing declared pool when a candidate is eligible."
     );
     return lines.join("\n");
   }

@@ -1305,4 +1305,85 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
     expect(live.join("")).not.toContain("cargo build");
     expect(result.output).toBe("built");
   });
+
+  it("clears a transient capacity error when a subsequent turn completes successfully", async () => {
+    const { result } = await runWithStream({
+      exitCode: 0,
+      stdout:
+        line({
+          type: "error",
+          codex_error_info: "server_overloaded",
+          message: "Selected model is at capacity. Please try a different model.",
+        }) +
+        line({
+          type: "turn.started",
+        }) +
+        line({
+          type: "item.completed",
+          item: {
+            id: "item_1",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Retried and succeeded." }],
+          },
+        }) +
+        line({
+          type: "turn.completed",
+        }),
+    });
+
+    expect(result).toMatchObject({
+      success: true,
+      output: "Retried and succeeded.",
+    });
+    expect(result.failure).toBeUndefined();
+  });
+
+  it("surfaces a terminal authentication failure even if an earlier transient capacity error occurred", async () => {
+    const { result } = await runWithStream({
+      exitCode: 1,
+      stdout:
+        line({
+          type: "error",
+          codex_error_info: "server_overloaded",
+          message: "Selected model is at capacity. Please try a different model.",
+        }) +
+        line({
+          type: "error",
+          message: "Authentication failed: token expired",
+        }),
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+    });
+    expect(result.failure).toBeUndefined();
+    expect(result.output).toContain("Authentication failed: token expired");
+    expect(result.output).not.toContain("[terminal provider capacity");
+  });
+
+  it("preserves an unrelated terminal failure without misclassifying as capacity when a transient capacity error was retried", async () => {
+    const { result } = await runWithStream({
+      exitCode: 1,
+      stdout:
+        line({
+          type: "error",
+          codex_error_info: "server_overloaded",
+          message: "Selected model is at capacity. Please try a different model.",
+        }) +
+        line({
+          type: "turn.failed",
+          error: {
+            message: "tool failed: process crashed with SIGSEGV",
+          },
+        }),
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+    });
+    expect(result.failure).toBeUndefined();
+    expect(result.output).toContain("tool failed: process crashed with SIGSEGV");
+    expect(result.output).not.toContain("[terminal provider capacity");
+  });
 });
