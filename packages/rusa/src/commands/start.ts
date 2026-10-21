@@ -1074,6 +1074,7 @@ function assembleConfiguredPortableInjection(
 
 export async function compactPortableContext(input: {
   actorId: string;
+  runId?: string;
   store: PortableContextStore;
   compactor: PortableContextCompactor;
   now?: () => string;
@@ -1096,6 +1097,7 @@ export async function compactPortableContext(input: {
     if (page.sources.length === 0) break;
     const result = await input.compactor.compact({
       actorId: input.actorId,
+      runId: input.runId,
       state,
       messages: page.sources,
       now: (input.now ?? (() => new Date().toISOString()))(),
@@ -2977,7 +2979,8 @@ async function composeStart(
   };
 
   const compactPortableActorAfterRun = async (
-    actorId: string
+    actorId: string,
+    runId: string
   ): Promise<PortableContextCompactionSummary | null> => {
     const current = actors.get(actorId);
     const context = current?.context?.type === "portable" ? current.context : undefined;
@@ -2986,6 +2989,7 @@ async function composeStart(
     try {
       return await compactPortableContext({
         actorId,
+        runId,
         store: portableContextStore,
         compactor,
       });
@@ -3264,7 +3268,7 @@ async function composeStart(
             }),
           });
         }
-        const compacted = deferred ? null : await compactPortableActorAfterRun(id);
+        const compacted = deferred ? null : await compactPortableActorAfterRun(id, event.runId);
         if (compacted) {
           mesh.recordEvent({
             kind: "portable_context_compacted",

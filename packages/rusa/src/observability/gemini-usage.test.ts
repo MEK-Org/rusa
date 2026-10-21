@@ -115,6 +115,58 @@ describe("Gemini usage logger and on-demand report", () => {
     );
   });
 
+  it("retains actor/run attribution, accepts legacy rows, and keeps actor sums equal to group totals", async () => {
+    const { lines } = capture();
+    for (const [runId, input] of [
+      ["run-1", 50],
+      ["run-2", 100],
+    ] as const)
+      await observeGeminiRequest(
+        "portable_compaction",
+        "model",
+        async () => ({
+          usageMetadata: { ...metadata, promptTokenCount: input, totalTokenCount: input + 27 },
+        }),
+        { actorId: "actor-a", runId }
+      );
+    await observeGeminiRequest("portable_compaction", "model", async () => ({
+      usageMetadata: metadata,
+    }));
+
+    const rows = lines.map((line) => JSON.parse(line));
+    expect(rows[0].usage).toMatchObject({ actorId: "actor-a", runId: "run-1" });
+    expect(rows[2].usage).toMatchObject({ actorId: null, runId: null });
+
+    // Pre-attribution v1 exports have neither field. They remain valid v1
+    // records and belong in the explicit unattributed bucket.
+    delete rows[2].usage.actorId;
+    delete rows[2].usage.runId;
+    const report = await buildGeminiUsageReport(
+      [source("attribution", `${lines[0]}${lines[1]}${JSON.stringify(rows[2])}\n`)],
+      window
+    );
+    const group = report.groups[0];
+    const actor = group.actors.find((entry) => entry.actorId === "actor-a");
+    const unattributed = group.actors.find((entry) => entry.actorId === null);
+    if (!actor || !unattributed) throw new Error("expected attributed and unattributed buckets");
+    expect(actor).toMatchObject({
+      calls: 2,
+      runIds: ["run-1", "run-2"],
+      input: { sum: 150, measured: 2, missing: 0 },
+      output: { sum: 50, measured: 2, missing: 0 },
+      inputPerCall: { max: 100, p50: 50, p90: 100 },
+    });
+    expect(unattributed).toMatchObject({
+      calls: 1,
+      runIds: [],
+      input: { sum: 100, measured: 1, missing: 0 },
+      output: { sum: 25, measured: 1, missing: 0 },
+    });
+    expect((actor.input.sum ?? 0) + (unattributed.input.sum ?? 0)).toBe(group.totals.input.sum);
+    expect((actor.output.sum ?? 0) + (unattributed.output.sum ?? 0)).toBe(group.totals.output.sum);
+    expect(formatGeminiUsageReport(report)).toContain("unattributed: 1 calls");
+  });
+
   it("counts outer retries, stronger-model fallback and a response rejected by application validation", async () => {
     const { lines } = capture();
     const call = vi

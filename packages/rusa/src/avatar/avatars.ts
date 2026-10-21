@@ -152,38 +152,43 @@ export interface AvatarGenDeps {
  * Call the Gemini image API once and return the decoded PNG bytes. No retries —
  * a failure throws and the fire-and-forget caller logs it and moves on.
  */
-async function callGeminiImage(apiKey: string, prompt: string): Promise<Buffer> {
-  const json = await observeGeminiRequest("avatar_generation", GEMINI_IMAGE_MODEL, async () => {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        // Native square 512x512 output (ISSUE_NUM, ISSUE_NUM): model renders 1:1 at 512 size.
-        generationConfig: {
-          imageConfig: {
-            aspectRatio: "1:1",
-            imageSize: "512",
+async function callGeminiImage(apiKey: string, prompt: string, actorId: string): Promise<Buffer> {
+  const json = await observeGeminiRequest(
+    "avatar_generation",
+    GEMINI_IMAGE_MODEL,
+    async () => {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          // Native square 512x512 output (ISSUE_NUM, ISSUE_NUM): model renders 1:1 at 512 size.
+          generationConfig: {
+            imageConfig: {
+              aspectRatio: "1:1",
+              imageSize: "512",
+            },
           },
-        },
-      }),
-    });
-    if (!res.ok) {
-      throw new Error(`gemini image API request failed (status ${res.status})`);
-    }
-    let json: {
-      candidates?: { content?: { parts?: { inlineData?: { data?: string } }[] } }[];
-    };
-    try {
-      json = (await res.json()) as {
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`gemini image API request failed (status ${res.status})`);
+      }
+      let json: {
         candidates?: { content?: { parts?: { inlineData?: { data?: string } }[] } }[];
       };
-    } catch {
-      throw new Error("gemini image API returned a non-JSON body");
-    }
-    return json;
-  });
+      try {
+        json = (await res.json()) as {
+          candidates?: { content?: { parts?: { inlineData?: { data?: string } }[] } }[];
+        };
+      } catch {
+        throw new Error("gemini image API returned a non-JSON body");
+      }
+      return json;
+    },
+    { actorId }
+  );
   const parts = json.candidates?.[0]?.content?.parts ?? [];
   for (const part of parts) {
     const data = part.inlineData?.data;
@@ -211,7 +216,7 @@ export async function generateAvatarOnce(threadId: string, deps: AvatarGenDeps):
 
   // The handle is the prompt subject only (display name), never the identity.
   const { adjective, animal } = splitHandle(generateHandle(threadId));
-  const png = await callGeminiImage(deps.apiKey, buildPrompt(adjective, animal));
+  const png = await callGeminiImage(deps.apiKey, buildPrompt(adjective, animal), threadId);
   writeAvatarCacheFile(threadId, png);
   deps.log?.(`avatar generated for ${threadId} (${generateHandle(threadId)})`);
 }
@@ -273,7 +278,7 @@ export async function generateAvatarForce(threadId: string, deps: AvatarGenDeps)
   const isRoot = threadId === deps.rootId || isRootHandle(threadId, deps.rootHandle);
   const handle = isRoot ? (deps.rootHandle ?? "root-actor") : generateHandle(threadId);
   const { adjective, animal } = splitHandle(handle);
-  const imageBytes = await callGeminiImage(deps.apiKey, buildPrompt(adjective, animal));
+  const imageBytes = await callGeminiImage(deps.apiKey, buildPrompt(adjective, animal), threadId);
   // Validate before writing so an unexpected Gemini response (wrong MIME,
   // truncated/malformed base64) throws instead of silently clobbering a working cached avatar.
   if (!isValidImageSignature(imageBytes)) {

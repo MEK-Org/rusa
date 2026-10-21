@@ -9,6 +9,8 @@ import {
   type PortableLedgerSource,
 } from "../db/repositories/actor-run-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
+import { configureGeminiUsage } from "../observability/gemini-usage.js";
+import { createLogger, nullLogger } from "../observability/logger.js";
 import * as geminiUtils from "../understanding/gemini-utils.js";
 import { seedPortableBriefState } from "./portable-context-brief.js";
 import {
@@ -1532,6 +1534,44 @@ describe("compactPortableContext integration (spec 6b)", () => {
     sequence = 0;
     // biome-ignore lint/suspicious/noExplicitAny: partial test mock
     vi.mocked(dbIdx.getRepositories).mockReturnValue({ actorRuns } as any);
+  });
+
+  it("records portable compaction against the actor and the completed run", async () => {
+    recordInbound("retain this decision");
+    const lines: string[] = [];
+    configureGeminiUsage(
+      createLogger({ format: "json", destination: { write: (line) => lines.push(line) } }),
+      "/synthetic/portable-compaction"
+    );
+    const generateContent = vi.fn().mockResolvedValue({
+      usageMetadata: {
+        promptTokenCount: 100,
+        candidatesTokenCount: 20,
+        thoughtsTokenCount: 5,
+        totalTokenCount: 125,
+      },
+      text: () => JSON.stringify({ operations: [] }),
+    });
+    vi.mocked(geminiUtils.getGeminiClient).mockReturnValue(
+      // biome-ignore lint/suspicious/noExplicitAny: partial test mock
+      { models: { generateContent } } as any
+    );
+
+    try {
+      await compactPortableContext({
+        actorId: "actor-a",
+        runId: "run-42",
+        store: new InMemoryPortableContextStore(),
+        compactor: new GeminiPortableContextCompactor("fake-key"),
+      });
+      expect(JSON.parse(lines[0] ?? "{}").usage).toMatchObject({
+        purpose: "portable_compaction",
+        actorId: "actor-a",
+        runId: "run-42",
+      });
+    } finally {
+      configureGeminiUsage(nullLogger, "/synthetic/test");
+    }
   });
 
   it("folds message and advances watermark even when quarantined, preventing re-fetch", async () => {
