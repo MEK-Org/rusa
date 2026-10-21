@@ -12,8 +12,8 @@ void main() {
       (tester) async {
         // Operator example:
         // Claude
-        // Weekly:  +8 (87% / 79%) - Resets in 2 days
-        // Session: -1 (5% / 6%)  - Resets in 25 minutes
+        // Weekly:  +8 (87% / 79%) - Provider reset in 2 days
+        // Session: -1 (5% / 6%)  - Provider reset in 25 minutes
         // Pacing:  every 10 minutes
         // Last Read: 30 minutes ago
 
@@ -80,11 +80,15 @@ void main() {
 
         expect(find.text('Claude'), findsOneWidget);
         expect(
-          find.textContaining('Weekly: +8 (87% / 79%) - Resets in 2 days'),
+          find.textContaining(
+            'Weekly: +8 (87% / 79%) - Provider reset in 2 days',
+          ),
           findsOneWidget,
         );
         expect(
-          find.textContaining('Session: -1 (5% / 6%) - Resets in 25 minutes'),
+          find.textContaining(
+            'Session: -1 (5% / 6%) - Provider reset in 25 minutes',
+          ),
           findsOneWidget,
         );
         expect(find.textContaining('Pacing: every 10 minutes'), findsOneWidget);
@@ -132,14 +136,56 @@ void main() {
 
       expect(find.text('Fable'), findsOneWidget);
       // The title already names the model; the row says which window.
-      expect(find.textContaining(RegExp(r'^Weekly: .*\(26% / ')), findsOneWidget);
+      expect(
+        find.textContaining(RegExp(r'^Weekly: .*\(26% / ')),
+        findsOneWidget,
+      );
       expect(find.textContaining('(Fable)'), findsNothing);
-      expect(find.textContaining('Resets in 5 days'), findsOneWidget);
+      expect(find.textContaining('Provider reset in 5 days'), findsOneWidget);
       expect(find.textContaining('Last Read: 5 minutes ago'), findsOneWidget);
       // Pacing row must be omitted when showThrottle is false
       expect(find.textContaining('Pacing:'), findsNothing);
       expect(find.textContaining('Session:'), findsNothing);
     });
+
+    testWidgets(
+      'shows sub-two-day provider resets in hours beside the pacing cadence',
+      (tester) async {
+        final weekly = QuotaWindowDto(
+          id: 'weekly',
+          label: 'Weekly',
+          usedPercent: 6.25,
+          status: 'available',
+          headline: true,
+          windowMs: 48 * 3600 * 1000,
+          resetAtIso: now.add(const Duration(hours: 45)).toIso8601String(),
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: QuotaTooltip(
+                providerName: 'Claude',
+                windows: [weekly],
+                throttle: const QuotaThrottleDto(
+                  intervalSeconds: 600,
+                  expired: false,
+                  buckets: [],
+                  updatedAt: '2026-09-29T12:00:00.000Z',
+                ),
+                now: now,
+              ),
+            ),
+          ),
+        );
+
+        expect(
+          find.textContaining('Provider reset in 45 hours'),
+          findsOneWidget,
+        );
+        expect(find.textContaining('Pacing: every 10 minutes'), findsOneWidget);
+      },
+    );
 
     testWidgets('renders unknown lane with truthful n/a indicators', (
       tester,
@@ -253,7 +299,9 @@ void main() {
 
         expect(find.text('Claude'), findsOneWidget);
         expect(
-          find.textContaining('Weekly: 60% remaining - Resets in 3 hours'),
+          find.textContaining(
+            'Weekly: 60% remaining - Provider reset in 3 hours',
+          ),
           findsOneWidget,
         );
         expect(find.textContaining('.000Z'), findsNothing);
@@ -479,7 +527,7 @@ void main() {
         tooltip.toPlainText(),
         'Claude\n'
         '\n'
-        'Weekly: +58 (87% / 29%) - Resets in 2 days\n'
+        'Weekly: +58 (87% / 29%) - Provider reset in 2 days\n'
         'Pacing: every 10 hours\n'
         'Last Read (manual): 30 minutes ago [overdue: hard-stale, fail-safe cap applied]\n'
         '\n'
@@ -534,7 +582,7 @@ void main() {
 
       expect(
         find.textContaining(
-          'Weekly: +17 (60% / 43%) - Resets in 3 days (est.)',
+          'Weekly: +17 (60% / 43%) - Provider reset in 3 days (est.)',
         ),
         findsOneWidget,
       );

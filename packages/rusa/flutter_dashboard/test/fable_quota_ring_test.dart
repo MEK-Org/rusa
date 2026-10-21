@@ -313,7 +313,7 @@ void main() {
         expect(fableTip, contains('Weekly: '));
         expect(fableTip, isNot(contains('(Fable)')));
         expect(fableTip, contains('25%'));
-        expect(fableTip, contains('Resets in'));
+        expect(fableTip, contains('Provider reset in'));
         expect(fableTip, contains('Last Read: 5 minutes ago'));
         expect(fableTip, isNot(contains('all models')));
 

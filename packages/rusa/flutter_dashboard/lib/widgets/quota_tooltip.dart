@@ -3,9 +3,11 @@ import 'package:intl/intl.dart';
 import '../models.dart';
 import '../theme.dart';
 
-/// Formats a relative reset duration, e.g. "2 days", "25 minutes", "1 hour".
+/// Formats a relative provider-reset duration, e.g. "2 days", "45 hours",
+/// "25 minutes", "1 hour". A reset within two days stays in hours so it does
+/// not hide the denominator of the ring's pacing position.
 String formatRelativeResetDuration(Duration diff) {
-  if (diff.inDays >= 1) {
+  if (diff.inHours >= 48) {
     final days = diff.inDays;
     return '$days ${days == 1 ? 'day' : 'days'}';
   }
@@ -176,7 +178,7 @@ List<String> quotaPacingDiagnostics(QuotaThrottleDto throttle) => [
 /// - Provider heading (e.g. "Claude")
 /// - One row per quota window, named for its kind (`Weekly`, `Session`) since
 ///   the heading already names the provider or model:
-///   `$label: $margin ($quotaRemaining% / $timeRemaining%) - Resets in $relativeReset`
+///   `$label: $margin ($quotaRemaining% / $timeRemaining%) - Provider reset in $relativeReset`
 ///   Marked with an estimate note when dead-reckoned (#759).
 /// - Pacing row: `Pacing: every $interval` (omitted when [showThrottle] is false)
 /// - Warning row: `Warning: no new reading for ...` when the reading behind
@@ -258,13 +260,14 @@ class QuotaTooltip extends StatelessWidget {
           Duration(milliseconds: pos.remainingMs!),
         );
         row =
-            '$label: $marginStr ($quotaRemaining% / $timeRemaining%) - Resets in $resetDuration';
+            '$label: $marginStr ($quotaRemaining% / $timeRemaining%) - Provider reset in $resetDuration';
       } else if (reset != null) {
         if (reset.isAfter(currentTime)) {
           final resetDuration = formatRelativeResetDuration(
             reset.difference(currentTime),
           );
-          row = '$label: $quotaRemaining% remaining - Resets in $resetDuration';
+          row =
+              '$label: $quotaRemaining% remaining - Provider reset in $resetDuration';
         } else {
           final resetStr = DateFormat('EEE h:mm a').format(reset.toLocal());
           row = '$label: $quotaRemaining% remaining - resets $resetStr';
