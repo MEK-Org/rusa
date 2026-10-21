@@ -110,6 +110,43 @@ describe("instanceWorkerFactory", () => {
     );
   });
 
+  it("marks a sessionless remote rehydration as reconnectable", () => {
+    const remote = new RemoteInstance(TARGET, process.platform, process.pid);
+    const hub = {
+      createHost: (_followerId: string, actorId: string) => remote.createHost(actorId),
+      toolUrls: () => [],
+    } as unknown as FollowerHub;
+    const context = {
+      executionTarget: TARGET,
+      // A follower can still retain this runtime when the leader's replacement
+      // handle has no saved provider session.
+      record: { id: ACTOR_ID },
+      getRecord: () => ({ id: ACTOR_ID }),
+    } as unknown as ActorFactoryContext;
+    const options = {
+      cwd: "/tmp/placed-actor",
+      mcpServers: [],
+      modelConfig: [{ provider: "codex", model: "gpt-5.5" }],
+      loadSessionId: () => undefined,
+      buildPrompt: () => ({ prompt: "" }),
+    } as unknown as ActorOptions;
+
+    instanceWorkerFactory(configWith({ codex: { cliCommand: "codex" } }), hub)(context, options);
+
+    const init = remote.commands.find(
+      (command) => "actorId" in command && command.message.type === "init"
+    );
+    const bootstrap =
+      init && "actorId" in init && init.message.type === "init"
+        ? init.message.bootstrap
+        : undefined;
+
+    // The follower itself decides whether there is a retained runtime. A true
+    // reconnect marker is harmless for an empty follower and lets it re-adopt
+    // a same-process actor after leader-side rehydration.
+    expect(bootstrap?.reconnect).toBe(true);
+  });
+
   it("places an actor declaring several candidates with its whole pool (#608)", () => {
     const remote = new RemoteInstance(TARGET, process.platform, process.pid);
     const hub = {

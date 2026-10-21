@@ -45,7 +45,11 @@ export function instanceWorkerFactory(
           timeoutMs: options.timeoutMs,
           debounceMs: options.debounceMs,
         },
-        reconnect: Boolean(options.loadSessionId() || record.sessionId),
+        // A follower may still retain its runtime when this leader handle was
+        // rehydrated without a provider session. The follower treats this only
+        // as permission to adopt an existing runtime; it still constructs one
+        // when none exists.
+        reconnect: true,
       },
       context,
       actorOptions: options,
