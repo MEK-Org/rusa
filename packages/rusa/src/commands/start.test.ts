@@ -8314,24 +8314,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
         runWithPoolFallback: (
           runId: string,
           selected: ProviderModelConfig,
-          primary: CodingProvider,
           runProvider: (provider: CodingProvider) => Promise<RunResult>
         ) => Promise<RunResult>;
       };
       if (!actor.opts.recoverFailedRuns) throw new Error("root pool fallback not configured");
       const lifecycleActor = root as Actor;
       const runId = await startLifecycleRun(lifecycleActor, selected);
-      const primary: CodingProvider = {
-        name: selected.provider,
-        providerName: selected.provider,
-        model: selected.model,
-        effort: selected.effort,
-        run: async () => ({ success: true, output: "unused", exitCode: 0 }),
-      };
       const attempts: CodingProvider[] = [];
-      const result = await actor.runWithPoolFallback(runId, selected, primary, async (provider) => {
+      // The chain resolves each entry itself, the selected one first; only that
+      // first attempt fails.
+      const result = await actor.runWithPoolFallback(runId, selected, async (provider) => {
         attempts.push(provider);
-        return provider === primary
+        return attempts.length === 1
           ? { success: false, output: "quota exhausted", exitCode: 1 }
           : recover(provider);
       });

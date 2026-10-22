@@ -696,8 +696,15 @@ export class Actor {
 
     this.killable = true;
     this.coalesceAborted = false;
+    // The run's controller carries only stops someone chose: an operator
+    // interrupt, a responsive preemption, a voice coalesce. Each provider
+    // attempt gets its own controller, linked to this one, which the watchdog
+    // timers abort instead; a watchdog kill therefore ends that attempt
+    // without marking the whole run stopped, and a recovery attempt starts on
+    // a live signal (#1150).
     const abortController = new AbortController();
     this.coalesceAbortController = abortController;
+    let attemptController: AbortController | undefined;
     let stallTimer: NodeJS.Timeout | undefined;
     let ceilingTimer: NodeJS.Timeout | undefined;
     let firstChunkSeen = false;
@@ -720,7 +727,7 @@ export class Actor {
       }
       stallTimer = setTimeout(() => {
         this.opts.log?.(`\n[Watchdog] Run stalled (no output for 15 minutes). Terminating...\n`);
-        abortController.abort(STALL_WATCHDOG_ABORT_REASON);
+        attemptController?.abort(STALL_WATCHDOG_ABORT_REASON);
       }, WATCHDOG_STALL_TIMEOUT_MS);
     };
 
@@ -731,13 +738,14 @@ export class Actor {
     // timer spanning the gate reads "queued" as "stalled" and kills it at 5:00 of
     // *waiting*. That abort is also the only one the run ever gets — abort() is
     // idempotent — so the run then spawns on a dead signal and executes to the
-    // provider backstop with nothing watching it.
+    // provider backstop with nothing watching it. They restart for each provider
+    // attempt, so a recovery attempt never runs out its predecessor's clock.
     const startWatchdogTimers = () => {
       ceilingTimer = setTimeout(() => {
         this.opts.log?.(
           `\n[Watchdog] Run ceiling timeout reached (${runTimeoutMs}ms). Terminating...\n`
         );
-        abortController.abort(RUN_CEILING_ABORT_REASON);
+        attemptController?.abort(RUN_CEILING_ABORT_REASON);
       }, runTimeoutMs);
       resetStallTimer();
     };
@@ -750,42 +758,59 @@ export class Actor {
       recoveryContext?: string
     ): Promise<RunResult> => {
       const runId = this.currentRunId;
-      await this.opts.onProviderAttempt?.(provider);
-      return provider.run({
-        prompt: recoveryContext ? `${recoveryContext}\n\n${built.prompt}` : built.prompt,
-        onPromptLaunched: (prompt) => {
-          if (runId)
-            void this.lifecycle.emit("onPrompt", {
-              actorId: this.id,
-              runId,
-              prompt,
-            });
-        },
-        cwd: this.opts.cwd,
-        // Continue this actor's own session (id undefined on first run → created).
-        session: { id: sessionId },
-        mcpServers: this.opts.mcpServers,
-        addDirs: this.opts.addDirs,
-        sandbox,
-        computerUse: this.opts.isComputerUseAdmitted?.() === true,
-        // timeoutMs: provider OS-level timeout is the actor ceiling plus a grace
-        // margin. The AbortController is the primary kill path; Node's spawn
-        // timeout is only a backstop for the rare case our abort fails to land.
-        timeoutMs: runTimeoutMs + 30_000,
-        signal: abortController.signal,
-        onChunk: (chunk: string) => {
-          // Once per RUN, not per provider attempt: `runWithPoolFallback` can call
-          // runProvider again on a different model, and the question this answers
-          // is "when did this wake start producing output", not "when did each
-          // attempt". The flag lives in the run scope for that reason.
-          if (!firstChunkSeen) {
-            firstChunkSeen = true;
-            this.opts.onFirstChunk?.();
-          }
-          resetStallTimer();
-          this.opts.log?.(chunk);
-        },
-      });
+      const attempt = new AbortController();
+      attemptController = attempt;
+      const stop = () => attempt.abort(abortController.signal.reason);
+      if (abortController.signal.aborted) stop();
+      else abortController.signal.addEventListener("abort", stop, { once: true });
+      startWatchdogTimers();
+      try {
+        await this.opts.onProviderAttempt?.(provider);
+        const result = await provider.run({
+          prompt: recoveryContext ? `${recoveryContext}\n\n${built.prompt}` : built.prompt,
+          onPromptLaunched: (prompt) => {
+            if (runId)
+              void this.lifecycle.emit("onPrompt", {
+                actorId: this.id,
+                runId,
+                prompt,
+              });
+          },
+          cwd: this.opts.cwd,
+          // Continue this actor's own session (id undefined on first run → created).
+          session: { id: sessionId },
+          mcpServers: this.opts.mcpServers,
+          addDirs: this.opts.addDirs,
+          sandbox,
+          computerUse: this.opts.isComputerUseAdmitted?.() === true,
+          // timeoutMs: provider OS-level timeout is the actor ceiling plus a grace
+          // margin. The AbortController is the primary kill path; Node's spawn
+          // timeout is only a backstop for the rare case our abort fails to land.
+          timeoutMs: runTimeoutMs + 30_000,
+          signal: attempt.signal,
+          onChunk: (chunk: string) => {
+            // Once per RUN, not per provider attempt: `runWithPoolFallback` can call
+            // runProvider again on a different model, and the question this answers
+            // is "when did this wake start producing output", not "when did each
+            // attempt". The flag lives in the run scope for that reason.
+            if (!firstChunkSeen) {
+              firstChunkSeen = true;
+              this.opts.onFirstChunk?.();
+            }
+            resetStallTimer();
+            this.opts.log?.(chunk);
+          },
+        });
+        // A watchdog kill is attributed to its own attempt here, so a recovery
+        // account names it; a chosen stop is attributed once, to the run, below.
+        if (attempt.signal.aborted && !abortController.signal.aborted) {
+          attributeAbort(result, attempt.signal);
+        }
+        return result;
+      } finally {
+        clearTimers();
+        abortController.signal.removeEventListener("abort", stop);
+      }
     };
     const invoke = async (selected: RawProviderModelConfig): Promise<RunResult> => {
       // Both queues have selected this run. From this point a later responsive
@@ -842,14 +867,7 @@ export class Actor {
       // BEFORE its hook for the opposite reason — there the risk is reporting the
       // same run's outcome twice, here it is claiming a start nobody saw.)
       this.runStartReported = true;
-      startWatchdogTimers();
-      let primary: CodingProvider;
-      try {
-        primary = this.opts.resolveProvider(selected);
-      } catch (err) {
-        throw new ProviderSelectionError(err);
-      }
-      return this.runWithPoolFallback(runId, selected, primary, runProvider);
+      return this.runWithPoolFallback(runId, selected, runProvider);
     };
 
     // The post-run hook is the single choke point for failure forwarding, so it
@@ -935,29 +953,10 @@ export class Actor {
         return;
       }
       if (this.coalesceAborted) return;
-      const selection = err instanceof ProviderSelectionError;
       const cause = err instanceof ProviderSelectionError ? err.cause : err;
       const runId = this.currentRunId;
       if (runId) await this.lifecycle.emit("onError", { actorId: this.id, runId, error: cause });
-      result = {
-        success: false,
-        // A PoolExhaustedError carries the operator-facing pool summary as its
-        // message; pasting a stack here would bury it (#655).
-        output:
-          cause instanceof PoolExhaustedError
-            ? cause.message
-            : cause instanceof Error
-              ? (cause.stack ?? cause.message)
-              : String(cause),
-        exitCode: 1,
-        sessionId,
-        // The run record keeps the stack above; the notice uses this message
-        // (#980).
-        failure: {
-          ...(selection ? { stage: "provider-selection" as const } : {}),
-          message: cause instanceof Error ? cause.message : String(cause),
-        },
-      };
+      result = { ...thrownRunResult(err), sessionId };
     } finally {
       this.pendingStart = undefined;
       clearTimers();
@@ -966,14 +965,7 @@ export class Actor {
     if (this.coalesceAborted) return;
     this.coalesceAbortController = undefined;
 
-    if (abortController.signal.aborted) {
-      if (!result.cancelled) {
-        result.success = false;
-        Object.assign(result, formatSigtermResult(result.output, abortController.signal));
-      } else if (!result.abortReason) {
-        result.abortReason = extractAbortReason(abortController.signal);
-      }
-    }
+    if (abortController.signal.aborted) attributeAbort(result, abortController.signal);
 
     if (result.sessionId && result.sessionId !== sessionId) {
       this.opts.saveSessionId(result.sessionId);
@@ -1030,13 +1022,21 @@ export class Actor {
   private async runWithPoolFallback(
     runId: string,
     selected: RawProviderModelConfig,
-    primary: CodingProvider,
     runProvider: (provider: CodingProvider, recoveryContext?: string) => Promise<RunResult>
   ): Promise<RunResult> {
-    const result = await runProvider(primary);
-    if (result.success || !this.opts.recoverFailedRuns || this.stoppedOnPurpose(result)) {
-      return result;
+    if (!this.opts.recoverFailedRuns) {
+      // Without recovery a throw is the run's own: executeTurn's terminal
+      // boundary synthesizes and reports it.
+      let primary: CodingProvider;
+      try {
+        primary = this.opts.resolveProvider(selected);
+      } catch (err) {
+        throw new ProviderSelectionError(err);
+      }
+      return runProvider(primary);
     }
+    const result = await this.attemptPoolEntry(runId, selected, runProvider);
+    if (result.success || this.stoppedOnPurpose(result)) return result;
     // The chain excludes the failed entry by value, not by position: the gate
     // may have launched a later pool entry (earliest-available-first), and
     // recovery must never retry the entry that just failed, wherever it sits
@@ -1082,29 +1082,10 @@ export class Actor {
       this.opts.log?.(
         `\n[PoolFallback] ${describeModelConfigEntry(failed)} failed; trying next configured pool entry ${describeModelConfigEntry(entry)}\n`
       );
-      let provider: CodingProvider;
-      try {
-        provider = this.opts.resolveProvider(entry);
-      } catch (err) {
-        // The entry could not even be built — e.g. its provider was dropped
-        // from config after this pool was persisted. That is this entry's
-        // failed attempt; it is never retried under some other tuple, and
-        // the remaining entries still get theirs.
-        const message = err instanceof Error ? err.message : String(err);
-        failures.push({
-          entry: { ...entry },
-          result: {
-            success: false,
-            output: message,
-            exitCode: 1,
-            failure: { stage: "provider-selection", message },
-          },
-        });
-        failed = entry;
-        continue;
-      }
-      const recoveryResult = await runProvider(
-        provider,
+      const recoveryResult = await this.attemptPoolEntry(
+        runId,
+        entry,
+        runProvider,
         formatRecoveryContext({ runId, entry, failures })
       );
       if (recoveryResult.success || this.stoppedOnPurpose(recoveryResult)) return recoveryResult;
@@ -1127,12 +1108,40 @@ export class Actor {
   }
 
   /**
+   * One recovering run's attempt on one pool entry. Whatever ends the attempt —
+   * a returned failure, an entry that cannot be built (its provider dropped
+   * from config after the pool was persisted), or a provider that throws — is
+   * that entry's result, so the chain keeps every earlier failure and the
+   * remaining entries still get their attempts.
+   */
+  private async attemptPoolEntry(
+    runId: string,
+    entry: RawProviderModelConfig,
+    runProvider: (provider: CodingProvider, recoveryContext?: string) => Promise<RunResult>,
+    recoveryContext?: string
+  ): Promise<RunResult> {
+    try {
+      let provider: CodingProvider;
+      try {
+        provider = this.opts.resolveProvider(entry);
+      } catch (err) {
+        throw new ProviderSelectionError(err);
+      }
+      return await runProvider(provider, recoveryContext);
+    } catch (err) {
+      const cause = err instanceof ProviderSelectionError ? err.cause : err;
+      await this.lifecycle.emit("onError", { actorId: this.id, runId, error: cause });
+      return thrownRunResult(err);
+    }
+  }
+
+  /**
    * Whether this run was stopped on purpose rather than failing: this run's
    * own abort signal fired (operator interrupt, responsive preemption, voice
    * coalesce), or the result attributes an interrupt. Mechanical — read from
    * the signal and typed result fields, never from output. A provider-internal
    * stall-watchdog or run-ceiling kill is `cancelled` too, but nobody chose
-   * it, so it does not count.
+   * it, so it does not count: it aborts only its own attempt's signal.
    */
   private stoppedOnPurpose(result: RunResult): boolean {
     return Boolean(result.interrupted || this.coalesceAbortController?.signal.aborted);
@@ -1156,6 +1165,39 @@ function sameModelConfigEntry(a: RawProviderModelConfig, b: RawProviderModelConf
     (a.model ?? "") === (b.model ?? "") &&
     (a.effort ?? "") === (b.effort ?? "")
   );
+}
+
+/**
+ * The failed result for a run or attempt that threw instead of returning:
+ * the record keeps the stack, the notice uses the message (#980).
+ */
+function thrownRunResult(err: unknown): RunResult {
+  const selection = err instanceof ProviderSelectionError;
+  const cause = selection ? err.cause : err;
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return {
+    success: false,
+    // A PoolExhaustedError carries the operator-facing pool summary as its
+    // message; pasting a stack here would bury it (#655).
+    output:
+      cause instanceof PoolExhaustedError
+        ? cause.message
+        : cause instanceof Error
+          ? (cause.stack ?? cause.message)
+          : String(cause),
+    exitCode: 1,
+    failure: { ...(selection ? { stage: "provider-selection" as const } : {}), message },
+  };
+}
+
+/** Attribute an aborted signal's SIGTERM to the result it ended, in place. */
+function attributeAbort(result: RunResult, signal: AbortSignal): void {
+  if (!result.cancelled) {
+    result.success = false;
+    Object.assign(result, formatSigtermResult(result.output, signal));
+  } else if (!result.abortReason) {
+    result.abortReason = extractAbortReason(signal);
+  }
 }
 
 /** A configured pool entry skipped during recovery without an attempt. */

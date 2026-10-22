@@ -3397,17 +3397,22 @@ describe("configured-root run recovery (#1150)", () => {
     expect(second.calls).toHaveLength(0);
   });
 
-  it("recovers a run its provider's stall watchdog killed: nobody chose that stop", async () => {
-    const first = new FakeProvider(
-      () => ({
-        success: false,
-        exitCode: 143,
-        cancelled: true,
-        abortReason: "stall-watchdog" as const,
-        output: "[Task killed by stall watchdog (no output for 15 minutes)]",
-      }),
+  // A real watchdog kill aborts the signal the provider was handed; the
+  // provider then reports a plain SIGTERM exit. Recovery must survive that
+  // abort and hand the replacement a live signal of its own.
+  const killedByItsSignal = () =>
+    new FakeProvider(
+      (opts) =>
+        new Promise<Partial<RunResult>>((resolve) => {
+          opts.signal?.addEventListener("abort", () =>
+            resolve({ success: false, exitCode: 143, output: "terminated" })
+          );
+        }),
       "first"
     );
+
+  it("recovers a run the actor's own stall watchdog killed, on a live signal", async () => {
+    const first = killedByItsSignal();
     const second = new FakeProvider(
       () => ({ success: true, output: "done", exitCode: 0 }),
       "second"
@@ -3425,10 +3430,184 @@ describe("configured-root run recovery (#1150)", () => {
 
     actor.requestRun();
     await vi.advanceTimersByTimeAsync(10);
+    expect(second.calls).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(WATCHDOG_STALL_TIMEOUT_MS);
+    await flush();
+
+    expect(first.calls[0]?.signal?.aborted).toBe(true);
+    expect(second.calls).toHaveLength(1);
+    expect(second.calls[0]?.signal?.aborted).toBe(false);
+    expect(second.calls[0]?.prompt).toContain(
+      "- attempt 1 on first:first-model (exit 143, stall-watchdog, session fake-session-1):"
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ success: true, output: "done" });
+    expect(seen[0]?.cancelled).toBeUndefined();
+  });
+
+  it("recovers a run the actor's run ceiling killed, with a fresh ceiling for the replacement", async () => {
+    const first = killedByItsSignal();
+    let resolveSecond!: (res: Partial<RunResult>) => void;
+    const second = new FakeProvider(
+      () =>
+        new Promise<Partial<RunResult>>((resolve) => {
+          resolveSecond = resolve;
+        }),
+      "second"
+    );
+    const seen: RunResult[] = [];
+    const actor = makeActor(
+      {
+        timeoutMs: 60_000,
+        modelConfig: pool,
+        resolveProvider: (entry) => (entry.provider === "first" ? first : second),
+        recoverFailedRuns: true,
+        onRunEnd: (r) => seen.push(r),
+      },
+      first
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await flush();
+
+    expect(second.calls).toHaveLength(1);
+    expect(second.calls[0]?.prompt).toContain("(exit 143, run-ceiling,");
+    // Most of a ceiling later the replacement is still alive: it is not running
+    // out the first attempt's clock.
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(second.calls[0]?.signal?.aborted).toBe(false);
+    resolveSecond({ success: true, output: "done", exitCode: 0 });
+    await flush();
+
+    expect(seen).toMatchObject([{ success: true, output: "done" }]);
+  });
+
+  it("still stops a recovering run an operator interrupts after a watchdog kill", async () => {
+    const first = killedByItsSignal();
+    let resolveSecond!: (res: Partial<RunResult>) => void;
+    const second = new FakeProvider(
+      () =>
+        new Promise<Partial<RunResult>>((resolve) => {
+          resolveSecond = resolve;
+        }),
+      "second"
+    );
+    const third = new FakeProvider(() => ({ success: true, output: "done", exitCode: 0 }), "third");
+    const seen: RunResult[] = [];
+    const actor = makeActor(
+      {
+        modelConfig: pool,
+        resolveProvider: (entry) =>
+          entry.provider === "first" ? first : entry.provider === "second" ? second : third,
+        recoverFailedRuns: true,
+        onRunEnd: (r) => seen.push(r),
+      },
+      first
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(WATCHDOG_STALL_TIMEOUT_MS);
+    await flush();
+    expect(second.calls).toHaveLength(1);
+    expect(actor.interrupt("root").interrupted).toBe(true);
+    expect(second.calls[0]?.signal?.aborted).toBe(true);
+    resolveSecond({ success: false, exitCode: 143, output: "terminated" });
+    await flush();
+
+    expect(third.calls).toHaveLength(0);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ success: false, cancelled: true, interruptSource: "root" });
+  });
+
+  it("recovers a run whose primary provider threw, keeping the thrown error as attempt 1", async () => {
+    const first = new FakeProvider(() => {
+      throw new Error("spawn blew up");
+    }, "first");
+    const second = new FakeProvider(
+      () => ({ success: true, output: "done", exitCode: 0 }),
+      "second"
+    );
+    const errors: unknown[] = [];
+    const seen: RunResult[] = [];
+    const actor = makeActor(
+      {
+        lifecycle: createActorLifecycle([{ onError: (event) => void errors.push(event.error) }]),
+        modelConfig: pool,
+        resolveProvider: (entry) => (entry.provider === "first" ? first : second),
+        recoverFailedRuns: true,
+        onRunEnd: (r) => seen.push(r),
+      },
+      first
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
 
     expect(second.calls).toHaveLength(1);
     expect(second.calls[0]?.prompt).toContain(
-      "- attempt 1 on first:first-model (exit 143, stall-watchdog, session fake-session-1): [Task killed by stall watchdog"
+      "- attempt 1 on first:first-model (exit 1): spawn blew up"
+    );
+    expect(errors).toHaveLength(1);
+    expect(seen).toMatchObject([{ success: true, output: "done" }]);
+  });
+
+  it("keeps earlier evidence and tries later entries when a replacement throws", async () => {
+    const first = new FakeProvider(
+      () => ({ success: false, exitCode: 1, output: "first failed" }),
+      "first"
+    );
+    const second = new FakeProvider(() => {
+      throw new Error("second blew up");
+    }, "second");
+    const third = new FakeProvider(() => ({ success: true, output: "done", exitCode: 0 }), "third");
+    const seen: RunResult[] = [];
+    const actor = makeActor(
+      {
+        modelConfig: pool,
+        resolveProvider: (entry) =>
+          entry.provider === "first" ? first : entry.provider === "second" ? second : third,
+        recoverFailedRuns: true,
+        onRunEnd: (r) => seen.push(r),
+      },
+      first
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(third.calls).toHaveLength(1);
+    expect(third.calls[0]?.prompt).toContain("- attempt 1 on first:first-model (exit 1");
+    expect(third.calls[0]?.prompt).toContain(
+      "- attempt 2 on second:second-model @ high (exit 1): second blew up"
+    );
+    expect(seen).toMatchObject([{ success: true, output: "done" }]);
+  });
+
+  it("recovers a run whose primary entry could not be prepared", async () => {
+    const second = new FakeProvider(
+      () => ({ success: true, output: "done", exitCode: 0 }),
+      "second"
+    );
+    const seen: RunResult[] = [];
+    const actor = makeActor({
+      modelConfig: pool,
+      resolveProvider: (entry) => {
+        if (entry.provider === "first") throw new Error("provider first is not configured");
+        return second;
+      },
+      recoverFailedRuns: true,
+      onRunEnd: (r) => seen.push(r),
+    });
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(second.calls).toHaveLength(1);
+    expect(second.calls[0]?.prompt).toContain(
+      "- attempt 1 on first:first-model (exit 1): could not prepare this entry; provider was not invoked. provider first is not configured"
     );
     expect(seen).toMatchObject([{ success: true, output: "done" }]);
   });
