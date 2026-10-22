@@ -85,6 +85,21 @@ export class RunMaterialIntegrityError extends Error {
   }
 }
 
+/**
+ * The next prompt key could not be made durable. Callers must treat this as
+ * admission failure: no provider can run or publish material against a key
+ * whose reservation was not confirmed.
+ */
+export class RunMaterialReservationError extends Error {
+  constructor(
+    message: string,
+    override readonly cause?: unknown
+  ) {
+    super(message);
+    this.name = "RunMaterialReservationError";
+  }
+}
+
 const sha256 = (content: Buffer): string => createHash("sha256").update(content).digest("hex");
 
 function errorCode(err: unknown): string | undefined {
@@ -92,8 +107,6 @@ function errorCode(err: unknown): string | undefined {
 }
 
 export class RunMaterialStore {
-  /** Last allocated prompt attempt per open run, ahead of the counter file when it cannot be written. */
-  private readonly attempts = new Map<string, number>();
   private readonly open = new Set<string>();
 
   constructor(
@@ -109,37 +122,32 @@ export class RunMaterialStore {
   closeRun(actorId: string, runId: string): void {
     const key = this.key(actorId, runId);
     this.open.delete(key);
-    this.attempts.delete(key);
   }
 
   /**
-   * Allocate the run's next prompt attempt. The key only advances: a write that
-   * later fails still spends its number, and the counter file carries it across
-   * a restart. The counter is persisted best-effort; memory alone still keeps
-   * this process monotonic when the directory cannot be written.
+   * Durably reserve the next prompt key before its provider can start. A
+   * failed or ambiguous reservation returns no key: the caller cannot fall
+   * back to full material, because that would publish an unconfirmed attempt.
+   *
+   * A counter update that reached rename but failed its directory fsync is
+   * still a failed reservation. It may leave a gap visible later; gaps are
+   * safe, while pretending that the failed update was durable is not.
    */
-  nextPromptAttempt(actorId: string, runId: string): number {
-    const key = this.key(actorId, runId);
+  reservePromptAttempt(actorId: string, runId: string): number {
     const dir = this.runDir(actorId, runId);
-    let last = Math.max(this.attempts.get(key) ?? 0, this.readCounter(dir));
+    let last: number;
     try {
+      last = this.readCounter(dir);
       for (const name of this.list(dir) ?? []) {
         const match = PROMPT_FILE.exec(name);
         if (match) last = Math.max(last, Number(match[1]));
       }
-    } catch {
-      // An unreadable directory cannot make the fallback lose its identity.
-      // Memory remains monotonic for this process and the counter write below
-      // is still attempted for the next process.
-    }
-    const next = last + 1;
-    this.attempts.set(key, next);
-    try {
+      const next = last + 1;
       this.writeCounter(dir, next);
-    } catch {
-      // The in-memory key above is authoritative for this process.
+      return next;
+    } catch (error) {
+      throw new RunMaterialReservationError("Could not durably reserve prompt attempt", error);
     }
-    return next;
   }
 
   putPrompt(actorId: string, runId: string, attempt: number, prompt: string): RunMaterialRef {
@@ -188,7 +196,7 @@ export class RunMaterialStore {
     let wanted = candidates;
     let latest: number | undefined;
     if (kind === "prompt") {
-      latest = this.readCounter(dir);
+      latest = Math.max(this.readCounter(dir));
       for (const candidate of candidates) latest = Math.max(latest, candidate.attempt ?? 0);
       const target = attempt ?? latest;
       wanted = candidates.filter((c) => c.attempt === target);
@@ -249,7 +257,6 @@ export class RunMaterialStore {
         const doomed = join(trash, randomUUID());
         this.io.renameSync(dir, doomed);
         this.io.rmSync(doomed, { recursive: true, force: true });
-        this.attempts.delete(this.key(actorId, runId));
         expired++;
       }
       if ((this.list(actorDir) ?? [undefined]).length === 0) {
@@ -293,9 +300,13 @@ export class RunMaterialStore {
   private readCounter(dir: string): number {
     try {
       const value = Number(this.io.readFileSync(join(dir, ATTEMPT_FILE), "utf8").trim());
-      return Number.isSafeInteger(value) && value > 0 ? value : 0;
-    } catch {
-      return 0;
+      if (!Number.isSafeInteger(value) || value < 1) {
+        throw new RunMaterialIntegrityError("prompt attempt counter is invalid");
+      }
+      return value;
+    } catch (err) {
+      if (errorCode(err) === "ENOENT" || errorCode(err) === "ENOTDIR") return 0;
+      throw err;
     }
   }
 

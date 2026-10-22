@@ -42,8 +42,8 @@ export interface ActorLifecycleStartEvent extends ActorLifecycleQueuedEvent {
 export interface ActorLifecyclePromptEvent extends ActorLifecycleRunEvent {
   prompt: string;
   /**
-   * The prompt's retention key on a run bound to its host (#1020). Present
-   * only when the host could not retain it and sent it in full instead.
+   * The prompt's durably reserved retention key on a run bound to its host
+   * (#1020). The host sends it onward only when it falls back to full text.
    */
   attempt?: number;
 }

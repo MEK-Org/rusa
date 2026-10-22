@@ -207,6 +207,17 @@ export interface ActorOptions {
    */
   onProviderAttempt?: (provider: ProviderAttempt) => void | Promise<void>;
   /**
+   * Prepare one provider invocation after its prompt is assembled but before
+   * the adapter is called. A rejection prevents that provider from starting.
+   * The returned prompt attempt, when present, is carried to the launched
+   * prompt observer without changing the provider-facing prompt.
+   */
+  beforeProviderAttempt?: (context: {
+    runId: string;
+    prompt: string;
+    provider: ProviderAttempt;
+  }) => number | undefined | Promise<number | undefined>;
+  /**
    * Optional hook fired ONCE per run, on the first chunk the provider emits —
    * the moment it starts answering, as distinct from the moment we asked.
    */
@@ -758,6 +769,8 @@ export class Actor {
       recoveryContext?: string
     ): Promise<RunResult> => {
       const runId = this.currentRunId;
+      if (!runId) throw new Error(`actor ${this.id} started without a lifecycle run id`);
+      const prompt = recoveryContext ? `${recoveryContext}\n\n${built.prompt}` : built.prompt;
       const attempt = new AbortController();
       attemptController = attempt;
       const stop = () => attempt.abort(abortController.signal.reason);
@@ -766,15 +779,20 @@ export class Actor {
       startWatchdogTimers();
       try {
         await this.opts.onProviderAttempt?.(provider);
+        const promptAttempt = await this.opts.beforeProviderAttempt?.({
+          runId,
+          prompt,
+          provider,
+        });
         const result = await provider.run({
-          prompt: recoveryContext ? `${recoveryContext}\n\n${built.prompt}` : built.prompt,
+          prompt,
           onPromptLaunched: (prompt) => {
-            if (runId)
-              void this.lifecycle.emit("onPrompt", {
-                actorId: this.id,
-                runId,
-                prompt,
-              });
+            void this.lifecycle.emit("onPrompt", {
+              actorId: this.id,
+              runId,
+              prompt,
+              ...(promptAttempt === undefined ? {} : { attempt: promptAttempt }),
+            });
           },
           cwd: this.opts.cwd,
           // Continue this actor's own session (id undefined on first run → created).

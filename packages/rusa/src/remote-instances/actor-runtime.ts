@@ -1,5 +1,5 @@
 import { Actor } from "../actor/actor.js";
-import { createActorLifecycle } from "../actor/actor-lifecycle.js";
+import { type ActorLifecycleStartEvent, createActorLifecycle } from "../actor/actor-lifecycle.js";
 import type { ComputerUseLock } from "../actor/computer-use-lock.js";
 import {
   RunStartCancelledError,
@@ -24,7 +24,12 @@ import {
   type Request,
   type RunSnapshot,
 } from "./protocol.js";
-import { boundedCompleteFits, boundRunResult, type RunMaterialStore } from "./run-material.js";
+import {
+  boundedCompleteFits,
+  boundRunResult,
+  RunMaterialReservationError,
+  type RunMaterialStore,
+} from "./run-material.js";
 
 /** This host's run material store and whether the current leader negotiated bounded execution (#1020). */
 export interface RunMaterialOptions {
@@ -78,6 +83,12 @@ export function createActorRuntime(
   const mcpServers: McpServerSpec[] = [];
   /** Runs bound to this host at start: their material is retained here (#1020). */
   const boundRuns = new Set<string>();
+  /**
+   * A negotiated run is not announced as material-bound until its first
+   * prompt key is durably reserved. This lets a reservation failure report an
+   * ordinary terminal error without publishing a material binding or fallback.
+   */
+  const pendingMaterialStarts = new Map<string, ActorLifecycleStartEvent>();
   function finishClose(): void {
     if (stopping && !closed && activeGates === 0 && !terminalAccountingPending) {
       closed = true;
@@ -120,6 +131,25 @@ export function createActorRuntime(
       type: "error",
       error: `Run material fallback for run ${runId}: ${reason}; sent in full`,
     });
+  }
+
+  function sendRunStart(event: ActorLifecycleStartEvent, bound: boolean): void {
+    send({
+      type: "runStart",
+      responsive: event.responsive,
+      injectRecord: event.injectRecord,
+      selected: event.selected,
+      runId: event.runId,
+      ...(bound ? { material: BOUNDED_EXECUTION_CAPABILITY } : {}),
+    });
+  }
+
+  /** Announce a deferred run without a material binding if it never launched. */
+  function flushPendingStart(runId: string): void {
+    const event = pendingMaterialStarts.get(runId);
+    if (!event) return;
+    pendingMaterialStarts.delete(runId);
+    sendRunStart(event, false);
   }
 
   /** Retain a bound run's output and bound its result, or keep the full result. */
@@ -260,6 +290,33 @@ export function createActorRuntime(
         };
       },
       prepareUnderstandingMount: () => request<string | undefined>({ op: "prepareMount" }).result,
+      beforeProviderAttempt: ({ runId }) => {
+        const pendingStart = pendingMaterialStarts.get(runId);
+        // A run that began unnegotiated remains legacy for its lifetime.
+        if (!material || (!pendingStart && !boundRuns.has(runId))) return undefined;
+        try {
+          const attempt = material.store.reservePromptAttempt(bootstrap.id, runId);
+          if (!boundRuns.has(runId)) {
+            boundRuns.add(runId);
+            material.store.openRun(bootstrap.id, runId);
+            if (pendingStart) {
+              pendingMaterialStarts.delete(runId);
+              sendRunStart(pendingStart, true);
+            }
+          }
+          return attempt;
+        } catch (error) {
+          // The leader still needs a run bracket for the honest terminal
+          // admission error, but it receives no material host/ref/fallback.
+          flushPendingStart(runId);
+          throw new RunMaterialReservationError(
+            `Run material admission failed for run ${runId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+            error
+          );
+        }
+      },
       beforeRun: async ({ mode }) => {
         currentRunComputerUse = false;
         pendingRunMode = mode;
@@ -411,28 +468,25 @@ export function createActorRuntime(
                 reportLocalAccountingFailure("start", event.runId, error);
               }
             }
-            // A run is bound to this host for its whole life by the leader
-            // that saw it start; prompts and output then stay here.
+            // A negotiated run gets its material binding only after the first
+            // counter reservation is durable. That reservation runs in the
+            // Actor's pre-provider hook, which can stop the provider.
             const bound = material?.enabled() === true;
             if (bound) {
-              boundRuns.add(event.runId);
-              material?.store.openRun(bootstrap.id, event.runId);
+              pendingMaterialStarts.set(event.runId, event);
+            } else {
+              sendRunStart(event, false);
             }
-            send({
-              type: "runStart",
-              responsive: event.responsive,
-              injectRecord: event.injectRecord,
-              selected: event.selected,
-              runId: event.runId,
-              ...(bound ? { material: BOUNDED_EXECUTION_CAPABILITY } : {}),
-            });
           },
           onPrompt: (event) => {
             if (material && boundRuns.has(event.runId)) {
-              let attempt: number | undefined;
+              const { attempt } = event;
               try {
-                // Allocated before the write, so a failed write still spends it.
-                attempt = material.store.nextPromptAttempt(bootstrap.id, event.runId);
+                if (attempt === undefined) {
+                  throw new RunMaterialReservationError(
+                    "Provider launched without a durable prompt reservation"
+                  );
+                }
                 const ref = material.store.putPrompt(
                   bootstrap.id,
                   event.runId,
@@ -474,6 +528,7 @@ export function createActorRuntime(
               error: event.error instanceof Error ? event.error.message : String(event.error),
             }),
           onEnd: (event) => {
+            flushPendingStart(event.runId);
             const bound = boundRuns.delete(event.runId);
             try {
               if (event.terminal.kind === "abandoned") {

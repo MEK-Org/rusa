@@ -237,28 +237,26 @@ describe("bounded remote execution (#1020)", () => {
     });
   }, 60_000);
 
-  it("keeps an explicit fallback attempt when host discovery is unreadable", async () => {
+  it("refuses execution and material publication when reservation is read-only", async () => {
     const failing: RunMaterialIo = {
       ...fs,
-      readdirSync: (() => {
-        throw Object.assign(new Error("permission denied"), { code: "EACCES" });
-      }) as typeof fs.readdirSync,
-      linkSync: () => {
-        throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+      renameSync: (from: fs.PathLike, to: fs.PathLike) => {
+        if (String(to).endsWith("/attempt")) {
+          throw Object.assign(new Error("read-only counter"), { code: "EROFS" });
+        }
+        fs.renameSync(from, to);
       },
     };
     const r = run({ enabled: true, io: failing });
     await r.done;
 
-    const prompt = r.h.followerEvents.find(
-      ({ actorId, message }) => actorId === r.id && message.type === "runPrompt"
-    );
-    expect(prompt?.message).toMatchObject({ prompt: r.prompts[0], attempt: 1 });
-    // The follower could not retain material, but the full, keyed fallback
-    // reached the leader's material store rather than the unversioned row.
-    expect(await r.read("prompt", 1)).toMatchObject({
-      status: 200,
-      body: { prompt: r.prompts[0], attempt: 1, source: "leader" },
-    });
+    // Reservation runs before the fixture provider, so EROFS cannot turn
+    // into a full prompt fallback or a material binding with an invented key.
+    expect(r.prompts).toEqual([]);
+    expect(r.starts[0]?.material).toBeUndefined();
+    expect(messageTypes(r)).not.toContain("runPrompt");
+    expect(messageTypes(r)).not.toContain("runPromptRef");
+    expect(completion(r)).toMatchObject({ success: false });
+    expect(completion(r)?.output).toContain("Run material admission failed");
   }, 60_000);
 });
