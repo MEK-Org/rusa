@@ -7,7 +7,7 @@ import {
 } from "../../dashboard/inbox-metrics.js";
 import type { InboxPayload } from "../../repositories/inbox-repository.js";
 import { runMigrations } from "../migrations/runner.js";
-import type { InboxMetricRepository } from "./inbox-metric-repository.js";
+import { ALL_INBOX_METRIC_NAMES, type InboxMetricRepository } from "./inbox-metric-repository.js";
 import { Repositories } from "./index.js";
 import type { MeshChatRepository } from "./mesh-chat-repository.js";
 import type { PrincipalRepository } from "./principal-repository.js";
@@ -287,11 +287,55 @@ describe("#1018 inbox metric samples", () => {
   it("reads metric samples by indexed range rather than scanning the table", () => {
     const plan = db
       .prepare(
-        "EXPLAIN QUERY PLAN SELECT * FROM metric_samples WHERE minute >= ? AND minute <= ? ORDER BY minute"
+        `EXPLAIN QUERY PLAN SELECT metric, minute, value, observed_at AS observedAt
+         FROM metric_samples
+         WHERE metric IN (?, ?, ?, ?, ?) AND minute >= ? AND minute <= ?
+         ORDER BY minute ASC`
       )
-      .all(iso(t0), iso(t0 + INBOX_METRIC_WINDOW_MS)) as Array<{ detail: string }>;
+      .all(...ALL_INBOX_METRIC_NAMES, iso(t0), iso(t0 + INBOX_METRIC_WINDOW_MS)) as Array<{
+      detail: string;
+    }>;
     expect(plan.map((row) => row.detail).join("\n")).toMatch(
-      /SEARCH metric_samples USING INDEX idx_metric_samples_minute \(minute>\? AND minute<\?\)/
+      /SEARCH metric_samples USING INDEX sqlite_autoindex_metric_samples_1 \(metric=\? AND minute>\? AND minute<\?\)/
     );
+  });
+
+  it("isolates inbox sampling and pruning from unrelated metrics in the generic table", () => {
+    addActor("a");
+
+    // Pre-insert an unrelated metric at the target sampling minute and far before the 72h window
+    const targetMinute = iso(t0);
+    const oldMinute = iso(t0 - 100 * MINUTE);
+    db.prepare(
+      `INSERT INTO metric_samples (metric, minute, value, observed_at) VALUES (?, ?, ?, ?)`
+    ).run("unrelated_metric", targetMinute, 42.0, targetMinute);
+    db.prepare(
+      `INSERT INTO metric_samples (metric, minute, value, observed_at) VALUES (?, ?, ?, ?)`
+    ).run("unrelated_metric", oldMinute, 99.0, oldMinute);
+
+    // sampleIfDue at targetMinute should not be suppressed by the existing unrelated metric row
+    const point = metrics.sampleIfDue(t0);
+    expect(point).not.toBeNull();
+    expect(point?.actorCount).toBe(1);
+
+    // inbox metrics should be present alongside the unrelated metric
+    const samplesAtTarget = db
+      .prepare(`SELECT metric FROM metric_samples WHERE minute = ?`)
+      .all(targetMinute) as Array<{ metric: string }>;
+    expect(samplesAtTarget.map((s) => s.metric).sort()).toEqual([
+      "actor_count",
+      "inbox_size_max",
+      "inbox_size_median",
+      "oldest_age_seconds_max",
+      "oldest_age_seconds_median",
+      "unrelated_metric",
+    ]);
+
+    // Pruning at t0 should delete older inbox metrics but NOT touch unrelated metrics
+    metrics.prune(t0);
+    const oldRow = db
+      .prepare(`SELECT value FROM metric_samples WHERE metric = ? AND minute = ?`)
+      .get("unrelated_metric", oldMinute) as { value: number };
+    expect(oldRow.value).toBe(99.0);
   });
 });

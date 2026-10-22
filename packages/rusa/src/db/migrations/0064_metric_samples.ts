@@ -19,7 +19,6 @@ export const metricSamples: Migration = {
         observed_at TEXT NOT NULL,
         PRIMARY KEY (metric, minute)
       );
-      CREATE INDEX idx_metric_samples_minute ON metric_samples (minute);
     `);
   },
 };

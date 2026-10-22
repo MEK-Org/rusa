@@ -20,49 +20,26 @@ describe("MetricRepository", () => {
 
   afterEach(() => db.close());
 
-  it("records and reads single metric samples within an inclusive UTC minute range", () => {
-    const sample1: MetricSample = {
-      metric: "inbox_size_median",
-      minute: iso(t0),
-      value: 3.5,
-      observedAt: iso(t0 + 2000),
-    };
-    const sample2: MetricSample = {
-      metric: "inbox_size_median",
-      minute: iso(t0 + MINUTE),
-      value: 4.0,
-      observedAt: iso(t0 + MINUTE + 1500),
-    };
-
-    repo.record(sample1);
-    repo.record(sample2);
-
-    const results = repo.read("inbox_size_median", {
-      startMinute: iso(t0),
-      endMinute: iso(t0 + MINUTE),
-    });
-
-    expect(results).toEqual([sample1, sample2]);
-  });
-
   it("distinguishes missing minutes, sampled nulls, and observed zeroes", () => {
     // minute 0: observed zero
-    repo.record({
-      metric: "inbox_size_median",
-      minute: iso(t0),
-      value: 0,
-      observedAt: iso(t0),
-    });
     // minute 1: missing minute (not recorded)
     // minute 2: sampled with zero live actors (value is null)
-    repo.record({
-      metric: "inbox_size_median",
-      minute: iso(t0 + 2 * MINUTE),
-      value: null,
-      observedAt: iso(t0 + 2 * MINUTE),
-    });
+    repo.recordMany([
+      {
+        metric: "inbox_size_median",
+        minute: iso(t0),
+        value: 0,
+        observedAt: iso(t0),
+      },
+      {
+        metric: "inbox_size_median",
+        minute: iso(t0 + 2 * MINUTE),
+        value: null,
+        observedAt: iso(t0 + 2 * MINUTE),
+      },
+    ]);
 
-    const results = repo.read("inbox_size_median", {
+    const results = repo.readMany(["inbox_size_median"], {
       startMinute: iso(t0),
       endMinute: iso(t0 + 2 * MINUTE),
     });
@@ -81,28 +58,54 @@ describe("MetricRepository", () => {
       observedAt: iso(t0 + 2 * MINUTE),
     });
 
-    // Checking hasSample
-    expect(repo.hasSample(iso(t0))).toBe(true);
-    expect(repo.hasSample(iso(t0 + MINUTE))).toBe(false);
-    expect(repo.hasSample(iso(t0 + 2 * MINUTE))).toBe(true);
+    // Checking hasSample per metric
+    expect(repo.hasSample(iso(t0), "inbox_size_median")).toBe(true);
+    expect(repo.hasSample(iso(t0 + MINUTE), "inbox_size_median")).toBe(false);
+    expect(repo.hasSample(iso(t0 + 2 * MINUTE), "inbox_size_median")).toBe(true);
+    expect(repo.hasSample(iso(t0), "actor_count")).toBe(false);
   });
 
   it("enforces primary key on (metric, minute)", () => {
-    repo.record({
-      metric: "actor_count",
-      minute: iso(t0),
-      value: 2,
-      observedAt: iso(t0),
-    });
-
-    expect(() => {
-      repo.record({
+    repo.recordMany([
+      {
         metric: "actor_count",
         minute: iso(t0),
-        value: 3,
-        observedAt: iso(t0 + 1000),
-      });
+        value: 2,
+        observedAt: iso(t0),
+      },
+    ]);
+
+    expect(() => {
+      repo.recordMany([
+        {
+          metric: "actor_count",
+          minute: iso(t0),
+          value: 3,
+          observedAt: iso(t0 + 1000),
+        },
+      ]);
     }).toThrow();
+  });
+
+  it("rolls back batch insertions atomically if any sample in the batch fails", () => {
+    repo.recordMany([{ metric: "actor_count", minute: iso(t0), value: 1, observedAt: iso(t0) }]);
+
+    // Batch where second item collides with the pre-existing row
+    const failingBatch: MetricSample[] = [
+      { metric: "actor_count", minute: iso(t0 + MINUTE), value: 2, observedAt: iso(t0 + MINUTE) },
+      { metric: "actor_count", minute: iso(t0), value: 3, observedAt: iso(t0) }, // Duplicate PK
+    ];
+
+    expect(() => repo.recordMany(failingBatch)).toThrow();
+
+    // The first item in failingBatch must have been rolled back
+    expect(repo.hasSample(iso(t0 + MINUTE), "actor_count")).toBe(false);
+    const rows = repo.readMany(["actor_count"], {
+      startMinute: iso(t0),
+      endMinute: iso(t0 + MINUTE),
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].value).toBe(1);
   });
 
   it("records batches atomically and reads multiple metrics ordered by minute", () => {
@@ -145,28 +148,43 @@ describe("MetricRepository", () => {
     ]);
   });
 
-  it("prunes samples before a given minute threshold", () => {
+  it("prunes samples before a given minute threshold scoped to metric names", () => {
+    const samples: MetricSample[] = [];
     for (let i = 0; i < 5; i++) {
-      repo.record({
+      samples.push({
         metric: "actor_count",
         minute: iso(t0 + i * MINUTE),
         value: i,
         observedAt: iso(t0 + i * MINUTE),
       });
+      samples.push({
+        metric: "unrelated_metric",
+        minute: iso(t0 + i * MINUTE),
+        value: i * 10,
+        observedAt: iso(t0 + i * MINUTE),
+      });
     }
+    repo.recordMany(samples);
 
-    // Prune before minute 2
-    const deleted = repo.prune(iso(t0 + 2 * MINUTE));
+    // Prune before minute 2 scoped only to actor_count
+    const deleted = repo.prune(iso(t0 + 2 * MINUTE), ["actor_count"]);
     expect(deleted).toBe(2);
 
-    const remaining = repo.read("actor_count", {
+    const remainingActorCount = repo.readMany(["actor_count"], {
       startMinute: iso(t0),
       endMinute: iso(t0 + 10 * MINUTE),
     });
-    expect(remaining.map((r: MetricSample) => r.minute)).toEqual([
+    expect(remainingActorCount.map((r: MetricSample) => r.minute)).toEqual([
       iso(t0 + 2 * MINUTE),
       iso(t0 + 3 * MINUTE),
       iso(t0 + 4 * MINUTE),
     ]);
+
+    // unrelated_metric rows before minute 2 must be preserved
+    const remainingUnrelated = repo.readMany(["unrelated_metric"], {
+      startMinute: iso(t0),
+      endMinute: iso(t0 + 10 * MINUTE),
+    });
+    expect(remainingUnrelated).toHaveLength(5);
   });
 });

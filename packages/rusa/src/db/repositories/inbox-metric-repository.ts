@@ -61,7 +61,7 @@ export class InboxMetricRepository {
     const minute = new Date(minuteFloor(nowMs)).toISOString();
     const observedAt = new Date(nowMs).toISOString();
     const point = this.db.transaction((): InboxMetricPoint | null => {
-      if (this.metrics.hasSample(minute)) return null;
+      if (this.metrics.hasSample(minute, INBOX_METRIC_NAMES.actorCount)) return null;
 
       // Every live actor, with its unhandled entries oldest first. An actor
       // with an empty inbox appears once, with no entry.
@@ -137,7 +137,7 @@ export class InboxMetricRepository {
   /** Deletes samples before the current window's first minute. */
   prune(nowMs = Date.now()): number {
     const { startMs } = inboxMetricWindowBounds(nowMs);
-    return this.metrics.prune(new Date(startMs).toISOString());
+    return this.metrics.prune(new Date(startMs).toISOString(), ALL_INBOX_METRIC_NAMES);
   }
 
   /** The prior three days of samples, oldest first, ending at the current minute. */
