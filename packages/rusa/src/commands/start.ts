@@ -146,7 +146,11 @@ import {
   seedRootModelConfig,
 } from "../actor/root-model-config.js";
 import { createRunAccounting, projectActorRunLaunchConfig } from "../actor/run-accounting.js";
-import { type ActiveRunContext, bindRunContext } from "../actor/run-context.js";
+import {
+  type ActiveRunContext,
+  bindRunContext,
+  resolveRunContextProvider,
+} from "../actor/run-context.js";
 import {
   ensureWakeToken,
   wakePortPath,
@@ -3874,6 +3878,9 @@ async function composeStart(
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
         let localActor: Actor | undefined;
+        let prepareRunMcp: (runId: string) => void = () => {
+          throw new Error(`actor ${id} prepared a run-scoped MCP endpoint before composition`);
+        };
         const computerUseAdmission = createComputerUseAdmission(() =>
           mesh.hasActiveCapability(id, COMPUTER_USE_CAPABILITY)
         );
@@ -3884,6 +3891,7 @@ async function composeStart(
           resolveProvider: (selected) =>
             resolveProvider(config, selected.provider, selected.model, selected.effort),
           mcpServers: workerMcp,
+          prepareRunMcp: (runId) => prepareRunMcp(runId),
           // E2E preserves the external-driver transport for the imported actor,
           // but its durable construction and tool surface stay ordinary.
           isE2eRoot: id === rootId && Boolean(opts?.e2e),
@@ -4042,10 +4050,11 @@ async function composeStart(
             `actor ${id} requests executionTarget ${JSON.stringify(ctx.executionTarget)} but this runtime has no remote placement support`
           );
         }
-        // The provider reads the mutable server array only after its lifecycle
-        // `onStart` hooks finish. Mount agent-exec there so its bearer URL is
-        // bound to this run's durable identity, live focus and actual provider
-        // attempt; a later run can never inherit it.
+        // A local provider reads the mutable server array after `onStart`, but
+        // a follower receives a copied admission snapshot before it emits that
+        // event. Mount from the leader-minted queued run id when that snapshot
+        // is built, then let the same exact lease become live at `onStart`.
+        // A later run receives a different endpoint and cannot inherit this one.
         let runAgentMcp:
           | {
               runId: string;
@@ -4054,59 +4063,67 @@ async function composeStart(
               revoke: () => void;
             }
           | undefined;
+        const mountRunAgentMcp = (runId: string): void => {
+          if (runAgentMcp?.runId === runId) return;
+          if (runAgentMcp) {
+            throw new Error(
+              `actor ${id} tried to mount agent execution for ${runId} while ${runAgentMcp.runId} is still active`
+            );
+          }
+          const lease = bindRunContext(id, runId, (): Readonly<ActiveRunContext> | undefined => {
+            if (runAccounting.activeRunId(id) !== runId) return undefined;
+            const repositories = getRepositories();
+            const run = repositories.actorRuns.getById(runId);
+            if (!run || run.actorId !== id || run.endedAt !== null) return undefined;
+            const focus = repositories.inboxFocus.getByRunId(runId);
+            const primaryObligationId = focus?.primaryObligationId ?? null;
+            const provider = resolveRunContextProvider(activeRunSelections.get(id), {
+              provider: run.provider ?? undefined,
+              model: run.model ?? undefined,
+              effort: run.modelConfig?.effort,
+            });
+            return {
+              actorId: id,
+              runId,
+              startedAt: run.startedAt,
+              ...provider,
+              selectedInboxEntryIds: focus?.entryIds ?? [],
+              primaryObligationId,
+              effectiveResponsive:
+                primaryObligationId !== null &&
+                repositories.obligations.get(primaryObligationId)?.effectiveResponsive === true,
+            };
+          });
+          const name = `${id}:run:${runId}:${AGENT_EXEC_MCP_NAME}`;
+          const url = mcpHttp.addServer(name, () =>
+            createAgentExecMcpServer(mesh, id, rootId, osScheduler, {
+              // Controller operations stay available to the one imported
+              // actor, but remain stamped by its exact active run.
+              ...(id === rootId ? { rootControl } : {}),
+              messageStamp: () => messageStamps.stampActor(lease.reader),
+              onWrite: () => {
+                mesh.markUnkillable(id);
+              },
+              modelClasses,
+              validateModelClass: (input) =>
+                validateModelConfigPool(config, input, { portable: true }),
+              availabilityHolds,
+              validateHoldScope,
+              getFollowers: () => (followerHub ? followerHub.list() : []),
+              chatRoom,
+              voices: () => supportedVoiceCatalog,
+            })
+          );
+          const actorRunNames = runAgentMcpNames.get(id) ?? new Set<string>();
+          actorRunNames.add(name);
+          runAgentMcpNames.set(id, actorRunNames);
+          workerMcp.push({ name: AGENT_EXEC_MCP_NAME, url });
+          runAgentMcp = { runId, name, url, revoke: lease.revoke };
+        };
+        prepareRunMcp = mountRunAgentMcp;
         ctx.lifecycle.add({
           onStart: (event) => {
-            const lease = bindRunContext(
-              id,
-              event.runId,
-              (): Readonly<ActiveRunContext> | undefined => {
-                if (runAccounting.activeRunId(id) !== event.runId) return undefined;
-                const repositories = getRepositories();
-                const run = repositories.actorRuns.getById(event.runId);
-                if (!run || run.actorId !== id || run.endedAt !== null) return undefined;
-                const focus = repositories.inboxFocus.getByRunId(event.runId);
-                const primaryObligationId = focus?.primaryObligationId ?? null;
-                const attempt = activeRunSelections.get(id);
-                return {
-                  actorId: id,
-                  runId: event.runId,
-                  startedAt: run.startedAt,
-                  provider: attempt?.provider ?? run.provider ?? undefined,
-                  model: attempt?.model ?? run.model ?? undefined,
-                  effort: attempt?.effort ?? run.modelConfig?.effort,
-                  selectedInboxEntryIds: focus?.entryIds ?? [],
-                  primaryObligationId,
-                  effectiveResponsive:
-                    primaryObligationId !== null &&
-                    repositories.obligations.get(primaryObligationId)?.effectiveResponsive === true,
-                };
-              }
-            );
-            const name = `${id}:run:${event.runId}:${AGENT_EXEC_MCP_NAME}`;
-            const url = mcpHttp.addServer(name, () =>
-              createAgentExecMcpServer(mesh, id, rootId, osScheduler, {
-                // Controller operations stay available to the one imported
-                // actor, but remain stamped by its exact active run.
-                ...(id === rootId ? { rootControl } : {}),
-                messageStamp: () => messageStamps.stampActor(lease.reader),
-                onWrite: () => {
-                  mesh.markUnkillable(id);
-                },
-                modelClasses,
-                validateModelClass: (input) =>
-                  validateModelConfigPool(config, input, { portable: true }),
-                availabilityHolds,
-                validateHoldScope,
-                getFollowers: () => (followerHub ? followerHub.list() : []),
-                chatRoom,
-                voices: () => supportedVoiceCatalog,
-              })
-            );
-            const actorRunNames = runAgentMcpNames.get(id) ?? new Set<string>();
-            actorRunNames.add(name);
-            runAgentMcpNames.set(id, actorRunNames);
-            workerMcp.push({ name: AGENT_EXEC_MCP_NAME, url });
-            runAgentMcp = { runId: event.runId, name, url, revoke: lease.revoke };
+            mountRunAgentMcp(event.runId);
           },
           onEnd: async (event) => {
             if (!runAgentMcp || runAgentMcp.runId !== event.runId) return;

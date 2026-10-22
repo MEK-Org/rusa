@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MessageStampService } from "./message-stamp.js";
-import { type ActiveRunContext, bindRunContext } from "./run-context.js";
+import { type ActiveRunContext, bindRunContext, resolveRunContextProvider } from "./run-context.js";
 
 const context = (overrides: Partial<ActiveRunContext> = {}): ActiveRunContext => ({
   actorId: "actor-a",
@@ -13,6 +13,15 @@ const context = (overrides: Partial<ActiveRunContext> = {}): ActiveRunContext =>
 });
 
 describe("bound run context", () => {
+  it("keeps omitted actual-attempt fields as provider defaults", () => {
+    expect(
+      resolveRunContextProvider(
+        { provider: "codex" },
+        { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }
+      )
+    ).toStrictEqual({ provider: "codex" });
+  });
+
   it("reads fresh focus and attempt facts only for its exact active run", () => {
     let current: ActiveRunContext | undefined = context({ provider: "first" });
     const lease = bindRunContext("actor-a", "run-a", () => current);

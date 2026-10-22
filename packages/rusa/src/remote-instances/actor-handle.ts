@@ -29,7 +29,9 @@ export interface ActorHandleOptions {
   bootstrap: Bootstrap;
   context: ActorFactoryContext;
   // Read only after central scheduler admission, so queued runs get fresh work.
-  snapshot: () => RunSnapshot;
+  // The minted queued run id lets a host include a run-scoped endpoint in the
+  // already-existing admission snapshot without extending the follower wire.
+  snapshot: (runId?: string) => RunSnapshot;
   saveSession: (sessionId: string) => void;
   onEvent?: (event: ActorEvent) => void;
   /**
@@ -1266,11 +1268,18 @@ export class ActorHandle implements MeshActor {
                     this.admittedAt = new Date();
                     // Selection is decided here and carried to the follower, so the
                     // remote run uses the candidate the leader actually reserved.
+                    const runId = this.queuedRunId;
+                    if (!runId) {
+                      throw new Error(
+                        `Remote actor ${this.id} was admitted without a queued run id`
+                      );
+                    }
+                    this.opts.actorOptions?.prepareRunMcp?.(runId);
                     this.send({
                       type: "reply",
                       requestId,
                       value: {
-                        ...this.opts.snapshot(),
+                        ...this.opts.snapshot(runId),
                         // A follower can wait in provider pacing after its
                         // beforeRun request. Read the durable grant at the
                         // selected-provider boundary instead of carrying that

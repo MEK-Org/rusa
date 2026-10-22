@@ -15,6 +15,25 @@ export interface ActiveRunContext {
   readonly effectiveResponsive: boolean;
 }
 
+/** The provider tuple shown by a run-context reader. */
+export interface RunContextProvider {
+  readonly provider?: string;
+  readonly model?: string;
+  readonly effort?: string;
+}
+
+/**
+ * Prefer one complete actual attempt over the immutable launch tuple. An
+ * omitted model or effort is meaningful: it preserves the provider default,
+ * rather than combining fields from two different attempts.
+ */
+export function resolveRunContextProvider(
+  attempt: Readonly<RunContextProvider> | undefined,
+  launch: Readonly<RunContextProvider>
+): Readonly<RunContextProvider> {
+  return attempt ?? launch;
+}
+
 /** The only context surface handed to a mesh-managed MCP server. */
 export interface BoundRunContextReader {
   /** Undefined means this exact lease is no longer active; it never falls forward. */

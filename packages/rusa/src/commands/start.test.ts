@@ -9906,6 +9906,27 @@ describe("runStart webhook event routing (Phase 4)", () => {
       `same-run fallback attempt\n\n_${generateHandle(workerId)} (gpt-5.5, low)_`
     );
 
+    // Once a follower reports an actual attempt, omitted optional fields mean
+    // that provider's defaults, not the launch tuple's values.
+    remote.receive({
+      actorId: workerId,
+      message: {
+        type: "request",
+        requestId: 1,
+        request: { op: "providerAttempt", attempt: { provider: "codex" } },
+      },
+    });
+    await vi.waitFor(() =>
+      expect(remote?.commands).toContainEqual({
+        actorId: workerId,
+        message: { type: "reply", requestId: 1 },
+      })
+    );
+    expect((await callChat("same-run default attempt")).isError).toBeFalsy();
+    expect(chatClient.sent[2]?.text).toBe(
+      `same-run default attempt\n\n_${generateHandle(workerId)}_`
+    );
+
     remote.receive({
       actorId: workerId,
       message: { type: "result", result: { success: true, output: "done", exitCode: 0 } },
@@ -9914,7 +9935,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(getRepositories().actorRuns.getById(runId)?.outcome).toBe("completed")
     );
     expect((await callChat("after remote terminal")).isError).toBeFalsy();
-    expect(chatClient.sent[2]?.text).toBe(`after remote terminal\n\n_${generateHandle(workerId)}_`);
+    expect(chatClient.sent[3]?.text).toBe(`after remote terminal\n\n_${generateHandle(workerId)}_`);
 
     // A late attempt is still answered, but cannot restore the cleared selection.
     remote.receive({
@@ -9935,10 +9956,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
       })
     );
     expect((await callChat("after late attempt")).isError).toBeFalsy();
-    expect(chatClient.sent[3]?.text).toBe(`after late attempt\n\n_${generateHandle(workerId)}_`);
+    expect(chatClient.sent[4]?.text).toBe(`after late attempt\n\n_${generateHandle(workerId)}_`);
   });
 
-  it("installs a real follower's normalized attempt before its provider can write", async () => {
+  it("installs a real follower's bound MCP endpoint and normalized attempt before provider writes", async () => {
     const chatClient = new FakeChatClient();
     writeFileSync(
       join(homeDir, "config.yaml"),
@@ -9958,7 +9979,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     );
     let mesh: ActorMesh | undefined;
     let remote: RemoteInstance | undefined;
-    let leaderOptions: ActorOptions | undefined;
     const followerHome = mkdtempSync(join(tmpdir(), "rusa-signature-follower-"));
     onTestFinished(() => rmSync(followerHome, { recursive: true, force: true }));
     // Follower events reach the leader in order but late, as through
@@ -9967,6 +9987,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // to win the race with.
     let held: Array<() => void> | undefined;
     let providerStarted = false;
+    let meshUrl: string | undefined;
     // The follower's own config fills what the admitted tuple omits, as
     // configured-provider.ts does. Each run makes its public write at once.
     const follower = new FollowerInstance(
@@ -9986,19 +10007,30 @@ describe("runStart webhook event routing (Phase 4)", () => {
         effort: selected?.effort ?? "low",
         async run(run) {
           providerStarted = true;
-          const chatUrl = leaderOptions?.mcpServers.find(
-            (server) => server.name === "chat-write"
-          )?.url;
-          if (!chatUrl) throw new Error("remote chat-write server missing");
-          const client = new Client({ name: "remote-signature-follower", version: "0.0.0" });
-          await client.connect(new StreamableHTTPClientTransport(new URL(chatUrl)));
+          meshUrl = run.mcpServers?.find((server) => server.name === "mesh")?.url;
+          if (!meshUrl) throw new Error("remote mesh server missing from run snapshot");
+          const client = new Client({ name: "remote-bound-send", version: "0.0.0" });
+          await client.connect(new StreamableHTTPClientTransport(new URL(meshUrl)));
           try {
-            await client.callTool({
+            const sent = await client.callTool({
+              name: "send_message",
+              arguments: { thread_id: rootId, body: "bound follower send" },
+            });
+            if (sent.isError) throw new Error(`remote bound send failed: ${JSON.stringify(sent)}`);
+          } finally {
+            await client.close();
+          }
+          const chatUrl = run.mcpServers?.find((server) => server.name === "chat-write")?.url;
+          if (!chatUrl) throw new Error("remote chat-write server missing");
+          const chatClient = new Client({ name: "remote-signature-follower", version: "0.0.0" });
+          await chatClient.connect(new StreamableHTTPClientTransport(new URL(chatUrl)));
+          try {
+            await chatClient.callTool({
               name: "send_message",
               arguments: { spaceName: "spaces/A", text: "written at provider start" },
             });
           } finally {
-            await client.close();
+            await chatClient.close();
           }
           return { success: true, output: "done", exitCode: 0, sessionId: run.session?.id };
         },
@@ -10010,7 +10042,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         e2e: {
           chatClient,
           createWorkerActor: (context: ActorFactoryContext, options: ActorOptions) => {
-            leaderOptions = options;
             if (!remote) {
               const instance = new RemoteInstance(
                 "signature-follower",
@@ -10036,7 +10067,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
               snapshot: () => {
                 const record = context.getRecord();
                 if (!record) throw new Error("remote signature worker record missing");
-                return { record, prompt: "remote signature fixture" };
+                return {
+                  record,
+                  prompt: "remote signature fixture",
+                  mcpServers: options.mcpServers,
+                };
               },
               saveSession: () => {},
               onFailure: () => {},
@@ -10080,6 +10115,19 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(chatClient.sent[0]?.text).toBe(
       `written at provider start\n\n_${generateHandle(workerId)} (gpt-5.5, low)_`
     );
+    await vi.waitFor(() =>
+      expect(getRepositories().actorRuns.listRecentCompleted(workerId, 1)).toHaveLength(1)
+    );
+    if (!meshUrl) throw new Error("remote mesh URL was not captured");
+    const stale = await fetch(meshUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1 }),
+    });
+    expect(stale.status).toBe(404);
   }, 20_000);
 
   it("records token usage linked to actor_runs.id through the real worker lifecycle wiring", async () => {
