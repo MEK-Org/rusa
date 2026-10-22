@@ -49,10 +49,13 @@ const quiet: Logger = {
   child: () => quiet,
 };
 
-function run(material: { enabled: boolean; io?: RunMaterialIo } | undefined) {
+function run(
+  material: { enabled: boolean; io?: RunMaterialIo } | undefined,
+  overrideProvider?: ProviderFactory
+) {
   const cwd = tempDir();
   const prompts: string[] = [];
-  const provider: ProviderFactory = (bridge, _options, selected) => ({
+  const defaultProvider: ProviderFactory = (bridge, _options, selected) => ({
     name: "instance-fixture",
     providerName: "instance-fixture",
     model: selected?.model,
@@ -81,7 +84,7 @@ function run(material: { enabled: boolean; io?: RunMaterialIo } | undefined) {
   const ends: ActorLifecycleEndEvent[] = [];
   const h = createHarness({
     cwd,
-    providerFactory: provider,
+    providerFactory: overrideProvider ?? defaultProvider,
     material: options,
     lifecycle: (actorId) => {
       const listener = runMaterialListener(
@@ -119,7 +122,6 @@ function run(material: { enabled: boolean; io?: RunMaterialIo } | undefined) {
     const runId = ends[0]?.runId ?? "";
     return readRunMaterial(
       {
-        runActor: () => id,
         binding: () => starts[0]?.material,
         local: leaderStore,
         remote: (host, actorId, request) =>
@@ -200,6 +202,21 @@ describe("bounded remote execution (#1020)", () => {
     });
   }, 60_000);
 
+  it("opens the run on the leader before confirming the first provider attempt", async () => {
+    // The leader applies a `providerAttempt` only to an open run, and opens it
+    // on `runStart`; a bounded run must not reverse that order.
+    const bounded = run({ enabled: true });
+    await bounded.done;
+    const sequence = bounded.h.followerEvents
+      .filter((e) => e.actorId === bounded.id)
+      .map(({ message }) =>
+        message.type === "request" ? `request:${message.request.op}` : message.type
+      );
+    const start = sequence.indexOf("runStart");
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(sequence.indexOf("request:providerAttempt")).toBeGreaterThan(start);
+  }, 60_000);
+
   it("falls back to the full prompt and result, disclosed, when the host cannot keep them", async () => {
     const failing: RunMaterialIo = {
       ...fs,
@@ -256,7 +273,41 @@ describe("bounded remote execution (#1020)", () => {
     expect(r.starts[0]?.material).toBeUndefined();
     expect(messageTypes(r)).not.toContain("runPrompt");
     expect(messageTypes(r)).not.toContain("runPromptRef");
+    // Nor does the leader hear of an attempt that never launched.
+    expect(
+      r.h.followerEvents.some(
+        ({ actorId, message }) =>
+          actorId === r.id && message.type === "request" && message.request.op === "providerAttempt"
+      )
+    ).toBe(false);
     expect(completion(r)).toMatchObject({ success: false });
     expect(completion(r)?.output).toContain("Run material admission failed");
+  }, 60_000);
+
+  it("reads 404 prompt not retained when launch fails after a successful reservation", async () => {
+    // When the first counter reservation succeeds, the run is announced on time
+    // with its material binding. If the provider fails before launching its
+    // prompt, the binding remains recorded on the leader and reading the prompt
+    // answers 404.
+    const failingProvider: ProviderFactory = (_bridge, _options, selected) => ({
+      name: "instance-fixture",
+      providerName: "instance-fixture",
+      model: selected?.model,
+      async run() {
+        throw new Error("provider launch failed");
+      },
+    });
+    const r = run({ enabled: true }, failingProvider);
+    await r.done;
+
+    expect(r.starts[0]?.material).toEqual({ version: 1, host: "test-follower" });
+    expect(r.prompts).toEqual([]);
+    expect(messageTypes(r)).not.toContain("runPrompt");
+    expect(messageTypes(r)).not.toContain("runPromptRef");
+    expect(completion(r)).toMatchObject({ success: false });
+    expect(await r.read("prompt")).toEqual({
+      status: 404,
+      body: { error: "prompt not retained" },
+    });
   }, 60_000);
 });

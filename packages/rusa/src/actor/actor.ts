@@ -207,8 +207,9 @@ export interface ActorOptions {
    */
   onProviderAttempt?: (provider: ProviderAttempt) => void | Promise<void>;
   /**
-   * Prepare one provider invocation after its prompt is assembled but before
-   * the adapter is called. A rejection prevents that provider from starting.
+   * Prepare one provider invocation after its prompt is assembled, before
+   * `onProviderAttempt` and the adapter. A rejection prevents that provider
+   * from starting.
    * The returned prompt attempt, when present, is carried to the launched
    * prompt observer without changing the provider-facing prompt.
    */
@@ -769,6 +770,7 @@ export class Actor {
       recoveryContext?: string
     ): Promise<RunResult> => {
       const runId = this.currentRunId;
+      // Unreachable, type narrowing only: currentRunId is set in executeTurn before runProvider is called.
       if (!runId) throw new Error(`actor ${this.id} started without a lifecycle run id`);
       const prompt = recoveryContext ? `${recoveryContext}\n\n${built.prompt}` : built.prompt;
       const attempt = new AbortController();
@@ -778,12 +780,12 @@ export class Actor {
       else abortController.signal.addEventListener("abort", stop, { once: true });
       startWatchdogTimers();
       try {
-        await this.opts.onProviderAttempt?.(provider);
         const promptAttempt = await this.opts.beforeProviderAttempt?.({
           runId,
           prompt,
           provider,
         });
+        await this.opts.onProviderAttempt?.(provider);
         const result = await provider.run({
           prompt,
           onPromptLaunched: (prompt) => {

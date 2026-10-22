@@ -12,7 +12,7 @@ import {
   readRunMaterial,
   runMaterialListener,
 } from "./leader-run-material.js";
-import { MaterialReadUnavailableError } from "./remote-instance.js";
+import { MaterialReadUnavailableError, RemoteInstance } from "./remote-instance.js";
 import {
   RUN_MATERIAL_READ_MAX_BYTES,
   type RunMaterialRead,
@@ -109,7 +109,6 @@ describe("readRunMaterial", () => {
     const asked: string[] = [];
     return {
       asked,
-      runActor: () => "worker",
       binding: () => ({ version: 1, host: "mac" }),
       local: store(),
       remote: async (host, actorId, request) => {
@@ -252,6 +251,32 @@ describe("readRunMaterial", () => {
     expect(await readRunMaterial(d, "worker", RUN, "prompt")).toMatchObject({
       status: 200,
       body: { prompt: "newest fallback", attempt: 2, source: "leader" },
+    });
+  });
+
+  it("does not replace an unavailable newest allocation with an older fallback across the remote instance wire", async () => {
+    const remote = new RemoteInstance("follower-a", process.platform, process.pid);
+    remote.boundedExecution = true;
+    const d = deps({
+      remote: (_host, actorId, request) => {
+        const pending = remote.materialRead(actorId, request);
+        const command = remote.commands.at(-1) as { message: { requestId: string } };
+        remote.receive({
+          actorId,
+          message: {
+            type: "materialReadResult",
+            requestId: command.message.requestId,
+            result: { status: "missing", attempt: 2 },
+          },
+        } as Parameters<RemoteInstance["receive"]>[0]);
+        return pending;
+      },
+    });
+    d.local.putPrompt("worker", RUN, 1, "older fallback");
+
+    expect(await readRunMaterial(d, "worker", RUN, "prompt")).toEqual({
+      status: 404,
+      body: { error: "prompt not retained" },
     });
   });
 });

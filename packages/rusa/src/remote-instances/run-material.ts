@@ -360,9 +360,9 @@ export class RunMaterialStore {
     } finally {
       this.removeQuietly(tmp);
     }
+    // `ensureDir` already confirmed every entry above `dir`; the link changed
+    // only `dir`.
     this.syncDir(dir);
-    this.syncDir(dirname(dir));
-    this.syncDir(this.root);
   }
 
   private ensureDir(dir: string): void {

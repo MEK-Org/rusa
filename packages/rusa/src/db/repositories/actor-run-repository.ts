@@ -94,6 +94,24 @@ interface SourceCursor {
 export const ACTOR_RUN_OUTPUT_MAX_CHARS = 40_000;
 
 /**
+ * Tail-truncate `text` to at most `maxChars`, prepending a summary of truncated
+ * characters. `omittedChars` counts code units already cut from the front of
+ * `text` (for example, by a bounded completion), so the rendered prefix matches
+ * the full original.
+ */
+export function clampTail(
+  text: string | null | undefined,
+  maxChars: number,
+  omittedChars = 0
+): string | null {
+  if (text == null) return null;
+  const total = text.length + omittedChars;
+  if (total <= maxChars) return text;
+  const dropped = total - maxChars;
+  return `… [${dropped.toLocaleString()} earlier chars truncated]\n${text.slice(-maxChars)}`;
+}
+
+/**
  * `omittedChars` counts code units already cut from the front of `output` by a
  * bounded completion (#1020), so a tail renders exactly as its original would.
  */
@@ -101,11 +119,7 @@ export function captureRunOutput(
   output: string | null | undefined,
   omittedChars = 0
 ): string | null {
-  if (output == null) return null;
-  const total = output.length + omittedChars;
-  if (total <= ACTOR_RUN_OUTPUT_MAX_CHARS) return output;
-  const dropped = total - ACTOR_RUN_OUTPUT_MAX_CHARS;
-  return `… [${dropped.toLocaleString()} earlier chars truncated]\n${output.slice(-ACTOR_RUN_OUTPUT_MAX_CHARS)}`;
+  return clampTail(output, ACTOR_RUN_OUTPUT_MAX_CHARS, omittedChars);
 }
 
 /** Durable lifecycle/output storage plus the portable ledger's cross-store read model. */

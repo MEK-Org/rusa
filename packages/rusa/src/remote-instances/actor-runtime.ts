@@ -84,11 +84,10 @@ export function createActorRuntime(
   /** Runs bound to this host at start: their material is retained here (#1020). */
   const boundRuns = new Set<string>();
   /**
-   * A negotiated run is not announced as material-bound until its first
-   * prompt key is durably reserved. This lets a reservation failure report an
-   * ordinary terminal error without publishing a material binding or fallback.
+   * First prompt attempt reservation result for a negotiated run, established in
+   * `onStart` so `runStart` is sent on time.
    */
-  const pendingMaterialStarts = new Map<string, ActorLifecycleStartEvent>();
+  const firstReservations = new Map<string, { attempt?: number; error?: unknown }>();
   function finishClose(): void {
     if (stopping && !closed && activeGates === 0 && !terminalAccountingPending) {
       closed = true;
@@ -142,14 +141,6 @@ export function createActorRuntime(
       runId: event.runId,
       ...(bound ? { material: BOUNDED_EXECUTION_CAPABILITY } : {}),
     });
-  }
-
-  /** Announce a deferred run without a material binding if it never launched. */
-  function flushPendingStart(runId: string): void {
-    const event = pendingMaterialStarts.get(runId);
-    if (!event) return;
-    pendingMaterialStarts.delete(runId);
-    sendRunStart(event, false);
   }
 
   /** Retain a bound run's output and bound its result, or keep the full result. */
@@ -291,24 +282,25 @@ export function createActorRuntime(
       },
       prepareUnderstandingMount: () => request<string | undefined>({ op: "prepareMount" }).result,
       beforeProviderAttempt: ({ runId }) => {
-        const pendingStart = pendingMaterialStarts.get(runId);
-        // A run that began unnegotiated remains legacy for its lifetime.
-        if (!material || (!pendingStart && !boundRuns.has(runId))) return undefined;
-        try {
-          const attempt = material.store.reservePromptAttempt(bootstrap.id, runId);
-          if (!boundRuns.has(runId)) {
-            boundRuns.add(runId);
-            material.store.openRun(bootstrap.id, runId);
-            if (pendingStart) {
-              pendingMaterialStarts.delete(runId);
-              sendRunStart(pendingStart, true);
-            }
+        const first = firstReservations.get(runId);
+        if (first) {
+          firstReservations.delete(runId);
+          if (first.error) {
+            const error = first.error;
+            throw new RunMaterialReservationError(
+              `Run material admission failed for run ${runId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+              error
+            );
           }
-          return attempt;
+          return first.attempt;
+        }
+        // A run that began unnegotiated remains legacy for its lifetime.
+        if (!material || !boundRuns.has(runId)) return undefined;
+        try {
+          return material.store.reservePromptAttempt(bootstrap.id, runId);
         } catch (error) {
-          // The leader still needs a run bracket for the honest terminal
-          // admission error, but it receives no material host/ref/fallback.
-          flushPendingStart(runId);
           throw new RunMaterialReservationError(
             `Run material admission failed for run ${runId}: ${
               error instanceof Error ? error.message : String(error)
@@ -468,12 +460,20 @@ export function createActorRuntime(
                 reportLocalAccountingFailure("start", event.runId, error);
               }
             }
-            // A negotiated run gets its material binding only after the first
-            // counter reservation is durable. That reservation runs in the
-            // Actor's pre-provider hook, which can stop the provider.
+            // A negotiated run reserves attempt 1 here so runStart is sent on
+            // time, bound when the reservation succeeded and unbound when it failed.
             const bound = material?.enabled() === true;
             if (bound) {
-              pendingMaterialStarts.set(event.runId, event);
+              try {
+                const attempt = material.store.reservePromptAttempt(bootstrap.id, event.runId);
+                boundRuns.add(event.runId);
+                material.store.openRun(bootstrap.id, event.runId);
+                firstReservations.set(event.runId, { attempt });
+                sendRunStart(event, true);
+              } catch (error) {
+                firstReservations.set(event.runId, { error });
+                sendRunStart(event, false);
+              }
             } else {
               sendRunStart(event, false);
             }
@@ -528,7 +528,7 @@ export function createActorRuntime(
               error: event.error instanceof Error ? event.error.message : String(event.error),
             }),
           onEnd: (event) => {
-            flushPendingStart(event.runId);
+            firstReservations.delete(event.runId);
             const bound = boundRuns.delete(event.runId);
             try {
               if (event.terminal.kind === "abandoned") {

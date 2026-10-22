@@ -65,8 +65,6 @@ export function runMaterialListener(
 }
 
 export interface RunMaterialReaderDeps {
-  /** The run's owning actor, or undefined for an unknown run. */
-  runActor: (runId: string) => string | undefined;
   binding: (actorId: string, runId: string) => RunMaterialBinding | undefined;
   /** The leader's own store: fallbacks for bound runs. */
   local: RunMaterialStore;

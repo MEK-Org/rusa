@@ -263,7 +263,7 @@ export type LeaderCommand =
 /** A follower's answer to `materialRead`; `content` is the original's bytes in base64. */
 export type MaterialReadReply =
   | { status: "ok"; attempt?: number; bytes: number; sha256: string; content: string }
-  | { status: "missing" }
+  | { status: "missing"; attempt?: number }
   | { status: "tooLarge"; attempt?: number; bytes: number; sha256: string }
   | { status: "integrity" }
   | { status: "error"; error: string };

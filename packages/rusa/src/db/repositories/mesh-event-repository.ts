@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-
 // The set of event kinds is authored once, in the actor layer (which owns the
 // observability seam and has no db dependency); the repository re-exports it so
 // producers and this reader can't drift. A failed run is a `run_end` with
@@ -8,6 +7,7 @@ import type Database from "better-sqlite3";
 // *forwarding* is the failure-sink's job). This is a type-only import: no
 // runtime coupling from db → actor.
 import type { MeshEventKind } from "../../actor/mesh-events.js";
+import { clampTail } from "./actor-run-repository.js";
 export type { MeshEventKind };
 
 /** An appended mesh event (camelCase domain object). */
@@ -94,12 +94,7 @@ export interface RunSelectedEvent extends MeshEvent<RunSelectedPayload> {
 const MAX_BODY_CHARS = 40_000;
 
 function clampBody(body: string | null | undefined, omittedChars = 0): string | null {
-  if (body == null) return null;
-  const total = body.length + omittedChars;
-  if (total <= MAX_BODY_CHARS) return body;
-  const dropped = total - MAX_BODY_CHARS;
-  // Keep the tail — for a run that's the result/summary, the most useful part.
-  return `… [${dropped.toLocaleString()} earlier chars truncated]\n${body.slice(-MAX_BODY_CHARS)}`;
+  return clampTail(body, MAX_BODY_CHARS, omittedChars);
 }
 
 /** Append-only data access for the `mesh_events` table. */

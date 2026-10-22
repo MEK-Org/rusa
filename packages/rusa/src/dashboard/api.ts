@@ -2605,7 +2605,6 @@ export async function handleMeshApiRequest(
     const response = await readRunMaterial(
       {
         ...deps.runMaterial,
-        runActor: () => actorId,
         binding: (owner, id) => meshEvents.getRunMaterialBinding(owner, id),
         legacyPrompt,
       },

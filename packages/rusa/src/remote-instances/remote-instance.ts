@@ -108,6 +108,11 @@ function parseMaterialReadReply(
     SHA256_HEX.test(r.sha256);
   switch (reply?.status) {
     case "missing":
+      if (reply.attempt === undefined) return { status: "missing" };
+      // Only a latest-prompt miss names an attempt: the newest allocated one.
+      if (request.kind !== "prompt" || request.attempt !== undefined) break;
+      if (!attemptFits(reply.attempt)) break;
+      return { status: "missing", attempt: reply.attempt as number };
     case "integrity":
       return { status: reply.status };
     case "error":
