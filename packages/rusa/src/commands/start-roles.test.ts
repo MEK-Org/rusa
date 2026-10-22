@@ -15,6 +15,7 @@ import {
 import { type InstanceIdentity, loadConfig } from "../config/index.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
+import { HostRunReceiptRepository } from "../db/repositories/run-receipt-repository.js";
 import type { RunOptions } from "../providers/types.js";
 import type { FollowerCommand } from "../remote-instances/follower-hub.js";
 import { FollowerInstance } from "../remote-instances/follower-instance.js";
@@ -1632,6 +1633,118 @@ describe("shared startup, role authority, and local database (#1019)", () => {
       } finally {
         await leader.close().catch(() => {});
       }
+    }
+  }, 20_000);
+
+  it("keeps a crashed run unresolved across boot and shutdown and redelivers a pending receipt after a lost acknowledgment (#1020)", async () => {
+    const home = makeTempHome();
+    process.env.RUSA_HOME = home;
+    // A previous follower process completed one receipt-backed run, without
+    // delivering its receipt, and died with another open.
+    initDb(home);
+    const previous = new HostRunReceiptRepository(getDb(), "follower-node-receipts");
+    const modelConfig = { version: 1 as const, provider: "codex", model: "gpt-5.6-sol" };
+    previous.start({ id: "run-done", actorId: "actor-done", modelConfig });
+    previous.complete(
+      "run-done",
+      "actor-done",
+      { success: true, exitCode: 0, output: "done" },
+      "observed"
+    );
+    previous.start({ id: "run-crashed", actorId: "actor-crashed", modelConfig });
+    closeDb();
+
+    const registerBodies: Record<string, unknown>[] = [];
+    const posted: Array<{ session: unknown; receipts: Array<Record<string, unknown>> }> = [];
+    let registrations = 0;
+    let shutdown: (() => Promise<void>) | undefined;
+    const leader = await startSyntheticLeader((path, body, res) => {
+      if (path === "/register") {
+        registrations++;
+        registerBodies.push(body);
+        // Each registration is a new leader incarnation; receipts survive it.
+        replyJson(res, {
+          session: `receipt-session-${registrations}`,
+          protocolVersion: INSTANCE_PROTOCOL_VERSION,
+          leaderToken: `receipt-leader-${registrations}`,
+          runReceipts: { version: 1 },
+        });
+        return;
+      }
+      if (path === "/receipts") {
+        const receipts = body.receipts as Array<Record<string, unknown>>;
+        posted.push({ session: body.session, receipts });
+        // The first answer is lost in transport after the leader recorded it.
+        if (posted.length === 1) {
+          replyJson(res, { error: "synthetic lost acknowledgment" }, 503);
+          return;
+        }
+        replyJson(res, {
+          results: receipts.map((r) => ({
+            runId: r.runId,
+            status: posted.length === 2 ? "duplicate" : "applied",
+          })),
+        });
+        return;
+      }
+      if (path === "/poll") {
+        setTimeout(() => replyJson(res, []), 20);
+        return;
+      }
+      replyJson(res, {});
+    });
+    try {
+      writeConfigFile(home, {
+        providers: { codex: { cliCommand: "codex" } },
+        peers: [{ type: "leader", url: leader.url, token: "token-synthetic-receipts" }],
+        instance: { id: "follower-node-receipts" },
+      });
+      await runStart({
+        e2e: {
+          connectPeer: true,
+          followerPolling: true,
+          onFollowerReady: (ready) => {
+            shutdown = ready.shutdown;
+          },
+        },
+      });
+      await waitUntil(() => posted.length >= 2, 10_000);
+
+      expect(registerBodies[0]).toMatchObject({
+        id: "follower-node-receipts",
+        runReceipts: { version: 1 },
+      });
+      // The retry carries the same identity: run ID, digest and bytes.
+      expect(posted[1].receipts).toEqual(posted[0].receipts);
+      // Only the completed run's receipt travels; nothing saw the crashed
+      // run's provider end, so boot wrote it no receipt.
+      expect(posted[0].receipts).toHaveLength(1);
+      const [envelope] = posted[0].receipts;
+      expect(Object.keys(envelope).sort()).toEqual(["digest", "receipt", "runId"]);
+      expect(envelope.runId).toBe("run-done");
+      expect(JSON.parse(String(envelope.receipt))).toMatchObject({
+        instanceId: "follower-node-receipts",
+        runId: "run-done",
+        outcome: "completed",
+        exitCode: 0,
+      });
+    } finally {
+      await shutdown?.();
+      await leader.close().catch(() => {});
+    }
+    expect(posted.flatMap((p) => p.receipts.map((r) => r.runId))).not.toContain("run-crashed");
+
+    // After boot and shutdown, the crashed run is still open and owes nothing yet.
+    const db = new Database(join(home, "data", "mesh.db"), { readonly: true });
+    try {
+      expect(db.prepare("SELECT id, outcome FROM actor_runs ORDER BY id").all()).toEqual([
+        { id: "run-crashed", outcome: null },
+        { id: "run-done", outcome: "completed" },
+      ]);
+      // The acknowledged receipt is dropped; the closed row is the host's record.
+      expect(db.prepare("SELECT run_id FROM host_run_receipts").all()).toEqual([]);
+    } finally {
+      db.close();
     }
   }, 20_000);
 });

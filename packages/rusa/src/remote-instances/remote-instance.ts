@@ -249,6 +249,11 @@ export class RemoteInstance {
   /** Set when this generation offered bounded execution and the hub echoed it (#1020). */
   boundedExecution = false;
   private readonly materialReads = new Map<string, PendingMaterialRead>();
+  /**
+   * Whether this generation negotiated durable run receipts at registration
+   * (#1020). Fixed per generation: a run opened under the contract keeps it.
+   */
+  runReceipts = false;
 
   constructor(
     readonly id: string,
@@ -353,10 +358,15 @@ export class RemoteInstance {
   }
 
   private openHost(actorId: string): ActorChannel {
-    const host = new InstanceActorChannel(this.id, this.pid, (message) => {
-      this.commands.push({ actorId, message });
-      this.flush();
-    });
+    const host = new InstanceActorChannel(
+      this.id,
+      this.pid,
+      (message) => {
+        this.commands.push({ actorId, message });
+        this.flush();
+      },
+      this.runReceipts ? this.id : undefined
+    );
     this.hosts.set(actorId, host);
     host.once("exit", () => this.hosts.delete(actorId));
     return host;
@@ -575,7 +585,8 @@ class InstanceActorChannel extends EventEmitter implements ActorChannel {
   constructor(
     readonly nodeId: string,
     readonly pid: number,
-    private readonly enqueue: (message: LeaderCommand) => void
+    private readonly enqueue: (message: LeaderCommand) => void,
+    readonly durableHost?: string
   ) {
     super();
   }

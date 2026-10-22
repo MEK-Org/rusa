@@ -35,6 +35,14 @@ export interface ActorActivity {
    * run cancelled while queued behind the concurrency cap never started, so
    * counting it here would cancel out an unrelated live run and report idle over
    * a running actor.
+   *
+   * A closure is the leader releasing its claim, not durable completion. A
+   * receipt-backed remote run abandoned with `termination: "unresolved"`
+   * (#1119) closes here while its durable rows stay open and its provider may
+   * still be running, so idle means nothing is claimed, not that every run
+   * has a terminal. Every abort of a receipt-backed run ends this way: an
+   * operator interrupt, a responsive preemption, the stall watchdog, the run
+   * ceiling, or a host drop.
    */
   runClosures: number;
 }

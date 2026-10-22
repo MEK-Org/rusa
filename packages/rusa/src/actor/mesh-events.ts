@@ -353,6 +353,13 @@ export function runEndModel(payload: string | null | undefined): string | null {
 export interface RunAbandonedPayload {
   /** Whether a `run_start` was emitted for this run before it was abandoned. */
   started: boolean;
+  /**
+   * `unresolved` when the leader released a receipt-backed remote run's
+   * claim without observed termination (#1119 ruling). The run's durable
+   * rows stay open until its host's receipt; this event closes only the
+   * in-memory claim and records no outcome.
+   */
+  termination?: "unresolved";
 }
 
 /**

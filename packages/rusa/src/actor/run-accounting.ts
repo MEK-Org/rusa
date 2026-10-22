@@ -3,6 +3,8 @@ import {
   createActorRunModelConfig,
 } from "../db/repositories/actor-run-model-config.js";
 import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
+import type { InstanceRunReceiptRepository } from "../db/repositories/run-receipt-repository.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 import { outputOmittedChars } from "../remote-instances/run-material.js";
@@ -31,9 +33,24 @@ export function projectActorRunLaunchConfig(selected: RawProviderModelConfig): A
  * completion is already in flight, and neither is a run outcome.
  */
 export interface RunAccounting {
-  /** Open this actor's externally-minted durable run. Throws if one is already open. */
-  begin(actorId: string, runId: string, modelConfig: ActorRunModelConfig): void;
-  /** Close this actor's named open run. Throws if it is not the active run. */
+  /**
+   * Open this actor's externally-minted durable run. Throws if one is already
+   * open. `durableHost` names the execution instance that owes the run a
+   * durable terminal receipt (#1020); that receipt, not this ledger, then
+   * writes the run's terminal.
+   */
+  begin(
+    actorId: string,
+    runId: string,
+    modelConfig: ActorRunModelConfig,
+    durableHost?: string
+  ): void;
+  /**
+   * Close this actor's named open run. A receipt-backed run's claim is
+   * released instead, leaving its receipt to close it; a successful return
+   * still spends its selected-work recovery budget (#1119). Throws if it is
+   * not the active run.
+   */
   complete(actorId: string, runId: string, result: RunResult): void;
   /** Close this actor's named open run as abandoned, or report there was none. */
   abandon(actorId: string, runId: string, reason: string): string | null;
@@ -41,8 +58,14 @@ export interface RunAccounting {
   activeRunId(actorId: string): string | undefined;
 }
 
-export function createRunAccounting(runs: () => ActorRunRepository): RunAccounting {
+export function createRunAccounting(
+  runs: () => ActorRunRepository,
+  receipts?: () => InstanceRunReceiptRepository,
+  log: Logger = nullLogger
+): RunAccounting {
   const activeRunIds = new Map<string, string>();
+  /** Open runs whose terminal arrives as a host receipt, not through this ledger. */
+  const receiptBacked = new Set<string>();
   const assertActive = (actorId: string, runId: string): void => {
     const activeRunId = activeRunIds.get(actorId);
     if (!activeRunId) throw new Error(`actor has no active durable run: ${actorId}`);
@@ -52,6 +75,15 @@ export function createRunAccounting(runs: () => ActorRunRepository): RunAccounti
   };
   const complete = (actorId: string, runId: string, result: RunResult): void => {
     assertActive(actorId, runId);
+    if (receiptBacked.has(runId)) {
+      // The receipt closes the run. A successful return still spends the
+      // selected-work recovery budget now, so a withheld receipt cannot
+      // grant another recovery (#1119).
+      if (result.success) receipts?.().recordReturn(runId);
+      receiptBacked.delete(runId);
+      activeRunIds.delete(actorId);
+      return;
+    }
     // The write is synchronous, so nothing can interleave between it and the
     // claim it closes: a second terminal event either precedes this one and
     // finds a claim, or follows it and finds none. Writing first is what makes
@@ -66,11 +98,27 @@ export function createRunAccounting(runs: () => ActorRunRepository): RunAccounti
     activeRunIds.delete(actorId);
   };
   return {
-    begin: (actorId, runId, modelConfig) => {
+    begin: (actorId, runId, modelConfig, durableHost) => {
       if (activeRunIds.has(actorId)) {
         throw new Error(`actor already has an active durable run: ${actorId}`);
       }
-      runs().start({ id: runId, actorId, modelConfig });
+      if (durableHost !== undefined) {
+        if (!receipts) throw new Error("run receipts are not configured on this leader");
+        const early = receipts().startRun({ runId, instanceId: durableHost, actorId, modelConfig });
+        // Its arrival was logged as an `unknown_run` conflict; this is where it applied.
+        if (early?.status === "applied") {
+          log.info("instance_receipt_applied", {
+            followerId: durableHost,
+            runId,
+            actorId,
+            early: true,
+            actorRunClosed: early.actorRunClosed,
+          });
+        }
+        receiptBacked.add(runId);
+      } else {
+        runs().start({ id: runId, actorId, modelConfig });
+      }
       activeRunIds.set(actorId, runId);
     },
     complete,
@@ -80,7 +128,7 @@ export function createRunAccounting(runs: () => ActorRunRepository): RunAccounti
       if (activeRunId !== runId) {
         throw new Error(`actor ${actorId} has active durable run ${activeRunId}, not ${runId}`);
       }
-      runs().abandon(runId, reason);
+      if (!receiptBacked.delete(runId)) runs().abandon(runId, reason);
       activeRunIds.delete(actorId);
       return runId;
     },

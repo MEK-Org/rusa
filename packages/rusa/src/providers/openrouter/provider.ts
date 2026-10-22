@@ -198,6 +198,8 @@ export class OpenRouterProvider implements CodingProvider {
         success: result.success,
         output: result.success ? result.output : (result.reason ?? "Pi failed"),
         exitCode: result.success ? 0 : 1,
+        // The process's own settlement is the run's termination evidence.
+        termination: processResult.termination,
         // Pi message.model is a configuration echo, not upstream read-back.
         ...(opts.signal?.aborted
           ? { cancelled: true, abortReason: processResult.abortReason }

@@ -44,6 +44,38 @@ export interface BoundedExecutionCapability {
 }
 export const BOUNDED_EXECUTION_CAPABILITY: BoundedExecutionCapability = { version: 1 };
 
+/**
+ * Durable run terminal receipts (#1020), negotiated on `/register` like event
+ * transfer and equally additive. A follower that can commit receipts offers
+ * `{ version: 1 }`; a leader with a receipt store answers the same. Only then
+ * are the generation's runs receipt-backed: either side being older leaves
+ * the legacy contract intact.
+ */
+export interface RunReceiptsOffer {
+  version: 1;
+}
+export interface RunReceiptsCapability {
+  version: 1;
+}
+/** Receipts per `/receipts` request. */
+export const RUN_RECEIPTS_MAX_PER_REQUEST = 100;
+
+/**
+ * The leader's durable answer for one posted receipt, keyed by its run ID.
+ * `applied`, `duplicate` and `conflict` are recorded dispositions, and each
+ * acknowledges that receipt alone. `invalid` is neither, and the host retries
+ * it without holding back the others.
+ */
+export interface RunReceiptPostResult {
+  runId: string;
+  status: "applied" | "duplicate" | "conflict" | "invalid";
+  /** Set for a conflict. */
+  kind?: "run_conflict" | "wrong_instance" | "unknown_run";
+}
+export interface RunReceiptsReply {
+  results: RunReceiptPostResult[];
+}
+
 /** One fragment of an event transfer, posted to `/events/transfer`. */
 export interface EventTransferFragment {
   transferId: string;

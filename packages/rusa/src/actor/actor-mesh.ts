@@ -1328,6 +1328,12 @@ export class ActorMesh {
               this.accountRun(event.actorId, event.terminal.result, event.runId);
             } else {
               this.abandonInboxRun(event.actorId);
+              // Usage a provider reported before its unproven end is consumption
+              // so far, recorded once with this run; the outcome stays open
+              // (#1119 clarification).
+              if (event.terminal.unresolved?.tokenUsage) {
+                this.accountRun(event.actorId, event.terminal.unresolved, event.runId);
+              }
               // A launched run that ended without a result still ended: a pool
               // staged while it ran is due now, not at some later dispatch (#652).
               if (event.terminal.started) this.applyPendingModel(event.actorId);
@@ -5811,8 +5817,12 @@ export class ActorMesh {
     };
   }
 
-  /** Record per-run token usage for accounting. */
-  accountRun(actorId: string, result: RunResult, runId?: string): void {
+  /** Record per-run token usage for accounting. It has no outcome-dependent effect. */
+  accountRun(
+    actorId: string,
+    result: RunResult | Pick<RunResult, "tokenUsage">,
+    runId?: string
+  ): void {
     if (!result.tokenUsage) return;
     if (!runId) {
       throw new Error(`token accounting requires a runId for actor ${actorId}`);

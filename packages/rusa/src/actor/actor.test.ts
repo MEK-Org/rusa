@@ -15,7 +15,7 @@ import {
   WATCHDOG_CEILING_TIMEOUT_MS,
   WATCHDOG_STALL_TIMEOUT_MS,
 } from "./actor.js";
-import { createActorLifecycle } from "./actor-lifecycle.js";
+import { type ActorLifecycleEndEvent, createActorLifecycle } from "./actor-lifecycle.js";
 import type { ActorRecord } from "./actor-record.js";
 import {
   ConcurrencyLimiter,
@@ -3383,5 +3383,85 @@ describe("configured-root run recovery (#1150)", () => {
         "- attempt 3 on third:third-model (exit 12): failure 3",
       ].join("\n")
     );
+  });
+});
+
+describe("termination evidence reaches the run's terminal (#1119)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const terminals = () => {
+    const ends: ActorLifecycleEndEvent["terminal"][] = [];
+    const lifecycle = createActorLifecycle([{ onEnd: (event) => void ends.push(event.terminal) }]);
+    return { ends, lifecycle };
+  };
+  const pooled = async (primary: Partial<RunResult>, recovery?: Partial<RunResult>) => {
+    const { ends, lifecycle } = terminals();
+    const first = new FakeProvider(() => primary, "primary");
+    const second = new FakeProvider(() => recovery ?? {}, "recovery");
+    const actor = makeActor(
+      {
+        lifecycle,
+        modelConfig: [{ provider: "primary" }, { provider: "recovery" }],
+        resolveProvider: (entry) => (entry.provider === "recovery" ? second : first),
+        recoverFailedRuns: true,
+      },
+      first
+    );
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    await flush();
+    expect(ends).toHaveLength(1);
+    const [terminal] = ends;
+    return terminal.kind === "result" ? terminal.result.termination : "not-a-result";
+  };
+  const exhausted = { success: false, exitCode: 1, output: "exhausted" };
+
+  it("passes a single attempt's evidence through unchanged, including none", async () => {
+    expect(await pooled({ success: true, termination: "observed" })).toBe("observed");
+    expect(await pooled({ success: false, exitCode: 1, termination: "unproven" })).toBe("unproven");
+    expect(await pooled({ success: true })).toBeUndefined();
+  });
+
+  it("is observed after recovery only if every launched attempt was observed", async () => {
+    expect(
+      await pooled({ ...exhausted, termination: "observed" }, { termination: "observed" })
+    ).toBe("observed");
+    // The recovery's clean close does not prove the timed-out primary ended.
+    expect(
+      await pooled({ ...exhausted, termination: "unproven" }, { termination: "observed" })
+    ).toBe("unproven");
+    expect(await pooled({ ...exhausted, termination: "observed" }, {})).toBe("unproven");
+    // Every entry exhausted: still only as good as the weakest attempt.
+    expect(
+      await pooled(
+        { ...exhausted, termination: "observed" },
+        { ...exhausted, termination: "unproven" }
+      )
+    ).toBe("unproven");
+  });
+
+  it("carries the aborted provider call's evidence on an abandoned terminal", async () => {
+    for (const termination of ["observed", "unproven"] as const) {
+      const { ends, lifecycle } = terminals();
+      let resolveRun!: (result: Partial<RunResult>) => void;
+      const provider = new FakeProvider(
+        () =>
+          new Promise<Partial<RunResult>>((resolve) => {
+            resolveRun = resolve;
+          })
+      );
+      const actor = makeActor({ debounceMs: 30000, lifecycle }, provider);
+      actor.requestRun({ priority: "responsive", voiceTimestamp: Date.now() });
+      await flush();
+      // A second responsive nudge coalesce-aborts the first run.
+      actor.requestRun({ priority: "responsive", voiceTimestamp: Date.now() + 100 });
+      await flush();
+      resolveRun({ success: false, exitCode: 143, output: "aborted", termination });
+      await flush();
+      expect(ends[0]).toMatchObject({ kind: "abandoned", reason: "coalesced", termination });
+      resolveRun({ success: true, termination: "observed" });
+      await flush();
+    }
   });
 });

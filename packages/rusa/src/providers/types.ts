@@ -82,12 +82,26 @@ export interface RunOptions {
   computerUse?: boolean;
 }
 
+/**
+ * Whether a run's provider process was observed to end (#1119). `observed`
+ * means the shared subprocess lifecycle settled the run from its direct
+ * child's `close` event; it is not proof that every descendant died.
+ * Anything else, including an absent value, is unproven.
+ */
+export type RunTermination = "observed" | "unproven";
+
 export interface RunResult {
   success: boolean;
   output: string;
   exitCode: number;
   cancelled?: boolean;
   interrupted?: boolean;
+  /**
+   * Termination evidence for the provider process behind this result. Only
+   * `runSubprocess` sets it, so a result built anywhere else is unproven.
+   * Durable run receipts close a run only on `observed` (#1119).
+   */
+  termination?: RunTermination;
   /** The explicit principal or mechanical source of the interrupt. */
   interruptSource?: string;
   /** The typed reason for termination/abort (e.g. 'stall-watchdog', 'run-ceiling', 'interrupt:<by>', 'unknown'). */

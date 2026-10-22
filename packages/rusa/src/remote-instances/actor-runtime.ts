@@ -534,7 +534,19 @@ export function createActorRuntime(
               if (event.terminal.kind === "abandoned") {
                 if (repositories && event.terminal.started) {
                   try {
-                    repositories.actorRuns.abandon(event.runId, event.terminal.reason);
+                    if (repositories.runReceipts) {
+                      // The evidence is the provider call's own settlement,
+                      // never this hook's: an abandoned run whose provider
+                      // was not observed to exit stays unresolved (#1119).
+                      repositories.runReceipts.abandon(
+                        event.runId,
+                        bootstrap.id,
+                        event.terminal.reason,
+                        event.terminal.termination
+                      );
+                    } else {
+                      repositories.actorRuns.abandon(event.runId, event.terminal.reason);
+                    }
                   } catch (error) {
                     reportLocalAccountingFailure("terminal", event.runId, error);
                   }
@@ -544,17 +556,33 @@ export function createActorRuntime(
                   abandon: {
                     reason: event.terminal.reason,
                     started: event.terminal.started,
+                    ...(event.terminal.termination
+                      ? { termination: event.terminal.termination }
+                      : {}),
                   },
                 });
                 return;
               }
               if (repositories) {
                 try {
-                  repositories.actorRuns.complete(event.runId, {
+                  const terminal = {
                     success: event.terminal.result.success,
                     exitCode: event.terminal.result.exitCode,
                     output: event.terminal.result.output,
-                  });
+                  };
+                  // With receipts (#1020), the local terminal and the receipt
+                  // the leader is owed commit together, and only when the
+                  // provider's exit was observed (#1119).
+                  if (repositories.runReceipts) {
+                    repositories.runReceipts.complete(
+                      event.runId,
+                      bootstrap.id,
+                      terminal,
+                      event.terminal.result.termination
+                    );
+                  } else {
+                    repositories.actorRuns.complete(event.runId, terminal);
+                  }
                 } catch (error) {
                   reportLocalAccountingFailure("terminal", event.runId, error);
                 }
