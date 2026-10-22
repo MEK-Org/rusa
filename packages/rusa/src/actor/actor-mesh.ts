@@ -5606,14 +5606,6 @@ export class ActorMesh {
   }
 
   /**
-   * Apply the staged contextConfig replacement at the run boundary.
-   * An idle or queued actor applies immediately; a running actor applies at run end.
-   */
-  applyPendingContext(id: string): void {
-    this.applyPendingTarget(id);
-  }
-
-  /**
    * Pure read of why a class-bound actor cannot be scheduled. Querying this
    * never emits an event, so dashboard and diagnostic callers can inspect the
    * record without changing its timeline.

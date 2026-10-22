@@ -5692,6 +5692,129 @@ describe("runStart webhook event routing (Phase 4)", () => {
     compactSpy.mockRestore();
   });
 
+  it("compacts ledger state using launch context when a different context mode is staged mid-run", async () => {
+    let mesh: ActorMesh | undefined;
+    const compactSpy = vi
+      .spyOn(GeminiPortableContextCompactor.prototype, "compact")
+      .mockImplementation(async ({ state, messages, now }) => ({
+        state: {
+          ...state,
+          generation: state.generation + 1,
+          updatedAt: now,
+          lastFoldedSourceId: messages.at(-1)?.id ?? null,
+          items: [
+            {
+              id: "mem-staged-instruction",
+              kind: "decision" as const,
+              priority: "must" as const,
+              status: "active" as const,
+              statement: "The ledger instruction was folded using launch context.",
+              evidence: [
+                {
+                  eventId: messages[0]?.id ?? "missing-source",
+                  sender: "operator",
+                  ts: messages[0]?.ts ?? now,
+                  quote: "Fold this ledger message.",
+                },
+              ],
+              updatedAt: now,
+            },
+          ],
+        },
+        quarantined: [],
+        operations: 0,
+      }));
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    if (!mesh) throw new Error("mesh not ready");
+    const activeMesh = mesh;
+
+    const workerId = activeMesh.spawn({
+      charter: "ledger worker staging context change",
+      parentId: rootId,
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      context: { type: "portable", mode: "ledger" },
+    });
+    const worker = activeMesh.get(workerId);
+    if (!worker) throw new Error("worker not found");
+
+    getRepositories().meshChat.record({
+      senderId: "operator",
+      recipientId: workerId,
+      body: "Fold this ledger message.",
+    });
+
+    // 1. Launch the run in ledger mode: captures launchContext = { type: "portable", mode: "ledger" }
+    const runId = await startLifecycleRun(worker as Actor, {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+
+    // 2. Stage a different context mode (tail) while the worker is running
+    const runningSpy = vi.spyOn(worker as Actor, "isRunning", "get").mockReturnValue(true);
+    const stageOutcome = activeMesh.setActorContext(workerId, "tail", rootId);
+    expect(stageOutcome).toBe("staged");
+    expect(activeMesh.actors.get(workerId)?.context).toEqual({ type: "portable", mode: "ledger" });
+    expect(activeMesh.actors.get(workerId)?.desiredContextConfig).toEqual({
+      type: "portable",
+      mode: "tail",
+    });
+
+    // 3. Complete the run: mesh finishInboxRun applies pending context (to tail),
+    // but the lifecycle listener must use the captured launchContext to fold the completed ledger run
+    runningSpy.mockReturnValue(false);
+    await endLifecycleRun(worker as Actor, runId, {
+      success: true,
+      output: "ledger worker run completed",
+      exitCode: 0,
+    });
+
+    // Observe that compaction executed using the launch configuration
+    expect(compactSpy).toHaveBeenCalledOnce();
+    const state = getRepositories().portableContext.load(workerId);
+    expect(state.generation).toBe(1);
+    expect(state.lastFoldedSourceId).toBeTruthy();
+
+    const compactedEvents = getRepositories().meshEvents.listEventsByActors([workerId], {
+      kinds: ["portable_context_compacted"],
+      limit: 10,
+    }).events;
+    expect(compactedEvents).toHaveLength(1);
+    expect(compactedEvents[0]?.detail).toContain("generation 1");
+
+    // And verify the pending context is now applied for the next run
+    expect(activeMesh.actors.get(workerId)?.context).toEqual({ type: "portable", mode: "tail" });
+    expect(activeMesh.actors.get(workerId)?.desiredContextConfig).toBeUndefined();
+
+    compactSpy.mockRestore();
+  });
+
   it("defers an interrupted run's fold under compacted_memory_delta and folds the delta once later (#1062)", async () => {
     let mesh: ActorMesh | undefined;
     const COMPACTOR_DELAY_MS = 300;
