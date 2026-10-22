@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:intl/intl.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/quota_history_chart.dart';
@@ -281,6 +282,48 @@ void main() {
       expect(find.text('55% · as of 2026-07-26T19:00:00.000Z'), findsNothing);
       expect(find.text('cached'), findsNWidgets(2));
       expect(find.text('now'), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'says where readings stop once the shared range runs past them (#1018)',
+    (tester) async {
+      tester.view.physicalSize = const Size(900, 1200);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final generatedAt = DateTime.parse(history.generatedAt);
+      Future<void> pumpEndingAt(DateTime end) => tester.pumpWidget(
+        MaterialApp(
+          theme: buildMeshTheme(),
+          home: Scaffold(
+            body: SizedBox(
+              width: 900,
+              child: QuotaHistoryChart(
+                history: history,
+                sharedRange: (
+                  start: end.subtract(const Duration(days: 3)),
+                  end: end,
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      // Under a minute behind is load skew: the readings are current.
+      await pumpEndingAt(generatedAt.add(const Duration(seconds: 59)));
+      expect(find.text('now'), findsNWidgets(2));
+
+      await pumpEndingAt(generatedAt.add(const Duration(hours: 2)));
+      final asOf =
+          'as of ${DateFormat('HH:mm').format(generatedAt.toLocal())}';
+      expect(find.text(asOf), findsNWidgets(2));
+      expect(find.text('now'), findsNothing);
+      expect(
+        find.bySemanticsLabel(RegExp('Readings end at ')),
+        findsNWidgets(2),
+      );
     },
   );
 

@@ -272,6 +272,13 @@ class DashboardApi {
     return QuotaHistoryDto.fromJson(await _getJson(_u('/api/quota/history')));
   }
 
+  /// `GET /api/mesh/inbox-metrics` → per-minute cross-actor inbox backlog.
+  Future<InboxMetricsDto> fetchInboxMetrics() async {
+    return InboxMetricsDto.fromJson(
+      await _getJson(_u('/api/mesh/inbox-metrics')),
+    );
+  }
+
   /// `GET /api/dashboard/config` → frontend-only dashboard config.
   Future<DashboardConfigDto> fetchDashboardConfig() async {
     return DashboardConfigDto.fromJson(

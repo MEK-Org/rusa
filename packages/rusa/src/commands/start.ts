@@ -4720,6 +4720,7 @@ async function composeStart(
           },
           portableContext: getRepositories().portableContext,
           inboxFocus: getRepositories().inboxFocus,
+          inboxMetrics: getRepositories().inboxMetrics,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,
             logger: log.child({ component: "reference-cache" }),
@@ -5335,6 +5336,22 @@ async function composeStart(
   };
   sweepRunMaterial();
   everyInterval("run material retention", sweepRunMaterial, RUN_MATERIAL_SWEEP_INTERVAL_MS);
+  // Inbox backlog for the Overview charts (#1018): one sample per UTC minute.
+  // Each tick samples only the current minute, if not yet sampled. Ticking
+  // four times a minute keeps a sample near its minute's start, and a timer up
+  // to 45 s late still lands in its minute; a minute with no tick, such as
+  // while the host is down, stays a gap.
+  const sampleInboxMetrics = () => {
+    try {
+      getRepositories().inboxMetrics.sampleIfDue();
+    } catch (err) {
+      log.warn("inbox_metrics_sample_failed", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+  sampleInboxMetrics();
+  everyInterval("inbox metric sampling", sampleInboxMetrics, 15 * 1000);
   // The interval handle says nothing about a probe already in flight, so keep
   // both a way to stop one (the signal) and a way to wait for it (the promise).
   // Acquired before the probe interval, so the interval stops first and no new

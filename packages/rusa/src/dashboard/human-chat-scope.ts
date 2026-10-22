@@ -1,4 +1,5 @@
 import type { IncomingMessage } from "node:http";
+import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import {
@@ -6,6 +7,7 @@ import {
   resolveSoleActiveUser,
 } from "../principals/operator-principal.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
+import { resolveReferenceSync } from "../references/resolve.js";
 import { getDashboardRequestPrincipal } from "./auth.js";
 
 /** Durable identities used to identify the viewer and classify participants. */
@@ -60,6 +62,24 @@ export function humanChatScope(
   const me = viewingUserPrincipalId(req, { listUsers: () => users });
   const viewerIds = new Set<string>();
   if (me) viewerIds.add(me);
+  return participantScope(viewerIds, principals);
+}
+
+/**
+ * The scope of no viewer at all: actor↔actor traffic only. Anything every
+ * viewer receives alike, such as a statistic stored once for all of them, is
+ * computed against this so it carries nothing from any human's conversation.
+ */
+export function sharedChatScope(
+  principals?: Pick<HumanChatPrincipalSource, "get">
+): HumanChatScope {
+  return participantScope(new Set(), principals);
+}
+
+function participantScope(
+  viewerIds: ReadonlySet<string>,
+  principals?: Pick<HumanChatPrincipalSource, "get">
+): HumanChatScope {
   return {
     viewerIds,
     canSee: (...participants) =>
@@ -69,6 +89,30 @@ export function humanChatScope(
         return kind === "actor" || kind === "system";
       }),
   };
+}
+
+/**
+ * Whether one inbox entry is a conversation `scope` may not read (#590). Only
+ * an entry pointing at a mesh message is a conversation. A legacy pointer's
+ * sender comes from its payload or `mesh:<sender>` source; that hint is checked
+ * first, and the canonical mesh message, when it resolves, is the authority.
+ * The inbox row is always the recipient's.
+ */
+export function inboxEntryHiddenFrom(
+  entry: { actorId: string; source: string; payload: unknown },
+  meshChat: Pick<MeshChatRepository, "getById"> | undefined,
+  scope: HumanChatScope
+): boolean {
+  const { messageId, fromId } = (entry.payload ?? {}) as { messageId?: unknown; fromId?: unknown };
+  if (typeof messageId !== "string") return false;
+  const sourceSender =
+    entry.source.startsWith("mesh:") && entry.source !== "mesh:unknown"
+      ? entry.source.slice("mesh:".length)
+      : undefined;
+  const senderId = typeof fromId === "string" ? fromId : sourceSender;
+  if (senderId && !scope.canSee(senderId, entry.actorId)) return true;
+  const { entity } = resolveReferenceSync(`mesh:messages/${messageId}`, { meshChat });
+  return entity?.type === "mesh_message" && !scope.canSee(entity.senderId, entity.recipientId);
 }
 
 /** Resolve the scope for one request with one read of principal storage. */

@@ -158,6 +158,7 @@ export interface DashboardMeshRefs {
   portableContext?: DashboardDataDeps["portableContext"];
   /** Durable per-entry obligation associations for activity correlation. */
   inboxFocus?: InboxFocusRepository;
+  inboxMetrics?: DashboardDataDeps["inboxMetrics"];
   emitter: MeshEventEmitter;
   /** The live ActorMesh instance. */
   mesh?: ActorMesh;
@@ -676,6 +677,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           runMaterial: options.mesh.runMaterial,
           portableContext: options.mesh.portableContext,
           inboxFocus: options.mesh.inboxFocus,
+          inboxMetrics: options.mesh.inboxMetrics,
           sseHub,
           mesh: options.mesh.mesh,
           rootControl: options.mesh.rootControl,

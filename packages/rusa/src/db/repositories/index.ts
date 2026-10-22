@@ -3,6 +3,8 @@ import type { CapabilityGrantStore } from "../../actor/capability-grants.js";
 import type { ExperimentEnrollmentStore } from "../../actor/experiments.js";
 import type { HostJobStore } from "../../actor/host-job-store.js";
 import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
+import { inboxEntryHiddenFrom, sharedChatScope } from "../../dashboard/human-chat-scope.js";
+import type { PrincipalRef } from "../../principals/principal-ref.js";
 import type { ActorRepository } from "../../repositories/actor-repository.js";
 import type { InboxRepository } from "../../repositories/inbox-repository.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
@@ -14,6 +16,7 @@ import { DbEventSourceSubscriptionStore } from "./event-source-subscription-repo
 import { DbExperimentEnrollmentStore } from "./experiment-enrollment-repository.js";
 import { DbHostJobStore } from "./host-job-repository.js";
 import { InboxFocusRepository } from "./inbox-focus-repository.js";
+import { InboxMetricRepository } from "./inbox-metric-repository.js";
 import { LegacyImportReceiptRepository } from "./legacy-import-receipt-repository.js";
 import { MaintenanceRepository } from "./maintenance-repository.js";
 import { MeshChatRepository } from "./mesh-chat-repository.js";
@@ -97,6 +100,7 @@ export class Repositories {
    */
   private readonly sqliteInbox: SqliteInboxRepository;
   readonly inboxFocus: InboxFocusRepository;
+  readonly inboxMetrics: InboxMetricRepository;
   readonly meshChat: MeshChatRepository;
   readonly quotaScrapes: QuotaScrapeRepository;
   readonly modelScrapes: ModelScrapeRepository;
@@ -131,6 +135,17 @@ export class Repositories {
     this.inbox = this.sqliteInbox;
     this.inboxFocus = new InboxFocusRepository(db);
     this.meshChat = new MeshChatRepository(db);
+    this.inboxMetrics = new InboxMetricRepository(db, () => {
+      // One sample asks about the same few principals once per entry.
+      const kinds = new Map<string, PrincipalRef | undefined>();
+      const scope = sharedChatScope({
+        get: (id) => {
+          if (!kinds.has(id)) kinds.set(id, this.principals.get(id));
+          return kinds.get(id);
+        },
+      });
+      return (entry) => inboxEntryHiddenFrom(entry, this.meshChat, scope);
+    });
     this.quotaScrapes = new QuotaScrapeRepository(db);
     this.modelScrapes = new ModelScrapeRepository(db);
     this.obligations = new ObligationRepository(db);
@@ -186,12 +201,20 @@ export { DbExperimentEnrollmentStore } from "./experiment-enrollment-repository.
 export { DbHostJobStore } from "./host-job-repository.js";
 export type { InboxFocusResolution, RunInboxFocus } from "./inbox-focus-repository.js";
 export { InboxFocusRepository } from "./inbox-focus-repository.js";
+export {
+  ALL_INBOX_METRIC_NAMES,
+  INBOX_METRIC_NAMES,
+  type InboxMetricEntry,
+  InboxMetricRepository,
+} from "./inbox-metric-repository.js";
 export { LegacyImportReceiptRepository } from "./legacy-import-receipt-repository.js";
 export { MaintenanceRepository } from "./maintenance-repository.js";
 export type { MeshChat } from "./mesh-chat-repository.js";
 export { MeshChatRepository } from "./mesh-chat-repository.js";
 export type { MeshEvent, MeshEventKind } from "./mesh-event-repository.js";
 export { MeshEventRepository } from "./mesh-event-repository.js";
+export type { MetricQueryRange, MetricSample } from "./metric-repository.js";
+export { MetricRepository } from "./metric-repository.js";
 export type { ModelClass } from "./model-class-repository.js";
 export { ModelClassRepository } from "./model-class-repository.js";
 export type { ModelScrape } from "./model-scrape-repository.js";
