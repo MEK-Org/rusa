@@ -150,9 +150,8 @@ async function readBound(
         : undefined;
     const localIsNewer =
       localLatest !== undefined &&
-      (remote.status === "missing"
-        ? remoteLatest === undefined || localLatest >= remoteLatest
-        : remoteLatest !== undefined && localLatest > remoteLatest);
+      remoteLatest !== undefined &&
+      (remote.status === "missing" ? localLatest >= remoteLatest : localLatest > remoteLatest);
     if (localIsNewer) {
       return { read: deps.local.read(actorId, runId, "prompt", localLatest), source: "leader" };
     }

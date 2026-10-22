@@ -186,8 +186,9 @@ describe("readRunMaterial", () => {
     });
     const hostEmpty = deps();
     hostEmpty.local.putPrompt("worker", RUN, 1, "leader one");
-    expect(await readRunMaterial(hostEmpty, "worker", RUN, "prompt")).toMatchObject({
-      body: { prompt: "leader one", attempt: 1, source: "leader" },
+    expect(await readRunMaterial(hostEmpty, "worker", RUN, "prompt")).toEqual({
+      status: 404,
+      body: { error: "prompt not retained" },
     });
     // A host too large to send at a higher attempt still beats an older leader copy.
     const hostLarge = deps({

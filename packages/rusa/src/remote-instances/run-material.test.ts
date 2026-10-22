@@ -225,6 +225,30 @@ describe("RunMaterialStore", () => {
     expect(new RunMaterialStore(dir).reservePromptAttempt("actor-a", RUN)).toBe(2);
   });
 
+  it("refuses a reservation when the run directory cannot be opened for sync", () => {
+    const dir = root();
+    const runDir = join(dir, "actor-a", RUN);
+    const io: RunMaterialIo = {
+      ...fs,
+      openSync: ((path: fs.PathLike, flags: string | number, mode?: number) => {
+        if (String(path) === runDir && flags === "r") {
+          throw Object.assign(new Error("directory sync unavailable"), { code: "EPERM" });
+        }
+        return fs.openSync(path, flags, mode);
+      }) as typeof fs.openSync,
+    };
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    if (!platform) throw new Error("process.platform descriptor is unavailable");
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      expect(() => new RunMaterialStore(dir, io).reservePromptAttempt("actor-a", RUN)).toThrow(
+        RunMaterialReservationError
+      );
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
+  });
+
   it("syncs every newly created path entry before publishing a material ref", () => {
     const dir = root();
     const synced = new Set<string>();

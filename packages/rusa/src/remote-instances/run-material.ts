@@ -424,18 +424,9 @@ export class RunMaterialStore {
   }
 
   private syncDir(dir: string): void {
-    let fd: number;
-    try {
-      fd = this.io.openSync(dir, "r");
-    } catch (err) {
-      // Windows cannot open a directory for fsync; NTFS journals the link.
-      if (process.platform === "win32") return;
-      throw err;
-    }
+    const fd = this.io.openSync(dir, "r");
     try {
       this.io.fsyncSync(fd);
-    } catch (err) {
-      if (process.platform !== "win32") throw err;
     } finally {
       this.io.closeSync(fd);
     }

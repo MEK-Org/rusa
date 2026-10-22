@@ -215,8 +215,6 @@ export interface ActorOptions {
    */
   beforeProviderAttempt?: (context: {
     runId: string;
-    prompt: string;
-    provider: ProviderAttempt;
   }) => number | undefined | Promise<number | undefined>;
   /**
    * Optional hook fired ONCE per run, on the first chunk the provider emits —
@@ -780,11 +778,7 @@ export class Actor {
       else abortController.signal.addEventListener("abort", stop, { once: true });
       startWatchdogTimers();
       try {
-        const promptAttempt = await this.opts.beforeProviderAttempt?.({
-          runId,
-          prompt,
-          provider,
-        });
+        const promptAttempt = await this.opts.beforeProviderAttempt?.({ runId });
         await this.opts.onProviderAttempt?.(provider);
         const result = await provider.run({
           prompt,
