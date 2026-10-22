@@ -529,6 +529,7 @@ export class CodexProvider implements CodingProvider {
       let lineBuffer = "";
       const assistantTexts: string[] = [];
       let lastTerminalError: CodexTerminalError | undefined;
+      const stderrChunks: string[] = [];
       const tick = () => opts.onChunk?.("");
       const itemText = (item: { content?: unknown; text?: unknown }): string => {
         if (typeof item.text === "string") return item.text;
@@ -744,6 +745,7 @@ export class CodexProvider implements CodingProvider {
           // The rendered transcript stays in the durable record but never
           // reaches the live-output callback (issue #210).
           chunks.push(text);
+          stderrChunks.push(text);
         },
         // Temp cleanup is owned by run() below, not per-spawn.
         buildKilledResult: (sigtermResult) =>
@@ -761,9 +763,19 @@ export class CodexProvider implements CodingProvider {
             processLine(lineBuffer);
             lineBuffer = "";
           }
-          const terminalError = exitCode !== 0 ? lastTerminalError : undefined;
-          // Auth reaching only stderr must not be masked as capacity.
-          const capacity = terminalError?.capacity === true && !isCodexAuthFailure(output);
+          const lastError = exitCode !== 0 ? lastTerminalError : undefined;
+          // Auth reaching only stderr must not be masked as capacity; its
+          // bounded line becomes the cause. Stdout is not searched, since tool
+          // output there can mention authorization without being the failure.
+          const stderrAuthLine = lastError?.capacity
+            ? stderrChunks
+                .join("")
+                .split("\n")
+                .find((l) => isCodexAuthFailure(l))
+            : undefined;
+          const terminalError =
+            stderrAuthLine !== undefined ? codexTerminalError(stderrAuthLine) : lastError;
+          const capacity = terminalError?.capacity === true;
           const progress = assistantTexts.join("\n");
           // Assistant progress alone would hide why the run failed, so the
           // bounded terminal cause follows it. A capacity cause replaces the raw
@@ -771,7 +783,7 @@ export class CodexProvider implements CodingProvider {
           // which already carries it.
           const outputText =
             terminalError && (capacity || progress)
-              ? appendTerminalError(progress, { ...terminalError, capacity })
+              ? appendTerminalError(progress, terminalError)
               : effectiveOutput(output);
           // Auth-fail alarm: if the run fails with an auth error, alert the operator.
           if (exitCode !== 0 && isCodexAuthFailure(outputText)) {

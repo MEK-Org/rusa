@@ -1373,6 +1373,61 @@ describe("CodexProvider live-output normalization (issue #210)", () => {
     errSpy.mockRestore();
   });
 
+  it("keeps a stderr authentication cause over a terminal capacity event after progress", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { result } = await runWithStream({
+      exitCode: 1,
+      stdout:
+        line({
+          type: "item.completed",
+          item: {
+            id: "item_1",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Progress before the failure." }],
+          },
+        }) +
+        line({
+          type: "turn.failed",
+          error: { message: "Selected model is at capacity. Please try a different model." },
+        }),
+      stderr: "Reading config...\nAuthentication failed: token expired\n",
+    });
+
+    expect(result.failure).toBeUndefined();
+    expect(result.output).toBe(
+      "Progress before the failure.\n\n[terminal error: Authentication failed: token expired]"
+    );
+    expect(isCodexAuthFailure(result.output)).toBe(true);
+    expect(errSpy.mock.calls.flat().join("\n")).toContain("AUTHENTICATION ALARM");
+    errSpy.mockRestore();
+  });
+
+  it("keeps a terminal capacity event when only tool output mentions authorization", async () => {
+    const { result } = await runWithStream({
+      exitCode: 1,
+      stdout:
+        line({
+          type: "item.completed",
+          item: {
+            id: "item_1",
+            type: "function_call_output",
+            exit_code: 1,
+            output: "HTTP 401 Unauthorized",
+          },
+        }) +
+        line({
+          type: "turn.failed",
+          error: { message: "Selected model is at capacity. Please try a different model." },
+        }),
+    });
+
+    expect(result.failure).toEqual({
+      kind: "provider-capacity",
+      message: "Selected model is at capacity. Please try a different model.",
+    });
+  });
+
   it("preserves an unrelated terminal failure without misclassifying as capacity when a transient capacity error was retried", async () => {
     const { result } = await runWithStream({
       exitCode: 1,
