@@ -52,7 +52,7 @@ async function eventually(check: () => boolean, timeoutMs = 2_000): Promise<void
 }
 
 describe("follower registration recovery", () => {
-  it("recovers one gap wake through replacement follower registration without a second dispatch", async () => {
+  it("recovers one gap wake through replacement registration without a second dispatch (#891)", async () => {
     const home = mkdtempSync(join(tmpdir(), "rusa-follower-relaunch-"));
     homes.push(home);
     const token = randomBytes(32).toString("hex");
