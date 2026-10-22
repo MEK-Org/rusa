@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { ActorMesh } from "../actor/actor-mesh.js";
+import { type ActorFactoryContext, ActorMesh } from "../actor/actor-mesh.js";
+import type { ActorRecord } from "../actor/actor-record.js";
 import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
 import {
   InMemoryEventSourceOwnerStore,
@@ -21,6 +22,7 @@ import { type FollowerActorCommand, type FollowerEvent, FollowerHub } from "./fo
 import { FollowerInstance } from "./follower-instance.js";
 import { registerFollowerRegistrationRecovery } from "./follower-registration-recovery.js";
 import { INSTANCE_PROTOCOL_VERSION, type ProviderFactory } from "./protocol.js";
+import { RemoteInstance } from "./remote-instance.js";
 
 const homes: string[] = [];
 const hubs: FollowerHub[] = [];
@@ -502,10 +504,12 @@ describe("follower registration recovery", () => {
     origin = await hub.listen("127.0.0.1", 0);
     const secondLifecycle: Array<{ type: "start" | "end"; runId: string; terminal?: unknown }> = [];
     createMesh(hub, secondLifecycle);
+    const replacementRecords = records.length;
 
     const secondRegistration = await register(origin);
     let bReadyAcknowledged = false;
     let bRunningAcknowledged = false;
+    let recoveryPreemptDelivered = false;
     let recoveryWakeDelivered = false;
     await pump(
       origin,
@@ -519,9 +523,15 @@ describe("follower registration recovery", () => {
         ) {
           expect(firstRunReleased).toBe(false);
         }
+        if (command.actorId === worker.id && command.message.type === "preempt") {
+          expect(bRunningAcknowledged).toBe(true);
+          recoveryPreemptDelivered = true;
+        }
         if (command.actorId === worker.id && command.message.type === "wake") {
           expect(firstRunReleased).toBe(false);
           expect(bReadyAcknowledged).toBe(true);
+          // A wake that overtook the preempt would have its dirty bit cancelled.
+          expect(recoveryPreemptDelivered).toBe(true);
           recoveryWakeDelivered = true;
         }
       },
@@ -540,6 +550,13 @@ describe("follower registration recovery", () => {
     expect(bReadyAcknowledged).toBe(true);
     expect(bRunningAcknowledged).toBe(true);
     expect(recoveryWakeDelivered).toBe(true);
+    // B never observed the retained run, so it decides the responsive gap row
+    // against the follower's report rather than the idle it was built with.
+    expect(records.slice(replacementRecords)).toContainEqual({
+      event: "remote_preempt_requested",
+      fields: expect.objectContaining({ actorId: worker.id, phase: "running" }),
+    });
+    expect(recoveryPreemptDelivered).toBe(true);
     expect(follower.actorIds).toEqual([worker.id]);
     expect(providerRuns).toBe(1);
     if (!releaseFirstRun) throw new Error("expected the original provider run to remain blocked");
@@ -557,7 +574,7 @@ describe("follower registration recovery", () => {
     const ends = secondLifecycle.filter((event) => event.type === "end");
     expect(firstLifecycle.filter((event) => event.type === "start")).toHaveLength(1);
     // This records the present leader-loss behavior, not a #963 result contract:
-    // A has already closed when the provider eventually reports its success.
+    // A has already closed when the displaced provider run finally reports.
     expect(firstLifecycle.filter((event) => event.type === "end")).toEqual([
       expect.objectContaining({
         terminal: {
@@ -573,7 +590,11 @@ describe("follower registration recovery", () => {
           type: "request",
           request: {
             op: "complete",
-            result: { success: true, output: "old-leader-run", exitCode: 0 },
+            result: expect.objectContaining({
+              success: false,
+              interrupted: true,
+              interruptSource: "responsive-notification",
+            }),
           },
         }),
       })
@@ -592,4 +613,43 @@ describe("follower registration recovery", () => {
       handledAt: null,
     });
   }, 15_000);
+
+  it("releases a held recovery wake and preempt when the follower never reports state (#963)", async () => {
+    const records: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const remote = new RemoteInstance("silent-follower", process.platform, process.pid);
+    const actorId = "silent-worker";
+    const handle = new ActorHandle({
+      host: remote.createHost(actorId),
+      bootstrap: { id: actorId, cwd: "/tmp/silent-worker", reconnect: true },
+      context: { onRuntimeStateChanged: () => {} } as unknown as ActorFactoryContext,
+      snapshot: () => ({ record: { id: actorId } as ActorRecord, prompt: "silent follower" }),
+      saveSession: () => {},
+      onFailure: () => {},
+      logger: testLogger(records),
+      stateStaleTimeoutMs: 50,
+    });
+    cleanups.push(() => {
+      handle.close();
+      remote.close();
+    });
+    const sent = () =>
+      remote.commands.flatMap((command) => ("message" in command ? [command.message.type] : []));
+
+    // The follower adopts its retained runtime but never sends the state report.
+    remote.receive({ actorId, message: { type: "ready", pid: process.pid } });
+    await expect(handle.ready).resolves.toBe(process.pid);
+    expect(handle.preemptForResponsive()).toEqual({ preempted: false });
+    handle.requestRun({ priority: "responsive" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sent()).toEqual(["init"]);
+    expect(records.map((record) => record.event)).toContain("remote_preempt_deferred");
+
+    // The existing stale-state deadline lets the follower's Actor decide.
+    await eventually(() => sent().includes("wake"));
+    expect(sent()).toEqual(["init", "preempt", "wake"]);
+    expect(records.map((record) => record.event)).toEqual(
+      expect.arrayContaining(["remote_state_stale_timeout", "remote_preempt_requested"])
+    );
+    expect(records.map((record) => record.event)).not.toContain("remote_wake_dropped");
+  });
 });
