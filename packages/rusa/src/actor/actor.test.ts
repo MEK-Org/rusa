@@ -1984,6 +1984,41 @@ describe("Actor", () => {
       expect(provider.calls).toHaveLength(1);
     });
 
+    it("reads sessionId inside the gate at admission time, avoiding stale pre-queue session ID", async () => {
+      let releaseGate!: () => void;
+      const gateHeld = new Promise<void>((resolve) => {
+        releaseGate = resolve;
+      });
+      let currentSessionId: string | undefined = "session-pre-queue";
+      let promptVersion = "prompt-v1";
+      const provider = new FakeProvider();
+      const actor = makeActor(
+        {
+          loadSessionId: () => currentSessionId,
+          buildPrompt: () => ({ prompt: promptVersion }),
+          gate: async (fn, candidates) => {
+            await gateHeld;
+            return fn(candidates[0]);
+          },
+        },
+        provider
+      );
+
+      actor.requestRun();
+      await vi.advanceTimersByTimeAsync(10); // Debounce: now queued in gate
+
+      // While queued behind gate, context mode transition occurs: session cleared, prompt changed
+      currentSessionId = undefined;
+      promptVersion = "prompt-v2-portable";
+
+      releaseGate();
+      await flush();
+
+      expect(provider.calls).toHaveLength(1);
+      expect(provider.calls[0]?.session).toEqual({ id: undefined });
+      expect(provider.calls[0]?.prompt).toBe("prompt-v2-portable");
+    });
+
     it("does not fire onRunStart for a run beforeRun gated off", async () => {
       let started = 0;
       const provider = new FakeProvider();

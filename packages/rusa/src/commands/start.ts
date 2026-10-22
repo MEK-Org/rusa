@@ -215,6 +215,7 @@ import type {
   AvailabilityHold,
   AvailabilityHoldOrigin,
 } from "../db/repositories/availability-hold-repository.js";
+import type { Repositories } from "../db/repositories/index.js";
 import type {
   ObligationStatusChange,
   PrerequisiteAttention,
@@ -994,14 +995,14 @@ interface PortableInjection {
  * this in would couple it to the repository/db layer. A live mesh-log read belongs
  * in the wiring layer (here), which is where the repositories already live.
  */
-function assemblePortableInjection(
+export function assemblePortableInjection(
   id: string,
   mode: "tail" | "ledger" | "brief",
   store: PortableContextStore,
   journal: PortableJournalMode = "window",
-  onDeltaFallback: (error: unknown) => void = () => {}
+  onDeltaFallback: (error: unknown) => void = () => {},
+  repositories: Pick<Repositories, "actorRuns" | "obligations" | "meshChat"> = getRepositories()
 ): PortableInjection {
-  const repositories = getRepositories();
   const runs = repositories.actorRuns
     .listRecentCompleted(id, portableContextMaxRuns())
     .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
@@ -1088,18 +1089,26 @@ function assemblePortableInjection(
     : { readRunIds };
 }
 
-function assembleConfiguredPortableInjection(
+export function assembleConfiguredPortableInjection(
   record: ActorRecord,
   apiKey: string | null,
   store: PortableContextStore,
   journal: PortableJournalMode = "window",
-  onDeltaFallback?: (error: unknown) => void
+  onDeltaFallback?: (error: unknown) => void,
+  repositories?: Pick<Repositories, "actorRuns" | "obligations" | "meshChat">
 ): PortableInjection | undefined {
   if (record.context?.type !== "portable") return undefined;
   if (record.context.mode === "ledger" && !apiKey) {
     throw new Error("portable context ledger mode requires geminiApiKey");
   }
-  return assemblePortableInjection(record.id, record.context.mode, store, journal, onDeltaFallback);
+  return assemblePortableInjection(
+    record.id,
+    record.context.mode,
+    store,
+    journal,
+    onDeltaFallback,
+    repositories
+  );
 }
 
 export async function compactPortableContext(input: {

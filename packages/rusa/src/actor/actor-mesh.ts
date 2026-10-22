@@ -5319,6 +5319,11 @@ export class ActorMesh {
         `Cannot change provider on non-portable actor ${id} (context mode: ${effectiveContext?.type ?? "native"}). Only portable (ledger/tail/brief) actors can be moved across providers.`
       );
     }
+    if (isModelClassReference(modelConfig) && record.desiredContextConfig?.type === "native") {
+      throw new Error(
+        `Cannot set a model class reference on actor ${id} while a transition to native context is pending: native sessions require exactly one declared entry; clear the pending context transition or specify a concrete model.`
+      );
+    }
     // Boundary contract (#199, #652): an in-flight run completes on its
     // already-launched pool, and the staged pool applies at that run's end
     // (see {@link finishInboxRun}). An idle or queued actor has no launched
@@ -5405,9 +5410,16 @@ export class ActorMesh {
 
     const newContext = record.desiredContextConfig;
     const wasPortable = record.context?.type === "portable";
-    const isPortable = newContext?.type === "portable";
+    const targetContext = newContext ?? record.context;
+    const isPortable = targetContext?.type === "portable";
+    const oldProvider = record.modelConfig?.[0]?.provider;
+    const newProvider = (record.desiredModelConfig ?? record.modelConfig)?.[0]?.provider;
+    const providerChanged =
+      oldProvider !== undefined && newProvider !== undefined && newProvider !== oldProvider;
     const resetSession =
-      newContext !== undefined && ((wasPortable && !isPortable) || (!wasPortable && isPortable));
+      (newContext !== undefined &&
+        ((wasPortable && !isPortable) || (!wasPortable && isPortable))) ||
+      (!isPortable && providerChanged);
 
     const modelChanges: ModelSelectionChange | undefined = hasPendingModel
       ? {
@@ -5424,7 +5436,13 @@ export class ActorMesh {
           desiredContextConfig: undefined,
           ...(resetSession ? { sessionId: undefined } : {}),
         }
-      : undefined;
+      : resetSession
+        ? {
+            context: record.context,
+            desiredContextConfig: undefined,
+            sessionId: undefined,
+          }
+        : undefined;
 
     // Persist both dimensions in a single atomic database transaction.
     this.actors.applyPendingSelections(id, {
@@ -5572,6 +5590,18 @@ export class ActorMesh {
       if ((effectivePool?.length ?? 0) > 1) {
         throw new Error(
           `Cannot switch to native context on actor ${id} while it holds a multi-entry model pool (${effectivePool?.length} candidates): native sessions require exactly one declared entry; narrow the pool first with set_actor_model.`
+        );
+      }
+      const activeProvider = record.modelConfig?.[0]?.provider;
+      const targetProvider = effectivePool?.[0]?.provider;
+      if (
+        record.context?.type !== "portable" &&
+        activeProvider !== undefined &&
+        targetProvider !== undefined &&
+        targetProvider !== activeProvider
+      ) {
+        throw new Error(
+          `Cannot switch to native context on actor ${id} while a cross-provider model change is staged (${activeProvider} -> ${targetProvider}): native actors cannot change providers; clear the staged model or select a model on provider "${activeProvider}".`
         );
       }
     }
@@ -5896,6 +5926,16 @@ export class ActorMesh {
         }
         const effectivePool = this.effectiveModelConfig(record);
         if ((effectivePool?.length ?? 0) > 1) {
+          return false;
+        }
+        const activeProvider = record.modelConfig?.[0]?.provider;
+        const targetProvider = effectivePool?.[0]?.provider;
+        if (
+          record.context?.type !== "portable" &&
+          activeProvider !== undefined &&
+          targetProvider !== undefined &&
+          targetProvider !== activeProvider
+        ) {
           return false;
         }
       } else if (targetContext.type === "portable") {

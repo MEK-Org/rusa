@@ -62,7 +62,7 @@ export type MeshEventKind =
   // `detail` = oldModel -> newModel summary.
   | "actor_model_set"
   // An actor's context mode was updated in-place via set_actor_context.
-  // `actorId` = the updated actor, `peerId` = the requester,
+  // `actorId` = the updated actor, `payload` = { requester, oldMode, newMode, outcome },
   // `detail` = oldMode -> newMode (applied|staged) summary.
   | "actor_context_set"
   // A class-bound actor's model class could not be resolved, so its run was
