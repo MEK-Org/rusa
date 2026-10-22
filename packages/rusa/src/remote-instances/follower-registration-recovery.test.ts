@@ -418,7 +418,6 @@ describe("follower registration recovery", () => {
       for (let turn = 0; turn < 80 && !done(); turn++) {
         if (events.length) {
           const batch = events.splice(0);
-          onEvents?.(batch);
           const response = await post(address, "/events", {
             ...registration,
             batchId: randomUUID(),
