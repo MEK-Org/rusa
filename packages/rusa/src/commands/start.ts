@@ -146,11 +146,7 @@ import {
   seedRootModelConfig,
 } from "../actor/root-model-config.js";
 import { createRunAccounting, projectActorRunLaunchConfig } from "../actor/run-accounting.js";
-import {
-  type ActiveRunContext,
-  bindRunContext,
-  resolveRunContextProvider,
-} from "../actor/run-context.js";
+import { type ActiveRunContext, bindRunContext } from "../actor/run-context.js";
 import {
   ensureWakeToken,
   wakePortPath,
@@ -4053,7 +4049,7 @@ async function composeStart(
         }
         // A local provider reads the mutable server array after `onStart`, but
         // a follower receives a copied admission snapshot before it emits that
-        // event. Mount from the leader-minted queued run id when that snapshot
+        // event. Mount from the queued run id when that snapshot
         // is built, then let the same exact lease become live at `onStart`.
         // A later run receives a different endpoint and cannot inherit this one.
         let runAgentMcp:
@@ -4078,11 +4074,14 @@ async function composeStart(
             if (!run || run.actorId !== id || run.endedAt !== null) return undefined;
             const focus = repositories.inboxFocus.getByRunId(runId);
             const primaryObligationId = focus?.primaryObligationId ?? null;
-            const provider = resolveRunContextProvider(activeRunSelections.get(id), {
+            // An actual attempt replaces the launch tuple as a whole: omitted
+            // model or effort means that provider's default, never a field
+            // borrowed from the immutable launch tuple.
+            const provider = activeRunSelections.get(id) ?? {
               provider: run.provider ?? undefined,
               model: run.model ?? undefined,
               effort: run.modelConfig?.effort,
-            });
+            };
             return {
               actorId: id,
               runId,
