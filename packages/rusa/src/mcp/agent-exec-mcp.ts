@@ -15,6 +15,7 @@ import {
   normalizeEventResource,
   resourceKey,
 } from "../actor/event-subscriptions.js";
+import type { MessageStamp } from "../actor/message-stamp.js";
 import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
@@ -129,6 +130,8 @@ export function createAgentExecMcpServer(
   wakeScheduler?: ActorWakeScheduler,
   options?: {
     onWrite?: () => void;
+    /** Host-created immutable stamp for this endpoint's exact active run. */
+    messageStamp?: () => MessageStamp;
     rootControl?: RootControlService;
     /**
      * Runtime model-class store. The model-class tools mount only when this and
@@ -383,11 +386,20 @@ export function createAgentExecMcpServer(
           );
         }
         if (selfId === rootId && options?.rootControl) {
-          options.rootControl.sendMessage(thread_id, body, "root-llm", deliver_at, session_id);
+          options.rootControl.sendMessage(
+            thread_id,
+            body,
+            "root-llm",
+            deliver_at,
+            session_id,
+            options.messageStamp?.()
+          );
           options?.onWrite?.();
           return toolOk(deliver_at ? `scheduled for ${deliver_at}` : "sent");
         }
-        const result = mesh.sendMessage(thread_id, body, selfId, session_id, deliver_at);
+        const result = mesh.sendMessage(thread_id, body, selfId, session_id, deliver_at, {
+          messageStamp: options?.messageStamp?.(),
+        });
         if (!result.delivered) {
           if (!result.status) {
             return toolError(new Error(`unknown thread id: ${thread_id}`));

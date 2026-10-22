@@ -375,7 +375,6 @@ function setup(
     isHalted?: ActorMeshOptions["isHalted"];
     isShuttingDown?: () => boolean;
     events?: MeshEventSink;
-    responsiveForActorMessage?: ActorMeshOptions["responsiveForActorMessage"];
     recordChat?: (opts: {
       id?: string;
       senderId: string;
@@ -477,7 +476,6 @@ function setup(
     isHalted: opts.isHalted,
     isShuttingDown: opts.isShuttingDown,
     events: opts.events,
-    responsiveForActorMessage: opts.responsiveForActorMessage,
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore,
     completedFocusEntryCounts: opts.completedFocusEntryCounts,
@@ -4346,14 +4344,13 @@ describe("ActorMesh", () => {
     expect(logs.some((l) => l.includes("dropped"))).toBe(true);
   });
 
-  it("stamps each message from the sender's current responsive selection", () => {
+  it("persists a host-created current-run responsiveness stamp", () => {
     const chat: Array<{ body: string; responsive?: boolean; responsiveReason?: string }> = [];
     let selectedResponsive = false;
     let sender = "";
     const inboxStore = createMemoryInboxStore();
     const { mesh } = setup({
       inboxStore,
-      responsiveForActorMessage: (actorId) => actorId === sender && selectedResponsive,
       recordChat: (message) => {
         chat.push({
           body: message.body,
@@ -4367,16 +4364,28 @@ describe("ActorMesh", () => {
     sender = mesh.spawn({ charter: "sender", parentId: "root" });
 
     // No selected obligation and an ordinary selected obligation both stay normal.
-    mesh.sendMessage(recipient, "no selection", sender);
+    const stamp = () =>
+      selectedResponsive
+        ? { responsive: true as const, responsiveReason: "responsive obligation" as const }
+        : { responsive: false as const };
+    mesh.sendMessage(recipient, "no selection", sender, undefined, undefined, {
+      messageStamp: stamp(),
+    });
     selectedResponsive = false;
-    mesh.sendMessage(recipient, "ordinary selection", sender);
+    mesh.sendMessage(recipient, "ordinary selection", sender, undefined, undefined, {
+      messageStamp: stamp(),
+    });
 
     // A subsequent send observes the current selection, not the sender identity
     // or an earlier message's priority.
     selectedResponsive = true;
-    mesh.sendMessage(recipient, "responsive selection", sender);
+    mesh.sendMessage(recipient, "responsive selection", sender, undefined, undefined, {
+      messageStamp: stamp(),
+    });
     selectedResponsive = false;
-    mesh.sendMessage(recipient, "selection changed", sender);
+    mesh.sendMessage(recipient, "selection changed", sender, undefined, undefined, {
+      messageStamp: stamp(),
+    });
 
     // A human ingress remains responsive through the same stamped delivery path.
     mesh.sendMessage(recipient, "human ingress", TEST_USER_ID, "human-session");
@@ -4412,14 +4421,15 @@ describe("ActorMesh", () => {
     const queued: Array<{ actorId: string; responsive: boolean }> = [];
     let sender = "";
     const { mesh, tick } = setup({
-      responsiveForActorMessage: (actorId) => actorId === sender,
       onQueued: (actorId, context) => queued.push({ actorId, responsive: context.responsive }),
     });
     const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
     sender = mesh.spawn({ charter: "sender", parentId: "root" });
     (mesh as unknown as { inboxStore?: InboxRepository }).inboxStore = undefined;
 
-    mesh.sendMessage(recipient, "responsive selection", sender);
+    mesh.sendMessage(recipient, "responsive selection", sender, undefined, undefined, {
+      messageStamp: { responsive: true, responsiveReason: "responsive obligation" },
+    });
     await tick();
 
     expect(queued).toContainEqual({ actorId: recipient, responsive: true });
@@ -10528,7 +10538,6 @@ describe("ActorMesh", () => {
       const inboxStore = createMemoryInboxStore();
       const { mesh, scheduledMessages } = setup({
         inboxStore,
-        responsiveForActorMessage: (actorId) => actorId === sender && selectedResponsive,
         recordChat: (message) => {
           chat.push({
             id: message.id,
@@ -10546,7 +10555,12 @@ describe("ActorMesh", () => {
         "frozen at send",
         sender,
         undefined,
-        new Date(Date.now() + 100_000).toISOString()
+        new Date(Date.now() + 100_000).toISOString(),
+        {
+          messageStamp: selectedResponsive
+            ? { responsive: true, responsiveReason: "responsive obligation" }
+            : { responsive: false },
+        }
       );
       selectedResponsive = false;
 

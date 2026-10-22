@@ -36,6 +36,12 @@ export const GEMINI_COUNT_FIELDS = {
 } as const;
 export type GeminiCounts = { -readonly [K in keyof typeof GEMINI_COUNT_FIELDS]: number | null };
 
+/** Optional mesh identity present at an already-attributed call site. */
+export interface GeminiUsageAttribution {
+  actorId?: string | null;
+  runId?: string | null;
+}
+
 export interface GeminiUsageRecord {
   version: 1;
   occurredAt: string;
@@ -44,6 +50,8 @@ export interface GeminiUsageRecord {
   pid: number;
   attemptId: string;
   purpose: GeminiUsagePurpose;
+  actorId: string | null;
+  runId: string | null;
   requestedModel: string;
   model: string;
   outcome: "response" | "error" | "cancelled";
@@ -87,12 +95,26 @@ export function geminiCounts(metadata: unknown): GeminiCounts {
   return counts;
 }
 
+function usageIdentifier(value: unknown): string | null {
+  // Identifiers are correlation keys, unlike displayable model names. Refuse
+  // an overlong value rather than recording a plausible-looking truncation.
+  return typeof value === "string" && value.length > 0 && value.length <= 200 ? value : null;
+}
+
 /** One observable application request, including every outer retry/fallback. */
-export function beginGeminiAttempt(purpose: GeminiUsagePurpose, requestedModel: string) {
+export function beginGeminiAttempt(
+  purpose: GeminiUsagePurpose,
+  requestedModel: string,
+  attribution?: GeminiUsageAttribution
+) {
   const attemptId = randomUUID();
   // Capture the sink and identity now: overlapping requests cannot switch sinks.
   const logger = usageLogger;
   const instance = instanceId;
+  const actorId = usageIdentifier(attribution?.actorId);
+  // A run always belongs to an actor. Do not create an orphan run id when a
+  // caller only has instance-level context.
+  const runId = actorId === null ? null : usageIdentifier(attribution?.runId);
   let counts = geminiCounts(undefined);
   let model = requestedModel;
   let finished = false;
@@ -122,6 +144,8 @@ export function beginGeminiAttempt(purpose: GeminiUsagePurpose, requestedModel: 
           pid: process.pid,
           attemptId,
           purpose,
+          actorId,
+          runId,
           requestedModel: requestedModel.slice(0, 200),
           model: model.slice(0, 200),
           outcome,
@@ -146,9 +170,10 @@ export function beginGeminiAttempt(purpose: GeminiUsagePurpose, requestedModel: 
 export async function observeGeminiRequest<T>(
   purpose: GeminiUsagePurpose,
   model: string,
-  request: () => Promise<T>
+  request: () => Promise<T>,
+  attribution?: GeminiUsageAttribution
 ): Promise<T> {
-  const attempt = beginGeminiAttempt(purpose, model);
+  const attempt = beginGeminiAttempt(purpose, model, attribution);
   try {
     const response = await request();
     attempt.observe(response);
@@ -164,7 +189,13 @@ export async function observeGeminiRequest<T>(
 export function generateGeminiContent(
   client: Pick<GoogleGenAI, "models">,
   purpose: GeminiUsagePurpose,
-  request: GenerateContentParameters
+  request: GenerateContentParameters,
+  attribution?: GeminiUsageAttribution
 ): Promise<GenerateContentResponse> {
-  return observeGeminiRequest(purpose, request.model, () => client.models.generateContent(request));
+  return observeGeminiRequest(
+    purpose,
+    request.model,
+    () => client.models.generateContent(request),
+    attribution
+  );
 }

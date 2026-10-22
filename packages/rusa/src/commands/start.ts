@@ -103,6 +103,7 @@ import {
   type RunAbandonedPayload,
   runEndPayload,
 } from "../actor/mesh-events.js";
+import { stampActor } from "../actor/message-stamp.js";
 import { OperatorActorControl } from "../actor/operator-actor-control.js";
 import { type ActorWakeScheduler, DefaultOsScheduler } from "../actor/os-scheduler.js";
 import {
@@ -145,6 +146,11 @@ import {
   seedRootModelConfig,
 } from "../actor/root-model-config.js";
 import { createRunAccounting, projectActorRunLaunchConfig } from "../actor/run-accounting.js";
+import {
+  type ActiveRunContext,
+  type BoundRunContextReader,
+  bindRunContext,
+} from "../actor/run-context.js";
 import {
   ensureWakeToken,
   wakePortPath,
@@ -333,6 +339,7 @@ import { resolveReference } from "../references/resolve.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import type { FollowerInstance } from "../remote-instances/follower-instance.js";
+import { registerFollowerRegistrationRecovery } from "../remote-instances/follower-registration-recovery.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
 import type {
   FollowerFileOperation,
@@ -782,6 +789,8 @@ export interface RunStartE2EHooks {
     instanceIdentity: InstanceIdentity;
     shutdown: () => Promise<void>;
   }) => void;
+  /** Observes each exact-run reader the host binds; production never sets this. */
+  onRunContextBound?: (actorId: string, runId: string, reader: BoundRunContextReader) => void;
 }
 
 export interface RunStartOptions {
@@ -1074,6 +1083,7 @@ function assembleConfiguredPortableInjection(
 
 export async function compactPortableContext(input: {
   actorId: string;
+  runId?: string;
   store: PortableContextStore;
   compactor: PortableContextCompactor;
   now?: () => string;
@@ -1096,6 +1106,7 @@ export async function compactPortableContext(input: {
     if (page.sources.length === 0) break;
     const result = await input.compactor.compact({
       actorId: input.actorId,
+      runId: input.runId,
       state,
       messages: page.sources,
       now: (input.now ?? (() => new Date().toISOString()))(),
@@ -2918,6 +2929,10 @@ async function composeStart(
   // provider at run start. A live grant updates it synchronously, which is the
   // latest boundary every provider CLI can reliably consume MCP configuration.
   const liveWorkerMcp = new Map<string, McpServerSpec[]>();
+  // Agent-exec endpoints are leases, not actor resources: each URL is bound to
+  // one run and is removed before that run's durable accounting closes. Each
+  // actor holds at most one lease; this releases it on actor teardown.
+  const runAgentMcpReleases = new Map<string, () => Promise<void>>();
   const refreshLiveActorMcp = (actorId: string): void => {
     const workerMcp = liveWorkerMcp.get(actorId);
     if (!workerMcp) return;
@@ -2936,8 +2951,10 @@ async function composeStart(
 
   // Tear down resources the mesh doesn't own: the per-actor MCP endpoints.
   const teardownActorMcp = (actorId: string) => {
+    const releaseRunAgentMcp = runAgentMcpReleases.get(actorId);
+    runAgentMcpReleases.delete(actorId);
+    void releaseRunAgentMcp?.();
     liveWorkerMcp.delete(actorId);
-    void mcpHttp.removeServer(actorId);
     void mcpHttp.removeServer(`${actorId}:${BRIEF_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${INBOX_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${OBLIGATIONS_MCP_NAME}`);
@@ -2977,7 +2994,8 @@ async function composeStart(
   };
 
   const compactPortableActorAfterRun = async (
-    actorId: string
+    actorId: string,
+    runId: string
   ): Promise<PortableContextCompactionSummary | null> => {
     const current = actors.get(actorId);
     const context = current?.context?.type === "portable" ? current.context : undefined;
@@ -2986,6 +3004,7 @@ async function composeStart(
     try {
       return await compactPortableContext({
         actorId,
+        runId,
         store: portableContextStore,
         compactor,
       });
@@ -3264,7 +3283,7 @@ async function composeStart(
             }),
           });
         }
-        const compacted = deferred ? null : await compactPortableActorAfterRun(id);
+        const compacted = deferred ? null : await compactPortableActorAfterRun(id, event.runId);
         if (compacted) {
           mesh.recordEvent({
             kind: "portable_context_compacted",
@@ -3329,20 +3348,6 @@ async function composeStart(
     supportedVoices: credentialValidSupportedVoices,
     actors,
     principals: getRepositories().principals,
-    // The inbox focus belongs to the active run, and effective responsiveness
-    // is read at send time. Actor tools receive no priority or obligation
-    // input, so neither can be forged or retained after the run ends.
-    responsiveForActorMessage: (actorId) => {
-      const runId = runAccounting.activeRunId(actorId);
-      if (!runId) return false;
-      const primaryObligationId =
-        getRepositories().inboxFocus.getByRunId(runId)?.primaryObligationId;
-      return (
-        primaryObligationId !== null &&
-        primaryObligationId !== undefined &&
-        getRepositories().obligations.get(primaryObligationId)?.effectiveResponsive === true
-      );
-    },
     rootId,
     // Placement exists when an e2e worker-construction override or the follower
     // gateway is wired. Unknown or disconnected targets fail closed.
@@ -3709,29 +3714,6 @@ async function composeStart(
       }
 
       try {
-        // A per-actor agent-execution endpoint, with this actor's identity baked in.
-        // The management deps are wired on every endpoint; the endpoint mounts
-        // the corresponding tools only for an actor holding the administrative
-        // capability (#549), so an ungranted worker sees none of them.
-        const meshUrl = mcpHttp.addServer(id, () =>
-          createAgentExecMcpServer(mesh, id, rootId, osScheduler, {
-            // Controller operations stay available to the one imported actor,
-            // but the imported identity itself adds no authority. The service
-            // enforces its empty-forest refusal when no such actor exists.
-            ...(id === rootId ? { rootControl } : {}),
-            onWrite: () => {
-              mesh.markUnkillable(id);
-            },
-            modelClasses,
-            validateModelClass: (input) =>
-              validateModelConfigPool(config, input, { portable: true }),
-            availabilityHolds,
-            validateHoldScope,
-            getFollowers: () => (followerHub ? followerHub.list() : []),
-            chatRoom,
-            voices: () => supportedVoiceCatalog,
-          })
-        );
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
           createInboxMcpServer(inboxStore, id, {
             select: inboxSelectFor(id),
@@ -3841,10 +3823,10 @@ async function composeStart(
           perActorShared.push({ name: SLACK_READ_MCP_NAME, url: slackReadUrl });
         }
 
-        // Workers get their per-actor shared tools, agent execution, and durable messaging.
+        // Agent execution is mounted by the run lifecycle below. Its URL must
+        // name the exact active run, rather than granting a reusable actor URL.
         const workerMcp: McpServerSpec[] = [
           ...perActorShared,
-          { name: AGENT_EXEC_MCP_NAME, url: meshUrl },
           { name: INBOX_MCP_NAME, url: inboxUrl },
           { name: OBLIGATIONS_MCP_NAME, url: obligationsUrl },
           { name: MESH_CHAT_MCP_NAME, url: meshChatUrl },
@@ -3896,6 +3878,9 @@ async function composeStart(
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
         let localActor: Actor | undefined;
+        let prepareRunMcp: (runId: string) => void = () => {
+          throw new Error(`actor ${id} prepared a run-scoped MCP endpoint before composition`);
+        };
         const computerUseAdmission = createComputerUseAdmission(() =>
           mesh.hasActiveCapability(id, COMPUTER_USE_CAPABILITY)
         );
@@ -3906,6 +3891,7 @@ async function composeStart(
           resolveProvider: (selected) =>
             resolveProvider(config, selected.provider, selected.model, selected.effort),
           mcpServers: workerMcp,
+          prepareRunMcp: (runId) => prepareRunMcp(runId),
           // E2E preserves the external-driver transport for the imported actor,
           // but its durable construction and tool surface stay ordinary.
           isE2eRoot: id === rootId && Boolean(opts?.e2e),
@@ -4064,6 +4050,106 @@ async function composeStart(
             `actor ${id} requests executionTarget ${JSON.stringify(ctx.executionTarget)} but this runtime has no remote placement support`
           );
         }
+        // A local provider reads the mutable server array after `onStart`, but
+        // a follower receives a copied admission snapshot before it emits that
+        // event. Mount from the queued run id when that snapshot
+        // is built, then let the same exact lease become live at `onStart`.
+        // A later run receives a different endpoint and cannot inherit this one.
+        let runAgentMcp:
+          | {
+              runId: string;
+              name: string;
+              url: string;
+              revoke: () => void;
+            }
+          | undefined;
+        const releaseRunAgentMcp = async (): Promise<void> => {
+          const mounted = runAgentMcp;
+          if (!mounted) return;
+          runAgentMcp = undefined;
+          // Revoke before closing transports. A concurrent tool invocation
+          // cannot stamp or send after the exact run reaches terminal state.
+          mounted.revoke();
+          const index = workerMcp.findIndex(
+            (server) => server.name === AGENT_EXEC_MCP_NAME && server.url === mounted.url
+          );
+          if (index >= 0) workerMcp.splice(index, 1);
+          await mcpHttp.removeServer(mounted.name);
+        };
+        runAgentMcpReleases.set(id, releaseRunAgentMcp);
+        const mountRunAgentMcp = (runId: string): void => {
+          if (runAgentMcp?.runId === runId) return;
+          if (runAgentMcp) {
+            if (runAccounting.activeRunId(id) === runAgentMcp.runId) {
+              throw new Error(
+                `actor ${id} tried to mount agent execution for ${runId} while ${runAgentMcp.runId} is still active`
+              );
+            }
+            // A follower can fail after admission but before `runStart`. The
+            // leader then books no run and emits no end, so that unstarted
+            // lease, whose reader already rejects, is replaced here.
+            void releaseRunAgentMcp();
+          }
+          const lease = bindRunContext(id, runId, (): Readonly<ActiveRunContext> | undefined => {
+            if (runAccounting.activeRunId(id) !== runId) return undefined;
+            const repositories = getRepositories();
+            const run = repositories.actorRuns.getById(runId);
+            if (!run || run.actorId !== id || run.endedAt !== null) return undefined;
+            const focus = repositories.inboxFocus.getByRunId(runId);
+            const primaryObligationId = focus?.primaryObligationId ?? null;
+            // An actual attempt replaces the launch tuple as a whole: omitted
+            // model or effort means that provider's default, never a field
+            // borrowed from the immutable launch tuple.
+            const provider = activeRunSelections.get(id) ?? {
+              provider: run.provider ?? undefined,
+              model: run.model ?? undefined,
+              effort: run.modelConfig?.effort,
+            };
+            return {
+              actorId: id,
+              runId,
+              startedAt: run.startedAt,
+              ...provider,
+              selectedInboxEntryIds: focus?.entryIds ?? [],
+              primaryObligationId,
+              effectiveResponsive:
+                primaryObligationId !== null &&
+                repositories.obligations.get(primaryObligationId)?.effectiveResponsive === true,
+            };
+          });
+          opts?.e2e?.onRunContextBound?.(id, runId, lease.reader);
+          const name = `${id}:run:${runId}:${AGENT_EXEC_MCP_NAME}`;
+          const url = mcpHttp.addServer(name, () =>
+            createAgentExecMcpServer(mesh, id, rootId, osScheduler, {
+              // Controller operations stay available to the one imported
+              // actor, but remain stamped by its exact active run.
+              ...(id === rootId ? { rootControl } : {}),
+              messageStamp: () => stampActor(lease.reader),
+              onWrite: () => {
+                mesh.markUnkillable(id);
+              },
+              modelClasses,
+              validateModelClass: (input) =>
+                validateModelConfigPool(config, input, { portable: true }),
+              availabilityHolds,
+              validateHoldScope,
+              getFollowers: () => (followerHub ? followerHub.list() : []),
+              chatRoom,
+              voices: () => supportedVoiceCatalog,
+            })
+          );
+          workerMcp.push({ name: AGENT_EXEC_MCP_NAME, url });
+          runAgentMcp = { runId, name, url, revoke: lease.revoke };
+        };
+        prepareRunMcp = mountRunAgentMcp;
+        ctx.lifecycle.add({
+          onStart: (event) => {
+            mountRunAgentMcp(event.runId);
+          },
+          onEnd: async (event) => {
+            if (runAgentMcp?.runId === event.runId) await releaseRunAgentMcp();
+          },
+        });
         const externalRoot =
           id === rootId && opts?.e2e?.rootDriver === "external"
             ? new ExternalRootDriver(id, undefined, (state) =>
@@ -4121,38 +4207,7 @@ async function composeStart(
   // not leave unhandled rejections.
   resources.acquire("actor mesh", () => mesh.shutdownAll());
   if (followerHub) {
-    followerHub.onRegister((follower) => {
-      for (const record of actors.list()) {
-        if (record.executionConfig?.executionTarget !== follower.id) continue;
-        if (record.status !== "active") {
-          followerHub.stopActor(follower.id, record.id);
-          continue;
-        }
-        const existing = mesh.get(record.id);
-        // A dispatch the follower never observed needs no re-derivation: the
-        // durable inbox still holds the work and its priority, so an advisory
-        // dispatch on either channel-recreating branch recovers it (#568).
-        if (!existing) {
-          mesh.rehydrate(record);
-          mesh.dispatch(record.id);
-        } else if (
-          "attachHost" in existing &&
-          typeof (existing as { attachHost?: (host: unknown) => void }).attachHost === "function"
-        ) {
-          try {
-            const newHost = followerHub.rebindHost(follower.id, record.id);
-            (existing as { attachHost: (host: unknown) => void }).attachHost(newHost);
-            mesh.dispatch(record.id);
-          } catch (err) {
-            log.warn("follower_reconnect_attach_failed", {
-              actorId: record.id,
-              followerId: follower.id,
-              err,
-            });
-          }
-        }
-      }
-    });
+    registerFollowerRegistrationRecovery({ actors, hub: followerHub, log, mesh });
   }
   // Route head changes as soon as the mesh exists — ahead of rehydration, which
   // is what registers the per-actor obligations MCP servers, and well ahead of
@@ -4690,7 +4745,7 @@ async function composeStart(
             return entries.length > 0 ? entries : null;
           },
           rootControl,
-          operatorActors: new OperatorActorControl(mesh, capabilityGrants),
+          operatorActors: new OperatorActorControl(mesh, capabilityGrants, rootId),
           // The configured actor's identity, so the dashboard shows this
           // instance's own handle instead of the default root-actor. Both the
           // handle and the image (cached under `avatars/root.png`) are the

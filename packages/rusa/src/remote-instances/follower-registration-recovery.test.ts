@@ -1,0 +1,655 @@
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import Database from "better-sqlite3";
+import { afterEach, describe, expect, it } from "vitest";
+import { type ActorFactoryContext, ActorMesh } from "../actor/actor-mesh.js";
+import type { ActorRecord } from "../actor/actor-record.js";
+import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
+import {
+  InMemoryEventSourceOwnerStore,
+  InMemoryEventSourceSubscriptionStore,
+} from "../actor/event-subscriptions.js";
+import { ExternalRootDriver } from "../actor/external-root-driver.js";
+import { runMigrations } from "../db/migrations/runner.js";
+import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
+import type { Logger } from "../observability/logger.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import { ActorHandle } from "./actor-handle.js";
+import { type FollowerActorCommand, type FollowerEvent, FollowerHub } from "./follower-hub.js";
+import { FollowerInstance } from "./follower-instance.js";
+import { registerFollowerRegistrationRecovery } from "./follower-registration-recovery.js";
+import { INSTANCE_PROTOCOL_VERSION, type ProviderFactory } from "./protocol.js";
+import { RemoteInstance } from "./remote-instance.js";
+
+const homes: string[] = [];
+const hubs: FollowerHub[] = [];
+const followers: FollowerInstance[] = [];
+const inboxDatabases: Array<{ close: () => void }> = [];
+const cleanups: Array<() => void> = [];
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0)) cleanup();
+  for (const follower of followers.splice(0)) follower.close();
+  await Promise.all(hubs.splice(0).map((hub) => hub.close()));
+  for (const inboxDatabase of inboxDatabases.splice(0)) inboxDatabase.close();
+  for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
+});
+
+function testLogger(records: Array<{ event: string; fields?: Record<string, unknown> }>): Logger {
+  let logger!: Logger;
+  const write = (event: string, fields?: Record<string, unknown>) =>
+    records.push({ event, fields });
+  logger = { debug: write, info: write, warn: write, error: write, child: () => logger };
+  return logger;
+}
+
+async function eventually(check: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error("timed out waiting for relaunch recovery");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+describe("follower registration recovery", () => {
+  it("recovers one gap wake through replacement registration without a second dispatch (#891)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "rusa-follower-relaunch-"));
+    homes.push(home);
+    const token = randomBytes(32).toString("hex");
+    const records: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const log = testLogger(records);
+    const hub = new FollowerHub(token, { logger: log });
+    hubs.push(hub);
+    const origin = await hub.listen("127.0.0.1", 0);
+    const post = (path: string, body: object) =>
+      fetch(`${origin}${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const register = async (generation: string) => {
+      const response = await post("/register", {
+        id: "relaunch-follower",
+        platform: process.platform,
+        pid: process.pid,
+        generation,
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      });
+      expect(response.status).toBe(200);
+      return {
+        id: "relaunch-follower",
+        ...((await response.json()) as { session: string }),
+      };
+    };
+
+    const actors = new InMemoryActorRepository();
+    const inboxDb = new Database(":memory:");
+    runMigrations(inboxDb);
+    inboxDatabases.push(inboxDb);
+    const inboxStore = new SqliteInboxRepository(inboxDb);
+    const principals = new PrincipalRepository(inboxDb);
+    principals.createUser({ email: "operator@example.test", createdAt: "t" });
+    const lifecycle: Array<{ type: "start" | "end"; runId: string; terminal?: unknown }> = [];
+    const provider: ProviderFactory = (_bridge, _options, selected) => ({
+      name: "relaunch-fixture",
+      providerName: "relaunch-fixture",
+      model: selected?.model,
+      async run() {
+        return { success: true, output: "recovered", exitCode: 0 };
+      },
+    });
+    const mesh = new ActorMesh({
+      actors,
+      principals,
+      rootId: "root",
+      inboxStore,
+      eventSourceOwners: new InMemoryEventSourceOwnerStore(),
+      eventSourceSubscriptions: new InMemoryEventSourceSubscriptionStore(),
+      capabilityGrants: new InMemoryCapabilityGrantStore(),
+      recordChat: () => "message",
+      createActor: (context) => {
+        const target = context.record.executionConfig?.executionTarget;
+        if (!target) throw new Error("relaunch fixture worker lacks a follower target");
+        context.lifecycle.add({
+          onStart: (event) => {
+            lifecycle.push({ type: "start", runId: event.runId });
+          },
+          onEnd: (event) => {
+            lifecycle.push({ type: "end", runId: event.runId, terminal: event.terminal });
+          },
+        });
+        return new ActorHandle({
+          host: hub.createHost(target, context.record.id),
+          context,
+          bootstrap: {
+            id: context.record.id,
+            cwd: home,
+            modelConfig: context.record.modelConfig,
+            providerOptions: { delayMs: 0 },
+          },
+          snapshot: () => ({ record: context.record, prompt: "relaunch recovery fixture" }),
+          saveSession: () => {},
+          onFailure: () => {},
+          logger: log,
+        });
+      },
+    });
+    const root = {
+      id: "root",
+      parentId: null,
+      charter: "root",
+      executionConfig: { unsandboxed: true },
+      status: "active" as const,
+      createdAt: new Date().toISOString(),
+    };
+    actors.upsert(root);
+    mesh.adopt(root, new ExternalRootDriver("root"));
+    const worker = {
+      id: "relaunch-worker",
+      parentId: "root",
+      charter: "recover durable gap work",
+      executionConfig: { executionTarget: "relaunch-follower" },
+      modelConfig: [{ provider: "relaunch-fixture", model: "test" }],
+      status: "active" as const,
+      createdAt: new Date().toISOString(),
+    };
+    actors.upsert(worker);
+    const unregisterRecovery = registerFollowerRegistrationRecovery({ actors, hub, log, mesh });
+    cleanups.push(unregisterRecovery);
+
+    const aEvents: FollowerEvent[] = [];
+    const followerA = new FollowerInstance(
+      join(home, "follower-a"),
+      false,
+      (event) => aEvents.push(event),
+      provider
+    );
+    followers.push(followerA);
+    const a = await register("generation-a");
+    const aPoll = await post("/poll", a);
+    expect(aPoll.status).toBe(200);
+    for (const command of (await aPoll.json()) as Array<{ actorId: string; message: never }>) {
+      followerA.dispatch(command);
+    }
+    await eventually(() => aEvents.length > 0);
+    const aEventsResponse = await post("/events", {
+      ...a,
+      batchId: randomUUID(),
+      events: aEvents.splice(0),
+    });
+    expect(aEventsResponse.status).toBe(200);
+    expect(followerA.actorIds).toEqual([worker.id]);
+
+    const unregistered = await post("/unregister", a);
+    expect(unregistered.status).toBe(200);
+    const [gapWake] = inboxStore.append([
+      {
+        actorId: worker.id,
+        source: "test:gap-wake",
+        payload: { type: "test.work", priority: "responsive" },
+      },
+    ]);
+    if (!gapWake) throw new Error("expected the durable gap wake to be inserted");
+    expect(mesh.dispatch(worker.id)).toBe(true);
+    await eventually(() => records.some((record) => record.event === "remote_wake_dropped"));
+    expect(lifecycle).toEqual([]);
+    // The dropped gap wake remains unseen until B registers; its later seen
+    // state and terminal result are the listener-driven recovery evidence.
+    expect(inboxStore.read(worker.id, gapWake.id)).toMatchObject({
+      id: gapWake.id,
+      seenAt: null,
+      handledAt: null,
+    });
+
+    const bEvents: FollowerEvent[] = [];
+    const followerB = new FollowerInstance(
+      join(home, "follower-b"),
+      false,
+      (event) => bEvents.push(event),
+      provider
+    );
+    followers.push(followerB);
+    expect(followerB.actorIds).toEqual([]);
+    const b = await register("generation-b");
+
+    for (
+      let turn = 0;
+      turn < 30 && lifecycle.filter((event) => event.type === "end").length === 0;
+      turn++
+    ) {
+      if (bEvents.length) {
+        const response = await post("/events", {
+          ...b,
+          batchId: randomUUID(),
+          events: bEvents.splice(0),
+        });
+        expect(response.status).toBe(200);
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 100);
+      try {
+        const response = await fetch(`${origin}/poll`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify(b),
+          signal: controller.signal,
+        });
+        if (response.ok) {
+          for (const command of (await response.json()) as Array<{
+            actorId: string;
+            message: never;
+          }>) {
+            followerB.dispatch(command);
+          }
+        }
+      } catch (error) {
+        if (!(error instanceof Error && error.name === "AbortError")) throw error;
+      } finally {
+        clearTimeout(timer);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    expect(followerB.actorIds).toEqual([worker.id]);
+    const starts = lifecycle.filter((event) => event.type === "start");
+    const ends = lifecycle.filter((event) => event.type === "end");
+    expect(starts).toHaveLength(1);
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({
+      runId: starts[0]?.runId,
+      terminal: {
+        kind: "result",
+        result: { success: true, output: "recovered", exitCode: 0 },
+      },
+    });
+    expect(inboxStore.read(worker.id, gapWake.id)).toMatchObject({
+      id: gapWake.id,
+      seenAt: expect.any(Date),
+      handledAt: null,
+    });
+  }, 10_000);
+
+  it("recovers a gap wake after a replacement hub re-adopts a retained running actor (#963)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "rusa-retained-follower-restart-"));
+    homes.push(home);
+    const token = randomBytes(32).toString("hex");
+    const records: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const log = testLogger(records);
+    const actors = new InMemoryActorRepository();
+    const inboxDb = new Database(":memory:");
+    runMigrations(inboxDb);
+    inboxDatabases.push(inboxDb);
+    const inboxStore = new SqliteInboxRepository(inboxDb);
+    const principals = new PrincipalRepository(inboxDb);
+    principals.createUser({ email: "operator@example.test", createdAt: "t" });
+
+    let providerRuns = 0;
+    let firstRunReleased = false;
+    let releaseFirstRun: (() => void) | undefined;
+    const provider: ProviderFactory = (_bridge, _options, selected) => ({
+      name: "retained-runtime-fixture",
+      providerName: "retained-runtime-fixture",
+      model: selected?.model,
+      async run() {
+        providerRuns++;
+        if (providerRuns === 1) {
+          await new Promise<void>((resolve) => {
+            releaseFirstRun = () => {
+              firstRunReleased = true;
+              resolve();
+            };
+          });
+          return { success: true, output: "old-leader-run", exitCode: 0 };
+        }
+        return { success: true, output: "recovered", exitCode: 0 };
+      },
+    });
+
+    const root = {
+      id: "root",
+      parentId: null,
+      charter: "root",
+      executionConfig: { unsandboxed: true },
+      status: "active" as const,
+      createdAt: new Date().toISOString(),
+    };
+    const worker = {
+      id: "retained-worker",
+      parentId: "root",
+      charter: "recover after leader replacement",
+      executionConfig: { executionTarget: "retained-follower" },
+      modelConfig: [{ provider: "retained-runtime-fixture", model: "test" }],
+      status: "active" as const,
+      createdAt: new Date().toISOString(),
+    };
+    actors.upsert(root);
+    actors.upsert(worker);
+
+    const createMesh = (
+      hub: FollowerHub,
+      lifecycle: Array<{ type: "start" | "end"; runId: string; terminal?: unknown }>
+    ) => {
+      const mesh = new ActorMesh({
+        actors,
+        principals,
+        rootId: root.id,
+        inboxStore,
+        eventSourceOwners: new InMemoryEventSourceOwnerStore(),
+        eventSourceSubscriptions: new InMemoryEventSourceSubscriptionStore(),
+        capabilityGrants: new InMemoryCapabilityGrantStore(),
+        recordChat: () => "message",
+        createActor: (context) => {
+          const target = context.record.executionConfig?.executionTarget;
+          if (!target) throw new Error("retained-runtime fixture worker lacks a follower target");
+          context.lifecycle.add({
+            onStart: (event) => {
+              lifecycle.push({ type: "start", runId: event.runId });
+            },
+            onEnd: (event) => {
+              lifecycle.push({ type: "end", runId: event.runId, terminal: event.terminal });
+            },
+          });
+          return new ActorHandle({
+            host: hub.createHost(target, context.record.id),
+            context,
+            bootstrap: {
+              id: context.record.id,
+              cwd: home,
+              modelConfig: context.record.modelConfig,
+              providerOptions: { delayMs: 0 },
+              // Production's remote adapter marks a sessionless bootstrap as
+              // reconnectable; an empty follower still constructs its actor.
+              reconnect: true,
+            },
+            snapshot: () => ({ record: context.record, prompt: "retained runtime fixture" }),
+            saveSession: () => {},
+            onFailure: () => {},
+            logger: log,
+          });
+        },
+      });
+      mesh.adopt(root, new ExternalRootDriver(root.id));
+      cleanups.push(registerFollowerRegistrationRecovery({ actors, hub, log, mesh }));
+      return mesh;
+    };
+
+    let hub = new FollowerHub(token, { logger: log });
+    hubs.push(hub);
+    let origin = await hub.listen("127.0.0.1", 0);
+    const firstLifecycle: Array<{ type: "start" | "end"; runId: string; terminal?: unknown }> = [];
+    const firstMesh = createMesh(hub, firstLifecycle);
+    const events: FollowerEvent[] = [];
+    const follower = new FollowerInstance(
+      join(home, "follower"),
+      false,
+      (event) => events.push(event),
+      provider
+    );
+    followers.push(follower);
+
+    const post = (address: string, path: string, body: object) =>
+      fetch(`${address}${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const register = async (address: string) => {
+      const body = {
+        id: "retained-follower",
+        platform: process.platform,
+        pid: process.pid,
+        generation: "retained-generation",
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      };
+      const response = await post(address, "/register", body);
+      expect(response.status).toBe(200);
+      return {
+        id: "retained-follower",
+        ...((await response.json()) as { session: string }),
+      };
+    };
+    const pump = async (
+      address: string,
+      registration: { id: string; session: string },
+      done: () => boolean,
+      onDispatch?: (command: FollowerActorCommand) => void,
+      onEvents?: (batch: FollowerEvent[]) => void
+    ) => {
+      for (let turn = 0; turn < 80 && !done(); turn++) {
+        if (events.length) {
+          const batch = events.splice(0);
+          const response = await post(address, "/events", {
+            ...registration,
+            batchId: randomUUID(),
+            events: batch,
+          });
+          expect(response.status).toBe(200);
+          onEvents?.(batch);
+        }
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 100);
+        try {
+          const response = await fetch(`${address}/poll`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+            body: JSON.stringify(registration),
+            signal: controller.signal,
+          });
+          if (response.ok) {
+            for (const command of (await response.json()) as FollowerActorCommand[]) {
+              follower.dispatch(command);
+              onDispatch?.(command);
+            }
+          }
+        } catch (error) {
+          if (!(error instanceof Error && error.name === "AbortError")) throw error;
+        } finally {
+          clearTimeout(timer);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      if (!done()) throw new Error("timed out pumping retained follower recovery");
+    };
+
+    const firstRegistration = await register(origin);
+    await pump(origin, firstRegistration, () => follower.actorIds.includes(worker.id));
+    const [firstWake] = inboxStore.append([
+      {
+        actorId: worker.id,
+        source: "test:first-run",
+        payload: { type: "test.work", priority: "responsive" },
+      },
+    ]);
+    if (!firstWake) throw new Error("expected initial durable work");
+    expect(firstMesh.dispatch(worker.id)).toBe(true);
+    await pump(origin, firstRegistration, () =>
+      firstLifecycle.some((event) => event.type === "start")
+    );
+    await eventually(() => releaseFirstRun !== undefined);
+    expect(providerRuns).toBe(1);
+    expect(inboxStore.read(worker.id, firstWake.id)).toMatchObject({
+      id: firstWake.id,
+      seenAt: expect.any(Date),
+      handledAt: null,
+    });
+
+    await hub.close();
+    const [gapWake] = inboxStore.append([
+      {
+        actorId: worker.id,
+        source: "test:leader-restart-gap-wake",
+        payload: { type: "test.work", priority: "responsive" },
+      },
+    ]);
+    if (!gapWake) throw new Error("expected restart-gap durable work");
+    expect(firstMesh.dispatch(worker.id)).toBe(true);
+    await eventually(() =>
+      records.some(
+        (record) =>
+          record.event === "remote_wake_dropped" &&
+          record.fields?.actorId === worker.id &&
+          record.fields?.priority === "responsive"
+      )
+    );
+    expect(inboxStore.read(worker.id, gapWake.id)).toMatchObject({
+      id: gapWake.id,
+      seenAt: null,
+      handledAt: null,
+    });
+
+    hub = new FollowerHub(token, { logger: log });
+    hubs.push(hub);
+    origin = await hub.listen("127.0.0.1", 0);
+    const secondLifecycle: Array<{ type: "start" | "end"; runId: string; terminal?: unknown }> = [];
+    createMesh(hub, secondLifecycle);
+    const replacementRecords = records.length;
+
+    const secondRegistration = await register(origin);
+    let bReadyAcknowledged = false;
+    let bRunningAcknowledged = false;
+    let recoveryPreemptDelivered = false;
+    let recoveryWakeDelivered = false;
+    await pump(
+      origin,
+      secondRegistration,
+      () => bReadyAcknowledged && bRunningAcknowledged && recoveryWakeDelivered,
+      (command) => {
+        if (
+          command.actorId === worker.id &&
+          command.message.type === "init" &&
+          command.message.bootstrap.reconnect
+        ) {
+          expect(firstRunReleased).toBe(false);
+        }
+        if (command.actorId === worker.id && command.message.type === "preempt") {
+          expect(bRunningAcknowledged).toBe(true);
+          recoveryPreemptDelivered = true;
+        }
+        if (command.actorId === worker.id && command.message.type === "wake") {
+          expect(firstRunReleased).toBe(false);
+          expect(bReadyAcknowledged).toBe(true);
+          // A wake that overtook the preempt would have its dirty bit cancelled.
+          expect(recoveryPreemptDelivered).toBe(true);
+          recoveryWakeDelivered = true;
+        }
+      },
+      (batch) => {
+        expect(firstRunReleased).toBe(false);
+        for (const event of batch) {
+          if (event.actorId !== worker.id) continue;
+          if (event.message.type === "ready") bReadyAcknowledged = true;
+          if (event.message.type === "state" && event.message.state === "running") {
+            bRunningAcknowledged = true;
+          }
+        }
+      }
+    );
+    expect(firstRunReleased).toBe(false);
+    expect(bReadyAcknowledged).toBe(true);
+    expect(bRunningAcknowledged).toBe(true);
+    expect(recoveryWakeDelivered).toBe(true);
+    // B never observed the retained run, so it decides the responsive gap row
+    // against the follower's report rather than the idle it was built with.
+    expect(records.slice(replacementRecords)).toContainEqual({
+      event: "remote_preempt_requested",
+      fields: expect.objectContaining({ actorId: worker.id, phase: "running" }),
+    });
+    expect(recoveryPreemptDelivered).toBe(true);
+    expect(follower.actorIds).toEqual([worker.id]);
+    expect(providerRuns).toBe(1);
+    if (!releaseFirstRun) throw new Error("expected the original provider run to remain blocked");
+    releaseFirstRun();
+    const forwardedEvents: FollowerEvent[] = [];
+    await pump(
+      origin,
+      secondRegistration,
+      () => secondLifecycle.filter((event) => event.type === "end").length === 1,
+      undefined,
+      (batch) => forwardedEvents.push(...batch)
+    );
+
+    const starts = secondLifecycle.filter((event) => event.type === "start");
+    const ends = secondLifecycle.filter((event) => event.type === "end");
+    expect(firstLifecycle.filter((event) => event.type === "start")).toHaveLength(1);
+    // This records the present leader-loss behavior, not a #963 result contract:
+    // A has already closed when the displaced provider run finally reports.
+    expect(firstLifecycle.filter((event) => event.type === "end")).toEqual([
+      expect.objectContaining({
+        terminal: {
+          kind: "result",
+          result: { success: false, output: "Remote actor exited (-1)", exitCode: -1 },
+        },
+      }),
+    ]);
+    expect(forwardedEvents).toContainEqual(
+      expect.objectContaining({
+        actorId: worker.id,
+        message: expect.objectContaining({
+          type: "request",
+          request: {
+            op: "complete",
+            result: expect.objectContaining({
+              success: false,
+              interrupted: true,
+              interruptSource: "responsive-notification",
+            }),
+          },
+        }),
+      })
+    );
+    expect(starts).toHaveLength(1);
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({
+      runId: starts[0]?.runId,
+      terminal: { kind: "result", result: { success: true, output: "recovered", exitCode: 0 } },
+    });
+    expect(follower.actorIds).toEqual([worker.id]);
+    expect(providerRuns).toBe(2);
+    expect(inboxStore.read(worker.id, gapWake.id)).toMatchObject({
+      id: gapWake.id,
+      seenAt: expect.any(Date),
+      handledAt: null,
+    });
+  }, 15_000);
+
+  it("releases a held recovery wake and preempt when the follower never reports state (#963)", async () => {
+    const records: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const remote = new RemoteInstance("silent-follower", process.platform, process.pid);
+    const actorId = "silent-worker";
+    const handle = new ActorHandle({
+      host: remote.createHost(actorId),
+      bootstrap: { id: actorId, cwd: "/tmp/silent-worker", reconnect: true },
+      context: { onRuntimeStateChanged: () => {} } as unknown as ActorFactoryContext,
+      snapshot: () => ({ record: { id: actorId } as ActorRecord, prompt: "silent follower" }),
+      saveSession: () => {},
+      onFailure: () => {},
+      logger: testLogger(records),
+      stateStaleTimeoutMs: 50,
+    });
+    cleanups.push(() => {
+      handle.close();
+      remote.close();
+    });
+    const sent = () =>
+      remote.commands.flatMap((command) => ("message" in command ? [command.message.type] : []));
+
+    // The follower adopts its retained runtime but never sends the state report.
+    remote.receive({ actorId, message: { type: "ready", pid: process.pid } });
+    await expect(handle.ready).resolves.toBe(process.pid);
+    expect(handle.preemptForResponsive()).toEqual({ preempted: false });
+    handle.requestRun({ priority: "responsive" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sent()).toEqual(["init"]);
+    expect(records.map((record) => record.event)).toContain("remote_preempt_deferred");
+
+    // The existing stale-state deadline lets the follower's Actor decide.
+    await eventually(() => sent().includes("wake"));
+    expect(sent()).toEqual(["init", "preempt", "wake"]);
+    expect(records.map((record) => record.event)).toEqual(
+      expect.arrayContaining(["remote_state_stale_timeout", "remote_preempt_requested"])
+    );
+    expect(records.map((record) => record.event)).not.toContain("remote_wake_dropped");
+  });
+});

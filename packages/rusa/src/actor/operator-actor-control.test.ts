@@ -10,6 +10,7 @@ import {
   OperatorActorControl,
   type OperatorObligationsAdminAudit,
   type OperatorReparentAudit,
+  type OperatorRetireAudit,
 } from "./operator-actor-control.js";
 
 const OPERATOR = "00000000-0000-4000-8000-000000000001";
@@ -53,13 +54,19 @@ function setup() {
     events
       .filter((event) => event.kind === "operator_obligations_admin")
       .map((event) => JSON.parse(event.payload ?? "{}") as OperatorObligationsAdminAudit);
+  const retirementAudits = (): OperatorRetireAudit[] =>
+    events
+      .filter((event) => event.kind === "operator_actor_retire")
+      .map((event) => JSON.parse(event.payload ?? "{}") as OperatorRetireAudit);
   return {
     actors,
     events,
     grants,
     audits,
     obligationAudits,
-    control: new OperatorActorControl(mesh, grants, () => "2026-10-16T05:30:00.000Z"),
+    retirementAudits,
+    mesh,
+    control: new OperatorActorControl(mesh, grants, "imported", () => "2026-10-16T05:30:00.000Z"),
   };
 }
 
@@ -155,6 +162,66 @@ describe("OperatorActorControl (#1003)", () => {
     ]);
   });
 
+  it("retires a detached actor through the authenticated operator boundary and audits it", () => {
+    const { actors, events, retirementAudits, control } = setup();
+
+    control.reparent("worker", null, OPERATOR);
+    control.retire("worker", OPERATOR);
+
+    expect(actors.get("worker")?.status).toBe("retired");
+    expect(retirementAudits()).toEqual([{ principal: OPERATOR, actorId: "worker", outcome: "ok" }]);
+    expect(events.filter((event) => event.kind === "operator_actor_retire")).toHaveLength(1);
+  });
+
+  it("refuses and audits root-LLM, configured root, unknown, already-retired, and mutation-time blocked operator retirement requests", () => {
+    const { actors, retirementAudits, control, mesh } = setup();
+    actors.patch("other-child", { status: "retired" });
+
+    expect(() => control.retire("worker", "root-llm")).toThrow(/human operator/);
+    control.reparent("root", "other", OPERATOR);
+    expect(() => control.retire("root", OPERATOR)).toThrow(/configured root actor/);
+    expect(() => control.retire("other", OPERATOR)).toThrow(/configured root actor/);
+    expect(actors.get("other")?.status).toBe("active");
+    expect(actors.get("imported")?.parentId).toBe("other");
+    expect(actors.get("imported")?.status).toBe("active");
+    expect(() => control.retire("ghost", OPERATOR)).toThrow(/unknown actor/);
+    expect(() => control.retire("other-child", OPERATOR)).toThrow(/not active/);
+    expect(actors.get("imported")?.status).toBe("active");
+    expect(actors.get("worker")?.status).toBe("active");
+
+    vi.spyOn(mesh, "retire").mockImplementationOnce(() => {
+      throw new Error("actor has in-flight run");
+    });
+    expect(() => control.retire("worker", OPERATOR)).toThrow("actor has in-flight run");
+    expect(actors.get("worker")?.status).toBe("active");
+
+    expect(retirementAudits()).toEqual([
+      expect.objectContaining({ principal: "root-llm", actorId: "worker", outcome: "denied" }),
+      expect.objectContaining({
+        principal: OPERATOR,
+        actorId: "imported",
+        outcome: "denied",
+        reason:
+          "operator retirement may not target the configured root actor or a subtree containing it",
+      }),
+      expect.objectContaining({
+        principal: OPERATOR,
+        actorId: "other",
+        outcome: "denied",
+        reason:
+          "operator retirement may not target the configured root actor or a subtree containing it",
+      }),
+      expect.objectContaining({ principal: OPERATOR, actorId: "ghost", outcome: "denied" }),
+      expect.objectContaining({ principal: OPERATOR, actorId: "other-child", outcome: "denied" }),
+      expect.objectContaining({
+        principal: OPERATOR,
+        actorId: "worker",
+        outcome: "denied",
+        reason: "actor has in-flight run",
+      }),
+    ]);
+  });
+
   it("provisions, reads back, revokes, and audits obligations administration separately", () => {
     const { control, grants, obligationAudits } = setup();
 
@@ -196,7 +263,7 @@ describe("OperatorActorControl (#1003)", () => {
   });
 
   it("uses durable actor IDs when the legacy root alias crosses an operator boundary", () => {
-    const { actors, audits, control, grants, obligationAudits } = setup();
+    const { actors, audits, control, grants, obligationAudits, retirementAudits } = setup();
 
     control.reparent("root", "other", OPERATOR);
     expect(actors.get("imported")?.parentId).toBe("other");
@@ -218,6 +285,12 @@ describe("OperatorActorControl (#1003)", () => {
     expect(grants.activeFor("imported")).toEqual([OBLIGATIONS_ADMIN_CAPABILITY]);
     expect(obligationAudits()).toEqual([
       expect.objectContaining({ actorId: "imported", outcome: "ok" }),
+    ]);
+
+    control.retire("other-child", OPERATOR);
+    expect(actors.get("other-child")?.status).toBe("retired");
+    expect(retirementAudits()).toEqual([
+      expect.objectContaining({ actorId: "other-child", outcome: "ok" }),
     ]);
   });
 

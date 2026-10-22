@@ -185,6 +185,10 @@ export class ActorHandle implements MeshActor {
       target: opts.target ?? opts.host.nodeId,
     });
     this.bindChannel(opts.host);
+    // A reconnect-marked bootstrap lets the follower adopt a runtime that
+    // outlived the leader that built it (#963). This handle never observed
+    // that runtime, so its initial idle says nothing about it either.
+    if (opts.bootstrap.reconnect) this.awaitStateReport();
     this.send({
       type: "init",
       bootstrap: { ...opts.bootstrap, modelConfigGeneration: this.modelConfigGeneration },
@@ -250,31 +254,7 @@ export class ActorHandle implements MeshActor {
     this.closed = false;
     // The follower kept its Actor across the gap; its first state report says
     // whether a run admitted before the loss is still in flight.
-    this.stateStale = true;
-    this.stateUnconfirmed = false;
-    this.settleState?.();
-    this.stateSettled = new Promise((resolve) => {
-      this.settleState = resolve;
-    });
-    clearTimeout(this.stateStaleTimer);
-    const staleTimeout = this.opts.stateStaleTimeoutMs ?? 10_000;
-    this.stateStaleTimer = setTimeout(() => {
-      if (!this.stateStale || this.closed) return;
-      this.log.warn("remote_state_stale_timeout", {
-        actorId: this.id,
-        target: this.opts.target ?? this.channel.nodeId,
-      });
-      // Only wake delivery waits on this deadline. A missing report is not
-      // proof the follower gave up a retained ticket: its resume claim, its
-      // first report, or a fresh admission still decides that (#602/#604).
-      this.stateStale = false;
-      this.stateUnconfirmed = true;
-      if (this.pendingPreempt) {
-        this.pendingPreempt = false;
-        this.applyPreempt();
-      }
-      this.settleState?.();
-    }, staleTimeout);
+    this.awaitStateReport();
     // A reconnect is transport recovery, not a fresh actor boot. Its delayed
     // state/ready report must not cancel a leader-retained admission after 10s.
     this.bindChannel(newChannel, false);
@@ -304,6 +284,39 @@ export class ActorHandle implements MeshActor {
     if (this.resumeCancelledPending) this.deliverResumeCancelled();
     // A ticket dropped during the gap: this channel can carry its work's wake.
     if (this.redispatchOwed) this.redispatchDroppedWork();
+  }
+
+  /**
+   * Hold preempt and wake decisions until the follower's first state report
+   * says which run, if any, its Actor holds. The deadline releases them as
+   * unconfirmed rather than stranding them behind a report that never comes.
+   */
+  private awaitStateReport(): void {
+    this.stateStale = true;
+    this.stateUnconfirmed = false;
+    this.settleState?.();
+    this.stateSettled = new Promise((resolve) => {
+      this.settleState = resolve;
+    });
+    clearTimeout(this.stateStaleTimer);
+    const staleTimeout = this.opts.stateStaleTimeoutMs ?? 10_000;
+    this.stateStaleTimer = setTimeout(() => {
+      if (!this.stateStale || this.closed) return;
+      this.log.warn("remote_state_stale_timeout", {
+        actorId: this.id,
+        target: this.opts.target ?? this.channel.nodeId,
+      });
+      // Only wake delivery waits on this deadline. A missing report is not
+      // proof the follower gave up a retained ticket: its resume claim, its
+      // first report, or a fresh admission still decides that (#602/#604).
+      this.stateStale = false;
+      this.stateUnconfirmed = true;
+      if (this.pendingPreempt) {
+        this.pendingPreempt = false;
+        this.applyPreempt();
+      }
+      this.settleState?.();
+    }, staleTimeout);
   }
 
   get isRunning(): boolean {
@@ -1266,6 +1279,13 @@ export class ActorHandle implements MeshActor {
                     this.admittedAt = new Date();
                     // Selection is decided here and carried to the follower, so the
                     // remote run uses the candidate the leader actually reserved.
+                    const runId = this.queuedRunId;
+                    if (!runId) {
+                      throw new Error(
+                        `Remote actor ${this.id} was admitted without a queued run id`
+                      );
+                    }
+                    this.opts.actorOptions?.prepareRunMcp?.(runId);
                     this.send({
                       type: "reply",
                       requestId,

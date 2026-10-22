@@ -151,7 +151,8 @@ describe("RootControlService", () => {
       "begin now",
       "root",
       undefined,
-      undefined
+      undefined,
+      { messageStamp: undefined }
     );
     expect(events[0]).toMatchObject({
       actorId: "root",

@@ -1391,6 +1391,34 @@ export async function handleMeshApiRequest(
       return true;
     }
 
+    // POST /api/mesh/actors/:id/retire — the authenticated operator's narrow
+    // cross-forest retirement boundary (#1085). Actor-facing retirement keeps
+    // its descendant-only authority; the mesh decides all lifecycle guards.
+    const retireActorMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/retire$/);
+    if (retireActorMatch) {
+      const operatorActors = deps?.operatorActors;
+      if (!operatorActors) {
+        sendJson(res, 503, { error: "operator actor control unavailable" });
+        return true;
+      }
+      const principal = requireOperatorPrincipal(req, res, deps);
+      if (!principal) return true;
+      let actorId: string;
+      try {
+        actorId = decodeURIComponent(retireActorMatch[1]);
+      } catch {
+        sendJson(res, 400, { error: "malformed actor id" });
+        return true;
+      }
+      try {
+        operatorActors.retire(actorId, principal);
+        sendJson(res, 200, { ok: true });
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return true;
+    }
+
     const match = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/chat$/);
     if (match) {
       if (!deps) {
