@@ -15,6 +15,7 @@ import {
   parseOutputBound,
   RUN_MATERIAL_READ_MAX_BYTES,
   RUN_MATERIAL_RETENTION_MS,
+  RUN_MATERIAL_ROOT,
   RunMaterialIntegrityError,
   type RunMaterialIo,
   RunMaterialReservationError,
@@ -291,6 +292,44 @@ describe("RunMaterialStore", () => {
     for (const path of [dirname(dirname(dir)), dirname(dir), dir, actorDir, runDir]) {
       expect(synced).toContain(path);
     }
+  });
+
+  it("reconfirms the store's own entry in the home after its sync failed", () => {
+    const home = mkdtempSync(join(tmpdir(), "rusa-run-material-home-"));
+    dirs.push(home);
+    const fds = new Map<number, string>();
+    const synced: string[] = [];
+    let failHome = true;
+    const io: RunMaterialIo = {
+      ...fs,
+      openSync: ((...args: Parameters<typeof fs.openSync>) => {
+        const fd = fs.openSync(...args);
+        fds.set(fd, String(args[0]));
+        return fd;
+      }) as typeof fs.openSync,
+      fsyncSync: (fd: number) => {
+        const path = fds.get(fd) ?? "";
+        // `run-material/` is created, but its entry in the home is never
+        // confirmed.
+        if (failHome && path === home) {
+          failHome = false;
+          throw Object.assign(new Error("home sync failed"), { code: "EIO" });
+        }
+        synced.push(path);
+        fs.fsyncSync(fd);
+      },
+    };
+    const dir = join(home, RUN_MATERIAL_ROOT);
+    expect(() => new RunMaterialStore(dir, io).reservePromptAttempt("actor-a", RUN)).toThrow(
+      RunMaterialReservationError
+    );
+    expect(failHome).toBe(false);
+
+    synced.length = 0;
+    expect(new RunMaterialStore(dir, io).reservePromptAttempt("actor-a", RUN)).toBe(1);
+    expect(synced).toContain(home);
+    // The home is the ceiling: nothing above it is touched.
+    expect(synced).not.toContain(dirname(home));
   });
 
   it("verifies an existing file on EEXIST and refuses a corrupt one", () => {
