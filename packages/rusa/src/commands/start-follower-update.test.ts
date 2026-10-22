@@ -1,18 +1,28 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { closeDb } from "../db/index.js";
+import { nullLogger } from "../observability/logger.js";
+import type { RunOptions } from "../providers/types.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import type { FollowerInstance } from "../remote-instances/follower-instance.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
 import type { FollowerBuildSeam, FollowerGitSeam } from "../remote-instances/follower-updater.js";
 import { waitUntil } from "../remote-instances/harness.js";
-import type { FollowerUpdateStatus, ProviderFactory } from "../remote-instances/protocol.js";
+import type {
+  ActorEvent,
+  FollowerUpdateStatus,
+  ProviderFactory,
+} from "../remote-instances/protocol.js";
+import { writeBuildSentinel } from "../update/build-sentinel.js";
 import { StepError } from "../update/orchestrator.js";
+import { BuildRunner } from "../update/runner.js";
 import { runStart } from "./start.js";
-import type { StartFollowerRelease } from "./start-follower.js";
+import { resolveStartFollowerRelease, type StartFollowerRelease } from "./start-follower.js";
 
 // The bwrap preflight is host-specific; these fixtures never spawn a sandbox.
 vi.mock("../providers/sandbox.js", async (importOriginal) => {
@@ -28,6 +38,7 @@ const FOLLOWER_ID = "follower-start-update";
 const originalHome = process.env.RUSA_HOME;
 const cleanups: Array<() => Promise<void> | void> = [];
 let originalExit: typeof process.exit;
+const originalArgv1 = process.argv[1];
 
 beforeEach(() => {
   originalExit = process.exit;
@@ -41,6 +52,7 @@ afterEach(async () => {
     } catch {}
   }
   process.exit = originalExit;
+  process.argv[1] = originalArgv1;
   closeDb();
   if (originalHome !== undefined) process.env.RUSA_HOME = originalHome;
   else delete process.env.RUSA_HOME;
@@ -198,6 +210,47 @@ it("updates a rusa start follower to the leader's requested release and reconnec
   expect(process.exit).not.toHaveBeenCalled();
 }, 20_000);
 
+it("rebuilds and restarts when only the checkout, not the running release, is at the target", async () => {
+  const home = tempDir("rusa-start-follower-update-head-");
+  const leader = await startLeader(home);
+  // The checkout already reached the target, but this process booted the old dist.
+  const git = syntheticGit(NEW_SHA, NEW_SHA);
+  const build = syntheticBuild();
+
+  await bootFollower(home, leader.url, {
+    runningSha: OLD_SHA,
+    update: { git: git.git, build: build.build, drainTimeoutMs: 50 },
+  });
+  leader.hub.updateFollower(FOLLOWER_ID, { targetSha: NEW_SHA, branch: "staging" });
+
+  await waitUntil(() =>
+    statusNames(leader.statuses).some((s) => s === "already_current" || s === "restarting")
+  );
+  expect(statusNames(leader.statuses)).not.toContain("already_current");
+  expect(build.calls).toEqual([`build ${NEW_SHA.slice(0, 7)}`]);
+  await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0);
+  expect(process.exit).toHaveBeenCalledWith(0);
+  // Success is recorded only once a process registers running the target.
+  expect(leader.store.hasSucceeded(FOLLOWER_ID, NEW_SHA)).toBe(false);
+}, 20_000);
+
+it("never treats an unproven running release as current", async () => {
+  const home = tempDir("rusa-start-follower-update-unproven-");
+  const leader = await startLeader(home);
+  const build = syntheticBuild();
+
+  await bootFollower(home, leader.url, {
+    update: { git: syntheticGit(NEW_SHA, NEW_SHA).git, build: build.build, drainTimeoutMs: 50 },
+  });
+  leader.hub.updateFollower(FOLLOWER_ID, { targetSha: NEW_SHA, branch: "staging" });
+
+  await waitUntil(() =>
+    statusNames(leader.statuses).some((s) => s === "already_current" || s === "restarting")
+  );
+  expect(statusNames(leader.statuses)).not.toContain("already_current");
+  expect(build.calls).toEqual([`build ${NEW_SHA.slice(0, 7)}`]);
+}, 20_000);
+
 it("reports a failed start-mode build truthfully, restores the checkout and keeps serving", async () => {
   const home = tempDir("rusa-start-follower-update-fail-");
   const leader = await startLeader(home);
@@ -225,19 +278,36 @@ it("reports a failed start-mode build truthfully, restores the checkout and keep
   ]);
 }, 20_000);
 
-it("admits no new actor while draining and restarts within the drain bound", async () => {
+it("holds an in-flight run through the bounded drain and settles it before restart", async () => {
   const home = tempDir("rusa-start-follower-update-drain-");
   const leader = await startLeader(home);
   const drainStartedAt: number[] = [];
   leader.hub.onUpdateStatus((_id, status) => {
     if (status.status === "draining") drainStartedAt.push(Date.now());
   });
-  // Hosted actors stay in place between runs, so the drain runs to its bound.
+  // The run stays open until shutdown aborts it, so the drain runs to its bound.
+  let runStarted: () => void = () => {};
+  const started = new Promise<void>((resolveStarted) => {
+    runStarted = resolveStarted;
+  });
   const providerFactory: ProviderFactory = (_bridge, _options, selected) => ({
-    name: "idle-provider",
-    providerName: "idle-provider",
+    name: "held-provider",
+    providerName: "held-provider",
     model: selected?.model,
-    run: async () => ({ success: true, output: "", exitCode: 0, model: selected?.model }),
+    async run(run: RunOptions) {
+      run.onPromptLaunched?.(run.prompt);
+      runStarted();
+      await new Promise<void>((resolveAbort) => {
+        if (!run.signal || run.signal.aborted) resolveAbort();
+        else run.signal.addEventListener("abort", () => resolveAbort(), { once: true });
+      });
+      return {
+        success: false,
+        output: "Interrupted by restart",
+        exitCode: 1,
+        model: selected?.model,
+      };
+    },
   });
   const { instance } = await bootFollower(
     home,
@@ -252,19 +322,46 @@ it("admits no new actor while draining and restarts within the drain bound", asy
     },
     providerFactory
   );
-  const init = (id: string) => ({
-    actorId: id,
-    message: {
-      type: "init" as const,
-      bootstrap: { id, cwd: home, modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }] },
-    },
+
+  // The leader places the actor and answers its run requests, as a leader actor host does.
+  const host = leader.hub.createHost(FOLLOWER_ID, "actor-hosted");
+  const reply = (requestId: number, value?: unknown) =>
+    host.send({ type: "reply", requestId, value }, () => {});
+  let ready = false;
+  host.on("message", (message: ActorEvent) => {
+    if (message.type === "ready") ready = true;
+    if (message.type !== "request") return;
+    const { op } = message.request as { op: string };
+    if (op === "beforeRun") reply(message.requestId, { allowed: true });
+    else if (op === "admit")
+      reply(message.requestId, {
+        record: {
+          id: "actor-hosted",
+          charter: "Drain test charter",
+          status: "active",
+          createdAt: new Date().toISOString(),
+        },
+        prompt: "Drain test prompt",
+        selected: { provider: "codex", model: "gpt-5.6-sol" },
+      });
+    else reply(message.requestId);
   });
-  instance.dispatch(init("actor-hosted"));
-  expect(instance.actorIds).toEqual(["actor-hosted"]);
+  const bootstrap = (id: string) => ({
+    id,
+    cwd: home,
+    modelConfig: [{ provider: "codex" as const, model: "gpt-5.6-sol" }],
+  });
+  host.send({ type: "init", bootstrap: bootstrap("actor-hosted") }, () => {});
+  await waitUntil(() => ready);
+  host.send({ type: "wake" }, () => {});
+  await started;
 
   leader.hub.updateFollower(FOLLOWER_ID, { targetSha: NEW_SHA, branch: "staging" });
   await waitUntil(() => drainStartedAt.length > 0);
-  instance.dispatch(init("actor-late"));
+  instance.dispatch({
+    actorId: "actor-late",
+    message: { type: "init", bootstrap: bootstrap("actor-late") },
+  });
   expect(instance.actorIds).toEqual(["actor-hosted"]);
   expect(process.exit).not.toHaveBeenCalled();
 
@@ -272,4 +369,79 @@ it("admits no new actor while draining and restarts within the drain bound", asy
   // The status is observed after a flush, so the measured wait can only be shorter.
   expect(Date.now() - drainStartedAt[0]).toBeGreaterThanOrEqual(300);
   expect(statusNames(leader.statuses).slice(-2)).toEqual(["draining", "restarting"]);
+
+  // Shutdown closed the database only after the open run reached a terminal record.
+  const db = new Database(join(home, "data", "mesh.db"), { readonly: true });
+  try {
+    const runs = db
+      .prepare("SELECT outcome, success, output FROM actor_runs WHERE actor_id = ?")
+      .all("actor-hosted");
+    expect(runs).toEqual([expect.objectContaining({ outcome: "completed", success: 0 })]);
+    expect(db.prepare("SELECT 1 FROM actor_runs WHERE actor_id = ?").all("actor-late")).toEqual([]);
+  } finally {
+    db.close();
+  }
 }, 20_000);
+
+/** A disposable rusa checkout whose built dist is the launched entry point. */
+function syntheticCheckout(options: { sentinel?: string; distName?: string } = {}) {
+  const root = realpathSync(tempDir("rusa-start-follower-checkout-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim();
+  git("init", "--quiet");
+  const packageDir = join(root, "packages", "rusa");
+  const distDir = join(packageDir, options.distName ?? "dist");
+  mkdirSync(distDir, { recursive: true });
+  writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: "rusa" }), "utf8");
+  writeFileSync(join(distDir, "index.js"), "", "utf8");
+  git("add", ".");
+  git(
+    "-c",
+    "user.name=fixture",
+    "-c",
+    "user.email=fixture@example.invalid",
+    "commit",
+    "--quiet",
+    "--no-gpg-sign",
+    "-m",
+    "fixture"
+  );
+  if (options.sentinel) writeBuildSentinel(distDir, options.sentinel);
+  process.argv[1] = join(distDir, "index.js");
+  return { root, packageDir, head: git("rev-parse", "HEAD") };
+}
+
+it("resolves a supported launch's running release and update source from its entry point", async () => {
+  const checkout = syntheticCheckout({ sentinel: OLD_SHA });
+
+  const release = resolveStartFollowerRelease(nullLogger);
+
+  expect(release.runningSha).toBe(OLD_SHA);
+  if ("unavailable" in release.update) throw new Error(release.update.unavailable);
+  // The updater reads the checkout the running dist was built from...
+  expect(await release.update.git.headSha()).toBe(checkout.head);
+  // ...and rebuilds that package's dist.
+  expect(release.update.build).toBeInstanceOf(BuildRunner);
+  expect(release.update.build).toMatchObject({ packageDir: checkout.packageDir });
+});
+
+it("reports no running release when the launched dist carries no build sentinel", () => {
+  syntheticCheckout();
+
+  const release = resolveStartFollowerRelease(nullLogger);
+
+  expect(release.runningSha).toBeUndefined();
+  expect("unavailable" in release.update).toBe(false);
+});
+
+it("refuses self-update for a launch outside a built dist, keeping its proven release", () => {
+  syntheticCheckout({ sentinel: OLD_SHA, distName: "src" });
+
+  expect(resolveStartFollowerRelease(nullLogger)).toEqual({
+    runningSha: OLD_SHA,
+    update: {
+      unavailable:
+        "Follower self-update is unsupported for this launch: rusa start is not running from a built dist directory",
+    },
+  });
+});

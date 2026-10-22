@@ -489,6 +489,8 @@ export async function composeFollowerStart(
         targetSha: command.targetSha,
         branch: command.branch,
         drainTimeoutMs: source.drainTimeoutMs,
+        // The checkout can reach the target without this process running it.
+        runningSha: release.runningSha ?? null,
       },
       {
         git: source.git,

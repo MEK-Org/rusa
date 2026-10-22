@@ -39,6 +39,12 @@ export interface FollowerUpdatePlan {
   targetSha?: string;
   branch?: string;
   drainTimeoutMs?: number;
+  /**
+   * The release this process is running, when the caller tracks it apart from
+   * the checkout: only that release makes an update a no-op, and `null` (an
+   * unproven release) never does. Omitted, checkout HEAD stands in for it.
+   */
+  runningSha?: string | null;
 }
 
 export interface FollowerUpdateResult {
@@ -254,7 +260,8 @@ export async function executeFollowerUpdate(
       );
     }
 
-    if (newSha === oldSha) {
+    const runningSha = plan.runningSha === undefined ? oldSha : plan.runningSha;
+    if (newSha === runningSha) {
       log(`[follower-update] already at target SHA ${newSha.slice(0, 7)}`);
       deps.emitter.emitStatus({
         type: "update_status",
