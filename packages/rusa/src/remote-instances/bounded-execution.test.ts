@@ -236,4 +236,29 @@ describe("bounded remote execution (#1020)", () => {
       body: { output: OUTPUT, source: "leader" },
     });
   }, 60_000);
+
+  it("keeps an explicit fallback attempt when host discovery is unreadable", async () => {
+    const failing: RunMaterialIo = {
+      ...fs,
+      readdirSync: (() => {
+        throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      }) as typeof fs.readdirSync,
+      linkSync: () => {
+        throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+      },
+    };
+    const r = run({ enabled: true, io: failing });
+    await r.done;
+
+    const prompt = r.h.followerEvents.find(
+      ({ actorId, message }) => actorId === r.id && message.type === "runPrompt"
+    );
+    expect(prompt?.message).toMatchObject({ prompt: r.prompts[0], attempt: 1 });
+    // The follower could not retain material, but the full, keyed fallback
+    // reached the leader's material store rather than the unversioned row.
+    expect(await r.read("prompt", 1)).toMatchObject({
+      status: 200,
+      body: { prompt: r.prompts[0], attempt: 1, source: "leader" },
+    });
+  }, 60_000);
 });

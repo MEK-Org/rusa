@@ -142,13 +142,18 @@ async function readBound(
   if (kind === "prompt" && attempt === undefined) {
     const localLatest = deps.local.latestPromptAttempt(actorId, runId);
     const remote = await deps.remote(host, actorId, request);
-    // The leader's copy wins only over a host attempt known to be older; a
-    // host answer without an attempt is returned as the error it is.
+    // The leader's copy wins only over a host attempt known to be older, or a
+    // host-missing latest whose allocated key it has retained. A host answer
+    // without an attempt is returned as the error it is.
     const remoteLatest =
-      remote.status === "ok" || remote.status === "tooLarge" ? remote.attempt : undefined;
+      remote.status === "ok" || remote.status === "tooLarge" || remote.status === "missing"
+        ? remote.attempt
+        : undefined;
     const localIsNewer =
       localLatest !== undefined &&
-      (remote.status === "missing" || (remoteLatest !== undefined && localLatest > remoteLatest));
+      (remote.status === "missing"
+        ? remoteLatest === undefined || localLatest >= remoteLatest
+        : remoteLatest !== undefined && localLatest > remoteLatest);
     if (localIsNewer) {
       return { read: deps.local.read(actorId, runId, "prompt", localLatest), source: "leader" };
     }

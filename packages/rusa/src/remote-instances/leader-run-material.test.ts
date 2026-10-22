@@ -218,6 +218,27 @@ describe("readRunMaterial", () => {
       body: { error: "integrity", source: "host" },
     });
   });
+
+  it("does not replace an unavailable newest allocation with an older fallback", async () => {
+    const d = deps({ remote: async () => ({ status: "missing", attempt: 2 }) });
+    d.local.putPrompt("worker", RUN, 1, "older fallback");
+
+    expect(await readRunMaterial(d, "worker", RUN, "prompt")).toEqual({
+      status: 404,
+      body: { error: "prompt not retained" },
+    });
+    expect(await readRunMaterial(d, "worker", RUN, "prompt", 1)).toMatchObject({
+      status: 200,
+      body: { prompt: "older fallback", attempt: 1, source: "leader" },
+    });
+
+    // A leader copy of the newest allocation is still a valid fallback.
+    d.local.putPrompt("worker", RUN, 2, "newest fallback");
+    expect(await readRunMaterial(d, "worker", RUN, "prompt")).toMatchObject({
+      status: 200,
+      body: { prompt: "newest fallback", attempt: 2, source: "leader" },
+    });
+  });
 });
 
 describe("getRunMaterialBinding", () => {

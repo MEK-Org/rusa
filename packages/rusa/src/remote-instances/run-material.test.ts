@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { failureDiagnostic } from "../actor/failure-sink.js";
 import { ACTOR_RUN_OUTPUT_MAX_CHARS } from "../db/repositories/actor-run-repository.js";
@@ -93,6 +93,35 @@ describe("RunMaterialStore", () => {
     expect(restarted.nextPromptAttempt("actor-a", RUN)).toBe(3);
   });
 
+  it("does not serve an older original when the newest allocated attempt was lost", () => {
+    const dir = root();
+    let failLinks = false;
+    const io: RunMaterialIo = {
+      ...fs,
+      linkSync: (from: fs.PathLike, to: fs.PathLike) => {
+        if (failLinks) throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+        fs.linkSync(from, to);
+      },
+    };
+    const store = new RunMaterialStore(dir, io);
+    const first = store.nextPromptAttempt("actor-a", RUN);
+    store.putPrompt("actor-a", RUN, first, "retained first");
+    const second = store.nextPromptAttempt("actor-a", RUN);
+    failLinks = true;
+    expect(() => store.putPrompt("actor-a", RUN, second, "lost second")).toThrow("disk full");
+
+    // The persisted allocation, rather than the highest filename, says that
+    // latest is unavailable. Explicit historical reads remain available.
+    expect(store.read("actor-a", RUN, "prompt")).toEqual({ status: "missing", attempt: 2 });
+    expect(store.read("actor-a", RUN, "prompt", 1)).toMatchObject({ status: "ok", attempt: 1 });
+    const reopened = new RunMaterialStore(dir);
+    expect(reopened.read("actor-a", RUN, "prompt")).toEqual({ status: "missing", attempt: 2 });
+    expect(reopened.read("actor-a", RUN, "prompt", 1)).toMatchObject({
+      status: "ok",
+      attempt: 1,
+    });
+  });
+
   it("keeps allocating attempts from memory when the run directory cannot be written", () => {
     const io: RunMaterialIo = {
       ...fs,
@@ -104,6 +133,54 @@ describe("RunMaterialStore", () => {
     expect(store.nextPromptAttempt("actor-a", RUN)).toBe(1);
     expect(store.nextPromptAttempt("actor-a", RUN)).toBe(2);
     expect(() => store.putOutput("actor-a", RUN, "out")).toThrow("read-only");
+  });
+
+  it("allocates a fallback attempt when reading the run directory fails", () => {
+    const dir = root();
+    const runDir = join(dir, "actor-a", RUN);
+    const io: RunMaterialIo = {
+      ...fs,
+      readdirSync: ((path: fs.PathLike) => {
+        if (String(path) === runDir) {
+          throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+        }
+        return fs.readdirSync(path);
+      }) as typeof fs.readdirSync,
+      linkSync: () => {
+        throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+      },
+    };
+    const store = new RunMaterialStore(dir, io);
+    expect(store.nextPromptAttempt("actor-a", RUN)).toBe(1);
+    expect(() => store.putPrompt("actor-a", RUN, 1, "full fallback")).toThrow("disk full");
+  });
+
+  it("syncs every newly created path entry before publishing a material ref", () => {
+    const dir = root();
+    const synced = new Set<string>();
+    const fds = new Map<number, string>();
+    const io: RunMaterialIo = {
+      ...fs,
+      openSync: ((...args: Parameters<typeof fs.openSync>) => {
+        const fd = fs.openSync(...args);
+        fds.set(fd, String(args[0]));
+        return fd;
+      }) as typeof fs.openSync,
+      fsyncSync: (fd: number) => {
+        const path = fds.get(fd);
+        if (path) synced.add(path);
+        fs.fsyncSync(fd);
+      },
+      linkSync: (from: fs.PathLike, to: fs.PathLike) => {
+        const run = join(dir, "actor-a", RUN);
+        for (const path of [dirname(dir), dir, join(dir, "actor-a"), run]) {
+          expect(synced.has(path)).toBe(true);
+        }
+        fs.linkSync(from, to);
+      },
+    };
+    const store = new RunMaterialStore(dir, io);
+    store.putOutput("actor-a", RUN, "original");
   });
 
   it("verifies an existing file on EEXIST and refuses a corrupt one", () => {

@@ -69,7 +69,11 @@ export interface RunMaterialRef {
 
 export type RunMaterialRead =
   | { status: "ok"; attempt?: number; bytes: number; sha256: string; content: Buffer }
-  | { status: "missing" }
+  /**
+   * A latest prompt read includes the newest allocated attempt when that
+   * original is unavailable. The leader must not substitute an older file.
+   */
+  | { status: "missing"; attempt?: number }
   | { status: "tooLarge"; attempt?: number; bytes: number; sha256: string }
   | { status: "integrity" };
 
@@ -117,11 +121,16 @@ export class RunMaterialStore {
   nextPromptAttempt(actorId: string, runId: string): number {
     const key = this.key(actorId, runId);
     const dir = this.runDir(actorId, runId);
-    const names = this.list(dir) ?? [];
     let last = Math.max(this.attempts.get(key) ?? 0, this.readCounter(dir));
-    for (const name of names) {
-      const match = PROMPT_FILE.exec(name);
-      if (match) last = Math.max(last, Number(match[1]));
+    try {
+      for (const name of this.list(dir) ?? []) {
+        const match = PROMPT_FILE.exec(name);
+        if (match) last = Math.max(last, Number(match[1]));
+      }
+    } catch {
+      // An unreadable directory cannot make the fallback lose its identity.
+      // Memory remains monotonic for this process and the counter write below
+      // is still attempted for the next process.
     }
     const next = last + 1;
     this.attempts.set(key, next);
@@ -150,14 +159,15 @@ export class RunMaterialStore {
     return { bytes: content.length, sha256: hash };
   }
 
-  /** The highest prompt attempt retained for the run, if any. */
+  /** The newest allocated prompt attempt for the run, if it can be discovered. */
   latestPromptAttempt(actorId: string, runId: string): number | undefined {
-    let latest: number | undefined;
-    for (const name of this.list(this.runDir(actorId, runId)) ?? []) {
+    const dir = this.runDir(actorId, runId);
+    let latest = this.readCounter(dir);
+    for (const name of this.list(dir) ?? []) {
       const match = PROMPT_FILE.exec(name);
-      if (match) latest = Math.max(latest ?? 0, Number(match[1]));
+      if (match) latest = Math.max(latest, Number(match[1]));
     }
-    return latest;
+    return latest || undefined;
   }
 
   /** Read one retained original; without `attempt`, a prompt read returns the latest attempt. */
@@ -176,11 +186,19 @@ export class RunMaterialStore {
       if (match) candidates.push({ name, hash: match[2], attempt: Number(match[1]) });
     }
     let wanted = candidates;
+    let latest: number | undefined;
     if (kind === "prompt") {
-      const target = attempt ?? Math.max(0, ...candidates.map((c) => c.attempt ?? 0));
+      latest = this.readCounter(dir);
+      for (const candidate of candidates) latest = Math.max(latest, candidate.attempt ?? 0);
+      const target = attempt ?? latest;
       wanted = candidates.filter((c) => c.attempt === target);
     }
-    if (wanted.length === 0) return { status: "missing" };
+    if (wanted.length === 0) {
+      return {
+        status: "missing",
+        ...(kind === "prompt" && attempt === undefined && latest ? { attempt: latest } : {}),
+      };
+    }
     // Two originals under one key means something other than this store wrote here.
     if (wanted.length > 1) return { status: "integrity" };
     const [file] = wanted;
@@ -321,7 +339,32 @@ export class RunMaterialStore {
   }
 
   private ensureDir(dir: string): void {
-    this.io.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // mkdir({recursive:true}) does not say which parent entries reached
+    // stable storage. Create one component at a time, syncing both the new
+    // directory and its parent before a child can publish a material ref.
+    const missing: string[] = [];
+    let cursor = dir;
+    for (;;) {
+      try {
+        this.io.statSync(cursor);
+        break;
+      } catch (err) {
+        if (errorCode(err) !== "ENOENT") throw err;
+        const parent = dirname(cursor);
+        if (parent === cursor) throw err;
+        missing.push(cursor);
+        cursor = parent;
+      }
+    }
+    for (const created of missing.reverse()) {
+      try {
+        this.io.mkdirSync(created, { mode: 0o700 });
+      } catch (err) {
+        if (errorCode(err) !== "EEXIST") throw err;
+      }
+      this.syncDir(created);
+      this.syncDir(dirname(created));
+    }
   }
 
   private writeFile(path: string, content: Buffer): void {
