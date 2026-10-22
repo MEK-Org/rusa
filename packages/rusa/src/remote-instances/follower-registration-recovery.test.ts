@@ -17,7 +17,7 @@ import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repositor
 import type { Logger } from "../observability/logger.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { ActorHandle } from "./actor-handle.js";
-import { type FollowerEvent, FollowerHub } from "./follower-hub.js";
+import { type FollowerActorCommand, type FollowerEvent, FollowerHub } from "./follower-hub.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { registerFollowerRegistrationRecovery } from "./follower-registration-recovery.js";
 import { INSTANCE_PROTOCOL_VERSION, type ProviderFactory } from "./protocol.js";
@@ -293,6 +293,7 @@ describe("follower registration recovery", () => {
     principals.createUser({ email: "operator@example.test", createdAt: "t" });
 
     let providerRuns = 0;
+    let firstRunReleased = false;
     let releaseFirstRun: (() => void) | undefined;
     const provider: ProviderFactory = (_bridge, _options, selected) => ({
       name: "retained-runtime-fixture",
@@ -302,7 +303,10 @@ describe("follower registration recovery", () => {
         providerRuns++;
         if (providerRuns === 1) {
           await new Promise<void>((resolve) => {
-            releaseFirstRun = resolve;
+            releaseFirstRun = () => {
+              firstRunReleased = true;
+              resolve();
+            };
           });
           return { success: true, output: "old-leader-run", exitCode: 0 };
         }
@@ -381,7 +385,6 @@ describe("follower registration recovery", () => {
     let hub = new FollowerHub(token, { logger: log });
     hubs.push(hub);
     let origin = await hub.listen("127.0.0.1", 0);
-    const port = Number(new URL(origin).port);
     const firstLifecycle: Array<{ type: "start" | "end"; runId: string; terminal?: unknown }> = [];
     const firstMesh = createMesh(hub, firstLifecycle);
     const events: FollowerEvent[] = [];
@@ -407,16 +410,7 @@ describe("follower registration recovery", () => {
         generation: "retained-generation",
         protocolVersion: INSTANCE_PROTOCOL_VERSION,
       };
-      let response: Response | undefined;
-      for (let attempt = 0; attempt < 2 && !response; attempt++) {
-        try {
-          response = await post(address, "/register", body);
-        } catch (error) {
-          if (attempt === 1) throw error;
-          await new Promise((resolve) => setTimeout(resolve, 0));
-        }
-      }
-      if (!response) throw new Error("follower registration made no response");
+      const response = await post(address, "/register", body);
       expect(response.status).toBe(200);
       return {
         id: "retained-follower",
@@ -426,7 +420,8 @@ describe("follower registration recovery", () => {
     const pump = async (
       address: string,
       registration: { id: string; session: string },
-      done: () => boolean
+      done: () => boolean,
+      onDispatch?: (command: FollowerActorCommand) => void
     ) => {
       for (let turn = 0; turn < 80 && !done(); turn++) {
         if (events.length) {
@@ -447,11 +442,9 @@ describe("follower registration recovery", () => {
             signal: controller.signal,
           });
           if (response.ok) {
-            for (const command of (await response.json()) as Array<{
-              actorId: string;
-              message: never;
-            }>) {
+            for (const command of (await response.json()) as FollowerActorCommand[]) {
               follower.dispatch(command);
+              onDispatch?.(command);
             }
           }
         } catch (error) {
@@ -507,12 +500,28 @@ describe("follower registration recovery", () => {
 
     hub = new FollowerHub(token, { logger: log });
     hubs.push(hub);
-    origin = await hub.listen("127.0.0.1", port);
+    origin = await hub.listen("127.0.0.1", 0);
     const secondLifecycle: Array<{ type: "start" | "end"; runId: string; terminal?: unknown }> = [];
     createMesh(hub, secondLifecycle);
 
     const secondRegistration = await register(origin);
-    await pump(origin, secondRegistration, () => follower.actorIds.includes(worker.id));
+    let reattachedWhileRunning = false;
+    await pump(
+      origin,
+      secondRegistration,
+      () => reattachedWhileRunning,
+      (command) => {
+        if (
+          command.actorId === worker.id &&
+          command.message.type === "init" &&
+          command.message.bootstrap.reconnect
+        ) {
+          reattachedWhileRunning = true;
+        }
+      }
+    );
+    expect(firstRunReleased).toBe(false);
+    expect(follower.actorIds).toEqual([worker.id]);
     expect(providerRuns).toBe(1);
     releaseFirstRun?.();
     await pump(
