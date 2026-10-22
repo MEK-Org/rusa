@@ -21,7 +21,6 @@ import { LegacyImportReceiptRepository } from "./legacy-import-receipt-repositor
 import { MaintenanceRepository } from "./maintenance-repository.js";
 import { MeshChatRepository } from "./mesh-chat-repository.js";
 import { MeshEventRepository } from "./mesh-event-repository.js";
-import { MetricRepository } from "./metric-repository.js";
 import { ModelClassRepository } from "./model-class-repository.js";
 import { ModelScrapeRepository } from "./model-scrape-repository.js";
 import { ObligationRepository } from "./obligation-repository.js";
@@ -101,7 +100,6 @@ export class Repositories {
    */
   private readonly sqliteInbox: SqliteInboxRepository;
   readonly inboxFocus: InboxFocusRepository;
-  readonly metrics: MetricRepository;
   readonly inboxMetrics: InboxMetricRepository;
   readonly meshChat: MeshChatRepository;
   readonly quotaScrapes: QuotaScrapeRepository;
@@ -137,22 +135,17 @@ export class Repositories {
     this.inbox = this.sqliteInbox;
     this.inboxFocus = new InboxFocusRepository(db);
     this.meshChat = new MeshChatRepository(db);
-    this.metrics = new MetricRepository(db);
-    this.inboxMetrics = new InboxMetricRepository(
-      db,
-      () => {
-        // One sample asks about the same few principals once per entry.
-        const kinds = new Map<string, PrincipalRef | undefined>();
-        const scope = sharedChatScope({
-          get: (id) => {
-            if (!kinds.has(id)) kinds.set(id, this.principals.get(id));
-            return kinds.get(id);
-          },
-        });
-        return (entry) => inboxEntryHiddenFrom(entry, this.meshChat, scope);
-      },
-      this.metrics
-    );
+    this.inboxMetrics = new InboxMetricRepository(db, () => {
+      // One sample asks about the same few principals once per entry.
+      const kinds = new Map<string, PrincipalRef | undefined>();
+      const scope = sharedChatScope({
+        get: (id) => {
+          if (!kinds.has(id)) kinds.set(id, this.principals.get(id));
+          return kinds.get(id);
+        },
+      });
+      return (entry) => inboxEntryHiddenFrom(entry, this.meshChat, scope);
+    });
     this.quotaScrapes = new QuotaScrapeRepository(db);
     this.modelScrapes = new ModelScrapeRepository(db);
     this.obligations = new ObligationRepository(db);

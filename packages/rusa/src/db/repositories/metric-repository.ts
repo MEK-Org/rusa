@@ -12,6 +12,24 @@ export interface MetricQueryRange {
   endMinute: string;
 }
 
+/** The one range-read statement used by the repository and its query-plan test. */
+export function metricReadManyQuery(
+  metrics: readonly string[],
+  range: MetricQueryRange
+): {
+  sql: string;
+  parameters: string[];
+} {
+  const placeholders = metrics.map(() => "?").join(", ");
+  return {
+    sql: `SELECT metric, minute, value, observed_at AS observedAt
+          FROM metric_samples
+          WHERE metric IN (${placeholders}) AND minute >= ? AND minute <= ?
+          ORDER BY minute ASC, metric ASC`,
+    parameters: [...metrics, range.startMinute, range.endMinute],
+  };
+}
+
 /**
  * Generic metric sample repository behind time-series metric storage.
  * Keyed by (metric, minute). Value is nullable to distinguish an
@@ -36,18 +54,11 @@ export class MetricRepository {
     tx(samples);
   }
 
-  /** Reads samples for multiple metrics within an inclusive UTC minute range, oldest first. */
+  /** Reads samples by UTC minute, then metric, within an inclusive UTC minute range. */
   readMany(metrics: readonly string[], range: MetricQueryRange): MetricSample[] {
     if (metrics.length === 0) return [];
-    const placeholders = metrics.map(() => "?").join(", ");
-    const rows = this.db
-      .prepare(
-        `SELECT metric, minute, value, observed_at AS observedAt
-         FROM metric_samples
-         WHERE metric IN (${placeholders}) AND minute >= ? AND minute <= ?
-         ORDER BY minute ASC`
-      )
-      .all(...metrics, range.startMinute, range.endMinute) as Array<{
+    const query = metricReadManyQuery(metrics, range);
+    const rows = this.db.prepare(query.sql).all(...query.parameters) as Array<{
       metric: string;
       minute: string;
       value: number | null;

@@ -88,6 +88,10 @@ describe("#1018 inbox metric samples", () => {
   });
   afterEach(() => db.close());
 
+  it("keeps generic metric storage internal to the inbox-metric repository", () => {
+    expect(Object.hasOwn(new Repositories(db), "metrics")).toBe(false);
+  });
+
   it("summarizes live actors with known-empty inboxes as zero size and zero age", () => {
     addActor("empty");
     for (const id of ["busy", "older", "one"]) addActor(id, "empty");
@@ -282,22 +286,6 @@ describe("#1018 inbox metric samples", () => {
     expect(
       (db.prepare("SELECT min(minute) AS m FROM metric_samples").get() as { m: string }).m
     ).toBe(iso(t0 + MINUTE));
-  });
-
-  it("reads metric samples by indexed range rather than scanning the table", () => {
-    const plan = db
-      .prepare(
-        `EXPLAIN QUERY PLAN SELECT metric, minute, value, observed_at AS observedAt
-         FROM metric_samples
-         WHERE metric IN (?, ?, ?, ?, ?) AND minute >= ? AND minute <= ?
-         ORDER BY minute ASC`
-      )
-      .all(...ALL_INBOX_METRIC_NAMES, iso(t0), iso(t0 + INBOX_METRIC_WINDOW_MS)) as Array<{
-      detail: string;
-    }>;
-    expect(plan.map((row) => row.detail).join("\n")).toMatch(
-      /SEARCH metric_samples USING INDEX sqlite_autoindex_metric_samples_1 \(metric=\? AND minute>\? AND minute<\?\)/
-    );
   });
 
   it("isolates inbox sampling and pruning from unrelated metrics in the generic table", () => {

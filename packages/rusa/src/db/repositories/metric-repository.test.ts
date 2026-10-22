@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runMigrations } from "../migrations/runner.js";
-import { MetricRepository, type MetricSample } from "./metric-repository.js";
+import { MetricRepository, type MetricSample, metricReadManyQuery } from "./metric-repository.js";
 
 const t0 = Date.parse("2026-10-10T12:00:00.000Z");
 const MINUTE = 60 * 1000;
@@ -108,7 +108,7 @@ describe("MetricRepository", () => {
     expect(rows[0].value).toBe(1);
   });
 
-  it("records batches atomically and reads multiple metrics ordered by minute", () => {
+  it("records batches atomically and reads multiple metrics ordered by minute then metric", () => {
     const batch: MetricSample[] = [
       { metric: "actor_count", minute: iso(t0), value: 5, observedAt: iso(t0) },
       { metric: "inbox_size_median", minute: iso(t0), value: 2.5, observedAt: iso(t0) },
@@ -166,6 +166,15 @@ describe("MetricRepository", () => {
     }
     repo.recordMany(samples);
 
+    // An empty scope is deliberately a no-op, before the real scoped deletion.
+    expect(repo.prune(iso(t0 + 2 * MINUTE), [])).toBe(0);
+    expect(
+      repo.readMany(["actor_count", "unrelated_metric"], {
+        startMinute: iso(t0),
+        endMinute: iso(t0 + 10 * MINUTE),
+      })
+    ).toHaveLength(10);
+
     // Prune before minute 2 scoped only to actor_count
     const deleted = repo.prune(iso(t0 + 2 * MINUTE), ["actor_count"]);
     expect(deleted).toBe(2);
@@ -188,22 +197,17 @@ describe("MetricRepository", () => {
     expect(remainingUnrelated).toHaveLength(5);
   });
 
-  it("does not delete any samples when given an empty metric list", () => {
-    repo.recordMany([
-      {
-        metric: "unrelated_metric",
-        minute: iso(t0),
-        value: 9,
-        observedAt: iso(t0),
-      },
-    ]);
-
-    expect(repo.prune(iso(t0 + MINUTE), [])).toBe(0);
-    expect(
-      repo.readMany(["unrelated_metric"], {
-        startMinute: iso(t0),
-        endMinute: iso(t0),
-      })
-    ).toHaveLength(1);
+  it("uses the primary-key range search for multi-metric reads", () => {
+    const query = metricReadManyQuery(["actor_count", "inbox_size_median"], {
+      startMinute: iso(t0),
+      endMinute: iso(t0 + MINUTE),
+    });
+    expect(query.sql).toContain("ORDER BY minute ASC, metric ASC");
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${query.sql}`).all(...query.parameters) as Array<{
+      detail: string;
+    }>;
+    expect(plan.map((row) => row.detail).join("\n")).toMatch(
+      /SEARCH metric_samples USING INDEX sqlite_autoindex_metric_samples_1 \(metric=\? AND minute>\? AND minute<\?\)/
+    );
   });
 });
