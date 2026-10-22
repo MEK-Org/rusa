@@ -132,10 +132,7 @@ void main() {
 
       expect(find.text('Fable'), findsOneWidget);
       // The title already names the model; the row says which window.
-      expect(
-        find.textContaining(RegExp(r'^Weekly: .*\(26% / ')),
-        findsOneWidget,
-      );
+      expect(find.textContaining(RegExp(r'^Weekly: .*\(26% / ')), findsOneWidget);
       expect(find.textContaining('(Fable)'), findsNothing);
       expect(find.textContaining('Resets in 5 days'), findsOneWidget);
       expect(find.textContaining('Last Read: 5 minutes ago'), findsOneWidget);
@@ -144,41 +141,40 @@ void main() {
       expect(find.textContaining('Session:'), findsNothing);
     });
 
-    testWidgets(
-      'shows sub-two-day provider resets in hours beside the pacing cadence',
-      (tester) async {
-        final weekly = QuotaWindowDto(
-          id: 'weekly',
-          label: 'Weekly',
-          usedPercent: 6.25,
-          status: 'available',
-          headline: true,
-          windowMs: 48 * 3600 * 1000,
-          resetAtIso: now.add(const Duration(hours: 45)).toIso8601String(),
-        );
+    testWidgets('shows sub-two-day provider resets in hours beside the pacing cadence', (
+      tester,
+    ) async {
+      final weekly = QuotaWindowDto(
+        id: 'weekly',
+        label: 'Weekly',
+        usedPercent: 6.25,
+        status: 'available',
+        headline: true,
+        windowMs: 48 * 3600 * 1000,
+        resetAtIso: now.add(const Duration(hours: 45)).toIso8601String(),
+      );
 
-        await tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: QuotaTooltip(
-                providerName: 'Claude',
-                windows: [weekly],
-                throttle: const QuotaThrottleDto(
-                  intervalSeconds: 600,
-                  expired: false,
-                  buckets: [],
-                  updatedAt: '2026-09-29T12:00:00.000Z',
-                ),
-                now: now,
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: QuotaTooltip(
+              providerName: 'Claude',
+              windows: [weekly],
+              throttle: const QuotaThrottleDto(
+                intervalSeconds: 600,
+                expired: false,
+                buckets: [],
+                updatedAt: '2026-09-29T12:00:00.000Z',
               ),
+              now: now,
             ),
           ),
-        );
+        ),
+      );
 
-        expect(find.textContaining('Resets in 45 hours'), findsOneWidget);
-        expect(find.textContaining('Pacing: every 10 minutes'), findsOneWidget);
-      },
-    );
+      expect(find.textContaining('Resets in 45 hours'), findsOneWidget);
+      expect(find.textContaining('Pacing: every 10 minutes'), findsOneWidget);
+    });
 
     testWidgets('renders unknown lane with truthful n/a indicators', (
       tester,
@@ -581,53 +577,55 @@ void main() {
       expect(tooltip.toPlainText(), isNot(contains('estimate:')));
     });
 
-    testWidgets(
-      'renders a 2h stale warning when reading is older than 2 hours (#759)',
-      (tester) async {
-        final oldRead = now.subtract(const Duration(hours: 3));
-        final staleWeekly = QuotaWindowDto(
-          id: 'weekly',
-          label: 'Weekly',
-          usedPercent: 40,
-          status: 'available',
-          headline: true,
-          windowMs: 7 * 24 * 3600 * 1000,
-          resetAtIso: now.add(const Duration(days: 3)).toIso8601String(),
-          scrapedAt: oldRead.toIso8601String(),
-          estimated: true,
-        );
+    testWidgets('renders a 2h stale warning when reading is older than 2 hours (#759)', (
+      tester,
+    ) async {
+      final oldRead = now.subtract(const Duration(hours: 3));
+      final staleWeekly = QuotaWindowDto(
+        id: 'weekly',
+        label: 'Weekly',
+        usedPercent: 40,
+        status: 'available',
+        headline: true,
+        windowMs: 7 * 24 * 3600 * 1000,
+        resetAtIso: now.add(const Duration(days: 3)).toIso8601String(),
+        scrapedAt: oldRead.toIso8601String(),
+        estimated: true,
+      );
 
-        final tooltip = QuotaTooltip(
-          providerName: 'Claude',
-          windows: [staleWeekly],
-          throttle: null,
-          scrapedAt: oldRead.toIso8601String(),
-          showThrottle: false,
-          now: now,
-        );
-        await tester.pumpWidget(MaterialApp(home: Scaffold(body: tooltip)));
+      final tooltip = QuotaTooltip(
+        providerName: 'Claude',
+        windows: [staleWeekly],
+        throttle: null,
+        scrapedAt: oldRead.toIso8601String(),
+        showThrottle: false,
+        now: now,
+      );
+      await tester.pumpWidget(MaterialApp(home: Scaffold(body: tooltip)));
 
-        expect(find.textContaining('Warning:'), findsNothing);
-        expect(find.textContaining('Last Read: 3 hours ago'), findsOneWidget);
-        final lastReadWidget = tester.widget<Text>(
-          find.textContaining('Last Read: 3 hours ago'),
-        );
-        final span = lastReadWidget.textSpan as TextSpan;
-        expect(span.children?[0].toPlainText(), 'Last Read: ');
-        expect((span.children?[0] as TextSpan).style, null);
-        expect(span.children?[1].toPlainText(), '3 hours ago');
-        expect(
-          (span.children?[1] as TextSpan).style?.fontWeight,
-          FontWeight.w700,
-        );
-        expect(
-          (span.children?[1] as TextSpan).style?.color,
-          const Color(0xFFC79A3C),
-        );
-        expect(tooltip.toPlainText(), contains('Last Read: 3 hours ago'));
-        expect(tooltip.toPlainText(), isNot(contains('Warning:')));
-      },
-    );
+      expect(find.textContaining('Warning:'), findsNothing);
+      expect(
+        find.textContaining('Last Read: 3 hours ago'),
+        findsOneWidget,
+      );
+      final lastReadWidget = tester.widget<Text>(
+        find.textContaining('Last Read: 3 hours ago'),
+      );
+      final span = lastReadWidget.textSpan as TextSpan;
+      expect(span.children?[0].toPlainText(), 'Last Read: ');
+      expect((span.children?[0] as TextSpan).style, null);
+      expect(span.children?[1].toPlainText(), '3 hours ago');
+      expect((span.children?[1] as TextSpan).style?.fontWeight, FontWeight.w700);
+      expect((span.children?[1] as TextSpan).style?.color, const Color(0xFFC79A3C));
+      expect(
+        tooltip.toPlainText(),
+        contains('Last Read: 3 hours ago'),
+      );
+      expect(
+        tooltip.toPlainText(),
+        isNot(contains('Warning:')),
+      );
+    });
 
     testWidgets('does not warning-style a reading healthy at fetch (#1055)', (
       tester,
@@ -662,49 +660,45 @@ void main() {
       expect((span.children?[1] as TextSpan).style, null);
     });
 
-    testWidgets(
-      'renders the same 2h warning for a stale reading served as-is (#759)',
-      (tester) async {
-        final oldRead = now.subtract(const Duration(hours: 3));
-        final passThroughWeekly = QuotaWindowDto(
-          id: 'weekly',
-          label: 'Weekly',
-          usedPercent: 30,
-          status: 'available',
-          headline: true,
-          windowMs: 7 * 24 * 3600 * 1000,
-          resetAtIso: now.add(const Duration(days: 3)).toIso8601String(),
-          scrapedAt: oldRead.toIso8601String(),
-          estimated: false,
-        );
+    testWidgets('renders the same 2h warning for a stale reading served as-is (#759)', (
+      tester,
+    ) async {
+      final oldRead = now.subtract(const Duration(hours: 3));
+      final passThroughWeekly = QuotaWindowDto(
+        id: 'weekly',
+        label: 'Weekly',
+        usedPercent: 30,
+        status: 'available',
+        headline: true,
+        windowMs: 7 * 24 * 3600 * 1000,
+        resetAtIso: now.add(const Duration(days: 3)).toIso8601String(),
+        scrapedAt: oldRead.toIso8601String(),
+        estimated: false,
+      );
 
-        final tooltip = QuotaTooltip(
-          providerName: 'Claude',
-          windows: [passThroughWeekly],
-          throttle: null,
-          scrapedAt: oldRead.toIso8601String(),
-          showThrottle: false,
-          now: now,
-        );
-        await tester.pumpWidget(MaterialApp(home: Scaffold(body: tooltip)));
+      final tooltip = QuotaTooltip(
+        providerName: 'Claude',
+        windows: [passThroughWeekly],
+        throttle: null,
+        scrapedAt: oldRead.toIso8601String(),
+        showThrottle: false,
+        now: now,
+      );
+      await tester.pumpWidget(MaterialApp(home: Scaffold(body: tooltip)));
 
-        expect(find.textContaining('Warning:'), findsNothing);
-        expect(find.textContaining('Last Read: 3 hours ago'), findsOneWidget);
-        final lastReadWidget = tester.widget<Text>(
-          find.textContaining('Last Read: 3 hours ago'),
-        );
-        final span = lastReadWidget.textSpan as TextSpan;
-        expect(
-          (span.children?[1] as TextSpan).style?.fontWeight,
-          FontWeight.w700,
-        );
-        expect(
-          (span.children?[1] as TextSpan).style?.color,
-          const Color(0xFFC79A3C),
-        );
-        expect(tooltip.toPlainText(), isNot(contains('estimate')));
-        expect(tooltip.toPlainText(), isNot(contains('Warning:')));
-      },
-    );
+      expect(find.textContaining('Warning:'), findsNothing);
+      expect(
+        find.textContaining('Last Read: 3 hours ago'),
+        findsOneWidget,
+      );
+      final lastReadWidget = tester.widget<Text>(
+        find.textContaining('Last Read: 3 hours ago'),
+      );
+      final span = lastReadWidget.textSpan as TextSpan;
+      expect((span.children?[1] as TextSpan).style?.fontWeight, FontWeight.w700);
+      expect((span.children?[1] as TextSpan).style?.color, const Color(0xFFC79A3C));
+      expect(tooltip.toPlainText(), isNot(contains('estimate')));
+      expect(tooltip.toPlainText(), isNot(contains('Warning:')));
+    });
   });
 }

@@ -8,8 +8,7 @@ import '../theme.dart';
 /// not hide the denominator of the ring's pacing position.
 String formatRelativeResetDuration(Duration diff) {
   if (diff.inHours >= 48) {
-    final days = diff.inDays;
-    return '$days ${days == 1 ? 'day' : 'days'}';
+    return '${diff.inDays} days';
   }
   if (diff.inHours >= 1) {
     final hours = diff.inHours;
