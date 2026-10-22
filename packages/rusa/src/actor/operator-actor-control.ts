@@ -128,12 +128,9 @@ export class OperatorActorControl {
       audit("denied", reason);
       throw new Error(reason);
     }
-    if (
-      this.rootId !== undefined &&
-      (canonicalActorId === this.rootId || this.mesh.isAncestorOf(canonicalActorId, this.rootId))
-    ) {
+    if (this.rootId !== undefined && this.mesh.isAncestorOf(canonicalActorId, this.rootId)) {
       const reason =
-        "configured root actor may not be retired through the operator retire boundary";
+        "operator retirement may not target the configured root actor or a subtree containing it";
       audit("denied", reason);
       throw new Error(reason);
     }

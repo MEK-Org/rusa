@@ -201,13 +201,15 @@ describe("OperatorActorControl (#1003)", () => {
         principal: OPERATOR,
         actorId: "imported",
         outcome: "denied",
-        reason: "configured root actor may not be retired through the operator retire boundary",
+        reason:
+          "operator retirement may not target the configured root actor or a subtree containing it",
       }),
       expect.objectContaining({
         principal: OPERATOR,
         actorId: "other",
         outcome: "denied",
-        reason: "configured root actor may not be retired through the operator retire boundary",
+        reason:
+          "operator retirement may not target the configured root actor or a subtree containing it",
       }),
       expect.objectContaining({ principal: OPERATOR, actorId: "ghost", outcome: "denied" }),
       expect.objectContaining({ principal: OPERATOR, actorId: "other-child", outcome: "denied" }),
