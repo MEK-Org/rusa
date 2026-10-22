@@ -146,7 +146,11 @@ import {
   seedRootModelConfig,
 } from "../actor/root-model-config.js";
 import { createRunAccounting, projectActorRunLaunchConfig } from "../actor/run-accounting.js";
-import { type ActiveRunContext, bindRunContext } from "../actor/run-context.js";
+import {
+  type ActiveRunContext,
+  type BoundRunContextReader,
+  bindRunContext,
+} from "../actor/run-context.js";
 import {
   ensureWakeToken,
   wakePortPath,
@@ -784,6 +788,8 @@ export interface RunStartE2EHooks {
     instanceIdentity: InstanceIdentity;
     shutdown: () => Promise<void>;
   }) => void;
+  /** Observes each exact-run reader the host binds; production never sets this. */
+  onRunContextBound?: (actorId: string, runId: string, reader: BoundRunContextReader) => void;
 }
 
 export interface RunStartOptions {
@@ -4106,6 +4112,7 @@ async function composeStart(
                 repositories.obligations.get(primaryObligationId)?.effectiveResponsive === true,
             };
           });
+          opts?.e2e?.onRunContextBound?.(id, runId, lease.reader);
           const name = `${id}:run:${runId}:${AGENT_EXEC_MCP_NAME}`;
           const url = mcpHttp.addServer(name, () =>
             createAgentExecMcpServer(mesh, id, rootId, osScheduler, {

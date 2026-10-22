@@ -45,6 +45,7 @@ import {
 import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { RootModelConfigStartupError } from "../actor/root-model-config.js";
+import type { ActiveRunContext, BoundRunContextReader } from "../actor/run-context.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import type { RusaConfig } from "../config/types.js";
@@ -10056,6 +10057,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     let held: Array<() => void> | undefined;
     let providerStarted = false;
     let meshUrl: string | undefined;
+    let reader: BoundRunContextReader | undefined;
+    let duringProvider: Readonly<ActiveRunContext> | undefined;
     // The follower's own config fills what the admitted tuple omits, as
     // configured-provider.ts does. Each run makes its public write at once.
     const follower = new FollowerInstance(
@@ -10075,6 +10078,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         effort: selected?.effort ?? "low",
         async run(run) {
           providerStarted = true;
+          duringProvider = reader?.current();
           meshUrl = run.mcpServers?.find((server) => server.name === "mesh")?.url;
           if (!meshUrl) throw new Error("remote mesh server missing from run snapshot");
           const client = new Client({ name: "remote-bound-send", version: "0.0.0" });
@@ -10109,6 +10113,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       void runStart({
         e2e: {
           chatClient,
+          onRunContextBound: (_actorId, _runId, bound) => {
+            reader = bound;
+          },
           createWorkerActor: (context: ActorFactoryContext, options: ActorOptions) => {
             if (!remote) {
               const instance = new RemoteInstance(
@@ -10177,15 +10184,28 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await vi.waitFor(() => expect(held).toBeDefined(), { timeout: 15_000 });
     for (let turn = 0; turn < 5; turn++) await new Promise((resolve) => setImmediate(resolve));
     expect(providerStarted).toBe(false);
+    // Before the follower's attempt lands, the live reader reports the launch
+    // tuple; the attempt then replaces it within the same run.
+    const launched = reader?.current();
+    expect(launched).toMatchObject({ provider: "codex", model: "gpt-5.5" });
+    expect(launched?.effort).toBeUndefined();
     for (const deliver of held?.splice(0) ?? []) deliver();
     held = undefined;
     await vi.waitFor(() => expect(chatClient.sent).toHaveLength(1), { timeout: 15_000 });
+    expect(duringProvider).toMatchObject({
+      actorId: workerId,
+      runId: launched?.runId,
+      provider: "codex",
+      model: "gpt-5.5",
+      effort: "low",
+    });
     expect(chatClient.sent[0]?.text).toBe(
       `written at provider start\n\n_${generateHandle(workerId)} (gpt-5.5, low)_`
     );
     await vi.waitFor(() =>
       expect(getRepositories().actorRuns.listRecentCompleted(workerId, 1)).toHaveLength(1)
     );
+    expect(reader?.current()).toBeUndefined();
     if (!meshUrl) throw new Error("remote mesh URL was not captured");
     const stale = await fetch(meshUrl, {
       method: "POST",
