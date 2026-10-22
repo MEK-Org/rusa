@@ -45,10 +45,9 @@ export class InboxMetricRepository {
    */
   constructor(
     private readonly db: Database.Database,
-    private readonly humanChatClassifier: () => (entry: InboxMetricEntry) => boolean,
-    metrics?: MetricRepository
+    private readonly humanChatClassifier: () => (entry: InboxMetricEntry) => boolean
   ) {
-    this.metrics = metrics ?? new MetricRepository(db);
+    this.metrics = new MetricRepository(db);
   }
 
   /**

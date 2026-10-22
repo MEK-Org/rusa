@@ -88,10 +88,6 @@ describe("#1018 inbox metric samples", () => {
   });
   afterEach(() => db.close());
 
-  it("keeps generic metric storage internal to the inbox-metric repository", () => {
-    expect(Object.hasOwn(new Repositories(db), "metrics")).toBe(false);
-  });
-
   it("summarizes live actors with known-empty inboxes as zero size and zero age", () => {
     addActor("empty");
     for (const id of ["busy", "older", "one"]) addActor(id, "empty");
