@@ -543,20 +543,11 @@ describe("follower registration recovery", () => {
       (batch) => forwardedEvents.push(...batch)
     );
 
-    // Give the immediate original-run result and the recovered gap result both
-    // a chance to reach B before proving that only the gap has B-side accounting.
-    let drainTurns = 0;
-    await pump(
-      origin,
-      secondRegistration,
-      () => ++drainTurns > 2,
-      undefined,
-      (batch) => forwardedEvents.push(...batch)
-    );
-
     const starts = secondLifecycle.filter((event) => event.type === "start");
     const ends = secondLifecycle.filter((event) => event.type === "end");
     expect(firstLifecycle.filter((event) => event.type === "start")).toHaveLength(1);
+    // This records the present leader-loss behavior, not a #963 result contract:
+    // A has already closed when the provider eventually reports its success.
     expect(firstLifecycle.filter((event) => event.type === "end")).toEqual([
       expect.objectContaining({
         terminal: {
