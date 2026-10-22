@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
+import type { ActorLifecycleTerminal } from "../actor/actor-lifecycle.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
 import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
 import {
@@ -24,8 +25,14 @@ import { INSTANCE_PROTOCOL_VERSION, type ProviderFactory } from "./protocol.js";
 
 const homes: string[] = [];
 const hubs: FollowerHub[] = [];
+const followers: FollowerInstance[] = [];
+const inboxDatabases: Array<{ close: () => void }> = [];
+const cleanups: Array<() => void> = [];
 afterEach(async () => {
+  for (const cleanup of cleanups.splice(0)) cleanup();
+  for (const follower of followers.splice(0)) follower.close();
   await Promise.all(hubs.splice(0).map((hub) => hub.close()));
+  for (const inboxDatabase of inboxDatabases.splice(0)) inboxDatabase.close();
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
 });
 
@@ -79,10 +86,14 @@ describe("follower registration recovery", () => {
     const actors = new InMemoryActorRepository();
     const inboxDb = new Database(":memory:");
     runMigrations(inboxDb);
+    inboxDatabases.push(inboxDb);
     const inboxStore = new SqliteInboxRepository(inboxDb);
     const principals = new PrincipalRepository(inboxDb);
     principals.createUser({ email: "operator@example.test", createdAt: "t" });
-    const lifecycle: Array<{ type: "start" | "end"; runId: string }> = [];
+    const lifecycle: Array<
+      | { type: "start"; runId: string }
+      | { type: "end"; runId: string; terminal: ActorLifecycleTerminal }
+    > = [];
     const provider: ProviderFactory = (_bridge, _options, selected) => ({
       name: "relaunch-fixture",
       providerName: "relaunch-fixture",
@@ -108,7 +119,7 @@ describe("follower registration recovery", () => {
             lifecycle.push({ type: "start", runId: event.runId });
           },
           onEnd: (event) => {
-            lifecycle.push({ type: "end", runId: event.runId });
+            lifecycle.push({ type: "end", runId: event.runId, terminal: event.terminal });
           },
         });
         return new ActorHandle({
@@ -148,8 +159,7 @@ describe("follower registration recovery", () => {
     };
     actors.upsert(worker);
     const unregisterRecovery = registerFollowerRegistrationRecovery({ actors, hub, log, mesh });
-    const disableRegistrationRecovery =
-      process.env.RUSA_TEST_DISABLE_FOLLOWER_REGISTRATION_RECOVERY === "1";
+    cleanups.push(unregisterRecovery);
 
     const aEvents: FollowerEvent[] = [];
     const followerA = new FollowerInstance(
@@ -158,6 +168,7 @@ describe("follower registration recovery", () => {
       (event) => aEvents.push(event),
       provider
     );
+    followers.push(followerA);
     const a = await register("generation-a");
     const aPoll = await post("/poll", a);
     expect(aPoll.status).toBe(200);
@@ -175,22 +186,30 @@ describe("follower registration recovery", () => {
 
     const unregistered = await post("/unregister", a);
     expect(unregistered.status).toBe(200);
-    inboxStore.append([
+    const [gapWake] = inboxStore.append([
       {
         actorId: worker.id,
         source: "test:gap-wake",
         payload: { type: "test.work", priority: "responsive" },
       },
     ]);
+    if (!gapWake) throw new Error("expected the durable gap wake to be inserted");
+    expect(gapWake).toMatchObject({
+      actorId: worker.id,
+      source: "test:gap-wake",
+      seenAt: null,
+      handledAt: null,
+    });
     expect(mesh.dispatch(worker.id)).toBe(true);
     await eventually(() => records.some((record) => record.event === "remote_wake_dropped"));
     expect(lifecycle).toEqual([]);
-
-    // The normal assertion below is also a reproducible red control: this
-    // test-only switch removes the actual registration listener just before B
-    // registers, so B's otherwise identical command/event pump never obtains
-    // a host or recovers the durable row. The ordinary run keeps it installed.
-    if (disableRegistrationRecovery) unregisterRecovery();
+    // The dropped gap wake remains unseen until B registers; its later seen
+    // state and terminal result are the listener-driven recovery evidence.
+    expect(inboxStore.read(worker.id, gapWake.id)).toMatchObject({
+      id: gapWake.id,
+      seenAt: null,
+      handledAt: null,
+    });
 
     const bEvents: FollowerEvent[] = [];
     const followerB = new FollowerInstance(
@@ -199,6 +218,7 @@ describe("follower registration recovery", () => {
       (event) => bEvents.push(event),
       provider
     );
+    followers.push(followerB);
     expect(followerB.actorIds).toEqual([]);
     const b = await register("generation-b");
 
@@ -241,20 +261,26 @@ describe("follower registration recovery", () => {
     }
 
     expect(followerB.actorIds).toEqual([worker.id]);
-    const starts = lifecycle.filter((event) => event.type === "start");
-    const ends = lifecycle.filter((event) => event.type === "end");
+    const starts = lifecycle.filter(
+      (event): event is Extract<(typeof lifecycle)[number], { type: "start" }> =>
+        event.type === "start"
+    );
+    const ends = lifecycle.filter(
+      (event): event is Extract<(typeof lifecycle)[number], { type: "end" }> => event.type === "end"
+    );
     expect(starts).toHaveLength(1);
     expect(ends).toHaveLength(1);
-    expect(ends[0]?.runId).toBe(starts[0]?.runId);
-    // The fixture provider does no inbox mutation; seeing this row proves the
-    // registration-driven run read the durable gap work rather than a test
-    // dispatch inventing new work after B registered.
-    const [gapWake] = inboxStore.list(worker.id, { status: "unhandled" }).entries;
-    expect(gapWake?.seenAt).not.toBeNull();
-    if (!disableRegistrationRecovery) unregisterRecovery();
-
-    followerA.close();
-    followerB.close();
-    inboxDb.close();
+    expect(ends[0]).toMatchObject({
+      runId: starts[0]?.runId,
+      terminal: {
+        kind: "result",
+        result: { success: true, output: "recovered", exitCode: 0 },
+      },
+    });
+    expect(inboxStore.read(worker.id, gapWake.id)).toMatchObject({
+      id: gapWake.id,
+      seenAt: expect.any(Date),
+      handledAt: null,
+    });
   }, 10_000);
 });
