@@ -104,8 +104,12 @@ describe("follower registration recovery", () => {
         const target = context.record.executionConfig?.executionTarget;
         if (!target) throw new Error("relaunch fixture worker lacks a follower target");
         context.lifecycle.add({
-          onStart: (event) => lifecycle.push({ type: "start", runId: event.runId }),
-          onEnd: (event) => lifecycle.push({ type: "end", runId: event.runId }),
+          onStart: (event) => {
+            lifecycle.push({ type: "start", runId: event.runId });
+          },
+          onEnd: (event) => {
+            lifecycle.push({ type: "end", runId: event.runId });
+          },
         });
         return new ActorHandle({
           host: hub.createHost(target, context.record.id),
