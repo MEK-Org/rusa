@@ -421,14 +421,17 @@ describe("follower registration recovery", () => {
       address: string,
       registration: { id: string; session: string },
       done: () => boolean,
-      onDispatch?: (command: FollowerActorCommand) => void
+      onDispatch?: (command: FollowerActorCommand) => void,
+      onEvents?: (batch: FollowerEvent[]) => void
     ) => {
       for (let turn = 0; turn < 80 && !done(); turn++) {
         if (events.length) {
+          const batch = events.splice(0);
+          onEvents?.(batch);
           const response = await post(address, "/events", {
             ...registration,
             batchId: randomUUID(),
-            events: events.splice(0),
+            events: batch,
           });
           expect(response.status).toBe(200);
         }
@@ -473,6 +476,11 @@ describe("follower registration recovery", () => {
     );
     await eventually(() => releaseFirstRun !== undefined);
     expect(providerRuns).toBe(1);
+    expect(inboxStore.read(worker.id, firstWake.id)).toMatchObject({
+      id: firstWake.id,
+      seenAt: expect.any(Date),
+      handledAt: null,
+    });
 
     await hub.close();
     const [gapWake] = inboxStore.append([
@@ -516,6 +524,7 @@ describe("follower registration recovery", () => {
           command.message.type === "init" &&
           command.message.bootstrap.reconnect
         ) {
+          expect(firstRunReleased).toBe(false);
           reattachedWhileRunning = true;
         }
       }
@@ -523,15 +532,51 @@ describe("follower registration recovery", () => {
     expect(firstRunReleased).toBe(false);
     expect(follower.actorIds).toEqual([worker.id]);
     expect(providerRuns).toBe(1);
-    releaseFirstRun?.();
+    if (!releaseFirstRun) throw new Error("expected the original provider run to remain blocked");
+    releaseFirstRun();
+    const forwardedEvents: FollowerEvent[] = [];
     await pump(
       origin,
       secondRegistration,
-      () => secondLifecycle.filter((event) => event.type === "end").length === 1
+      () => secondLifecycle.filter((event) => event.type === "end").length === 1,
+      undefined,
+      (batch) => forwardedEvents.push(...batch)
+    );
+
+    // Give the immediate original-run result and the recovered gap result both
+    // a chance to reach B before proving that only the gap has B-side accounting.
+    let drainTurns = 0;
+    await pump(
+      origin,
+      secondRegistration,
+      () => ++drainTurns > 2,
+      undefined,
+      (batch) => forwardedEvents.push(...batch)
     );
 
     const starts = secondLifecycle.filter((event) => event.type === "start");
     const ends = secondLifecycle.filter((event) => event.type === "end");
+    expect(firstLifecycle.filter((event) => event.type === "start")).toHaveLength(1);
+    expect(firstLifecycle.filter((event) => event.type === "end")).toEqual([
+      expect.objectContaining({
+        terminal: {
+          kind: "result",
+          result: { success: false, output: "Remote actor exited (-1)", exitCode: -1 },
+        },
+      }),
+    ]);
+    expect(forwardedEvents).toContainEqual(
+      expect.objectContaining({
+        actorId: worker.id,
+        message: expect.objectContaining({
+          type: "request",
+          request: {
+            op: "complete",
+            result: { success: true, output: "old-leader-run", exitCode: 0 },
+          },
+        }),
+      })
+    );
     expect(starts).toHaveLength(1);
     expect(ends).toHaveLength(1);
     expect(ends[0]).toMatchObject({
