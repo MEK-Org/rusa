@@ -344,13 +344,54 @@ describe("routeRunFailure", () => {
   });
 
   describe("exhaustion classification leads the notice ", () => {
-    it("names the exhaustion on the FIRST line when classify reports exhausted", async () => {
-      const { deps, toParent } = makeDeps(
+    const QUOTA_LIKE: RunResult = {
+      success: false,
+      output: "You've hit your usage limit. Try again at 5pm.",
+      exitCode: 1,
+    };
+    const counting = () => {
+      const calls: RunResult[] = [];
+      return {
+        calls,
+        classify: async (result: RunResult) => {
+          calls.push(result);
+          return { exhausted: true };
+        },
+      };
+    };
+
+    it("reports a child's actual failure to its parent without classifying it (#1148)", async () => {
+      const { calls, classify } = counting();
+      const { deps, toParent, toChat } = makeDeps(
         { w1: { id: "w1", parentId: "root" } },
-        { classify: async () => ({ exhausted: true }) }
+        { classify }
       );
-      await routeRunFailure(deps, "w1", FAIL, "claude/claude-sonnet-5");
-      const body = toParent[0]?.body ?? "";
+      await routeRunFailure(deps, "w1", QUOTA_LIKE, "claude/claude-sonnet-5", "run-1");
+      expect(calls).toHaveLength(0);
+      expect(toChat).toEqual([]);
+      expect(toParent).toHaveLength(1);
+      expect(toParent[0]?.body).toBe(
+        "[run failed] Run run-1: provider run claude/claude-sonnet-5 failed.\n\n(exit 1)\n\nYou've hit your usage limit. Try again at 5pm."
+      );
+      expect(toParent[0]?.forensics).toEqual({ runId: "run-1", actorId: "w1", exitCode: 1 });
+    });
+
+    it("reports a child whose parent is gone without classifying it (#1148)", async () => {
+      const { calls, classify } = counting();
+      const { deps, toParent } = makeDeps({ w1: { id: "w1", parentId: "retired" } }, { classify });
+      await routeRunFailure(deps, "w1", QUOTA_LIKE, "claude/claude-sonnet-5");
+      expect(calls).toHaveLength(0);
+      // The mesh's delivery drops a notice for a parent that is no longer live.
+      expect(toParent.map((n) => n.toId)).toEqual(["retired"]);
+      expect(toParent[0]?.body).not.toContain("quota exhausted");
+    });
+
+    it("still names exhaustion first for the root's error-chat notice", async () => {
+      const { calls, classify } = counting();
+      const { deps, toChat } = makeDeps({ root: { id: "root" } }, { classify });
+      await routeRunFailure(deps, "root", FAIL, "claude/claude-sonnet-5");
+      expect(calls).toEqual([FAIL]);
+      const body = toChat[0] ?? "";
       const firstLine = body.split("\n")[0];
       expect(firstLine).toContain("quota exhausted");
       expect(firstLine).toContain("claude/claude-sonnet-5");
@@ -358,6 +399,16 @@ describe("routeRunFailure", () => {
       // The usual exit-code/tail summary still follows, unmodified.
       expect(body).toContain("exit 1");
       expect(body).toContain("boom");
+    });
+
+    it("still classifies a top-level actor beside the root", async () => {
+      const { calls, classify } = counting();
+      const { deps, toChat } = makeDeps({ second: { id: "second", parentId: null } }, { classify });
+      await routeRunFailure(deps, "second", QUOTA_LIKE, "codex/gpt-fixture");
+      expect(calls).toEqual([QUOTA_LIKE]);
+      expect(toChat[0]).toContain(
+        "Top-level actor second run failed quota exhausted: codex/gpt-fixture"
+      );
     });
 
     it("names a structured temporary provider-capacity rejection without fabricating quota exhaustion", async () => {
@@ -413,19 +464,16 @@ describe("routeRunFailure", () => {
     it("does not label network transient failures as quota exhausted ", async () => {
       const { createExhaustionClassifier } = await import("../providers/exhaustion-classifier.js");
       const classifier = createExhaustionClassifier(); // no api key -> deterministic fallback
-      const { deps, toParent } = makeDeps(
-        { w1: { id: "w1", parentId: "root" } },
-        { classify: classifier }
-      );
+      const { deps, toChat } = makeDeps({ root: { id: "root" } }, { classify: classifier });
       const networkFail: RunResult = {
         success: false,
         output: "Error: connect ETIMEDOUT 142.250.180.14:443\nnetwork changed",
         exitCode: 1,
       };
-      await routeRunFailure(deps, "w1", networkFail, "antigravity");
-      const body = toParent[0]?.body ?? "";
+      await routeRunFailure(deps, "root", networkFail, "antigravity");
+      const body = toChat[0] ?? "";
       expect(body).not.toContain("quota exhausted");
-      expect(body).toContain("[run failed] provider run antigravity failed.");
+      expect(body).toContain("root run failed provider run antigravity failed.");
       expect(body).toContain("(exit 1)");
       expect(body).toContain("connect ETIMEDOUT");
     });
