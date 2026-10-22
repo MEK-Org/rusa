@@ -176,9 +176,9 @@ export class RootControlService {
     const rootId = this.requireRootId();
     const text = body.trim();
     if (!text) throw new Error("message body is required");
-    const result = messageStamp
-      ? this.options.mesh.sendMessage(toId, text, rootId, sessionId, deliverAt, { messageStamp })
-      : this.options.mesh.sendMessage(toId, text, rootId, sessionId, deliverAt);
+    const result = this.options.mesh.sendMessage(toId, text, rootId, sessionId, deliverAt, {
+      messageStamp,
+    });
     if (!result.delivered) {
       if (!result.status) {
         throw new Error(`unknown thread id: ${toId}`);

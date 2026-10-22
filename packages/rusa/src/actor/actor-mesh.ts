@@ -108,7 +108,7 @@ import {
   NOOP_MESH_EVENT_SINK,
   RUN_TERMINAL_EVENT_KINDS,
 } from "./mesh-events.js";
-import { type MessageStamp, MessageStampService } from "./message-stamp.js";
+import { type MessageStamp, stampHuman } from "./message-stamp.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "./os-scheduler.js";
 import {
   type ResponsiveInterruptionVerdict,
@@ -948,7 +948,6 @@ export class ActorMesh {
     responsive?: boolean;
     responsiveReason?: string;
   }) => string;
-  private readonly messageStamps = new MessageStampService();
   readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
   private readonly experiments: ExperimentEnrollmentStore;
@@ -4290,7 +4289,7 @@ export class ActorMesh {
     // ingress policy; actor endpoints can only supply a host-created stamp
     // bound to their current run, never a caller-provided priority or
     // obligation id.
-    const stamp = humanSender ? this.messageStamps.stampHuman() : options.messageStamp;
+    const stamp = humanSender ? stampHuman() : options.messageStamp;
     const responsive = stamp?.responsive ?? false;
     const responsiveReason = stamp?.responsiveReason;
 

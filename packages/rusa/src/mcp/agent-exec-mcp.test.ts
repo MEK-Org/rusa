@@ -40,7 +40,7 @@ import {
   type ExperimentEnrollmentStore,
   InMemoryExperimentEnrollmentStore,
 } from "../actor/experiments.js";
-import { MessageStampService } from "../actor/message-stamp.js";
+import { stampActor } from "../actor/message-stamp.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import { RootControlService } from "../actor/root-control.js";
 import { type ActiveRunContext, bindRunContext } from "../actor/run-context.js";
@@ -2049,10 +2049,9 @@ describe("agent-execution MCP server", () => {
           }
         : undefined
     );
-    const stamps = new MessageStampService();
     const client = await connect(
       createAgentExecMcpServer(mesh, "root", "root", undefined, {
-        messageStamp: () => stamps.stampActor(lease.reader),
+        messageStamp: () => stampActor(lease.reader),
       })
     );
     const recipient = mesh.spawn({

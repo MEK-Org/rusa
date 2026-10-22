@@ -6,17 +6,16 @@ export interface MessageStamp {
   readonly responsiveReason?: "human message" | "responsive obligation";
 }
 
-/** Shared trusted policy for human and actor message creation. */
-export class MessageStampService {
-  stampHuman(): MessageStamp {
-    return { responsive: true, responsiveReason: "human message" };
-  }
+/** Shared trusted policy for human message creation. */
+export function stampHuman(): MessageStamp {
+  return { responsive: true, responsiveReason: "human message" };
+}
 
-  stampActor(reader: BoundRunContextReader): MessageStamp {
-    const context = reader.current();
-    if (!context) throw new Error("actor run context has ended");
-    return context.effectiveResponsive
-      ? { responsive: true, responsiveReason: "responsive obligation" }
-      : { responsive: false };
-  }
+/** Shared trusted policy for exact-run actor message creation. */
+export function stampActor(reader: BoundRunContextReader): MessageStamp {
+  const context = reader.current();
+  if (!context) throw new Error("actor run context has ended");
+  return context.effectiveResponsive
+    ? { responsive: true, responsiveReason: "responsive obligation" }
+    : { responsive: false };
 }

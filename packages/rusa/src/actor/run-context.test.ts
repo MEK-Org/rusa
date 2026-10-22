@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MessageStampService } from "./message-stamp.js";
+import { stampActor, stampHuman } from "./message-stamp.js";
 import { type ActiveRunContext, bindRunContext, resolveRunContextProvider } from "./run-context.js";
 
 const context = (overrides: Partial<ActiveRunContext> = {}): ActiveRunContext => ({
@@ -52,16 +52,15 @@ describe("bound run context", () => {
   });
 
   it("stamps human ingress and refuses ended actor contexts", () => {
-    const stamps = new MessageStampService();
-    expect(stamps.stampHuman()).toEqual({ responsive: true, responsiveReason: "human message" });
+    expect(stampHuman()).toEqual({ responsive: true, responsiveReason: "human message" });
 
     let current: ActiveRunContext | undefined = context({ effectiveResponsive: true });
     const lease = bindRunContext("actor-a", "run-a", () => current);
-    expect(stamps.stampActor(lease.reader)).toEqual({
+    expect(stampActor(lease.reader)).toEqual({
       responsive: true,
       responsiveReason: "responsive obligation",
     });
     current = undefined;
-    expect(() => stamps.stampActor(lease.reader)).toThrow("has ended");
+    expect(() => stampActor(lease.reader)).toThrow("has ended");
   });
 });

@@ -103,7 +103,7 @@ import {
   type RunAbandonedPayload,
   runEndPayload,
 } from "../actor/mesh-events.js";
-import { MessageStampService } from "../actor/message-stamp.js";
+import { stampActor } from "../actor/message-stamp.js";
 import { OperatorActorControl } from "../actor/operator-actor-control.js";
 import { type ActorWakeScheduler, DefaultOsScheduler } from "../actor/os-scheduler.js";
 import {
@@ -2680,7 +2680,6 @@ async function composeStart(
   // The one live attribution source: populated only for an actual provider
   // attempt (including fallbacks), and cleared by every terminal run hook.
   const activeRunSelections = new Map<string, RawProviderModelConfig>();
-  const messageStamps = new MessageStampService();
   // ── Host-maintenance tools (#549) ── `update` and `pnpm-hardlinks` used to be
   // mounted on the configured root's tool set by id. They are now ordinary
   // grantable capabilities (named after their servers) registered through
@@ -2949,10 +2948,12 @@ async function composeStart(
     const workerMcp = liveWorkerMcp.get(actorId);
     const runNames = runAgentMcpNames.get(actorId);
     runAgentMcpNames.delete(actorId);
-    if (workerMcp && runNames) {
+    if (runNames) {
       for (const name of runNames) {
-        const index = workerMcp.findIndex((server) => server.name === AGENT_EXEC_MCP_NAME);
-        if (index >= 0) workerMcp.splice(index, 1);
+        if (workerMcp) {
+          const index = workerMcp.findIndex((server) => server.name === AGENT_EXEC_MCP_NAME);
+          if (index >= 0) workerMcp.splice(index, 1);
+        }
         void mcpHttp.removeServer(name);
       }
     }
@@ -4100,7 +4101,7 @@ async function composeStart(
               // Controller operations stay available to the one imported
               // actor, but remain stamped by its exact active run.
               ...(id === rootId ? { rootControl } : {}),
-              messageStamp: () => messageStamps.stampActor(lease.reader),
+              messageStamp: () => stampActor(lease.reader),
               onWrite: () => {
                 mesh.markUnkillable(id);
               },
