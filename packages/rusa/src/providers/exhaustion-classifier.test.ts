@@ -26,6 +26,24 @@ describe("exhaustion classifier", () => {
     ).toBe("quota");
   });
 
+  it("uses Codex's structured temporary-capacity result without inferring quota or calling a remote classifier", async () => {
+    await expect(
+      classifyRunExhaustion(
+        {
+          success: false,
+          output: "[terminal provider capacity: Selected model is at capacity.]",
+          exitCode: 1,
+          failure: {
+            kind: "provider-capacity",
+            message: "Selected model is at capacity.",
+          },
+        },
+        "gemini-key"
+      )
+    ).resolves.toEqual({ exhausted: true });
+    expect(gemini.generateContent).not.toHaveBeenCalled();
+  });
+
   it("classifies network transients as transient-network and logs them", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
