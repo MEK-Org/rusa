@@ -29,11 +29,11 @@ export interface FailureSinkDeps {
   /** Optional workers home directory to check for unpushed work on SIGTERM. */
   workersDir?: string;
   /**
-   * Optional exhaustion classifier . When set, a failed run's output is
-   * classified before the notice is built; if it classifies as quota
-   * exhaustion, the notice LEADS with a named condition — a worker can no
-   * longer self-heal onto a fallback, so the parent needs to see the cause up
-   * front to judge: wait, respawn on another provider/tier, or re-scope.
+   * Optional exhaustion classifier for parentless actors' error-chat notices.
+   * When set, a root or top-level actor's failed run is classified before the
+   * notice is built, and a quota-exhaustion classification LEADS the notice.
+   * A child's failure is never classified (#1148): its parent judges the
+   * observed failure itself.
    */
   classify?: ExhaustionClassifier;
   /**
@@ -203,12 +203,12 @@ function findDirtyOrAheadRepoPath(workerDir: string): string | null {
  * The parent-gone case is handled for free: the mesh's sendMessage drops-and-logs
  * when the target isn't live.
  *
- * When {@link FailureSinkDeps.classify} is set, the failed run's output is
- * classified first . A worker has no fallback of its own anymore — its
- * parent is the one who judges what quota exhaustion means (wait, respawn on
- * another provider/tier, or re-scope) — so an exhaustion classification leads
- * the notice with a named condition, ahead of the usual exit-code/tail
- * summary. `providerLabel` (typically `<provider>/<model> @ <effort>`, via
+ * A child's notice reports the observed failure as-is (#1148): its parent
+ * already has to judge it, and a quota classification would not change where it
+ * goes. Only a parentless actor's run is classified, when
+ * {@link FailureSinkDeps.classify} is set, so an exhaustion classification can
+ * lead its error-chat notice ahead of the usual exit-code/tail summary.
+ * `providerLabel` (typically `<provider>/<model> @ <effort>`, via
  * {@link formatProviderLabel}) identifies the provider/model that produced the
  * failed run; it does not claim that selection itself failed.
  */
@@ -250,7 +250,7 @@ export async function routeRunFailure(
   } else if (result.failure?.stage === "provider-selection") {
     // Established at the resolver boundary: nothing ran, so nothing exhausted.
     leadLine = `could not prepare ${providerLabel ?? "the configured provider/model"}.\nProvider was not invoked.`;
-  } else if (deps.classify) {
+  } else if (deps.classify && !deps.actors.get(actorId)?.parentId) {
     const classification = await deps.classify(result);
     if (classification.exhausted) {
       leadLine =

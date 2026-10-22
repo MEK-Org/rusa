@@ -4334,8 +4334,8 @@ async function composeStart(
     log: (m) => console.warn(`[failure-sink] ${m}`),
     workersDir,
     principals: getRepositories().principals,
-    // ISSUE_NUM: name quota exhaustion in the failure notice so a worker's parent
-    // (who now owns the fallback judgment) can see the cause up front.
+    // Names quota exhaustion in a parentless actor's error-chat notice; a
+    // child's failure reaches its parent unclassified (#1148).
     classify: classifyExhaustion,
     // #189: a child's failure wakes its parent past provider pacing, backed
     // off per child so a crash loop cannot hammer the parent.
