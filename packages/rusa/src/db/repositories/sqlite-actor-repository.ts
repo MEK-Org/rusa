@@ -5,6 +5,7 @@ import { lookupModelClassPool, type ModelClassStore } from "../../providers/mode
 import type {
   ActorRecordPatch,
   ActorRepository,
+  ContextSelectionChange,
   ModelSelectionChange,
 } from "../../repositories/actor-repository.js";
 import { canonicalSupportedVoiceName } from "../../voice/tts-voices.js";
@@ -702,6 +703,28 @@ export class SqliteActorRepository implements ActorRepository {
       throw new Error(`SqliteActorRepository: cannot set model selection on unknown actor '${id}'`);
     }
     this.write({ ...record, ...changes, id }, { restateModelConfig: true });
+  }
+
+  applyPendingSelections(
+    id: string,
+    changes: {
+      model?: ModelSelectionChange;
+      context?: ContextSelectionChange;
+    }
+  ): void {
+    const record = this.get(id);
+    if (!record) {
+      throw new Error(
+        `SqliteActorRepository: cannot apply pending selections on unknown actor '${id}'`
+      );
+    }
+    const updated: ActorRecord = {
+      ...record,
+      ...(changes.context ?? {}),
+      ...(changes.model ?? {}),
+      id,
+    };
+    this.write(updated, { restateModelConfig: changes.model !== undefined });
   }
 
   private write(record: ActorRecord, opts?: { restateModelConfig?: boolean }): void {

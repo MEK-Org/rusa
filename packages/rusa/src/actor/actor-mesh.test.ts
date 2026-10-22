@@ -7200,6 +7200,157 @@ describe("ActorMesh", () => {
       releaseDeferred();
     });
 
+    it("clears old class binding for effective-target validation when concrete pool is staged", async () => {
+      const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
+      const testSetup = setup({
+        sharedProvider: deferredRunProvider,
+      });
+
+      const worker = testSetup.mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+      });
+      testSetup.registry.setModelSelection(worker, { modelClass: "fast-tier" });
+
+      testSetup.mesh.sendMessage(worker, "run", "root");
+      await testSetup.tick();
+      expect(testSetup.mesh.activeRunState(worker)?.phase).toBe("running");
+
+      // Stage a concrete single-entry pool
+      const modelOutcome = testSetup.mesh.setActorModel(
+        worker,
+        { provider: "claude", model: "claude-sonnet-5" },
+        "root"
+      );
+      expect(modelOutcome).toBe("staged");
+
+      // Staged native context must not throw old-class refusal because the staged
+      // concrete pool clears the active class binding for effective target validation
+      const contextOutcome = testSetup.mesh.setActorContext(worker, "native", "root");
+      expect(contextOutcome).toBe("staged");
+
+      expect(testSetup.mesh.validateCombinedEffectiveTarget(worker)).toBe(true);
+
+      releaseDeferred();
+      await testSetup.tick();
+
+      const updated = testSetup.registry.get(worker);
+      expect(updated?.modelClass).toBeUndefined();
+      expect(updated?.modelConfig).toEqual([{ provider: "claude", model: "claude-sonnet-5" }]);
+      expect(updated?.context).toEqual({ type: "native" });
+      expect(updated?.desiredModelConfig).toBeUndefined();
+      expect(updated?.desiredContextConfig).toBeUndefined();
+    });
+
+    it("atomically applies and clears combined durable target at run boundary", async () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const actorRepo = new SqliteActorRepository(db);
+
+      const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
+      const testSetup = setup({
+        actors: actorRepo,
+        sharedProvider: deferredRunProvider,
+      });
+
+      const worker = testSetup.mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "native" },
+      });
+
+      testSetup.mesh.sendMessage(worker, "work", "root");
+      await testSetup.tick();
+      expect(testSetup.mesh.activeRunState(worker)?.phase).toBe("running");
+
+      expect(testSetup.mesh.setActorContext(worker, "tail", "root")).toBe("staged");
+      expect(
+        testSetup.mesh.setActorModel(worker, { provider: "codex", model: "gpt-5.6-sol" }, "root")
+      ).toBe("staged");
+
+      // Verify staged rows in DB before boundary
+      const preRow = db
+        .prepare("SELECT model_config, context_config FROM actors WHERE id = ?")
+        .get(worker) as { model_config: string; context_config: string };
+      const preModelJson = preRow.model_config;
+      const preContextJson = preRow.context_config;
+
+      // Install synthetic SQLite trigger that fails only when pending context is cleared
+      db.exec(`
+        CREATE TEMP TRIGGER synthetic_reject_context_clear BEFORE UPDATE ON actors
+        WHEN json_extract(OLD.context_config, '$.desired') IS NOT NULL
+         AND json_extract(NEW.context_config, '$.desired') IS NULL
+        BEGIN SELECT RAISE(ABORT, 'synthetic context clear failure'); END;
+      `);
+
+      // Attempt prepareRun: must throw due to trigger abort
+      const reopenedRepo = new SqliteActorRepository(db);
+      const onModelSetSpy = vi.fn();
+      const events: MeshEventInput[] = [];
+      const freshSetup = setup({
+        actors: reopenedRepo,
+        onModelSet: onModelSetSpy,
+        events: (e) => events.push(e),
+      });
+
+      expect(() => freshSetup.mesh.prepareRun(worker)).toThrow(/synthetic context clear failure/);
+
+      // Verify that failure left BOTH active and pending dimensions completely unchanged in the DB
+      const failedRow = db
+        .prepare("SELECT model_config, context_config FROM actors WHERE id = ?")
+        .get(worker) as { model_config: string; context_config: string };
+      expect(failedRow.model_config).toBe(preModelJson);
+      expect(failedRow.context_config).toBe(preContextJson);
+
+      const workerAfterFail = reopenedRepo.get(worker);
+      expect(workerAfterFail?.modelConfig).toEqual([
+        { provider: "claude", model: "claude-sonnet-5" },
+      ]);
+      expect(workerAfterFail?.desiredModelConfig).toEqual([
+        { provider: "codex", model: "gpt-5.6-sol" },
+      ]);
+      expect(workerAfterFail?.context).toEqual({ type: "native" });
+      expect(workerAfterFail?.desiredContextConfig).toEqual({ type: "portable", mode: "tail" });
+
+      // No callbacks or events published when boundary write aborted
+      expect(onModelSetSpy).not.toHaveBeenCalled();
+      const modelSetEvents = events.filter((e) => e.kind === "actor_model_set");
+      expect(modelSetEvents).toHaveLength(0);
+
+      // Drop the synthetic trigger and retry
+      db.exec("DROP TRIGGER synthetic_reject_context_clear;");
+
+      const retrySuccess = freshSetup.mesh.prepareRun(worker);
+      expect(retrySuccess).toBe(true);
+
+      // Verify both dimensions are now transitioned in DB
+      const appliedRow = db
+        .prepare("SELECT model_config, context_config FROM actors WHERE id = ?")
+        .get(worker) as { model_config: string; context_config: string };
+      expect(JSON.parse(appliedRow.context_config)).toMatchObject({
+        schemaVersion: 1,
+        type: "portable",
+        mode: "tail",
+      });
+      expect(JSON.parse(appliedRow.context_config).desired).toBeUndefined();
+      expect(JSON.parse(appliedRow.model_config)).toMatchObject({
+        schemaVersion: 2,
+        entries: [{ provider: "codex", model: "gpt-5.6-sol" }],
+      });
+      expect(JSON.parse(appliedRow.model_config).desiredEntries).toBeUndefined();
+
+      // Callbacks and events published after successful durable transition
+      expect(onModelSetSpy).toHaveBeenCalledTimes(1);
+      const postEvents = events.filter((e) => e.kind === "actor_model_set");
+      expect(postEvents).toHaveLength(1);
+
+      releaseDeferred();
+    });
+
     it("resumes retained portable ledger items and brief across portable -> native -> portable", () => {
       const db = new Database(":memory:");
       runMigrations(db);

@@ -87,11 +87,11 @@ export interface ActorRecord {
    * Derived per read, never stored on the actor row.
    */
   modelClassError?: string;
-  /** Process-local staged full-pool replacement; deliberately not durable. */
+  /** Staged full-pool replacement; persisted across restarts and applied at the run boundary. */
   desiredModelConfig?: ProviderModelConfig[];
-  /** Process-local provenance for [desiredModelConfig], cleared with that staged pool. */
+  /** Provenance for [desiredModelConfig], cleared when the staged selection applies. */
   desiredModelClass?: string;
-  /** Process-local staged context config replacement; deliberately not durable. */
+  /** Staged context config replacement; persisted across restarts and applied at the run boundary. */
   desiredContextConfig?: ContextConfig;
   sessionId?: string;
   context?: ContextConfig;

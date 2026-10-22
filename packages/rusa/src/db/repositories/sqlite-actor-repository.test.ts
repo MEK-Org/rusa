@@ -975,6 +975,64 @@ describe("SqliteActorRepository", () => {
     expect(storedModelConfig("root")).toBe(legacyClass);
   });
 
+  it("atomically applies pending model and context selections in one transaction", () => {
+    repository.upsert(root);
+    repository.patch("root", {
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
+      desiredContextConfig: { type: "portable", mode: "brief" },
+    });
+
+    const staged = db
+      .prepare("SELECT model_config, context_config FROM actors WHERE id = 'root'")
+      .get() as { model_config: string; context_config: string };
+
+    db.exec(`
+      CREATE TEMP TRIGGER synthetic_reject_context_clear BEFORE UPDATE ON actors
+      WHEN json_extract(OLD.context_config, '$.desired') IS NOT NULL
+       AND json_extract(NEW.context_config, '$.desired') IS NULL
+      BEGIN SELECT RAISE(ABORT, 'synthetic context clear failure'); END;
+    `);
+
+    expect(() =>
+      repository.applyPendingSelections("root", {
+        model: {
+          modelConfig: [{ provider: "claude", model: "claude-opus" }],
+          desiredModelConfig: undefined,
+          desiredModelClass: undefined,
+        },
+        context: {
+          context: { type: "portable", mode: "brief" },
+          desiredContextConfig: undefined,
+        },
+      })
+    ).toThrow(/synthetic context clear failure/);
+
+    const afterFailed = db
+      .prepare("SELECT model_config, context_config FROM actors WHERE id = 'root'")
+      .get() as { model_config: string; context_config: string };
+    expect(afterFailed).toEqual(staged);
+
+    db.exec("DROP TRIGGER synthetic_reject_context_clear;");
+
+    repository.applyPendingSelections("root", {
+      model: {
+        modelConfig: [{ provider: "claude", model: "claude-opus" }],
+        desiredModelConfig: undefined,
+        desiredModelClass: undefined,
+      },
+      context: {
+        context: { type: "portable", mode: "brief" },
+        desiredContextConfig: undefined,
+      },
+    });
+
+    const applied = repository.get("root");
+    expect(applied?.modelConfig).toEqual([{ provider: "claude", model: "claude-opus" }]);
+    expect(applied?.desiredModelConfig).toBeUndefined();
+    expect(applied?.context).toEqual({ type: "portable", mode: "brief" });
+    expect(applied?.desiredContextConfig).toBeUndefined();
+  });
+
   it("migrates a pre-#169 singleton model_config document into a one-entry pool on read", () => {
     repository.upsert(root);
     db.prepare("UPDATE actors SET model_config = ? WHERE id = 'root'").run(

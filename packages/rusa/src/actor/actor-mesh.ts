@@ -26,7 +26,11 @@ import {
 import type { AbortReason } from "../providers/termination-attribution.js";
 import type { RunResult } from "../providers/types.js";
 import { parseReference } from "../references/reference.js";
-import type { ActorRepository } from "../repositories/actor-repository.js";
+import type {
+  ActorRepository,
+  ContextSelectionChange,
+  ModelSelectionChange,
+} from "../repositories/actor-repository.js";
 import {
   EmptyInboxRepository,
   type InboxAppendInput,
@@ -1346,8 +1350,7 @@ export class ActorMesh {
               // A launched run that ended without a result still ended: a pool
               // staged while it ran is due now, not at some later dispatch (#652).
               if (event.terminal.started) {
-                this.applyPendingModel(event.actorId);
-                this.applyPendingContext(event.actorId);
+                this.applyPendingTarget(event.actorId);
               }
             }
             // A selection is run-scoped regardless of its terminal shape.
@@ -2330,8 +2333,7 @@ export class ActorMesh {
     // stays on the launched tuple and only picks up the new one now, for the
     // run after. A tuple set while idle/queued was already applied by
     // {@link setActorModel}, so this call is then a no-op.
-    this.applyPendingModel(actorId);
-    this.applyPendingContext(actorId);
+    this.applyPendingTarget(actorId);
 
     // A real provider failure follows the ordinary failure route.  The one
     // bounded retry is exclusively a recovery for selected work a provider
@@ -5320,8 +5322,8 @@ export class ActorMesh {
     // Boundary contract (#199, #652): an in-flight run completes on its
     // already-launched pool, and the staged pool applies at that run's end
     // (see {@link finishInboxRun}). An idle or queued actor has no launched
-    // run, so there is nothing to wait for: apply and persist now. Staging is
-    // process memory, so a pool left staged here would be lost to a restart.
+    // run, so there is nothing to wait for: apply and persist now. Staged
+    // selections are persisted in the versioned actor document and survive restarts.
     const desiredModelClass = isModelClassReference(modelConfig) ? modelConfig.class : undefined;
     this.actors.patch(id, {
       desiredModelConfig: validated,
@@ -5331,7 +5333,7 @@ export class ActorMesh {
     });
     const phase = this.activeRunState(id)?.phase;
     const staged = phase === "running";
-    if (!staged) this.applyPendingModel(id);
+    if (!staged) this.applyPendingTarget(id);
 
     // A queued reservation has already quoted one of the old pool's lanes.
     // Replacing that pool must release the old quote now and pass the same
@@ -5355,21 +5357,44 @@ export class ActorMesh {
   }
 
   /**
-   * Apply the staged modelConfig replacement at whichever boundary the
-   * actor's current state puts it behind next. `setActorModel` applies the
-   * normal idle/queued case immediately; dispatch is the fallback for an
-   * overlay retained by an admission gap or an all-halted preflight. A
-   * mid-run overlay applies at run end (from {@link finishInboxRun}).
-   * Public — like {@link finishInboxRun} and {@link actorQueued} — because both
-   * factory-created workers and the externally-constructed root invoke it at
-   * their dispatch boundary.
-   * A no-op when nothing is staged, so calling it from both boundaries on the
-   * same run is safe: whichever fires first consumes the pending pool.
+   * Return the effective model class for an actor, taking pending staged
+   * model changes into account. A pending concrete pool clears the active class
+   * binding; a pending class reference replaces it; if no model change is staged,
+   * the active class binding remains.
    */
-  applyPendingModel(id: string): void {
+  effectiveModelClass(record: ActorRecord): string | undefined {
+    if (record.desiredModelClass !== undefined) {
+      return record.desiredModelClass;
+    }
+    if (record.desiredModelConfig !== undefined) {
+      return undefined;
+    }
+    return record.modelClass;
+  }
+
+  /**
+   * Return the effective model pool for an actor, taking pending staged
+   * model changes into account.
+   */
+  effectiveModelConfig(record: ActorRecord): ProviderModelConfig[] | undefined {
+    return record.desiredModelConfig ?? record.modelConfig;
+  }
+
+  /**
+   * Apply any staged model and context configuration replacements at the run
+   * boundary in one atomic transaction.
+   * Both factory-created workers and the externally-constructed root invoke it at
+   * their dispatch boundary. An idle or queued actor applies immediately; a
+   * running actor applies at run end.
+   */
+  applyPendingTarget(id: string): void {
     const record = this.actors.get(id);
     if (!record) return;
-    if (record.desiredModelConfig === undefined) {
+
+    const hasPendingModel = record.desiredModelConfig !== undefined;
+    const hasPendingContext = record.desiredContextConfig !== undefined;
+
+    if (!hasPendingModel && !hasPendingContext) {
       this.refreshClassBoundPool(id, record);
       return;
     }
@@ -5378,46 +5403,72 @@ export class ActorMesh {
     const newModelConfig = record.desiredModelConfig;
     const boundClass = record.desiredModelClass;
 
-    // The one deliberate model-configuration write: it restates the row's
-    // model-config document, which an ordinary `patch` deliberately does not
-    // (#626).
-    this.actors.setModelSelection(id, {
-      modelConfig: newModelConfig,
-      modelClass: boundClass,
-      desiredModelConfig: undefined,
-      desiredModelClass: undefined,
+    const newContext = record.desiredContextConfig;
+    const wasPortable = record.context?.type === "portable";
+    const isPortable = newContext?.type === "portable";
+    const resetSession =
+      newContext !== undefined && ((wasPortable && !isPortable) || (!wasPortable && isPortable));
+
+    const modelChanges: ModelSelectionChange | undefined = hasPendingModel
+      ? {
+          modelConfig: newModelConfig,
+          modelClass: boundClass,
+          desiredModelConfig: undefined,
+          desiredModelClass: undefined,
+        }
+      : undefined;
+
+    const contextChanges: ContextSelectionChange | undefined = hasPendingContext
+      ? {
+          context: newContext,
+          desiredContextConfig: undefined,
+          ...(resetSession ? { sessionId: undefined } : {}),
+        }
+      : undefined;
+
+    // Persist both dimensions in a single atomic database transaction.
+    this.actors.applyPendingSelections(id, {
+      model: modelChanges,
+      context: contextChanges,
     });
 
     const verified = this.actors.get(id);
-    if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);
-    if (boundClass !== undefined) {
-      // A class binding persists the reference, not the pool the selection
-      // resolved to, so the pool is whatever the class says now — verify the
-      // binding landed and publish the live definition rather than a snapshot
-      // that a concurrent class edit may already have overtaken (#626).
-      if (verified.modelClass !== boundClass) {
-        throw new Error(`Failed to verify deferred model class update for thread: ${id}`);
+    if (!verified) throw new Error(`Failed to reload thread after update: ${id}`);
+
+    if (newModelConfig !== undefined) {
+      if (boundClass !== undefined) {
+        if (verified.modelClass !== boundClass) {
+          throw new Error(`Failed to verify deferred model class update for thread: ${id}`);
+        }
+        if (!verified.modelConfig) {
+          throw new Error(
+            `Model class "${boundClass}" applied to thread ${id} no longer resolves: ${verified.modelClassError ?? "unknown reason"}`
+          );
+        }
+      } else if (JSON.stringify(verified.modelConfig) !== JSON.stringify(newModelConfig)) {
+        throw new Error(`Failed to verify deferred model update for thread: ${id}`);
       }
-      if (!verified.modelConfig) {
-        throw new Error(
-          `Model class "${boundClass}" applied to thread ${id} no longer resolves: ${verified.modelClassError ?? "unknown reason"}`
-        );
-      }
-    } else if (JSON.stringify(verified.modelConfig) !== JSON.stringify(newModelConfig)) {
-      throw new Error(`Failed to verify deferred model update for thread: ${id}`);
+
+      const appliedModelConfig = verified.modelConfig ?? newModelConfig;
+      // Publish before journalling. The durable `actor_model_set` event below is
+      // the record that this pool reached the actor, so a publication that threw
+      // must not leave that claim behind.
+      this.onModelSet?.(id, appliedModelConfig, verified);
+
+      this.recordEvent({
+        kind: "actor_model_set",
+        actorId: id,
+        detail: `${oldModelConfig ? describeModelConfigPool(oldModelConfig) : "default"} -> ${describeModelConfigPool(appliedModelConfig)}${boundClass !== undefined ? ` (class "${boundClass}")` : ""}`,
+      });
     }
 
-    const appliedModelConfig = verified.modelConfig ?? newModelConfig;
-    // Publish before journalling. The durable `actor_model_set` event below is
-    // the record that this pool reached the actor, so a publication that threw
-    // must not leave that claim behind.
-    this.onModelSet?.(id, appliedModelConfig, verified);
+    if (newModelConfig === undefined) {
+      this.refreshClassBoundPool(id, verified);
+    }
+  }
 
-    this.recordEvent({
-      kind: "actor_model_set",
-      actorId: id,
-      detail: `${oldModelConfig ? describeModelConfigPool(oldModelConfig) : "default"} -> ${describeModelConfigPool(appliedModelConfig)}${boundClass !== undefined ? ` (class "${boundClass}")` : ""}`,
-    });
+  applyPendingModel(id: string): void {
+    this.applyPendingTarget(id);
   }
 
   /**
@@ -5511,13 +5562,13 @@ export class ActorMesh {
     }
 
     if (validated.type === "native") {
-      const effectiveClass = record.desiredModelClass ?? record.modelClass;
+      const effectiveClass = this.effectiveModelClass(record);
       if (effectiveClass !== undefined) {
         throw new Error(
           `Cannot switch to native context on actor ${id} while it holds a model class reference ("${effectiveClass}"): native sessions require exactly one declared entry; narrow the pool first with set_actor_model.`
         );
       }
-      const effectivePool = record.desiredModelConfig ?? record.modelConfig;
+      const effectivePool = this.effectiveModelConfig(record);
       if ((effectivePool?.length ?? 0) > 1) {
         throw new Error(
           `Cannot switch to native context on actor ${id} while it holds a multi-entry model pool (${effectivePool?.length} candidates): native sessions require exactly one declared entry; narrow the pool first with set_actor_model.`
@@ -5532,7 +5583,7 @@ export class ActorMesh {
     const phase = this.activeRunState(id)?.phase;
     const staged = phase === "running";
     if (!staged) {
-      this.applyPendingContext(id);
+      this.applyPendingTarget(id);
     }
 
     const oldMode = record.context?.type === "portable" ? record.context.mode : "native";
@@ -5559,19 +5610,7 @@ export class ActorMesh {
    * An idle or queued actor applies immediately; a running actor applies at run end.
    */
   applyPendingContext(id: string): void {
-    const record = this.actors.get(id);
-    if (!record || record.desiredContextConfig === undefined) return;
-
-    const newContext = record.desiredContextConfig;
-    const wasPortable = record.context?.type === "portable";
-    const isPortable = newContext.type === "portable";
-    const resetSession = (wasPortable && !isPortable) || (!wasPortable && isPortable);
-
-    this.actors.patch(id, {
-      context: newContext,
-      desiredContextConfig: undefined,
-      ...(resetSession ? { sessionId: undefined } : {}),
-    });
+    this.applyPendingTarget(id);
   }
 
   /**
@@ -5825,7 +5864,7 @@ export class ActorMesh {
 
   /**
    * The modelConfig pool a thread's next run will actually launch on.
-   * An overlay is normally consumed immediately by `setActorModel`; when one
+   * A staged selection is normally consumed immediately by `setActorModel`; when one
    * remains for a run boundary (mid-run, an admission gap, or an all-halted
    * preflight), every halt-gate check must still consult it instead of the
    * record's current `modelConfig`. Otherwise a staged move to an
@@ -5851,8 +5890,8 @@ export class ActorMesh {
     if (!record) return false;
 
     const effectiveContext = record.desiredContextConfig ?? record.context;
-    const effectiveClass = record.desiredModelClass ?? record.modelClass;
-    const effectivePool = record.desiredModelConfig ?? record.modelConfig;
+    const effectiveClass = this.effectiveModelClass(record);
+    const effectivePool = this.effectiveModelConfig(record);
 
     if (effectiveContext?.type === "native") {
       if (effectiveClass !== undefined) {
@@ -5889,8 +5928,7 @@ export class ActorMesh {
     if (!this.validateCombinedEffectiveTarget(id)) {
       return false;
     }
-    this.applyPendingModel(id);
-    this.applyPendingContext(id);
+    this.applyPendingTarget(id);
     // A staged rebind or explicit pin is the supported repair path for a
     // broken current class. Apply it before inspecting the current binding so
     // an idle actor can repair itself on its next dispatch (#626).
