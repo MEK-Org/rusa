@@ -141,6 +141,7 @@ async function readBound(
   const { runId, kind, attempt } = request;
   if (kind === "prompt" && attempt === undefined) {
     const localLatest = deps.local.latestPromptAttempt(actorId, runId);
+    if (localLatest === "integrity") return { read: { status: "integrity" }, source: "leader" };
     const remote = await deps.remote(host, actorId, request);
     // The leader's copy wins only over a host attempt known to be older, or a
     // host-missing latest whose allocated key it has retained. A host answer

@@ -167,10 +167,14 @@ export class RunMaterialStore {
     return { bytes: content.length, sha256: hash };
   }
 
-  /** The newest allocated prompt attempt for the run, if it can be discovered. */
-  latestPromptAttempt(actorId: string, runId: string): number | undefined {
+  /**
+   * The newest allocated prompt attempt for the run, if it can be discovered.
+   * An invalid counter is reported as `"integrity"`, as `read` reports it.
+   */
+  latestPromptAttempt(actorId: string, runId: string): number | "integrity" | undefined {
     const dir = this.runDir(actorId, runId);
-    let latest = this.readCounter(dir);
+    let latest = this.readCounterForRead(dir);
+    if (latest === "integrity") return latest;
     for (const name of this.list(dir) ?? []) {
       const match = PROMPT_FILE.exec(name);
       if (match) latest = Math.max(latest, Number(match[1]));
@@ -196,7 +200,9 @@ export class RunMaterialStore {
     let wanted = candidates;
     let latest: number | undefined;
     if (kind === "prompt") {
-      latest = this.readCounter(dir);
+      const counter = this.readCounterForRead(dir);
+      if (counter === "integrity") return { status: "integrity" };
+      latest = counter;
       for (const candidate of candidates) latest = Math.max(latest, candidate.attempt ?? 0);
       const target = attempt ?? latest;
       wanted = candidates.filter((c) => c.attempt === target);
@@ -306,6 +312,16 @@ export class RunMaterialStore {
       return value;
     } catch (err) {
       if (errorCode(err) === "ENOENT" || errorCode(err) === "ENOTDIR") return 0;
+      throw err;
+    }
+  }
+
+  /** Reservation refuses an invalid counter; a read reports it as an integrity outcome. */
+  private readCounterForRead(dir: string): number | "integrity" {
+    try {
+      return this.readCounter(dir);
+    } catch (err) {
+      if (err instanceof RunMaterialIntegrityError) return "integrity";
       throw err;
     }
   }

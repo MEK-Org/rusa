@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -217,6 +217,21 @@ describe("readRunMaterial", () => {
       status: 502,
       body: { error: "integrity", source: "host" },
     });
+  });
+
+  it("answers an invalid leader counter as an integrity failure", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rusa-leader-material-"));
+    dirs.push(dir);
+    const root = join(dir, "run-material", "v1");
+    const d = deps({ local: new RunMaterialStore(root) });
+    d.local.putPrompt("worker", RUN, 1, "fallback");
+    writeFileSync(join(root, "worker", RUN, "attempt"), "0\n");
+
+    expect(await readRunMaterial(d, "worker", RUN, "prompt")).toEqual({
+      status: 502,
+      body: { error: "integrity", source: "leader" },
+    });
+    expect(d.asked).toEqual([]);
   });
 
   it("does not replace an unavailable newest allocation with an older fallback", async () => {

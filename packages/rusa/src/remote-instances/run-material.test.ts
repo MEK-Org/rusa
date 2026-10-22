@@ -126,6 +126,17 @@ describe("RunMaterialStore", () => {
     });
   });
 
+  it("reports an invalid counter as integrity on reads and refuses it for reservation", () => {
+    const dir = root();
+    const store = new RunMaterialStore(dir);
+    store.putPrompt("actor-a", RUN, store.reservePromptAttempt("actor-a", RUN), "first");
+    writeFileSync(join(dir, "actor-a", RUN, "attempt"), "not a number\n");
+
+    expect(store.read("actor-a", RUN, "prompt")).toEqual({ status: "integrity" });
+    expect(store.latestPromptAttempt("actor-a", RUN)).toBe("integrity");
+    expect(() => store.reservePromptAttempt("actor-a", RUN)).toThrow(RunMaterialReservationError);
+  });
+
   it("refuses a counter write before it can return a prompt key", () => {
     const dir = root();
     let failCounter = false;
