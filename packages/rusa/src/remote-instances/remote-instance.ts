@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
 import type { ActorChannel } from "./actor-channel.js";
@@ -13,8 +13,16 @@ import type {
   FollowerUpdateStatusEvent,
   FollowerUpdateStatusPhase,
   LeaderCommand,
+  MaterialReadReply,
 } from "./protocol.js";
 import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
+import {
+  MATERIAL_READ_TIMEOUT_MS,
+  MATERIAL_READS_PER_HOST,
+  RUN_MATERIAL_READ_MAX_BYTES,
+  type RunMaterialKind,
+  type RunMaterialRead,
+} from "./run-material.js";
 
 /**
  * First protocol whose followers run `fileOp` (#1013). A capability floor, so
@@ -51,6 +59,97 @@ function parseFileOpResult(value: unknown): FollowerFileOperationResult | undefi
     ...(typeof candidate.name === "string" ? { name: candidate.name } : {}),
     ...(typeof candidate.contentType === "string" ? { contentType: candidate.contentType } : {}),
   };
+}
+
+/** Why a run's execution host cannot answer a material read now; retrying later may. */
+export type MaterialReadUnavailableReason =
+  | "offline"
+  | "unsupported"
+  | "busy"
+  | "timeout"
+  | "disconnected";
+
+export class MaterialReadUnavailableError extends Error {
+  constructor(
+    readonly reason: MaterialReadUnavailableReason,
+    message: string
+  ) {
+    super(message);
+    this.name = "MaterialReadUnavailableError";
+  }
+}
+
+export interface MaterialReadRequest {
+  runId: string;
+  kind: RunMaterialKind;
+  attempt?: number;
+}
+
+/**
+ * Check a follower's material reply against the leader's own limits: an `ok`
+ * whose decoded bytes do not match its length and digest is an integrity
+ * failure, whatever the follower claimed.
+ */
+function parseMaterialReadReply(
+  value: unknown,
+  request: MaterialReadRequest
+): RunMaterialRead | { status: "error"; error: string } {
+  const reply = value as Partial<Record<string, unknown>> | null;
+  // A prompt answer names its attempt, the one asked for when one was.
+  const attemptFits = (attempt: unknown) =>
+    request.kind !== "prompt" ||
+    (Number.isSafeInteger(attempt) &&
+      (attempt as number) >= 1 &&
+      (request.attempt === undefined || attempt === request.attempt));
+  const isRef = (r: Partial<Record<string, unknown>>) =>
+    Number.isSafeInteger(r.bytes) &&
+    (r.bytes as number) >= 0 &&
+    typeof r.sha256 === "string" &&
+    SHA256_HEX.test(r.sha256);
+  switch (reply?.status) {
+    case "missing":
+    case "integrity":
+      return { status: reply.status };
+    case "error":
+      return { status: "error", error: String(reply.error ?? "unknown error") };
+    case "tooLarge":
+      if (!isRef(reply) || !attemptFits(reply.attempt)) break;
+      return {
+        status: "tooLarge",
+        ...(request.kind === "prompt" ? { attempt: reply.attempt as number } : {}),
+        bytes: reply.bytes as number,
+        sha256: reply.sha256 as string,
+      };
+    case "ok": {
+      if (!isRef(reply) || typeof reply.content !== "string") break;
+      if ((reply.bytes as number) > RUN_MATERIAL_READ_MAX_BYTES) break;
+      if (!attemptFits(reply.attempt)) break;
+      const attempt = reply.attempt;
+      const content = Buffer.from(reply.content, "base64");
+      if (
+        content.length !== reply.bytes ||
+        createHash("sha256").update(content).digest("hex") !== reply.sha256
+      ) {
+        return { status: "integrity" };
+      }
+      return {
+        status: "ok",
+        ...(request.kind === "prompt" ? { attempt: attempt as number } : {}),
+        bytes: content.length,
+        sha256: reply.sha256 as string,
+        content,
+      };
+    }
+  }
+  return { status: "error", error: "malformed material read reply" };
+}
+
+interface PendingMaterialRead {
+  actorId: string;
+  request: MaterialReadRequest;
+  resolve: (result: RunMaterialRead | { status: "error"; error: string }) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 interface PendingFileOp {
@@ -142,6 +241,9 @@ export class RemoteInstance {
   /** Latest parked-head report; undefined until a follower that reports one polls (#880). */
   parkedEvent?: FollowerParkedEvent | null;
   private readonly fileOps = new Map<string, PendingFileOp>();
+  /** Set when this generation offered bounded execution and the hub echoed it (#1020). */
+  boundedExecution = false;
+  private readonly materialReads = new Map<string, PendingMaterialRead>();
 
   constructor(
     readonly id: string,
@@ -299,6 +401,74 @@ export class RemoteInstance {
     else pending.reject(new Error(`Follower ${this.id} returned a malformed file result`));
   }
 
+  /**
+   * Read one retained original of an actor's run from this follower (#1020).
+   * Rejects with {@link MaterialReadUnavailableError} when this generation did
+   * not negotiate bounded execution, already has
+   * {@link MATERIAL_READS_PER_HOST} reads in flight, does not answer within
+   * {@link MATERIAL_READ_TIMEOUT_MS}, or closes first.
+   */
+  materialRead(
+    actorId: string,
+    request: MaterialReadRequest
+  ): Promise<RunMaterialRead | { status: "error"; error: string }> {
+    if (!this.boundedExecution) {
+      return Promise.reject(
+        new MaterialReadUnavailableError(
+          "unsupported",
+          `Follower ${this.id} did not negotiate bounded execution`
+        )
+      );
+    }
+    if (this.materialReads.size >= MATERIAL_READS_PER_HOST) {
+      return Promise.reject(
+        new MaterialReadUnavailableError(
+          "busy",
+          `Follower ${this.id} already has ${MATERIAL_READS_PER_HOST} material reads in flight`
+        )
+      );
+    }
+    const requestId = randomUUID();
+    const result = new Promise<RunMaterialRead | { status: "error"; error: string }>(
+      (resolve, reject) => {
+        const timer = setTimeout(() => {
+          this.materialReads.delete(requestId);
+          reject(
+            new MaterialReadUnavailableError(
+              "timeout",
+              `Follower ${this.id} did not answer the material read within ${MATERIAL_READ_TIMEOUT_MS / 1000}s`
+            )
+          );
+        }, MATERIAL_READ_TIMEOUT_MS);
+        timer.unref?.();
+        this.materialReads.set(requestId, { actorId, request, resolve, reject, timer });
+      }
+    );
+    this.commands.push({
+      actorId,
+      message: {
+        type: "materialRead",
+        requestId,
+        runId: request.runId,
+        kind: request.kind,
+        ...(request.attempt === undefined ? {} : { attempt: request.attempt }),
+      },
+    });
+    this.flush();
+    return result;
+  }
+
+  private settleMaterialRead(
+    actorId: string,
+    message: { requestId: string; result: MaterialReadReply }
+  ): void {
+    const pending = this.materialReads.get(message.requestId);
+    if (!pending || pending.actorId !== actorId) return;
+    this.materialReads.delete(message.requestId);
+    clearTimeout(pending.timer);
+    pending.resolve(parseMaterialReadReply(message.result, pending.request));
+  }
+
   receive(event: {
     actorId: string;
     message:
@@ -331,6 +501,10 @@ export class RemoteInstance {
     }
     if (event.message.type === "fileOpResult") {
       this.settleFileOp(event.actorId, event.message);
+      return;
+    }
+    if (event.message.type === "materialReadResult") {
+      this.settleMaterialRead(event.actorId, event.message);
       return;
     }
     this.hosts
@@ -375,6 +549,16 @@ export class RemoteInstance {
       pending.reject(new Error(`Follower ${this.id} disconnected during a file operation`));
     }
     this.fileOps.clear();
+    for (const pending of this.materialReads.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(
+        new MaterialReadUnavailableError(
+          "disconnected",
+          `Follower ${this.id} disconnected during a material read`
+        )
+      );
+    }
+    this.materialReads.clear();
   }
 }
 

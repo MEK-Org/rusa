@@ -11,9 +11,10 @@ import { projectActorRunLaunchConfig } from "../actor/run-accounting.js";
 import type { ActorRunMode } from "../actor/trigger-runner.js";
 import type { FollowerRepositories } from "../db/repositories/index.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
-import type { CodingProvider, McpServerSpec } from "../providers/types.js";
+import type { CodingProvider, McpServerSpec, RunResult } from "../providers/types.js";
 import {
   type ActorEvent,
+  BOUNDED_EXECUTION_CAPABILITY,
   type Bootstrap,
   COORDINATOR_ADMISSION_CANCELLED_ERROR,
   COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
@@ -23,6 +24,13 @@ import {
   type Request,
   type RunSnapshot,
 } from "./protocol.js";
+import { boundedCompleteFits, boundRunResult, type RunMaterialStore } from "./run-material.js";
+
+/** This host's run material store and whether the current leader negotiated bounded execution (#1020). */
+export interface RunMaterialOptions {
+  store: RunMaterialStore;
+  enabled: () => boolean;
+}
 
 type AdmitRequest = Extract<Request, { op: "admit" }>;
 
@@ -32,7 +40,8 @@ export function createActorRuntime(
   send: (message: ActorEvent) => void,
   onClosed: () => void,
   computerUseLock?: ComputerUseLock,
-  repositories?: FollowerRepositories
+  repositories?: FollowerRepositories,
+  material?: RunMaterialOptions
 ) {
   let actor: Actor | undefined;
   let sequence = 0;
@@ -67,6 +76,8 @@ export function createActorRuntime(
    */
   let interruptedAdmission = false;
   const mcpServers: McpServerSpec[] = [];
+  /** Runs bound to this host at start: their material is retained here (#1020). */
+  const boundRuns = new Set<string>();
   function finishClose(): void {
     if (stopping && !closed && activeGates === 0 && !terminalAccountingPending) {
       closed = true;
@@ -89,6 +100,45 @@ export function createActorRuntime(
         error instanceof Error ? error.message : String(error)
       }`,
     });
+  }
+
+  /**
+   * A bound run's material went to the leader in full. The event itself says
+   * so (`runPrompt.attempt`, or a `complete` without `outputBound`); this
+   * reports why.
+   */
+  function reportMaterialFallback(
+    item: "prompt" | "output" | "envelope",
+    runId: string,
+    error?: unknown
+  ): void {
+    const reason =
+      item === "envelope"
+        ? "the bounded completion exceeds its envelope"
+        : `retaining the ${item} failed: ${error instanceof Error ? error.message : String(error)}`;
+    send({
+      type: "error",
+      error: `Run material fallback for run ${runId}: ${reason}; sent in full`,
+    });
+  }
+
+  /** Retain a bound run's output and bound its result, or keep the full result. */
+  function completionFor(actorId: string, runId: string, result: RunResult): RunResult {
+    if (!material) return result;
+    try {
+      const bounded = boundRunResult(
+        result,
+        material.store.putOutput(actorId, runId, result.output)
+      );
+      // A leader that stopped negotiating since the run started gets the
+      // full result; the original is retained here regardless.
+      if (!material.enabled()) return result;
+      if (boundedCompleteFits(bounded)) return bounded;
+      reportMaterialFallback("envelope", runId);
+    } catch (error) {
+      reportMaterialFallback("output", runId, error);
+    }
+    return result;
   }
 
   function request<T>(payload: Request): { id: number; result: Promise<T> } {
@@ -361,20 +411,55 @@ export function createActorRuntime(
                 reportLocalAccountingFailure("start", event.runId, error);
               }
             }
+            // A run is bound to this host for its whole life by the leader
+            // that saw it start; prompts and output then stay here.
+            const bound = material?.enabled() === true;
+            if (bound) {
+              boundRuns.add(event.runId);
+              material?.store.openRun(bootstrap.id, event.runId);
+            }
             send({
               type: "runStart",
               responsive: event.responsive,
               injectRecord: event.injectRecord,
               selected: event.selected,
               runId: event.runId,
+              ...(bound ? { material: BOUNDED_EXECUTION_CAPABILITY } : {}),
             });
           },
           onPrompt: (event) => {
-            send({
-              type: "runPrompt",
-              runId: event.runId,
-              prompt: event.prompt,
-            });
+            if (material && boundRuns.has(event.runId)) {
+              let attempt: number | undefined;
+              try {
+                // Allocated before the write, so a failed write still spends it.
+                attempt = material.store.nextPromptAttempt(bootstrap.id, event.runId);
+                const ref = material.store.putPrompt(
+                  bootstrap.id,
+                  event.runId,
+                  attempt,
+                  event.prompt
+                );
+                send(
+                  material.enabled()
+                    ? { type: "runPromptRef", runId: event.runId, attempt, ...ref }
+                    : { type: "runPrompt", runId: event.runId, prompt: event.prompt, attempt }
+                );
+              } catch (error) {
+                send({
+                  type: "runPrompt",
+                  runId: event.runId,
+                  prompt: event.prompt,
+                  ...(attempt === undefined ? {} : { attempt }),
+                });
+                reportMaterialFallback("prompt", event.runId, error);
+              }
+            } else {
+              send({
+                type: "runPrompt",
+                runId: event.runId,
+                prompt: event.prompt,
+              });
+            }
             if (repositories) {
               try {
                 repositories.runPrompts.recordForActor(bootstrap.id, event.runId, event.prompt);
@@ -389,6 +474,7 @@ export function createActorRuntime(
               error: event.error instanceof Error ? event.error.message : String(event.error),
             }),
           onEnd: (event) => {
+            const bound = boundRuns.delete(event.runId);
             try {
               if (event.terminal.kind === "abandoned") {
                 if (repositories && event.terminal.started) {
@@ -418,9 +504,12 @@ export function createActorRuntime(
                   reportLocalAccountingFailure("terminal", event.runId, error);
                 }
               }
-              if (!stopping)
-                return request<void>({ op: "complete", result: event.terminal.result }).result;
+              const result = bound
+                ? completionFor(bootstrap.id, event.runId, event.terminal.result)
+                : event.terminal.result;
+              if (!stopping) return request<void>({ op: "complete", result }).result;
             } finally {
+              if (bound) material?.store.closeRun(bootstrap.id, event.runId);
               terminalAccountingPending = false;
               finishClose();
             }

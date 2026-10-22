@@ -154,6 +154,7 @@ export interface DashboardMeshRefs {
   /** Completed selection intervals used to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
   runPrompts?: RunPromptRepository;
+  runMaterial?: DashboardDataDeps["runMaterial"];
   portableContext?: DashboardDataDeps["portableContext"];
   /** Durable per-entry obligation associations for activity correlation. */
   inboxFocus?: InboxFocusRepository;
@@ -372,19 +373,20 @@ export function createDashboardRequestHandler(
       )
         return;
       beginDashboardRoutePhase();
-      // #866: complete prompts are available in sole-email/local mode only.
+      // #866: complete prompts (and, #1020, outputs) are available in sole-email/local mode only.
+      const runMaterialPath = /^\/api\/mesh\/runs\/[^/]+\/(prompt|output)$/.exec(pathname);
       // Keep allowlist refusal at the established auth boundary, before storage reads.
       // allowedEmails also fails closed for an unvalidated adapter object with both fields.
       // Auth-disabled mode with several active users cannot identify its viewer (#590).
       if (
         req.method === "GET" &&
-        /^\/api\/mesh\/runs\/[^/]+\/prompt$/.test(pathname) &&
+        runMaterialPath &&
         (auth
           ? !auth.config?.email || Boolean(auth.config.allowedEmails)
           : localViewerIsAmbiguous(dataDeps?.principals))
       ) {
         res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
-        res.end(JSON.stringify({ error: "prompt not retained" }));
+        res.end(JSON.stringify({ error: `${runMaterialPath[1]} not retained` }));
         return;
       }
       if (auth && (pathname === "/api/mesh/stream" || pathname === "/api/mesh/voice/stream")) {
@@ -671,6 +673,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           resolveActorId: options.mesh.resolveActorId,
           actorRuns: options.mesh.actorRuns,
           runPrompts: options.mesh.runPrompts,
+          runMaterial: options.mesh.runMaterial,
           portableContext: options.mesh.portableContext,
           inboxFocus: options.mesh.inboxFocus,
           sseHub,

@@ -31,11 +31,21 @@ export interface ActorLifecycleQueuedEvent extends ActorLifecycleRunEvent {
 export interface ActorLifecycleStartEvent extends ActorLifecycleQueuedEvent {
   injectRecord?: InjectRecord;
   selected: RawProviderModelConfig;
+  /**
+   * Set when the run's prompts and output are retained on its execution host
+   * (#1020): `host` is the follower that started it, where they are read from.
+   */
+  material?: { version: 1; host: string };
 }
 
 /** Internal observation only: never added to mesh_events or run logs. */
 export interface ActorLifecyclePromptEvent extends ActorLifecycleRunEvent {
   prompt: string;
+  /**
+   * The prompt's retention key on a run bound to its host (#1020). Present
+   * only when the host could not retain it and sent it in full instead.
+   */
+  attempt?: number;
 }
 
 export interface ActorLifecycleErrorEvent extends ActorLifecycleRunEvent {

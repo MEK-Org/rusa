@@ -26,12 +26,25 @@ import type {
   LeaderCommand,
 } from "./protocol.js";
 import {
+  BOUNDED_EXECUTION_CAPABILITY,
   FOLLOWER_HTTP_BODY_LIMIT_BYTES,
   INSTANCE_PROTOCOL_VERSION,
   OLDEST_FOLLOWER_PROTOCOL_VERSION,
 } from "./protocol.js";
-import { FollowerDedupeTracker, RemoteInstance } from "./remote-instance.js";
+import {
+  FollowerDedupeTracker,
+  type MaterialReadRequest,
+  MaterialReadUnavailableError,
+  RemoteInstance,
+} from "./remote-instance.js";
+import type { RunMaterialRead } from "./run-material.js";
 import { isSafeFollowerBind } from "./safe-bind.js";
+
+/** Whether a `/register` body offers the bounded execution this leader speaks (#1020). */
+function offersBoundedExecution(body: Record<string, unknown>): boolean {
+  const offer = body.boundedExecution as { version?: unknown } | null | undefined;
+  return typeof offer === "object" && offer !== null && offer.version === 1;
+}
 
 export interface FollowerInfo {
   id: string;
@@ -370,6 +383,20 @@ export class FollowerHub {
     }
     return follower.fileOp(actorId, operation);
   }
+  /** Read one retained original from the follower that executed the run (#1020). */
+  materialRead(
+    followerId: string,
+    actorId: string,
+    request: MaterialReadRequest
+  ): Promise<RunMaterialRead | { status: "error"; error: string }> {
+    const follower = this.followers.get(followerId);
+    if (!follower) {
+      return Promise.reject(
+        new MaterialReadUnavailableError("offline", `Follower ${followerId} is not connected`)
+      );
+    }
+    return follower.materialRead(actorId, request);
+  }
   stopActor(followerId: string, actorId: string): void {
     const follower = this.followers.get(followerId);
     if (!follower) return;
@@ -611,11 +638,16 @@ export class FollowerHub {
               this.log.warn("follower_register_listener_error", { followerId: existing.id, err });
             }
           }
+          // The same process offers the same capabilities; answer them again.
+          existing.boundedExecution = offersBoundedExecution(body);
           reply(res, 200, {
             session: existing.session,
             protocolVersion: existing.protocolVersion,
             leaderToken: this.leaderToken,
             eventTransfer: this.eventTransfers.capability,
+            ...(existing.boundedExecution
+              ? { boundedExecution: BOUNDED_EXECUTION_CAPABILITY }
+              : {}),
           });
           return;
         }
@@ -639,6 +671,7 @@ export class FollowerHub {
         body.generation,
         FollowerHub.STALE_AFTER_MS
       );
+      follower.boundedExecution = offersBoundedExecution(body);
       this.followers.set(follower.id, follower);
       this.staleFollowerIds.delete(follower.id);
       this.log.info("follower_connected", {
@@ -660,6 +693,7 @@ export class FollowerHub {
         protocolVersion,
         leaderToken: this.leaderToken,
         eventTransfer: this.eventTransfers.capability,
+        ...(follower.boundedExecution ? { boundedExecution: BOUNDED_EXECUTION_CAPABILITY } : {}),
       });
       return;
     }

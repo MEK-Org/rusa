@@ -93,10 +93,18 @@ interface SourceCursor {
 /** Match the historical run_end capture bound while moving authority off the event log. */
 export const ACTOR_RUN_OUTPUT_MAX_CHARS = 40_000;
 
-export function captureRunOutput(output: string | null | undefined): string | null {
+/**
+ * `omittedChars` counts code units already cut from the front of `output` by a
+ * bounded completion (#1020), so a tail renders exactly as its original would.
+ */
+export function captureRunOutput(
+  output: string | null | undefined,
+  omittedChars = 0
+): string | null {
   if (output == null) return null;
-  if (output.length <= ACTOR_RUN_OUTPUT_MAX_CHARS) return output;
-  const dropped = output.length - ACTOR_RUN_OUTPUT_MAX_CHARS;
+  const total = output.length + omittedChars;
+  if (total <= ACTOR_RUN_OUTPUT_MAX_CHARS) return output;
+  const dropped = total - ACTOR_RUN_OUTPUT_MAX_CHARS;
   return `… [${dropped.toLocaleString()} earlier chars truncated]\n${output.slice(-ACTOR_RUN_OUTPUT_MAX_CHARS)}`;
 }
 
@@ -154,6 +162,8 @@ export class ActorRunRepository {
       success: boolean;
       exitCode: number;
       output: string;
+      /** Code units a bounded completion already cut from the front of `output`. */
+      outputOmittedChars?: number;
       yieldStatus?: string;
       yieldNote?: string;
     }
@@ -176,7 +186,7 @@ export class ActorRunRepository {
         endedAt,
         opts.success ? 1 : 0,
         opts.exitCode,
-        captureRunOutput(opts.output),
+        captureRunOutput(opts.output, opts.outputOmittedChars),
         opts.yieldStatus ?? null,
         yieldNote,
         opts.yieldStatus ?? null,

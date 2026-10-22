@@ -23,6 +23,9 @@ import { RunPromptRepository } from "../db/repositories/run-prompt-repository.js
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 
 import { ReferenceCacheService } from "../references/cache-service.js";
+import { MaterialReadUnavailableError } from "../remote-instances/remote-instance.js";
+import type { RunMaterialRead } from "../remote-instances/run-material.js";
+import { RunMaterialStore } from "../remote-instances/run-material.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { VoiceService } from "../voice/voice-service.js";
 import { attachVoiceOutbound } from "../voice/wiring.js";
@@ -412,6 +415,74 @@ describe("human chat isolation (#590)", () => {
     expect(unavailable).toBe(JSON.stringify({ error: "prompt not retained" }));
     expect(unavailable).not.toContain("Synthetic charter");
     expect(prompts.getById(runId)?.prompt).toBe(prompt);
+  });
+
+  it("#1020 reads a bound run's originals from its recorded host behind the #866 boundary", async () => {
+    const home = mkdtempSync(join(tmpdir(), "rusa-run-material-dashboard-"));
+    try {
+      const asked: string[] = [];
+      let answer: () => Promise<RunMaterialRead> = async () => ({ status: "missing" });
+      deps.actorRuns = new ActorRunRepository(db);
+      deps.runMaterial = {
+        local: new RunMaterialStore(join(home, "run-material", "v1")),
+        remote: (host, actorId, request) => {
+          asked.push(`${host}/${actorId}/${request.kind}/${request.attempt ?? "latest"}`);
+          return answer();
+        },
+      };
+      const runId = deps.actorRuns.start({
+        actorId: ACTOR,
+        modelConfig: createActorRunModelConfig({ provider: "claude", model: "fixture" }),
+      });
+      meshEvents.record({
+        kind: "run_start",
+        actorId: ACTOR,
+        payload: JSON.stringify({ runId, material: { version: 1, host: "mac" } }),
+      });
+      const output = `Synthetic output ✓\r\n${"o".repeat(300_000)}`;
+      const content = Buffer.from(output, "utf8");
+      const path = `/api/mesh/runs/${runId}/output`;
+
+      // allowedEmails viewers are refused before any host is asked.
+      const a = await login(alice);
+      const refused = await fetch(origin + path, { headers: { Cookie: a.cookie } });
+      expect(refused.status).toBe(404);
+      expect(await refused.text()).toBe(JSON.stringify({ error: "output not retained" }));
+      expect(asked).toEqual([]);
+
+      server.removeAllListeners("request");
+      server.on("request", createDashboardRequestHandler({ port: 0 }, deps));
+      answer = async () => ({
+        status: "ok",
+        bytes: content.length,
+        sha256: "a".repeat(64),
+        content,
+      });
+      const served = await fetch(origin + path);
+      expect(served.status).toBe(200);
+      expect(await served.json()).toEqual({
+        output,
+        bytes: content.length,
+        sha256: "a".repeat(64),
+        source: "host",
+      });
+      expect(asked).toEqual([`mac/${ACTOR}/output/latest`]);
+      for (const bad of [`${path}?attempt=1`, `/api/mesh/runs/${runId}/prompt?attempt=0`]) {
+        const response = await fetch(origin + bad);
+        expect(response.status).toBe(400);
+      }
+      answer = () => Promise.reject(new MaterialReadUnavailableError("busy", "full"));
+      const busy = await fetch(origin + path);
+      expect(busy.status).toBe(503);
+      expect(busy.headers.get("retry-after")).toBe("1");
+      expect(await busy.json()).toEqual({
+        error: "materialHostUnavailable",
+        host: "mac",
+        reason: "busy",
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   /** Two humans each talk to the actor and the actor answers each of them. */

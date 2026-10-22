@@ -30,6 +30,20 @@ export const EVENT_TRANSFER_CAPABILITY: EventTransferCapability = {
   maxFragmentBytes: 1024 * 1024,
 };
 
+/**
+ * Negotiated bounded execution (#1020). A follower that retains its runs'
+ * prompts and output on its own disk offers it on `/register`; the leader
+ * echoes it only if it understands it. Only then does the follower bind runs
+ * to itself (`runStart.material`), send `runPromptRef` instead of a prompt and
+ * a bounded `complete`, and answer `materialRead`. It is additive and does
+ * not change the protocol version: either side without it keeps sending and
+ * receiving full text.
+ */
+export interface BoundedExecutionCapability {
+  version: 1;
+}
+export const BOUNDED_EXECUTION_CAPABILITY: BoundedExecutionCapability = { version: 1 };
+
 /** One fragment of an event transfer, posted to `/events/transfer`. */
 export interface EventTransferFragment {
   transferId: string;
@@ -232,7 +246,27 @@ export type LeaderCommand =
   | { type: "stop" }
   | { type: "reply"; requestId: number; value?: unknown; error?: string }
   /** v9: run one provider download for this actor; answered by `fileOpResult`. */
-  | { type: "fileOp"; requestId: string; operation: FollowerFileOperation };
+  | { type: "fileOp"; requestId: string; operation: FollowerFileOperation }
+  /**
+   * Bounded execution: read one retained original of this actor's run on this
+   * host; answered by `materialReadResult`. Without `attempt` a prompt read
+   * returns the latest attempt.
+   */
+  | {
+      type: "materialRead";
+      requestId: string;
+      runId: string;
+      kind: "prompt" | "output";
+      attempt?: number;
+    };
+
+/** A follower's answer to `materialRead`; `content` is the original's bytes in base64. */
+export type MaterialReadReply =
+  | { status: "ok"; attempt?: number; bytes: number; sha256: string; content: string }
+  | { status: "missing" }
+  | { status: "tooLarge"; attempt?: number; bytes: number; sha256: string }
+  | { status: "integrity" }
+  | { status: "error"; error: string };
 
 export type ActorEvent =
   | { type: "ready"; pid: number }
@@ -258,8 +292,19 @@ export type ActorEvent =
       /** The candidate this run actually launched on, for leader-side accounting. */
       selected: RawProviderModelConfig;
       runId?: string;
+      /**
+       * Bounded execution: this run's prompts and output are retained on the
+       * sending host, which is where the leader reads them from.
+       */
+      material?: BoundedExecutionCapability;
     }
-  | { type: "runPrompt"; runId: string; prompt: string }
+  /**
+   * The full prompt. On a run bound to its host, `attempt` is the prompt's
+   * retention key and the event is the fallback when the host could not retain it.
+   */
+  | { type: "runPrompt"; runId: string; prompt: string; attempt?: number }
+  /** Bounded execution: the prompt is retained on the host under this attempt. */
+  | { type: "runPromptRef"; runId: string; attempt: number; bytes: number; sha256: string }
   | { type: "firstChunk" }
   | { type: "abandoned"; abandon: RunAbandon }
   | { type: "coalesced"; count: number; ageMs: number }
@@ -271,7 +316,9 @@ export type ActorEvent =
       requestId: string;
       result?: FollowerFileOperationResult;
       error?: string;
-    };
+    }
+  /** Bounded execution: the answer to `materialRead`. */
+  | { type: "materialReadResult"; requestId: string; result: MaterialReadReply };
 
 export type FollowerUpdateStatusPhase =
   | "pending"

@@ -1,6 +1,9 @@
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
-import type { ActorLifecyclePromptEvent } from "../actor/actor-lifecycle.js";
+import type {
+  ActorLifecycleListener,
+  ActorLifecyclePromptEvent,
+} from "../actor/actor-lifecycle.js";
 import { ActorMesh, type ActorMeshOptions } from "../actor/actor-mesh.js";
 import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
 import { COMPUTER_USE_CAPABILITY } from "../actor/computer-use-lock.js";
@@ -19,7 +22,9 @@ import type { LogFields, Logger } from "../observability/logger.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { ActorHandle } from "./actor-handle.js";
+import type { RunMaterialOptions } from "./actor-runtime.js";
 import { createProvider } from "./fixture-provider.js";
+import type { FollowerEvent } from "./follower-hub.js";
 import { FollowerInstance } from "./follower-instance.js";
 import type { ActorEvent, ProviderFactory } from "./protocol.js";
 import { RemoteInstance } from "./remote-instance.js";
@@ -54,18 +59,32 @@ export function createHarness(options: {
   responsiveInterruption?: ActorMeshOptions["responsiveInterruption"];
   responsiveInterruptionMode?: ActorMeshOptions["responsiveInterruptionMode"];
   repositories?: FollowerRepositories;
+  /** The follower's run material (#1020); its leader negotiates it whenever it is enabled. */
+  material?: RunMaterialOptions;
+  /** Further leader-side lifecycle listeners, one set per actor. */
+  lifecycle?: (actorId: string) => ActorLifecycleListener;
 }) {
   const promptEvents: ActorLifecyclePromptEvent[] = [];
   const actors = new InMemoryActorRepository();
   const runtimes = new Map<string, ActorHandle>();
-  let remote = new RemoteInstance("test-follower", process.platform, process.pid);
+  const newRemote = () => {
+    const instance = new RemoteInstance("test-follower", process.platform, process.pid);
+    instance.boundedExecution = options.material?.enabled() === true;
+    return instance;
+  };
+  let remote = newRemote();
   const remotes = [remote];
+  /** Every follower→leader event, as the wire would carry it. */
+  const followerEvents: FollowerEvent[] = [];
   const follower = new FollowerInstance(
     options.cwd,
     false,
-    (event) => queueMicrotask(() => remote.receive(structuredClone(event))),
+    (event) => {
+      followerEvents.push(structuredClone(event));
+      queueMicrotask(() => remote.receive(structuredClone(event)));
+    },
     options.providerFactory ?? createProvider,
-    { repositories: options.repositories }
+    { repositories: options.repositories, material: options.material }
   );
   // Exercise the same instance commands without opening a port in unit tests.
   const wire = (instance: RemoteInstance) => {
@@ -172,6 +191,7 @@ export function createHarness(options: {
     createActor: (context) => {
       let cursor = 0;
       let admittedCursor = 0;
+      if (options.lifecycle) context.lifecycle.add(options.lifecycle(context.record.id));
       context.lifecycle.add({
         onPrompt: (event) => {
           promptEvents.push(event);
@@ -285,6 +305,7 @@ export function createHarness(options: {
     runtimes,
     messages,
     promptEvents,
+    followerEvents,
     events,
     meshEvents,
     logs,
@@ -296,7 +317,7 @@ export function createHarness(options: {
       return remote;
     },
     reconnect() {
-      remote = new RemoteInstance("test-follower", process.platform, process.pid);
+      remote = newRemote();
       remotes.push(remote);
       wire(remote);
       return remote;

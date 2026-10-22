@@ -48,6 +48,11 @@ import {
   type ResolvedReferenceWithEntity,
   resolveReferenceSync,
 } from "../references/resolve.js";
+import {
+  type RunMaterialReaderDeps,
+  readRunMaterial,
+} from "../remote-instances/leader-run-material.js";
+import type { RunMaterialKind } from "../remote-instances/run-material.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type {
   InboxEntry,
@@ -99,6 +104,11 @@ export interface DashboardDataDeps {
   /** Completed selection intervals used only to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
   runPrompts?: RunPromptRepository;
+  /**
+   * Retained run originals (#1020): the leader's own store and a read from a
+   * run's recorded execution host. Absent → only `run_prompts` is served.
+   */
+  runMaterial?: Pick<RunMaterialReaderDeps, "local" | "remote">;
   portableContext?: Pick<PortableContextStore, "load"> &
     Pick<PortableBriefStore, "listBriefRevisions">;
   /** Durable per-entry obligation associations for activity correlation. */
@@ -2571,15 +2581,42 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  // Complete launch text is fetched on demand through the existing dashboard access path.
-  const runPromptMatch = /^\/api\/mesh\/runs\/([^/]+)\/prompt$/.exec(pathname);
-  if (runPromptMatch && req.method === "GET") {
-    const retained = deps.runPrompts?.getById(decodeURIComponent(runPromptMatch[1]));
-    if (!retained) {
-      sendJson(res, 404, { error: "prompt not retained" });
+  // Complete launch text and output are fetched on demand through the existing
+  // dashboard access path (#866); a bound run's originals come from the host
+  // recorded at its start (#1020). `?attempt=N` names one prompt attempt.
+  const runMaterialMatch = /^\/api\/mesh\/runs\/([^/]+)\/(prompt|output)$/.exec(pathname);
+  if (runMaterialMatch && req.method === "GET") {
+    const runId = decodeURIComponent(runMaterialMatch[1]);
+    const kind = runMaterialMatch[2] as RunMaterialKind;
+    const attemptParam = url.searchParams.get("attempt");
+    if (attemptParam !== null && (kind === "output" || !/^[1-9]\d{0,8}$/.test(attemptParam))) {
+      sendJson(res, 400, { error: "Invalid attempt" });
       return true;
     }
-    sendJson(res, 200, { prompt: retained.prompt });
+    const attempt = attemptParam === null ? undefined : Number(attemptParam);
+    const legacyPrompt = (id: string) => deps.runPrompts?.getById(id)?.prompt;
+    const actorId = deps.actorRuns?.getById(runId)?.actorId;
+    if (!actorId || !deps.runMaterial) {
+      const prompt = kind === "prompt" && attempt === undefined ? legacyPrompt(runId) : undefined;
+      if (prompt === undefined) sendJson(res, 404, { error: `${kind} not retained` });
+      else sendJson(res, 200, { prompt });
+      return true;
+    }
+    const response = await readRunMaterial(
+      {
+        ...deps.runMaterial,
+        runActor: () => actorId,
+        binding: (owner, id) => meshEvents.getRunMaterialBinding(owner, id),
+        legacyPrompt,
+      },
+      actorId,
+      runId,
+      kind,
+      attempt
+    );
+    if (response.retryAfter !== undefined)
+      res.setHeader("Retry-After", String(response.retryAfter));
+    sendJson(res, response.status, response.body);
     return true;
   }
 

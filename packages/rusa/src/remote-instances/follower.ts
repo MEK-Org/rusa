@@ -23,10 +23,12 @@ import { FollowerInstance } from "./follower-instance.js";
 import { isFullCommitSha } from "./follower-update-validation.js";
 import { executeFollowerUpdate, FollowerBuildRunner } from "./follower-updater.js";
 import {
+  type BoundedExecutionCapability,
   type EventTransferCapability,
   type FollowerUpdateCommand,
   INSTANCE_PROTOCOL_VERSION,
 } from "./protocol.js";
+import { FollowerRunMaterial } from "./run-material.js";
 
 const { values } = parseArgs({
   options: {
@@ -87,6 +89,10 @@ try {
   );
 }
 
+// Prompts and output of runs executed here stay here once the leader
+// negotiates bounded execution (#1020).
+const runMaterial = new FollowerRunMaterial(root);
+runMaterial.startSweeping((err) => log.warn("run_material_sweep_failed", { err }));
 const instance = new FollowerInstance(
   root,
   values.sandbox === "bwrap",
@@ -94,7 +100,10 @@ const instance = new FollowerInstance(
   undefined,
   // This follower's own Google credentials, never the leader's (#1013). This
   // entry point loads no config, so they are always in the default directory.
-  { fileOps: createFollowerFileOps({ credentialDir: defaultGchatConfigDir() }) }
+  {
+    fileOps: createFollowerFileOps({ credentialDir: defaultGchatConfigDir() }),
+    material: runMaterial.options,
+  }
 );
 // A registration can renew after an HTTP fault. It identifies this running
 // process, not its short-lived server session or the reusable enrollment token.
@@ -229,12 +238,14 @@ async function run(): Promise<void> {
           protocolVersion: number;
           leaderToken?: string;
           eventTransfer?: EventTransferCapability;
+          boundedExecution?: BoundedExecutionCapability;
         }>("/register", {
           platform: process.platform,
           pid: process.pid,
           generation,
           protocolVersion: INSTANCE_PROTOCOL_VERSION,
           commitSha: tryGetCommitSha(repoRoot),
+          boundedExecution: runMaterial.offer,
         });
         if (registration.protocolVersion !== INSTANCE_PROTOCOL_VERSION)
           throw new Error("Incompatible instance protocol; rebuild leader and follower");
@@ -248,6 +259,7 @@ async function run(): Promise<void> {
         }
         leaderToken = registration.leaderToken;
         session = registration.session;
+        runMaterial.accept(registration.boundedExecution);
         eventTransfer = httpEventTransferSender(
           registration.eventTransfer,
           (fragment) => request("/events/transfer", fragment),
