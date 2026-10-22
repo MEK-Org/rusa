@@ -23,6 +23,7 @@ import {
   type LeaderCommand,
   type RunSnapshot,
 } from "./protocol.js";
+import { parseOutputBound } from "./run-material.js";
 
 export interface ActorHandleOptions {
   host: ActorChannel;
@@ -953,6 +954,24 @@ export class ActorHandle implements MeshActor {
     });
   }
 
+  /**
+   * A bounded completion's counts drive what the leader records (#1020), so
+   * only a well-formed bound survives; a malformed one is dropped and the
+   * output it came with is taken as the whole output.
+   */
+  private checkedResult(result: RunResult): RunResult {
+    if (result.outputBound === undefined) return result;
+    const outputBound = parseOutputBound(result);
+    if (outputBound) return { ...result, outputBound };
+    this.log.warn("remote_run_output_bound_invalid", {
+      actorId: this.id,
+      runId: this.startedRunId,
+      target: this.opts.target ?? this.channel.nodeId,
+    });
+    const { outputBound: _dropped, ...whole } = result;
+    return whole;
+  }
+
   private send(message: LeaderCommand): boolean {
     if (!this.channel.connected) return false;
     return this.channel.send(message, (error) => {
@@ -1100,6 +1119,11 @@ export class ActorHandle implements MeshActor {
           mode: this.queuedMode ?? "ordinary",
           injectRecord: message.injectRecord,
           selected: message.selected,
+          // The run is bound to the follower that started it, never to
+          // whatever the actor targets later.
+          ...(message.material?.version === 1 && this.channel.nodeId
+            ? { material: { version: 1 as const, host: this.channel.nodeId } }
+            : {}),
         });
       case "runPrompt":
         if (message.runId !== this.startedRunId) return;
@@ -1107,7 +1131,22 @@ export class ActorHandle implements MeshActor {
           actorId: this.id,
           runId: message.runId,
           prompt: message.prompt,
+          ...(Number.isSafeInteger(message.attempt) && (message.attempt as number) > 0
+            ? { attempt: message.attempt }
+            : {}),
         });
+      case "runPromptRef":
+        // The prompt stays on the host that ran it (#1020); only its key travels.
+        if (message.runId !== this.startedRunId) return;
+        this.log.info("remote_run_prompt_ref", {
+          actorId: this.id,
+          runId: message.runId,
+          target: this.opts.target ?? this.channel.nodeId,
+          attempt: message.attempt,
+          bytes: message.bytes,
+          sha256: message.sha256,
+        });
+        break;
       case "firstChunk":
         hooks?.onFirstChunk?.();
         break;
@@ -1166,8 +1205,9 @@ export class ActorHandle implements MeshActor {
                 });
               })();
             case "complete": {
-              this.opts.onEvent?.({ type: "result", result: request.result });
-              const endResult = this.endRun(request.result);
+              const result = this.checkedResult(request.result);
+              this.opts.onEvent?.({ type: "result", result });
+              const endResult = this.endRun(result);
               if (endResult && typeof (endResult as Promise<void>).then === "function") {
                 return (endResult as Promise<void>).then(() => {
                   this.send({ type: "reply", requestId });

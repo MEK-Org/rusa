@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-
 // The set of event kinds is authored once, in the actor layer (which owns the
 // observability seam and has no db dependency); the repository re-exports it so
 // producers and this reader can't drift. A failed run is a `run_end` with
@@ -8,6 +7,7 @@ import type Database from "better-sqlite3";
 // *forwarding* is the failure-sink's job). This is a type-only import: no
 // runtime coupling from db → actor.
 import type { MeshEventKind } from "../../actor/mesh-events.js";
+import { clampTail } from "./actor-run-repository.js";
 export type { MeshEventKind };
 
 /** An appended mesh event (camelCase domain object). */
@@ -55,6 +55,17 @@ export interface RunStartPayload {
   model?: string;
   /** Durable actor_runs identity for this execution. */
   runId?: string;
+  /**
+   * Bounded execution (#1020): the run's prompts and output are retained on
+   * `host`, the follower that started it. Absent when the leader holds them.
+   */
+  material?: RunMaterialBinding;
+}
+
+/** Where a run's retained material lives; version 1 names the executing follower. */
+export interface RunMaterialBinding {
+  version: 1;
+  host: string;
 }
 
 export interface RunStartEvent extends MeshEvent<RunStartPayload> {
@@ -82,12 +93,8 @@ export interface RunSelectedEvent extends MeshEvent<RunSelectedPayload> {
 /** Largest body we persist per event; longer text is tail-truncated. */
 const MAX_BODY_CHARS = 40_000;
 
-function clampBody(body: string | null | undefined): string | null {
-  if (body == null) return null;
-  if (body.length <= MAX_BODY_CHARS) return body;
-  const dropped = body.length - MAX_BODY_CHARS;
-  // Keep the tail — for a run that's the result/summary, the most useful part.
-  return `… [${dropped.toLocaleString()} earlier chars truncated]\n${body.slice(-MAX_BODY_CHARS)}`;
+function clampBody(body: string | null | undefined, omittedChars = 0): string | null {
+  return clampTail(body, MAX_BODY_CHARS, omittedChars);
 }
 
 /** Append-only data access for the `mesh_events` table. */
@@ -103,6 +110,8 @@ export class MeshEventRepository {
     body?: string | null;
     payload?: string | null;
     success?: boolean | null;
+    /** Code units a bounded completion already cut from the front of `body` (#1020). */
+    bodyOmittedChars?: number;
     /** Override the stamp (tests); defaults to now. */
     ts?: string;
   }): string {
@@ -118,7 +127,7 @@ export class MeshEventRepository {
         opts.kind,
         opts.actorId ?? null,
         opts.detail ?? null,
-        clampBody(opts.body),
+        clampBody(opts.body, opts.bodyOmittedChars),
         opts.payload ?? null,
         opts.success == null ? null : opts.success ? 1 : 0
       );
@@ -378,6 +387,36 @@ export class MeshEventRepository {
         payload: JSON.parse(row.payload ?? "{}") as RunStartPayload,
       };
     });
+  }
+
+  /**
+   * The material binding a run's `run_start` recorded (#1020), or undefined
+   * when it recorded none. `run_start` rows are never pruned, so the binding
+   * outlives the material it points to.
+   */
+  getRunMaterialBinding(actorId: string, runId: string): RunMaterialBinding | undefined {
+    const rows = this.db
+      .prepare(
+        `SELECT json_extract(payload, '$.material') AS material
+         FROM (
+           SELECT payload FROM mesh_events
+           WHERE actor_id = ? AND kind = 'run_start' AND json_valid(payload)
+         )
+         WHERE json_extract(payload, '$.runId') = ?`
+      )
+      .all(actorId, runId) as { material: string | null }[];
+    for (const row of rows) {
+      if (!row.material) continue;
+      try {
+        const parsed = JSON.parse(row.material) as Partial<RunMaterialBinding>;
+        if (parsed.version === 1 && typeof parsed.host === "string" && parsed.host) {
+          return { version: 1, host: parsed.host };
+        }
+      } catch {
+        // A malformed payload binds nothing.
+      }
+    }
+    return undefined;
   }
 
   /**

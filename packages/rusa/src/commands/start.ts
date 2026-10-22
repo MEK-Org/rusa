@@ -340,11 +340,19 @@ import { FollowerHub } from "../remote-instances/follower-hub.js";
 import type { FollowerInstance } from "../remote-instances/follower-instance.js";
 import { registerFollowerRegistrationRecovery } from "../remote-instances/follower-registration-recovery.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
+import { runMaterialListener } from "../remote-instances/leader-run-material.js";
 import type {
   FollowerFileOperation,
   FollowerFileOperationResult,
   ProviderFactory,
 } from "../remote-instances/protocol.js";
+import { MaterialReadUnavailableError } from "../remote-instances/remote-instance.js";
+import {
+  outputOmittedChars,
+  RUN_MATERIAL_ROOT,
+  RUN_MATERIAL_SWEEP_INTERVAL_MS,
+  RunMaterialStore,
+} from "../remote-instances/run-material.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 import { constructActorFromInvocation } from "../runtime/actor-invocation.js";
 import {
@@ -2134,6 +2142,10 @@ async function composeStart(
     runId ? actorRunLog.child({ actorId, runId }) : actorRunLog.child({ actorId });
 
   const meshEventLog = log.child({ component: "mesh-events" });
+  // This leader's own run material: what a bound run's host sent in full
+  // because it could not keep it (#1020).
+  const runMaterial = new RunMaterialStore(join(mcHome, RUN_MATERIAL_ROOT));
+  const runMaterialLog = log.child({ component: "run-material" });
   const meshEvents: MeshEventSink = (e) => {
     const id = getRepositories().meshEvents.record(e);
     try {
@@ -3179,6 +3191,16 @@ async function composeStart(
     // Which entry actually ran, for the failure-notice label. A declared pool
     // can move while idle, so this is captured at lifecycle start.
     let lastSelected = firstSelected;
+    // A run bound to its execution host keeps its originals there; only an
+    // unbound run's prompt goes to `run_prompts` (#1020).
+    lifecycle.add(
+      runMaterialListener(
+        id,
+        runMaterial,
+        (runId, prompt) => getRepositories().runPrompts.recordForActor(id, runId, prompt),
+        runMaterialLog
+      )
+    );
     lifecycle.add({
       onStart: (event) => {
         lastSelected = event.selected;
@@ -3197,9 +3219,6 @@ async function composeStart(
       },
     });
     lifecycle.add({
-      onPrompt: (event) => {
-        getRepositories().runPrompts.recordForActor(id, event.runId, event.prompt);
-      },
       onQueued: (event) => {
         mesh.recordEvent({
           kind: "run_queued",
@@ -3228,6 +3247,7 @@ async function composeStart(
             effort: launchConfig.effort,
             responsive: event.responsive,
             runId: event.runId,
+            ...(event.material ? { material: event.material } : {}),
           }),
         });
       },
@@ -3265,6 +3285,7 @@ async function composeStart(
           success: result.success,
           detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
           body: result.output,
+          bodyOmittedChars: outputOmittedChars(result),
           payload: runEndPayload({ ...result, runId: event.runId }),
         });
       },
@@ -4688,6 +4709,15 @@ async function composeStart(
           resolveActorId: (id) => (id === "root" ? (rootId ?? id) : id),
           actorRuns: getRepositories().actorRuns,
           runPrompts: getRepositories().runPrompts,
+          runMaterial: {
+            local: runMaterial,
+            remote: (host, actorId, request) =>
+              followerHub
+                ? followerHub.materialRead(host, actorId, request)
+                : Promise.reject(
+                    new MaterialReadUnavailableError("offline", "no follower hub is listening")
+                  ),
+          },
           portableContext: getRepositories().portableContext,
           inboxFocus: getRepositories().inboxFocus,
           referenceCache: new ReferenceCacheService({
@@ -5296,6 +5326,15 @@ async function composeStart(
   };
   pruneRunPrompts();
   everyInterval("run prompt retention", pruneRunPrompts, 60 * 60 * 1000);
+  const sweepRunMaterial = () => {
+    try {
+      runMaterial.sweep();
+    } catch (err) {
+      runMaterialLog.warn("run_material_sweep_failed", { err });
+    }
+  };
+  sweepRunMaterial();
+  everyInterval("run material retention", sweepRunMaterial, RUN_MATERIAL_SWEEP_INTERVAL_MS);
   // The interval handle says nothing about a probe already in flight, so keep
   // both a way to stop one (the signal) and a way to wait for it (the promise).
   // Acquired before the probe interval, so the interval stops first and no new

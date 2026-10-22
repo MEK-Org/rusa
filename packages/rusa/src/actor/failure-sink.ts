@@ -215,7 +215,8 @@ export async function routeRunFailure(
     deps.log(`suppressing expected responsive preemption notice for ${actorId}`);
     return;
   }
-  const diagnostic = failureDiagnostic(result);
+  // A bounded completion (#1020) carries the diagnostic of its full output.
+  const diagnostic = result.outputBound?.failureDiagnostic ?? failureDiagnostic(result);
   const exitDesc = result.abortReason
     ? `exit ${result.exitCode}, ${result.abortReason}`
     : `exit ${result.exitCode}`;

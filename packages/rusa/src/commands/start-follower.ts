@@ -26,10 +26,12 @@ import {
   type FollowerGitSeam,
 } from "../remote-instances/follower-updater.js";
 import {
+  type BoundedExecutionCapability,
   type EventTransferCapability,
   type FollowerUpdateCommand,
   INSTANCE_PROTOCOL_VERSION,
 } from "../remote-instances/protocol.js";
+import { FollowerRunMaterial } from "../remote-instances/run-material.js";
 import type { ResourceScope } from "../runtime/resource-scope.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
 import {
@@ -321,6 +323,13 @@ export async function composeFollowerStart(
     }
   }
 
+  // Prompts and output of runs executed here stay here once the leader
+  // negotiates bounded execution (#1020).
+  const runMaterial = new FollowerRunMaterial(mcHome);
+  const stopMaterialSweep = runMaterial.startSweeping((err) =>
+    log.warn("run_material_sweep_failed", { err })
+  );
+  resources.acquire("runMaterialSweep", stopMaterialSweep);
   const instance = new FollowerInstance(
     mcHome,
     config.sandbox === "bwrap",
@@ -336,6 +345,7 @@ export async function composeFollowerStart(
       fileOps: createFollowerFileOps({
         credentialDir: config.chat?.gchatConfigDir ?? defaultGchatConfigDir(),
       }),
+      material: runMaterial.options,
     }
   );
   resources.acquire("followerInstance", async () => {
@@ -385,6 +395,7 @@ export async function composeFollowerStart(
         protocolVersion: number;
         leaderToken?: string;
         eventTransfer?: EventTransferCapability;
+        boundedExecution?: BoundedExecutionCapability;
       }>("/register", {
         platform: process.platform,
         pid: process.pid,
@@ -392,6 +403,7 @@ export async function composeFollowerStart(
         protocolVersion: INSTANCE_PROTOCOL_VERSION,
         // The leader's update reconciliation compares this with its target.
         ...(release.runningSha ? { commitSha: release.runningSha } : {}),
+        boundedExecution: runMaterial.offer,
       });
       if (reg.protocolVersion !== INSTANCE_PROTOCOL_VERSION) {
         log.warn("follower_protocol_mismatch", {
@@ -411,6 +423,7 @@ export async function composeFollowerStart(
       }
       session = reg.session;
       if (reg.leaderToken) leaderToken = reg.leaderToken;
+      runMaterial.accept(reg.boundedExecution);
       eventTransfer = httpEventTransferSender(
         reg.eventTransfer,
         (fragment) => request("/events/transfer", fragment),
