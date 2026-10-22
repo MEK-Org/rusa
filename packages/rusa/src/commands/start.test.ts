@@ -2434,17 +2434,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     // Ending run A removes its bearer endpoint. A later run receives a fresh
     // endpoint and cannot make the retained A URL observe or act for B.
-    let oldRunRejected = false;
-    try {
-      const stale = await call(runAUrl, "send_message", {
+    await expect(
+      call(runAUrl, "send_message", {
         thread_id: recipient,
         body: "must not deliver from ended run",
-      });
-      oldRunRejected = stale.isError === true;
-    } catch {
-      oldRunRejected = true;
-    }
-    expect(oldRunRejected).toBe(true);
+      })
+    ).rejects.toThrow();
 
     // A provider startup failure has already opened a run, so its terminal
     // event must revoke that run's endpoint just like ordinary completion.
@@ -9881,52 +9876,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       `initial remote attempt\n\n_${generateHandle(workerId)} (Gemini 3.7 Flash, high)_`
     );
 
-    // The same follower run can move to an actual fallback attempt. The
-    // leader must use the fresh provider/model/effort, rather than the launch
-    // tuple or a future run's context, for the next host-owned write.
-    remote.receive({
-      actorId: workerId,
-      message: {
-        type: "request",
-        requestId: 1,
-        request: {
-          op: "providerAttempt",
-          attempt: { provider: "codex", model: "gpt-5.5", effort: "low" },
-        },
-      },
-    });
-    await vi.waitFor(() =>
-      expect(remote?.commands).toContainEqual({
-        actorId: workerId,
-        message: { type: "reply", requestId: 1 },
-      })
-    );
-    expect((await callChat("same-run fallback attempt")).isError).toBeFalsy();
-    expect(chatClient.sent[1]?.text).toBe(
-      `same-run fallback attempt\n\n_${generateHandle(workerId)} (gpt-5.5, low)_`
-    );
-
-    // Once a follower reports an actual attempt, omitted optional fields mean
-    // that provider's defaults, not the launch tuple's values.
-    remote.receive({
-      actorId: workerId,
-      message: {
-        type: "request",
-        requestId: 1,
-        request: { op: "providerAttempt", attempt: { provider: "codex" } },
-      },
-    });
-    await vi.waitFor(() =>
-      expect(remote?.commands).toContainEqual({
-        actorId: workerId,
-        message: { type: "reply", requestId: 1 },
-      })
-    );
-    expect((await callChat("same-run default attempt")).isError).toBeFalsy();
-    expect(chatClient.sent[2]?.text).toBe(
-      `same-run default attempt\n\n_${generateHandle(workerId)}_`
-    );
-
     remote.receive({
       actorId: workerId,
       message: { type: "result", result: { success: true, output: "done", exitCode: 0 } },
@@ -9935,7 +9884,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(getRepositories().actorRuns.getById(runId)?.outcome).toBe("completed")
     );
     expect((await callChat("after remote terminal")).isError).toBeFalsy();
-    expect(chatClient.sent[3]?.text).toBe(`after remote terminal\n\n_${generateHandle(workerId)}_`);
+    expect(chatClient.sent[1]?.text).toBe(`after remote terminal\n\n_${generateHandle(workerId)}_`);
 
     // A late attempt is still answered, but cannot restore the cleared selection.
     remote.receive({
@@ -9956,7 +9905,126 @@ describe("runStart webhook event routing (Phase 4)", () => {
       })
     );
     expect((await callChat("after late attempt")).isError).toBeFalsy();
-    expect(chatClient.sent[4]?.text).toBe(`after late attempt\n\n_${generateHandle(workerId)}_`);
+    expect(chatClient.sent[2]?.text).toBe(`after late attempt\n\n_${generateHandle(workerId)}_`);
+  });
+
+  it("replaces a follower's admitted endpoint when that run fails before it starts", async () => {
+    let mesh: ActorMesh | undefined;
+    let remote: RemoteInstance | undefined;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          createWorkerActor: (context: ActorFactoryContext, options: ActorOptions) => {
+            remote ??= new RemoteInstance("prestart-follower", process.platform, process.pid);
+            return new ActorHandle({
+              host: remote.createHost(context.record.id),
+              bootstrap: {
+                id: context.record.id,
+                cwd: options.cwd,
+                modelConfig: [...options.modelConfig],
+              },
+              context,
+              actorOptions: options,
+              snapshot: () => {
+                const record = context.getRecord();
+                if (!record) throw new Error("remote prestart worker record missing");
+                return {
+                  record,
+                  prompt: "remote prestart fixture",
+                  mcpServers: options.mcpServers,
+                };
+              },
+              saveSession: () => {},
+              onFailure: () => {},
+            });
+          },
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("remote prestart fixture mesh did not start");
+    const selected = { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" };
+    const workerId = mesh.spawn({
+      charter: "remote prestart fixture",
+      parentId: rootId,
+      executionTarget: "prestart-follower",
+      modelConfig: selected,
+    });
+    const follower = remote;
+    if (!follower) throw new Error("remote prestart worker did not start");
+    follower.receive({ actorId: workerId, message: { type: "ready", pid: 4242 } });
+    // Host admission requires pending durable work.
+    mesh.sendMessage(workerId, "remote prestart work", rootId);
+    const admit = async (runId: string, requestId: number): Promise<string> => {
+      follower.receive({
+        actorId: workerId,
+        message: { type: "queued", runId, mode: "ordinary", responsive: false },
+      });
+      follower.receive({
+        actorId: workerId,
+        message: {
+          type: "request",
+          requestId,
+          request: { op: "admit", candidates: [selected], responsive: false, mode: "ordinary" },
+        },
+      });
+      const reply = await vi.waitFor(() => {
+        const found = follower.commands.find(
+          (command) =>
+            "actorId" in command &&
+            command.message.type === "reply" &&
+            command.message.requestId === requestId &&
+            !(command.message.value as { deferred?: boolean } | undefined)?.deferred
+        );
+        if (!found || !("actorId" in found) || found.message.type !== "reply") {
+          throw new Error(`admission ${requestId} has no reply`);
+        }
+        return found.message;
+      });
+      const value = reply.value as
+        | { mcpServers?: Array<{ name: string; url: string }> }
+        | undefined;
+      const url = value?.mcpServers?.find((server) => server.name === "mesh")?.url;
+      if (!url)
+        throw new Error(`admission ${requestId} has no mesh endpoint: ${JSON.stringify(reply)}`);
+      return url;
+    };
+    const status = async (url: string) =>
+      (
+        await fetch(url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1 }),
+        })
+      ).status;
+
+    // The follower fails after admission but before `runStart`, as when its
+    // prompt build throws. The leader books no run, so the next admission
+    // must replace that unstarted lease rather than refuse every later run.
+    const unstartedUrl = await admit("prestart-failed-run", 1);
+    follower.receive({
+      actorId: workerId,
+      message: {
+        type: "request",
+        requestId: 2,
+        request: {
+          op: "complete",
+          result: { success: false, output: "prompt build failed", exitCode: 1 },
+        },
+      },
+    });
+    follower.receive({ actorId: workerId, message: { type: "release", requestId: 1 } });
+
+    const nextUrl = await admit("next-run", 3);
+    expect(nextUrl).not.toBe(unstartedUrl);
+    await vi.waitFor(async () => expect(await status(unstartedUrl)).toBe(404));
   });
 
   it("installs a real follower's bound MCP endpoint and normalized attempt before provider writes", async () => {

@@ -2921,8 +2921,9 @@ async function composeStart(
   // latest boundary every provider CLI can reliably consume MCP configuration.
   const liveWorkerMcp = new Map<string, McpServerSpec[]>();
   // Agent-exec endpoints are leases, not actor resources: each URL is bound to
-  // one run and is removed before that run's durable accounting closes.
-  const runAgentMcpNames = new Map<string, Set<string>>();
+  // one run and is removed before that run's durable accounting closes. Each
+  // actor holds at most one lease; this releases it on actor teardown.
+  const runAgentMcpReleases = new Map<string, () => Promise<void>>();
   const refreshLiveActorMcp = (actorId: string): void => {
     const workerMcp = liveWorkerMcp.get(actorId);
     if (!workerMcp) return;
@@ -2941,18 +2942,9 @@ async function composeStart(
 
   // Tear down resources the mesh doesn't own: the per-actor MCP endpoints.
   const teardownActorMcp = (actorId: string) => {
-    const workerMcp = liveWorkerMcp.get(actorId);
-    const runNames = runAgentMcpNames.get(actorId);
-    runAgentMcpNames.delete(actorId);
-    if (runNames) {
-      for (const name of runNames) {
-        if (workerMcp) {
-          const index = workerMcp.findIndex((server) => server.name === AGENT_EXEC_MCP_NAME);
-          if (index >= 0) workerMcp.splice(index, 1);
-        }
-        void mcpHttp.removeServer(name);
-      }
-    }
+    const releaseRunAgentMcp = runAgentMcpReleases.get(actorId);
+    runAgentMcpReleases.delete(actorId);
+    void releaseRunAgentMcp?.();
     liveWorkerMcp.delete(actorId);
     void mcpHttp.removeServer(`${actorId}:${BRIEF_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${INBOX_MCP_NAME}`);
@@ -4060,12 +4052,32 @@ async function composeStart(
               revoke: () => void;
             }
           | undefined;
+        const releaseRunAgentMcp = async (): Promise<void> => {
+          const mounted = runAgentMcp;
+          if (!mounted) return;
+          runAgentMcp = undefined;
+          // Revoke before closing transports. A concurrent tool invocation
+          // cannot stamp or send after the exact run reaches terminal state.
+          mounted.revoke();
+          const index = workerMcp.findIndex(
+            (server) => server.name === AGENT_EXEC_MCP_NAME && server.url === mounted.url
+          );
+          if (index >= 0) workerMcp.splice(index, 1);
+          await mcpHttp.removeServer(mounted.name);
+        };
+        runAgentMcpReleases.set(id, releaseRunAgentMcp);
         const mountRunAgentMcp = (runId: string): void => {
           if (runAgentMcp?.runId === runId) return;
           if (runAgentMcp) {
-            throw new Error(
-              `actor ${id} tried to mount agent execution for ${runId} while ${runAgentMcp.runId} is still active`
-            );
+            if (runAccounting.activeRunId(id) === runAgentMcp.runId) {
+              throw new Error(
+                `actor ${id} tried to mount agent execution for ${runId} while ${runAgentMcp.runId} is still active`
+              );
+            }
+            // A follower can fail after admission but before `runStart`. The
+            // leader then books no run and emits no end, so that unstarted
+            // lease, whose reader already rejects, is replaced here.
+            void releaseRunAgentMcp();
           }
           const lease = bindRunContext(id, runId, (): Readonly<ActiveRunContext> | undefined => {
             if (runAccounting.activeRunId(id) !== runId) return undefined;
@@ -4114,9 +4126,6 @@ async function composeStart(
               voices: () => supportedVoiceCatalog,
             })
           );
-          const actorRunNames = runAgentMcpNames.get(id) ?? new Set<string>();
-          actorRunNames.add(name);
-          runAgentMcpNames.set(id, actorRunNames);
           workerMcp.push({ name: AGENT_EXEC_MCP_NAME, url });
           runAgentMcp = { runId, name, url, revoke: lease.revoke };
         };
@@ -4126,18 +4135,7 @@ async function composeStart(
             mountRunAgentMcp(event.runId);
           },
           onEnd: async (event) => {
-            if (!runAgentMcp || runAgentMcp.runId !== event.runId) return;
-            const mounted = runAgentMcp;
-            runAgentMcp = undefined;
-            // Revoke before closing transports. A concurrent tool invocation
-            // cannot stamp or send after the exact run reaches terminal state.
-            mounted.revoke();
-            const index = workerMcp.findIndex(
-              (server) => server.name === AGENT_EXEC_MCP_NAME && server.url === mounted.url
-            );
-            if (index >= 0) workerMcp.splice(index, 1);
-            runAgentMcpNames.get(id)?.delete(mounted.name);
-            await mcpHttp.removeServer(mounted.name);
+            if (runAgentMcp?.runId === event.runId) await releaseRunAgentMcp();
           },
         });
         const externalRoot =
