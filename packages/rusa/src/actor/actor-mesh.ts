@@ -108,6 +108,7 @@ import {
   NOOP_MESH_EVENT_SINK,
   RUN_TERMINAL_EVENT_KINDS,
 } from "./mesh-events.js";
+import { type MessageStamp, stampHuman } from "./message-stamp.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "./os-scheduler.js";
 import {
   type ResponsiveInterruptionVerdict,
@@ -577,12 +578,6 @@ export interface RetireCleanup {
 export interface ActorMeshOptions {
   actors: ActorRepository;
   principals?: PrincipalRepository;
-  /**
-   * The effective responsive state of an actor's currently selected inbox
-   * obligation. The host owns this projection: actors cannot provide a
-   * message priority themselves.
-   */
-  responsiveForActorMessage?: (actorId: string) => boolean;
   /** This account/subtree's root id. Also backs the grandfathered `"root"` address alias. */
   rootId?: string;
   /** Builds a live Actor for a thread record (resolves provider/cwd/mcp/session). */
@@ -953,7 +948,6 @@ export class ActorMesh {
     responsive?: boolean;
     responsiveReason?: string;
   }) => string;
-  private readonly responsiveForActorMessage?: (actorId: string) => boolean;
   readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
   private readonly experiments: ExperimentEnrollmentStore;
@@ -1162,7 +1156,6 @@ export class ActorMesh {
     ];
     this.events = opts.events ?? NOOP_MESH_EVENT_SINK;
     this.recordChat = opts.recordChat;
-    this.responsiveForActorMessage = opts.responsiveForActorMessage;
     this.voiceTransferLog = opts.voiceTransferLogger ?? nullLogger;
     this.scheduledMessages = opts.scheduledMessages;
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
@@ -4286,22 +4279,19 @@ export class ActorMesh {
     fromId: string,
     sessionId?: string,
     deliverAt?: string,
-    options: { voice?: boolean } = {}
+    options: { voice?: boolean; messageStamp?: MessageStamp } = {}
   ): MessageDeliveryResult {
     toId = this.resolveThreadId(toId);
     fromId = this.resolveThreadId(fromId);
     const humanSender = this.principals?.getUser(fromId);
     if (humanSender?.disabledAt) throw new Error("Message sender is disabled");
-    // An immutable creation-time snapshot. Actor tools provide neither a
-    // priority nor an obligation id; only the host can project their active
-    // run's selected obligation. Human ingress follows this same path.
-    const responsive =
-      humanSender !== undefined || this.responsiveForActorMessage?.(fromId) === true;
-    const responsiveReason = humanSender
-      ? "human message"
-      : responsive
-        ? "responsive obligation"
-        : undefined;
+    // An immutable creation-time snapshot. A user is stamped by the shared
+    // ingress policy; actor endpoints can only supply a host-created stamp
+    // bound to their current run, never a caller-provided priority or
+    // obligation id.
+    const stamp = humanSender ? stampHuman() : options.messageStamp;
+    const responsive = stamp?.responsive ?? false;
+    const responsiveReason = stamp?.responsiveReason;
 
     const humanRecipient = this.principals?.getUser(toId);
     if (humanRecipient) {

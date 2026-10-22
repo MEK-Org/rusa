@@ -45,6 +45,7 @@ import {
 import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { RootModelConfigStartupError } from "../actor/root-model-config.js";
+import type { ActiveRunContext, BoundRunContextReader } from "../actor/run-context.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import type { RusaConfig } from "../config/types.js";
@@ -2073,6 +2074,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       return actor;
     };
 
+    const rootRunId = await startLifecycleRun(root, {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+
     // The retired experiment is gone from the live surface: only the live
     // registry (#1062) is listed, and the retired name can no longer be
     // enrolled. Strict closure needs neither.
@@ -2087,6 +2094,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         })
       ).isError
     ).toBe(true);
+    await endLifecycleRun(root, rootRunId, { success: true, output: "", exitCode: 0 });
 
     // Attention arrives the way production delivers it: creating the obligation
     // moves each worker's ready head, and runStart's ready-head listener routes
@@ -2281,7 +2289,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(returnRejections(direct)).toEqual([]);
   }, 10_000);
 
-  it("stamps an actor message from its selected obligation's inherited responsiveness", async () => {
+  it("binds the actor message endpoint to one run through rejected, failed, cancelled, and completed lifecycles", async () => {
     let mesh: ActorMesh | undefined;
     let root: Actor | undefined;
     await new Promise<void>((resolve) => {
@@ -2311,6 +2319,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!url) throw new Error(`${server} MCP server missing`);
       return url;
     };
+    const hasAgentExec = (actor: Actor) =>
+      (actor as unknown as { opts: LiveActorOptions }).opts.mcpServers.some(
+        (entry) => entry.name === "mesh"
+      );
     const call = async (url: string, name: string, args: Record<string, unknown>) => {
       const client = new Client({ name: "message-priority-dogfood", version: "0.0.0" });
       await client.connect(new StreamableHTTPClientTransport(new URL(url)));
@@ -2344,6 +2356,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
       parentId: responsiveParent.id,
     });
     expect(getRepositories().obligations.require(selected.id).effectiveResponsive).toBe(true);
+    // An admission that never reaches onStart must not acquire a run bearer.
+    const rejectedRunId = randomUUID();
+    await actorOf(sender).lifecycle.emit("onQueued", {
+      actorId: sender,
+      runId: rejectedRunId,
+      responsive: false,
+      mode: "ordinary",
+    });
+    await abandonLifecycleRun(actorOf(sender), rejectedRunId, "start-cancelled", false);
+    expect(hasAgentExec(actorOf(sender))).toBe(false);
 
     const runId = await startLifecycleRun(actorOf(sender), {
       provider: "antigravity",
@@ -2382,8 +2404,101 @@ describe("runStart webhook event routing (Phase 4)", () => {
       getRepositories().meshChat.getById(String(received?.payload.messageId))?.responsive
     ).toBe(true);
 
+    // The same selected entry must be read dynamically at send time. Moving it
+    // below an ordinary parent changes the next stamp without selecting again.
+    const ordinaryParent = getRepositories().obligations.create({
+      title: "ordinary parent",
+      ownerId: sender,
+    });
+    getRepositories().obligations.reparent(selected.id, ordinaryParent.id, sender);
+    expect(getRepositories().obligations.require(selected.id).effectiveResponsive).toBe(false);
+    const runAUrl = urlOf(actorOf(sender), "mesh");
+    expect(
+      (
+        await call(runAUrl, "send_message", {
+          thread_id: recipient,
+          body: "changed inherited responsiveness",
+        })
+      ).isError
+    ).toBeFalsy();
+    const changed = getRepositories()
+      .inbox.list(recipient)
+      .entries.find(
+        (entry) =>
+          getRepositories().meshChat.getById(String(entry.payload.messageId))?.body ===
+          "changed inherited responsiveness"
+      );
+    expect(changed?.payload.priority).toBeUndefined();
+
     getRepositories().obligations.setTerminalStatus(selected.id, "done", null, null, sender);
     await endLifecycleRun(actorOf(sender), runId, { success: true, output: "", exitCode: 0 });
+
+    // Ending run A removes its bearer endpoint. A later run receives a fresh
+    // endpoint and cannot make the retained A URL observe or act for B.
+    await expect(
+      call(runAUrl, "send_message", {
+        thread_id: recipient,
+        body: "must not deliver from ended run",
+      })
+    ).rejects.toThrow();
+
+    // A provider startup failure has already opened a run, so its terminal
+    // event must revoke that run's endpoint just like ordinary completion.
+    const failedRunId = await startLifecycleRun(actorOf(sender), {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    const failedRunUrl = urlOf(actorOf(sender), "mesh");
+    await actorOf(sender).lifecycle.emit("onError", {
+      actorId: sender,
+      runId: failedRunId,
+      error: new Error("provider startup failed"),
+    });
+    await endLifecycleRun(actorOf(sender), failedRunId, {
+      success: false,
+      output: "provider startup failed",
+      exitCode: 1,
+    });
+    await expect(
+      call(failedRunUrl, "send_message", {
+        thread_id: recipient,
+        body: "must not deliver from failed start",
+      })
+    ).rejects.toThrow();
+
+    // A started cancellation is another terminal path and must not leave a
+    // usable endpoint behind.
+    const cancelledRunId = await startLifecycleRun(actorOf(sender), {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    const cancelledRunUrl = urlOf(actorOf(sender), "mesh");
+    await abandonLifecycleRun(actorOf(sender), cancelledRunId, "coalesced", true);
+    await expect(
+      call(cancelledRunUrl, "send_message", {
+        thread_id: recipient,
+        body: "must not deliver from cancellation",
+      })
+    ).rejects.toThrow();
+
+    const runBId = await startLifecycleRun(actorOf(sender), {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    const runBUrl = urlOf(actorOf(sender), "mesh");
+    expect(runBUrl).not.toBe(runAUrl);
+    expect(
+      (
+        await call(runBUrl, "send_message", {
+          thread_id: recipient,
+          body: "run B remains usable",
+        })
+      ).isError
+    ).toBeFalsy();
+    await endLifecycleRun(actorOf(sender), runBId, { success: true, output: "", exitCode: 0 });
   }, 10_000);
 
   describe("root pool fallback is root-only ", () => {
@@ -4564,6 +4679,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     });
     if (!mesh || !root || !rootControl) throw new Error("mesh, root, or root control not ready");
+    const rootRunId = await startLifecycleRun(root, {
+      provider: "claude",
+      model: "claude-sonnet-5",
+    });
     const rootOptions = (
       root as unknown as { opts: { mcpServers: Array<{ name: string; url: string }> } }
     ).opts;
@@ -4595,6 +4714,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect.objectContaining({ provider: "claude", origin: "mesh", createdBy: root.id }),
       expect.objectContaining({ provider: "codex", origin: "mesh", createdBy: root.id }),
     ]);
+    await endLifecycleRun(root, rootRunId, { success: true, output: "", exitCode: 0 });
     // Every configured actor lane is indefinitely mesh-held: neither the root
     // nor the codex worker is admitted, and both pools remain untouched.
     expect(mesh.prepareRun(root.id)).toBe(false);
@@ -4751,6 +4871,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     });
     if (!mesh || !root) throw new Error("mesh or root not ready");
+    const rootRunId = await startLifecycleRun(root, {
+      provider: "claude",
+      model: "claude-sonnet-5",
+    });
     const meshUrl = (
       root as unknown as { opts: { mcpServers: Array<{ name: string; url: string }> } }
     ).opts.mcpServers.find((server) => server.name === "mesh")?.url;
@@ -4926,6 +5050,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await message("/resume provider:codex", "messages/origin-resume-codex-chat-only");
     expect(lastReply()).not.toContain("Still held");
     expect(getRepositories().availabilityHolds.list()).toEqual([]);
+    await endLifecycleRun(root, rootRunId, { success: true, output: "", exitCode: 0 });
     clearProviderModelCatalog();
   });
 
@@ -9784,7 +9909,126 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(chatClient.sent[2]?.text).toBe(`after late attempt\n\n_${generateHandle(workerId)}_`);
   });
 
-  it("installs a real follower's normalized attempt before its provider can write", async () => {
+  it("replaces a follower's admitted endpoint when that run fails before it starts", async () => {
+    let mesh: ActorMesh | undefined;
+    let remote: RemoteInstance | undefined;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          createWorkerActor: (context: ActorFactoryContext, options: ActorOptions) => {
+            remote ??= new RemoteInstance("prestart-follower", process.platform, process.pid);
+            return new ActorHandle({
+              host: remote.createHost(context.record.id),
+              bootstrap: {
+                id: context.record.id,
+                cwd: options.cwd,
+                modelConfig: [...options.modelConfig],
+              },
+              context,
+              actorOptions: options,
+              snapshot: () => {
+                const record = context.getRecord();
+                if (!record) throw new Error("remote prestart worker record missing");
+                return {
+                  record,
+                  prompt: "remote prestart fixture",
+                  mcpServers: options.mcpServers,
+                };
+              },
+              saveSession: () => {},
+              onFailure: () => {},
+            });
+          },
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("remote prestart fixture mesh did not start");
+    const selected = { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" };
+    const workerId = mesh.spawn({
+      charter: "remote prestart fixture",
+      parentId: rootId,
+      executionTarget: "prestart-follower",
+      modelConfig: selected,
+    });
+    const follower = remote;
+    if (!follower) throw new Error("remote prestart worker did not start");
+    follower.receive({ actorId: workerId, message: { type: "ready", pid: 4242 } });
+    // Host admission requires pending durable work.
+    mesh.sendMessage(workerId, "remote prestart work", rootId);
+    const admit = async (runId: string, requestId: number): Promise<string> => {
+      follower.receive({
+        actorId: workerId,
+        message: { type: "queued", runId, mode: "ordinary", responsive: false },
+      });
+      follower.receive({
+        actorId: workerId,
+        message: {
+          type: "request",
+          requestId,
+          request: { op: "admit", candidates: [selected], responsive: false, mode: "ordinary" },
+        },
+      });
+      const reply = await vi.waitFor(() => {
+        const found = follower.commands.find(
+          (command) =>
+            "actorId" in command &&
+            command.message.type === "reply" &&
+            command.message.requestId === requestId &&
+            !(command.message.value as { deferred?: boolean } | undefined)?.deferred
+        );
+        if (!found || !("actorId" in found) || found.message.type !== "reply") {
+          throw new Error(`admission ${requestId} has no reply`);
+        }
+        return found.message;
+      });
+      const value = reply.value as
+        | { mcpServers?: Array<{ name: string; url: string }> }
+        | undefined;
+      const url = value?.mcpServers?.find((server) => server.name === "mesh")?.url;
+      if (!url)
+        throw new Error(`admission ${requestId} has no mesh endpoint: ${JSON.stringify(reply)}`);
+      return url;
+    };
+    const status = async (url: string) =>
+      (
+        await fetch(url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1 }),
+        })
+      ).status;
+
+    // The follower fails after admission but before `runStart`, as when its
+    // prompt build throws. The leader books no run, so the next admission
+    // must replace that unstarted lease rather than refuse every later run.
+    const unstartedUrl = await admit("prestart-failed-run", 1);
+    follower.receive({
+      actorId: workerId,
+      message: {
+        type: "request",
+        requestId: 2,
+        request: {
+          op: "complete",
+          result: { success: false, output: "prompt build failed", exitCode: 1 },
+        },
+      },
+    });
+    follower.receive({ actorId: workerId, message: { type: "release", requestId: 1 } });
+
+    const nextUrl = await admit("next-run", 3);
+    expect(nextUrl).not.toBe(unstartedUrl);
+    await vi.waitFor(async () => expect(await status(unstartedUrl)).toBe(404));
+  });
+
+  it("installs a real follower's bound MCP endpoint and normalized attempt before provider writes", async () => {
     const chatClient = new FakeChatClient();
     writeFileSync(
       join(homeDir, "config.yaml"),
@@ -9804,7 +10048,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     );
     let mesh: ActorMesh | undefined;
     let remote: RemoteInstance | undefined;
-    let leaderOptions: ActorOptions | undefined;
     const followerHome = mkdtempSync(join(tmpdir(), "rusa-signature-follower-"));
     onTestFinished(() => rmSync(followerHome, { recursive: true, force: true }));
     // Follower events reach the leader in order but late, as through
@@ -9813,6 +10056,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // to win the race with.
     let held: Array<() => void> | undefined;
     let providerStarted = false;
+    let meshUrl: string | undefined;
+    let reader: BoundRunContextReader | undefined;
+    let duringProvider: Readonly<ActiveRunContext> | undefined;
     // The follower's own config fills what the admitted tuple omits, as
     // configured-provider.ts does. Each run makes its public write at once.
     const follower = new FollowerInstance(
@@ -9832,19 +10078,31 @@ describe("runStart webhook event routing (Phase 4)", () => {
         effort: selected?.effort ?? "low",
         async run(run) {
           providerStarted = true;
-          const chatUrl = leaderOptions?.mcpServers.find(
-            (server) => server.name === "chat-write"
-          )?.url;
-          if (!chatUrl) throw new Error("remote chat-write server missing");
-          const client = new Client({ name: "remote-signature-follower", version: "0.0.0" });
-          await client.connect(new StreamableHTTPClientTransport(new URL(chatUrl)));
+          duringProvider = reader?.current();
+          meshUrl = run.mcpServers?.find((server) => server.name === "mesh")?.url;
+          if (!meshUrl) throw new Error("remote mesh server missing from run snapshot");
+          const client = new Client({ name: "remote-bound-send", version: "0.0.0" });
+          await client.connect(new StreamableHTTPClientTransport(new URL(meshUrl)));
           try {
-            await client.callTool({
+            const sent = await client.callTool({
+              name: "send_message",
+              arguments: { thread_id: rootId, body: "bound follower send" },
+            });
+            if (sent.isError) throw new Error(`remote bound send failed: ${JSON.stringify(sent)}`);
+          } finally {
+            await client.close();
+          }
+          const chatUrl = run.mcpServers?.find((server) => server.name === "chat-write")?.url;
+          if (!chatUrl) throw new Error("remote chat-write server missing");
+          const chatClient = new Client({ name: "remote-signature-follower", version: "0.0.0" });
+          await chatClient.connect(new StreamableHTTPClientTransport(new URL(chatUrl)));
+          try {
+            await chatClient.callTool({
               name: "send_message",
               arguments: { spaceName: "spaces/A", text: "written at provider start" },
             });
           } finally {
-            await client.close();
+            await chatClient.close();
           }
           return { success: true, output: "done", exitCode: 0, sessionId: run.session?.id };
         },
@@ -9855,8 +10113,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
       void runStart({
         e2e: {
           chatClient,
+          onRunContextBound: (_actorId, _runId, bound) => {
+            reader = bound;
+          },
           createWorkerActor: (context: ActorFactoryContext, options: ActorOptions) => {
-            leaderOptions = options;
             if (!remote) {
               const instance = new RemoteInstance(
                 "signature-follower",
@@ -9882,7 +10142,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
               snapshot: () => {
                 const record = context.getRecord();
                 if (!record) throw new Error("remote signature worker record missing");
-                return { record, prompt: "remote signature fixture" };
+                return {
+                  record,
+                  prompt: "remote signature fixture",
+                  mcpServers: options.mcpServers,
+                };
               },
               saveSession: () => {},
               onFailure: () => {},
@@ -9920,12 +10184,38 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await vi.waitFor(() => expect(held).toBeDefined(), { timeout: 15_000 });
     for (let turn = 0; turn < 5; turn++) await new Promise((resolve) => setImmediate(resolve));
     expect(providerStarted).toBe(false);
+    // Before the follower's attempt lands, the live reader reports the launch
+    // tuple; the attempt then replaces it within the same run.
+    const launched = reader?.current();
+    expect(launched).toMatchObject({ provider: "codex", model: "gpt-5.5" });
+    expect(launched?.effort).toBeUndefined();
     for (const deliver of held?.splice(0) ?? []) deliver();
     held = undefined;
     await vi.waitFor(() => expect(chatClient.sent).toHaveLength(1), { timeout: 15_000 });
+    expect(duringProvider).toMatchObject({
+      actorId: workerId,
+      runId: launched?.runId,
+      provider: "codex",
+      model: "gpt-5.5",
+      effort: "low",
+    });
     expect(chatClient.sent[0]?.text).toBe(
       `written at provider start\n\n_${generateHandle(workerId)} (gpt-5.5, low)_`
     );
+    await vi.waitFor(() =>
+      expect(getRepositories().actorRuns.listRecentCompleted(workerId, 1)).toHaveLength(1)
+    );
+    expect(reader?.current()).toBeUndefined();
+    if (!meshUrl) throw new Error("remote mesh URL was not captured");
+    const stale = await fetch(meshUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1 }),
+    });
+    expect(stale.status).toBe(404);
   }, 20_000);
 
   it("records token usage linked to actor_runs.id through the real worker lifecycle wiring", async () => {
@@ -10442,7 +10732,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "understanding",
         "quota",
         "dashboard-timing",
-        "mesh",
         "inbox",
         "obligations",
         "mesh-chat-read",
@@ -10457,7 +10746,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "understanding",
         "quota",
         "dashboard-timing",
-        "mesh",
         "inbox",
         "obligations",
         "mesh-chat-read",
@@ -10499,7 +10787,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "quota",
         "dashboard-timing",
         "chat-read",
-        "mesh",
         "inbox",
         "obligations",
         "mesh-chat-read",
@@ -10516,7 +10803,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "quota",
         "dashboard-timing",
         "chat-read",
-        "mesh",
         "inbox",
         "obligations",
         "mesh-chat-read",

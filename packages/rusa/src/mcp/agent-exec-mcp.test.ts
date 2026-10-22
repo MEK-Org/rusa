@@ -40,8 +40,10 @@ import {
   type ExperimentEnrollmentStore,
   InMemoryExperimentEnrollmentStore,
 } from "../actor/experiments.js";
+import { stampActor } from "../actor/message-stamp.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import { RootControlService } from "../actor/root-control.js";
+import { type ActiveRunContext, bindRunContext } from "../actor/run-context.js";
 import type { RusaConfig } from "../config/types.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { AvailabilityHoldRepository } from "../db/repositories/availability-hold-repository.js";
@@ -2029,6 +2031,76 @@ describe("agent-execution MCP server", () => {
     })) as CallToolResult;
     expect(res.isError).toBeFalsy();
     expect(dataOf(res)).toBe("sent");
+  });
+
+  it("stamps from the bound run at send time and rejects its ended context", async () => {
+    const { inboxStore, mesh } = setup();
+    let active = true;
+    let responsive = false;
+    const lease = bindRunContext("root", "run-a", (): ActiveRunContext | undefined =>
+      active
+        ? {
+            actorId: "root",
+            runId: "run-a",
+            startedAt: "2026-01-01T00:00:00Z",
+            selectedInboxEntryIds: [],
+            primaryObligationId: null,
+            effectiveResponsive: responsive,
+          }
+        : undefined
+    );
+    const client = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, {
+        messageStamp: () => stampActor(lease.reader),
+      })
+    );
+    const recipient = mesh.spawn({
+      charter: "recipient",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+    });
+
+    const existingEntries = new Set(inboxStore.list(recipient).entries.map((entry) => entry.id));
+    expect(
+      (
+        await client.callTool({
+          name: "send_message",
+          arguments: { thread_id: recipient, body: "ordinary" },
+        })
+      ).isError
+    ).toBeFalsy();
+    const ordinaryEntries = inboxStore
+      .list(recipient)
+      .entries.filter((entry) => !existingEntries.has(entry.id));
+    expect(ordinaryEntries).toHaveLength(1);
+    expect(ordinaryEntries[0]?.payload.priority).toBeUndefined();
+
+    responsive = true;
+    const entriesBeforeResponsive = new Set(
+      inboxStore.list(recipient).entries.map((entry) => entry.id)
+    );
+    expect(
+      (
+        await client.callTool({
+          name: "send_message",
+          arguments: { thread_id: recipient, body: "responsive" },
+        })
+      ).isError
+    ).toBeFalsy();
+    const responsiveEntries = inboxStore
+      .list(recipient)
+      .entries.filter((entry) => !entriesBeforeResponsive.has(entry.id));
+    expect(responsiveEntries).toHaveLength(1);
+    expect(responsiveEntries[0]?.payload.priority).toBe("responsive");
+
+    active = false;
+    const ended = await client.callTool({
+      name: "send_message",
+      arguments: { thread_id: recipient, body: "must not deliver" },
+    });
+    expect(ended.isError).toBe(true);
+    expect(dataOf(ended as CallToolResult)).toContain("has ended");
+    expect(inboxStore.list(recipient).entries).toHaveLength(2);
   });
 
   it("send_message reports a retired recipient instead of claiming delivery", async () => {

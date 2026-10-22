@@ -92,6 +92,11 @@ export interface ActorOptions {
   /** MCP servers attached as this actor's tools. */
   mcpServers: McpServerSpec[];
   /**
+   * Prepares run-scoped MCP entries before a remote follower receives its
+   * admission snapshot. Local actors mount the same entries from `onStart`.
+   */
+  prepareRunMcp?: (runId: string) => void;
+  /**
    * Run this actor's agent under the bwrap sandbox. The sandbox is rooted at the
    * actor's `cwd` and grants git + gh (we don't restrict those); callers just
    * opt in. Used for agy workers, which need a per-invocation MCP config.

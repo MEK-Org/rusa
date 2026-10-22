@@ -1266,6 +1266,13 @@ export class ActorHandle implements MeshActor {
                     this.admittedAt = new Date();
                     // Selection is decided here and carried to the follower, so the
                     // remote run uses the candidate the leader actually reserved.
+                    const runId = this.queuedRunId;
+                    if (!runId) {
+                      throw new Error(
+                        `Remote actor ${this.id} was admitted without a queued run id`
+                      );
+                    }
+                    this.opts.actorOptions?.prepareRunMcp?.(runId);
                     this.send({
                       type: "reply",
                       requestId,
