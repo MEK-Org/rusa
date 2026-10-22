@@ -2073,6 +2073,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       return actor;
     };
 
+    const rootRunId = await startLifecycleRun(root, {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+
     // The retired experiment is gone from the live surface: only the live
     // registry (#1062) is listed, and the retired name can no longer be
     // enrolled. Strict closure needs neither.
@@ -2087,6 +2093,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         })
       ).isError
     ).toBe(true);
+    await endLifecycleRun(root, rootRunId, { success: true, output: "", exitCode: 0 });
 
     // Attention arrives the way production delivers it: creating the obligation
     // moves each worker's ready head, and runStart's ready-head listener routes
@@ -2382,8 +2389,57 @@ describe("runStart webhook event routing (Phase 4)", () => {
       getRepositories().meshChat.getById(String(received?.payload.messageId))?.responsive
     ).toBe(true);
 
+    // The same selected entry must be read dynamically at send time. Moving it
+    // below an ordinary parent changes the next stamp without selecting again.
+    const ordinaryParent = getRepositories().obligations.create({
+      title: "ordinary parent",
+      ownerId: sender,
+    });
+    getRepositories().obligations.reparent(selected.id, ordinaryParent.id, sender);
+    expect(getRepositories().obligations.require(selected.id).effectiveResponsive).toBe(false);
+    const runAUrl = urlOf(actorOf(sender), "mesh");
+    expect(
+      (
+        await call(runAUrl, "send_message", {
+          thread_id: recipient,
+          body: "changed inherited responsiveness",
+        })
+      ).isError
+    ).toBeFalsy();
+    const changed = getRepositories()
+      .inbox.list(recipient)
+      .entries.find(
+        (entry) =>
+          getRepositories().meshChat.getById(String(entry.payload.messageId))?.body ===
+          "changed inherited responsiveness"
+      );
+    expect(changed?.payload.priority).toBeUndefined();
+
     getRepositories().obligations.setTerminalStatus(selected.id, "done", null, null, sender);
     await endLifecycleRun(actorOf(sender), runId, { success: true, output: "", exitCode: 0 });
+
+    // Ending run A removes its bearer endpoint. A later run receives a fresh
+    // endpoint and cannot make the retained A URL observe or act for B.
+    let oldRunRejected = false;
+    try {
+      const stale = await call(runAUrl, "send_message", {
+        thread_id: recipient,
+        body: "must not deliver from ended run",
+      });
+      oldRunRejected = stale.isError === true;
+    } catch {
+      oldRunRejected = true;
+    }
+    expect(oldRunRejected).toBe(true);
+
+    const runBId = await startLifecycleRun(actorOf(sender), {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    const runBUrl = urlOf(actorOf(sender), "mesh");
+    expect(runBUrl).not.toBe(runAUrl);
+    await endLifecycleRun(actorOf(sender), runBId, { success: true, output: "", exitCode: 0 });
   }, 10_000);
 
   describe("root pool fallback is root-only ", () => {
@@ -4564,6 +4620,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     });
     if (!mesh || !root || !rootControl) throw new Error("mesh, root, or root control not ready");
+    const rootRunId = await startLifecycleRun(root, {
+      provider: "claude",
+      model: "claude-sonnet-5",
+    });
     const rootOptions = (
       root as unknown as { opts: { mcpServers: Array<{ name: string; url: string }> } }
     ).opts;
@@ -4595,6 +4655,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect.objectContaining({ provider: "claude", origin: "mesh", createdBy: root.id }),
       expect.objectContaining({ provider: "codex", origin: "mesh", createdBy: root.id }),
     ]);
+    await endLifecycleRun(root, rootRunId, { success: true, output: "", exitCode: 0 });
     // Every configured actor lane is indefinitely mesh-held: neither the root
     // nor the codex worker is admitted, and both pools remain untouched.
     expect(mesh.prepareRun(root.id)).toBe(false);
@@ -4751,6 +4812,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     });
     if (!mesh || !root) throw new Error("mesh or root not ready");
+    const rootRunId = await startLifecycleRun(root, {
+      provider: "claude",
+      model: "claude-sonnet-5",
+    });
     const meshUrl = (
       root as unknown as { opts: { mcpServers: Array<{ name: string; url: string }> } }
     ).opts.mcpServers.find((server) => server.name === "mesh")?.url;
@@ -4926,6 +4991,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await message("/resume provider:codex", "messages/origin-resume-codex-chat-only");
     expect(lastReply()).not.toContain("Still held");
     expect(getRepositories().availabilityHolds.list()).toEqual([]);
+    await endLifecycleRun(root, rootRunId, { success: true, output: "", exitCode: 0 });
     clearProviderModelCatalog();
   });
 
@@ -10442,7 +10508,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "understanding",
         "quota",
         "dashboard-timing",
-        "mesh",
         "inbox",
         "obligations",
         "mesh-chat-read",
@@ -10457,7 +10522,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "understanding",
         "quota",
         "dashboard-timing",
-        "mesh",
         "inbox",
         "obligations",
         "mesh-chat-read",
@@ -10499,7 +10563,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "quota",
         "dashboard-timing",
         "chat-read",
-        "mesh",
         "inbox",
         "obligations",
         "mesh-chat-read",
@@ -10516,7 +10579,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "quota",
         "dashboard-timing",
         "chat-read",
-        "mesh",
         "inbox",
         "obligations",
         "mesh-chat-read",

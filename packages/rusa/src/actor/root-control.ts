@@ -8,6 +8,7 @@ import {
 import type { ActorHandle, ActorRecord, ContextConfig } from "./actor-record.js";
 import { defaultGrantRecipient } from "./administrative-capabilities.js";
 import type { AvailabilityHolds, ClearedHolds, ReleasedHalts } from "./availability-holds.js";
+import type { MessageStamp } from "./message-stamp.js";
 
 /**
  * UUID string format representing a durable user principal ID.
@@ -44,7 +45,8 @@ export interface RootControlMesh {
     body: string,
     fromId: string,
     sessionId?: string,
-    deliverAt?: string
+    deliverAt?: string,
+    options?: { messageStamp?: MessageStamp }
   ): {
     delivered: boolean;
     status?: string;
@@ -168,12 +170,15 @@ export class RootControlService {
     body: string,
     principal: RootControlPrincipal,
     deliverAt?: string,
-    sessionId?: string
+    sessionId?: string,
+    messageStamp?: MessageStamp
   ): void {
     const rootId = this.requireRootId();
     const text = body.trim();
     if (!text) throw new Error("message body is required");
-    const result = this.options.mesh.sendMessage(toId, text, rootId, sessionId, deliverAt);
+    const result = messageStamp
+      ? this.options.mesh.sendMessage(toId, text, rootId, sessionId, deliverAt, { messageStamp })
+      : this.options.mesh.sendMessage(toId, text, rootId, sessionId, deliverAt);
     if (!result.delivered) {
       if (!result.status) {
         throw new Error(`unknown thread id: ${toId}`);

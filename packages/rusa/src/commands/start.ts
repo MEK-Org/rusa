@@ -103,6 +103,7 @@ import {
   type RunAbandonedPayload,
   runEndPayload,
 } from "../actor/mesh-events.js";
+import { MessageStampService } from "../actor/message-stamp.js";
 import { OperatorActorControl } from "../actor/operator-actor-control.js";
 import { type ActorWakeScheduler, DefaultOsScheduler } from "../actor/os-scheduler.js";
 import {
@@ -145,6 +146,7 @@ import {
   seedRootModelConfig,
 } from "../actor/root-model-config.js";
 import { createRunAccounting, projectActorRunLaunchConfig } from "../actor/run-accounting.js";
+import { type ActiveRunContext, bindRunContext } from "../actor/run-context.js";
 import {
   ensureWakeToken,
   wakePortPath,
@@ -2674,6 +2676,7 @@ async function composeStart(
   // The one live attribution source: populated only for an actual provider
   // attempt (including fallbacks), and cleared by every terminal run hook.
   const activeRunSelections = new Map<string, RawProviderModelConfig>();
+  const messageStamps = new MessageStampService();
   // ── Host-maintenance tools (#549) ── `update` and `pnpm-hardlinks` used to be
   // mounted on the configured root's tool set by id. They are now ordinary
   // grantable capabilities (named after their servers) registered through
@@ -2918,6 +2921,9 @@ async function composeStart(
   // provider at run start. A live grant updates it synchronously, which is the
   // latest boundary every provider CLI can reliably consume MCP configuration.
   const liveWorkerMcp = new Map<string, McpServerSpec[]>();
+  // Agent-exec endpoints are leases, not actor resources: each URL is bound to
+  // one run and is removed before that run's durable accounting closes.
+  const runAgentMcpNames = new Map<string, Set<string>>();
   const refreshLiveActorMcp = (actorId: string): void => {
     const workerMcp = liveWorkerMcp.get(actorId);
     if (!workerMcp) return;
@@ -2936,8 +2942,17 @@ async function composeStart(
 
   // Tear down resources the mesh doesn't own: the per-actor MCP endpoints.
   const teardownActorMcp = (actorId: string) => {
+    const workerMcp = liveWorkerMcp.get(actorId);
+    const runNames = runAgentMcpNames.get(actorId);
+    runAgentMcpNames.delete(actorId);
+    if (workerMcp && runNames) {
+      for (const name of runNames) {
+        const index = workerMcp.findIndex((server) => server.name === AGENT_EXEC_MCP_NAME);
+        if (index >= 0) workerMcp.splice(index, 1);
+        void mcpHttp.removeServer(name);
+      }
+    }
     liveWorkerMcp.delete(actorId);
-    void mcpHttp.removeServer(actorId);
     void mcpHttp.removeServer(`${actorId}:${BRIEF_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${INBOX_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${OBLIGATIONS_MCP_NAME}`);
@@ -3329,20 +3344,6 @@ async function composeStart(
     supportedVoices: credentialValidSupportedVoices,
     actors,
     principals: getRepositories().principals,
-    // The inbox focus belongs to the active run, and effective responsiveness
-    // is read at send time. Actor tools receive no priority or obligation
-    // input, so neither can be forged or retained after the run ends.
-    responsiveForActorMessage: (actorId) => {
-      const runId = runAccounting.activeRunId(actorId);
-      if (!runId) return false;
-      const primaryObligationId =
-        getRepositories().inboxFocus.getByRunId(runId)?.primaryObligationId;
-      return (
-        primaryObligationId !== null &&
-        primaryObligationId !== undefined &&
-        getRepositories().obligations.get(primaryObligationId)?.effectiveResponsive === true
-      );
-    },
     rootId,
     // Placement exists when an e2e worker-construction override or the follower
     // gateway is wired. Unknown or disconnected targets fail closed.
@@ -3709,29 +3710,6 @@ async function composeStart(
       }
 
       try {
-        // A per-actor agent-execution endpoint, with this actor's identity baked in.
-        // The management deps are wired on every endpoint; the endpoint mounts
-        // the corresponding tools only for an actor holding the administrative
-        // capability (#549), so an ungranted worker sees none of them.
-        const meshUrl = mcpHttp.addServer(id, () =>
-          createAgentExecMcpServer(mesh, id, rootId, osScheduler, {
-            // Controller operations stay available to the one imported actor,
-            // but the imported identity itself adds no authority. The service
-            // enforces its empty-forest refusal when no such actor exists.
-            ...(id === rootId ? { rootControl } : {}),
-            onWrite: () => {
-              mesh.markUnkillable(id);
-            },
-            modelClasses,
-            validateModelClass: (input) =>
-              validateModelConfigPool(config, input, { portable: true }),
-            availabilityHolds,
-            validateHoldScope,
-            getFollowers: () => (followerHub ? followerHub.list() : []),
-            chatRoom,
-            voices: () => supportedVoiceCatalog,
-          })
-        );
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
           createInboxMcpServer(inboxStore, id, {
             select: inboxSelectFor(id),
@@ -3841,10 +3819,10 @@ async function composeStart(
           perActorShared.push({ name: SLACK_READ_MCP_NAME, url: slackReadUrl });
         }
 
-        // Workers get their per-actor shared tools, agent execution, and durable messaging.
+        // Agent execution is mounted by the run lifecycle below. Its URL must
+        // name the exact active run, rather than granting a reusable actor URL.
         const workerMcp: McpServerSpec[] = [
           ...perActorShared,
-          { name: AGENT_EXEC_MCP_NAME, url: meshUrl },
           { name: INBOX_MCP_NAME, url: inboxUrl },
           { name: OBLIGATIONS_MCP_NAME, url: obligationsUrl },
           { name: MESH_CHAT_MCP_NAME, url: meshChatUrl },
@@ -4064,6 +4042,87 @@ async function composeStart(
             `actor ${id} requests executionTarget ${JSON.stringify(ctx.executionTarget)} but this runtime has no remote placement support`
           );
         }
+        // The provider reads the mutable server array only after its lifecycle
+        // `onStart` hooks finish. Mount agent-exec there so its bearer URL is
+        // bound to this run's durable identity, live focus and actual provider
+        // attempt; a later run can never inherit it.
+        let runAgentMcp:
+          | {
+              runId: string;
+              name: string;
+              url: string;
+              revoke: () => void;
+            }
+          | undefined;
+        ctx.lifecycle.add({
+          onStart: (event) => {
+            const lease = bindRunContext(
+              id,
+              event.runId,
+              (): Readonly<ActiveRunContext> | undefined => {
+                if (runAccounting.activeRunId(id) !== event.runId) return undefined;
+                const repositories = getRepositories();
+                const run = repositories.actorRuns.getById(event.runId);
+                if (!run || run.actorId !== id || run.endedAt !== null) return undefined;
+                const focus = repositories.inboxFocus.getByRunId(event.runId);
+                const primaryObligationId = focus?.primaryObligationId ?? null;
+                const attempt = activeRunSelections.get(id);
+                return {
+                  actorId: id,
+                  runId: event.runId,
+                  startedAt: run.startedAt,
+                  provider: attempt?.provider ?? run.provider ?? undefined,
+                  model: attempt?.model ?? run.model ?? undefined,
+                  effort: attempt?.effort ?? run.modelConfig?.effort,
+                  selectedInboxEntryIds: focus?.entryIds ?? [],
+                  primaryObligationId,
+                  effectiveResponsive:
+                    primaryObligationId !== null &&
+                    repositories.obligations.get(primaryObligationId)?.effectiveResponsive === true,
+                };
+              }
+            );
+            const name = `${id}:run:${event.runId}:${AGENT_EXEC_MCP_NAME}`;
+            const url = mcpHttp.addServer(name, () =>
+              createAgentExecMcpServer(mesh, id, rootId, osScheduler, {
+                // Controller operations stay available to the one imported
+                // actor, but remain stamped by its exact active run.
+                ...(id === rootId ? { rootControl } : {}),
+                messageStamp: () => messageStamps.stampActor(lease.reader),
+                onWrite: () => {
+                  mesh.markUnkillable(id);
+                },
+                modelClasses,
+                validateModelClass: (input) =>
+                  validateModelConfigPool(config, input, { portable: true }),
+                availabilityHolds,
+                validateHoldScope,
+                getFollowers: () => (followerHub ? followerHub.list() : []),
+                chatRoom,
+                voices: () => supportedVoiceCatalog,
+              })
+            );
+            const actorRunNames = runAgentMcpNames.get(id) ?? new Set<string>();
+            actorRunNames.add(name);
+            runAgentMcpNames.set(id, actorRunNames);
+            workerMcp.push({ name: AGENT_EXEC_MCP_NAME, url });
+            runAgentMcp = { runId: event.runId, name, url, revoke: lease.revoke };
+          },
+          onEnd: async (event) => {
+            if (!runAgentMcp || runAgentMcp.runId !== event.runId) return;
+            const mounted = runAgentMcp;
+            runAgentMcp = undefined;
+            // Revoke before closing transports. A concurrent tool invocation
+            // cannot stamp or send after the exact run reaches terminal state.
+            mounted.revoke();
+            const index = workerMcp.findIndex(
+              (server) => server.name === AGENT_EXEC_MCP_NAME && server.url === mounted.url
+            );
+            if (index >= 0) workerMcp.splice(index, 1);
+            runAgentMcpNames.get(id)?.delete(mounted.name);
+            await mcpHttp.removeServer(mounted.name);
+          },
+        });
         const externalRoot =
           id === rootId && opts?.e2e?.rootDriver === "external"
             ? new ExternalRootDriver(id, undefined, (state) =>
