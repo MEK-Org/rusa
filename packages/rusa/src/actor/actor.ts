@@ -275,7 +275,20 @@ export function formatPoolRecoveryFailure(input: {
   primaryName: string;
   recoveryEntry: string;
   recoveryOutput: string;
+  /** The primary's own temporary-capacity reason, never a quota reading. */
+  primaryCapacityReason?: string;
 }): string {
+  if (input.primaryCapacityReason) {
+    return [
+      `primary ${input.primaryName} was temporarily unavailable; recovery onto pool entry ${input.recoveryEntry} failed for an unrelated reason.`,
+      "",
+      `Terminal provider capacity reason: ${input.primaryCapacityReason}`,
+      "That capacity rejection is not a quota reading and implies no reset timer. The recovery error below explains only why recovery was unavailable.",
+      "",
+      `--- pool entry ${input.recoveryEntry} (recovery failed) ---`,
+      input.recoveryOutput,
+    ].join("\n");
+  }
   return [
     `primary ${input.primaryName} exhausted; recovery onto pool entry ${input.recoveryEntry} failed for an unrelated reason.`,
     "",
@@ -1065,6 +1078,9 @@ export class Actor {
     let lastResult = result;
     const attempted: RawProviderModelConfig[] = [selected];
     const skipped: PoolSkippedEntry[] = [];
+    const primaryCapacityReason =
+      result.failure?.kind === "provider-capacity" ? result.failure.message : undefined;
+    let capacityFailure = result.failure?.kind === "provider-capacity" ? result.failure : undefined;
 
     for (const [index, entry] of chain.entries()) {
       const attempt = index + 2; // attempt 1 was the gated primary
@@ -1115,6 +1131,7 @@ export class Actor {
             primaryName,
             recoveryEntry: describeModelConfigEntry(entry),
             recoveryOutput: err instanceof Error ? err.message : String(err),
+            primaryCapacityReason,
           }),
           exitCode: lastResult.exitCode || 1,
           sessionId: lastResult.sessionId,
@@ -1123,6 +1140,9 @@ export class Actor {
       attempted.push(entry);
       const recoveryResult = await runProvider(provider);
       if (recoveryResult.success) return recoveryResult;
+      if (!capacityFailure && recoveryResult.failure?.kind === "provider-capacity") {
+        capacityFailure = recoveryResult.failure;
+      }
       if (!(await classify(recoveryResult)).exhausted) {
         // We only reach here because the primary was classified exhausted, so
         // returning the entry's error bare would report a soft, timer-bound
@@ -1131,10 +1151,12 @@ export class Actor {
         // lead the output with the exhaustion that actually caused this run.
         return {
           ...recoveryResult,
+          failure: undefined,
           output: formatPoolRecoveryFailure({
             primaryName,
             recoveryEntry: describeModelConfigEntry(entry),
             recoveryOutput: recoveryResult.output,
+            primaryCapacityReason,
           }),
         };
       }
@@ -1147,6 +1169,16 @@ export class Actor {
       output: formatPoolExhaustedFailure({ attempted, skipped }),
       exitCode: lastResult.exitCode || 1,
       sessionId: lastResult.sessionId,
+      ...(capacityFailure
+        ? {
+            output: formatPoolExhaustedFailure({
+              attempted,
+              skipped,
+              capacityReason: capacityFailure.message,
+            }),
+            failure: capacityFailure,
+          }
+        : {}),
     };
   }
 }
@@ -1191,7 +1223,32 @@ export function formatPoolExhaustedFailure(input: {
   attempted: readonly RawProviderModelConfig[];
   /** Entries in the recovery chain that were skipped due to halt, exhaustion, or pacing. */
   skipped?: readonly PoolSkippedEntry[];
+  /** Structured temporary-capacity evidence preserved by the provider adapter. */
+  capacityReason?: string;
 }): string {
+  if (input.capacityReason) {
+    const totalConfigured = input.attempted.length + (input.skipped?.length ?? 0);
+    const lines = [
+      input.skipped && input.skipped.length > 0
+        ? `model pool exhausted: ${input.attempted.length} of ${totalConfigured} configured pool ${totalConfigured === 1 ? "entry" : "entries"} reported provider capacity/quota exhaustion; ${input.skipped.length} skipped as currently ineligible.`
+        : `model pool exhausted: all ${input.attempted.length} configured pool ${input.attempted.length === 1 ? "entry" : "entries"} reported provider capacity/quota exhaustion.`,
+      `Terminal provider capacity reason: ${input.capacityReason}`,
+    ];
+    if (input.attempted.length > 0) {
+      lines.push(
+        `Attempted in order: ${input.attempted.map(describeModelConfigEntry).join(" -> ")}.`
+      );
+    }
+    if (input.skipped && input.skipped.length > 0) {
+      lines.push(
+        `Skipped in order: ${input.skipped.map((s) => `${describeModelConfigEntry(s.entry)} (${s.reason})`).join(", ")}.`
+      );
+    }
+    lines.push(
+      "Temporary capacity exhaustion does not infer a quota reset timer. Retry only through the existing declared pool when a candidate is eligible."
+    );
+    return lines.join("\n");
+  }
   const isSingle = input.attempted.length === 1 && (!input.skipped || input.skipped.length === 0);
   const lines: string[] = [];
 
