@@ -7246,6 +7246,109 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig).toBeUndefined();
   });
 
+  it("production composition validates effective candidate context on setActorModel and enforces provider constraints on setActorContext", async () => {
+    clearProviderModelCatalog();
+    let mesh: ActorMesh | undefined;
+    const config = {
+      github: {
+        account: "mock-bot",
+      },
+      providers: {
+        antigravity: { cliCommand: "agy" },
+        claude: { cliCommand: "claude" },
+        openrouter: {
+          cliCommand: "openrouter",
+          openrouterPoc: {
+            authDir: homeDir,
+            artifactDir: homeDir,
+          },
+        },
+      },
+      rootActor: {
+        provider: "claude",
+        model: "claude-sonnet-5",
+      },
+      geminiApiKey: "fake-gemini-key",
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+
+    const prevPoc = process.env.RUSA_OPENROUTER_POC;
+    process.env.RUSA_OPENROUTER_POC = "1";
+    onTestFinished(() => {
+      if (prevPoc === undefined) {
+        delete process.env.RUSA_OPENROUTER_POC;
+      } else {
+        process.env.RUSA_OPENROUTER_POC = prevPoc;
+      }
+    });
+
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    await readyPromise;
+    expect(mesh).toBeDefined();
+    if (!mesh) throw new Error("mesh not ready");
+    const activeMesh = mesh;
+
+    // 1. While a native actor is running, stage tail/brief, then set a multi-entry pool:
+    // start.ts validateModel must validate with the effective candidate portable context
+    const runningWorkerId = activeMesh.spawn({
+      charter: "running native worker",
+      parentId: rootId,
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      context: { type: "native" },
+    });
+    const runningActor = activeMesh.get(runningWorkerId);
+    if (!runningActor) throw new Error("running worker not found");
+    const runningSpy = vi.spyOn(runningActor, "isRunning", "get").mockReturnValue(true);
+
+    const contextOutcome = activeMesh.setActorContext(runningWorkerId, "tail", rootId);
+    expect(contextOutcome).toBe("staged");
+    expect(activeMesh.actors.get(runningWorkerId)?.context?.type).toBe("native");
+    expect(activeMesh.actors.get(runningWorkerId)?.desiredContextConfig).toMatchObject({
+      type: "portable",
+      mode: "tail",
+    });
+
+    // Multi-candidate pool would be rejected on native, but effective candidate context is portable:
+    const modelOutcome = activeMesh.setActorModel(
+      runningWorkerId,
+      [
+        { provider: "claude", model: "claude-sonnet-5" },
+        { provider: "claude", model: "claude-opus-5" },
+      ],
+      rootId
+    );
+    expect(modelOutcome).toBe("staged");
+    expect(activeMesh.actors.get(runningWorkerId)?.desiredModelConfig).toHaveLength(2);
+
+    runningSpy.mockReturnValue(false);
+
+    // 2. Portable actor with an OpenRouter model entry cannot transition to native:
+    // start.ts validateContext must invoke validateModelConfigPool against candidate native context
+    const openrouterWorkerId = activeMesh.spawn({
+      charter: "openrouter worker",
+      parentId: rootId,
+      modelConfig: { provider: "openrouter", model: "vendor/fixed-model" },
+      context: { type: "portable", mode: "tail" },
+    });
+
+    expect(() => {
+      activeMesh.setActorContext(openrouterWorkerId, "native", rootId);
+    }).toThrow(/OpenRouter prototype requires portable context/);
+    expect(activeMesh.actors.get(openrouterWorkerId)?.context?.type).toBe("portable");
+    expect(activeMesh.actors.get(openrouterWorkerId)?.desiredContextConfig).toBeUndefined();
+  });
+
   it("root's run_start records the live model after a pool set while idle, not the value frozen when root was built (#199 amend gap 1, extended to pools)", async () => {
     // A prior test in this file registers a real "antigravity"/"agy" model
     // catalog via setProviderModelCatalog and never clears it; that module-level

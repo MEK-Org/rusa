@@ -9,6 +9,7 @@ import { closeDb, getDb, initDb } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
+import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { DbPortableContextStore } from "../db/repositories/portable-context-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
@@ -7349,6 +7350,63 @@ describe("ActorMesh", () => {
       expect(postEvents).toHaveLength(1);
 
       releaseDeferred();
+    });
+
+    it("preserves scheduling for unchanged native actor bound to a single-entry model class while refusing transition to native while holding a class", () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      const classRepo = new ModelClassRepository(db);
+      classRepo.upsert(
+        "default-class",
+        [{ provider: "claude", model: "claude-sonnet-5" }],
+        new Date().toISOString()
+      );
+      classRepo.upsert(
+        "worker-class",
+        [{ provider: "claude", model: "claude-sonnet-5" }],
+        new Date().toISOString()
+      );
+      const actorRepo = new SqliteActorRepository(db, undefined, classRepo);
+
+      // Root is native and bound to a model class
+      actorRepo.upsert({
+        id: "root",
+        charter: "Root",
+        parentId: null,
+        modelClass: "default-class",
+        context: { type: "native" },
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+
+      const { mesh, registry } = setup({
+        actors: actorRepo,
+      });
+
+      // 1. Unchanged native actor with a model class is schedulable and runs without refusal
+      expect(mesh.validateCombinedEffectiveTarget("root")).toBe(true);
+      expect(mesh.prepareRun("root")).toBe(true);
+
+      // 2. A portable actor bound to a model class is refused when attempting to switch to native
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "tail" },
+      });
+      registry.setModelSelection(worker, { modelClass: "worker-class" });
+
+      expect(() => mesh.setActorContext(worker, "native", "root")).toThrow(
+        /Cannot switch to native context on actor .* while it holds a model class reference/
+      );
+
+      // 3. If a transition to native was somehow pending while holding a class, validateCombinedEffectiveTarget rejects it
+      registry.patch(worker, {
+        desiredContextConfig: { type: "native" },
+      });
+      expect(mesh.validateCombinedEffectiveTarget(worker)).toBe(false);
+      expect(mesh.prepareRun(worker)).toBe(false);
     });
 
     it("resumes retained portable ledger items and brief across portable -> native -> portable", () => {

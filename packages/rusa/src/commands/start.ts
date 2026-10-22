@@ -3387,15 +3387,23 @@ async function composeStart(
       // class reference would otherwise pass through it untouched.
       const resolved = resolveModelClasses(modelClasses, modelConfig);
       const filled = fillModelConfigFromCurrent(resolved, record.modelConfig);
+      const effectiveContext = record.desiredContextConfig ?? record.context;
       return validateModelConfigPool(config, filled, {
-        portable: record.context?.type === "portable",
+        portable: effectiveContext?.type === "portable",
       });
     },
-    validateContext: (_record, context) => {
+    validateContext: (record, context) => {
       assertSpawnContextSupported(
         { context },
         { ledgerCompactionAvailable: portableContextApiKey !== null }
       );
+      const effectivePool =
+        (record.desiredModelConfig as ProviderModelConfig[] | undefined) ?? record.modelConfig;
+      if (effectivePool && effectivePool.length > 0) {
+        validateModelConfigPool(config, effectivePool, {
+          portable: context.type === "portable",
+        });
+      }
     },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),

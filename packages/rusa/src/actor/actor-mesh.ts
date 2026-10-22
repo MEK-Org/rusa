@@ -5884,30 +5884,37 @@ export class ActorMesh {
   /**
    * Validate that the combined effective configuration (merging any staged
    * model/context changes with the actor's current state) is valid to run.
+   *
+   * Transition-specific constraints (such as refusing native context while
+   * holding a model class reference or multi-entry pool) apply when a context
+   * transition is pending (record.desiredContextConfig !== undefined).
+   * Unchanged native actors already bound to a valid model class preserve
+   * their existing scheduling.
    */
   validateCombinedEffectiveTarget(id: string): boolean {
     const record = this.actors.get(id);
     if (!record) return false;
 
-    const effectiveContext = record.desiredContextConfig ?? record.context;
-    const effectiveClass = this.effectiveModelClass(record);
-    const effectivePool = this.effectiveModelConfig(record);
-
-    if (effectiveContext?.type === "native") {
-      if (effectiveClass !== undefined) {
-        return false;
-      }
-      if ((effectivePool?.length ?? 0) > 1) {
-        return false;
-      }
-    } else if (effectiveContext?.type === "portable") {
-      try {
-        assertSpawnContextSupported(
-          { context: effectiveContext },
-          { ledgerCompactionAvailable: this.ledgerCompactionAvailable }
-        );
-      } catch {
-        return false;
+    if (record.desiredContextConfig !== undefined) {
+      const targetContext = record.desiredContextConfig;
+      if (targetContext.type === "native") {
+        const effectiveClass = this.effectiveModelClass(record);
+        if (effectiveClass !== undefined) {
+          return false;
+        }
+        const effectivePool = this.effectiveModelConfig(record);
+        if ((effectivePool?.length ?? 0) > 1) {
+          return false;
+        }
+      } else if (targetContext.type === "portable") {
+        try {
+          assertSpawnContextSupported(
+            { context: targetContext },
+            { ledgerCompactionAvailable: this.ledgerCompactionAvailable }
+          );
+        } catch {
+          return false;
+        }
       }
     }
     return true;
