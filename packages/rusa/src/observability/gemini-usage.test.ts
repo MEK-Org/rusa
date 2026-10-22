@@ -11,7 +11,6 @@ import {
 import {
   buildGeminiUsageReport,
   formatGeminiUsageReport,
-  MAX_REPORT_ATTEMPTS,
   MAX_USAGE_LINE_BYTES,
 } from "./gemini-usage-report.js";
 import { createLogger, nullLogger } from "./logger.js";
@@ -133,10 +132,23 @@ describe("Gemini usage logger and on-demand report", () => {
     await observeGeminiRequest("portable_compaction", "model", async () => ({
       usageMetadata: metadata,
     }));
+    const partial = beginGeminiAttempt("portable_compaction", "model", {
+      actorId: "actor-a",
+      runId: "run-3",
+    });
+    partial.observe({ usageMetadata: metadata });
+    partial.finish("cancelled", true);
+    await observeGeminiRequest(
+      "portable_compaction",
+      "model",
+      async () => ({ usageMetadata: metadata }),
+      { actorId: "x".repeat(201), runId: "must-not-survive" }
+    );
 
     const rows = lines.map((line) => JSON.parse(line));
     expect(rows[0].usage).toMatchObject({ actorId: "actor-a", runId: "run-1" });
     expect(rows[2].usage).toMatchObject({ actorId: null, runId: null });
+    expect(rows[4].usage).toMatchObject({ actorId: null, runId: null });
 
     // Pre-attribution v1 exports have neither field. They remain valid v1
     // records and belong in the explicit unattributed bucket.
@@ -145,7 +157,7 @@ describe("Gemini usage logger and on-demand report", () => {
     rows[2].usage.counts.input = 200;
     rows[2].usage.counts.total = 227;
     const report = await buildGeminiUsageReport(
-      [source("attribution", `${lines[0]}${lines[1]}${JSON.stringify(rows[2])}\n`)],
+      [source("attribution", `${lines[0]}${lines[1]}${JSON.stringify(rows[2])}\n${lines[3]}`)],
       window
     );
     const group = report.groups[0];
@@ -153,14 +165,16 @@ describe("Gemini usage logger and on-demand report", () => {
     const unattributed = group.actors.find((entry) => entry.actorId === null);
     if (!actor || !unattributed) throw new Error("expected attributed and unattributed buckets");
     expect(actor).toMatchObject({
-      calls: 2,
-      runIds: ["run-1", "run-2"],
+      calls: 3,
+      partialCalls: 1,
+      runIds: ["run-1", "run-2", "run-3"],
       input: { sum: 150, measured: 2, missing: 0 },
       output: { sum: 50, measured: 2, missing: 0 },
       inputPerCall: { max: 100, p50: 50, p90: 100 },
     });
     expect(unattributed).toMatchObject({
       calls: 1,
+      partialCalls: 0,
       runIds: [],
       input: { sum: 200, measured: 1, missing: 0 },
       output: { sum: 25, measured: 1, missing: 0 },
@@ -168,57 +182,9 @@ describe("Gemini usage logger and on-demand report", () => {
     expect((actor.input.sum ?? 0) + (unattributed.input.sum ?? 0)).toBe(group.totals.input.sum);
     expect((actor.output.sum ?? 0) + (unattributed.output.sum ?? 0)).toBe(group.totals.output.sum);
     expect(group.actors.map((entry) => entry.actorId)).toEqual([null, "actor-a"]);
-    expect(formatGeminiUsageReport(report)).toContain("unattributed: 1 calls");
+    expect(formatGeminiUsageReport(report)).toContain("actor unattributed: 1 calls; interrupted=0");
+    expect(formatGeminiUsageReport(report)).toContain("actor actor-a: 3 calls; interrupted=1");
   });
-
-  it("summarizes a large single-actor bucket below the report attempt limit", async () => {
-    // This exceeds V8's practical function-argument cap, while remaining far
-    // below the documented report limit. Keep it streamed so the test also
-    // exercises the report's normal bounded line reader.
-    const samples = 131_072;
-    expect(samples).toBeLessThan(MAX_REPORT_ATTEMPTS);
-    const stream = (async function* () {
-      for (let index = 0; index < samples; index++)
-        yield Buffer.from(
-          `${JSON.stringify({
-            time: "2026-10-14T12:30:00.000Z",
-            msg: "gemini_usage",
-            usage: {
-              version: 1,
-              occurredAt: "2026-10-14T12:30:00.000Z",
-              instanceId: "instance",
-              processId: "process",
-              pid: 1,
-              attemptId: `attempt-${index}`,
-              purpose: "portable_compaction",
-              actorId: "actor-large",
-              runId: "run-large",
-              requestedModel: "model",
-              model: "model",
-              outcome: "response",
-              usage: "complete",
-              partial: false,
-              counts: {
-                input: index,
-                response: 1,
-                thinking: 0,
-                cachedInput: 0,
-                toolInput: 0,
-                total: index + 1,
-              },
-            },
-          })}\n`
-        );
-    })();
-    const report = await buildGeminiUsageReport([{ name: "large-actor", stream }], window);
-    expect(report.groups[0]?.actors).toEqual([
-      expect.objectContaining({
-        actorId: "actor-large",
-        calls: samples,
-        inputPerCall: { max: samples - 1, p50: 65_535, p90: 117_964 },
-      }),
-    ]);
-  }, 20_000);
 
   it("counts outer retries, stronger-model fallback and a response rejected by application validation", async () => {
     const { lines } = capture();

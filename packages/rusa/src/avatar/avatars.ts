@@ -276,17 +276,20 @@ export async function generateAvatarForce(threadId: string, deps: AvatarGenDeps)
   if (!deps.apiKey) return; // no key configured → nothing to do
 
   const isRoot = threadId === deps.rootId || isRootHandle(threadId, deps.rootHandle);
-  const targetId = isRoot ? "root" : threadId;
+  // The cache retains its historical root key, but usage must keep the durable
+  // actor identity available to the caller for correlation with other work.
+  const cacheId = isRoot ? "root" : threadId;
+  const actorId = isRoot ? (deps.rootId ?? threadId) : threadId;
   const handle = isRoot ? (deps.rootHandle ?? "root-actor") : generateHandle(threadId);
   const { adjective, animal } = splitHandle(handle);
-  const imageBytes = await callGeminiImage(deps.apiKey, buildPrompt(adjective, animal), targetId);
+  const imageBytes = await callGeminiImage(deps.apiKey, buildPrompt(adjective, animal), actorId);
   // Validate before writing so an unexpected Gemini response (wrong MIME,
   // truncated/malformed base64) throws instead of silently clobbering a working cached avatar.
   if (!isValidImageSignature(imageBytes)) {
     throw new Error("gemini image API returned bytes that are not a valid PNG or JPEG");
   }
-  writeAvatarCacheFile(targetId, imageBytes);
-  deps.log?.(`avatar force-generated for ${targetId} (${handle})`);
+  writeAvatarCacheFile(cacheId, imageBytes);
+  deps.log?.(`avatar force-generated for ${cacheId} (${handle})`);
 }
 
 /**

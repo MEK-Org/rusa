@@ -47,6 +47,8 @@ interface UsageActor {
   /** Distinct attributed run ids; omitted from text output but retained in JSON. */
   runIds: string[];
   calls: number;
+  /** Interrupted calls are excluded from completed usage summaries. */
+  partialCalls: number;
   input: Measurement;
   output: Measurement;
   inputPerCall: InputPerCall;
@@ -55,6 +57,7 @@ interface UsageActorAccumulator {
   actorId: string | null;
   runIds: Set<string>;
   calls: number;
+  partialCalls: number;
   input: Measurement;
   output: Measurement;
   inputSamples: number[];
@@ -248,6 +251,7 @@ function finalizeActor(actor: UsageActorAccumulator): UsageActor {
     actorId: actor.actorId,
     runIds: [...actor.runIds].sort(),
     calls: actor.calls,
+    partialCalls: actor.partialCalls,
     input: actor.input,
     output: actor.output,
     inputPerCall: inputPerCall(actor.inputSamples),
@@ -373,6 +377,7 @@ export async function buildGeminiUsageReport(
           actorId: record.actorId,
           runIds: new Set(),
           calls: 0,
+          partialCalls: 0,
           input: { sum: null, measured: 0, missing: 0 },
           output: { sum: null, measured: 0, missing: 0 },
           inputSamples: [],
@@ -380,6 +385,7 @@ export async function buildGeminiUsageReport(
         actorGroups.set(record.actorId, actor);
       }
       actor.calls++;
+      if (record.partial) actor.partialCalls++;
       if (record.runId !== null) actor.runIds.add(record.runId);
       // Keep per-actor measured sums and percentiles on the same completed-only
       // basis as the group totals. Interrupted snapshots remain separate above.
@@ -436,7 +442,7 @@ export function formatGeminiUsageReport(report: GeminiUsageReport): string {
       );
     for (const actor of group.actors)
       lines.push(
-        `  ${actor.actorId ?? "unattributed"}: ${actor.calls} calls; input: ${measured(actor.input)}; output: ${measured(actor.output)}; input/call max=${actor.inputPerCall.max ?? "unknown"}, p50=${actor.inputPerCall.p50 ?? "unknown"}, p90=${actor.inputPerCall.p90 ?? "unknown"}`
+        `  actor ${actor.actorId ?? "unattributed"}: ${actor.calls} calls; interrupted=${actor.partialCalls}; input: ${measured(actor.input)}; output: ${measured(actor.output)}; input/call max=${actor.inputPerCall.max ?? "unknown"}, p50=${actor.inputPerCall.p50 ?? "unknown"}, p90=${actor.inputPerCall.p90 ?? "unknown"}`
       );
   }
   lines.push(

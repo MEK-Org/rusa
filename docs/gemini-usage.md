@@ -58,7 +58,8 @@ otherwise the requested model; `requestedModel` preserves the requested alias.
 scope; a non-null run id always has a non-null actor id. Absent attribution is
 represented as `null`, including in legacy v1 records that predate these
 fields. Under each purpose/model group, the report
-breaks out actor calls, measured input/output sums and input-per-call max/p50/p90
+breaks out actor calls (including an explicit interrupted-call count), measured
+completed-call input/output sums and input-per-call max/p50/p90
 (using nearest-rank percentiles);
 the explicit `unattributed` bucket holds null actor ids. JSON includes each
 actor's distinct non-null run ids, while the text report omits them. These are

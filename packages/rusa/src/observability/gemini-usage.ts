@@ -96,7 +96,9 @@ export function geminiCounts(metadata: unknown): GeminiCounts {
 }
 
 function usageIdentifier(value: unknown): string | null {
-  return typeof value === "string" && value.length > 0 ? value.slice(0, 200) : null;
+  // Identifiers are correlation keys, unlike displayable model names. Refuse
+  // an overlong value rather than recording a plausible-looking truncation.
+  return typeof value === "string" && value.length > 0 && value.length <= 200 ? value : null;
 }
 
 /** One observable application request, including every outer retry/fallback. */
