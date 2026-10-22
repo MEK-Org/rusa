@@ -2061,6 +2061,7 @@ describe("agent-execution MCP server", () => {
       modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
     });
 
+    const existingEntries = new Set(inboxStore.list(recipient).entries.map((entry) => entry.id));
     expect(
       (
         await client.callTool({
@@ -2069,7 +2070,16 @@ describe("agent-execution MCP server", () => {
         })
       ).isError
     ).toBeFalsy();
+    const ordinaryEntries = inboxStore
+      .list(recipient)
+      .entries.filter((entry) => !existingEntries.has(entry.id));
+    expect(ordinaryEntries).toHaveLength(1);
+    expect(ordinaryEntries[0]?.payload.priority).toBeUndefined();
+
     responsive = true;
+    const entriesBeforeResponsive = new Set(
+      inboxStore.list(recipient).entries.map((entry) => entry.id)
+    );
     expect(
       (
         await client.callTool({
@@ -2078,9 +2088,11 @@ describe("agent-execution MCP server", () => {
         })
       ).isError
     ).toBeFalsy();
-    expect(
-      inboxStore.list(recipient).entries.map((entry) => entry.payload.priority ?? "normal")
-    ).toEqual(["responsive", "normal"]);
+    const responsiveEntries = inboxStore
+      .list(recipient)
+      .entries.filter((entry) => !entriesBeforeResponsive.has(entry.id));
+    expect(responsiveEntries).toHaveLength(1);
+    expect(responsiveEntries[0]?.payload.priority).toBe("responsive");
 
     active = false;
     const ended = await client.callTool({
