@@ -257,6 +257,83 @@ describe("executeFollowerUpdate", () => {
     expect(emitted.map((e) => e.status)).toEqual(["fetching", "already_current"]);
   });
 
+  it("uses a sentinel-proven running release, rather than checkout HEAD, for already_current", async () => {
+    const runningSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const checkoutSha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const git = makeFakeGit({
+      headSha: vi.fn().mockResolvedValue(checkoutSha),
+      remoteSha: vi.fn().mockResolvedValue(runningSha),
+    });
+    const { deps, emitted } = makeDeps({ git });
+
+    const result = await executeFollowerUpdate(
+      { updateId: "sentinel-current", targetSha: runningSha, runningSha },
+      deps
+    );
+
+    expect(result).toMatchObject({ ok: true, alreadyCurrent: true, oldSha: checkoutSha });
+    expect(deps.git.resetHard).not.toHaveBeenCalled();
+    expect(deps.build.build).not.toHaveBeenCalled();
+    expect(deps.drain.drain).not.toHaveBeenCalled();
+    expect(emitted.map((event) => event.status)).toEqual(["fetching", "already_current"]);
+  });
+
+  it("rebuilds when checkout HEAD is current but the proven running release is not", async () => {
+    const targetSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const runningSha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const git = makeFakeGit({
+      headSha: vi.fn().mockResolvedValue(targetSha),
+      remoteSha: vi.fn().mockResolvedValue(targetSha),
+    });
+    const { deps, emitted } = makeDeps({ git });
+
+    const result = await executeFollowerUpdate(
+      { updateId: "checkout-current", targetSha, runningSha },
+      deps
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      restarting: true,
+      oldSha: targetSha,
+      newSha: targetSha,
+    });
+    expect(deps.git.resetHard).toHaveBeenCalledWith(targetSha);
+    expect(deps.build.build).toHaveBeenCalledWith(targetSha);
+    expect(deps.drain.drain).toHaveBeenCalledOnce();
+    expect(emitted.map((event) => event.status)).toEqual([
+      "fetching",
+      "building",
+      "draining",
+      "restarting",
+    ]);
+  });
+
+  it("rebuilds when the start-mode running release is unproven", async () => {
+    const targetSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const git = makeFakeGit({
+      headSha: vi.fn().mockResolvedValue(targetSha),
+      remoteSha: vi.fn().mockResolvedValue(targetSha),
+    });
+    const { deps, emitted } = makeDeps({ git });
+
+    const result = await executeFollowerUpdate(
+      { updateId: "sentinel-unknown", targetSha, runningSha: null },
+      deps
+    );
+
+    expect(result).toMatchObject({ ok: true, restarting: true });
+    expect(deps.git.resetHard).toHaveBeenCalledWith(targetSha);
+    expect(deps.build.build).toHaveBeenCalledWith(targetSha);
+    expect(deps.drain.drain).toHaveBeenCalledOnce();
+    expect(emitted.map((event) => event.status)).toEqual([
+      "fetching",
+      "building",
+      "draining",
+      "restarting",
+    ]);
+  });
+
   it("rejects a target outside the fetched branch before checkout", async () => {
     const git = makeFakeGit({ isAncestor: vi.fn().mockResolvedValue(false) });
     const { deps, emitted } = makeDeps({ git });

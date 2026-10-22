@@ -55,6 +55,10 @@ import {
   resolveServiceInstance,
   type ServiceEnvironment,
 } from "./service-instance.js";
+import {
+  START_FOLLOWER_UPDATE_LAUNCHER_ENV,
+  START_FOLLOWER_UPDATE_LAUNCHER_VERSION,
+} from "./start-follower-launcher-contract.js";
 
 function quoteExecArg(value: string): string {
   return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
@@ -165,6 +169,8 @@ export function buildServiceUnit(opts: {
   coordinatorUnit?: string;
   /** Boot gate command (verify-build); only set for self-deploy. */
   execStartPre?: string;
+  /** Versioned process-local assertion for the supported start-mode updater launcher. */
+  startFollowerUpdateLauncher?: typeof START_FOLLOWER_UPDATE_LAUNCHER_VERSION;
   /**
    * Send stdout/stderr to the systemd journal (self-rotating, queryable with
    * `journalctl`/`rusa logs`) instead of appending to a file, which only the
@@ -173,6 +179,9 @@ export function buildServiceUnit(opts: {
    */
   logToJournal?: boolean;
 }): string {
+  if (opts.startFollowerUpdateLauncher && opts.restart !== "always") {
+    throw new Error("The start-mode follower update launcher contract requires Restart=always");
+  }
   const logFile = join(opts.mcHome, "logs", "rusa.log");
   const startArgs = ["start"];
   if (opts.deployOnMergeBranch) {
@@ -216,6 +225,13 @@ export function buildServiceUnit(opts: {
     "WantedBy=default.target",
     ""
   );
+  if (opts.startFollowerUpdateLauncher) {
+    unit.splice(
+      unit.indexOf(`EnvironmentFile=-${join(opts.mcHome, ".env")}`) + 1,
+      0,
+      `Environment=${START_FOLLOWER_UPDATE_LAUNCHER_ENV}=${opts.startFollowerUpdateLauncher}`
+    );
+  }
   return unit.join("\n");
 }
 
@@ -794,6 +810,9 @@ function installSingleRusaService(opts: {
       onFailureUnit: alertUnitName,
       coordinatorUnit: coordinatorUnitForClient(opts.systemdUserDir),
       execStartPre,
+      ...(deploymentMode === "self"
+        ? { startFollowerUpdateLauncher: START_FOLLOWER_UPDATE_LAUNCHER_VERSION }
+        : {}),
       logToJournal: opts.logToJournal,
     })
   );

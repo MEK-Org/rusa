@@ -40,6 +40,11 @@ import {
 } from "../update/runner.js";
 import { resolveRepoRoot } from "./service-instance.js";
 import type { RunStartOptions } from "./start.js";
+import {
+  hasSupportedStartFollowerLauncherContract,
+  START_FOLLOWER_UPDATE_LAUNCHER_ENV,
+  START_FOLLOWER_UPDATE_LAUNCHER_VERSION,
+} from "./start-follower-launcher-contract.js";
 
 export class FollowerHttpError extends Error {
   constructor(
@@ -72,9 +77,9 @@ const RESTART_FLUSH_TIMEOUT_MS = 1500;
 
 /**
  * Resolve the running release from the launched entry point. Self-update is
- * supported only when `rusa start` runs from `packages/rusa/dist` of a git
- * checkout: the update resets that checkout and rebuilds that dist, and a
- * supervisor restarts the clean exit onto it.
+ * supported only when a supported launcher has explicitly asserted that a
+ * clean exit restarts onto the same entry point, preserving home/config, and
+ * `rusa start` runs from `packages/rusa/dist` of a git checkout.
  */
 export function resolveStartFollowerRelease(log: Logger): StartFollowerRelease {
   let distDir: string;
@@ -89,6 +94,11 @@ export function resolveStartFollowerRelease(log: Logger): StartFollowerRelease {
     runningSha,
     update: { unavailable: `Follower self-update is unsupported for this launch: ${reason}` },
   });
+  if (!hasSupportedStartFollowerLauncherContract()) {
+    return unsupported(
+      `supported launcher contract is absent or unrecognized (expected ${START_FOLLOWER_UPDATE_LAUNCHER_ENV}=${START_FOLLOWER_UPDATE_LAUNCHER_VERSION})`
+    );
+  }
   if (basename(distDir) !== "dist") {
     return unsupported("rusa start is not running from a built dist directory");
   }

@@ -23,6 +23,10 @@ import { StepError } from "../update/orchestrator.js";
 import { BuildRunner } from "../update/runner.js";
 import { runStart } from "./start.js";
 import { resolveStartFollowerRelease, type StartFollowerRelease } from "./start-follower.js";
+import {
+  START_FOLLOWER_UPDATE_LAUNCHER_ENV,
+  START_FOLLOWER_UPDATE_LAUNCHER_VERSION,
+} from "./start-follower-launcher-contract.js";
 
 // The bwrap preflight is host-specific; these fixtures never spawn a sandbox.
 vi.mock("../providers/sandbox.js", async (importOriginal) => {
@@ -36,6 +40,7 @@ const TOKEN = "t".repeat(40);
 const FOLLOWER_ID = "follower-start-update";
 
 const originalHome = process.env.RUSA_HOME;
+const originalLauncherContract = process.env[START_FOLLOWER_UPDATE_LAUNCHER_ENV];
 const cleanups: Array<() => Promise<void> | void> = [];
 let originalExit: typeof process.exit;
 const originalArgv1 = process.argv[1];
@@ -56,6 +61,11 @@ afterEach(async () => {
   closeDb();
   if (originalHome !== undefined) process.env.RUSA_HOME = originalHome;
   else delete process.env.RUSA_HOME;
+  if (originalLauncherContract !== undefined) {
+    process.env[START_FOLLOWER_UPDATE_LAUNCHER_ENV] = originalLauncherContract;
+  } else {
+    delete process.env[START_FOLLOWER_UPDATE_LAUNCHER_ENV];
+  }
 });
 
 function tempDir(prefix: string): string {
@@ -251,6 +261,25 @@ it("never treats an unproven running release as current", async () => {
   expect(build.calls).toEqual([`build ${NEW_SHA.slice(0, 7)}`]);
 }, 20_000);
 
+it("passes a proven start-mode release through to already_current", async () => {
+  const home = tempDir("rusa-start-follower-current-");
+  const leader = await startLeader(home);
+  const git = syntheticGit(OLD_SHA, NEW_SHA);
+  const build = syntheticBuild();
+
+  await bootFollower(home, leader.url, {
+    runningSha: NEW_SHA,
+    update: { git: git.git, build: build.build, drainTimeoutMs: 50 },
+  });
+  leader.hub.updateFollower(FOLLOWER_ID, { targetSha: NEW_SHA, branch: "staging" });
+
+  await waitUntil(() => statusNames(leader.statuses).includes("already_current"));
+  expect(statusNames(leader.statuses)).toEqual(["pending", "fetching", "already_current"]);
+  expect(git.calls).toEqual(["fetch staging", `isAncestor ${NEW_SHA.slice(0, 7)} origin/staging`]);
+  expect(build.calls).toEqual([]);
+  expect(process.exit).not.toHaveBeenCalled();
+}, 20_000);
+
 it("reports a failed start-mode build truthfully, restores the checkout and keeps serving", async () => {
   const home = tempDir("rusa-start-follower-update-fail-");
   const leader = await startLeader(home);
@@ -413,6 +442,7 @@ function syntheticCheckout(options: { sentinel?: string; distName?: string } = {
 
 it("resolves a supported launch's running release and update source from its entry point", async () => {
   const checkout = syntheticCheckout({ sentinel: OLD_SHA });
+  process.env[START_FOLLOWER_UPDATE_LAUNCHER_ENV] = START_FOLLOWER_UPDATE_LAUNCHER_VERSION;
 
   const release = resolveStartFollowerRelease(nullLogger);
 
@@ -427,6 +457,7 @@ it("resolves a supported launch's running release and update source from its ent
 
 it("reports no running release when the launched dist carries no build sentinel", () => {
   syntheticCheckout();
+  process.env[START_FOLLOWER_UPDATE_LAUNCHER_ENV] = START_FOLLOWER_UPDATE_LAUNCHER_VERSION;
 
   const release = resolveStartFollowerRelease(nullLogger);
 
@@ -436,6 +467,7 @@ it("reports no running release when the launched dist carries no build sentinel"
 
 it("refuses self-update for a launch outside a built dist, keeping its proven release", () => {
   syntheticCheckout({ sentinel: OLD_SHA, distName: "src" });
+  process.env[START_FOLLOWER_UPDATE_LAUNCHER_ENV] = START_FOLLOWER_UPDATE_LAUNCHER_VERSION;
 
   expect(resolveStartFollowerRelease(nullLogger)).toEqual({
     runningSha: OLD_SHA,
@@ -444,4 +476,19 @@ it("refuses self-update for a launch outside a built dist, keeping its proven re
         "Follower self-update is unsupported for this launch: rusa start is not running from a built dist directory",
     },
   });
+});
+
+it("refuses absent and unrecognized launcher contracts before update work", () => {
+  syntheticCheckout({ sentinel: OLD_SHA });
+
+  const unsupported = {
+    runningSha: OLD_SHA,
+    update: {
+      unavailable: `Follower self-update is unsupported for this launch: supported launcher contract is absent or unrecognized (expected ${START_FOLLOWER_UPDATE_LAUNCHER_ENV}=${START_FOLLOWER_UPDATE_LAUNCHER_VERSION})`,
+    },
+  };
+  expect(resolveStartFollowerRelease(nullLogger)).toEqual(unsupported);
+
+  process.env[START_FOLLOWER_UPDATE_LAUNCHER_ENV] = "v2";
+  expect(resolveStartFollowerRelease(nullLogger)).toEqual(unsupported);
 });
