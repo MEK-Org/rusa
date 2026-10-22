@@ -30,7 +30,7 @@ export interface OperatorRetireAudit {
   principal: string;
   actorId: string;
   outcome: "ok" | "denied";
-  /** Why a denied retirement was refused by the mesh at mutation time. */
+  /** Why a denied retirement was refused. */
   reason?: string;
 }
 
@@ -71,6 +71,7 @@ export class OperatorActorControl {
   constructor(
     private readonly mesh: OperatorActorControlMesh,
     private readonly grants: CapabilityGrantStore,
+    private readonly rootId: string | undefined,
     private readonly now: () => string = () => new Date().toISOString()
   ) {}
 
@@ -105,11 +106,12 @@ export class OperatorActorControl {
   }
 
   /**
-   * The authenticated operator may retire any active actor, including one
-   * detached from every actor-owned subtree (#1085). The operator boundary
-   * checks that the target is active immediately before the synchronous mesh
-   * mutation; the mesh remains the lifecycle authority for all run, work,
-   * message, and subscription retirement guards.
+   * The authenticated operator may retire any active non-root actor, including
+   * one detached from every actor-owned subtree (#1085). The configured root
+   * stays protected even if it is reparented. The operator boundary checks that
+   * the target is active immediately before the synchronous mesh mutation; the
+   * mesh remains the lifecycle authority for all run, work, message, and
+   * subscription retirement guards.
    */
   retire(actorId: string, principal: RootControlPrincipal): void {
     const canonicalActorId = this.mesh.resolveActorId(actorId);
@@ -122,6 +124,12 @@ export class OperatorActorControl {
       });
     if (principal === "root-llm") {
       const reason = "only an authenticated human operator may use the operator retire boundary";
+      audit("denied", reason);
+      throw new Error(reason);
+    }
+    if (canonicalActorId === this.rootId) {
+      const reason =
+        "configured root actor may not be retired through the operator retire boundary";
       audit("denied", reason);
       throw new Error(reason);
     }

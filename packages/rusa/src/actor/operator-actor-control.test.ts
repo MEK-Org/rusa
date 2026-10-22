@@ -66,7 +66,7 @@ function setup() {
     obligationAudits,
     retirementAudits,
     mesh,
-    control: new OperatorActorControl(mesh, grants, () => "2026-10-16T05:30:00.000Z"),
+    control: new OperatorActorControl(mesh, grants, "imported", () => "2026-10-16T05:30:00.000Z"),
   };
 }
 
@@ -173,13 +173,17 @@ describe("OperatorActorControl (#1003)", () => {
     expect(events.filter((event) => event.kind === "operator_actor_retire")).toHaveLength(1);
   });
 
-  it("refuses and audits root-LLM, unknown, already-retired, and mutation-time blocked operator retirement requests", () => {
+  it("refuses and audits root-LLM, configured root, unknown, already-retired, and mutation-time blocked operator retirement requests", () => {
     const { actors, retirementAudits, control, mesh } = setup();
     actors.patch("other-child", { status: "retired" });
 
     expect(() => control.retire("worker", "root-llm")).toThrow(/human operator/);
+    control.reparent("root", "other", OPERATOR);
+    expect(() => control.retire("root", OPERATOR)).toThrow(/configured root actor/);
+    expect(actors.get("imported")?.parentId).toBe("other");
     expect(() => control.retire("ghost", OPERATOR)).toThrow(/unknown actor/);
     expect(() => control.retire("other-child", OPERATOR)).toThrow(/not active/);
+    expect(actors.get("imported")?.status).toBe("active");
     expect(actors.get("worker")?.status).toBe("active");
 
     vi.spyOn(mesh, "retire").mockImplementationOnce(() => {
@@ -190,6 +194,12 @@ describe("OperatorActorControl (#1003)", () => {
 
     expect(retirementAudits()).toEqual([
       expect.objectContaining({ principal: "root-llm", actorId: "worker", outcome: "denied" }),
+      expect.objectContaining({
+        principal: OPERATOR,
+        actorId: "imported",
+        outcome: "denied",
+        reason: "configured root actor may not be retired through the operator retire boundary",
+      }),
       expect.objectContaining({ principal: OPERATOR, actorId: "ghost", outcome: "denied" }),
       expect.objectContaining({ principal: OPERATOR, actorId: "other-child", outcome: "denied" }),
       expect.objectContaining({
@@ -266,10 +276,10 @@ describe("OperatorActorControl (#1003)", () => {
       expect.objectContaining({ actorId: "imported", outcome: "ok" }),
     ]);
 
-    control.retire("root", OPERATOR);
-    expect(actors.get("imported")?.status).toBe("retired");
+    control.retire("other-child", OPERATOR);
+    expect(actors.get("other-child")?.status).toBe("retired");
     expect(retirementAudits()).toEqual([
-      expect.objectContaining({ actorId: "imported", outcome: "ok" }),
+      expect.objectContaining({ actorId: "other-child", outcome: "ok" }),
     ]);
   });
 
