@@ -333,6 +333,7 @@ import { resolveReference } from "../references/resolve.js";
 import { instanceWorkerFactory } from "../remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../remote-instances/follower-hub.js";
 import type { FollowerInstance } from "../remote-instances/follower-instance.js";
+import { registerFollowerRegistrationRecovery } from "../remote-instances/follower-registration-recovery.js";
 import { FollowerUpdateTriggerStore } from "../remote-instances/follower-update-trigger-store.js";
 import type {
   FollowerFileOperation,
@@ -4121,38 +4122,7 @@ async function composeStart(
   // not leave unhandled rejections.
   resources.acquire("actor mesh", () => mesh.shutdownAll());
   if (followerHub) {
-    followerHub.onRegister((follower) => {
-      for (const record of actors.list()) {
-        if (record.executionConfig?.executionTarget !== follower.id) continue;
-        if (record.status !== "active") {
-          followerHub.stopActor(follower.id, record.id);
-          continue;
-        }
-        const existing = mesh.get(record.id);
-        // A dispatch the follower never observed needs no re-derivation: the
-        // durable inbox still holds the work and its priority, so an advisory
-        // dispatch on either channel-recreating branch recovers it (#568).
-        if (!existing) {
-          mesh.rehydrate(record);
-          mesh.dispatch(record.id);
-        } else if (
-          "attachHost" in existing &&
-          typeof (existing as { attachHost?: (host: unknown) => void }).attachHost === "function"
-        ) {
-          try {
-            const newHost = followerHub.rebindHost(follower.id, record.id);
-            (existing as { attachHost: (host: unknown) => void }).attachHost(newHost);
-            mesh.dispatch(record.id);
-          } catch (err) {
-            log.warn("follower_reconnect_attach_failed", {
-              actorId: record.id,
-              followerId: follower.id,
-              err,
-            });
-          }
-        }
-      }
-    });
+    registerFollowerRegistrationRecovery({ actors, hub: followerHub, log, mesh });
   }
   // Route head changes as soon as the mesh exists — ahead of rehydration, which
   // is what registers the per-actor obligations MCP servers, and well ahead of
