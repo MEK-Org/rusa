@@ -66,13 +66,11 @@ export class MetricRepository {
   }
 
   /** Deletes samples for the given metrics before the given minute. Returns the number of pruned rows. */
-  prune(beforeMinute: string, metrics?: readonly string[]): number {
-    if (metrics !== undefined && metrics.length > 0) {
-      const placeholders = metrics.map(() => "?").join(", ");
-      return this.db
-        .prepare(`DELETE FROM metric_samples WHERE metric IN (${placeholders}) AND minute < ?`)
-        .run(...metrics, beforeMinute).changes;
-    }
-    return this.db.prepare(`DELETE FROM metric_samples WHERE minute < ?`).run(beforeMinute).changes;
+  prune(beforeMinute: string, metrics: readonly string[]): number {
+    if (metrics.length === 0) return 0;
+    const placeholders = metrics.map(() => "?").join(", ");
+    return this.db
+      .prepare(`DELETE FROM metric_samples WHERE metric IN (${placeholders}) AND minute < ?`)
+      .run(...metrics, beforeMinute).changes;
   }
 }

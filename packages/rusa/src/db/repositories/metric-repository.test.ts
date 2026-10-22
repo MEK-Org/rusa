@@ -187,4 +187,23 @@ describe("MetricRepository", () => {
     });
     expect(remainingUnrelated).toHaveLength(5);
   });
+
+  it("does not delete any samples when given an empty metric list", () => {
+    repo.recordMany([
+      {
+        metric: "unrelated_metric",
+        minute: iso(t0),
+        value: 9,
+        observedAt: iso(t0),
+      },
+    ]);
+
+    expect(repo.prune(iso(t0 + MINUTE), [])).toBe(0);
+    expect(
+      repo.readMany(["unrelated_metric"], {
+        startMinute: iso(t0),
+        endMinute: iso(t0),
+      })
+    ).toHaveLength(1);
+  });
 });

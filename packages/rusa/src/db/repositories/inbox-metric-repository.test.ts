@@ -303,15 +303,20 @@ describe("#1018 inbox metric samples", () => {
   it("isolates inbox sampling and pruning from unrelated metrics in the generic table", () => {
     addActor("a");
 
-    // Pre-insert an unrelated metric at the target sampling minute and far before the 72h window
+    // Pre-insert unrelated and inbox metrics at the target minute and before the 72h window.
     const targetMinute = iso(t0);
-    const oldMinute = iso(t0 - 100 * MINUTE);
+    const oldMinute = iso(t0 - INBOX_METRIC_WINDOW_MS - MINUTE);
     db.prepare(
       `INSERT INTO metric_samples (metric, minute, value, observed_at) VALUES (?, ?, ?, ?)`
     ).run("unrelated_metric", targetMinute, 42.0, targetMinute);
     db.prepare(
       `INSERT INTO metric_samples (metric, minute, value, observed_at) VALUES (?, ?, ?, ?)`
     ).run("unrelated_metric", oldMinute, 99.0, oldMinute);
+    for (const metric of ALL_INBOX_METRIC_NAMES) {
+      db.prepare(
+        `INSERT INTO metric_samples (metric, minute, value, observed_at) VALUES (?, ?, ?, ?)`
+      ).run(metric, oldMinute, 1.0, oldMinute);
+    }
 
     // sampleIfDue at targetMinute should not be suppressed by the existing unrelated metric row
     const point = metrics.sampleIfDue(t0);
@@ -331,11 +336,15 @@ describe("#1018 inbox metric samples", () => {
       "unrelated_metric",
     ]);
 
-    // Pruning at t0 should delete older inbox metrics but NOT touch unrelated metrics
-    metrics.prune(t0);
-    const oldRow = db
+    // The scheduled t0 prune deletes inbox rows before the 72h window but preserves unrelated data.
+    const oldRows = db
       .prepare(`SELECT value FROM metric_samples WHERE metric = ? AND minute = ?`)
-      .get("unrelated_metric", oldMinute) as { value: number };
-    expect(oldRow.value).toBe(99.0);
+      .all("unrelated_metric", oldMinute) as Array<{ value: number }>;
+    expect(oldRows).toEqual([{ value: 99.0 }]);
+    expect(
+      db
+        .prepare(`SELECT metric FROM metric_samples WHERE minute = ? AND metric IN (?, ?, ?, ?, ?)`)
+        .all(oldMinute, ...ALL_INBOX_METRIC_NAMES)
+    ).toEqual([]);
   });
 });
