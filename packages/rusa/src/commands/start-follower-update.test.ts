@@ -469,6 +469,25 @@ it("refuses absent and unrecognized launcher contracts before update work", () =
   expect(resolveStartFollowerRelease(nullLogger)).toEqual(unsupported);
 });
 
+it("answers an update to an unsupported launch with failed and stays connected", async () => {
+  syntheticCheckout({ sentinel: OLD_SHA });
+  const home = tempDir("rusa-start-follower-unsupported-");
+  const leader = await startLeader(home);
+
+  await bootFollower(home, leader.url, resolveStartFollowerRelease(nullLogger));
+  leader.hub.updateFollower(FOLLOWER_ID, { targetSha: NEW_SHA, branch: "staging" });
+
+  await waitUntil(() => statusNames(leader.statuses).includes("failed"));
+  expect(leader.statuses.at(-1)).toMatchObject({
+    status: "failed",
+    error: expect.stringContaining("supported launcher contract is absent or unrecognized"),
+  });
+  expect(process.exit).not.toHaveBeenCalled();
+  expect(leader.hub.list()).toEqual([
+    expect.objectContaining({ id: FOLLOWER_ID, commitSha: OLD_SHA }),
+  ]);
+}, 20_000);
+
 it("consumes the launcher assertion so descendant processes cannot inherit it", () => {
   syntheticCheckout({ sentinel: OLD_SHA });
   process.env[START_FOLLOWER_UPDATE_LAUNCHER_ENV] = START_FOLLOWER_UPDATE_LAUNCHER_VERSION;

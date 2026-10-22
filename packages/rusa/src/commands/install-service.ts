@@ -216,6 +216,9 @@ export function buildServiceUnit(opts: {
     `Environment=RUSA_HOME=${opts.mcHome}`,
     `Environment=PATH=${opts.userPath}`,
     `EnvironmentFile=-${join(opts.mcHome, ".env")}`,
+    ...(opts.startFollowerUpdateLauncher
+      ? [`Environment=${START_FOLLOWER_UPDATE_LAUNCHER_ENV}=${opts.startFollowerUpdateLauncher}`]
+      : []),
     `Restart=${opts.restart ?? "on-failure"}`,
     "RestartSec=10",
     `StandardOutput=${opts.logToJournal ? "journal" : `append:${logFile}`}`,
@@ -225,13 +228,6 @@ export function buildServiceUnit(opts: {
     "WantedBy=default.target",
     ""
   );
-  if (opts.startFollowerUpdateLauncher) {
-    unit.splice(
-      unit.indexOf(`EnvironmentFile=-${join(opts.mcHome, ".env")}`) + 1,
-      0,
-      `Environment=${START_FOLLOWER_UPDATE_LAUNCHER_ENV}=${opts.startFollowerUpdateLauncher}`
-    );
-  }
   return unit.join("\n");
 }
 
