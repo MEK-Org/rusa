@@ -1739,6 +1739,11 @@ console.log(JSON.stringify({type:"result", subtype:"success", result:"synthetic 
     const h = setup({ startupTimeoutMs: 50 });
     const first = h.spawn("First actor");
     await expect(h.runtime(first).ready).resolves.toBe(process.pid);
+    // Let the first actor's run finish on this connection. `h.reconnect()` below
+    // routes follower events to a remote with no host for the first actor, so a
+    // run still in flight there never reports its result and holds the only
+    // concurrency slot the second actor's run needs (#979).
+    await waitUntil(() => h.events.some((e) => e.actorId === first && e.event.type === "result"));
 
     // Suppress dispatch for the second actor to simulate follower omitting it at boot
     const origDispatch = h.follower.dispatch.bind(h.follower);
