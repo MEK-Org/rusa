@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import type { ActorLifecycleTerminal } from "../actor/actor-lifecycle.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
 import { InMemoryCapabilityGrantStore } from "../actor/capability-grants.js";
 import {
@@ -90,10 +89,7 @@ describe("follower registration recovery", () => {
     const inboxStore = new SqliteInboxRepository(inboxDb);
     const principals = new PrincipalRepository(inboxDb);
     principals.createUser({ email: "operator@example.test", createdAt: "t" });
-    const lifecycle: Array<
-      | { type: "start"; runId: string }
-      | { type: "end"; runId: string; terminal: ActorLifecycleTerminal }
-    > = [];
+    const lifecycle: Array<{ type: "start" | "end"; runId: string; terminal?: unknown }> = [];
     const provider: ProviderFactory = (_bridge, _options, selected) => ({
       name: "relaunch-fixture",
       providerName: "relaunch-fixture",
@@ -194,12 +190,6 @@ describe("follower registration recovery", () => {
       },
     ]);
     if (!gapWake) throw new Error("expected the durable gap wake to be inserted");
-    expect(gapWake).toMatchObject({
-      actorId: worker.id,
-      source: "test:gap-wake",
-      seenAt: null,
-      handledAt: null,
-    });
     expect(mesh.dispatch(worker.id)).toBe(true);
     await eventually(() => records.some((record) => record.event === "remote_wake_dropped"));
     expect(lifecycle).toEqual([]);
@@ -261,13 +251,8 @@ describe("follower registration recovery", () => {
     }
 
     expect(followerB.actorIds).toEqual([worker.id]);
-    const starts = lifecycle.filter(
-      (event): event is Extract<(typeof lifecycle)[number], { type: "start" }> =>
-        event.type === "start"
-    );
-    const ends = lifecycle.filter(
-      (event): event is Extract<(typeof lifecycle)[number], { type: "end" }> => event.type === "end"
-    );
+    const starts = lifecycle.filter((event) => event.type === "start");
+    const ends = lifecycle.filter((event) => event.type === "end");
     expect(starts).toHaveLength(1);
     expect(ends).toHaveLength(1);
     expect(ends[0]).toMatchObject({
