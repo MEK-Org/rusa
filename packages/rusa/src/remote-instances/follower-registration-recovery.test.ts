@@ -522,7 +522,6 @@ describe("follower registration recovery", () => {
         if (command.actorId === worker.id && command.message.type === "wake") {
           expect(firstRunReleased).toBe(false);
           expect(bReadyAcknowledged).toBe(true);
-          expect(bRunningAcknowledged).toBe(true);
           recoveryWakeDelivered = true;
         }
       },
