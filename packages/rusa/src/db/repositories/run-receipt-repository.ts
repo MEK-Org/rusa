@@ -68,12 +68,11 @@ export class HostRunReceiptRepository {
     modelConfig: ActorRunModelConfig;
     startedAt?: string;
   }): void {
-    const startedAt = opts.startedAt ?? new Date().toISOString();
     this.db.transaction(() => {
-      this.runs.start({ ...opts, startedAt });
+      this.runs.start({ ...opts, startedAt: opts.startedAt ?? new Date().toISOString() });
       this.db
-        .prepare(`INSERT INTO host_runs (run_id, instance_id, started_at) VALUES (?, ?, ?)`)
-        .run(opts.id, this.instanceId, startedAt);
+        .prepare(`INSERT INTO host_runs (run_id, instance_id) VALUES (?, ?)`)
+        .run(opts.id, this.instanceId);
     })();
   }
 
@@ -308,8 +307,8 @@ export class InstanceRunReceiptRepository {
         modelConfig: opts.modelConfig,
       });
       this.db
-        .prepare(`INSERT INTO instance_runs (run_id, instance_id, started_at) VALUES (?, ?, ?)`)
-        .run(opts.runId, opts.instanceId, startedAt);
+        .prepare(`INSERT INTO instance_runs (run_id, instance_id) VALUES (?, ?)`)
+        .run(opts.runId, opts.instanceId);
       const early = this.db
         .prepare(
           `SELECT id, digest, receipt, received_at FROM instance_receipt_conflicts

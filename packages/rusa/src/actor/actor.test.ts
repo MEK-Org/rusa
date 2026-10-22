@@ -3395,6 +3395,14 @@ describe("termination evidence reaches the run's terminal (#1119)", () => {
     const lifecycle = createActorLifecycle([{ onEnd: (event) => void ends.push(event.terminal) }]);
     return { ends, lifecycle };
   };
+  const evidenceOf = async (actor: Actor, ends: ActorLifecycleEndEvent["terminal"][]) => {
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    await flush();
+    expect(ends).toHaveLength(1);
+    const [terminal] = ends;
+    return terminal.kind === "result" ? terminal.result.termination : "not-a-result";
+  };
   const pooled = async (primary: Partial<RunResult>, recovery?: Partial<RunResult>) => {
     const { ends, lifecycle } = terminals();
     const first = new FakeProvider(() => primary, "primary");
@@ -3408,19 +3416,56 @@ describe("termination evidence reaches the run's terminal (#1119)", () => {
       },
       first
     );
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-    expect(ends).toHaveLength(1);
-    const [terminal] = ends;
-    return terminal.kind === "result" ? terminal.result.termination : "not-a-result";
+    return evidenceOf(actor, ends);
+  };
+  /** The same run shape with nowhere to recover to: its own result is the account. */
+  const solo = async (primary: Partial<RunResult>) => {
+    const { ends, lifecycle } = terminals();
+    const first = new FakeProvider(() => primary, "primary");
+    const actor = makeActor(
+      {
+        lifecycle,
+        modelConfig: [{ provider: "primary" }],
+        resolveProvider: () => first,
+        recoverFailedRuns: true,
+      },
+      first
+    );
+    return evidenceOf(actor, ends);
   };
   const exhausted = { success: false, exitCode: 1, output: "exhausted" };
 
   it("passes a single attempt's evidence through unchanged, including none", async () => {
+    // The success gate returns the primary's own result before the pool is
+    // consulted, so these never build a second provider.
     expect(await pooled({ success: true, termination: "observed" })).toBe("observed");
-    expect(await pooled({ success: false, exitCode: 1, termination: "unproven" })).toBe("unproven");
     expect(await pooled({ success: true })).toBeUndefined();
+    // A one-entry pool returns a failed primary untouched (its chain is
+    // empty), so the pass-through itself is what "unchanged" means here.
+    expect(await solo({ success: false, exitCode: 1, termination: "unproven" })).toBe("unproven");
+    expect(await solo({ success: false, exitCode: 1 })).toBeUndefined();
+  });
+
+  it("stays observed when an unresolvable entry never launched a process", async () => {
+    // A exits observed; B cannot be constructed (its provider is gone from
+    // config), which launches no process; C runs and its close is observed.
+    // Only launched processes bear on the composition's evidence (#1119).
+    const { ends, lifecycle } = terminals();
+    const a = new FakeProvider(() => ({ ...exhausted, termination: "observed" }), "a");
+    const c = new FakeProvider(() => ({ success: true, termination: "observed" }), "c");
+    const actor = makeActor(
+      {
+        lifecycle,
+        modelConfig: [{ provider: "a" }, { provider: "b" }, { provider: "c" }],
+        resolveProvider: (entry) => {
+          if (entry.provider === "b") throw new Error("provider b is not configured");
+          return entry.provider === "c" ? c : a;
+        },
+        recoverFailedRuns: true,
+      },
+      a
+    );
+    expect(await evidenceOf(actor, ends)).toBe("observed");
   });
 
   it("is observed after recovery only if every launched attempt was observed", async () => {

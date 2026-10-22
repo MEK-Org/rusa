@@ -1069,14 +1069,20 @@ export class Actor {
     }
     // A run's termination is observed only if every provider process it
     // launched was (#1119): a recovery attempt does not prove that an earlier
-    // one ended.
+    // one ended. An entry that could not be constructed launched nothing, so
+    // it does not bear on the evidence.
     let unproven = false;
     const attemptProvider = async (
       entry: RawProviderModelConfig,
       recoveryContext?: string
     ): Promise<RunResult> => {
       const attempt = await this.attemptPoolEntry(runId, entry, runProvider, recoveryContext);
-      if (attempt.termination !== "observed") unproven = true;
+      // A provider-selection failure never entered runProvider, so it cannot
+      // make an otherwise fully observed chain unproven; missing evidence
+      // from a process that did run stays unproven.
+      if (attempt.termination !== "observed" && attempt.failure?.stage !== "provider-selection") {
+        unproven = true;
+      }
       return attempt;
     };
     const withEvidence = (composed: RunResult): RunResult => ({

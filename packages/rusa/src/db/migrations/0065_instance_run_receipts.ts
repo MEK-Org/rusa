@@ -44,8 +44,7 @@ export const instanceRunReceipts: Migration = {
     db.exec(`
       CREATE TABLE host_runs (
         run_id TEXT PRIMARY KEY REFERENCES actor_runs(id) ON DELETE CASCADE,
-        instance_id TEXT NOT NULL,
-        started_at TEXT NOT NULL
+        instance_id TEXT NOT NULL
       );
 
       CREATE TABLE host_run_receipts (
@@ -62,7 +61,6 @@ export const instanceRunReceipts: Migration = {
       CREATE TABLE instance_runs (
         run_id TEXT PRIMARY KEY REFERENCES actor_runs(id) ON DELETE CASCADE,
         instance_id TEXT NOT NULL,
-        started_at TEXT NOT NULL,
         returned_at TEXT
       );
 

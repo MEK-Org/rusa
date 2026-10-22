@@ -51,9 +51,6 @@ export const BOUNDED_EXECUTION_CAPABILITY: BoundedExecutionCapability = { versio
  * are the generation's runs receipt-backed: either side being older leaves
  * the legacy contract intact.
  */
-export interface RunReceiptsOffer {
-  version: 1;
-}
 export interface RunReceiptsCapability {
   version: 1;
 }
