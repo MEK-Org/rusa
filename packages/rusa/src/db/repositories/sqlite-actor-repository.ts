@@ -33,6 +33,11 @@ type ActorRow = {
  * and rewrote every v2 document as v1, so v2 is no longer read.
  */
 export const ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION = 1 as const;
+/**
+ * Durable staged context selections. Context v2 was retired with placement
+ * data in migration 0056, so v3 is the next unambiguous format.
+ */
+const STAGED_CONTEXT_CONFIG_SCHEMA_VERSION = 3 as const;
 
 /** `execution_config` version emitted by this build (#550). */
 export const ACTOR_EXECUTION_CONFIG_SCHEMA_VERSION = 1 as const;
@@ -49,6 +54,8 @@ const MODEL_CONFIG_CLASS_SCHEMA_VERSION = 3 as const;
  * which is what let an actor disagree with its own class after an edit.
  */
 const MODEL_CONFIG_CLASS_REFERENCE_SCHEMA_VERSION = 4 as const;
+/** Durable staged model selections; v1 through v4 remain immutable readers. */
+const STAGED_MODEL_CONFIG_SCHEMA_VERSION = 5 as const;
 
 const modelConfigEntrySchema = z
   .object({
@@ -64,8 +71,6 @@ const legacyModelConfigSchema = z
     provider: z.string().optional(),
     model: z.string().optional(),
     effort: z.string().optional(),
-    desiredEntries: z.array(modelConfigEntrySchema).min(1).optional(),
-    desiredClass: z.string().min(1).optional(),
   })
   .strict()
   .refine(
@@ -77,18 +82,9 @@ const legacyModelConfigSchema = z
 const modelConfigPoolSchema = z
   .object({
     schemaVersion: z.literal(MODEL_CONFIG_POOL_SCHEMA_VERSION),
-    entries: z.array(modelConfigEntrySchema),
-    desiredEntries: z.array(modelConfigEntrySchema).min(1).optional(),
-    desiredClass: z.string().min(1).optional(),
+    entries: z.array(modelConfigEntrySchema).min(1),
   })
-  .strict()
-  .refine(
-    (config) =>
-      config.entries.length > 0 ||
-      config.desiredEntries !== undefined ||
-      config.desiredClass !== undefined,
-    { message: "entries cannot be empty unless desiredEntries or desiredClass is set" }
-  );
+  .strict();
 
 const modelConfigClassSchema = z
   .object({
@@ -98,8 +94,6 @@ const modelConfigClassSchema = z
     // name lets the dashboard distinguish that intentional class selection
     // from an explicit pool without making the runtime re-resolve it later.
     modelClass: z.string().min(1),
-    desiredEntries: z.array(modelConfigEntrySchema).min(1).optional(),
-    desiredClass: z.string().min(1).optional(),
   })
   .strict();
 
@@ -110,15 +104,43 @@ const modelConfigClassReferenceSchema = z
     // back to, which is what makes "the class row is authoritative" a fact
     // about the data rather than a rule readers have to remember.
     modelClass: z.string().min(1),
+  })
+  .strict();
+
+const stagedModelSelectionSchema = z
+  .object({
     desiredEntries: z.array(modelConfigEntrySchema).min(1).optional(),
     desiredClass: z.string().min(1).optional(),
   })
-  .strict();
+  .strict()
+  .refine((config) => config.desiredEntries !== undefined || config.desiredClass !== undefined, {
+    message: "a staged model document requires a desired selection",
+  });
+
+const stagedModelConfigPoolSchema = z
+  .object({
+    schemaVersion: z.literal(STAGED_MODEL_CONFIG_SCHEMA_VERSION),
+    // Empty only represents an actor without an active explicit selection;
+    // `desiredEntries` or `desiredClass` remains required by the intersection.
+    entries: z.array(modelConfigEntrySchema),
+  })
+  .strict()
+  .and(stagedModelSelectionSchema);
+
+const stagedModelConfigClassReferenceSchema = z
+  .object({
+    schemaVersion: z.literal(STAGED_MODEL_CONFIG_SCHEMA_VERSION),
+    modelClass: z.string().min(1),
+  })
+  .strict()
+  .and(stagedModelSelectionSchema);
 
 // v1, v2 and v3 all remain readable so existing records stay valid. Class-bound
 // documents are written as v4; a v3 record's copied pool remains encoded until
 // an explicit model-configuration change, and is ignored on every read.
 const modelConfigDocumentSchema = z.union([
+  stagedModelConfigClassReferenceSchema,
+  stagedModelConfigPoolSchema,
   modelConfigClassReferenceSchema,
   modelConfigClassSchema,
   modelConfigPoolSchema,
@@ -146,7 +168,6 @@ const contextConfigSchema = z.discriminatedUnion("type", [
       schemaVersion: z.literal(ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
       type: z.literal("native"),
       sessionId: z.string().optional(),
-      desired: desiredContextSchema.optional(),
     })
     .strict(),
   z
@@ -155,11 +176,31 @@ const contextConfigSchema = z.discriminatedUnion("type", [
       type: z.literal("portable"),
       mode: z.enum(["tail", "ledger", "brief"]),
       compactionModel: z.string().optional(),
-      desired: desiredContextSchema.optional(),
     })
     .strict(),
 ]);
-type ContextConfigDocument = z.infer<typeof contextConfigSchema>;
+
+const stagedContextConfigSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      schemaVersion: z.literal(STAGED_CONTEXT_CONFIG_SCHEMA_VERSION),
+      type: z.literal("native"),
+      sessionId: z.string().optional(),
+      desired: desiredContextSchema,
+    })
+    .strict(),
+  z
+    .object({
+      schemaVersion: z.literal(STAGED_CONTEXT_CONFIG_SCHEMA_VERSION),
+      type: z.literal("portable"),
+      mode: z.enum(["tail", "ledger", "brief"]),
+      compactionModel: z.string().optional(),
+      desired: desiredContextSchema,
+    })
+    .strict(),
+]);
+
+const contextConfigDocumentSchema = z.union([stagedContextConfigSchema, contextConfigSchema]);
 
 /**
  * The stored {@link ExecutionConfig} (#550): whether the actor runs outside
@@ -213,23 +254,38 @@ function buildModelConfig(record: ActorRecord): string | null {
       : undefined;
   const desiredClass = record.desiredModelClass;
 
-  if (record.modelClass !== undefined) {
-    return JSON.stringify({
-      schemaVersion: MODEL_CONFIG_CLASS_REFERENCE_SCHEMA_VERSION,
-      modelClass: record.modelClass,
-      ...(desiredEntries !== undefined ? { desiredEntries } : {}),
-      ...(desiredClass !== undefined ? { desiredClass } : {}),
-    });
-  }
-  if (!record.modelConfig || record.modelConfig.length === 0) {
-    if (desiredEntries !== undefined || desiredClass !== undefined) {
+  // Pending selections carry a format of their own. The old strict schemas
+  // stay immutable so deployed old readers continue to read unchanged rows
+  // and fail closed on this deliberately unsupported downgrade format.
+  if (desiredEntries !== undefined || desiredClass !== undefined) {
+    if (record.modelClass !== undefined) {
       return JSON.stringify({
-        schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION,
-        entries: [],
+        schemaVersion: STAGED_MODEL_CONFIG_SCHEMA_VERSION,
+        modelClass: record.modelClass,
         ...(desiredEntries !== undefined ? { desiredEntries } : {}),
         ...(desiredClass !== undefined ? { desiredClass } : {}),
       });
     }
+    const entries = (record.modelConfig ?? []).map((entry) => ({
+      provider: entry.provider,
+      model: entry.model,
+      ...(entry.effort !== undefined ? { effort: entry.effort } : {}),
+    }));
+    return JSON.stringify({
+      schemaVersion: STAGED_MODEL_CONFIG_SCHEMA_VERSION,
+      entries,
+      ...(desiredEntries !== undefined ? { desiredEntries } : {}),
+      ...(desiredClass !== undefined ? { desiredClass } : {}),
+    });
+  }
+
+  if (record.modelClass !== undefined) {
+    return JSON.stringify({
+      schemaVersion: MODEL_CONFIG_CLASS_REFERENCE_SCHEMA_VERSION,
+      modelClass: record.modelClass,
+    });
+  }
+  if (!record.modelConfig || record.modelConfig.length === 0) {
     return null;
   }
   const entries = record.modelConfig.map((entry) => ({
@@ -240,8 +296,6 @@ function buildModelConfig(record: ActorRecord): string | null {
   return JSON.stringify({
     schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION,
     entries,
-    ...(desiredEntries !== undefined ? { desiredEntries } : {}),
-    ...(desiredClass !== undefined ? { desiredClass } : {}),
   });
 }
 
@@ -263,38 +317,60 @@ function buildModelConfig(record: ActorRecord): string | null {
  * `setModelSelection` and always restate independently of this predicate.
  */
 function keepStoredModelConfig(record: ActorRecord, stored: string | null): string | undefined {
-  if (stored === null || record.modelClass === undefined) return undefined;
+  if (stored === null) return undefined;
   let parsed: unknown;
   try {
     parsed = JSON.parse(stored);
   } catch {
     return undefined;
   }
-  if (typeof parsed !== "object" || parsed === null) return undefined;
-  const storedObj = parsed as {
-    modelClass?: unknown;
-    desiredEntries?: unknown;
-    desiredClass?: unknown;
-  };
-  if (storedObj.modelClass !== record.modelClass) return undefined;
+  const document = modelConfigDocumentSchema.safeParse(parsed);
+  if (!document.success) return undefined;
+  const storedObj = document.data;
 
   const recordHasDesiredEntries = record.desiredModelConfig !== undefined;
-  const storedHasDesiredEntries = storedObj.desiredEntries !== undefined;
+  const storedHasDesiredEntries =
+    "desiredEntries" in storedObj && storedObj.desiredEntries !== undefined;
   if (recordHasDesiredEntries !== storedHasDesiredEntries) return undefined;
 
   const recordHasDesiredClass = record.desiredModelClass !== undefined;
-  const storedHasDesiredClass = storedObj.desiredClass !== undefined;
+  const storedHasDesiredClass = "desiredClass" in storedObj && storedObj.desiredClass !== undefined;
   if (recordHasDesiredClass !== storedHasDesiredClass) return undefined;
 
   if (
     recordHasDesiredEntries &&
-    JSON.stringify(record.desiredModelConfig) !== JSON.stringify(storedObj.desiredEntries)
+    JSON.stringify(record.desiredModelConfig) !==
+      JSON.stringify("desiredEntries" in storedObj ? storedObj.desiredEntries : undefined)
   ) {
     return undefined;
   }
-  if (recordHasDesiredClass && record.desiredModelClass !== storedObj.desiredClass) {
+  if (
+    recordHasDesiredClass &&
+    record.desiredModelClass !== ("desiredClass" in storedObj ? storedObj.desiredClass : undefined)
+  ) {
     return undefined;
   }
+
+  if ("modelClass" in storedObj) {
+    return storedObj.modelClass === record.modelClass ? stored : undefined;
+  }
+  if (record.modelClass !== undefined) return undefined;
+  if ("entries" in storedObj) {
+    return JSON.stringify(record.modelConfig ?? []) === JSON.stringify(storedObj.entries)
+      ? stored
+      : undefined;
+  }
+  const legacyEntries =
+    storedObj.provider !== undefined && storedObj.model !== undefined
+      ? [
+          {
+            provider: storedObj.provider,
+            model: storedObj.model,
+            ...(storedObj.effort !== undefined ? { effort: storedObj.effort } : {}),
+          },
+        ]
+      : [];
+  if (JSON.stringify(record.modelConfig ?? []) !== JSON.stringify(legacyEntries)) return undefined;
 
   return stored;
 }
@@ -386,8 +462,11 @@ function buildContextConfig(record: ActorRecord): string | null {
       : undefined;
 
   if (record.context?.type === "portable") {
-    const config: ContextConfigDocument = {
-      schemaVersion: ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
+    const config = {
+      schemaVersion:
+        desired !== undefined
+          ? STAGED_CONTEXT_CONFIG_SCHEMA_VERSION
+          : ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
       type: "portable",
       mode: record.context.mode,
       ...(record.context.compactionModel !== undefined
@@ -402,8 +481,11 @@ function buildContextConfig(record: ActorRecord): string | null {
     record.sessionId !== undefined ||
     desired !== undefined
   ) {
-    const config: ContextConfigDocument = {
-      schemaVersion: ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
+    const config = {
+      schemaVersion:
+        desired !== undefined
+          ? STAGED_CONTEXT_CONFIG_SCHEMA_VERSION
+          : ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
       type: "native",
       ...(record.sessionId !== undefined ? { sessionId: record.sessionId } : {}),
       ...(desired !== undefined ? { desired } : {}),
@@ -413,14 +495,42 @@ function buildContextConfig(record: ActorRecord): string | null {
   return null;
 }
 
+/** Keep a semantically unchanged context document byte-for-byte on incidental writes. */
+function keepStoredContextConfig(record: ActorRecord, stored: string | null): string | undefined {
+  if (stored === null) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stored);
+  } catch {
+    return undefined;
+  }
+  const document = contextConfigDocumentSchema.safeParse(parsed);
+  if (!document.success) return undefined;
+  const storedContext = document.data;
+  const desired = "desired" in storedContext ? storedContext.desired : undefined;
+  if (JSON.stringify(record.desiredContextConfig) !== JSON.stringify(desired)) return undefined;
+
+  if (storedContext.type === "portable") {
+    return record.context?.type === "portable" &&
+      record.context.mode === storedContext.mode &&
+      record.context.compactionModel === storedContext.compactionModel &&
+      record.sessionId === undefined
+      ? stored
+      : undefined;
+  }
+  return record.context?.type === "native" && record.sessionId === storedContext.sessionId
+    ? stored
+    : undefined;
+}
+
 function parseContextConfig(
   actorId: string,
   json: string | null
 ): Pick<ActorRecord, "context" | "sessionId" | "desiredContextConfig"> {
   if (!json) return {};
-  const parsed = parseDocument(actorId, "context_config", json, contextConfigSchema);
+  const parsed = parseDocument(actorId, "context_config", json, contextConfigDocumentSchema);
   const desiredPart: Pick<ActorRecord, "desiredContextConfig"> =
-    parsed.desired !== undefined
+    "desired" in parsed && parsed.desired !== undefined
       ? {
           desiredContextConfig:
             parsed.desired.type === "portable"
@@ -598,11 +708,17 @@ export class SqliteActorRepository implements ActorRepository {
     const executionConfigJson = buildExecutionConfig(record);
 
     this.db.transaction(() => {
-      // One read of the prior row serves both the retirement timestamp and the
-      // stored model-config document an incidental write must preserve.
+      // One read of the prior row serves the retirement timestamp and both
+      // stored config documents an incidental write must preserve.
       const prior = this.db
-        .prepare("SELECT retired_at, model_config FROM actors WHERE id = ?")
-        .get(record.id) as { retired_at: string | null; model_config: string | null } | undefined;
+        .prepare("SELECT retired_at, model_config, context_config FROM actors WHERE id = ?")
+        .get(record.id) as
+        | {
+            retired_at: string | null;
+            model_config: string | null;
+            context_config: string | null;
+          }
+        | undefined;
       const retiredAt =
         record.status === "active" ? null : (prior?.retired_at ?? new Date().toISOString());
       const modelConfigJson =
@@ -626,7 +742,8 @@ export class SqliteActorRepository implements ActorRepository {
           record.charter,
           record.parentId,
           modelConfigJson,
-          buildContextConfig(record),
+          keepStoredContextConfig(record, prior?.context_config ?? null) ??
+            buildContextConfig(record),
           buildVoiceConfig(record),
           record.title ?? null,
           retiredAt,

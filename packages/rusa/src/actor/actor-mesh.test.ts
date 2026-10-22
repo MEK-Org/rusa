@@ -7100,7 +7100,9 @@ describe("ActorMesh", () => {
         .get(worker) as { model_config: string; context_config: string };
       const parsedContext = JSON.parse(rawRow.context_config);
       const parsedModel = JSON.parse(rawRow.model_config);
+      expect(parsedContext.schemaVersion).toBe(3);
       expect(parsedContext.desired).toEqual({ type: "portable", mode: "tail" });
+      expect(parsedModel.schemaVersion).toBe(5);
       expect(parsedModel.desiredEntries).toEqual([{ provider: "codex", model: "gpt-5.6-sol" }]);
 
       const reopenedRepo = new SqliteActorRepository(db);
@@ -7130,7 +7132,12 @@ describe("ActorMesh", () => {
       const clearedRow = db
         .prepare("SELECT model_config, context_config FROM actors WHERE id = ?")
         .get(worker) as { model_config: string; context_config: string };
+      expect(JSON.parse(clearedRow.context_config)).toMatchObject({
+        schemaVersion: 1,
+        type: "portable",
+      });
       expect(JSON.parse(clearedRow.context_config).desired).toBeUndefined();
+      expect(JSON.parse(clearedRow.model_config)).toMatchObject({ schemaVersion: 2 });
       expect(JSON.parse(clearedRow.model_config).desiredEntries).toBeUndefined();
 
       releaseDeferred();
