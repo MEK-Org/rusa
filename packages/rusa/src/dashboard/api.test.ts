@@ -1429,7 +1429,7 @@ describe("handleMeshApiRequest", () => {
         retire: () => {
           throw new Error("actor has in-flight run");
         },
-      },
+      } as unknown as OperatorActorControl,
     };
     const { res } = await call(throwingDeps, "POST", `/api/mesh/actors/${UUID_B}/retire`);
 
