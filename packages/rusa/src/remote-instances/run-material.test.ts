@@ -287,7 +287,10 @@ describe("RunMaterialStore", () => {
     // The directories now exist, which proves nothing about their entries.
     synced.length = 0;
     expect(new RunMaterialStore(dir, io).reservePromptAttempt("actor-a", RUN)).toBe(1);
-    for (const path of [dirname(dir), dir, actorDir, runDir]) expect(synced).toContain(path);
+    // The store reconfirms its own top entry inside the existing home too.
+    for (const path of [dirname(dirname(dir)), dirname(dir), dir, actorDir, runDir]) {
+      expect(synced).toContain(path);
+    }
   });
 
   it("verifies an existing file on EEXIST and refuses a corrupt one", () => {

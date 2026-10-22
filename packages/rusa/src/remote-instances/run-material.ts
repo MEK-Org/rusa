@@ -393,9 +393,10 @@ export class RunMaterialStore {
       this.syncDir(dirname(created));
     }
     // Existence is not durability: an earlier attempt may have created a
-    // directory and then failed to sync its parent. Reconfirm every entry from
-    // `dir` up to the store root's own entry on each call.
-    const top = dirname(this.root);
+    // directory and then failed to sync its parent. Reconfirm every entry the
+    // store can create, from `dir` up to its top directory inside the existing
+    // home. Never walk further toward `/`.
+    const top = dirname(dirname(this.root));
     for (let entry = dir; entry !== top && dirname(entry) !== entry; entry = dirname(entry)) {
       this.syncDir(dirname(entry));
     }
