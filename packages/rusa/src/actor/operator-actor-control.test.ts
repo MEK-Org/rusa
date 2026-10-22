@@ -180,7 +180,10 @@ describe("OperatorActorControl (#1003)", () => {
     expect(() => control.retire("worker", "root-llm")).toThrow(/human operator/);
     control.reparent("root", "other", OPERATOR);
     expect(() => control.retire("root", OPERATOR)).toThrow(/configured root actor/);
+    expect(() => control.retire("other", OPERATOR)).toThrow(/configured root actor/);
+    expect(actors.get("other")?.status).toBe("active");
     expect(actors.get("imported")?.parentId).toBe("other");
+    expect(actors.get("imported")?.status).toBe("active");
     expect(() => control.retire("ghost", OPERATOR)).toThrow(/unknown actor/);
     expect(() => control.retire("other-child", OPERATOR)).toThrow(/not active/);
     expect(actors.get("imported")?.status).toBe("active");
@@ -197,6 +200,12 @@ describe("OperatorActorControl (#1003)", () => {
       expect.objectContaining({
         principal: OPERATOR,
         actorId: "imported",
+        outcome: "denied",
+        reason: "configured root actor may not be retired through the operator retire boundary",
+      }),
+      expect.objectContaining({
+        principal: OPERATOR,
+        actorId: "other",
         outcome: "denied",
         reason: "configured root actor may not be retired through the operator retire boundary",
       }),

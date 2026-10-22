@@ -45,6 +45,7 @@ export interface OperatorActorControlMesh {
   reparentThread(id: string, newParentId: string | null): void;
   retire(id: string): void;
   resolveActorId(id: string): string;
+  isAncestorOf(ancestorId: string, id: string): boolean;
   recordEvent(event: {
     kind: "operator_actor_reparent" | "operator_obligations_admin" | "operator_actor_retire";
     actorId: string;
@@ -127,7 +128,10 @@ export class OperatorActorControl {
       audit("denied", reason);
       throw new Error(reason);
     }
-    if (canonicalActorId === this.rootId) {
+    if (
+      this.rootId !== undefined &&
+      (canonicalActorId === this.rootId || this.mesh.isAncestorOf(canonicalActorId, this.rootId))
+    ) {
       const reason =
         "configured root actor may not be retired through the operator retire boundary";
       audit("denied", reason);
