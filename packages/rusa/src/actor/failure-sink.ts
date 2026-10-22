@@ -2,7 +2,6 @@ import { execSync } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
-import type { ExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { MechanicalInboxForensics } from "./actor-mesh.js";
@@ -28,14 +27,6 @@ export interface FailureSinkDeps {
   log: (message: string) => void;
   /** Optional workers home directory to check for unpushed work on SIGTERM. */
   workersDir?: string;
-  /**
-   * Optional exhaustion classifier for parentless actors' error-chat notices.
-   * When set, a root or top-level actor's failed run is classified before the
-   * notice is built, and a quota-exhaustion classification LEADS the notice.
-   * A child's failure is never classified (#1148): its parent judges the
-   * observed failure itself.
-   */
-  classify?: ExhaustionClassifier;
   /**
    * Durable principals, so an interrupt attributed to a user principal id is
    * recognized as a human cancellation (#460) rather than a failure to report.
@@ -203,11 +194,10 @@ function findDirtyOrAheadRepoPath(workerDir: string): string | null {
  * The parent-gone case is handled for free: the mesh's sendMessage drops-and-logs
  * when the target isn't live.
  *
- * A child's notice reports the observed failure as-is (#1148): its parent
- * already has to judge it, and a quota classification would not change where it
- * goes. Only a parentless actor's run is classified, when
- * {@link FailureSinkDeps.classify} is set, so an exhaustion classification can
- * lead its error-chat notice ahead of the usual exit-code/tail summary.
+ * Every notice reports the observed failure as-is (#1148, #1150): nothing
+ * guesses its cause. A child's parent judges it; a root's run has already been
+ * through configured-pool recovery, whose accumulated per-attempt report is the
+ * run's output.
  * `providerLabel` (typically `<provider>/<model> @ <effort>`, via
  * {@link formatProviderLabel}) identifies the provider/model that produced the
  * failed run; it does not claim that selection itself failed.
@@ -225,16 +215,7 @@ export async function routeRunFailure(
     deps.log(`suppressing expected responsive preemption notice for ${actorId}`);
     return;
   }
-  // A caught exception's own message says what went wrong; its stack does not,
-  // and a long one would push the message out of the budget. Output (the stack,
-  // or an ordinary CLI exit's own text) is the fallback only without a message.
-  // A capacity failure's output already carries its reason plus any pool
-  // aggregate (attempted/skipped entries), so it stays the diagnostic.
-  const message =
-    result.failure?.kind !== "provider-capacity" && result.failure?.message.trim()
-      ? result.failure.message
-      : undefined;
-  const diagnostic = clipFailureDiagnostic(sanitizeFailureText(message ?? result.output ?? ""));
+  const diagnostic = failureDiagnostic(result);
   const exitDesc = result.abortReason
     ? `exit ${result.exitCode}, ${result.abortReason}`
     : `exit ${result.exitCode}`;
@@ -250,13 +231,6 @@ export async function routeRunFailure(
   } else if (result.failure?.stage === "provider-selection") {
     // Established at the resolver boundary: nothing ran, so nothing exhausted.
     leadLine = `could not prepare ${providerLabel ?? "the configured provider/model"}.\nProvider was not invoked.`;
-  } else if (deps.classify && !deps.actors.get(actorId)?.parentId) {
-    const classification = await deps.classify(result);
-    if (classification.exhausted) {
-      leadLine =
-        `quota exhausted: ${providerLabel ?? "unknown provider/model"} — clears on a timer. ` +
-        "Parent judgment needed: wait, respawn on another provider/tier, or re-scope.";
-    }
   }
 
   if (!leadLine && providerLabel) {
@@ -314,6 +288,22 @@ export function isResponsivePreemption(result: RunResult): boolean {
   return Boolean(
     result.cancelled && result.interrupted && result.interruptSource === "responsive-notification"
   );
+}
+
+/**
+ * A failed run's sanitized diagnostic, clipped to `budget` (#980). A caught
+ * exception's own message says what went wrong; its stack does not, and a long
+ * one would push the message out of the budget. Output (the stack, or an
+ * ordinary CLI exit's own text) is the fallback only without a message. A
+ * capacity failure's output already carries its reason plus any pool aggregate,
+ * so it stays the diagnostic.
+ */
+export function failureDiagnostic(result: RunResult, budget = FAILURE_DIAGNOSTIC_BUDGET): string {
+  const message =
+    result.failure?.kind !== "provider-capacity" && result.failure?.message.trim()
+      ? result.failure.message
+      : undefined;
+  return clipFailureDiagnostic(sanitizeFailureText(message ?? result.output ?? ""), budget);
 }
 
 /**

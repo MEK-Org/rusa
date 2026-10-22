@@ -61,7 +61,6 @@ import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { McpHttpServer } from "../mcp/http-server.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import type { DiskUsageAlertDeps } from "../observability/disk-alert.js";
-import * as exhaustionClassifier from "../providers/exhaustion-classifier.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
@@ -2502,7 +2501,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
   }, 10_000);
 
   describe("root pool fallback is root-only ", () => {
-    it("wires exhaustion classification only for root actors", async () => {
+    it("enables failed-run recovery only for the root actor (#1150)", async () => {
       const config = {
         github: { account: "mock-bot" },
         providers: {
@@ -2554,18 +2553,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!mesh) throw new Error("mesh not ready");
       const workerActor = mesh.get("test-kimi-worker");
       expect(workerActor).toBeDefined();
-      const kimiActorOpts = (workerActor as unknown as { opts: { classifyExhaustion?: unknown } })
+      const kimiActorOpts = (workerActor as unknown as { opts: { recoverFailedRuns?: unknown } })
         .opts;
       const rootActorOpts = (
         mesh.get(rootId) as unknown as {
-          opts: { classifyExhaustion?: unknown };
+          opts: { recoverFailedRuns?: unknown };
         }
       ).opts;
 
-      // Workers report quota exhaustion to their parent rather than consuming
+      // Workers report a failed run to their parent rather than consuming
       // their own configured pool. Only the root enables recovery.
-      expect(kimiActorOpts.classifyExhaustion).toBeUndefined();
-      expect(rootActorOpts.classifyExhaustion).toBeTypeOf("function");
+      expect(kimiActorOpts.recoverFailedRuns).toBeUndefined();
+      expect(rootActorOpts.recoverFailedRuns).toBe(true);
     });
 
     it("boot wires the obligation store's actor guard, so it is not inert", async () => {
@@ -3101,7 +3100,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
   describe("run settlement on provider return (#828)", () => {
     /**
      * Boot the production wiring with one rehydrated worker and hand back the
-     * hooks `runStart` actually built for it. The Actor's own classification is
+     * hooks `runStart` actually built for it. The Actor's own run settlement is
      * covered in actor.test.ts; what is asserted here is everything downstream
      * of it — durable history, the `run_end` a dashboard reads, and the
      * mechanical notice a parent receives.
@@ -3113,8 +3112,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           github: { account: "mock-bot" },
           providers: { antigravity: { cliCommand: "agy" } },
           rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-          // No geminiApiKey: the failure route's exhaustion classifier then takes
-          // its deterministic offline branch, so this test never leaves the box.
         }),
         "utf8"
       );
@@ -5708,12 +5705,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       releaseFirstFold = resolve;
     });
     onTestFinished(() => releaseFirstFold());
-    // The compactor needs a synthetic API key, but failed-run classification
-    // is unrelated to this fixture and must stay offline.
-    const classifierSpy = vi
-      .spyOn(exhaustionClassifier, "createExhaustionClassifier")
-      .mockReturnValue(async () => ({ exhausted: false }));
-    onTestFinished(() => classifierSpy.mockRestore());
     const compactSpy = vi
       .spyOn(GeminiPortableContextCompactor.prototype, "compact")
       .mockImplementation(async ({ state, messages, now }) => {
@@ -8306,7 +8297,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // `runWithPoolFallback` is the production boundary that resolves the
     // ordered remaining root pool.
     // `requestRun` is mocked file-wide, so this drives the lifecycle with a
-    // stubbed provider and classifies the primary as exhausted.
+    // stubbed provider whose primary attempt fails.
     const rootPoolFallbackRun = async (
       mesh: ActorMesh,
       selected: ProviderModelConfig,
@@ -8319,9 +8310,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       const root = mesh.get(rootId);
       if (!root) throw new Error("root actor not ready");
       const actor = root as unknown as {
-        opts: {
-          classifyExhaustion?: (result: RunResult) => Promise<{ exhausted: boolean }>;
-        };
+        opts: { recoverFailedRuns?: boolean };
         runWithPoolFallback: (
           runId: string,
           selected: ProviderModelConfig,
@@ -8329,8 +8318,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           runProvider: (provider: CodingProvider) => Promise<RunResult>
         ) => Promise<RunResult>;
       };
-      if (!actor.opts.classifyExhaustion) throw new Error("root pool fallback not configured");
-      actor.opts.classifyExhaustion = vi.fn(async () => ({ exhausted: true }));
+      if (!actor.opts.recoverFailedRuns) throw new Error("root pool fallback not configured");
       const lifecycleActor = root as Actor;
       const runId = await startLifecycleRun(lifecycleActor, selected);
       const primary: CodingProvider = {

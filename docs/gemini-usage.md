@@ -109,7 +109,8 @@ account-wide billed-dollar reconciliation remain separate.
 ## Instrumented purposes
 
 The active SDK/REST inventory for this implementation, after the commitment-polarity
-removal in [#1060](https://github.com/MEK-Org/rusa/pull/1060), is:
+removal in [#1060](https://github.com/MEK-Org/rusa/pull/1060) and the run-failure
+exhaustion classifier removal in [#1150](https://github.com/MEK-Org/rusa/issues/1150), is:
 
 | Stable purpose | Production call site |
 | --- | --- |
@@ -117,18 +118,21 @@ removal in [#1060](https://github.com/MEK-Org/rusa/pull/1060), is:
 | `quota_parse` | `src/mcp/quota-mcp.ts`, each parser attempt and model fallback |
 | `model_catalog_parse` | `src/providers/model-catalog.ts` |
 | `kimi_screen_classification` | `src/providers/kimi-usage-scrape.ts` |
-| `exhaustion_classification` | `src/providers/exhaustion-classifier.ts` |
 | `understanding_distillation` | `src/understanding/distill.ts`, every tool-loop turn |
 | `understanding_retrieval` | `src/understanding/retrieve-llm.ts`, every tool-loop turn |
 | `avatar_generation` | `src/avatar/avatars.ts`, REST response before image validation |
 | `speech_transcription` | `src/voice/gemini-speech.ts`, REST response before transcript validation |
 | `speech_synthesis` | `src/voice/gemini-speech.ts`, REST and streamed responses |
 
+The retired `exhaustion_classification` purpose has no call site. A report still
+accepts its already-recorded calls, so they stay counted rather than invalid, and
+never lists it as unobserved.
+
 Paths are relative to `packages/rusa`. No schema or dashboard change is needed.
 Credential redaction remains intact: numeric usage lives under
 `counts.input/response/thinking/cachedInput/toolInput/total`, while fields whose
 names contain `token` remain redacted. The synthetic tests exercise the actual
 logger → JSONL → built CLI report path in two real processes, overlapping
-exports, all ten active purpose fixtures, retries, rejected validation, missing and
+exports, all nine active purpose fixtures, retries, rejected validation, missing and
 partial metadata, streaming completion/cancellation/errors, time bounds and
 known history gaps. Call-site suites check their existing behavior unchanged.

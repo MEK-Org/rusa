@@ -288,7 +288,6 @@ import {
   codexAuthBrokerConfigured,
   configureCodexAuthBroker,
 } from "../providers/codex-auth-broker.js";
-import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import {
   acceptableModelPins,
   ingestKimiHostModels,
@@ -2048,7 +2047,6 @@ async function composeStart(
   log.info("shared_mcp_serving", { servers: sharedMcp.map((u) => u.name) });
 
   // ── Provider + actor repository ──
-  const classifyExhaustion = createExhaustionClassifier(config.geminiApiKey);
   const repoRoot = (() => {
     try {
       return resolveRepoRoot();
@@ -3540,7 +3538,7 @@ async function composeStart(
             entry: { ...entry },
             reason: isProviderHalted(entry.provider, entry.model) ? "halted" : "exhausted",
           }));
-          return new PoolExhaustedError(formatPoolExhaustedFailure({ attempted: [], skipped }));
+          return new PoolExhaustedError(formatPoolExhaustedFailure({ skipped }));
         },
         onSelected: request.threadId
           ? (selection) => {
@@ -3969,7 +3967,7 @@ async function composeStart(
           // actor, not an alternate authority-bearing construction path.
           ...(id === rootId
             ? {
-                classifyExhaustion,
+                recoverFailedRuns: true,
                 onPoolFallback: ({ runId, attempt, failed, next, remainingAfter, skipReason }) => {
                   runLogger(id, runId).warn("run_pool_fallback", {
                     attempt,
@@ -3995,10 +3993,10 @@ async function composeStart(
                 },
               }
             : {}),
-          // No worker-side fallback : fallbacks are root-only. A worker's
-          // quota exhaustion is not something it self-heals out of — it's a
-          // signal to the worker's parent, who judges what happens next (see
-          // the exhaustion-classified onRun failure notice below).
+          // No worker-side recovery: it is root-only (#1150). A worker's
+          // failed run is not something it self-heals out of — it's a signal
+          // to the worker's parent, who judges what happens next (see the
+          // factual onRun failure notice below).
           gate: (fn, candidates, responsive) => {
             // A remote target executes inside its follower and obtains that
             // follower's lock. Never make two independent instances contend
@@ -4334,9 +4332,6 @@ async function composeStart(
     log: (m) => console.warn(`[failure-sink] ${m}`),
     workersDir,
     principals: getRepositories().principals,
-    // Names quota exhaustion in a parentless actor's error-chat notice; a
-    // child's failure reaches its parent unclassified (#1148).
-    classify: classifyExhaustion,
     // #189: a child's failure wakes its parent past provider pacing, backed
     // off per child so a crash loop cannot hammer the parent.
     escalation: new FailureEscalationBackoff(),
