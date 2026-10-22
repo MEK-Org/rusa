@@ -2288,7 +2288,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(returnRejections(direct)).toEqual([]);
   }, 10_000);
 
-  it("stamps an actor message from its selected obligation's inherited responsiveness", async () => {
+  it("binds the actor message endpoint to one run through rejected, failed, cancelled, and completed lifecycles", async () => {
     let mesh: ActorMesh | undefined;
     let root: Actor | undefined;
     await new Promise<void>((resolve) => {
@@ -2318,6 +2318,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!url) throw new Error(`${server} MCP server missing`);
       return url;
     };
+    const hasAgentExec = (actor: Actor) =>
+      (actor as unknown as { opts: LiveActorOptions }).opts.mcpServers.some(
+        (entry) => entry.name === "mesh"
+      );
     const call = async (url: string, name: string, args: Record<string, unknown>) => {
       const client = new Client({ name: "message-priority-dogfood", version: "0.0.0" });
       await client.connect(new StreamableHTTPClientTransport(new URL(url)));
@@ -2351,6 +2355,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
       parentId: responsiveParent.id,
     });
     expect(getRepositories().obligations.require(selected.id).effectiveResponsive).toBe(true);
+    // An admission that never reaches onStart must not acquire a run bearer.
+    const rejectedRunId = randomUUID();
+    await actorOf(sender).lifecycle.emit("onQueued", {
+      actorId: sender,
+      runId: rejectedRunId,
+      responsive: false,
+      mode: "ordinary",
+    });
+    await abandonLifecycleRun(actorOf(sender), rejectedRunId, "start-cancelled", false);
+    expect(hasAgentExec(actorOf(sender))).toBe(false);
 
     const runId = await startLifecycleRun(actorOf(sender), {
       provider: "antigravity",
@@ -2432,6 +2446,47 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
     expect(oldRunRejected).toBe(true);
 
+    // A provider startup failure has already opened a run, so its terminal
+    // event must revoke that run's endpoint just like ordinary completion.
+    const failedRunId = await startLifecycleRun(actorOf(sender), {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    const failedRunUrl = urlOf(actorOf(sender), "mesh");
+    await actorOf(sender).lifecycle.emit("onError", {
+      actorId: sender,
+      runId: failedRunId,
+      error: new Error("provider startup failed"),
+    });
+    await endLifecycleRun(actorOf(sender), failedRunId, {
+      success: false,
+      output: "provider startup failed",
+      exitCode: 1,
+    });
+    await expect(
+      call(failedRunUrl, "send_message", {
+        thread_id: recipient,
+        body: "must not deliver from failed start",
+      })
+    ).rejects.toThrow();
+
+    // A started cancellation is another terminal path and must not leave a
+    // usable endpoint behind.
+    const cancelledRunId = await startLifecycleRun(actorOf(sender), {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    const cancelledRunUrl = urlOf(actorOf(sender), "mesh");
+    await abandonLifecycleRun(actorOf(sender), cancelledRunId, "coalesced", true);
+    await expect(
+      call(cancelledRunUrl, "send_message", {
+        thread_id: recipient,
+        body: "must not deliver from cancellation",
+      })
+    ).rejects.toThrow();
+
     const runBId = await startLifecycleRun(actorOf(sender), {
       provider: "antigravity",
       model: "Gemini 3.7 Flash",
@@ -2439,6 +2494,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
     const runBUrl = urlOf(actorOf(sender), "mesh");
     expect(runBUrl).not.toBe(runAUrl);
+    expect(
+      (
+        await call(runBUrl, "send_message", {
+          thread_id: recipient,
+          body: "run B remains usable",
+        })
+      ).isError
+    ).toBeFalsy();
     await endLifecycleRun(actorOf(sender), runBId, { success: true, output: "", exitCode: 0 });
   }, 10_000);
 
@@ -9818,6 +9881,31 @@ describe("runStart webhook event routing (Phase 4)", () => {
       `initial remote attempt\n\n_${generateHandle(workerId)} (Gemini 3.7 Flash, high)_`
     );
 
+    // The same follower run can move to an actual fallback attempt. The
+    // leader must use the fresh provider/model/effort, rather than the launch
+    // tuple or a future run's context, for the next host-owned write.
+    remote.receive({
+      actorId: workerId,
+      message: {
+        type: "request",
+        requestId: 1,
+        request: {
+          op: "providerAttempt",
+          attempt: { provider: "codex", model: "gpt-5.5", effort: "low" },
+        },
+      },
+    });
+    await vi.waitFor(() =>
+      expect(remote?.commands).toContainEqual({
+        actorId: workerId,
+        message: { type: "reply", requestId: 1 },
+      })
+    );
+    expect((await callChat("same-run fallback attempt")).isError).toBeFalsy();
+    expect(chatClient.sent[1]?.text).toBe(
+      `same-run fallback attempt\n\n_${generateHandle(workerId)} (gpt-5.5, low)_`
+    );
+
     remote.receive({
       actorId: workerId,
       message: { type: "result", result: { success: true, output: "done", exitCode: 0 } },
@@ -9826,7 +9914,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(getRepositories().actorRuns.getById(runId)?.outcome).toBe("completed")
     );
     expect((await callChat("after remote terminal")).isError).toBeFalsy();
-    expect(chatClient.sent[1]?.text).toBe(`after remote terminal\n\n_${generateHandle(workerId)}_`);
+    expect(chatClient.sent[2]?.text).toBe(`after remote terminal\n\n_${generateHandle(workerId)}_`);
 
     // A late attempt is still answered, but cannot restore the cleared selection.
     remote.receive({
@@ -9847,7 +9935,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       })
     );
     expect((await callChat("after late attempt")).isError).toBeFalsy();
-    expect(chatClient.sent[2]?.text).toBe(`after late attempt\n\n_${generateHandle(workerId)}_`);
+    expect(chatClient.sent[3]?.text).toBe(`after late attempt\n\n_${generateHandle(workerId)}_`);
   });
 
   it("installs a real follower's normalized attempt before its provider can write", async () => {
