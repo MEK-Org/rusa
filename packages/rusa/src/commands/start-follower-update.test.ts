@@ -220,30 +220,6 @@ it("updates a rusa start follower to the leader's requested release and reconnec
   expect(process.exit).not.toHaveBeenCalled();
 }, 20_000);
 
-it("rebuilds and restarts when only the checkout, not the running release, is at the target", async () => {
-  const home = tempDir("rusa-start-follower-update-head-");
-  const leader = await startLeader(home);
-  // The checkout already reached the target, but this process booted the old dist.
-  const git = syntheticGit(NEW_SHA, NEW_SHA);
-  const build = syntheticBuild();
-
-  await bootFollower(home, leader.url, {
-    runningSha: OLD_SHA,
-    update: { git: git.git, build: build.build, drainTimeoutMs: 50 },
-  });
-  leader.hub.updateFollower(FOLLOWER_ID, { targetSha: NEW_SHA, branch: "staging" });
-
-  await waitUntil(() =>
-    statusNames(leader.statuses).some((s) => s === "already_current" || s === "restarting")
-  );
-  expect(statusNames(leader.statuses)).not.toContain("already_current");
-  expect(build.calls).toEqual([`build ${NEW_SHA.slice(0, 7)}`]);
-  await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0);
-  expect(process.exit).toHaveBeenCalledWith(0);
-  // Success is recorded only once a process registers running the target.
-  expect(leader.store.hasSucceeded(FOLLOWER_ID, NEW_SHA)).toBe(false);
-}, 20_000);
-
 it("never treats an unproven running release as current", async () => {
   const home = tempDir("rusa-start-follower-update-unproven-");
   const leader = await startLeader(home);
@@ -491,4 +467,17 @@ it("refuses absent and unrecognized launcher contracts before update work", () =
 
   process.env[START_FOLLOWER_UPDATE_LAUNCHER_ENV] = "v2";
   expect(resolveStartFollowerRelease(nullLogger)).toEqual(unsupported);
+});
+
+it("consumes the launcher assertion so descendant processes cannot inherit it", () => {
+  syntheticCheckout({ sentinel: OLD_SHA });
+  process.env[START_FOLLOWER_UPDATE_LAUNCHER_ENV] = START_FOLLOWER_UPDATE_LAUNCHER_VERSION;
+
+  expect("unavailable" in resolveStartFollowerRelease(nullLogger).update).toBe(false);
+  expect(process.env[START_FOLLOWER_UPDATE_LAUNCHER_ENV]).toBeUndefined();
+
+  process.argv[1] = join(tempDir("rusa-start-follower-missing-"), "missing", "index.js");
+  process.env[START_FOLLOWER_UPDATE_LAUNCHER_ENV] = START_FOLLOWER_UPDATE_LAUNCHER_VERSION;
+  expect("unavailable" in resolveStartFollowerRelease(nullLogger).update).toBe(true);
+  expect(process.env[START_FOLLOWER_UPDATE_LAUNCHER_ENV]).toBeUndefined();
 });

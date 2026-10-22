@@ -41,7 +41,7 @@ import {
 import { resolveRepoRoot } from "./service-instance.js";
 import type { RunStartOptions } from "./start.js";
 import {
-  hasSupportedStartFollowerLauncherContract,
+  consumeSupportedStartFollowerLauncherContract,
   START_FOLLOWER_UPDATE_LAUNCHER_ENV,
   START_FOLLOWER_UPDATE_LAUNCHER_VERSION,
 } from "./start-follower-launcher-contract.js";
@@ -82,6 +82,7 @@ const RESTART_FLUSH_TIMEOUT_MS = 1500;
  * `rusa start` runs from `packages/rusa/dist` of a git checkout.
  */
 export function resolveStartFollowerRelease(log: Logger): StartFollowerRelease {
+  const launcherContract = consumeSupportedStartFollowerLauncherContract();
   let distDir: string;
   try {
     distDir = dirname(realpathSync(resolve(process.argv[1] ?? "")));
@@ -94,7 +95,7 @@ export function resolveStartFollowerRelease(log: Logger): StartFollowerRelease {
     runningSha,
     update: { unavailable: `Follower self-update is unsupported for this launch: ${reason}` },
   });
-  if (!hasSupportedStartFollowerLauncherContract()) {
+  if (!launcherContract) {
     return unsupported(
       `supported launcher contract is absent or unrecognized (expected ${START_FOLLOWER_UPDATE_LAUNCHER_ENV}=${START_FOLLOWER_UPDATE_LAUNCHER_VERSION})`
     );
